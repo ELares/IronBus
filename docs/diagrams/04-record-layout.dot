@@ -1,0 +1,45 @@
+// IronBus on-disk record and segment binary layout (frozen in #5). Render: dot -Tpdf 04-record-layout.dot -o 04-record-layout.pdf
+digraph record_layout {
+  rankdir=TB;
+  labelloc="t"; fontsize=18; fontname="Helvetica";
+  label="IronBus on-disk format (little-endian, frozen v1): record frame and segment frame";
+  graph [bgcolor="white", ranksep=0.5];
+  node  [fontname="Helvetica", shape=plaintext];
+
+  record [label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="5">
+      <TR><TD COLSPAN="3" BGCOLOR="#33506b"><FONT COLOR="white"><B>Record frame</B> (header 36 B, CRC32C over bytes [0..32) )</FONT></TD></TR>
+      <TR><TD BGCOLOR="#eef3fb"><B>offset</B></TD><TD BGCOLOR="#eef3fb"><B>field</B></TD><TD BGCOLOR="#eef3fb"><B>type / width</B></TD></TR>
+      <TR><TD>0</TD><TD>magic = 0x4942</TD><TD>u16 (2 B)</TD></TR>
+      <TR><TD>2</TD><TD>version</TD><TD>u8 (1 B)</TD></TR>
+      <TR><TD>3</TD><TD>flags (compressed, has_key, ...)</TD><TD>u8 (1 B)</TD></TR>
+      <TR><TD>4</TD><TD>seq</TD><TD>u64 (8 B)</TD></TR>
+      <TR><TD>12</TD><TD>timestamp (ms)</TD><TD>u64 (8 B)</TD></TR>
+      <TR><TD>20</TD><TD>key_len</TD><TD>u32 (4 B)</TD></TR>
+      <TR><TD>24</TD><TD>hdr_len</TD><TD>u32 (4 B)</TD></TR>
+      <TR><TD>28</TD><TD>payload_len</TD><TD>u32 (4 B)</TD></TR>
+      <TR><TD>32</TD><TD>header_crc (CRC32C of [0..32))</TD><TD>u32 (4 B)</TD></TR>
+      <TR><TD>36</TD><TD BGCOLOR="#f6f6f6">key bytes</TD><TD>key_len</TD></TR>
+      <TR><TD>...</TD><TD BGCOLOR="#f6f6f6">headers</TD><TD>hdr_len</TD></TR>
+      <TR><TD>...</TD><TD BGCOLOR="#f6f6f6">payload (optionally zstd, dict_id=0 in v1)</TD><TD>payload_len</TD></TR>
+      <TR><TD>...</TD><TD BGCOLOR="#e7f6ec">body_crc (CRC32C of body; xxh3-64 too if payload &gt; 64 KiB)</TD><TD>u32 (4 B)</TD></TR>
+      <TR><TD>...</TD><TD BGCOLOR="#e7f6ec">total_len (whole record, enables reverse scan)</TD><TD>u32 (4 B)</TD></TR>
+    </TABLE>
+  >];
+
+  segment [label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="5">
+      <TR><TD COLSPAN="2" BGCOLOR="#9a8a1e"><FONT COLOR="white"><B>Segment file (.log)</B></FONT></TD></TR>
+      <TR><TD BGCOLOR="#fff7d6"><B>Segment header</B> (64 B, 4 KiB-aligned)</TD><TD BGCOLOR="#fff7d6">8-B magic "IRONBUS\0", version, checksum_algo=0x1,<BR/>segment_id u64, base_seq u64, base_offset u64, created_ts, header_crc</TD></TR>
+      <TR><TD>record 0</TD><TD>frame as above (seq = base_seq)</TD></TR>
+      <TR><TD>record 1 .. N-1</TD><TD>contiguous, record-aligned (NO 32 KiB block layer, NO fragments)</TD></TR>
+      <TR><TD BGCOLOR="#f0ead9"><B>Segment footer</B> (32 B)</TD><TD BGCOLOR="#f0ead9">record_count, last_seq, footer_crc (written on seal)</TD></TR>
+    </TABLE>
+  >];
+
+  sidecars [shape=note, fillcolor="#f0ead9", style=filled, color="#9a8a1e", fontname="Helvetica", fontsize=10,
+    label="Derived sidecars (non-authoritative, rebuilt by recovery):\l  .index   sparse offset -> file position\l  .tindex  sparse timestamp -> offset\lNaming: 20-digit zero-padded base offset. Limits: max record 16 MiB (to 1 GiB),\lsegment 64 MiB (8 MiB edge); a record never spans two segments.\l"];
+
+  record -> segment [style=invis];
+  segment -> sidecars [style=invis];
+}

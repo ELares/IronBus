@@ -1,0 +1,57 @@
+// IronBus system architecture (planning phase). Render: dot -Tpdf 01-architecture.dot -o 01-architecture.pdf
+digraph ironbus_architecture {
+  rankdir=LR;
+  labelloc="t"; fontsize=20; fontname="Helvetica";
+  label="IronBus system architecture (v1, single durable queue, log-is-WAL)";
+  graph [bgcolor="white", nodesep=0.35, ranksep=0.9, splines=polyline];
+  node  [fontname="Helvetica", fontsize=11, style="filled,rounded", shape=box, fillcolor="#eef3fb", color="#33506b"];
+  edge  [fontname="Helvetica", fontsize=9, color="#33506b"];
+
+  subgraph cluster_clients {
+    label="Clients"; style="rounded,filled"; fillcolor="#f6f6f6"; color="#bbbbbb";
+    prod [label="Producers", fillcolor="#e7f6ec", color="#2f7d4f"];
+    cons [label="Consumers\n(many: competing or independent)", fillcolor="#e7f6ec", color="#2f7d4f"];
+    cli  [label="CLI (same binary)\nonline + offline inspection", fillcolor="#fff4e0", color="#b07b1e"];
+  }
+
+  subgraph cluster_server {
+    label="IronBus broker (single static binary)"; style="rounded,filled"; fillcolor="#fbfcff"; color="#33506b";
+    listener [label="Listener\nTLS 1.3 (mandatory off-loopback)"];
+    auth     [label="Auth + scopes\n(publish / subscribe / admin)"];
+    ingress  [label="Ingress ring\n+ credit-based backpressure"];
+    append   [label="Append actor\n(single writer, mints u64 offsets,\nframes + CRC32C)", fillcolor="#e9e3f7", color="#5a3fa0"];
+    commit   [label="Commit thread\ngroup-commit fdatasync (<= 1 MiB),\nack only after sync", fillcolor="#e9e3f7", color="#5a3fa0"];
+    index    [label="Derived offset / time index\n(in-memory, rebuildable)"];
+    delivery [label="Delivery\nleases, ack, redelivery, DLQ", fillcolor="#e7f6ec", color="#2f7d4f"];
+    janitor  [label="Janitor + checkpointer\nseal, retain, retire, recycle", fillcolor="#fdeceb", color="#a3322b"];
+    scrubber [label="Background scrubber\nverify CRC, quarantine", fillcolor="#fdeceb", color="#a3322b"];
+    obs      [label="Observability\nmetrics, health, tracing"];
+  }
+
+  subgraph cluster_disk {
+    label="Data directory (one disk)"; style="rounded,filled"; fillcolor="#f4f4ef"; color="#999977";
+    active  [label="Active segment\n(THIS IS THE WAL)", shape=folder, fillcolor="#fff7d6", color="#9a8a1e"];
+    sealed  [label="Sealed segments\n.log + .index + .tindex", shape=folder, fillcolor="#f0ead9", color="#9a8a1e"];
+    cstate  [label="consumers/<name>/\nstate log", shape=folder, fillcolor="#f0ead9", color="#9a8a1e"];
+    quar    [label="quarantine/\ncopied corrupt segments", shape=folder, fillcolor="#f3dedb", color="#a3322b"];
+    ptr     [label="current pointer\n+ advisory manifest", shape=note, fillcolor="#f0ead9", color="#9a8a1e"];
+  }
+
+  prod -> listener -> auth -> ingress -> append -> commit;
+  commit -> active [label="append + fdatasync"];
+  commit -> append [label="ack(offset)", style=dashed];
+  active -> sealed [label="roll 64 MiB / 1h"];
+  append -> index [label="update tail", style=dotted];
+  sealed -> index [label="rebuild on boot", style=dotted];
+  index -> delivery;
+  sealed -> delivery [label="read (lock-free)"];
+  delivery -> cons [label="deliver (lease)"];
+  cons -> delivery [label="ack / nack", style=dashed];
+  delivery -> cstate [label="persist state"];
+  janitor -> sealed [label="seal / delete / recycle"];
+  janitor -> ptr [label="advance"];
+  scrubber -> sealed [label="verify"];
+  scrubber -> quar [label="quarantine"];
+  obs -> cli [style=dotted, label="scrape"];
+  cli -> sealed [label="offline peek / scrub", style=dotted];
+}
