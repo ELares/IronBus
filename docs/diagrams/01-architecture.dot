@@ -7,12 +7,10 @@ digraph ironbus_architecture {
   node  [fontname="Helvetica", fontsize=11, style="filled,rounded", shape=box, fillcolor="#eef3fb", color="#33506b"];
   edge  [fontname="Helvetica", fontsize=9, color="#33506b"];
 
-  subgraph cluster_clients {
-    label="Clients"; style="rounded,filled"; fillcolor="#f6f6f6"; color="#bbbbbb";
-    prod [label="Producers", fillcolor="#e7f6ec", color="#2f7d4f"];
-    cons [label="Consumers\n(many: competing or independent)", fillcolor="#e7f6ec", color="#2f7d4f"];
-    cli  [label="CLI (same binary)\nonline + offline inspection", fillcolor="#fff4e0", color="#b07b1e"];
-  }
+  // Clients as free nodes (no cluster) so dot ranks producers at the source and consumers at the sink.
+  prod [label="Producers", fillcolor="#e7f6ec", color="#2f7d4f"];
+  cons [label="Consumers\n(many: competing or independent)", fillcolor="#e7f6ec", color="#2f7d4f"];
+  cli  [label="CLI (same binary)\nonline + offline inspection", fillcolor="#fff4e0", color="#b07b1e"];
 
   subgraph cluster_server {
     label="IronBus broker (single static binary)"; style="rounded,filled"; fillcolor="#fbfcff"; color="#33506b";

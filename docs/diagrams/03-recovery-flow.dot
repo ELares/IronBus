@@ -6,7 +6,6 @@ digraph recovery_flow {
   graph [bgcolor="white", ranksep=0.45, nodesep=0.4];
   node  [fontname="Helvetica", fontsize=11, shape=box, style="filled,rounded", fillcolor="#eef3fb", color="#33506b"];
   edge  [fontname="Helvetica", fontsize=10, color="#33506b"];
-  D     [shape=diamond, style="filled", fillcolor="#fff4e0", color="#b07b1e"];
 
   start  [label="Open data directory", shape=oval, fillcolor="#e7f6ec", color="#2f7d4f"];
   ptr    [label="Read current pointer\n(base offset + last-flushed offset)"];
