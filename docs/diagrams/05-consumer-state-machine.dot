@@ -1,0 +1,25 @@
+// IronBus message delivery state machine (per message, per consumer group). Render: dot -Tpdf 05-consumer-state-machine.dot -o 05-consumer-state-machine.pdf
+digraph consumer_state {
+  rankdir=LR;
+  labelloc="t"; fontsize=18; fontname="Helvetica";
+  label="IronBus delivery state machine (at-least-once, SQS-style leases, pull v1)";
+  graph [bgcolor="white", ranksep=0.7, nodesep=0.5];
+  node  [fontname="Helvetica", fontsize=11, shape=box, style="filled,rounded", fillcolor="#eef3fb", color="#33506b"];
+  edge  [fontname="Helvetica", fontsize=10, color="#33506b"];
+
+  avail   [label="AVAILABLE\n(at consumer cursor)", fillcolor="#e7f6ec", color="#2f7d4f"];
+  inflight[label="IN_FLIGHT\n(leased, visibility timeout 30s,\nhard cap 5 min)", fillcolor="#fff4e0", color="#b07b1e"];
+  acked   [label="ACKED\n(cursor advances; record stays\nimmutable in the log)", fillcolor="#e7f6ec", color="#2f7d4f"];
+  dlq     [label="DEAD-LETTER QUEUE\n(after max_deliver = 5)", fillcolor="#f3dedb", color="#a3322b"];
+  parked  [label="PARKED\n(ordered group, DLQ off:\nstop redelivery + advisory)", fillcolor="#f3dedb", color="#a3322b"];
+
+  avail   -> inflight [label="deliver (consume 1 credit + bytes)"];
+  inflight-> acked    [label="ack"];
+  inflight-> avail    [label="nack  OR  lease expiry (janitor sweep)\nattempts += 1, fencing token bumped"];
+  inflight-> dlq      [label="attempts > max_deliver\n(unordered group)"];
+  inflight-> parked   [label="attempts > max_deliver\n(ordered group, DLQ off)"];
+
+  note [shape=plaintext, fontname="Helvetica", fontsize=10, label=
+    "State lives in a per-consumer append-only state log (consumers/<name>/), not inline with data.\lLeases are reclaimed only after the visibility deadline; a late ack from a prior holder is fenced.\lOn unclean restart, all in-flight leases are treated as expired and redelivered on the next sweep.\l"];
+  acked -> note [style=invis];
+}

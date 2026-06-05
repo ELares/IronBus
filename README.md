@@ -28,7 +28,7 @@ We rank the tenets, and when two conflict we resolve in this order: **Resilient 
 
 | Tenet | What it means in practice |
 | --- | --- |
-| **Simple** | One logical queue, one binary, one config file with safe defaults, a tiny length-framed wire protocol you can drive with netcat. Install to first message in under a minute. No ZooKeeper, no JVM, no external dependencies. |
+| **Simple** | One logical queue, one binary, one config file with safe defaults, a tiny length-framed binary wire protocol you can inspect with the built-in `ironbus tap` and `ironbus wire` commands. Install to first message in under a minute. No ZooKeeper, no JVM, no external dependencies. |
 | **Resilient** | Every acknowledged durable write survives power loss. Startup always recovers a consistent prefix. A torn tail or a poison record or segment is skipped, never fatal, with loss bounded and reported as a number. |
 | **HyperScale** | High per-core throughput on edge hardware (not horizontal scale-out): a bounded ring-buffer core with structural backpressure, group-commit `fdatasync`, and zero-copy fan-out, sustaining tens of thousands of small messages per second per core. |
 | **Edge First** | RAM ceilings, flash-wear budgets, and brownout behavior are first-class configuration, not afterthoughts. The queue spills to disk and sheds load rather than blocking producers or running out of memory. |

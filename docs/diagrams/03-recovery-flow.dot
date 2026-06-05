@@ -1,0 +1,43 @@
+// IronBus crash recovery and corruption-skip flow. Render: dot -Tpdf 03-recovery-flow.dot -o 03-recovery-flow.pdf
+digraph recovery_flow {
+  rankdir=TB;
+  labelloc="t"; fontsize=18; fontname="Helvetica";
+  label="IronBus startup recovery: longest-valid-prefix with bounded, reported skip";
+  graph [bgcolor="white", ranksep=0.45, nodesep=0.4];
+  node  [fontname="Helvetica", fontsize=11, shape=box, style="filled,rounded", fillcolor="#eef3fb", color="#33506b"];
+  edge  [fontname="Helvetica", fontsize=10, color="#33506b"];
+
+  start  [label="Open data directory", shape=oval, fillcolor="#e7f6ec", color="#2f7d4f"];
+  ptr    [label="Read current pointer\n(base offset + last-flushed offset)"];
+  scan   [label="Directory scan + per-segment header CRC\n(pointer is advisory, never trusted blindly)"];
+  rec    [label="Replay records from last checkpoint,\nvalidate CRC32C and seq in [base_seq, ...)"];
+
+  dtail  [shape=diamond, style="filled", fillcolor="#fff4e0", color="#b07b1e", label="Torn or zero-filled tail?"];
+  trunc  [label="Truncate logical replay at last good record\n(clean tail = normal truncation)"];
+
+  dbad   [shape=diamond, style="filled", fillcolor="#fff4e0", color="#b07b1e", label="Bad CRC / bad length\nmid-log?"];
+  skip   [label="Skip poison record; if segment header unreadable,\ncopy segment to quarantine/ and skip it", fillcolor="#fdeceb", color="#a3322b"];
+  resync [label="Resync: scan forward for magic + valid header_crc\n+ seq == prev_good_seq + 1"];
+
+  dcap   [shape=diamond, style="filled", fillcolor="#fff4e0", color="#b07b1e", label="Loss > cap?\n(1 segment / 64 MiB per event,\n1% of durable bytes total)"];
+  freeze [label="FREEZE log read-only, non-zero exit, alert", fillcolor="#f3dedb", color="#a3322b", fontcolor="#a3322b"];
+  report [label="Emit bounded-loss report:\nrecords_lost, bytes_lost, segments_affected,\noffset range, reason enum", shape=note, fillcolor="#e7f6ec", color="#2f7d4f"];
+
+  rebuild [label="Rebuild derived offset/time index from .log\n(indexes are non-authoritative)"];
+  ready   [label="Recovery complete: writer accepts PUB, consumers resume", shape=oval, fillcolor="#e7f6ec", color="#2f7d4f"];
+
+  start -> ptr -> scan -> rec -> dtail;
+  dtail -> trunc [label="yes"];
+  dtail -> dbad  [label="no"];
+  trunc -> rebuild;
+  dbad  -> resync [label="yes"];
+  dbad  -> rebuild [label="no, prefix clean"];
+  skip  -> resync;
+  resync -> dcap;
+  dbad -> skip [style=invis];
+  dcap -> freeze [label="yes"];
+  dcap -> report [label="no"];
+  report -> rec [label="continue scan", style=dashed, constraint=false];
+  report -> rebuild;
+  rebuild -> ready;
+}

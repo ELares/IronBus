@@ -1,0 +1,141 @@
+// IronBus contract models (generated). Render: dot -Tpdf 08-contract-models-er.dot -o 08-contract-models-er.pdf
+digraph contracts {
+  rankdir=LR;
+  labelloc="t"; fontsize=18; fontname="Helvetica";
+  label="IronBus contract models: on-disk, wire, config, runtime, report (fields are the agreed schema, not code)";
+  graph [bgcolor="white", ranksep=0.9, nodesep=0.3];
+  node [fontname="Helvetica", fontsize=9, shape=plaintext];
+  edge [fontname="Helvetica", fontsize=8, color="#555555"];
+  subgraph cluster_0 { label="On-disk format"; style="rounded,filled"; fillcolor="#f4f4ef"; color="#9a8a1e";
+    m_RecordHeader [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>RecordHeader</B>  (on-disk)</FONT></TD></TR><TR><TD ALIGN="LEFT">magic</TD><TD ALIGN="LEFT">u16 (2)</TD></TR><TR><TD ALIGN="LEFT">version</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">flags</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">seq</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">timestamp</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">key_len</TD><TD ALIGN="LEFT">u32 (4)</TD></TR><TR><TD ALIGN="LEFT" COLSPAN="2"><I>... +3 more</I></TD></TR></TABLE>
+>];
+    m_RecordTrailer [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>RecordTrailer</B>  (on-disk)</FONT></TD></TR><TR><TD ALIGN="LEFT">body_crc</TD><TD ALIGN="LEFT">u32 (4)</TD></TR><TR><TD ALIGN="LEFT">total_len</TD><TD ALIGN="LEFT">u32 (4)</TD></TR></TABLE>
+>];
+    m_SegmentHeader [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>SegmentHeader</B>  (on-disk)</FONT></TD></TR><TR><TD ALIGN="LEFT">magic</TD><TD ALIGN="LEFT">bytes (8)</TD></TR><TR><TD ALIGN="LEFT">version</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">checksum_algo</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">flags</TD><TD ALIGN="LEFT">u16 (2)</TD></TR><TR><TD ALIGN="LEFT">segment_id</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">base_seq</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT" COLSPAN="2"><I>... +3 more</I></TD></TR></TABLE>
+>];
+    m_SegmentFooter [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>SegmentFooter</B>  (on-disk)</FONT></TD></TR><TR><TD ALIGN="LEFT">record_count</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">last_seq</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">footer_crc</TD><TD ALIGN="LEFT">u32 (4)</TD></TR><TR><TD ALIGN="LEFT">reserved</TD><TD ALIGN="LEFT">bytes (12)</TD></TR></TABLE>
+>];
+    m_OffsetIndexEntry [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>OffsetIndexEntry</B>  (on-disk)</FONT></TD></TR><TR><TD ALIGN="LEFT">rel_offset</TD><TD ALIGN="LEFT">u32 (4)</TD></TR><TR><TD ALIGN="LEFT">byte_pos</TD><TD ALIGN="LEFT">u32 (4)</TD></TR></TABLE>
+>];
+    m_TimeIndexEntry [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>TimeIndexEntry</B>  (on-disk)</FONT></TD></TR><TR><TD ALIGN="LEFT">timestamp</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">rel_offset</TD><TD ALIGN="LEFT">u32 (4)</TD></TR></TABLE>
+>];
+    m_CurrentPointer [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>CurrentPointer</B>  (on-disk)</FONT></TD></TR><TR><TD ALIGN="LEFT">active_segment_id</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">active_base_offset</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">last_flushed_offset</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">crc</TD><TD ALIGN="LEFT">u32 (4)</TD></TR></TABLE>
+>];
+    m_ManifestEdit [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>ManifestEdit</B>  (on-disk)</FONT></TD></TR><TR><TD ALIGN="LEFT">edit_type</TD><TD ALIGN="LEFT">enum (1)</TD></TR><TR><TD ALIGN="LEFT">segment_id</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">base_seq</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">timestamp</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">crc</TD><TD ALIGN="LEFT">u32 (4)</TD></TR></TABLE>
+>];
+    m_ConsumerStateEvent [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>ConsumerStateEvent</B>  (on-disk)</FONT></TD></TR><TR><TD ALIGN="LEFT">event_type</TD><TD ALIGN="LEFT">enum (1)</TD></TR><TR><TD ALIGN="LEFT">offset</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">attempt</TD><TD ALIGN="LEFT">u32 (4)</TD></TR><TR><TD ALIGN="LEFT">lease_id</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">fence_token</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">timestamp_unix_ms</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT" COLSPAN="2"><I>... +1 more</I></TD></TR></TABLE>
+>];
+  }
+  subgraph cluster_1 { label="Runtime"; style="rounded,filled"; fillcolor="#e9e3f7"; color="#5a3fa0";
+    m_Lease [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>Lease</B>  (runtime)</FONT></TD></TR><TR><TD ALIGN="LEFT">lease_id</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">consumer</TD><TD ALIGN="LEFT">string (var)</TD></TR><TR><TD ALIGN="LEFT">offset</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">attempt</TD><TD ALIGN="LEFT">u32 (4)</TD></TR><TR><TD ALIGN="LEFT">granted_unix_ms</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">visibility_deadline_ms</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT" COLSPAN="2"><I>... +1 more</I></TD></TR></TABLE>
+>];
+    m_DlqEntry [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>DlqEntry</B>  (runtime)</FONT></TD></TR><TR><TD ALIGN="LEFT">source_offset</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">original_enqueue_unix_ms</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">attempts</TD><TD ALIGN="LEFT">u32 (4)</TD></TR><TR><TD ALIGN="LEFT">reason</TD><TD ALIGN="LEFT">enum (1)</TD></TR><TR><TD ALIGN="LEFT">dlq_offset</TD><TD ALIGN="LEFT">u64 (8)</TD></TR></TABLE>
+>];
+  }
+  subgraph cluster_2 { label="Reports"; style="rounded,filled"; fillcolor="#e7f6ec"; color="#2f7d4f";
+    m_RecoveryReport [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>RecoveryReport</B>  (report)</FONT></TD></TR><TR><TD ALIGN="LEFT">shutdown_type</TD><TD ALIGN="LEFT">enum (1)</TD></TR><TR><TD ALIGN="LEFT">checkpoint_seq</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">checkpoint_offset</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">records_validated</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">bytes_scanned</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">bytes_truncated</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT" COLSPAN="2"><I>... +9 more</I></TD></TR></TABLE>
+>];
+    m_SkipEvent [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>SkipEvent</B>  (report)</FONT></TD></TR><TR><TD ALIGN="LEFT">timestamp</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">segment_id</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">reason_code</TD><TD ALIGN="LEFT">enum (1)</TD></TR><TR><TD ALIGN="LEFT">lost_offset_start</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">lost_offset_end</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">lost_bytes</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT" COLSPAN="2"><I>... +3 more</I></TD></TR></TABLE>
+>];
+  }
+  subgraph cluster_3 { label="Wire protocol frames"; style="rounded,filled"; fillcolor="#eef3fb"; color="#33506b";
+    m_ConnectFrame [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>ConnectFrame</B>  (wire)</FONT></TD></TR><TR><TD ALIGN="LEFT">verb</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">queue_name</TD><TD ALIGN="LEFT">string (var)</TD></TR><TR><TD ALIGN="LEFT">auth_method</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">auth_len</TD><TD ALIGN="LEFT">varint (1-5)</TD></TR><TR><TD ALIGN="LEFT">auth_blob</TD><TD ALIGN="LEFT">bytes (var)</TD></TR><TR><TD ALIGN="LEFT">stream_id</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT" COLSPAN="2"><I>... +1 more</I></TD></TR></TABLE>
+>];
+    m_InfoFrame [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>InfoFrame</B>  (wire)</FONT></TD></TR><TR><TD ALIGN="LEFT">verb</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">version</TD><TD ALIGN="LEFT">string (var)</TD></TR><TR><TD ALIGN="LEFT">max_frame_size</TD><TD ALIGN="LEFT">varint (1-5)</TD></TR><TR><TD ALIGN="LEFT">capabilities</TD><TD ALIGN="LEFT">bytes (var)</TD></TR></TABLE>
+>];
+    m_PubFrame [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>PubFrame</B>  (wire)</FONT></TD></TR><TR><TD ALIGN="LEFT">verb</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">flags</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">headers</TD><TD ALIGN="LEFT">bytes (var)</TD></TR><TR><TD ALIGN="LEFT">key_len</TD><TD ALIGN="LEFT">varint (1-5)</TD></TR><TR><TD ALIGN="LEFT">key</TD><TD ALIGN="LEFT">bytes (var)</TD></TR><TR><TD ALIGN="LEFT">payload_len</TD><TD ALIGN="LEFT">varint (1-5)</TD></TR><TR><TD ALIGN="LEFT" COLSPAN="2"><I>... +1 more</I></TD></TR></TABLE>
+>];
+    m_PubAckFrame [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>PubAckFrame</B>  (wire)</FONT></TD></TR><TR><TD ALIGN="LEFT">verb</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">assigned_offset</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">dedup_hit</TD><TD ALIGN="LEFT">bool (1)</TD></TR></TABLE>
+>];
+    m_SubFrame [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>SubFrame</B>  (wire)</FONT></TD></TR><TR><TD ALIGN="LEFT">verb</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">consumer</TD><TD ALIGN="LEFT">string (var)</TD></TR><TR><TD ALIGN="LEFT">credit</TD><TD ALIGN="LEFT">varint (1-5)</TD></TR><TR><TD ALIGN="LEFT">start_mode</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">start_offset</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">close</TD><TD ALIGN="LEFT">u8 (1)</TD></TR></TABLE>
+>];
+    m_DeliverFrame [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>DeliverFrame</B>  (wire)</FONT></TD></TR><TR><TD ALIGN="LEFT">verb</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">offset</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">attempt</TD><TD ALIGN="LEFT">u32 (4)</TD></TR><TR><TD ALIGN="LEFT">headers</TD><TD ALIGN="LEFT">bytes (var)</TD></TR><TR><TD ALIGN="LEFT">key_len</TD><TD ALIGN="LEFT">varint (1-5)</TD></TR><TR><TD ALIGN="LEFT">key</TD><TD ALIGN="LEFT">bytes (var)</TD></TR><TR><TD ALIGN="LEFT" COLSPAN="2"><I>... +2 more</I></TD></TR></TABLE>
+>];
+    m_AckFrame [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>AckFrame</B>  (wire)</FONT></TD></TR><TR><TD ALIGN="LEFT">verb</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">offset</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">lease_id</TD><TD ALIGN="LEFT">u64 (8)</TD></TR></TABLE>
+>];
+    m_NackFrame [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>NackFrame</B>  (wire)</FONT></TD></TR><TR><TD ALIGN="LEFT">verb</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">offset</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">lease_id</TD><TD ALIGN="LEFT">u64 (8)</TD></TR><TR><TD ALIGN="LEFT">disposition</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">delay_ms</TD><TD ALIGN="LEFT">varint (1-5)</TD></TR><TR><TD ALIGN="LEFT">reason</TD><TD ALIGN="LEFT">bytes (var)</TD></TR></TABLE>
+>];
+    m_FlowFrame [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>FlowFrame</B>  (wire)</FONT></TD></TR><TR><TD ALIGN="LEFT">verb</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">direction</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">credit</TD><TD ALIGN="LEFT">varint (1-5)</TD></TR><TR><TD ALIGN="LEFT">bytes_per_sec</TD><TD ALIGN="LEFT">varint (1-5)</TD></TR><TR><TD ALIGN="LEFT">pause</TD><TD ALIGN="LEFT">u8 (1)</TD></TR></TABLE>
+>];
+    m_PingFrame [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>PingFrame</B>  (wire)</FONT></TD></TR><TR><TD ALIGN="LEFT">verb</TD><TD ALIGN="LEFT">u8 (1)</TD></TR></TABLE>
+>];
+    m_ErrorFrame [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>ErrorFrame</B>  (wire)</FONT></TD></TR><TR><TD ALIGN="LEFT">verb</TD><TD ALIGN="LEFT">u8 (1)</TD></TR><TR><TD ALIGN="LEFT">code</TD><TD ALIGN="LEFT">u16 (2)</TD></TR><TR><TD ALIGN="LEFT">reason_len</TD><TD ALIGN="LEFT">varint (1-5)</TD></TR><TR><TD ALIGN="LEFT">reason</TD><TD ALIGN="LEFT">string (var)</TD></TR></TABLE>
+>];
+  }
+  subgraph cluster_4 { label="Config"; style="rounded,filled"; fillcolor="#fff4e0"; color="#b07b1e";
+    m_Config [label=<
+<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3"><TR><TD BGCOLOR="#33506b" COLSPAN="2"><FONT COLOR="white"><B>Config</B>  (config)</FONT></TD></TR><TR><TD ALIGN="LEFT">profile</TD><TD ALIGN="LEFT">enum (var)</TD></TR><TR><TD ALIGN="LEFT">durability</TD><TD ALIGN="LEFT">string (var)</TD></TR><TR><TD ALIGN="LEFT">storage</TD><TD ALIGN="LEFT">string (var)</TD></TR><TR><TD ALIGN="LEFT">retention</TD><TD ALIGN="LEFT">string (var)</TD></TR><TR><TD ALIGN="LEFT">compression</TD><TD ALIGN="LEFT">string (var)</TD></TR><TR><TD ALIGN="LEFT">backpressure</TD><TD ALIGN="LEFT">string (var)</TD></TR><TR><TD ALIGN="LEFT" COLSPAN="2"><I>... +1 more</I></TD></TR></TABLE>
+>];
+  }
+  m_RecordHeader -> m_RecordTrailer [label="is-closed-by"];
+  m_RecordHeader -> m_SegmentHeader [label="contained-in-segment"];
+  m_RecordTrailer -> m_RecordHeader [label="closes"];
+  m_SegmentHeader -> m_SegmentFooter [label="sealed-by"];
+  m_SegmentHeader -> m_OffsetIndexEntry [label="indexed-by"];
+  m_SegmentHeader -> m_TimeIndexEntry [label="indexed-by"];
+  m_SegmentFooter -> m_SegmentHeader [label="seals"];
+  m_OffsetIndexEntry -> m_SegmentHeader [label="derived-from"];
+  m_TimeIndexEntry -> m_SegmentHeader [label="derived-from"];
+  m_CurrentPointer -> m_SegmentHeader [label="points-to-active"];
+  m_CurrentPointer -> m_ManifestEdit [label="accelerated-by"];
+  m_ManifestEdit -> m_SegmentHeader [label="describes"];
+  m_ManifestEdit -> m_CurrentPointer [label="advises"];
+  m_ConsumerStateEvent -> m_Lease [label="records"];
+  m_ConsumerStateEvent -> m_DlqEntry [label="emits"];
+  m_Lease -> m_ConsumerStateEvent [label="persisted-as"];
+  m_Lease -> m_DlqEntry [label="exhausts-into"];
+  m_DlqEntry -> m_Lease [label="created-from"];
+  m_DlqEntry -> m_ConsumerStateEvent [label="committed-by"];
+  m_RecoveryReport -> m_SkipEvent [label="aggregates"];
+  m_RecoveryReport -> m_SegmentHeader [label="validates"];
+  m_SkipEvent -> m_RecoveryReport [label="rolled-up-into"];
+  m_SkipEvent -> m_SegmentHeader [label="references"];
+  m_ConnectFrame -> m_InfoFrame [label="answered-by"];
+  m_ConnectFrame -> m_ErrorFrame [label="rejected-by"];
+  m_InfoFrame -> m_ConnectFrame [label="responds-to"];
+  m_PubFrame -> m_PubAckFrame [label="acknowledged-by"];
+  m_PubFrame -> m_RecordHeader [label="appended-as"];
+  m_PubAckFrame -> m_PubFrame [label="acknowledges"];
+  m_SubFrame -> m_DeliverFrame [label="produces"];
+  m_SubFrame -> m_ErrorFrame [label="validated-by"];
+  m_DeliverFrame -> m_AckFrame [label="acknowledged-by"];
+  m_DeliverFrame -> m_NackFrame [label="rejected-by"];
+  m_DeliverFrame -> m_Lease [label="grants"];
+  m_AckFrame -> m_DeliverFrame [label="settles"];
+  m_AckFrame -> m_Lease [label="releases"];
+  m_NackFrame -> m_DeliverFrame [label="settles"];
+  m_NackFrame -> m_DlqEntry [label="may-trigger"];
+  m_FlowFrame -> m_PubFrame [label="throttles"];
+  m_FlowFrame -> m_SubFrame [label="credits"];
+  m_PingFrame -> m_InfoFrame [label="keepalive-for"];
+  m_ErrorFrame -> m_ConnectFrame [label="may-reject"];
+  m_ErrorFrame -> m_PubFrame [label="may-reject"];
+  m_ErrorFrame -> m_SubFrame [label="may-reject"];
+  m_Config -> m_RecordHeader [label="governs"];
+  m_Config -> m_Lease [label="governs"];
+  m_Config -> m_SegmentHeader [label="governs"];
+}

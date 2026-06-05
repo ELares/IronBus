@@ -1,0 +1,36 @@
+// IronBus WAL/segment lifecycle and cleanup. Render: dot -Tpdf 06-wal-segment-lifecycle.dot -o 06-wal-segment-lifecycle.pdf
+// log-is-WAL: the active segment IS the WAL, so "WAL cleanup" is seal-then-retire of sealed segments.
+digraph wal_lifecycle {
+  rankdir=LR;
+  labelloc="t"; fontsize=18; fontname="Helvetica";
+  label="IronBus segment lifecycle and file cleanup (log-is-WAL): who retires the files, and when";
+  graph [bgcolor="white", ranksep=0.8, nodesep=0.45, splines=polyline];
+  node  [fontname="Helvetica", fontsize=11, shape=box, style="filled,rounded", fillcolor="#eef3fb", color="#33506b"];
+  edge  [fontname="Helvetica", fontsize=9, color="#33506b"];
+
+  active   [label="ACTIVE\n(the WAL: appended + group-commit fdatasync)", fillcolor="#fff7d6", color="#9a8a1e"];
+  sealing  [label="SEALING\n(write footer, fsync .index/.tindex,\nfsync data, advance pointer, manifest edit)"];
+  sealed   [label="SEALED\n(immutable, served lock-free to consumers)", fillcolor="#f0ead9", color="#9a8a1e"];
+  eligible [label="ELIGIBLE\n(min(checkpoint, retention bound,\nslowest consumer cursor) has passed)", fillcolor="#e7f6ec", color="#2f7d4f"];
+  deleting [label="DELETING\n(unlink, fsync dir, drop manifest entry,\nupdate disk accounting)", fillcolor="#fdeceb", color="#a3322b"];
+  deleted  [label="DELETED", fillcolor="#f3dedb", color="#a3322b"];
+  recycled [label="RECYCLED (deferred, OPEN DECISION)\nzeroed + renamed, generation-tagged", style="dashed,filled", fillcolor="#f0f0f0", color="#999999", fontcolor="#777777"];
+  quar     [label="QUARANTINED\n(corrupt: copied aside by scrubber)", fillcolor="#f3dedb", color="#a3322b"];
+
+  active   -> sealing  [label="roll at 64 MiB / 1h (Append actor)"];
+  sealing  -> sealed;
+  sealed   -> eligible [label="all 3 watermarks cleared (Reaper)"];
+  sealed   -> quar     [label="CRC fails (Scrubber)"];
+  eligible -> deleting [label="Reaper retires"];
+  deleting -> deleted;
+  deleting -> recycled [label="v2 option", style=dashed, color="#999999", fontcolor="#777777"];
+  recycled -> active   [label="reused", style=dashed, color="#999999", fontcolor="#777777"];
+  quar     -> deleted  [label="after forensic capture"];
+
+  actors [shape=note, fillcolor="#fbfcff", style=filled, color="#33506b", fontname="Helvetica", fontsize=9, label=
+    "Cleanup ownership (no single actor is blocked by another):\l  Append actor (#4): seals the active segment, hands immutable index to readers.\l  Group-commit thread (#6): establishes durable_offset; fatal fsync error freezes the instance.\l  Checkpointer (#7): publishes the durable watermark (gate 1 for deletion) on roll / 1s / 4 MiB.\l  Reaper / janitor (#13): retires sealed segments past min(checkpoint, retention, slowest cursor);\l                          event-driven on seal, 60s age timer, forced run at 90% disk high-water.\l  Compactor (#13, optional): re-copies survivor segments, never in-place, single atomic manifest swap.\l  Backpressure controller (#10): when nothing is eligible and disk fills, durable spills then sheds\l                          (drop_new, counted), telemetry drop_oldest, block is opt-in and bounded.\l"];
+  deleted -> actors [style=invis];
+  sources [shape=plaintext, fontname="Helvetica", fontsize=8, fontcolor="#777777", label=
+    "Lessons borrowed: PostgreSQL checkpoints + WAL recycling, RocksDB max_total_wal_size + flush-advances-log,\lKafka whole-segment retention (active never deleted), SQLite wal_autocheckpoint, etcd snapshot-then-compact.\l"];
+  actors -> sources [style=invis];
+}

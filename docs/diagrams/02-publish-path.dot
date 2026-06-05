@@ -1,0 +1,25 @@
+// IronBus publish data path and durability boundary. Render: dot -Tpdf 02-publish-path.dot -o 02-publish-path.pdf
+digraph publish_path {
+  rankdir=TB;
+  labelloc="t"; fontsize=18; fontname="Helvetica";
+  label="IronBus publish path: ack is returned only after the covering fdatasync";
+  graph [bgcolor="white", ranksep=0.55, nodesep=0.4];
+  node  [fontname="Helvetica", fontsize=11, shape=box, style="filled,rounded", fillcolor="#eef3fb", color="#33506b"];
+  edge  [fontname="Helvetica", fontsize=10, color="#33506b"];
+
+  s1 [label="1. Producer sends PUB(payload, optional key, optional msg_id)"];
+  s2 [label="2. TLS 1.3 session + scope check (publish)"];
+  s3 [label="3. Admission credit acquired from group-commit headroom\n(if exhausted: durable topic blocks up to ack_timeout, telemetry sheds)", fillcolor="#fff4e0", color="#b07b1e"];
+  s4 [label="4. Append actor assigns monotonic u64 offset,\nframes the record, computes CRC32C (and xxh3-64 if payload > 64 KiB)", fillcolor="#e9e3f7", color="#5a3fa0"];
+  s5 [label="5. Record bytes + completion handle enqueued to the single commit thread (MPSC)"];
+  s6 [label="6. Commit thread drains queued appends (cap 1 MiB, 0 ms linger),\none write() to the active segment, one fdatasync()", fillcolor="#e9e3f7", color="#5a3fa0"];
+  dur [label="DURABILITY BOUNDARY: bytes are now power-loss safe", shape=note, fillcolor="#e7f6ec", color="#2f7d4f", fontcolor="#2f7d4f"];
+  s7 [label="7. Commit thread completes each waiter; server returns PubAck(offset, duplicate?)", fillcolor="#e7f6ec", color="#2f7d4f"];
+  s8 [label="8. Record becomes visible to consumers at its offset"];
+
+  s1 -> s2 -> s3 -> s4 -> s5 -> s6 -> dur -> s7 -> s8;
+
+  note1 [shape=plaintext, fillcolor="none",
+    label="Notes:\l- Single writer per active segment; many producers fan in through the MPSC queue.\l- Group commit coalesces whatever arrived during the previous sync (natural batching under load).\l- On a fatal fsync error the writer freezes read-only and no further PUB is acked (fsyncgate discipline).\l- durability mode none/interval changes WHEN ack returns; fdatasync-before-ack is the default.\l"];
+  s8 -> note1 [style=invis];
+}
