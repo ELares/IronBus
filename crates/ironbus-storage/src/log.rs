@@ -90,9 +90,9 @@ pub struct Log<F: Filesystem, C: Clock> {
     flushed_offset: Offset,
     /// Every segment in the log, sorted by base offset, for offset-to-segment lookup.
     segments: Vec<SegmentSlot>,
-    /// Bytes dropped from a torn or unsynced active-segment tail at recovery, the silent
-    /// loss recovery truncates to reach the last intact record. Zero for a fresh log or a
-    /// clean recovery.
+    /// Bytes dropped from a torn or unsynced active-segment tail at recovery: the silent
+    /// loss that recovery truncates to reach the last intact record. Zero for a fresh log
+    /// or a clean recovery.
     recovered_truncated_bytes: u64,
 }
 
@@ -402,10 +402,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         self.flushed_offset
     }
 
-    /// Bytes dropped from a torn or unsynced active-segment tail at recovery (the silent
-    /// loss recovery truncated to reach the last intact record). Zero for a fresh log or a
-    /// clean recovery. This is the raw recovery-loss signal an operator can surface; the
-    /// structured loss report is later work (#120).
+    /// Bytes dropped from a torn or unsynced active-segment tail at recovery: the silent
+    /// loss that recovery truncated to reach the last intact record. Zero for a fresh log
+    /// or a clean recovery. This is the raw recovery-loss signal an operator can surface;
+    /// the structured loss report is later work (#120).
     #[must_use]
     pub fn recovered_truncated_bytes(&self) -> u64 {
         self.recovered_truncated_bytes
