@@ -447,11 +447,14 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             "`--max-connections` must be at least 1".to_string(),
         ));
     }
-    if max_deliver == 0 {
-        // 0 means unlimited delivery, which loops a poison message forever; require the
-        // explicit positive count rather than silently enabling it from the CLI.
+    if max_deliver == 0 || max_deliver == u32::MAX {
+        // Both 0 and u32::MAX mean unlimited delivery (the lease counter saturates at the max,
+        // so a poison message loops forever); require an explicit bounded count rather than
+        // silently enabling it, or surfacing it as an internal error, from the CLI.
         return Err(CliError::Usage(
-            "`--max-deliver` must be at least 1 (unlimited delivery is not supported)".to_string(),
+            "`--max-deliver` must be at least 1 and below 4294967295 (0 and that maximum both \
+             mean unlimited delivery, which is not supported)"
+                .to_string(),
         ));
     }
     cmd_serve(
@@ -767,6 +770,29 @@ mod tests {
         assert_eq!(e.exit_code(), EXIT_USAGE);
         match e {
             CliError::Usage(m) => assert!(m.contains("at least 1"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_rejects_an_unlimited_max_deliver() {
+        // u32::MAX is also "unlimited" (the lease counter saturates), so it is a usage error,
+        // not an internal error, just like 0.
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-cli-mdmax-never-created".to_string(),
+                "--max-deliver".to_string(),
+                u32::MAX.to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("unlimited"), "{m}"),
             other => panic!("expected Usage, got {other:?}"),
         }
     }
