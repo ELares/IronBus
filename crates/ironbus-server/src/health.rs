@@ -230,6 +230,9 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
          # HELP ironbus_produced_total Messages appended by produce.\n\
          # TYPE ironbus_produced_total counter\n\
          ironbus_produced_total {produced}\n\
+         # HELP ironbus_produced_bytes_total Logical message bytes appended by produce (key + headers + payload).\n\
+         # TYPE ironbus_produced_bytes_total counter\n\
+         ironbus_produced_bytes_total {produced_bytes}\n\
          # HELP ironbus_delivered_total Message deliveries handed out (a redelivery counts again).\n\
          # TYPE ironbus_delivered_total counter\n\
          ironbus_delivered_total {delivered}\n\
@@ -244,6 +247,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
          ironbus_acks_total {acks}\n",
         healthy_value = u8::from(healthy),
         produced = counters.produced,
+        produced_bytes = counters.produced_bytes,
         delivered = counters.delivered,
         redelivered = counters.redelivered,
         dead_lettered = counters.dead_lettered,
@@ -543,6 +547,7 @@ mod tests {
             "{m}"
         );
         assert!(m.contains("\nironbus_produced_total 2\n"), "{m}");
+        assert!(m.contains("\nironbus_produced_bytes_total 2\n"), "{m}");
         assert!(m.contains("\nironbus_delivered_total 0\n"), "{m}");
         assert!(m.contains("\nironbus_dead_lettered_total 0\n"), "{m}");
         // The fsync histogram: two produces above, so count and the +Inf bucket are 2. The
