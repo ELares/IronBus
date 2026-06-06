@@ -50,6 +50,9 @@ pub enum StorageError {
         /// The sequence actually stored.
         found: u64,
     },
+    /// The log writer is frozen: a fatal IO error left it without a valid active
+    /// segment, so it refuses further writes rather than risk corruption.
+    WriterFrozen,
 }
 
 impl core::fmt::Display for StorageError {
@@ -76,6 +79,7 @@ impl core::fmt::Display for StorageError {
                 f,
                 "record {index} has sequence {found}, expected {expected}"
             ),
+            StorageError::WriterFrozen => write!(f, "log writer is frozen after a fatal error"),
         }
     }
 }
