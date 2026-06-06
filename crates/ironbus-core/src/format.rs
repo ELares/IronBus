@@ -13,7 +13,8 @@
 /// The on-disk format version this build writes and is the baseline it reads.
 pub const FORMAT_VERSION: u8 = 1;
 
-/// Record frame magic (`b"BI"` read as little-endian `u16` = `0x4942`).
+/// Record frame magic. On disk the two bytes are `0x42 0x49` (`b'B'`, `b'I'`),
+/// which read back as the little-endian `u16` `0x4942`.
 pub const RECORD_MAGIC: u16 = 0x4942;
 
 /// Total size in bytes of a record header.
@@ -47,6 +48,24 @@ pub const MAX_RECORD_BYTES_CEILING: u32 = 1024 * 1024 * 1024;
 
 /// Compile-time invariant: the default maximum record size never exceeds the ceiling.
 const _: () = assert!(DEFAULT_MAX_RECORD_BYTES <= MAX_RECORD_BYTES_CEILING);
+
+/// Payload size at or above which a second, independent xxh3-64 checksum is added
+/// to a record in addition to the mandatory CRC32C: 64 KiB.
+pub const XXH3_PAYLOAD_THRESHOLD: u32 = 64 * 1024;
+
+/// Default target size at which an active segment is rolled and sealed: 64 MiB.
+///
+/// The startup config validator enforces that the configured maximum record size
+/// is smaller than the active segment size, so a record never spans two segments.
+/// On the edge profile the segment size drops (see [`EDGE_SEGMENT_BYTES`]), which
+/// also lowers the permitted maximum record size.
+pub const DEFAULT_SEGMENT_BYTES: u32 = 64 * 1024 * 1024;
+
+/// Active-segment roll size on the constrained edge profile: 8 MiB.
+pub const EDGE_SEGMENT_BYTES: u32 = 8 * 1024 * 1024;
+
+/// Default maximum age before an active segment is rolled, in hours: 1.
+pub const DEFAULT_SEGMENT_ROLL_HOURS: u32 = 1;
 
 /// Byte offsets of each field within the record header. The header is little-endian
 /// and tightly packed: `magic(2) version(1) flags(1) seq(8) timestamp(8) key_len(4)
@@ -88,19 +107,33 @@ mod tests {
 
     #[test]
     fn header_field_offsets_are_tightly_packed() {
+        // Absolute offsets freeze the exact layout: a consistent-but-wrong shift of
+        // two interior fields (which preserves the running sum) is still caught.
         assert_eq!(off::MAGIC, 0);
-        assert_eq!(off::VERSION, off::MAGIC + 2);
-        assert_eq!(off::FLAGS, off::VERSION + 1);
-        assert_eq!(off::SEQ, off::FLAGS + 1);
-        assert_eq!(off::TIMESTAMP, off::SEQ + 8);
-        assert_eq!(off::KEY_LEN, off::TIMESTAMP + 8);
-        assert_eq!(off::HDR_LEN, off::KEY_LEN + 4);
-        assert_eq!(off::PAYLOAD_LEN, off::HDR_LEN + 4);
-        assert_eq!(off::HEADER_CRC, off::PAYLOAD_LEN + 4);
+        assert_eq!(off::VERSION, 2);
+        assert_eq!(off::FLAGS, 3);
+        assert_eq!(off::SEQ, 4);
+        assert_eq!(off::TIMESTAMP, 12);
+        assert_eq!(off::KEY_LEN, 20);
+        assert_eq!(off::HDR_LEN, 24);
+        assert_eq!(off::PAYLOAD_LEN, 28);
+        assert_eq!(off::HEADER_CRC, 32);
         // The CRC field sits exactly at the end of the protected range and the
         // header ends right after it.
         assert_eq!(off::HEADER_CRC, RECORD_HEADER_CRC_RANGE.end);
         assert_eq!(off::HEADER_CRC + 4, RECORD_HEADER_LEN);
+    }
+
+    #[test]
+    fn frozen_values() {
+        assert_eq!(FORMAT_VERSION, 1);
+        assert_eq!(RECORD_MAGIC, 0x4942);
+        assert_eq!(SEGMENT_MAGIC, *b"IRONBUS\0");
+        assert_eq!(CHECKSUM_ALGO_CRC32C, 0x1);
+        assert_eq!(XXH3_PAYLOAD_THRESHOLD, 64 * 1024);
+        assert_eq!(DEFAULT_SEGMENT_BYTES, 64 * 1024 * 1024);
+        assert_eq!(EDGE_SEGMENT_BYTES, 8 * 1024 * 1024);
+        assert_eq!(DEFAULT_SEGMENT_ROLL_HOURS, 1);
     }
 
     #[test]
