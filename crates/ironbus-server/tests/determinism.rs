@@ -26,9 +26,10 @@ fn config() -> EngineConfig {
     }
 }
 
-/// Produces three messages, then polls and acks each (advancing and checkpointing the durable
-/// cursor), and returns the full disk image (segments AND `cursor.ckpt`) as a sorted list of
-/// (file name, bytes).
+/// Produces three messages, polls and acks each, then checkpoints the durable cursor: `ack`
+/// only advances the cursor in memory, so `maybe_checkpoint` is what actually persists it to
+/// `cursor.ckpt` (exactly as the server session loop does). Returns the full disk image
+/// (segments AND a non-empty `cursor.ckpt`) as a sorted list of (file name, bytes).
 fn run_workload() -> Vec<(String, Vec<u8>)> {
     let mut engine = Engine::open(InMemoryFs::new(), ManualClock::new(), config()).unwrap();
     for payload in [&b"a"[..], b"b", b"c"] {
@@ -50,6 +51,13 @@ fn run_workload() -> Vec<(String, Vec<u8>)> {
             other => panic!("expected a message, got {other:?}"),
         }
     }
+    // ack only advances the in-memory cursor; the session loop is what checkpoints it. Do that
+    // here so cursor.ckpt is actually written (committed advanced 3 >= the interval of 1), and
+    // its bytes are part of the compared image.
+    assert!(
+        engine.maybe_checkpoint().unwrap(),
+        "the cursor checkpoint should have been written"
+    );
     let fs = engine.into_filesystem();
     let mut image: Vec<(String, Vec<u8>)> = fs
         .list()
@@ -68,10 +76,16 @@ fn run_workload() -> Vec<(String, Vec<u8>)> {
 fn the_same_engine_lifecycle_produces_a_byte_identical_disk_image() {
     let first = run_workload();
     let second = run_workload();
+    // The cursor checkpoint must be present AND non-empty, so the byte comparison genuinely
+    // covers the checkpoint write path (not an empty, never-written file).
+    let ckpt = first.iter().find(|(name, _)| name.contains("ckpt"));
     assert!(
-        first.iter().any(|(name, _)| name.contains("ckpt")),
-        "the durable cursor checkpoint is part of the compared image, got {:?}",
-        first.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        ckpt.is_some_and(|(_, bytes)| !bytes.is_empty()),
+        "the cursor checkpoint should be written and non-empty, got {:?}",
+        first
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.len()))
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         first, second,
