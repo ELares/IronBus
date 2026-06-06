@@ -367,7 +367,9 @@ impl StdFile {
         Ok(StdFile { file })
     }
 
-    /// Creates a new file (truncating any existing one) for reading and writing.
+    /// Creates a file for reading and writing, TRUNCATING any existing file at the
+    /// path. This is destructive: for a durable segment that must never clobber an
+    /// existing one, use [`StdFile::create_new`]. Intended for scratch and tests.
     ///
     /// # Errors
     /// Propagates the underlying IO error.
@@ -381,7 +383,24 @@ impl StdFile {
         Ok(StdFile { file })
     }
 
-    /// Wraps an already-open file.
+    /// Creates a new file for reading and writing, failing with
+    /// [`io::ErrorKind::AlreadyExists`] if the path already exists (`O_EXCL`). This is
+    /// the safe primitive for creating a durable segment: it can never clobber an
+    /// existing one.
+    ///
+    /// # Errors
+    /// Returns `AlreadyExists` if the path exists, or propagates the underlying IO error.
+    pub fn create_new(path: &std::path::Path) -> io::Result<StdFile> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        Ok(StdFile { file })
+    }
+
+    /// Wraps an already-open file, for a preallocated or handed-off descriptor. The
+    /// caller is responsible for opening it read and write.
     #[must_use]
     pub fn from_file(file: std::fs::File) -> StdFile {
         StdFile { file }
@@ -418,6 +437,9 @@ impl RandomAccessFile for StdFile {
 /// Fsyncs the directory at `path` so a newly created, renamed, or removed entry in
 /// it is crash-durable. Without this, a power loss after creating a segment file but
 /// before syncing its directory can leave the file absent on restart.
+///
+/// Ordering: call this AFTER the new file's own `sync_all`, so the create path is
+/// fsync-the-file, then full-fsync-the-parent-directory, then ack.
 ///
 /// # Errors
 /// Propagates the underlying IO error.
@@ -468,6 +490,38 @@ mod std_file_tests {
         let f = StdFile::create(&dir.path().join("e")).unwrap();
         let mut buf = [0u8; 4];
         assert_eq!(f.read_at(&mut buf, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn create_new_refuses_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg");
+        let _f = StdFile::create_new(&path).unwrap();
+        let err = StdFile::create_new(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn concurrent_positioned_reads_are_race_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = StdFile::create(&dir.path().join("seg")).unwrap();
+        f.write_all_at(b"0123456789", 0).unwrap();
+        f.sync_data().unwrap();
+        let f = std::sync::Arc::new(f);
+        std::thread::scope(|sc| {
+            for k in 0u64..8 {
+                let f = std::sync::Arc::clone(&f);
+                sc.spawn(move || {
+                    let off = k % 7;
+                    let start = usize::try_from(off).unwrap();
+                    for _ in 0..200 {
+                        let mut buf = [0u8; 3];
+                        f.read_exact_at(&mut buf, off).unwrap();
+                        assert_eq!(&buf, &b"0123456789"[start..start + 3]);
+                    }
+                });
+            }
+        });
     }
 
     #[test]
