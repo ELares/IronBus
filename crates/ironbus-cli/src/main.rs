@@ -1170,6 +1170,79 @@ mod tests {
         handle.join().unwrap();
     }
 
+    #[test]
+    fn the_in_flight_window_bounds_each_delivery_batch() {
+        // Backpressure / no unbounded in-flight (#133 overload): with max_in_flight = 2, each
+        // fetch delivers at most 2 messages even with a credit of 10 and 4 produced. The
+        // window, not the credit, is the cap; acks free slots for the next batch.
+        let engine = Engine::open(
+            InMemoryFs::new(),
+            SystemClock::new(),
+            EngineConfig {
+                log: LogConfig::default(),
+                lease: LeaseConfig::from_millis(30_000, 300_000),
+                delivery: DeliveryConfig::new(5, false, Vec::new()).unwrap(),
+                max_in_flight: 2,
+                checkpoint_interval: 1024,
+            },
+        )
+        .unwrap();
+        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            let shared = Arc::clone(&shared);
+            move || serve(&listener, &shared, &shutdown, 16).unwrap()
+        });
+        let a = addr.to_string();
+
+        for (i, payload) in [&b"a"[..], b"b", b"c", b"d"].into_iter().enumerate() {
+            let mut out = Vec::new();
+            cmd_pub(&a, b"", payload, &mut out).unwrap();
+            assert_eq!(String::from_utf8(out).unwrap(), format!("{i}\n"));
+        }
+
+        // First fetch: capped at the window of 2 despite a credit of 10 and 4 available.
+        let mut batch1 = Vec::new();
+        cmd_sub(&a, 10, Disposition::Ack, &mut batch1).unwrap();
+        let batch1 = String::from_utf8(batch1).unwrap();
+        assert!(
+            batch1.contains("fetched 2 message(s)"),
+            "the in-flight window caps the batch at 2, not the credit of 10: {batch1}"
+        );
+        assert!(
+            batch1.contains("payload=a") && batch1.contains("payload=b"),
+            "the first two: {batch1}"
+        );
+
+        // The acks freed the window; the next fetch delivers the next two.
+        let mut batch2 = Vec::new();
+        cmd_sub(&a, 10, Disposition::Ack, &mut batch2).unwrap();
+        let batch2 = String::from_utf8(batch2).unwrap();
+        assert!(
+            batch2.contains("fetched 2 message(s)"),
+            "the next batch is also capped at 2: {batch2}"
+        );
+        assert!(
+            batch2.contains("payload=c") && batch2.contains("payload=d"),
+            "the next two: {batch2}"
+        );
+
+        // All four committed: the stream is drained.
+        let mut batch3 = Vec::new();
+        cmd_sub(&a, 10, Disposition::Peek, &mut batch3).unwrap();
+        assert_eq!(
+            String::from_utf8(batch3).unwrap(),
+            "fetched 0 message(s)\n",
+            "the stream is drained"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn serve_on_disk_round_trips_and_survives_a_restart() {
