@@ -67,14 +67,15 @@ ironbus: a durable edge message queue.
 USAGE:
     ironbus serve --data-dir <dir> [--addr <host:port>] [--max-connections <n>] [--checkpoint-interval <n>]
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
-    ironbus sub   [--addr <host:port>] [--max <n>] [--ack]
+    ironbus sub   [--addr <host:port>] [--max <n>] [--ack | --nack [--delay-ms <n>] | --term]
     ironbus help
 
 Notes:
     The default address is 127.0.0.1:7777 (loopback only).
     pub reads the payload from the argument, or from stdin if omitted (an empty input
     publishes an empty message, which is a valid record).
-    sub prints one line per message; --ack acknowledges each fetched message.
+    sub prints one line per message; at most one disposition applies to the batch:
+    --ack commits, --nack requeues (after --delay-ms), --term drops without dead-lettering.
     Exit codes: 0 clean, 1 usage, 5 broker unreachable, 70 internal.";
 
 /// A command-line failure, mapped to a frozen exit code by [`main`].
@@ -242,10 +243,35 @@ fn cmd_pub(addr: &str, key: &[u8], payload: &[u8], out: &mut impl Write) -> Resu
     Ok(())
 }
 
+/// What `sub` does with each fetched message.
+#[derive(Clone, Copy)]
+enum Disposition {
+    /// Print only; the message stays in flight and redelivers after the visibility timeout.
+    Peek,
+    /// Commit each message (`--ack`).
+    Ack,
+    /// Requeue each message for redelivery after `delay_ms` (`--nack`).
+    Nack { delay_ms: u64 },
+    /// Drop each message without dead-lettering (`--term`).
+    Term,
+}
+
+/// Records a chosen `sub` disposition, rejecting a second one (the three are exclusive).
+fn set_dispose(slot: &mut Option<&'static str>, verb: &'static str) -> Result<(), CliError> {
+    if slot.is_some() {
+        return Err(CliError::Usage(
+            "sub takes at most one of `--ack`, `--nack`, `--term`".to_string(),
+        ));
+    }
+    *slot = Some(verb);
+    Ok(())
+}
+
 fn run_sub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut addr = DEFAULT_ADDR.to_string();
     let mut max = DEFAULT_FETCH;
-    let mut do_ack = false;
+    let mut dispose: Option<&'static str> = None;
+    let mut delay_ms: Option<u64> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -257,8 +283,22 @@ fn run_sub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
                     .map_err(|_| CliError::Usage(format!("`--max` needs a number, got `{raw}`")))?;
             }
             "--ack" => {
-                do_ack = true;
+                set_dispose(&mut dispose, "ack")?;
                 i += 1;
+            }
+            "--nack" => {
+                set_dispose(&mut dispose, "nack")?;
+                i += 1;
+            }
+            "--term" => {
+                set_dispose(&mut dispose, "term")?;
+                i += 1;
+            }
+            "--delay-ms" => {
+                let raw = take_value("--delay-ms", args, &mut i)?;
+                delay_ms = Some(raw.parse::<u64>().map_err(|_| {
+                    CliError::Usage(format!("`--delay-ms` needs a number, got `{raw}`"))
+                })?);
             }
             flag if flag.starts_with("--") => {
                 return Err(CliError::Usage(format!("unknown flag `{flag}` for sub")))
@@ -270,10 +310,28 @@ fn run_sub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             }
         }
     }
-    cmd_sub(&addr, max, do_ack, out)
+    if delay_ms.is_some() && dispose != Some("nack") {
+        return Err(CliError::Usage(
+            "`--delay-ms` is only valid with `--nack`".to_string(),
+        ));
+    }
+    let disposition = match dispose {
+        Some("ack") => Disposition::Ack,
+        Some("nack") => Disposition::Nack {
+            delay_ms: delay_ms.unwrap_or(0),
+        },
+        Some("term") => Disposition::Term,
+        _ => Disposition::Peek,
+    };
+    cmd_sub(&addr, max, disposition, out)
 }
 
-fn cmd_sub(addr: &str, max: u32, do_ack: bool, out: &mut impl Write) -> Result<(), CliError> {
+fn cmd_sub(
+    addr: &str,
+    max: u32,
+    disposition: Disposition,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
     let mut client = connect(addr)?;
     let messages = client
         .fetch(max)
@@ -287,15 +345,26 @@ fn cmd_sub(addr: &str, max: u32, do_ack: bool, out: &mut impl Write) -> Result<(
             String::from_utf8_lossy(&m.key),
             String::from_utf8_lossy(&m.payload),
         )?;
-        if do_ack {
-            let committed = client
-                .ack(m.offset, m.generation)
-                .map_err(|e| classify(addr, "acking to", &e))?;
-            writeln!(
-                out,
-                "  ack {}",
-                if committed { "committed" } else { "fenced" }
-            )?;
+        match disposition {
+            Disposition::Peek => {}
+            Disposition::Ack => {
+                let ok = client
+                    .ack(m.offset, m.generation)
+                    .map_err(|e| classify(addr, "acking to", &e))?;
+                writeln!(out, "  ack {}", if ok { "committed" } else { "fenced" })?;
+            }
+            Disposition::Nack { delay_ms } => {
+                let ok = client
+                    .nack(m.offset, m.generation, delay_ms)
+                    .map_err(|e| classify(addr, "nacking to", &e))?;
+                writeln!(out, "  nack {}", if ok { "requeued" } else { "fenced" })?;
+            }
+            Disposition::Term => {
+                let ok = client
+                    .term(m.offset, m.generation)
+                    .map_err(|e| classify(addr, "terminating on", &e))?;
+                writeln!(out, "  term {}", if ok { "dropped" } else { "fenced" })?;
+            }
         }
     }
     writeln!(out, "fetched {} message(s)", messages.len())?;
@@ -475,7 +544,7 @@ mod tests {
         assert_eq!(String::from_utf8(published).unwrap(), "0\n");
 
         let mut consumed = Vec::new();
-        cmd_sub(&a, 10, true, &mut consumed).unwrap();
+        cmd_sub(&a, 10, Disposition::Ack, &mut consumed).unwrap();
         let text = String::from_utf8(consumed).unwrap();
         assert!(text.contains("#0 gen="), "missing offset line: {text}");
         assert!(text.contains("key=the-key"), "missing key: {text}");
@@ -491,7 +560,7 @@ mod tests {
 
         // Acked: a second sub sees nothing.
         let mut again = Vec::new();
-        cmd_sub(&a, 10, false, &mut again).unwrap();
+        cmd_sub(&a, 10, Disposition::Peek, &mut again).unwrap();
         assert_eq!(String::from_utf8(again).unwrap(), "fetched 0 message(s)\n");
 
         shutdown.store(true, Ordering::Release);
@@ -502,7 +571,7 @@ mod tests {
     fn sub_on_an_empty_queue_reports_zero() {
         let (addr, shutdown, handle) = start_inmem_server();
         let mut buf = Vec::new();
-        cmd_sub(&addr.to_string(), 5, true, &mut buf).unwrap();
+        cmd_sub(&addr.to_string(), 5, Disposition::Ack, &mut buf).unwrap();
         assert_eq!(String::from_utf8(buf).unwrap(), "fetched 0 message(s)\n");
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
@@ -591,6 +660,65 @@ mod tests {
         assert!(matches!(e, CliError::Unreachable(_)));
     }
 
+    #[test]
+    fn sub_rejects_two_dispositions() {
+        let mut buf = Vec::new();
+        let e = run(
+            &["sub".to_string(), "--ack".to_string(), "--nack".to_string()],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        assert!(matches!(e, CliError::Usage(_)));
+    }
+
+    #[test]
+    fn delay_ms_requires_nack() {
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "sub".to_string(),
+                "--ack".to_string(),
+                "--delay-ms".to_string(),
+                "5".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        assert!(matches!(e, CliError::Usage(m) if m.contains("--delay-ms")));
+    }
+
+    #[test]
+    fn sub_nack_requeues_and_sub_term_drops() {
+        let (addr, shutdown, handle) = start_inmem_server();
+        let a = addr.to_string();
+
+        // Nack: the message is requeued and redelivers on the next fetch (the default 30s
+        // visibility means the redelivery is the nack's doing, not a timeout).
+        cmd_pub(&a, b"", b"retry", &mut Vec::new()).unwrap();
+        let mut nout = Vec::new();
+        cmd_sub(&a, 10, Disposition::Nack { delay_ms: 0 }, &mut nout).unwrap();
+        assert!(String::from_utf8(nout).unwrap().contains("nack requeued"));
+        let mut aout = Vec::new();
+        cmd_sub(&a, 10, Disposition::Ack, &mut aout).unwrap();
+        let atext = String::from_utf8(aout).unwrap();
+        assert!(atext.contains("payload=retry"), "redelivered: {atext}");
+        assert!(atext.contains("ack committed"), "acked: {atext}");
+
+        // Term: the message is dropped (committed past) and a re-fetch is empty.
+        cmd_pub(&a, b"", b"drop", &mut Vec::new()).unwrap();
+        let mut tout = Vec::new();
+        cmd_sub(&a, 10, Disposition::Term, &mut tout).unwrap();
+        assert!(String::from_utf8(tout).unwrap().contains("term dropped"));
+        let mut eout = Vec::new();
+        cmd_sub(&a, 10, Disposition::Peek, &mut eout).unwrap();
+        assert_eq!(String::from_utf8(eout).unwrap(), "fetched 0 message(s)\n");
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn serve_on_disk_round_trips_and_survives_a_restart() {
@@ -614,7 +742,7 @@ mod tests {
         assert_eq!(String::from_utf8(published).unwrap(), "0\n");
 
         let mut consumed = Vec::new();
-        cmd_sub(&a, 10, true, &mut consumed).unwrap();
+        cmd_sub(&a, 10, Disposition::Ack, &mut consumed).unwrap();
         let text = String::from_utf8(consumed).unwrap();
         assert!(text.contains("payload=on-disk"), "missing payload: {text}");
         assert!(text.contains("ack committed"), "missing ack: {text}");
@@ -637,7 +765,7 @@ mod tests {
         let a2 = addr2.to_string();
 
         let mut after_restart = Vec::new();
-        cmd_sub(&a2, 10, false, &mut after_restart).unwrap();
+        cmd_sub(&a2, 10, Disposition::Peek, &mut after_restart).unwrap();
         assert_eq!(
             String::from_utf8(after_restart).unwrap(),
             "fetched 0 message(s)\n",
