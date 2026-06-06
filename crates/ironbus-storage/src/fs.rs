@@ -46,19 +46,22 @@ pub trait Filesystem: Send + Sync {
     /// Returns [`io::ErrorKind::NotFound`] if the file does not exist, or an IO error.
     fn remove(&self, name: &str) -> io::Result<()>;
 
-    /// Lists the names of the files in the directory, in unspecified order.
+    /// Lists the names of the regular files in the directory, in sorted order.
+    ///
+    /// Only regular files are reported (not subdirectories), and every returned name
+    /// can be passed to [`Filesystem::open`]. The order is deterministic across
+    /// backends so recovery never depends on raw directory order.
     ///
     /// # Errors
     /// Propagates the underlying IO error.
     fn list(&self) -> io::Result<Vec<String>>;
 
-    /// Reports whether a file of this name exists.
+    /// Reports whether a regular file of this name exists (consistent with
+    /// [`Filesystem::list`], which reports only regular files).
     ///
     /// # Errors
     /// Propagates the underlying IO error.
-    fn exists(&self, name: &str) -> io::Result<bool> {
-        Ok(self.list()?.iter().any(|n| n == name))
-    }
+    fn exists(&self, name: &str) -> io::Result<bool>;
 
     /// Fsyncs the directory so a create or remove is crash-durable. Per the
     /// segment-create ordering, call this AFTER the new file's own `sync_all`, so the
@@ -183,11 +186,14 @@ impl StdFs {
     /// Resolves `name` to a path inside the data directory, rejecting anything that is
     /// not a single, safe path component so a segment name can never escape the root.
     fn resolve(&self, name: &str) -> io::Result<std::path::PathBuf> {
+        // A backslash is a legal byte in a Unix filename, so it is NOT rejected here:
+        // rejecting it would make `list` (which does not filter it) return names this
+        // `resolve` then refuses, an asymmetry the recovery walk would trip over. The
+        // checks below are exactly what keeps a name from escaping the data directory.
         let is_plain = !name.is_empty()
             && name != "."
             && name != ".."
             && !name.contains('/')
-            && !name.contains('\\')
             && !name.contains('\0');
         if !is_plain {
             return Err(io::Error::new(
@@ -219,23 +225,30 @@ impl Filesystem for StdFs {
         let mut names = Vec::new();
         for entry in std::fs::read_dir(&self.root)? {
             let entry = entry?;
-            if entry.file_type()?.is_file() {
-                match entry.file_name().into_string() {
-                    Ok(name) => names.push(name),
-                    Err(_) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "non-UTF-8 file name in data directory",
-                        ))
-                    }
-                }
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            // A non-UTF-8 entry cannot be an IronBus segment (segment names are ASCII),
+            // so skip it rather than failing the whole listing on one foreign file.
+            // Everything returned is therefore a regular file that `open` can resolve.
+            if let Ok(name) = entry.file_name().into_string() {
+                names.push(name);
             }
         }
+        // Sorted, so `list` is deterministic across backends (an in-memory `BTreeMap`
+        // is already sorted); recovery must not depend on raw `read_dir` order.
+        names.sort();
         Ok(names)
     }
 
     fn exists(&self, name: &str) -> io::Result<bool> {
-        self.resolve(name)?.try_exists()
+        // Match `list`: report true only for a regular file (not a directory or a
+        // dangling symlink), so the two backends answer `exists` identically.
+        match std::fs::symlink_metadata(self.resolve(name)?) {
+            Ok(meta) => Ok(meta.is_file()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     fn sync_dir(&self) -> io::Result<()> {
@@ -349,6 +362,32 @@ mod tests {
         fs.simulate_power_loss();
         assert!(!fs.exists("seg").unwrap());
     }
+
+    #[test]
+    fn power_loss_after_remove_and_recreate_same_name_restores_original_inode() {
+        // The durable directory keeps the ORIGINAL file object when a name is removed
+        // and recreated before a dir-sync, so power loss restores the original inode's
+        // content, not the replacement's. This pins that load-bearing Arc-identity
+        // behavior: a future change that deep-copied content or reused the Arc on
+        // recreate would silently break recovery while every other test still passed.
+        let fs = InMemoryFs::new();
+        let original = fs.create_new("a").unwrap();
+        original.write_all_at(b"ORIGINAL", 0).unwrap();
+        original.sync_all().unwrap();
+        fs.sync_dir().unwrap();
+
+        fs.remove("a").unwrap();
+        let replacement = fs.create_new("a").unwrap();
+        replacement.write_all_at(b"NEW", 0).unwrap();
+        replacement.sync_all().unwrap(); // file-synced, but the directory is not synced
+
+        fs.simulate_power_loss();
+        let g = fs.open("a").unwrap();
+        let mut buf = [0u8; 8];
+        g.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"ORIGINAL");
+        assert_eq!(g.len().unwrap(), 8);
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -388,7 +427,15 @@ mod std_tests {
     fn names_must_be_single_components() {
         let dir = tempfile::tempdir().unwrap();
         let fs = StdFs::new(dir.path().to_path_buf());
-        for bad in ["../escape", "a/b", "", ".", "..", "with\0nul"] {
+        for bad in [
+            "../escape",
+            "a/b",
+            "",
+            ".",
+            "..",
+            "with\0nul",
+            "/etc/passwd",
+        ] {
             assert_eq!(
                 fs.create_new(bad).unwrap_err().kind(),
                 io::ErrorKind::InvalidInput,
@@ -404,5 +451,33 @@ mod std_tests {
         let fs = StdFs::new(dir.path().to_path_buf());
         fs.create_new("a.log").unwrap();
         assert_eq!(fs.list().unwrap(), vec!["a.log".to_owned()]);
+        // A subdirectory is never reported as an existing file.
+        assert!(!fs.exists("subdir").unwrap());
+        assert!(fs.exists("a.log").unwrap());
+    }
+
+    #[test]
+    fn every_listed_name_is_openable_and_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = StdFs::new(dir.path().to_path_buf());
+        // Created out of lexicographic order, including a backslash name (a legal Unix
+        // filename byte that resolve must accept so list/open stay consistent).
+        for name in [
+            "seg-000003.log",
+            "seg-000001.log",
+            "odd\\name",
+            "seg-000002.log",
+        ] {
+            fs.create_new(name).unwrap();
+        }
+        let listed = fs.list().unwrap();
+        let mut sorted = listed.clone();
+        sorted.sort();
+        assert_eq!(listed, sorted, "list must be sorted");
+        for name in &listed {
+            // The whole point of the consistency fix: nothing list returns is rejected.
+            fs.open(name).unwrap();
+            assert!(fs.exists(name).unwrap());
+        }
     }
 }
