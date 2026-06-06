@@ -4,5 +4,6 @@
 
 pub mod fs;
 pub mod io;
+pub mod log;
 pub mod naming;
 pub mod segment;

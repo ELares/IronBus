@@ -33,6 +33,23 @@ pub enum StorageError {
     },
     /// The segment is full: its record count or byte length would overflow.
     SegmentFull,
+    /// Recovery found the active (highest) segment already sealed. This single-active
+    /// segment version cannot continue past a seal; rolling to the next segment is
+    /// follow-up work.
+    ActiveSegmentSealed {
+        /// The id of the sealed segment.
+        segment_id: u64,
+    },
+    /// Recovery found a record whose sequence number breaks the contiguous run from the
+    /// segment `base_seq`, so the segment is structurally inconsistent.
+    RecoveredSequenceMismatch {
+        /// The record index within the segment.
+        index: usize,
+        /// The sequence the record should have carried (`base_seq + index`).
+        expected: u64,
+        /// The sequence actually stored.
+        found: u64,
+    },
 }
 
 impl core::fmt::Display for StorageError {
@@ -48,6 +65,17 @@ impl core::fmt::Display for StorageError {
                 )
             }
             StorageError::SegmentFull => write!(f, "segment is full"),
+            StorageError::ActiveSegmentSealed { segment_id } => {
+                write!(f, "active segment {segment_id} is already sealed")
+            }
+            StorageError::RecoveredSequenceMismatch {
+                index,
+                expected,
+                found,
+            } => write!(
+                f,
+                "record {index} has sequence {found}, expected {expected}"
+            ),
         }
     }
 }
@@ -137,6 +165,32 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
             record_count: 0,
             last_seq: header.base_seq,
         })
+    }
+
+    /// Resumes appending to an existing, already-validated segment at its recovered
+    /// write head, without rewriting the header.
+    ///
+    /// Recovery scans the segment, truncates any torn tail, and calls this with the
+    /// recovered state: `write_pos` is the byte offset just past the last intact record
+    /// (`SegmentScan::valid_end`), `record_count` is how many records precede it, and
+    /// `last_seq` is that last record's sequence, or the header `base_seq` if the
+    /// segment is empty. The caller guarantees those match the bytes on disk; this
+    /// constructor performs no IO.
+    #[must_use]
+    pub fn resume(
+        file: F,
+        header: SegmentHeader,
+        write_pos: u64,
+        record_count: u32,
+        last_seq: Seq,
+    ) -> SegmentWriter<F> {
+        SegmentWriter {
+            file,
+            header,
+            write_pos,
+            record_count,
+            last_seq,
+        }
     }
 
     /// The log offset the NEXT appended record will receive. Saturates at
