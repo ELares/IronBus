@@ -15,6 +15,9 @@ use crate::naming::{segment_file_name, segment_ids};
 use crate::segment::{OwnedRecord, RecoveryScan, SegmentReader, SegmentWriter, StorageError};
 use ironbus_core::clock::Clock;
 use ironbus_core::codec::RecordView;
+use ironbus_core::format::{
+    RECORD_HEADER_LEN, RECORD_TRAILER_LEN, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN,
+};
 use ironbus_core::segment::SegmentHeader;
 use ironbus_core::types::{Offset, RecordFlags, Seq};
 
@@ -22,19 +25,77 @@ use ironbus_core::types::{Offset, RecordFlags, Seq};
 const FIRST_SEGMENT_ID: u64 = 0;
 
 /// Tunables for a [`Log`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LogConfig {
-    /// Soft cap on a segment's byte size. The active segment is sealed and a new one
-    /// started before the first append that would begin at or beyond this size, so a
-    /// segment may exceed it by at most the last record. An empty segment is never
+    /// Soft cap on a segment's TOTAL byte size, the 64-byte header included (it is compared
+    /// against the write position, which starts at the header). The active segment is sealed
+    /// and a new one started before the first append that would begin at or beyond this size,
+    /// so a segment may exceed it by at most the last record. An empty segment is never
     /// rolled, so a record larger than the cap still gets written (to its own segment).
+    ///
+    /// Prefer [`LogConfig::new`], which rejects a cap below
+    /// [`LogConfig::MIN_MAX_SEGMENT_BYTES`]. Setting this field directly to `0` or any value
+    /// below that floor is a footgun: a segment could not hold more than one record, so the
+    /// log fragments into one-record segments with no diagnostic.
     pub max_segment_bytes: u64,
 }
 
 impl LogConfig {
     /// The frozen v1 default segment size, 64 MiB.
     pub const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+
+    /// The smallest sane `max_segment_bytes`: the segment header and footer plus room for at
+    /// least two minimum-size records, so a segment can always hold more than one record. A
+    /// cap below this fragments the log into one-record segments and is rejected by
+    /// [`LogConfig::new`].
+    pub const MIN_MAX_SEGMENT_BYTES: u64 =
+        (SEGMENT_HEADER_LEN + SEGMENT_FOOTER_LEN + 2 * (RECORD_HEADER_LEN + RECORD_TRAILER_LEN))
+            as u64;
+
+    /// Builds a [`LogConfig`], rejecting a `max_segment_bytes` below
+    /// [`LogConfig::MIN_MAX_SEGMENT_BYTES`]. This is the validating path that keeps a
+    /// degenerate cap (`0`, or a sub-header value) from silently fragmenting the log.
+    ///
+    /// # Errors
+    /// Returns [`LogConfigError::MaxSegmentBytesTooSmall`] if `max_segment_bytes` is below the
+    /// floor.
+    pub fn new(max_segment_bytes: u64) -> Result<LogConfig, LogConfigError> {
+        if max_segment_bytes < LogConfig::MIN_MAX_SEGMENT_BYTES {
+            return Err(LogConfigError::MaxSegmentBytesTooSmall {
+                value: max_segment_bytes,
+                floor: LogConfig::MIN_MAX_SEGMENT_BYTES,
+            });
+        }
+        Ok(LogConfig { max_segment_bytes })
+    }
 }
+
+/// An invalid [`LogConfig`] rejected by [`LogConfig::new`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogConfigError {
+    /// `max_segment_bytes` is below [`LogConfig::MIN_MAX_SEGMENT_BYTES`]: a cap so small a
+    /// segment could not hold more than one record.
+    MaxSegmentBytesTooSmall {
+        /// The rejected value.
+        value: u64,
+        /// The smallest accepted value.
+        floor: u64,
+    },
+}
+
+impl std::fmt::Display for LogConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogConfigError::MaxSegmentBytesTooSmall { value, floor } => write!(
+                f,
+                "max_segment_bytes {value} is below the minimum {floor} (smaller caps make \
+                 one-record segments)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LogConfigError {}
 
 impl Default for LogConfig {
     fn default() -> LogConfig {
@@ -483,7 +544,10 @@ mod tests {
     use crate::segment::OwnedRecord;
     use ironbus_core::clock::ManualClock;
 
-    // A small segment cap so rolling happens after a handful of records.
+    // A small segment cap so rolling happens after a handful of records. This deliberately
+    // sets the field below `MIN_MAX_SEGMENT_BYTES` via the struct literal (the documented
+    // test path), since `LogConfig::new` would reject it; recovery and rolling do not depend
+    // on the floor, only on the cap value.
     fn small_config() -> LogConfig {
         LogConfig {
             max_segment_bytes: 128,
@@ -492,6 +556,44 @@ mod tests {
 
     fn open_mem(config: LogConfig) -> Log<InMemoryFs, ManualClock> {
         Log::open(InMemoryFs::new(), ManualClock::new(), config).unwrap()
+    }
+
+    #[test]
+    fn log_config_new_rejects_a_cap_below_the_floor() {
+        // A cap that cannot hold more than one record is rejected with a typed error, not
+        // silently accepted (#162). The floor leaves room for the header, the footer, and at
+        // least two minimum records.
+        let floor = LogConfig::MIN_MAX_SEGMENT_BYTES;
+        assert!(floor >= (SEGMENT_HEADER_LEN + SEGMENT_FOOTER_LEN + 2 * RECORD_HEADER_LEN) as u64);
+        for bad in [0, 1, 64, floor - 1] {
+            assert_eq!(
+                LogConfig::new(bad),
+                Err(LogConfigError::MaxSegmentBytesTooSmall { value: bad, floor }),
+                "cap {bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn log_config_new_accepts_the_floor_and_above() {
+        assert_eq!(
+            LogConfig::new(LogConfig::MIN_MAX_SEGMENT_BYTES)
+                .unwrap()
+                .max_segment_bytes,
+            LogConfig::MIN_MAX_SEGMENT_BYTES
+        );
+        assert_eq!(
+            LogConfig::new(LogConfig::DEFAULT_MAX_SEGMENT_BYTES)
+                .unwrap()
+                .max_segment_bytes,
+            LogConfig::DEFAULT_MAX_SEGMENT_BYTES
+        );
+        // A config built through `new` opens and rolls like any other.
+        let cfg = LogConfig::new(LogConfig::MIN_MAX_SEGMENT_BYTES).unwrap();
+        let mut log = open_mem(cfg);
+        log.append(&rec(b"x")).unwrap();
+        log.sync().unwrap();
+        assert_eq!(log.flushed_offset(), Offset::new(1));
     }
 
     fn rec(payload: &[u8]) -> Append<'_> {
