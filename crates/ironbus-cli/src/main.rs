@@ -54,6 +54,9 @@ const DEFAULT_MAX_CONNECTIONS: usize = 256;
 /// The default in-flight window for the `serve` engine.
 #[cfg(unix)]
 const DEFAULT_MAX_IN_FLIGHT: u32 = 1024;
+
+/// The default max delivery attempts before a poison message is dead-lettered.
+const DEFAULT_MAX_DELIVER: u32 = 5;
 /// The default cursor-checkpoint interval for the `serve` engine: at most this many messages
 /// are redelivered after an abrupt crash (a clean disconnect flushes the cursor sooner).
 const DEFAULT_CHECKPOINT_INTERVAL: u64 = 1024;
@@ -79,7 +82,7 @@ ironbus: a durable edge message queue.
 
 USAGE:
     ironbus serve --data-dir <dir> [--addr <host:port>] [--max-connections <n>]
-                  [--checkpoint-interval <n>] [--health-addr <host:port>]
+                  [--checkpoint-interval <n>] [--max-deliver <n>] [--health-addr <host:port>]
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
     ironbus sub   [--addr <host:port>] [--max <n>] [--ack | --nack [--delay-ms <n>] | --term]
     ironbus help
@@ -398,6 +401,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut data_dir: Option<String> = None;
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
     let mut checkpoint_interval = DEFAULT_CHECKPOINT_INTERVAL;
+    let mut max_deliver = DEFAULT_MAX_DELIVER;
     let mut health_addr: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
@@ -416,6 +420,12 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
                     CliError::Usage(format!(
                         "`--checkpoint-interval` needs a number, got `{raw}`"
                     ))
+                })?;
+            }
+            "--max-deliver" => {
+                let raw = take_value("--max-deliver", args, &mut i)?;
+                max_deliver = raw.parse::<u32>().map_err(|_| {
+                    CliError::Usage(format!("`--max-deliver` needs a number, got `{raw}`"))
                 })?;
             }
             "--health-addr" => health_addr = Some(take_value("--health-addr", args, &mut i)?),
@@ -437,11 +447,22 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             "`--max-connections` must be at least 1".to_string(),
         ));
     }
+    if max_deliver == 0 || max_deliver == u32::MAX {
+        // Both 0 and u32::MAX mean unlimited delivery (the lease counter saturates at the max,
+        // so a poison message loops forever); require an explicit bounded count rather than
+        // silently enabling it, or surfacing it as an internal error, from the CLI.
+        return Err(CliError::Usage(
+            "`--max-deliver` must be at least 1 and below 4294967295 (0 and that maximum both \
+             mean unlimited delivery, which is not supported)"
+                .to_string(),
+        ));
+    }
     cmd_serve(
         &addr,
         Path::new(&data_dir),
         max_connections,
         checkpoint_interval,
+        max_deliver,
         health_addr.as_deref(),
         out,
     )
@@ -453,10 +474,16 @@ fn cmd_serve(
     data_dir: &Path,
     max_connections: usize,
     checkpoint_interval: u64,
+    max_deliver: u32,
     health_addr: Option<&str>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
-    let shared = open_disk_engine(data_dir, DEFAULT_MAX_IN_FLIGHT, checkpoint_interval)?;
+    let shared = open_disk_engine(
+        data_dir,
+        DEFAULT_MAX_IN_FLIGHT,
+        checkpoint_interval,
+        max_deliver,
+    )?;
     let listener = TcpListener::bind(addr)
         .map_err(|e| CliError::Internal(format!("cannot bind {addr}: {e}")))?;
     let local = listener
@@ -509,6 +536,7 @@ fn cmd_serve(
     data_dir: &Path,
     max_connections: usize,
     checkpoint_interval: u64,
+    max_deliver: u32,
     health_addr: Option<&str>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -517,6 +545,7 @@ fn cmd_serve(
         data_dir,
         max_connections,
         checkpoint_interval,
+        max_deliver,
         health_addr,
         out,
     );
@@ -531,11 +560,12 @@ fn open_disk_engine(
     data_dir: &Path,
     max_in_flight: u32,
     checkpoint_interval: u64,
+    max_deliver: u32,
 ) -> Result<SharedEngine<StdFs, SystemClock>, CliError> {
     std::fs::create_dir_all(data_dir)
         .map_err(|e| CliError::Internal(format!("cannot create {}: {e}", data_dir.display())))?;
     let fs = StdFs::new(data_dir.to_path_buf());
-    let delivery = DeliveryConfig::new(5, false, DEFAULT_NACK_BACKOFF_NANOS.to_vec())
+    let delivery = DeliveryConfig::new(max_deliver, false, DEFAULT_NACK_BACKOFF_NANOS.to_vec())
         .map_err(|e| CliError::Internal(format!("delivery config: {e:?}")))?;
     let engine = Engine::open(
         fs,
@@ -705,6 +735,69 @@ mod tests {
     }
 
     #[test]
+    fn serve_rejects_a_non_numeric_max_deliver() {
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--max-deliver".to_string(),
+                "lots".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--max-deliver"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_rejects_a_zero_max_deliver() {
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-cli-md0-never-created".to_string(),
+                "--max-deliver".to_string(),
+                "0".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("at least 1"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_rejects_an_unlimited_max_deliver() {
+        // u32::MAX is also "unlimited" (the lease counter saturates), so it is a usage error,
+        // not an internal error, just like 0.
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-cli-mdmax-never-created".to_string(),
+                "--max-deliver".to_string(),
+                u32::MAX.to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("unlimited"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn an_unreachable_broker_maps_to_exit_five() {
         // Port 1 on loopback refuses immediately, so this does not hang on the connect timeout.
         let mut buf = Vec::new();
@@ -813,7 +906,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ironbus-cli-it-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let shared = open_disk_engine(&dir, 64, 1).unwrap();
+        let shared = open_disk_engine(&dir, 64, 1, DEFAULT_MAX_DELIVER).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -840,7 +933,7 @@ mod tests {
         // persisted the committed cursor synchronously when it acked offset 0, so a clean
         // restart RESUMES past the acked message (it does not redeliver), and the durable log
         // continues at offset 1 rather than overwriting offset 0.
-        let reopened = open_disk_engine(&dir, 64, 1).unwrap();
+        let reopened = open_disk_engine(&dir, 64, 1, DEFAULT_MAX_DELIVER).unwrap();
         let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr2 = listener2.local_addr().unwrap();
         let shutdown2 = Arc::new(AtomicBool::new(false));
