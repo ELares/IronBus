@@ -85,7 +85,13 @@ impl AckCursor {
         if offset < self.committed || self.contains_ahead(offset) {
             return false;
         }
-        self.insert(offset);
+        // The offset space treats `u64::MAX` as exhausted (see [`Offset::checked_next`])
+        // and a real deployment never reaches it. Refuse the ack rather than overflow the
+        // half-open range end, which would otherwise wrap and collapse `committed` to 0.
+        let Some(next) = offset.checked_add(1) else {
+            return false;
+        };
+        self.insert(offset, next);
         self.advance();
         true
     }
@@ -94,25 +100,25 @@ impl AckCursor {
         self.ahead.iter().any(|&(s, e)| offset >= s && offset < e)
     }
 
-    /// Inserts `[offset, offset + 1)` into the ahead set, merging with adjacent ranges so
-    /// the set stays disjoint and non-adjacent. `offset` is known not to be present and
-    /// to be at or above `committed`.
-    fn insert(&mut self, offset: u64) {
+    /// Inserts `[offset, next)` (where `next == offset + 1`) into the ahead set, merging
+    /// with adjacent ranges so the set stays disjoint and non-adjacent. `offset` is known
+    /// not to be present and to be at or above `committed`.
+    fn insert(&mut self, offset: u64, next: u64) {
         let i = self
             .ahead
             .iter()
             .position(|&(s, _)| s > offset)
             .unwrap_or(self.ahead.len());
         let merge_left = i > 0 && self.ahead[i - 1].1 == offset;
-        let merge_right = i < self.ahead.len() && self.ahead[i].0 == offset + 1;
+        let merge_right = i < self.ahead.len() && self.ahead[i].0 == next;
         match (merge_left, merge_right) {
             (true, true) => {
                 self.ahead[i - 1].1 = self.ahead[i].1;
                 self.ahead.remove(i);
             }
-            (true, false) => self.ahead[i - 1].1 = offset + 1,
+            (true, false) => self.ahead[i - 1].1 = next,
             (false, true) => self.ahead[i].0 = offset,
-            (false, false) => self.ahead.insert(i, (offset, offset + 1)),
+            (false, false) => self.ahead.insert(i, (offset, next)),
         }
     }
 
@@ -201,6 +207,33 @@ mod tests {
         assert_eq!(c.committed(), off(11));
     }
 
+    #[test]
+    fn acking_the_max_offset_never_overflows_or_collapses_committed() {
+        // The offset-space boundary must not panic (debug) or wrap `committed` to 0
+        // (release): acking u64::MAX is refused as the exhausted boundary.
+        let mut c = AckCursor::resume(off(u64::MAX));
+        assert!(!c.ack(off(u64::MAX)));
+        assert_eq!(c.committed(), off(u64::MAX), "committed must not collapse");
+        assert_eq!(c.ahead_len(), 0);
+
+        let mut fresh = AckCursor::new();
+        assert!(!fresh.ack(off(u64::MAX)));
+        assert_eq!(fresh.committed(), off(0));
+        assert_eq!(fresh.ahead_len(), 0);
+    }
+
+    #[test]
+    fn far_apart_offsets_do_not_merge() {
+        let mut c = AckCursor::new();
+        c.ack(off(5));
+        c.ack(off(1_000_000));
+        assert_eq!(c.ahead_runs(), 2);
+        assert_eq!(c.ahead_len(), 2);
+        assert!(c.is_acked(off(5)) && c.is_acked(off(1_000_000)));
+        assert!(!c.is_acked(off(6)));
+        assert_eq!(c.committed(), off(0));
+    }
+
     proptest! {
         #[test]
         fn acking_a_permutation_commits_everything(perm in any_permutation(1..40usize)) {
@@ -250,6 +283,52 @@ mod tests {
             let acked: std::collections::BTreeSet<u64> = acks.iter().copied().collect();
             for o in 0..25u64 {
                 prop_assert_eq!(c.is_acked(off(o)), acked.contains(&o));
+            }
+        }
+
+        /// Arbitrary offsets across the FULL u64 domain (including `u64::MAX`) never panic
+        /// or corrupt: the invariants hold and `committed` stays monotonic.
+        #[test]
+        fn invariants_hold_over_the_full_offset_domain(
+            acks in prop::collection::vec(any::<u64>(), 0..50),
+        ) {
+            let mut c = AckCursor::new();
+            let mut last_committed = 0u64;
+            for &o in &acks {
+                c.ack(off(o));
+                prop_assert!(c.committed().get() >= last_committed);
+                last_committed = c.committed().get();
+                let mut prev_end = c.committed().get();
+                for &(s, e) in &c.ahead {
+                    prop_assert!(s < e);
+                    prop_assert!(s > prev_end);
+                    prev_end = e;
+                }
+            }
+        }
+
+        /// A cursor resumed from a non-zero base stays consistent under further acks.
+        #[test]
+        fn resume_base_then_acks_stays_consistent(
+            base in 0u64..1000,
+            acks in prop::collection::vec(0u64..1100, 0..40),
+        ) {
+            let mut c = AckCursor::resume(off(base));
+            let mut last_committed = base;
+            for &o in &acks {
+                c.ack(off(o));
+                prop_assert!(c.committed().get() >= last_committed);
+                last_committed = c.committed().get();
+            }
+            prop_assert!(c.committed().get() >= base);
+            let mut prev_end = c.committed().get();
+            for &(s, e) in &c.ahead {
+                prop_assert!(s < e);
+                prop_assert!(s > prev_end);
+                prev_end = e;
+            }
+            for o in 0..base {
+                prop_assert!(c.is_acked(off(o)));
             }
         }
     }
