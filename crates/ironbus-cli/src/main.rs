@@ -54,7 +54,6 @@ const DEFAULT_MAX_CONNECTIONS: usize = 256;
 const DEFAULT_MAX_IN_FLIGHT: u32 = 1024;
 /// The default cursor-checkpoint interval for the `serve` engine: at most this many messages
 /// are redelivered after an abrupt crash (a clean disconnect flushes the cursor sooner).
-#[cfg(unix)]
 const DEFAULT_CHECKPOINT_INTERVAL: u64 = 1024;
 
 /// Frozen exit codes (subset in use for these verbs), per issue #91.
@@ -66,7 +65,7 @@ const USAGE: &str = "\
 ironbus: a durable edge message queue.
 
 USAGE:
-    ironbus serve --data-dir <dir> [--addr <host:port>] [--max-connections <n>]
+    ironbus serve --data-dir <dir> [--addr <host:port>] [--max-connections <n>] [--checkpoint-interval <n>]
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
     ironbus sub   [--addr <host:port>] [--max <n>] [--ack]
     ironbus help
@@ -307,6 +306,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut addr = DEFAULT_ADDR.to_string();
     let mut data_dir: Option<String> = None;
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
+    let mut checkpoint_interval = DEFAULT_CHECKPOINT_INTERVAL;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -316,6 +316,14 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
                 let raw = take_value("--max-connections", args, &mut i)?;
                 max_connections = raw.parse::<usize>().map_err(|_| {
                     CliError::Usage(format!("`--max-connections` needs a number, got `{raw}`"))
+                })?;
+            }
+            "--checkpoint-interval" => {
+                let raw = take_value("--checkpoint-interval", args, &mut i)?;
+                checkpoint_interval = raw.parse::<u64>().map_err(|_| {
+                    CliError::Usage(format!(
+                        "`--checkpoint-interval` needs a number, got `{raw}`"
+                    ))
                 })?;
             }
             flag if flag.starts_with("--") => {
@@ -336,7 +344,13 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             "`--max-connections` must be at least 1".to_string(),
         ));
     }
-    cmd_serve(&addr, Path::new(&data_dir), max_connections, out)
+    cmd_serve(
+        &addr,
+        Path::new(&data_dir),
+        max_connections,
+        checkpoint_interval,
+        out,
+    )
 }
 
 #[cfg(unix)]
@@ -344,9 +358,10 @@ fn cmd_serve(
     addr: &str,
     data_dir: &Path,
     max_connections: usize,
+    checkpoint_interval: u64,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
-    let shared = open_disk_engine(data_dir, DEFAULT_MAX_IN_FLIGHT, DEFAULT_CHECKPOINT_INTERVAL)?;
+    let shared = open_disk_engine(data_dir, DEFAULT_MAX_IN_FLIGHT, checkpoint_interval)?;
     let listener = TcpListener::bind(addr)
         .map_err(|e| CliError::Internal(format!("cannot bind {addr}: {e}")))?;
     let local = listener
@@ -371,9 +386,10 @@ fn cmd_serve(
     addr: &str,
     data_dir: &Path,
     max_connections: usize,
+    checkpoint_interval: u64,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
-    let _ = (addr, data_dir, max_connections, out);
+    let _ = (addr, data_dir, max_connections, checkpoint_interval, out);
     Err(CliError::Internal(
         "ironbus serve requires a Unix host in v1: on-disk storage is Unix-only".to_string(),
     ))
