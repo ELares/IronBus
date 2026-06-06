@@ -13,7 +13,10 @@
 //! of the watermark. An out-of-order ack lands in that set; whenever the offset at the
 //! watermark becomes acked, the watermark jumps over the now-contiguous run. The cursor
 //! is pure and IO-free; durability of `committed` and bounding the ahead set (via the
-//! consumer's max-in-flight) are the caller's responsibility.
+//! consumer's max-in-flight) are the caller's responsibility. The ahead set is also
+//! persistable: [`AckCursor::ahead_ranges`] snapshots it and [`AckCursor::resume_with_ahead`]
+//! restores it (validating the shape), so a durable consumer-state store (#60) can resume a
+//! restart that redelivers only genuinely unacked offsets, not the acked-ahead ones too.
 
 use crate::types::Offset;
 
@@ -48,6 +51,46 @@ impl AckCursor {
             committed: committed.get(),
             ahead: Vec::new(),
         }
+    }
+
+    /// Resumes a cursor at `committed` WITH a persisted acked-ahead set (the run-length ranges
+    /// a prior [`AckCursor::ahead_ranges`] snapshot produced), so a restart redelivers only
+    /// genuinely unacked offsets rather than the acked-ahead ones too. The ranges must be the
+    /// exact shape the cursor maintains: each `[start, end)` non-empty, sorted, pairwise
+    /// disjoint, non-adjacent, and strictly above `committed`.
+    ///
+    /// # Errors
+    /// Returns [`AckCursorError`] if the ranges are malformed (a corrupt or torn snapshot), so
+    /// the caller can fall back to [`AckCursor::resume`] (drop the ahead set and redeliver)
+    /// rather than trust bad state. A rejected snapshot never yields a half-built cursor.
+    pub fn resume_with_ahead(
+        committed: Offset,
+        ahead: Vec<(u64, u64)>,
+    ) -> Result<AckCursor, AckCursorError> {
+        let committed = committed.get();
+        let mut prev_end = committed;
+        for &(start, end) in &ahead {
+            if start >= end {
+                return Err(AckCursorError::EmptyRange { start, end });
+            }
+            // `start > prev_end` enforces, in one check, that the first range is strictly above
+            // `committed` (a range starting AT `committed` would be contiguous and should have
+            // advanced) and that every later range is sorted, disjoint, and non-adjacent.
+            if start <= prev_end {
+                return Err(AckCursorError::NotSortedDisjointAndAboveCommitted { start, prev_end });
+            }
+            prev_end = end;
+        }
+        Ok(AckCursor { committed, ahead })
+    }
+
+    /// The acked-ahead set as run-length `[start, end)` ranges: sorted, disjoint, non-adjacent,
+    /// every range strictly above [`AckCursor::committed`]. This is the compact snapshot a
+    /// durable consumer-state store (#60) persists and later hands to
+    /// [`AckCursor::resume_with_ahead`].
+    #[must_use]
+    pub fn ahead_ranges(&self) -> &[(u64, u64)] {
+        &self.ahead
     }
 
     /// The committed offset: every offset below it is acked, and it is the next offset a
@@ -133,6 +176,43 @@ impl AckCursor {
         }
     }
 }
+
+/// A malformed acked-ahead snapshot rejected by [`AckCursor::resume_with_ahead`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AckCursorError {
+    /// A range `[start, end)` was empty or reversed (`start >= end`).
+    EmptyRange {
+        /// The range start.
+        start: u64,
+        /// The range end.
+        end: u64,
+    },
+    /// A range was not strictly above the watermark, not sorted, or adjacent to or
+    /// overlapping its predecessor (`start <= prev_end`, where `prev_end` is `committed` for
+    /// the first range).
+    NotSortedDisjointAndAboveCommitted {
+        /// The offending range start.
+        start: u64,
+        /// The end of the previous range, or `committed` for the first range.
+        prev_end: u64,
+    },
+}
+
+impl core::fmt::Display for AckCursorError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            AckCursorError::EmptyRange { start, end } => {
+                write!(f, "acked-ahead range [{start}, {end}) is empty or reversed")
+            }
+            AckCursorError::NotSortedDisjointAndAboveCommitted { start, prev_end } => write!(
+                f,
+                "acked-ahead range start {start} is not strictly above the previous end {prev_end}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AckCursorError {}
 
 #[cfg(test)]
 mod tests {
@@ -234,6 +314,55 @@ mod tests {
         assert_eq!(c.committed(), off(0));
     }
 
+    #[test]
+    fn resume_with_ahead_restores_the_sparse_set_exactly() {
+        // Build a cursor with a gap so the ahead set is non-trivial: commit 0, ack 2,3 and 5.
+        let mut c = AckCursor::new();
+        c.ack(off(0));
+        c.ack(off(2));
+        c.ack(off(3));
+        c.ack(off(5));
+        assert_eq!(c.committed(), off(1));
+        let snapshot = c.ahead_ranges().to_vec();
+        assert_eq!(snapshot, vec![(2, 4), (5, 6)]);
+
+        // Resuming with that snapshot reconstructs the cursor exactly: same committed, same
+        // ahead, same is_acked, so a restart redelivers only the genuine gaps (1 and 4).
+        let restored = AckCursor::resume_with_ahead(c.committed(), snapshot).unwrap();
+        assert_eq!(restored, c);
+        assert!(
+            !restored.is_acked(off(1)) && !restored.is_acked(off(4)),
+            "gaps redeliver"
+        );
+        assert!(
+            restored.is_acked(off(2)) && restored.is_acked(off(5)),
+            "acked-ahead survives"
+        );
+    }
+
+    #[test]
+    fn resume_with_ahead_rejects_a_malformed_snapshot() {
+        // A range at or below the watermark (would have advanced), out of order, overlapping,
+        // adjacent (should have merged), or empty: each is a corrupt snapshot.
+        let bad = [
+            vec![(5u64, 5u64)],   // empty / reversed
+            vec![(10, 9)],        // reversed
+            vec![(5, 6), (5, 7)], // not sorted / overlapping
+            vec![(5, 7), (6, 8)], // overlapping
+            vec![(5, 7), (7, 9)], // adjacent (should be one run)
+        ];
+        for ranges in bad {
+            assert!(
+                AckCursor::resume_with_ahead(off(5), ranges.clone()).is_err(),
+                "malformed snapshot {ranges:?} must be rejected"
+            );
+        }
+        // A range starting AT committed is contiguous and invalid (the watermark should hold it).
+        assert!(AckCursor::resume_with_ahead(off(5), vec![(5, 6)]).is_err());
+        // A well-formed snapshot above the watermark is accepted.
+        AckCursor::resume_with_ahead(off(5), vec![(7, 9), (11, 12)]).unwrap();
+    }
+
     proptest! {
         #[test]
         fn acking_a_permutation_commits_everything(perm in any_permutation(1..40usize)) {
@@ -246,6 +375,35 @@ mod tests {
             prop_assert_eq!(c.committed(), off(n));
             prop_assert_eq!(c.ahead_len(), 0);
             prop_assert_eq!(c.ahead_runs(), 0);
+        }
+
+        /// #61 criterion: no offset below `committed` is ever unacked (no silent skip). The
+        /// watermark only advances over genuinely contiguous acked runs, under any ack order.
+        #[test]
+        fn no_offset_below_committed_is_ever_unacked(acks in prop::collection::vec(0u64..40, 0..80)) {
+            let mut c = AckCursor::new();
+            for &o in &acks {
+                c.ack(off(o));
+                for below in 0..c.committed().get() {
+                    prop_assert!(c.is_acked(off(below)), "offset {below} below committed must be acked");
+                }
+            }
+        }
+
+        /// Snapshot then resume round-trips exactly: a persisted ahead set restores to an
+        /// identical cursor, so the durable consumer-state store (#60) loses no acked-ahead work.
+        #[test]
+        fn snapshot_then_resume_with_ahead_round_trips(acks in prop::collection::vec(0u64..40, 0..80)) {
+            let mut c = AckCursor::new();
+            for &o in &acks {
+                c.ack(off(o));
+            }
+            let restored = AckCursor::resume_with_ahead(c.committed(), c.ahead_ranges().to_vec())
+                .expect("a cursor's own snapshot is always well-formed");
+            prop_assert_eq!(&restored, &c);
+            for o in 0..45u64 {
+                prop_assert_eq!(restored.is_acked(off(o)), c.is_acked(off(o)));
+            }
         }
 
         #[test]
