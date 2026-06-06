@@ -19,7 +19,9 @@
 use ironbus_core::clock::Clock;
 use ironbus_core::cursor::AckCursor;
 use ironbus_core::delivery::{DeliveryConfig, Disposition};
-use ironbus_core::lease::{AckOutcome, Claim, LeaseConfig, LeaseTable, LeaseToken, NackOutcome};
+use ironbus_core::lease::{
+    AckOutcome, Claim, ExtendOutcome, LeaseConfig, LeaseTable, LeaseToken, NackOutcome,
+};
 use ironbus_core::types::Offset;
 use ironbus_storage::checkpoint::Checkpoint;
 use ironbus_storage::fs::Filesystem;
@@ -154,6 +156,18 @@ pub enum NackResult {
     /// The message was requeued for redelivery (immediately, or after the requested delay).
     Requeued,
     /// The token was stale (already acked, or redelivered); the nack was ignored.
+    Fenced,
+}
+
+/// The outcome of [`Engine::progress`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressResult {
+    /// The lease deadline was extended by one visibility window.
+    Extended,
+    /// The hard cap from the attempt start has been reached; the lease cannot be extended
+    /// further and will expire (and the message redeliver) on schedule.
+    CapReached,
+    /// The token was stale (already acked, or redelivered); the progress was ignored.
     Fenced,
 }
 
@@ -374,6 +388,27 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
             NackOutcome::Fenced => NackResult::Fenced,
             NackOutcome::Exhausted => return Err(EngineError::GenerationExhausted),
         })
+    }
+
+    /// Terminates delivery of the message named by `token`: an intentional drop that commits
+    /// past it so it never redelivers and is NOT dead-lettered. Mechanically a commit, like
+    /// [`Engine::ack`], and distinct only in the caller's intent (a future metrics or
+    /// dead-letter-policy split can diverge them); sharing the commit path keeps the cursor
+    /// and lease invariants identical to a normal ack.
+    pub fn term(&mut self, token: &LeaseToken) -> AckResult {
+        self.ack(token)
+    }
+
+    /// Extends the lease named by `token` by one visibility window (the consumer is still
+    /// working), clamped to the hard cap from the attempt start. A stale token is fenced; a
+    /// lease already at its cap returns [`ProgressResult::CapReached`].
+    pub fn progress(&mut self, token: &LeaseToken) -> ProgressResult {
+        let now = self.log.now_monotonic();
+        match self.leases.extend(token, now) {
+            ExtendOutcome::Extended(_) => ProgressResult::Extended,
+            ExtendOutcome::CapReached => ProgressResult::CapReached,
+            ExtendOutcome::Fenced => ProgressResult::Fenced,
+        }
     }
 
     /// The committed offset: every offset below it is acked, and where a restart resumes.
@@ -803,6 +838,58 @@ mod tests {
         let d0 = message(e.poll_now().unwrap());
         e.ack(&d0.token); // commit, so the token is now stale
         assert_eq!(e.nack(&d0.token, 0).unwrap(), NackResult::Fenced);
+    }
+
+    #[test]
+    fn term_drops_the_message_without_redelivery() {
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"drop-me");
+        let d = message(e.poll_now().unwrap());
+        // Term is an intentional drop: it commits past the message (cursor advances) so it
+        // never redelivers, the same mechanism as ack.
+        assert_eq!(e.term(&d.token), AckResult::Acked);
+        assert_eq!(e.committed_offset().get(), 1);
+        assert!(matches!(e.poll_now().unwrap(), Poll::Idle));
+        // A stale term is fenced (no double-commit).
+        assert_eq!(e.term(&d.token), AckResult::Fenced);
+    }
+
+    #[test]
+    fn progress_extends_the_lease_then_caps_at_the_hard_cap() {
+        // config(_, _) sets visibility 30 ns, hard cap 100 ns. Use an Arc<ManualClock> the
+        // test advances, since progress reads the engine's own clock.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(
+            InMemoryFs::new(),
+            std::sync::Arc::clone(&clock),
+            config(10, 5),
+        )
+        .unwrap();
+        // The produce test helper is monomorphic over ManualClock, so inline it for this
+        // Arc<ManualClock> engine.
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"slow",
+        })
+        .unwrap();
+        // Deliver at t=0: deadline 30, attempt_start 0, hard cap at t=100.
+        let d = message(e.poll_now().unwrap());
+        // At t=25, progress extends the deadline to 55 (< cap), so it stays in flight.
+        clock.advance_monotonic_nanos(25);
+        assert_eq!(e.progress(&d.token), ProgressResult::Extended);
+        assert!(
+            matches!(e.poll_now().unwrap(), Poll::Idle),
+            "still leased after extend"
+        );
+        // At t=100 (attempt_start + hard cap), progress can no longer extend.
+        clock.advance_monotonic_nanos(75);
+        assert_eq!(e.progress(&d.token), ProgressResult::CapReached);
+        // A stale token is fenced.
+        e.ack(&d.token);
+        assert_eq!(e.progress(&d.token), ProgressResult::Fenced);
     }
 
     #[test]

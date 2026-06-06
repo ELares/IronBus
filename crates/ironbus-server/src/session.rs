@@ -13,7 +13,7 @@
 //! offset; other `Ok`s have an empty body; an `Err` carries a UTF-8 message. A malformed
 //! frame envelope is unrecoverable for a length-prefixed stream, so it ends the session.
 
-use crate::engine::{AckResult, Engine, EngineError, NackResult, Poll};
+use crate::engine::{AckResult, Engine, EngineError, NackResult, Poll, ProgressResult};
 use ironbus_core::clock::Clock;
 use ironbus_core::types::RecordFlags;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
@@ -222,13 +222,26 @@ impl Session {
                     Ok(())
                 }
             },
-            // term (stop without dead-lettering) and progress (extend the lease) are the next
-            // slice of the ack vocabulary; recognized but not yet wired.
-            AckOp::Term | AckOp::Progress => {
-                reply_err(
-                    out,
-                    "term and progress are not yet supported on this connection",
-                );
+            // Term is an intentional drop: commit past the message (the same mechanism as
+            // ack) so it never redelivers and is not dead-lettered. 1 = dropped, 0 = fenced.
+            AckOp::Term => {
+                let status = match engine.term(&token) {
+                    AckResult::Acked => 1u8,
+                    AckResult::Fenced => 0u8,
+                };
+                reply(out, FrameType::Ok, &[status]);
+                Ok(())
+            }
+            // Progress extends the lease (the consumer is still working). 1 = extended,
+            // 2 = cap reached (the lease will expire and the message redeliver on schedule),
+            // 0 = fenced.
+            AckOp::Progress => {
+                let status = match engine.progress(&token) {
+                    ProgressResult::Extended => 1u8,
+                    ProgressResult::CapReached => 2u8,
+                    ProgressResult::Fenced => 0u8,
+                };
+                reply(out, FrameType::Ok, &[status]);
                 Ok(())
             }
         }

@@ -109,6 +109,18 @@ pub struct Message {
     pub payload: Vec<u8>,
 }
 
+/// The outcome of a [`Client::progress`] call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressOutcome {
+    /// The lease was extended by one visibility window.
+    Extended,
+    /// The lease reached its hard cap and cannot be extended further; it will expire and the
+    /// message redeliver on schedule.
+    CapReached,
+    /// The token was stale (already acked, or redelivered); the progress was ignored.
+    Fenced,
+}
+
 /// A connected IronBus client over one TCP connection.
 #[derive(Debug)]
 pub struct Client {
@@ -306,6 +318,75 @@ impl Client {
                 [status] => Ok(*status == 1),
                 _ => Err(ClientError::BadResponse(
                     "nack reply was not a one-byte status",
+                )),
+            },
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Terminates delivery of a fetched message: an intentional drop. The broker commits past
+    /// it so it never redelivers and is NOT dead-lettered. Returns `true` if it was dropped,
+    /// `false` if the token was fenced (stale: it already redelivered or was acked).
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, a server error, or a wrong-shape reply.
+    pub fn term(&mut self, offset: u64, generation: u64) -> Result<bool, ClientError> {
+        let mut body = Vec::new();
+        encode_ack(
+            &AckBody {
+                op: AckOp::Term,
+                offset,
+                generation,
+                delay_ms: 0,
+            },
+            &mut body,
+        );
+        self.send(FrameType::Ack, &body)?;
+        match self.read_frame()? {
+            (FrameType::Ok, body) => match body.as_slice() {
+                [status] => Ok(*status == 1),
+                _ => Err(ClientError::BadResponse(
+                    "term reply was not a one-byte status",
+                )),
+            },
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Reports that work on a fetched message is still in progress, extending its lease by one
+    /// visibility window so it is not redelivered while the consumer keeps working.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, a server error, or a wrong-shape reply.
+    pub fn progress(
+        &mut self,
+        offset: u64,
+        generation: u64,
+    ) -> Result<ProgressOutcome, ClientError> {
+        let mut body = Vec::new();
+        encode_ack(
+            &AckBody {
+                op: AckOp::Progress,
+                offset,
+                generation,
+                delay_ms: 0,
+            },
+            &mut body,
+        );
+        self.send(FrameType::Ack, &body)?;
+        match self.read_frame()? {
+            (FrameType::Ok, body) => match body.as_slice() {
+                [1] => Ok(ProgressOutcome::Extended),
+                [2] => Ok(ProgressOutcome::CapReached),
+                [0] => Ok(ProgressOutcome::Fenced),
+                _ => Err(ClientError::BadResponse(
+                    "progress reply was not a known one-byte status",
                 )),
             },
             (FrameType::Err, body) => {
@@ -637,6 +718,46 @@ mod tests {
         assert!(!c.ack(first[0].offset, first[0].generation).unwrap());
         assert!(c.ack(second[0].offset, second[0].generation).unwrap());
         assert!(c.fetch(10).unwrap().is_empty());
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn term_drops_a_message_and_progress_extends_a_lease() {
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+        for p in [&b"keep"[..], b"drop"] {
+            c.produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                payload: p,
+            })
+            .unwrap();
+        }
+        let msgs = c.fetch(10).unwrap();
+        assert_eq!(msgs.len(), 2);
+
+        // Progress on the first: the lease is extended.
+        assert_eq!(
+            c.progress(msgs[0].offset, msgs[0].generation).unwrap(),
+            ProgressOutcome::Extended
+        );
+        // Term the second: an intentional drop (committed past, never redelivered).
+        assert!(c.term(msgs[1].offset, msgs[1].generation).unwrap());
+
+        // Ack the first; now the whole prefix is committed and nothing remains.
+        assert!(c.ack(msgs[0].offset, msgs[0].generation).unwrap());
+        assert!(c.fetch(10).unwrap().is_empty());
+
+        // A progress or term on a now-stale token is fenced.
+        assert_eq!(
+            c.progress(msgs[0].offset, msgs[0].generation).unwrap(),
+            ProgressOutcome::Fenced
+        );
+        assert!(!c.term(msgs[1].offset, msgs[1].generation).unwrap());
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
