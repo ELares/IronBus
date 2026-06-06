@@ -17,7 +17,7 @@
 //! separately.
 
 use ironbus_core::clock::ManualClock;
-use ironbus_core::format::SEGMENT_HEADER_LEN;
+use ironbus_core::format::{RECORD_HEADER_LEN, SEGMENT_HEADER_LEN};
 use ironbus_core::types::{Offset, RecordFlags, Seq};
 use ironbus_storage::fs::{Filesystem, InMemoryFs};
 use ironbus_storage::io::RandomAccessFile;
@@ -185,12 +185,9 @@ fn tail_truncation_drops_the_partial_record() {
     assert_prefix(&log, n - 1);
 }
 
-#[test]
-fn mid_log_corruption_stops_at_the_first_bad_record() {
-    // Equal-size records, so record k occupies a known, fixed-width slot. Corrupting a
-    // byte inside record k must make recovery stop right before it.
-    let n = 8u64;
-    let k = 3u64;
+/// Flips the byte at `in_frame` bytes into record `k` of an n-record sealed segment,
+/// then asserts recovery stops exactly before record k (its prefix kept).
+fn assert_corruption_in_record_stops_before_it(n: u64, k: u64, in_frame: usize) {
     let ops: Vec<Op> = (0..n).map(|_| Op::Append).chain([Op::Sync]).collect();
     let log = apply(InMemoryFs::new(), big_config(), &ops);
     let fs = log.into_filesystem();
@@ -199,7 +196,7 @@ fn mid_log_corruption_stops_at_the_first_bad_record() {
     let mut bytes = file.snapshot();
     let header = SEGMENT_HEADER_LEN;
     let frame = (bytes.len() - header) / usize::try_from(n).unwrap();
-    let target = header + usize::try_from(k).unwrap() * frame + frame / 2;
+    let target = header + usize::try_from(k).unwrap() * frame + in_frame;
     bytes[target] ^= 0xff;
     file.set_len(0).unwrap();
     file.write_all_at(&bytes, 0).unwrap();
@@ -208,6 +205,72 @@ fn mid_log_corruption_stops_at_the_first_bad_record() {
     let log = Log::open(fs, ManualClock::new(), big_config()).unwrap();
     assert_eq!(log.flushed_offset(), Offset::new(k));
     assert_prefix(&log, k);
+}
+
+#[test]
+fn mid_log_header_corruption_stops_at_the_first_bad_record() {
+    // A byte in record 3's frame header, exercising the record HEADER checksum.
+    assert_corruption_in_record_stops_before_it(8, 3, RECORD_HEADER_LEN / 2);
+}
+
+#[test]
+fn mid_log_body_corruption_stops_at_the_first_bad_record() {
+    // A byte in record 3's payload, exercising the record BODY checksum (the header
+    // checksum cannot see this byte, so it proves body-CRC verification runs).
+    assert_corruption_in_record_stops_before_it(8, 3, RECORD_HEADER_LEN + 1);
+}
+
+#[test]
+fn recovery_rejects_a_synthesized_sequence_gap() {
+    // The harness must be able to falsify a broken sequence-contiguity guard itself, not
+    // lean on a separate unit test: hand-build a segment whose second record skips a
+    // sequence number and assert recovery rejects it.
+    use ironbus_core::codec::RecordView;
+    use ironbus_core::segment::SegmentHeader;
+    use ironbus_storage::segment::{SegmentWriter, StorageError};
+
+    let fs = InMemoryFs::new();
+    let file = fs.create_new(&segment_file_name(0)).unwrap();
+    let header = SegmentHeader {
+        segment_id: 0,
+        base_seq: Seq::new(0),
+        base_offset: Offset::ZERO,
+        created_unix_ms: 0,
+        flags: 0,
+    };
+    let mut writer = SegmentWriter::create(file, header).unwrap();
+    writer
+        .append(&RecordView {
+            seq: Seq::new(0),
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"a",
+        })
+        .unwrap();
+    writer
+        .append(&RecordView {
+            seq: Seq::new(5), // a gap: the contiguous next sequence is 1
+            timestamp_ms: 5,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"b",
+        })
+        .unwrap();
+    writer.sync().unwrap();
+    drop(writer);
+
+    let err = Log::open(fs, ManualClock::new(), big_config()).unwrap_err();
+    assert!(matches!(
+        err,
+        StorageError::RecoveredSequenceMismatch {
+            index: 1,
+            expected: 1,
+            found: 5
+        }
+    ));
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -242,6 +305,8 @@ proptest! {
             let i = u64::try_from(i).unwrap();
             prop_assert_eq!(record.offset, Offset::new(i));
             prop_assert_eq!(record.seq, Seq::new(i));
+            let expected = payload(i);
+            prop_assert_eq!(record.payload.as_slice(), expected.as_slice());
         }
     }
 
@@ -274,6 +339,11 @@ proptest! {
                 let i = u64::try_from(i).unwrap();
                 prop_assert_eq!(record.offset, Offset::new(i));
                 prop_assert_eq!(record.seq, Seq::new(i));
+                // Every SURVIVED record has intact bytes (the corruption fell in a record
+                // that was dropped, or in the segment header), so a checksum that wrongly
+                // accepted a corrupt record would surface here as a mismatched payload.
+                let expected = payload(i);
+                prop_assert_eq!(record.payload.as_slice(), expected.as_slice());
             }
         }
     }
