@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[dependencies]
+ironbus-core = { path = "../ironbus-core", version = "0.0.0" }
+
 [dev-dependencies]
 tempfile = "3"
 

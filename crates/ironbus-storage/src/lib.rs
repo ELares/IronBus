@@ -3,3 +3,4 @@
 #![warn(missing_docs)]
 
 pub mod io;
+pub mod segment;
