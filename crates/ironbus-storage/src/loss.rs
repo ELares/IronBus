@@ -52,6 +52,29 @@ impl ReasonCode {
             ReasonCode::SequenceGap => 5,
         }
     }
+
+    /// Every reason, in code order, so a consumer can enumerate them (for example to emit a
+    /// metric series per reason). Appended to, never reordered.
+    pub const ALL: [ReasonCode; 5] = [
+        ReasonCode::TornTail,
+        ReasonCode::CorruptRecordHeader,
+        ReasonCode::CorruptRecordBody,
+        ReasonCode::CorruptSegmentHeader,
+        ReasonCode::SequenceGap,
+    ];
+
+    /// A stable, lower-snake-case label for this reason, for a metric series or a log field.
+    /// Frozen alongside [`ReasonCode::code`].
+    #[must_use]
+    pub fn metric_label(self) -> &'static str {
+        match self {
+            ReasonCode::TornTail => "torn_tail",
+            ReasonCode::CorruptRecordHeader => "corrupt_record_header",
+            ReasonCode::CorruptRecordBody => "corrupt_record_body",
+            ReasonCode::CorruptSegmentHeader => "corrupt_segment_header",
+            ReasonCode::SequenceGap => "sequence_gap",
+        }
+    }
 }
 
 /// One contiguous span of bytes that recovery dropped from one segment, with its cause and
@@ -170,6 +193,16 @@ impl LossReport {
         self.events
             .iter()
             .fold(0u64, |acc, e| acc.saturating_add(e.records_lost_estimate))
+    }
+
+    /// The total bytes dropped by events with `reason` (saturating). Useful for a per-reason
+    /// metric series.
+    #[must_use]
+    pub fn bytes_skipped_for(&self, reason: ReasonCode) -> u64 {
+        self.events
+            .iter()
+            .filter(|e| e.reason_code == reason)
+            .fold(0u64, |acc, e| acc.saturating_add(e.bytes_skipped))
     }
 
     /// The global loss cap in bytes for a log holding `durable_bytes` of durable data, using
@@ -390,6 +423,33 @@ mod tests {
                 cap: 200,
             })
         );
+    }
+
+    #[test]
+    fn bytes_skipped_for_sums_per_reason_and_labels_are_frozen() {
+        let mut r = LossReport::new();
+        r.push(LossEvent::span(0, 0, 10, 1, ReasonCode::TornTail));
+        r.push(LossEvent::span(1, 0, 30, 1, ReasonCode::CorruptRecordBody));
+        r.push(LossEvent::span(2, 0, 5, 1, ReasonCode::TornTail));
+        assert_eq!(r.bytes_skipped_for(ReasonCode::TornTail), 15);
+        assert_eq!(r.bytes_skipped_for(ReasonCode::CorruptRecordBody), 30);
+        assert_eq!(r.bytes_skipped_for(ReasonCode::SequenceGap), 0);
+        // The per-reason totals sum to the grand total.
+        let by_reason: u64 = ReasonCode::ALL
+            .iter()
+            .map(|&rc| r.bytes_skipped_for(rc))
+            .sum();
+        assert_eq!(by_reason, r.total_bytes_skipped());
+        // Labels are frozen and distinct, in code order.
+        assert_eq!(ReasonCode::ALL.len(), 5);
+        assert_eq!(ReasonCode::TornTail.metric_label(), "torn_tail");
+        assert_eq!(
+            ReasonCode::CorruptRecordHeader.metric_label(),
+            "corrupt_record_header"
+        );
+        let labels: std::collections::BTreeSet<_> =
+            ReasonCode::ALL.iter().map(|rc| rc.metric_label()).collect();
+        assert_eq!(labels.len(), 5, "labels are distinct");
     }
 
     #[test]

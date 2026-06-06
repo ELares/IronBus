@@ -27,6 +27,7 @@ use ironbus_core::types::Offset;
 use ironbus_storage::checkpoint::Checkpoint;
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::{Append, Log, LogConfig};
+use ironbus_storage::loss::LossReport;
 use ironbus_storage::segment::{OwnedRecord, StorageError};
 
 /// Tunables for an [`Engine`].
@@ -476,6 +477,14 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     #[must_use]
     pub fn recovered_truncated_bytes(&self) -> u64 {
         self.log.recovered_truncated_bytes()
+    }
+
+    /// The structured loss report from recovery (#120): the byte spans dropped to reach the
+    /// last intact record, with their reasons. Empty for a fresh log or a clean recovery. The
+    /// metrics endpoint reads it for the per-reason recovery-loss series.
+    #[must_use]
+    pub fn loss_report(&self) -> &LossReport {
+        self.log.loss_report()
     }
 
     /// A snapshot of the operational counters (monotonic since process start).
