@@ -91,6 +91,20 @@ impl From<std::io::Error> for EngineError {
     }
 }
 
+impl EngineError {
+    /// Whether this error leaves the engine permanently unusable, the writer is frozen or
+    /// an internal invariant broke, so a caller should stop rather than keep retrying.
+    #[must_use]
+    pub fn is_fatal(&self) -> bool {
+        matches!(
+            self,
+            EngineError::GenerationExhausted
+                | EngineError::MissingRecord { .. }
+                | EngineError::Storage(StorageError::WriterFrozen)
+        )
+    }
+}
+
 /// A message handed to a consumer by [`Engine::poll`], plus the token to ack it with.
 #[derive(Clone, Debug)]
 pub struct Delivery {
