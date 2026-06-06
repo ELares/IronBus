@@ -5,3 +5,7 @@
 //! the network, spawn processes, or pull in an async runtime. A CI lint enforces
 //! this, so the engine logic stays pure and deterministic.
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+pub mod format;
+pub mod types;
