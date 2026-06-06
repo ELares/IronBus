@@ -19,6 +19,7 @@
 use ironbus_core::clock::ManualClock;
 use ironbus_core::format::{RECORD_HEADER_LEN, SEGMENT_HEADER_LEN};
 use ironbus_core::types::{Offset, RecordFlags, Seq};
+use ironbus_storage::fault::FaultFs;
 use ironbus_storage::fs::{Filesystem, InMemoryFs};
 use ironbus_storage::io::RandomAccessFile;
 use ironbus_storage::log::{Append, Log, LogConfig};
@@ -44,7 +45,7 @@ fn payload(i: u64) -> Vec<u8> {
     i.to_le_bytes().to_vec()
 }
 
-fn append_at(log: &mut Log<InMemoryFs, ManualClock>, i: u64) {
+fn append_at<F: Filesystem>(log: &mut Log<F, ManualClock>, i: u64) {
     let p = payload(i);
     log.append(&Append {
         timestamp_ms: i,
@@ -99,7 +100,7 @@ fn assert_recovers_durable_prefix(fs: InMemoryFs, config: LogConfig, durable: u6
 
 /// Asserts the readable records are a contiguous, correctly-numbered prefix of length
 /// `expected`.
-fn assert_prefix(log: &Log<InMemoryFs, ManualClock>, expected: u64) {
+fn assert_prefix<F: Filesystem>(log: &Log<F, ManualClock>, expected: u64) {
     let records = log.read_from(Offset::ZERO, usize::MAX).unwrap();
     assert_eq!(records.len() as u64, expected);
     for (i, record) in records.iter().enumerate() {
@@ -271,6 +272,120 @@ fn recovery_rejects_a_synthesized_sequence_gap() {
             found: 5
         }
     ));
+}
+
+#[test]
+fn fatal_fsync_freeze_loses_no_acked_record() {
+    // Block-layer fault, the fsyncgate EIO mode: a fatal fdatasync while the writer is live.
+    // The acked prefix must survive the crash that accompanies the failed fsync; the unsynced
+    // tail (its page-cache bytes) may vanish. No acknowledged record is lost.
+    for durable in [1u64, 3, 5] {
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut log = Log::open(fs, ManualClock::new(), big_config()).unwrap();
+        for i in 0..durable {
+            append_at(&mut log, i);
+        }
+        log.sync().unwrap(); // these `durable` records are acked
+        assert_eq!(log.flushed_offset(), Offset::new(durable));
+
+        // An unsynced tail, then a fatal fsync: the sync freezes the writer read-only.
+        append_at(&mut log, durable);
+        append_at(&mut log, durable + 1);
+        let appended = log.next_offset().get();
+        control.set_fail_sync(true);
+        assert!(matches!(
+            log.sync(),
+            Err(ironbus_storage::segment::StorageError::WriterFrozen)
+        ));
+        assert!(!log.is_writable(), "a fatal fsync freezes the writer");
+        assert_eq!(
+            log.flushed_offset(),
+            Offset::new(durable),
+            "the durable mark never advanced past the acked prefix"
+        );
+
+        // Model the crash: the unsynced page-cache bytes are lost. Reopen and assert the
+        // acked prefix recovered exactly, monotone and intact.
+        control.set_fail_sync(false);
+        let faultfs = log.into_filesystem();
+        faultfs.inner().simulate_power_loss();
+        let log = Log::open(faultfs, ManualClock::new(), big_config()).unwrap();
+        let recovered = log.flushed_offset().get();
+        assert!(
+            recovered >= durable,
+            "lost an acknowledged record: recovered {recovered} < durable {durable}"
+        );
+        assert!(
+            recovered <= appended,
+            "invented a record beyond what was appended"
+        );
+        assert_eq!(
+            recovered, durable,
+            "the unsynced tail did not survive the crash"
+        );
+        assert_prefix(&log, durable);
+    }
+}
+
+#[test]
+fn fatal_fsync_freeze_during_a_roll_loses_no_acked_record() {
+    // The freeze can also strike inside a segment roll, where the seal's sync_all (not an
+    // explicit Log::sync) is the faulting fdatasync. The acked prefix written before the roll
+    // must still survive the crash.
+    let (fs, control) = FaultFs::new(InMemoryFs::new());
+    let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+    // A durable prefix kept under the cap (no roll yet), each record acked.
+    let durable = 4u64;
+    for i in 0..durable {
+        append_at(&mut log, i);
+        log.sync().unwrap();
+    }
+    let acked = log.flushed_offset().get();
+    assert_eq!(acked, durable, "the whole prefix is acked before any roll");
+
+    // Arm the fault, then append (without syncing) until a roll fires: the seal's sync_all
+    // faults and freezes the writer from inside the roll path, not an explicit sync.
+    control.set_fail_sync(true);
+    let mut froze = false;
+    for i in durable..durable + 60 {
+        match log.append(&Append {
+            timestamp_ms: i,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: &payload(i),
+        }) {
+            Ok(_) => {}
+            Err(ironbus_storage::segment::StorageError::WriterFrozen) => {
+                froze = true;
+                break;
+            }
+            Err(other) => panic!("a freezing roll must be fatal, got {other:?}"),
+        }
+    }
+    assert!(froze, "a roll's seal fsync should have frozen the writer");
+    assert!(!log.is_writable());
+    assert_eq!(
+        log.flushed_offset().get(),
+        acked,
+        "the durable mark never advanced past the acked prefix during the failed roll"
+    );
+
+    // Crash and reopen: the acked prefix (everything synced before the roll) survives, and
+    // the recovered records are a valid, monotone prefix.
+    control.set_fail_sync(false);
+    let faultfs = log.into_filesystem();
+    faultfs.inner().simulate_power_loss();
+    let log = Log::open(faultfs, ManualClock::new(), small_config()).unwrap();
+    let recovered = log.flushed_offset().get();
+    // Exactly the acked prefix: the seal faulted before segment 1 was ever created, so no
+    // uncommitted record can survive (no acked record lost, none invented). This mirrors the
+    // tight assertion in the non-roll gate.
+    assert_eq!(
+        recovered, acked,
+        "the roll freeze must recover exactly the acked prefix"
+    );
+    assert_prefix(&log, recovered);
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
