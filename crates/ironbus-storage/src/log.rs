@@ -722,6 +722,52 @@ mod tests {
     }
 
     #[test]
+    fn segment_ids_increase_monotonically_and_are_never_recycled() {
+        // #139 decision: v1 never recycles segments. A new segment always gets a fresh id higher
+        // than any existing one, never reusing a lower id, across rolls AND a restart. This keeps
+        // the at-rest nonce (#18) safe: a segment_id is never reused under a fixed key.
+        let mut log = open_mem(small_config());
+        for i in 0..16u8 {
+            log.append(&rec(&[i; 20])).unwrap();
+        }
+        log.sync().unwrap();
+        let max_before = log.active_segment_id();
+        assert!(max_before >= 2, "rolled multiple segments");
+        // The on-disk ids are exactly 0..=max_before, a contiguous run, each used once.
+        let ids = segment_ids(log.filesystem()).unwrap();
+        assert_eq!(
+            ids,
+            (0..=max_before).collect::<Vec<_>>(),
+            "segment ids are a contiguous run with no recycling"
+        );
+
+        // Restart on the same data dir and append more: the new segments get ids STRICTLY
+        // GREATER than max_before; id 0 and every prior id is retained, never reused.
+        let fs = log.into_filesystem();
+        let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        for i in 0..16u8 {
+            log.append(&rec(&[i; 20])).unwrap();
+        }
+        log.sync().unwrap();
+        assert!(
+            log.active_segment_id() > max_before,
+            "after a restart, new segments use fresh ids, never recycling a lower one"
+        );
+        let ids_after = segment_ids(log.filesystem()).unwrap();
+        for id in 0..=max_before {
+            assert!(
+                ids_after.contains(&id),
+                "original segment {id} is retained, not recycled or overwritten"
+            );
+        }
+        assert_eq!(
+            ids_after,
+            (0..=log.active_segment_id()).collect::<Vec<_>>(),
+            "the whole id space stays a contiguous, monotonic, never-recycled run"
+        );
+    }
+
+    #[test]
     fn segment_base_offset_and_seq_continue_across_a_roll() {
         let mut log = open_mem(small_config());
         for i in 0..8u8 {
