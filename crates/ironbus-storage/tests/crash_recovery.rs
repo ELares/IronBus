@@ -19,7 +19,7 @@
 use ironbus_core::clock::ManualClock;
 use ironbus_core::format::{RECORD_HEADER_LEN, SEGMENT_HEADER_LEN};
 use ironbus_core::types::{Offset, RecordFlags, Seq};
-use ironbus_storage::fault::FaultFs;
+use ironbus_storage::fault::{FaultControl, FaultFs};
 use ironbus_storage::fs::{Filesystem, InMemoryFs};
 use ironbus_storage::invariants::{
     check_longest_valid_prefix, check_no_acked_loss, check_pure_recovery,
@@ -791,6 +791,93 @@ proptest! {
             prop_assert_eq!(record.seq, Seq::new(i));
             let expected = payload(i);
             prop_assert_eq!(record.payload.as_slice(), expected.as_slice());
+        }
+    }
+}
+
+/// One injected storage fault, chosen from the proptest seed so a failure replays exactly.
+#[derive(Clone, Debug)]
+enum Fault {
+    /// Every `sync_data` / `sync_all` returns an injected error.
+    FailSync,
+    /// Every `write_all_at` fails cleanly without writing.
+    FailWrite,
+    /// Every `read_at` returns an injected error.
+    FailRead,
+    /// Every `read_at` returns at most this many bytes (a partial read), 1 or more.
+    ShortRead(u64),
+    /// The next `write_all_at` persists this many bytes then errors (a torn write).
+    TornWrite(u64),
+}
+
+fn fault_strategy() -> impl Strategy<Value = Fault> {
+    prop_oneof![
+        Just(Fault::FailSync),
+        Just(Fault::FailWrite),
+        Just(Fault::FailRead),
+        (1u64..8).prop_map(Fault::ShortRead),
+        (0u64..16).prop_map(Fault::TornWrite),
+    ]
+}
+
+fn arm_fault(control: &FaultControl, fault: &Fault) {
+    match *fault {
+        Fault::FailSync => control.set_fail_sync(true),
+        Fault::FailWrite => control.set_fail_write(true),
+        Fault::FailRead => control.set_fail_read(true),
+        Fault::ShortRead(n) => control.set_short_read(n),
+        Fault::TornWrite(n) => control.arm_torn_write(n),
+    }
+}
+
+fn disarm_all(control: &FaultControl) {
+    control.set_fail_sync(false);
+    control.set_fail_write(false);
+    control.set_fail_read(false);
+    control.set_short_read(0);
+}
+
+proptest! {
+    /// The seed-driven half of the fault-injection contract (#151): for an arbitrary workload
+    /// and an arbitrary one of the five injected faults (fsync EIO, clean write failure, read
+    /// error, short read, torn write), recovery under that fault must hold the resilience
+    /// invariants. It must NEVER panic; it either recovers a valid prefix (I2) that preserves
+    /// every durably acked record (I1), or fails closed with a typed error. A buggy recovery
+    /// that lost an acked record, read past a torn tail, or panicked on an IO fault fails here.
+    ///
+    /// Coverage note: recovering a CLEAN image always READS, so the read faults (`FailRead`,
+    /// `ShortRead`) fire on every case. The write and sync faults fire only when recovery itself
+    /// writes or syncs, which a clean image seldom triggers (a truncation `sync_all` needs a torn
+    /// tail; a roll-forward header write needs a sealed highest segment). Forcing those write
+    /// paths under the write/sync/torn faults is the targeted follow-up #231; here those arms
+    /// assert the invariant holds whether or not the fault triggers.
+    #[test]
+    fn recovery_under_an_arbitrary_seeded_fault_holds_the_invariants(
+        ops in prop::collection::vec(op_strategy(), 0..30),
+        roll in any::<bool>(),
+        fault in fault_strategy(),
+    ) {
+        let config = if roll { small_config() } else { big_config() };
+        let log = apply(InMemoryFs::new(), config, &ops);
+        let durable = log.flushed_offset().get();
+        let disk = log.into_filesystem();
+
+        let (faultfs, control) = FaultFs::new(disk);
+        arm_fault(&control, &fault);
+
+        // Recover under the fault. Reaching past this call at all (no unwind) already proves
+        // the no-panic invariant; an `Err` is the fail-closed outcome (a clean typed error),
+        // which is acceptable. Only a successful recovery is held to the I1/I2 invariants.
+        if let Ok(log) = Log::open(faultfs, ManualClock::new(), config) {
+            // Recovery succeeded despite the fault. Disarm so the invariant check inspects the
+            // recovered STATE, not reads taken under a still-armed fault.
+            disarm_all(&control);
+            let records = log.read_from(Offset::ZERO, usize::MAX).unwrap();
+            // I2: the recovered run is a contiguous valid prefix from offset 0.
+            check_longest_valid_prefix(&records).map_err(|v| TestCaseError::fail(v.to_string()))?;
+            // I1: every durably acked offset survived (recovery may keep more, never less).
+            let acked: Vec<u64> = (0..durable).collect();
+            check_no_acked_loss(&records, &acked).map_err(|v| TestCaseError::fail(v.to_string()))?;
         }
     }
 }
