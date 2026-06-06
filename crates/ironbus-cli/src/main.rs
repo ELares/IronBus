@@ -481,7 +481,7 @@ fn cmd_serve(
             .map_err(|e| CliError::Internal(format!("cannot read health address: {e}")))?;
         writeln!(
             out,
-            "ironbus health endpoints on {health_local} (/healthz, /readyz)"
+            "ironbus health endpoints on {health_local} (/healthz, /readyz, /metrics)"
         )?;
         let engine = Arc::clone(&shared);
         let shutdown = Arc::clone(&shutdown);

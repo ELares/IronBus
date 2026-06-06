@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! A minimal HTTP health endpoint for an operator or an orchestrator probe.
 //!
-//! Two routes on a loopback HTTP port (#16): `GET /healthz` is liveness (this loop is
+//! Three routes on a loopback HTTP port (#16): `GET /healthz` is liveness (this loop is
 //! running, so the process is up) and `GET /readyz` is readiness (the broker's durable log
 //! writer is live, an active segment is open, so it can still accept writes; a writer frozen
 //! by a failed segment roll answers `503`). NOTE: a frozen-on-fatal-fsync writer is NOT yet
@@ -9,8 +9,9 @@
 //! `/readyz` takes the engine lock, so its latency tracks an in-flight produce fsync (a slow
 //! disk shows up as readiness latency, which is the intent). The parser reads only the bounded
 //! request line, blocks with read and write timeouts plus a total deadline, and closes after
-//! one response, so a slow or hostile client cannot wedge the loop. This is the first slice of
-//! the observability surface; `OpenMetrics` `/metrics` and introspection are follow-ups (#16).
+//! one response, so a slow or hostile client cannot wedge the loop. `GET /metrics` exposes a
+//! few engine gauges (committed offset, durable head, consumer lag, in-flight, writer health)
+//! in Prometheus text format. The drop/skip/loss counters and fsync histograms are follow-ups (#16).
 
 use crate::server::SharedEngine;
 use ironbus_core::clock::Clock;
@@ -130,6 +131,38 @@ where
                 respond(&mut stream, 503, "Service Unavailable", "writer frozen")
             }
         }
+        "/metrics" => {
+            let (committed, flushed, in_flight, healthy) = {
+                let g = engine.lock().unwrap_or_else(PoisonError::into_inner);
+                (
+                    g.committed_offset().get(),
+                    g.flushed_offset().get(),
+                    g.in_flight(),
+                    g.is_healthy(),
+                )
+            };
+            // Consumer lag: durable records produced but not yet committed.
+            let lag = flushed.saturating_sub(committed);
+            let body = format!(
+                "# HELP ironbus_committed_offset The committed consumer cursor; every offset below it is acked.\n\
+                 # TYPE ironbus_committed_offset gauge\n\
+                 ironbus_committed_offset {committed}\n\
+                 # HELP ironbus_flushed_offset The durable log head; the offset of the next record to be written.\n\
+                 # TYPE ironbus_flushed_offset gauge\n\
+                 ironbus_flushed_offset {flushed}\n\
+                 # HELP ironbus_consumer_lag Durable records produced but not yet committed.\n\
+                 # TYPE ironbus_consumer_lag gauge\n\
+                 ironbus_consumer_lag {lag}\n\
+                 # HELP ironbus_in_flight Messages delivered (leased) but not yet acked.\n\
+                 # TYPE ironbus_in_flight gauge\n\
+                 ironbus_in_flight {in_flight}\n\
+                 # HELP ironbus_writer_healthy 1 if the durable log writer is live, 0 if frozen.\n\
+                 # TYPE ironbus_writer_healthy gauge\n\
+                 ironbus_writer_healthy {healthy_value}\n",
+                healthy_value = u8::from(healthy),
+            );
+            respond(&mut stream, 200, "OK", &body)
+        }
         _ => respond(&mut stream, 404, "Not Found", "unknown endpoint"),
     }
 }
@@ -151,17 +184,19 @@ fn respond(stream: &mut TcpStream, code: u16, reason: &str, body: &str) -> std::
 mod tests {
     use super::*;
     use crate::clock::SystemClock;
-    use crate::engine::{Engine, EngineConfig};
+    use crate::engine::{AckResult, Engine, EngineConfig, Poll};
     use ironbus_core::delivery::DeliveryConfig;
     use ironbus_core::lease::LeaseConfig;
+    use ironbus_core::types::RecordFlags;
     use ironbus_storage::fs::InMemoryFs;
-    use ironbus_storage::log::LogConfig;
+    use ironbus_storage::log::{Append, LogConfig};
     use std::sync::{Arc, Mutex};
 
     fn start() -> (
         std::net::SocketAddr,
         Arc<AtomicBool>,
         std::thread::JoinHandle<()>,
+        SharedEngine<InMemoryFs, SystemClock>,
     ) {
         let engine = Engine::open(
             InMemoryFs::new(),
@@ -179,11 +214,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
+        let engine = Arc::clone(&shared);
         let handle = std::thread::spawn({
             let shutdown = Arc::clone(&shutdown);
             move || serve_health(&listener, &shared, &shutdown).unwrap()
         });
-        (addr, shutdown, handle)
+        (addr, shutdown, handle, engine)
     }
 
     /// Sends one raw request and returns the full response text.
@@ -198,7 +234,7 @@ mod tests {
 
     #[test]
     fn healthz_is_ok_and_readyz_is_ready_on_a_live_broker() {
-        let (addr, shutdown, handle) = start();
+        let (addr, shutdown, handle, _engine) = start();
 
         let h = request(addr, "GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n");
         assert!(h.starts_with("HTTP/1.1 200 OK"), "{h}");
@@ -218,7 +254,7 @@ mod tests {
 
     #[test]
     fn unknown_path_is_404_and_non_get_is_405() {
-        let (addr, shutdown, handle) = start();
+        let (addr, shutdown, handle, _engine) = start();
 
         let nf = request(addr, "GET /nope HTTP/1.1\r\n\r\n");
         assert!(nf.starts_with("HTTP/1.1 404 Not Found"), "{nf}");
@@ -231,8 +267,60 @@ mod tests {
     }
 
     #[test]
+    fn metrics_exposes_engine_gauges() {
+        let (addr, shutdown, handle, engine) = start();
+        // Produce two durable records so the flushed head and the lag advance.
+        {
+            let mut g = engine.lock().unwrap();
+            for payload in [&b"a"[..], b"b"] {
+                g.produce(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                })
+                .unwrap();
+            }
+        }
+        // Anchor each assertion to a full line so a future value like 20 cannot false-match 2.
+        let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(m.starts_with("HTTP/1.1 200 OK"), "{m}");
+        assert!(m.contains("# TYPE ironbus_consumer_lag gauge"), "{m}");
+        assert!(m.contains("\nironbus_flushed_offset 2\n"), "{m}");
+        assert!(m.contains("\nironbus_committed_offset 0\n"), "{m}");
+        assert!(m.contains("\nironbus_consumer_lag 2\n"), "{m}");
+        assert!(m.contains("\nironbus_in_flight 0\n"), "{m}");
+        assert!(m.contains("\nironbus_writer_healthy 1\n"), "{m}");
+
+        // Lease one message: in-flight reflects the outstanding lease.
+        let token = {
+            let mut g = engine.lock().unwrap();
+            match g.poll_now().unwrap() {
+                Poll::Message(d) => d.token,
+                other => panic!("expected a message, got {other:?}"),
+            }
+        };
+        let leased = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(leased.contains("\nironbus_in_flight 1\n"), "{leased}");
+
+        // Ack it: the committed cursor advances and the lag shrinks.
+        {
+            let mut g = engine.lock().unwrap();
+            assert_eq!(g.ack(&token), AckResult::Acked);
+        }
+        let acked = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(acked.contains("\nironbus_committed_offset 1\n"), "{acked}");
+        assert!(acked.contains("\nironbus_consumer_lag 1\n"), "{acked}");
+        assert!(acked.contains("\nironbus_in_flight 0\n"), "{acked}");
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn a_request_split_across_tcp_segments_is_handled() {
-        let (addr, shutdown, handle) = start();
+        let (addr, shutdown, handle, _engine) = start();
         let mut c = TcpStream::connect(addr).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         // Send the request line in two segments with a gap, so the server does two reads. With
@@ -255,7 +343,7 @@ mod tests {
 
     #[test]
     fn a_bare_newline_request_line_does_not_panic() {
-        let (addr, shutdown, handle) = start();
+        let (addr, shutdown, handle, _engine) = start();
         // A malformed request (just a newline) yields 405 (empty method != GET), never a panic.
         let r = request(addr, "\r\n");
         assert!(r.starts_with("HTTP/1.1 405"), "{r}");
