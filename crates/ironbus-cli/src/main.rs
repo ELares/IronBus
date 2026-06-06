@@ -69,7 +69,8 @@ USAGE:
 
 Notes:
     The default address is 127.0.0.1:7777 (loopback only).
-    pub reads the payload from the argument, or from stdin if it is omitted.
+    pub reads the payload from the argument, or from stdin if omitted (an empty input
+    publishes an empty message, which is a valid record).
     sub prints one line per message; --ack acknowledges each fetched message.
     Exit codes: 0 clean, 1 usage, 5 broker unreachable, 70 internal.";
 
@@ -157,15 +158,21 @@ fn take_value(flag: &str, args: &[String], i: &mut usize) -> Result<String, CliE
     Ok(value)
 }
 
-/// Connects to a broker, mapping a connection failure to the broker-unreachable exit code
-/// and any other client error to internal.
+/// Classifies a client error against the frozen exit-code scheme. A connection-level failure
+/// (the broker is down, or dropped us mid-request) is broker-unreachable (5); a broker that
+/// answered but spoke a wrong-shape or error frame is an internal/protocol fault (70). Used
+/// at every client call site so "broker down" is exit 5 whether it was down before the dial
+/// or died one request into the exchange.
+fn classify(addr: &str, doing: &str, e: &ClientError) -> CliError {
+    let message = format!("{doing} broker at {addr}: {e}");
+    match e {
+        ClientError::Io(_) | ClientError::Closed => CliError::Unreachable(message),
+        _ => CliError::Internal(message),
+    }
+}
+
 fn connect(addr: &str) -> Result<Client, CliError> {
-    Client::connect(addr).map_err(|e| match e {
-        ClientError::Io(_) | ClientError::Closed => {
-            CliError::Unreachable(format!("cannot reach broker at {addr}: {e}"))
-        }
-        other => CliError::Internal(format!("connecting to {addr}: {other}")),
-    })
+    Client::connect(addr).map_err(|e| classify(addr, "connecting to", &e))
 }
 
 fn run_pub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
@@ -177,6 +184,20 @@ fn run_pub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         match args[i].as_str() {
             "--addr" => addr = take_value("--addr", args, &mut i)?,
             "--key" => key = take_value("--key", args, &mut i)?,
+            "--" => {
+                // End of options: every remaining token is the payload (at most one), so a
+                // payload that begins with `--` can still be published from the argument form.
+                i += 1;
+                while i < args.len() {
+                    if payload_arg.is_some() {
+                        return Err(CliError::Usage(
+                            "pub takes at most one payload argument".to_string(),
+                        ));
+                    }
+                    payload_arg = Some(args[i].clone());
+                    i += 1;
+                }
+            }
             flag if flag.starts_with("--") => {
                 return Err(CliError::Usage(format!("unknown flag `{flag}` for pub")))
             }
@@ -213,7 +234,7 @@ fn cmd_pub(addr: &str, key: &[u8], payload: &[u8], out: &mut impl Write) -> Resu
             headers: b"",
             payload,
         })
-        .map_err(|e| CliError::Internal(format!("publish failed: {e}")))?;
+        .map_err(|e| classify(addr, "publishing to", &e))?;
     writeln!(out, "{offset}")?;
     Ok(())
 }
@@ -253,7 +274,7 @@ fn cmd_sub(addr: &str, max: u32, do_ack: bool, out: &mut impl Write) -> Result<(
     let mut client = connect(addr)?;
     let messages = client
         .fetch(max)
-        .map_err(|e| CliError::Internal(format!("fetch failed: {e}")))?;
+        .map_err(|e| classify(addr, "fetching from", &e))?;
     for m in &messages {
         writeln!(
             out,
@@ -266,7 +287,7 @@ fn cmd_sub(addr: &str, max: u32, do_ack: bool, out: &mut impl Write) -> Result<(
         if do_ack {
             let committed = client
                 .ack(m.offset, m.generation)
-                .map_err(|e| CliError::Internal(format!("ack failed: {e}")))?;
+                .map_err(|e| classify(addr, "acking to", &e))?;
             writeln!(
                 out,
                 "  ack {}",
@@ -305,6 +326,12 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     }
     let data_dir =
         data_dir.ok_or_else(|| CliError::Usage("serve requires `--data-dir <dir>`".to_string()))?;
+    if max_connections == 0 {
+        // A zero cap binds and looks healthy but refuses every connection: reject it.
+        return Err(CliError::Usage(
+            "`--max-connections` must be at least 1".to_string(),
+        ));
+    }
     cmd_serve(&addr, Path::new(&data_dir), max_connections, out)
 }
 
@@ -543,9 +570,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn serve_opens_a_real_on_disk_broker_and_round_trips() {
-        // Exercise the CLI-specific disk wiring (create dir, StdFs, Engine::open) and a full
-        // publish/fetch/ack round-trip over a real directory, distinct from the in-memory path.
+    fn serve_on_disk_round_trips_and_survives_a_restart() {
+        // Exercise the CLI-specific disk wiring (create dir, StdFs, Engine::open), a full
+        // publish/fetch/ack round-trip over a real directory, and durability across a restart.
         let dir = std::env::temp_dir().join(format!("ironbus-cli-it-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -571,6 +598,40 @@ mod tests {
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
+
+        // Restart: reopen the SAME data dir. The append was fsynced before its offset was
+        // returned, so the record is durable: a fresh publish continues at offset 1 rather
+        // than overwriting offset 0. The committed cursor is NOT yet persisted on ack by the
+        // server (the durable-cursor wiring is tracked as a follow-up), so the acked message
+        // redelivers: safe at-least-once (a duplicate, never a loss).
+        let reopened = open_disk_engine(&dir, 64).unwrap();
+        let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let shutdown2 = Arc::new(AtomicBool::new(false));
+        let handle2 = std::thread::spawn({
+            let shutdown2 = Arc::clone(&shutdown2);
+            move || serve(&listener2, &reopened, &shutdown2, 16).unwrap()
+        });
+        let a2 = addr2.to_string();
+
+        let mut redelivered = Vec::new();
+        cmd_sub(&a2, 10, false, &mut redelivered).unwrap();
+        let rtext = String::from_utf8(redelivered).unwrap();
+        assert!(
+            rtext.contains("#0 ") && rtext.contains("payload=on-disk"),
+            "durable record did not survive restart: {rtext}"
+        );
+
+        let mut next = Vec::new();
+        cmd_pub(&a2, b"k", b"after-restart", &mut next).unwrap();
+        assert_eq!(
+            String::from_utf8(next).unwrap(),
+            "1\n",
+            "log did not persist offset 0 across restart"
+        );
+
+        shutdown2.store(true, Ordering::Release);
+        handle2.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
