@@ -28,8 +28,11 @@ pub trait Clock: Send + Sync {
 /// A deterministic [`Clock`] whose time only changes when a test advances it.
 ///
 /// Both clocks start at zero and never read the host clock, so they are the time
-/// source for unit tests and the deterministic simulation. Time is held in atomics
-/// so the clock can be shared across threads.
+/// source for unit tests and the deterministic simulation. Time is held in two
+/// independent atomics so the clock can be shared across threads; a single advance
+/// is therefore not an atomic snapshot across both clocks, so a concurrent reader
+/// may observe the wall and monotonic values from different advance points. The
+/// single-threaded deterministic simulation never hits that interleaving.
 #[derive(Debug, Default)]
 pub struct ManualClock {
     unix_millis: AtomicU64,
@@ -60,6 +63,11 @@ impl ManualClock {
 
     /// Advances the wall clock by `millis` and the monotonic clock by the matching
     /// nanoseconds, saturating at `u64::MAX` (a clock must never wrap backwards).
+    ///
+    /// This advances both clocks in lockstep with no skew. To model clock skew (an
+    /// NTP step, a stalled wall clock, a backwards jump), drive
+    /// [`set_unix_millis`](ManualClock::set_unix_millis) and
+    /// [`advance_monotonic_nanos`](ManualClock::advance_monotonic_nanos) independently.
     pub fn advance_millis(&self, millis: u64) {
         saturating_add(&self.unix_millis, millis);
         saturating_add(&self.monotonic_nanos, millis.saturating_mul(1_000_000));
@@ -138,5 +146,48 @@ mod tests {
         c.advance_monotonic_nanos(u64::MAX);
         c.advance_millis(1); // would overflow monotonic; saturates instead
         assert_eq!(c.now_monotonic_nanos(), u64::MAX);
+    }
+
+    #[test]
+    fn monotonic_never_decreases() {
+        let c = ManualClock::new();
+        let mut prev = c.now_monotonic_nanos();
+        for d in [3u64, 0, 100, 1, u64::MAX, 5] {
+            c.advance_monotonic_nanos(d);
+            let now = c.now_monotonic_nanos();
+            assert!(now >= prev);
+            prev = now;
+        }
+    }
+
+    #[test]
+    fn wall_clock_advance_saturates() {
+        let c = ManualClock::at_unix_millis(u64::MAX - 1);
+        c.advance_millis(10);
+        assert_eq!(c.now_unix_millis(), u64::MAX);
+    }
+
+    #[test]
+    fn set_wall_does_not_touch_monotonic() {
+        let c = ManualClock::new();
+        c.advance_monotonic_nanos(123);
+        c.set_unix_millis(999);
+        assert_eq!(c.now_monotonic_nanos(), 123);
+        assert_eq!(c.now_unix_millis(), 999);
+    }
+
+    #[test]
+    fn concurrent_advances_are_all_counted() {
+        let c = ManualClock::new();
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..1000 {
+                        c.advance_monotonic_nanos(1);
+                    }
+                });
+            }
+        });
+        assert_eq!(c.now_monotonic_nanos(), 4 * 1000);
     }
 }
