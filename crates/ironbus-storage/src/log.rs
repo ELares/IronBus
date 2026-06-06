@@ -91,18 +91,45 @@ impl<F: Filesystem> Log<F> {
         // Scan the active segment to find the durable valid prefix.
         let scan = SegmentReader::open(fs.open(&name)?)?.scan()?;
         let header = scan.header;
+        // A sealed segment cannot be the active (appendable) one here: resuming over it
+        // would overwrite its footer. Rolling past a seal is follow-up work, so refuse.
+        if scan.footer.is_some() {
+            return Err(StorageError::ActiveSegmentSealed {
+                segment_id: header.segment_id,
+            });
+        }
         let record_count =
             u32::try_from(scan.records.len()).map_err(|_| StorageError::SegmentFull)?;
+        // Sequences are a contiguous run from base_seq, so validate the recovered
+        // records and derive the next sequence as base_seq + record_count (kept in
+        // lockstep with next_offset, which is base_offset + record_count). A record with
+        // an out-of-run sequence means the segment is structurally inconsistent.
+        let base_seq = header.base_seq.get();
+        for (index, r) in scan.records.iter().enumerate() {
+            let expected = base_seq
+                .checked_add(index as u64)
+                .ok_or(StorageError::SegmentFull)?;
+            if r.seq.get() != expected {
+                return Err(StorageError::RecoveredSequenceMismatch {
+                    index,
+                    expected,
+                    found: r.seq.get(),
+                });
+            }
+        }
+        let next_seq = Seq::new(
+            base_seq
+                .checked_add(u64::from(record_count))
+                .ok_or(StorageError::SegmentFull)?,
+        );
         let last_seq = scan.records.last().map_or(header.base_seq, |r| r.seq);
-        let next_seq = match scan.records.last() {
-            Some(r) => r.seq.checked_next().ok_or(StorageError::SegmentFull)?,
-            None => header.base_seq,
-        };
         // Drop any torn or unsynced tail so appends continue from an intact boundary.
+        // set_len changes the length, so it needs sync_all (fsync), not sync_data: the
+        // RandomAccessFile contract does not promise sync_data persists a length change.
         let file = fs.open(&name)?;
         if scan.valid_end < file.len()? {
             file.set_len(scan.valid_end)?;
-            file.sync_data()?;
+            file.sync_all()?;
         }
         let active = SegmentWriter::resume(file, header, scan.valid_end, record_count, last_seq);
         Ok(Log {
@@ -151,6 +178,10 @@ impl<F: Filesystem> Log<F> {
     /// exhausted, or the record is too large to frame, or an IO error from the write.
     pub fn append(&mut self, record: &Append<'_>) -> Result<Offset, StorageError> {
         let seq = self.next_seq;
+        // Reserve the next sequence BEFORE writing. If the sequence space is exhausted
+        // we refuse here, so a record is never durably written under a sequence we
+        // cannot advance past (which would force the next append to reuse it).
+        let next_seq = seq.checked_next().ok_or(StorageError::SegmentFull)?;
         let view = RecordView {
             seq,
             timestamp_ms: record.timestamp_ms,
@@ -159,10 +190,10 @@ impl<F: Filesystem> Log<F> {
             headers: record.headers,
             payload: record.payload,
         };
-        // The sequence advances only after the write returns Ok: a failed append leaves
-        // a torn tail recovery discards, and its sequence number is reused, not skipped.
+        // next_seq is committed only after the write returns Ok: a failed append leaves a
+        // torn tail recovery discards, and its sequence number is reused, not skipped.
         let offset = self.active.append(&view)?;
-        self.next_seq = seq.checked_next().ok_or(StorageError::SegmentFull)?;
+        self.next_seq = next_seq;
         Ok(offset)
     }
 
@@ -193,9 +224,31 @@ mod tests {
         }
     }
 
-    fn read_back(fs: &InMemoryFs, id: u64) -> Vec<OwnedRecord> {
+    fn read_back<G: Filesystem>(fs: &G, id: u64) -> Vec<OwnedRecord> {
         let file = fs.open(&segment_file_name(id)).unwrap();
         SegmentReader::open(file).unwrap().scan().unwrap().records
+    }
+
+    // A raw record view, for hand-building a segment with chosen sequence numbers.
+    fn view(seq: u64, payload: &[u8]) -> RecordView<'_> {
+        RecordView {
+            seq: Seq::new(seq),
+            timestamp_ms: seq,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload,
+        }
+    }
+
+    fn header_at(segment_id: u64, base: u64) -> SegmentHeader {
+        SegmentHeader {
+            segment_id,
+            base_seq: Seq::new(base),
+            base_offset: Offset::new(base),
+            created_unix_ms: 0,
+            flags: 0,
+        }
     }
 
     #[test]
@@ -277,5 +330,127 @@ mod tests {
         assert_eq!(log.next_offset(), Offset::ZERO);
         assert_eq!(log.next_seq(), Seq::new(0));
         assert!(read_back(log.filesystem(), 0).is_empty());
+    }
+
+    #[test]
+    fn open_errors_on_a_sealed_active_segment() {
+        // Recovery must refuse a sealed segment rather than truncate its footer and
+        // resume appending over it (which would silently unseal and corrupt it).
+        let fs = InMemoryFs::new();
+        let file = fs.create_new(&segment_file_name(0)).unwrap();
+        let mut w = SegmentWriter::create(file, header_at(0, 0)).unwrap();
+        w.append(&view(0, b"x")).unwrap();
+        w.seal().unwrap();
+
+        let clock = ManualClock::new();
+        let err = Log::open(fs, &clock).unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::ActiveSegmentSealed { segment_id: 0 }
+        ));
+    }
+
+    #[test]
+    fn recovers_a_segment_with_a_non_zero_base() {
+        // A segment whose base_seq / base_offset are non-zero recovers with next_seq and
+        // next_offset continuing from base + record_count.
+        let fs = InMemoryFs::new();
+        let file = fs.create_new(&segment_file_name(0)).unwrap();
+        let mut w = SegmentWriter::create(file, header_at(0, 5)).unwrap();
+        w.append(&view(5, b"a")).unwrap();
+        w.append(&view(6, b"b")).unwrap();
+        w.append(&view(7, b"c")).unwrap();
+        w.sync().unwrap();
+        drop(w);
+
+        let clock = ManualClock::new();
+        let mut log = Log::open(fs, &clock).unwrap();
+        assert_eq!(log.next_seq(), Seq::new(8));
+        assert_eq!(log.next_offset(), Offset::new(8));
+        assert_eq!(log.append(&rec(b"d")).unwrap(), Offset::new(8));
+    }
+
+    #[test]
+    fn rejects_a_segment_with_a_sequence_gap() {
+        // A record whose sequence breaks the contiguous run from base_seq is a
+        // structural inconsistency recovery reports rather than silently accepting.
+        let fs = InMemoryFs::new();
+        let file = fs.create_new(&segment_file_name(0)).unwrap();
+        let mut w = SegmentWriter::create(file, header_at(0, 0)).unwrap();
+        w.append(&view(0, b"a")).unwrap();
+        w.append(&view(5, b"b")).unwrap(); // expected sequence 1
+        w.sync().unwrap();
+        drop(w);
+
+        let clock = ManualClock::new();
+        let err = Log::open(fs, &clock).unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::RecoveredSequenceMismatch {
+                index: 1,
+                expected: 1,
+                found: 5
+            }
+        ));
+    }
+
+    #[test]
+    fn corrupt_synced_record_is_truncated_on_reopen() {
+        let clock = ManualClock::new();
+        let mut log = Log::open(InMemoryFs::new(), &clock).unwrap();
+        log.append(&rec(b"good1")).unwrap();
+        log.append(&rec(b"good2-with-a-longer-payload")).unwrap();
+        log.sync().unwrap();
+
+        // Corrupt the last byte (inside the second record) so it fails to decode.
+        let name = segment_file_name(0);
+        let f = log.filesystem().open(&name).unwrap();
+        let len_before = f.len().unwrap();
+        let mut bytes = f.snapshot();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        f.set_len(0).unwrap();
+        f.write_all_at(&bytes, 0).unwrap();
+        f.sync_data().unwrap();
+        let fs = log.into_filesystem();
+
+        let mut log = Log::open(fs, &clock).unwrap();
+        // The corrupt record was dropped and its slot recovered.
+        assert_eq!(log.next_offset(), Offset::new(1));
+        assert_eq!(log.next_seq(), Seq::new(1));
+        // The torn tail was actually truncated: the file is now shorter.
+        let len_after = log.filesystem().open(&name).unwrap().len().unwrap();
+        assert!(len_after < len_before, "file should shrink on truncation");
+        assert_eq!(log.append(&rec(b"after")).unwrap(), Offset::new(1));
+        log.sync().unwrap();
+        let records = read_back(log.filesystem(), 0);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].payload, b"good1");
+        assert_eq!(records[1].payload, b"after");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_resumes_on_a_real_directory() {
+        use crate::fs::StdFs;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let clock = ManualClock::new();
+
+        let mut log = Log::open(StdFs::new(root.clone()), &clock).unwrap();
+        log.append(&rec(b"alpha")).unwrap();
+        log.append(&rec(b"beta")).unwrap();
+        log.sync().unwrap();
+        drop(log);
+
+        let mut log = Log::open(StdFs::new(root.clone()), &clock).unwrap();
+        assert_eq!(log.next_offset(), Offset::new(2));
+        assert_eq!(log.append(&rec(b"gamma")).unwrap(), Offset::new(2));
+        log.sync().unwrap();
+
+        let records = read_back(&StdFs::new(root), 0);
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[2].payload, b"gamma");
+        assert_eq!(records[2].seq, Seq::new(2));
     }
 }
