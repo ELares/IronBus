@@ -12,7 +12,7 @@
 use crate::fs::Filesystem;
 use crate::io::RandomAccessFile;
 use crate::naming::{segment_file_name, segment_ids};
-use crate::segment::{SegmentReader, SegmentWriter, StorageError};
+use crate::segment::{SegmentReader, SegmentScan, SegmentWriter, StorageError};
 use ironbus_core::clock::Clock;
 use ironbus_core::codec::RecordView;
 use ironbus_core::segment::SegmentHeader;
@@ -90,7 +90,8 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// # Errors
     /// Returns [`StorageError`] on an IO error or a structurally invalid segment.
     pub fn open(fs: F, clock: C, config: LogConfig) -> Result<Log<F, C>, StorageError> {
-        match segment_ids(&fs)?.last().copied() {
+        let ids = segment_ids(&fs)?;
+        match ids.last().copied() {
             None => {
                 let mut log = Log {
                     fs,
@@ -104,7 +105,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 log.start_segment(FIRST_SEGMENT_ID, Seq::new(0), Offset::ZERO)?;
                 Ok(log)
             }
-            Some(active_id) => Self::recover(fs, clock, config, active_id),
+            Some(last_id) => Self::recover(fs, clock, config, &ids, last_id),
         }
     }
 
@@ -112,45 +113,76 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         fs: F,
         clock: C,
         config: LogConfig,
-        active_id: u64,
+        ids: &[u64],
+        last_id: u64,
     ) -> Result<Log<F, C>, StorageError> {
-        let name = segment_file_name(active_id);
-        let scan = SegmentReader::open(fs.open(&name)?)?.scan()?;
-        let header = scan.header;
-        let record_count =
-            u32::try_from(scan.records.len()).map_err(|_| StorageError::SegmentFull)?;
-        let base_seq = header.base_seq.get();
-        let base_offset = header.base_offset.get();
-        // Sequences are a contiguous run from base_seq; validate the recovered records.
-        for (index, r) in scan.records.iter().enumerate() {
-            let expected = base_seq
-                .checked_add(index as u64)
-                .ok_or(StorageError::SegmentFull)?;
-            if r.seq.get() != expected {
-                return Err(StorageError::RecoveredSequenceMismatch {
-                    index,
-                    expected,
-                    found: r.seq.get(),
+        // Walk every segment in ascending order, validating the chain: each segment's
+        // stored id matches its file name, its base continues from its predecessor, its
+        // records are a contiguous sequence run, and every NON-final segment is sealed.
+        // A corrupt or unreadable segment fails its scan here, not silently at read time.
+        let mut next_base_offset = 0u64;
+        let mut next_base_seq = 0u64;
+        let mut highest: Option<SegmentScan> = None;
+        let total = ids.len();
+        for (i, &id) in ids.iter().enumerate() {
+            let scan = SegmentReader::open(fs.open(&segment_file_name(id))?)?.scan()?;
+            let header = scan.header;
+            if header.segment_id != id {
+                return Err(StorageError::SegmentIdMismatch {
+                    file_id: id,
+                    header_id: header.segment_id,
                 });
             }
+            let base_offset = header.base_offset.get();
+            let base_seq = header.base_seq.get();
+            if i > 0 && (base_offset != next_base_offset || base_seq != next_base_seq) {
+                return Err(StorageError::SegmentChainBroken {
+                    segment_id: id,
+                    expected_base_offset: next_base_offset,
+                    found_base_offset: base_offset,
+                    expected_base_seq: next_base_seq,
+                    found_base_seq: base_seq,
+                });
+            }
+            for (index, r) in scan.records.iter().enumerate() {
+                let expected = base_seq
+                    .checked_add(u64::try_from(index).map_err(|_| StorageError::SegmentFull)?)
+                    .ok_or(StorageError::SegmentFull)?;
+                if r.seq.get() != expected {
+                    return Err(StorageError::RecoveredSequenceMismatch {
+                        index,
+                        expected,
+                        found: r.seq.get(),
+                    });
+                }
+            }
+            let is_last = i + 1 == total;
+            if !is_last && scan.footer.is_none() {
+                return Err(StorageError::UnsealedPredecessor { segment_id: id });
+            }
+            let count = u64::try_from(scan.records.len()).map_err(|_| StorageError::SegmentFull)?;
+            next_base_offset = base_offset
+                .checked_add(count)
+                .ok_or(StorageError::SegmentFull)?;
+            next_base_seq = base_seq
+                .checked_add(count)
+                .ok_or(StorageError::SegmentFull)?;
+            if is_last {
+                highest = Some(scan);
+            }
         }
-        let next_seq = Seq::new(
-            base_seq
-                .checked_add(u64::from(record_count))
-                .ok_or(StorageError::SegmentFull)?,
-        );
-        let next_offset = Offset::new(
-            base_offset
-                .checked_add(u64::from(record_count))
-                .ok_or(StorageError::SegmentFull)?,
-        );
+        // `highest` is Some because `open` only calls `recover` with a non-empty list.
+        let scan = highest.ok_or(StorageError::WriterFrozen)?;
+        let header = scan.header;
+        let next_offset = Offset::new(next_base_offset);
+        let next_seq = Seq::new(next_base_seq);
 
         let mut log = Log {
             fs,
             clock,
             config,
             active: None,
-            active_id,
+            active_id: last_id,
             next_offset,
             next_seq,
         };
@@ -158,16 +190,19 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         if scan.footer.is_some() {
             // Crash after sealing the highest segment but before the next was created:
             // roll forward and create it, continuing the offset and sequence space.
-            let next_id = active_id.checked_add(1).ok_or(StorageError::SegmentFull)?;
+            let next_id = last_id.checked_add(1).ok_or(StorageError::SegmentFull)?;
             log.start_segment(next_id, next_seq, next_offset)?;
         } else {
             // The active segment is unsealed: drop any torn or unsynced tail and resume.
             // set_len changes the length, so it needs sync_all, not sync_data.
+            let name = segment_file_name(last_id);
             let file = log.fs.open(&name)?;
             if scan.valid_end < file.len()? {
                 file.set_len(scan.valid_end)?;
                 file.sync_all()?;
             }
+            let record_count =
+                u32::try_from(scan.records.len()).map_err(|_| StorageError::SegmentFull)?;
             let last_seq = scan.records.last().map_or(header.base_seq, |r| r.seq);
             log.active = Some(SegmentWriter::resume(
                 file,
@@ -529,6 +564,174 @@ mod tests {
                 found: 5
             }
         ));
+    }
+
+    #[test]
+    fn rejects_a_corrupt_predecessor_segment() {
+        // A predecessor that no longer decodes its header must fail recovery, not be
+        // discovered as garbage only when a reader later reaches it.
+        let mut log = open_mem(small_config());
+        for i in 0..7u8 {
+            log.append(&rec(&[i; 20])).unwrap();
+        }
+        log.sync().unwrap();
+        assert!(log.active_segment_id() >= 1);
+        let f = log.filesystem().open(&segment_file_name(0)).unwrap();
+        let mut bytes = f.snapshot();
+        bytes[0] ^= 0xff; // corrupt segment 0's header magic
+        f.set_len(0).unwrap();
+        f.write_all_at(&bytes, 0).unwrap();
+        f.sync_data().unwrap();
+        let fs = log.into_filesystem();
+
+        let err = Log::open(fs, ManualClock::new(), small_config()).unwrap_err();
+        assert!(matches!(err, StorageError::Segment(_)));
+    }
+
+    #[test]
+    fn rejects_a_segment_chain_with_a_base_gap() {
+        // seg0: two records, sealed, base 0.
+        let fs = InMemoryFs::new();
+        let f0 = fs.create_new(&segment_file_name(0)).unwrap();
+        let mut w0 = SegmentWriter::create(f0, header_at(0, 0)).unwrap();
+        w0.append(&view(0, b"a")).unwrap();
+        w0.append(&view(1, b"b")).unwrap();
+        w0.seal().unwrap();
+        // seg1: base 999 instead of the expected 2.
+        let f1 = fs.create_new(&segment_file_name(1)).unwrap();
+        let mut w1 = SegmentWriter::create(f1, header_at(1, 999)).unwrap();
+        w1.append(&view(999, b"c")).unwrap();
+        w1.sync().unwrap();
+        drop(w1);
+
+        let err = Log::open(fs, ManualClock::new(), small_config()).unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::SegmentChainBroken {
+                segment_id: 1,
+                expected_base_offset: 2,
+                found_base_offset: 999,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_an_unsealed_predecessor() {
+        // Two segments where the lower one was never sealed: two appendable segments.
+        let fs = InMemoryFs::new();
+        let f0 = fs.create_new(&segment_file_name(0)).unwrap();
+        let mut w0 = SegmentWriter::create(f0, header_at(0, 0)).unwrap();
+        w0.append(&view(0, b"a")).unwrap();
+        w0.sync().unwrap(); // synced but NOT sealed
+        drop(w0);
+        let f1 = fs.create_new(&segment_file_name(1)).unwrap();
+        let mut w1 = SegmentWriter::create(f1, header_at(1, 1)).unwrap();
+        w1.append(&view(1, b"b")).unwrap();
+        w1.sync().unwrap();
+        drop(w1);
+
+        let err = Log::open(fs, ManualClock::new(), small_config()).unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::UnsealedPredecessor { segment_id: 0 }
+        ));
+    }
+
+    #[test]
+    fn recovery_resumes_an_empty_active_segment_after_a_completed_roll() {
+        // Crash point (e): seg0 sealed, seg1 created (empty, base 2) and durable.
+        let fs = InMemoryFs::new();
+        let f0 = fs.create_new(&segment_file_name(0)).unwrap();
+        let mut w0 = SegmentWriter::create(f0, header_at(0, 0)).unwrap();
+        w0.append(&view(0, b"a")).unwrap();
+        w0.append(&view(1, b"b")).unwrap();
+        w0.seal().unwrap();
+        let f1 = fs.create_new(&segment_file_name(1)).unwrap();
+        let w1 = SegmentWriter::create(f1, header_at(1, 2)).unwrap();
+        w1.sync().unwrap();
+        drop(w1);
+
+        let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        assert_eq!(log.active_segment_id(), 1);
+        assert_eq!(log.next_offset(), Offset::new(2));
+        assert_eq!(log.next_seq(), Seq::new(2));
+        assert_eq!(log.append(&rec(b"c")).unwrap(), Offset::new(2));
+    }
+
+    #[test]
+    fn power_loss_after_a_roll_recovers_the_synced_prefix() {
+        let mut log = open_mem(small_config());
+        for i in 0..7u8 {
+            log.append(&rec(&[i; 20])).unwrap();
+        }
+        log.sync().unwrap();
+        assert!(log.active_segment_id() >= 1, "should have rolled");
+        log.append(&rec(b"lost")).unwrap(); // never synced
+        log.filesystem().simulate_power_loss();
+        let fs = log.into_filesystem();
+
+        let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        assert_eq!(log.next_offset(), Offset::new(7));
+        let total: usize = segment_ids(log.filesystem())
+            .unwrap()
+            .iter()
+            .map(|id| read_back(log.filesystem(), *id).len())
+            .sum();
+        assert_eq!(total, 7);
+        assert_eq!(log.append(&rec(b"after")).unwrap(), Offset::new(7));
+    }
+
+    #[test]
+    fn a_failed_roll_freezes_the_writer() {
+        let mut log = open_mem(small_config());
+        // Pre-create the file the next roll targets, so its create_new fails mid-roll.
+        log.filesystem().create_new(&segment_file_name(1)).unwrap();
+        let mut roll_err = None;
+        for i in 0..20u8 {
+            if let Err(e) = log.append(&rec(&[i; 20])) {
+                roll_err = Some(e);
+                break;
+            }
+            log.sync().unwrap();
+        }
+        // The roll's create_new hit AlreadyExists.
+        assert!(matches!(roll_err, Some(StorageError::Io(_))));
+        // The writer is frozen: further writes refuse, getters stay sane (no panic).
+        assert!(matches!(
+            log.append(&rec(b"x")),
+            Err(StorageError::WriterFrozen)
+        ));
+        assert!(matches!(log.sync(), Err(StorageError::WriterFrozen)));
+        let _ = log.next_offset();
+        let _ = log.next_seq();
+        let _ = log.active_segment_id();
+    }
+
+    #[test]
+    fn many_segments_hold_every_record_in_global_offset_order() {
+        let mut log = open_mem(small_config());
+        let n: usize = 20;
+        for i in 0..n {
+            let b = u8::try_from(i).unwrap();
+            log.append(&rec(&[b; 20])).unwrap();
+        }
+        log.sync().unwrap();
+        assert!(
+            log.active_segment_id() >= 2,
+            "should span three or more segments"
+        );
+        // Concatenating records across all segments in id order yields a contiguous
+        // global offset and sequence run 0..n, the end-to-end continuity invariant.
+        let mut all = Vec::new();
+        for id in segment_ids(log.filesystem()).unwrap() {
+            all.extend(read_back(log.filesystem(), id));
+        }
+        assert_eq!(all.len(), n);
+        for (i, r) in all.iter().enumerate() {
+            assert_eq!(r.offset, Offset::new(i as u64));
+            assert_eq!(r.seq, Seq::new(i as u64));
+        }
     }
 
     #[cfg(unix)]
