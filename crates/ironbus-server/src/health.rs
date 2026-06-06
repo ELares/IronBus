@@ -149,6 +149,10 @@ where
                         let r = g.loss_report();
                         ReasonCode::ALL.map(|rc| r.bytes_skipped_for(rc))
                     },
+                    recovery_loss_records: {
+                        let r = g.loss_report();
+                        ReasonCode::ALL.map(|rc| r.records_lost_for(rc))
+                    },
                     // -1 is the unambiguous "none yet" sentinel (offsets are never negative).
                     last_dead_lettered: g
                         .last_dead_lettered_offset()
@@ -174,6 +178,8 @@ struct MetricsSnapshot {
     recovered_truncated: u64,
     /// Bytes dropped at the last recovery, per [`ReasonCode`] in code order.
     recovery_loss: [u64; 5],
+    /// Records dropped at the last recovery, per [`ReasonCode`] in code order.
+    recovery_loss_records: [u64; 5],
     /// The most recent dead-letter offset, or -1 if none (the exposition sentinel).
     last_dead_lettered: i64,
     counters: Counters,
@@ -192,6 +198,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         healthy,
         recovered_truncated,
         recovery_loss,
+        recovery_loss_records,
         last_dead_lettered,
         counters,
         fsync,
@@ -243,6 +250,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         acks = counters.acks,
     );
     body.push_str(&recovery_loss_lines(&recovery_loss));
+    body.push_str(&recovery_loss_records_lines(&recovery_loss_records));
     body.push_str(&fsync_histogram_lines(&fsync));
     body.push_str(&group_consumer_lines(&groups, flushed));
     body
@@ -314,14 +322,32 @@ fn group_consumer_lines(groups: &[GroupConsumerStat], flushed: u64) -> String {
 /// occur. The grand total equals `ironbus_recovery_truncated_bytes`.
 fn recovery_loss_lines(by_reason: &[u64; 5]) -> String {
     let mut s = String::from(
-        "# HELP ironbus_recovery_loss_bytes Bytes dropped at the last recovery, by reason.
-         # TYPE ironbus_recovery_loss_bytes gauge
-",
+        "# HELP ironbus_recovery_loss_bytes Bytes dropped at the last recovery, by reason.\n\
+         # TYPE ironbus_recovery_loss_bytes gauge\n",
     );
     for (reason, bytes) in ReasonCode::ALL.iter().zip(by_reason.iter()) {
         let _ = writeln!(
             s,
             "ironbus_recovery_loss_bytes{{reason=\"{}\"}} {bytes}",
+            reason.metric_label()
+        );
+    }
+    s
+}
+
+/// Renders the per-reason recovery-loss gauge `ironbus_recovery_loss_records{reason=...}`
+/// from the last recovery's loss report: the record-count complement of
+/// `ironbus_recovery_loss_bytes`, so an operator sees not just how many bytes recovery
+/// dropped but how many records, by reason. Zero where a reason did not occur.
+fn recovery_loss_records_lines(by_reason: &[u64; 5]) -> String {
+    let mut s = String::from(
+        "# HELP ironbus_recovery_loss_records Records dropped at the last recovery, by reason.\n\
+         # TYPE ironbus_recovery_loss_records gauge\n",
+    );
+    for (reason, records) in ReasonCode::ALL.iter().zip(by_reason.iter()) {
+        let _ = writeln!(
+            s,
+            "ironbus_recovery_loss_records{{reason=\"{}\"}} {records}",
             reason.metric_label()
         );
     }
@@ -491,6 +517,25 @@ mod tests {
         );
         assert!(
             m.contains("\nironbus_recovery_loss_bytes{reason=\"corrupt_record_body\"} 0\n"),
+            "{m}"
+        );
+        // The record-count complement of the per-reason loss-bytes series, plus a clean
+        // (no leading whitespace) TYPE line so a strict Prometheus parser accepts it.
+        assert!(
+            m.contains("\n# TYPE ironbus_recovery_loss_records gauge\n"),
+            "{m}"
+        );
+        assert!(
+            m.contains("\nironbus_recovery_loss_records{reason=\"torn_tail\"} 0\n"),
+            "{m}"
+        );
+        assert!(
+            m.contains("\nironbus_recovery_loss_records{reason=\"sequence_gap\"} 0\n"),
+            "{m}"
+        );
+        // The loss-bytes TYPE line is also clean (no indentation regression).
+        assert!(
+            m.contains("\n# TYPE ironbus_recovery_loss_bytes gauge\n"),
             "{m}"
         );
         assert!(
