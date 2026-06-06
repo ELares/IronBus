@@ -13,7 +13,7 @@
 //! offset; other `Ok`s have an empty body; an `Err` carries a UTF-8 message. A malformed
 //! frame envelope is unrecoverable for a length-prefixed stream, so it ends the session.
 
-use crate::engine::Engine;
+use crate::engine::{AckResult, Engine, EngineError};
 use ironbus_core::clock::Clock;
 use ironbus_core::types::RecordFlags;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
@@ -21,18 +21,23 @@ use ironbus_proto::message::{decode_ack, decode_pub, AckOp};
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
 
-/// A session error that ends the connection (the frame boundary is lost and cannot be
-/// resynced).
+/// A session error that ends the connection.
 #[derive(Debug)]
 pub enum SessionError {
-    /// The frame envelope was malformed (a zero or over-cap length prefix).
+    /// The frame envelope was malformed (a zero or over-cap length prefix); a
+    /// length-prefixed stream cannot resync, so the connection must close.
     BadFrame(FrameError),
+    /// The engine hit a fatal, unrecoverable error (a frozen writer or a broken
+    /// invariant): retrying is pointless, so the session ends. The real error is carried
+    /// for the caller to log.
+    EngineFatal(EngineError),
 }
 
 impl core::fmt::Display for SessionError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             SessionError::BadFrame(e) => write!(f, "malformed frame, closing session: {e}"),
+            SessionError::EngineFatal(e) => write!(f, "fatal engine error, closing session: {e}"),
         }
     }
 }
@@ -65,7 +70,6 @@ impl Session {
         engine: &mut Engine<F, C>,
         input: &[u8],
         out: &mut Vec<u8>,
-        now: u64,
     ) -> Result<usize, SessionError> {
         let mut consumed = 0;
         loop {
@@ -76,7 +80,9 @@ impl Session {
                     body,
                     consumed: n,
                 } => {
-                    self.dispatch(engine, type_tag, body, now, out);
+                    // A fatal engine error ends the session AFTER its Err response is
+                    // queued (the caller flushes `out`, then closes).
+                    self.dispatch(engine, type_tag, body, out)?;
                     consumed += n;
                 }
             }
@@ -88,22 +94,36 @@ impl Session {
         engine: &mut Engine<F, C>,
         type_tag: u8,
         body: &[u8],
-        now: u64,
         out: &mut Vec<u8>,
-    ) {
+    ) -> Result<(), SessionError> {
         match FrameType::from_u8(type_tag) {
+            // A repeated Connect is idempotent today (the handshake carries no negotiated
+            // state yet); once Connect carries capabilities, decide whether to reject one.
             Some(FrameType::Connect) => {
                 self.connected = true;
                 reply(out, FrameType::Info, &[]);
+                Ok(())
             }
-            Some(FrameType::Ping) => reply(out, FrameType::Pong, &[]),
+            Some(FrameType::Ping) => {
+                reply(out, FrameType::Pong, &[]);
+                Ok(())
+            }
             Some(FrameType::Pub) => self.handle_pub(engine, body, out),
-            Some(FrameType::Ack) => self.handle_ack(engine, body, now, out),
+            Some(FrameType::Ack) => {
+                self.handle_ack(engine, body, out);
+                Ok(())
+            }
             // Recognized but not yet wired (streaming consumer path), or response-only verbs
             // a client should not send.
-            Some(_) => reply_err(out, "verb not supported on this connection"),
+            Some(_) => {
+                reply_err(out, "verb not supported on this connection");
+                Ok(())
+            }
             // An unknown tag is forward-compatible at the envelope level but has no handler.
-            None => reply_err(out, "unknown frame type"),
+            None => {
+                reply_err(out, "unknown frame type");
+                Ok(())
+            }
         }
     }
 
@@ -112,33 +132,49 @@ impl Session {
         engine: &mut Engine<F, C>,
         body: &[u8],
         out: &mut Vec<u8>,
-    ) {
+    ) -> Result<(), SessionError> {
         if !self.connected {
             reply_err(out, "not connected");
-            return;
+            return Ok(());
         }
         let Ok(msg) = decode_pub(body) else {
             reply_err(out, "malformed pub body");
-            return;
+            return Ok(());
         };
         let append = Append {
             timestamp_ms: msg.timestamp_ms,
+            // The codec normalizes the HAS_KEY bit and preserves unknown bits for
+            // forward compatibility; the storage layer never acts on unknown bits.
             flags: RecordFlags::from_bits(msg.flags),
             key: msg.key,
             headers: msg.headers,
             payload: msg.payload,
         };
         match engine.produce(&append) {
-            Ok(offset) => reply(out, FrameType::Ok, &offset.get().to_le_bytes()),
-            Err(_) => reply_err(out, "produce failed"),
+            Ok(offset) => {
+                reply(out, FrameType::Ok, &offset.get().to_le_bytes());
+                Ok(())
+            }
+            // A fatal error (frozen writer) would fail every future produce, so end the
+            // session rather than masquerade as a transient failure.
+            Err(e) if e.is_fatal() => {
+                reply_err(out, "fatal storage error");
+                Err(SessionError::EngineFatal(e))
+            }
+            Err(_) => {
+                reply_err(out, "produce failed");
+                Ok(())
+            }
         }
     }
 
+    /// Acks a delivered message. NOTE: acks are not connection-scoped, the generation token
+    /// is the sole authority, so any session presenting a matching `(offset, generation)`
+    /// commits it. Per-connection ack ownership is tracked as #175 for the consumer path.
     fn handle_ack<F: Filesystem, C: Clock>(
         &mut self,
         engine: &mut Engine<F, C>,
         body: &[u8],
-        _now: u64,
         out: &mut Vec<u8>,
     ) {
         if !self.connected {
@@ -158,20 +194,26 @@ impl Session {
             offset: ironbus_core::types::Offset::new(ack.offset),
             generation: ack.generation,
         };
-        // ack is idempotent: a fenced (stale) ack is a no-op, still an Ok to the client.
-        let _ = engine.ack(&token);
-        reply(out, FrameType::Ok, &[]);
+        // The Ok body is a status byte so the client knows the truth: 1 = committed,
+        // 0 = fenced (the token was stale, the message will redeliver, do NOT drop state).
+        let status = match engine.ack(&token) {
+            AckResult::Acked => 1u8,
+            AckResult::Fenced => 0u8,
+        };
+        reply(out, FrameType::Ok, &[status]);
     }
 }
 
-/// Encodes a response frame (never fails: bodies here are tiny and well under the cap).
+/// Encodes a response frame. Bodies here are tiny (<= 8 bytes, or a short literal), well
+/// under [`MAX_FRAME_LEN`](ironbus_proto::frame::MAX_FRAME_LEN), so the encode cannot fail;
+/// the debug assert pins that invariant against a future large-body call site.
 fn reply(out: &mut Vec<u8>, frame_type: FrameType, body: &[u8]) {
-    // The body is at most 8 bytes here, so encoding cannot exceed MAX_FRAME_LEN.
-    let _ = encode_frame(frame_type, body, out);
+    let result = encode_frame(frame_type, body, out);
+    debug_assert!(result.is_ok(), "response body exceeded the frame cap");
 }
 
 fn reply_err(out: &mut Vec<u8>, message: &str) {
-    let _ = encode_frame(FrameType::Err, message.as_bytes(), out);
+    reply(out, FrameType::Err, message.as_bytes());
 }
 
 #[cfg(test)]
@@ -224,7 +266,7 @@ mod tests {
         let mut s = Session::new();
         let mut out = Vec::new();
         let input = frame(FrameType::Ping, b"");
-        let consumed = s.process(&mut e, &input, &mut out, 0).unwrap();
+        let consumed = s.process(&mut e, &input, &mut out).unwrap();
         assert_eq!(consumed, input.len());
         assert_eq!(one_response(&out).0, FrameType::Pong);
     }
@@ -234,7 +276,7 @@ mod tests {
         let mut e = engine();
         let mut s = Session::new();
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out, 0)
+        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Info);
     }
@@ -259,7 +301,7 @@ mod tests {
         .unwrap();
         input.extend_from_slice(&frame(FrameType::Pub, &pub_body));
 
-        let consumed = s.process(&mut e, &input, &mut out, 0).unwrap();
+        let consumed = s.process(&mut e, &input, &mut out).unwrap();
         assert_eq!(consumed, input.len());
         // Two responses: Info, then Ok with offset 0.
         let info = decode_frame(&out).unwrap();
@@ -293,7 +335,7 @@ mod tests {
             &mut pub_body,
         )
         .unwrap();
-        s.process(&mut e, &frame(FrameType::Pub, &pub_body), &mut out, 0)
+        s.process(&mut e, &frame(FrameType::Pub, &pub_body), &mut out)
             .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Err);
     }
@@ -304,7 +346,7 @@ mod tests {
         let mut s = Session::new();
         // Connect + produce + deliver out of band, then ack via the session.
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out, 0)
+        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
         e.produce(&Append {
             timestamp_ms: 0,
@@ -329,9 +371,11 @@ mod tests {
             &mut ack_body,
         );
         out.clear();
-        s.process(&mut e, &frame(FrameType::Ack, &ack_body), &mut out, 0)
+        s.process(&mut e, &frame(FrameType::Ack, &ack_body), &mut out)
             .unwrap();
-        assert_eq!(one_response(&out).0, FrameType::Ok);
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::Ok);
+        assert_eq!(body, vec![1u8], "status 1 = committed");
         assert_eq!(e.committed_offset().get(), 1);
     }
 
@@ -343,9 +387,141 @@ mod tests {
         let ping = frame(FrameType::Ping, b"");
         let mut input = ping.clone();
         input.extend_from_slice(&frame(FrameType::Ping, b"")[..2]); // half of a second frame
-        let consumed = s.process(&mut e, &input, &mut out, 0).unwrap();
+        let consumed = s.process(&mut e, &input, &mut out).unwrap();
         assert_eq!(consumed, ping.len(), "only the complete frame is consumed");
         assert_eq!(one_response(&out).0, FrameType::Pong);
+    }
+
+    #[test]
+    fn empty_input_consumes_nothing() {
+        let mut e = engine();
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        assert_eq!(s.process(&mut e, &[], &mut out).unwrap(), 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn ack_before_connect_is_rejected() {
+        let mut e = engine();
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        let mut ack_body = Vec::new();
+        encode_ack(
+            &AckBody {
+                op: AckOp::Ack,
+                offset: 0,
+                generation: 0,
+                delay_ms: 0,
+            },
+            &mut ack_body,
+        );
+        s.process(&mut e, &frame(FrameType::Ack, &ack_body), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Err);
+    }
+
+    #[test]
+    fn a_fenced_ack_replies_ok_with_status_zero() {
+        let mut e = engine();
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        // A never-delivered token is stale: fenced, status 0, the client must not drop state.
+        let mut ack_body = Vec::new();
+        encode_ack(
+            &AckBody {
+                op: AckOp::Ack,
+                offset: 999,
+                generation: 42,
+                delay_ms: 0,
+            },
+            &mut ack_body,
+        );
+        s.process(&mut e, &frame(FrameType::Ack, &ack_body), &mut out)
+            .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::Ok);
+        assert_eq!(body, vec![0u8], "status 0 = fenced");
+        assert_eq!(e.committed_offset().get(), 0);
+    }
+
+    #[test]
+    fn a_malformed_body_does_not_desync_the_stream() {
+        // [Connect][Pub with a truncated body][Ping] in one buffer: the bad body is
+        // contained (Err reply), and the trailing Ping still gets a Pong.
+        let mut e = engine();
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        let mut input = frame(FrameType::Connect, b"");
+        input.extend_from_slice(&frame(FrameType::Pub, b"\x01")); // 1 byte: not a valid pub body
+        input.extend_from_slice(&frame(FrameType::Ping, b""));
+
+        let consumed = s.process(&mut e, &input, &mut out).unwrap();
+        assert_eq!(
+            consumed,
+            input.len(),
+            "all three frames consumed, no desync"
+        );
+        // Responses: Info, Err (bad pub), Pong.
+        let mut off = 0;
+        let mut types = Vec::new();
+        while off < out.len() {
+            match decode_frame(&out[off..]).unwrap() {
+                FrameDecode::Frame {
+                    type_tag,
+                    consumed: n,
+                    ..
+                } => {
+                    types.push(FrameType::from_u8(type_tag).unwrap());
+                    off += n;
+                }
+                FrameDecode::Incomplete { .. } => break,
+            }
+        }
+        assert_eq!(
+            types,
+            vec![FrameType::Info, FrameType::Err, FrameType::Pong]
+        );
+    }
+
+    #[test]
+    fn a_second_connection_can_ack_a_message_delivered_to_the_first() {
+        // Documents the current model (issue #175): acks are not connection-scoped; the
+        // generation token is the sole authority, so any session with a valid token commits.
+        let mut e = engine();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"m",
+        })
+        .unwrap();
+        let token = match e.poll(0).unwrap() {
+            Poll::Message(d) => d.token,
+            other => panic!("expected a delivery, got {other:?}"),
+        };
+        // A fresh session B (never delivered the message) acks it with the token.
+        let mut b = Session::new();
+        let mut out = Vec::new();
+        b.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        let mut ack_body = Vec::new();
+        encode_ack(
+            &AckBody {
+                op: AckOp::Ack,
+                offset: token.offset.get(),
+                generation: token.generation,
+                delay_ms: 0,
+            },
+            &mut ack_body,
+        );
+        b.process(&mut e, &frame(FrameType::Ack, &ack_body), &mut out)
+            .unwrap();
+        assert_eq!(e.committed_offset().get(), 1, "B committed A's message");
     }
 
     #[test]
@@ -355,7 +531,7 @@ mod tests {
         let mut out = Vec::new();
         let bad = [0u8, 0, 0, 0]; // zero-length prefix
         assert!(matches!(
-            s.process(&mut e, &bad, &mut out, 0),
+            s.process(&mut e, &bad, &mut out),
             Err(SessionError::BadFrame(_))
         ));
     }
@@ -365,11 +541,11 @@ mod tests {
         let mut e = engine();
         let mut s = Session::new();
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out, 0)
+        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
         out.clear();
         // Sub is recognized but not wired on this connection.
-        s.process(&mut e, &frame(FrameType::Sub, b""), &mut out, 0)
+        s.process(&mut e, &frame(FrameType::Sub, b""), &mut out)
             .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Err);
     }
