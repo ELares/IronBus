@@ -139,14 +139,16 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         })
     }
 
-    /// The log offset the NEXT appended record will receive.
+    /// The log offset the NEXT appended record will receive. Saturates at
+    /// `u64::MAX` if the offset space is exhausted; [`SegmentWriter::append`] refuses
+    /// to mint a wrapped offset and returns [`StorageError::SegmentFull`] instead.
     #[must_use]
     pub fn next_offset(&self) -> Offset {
         Offset::new(
             self.header
                 .base_offset
                 .get()
-                .wrapping_add(u64::from(self.record_count)),
+                .saturating_add(u64::from(self.record_count)),
         )
     }
 
@@ -173,6 +175,14 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         if self.record_count == u32::MAX {
             return Err(StorageError::SegmentFull);
         }
+        // Offsets are monotonic and never reused; refuse to wrap the offset space
+        // rather than mint a duplicate id (see `Offset::checked_next`).
+        let offset = self
+            .header
+            .base_offset
+            .get()
+            .checked_add(u64::from(self.record_count))
+            .ok_or(StorageError::SegmentFull)?;
         let mut buf = Vec::new();
         codec::encode(record, &mut buf).map_err(|_| StorageError::SegmentFull)?;
         let len = u64::try_from(buf.len()).map_err(|_| StorageError::SegmentFull)?;
@@ -181,11 +191,10 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
             .checked_add(len)
             .ok_or(StorageError::SegmentFull)?;
         self.file.write_all_at(&buf, self.write_pos)?;
-        let offset = self.next_offset();
         self.write_pos = end;
         self.record_count += 1;
         self.last_seq = record.seq;
-        Ok(offset)
+        Ok(Offset::new(offset))
     }
 
     /// Flushes appended records to durable storage (fdatasync). A record is durable
@@ -228,7 +237,9 @@ pub struct SegmentScan {
     /// `true` if every byte up to the footer or end was a valid record (no torn or
     /// corrupt tail was encountered).
     pub clean: bool,
-    /// The byte offset at which scanning stopped (the durable, valid prefix length).
+    /// The byte offset at which the valid record region ends (the durable valid
+    /// prefix length). For a sealed segment this is the start of the footer, so it
+    /// excludes the trailing 32 footer bytes.
     pub valid_end: u64,
 }
 
@@ -247,10 +258,14 @@ impl<F: RandomAccessFile> SegmentReader<F> {
     /// Returns [`StorageError::Segment`] if the header is missing or invalid, or an
     /// IO error.
     pub fn open(file: F) -> Result<SegmentReader<F>, StorageError> {
+        let file_len = file.len()?;
+        if file_len < SEGMENT_HEADER_LEN as u64 {
+            // Too short to hold a header: a typed structural error, not a raw IO EOF.
+            return Err(StorageError::Segment(SegmentError::Truncated));
+        }
         let mut hbuf = [0u8; SEGMENT_HEADER_LEN];
         file.read_exact_at(&mut hbuf, 0)?;
         let header = SegmentHeader::decode(&hbuf)?;
-        let file_len = file.len()?;
         Ok(SegmentReader {
             file,
             header,
@@ -264,32 +279,98 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         &self.header
     }
 
-    /// Scans the segment: detects a sealed footer (bound to this segment), reads the
-    /// record region, and decodes records in order, stopping at the first torn or
-    /// corrupt frame. The records before that point are the durable valid prefix.
+    /// Scans the segment: reads the record region, decodes records in order, and
+    /// stops at the first torn or corrupt frame, returning the records before that
+    /// point as the durable valid prefix.
+    ///
+    /// A trailing footer is trusted as a seal only when it is consistent with the
+    /// body: the record region must decode cleanly up to exactly the footer, and the
+    /// footer's `record_count` and `last_seq` must match the recovered records. A
+    /// footer that disagrees with the body, whether a torn sealed tail or 32 trailing
+    /// bytes that merely look like a footer (coincidental or forged through record
+    /// payload), is not trusted, and the segment is recovered as unsealed. Only a
+    /// footer that sits exactly at the record-region boundary AND describes the body
+    /// but names a different segment is a hard error: that is a recycled or mixed-up
+    /// file, not an unsealed tail.
     ///
     /// # Errors
-    /// Returns an error if the footer belongs to a different segment, or on IO error.
+    /// Returns [`StorageError::FooterSegmentMismatch`] if a body-consistent footer
+    /// names a different segment, or an IO error.
     pub fn scan(&self) -> Result<SegmentScan, StorageError> {
         let header_end = SEGMENT_HEADER_LEN as u64;
-        let (footer, body_end) = self.detect_footer(header_end)?;
+        let footer_len = SEGMENT_FOOTER_LEN as u64;
 
-        let body_len = usize::try_from(body_end.saturating_sub(header_end))
-            .map_err(|_| StorageError::SegmentFull)?;
-        let mut body = vec![0u8; body_len];
-        if body_len > 0 {
-            self.file.read_exact_at(&mut body, header_end)?;
+        // Decode the trailing 32 bytes as a footer CANDIDATE only. It is validated
+        // against the record body below before being trusted, so neither coincidental
+        // nor forged tail bytes can fake a seal and hide synced records.
+        let candidate = if self.file_len >= header_end + footer_len {
+            let mut fbuf = [0u8; SEGMENT_FOOTER_LEN];
+            self.file
+                .read_exact_at(&mut fbuf, self.file_len - footer_len)?;
+            SegmentFooter::decode(&fbuf).ok()
+        } else {
+            None
+        };
+
+        if let Some(footer) = candidate {
+            let body_end = self.file_len - footer_len;
+            let (records, cursor, clean) = self.scan_body(header_end, body_end)?;
+            let ends_at_footer = clean && header_end + cursor == body_end;
+            let expected_last_seq = records.last().map_or(self.header.base_seq, |r| r.seq);
+            let body_matches = u64::from(footer.record_count) == records.len() as u64
+                && footer.last_seq == expected_last_seq;
+            if ends_at_footer && body_matches {
+                // The footer truly describes this body. It is a genuine seal only if
+                // it is bound to this segment; a different id is a recycled/mixed file.
+                if footer.segment_id != self.header.segment_id {
+                    return Err(StorageError::FooterSegmentMismatch {
+                        header: self.header.segment_id,
+                        footer: footer.segment_id,
+                    });
+                }
+                return Ok(SegmentScan {
+                    header: self.header,
+                    records,
+                    footer: Some(footer),
+                    clean: true,
+                    valid_end: body_end,
+                });
+            }
+            // The candidate does not describe the body: treat the segment as unsealed
+            // and recover the valid prefix from the full file (the candidate bytes are
+            // then just record data or a torn tail).
         }
 
+        let (records, cursor, clean) = self.scan_body(header_end, self.file_len)?;
+        Ok(SegmentScan {
+            header: self.header,
+            records,
+            footer: None,
+            clean,
+            valid_end: header_end + cursor,
+        })
+    }
+
+    /// Reads `[start, end)` and decodes records forward, stopping at the first torn or
+    /// corrupt frame. Returns the records, the number of bytes consumed (relative to
+    /// `start`), and whether the whole region decoded cleanly (no torn tail).
+    fn scan_body(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<(Vec<OwnedRecord>, u64, bool), StorageError> {
+        let body_len =
+            usize::try_from(end.saturating_sub(start)).map_err(|_| StorageError::SegmentFull)?;
+        let mut body = vec![0u8; body_len];
+        if body_len > 0 {
+            self.file.read_exact_at(&mut body, start)?;
+        }
         let mut records = Vec::new();
         let mut cursor = 0usize;
         let mut clean = true;
-        loop {
-            if cursor >= body.len() {
-                break;
-            }
-            // A torn or corrupt frame ends the valid prefix; recovery skips the
-            // rest. The bounded-loss report is produced by a later layer.
+        while cursor < body.len() {
+            // A torn or corrupt frame ends the valid prefix; recovery skips the rest.
+            // The bounded-loss report is produced by a later layer.
             let Ok((view, consumed)) = codec::decode(&body[cursor..]) else {
                 clean = false;
                 break;
@@ -298,45 +379,12 @@ impl<F: RandomAccessFile> SegmentReader<F> {
                 self.header
                     .base_offset
                     .get()
-                    .wrapping_add(records.len() as u64),
+                    .saturating_add(records.len() as u64),
             );
             records.push(OwnedRecord::from_view(offset, &view));
             cursor += consumed;
         }
-
-        Ok(SegmentScan {
-            header: self.header,
-            records,
-            footer,
-            clean,
-            valid_end: header_end + cursor as u64,
-        })
-    }
-
-    /// Looks for a sealed footer in the last 32 bytes. Returns the footer (if the
-    /// segment is sealed and the footer is bound to this segment) and the byte offset
-    /// at which the record region ends.
-    fn detect_footer(&self, header_end: u64) -> Result<(Option<SegmentFooter>, u64), StorageError> {
-        let footer_len = SEGMENT_FOOTER_LEN as u64;
-        if self.file_len < header_end + footer_len {
-            return Ok((None, self.file_len.max(header_end)));
-        }
-        let mut fbuf = [0u8; SEGMENT_FOOTER_LEN];
-        self.file
-            .read_exact_at(&mut fbuf, self.file_len - footer_len)?;
-        match SegmentFooter::decode(&fbuf) {
-            Ok(footer) => {
-                if footer.segment_id != self.header.segment_id {
-                    return Err(StorageError::FooterSegmentMismatch {
-                        header: self.header.segment_id,
-                        footer: footer.segment_id,
-                    });
-                }
-                Ok((Some(footer), self.file_len - footer_len))
-            }
-            // Not a footer: an active (unsealed) segment whose tail is record data.
-            Err(_) => Ok((None, self.file_len)),
-        }
+        Ok((records, cursor as u64, clean))
     }
 }
 
@@ -491,6 +539,127 @@ mod tests {
                 header: 1,
                 footer: 999
             }
+        ));
+    }
+
+    #[test]
+    fn footer_disagreeing_with_body_is_not_trusted() {
+        // A footer bound to THIS segment but whose record_count lies must not be
+        // trusted on content alone (M2): the scan cross-checks it against the body.
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        w.append(&rec(0, b"a")).unwrap();
+        w.append(&rec(1, b"b")).unwrap();
+        w.seal().unwrap();
+        let lying = SegmentFooter {
+            segment_id: 1,
+            last_seq: Seq::new(1),
+            record_count: 7, // body has 2 records, not 7
+        };
+        let len = file.len().unwrap();
+        file.write_all_at(&lying.encode(), len - SEGMENT_FOOTER_LEN as u64)
+            .unwrap();
+
+        let scan = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .scan()
+            .unwrap();
+        // The lying footer is rejected; the two real records are still recovered and
+        // the segment is reported as not-cleanly-sealed rather than a 7-record seal.
+        assert!(scan.footer.is_none());
+        assert!(!scan.clean);
+        assert_eq!(scan.records.len(), 2);
+        assert_eq!(scan.records[0].payload, b"a");
+        assert_eq!(scan.records[1].payload, b"b");
+    }
+
+    #[test]
+    fn footer_overlapping_record_data_is_not_trusted() {
+        // A content-valid footer (correct segment id) overlaid on top of real record
+        // bytes must not be accepted as a seal (M1): doing so would silently drop the
+        // record it overlaps and falsely mark the segment sealed.
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        w.append(&rec(0, b"small")).unwrap();
+        // A large second record so the trailing 32 bytes fall well inside its frame.
+        w.append(&rec(1, &[0x5a; 64])).unwrap();
+        w.sync().unwrap();
+
+        let forged = SegmentFooter {
+            segment_id: 1,
+            last_seq: Seq::new(1),
+            record_count: 2,
+        };
+        let len = file.len().unwrap();
+        file.write_all_at(&forged.encode(), len - SEGMENT_FOOTER_LEN as u64)
+            .unwrap();
+
+        let scan = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .scan()
+            .unwrap();
+        // Not falsely sealed; the un-corrupted prefix (the first record) survives.
+        assert!(scan.footer.is_none());
+        assert!(!scan.clean);
+        assert_eq!(scan.records[0].payload, b"small");
+    }
+
+    #[test]
+    fn corrupt_footer_crc_still_recovers_records() {
+        // A sealed segment whose footer CRC is damaged is recovered as unsealed: the
+        // records survive even though the seal is unreadable (N1).
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        w.append(&rec(0, b"keep1")).unwrap();
+        w.append(&rec(1, b"keep2")).unwrap();
+        w.seal().unwrap();
+        // Flip a byte inside the footer so SegmentFooter::decode fails.
+        let mut bytes = file.snapshot();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        file.set_len(0).unwrap();
+        file.write_all_at(&bytes, 0).unwrap();
+
+        let scan = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .scan()
+            .unwrap();
+        assert!(scan.footer.is_none());
+        assert_eq!(scan.records.len(), 2);
+        assert_eq!(scan.records[0].payload, b"keep1");
+        assert_eq!(scan.records[1].payload, b"keep2");
+    }
+
+    #[test]
+    fn short_file_is_typed_truncation_not_io() {
+        // A file too short to hold a header surfaces a typed structural error (M4),
+        // not a raw IO end-of-file, so recovery can distinguish the two.
+        let file = Arc::new(InMemoryFile::new());
+        file.write_all_at(&[0u8; 10], 0).unwrap();
+        let err = SegmentReader::open(Arc::clone(&file)).unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::Segment(SegmentError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn offset_space_exhaustion_is_refused() {
+        // Offsets are never reused; an append that would wrap the offset space is
+        // refused rather than minting a duplicate id (M3).
+        let h = SegmentHeader {
+            segment_id: 1,
+            base_seq: Seq::new(0),
+            base_offset: Offset::new(u64::MAX),
+            created_unix_ms: 0,
+            flags: 0,
+        };
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), h).unwrap();
+        assert_eq!(w.append(&rec(0, b"x")).unwrap(), Offset::new(u64::MAX));
+        assert!(matches!(
+            w.append(&rec(1, b"y")),
+            Err(StorageError::SegmentFull)
         ));
     }
 }
