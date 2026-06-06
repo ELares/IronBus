@@ -14,3 +14,4 @@ to follow Semantic Versioning once it reaches a tagged release.
 - Continuous integration: rustfmt, clippy (deny warnings), test matrix on Linux,
   macOS, and Windows, an MSRV 1.78 build, and a lint that keeps `ironbus-core` IO-free.
 - Dual `MIT OR Apache-2.0` license files.
+- Supply-chain CI gate (`cargo-deny`) with a permissive-license allowlist, and SPDX license headers on every Rust source enforced by CI.

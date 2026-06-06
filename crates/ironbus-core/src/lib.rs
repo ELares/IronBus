@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Core types and IO-free logic for IronBus.
 //!
 //! This crate performs no input or output: it must not touch the filesystem or
