@@ -11,6 +11,7 @@
 
 use crate::fs::Filesystem;
 use crate::io::RandomAccessFile;
+use crate::loss::{LossEvent, LossReport, ReasonCode};
 use crate::naming::{segment_file_name, segment_ids};
 use crate::segment::{OwnedRecord, RecoveryScan, SegmentReader, SegmentWriter, StorageError};
 use ironbus_core::clock::Clock;
@@ -155,6 +156,10 @@ pub struct Log<F: Filesystem, C: Clock> {
     /// loss that recovery truncates to reach the last intact record. Zero for a fresh log
     /// or a clean recovery.
     recovered_truncated_bytes: u64,
+    /// The structured, versioned report of what recovery dropped (#120): the same loss as
+    /// `recovered_truncated_bytes`, but as per-segment events carrying the byte span and the
+    /// reason. Empty for a fresh log or a clean recovery.
+    loss_report: LossReport,
 }
 
 impl<F: Filesystem, C: Clock> Log<F, C> {
@@ -183,6 +188,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     flushed_offset: Offset::ZERO,
                     segments: Vec::new(),
                     recovered_truncated_bytes: 0,
+                    loss_report: LossReport::new(),
                 };
                 log.start_segment(FIRST_SEGMENT_ID, Seq::new(0), Offset::ZERO)?;
                 Ok(log)
@@ -261,6 +267,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             flushed_offset: next_offset,
             segments: slots,
             recovered_truncated_bytes: 0,
+            loss_report: LossReport::new(),
         };
 
         if scan.footer.is_some() {
@@ -276,8 +283,14 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             let len = file.len()?;
             if scan.valid_end < len {
                 // Record the silent loss before dropping it, so an operator can see that a
-                // torn or unsynced tail was discarded at recovery.
+                // torn or unsynced tail was discarded at recovery, both as a raw byte count
+                // and as a structured loss event carrying the span and the reason (#120). The
+                // records-lost estimate is a lower bound: the torn or corrupt span is, by
+                // definition, not fully parseable, but at least the frame at `valid_end` is gone.
                 log.recovered_truncated_bytes = len - scan.valid_end;
+                let reason = scan.tail_reason.unwrap_or(ReasonCode::TornTail);
+                log.loss_report
+                    .push(LossEvent::span(last_id, scan.valid_end, len, 1, reason));
                 file.set_len(scan.valid_end)?;
                 file.sync_all()?;
             }
@@ -458,6 +471,14 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     #[must_use]
     pub fn recovered_truncated_bytes(&self) -> u64 {
         self.recovered_truncated_bytes
+    }
+
+    /// The structured, versioned [`LossReport`] from recovery: every byte span recovery
+    /// dropped to reach the last intact record, with its reason. Empty for a fresh log or a
+    /// clean recovery. The metrics endpoint (#16) and the offline inspector (#15) read this.
+    #[must_use]
+    pub fn loss_report(&self) -> &LossReport {
+        &self.loss_report
     }
 
     /// The current monotonic time from the log's clock, for the consumer's lease deadlines.
@@ -1257,6 +1278,10 @@ mod tests {
         // A clean reopen reports zero loss.
         let clean = Log::open(fs, ManualClock::new(), LogConfig::default()).unwrap();
         assert_eq!(clean.recovered_truncated_bytes(), 0);
+        assert!(
+            clean.loss_report().is_empty(),
+            "a clean recovery reports no loss"
+        );
         assert_eq!(clean.flushed_offset(), Offset::new(4));
         let fs = clean.into_filesystem();
 
@@ -1281,6 +1306,58 @@ mod tests {
             .unwrap();
         assert!(torn.recovered_truncated_bytes() > 0);
         assert_eq!(torn.recovered_truncated_bytes(), torn_len - post_len);
+
+        // The same loss is also reported structurally (#120): one torn-tail event in segment
+        // 0 whose byte span is exactly the dropped region and whose bytes agree with the raw
+        // counter.
+        let report = torn.loss_report();
+        assert!(!report.is_empty());
+        assert_eq!(report.events.len(), 1);
+        let e = report.events[0];
+        assert_eq!(e.reason_code, crate::loss::ReasonCode::TornTail);
+        assert_eq!(e.segment_id, 0);
+        assert_eq!(e.byte_offset_start, post_len);
+        assert_eq!(e.byte_offset_end, torn_len);
+        assert_eq!(e.bytes_skipped, torn.recovered_truncated_bytes());
+        assert_eq!(
+            report.total_bytes_skipped(),
+            torn.recovered_truncated_bytes()
+        );
+        assert!(e.records_lost_estimate >= 1);
+    }
+
+    #[test]
+    fn recovery_reports_a_corrupt_body_in_the_loss_report() {
+        let mut log = open_mem(LogConfig::default());
+        for i in 0..4u8 {
+            log.append(&rec(&[i; 8])).unwrap();
+        }
+        log.sync().unwrap();
+        let fs = log.into_filesystem();
+
+        // Flip the last byte of the segment (inside the last record's frame) so its body CRC
+        // fails. The length is unchanged, so this is a corrupt body, not a torn tail.
+        let file = fs.open(&segment_file_name(0)).unwrap();
+        let mut bytes = file.snapshot();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        file.write_all_at(&bytes, 0).unwrap();
+        file.sync_data().unwrap();
+
+        let recovered = Log::open(fs, ManualClock::new(), LogConfig::default()).unwrap();
+        // The corrupt last record is dropped; the three intact records survive.
+        assert_eq!(recovered.flushed_offset(), Offset::new(3));
+        let report = recovered.loss_report();
+        assert_eq!(report.events.len(), 1, "one corrupt-tail event");
+        assert_eq!(
+            report.events[0].reason_code,
+            crate::loss::ReasonCode::CorruptRecordBody
+        );
+        assert_eq!(report.events[0].segment_id, 0);
+        assert_eq!(
+            report.events[0].bytes_skipped,
+            recovered.recovered_truncated_bytes()
+        );
     }
 
     #[test]
