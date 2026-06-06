@@ -487,11 +487,14 @@ fn recovery_is_idempotent_after_a_fault_during_recovery() {
         }
         log.sync().unwrap();
     }
-    // Tear a few bytes off the last record so recovery must truncate it.
+    // Tear a few bytes off the last record so recovery must truncate it. The torn-tail
+    // image must be DURABLE so it survives the power loss below and forces recovery to
+    // re-truncate: a `set_len` shrink is metadata that only `sync_all` persists (#158), so
+    // pair it with `sync_all`, not `sync_data` (which a power loss would revert).
     let seg = disk.open(&segment_file_name(0)).unwrap();
     let len = seg.len().unwrap();
     seg.set_len(len - 3).unwrap();
-    seg.sync_data().unwrap();
+    seg.sync_all().unwrap();
     drop(seg);
 
     // Crash during recovery: wrap a shared handle in a FaultFs, arm a sync fault. Recovery's

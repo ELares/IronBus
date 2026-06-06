@@ -7,6 +7,7 @@ to follow Semantic Versioning once it reaches a tagged release.
 ## [Unreleased]
 
 ### Fixed
+- `InMemoryFile` modeled `fdatasync` (`sync_data`) and `fsync` (`sync_all`) identically, treating a `set_len` truncation as durable after either (#158). A real `fdatasync` flushes data but need not persist a length-shrink (metadata), so the simulation now reverts a truncation that was only `sync_data`'d on a power loss and persists it only after `sync_all`, while in-place edits and data growth stay durable under `fdatasync`. This pins the conservative real-disk contract that `Log::recover` already follows (truncate a torn tail, then `sync_all`); a regression that truncated with only `sync_data` would now fail the crash-recovery sweep. Includes two model tests and updates the recovery-idempotence gate's torn-tail setup to make the truncation durable via `sync_all` (refs #6, #21).
 - The `dead_letter_iff_a_finite_cap_is_exceeded` delivery proptest no longer relies on a `prop_assume!` that rejected ~2.5% of inputs: under a deep (nightly) sweep that exhausted proptest's global-reject budget and aborted the test. The strategy now generates only valid configs (max == 0 forces the unlimited opt-in), so it rejects nothing and is robust at any case count (refs #21).
 
 ### Added

@@ -108,7 +108,10 @@ fn invalid_input(msg: &'static str) -> io::Error {
 struct State {
     /// The current (possibly-unsynced) bytes.
     live: Vec<u8>,
-    /// The bytes as of the last sync: the only bytes that survive a power loss.
+    /// The bytes that survive a power loss. Its length is the durable file length, which
+    /// `sync_data` (fdatasync) advances for data but never shrinks for a `set_len`
+    /// truncation (length is metadata): only `sync_all` (fsync) makes a truncation
+    /// durable. See the sync methods below and [`InMemoryFile`] for the contract.
     durable: Vec<u8>,
 }
 
@@ -118,6 +121,16 @@ struct State {
 /// each sync). [`simulate_power_loss`](InMemoryFile::simulate_power_loss) discards
 /// every write made since the last sync, so a simulation can verify that no
 /// acknowledged-and-synced data is ever lost and that unsynced writes may vanish.
+///
+/// Durability contract (the fsync policy this models, #158): `sync_data` models
+/// `fdatasync`, which flushes file data and any growth that data caused, but is not
+/// required to persist a length-shrink from `set_len` (a truncation is metadata).
+/// `sync_all` models `fsync`, a full barrier that persists data and the length. So a
+/// `set_len` truncation becomes durable only after a `sync_all`; a truncation followed
+/// by only `sync_data` is reverted by a simulated power loss, which restores the
+/// pre-truncation length and the bytes beyond the truncation point. Truncation is the
+/// only length change IronBus makes through `set_len` (recovery drops a torn tail, then
+/// `sync_all`s, in `Log::recover`), and this model now enforces that pairing.
 #[derive(Debug, Default)]
 pub struct InMemoryFile {
     state: Mutex<State>,
@@ -205,16 +218,33 @@ impl RandomAccessFile for InMemoryFile {
     }
 
     fn sync_data(&self) -> io::Result<()> {
-        // In-memory has no separate metadata, so data and metadata sync are identical.
+        // fdatasync: flush data and any growth that data caused, but NOT a length shrink
+        // from `set_len`. A truncation is metadata that a real fdatasync need not persist
+        // (#158), so the durable image keeps its old length and the bytes beyond the new
+        // live length until a `sync_all` makes the truncation durable. In-place edits and
+        // writes that extend the file are data, so they DO become durable here.
         let mut guard = self.lock();
         let s = &mut *guard;
-        s.durable.clone_from(&s.live);
+        if s.live.len() >= s.durable.len() {
+            s.durable.clone_from(&s.live);
+        } else {
+            // An unsynced truncation: flush the surviving data in place, keep the old
+            // durable length, and retain the un-truncated tail so a power loss can still
+            // expose it (exactly until a `sync_all` persists the shorter length).
+            s.durable[..s.live.len()].copy_from_slice(&s.live);
+        }
         self.syncs.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
     fn sync_all(&self) -> io::Result<()> {
-        self.sync_data()
+        // fsync: a full barrier. Data AND metadata (the file length, including a
+        // `set_len` truncation) become durable, so the durable image equals the live one.
+        let mut guard = self.lock();
+        let s = &mut *guard;
+        s.durable.clone_from(&s.live);
+        self.syncs.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     fn len(&self) -> io::Result<u64> {
@@ -311,6 +341,54 @@ mod tests {
         // Only the synced prefix survives.
         assert_eq!(f.snapshot(), b"durable");
         assert_eq!(f.durable_snapshot(), b"durable");
+    }
+
+    #[test]
+    fn a_truncation_is_durable_only_after_sync_all() {
+        // fdatasync (sync_data) does not persist a `set_len` shrink: a power loss restores
+        // the pre-truncation length and the bytes beyond the new end. fsync (sync_all)
+        // does persist it. This pins the fdatasync-vs-fsync metadata contract (#158).
+        let f = InMemoryFile::from_bytes(b"abcdef".to_vec());
+        f.sync_all().unwrap(); // the full 6-byte image is durable
+        f.set_len(3).unwrap(); // truncate to "abc"
+        assert_eq!(f.snapshot(), b"abc");
+        f.sync_data().unwrap(); // fdatasync must NOT persist the truncation
+        f.simulate_power_loss();
+        assert_eq!(
+            f.snapshot(),
+            b"abcdef",
+            "a truncation that was only fdatasync'd is reverted by a power loss"
+        );
+        assert_eq!(f.len().unwrap(), 6, "the pre-truncation length is restored");
+
+        // Truncate again and this time fsync: now the shorter length is durable.
+        f.set_len(3).unwrap();
+        f.sync_all().unwrap();
+        f.simulate_power_loss();
+        assert_eq!(
+            f.snapshot(),
+            b"abc",
+            "an fsync'd truncation survives a power loss"
+        );
+        assert_eq!(f.len().unwrap(), 3);
+    }
+
+    #[test]
+    fn fdatasync_persists_an_in_place_edit_under_an_unsynced_truncation() {
+        // A compound case: a data edit inside the surviving range is durable via fdatasync
+        // even while a concurrent truncation is not, so the power-loss image keeps the
+        // edit AND the un-truncated tail. This guards the model's per-byte faithfulness.
+        let f = InMemoryFile::from_bytes(b"ABCDEF".to_vec());
+        f.sync_all().unwrap();
+        f.set_len(3).unwrap(); // live = "ABC" (truncation pending, not yet durable)
+        f.write_all_at(b"X", 0).unwrap(); // edit within the surviving range: live = "XBC"
+        f.sync_data().unwrap(); // fdatasync: the edit is durable, the truncation is not
+        f.simulate_power_loss();
+        assert_eq!(
+            f.snapshot(),
+            b"XBCDEF",
+            "the edit survives via fdatasync, the truncated tail returns (length not synced)"
+        );
     }
 
     #[test]
