@@ -19,8 +19,10 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-# Per #139, zstd-sys is the only vendored-C crate allowed on the default path.
-# A C-FFI allowlist will be enforced here once dependencies are introduced (tracked in #102).
+# Per #139, the default path is pure Rust: no vendored-C crate is allowed on it. The default
+# compression codec is lz4_flex (pure Rust); zstd (zstd-sys, vendored C) is opt-in only, behind an
+# explicit feature, never on the default path. A C-FFI allowlist is enforced here once any such
+# opt-in dependency is introduced (tracked in #102).
 
 [advisories]
 yanked = "deny"
