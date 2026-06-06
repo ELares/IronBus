@@ -14,9 +14,11 @@
 //! in Prometheus text format. The drop/skip/loss counters and fsync histograms are follow-ups (#16).
 
 use crate::engine::Counters;
+use crate::metrics::{LatencyHistogram, FSYNC_BUCKET_LE_SECONDS};
 use crate::server::SharedEngine;
 use ironbus_core::clock::Clock;
 use ironbus_storage::fs::Filesystem;
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -133,53 +135,57 @@ where
             }
         }
         "/metrics" => {
-            let (committed, flushed, in_flight, healthy, recovered_truncated, last_dead, counters) = {
+            let snapshot = {
                 let g = engine.lock().unwrap_or_else(PoisonError::into_inner);
-                (
-                    g.committed_offset().get(),
-                    g.flushed_offset().get(),
-                    g.in_flight(),
-                    g.is_healthy(),
-                    g.recovered_truncated_bytes(),
-                    g.last_dead_lettered_offset(),
-                    g.counters(),
-                )
+                MetricsSnapshot {
+                    committed: g.committed_offset().get(),
+                    flushed: g.flushed_offset().get(),
+                    in_flight: g.in_flight(),
+                    healthy: g.is_healthy(),
+                    recovered_truncated: g.recovered_truncated_bytes(),
+                    // -1 is the unambiguous "none yet" sentinel (offsets are never negative).
+                    last_dead_lettered: g
+                        .last_dead_lettered_offset()
+                        .map_or(-1i64, |o| i64::try_from(o.get()).unwrap_or(i64::MAX)),
+                    counters: g.counters(),
+                    fsync: g.fsync_histogram(),
+                }
             };
-            // -1 is the unambiguous "none yet" sentinel (offsets are never negative).
-            let last_dead_lettered =
-                last_dead.map_or(-1i64, |o| i64::try_from(o.get()).unwrap_or(i64::MAX));
-            respond(
-                &mut stream,
-                200,
-                "OK",
-                &metrics_body(
-                    committed,
-                    flushed,
-                    in_flight,
-                    healthy,
-                    recovered_truncated,
-                    last_dead_lettered,
-                    counters,
-                ),
-            )
+            respond(&mut stream, 200, "OK", &metrics_body(snapshot))
         }
         _ => respond(&mut stream, 404, "Not Found", "unknown endpoint"),
     }
 }
 
-/// Renders the Prometheus text exposition body from an engine snapshot. Consumer lag is the
-/// durable records produced but not yet committed (`flushed - committed`).
-fn metrics_body(
+/// A consistent snapshot of the metric inputs, read under one engine lock.
+#[derive(Clone, Copy)]
+struct MetricsSnapshot {
     committed: u64,
     flushed: u64,
     in_flight: usize,
     healthy: bool,
     recovered_truncated: u64,
+    /// The most recent dead-letter offset, or -1 if none (the exposition sentinel).
     last_dead_lettered: i64,
     counters: Counters,
-) -> String {
+    fsync: LatencyHistogram,
+}
+
+/// Renders the Prometheus text exposition body from an engine snapshot. Consumer lag is the
+/// durable records produced but not yet committed (`flushed - committed`).
+fn metrics_body(snapshot: MetricsSnapshot) -> String {
+    let MetricsSnapshot {
+        committed,
+        flushed,
+        in_flight,
+        healthy,
+        recovered_truncated,
+        last_dead_lettered,
+        counters,
+        fsync,
+    } = snapshot;
     let lag = flushed.saturating_sub(committed);
-    format!(
+    let mut body = format!(
         "# HELP ironbus_committed_offset The committed consumer cursor; every offset below it is acked.\n\
          # TYPE ironbus_committed_offset gauge\n\
          ironbus_committed_offset {committed}\n\
@@ -222,7 +228,34 @@ fn metrics_body(
         redelivered = counters.redelivered,
         dead_lettered = counters.dead_lettered,
         acks = counters.acks,
-    )
+    );
+    body.push_str(&fsync_histogram_lines(&fsync));
+    body
+}
+
+/// Renders the `ironbus_fsync_seconds` Prometheus histogram (cumulative `le` buckets in
+/// seconds, plus `_sum` and `_count`) from a [`LatencyHistogram`] snapshot.
+fn fsync_histogram_lines(fsync: &LatencyHistogram) -> String {
+    let cumulative = fsync.cumulative_buckets();
+    let mut s = String::from(
+        "# HELP ironbus_fsync_seconds The fsync (durability barrier) latency on produce.\n\
+         # TYPE ironbus_fsync_seconds histogram\n",
+    );
+    for (le, count) in FSYNC_BUCKET_LE_SECONDS.iter().zip(cumulative.iter()) {
+        let _ = writeln!(s, "ironbus_fsync_seconds_bucket{{le=\"{le}\"}} {count}");
+    }
+    let total = fsync.count();
+    let nanos = fsync.sum_nanos();
+    let _ = writeln!(s, "ironbus_fsync_seconds_bucket{{le=\"+Inf\"}} {total}");
+    // Seconds with nanosecond precision, formatted without floating point.
+    let _ = writeln!(
+        s,
+        "ironbus_fsync_seconds_sum {}.{:09}",
+        nanos / 1_000_000_000,
+        nanos % 1_000_000_000
+    );
+    let _ = writeln!(s, "ironbus_fsync_seconds_count {total}");
+    s
 }
 
 fn respond(stream: &mut TcpStream, code: u16, reason: &str, body: &str) -> std::io::Result<()> {
@@ -358,6 +391,14 @@ mod tests {
         assert!(m.contains("\nironbus_produced_total 2\n"), "{m}");
         assert!(m.contains("\nironbus_delivered_total 0\n"), "{m}");
         assert!(m.contains("\nironbus_dead_lettered_total 0\n"), "{m}");
+        // The fsync histogram: two produces above, so count and the +Inf bucket are 2. The
+        // bucket distribution is timing-dependent under the system clock, so it is not pinned.
+        assert!(m.contains("# TYPE ironbus_fsync_seconds histogram"), "{m}");
+        assert!(m.contains("\nironbus_fsync_seconds_count 2\n"), "{m}");
+        assert!(
+            m.contains("ironbus_fsync_seconds_bucket{le=\"+Inf\"} 2"),
+            "{m}"
+        );
 
         // Lease one message: in-flight reflects the outstanding lease.
         let token = {

@@ -16,6 +16,7 @@
 //! rule. Delivery flow control is a sliding window of `max_in_flight` offsets above the
 //! committed cursor (the max-ack-pending bound), so in-flight work never grows unbounded.
 
+use crate::metrics::LatencyHistogram;
 use ironbus_core::clock::Clock;
 use ironbus_core::cursor::AckCursor;
 use ironbus_core::delivery::{DeliveryConfig, Disposition};
@@ -198,6 +199,8 @@ pub struct Engine<F: Filesystem, C: Clock> {
     checkpoint_interval: u64,
     last_checkpointed: u64,
     counters: Counters,
+    /// The fsync (durability barrier) latency distribution observed on produce.
+    fsync: LatencyHistogram,
     /// The log offset of the most recently dead-lettered (parked past `MaxDeliver`) message,
     /// or `None` if none has been dead-lettered. A gauge-style companion to the
     /// `dead_lettered` counter.
@@ -263,6 +266,7 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
             checkpoint_interval: config.checkpoint_interval,
             last_checkpointed: committed,
             counters: Counters::default(),
+            fsync: LatencyHistogram::default(),
             last_dead_lettered: None,
         })
     }
@@ -310,7 +314,12 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// Propagates a storage error from the append or sync.
     pub fn produce(&mut self, message: &Append<'_>) -> Result<Offset, EngineError> {
         let offset = self.log.append(message)?;
+        // Time the durability barrier itself (the fsync), via the clock seam so the
+        // deterministic sim stays reproducible (logical time does not advance in-memory).
+        let started = self.log.now_monotonic();
         self.log.sync()?;
+        self.fsync
+            .observe(self.log.now_monotonic().saturating_sub(started));
         self.counters.produced += 1;
         Ok(offset)
     }
@@ -473,6 +482,12 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     #[must_use]
     pub fn counters(&self) -> Counters {
         self.counters
+    }
+
+    /// A snapshot of the fsync (durability barrier) latency histogram observed on produce.
+    #[must_use]
+    pub fn fsync_histogram(&self) -> LatencyHistogram {
+        self.fsync
     }
 
     /// The log offset of the most recently dead-lettered (parked past `MaxDeliver`) message,
@@ -656,6 +671,19 @@ mod tests {
         // The poison message is committed past and never redelivers.
         assert_eq!(e.committed_offset(), Offset::new(1));
         assert!(matches!(e.poll(80).unwrap(), Poll::Idle));
+    }
+
+    #[test]
+    fn produce_records_one_fsync_observation_each() {
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"a");
+        produce(&mut e, b"b");
+        let h = e.fsync_histogram();
+        assert_eq!(h.count(), 2, "one fsync observation per produce");
+        // The manual clock does not advance during the in-memory sync, so each latency is 0,
+        // which falls in the first (and so every cumulative) bucket.
+        assert_eq!(h.sum_nanos(), 0);
+        assert_eq!(h.cumulative_buckets()[0], 2);
     }
 
     #[test]
