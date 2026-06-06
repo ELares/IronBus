@@ -30,8 +30,10 @@ ironbus serve --data-dir /var/lib/ironbus
 
 `serve` opens (creating if absent) the durable log under `--data-dir`, binds the wire
 protocol on `--addr` (default `127.0.0.1:7777`, loopback only), and runs until the
-process is signalled. Durability holds across an abrupt termination because every ack
-is fsynced before it returns.
+process is signalled. A produce is synchronously durable: the offset is returned only
+after the record is fsynced, so an abrupt termination never loses an acknowledged
+publish. The consumer cursor is a separate, lagging checkpoint (see "Restart and
+resume" below), so it is NOT fsynced on every ack.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
@@ -73,10 +75,14 @@ At most one disposition applies to the whole fetched batch:
 
 | Disposition | Effect |
 |-------------|--------|
-| (none) | Peek: print only. The messages stay in flight and redeliver after the visibility timeout. |
+| (none) | Peek: print only, do not commit. The messages stay leased and redeliver after the visibility timeout (30 seconds; not flag-configurable). A peek still claims a lease, so it counts as a delivery attempt: repeatedly peeking without acking eventually parks the message at `MaxDeliver`. |
 | `--ack` | Commit each message; it never redelivers. |
 | `--nack [--delay-ms <n>]` | Requeue each message for redelivery. With `--delay-ms`, defer by that many milliseconds; without it, the broker applies its escalating backoff schedule (100 ms, 500 ms, 2 s, 10 s, 30 s by attempt). |
 | `--term` | Drop each message without dead-lettering (an intentional discard). |
+
+The wire protocol also supports `progress` (extend a lease while a consumer is still
+working) and a keepalive `ping`, but those are library-only and not yet surfaced as
+`sub` flags.
 
 Acknowledgement is at-least-once: a message is redelivered until it is acked or termed,
 and a stale token (the message already redelivered) is fenced, so a late ack cannot
@@ -86,10 +92,21 @@ looping forever.
 
 ## Restart and resume
 
-The broker persists the consumer cursor, so restarting on the same `--data-dir` resumes
-past the messages that were already acked rather than redelivering the whole log. The
-durable log itself always survives, so a fresh publish after a restart continues at the
-next offset.
+The durable log always survives a restart, so a fresh publish after restarting on the
+same `--data-dir` continues at the next offset (the message bytes were fsynced at
+produce time).
+
+The consumer cursor is a lagging checkpoint, not a per-ack fsync. It becomes durable
+when a consumer's connection closes cleanly (the disconnect flushes it) or after
+`--checkpoint-interval` cumulative commits (default 1024). So a clean restart resumes
+past acked messages, but an abrupt stop can redeliver up to `--checkpoint-interval`
+recently-acked messages. Note there is no graceful-shutdown drain yet, so signalling the
+broker (SIGTERM/SIGINT) IS an abrupt stop. This is safe at-least-once (a duplicate, never
+a loss), and `--checkpoint-interval` is exactly the knob that trades that redelivery
+window against checkpoint write amplification; a lower value (even `1`) persists the
+cursor more eagerly. The everyday `pub`/`sub` flow resumes cleanly because each
+short-lived `sub` connection closes and flushes the cursor; a long-lived consumer that is
+still connected when the broker is signalled gets the redelivery behavior instead.
 
 ## Health and metrics
 
