@@ -388,6 +388,89 @@ fn fatal_fsync_freeze_during_a_roll_loses_no_acked_record() {
     assert_prefix(&log, recovered);
 }
 
+#[test]
+fn a_write_eio_during_append_recovers_the_acked_prefix() {
+    // A write that fails cleanly (no bytes persisted) leaves the record unacked and the
+    // writer consistent (a write fault, unlike a fatal fsync, does not freeze the writer).
+    // Recovery yields exactly the acked prefix.
+    let durable = 5u64;
+    let (fs, control) = FaultFs::new(InMemoryFs::new());
+    let mut log = Log::open(fs, ManualClock::new(), big_config()).unwrap();
+    for i in 0..durable {
+        append_at(&mut log, i);
+    }
+    log.sync().unwrap();
+
+    control.set_fail_write(true);
+    let p = payload(durable);
+    let err = log.append(&Append {
+        timestamp_ms: durable,
+        flags: RecordFlags::EMPTY,
+        key: b"",
+        headers: b"",
+        payload: &p,
+    });
+    assert!(matches!(
+        err,
+        Err(ironbus_storage::segment::StorageError::Io(_))
+    ));
+    assert_eq!(
+        log.next_offset(),
+        Offset::new(durable),
+        "a failed write does not advance the offset"
+    );
+    assert!(
+        log.is_writable(),
+        "a write fault does not freeze the writer"
+    );
+
+    control.set_fail_write(false);
+    let faultfs = log.into_filesystem();
+    let log = Log::open(faultfs, ManualClock::new(), big_config()).unwrap();
+    assert_eq!(log.flushed_offset(), Offset::new(durable));
+    assert_prefix(&log, durable);
+}
+
+#[test]
+fn a_torn_write_during_append_is_truncated_by_recovery() {
+    // A torn write persists a prefix of the record's bytes, then fails. The record is not
+    // acked; recovery truncates the torn tail and yields exactly the intact acked prefix,
+    // never reading past the torn bytes. No power loss: this exercises truncation of a real
+    // torn write left in the live image, not an all-or-nothing revert.
+    let durable = 5u64;
+    let (fs, control) = FaultFs::new(InMemoryFs::new());
+    let mut log = Log::open(fs, ManualClock::new(), big_config()).unwrap();
+    for i in 0..durable {
+        append_at(&mut log, i);
+    }
+    log.sync().unwrap();
+
+    // Tear the next record a few bytes in (a partial record header on disk).
+    control.arm_torn_write(4);
+    let p = payload(durable);
+    let err = log.append(&Append {
+        timestamp_ms: durable,
+        flags: RecordFlags::EMPTY,
+        key: b"",
+        headers: b"",
+        payload: &p,
+    });
+    assert!(matches!(
+        err,
+        Err(ironbus_storage::segment::StorageError::Io(_))
+    ));
+    assert_eq!(
+        log.next_offset(),
+        Offset::new(durable),
+        "a torn write does not advance the offset"
+    );
+
+    let faultfs = log.into_filesystem();
+    let log = Log::open(faultfs, ManualClock::new(), big_config()).unwrap();
+    assert_eq!(log.flushed_offset(), Offset::new(durable));
+    assert_prefix(&log, durable);
+}
+
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
         3 => Just(Op::Append),
