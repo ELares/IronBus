@@ -243,7 +243,9 @@ impl Session {
                     reply(out, FrameType::Deliver, &frame_body);
                     delivered += 1;
                 }
-                // A parked (poison) message is skipped from delivery; keep draining credits.
+                // A parked (poison, over max-deliver) message is committed past by the
+                // engine and skipped from delivery. The dead-letter advisory + DLQ write
+                // (#63) is not yet wired, so the consumer is not told here; keep draining.
                 Ok(Poll::Parked { .. }) => {}
                 // Nothing more deliverable right now: end the batch early.
                 Ok(Poll::Idle) => break,
@@ -252,8 +254,10 @@ impl Session {
                     return Err(SessionError::EngineFatal(e));
                 }
                 Err(_) => {
+                    // The Err is this batch's terminator; do NOT also send Ok (that would
+                    // desync the client, which expects exactly one terminator per Flow).
                     reply_err(out, "fetch failed");
-                    break;
+                    return Ok(());
                 }
             }
         }
@@ -284,6 +288,7 @@ mod tests {
     use ironbus_proto::message::{decode_deliver, encode_ack, encode_pub, AckBody, PubBody};
     use ironbus_storage::fs::InMemoryFs;
     use ironbus_storage::log::LogConfig;
+    use std::sync::Arc;
 
     fn engine() -> Engine<InMemoryFs, ManualClock> {
         Engine::open(
@@ -338,7 +343,7 @@ mod tests {
         frames
     }
 
-    fn produce(e: &mut Engine<InMemoryFs, ManualClock>, payload: &[u8]) {
+    fn produce<C: Clock>(e: &mut Engine<InMemoryFs, C>, payload: &[u8]) {
         e.produce(&Append {
             timestamp_ms: 0,
             flags: RecordFlags::EMPTY,
@@ -347,6 +352,129 @@ mod tests {
             payload,
         })
         .unwrap();
+    }
+
+    fn engine_with(
+        clock: Arc<ManualClock>,
+        max_deliver: u32,
+    ) -> Engine<InMemoryFs, Arc<ManualClock>> {
+        Engine::open(
+            InMemoryFs::new(),
+            clock,
+            EngineConfig {
+                log: LogConfig::default(),
+                lease: LeaseConfig {
+                    visibility_nanos: 30,
+                    hard_cap_nanos: 100,
+                },
+                delivery: DeliveryConfig::new(max_deliver, false, vec![]).unwrap(),
+                max_in_flight: 10,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Decodes every Deliver frame in a Flow response and returns (offset, generation).
+    fn delivered_tokens(out: &[u8]) -> Vec<(u64, u64)> {
+        decode_all(out)
+            .into_iter()
+            .filter(|(ty, _)| *ty == FrameType::Deliver)
+            .map(|(_, body)| {
+                let d = decode_deliver(&body).unwrap();
+                (d.offset, d.generation)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_unacked_fetched_message_redelivers_after_the_visibility_timeout() {
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_with(Arc::clone(&clock), 5);
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        produce(&mut e, b"x");
+
+        // First fetch delivers and leases it (deadline = now(0) + 30).
+        out.clear();
+        s.process(
+            &mut e,
+            &frame(FrameType::Flow, &1u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let first = delivered_tokens(&out);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, 0);
+
+        // Re-fetch before the timeout: the lease is still held, nothing redelivers.
+        out.clear();
+        s.process(
+            &mut e,
+            &frame(FrameType::Flow, &1u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        assert!(
+            delivered_tokens(&out).is_empty(),
+            "in-flight, not redelivered yet"
+        );
+
+        // Advance past the visibility timeout: now it redelivers with a NEW generation.
+        clock.advance_monotonic_nanos(40);
+        out.clear();
+        s.process(
+            &mut e,
+            &frame(FrameType::Flow, &1u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let second = delivered_tokens(&out);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].0, 0);
+        assert_ne!(second[0].1, first[0].1, "redelivery fences the old token");
+    }
+
+    #[test]
+    fn a_poison_message_is_parked_and_skipped_in_the_fetch() {
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_with(Arc::clone(&clock), 1); // max_deliver = 1
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        produce(&mut e, b"poison");
+
+        // First fetch delivers (delivery 1).
+        out.clear();
+        s.process(
+            &mut e,
+            &frame(FrameType::Flow, &1u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(delivered_tokens(&out).len(), 1);
+
+        // Expire it; the next fetch's claim is delivery 2 > max_deliver, so it is parked
+        // (committed past) and NOT delivered: an empty batch (Ok with no Deliver frames).
+        clock.advance_monotonic_nanos(40);
+        out.clear();
+        s.process(
+            &mut e,
+            &frame(FrameType::Flow, &1u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        assert!(
+            delivered_tokens(&out).is_empty(),
+            "the poison message is not delivered"
+        );
+        assert_eq!(
+            e.committed_offset().get(),
+            1,
+            "the poison message is parked past"
+        );
     }
 
     #[test]
