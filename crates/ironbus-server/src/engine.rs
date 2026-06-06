@@ -294,6 +294,16 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
         Ok(Poll::Idle)
     }
 
+    /// Like [`Engine::poll`] but reads the current monotonic time from the engine's own
+    /// clock, so the caller does not have to supply it.
+    ///
+    /// # Errors
+    /// As [`Engine::poll`].
+    pub fn poll_now(&mut self) -> Result<Poll, EngineError> {
+        let now = self.log.now_monotonic();
+        self.poll(now)
+    }
+
     /// Acks the message named by `token`: removes its lease (fenced if stale) and advances
     /// the committed cursor over any newly contiguous prefix.
     pub fn ack(&mut self, token: &LeaseToken) -> AckResult {

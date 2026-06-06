@@ -142,7 +142,7 @@ mod tests {
     use ironbus_core::delivery::DeliveryConfig;
     use ironbus_core::lease::LeaseConfig;
     use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameType};
-    use ironbus_proto::message::{encode_pub, PubBody};
+    use ironbus_proto::message::{decode_deliver, encode_ack, encode_pub, AckBody, AckOp, PubBody};
     use ironbus_storage::fs::InMemoryFs;
     use ironbus_storage::log::LogConfig;
 
@@ -161,13 +161,21 @@ mod tests {
         v
     }
 
-    /// Reads from `stream` until one complete frame is available, returning its type and body.
-    fn read_one_frame(stream: &mut TcpStream) -> (FrameType, Vec<u8>) {
-        let mut buf = Vec::new();
+    /// Reads from `stream` until one complete frame is available, returning its type and
+    /// body. `buf` carries leftover bytes between calls so a read that delivers several
+    /// frames at once is not lost.
+    fn read_one_frame(stream: &mut TcpStream, buf: &mut Vec<u8>) -> (FrameType, Vec<u8>) {
         let mut chunk = [0u8; 256];
         loop {
-            if let Ok(FrameDecode::Frame { type_tag, body, .. }) = decode_frame(&buf) {
-                return (FrameType::from_u8(type_tag).unwrap(), body.to_vec());
+            if let Ok(FrameDecode::Frame {
+                type_tag,
+                body,
+                consumed,
+            }) = decode_frame(buf)
+            {
+                let result = (FrameType::from_u8(type_tag).unwrap(), body.to_vec());
+                buf.drain(..consumed);
+                return result;
             }
             let n = stream.read(&mut chunk).unwrap();
             assert!(n > 0, "connection closed before a full frame");
@@ -214,8 +222,9 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
+        let mut buf = Vec::new();
         client.write_all(&frame(FrameType::Connect, b"")).unwrap();
-        assert_eq!(read_one_frame(&mut client).0, FrameType::Info);
+        assert_eq!(read_one_frame(&mut client, &mut buf).0, FrameType::Info);
 
         let mut pub_body = Vec::new();
         encode_pub(
@@ -230,7 +239,7 @@ mod tests {
         )
         .unwrap();
         client.write_all(&frame(FrameType::Pub, &pub_body)).unwrap();
-        let (ty, body) = read_one_frame(&mut client);
+        let (ty, body) = read_one_frame(&mut client, &mut buf);
         assert_eq!(ty, FrameType::Ok);
         assert_eq!(body, 0u64.to_le_bytes(), "Ok carries the assigned offset 0");
 
@@ -244,6 +253,72 @@ mod tests {
             Poll::Message(d) => assert_eq!(d.record.payload, b"net"),
             other => panic!("expected the produced message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn full_produce_fetch_ack_round_trip_over_tcp() {
+        let engine = Engine::open(InMemoryFs::new(), SystemClock::new(), config()).unwrap();
+        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = std::thread::spawn({
+            let engine = Arc::clone(&shared);
+            let shutdown = Arc::clone(&shutdown);
+            move || serve(&listener, &engine, &shutdown, 16).unwrap()
+        });
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = Vec::new();
+        c.write_all(&frame(FrameType::Connect, b"")).unwrap();
+        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::Info);
+
+        // Produce.
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                payload: b"e2e",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        c.write_all(&frame(FrameType::Pub, &pub_body)).unwrap();
+        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::Ok);
+
+        // Fetch: a Deliver frame then the Ok terminator.
+        c.write_all(&frame(FrameType::Flow, &1u32.to_le_bytes()))
+            .unwrap();
+        let (ty, body) = read_one_frame(&mut c, &mut buf);
+        assert_eq!(ty, FrameType::Deliver);
+        let delivered = decode_deliver(&body).unwrap();
+        assert_eq!(delivered.payload, b"e2e");
+        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::Ok); // batch terminator
+
+        // Ack it.
+        let mut ack_body = Vec::new();
+        encode_ack(
+            &AckBody {
+                op: AckOp::Ack,
+                offset: delivered.offset,
+                generation: delivered.generation,
+                delay_ms: 0,
+            },
+            &mut ack_body,
+        );
+        c.write_all(&frame(FrameType::Ack, &ack_body)).unwrap();
+        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::Ok);
+
+        drop(c);
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+
+        // The message was committed: nothing left to deliver.
+        assert_eq!(shared.lock().unwrap().committed_offset().get(), 1);
     }
 
     #[test]

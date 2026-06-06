@@ -25,6 +25,18 @@ pub trait Clock: Send + Sync {
     fn now_monotonic_nanos(&self) -> u64;
 }
 
+/// Sharing a clock behind an [`std::sync::Arc`] forwards to the inner clock, so several
+/// owners (an engine and a test driving time, for instance) observe the same clock.
+impl<C: Clock + ?Sized> Clock for std::sync::Arc<C> {
+    fn now_unix_millis(&self) -> u64 {
+        (**self).now_unix_millis()
+    }
+
+    fn now_monotonic_nanos(&self) -> u64 {
+        (**self).now_monotonic_nanos()
+    }
+}
+
 /// A deterministic [`Clock`] whose time only changes when a test advances it.
 ///
 /// Both clocks start at zero and never read the host clock, so they are the time
@@ -101,6 +113,18 @@ impl Clock for ManualClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn arc_clock_forwards_and_shares_state() {
+        let clock = Arc::new(ManualClock::new());
+        let shared = Arc::clone(&clock);
+        clock.set_unix_millis(1_000);
+        clock.advance_monotonic_nanos(500);
+        // The Arc forwards to the same inner clock, so the shared handle sees the advance.
+        assert_eq!(shared.now_unix_millis(), 1_000);
+        assert_eq!(shared.now_monotonic_nanos(), 500);
+    }
 
     #[test]
     fn starts_at_zero() {
