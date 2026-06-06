@@ -55,6 +55,17 @@ const DEFAULT_MAX_IN_FLIGHT: u32 = 1024;
 /// The default cursor-checkpoint interval for the `serve` engine: at most this many messages
 /// are redelivered after an abrupt crash (a clean disconnect flushes the cursor sooner).
 const DEFAULT_CHECKPOINT_INTERVAL: u64 = 1024;
+/// The default escalating nack backoff schedule (nanoseconds), indexed by delivery attempt and
+/// clamped to the last entry: 100 ms, 500 ms, 2 s, 10 s, 30 s. Applied when a nack carries no
+/// explicit delay, so a flapping consumer backs off instead of hot-looping a retry.
+#[cfg(unix)]
+const DEFAULT_NACK_BACKOFF_NANOS: [u64; 5] = [
+    100_000_000,
+    500_000_000,
+    2_000_000_000,
+    10_000_000_000,
+    30_000_000_000,
+];
 
 /// Frozen exit codes (subset in use for these verbs), per issue #91.
 const EXIT_USAGE: u8 = 1;
@@ -484,7 +495,7 @@ fn open_disk_engine(
     std::fs::create_dir_all(data_dir)
         .map_err(|e| CliError::Internal(format!("cannot create {}: {e}", data_dir.display())))?;
     let fs = StdFs::new(data_dir.to_path_buf());
-    let delivery = DeliveryConfig::new(5, false, Vec::new())
+    let delivery = DeliveryConfig::new(5, false, DEFAULT_NACK_BACKOFF_NANOS.to_vec())
         .map_err(|e| CliError::Internal(format!("delivery config: {e:?}")))?;
     let engine = Engine::open(
         fs,

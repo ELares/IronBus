@@ -380,9 +380,16 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// Returns [`EngineError::GenerationExhausted`] if the lease generation space is spent.
     pub fn nack(&mut self, token: &LeaseToken, delay_ms: u64) -> Result<NackResult, EngineError> {
         let now = self.log.now_monotonic();
-        // Convert the wire delay (milliseconds) to the monotonic-nanosecond units the lease
-        // deadlines use, saturating rather than overflowing on an absurd delay.
-        let delay_nanos = delay_ms.saturating_mul(1_000_000);
+        let delay_nanos = if delay_ms == 0 {
+            // No explicit client delay: apply the configured escalating backoff for this
+            // attempt (an empty schedule yields 0, i.e. immediate, the prior behavior).
+            let attempt = self.leases.deliveries(token).unwrap_or(0);
+            self.delivery.nack_backoff(attempt)
+        } else {
+            // An explicit client delay (milliseconds) overrides the schedule; saturate rather
+            // than overflow on an absurd value.
+            delay_ms.saturating_mul(1_000_000)
+        };
         Ok(match self.leases.nack(token, now, delay_nanos) {
             NackOutcome::Requeued { .. } => NackResult::Requeued,
             NackOutcome::Fenced => NackResult::Fenced,
@@ -890,6 +897,62 @@ mod tests {
         // A stale token is fenced.
         e.ack(&d.token);
         assert_eq!(e.progress(&d.token), ProgressResult::Fenced);
+    }
+
+    #[test]
+    fn nack_with_no_delay_applies_the_backoff_schedule() {
+        // backoff [50] ns for the first attempt: a nack with no client delay defers redelivery
+        // to now + 50 rather than redelivering immediately.
+        let mut cfg = config(10, 5);
+        cfg.delivery = DeliveryConfig::new(5, false, vec![50]).unwrap();
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(InMemoryFs::new(), std::sync::Arc::clone(&clock), cfg).unwrap();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"x",
+        })
+        .unwrap();
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.deliveries, 1);
+        assert_eq!(e.nack(&d.token, 0).unwrap(), NackResult::Requeued);
+        // The backoff deadline (now + 50) is in the future, so nothing redelivers yet.
+        assert!(
+            matches!(e.poll_now().unwrap(), Poll::Idle),
+            "backoff defers redelivery"
+        );
+        // Past the backoff window it redelivers, with the attempt count escalated.
+        clock.advance_monotonic_nanos(50);
+        let d2 = message(e.poll_now().unwrap());
+        assert_eq!(d2.offset, d.offset);
+        assert_eq!(d2.deliveries, 2);
+    }
+
+    #[test]
+    fn an_explicit_nack_delay_overrides_the_backoff_schedule() {
+        // backoff [50] ns, but the client asks for 1 ms (1_000_000 ns); the client wins.
+        let mut cfg = config(10, 5);
+        cfg.delivery = DeliveryConfig::new(5, false, vec![50]).unwrap();
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(InMemoryFs::new(), std::sync::Arc::clone(&clock), cfg).unwrap();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"x",
+        })
+        .unwrap();
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(e.nack(&d.token, 1).unwrap(), NackResult::Requeued);
+        // Advancing past the backoff (50 ns) is not enough: the client's 1 ms delay governs.
+        clock.advance_monotonic_nanos(50);
+        assert!(
+            matches!(e.poll_now().unwrap(), Poll::Idle),
+            "an explicit client delay overrides the backoff schedule"
+        );
     }
 
     #[test]
