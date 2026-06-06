@@ -129,7 +129,9 @@ pub fn encode_pub(msg: &PubBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError>
     Ok(())
 }
 
-/// Decodes a PUB body. The payload is whatever remains after the framed fields.
+/// Decodes a PUB body. The payload is whatever remains after the framed fields, so
+/// `body` MUST be exactly one frame's body (as handed out by [`crate::frame::decode_frame`]):
+/// any trailing bytes would be folded into the payload.
 ///
 /// # Errors
 /// Returns a [`BodyError`] on a short or inconsistent body.
@@ -332,6 +334,32 @@ mod tests {
             assert_eq!(buf.len(), 25);
             assert_eq!(decode_ack(&buf).unwrap(), ack);
         }
+    }
+
+    #[test]
+    fn ackop_tags_have_their_exact_frozen_wire_values() {
+        // Pin the on-the-wire op numbers so a future reorder breaks a test here, not a
+        // deployed peer. Part of the frozen wire contract.
+        assert_eq!(AckOp::Ack.as_u8(), 0);
+        assert_eq!(AckOp::Nack.as_u8(), 1);
+        assert_eq!(AckOp::Term.as_u8(), 2);
+        assert_eq!(AckOp::Progress.as_u8(), 3);
+    }
+
+    #[test]
+    fn pub_round_trips_at_the_u16_field_boundary() {
+        // key and headers each at exactly u16::MAX, the largest a length field can name.
+        let big = vec![0xa5_u8; usize::from(u16::MAX)];
+        let msg = PubBody {
+            flags: 7,
+            timestamp_ms: 1,
+            key: &big,
+            headers: &big,
+            payload: b"tail",
+        };
+        let mut buf = Vec::new();
+        encode_pub(&msg, &mut buf).unwrap();
+        assert_eq!(decode_pub(&buf).unwrap(), msg);
     }
 
     #[test]
