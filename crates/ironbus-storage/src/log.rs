@@ -210,6 +210,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // A corrupt or unreadable segment fails its scan here, not silently at read time.
         let mut next_base_offset = 0u64;
         let mut next_base_seq = 0u64;
+        // Total durable record-region bytes across the recovered prefix, for the I3 global
+        // loss cap (the byte count loss is measured against).
+        let mut durable_bytes = 0u64;
         let mut highest: Option<RecoveryScan> = None;
         let mut slots: Vec<SegmentSlot> = Vec::with_capacity(ids.len());
         let total = ids.len();
@@ -245,6 +248,8 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             next_base_seq = base_seq
                 .checked_add(count)
                 .ok_or(StorageError::SegmentFull)?;
+            durable_bytes = durable_bytes
+                .saturating_add(scan.valid_end.saturating_sub(SEGMENT_HEADER_LEN as u64));
             if is_last {
                 highest = Some(scan);
             }
@@ -305,6 +310,21 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 last_seq,
             ));
         }
+
+        // I3: fail closed if recovery would drop more than the bounded-loss caps allow (#120),
+        // rather than accept unbounded silent loss. The per-event cap is one segment or 64 MiB,
+        // whichever is smaller. The global cap is 1% of the durable bytes, FLOORED at the
+        // per-event cap so a single in-cap event (the normal torn tail, even on a tiny log whose
+        // 1% is under one byte) is always within bounds; without that floor the literal 1% would
+        // freeze a normal small-log recovery.
+        let per_event_cap = log
+            .config
+            .max_segment_bytes
+            .min(LossReport::PER_EVENT_BYTE_CAP);
+        let global_cap = LossReport::global_loss_cap_bytes(durable_bytes).max(per_event_cap);
+        log.loss_report
+            .check_caps(per_event_cap, global_cap)
+            .map_err(StorageError::ExcessiveRecoveryLoss)?;
         Ok(log)
     }
 
@@ -1358,6 +1378,68 @@ mod tests {
             report.events[0].bytes_skipped,
             recovered.recovered_truncated_bytes()
         );
+    }
+
+    #[test]
+    fn recovery_fails_closed_when_loss_exceeds_the_per_event_cap() {
+        // A single torn span larger than the per-event cap (here one segment, 4096) must fail
+        // recovery closed, not be accepted as silent loss (#120, I3).
+        let config = LogConfig {
+            max_segment_bytes: 4096,
+        };
+        let mut log = open_mem(config);
+        for i in 0..3u8 {
+            log.append(&rec(&[i; 8])).unwrap();
+        }
+        log.sync().unwrap();
+        let active = log.active_segment_id();
+        let fs = log.into_filesystem();
+
+        // Append a 5000-byte run of 0xff past the durable tail: a corrupt tail bigger than the
+        // 4096 per-event cap. (0xffff is not the record magic, so it is a corrupt header.)
+        let file = fs.open(&segment_file_name(active)).unwrap();
+        let len = file.len().unwrap();
+        file.write_all_at(&[0xffu8; 5000], len).unwrap();
+        file.sync_data().unwrap();
+
+        let err = Log::open(fs, ManualClock::new(), config).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::ExcessiveRecoveryLoss(crate::loss::CapViolation::PerEvent {
+                    cap: 4096,
+                    ..
+                })
+            ),
+            "expected a per-event cap violation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_normal_small_log_torn_tail_recovers_despite_exceeding_one_percent() {
+        // The small-log-safe floor: a tiny log (4 records, a few dozen durable bytes) whose
+        // torn tail is far more than 1% of its durable bytes still recovers, because the global
+        // cap is floored at the per-event cap. Without the floor, the literal 1% would freeze
+        // this normal recovery.
+        let mut log = open_mem(LogConfig::default());
+        for i in 0..4u8 {
+            log.append(&rec(&[i; 8])).unwrap();
+        }
+        log.sync().unwrap();
+        let fs = log.into_filesystem();
+        let file = fs.open(&segment_file_name(0)).unwrap();
+        let len = file.len().unwrap();
+        file.set_len(len - 3).unwrap();
+        file.sync_data().unwrap();
+
+        // Recovery SUCCEEDS (does not freeze) and reports the loss. The durable record region
+        // here is only a few dozen bytes, so its 1% is under a single byte and the three torn
+        // bytes exceed it; without the per-event-cap floor on the global cap this recovery
+        // would have failed closed.
+        let recovered = Log::open(fs, ManualClock::new(), LogConfig::default()).unwrap();
+        assert_eq!(recovered.flushed_offset(), Offset::new(3));
+        assert!(recovered.recovered_truncated_bytes() > 0);
+        assert_eq!(recovered.loss_report().events.len(), 1);
     }
 
     #[test]

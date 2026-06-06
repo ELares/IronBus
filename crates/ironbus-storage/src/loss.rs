@@ -180,7 +180,77 @@ impl LossReport {
         durable_bytes / LossReport::GLOBAL_LOSS_CAP_DENOMINATOR
             * LossReport::GLOBAL_LOSS_CAP_NUMERATOR
     }
+
+    /// Checks this report against the I3 bounded-loss caps (#120): no single event may drop
+    /// more than `per_event_cap`, and the total dropped may not exceed `global_cap`. Returns
+    /// the first violation, or `Ok(())` if the loss is within bounds.
+    ///
+    /// The caller computes the caps from the runtime config (the per-event cap is one segment
+    /// or 64 MiB whichever is smaller; the global cap is derived from the durable byte count).
+    /// This is a pure function so the recovery path, the sim, and corpus or property fixtures
+    /// can all assert the same bound.
+    ///
+    /// # Errors
+    /// Returns the first [`CapViolation`] found.
+    pub fn check_caps(&self, per_event_cap: u64, global_cap: u64) -> Result<(), CapViolation> {
+        for e in &self.events {
+            if e.bytes_skipped > per_event_cap {
+                return Err(CapViolation::PerEvent {
+                    bytes_skipped: e.bytes_skipped,
+                    cap: per_event_cap,
+                });
+            }
+        }
+        let total = self.total_bytes_skipped();
+        if total > global_cap {
+            return Err(CapViolation::Global {
+                total_bytes_skipped: total,
+                cap: global_cap,
+            });
+        }
+        Ok(())
+    }
 }
+
+/// A bounded-loss cap that [`LossReport::check_caps`] found exceeded: recovery must fail
+/// closed rather than accept this as silent loss (#120, I3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapViolation {
+    /// A single event dropped more than the per-event cap allows.
+    PerEvent {
+        /// The offending event's dropped bytes.
+        bytes_skipped: u64,
+        /// The per-event cap (one segment or 64 MiB, whichever is smaller).
+        cap: u64,
+    },
+    /// The total dropped across all events exceeded the global cap.
+    Global {
+        /// The total dropped across the report.
+        total_bytes_skipped: u64,
+        /// The global cap (derived from the durable byte count).
+        cap: u64,
+    },
+}
+
+impl std::fmt::Display for CapViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CapViolation::PerEvent { bytes_skipped, cap } => write!(
+                f,
+                "a recovery loss event dropped {bytes_skipped} bytes, over the per-event cap {cap}"
+            ),
+            CapViolation::Global {
+                total_bytes_skipped,
+                cap,
+            } => write!(
+                f,
+                "recovery would drop {total_bytes_skipped} bytes total, over the global cap {cap}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CapViolation {}
 
 impl Default for LossReport {
     fn default() -> LossReport {
@@ -293,5 +363,51 @@ mod tests {
         let back: LossReport = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);
         assert_eq!(back.schema_version, LossReport::SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn check_caps_accepts_loss_within_bounds() {
+        let mut r = LossReport::new();
+        r.push(LossEvent::span(0, 0, 100, 1, ReasonCode::TornTail));
+        r.push(LossEvent::span(1, 0, 100, 1, ReasonCode::CorruptRecordBody));
+        // Each event (100) is under the per-event cap, and the total (200) is under the global.
+        assert_eq!(r.check_caps(150, 500), Ok(()));
+        // An empty report is always within bounds.
+        assert_eq!(LossReport::new().check_caps(0, 0), Ok(()));
+    }
+
+    #[test]
+    fn check_caps_rejects_a_single_oversized_event() {
+        let mut r = LossReport::new();
+        r.push(LossEvent::span(0, 0, 50, 1, ReasonCode::TornTail));
+        r.push(LossEvent::span(1, 0, 300, 1, ReasonCode::TornTail));
+        // The second event (300) exceeds the per-event cap (200), even though the global cap
+        // is generous. The per-event check fires first and names the offending event.
+        assert_eq!(
+            r.check_caps(200, 10_000),
+            Err(CapViolation::PerEvent {
+                bytes_skipped: 300,
+                cap: 200,
+            })
+        );
+    }
+
+    #[test]
+    fn check_caps_rejects_a_cascade_over_the_global_cap() {
+        // Many events, each under the per-event cap, summing past the global cap: a cascade of
+        // skipped spans that turns bounded loss into unbounded loss.
+        let mut r = LossReport::new();
+        for i in 0..5u64 {
+            r.push(LossEvent::span(i, 0, 100, 1, ReasonCode::CorruptRecordBody));
+        }
+        assert_eq!(r.total_bytes_skipped(), 500);
+        // Per-event cap (200) holds for every event, but the total (500) exceeds the global (400).
+        assert_eq!(
+            r.check_caps(200, 400),
+            Err(CapViolation::Global {
+                total_bytes_skipped: 500,
+                cap: 400,
+            })
+        );
     }
 }
