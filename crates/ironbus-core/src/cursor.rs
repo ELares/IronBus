@@ -20,6 +20,16 @@
 
 use crate::types::Offset;
 
+/// The on-disk snapshot format version for an [`AckCursor`] (see [`AckCursor::encode_snapshot`]).
+const SNAPSHOT_VERSION: u8 = 1;
+
+/// Reads a little-endian `u64` at `pos`; the caller has bounds-checked the slice length.
+fn read_u64(buf: &[u8], pos: usize) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&buf[pos..pos + 8]);
+    u64::from_le_bytes(b)
+}
+
 /// Tracks a work-group's committed cursor as acks arrive, possibly out of order.
 ///
 /// `committed` is the next offset to deliver: every offset strictly below it is acked.
@@ -91,6 +101,65 @@ impl AckCursor {
     #[must_use]
     pub fn ahead_ranges(&self) -> &[(u64, u64)] {
         &self.ahead
+    }
+
+    /// Encodes a durable snapshot of this cursor for a consumer-state store (#60): a 1-byte
+    /// version, the committed watermark, the run-length acked-ahead ranges, then a trailing
+    /// crc32c over everything before it. The run count is implicit (the bytes between the
+    /// header and the checksum), so [`AckCursor::decode_snapshot`] needs no separate length.
+    pub fn encode_snapshot(&self, out: &mut Vec<u8>) {
+        let start = out.len();
+        out.push(SNAPSHOT_VERSION);
+        out.extend_from_slice(&self.committed.to_le_bytes());
+        for &(s, e) in &self.ahead {
+            out.extend_from_slice(&s.to_le_bytes());
+            out.extend_from_slice(&e.to_le_bytes());
+        }
+        let crc = crc32c::crc32c(&out[start..]);
+        out.extend_from_slice(&crc.to_le_bytes());
+    }
+
+    /// Decodes a snapshot produced by [`AckCursor::encode_snapshot`], validating the version,
+    /// the checksum, and the acked-ahead range shape (via the same rules as
+    /// [`AckCursor::resume_with_ahead`]). A torn or corrupt snapshot is rejected with a typed
+    /// [`SnapshotError`] so the caller can fall back to the previous snapshot rather than
+    /// restore a broken cursor.
+    ///
+    /// # Errors
+    /// Returns [`SnapshotError`] for a short, mis-sized, wrong-version, bad-checksum, or
+    /// structurally invalid snapshot.
+    pub fn decode_snapshot(input: &[u8]) -> Result<AckCursor, SnapshotError> {
+        // version (1) + committed (8) + crc (4) = 13 fixed bytes, plus 16 per ahead range.
+        const FIXED: usize = 1 + 8 + 4;
+        if input.len() < FIXED {
+            return Err(SnapshotError::Truncated);
+        }
+        let runs_len = input.len() - FIXED;
+        if runs_len % 16 != 0 {
+            return Err(SnapshotError::BadLength { len: input.len() });
+        }
+        let version = input[0];
+        if version != SNAPSHOT_VERSION {
+            return Err(SnapshotError::UnsupportedVersion(version));
+        }
+        let crc_at = input.len() - 4;
+        let stored = u32::from_le_bytes([
+            input[crc_at],
+            input[crc_at + 1],
+            input[crc_at + 2],
+            input[crc_at + 3],
+        ]);
+        if crc32c::crc32c(&input[..crc_at]) != stored {
+            return Err(SnapshotError::BadCrc);
+        }
+        let committed = read_u64(input, 1);
+        let mut ahead = Vec::with_capacity(runs_len / 16);
+        let mut pos = 9;
+        while pos < crc_at {
+            ahead.push((read_u64(input, pos), read_u64(input, pos + 8)));
+            pos += 16;
+        }
+        AckCursor::resume_with_ahead(Offset::new(committed), ahead).map_err(SnapshotError::Ranges)
     }
 
     /// The committed offset: every offset below it is acked, and it is the next offset a
@@ -213,6 +282,52 @@ impl core::fmt::Display for AckCursorError {
 }
 
 impl std::error::Error for AckCursorError {}
+
+/// A failure decoding an [`AckCursor`] snapshot (see [`AckCursor::decode_snapshot`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotError {
+    /// The snapshot is shorter than the fixed header plus checksum.
+    Truncated,
+    /// The snapshot length is not a fixed header plus a whole number of 16-byte ranges.
+    BadLength {
+        /// The rejected length.
+        len: usize,
+    },
+    /// The snapshot's version byte is one this build does not understand.
+    UnsupportedVersion(u8),
+    /// The trailing crc32c did not match the body (a torn or corrupt snapshot).
+    BadCrc,
+    /// The decoded acked-ahead ranges were structurally invalid.
+    Ranges(AckCursorError),
+}
+
+impl core::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SnapshotError::Truncated => write!(f, "cursor snapshot is too short for its header"),
+            SnapshotError::BadLength { len } => {
+                write!(
+                    f,
+                    "cursor snapshot length {len} is not a header plus whole ranges"
+                )
+            }
+            SnapshotError::UnsupportedVersion(v) => {
+                write!(f, "cursor snapshot version {v} is not supported")
+            }
+            SnapshotError::BadCrc => write!(f, "cursor snapshot checksum did not match"),
+            SnapshotError::Ranges(e) => write!(f, "cursor snapshot ranges are invalid: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SnapshotError::Ranges(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -363,6 +478,145 @@ mod tests {
         AckCursor::resume_with_ahead(off(5), vec![(7, 9), (11, 12)]).unwrap();
     }
 
+    /// Builds a crc-correct snapshot from arbitrary, possibly invalid, parts, so a test can feed
+    /// `decode_snapshot` a structurally broken body that still passes the checksum.
+    fn raw_snapshot(committed: u64, ranges: &[(u64, u64)]) -> Vec<u8> {
+        let mut out = vec![SNAPSHOT_VERSION];
+        out.extend_from_slice(&committed.to_le_bytes());
+        for &(s, e) in ranges {
+            out.extend_from_slice(&s.to_le_bytes());
+            out.extend_from_slice(&e.to_le_bytes());
+        }
+        let crc = crc32c::crc32c(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn snapshot_round_trips_an_empty_cursor() {
+        let c = AckCursor::resume(off(42));
+        let mut buf = Vec::new();
+        c.encode_snapshot(&mut buf);
+        // No acked-ahead runs: just version (1) + committed (8) + crc (4).
+        assert_eq!(buf.len(), 13);
+        let restored = AckCursor::decode_snapshot(&buf).expect("own snapshot decodes");
+        assert_eq!(restored, c);
+    }
+
+    #[test]
+    fn snapshot_round_trips_multiple_runs() {
+        let mut c = AckCursor::new();
+        // Leave gaps so the acked-ahead set keeps several disjoint, non-adjacent runs.
+        for o in [1u64, 2, 5, 8, 9, 10, 20] {
+            c.ack(off(o));
+        }
+        assert!(
+            c.ahead_runs() >= 3,
+            "test needs several runs, got {}",
+            c.ahead_runs()
+        );
+        let mut buf = Vec::new();
+        c.encode_snapshot(&mut buf);
+        assert_eq!(buf.len(), 13 + 16 * c.ahead_runs());
+        let restored = AckCursor::decode_snapshot(&buf).expect("own snapshot decodes");
+        assert_eq!(restored, c);
+        assert_eq!(restored.ahead_ranges(), c.ahead_ranges());
+    }
+
+    #[test]
+    fn decode_rejects_a_truncated_snapshot() {
+        // Anything shorter than the 13-byte fixed header cannot hold a version + committed + crc.
+        for len in 0..13usize {
+            let buf = vec![0u8; len];
+            assert_eq!(
+                AckCursor::decode_snapshot(&buf),
+                Err(SnapshotError::Truncated),
+                "length {len} must be Truncated"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rejects_a_mis_sized_snapshot() {
+        // 13 + a partial range (not a whole 16-byte multiple) is a corrupt length.
+        let snapshot = raw_snapshot(0, &[]);
+        for extra in 1..16usize {
+            let mut bad = snapshot.clone();
+            // Insert junk bytes before the crc so the run region is not 16-aligned.
+            bad.splice(9..9, vec![0u8; extra]);
+            assert_eq!(
+                AckCursor::decode_snapshot(&bad),
+                Err(SnapshotError::BadLength { len: bad.len() }),
+                "an extra {extra} bytes must be BadLength"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rejects_an_unsupported_version() {
+        let mut buf = raw_snapshot(7, &[(9, 11)]);
+        buf[0] = SNAPSHOT_VERSION + 1;
+        // Re-checksum so the only fault is the version byte: this proves the version is validated,
+        // not merely caught by the crc.
+        let crc_at = buf.len() - 4;
+        let crc = crc32c::crc32c(&buf[..crc_at]);
+        buf[crc_at..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            AckCursor::decode_snapshot(&buf),
+            Err(SnapshotError::UnsupportedVersion(SNAPSHOT_VERSION + 1))
+        );
+    }
+
+    #[test]
+    fn decode_rejects_a_corrupt_checksum() {
+        let mut c = AckCursor::new();
+        for o in [0u64, 1, 4, 5] {
+            c.ack(off(o));
+        }
+        let mut buf = Vec::new();
+        c.encode_snapshot(&mut buf);
+        // Flip one bit in the committed watermark; the trailing crc no longer matches.
+        buf[1] ^= 0x01;
+        assert_eq!(AckCursor::decode_snapshot(&buf), Err(SnapshotError::BadCrc));
+    }
+
+    #[test]
+    fn decode_rejects_structurally_invalid_ranges() {
+        // A crc-correct body whose ranges break the cursor's shape rules must still be rejected:
+        // the codec delegates range validation to `resume_with_ahead`.
+        let adjacent = raw_snapshot(5, &[(7, 9), (9, 11)]); // adjacent: should be one run
+        assert!(matches!(
+            AckCursor::decode_snapshot(&adjacent),
+            Err(SnapshotError::Ranges(_))
+        ));
+        let below = raw_snapshot(5, &[(3, 4)]); // below the watermark
+        assert!(matches!(
+            AckCursor::decode_snapshot(&below),
+            Err(SnapshotError::Ranges(_))
+        ));
+        let empty_run = raw_snapshot(5, &[(7, 7)]); // empty / reversed
+        assert!(matches!(
+            AckCursor::decode_snapshot(&empty_run),
+            Err(SnapshotError::Ranges(_))
+        ));
+    }
+
+    #[test]
+    fn encode_appends_to_a_prefixed_buffer() {
+        // The storage layer frames the snapshot after other bytes, so encode must not assume an
+        // empty buffer and the appended suffix must decode on its own.
+        let mut c = AckCursor::new();
+        for o in [0u64, 2, 3] {
+            c.ack(off(o));
+        }
+        let mut buf = vec![0xAA, 0xBB, 0xCC];
+        let start = buf.len();
+        c.encode_snapshot(&mut buf);
+        let restored = AckCursor::decode_snapshot(&buf[start..]).expect("suffix decodes");
+        assert_eq!(restored, c);
+        assert_eq!(&buf[..start], &[0xAA, 0xBB, 0xCC]);
+    }
+
     proptest! {
         #[test]
         fn acking_a_permutation_commits_everything(perm in any_permutation(1..40usize)) {
@@ -404,6 +658,48 @@ mod tests {
             for o in 0..45u64 {
                 prop_assert_eq!(restored.is_acked(off(o)), c.is_acked(off(o)));
             }
+        }
+
+        /// The on-disk snapshot codec round-trips any reachable cursor: encode then decode is the
+        /// identity, the checksum accepts the cursor's own bytes, and the framing length is exact.
+        #[test]
+        fn snapshot_codec_round_trips(acks in prop::collection::vec(0u64..40, 0..80)) {
+            let mut c = AckCursor::new();
+            for &o in &acks {
+                c.ack(off(o));
+            }
+            let mut buf = Vec::new();
+            c.encode_snapshot(&mut buf);
+            // version (1) + committed (8) + crc (4) + 16 bytes per acked-ahead run.
+            prop_assert_eq!(buf.len(), 13 + 16 * c.ahead_runs());
+            let restored = AckCursor::decode_snapshot(&buf)
+                .expect("a cursor's own snapshot is always well-formed");
+            prop_assert_eq!(&restored, &c);
+            for o in 0..45u64 {
+                prop_assert_eq!(restored.is_acked(off(o)), c.is_acked(off(o)));
+            }
+        }
+
+        /// crc32c detects every single-bit error in a message this small, so flipping any one bit
+        /// of a snapshot is always rejected: no silently corrupted cursor is ever restored.
+        #[test]
+        fn snapshot_codec_detects_single_bit_flips(
+            acks in prop::collection::vec(0u64..40, 0..40),
+            idx in 0usize..4096,
+            bit in 0u8..8,
+        ) {
+            let mut c = AckCursor::new();
+            for &o in &acks {
+                c.ack(off(o));
+            }
+            let mut buf = Vec::new();
+            c.encode_snapshot(&mut buf);
+            let i = idx % buf.len();
+            buf[i] ^= 1u8 << bit;
+            prop_assert!(
+                AckCursor::decode_snapshot(&buf).is_err(),
+                "a flip of byte {i} bit {bit} must be detected"
+            );
         }
 
         #[test]
