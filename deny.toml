@@ -1,0 +1,30 @@
+# Supply-chain policy for IronBus (https://embarkstudios.github.io/cargo-deny/).
+[graph]
+all-features = true
+
+[licenses]
+# Permissive licenses only, per the governance decision (#22).
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Per #139, zstd-sys is the only vendored-C crate allowed on the default path.
+# A C-FFI allowlist is enforced here once dependencies are introduced.
+
+[advisories]
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
