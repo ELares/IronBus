@@ -47,6 +47,25 @@ resume" below), so it is NOT fsynced on every ack.
 | `--visibility-timeout-ms <n>` | `30000` | How long a delivered message stays in flight before it may redeliver. Must be at least 1. The lease hard cap is the larger of 5 minutes and this. |
 | `--health-addr <host:port>` | off | If set, also serve the health and metrics HTTP endpoints on this loopback port. |
 
+### Durability across platforms
+
+A produce is acknowledged only after its record clears a true write-barrier to the
+storage device, so an acknowledged offset means the bytes will survive a power cut. How
+that barrier is issued depends on the platform, and IronBus relies on the standard
+library to issue the right one:
+
+| Platform | Durable-sync barrier |
+|----------|----------------------|
+| Linux (the production target: static musl on ext4 or f2fs) | `fdatasync(2)` / `fsync(2)`, true device write-barriers. |
+| macOS and iOS (developer and CI targets) | `fcntl(fd, F_FULLFSYNC)`, which flushes the drive's volatile write cache to permanent storage. A plain `fsync(2)` on Darwin does NOT issue that flush, so the standard library uses `F_FULLFSYNC` for both `sync_data` and `sync_all`, and IronBus relies on exactly that. |
+| Windows | Not a v1 broker target; `pub` and `sub` run, but `serve` does not. |
+
+IronBus does not silently downgrade the barrier. If a filesystem cannot honour
+`F_FULLFSYNC`, the sync surfaces an error, the log writer freezes (`/readyz` reports
+`503`), and the broker stops acknowledging rather than letting an ack outrun a real
+flush. Production durability targets Linux musl; macOS is supported for development and
+CI, where the `F_FULLFSYNC` barrier still applies.
+
 ## Produce
 
 ```sh
