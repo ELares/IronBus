@@ -342,3 +342,193 @@ mod tests {
         assert_eq!(&buf, b"data");
     }
 }
+
+/// A production [`RandomAccessFile`] backed by an OS file, using cursor-free
+/// positioned IO (`pread`/`pwrite`) so concurrent readers never contend on a shared
+/// file cursor. Available on Unix targets (the v1 production targets are Linux musl
+/// and macOS); Windows is a v1 non-goal and gets only the trait and [`InMemoryFile`].
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct StdFile {
+    file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl StdFile {
+    /// Opens an existing file for reading and writing.
+    ///
+    /// # Errors
+    /// Propagates the underlying IO error.
+    pub fn open(path: &std::path::Path) -> io::Result<StdFile> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        Ok(StdFile { file })
+    }
+
+    /// Creates a file for reading and writing, TRUNCATING any existing file at the
+    /// path. This is destructive: for a durable segment that must never clobber an
+    /// existing one, use [`StdFile::create_new`]. Intended for scratch and tests.
+    ///
+    /// # Errors
+    /// Propagates the underlying IO error.
+    pub fn create(path: &std::path::Path) -> io::Result<StdFile> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        Ok(StdFile { file })
+    }
+
+    /// Creates a new file for reading and writing, failing with
+    /// [`io::ErrorKind::AlreadyExists`] if the path already exists (`O_EXCL`). This is
+    /// the safe primitive for creating a durable segment: it can never clobber an
+    /// existing one.
+    ///
+    /// # Errors
+    /// Returns `AlreadyExists` if the path exists, or propagates the underlying IO error.
+    pub fn create_new(path: &std::path::Path) -> io::Result<StdFile> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        Ok(StdFile { file })
+    }
+
+    /// Wraps an already-open file, for a preallocated or handed-off descriptor. The
+    /// caller is responsible for opening it read and write.
+    #[must_use]
+    pub fn from_file(file: std::fs::File) -> StdFile {
+        StdFile { file }
+    }
+}
+
+#[cfg(unix)]
+impl RandomAccessFile for StdFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        std::os::unix::fs::FileExt::read_at(&self.file, buf, offset)
+    }
+
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        std::os::unix::fs::FileExt::write_all_at(&self.file, buf, offset)
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        self.file.sync_data()
+    }
+
+    fn sync_all(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.file.set_len(len)
+    }
+}
+
+/// Fsyncs the directory at `path` so a newly created, renamed, or removed entry in
+/// it is crash-durable. Without this, a power loss after creating a segment file but
+/// before syncing its directory can leave the file absent on restart.
+///
+/// Ordering: call this AFTER the new file's own `sync_all`, so the create path is
+/// fsync-the-file, then full-fsync-the-parent-directory, then ack.
+///
+/// # Errors
+/// Propagates the underlying IO error.
+#[cfg(unix)]
+pub fn sync_dir(path: &std::path::Path) -> io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(all(test, unix))]
+mod std_file_tests {
+    use super::*;
+
+    #[test]
+    fn stdfile_roundtrip_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg.log");
+        let f = StdFile::create(&path).unwrap();
+        f.write_all_at(b"hello world", 0).unwrap();
+        f.sync_data().unwrap();
+        let mut buf = [0u8; 11];
+        f.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"hello world");
+        assert_eq!(f.len().unwrap(), 11);
+        drop(f);
+        // Reopen and verify the bytes persisted.
+        let g = StdFile::open(&path).unwrap();
+        let mut b2 = [0u8; 5];
+        assert_eq!(g.read_at(&mut b2, 6).unwrap(), 5);
+        assert_eq!(&b2, b"world");
+    }
+
+    #[test]
+    fn stdfile_set_len_truncate_and_extend() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = StdFile::create(&dir.path().join("x")).unwrap();
+        f.write_all_at(b"abcdef", 0).unwrap();
+        f.set_len(3).unwrap();
+        assert_eq!(f.len().unwrap(), 3);
+        f.set_len(5).unwrap();
+        let mut buf = [9u8; 5];
+        f.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, &[b'a', b'b', b'c', 0, 0]);
+    }
+
+    #[test]
+    fn stdfile_read_past_end_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = StdFile::create(&dir.path().join("e")).unwrap();
+        let mut buf = [0u8; 4];
+        assert_eq!(f.read_at(&mut buf, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn create_new_refuses_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg");
+        let _f = StdFile::create_new(&path).unwrap();
+        let err = StdFile::create_new(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn concurrent_positioned_reads_are_race_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = StdFile::create(&dir.path().join("seg")).unwrap();
+        f.write_all_at(b"0123456789", 0).unwrap();
+        f.sync_data().unwrap();
+        let f = std::sync::Arc::new(f);
+        std::thread::scope(|sc| {
+            for k in 0u64..8 {
+                let f = std::sync::Arc::clone(&f);
+                sc.spawn(move || {
+                    let off = k % 7;
+                    let start = usize::try_from(off).unwrap();
+                    for _ in 0..200 {
+                        let mut buf = [0u8; 3];
+                        f.read_exact_at(&mut buf, off).unwrap();
+                        assert_eq!(&buf, &b"0123456789"[start..start + 3]);
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn sync_dir_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = StdFile::create(&dir.path().join("f")).unwrap();
+        f.sync_all().unwrap();
+        sync_dir(dir.path()).unwrap();
+    }
+}
