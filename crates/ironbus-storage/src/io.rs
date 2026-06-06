@@ -417,6 +417,23 @@ impl RandomAccessFile for StdFile {
         std::os::unix::fs::FileExt::write_all_at(&self.file, buf, offset)
     }
 
+    // Durability barrier (the load-bearing guarantee behind ack-implies-durable, I2).
+    //
+    // These delegate straight to `std`, and that is deliberate, not an oversight (#153):
+    // - Linux (the production target, musl on ext4/f2fs): `sync_data` is `fdatasync(2)`
+    //   and `sync_all` is `fsync(2)`, both true write-barriers to the device.
+    // - Apple (a developer and CI target): `std` maps BOTH `sync_data` and `sync_all` to
+    //   `fcntl(fd, F_FULLFSYNC)`, which flushes the drive's volatile write cache to
+    //   permanent storage. Plain `fsync(2)` on Darwin does NOT issue that barrier, so the
+    //   correct path is exactly the `F_FULLFSYNC` that `std` already performs; wrapping
+    //   our own `fcntl` here would only duplicate the barrier. Verified against the
+    //   `std::sys::fs::unix` source (`os_fsync`/`os_datasync`, `target_vendor = \"apple\"`).
+    //
+    // `std` issues `F_FULLFSYNC` unconditionally, with no `ENOTSUP` fallback to a weaker
+    // `fsync`. We rely on that on purpose: on the rare filesystem that cannot honour the
+    // barrier, surfacing the error (which the engine turns into a frozen writer) and
+    // refusing to ack is the fail-closed outcome a durability system wants, never a
+    // silent downgrade that would let an ack outrun a real flush.
     fn sync_data(&self) -> io::Result<()> {
         self.file.sync_data()
     }
@@ -530,6 +547,31 @@ mod std_file_tests {
         let f = StdFile::create(&dir.path().join("f")).unwrap();
         f.sync_all().unwrap();
         sync_dir(dir.path()).unwrap();
+    }
+
+    // On Apple targets `std` maps both `sync_data` and `sync_all` to
+    // `fcntl(fd, F_FULLFSYNC)` (the device-cache flush, not a plain `fsync`). This
+    // exercises that durability-barrier path on the macOS CI runner and asserts it
+    // succeeds on a regular file and the bytes survive a close/reopen. It cannot, in CI,
+    // prove the physical platter flush happened (that needs a real power cut, which #133
+    // and the device gates own); it pins that the `F_FULLFSYNC` syscall path is taken and
+    // does not error, so a regression that stopped issuing the barrier here would be
+    // caught the moment the call started failing or the round-trip broke (#153).
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn apple_durable_sync_takes_the_full_fsync_barrier_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("barrier.log");
+        let f = StdFile::create(&path).unwrap();
+        f.write_all_at(b"durable", 0).unwrap();
+        // Both durable-sync entry points reach `F_FULLFSYNC` on Apple; both must succeed.
+        f.sync_data().unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        let g = StdFile::open(&path).unwrap();
+        let mut buf = [0u8; 7];
+        g.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"durable");
     }
 }
 
