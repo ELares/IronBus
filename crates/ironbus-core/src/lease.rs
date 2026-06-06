@@ -15,13 +15,23 @@
 //!
 //! The table is pure and IO-free: the caller supplies monotonic time (`now`, in
 //! nanoseconds, from the clock seam) on each call. Across a restart the table is empty,
-//! so every previously in-flight message is treated as expired and redelivered. The
-//! caller bounds the table size through its max-in-flight (no unbounded growth here).
+//! so every previously in-flight message is treated as expired and redelivered. Because
+//! the table also resets its generation counter on a restart, fencing across a restart is
+//! NOT self-sufficient here: the caller must invalidate pre-restart tokens through an
+//! outer epoch (a server/connection generation), so a client cannot present a token
+//! minted before the restart. The caller also bounds the table size through its
+//! max-in-flight (no unbounded growth here), and drives expired leases through
+//! claim/max-deliver so orphaned leases are eventually evicted.
 
 use crate::types::Offset;
 use std::collections::BTreeMap;
 
 /// Visibility-timeout and hard-cap tunables, in nanoseconds of monotonic time.
+///
+/// A degenerate config is accepted but behaves as the clamp dictates: `hard_cap_nanos`
+/// below `visibility_nanos` clamps every deadline to the (smaller) cap, and a zero
+/// `visibility_nanos` or `hard_cap_nanos` makes a lease expire the instant it is granted
+/// (continuous redelivery). Use the defaults unless you mean it.
 #[derive(Clone, Copy, Debug)]
 pub struct LeaseConfig {
     /// How long a delivered message stays in-flight before it may be redelivered.
@@ -91,6 +101,11 @@ pub enum Claim {
     },
     /// The message is currently leased to a holder and its visibility has not expired.
     InFlight,
+    /// The generation space is exhausted (after `u64::MAX` grants, unreachable in any
+    /// real deployment). The table refuses to grant rather than reuse a generation, which
+    /// would silently break fencing; this mirrors the loud-failure contract of
+    /// [`Offset::checked_next`](crate::types::Offset::checked_next).
+    Exhausted,
 }
 
 /// The outcome of a [`LeaseTable::ack`].
@@ -153,8 +168,17 @@ impl LeaseTable {
             }
         }
         let generation = self.next_generation;
-        self.next_generation = generation.saturating_add(1);
-        let deadline = now.saturating_add(self.config.visibility_nanos);
+        // Refuse rather than reuse a generation: a saturating counter would silently break
+        // fencing, since a redelivery sharing the prior holder's generation double-acks.
+        let Some(next_generation) = generation.checked_add(1) else {
+            return Claim::Exhausted;
+        };
+        self.next_generation = next_generation;
+        // The deadline never exceeds the hard cap from the attempt start, even when the
+        // configured visibility window is larger than the cap, so the cap is a true bound.
+        let deadline = now
+            .saturating_add(self.config.visibility_nanos)
+            .min(now.saturating_add(self.config.hard_cap_nanos));
         let deliveries = if let Some(lease) = self.leases.get_mut(&off) {
             // Redelivery: a new attempt under a fresh generation, fencing the prior holder.
             lease.generation = generation;
@@ -249,7 +273,7 @@ mod tests {
     fn token(claim: Claim) -> LeaseToken {
         match claim {
             Claim::Granted { token, .. } => token,
-            Claim::InFlight => panic!("expected a grant"),
+            other => panic!("expected a grant, got {other:?}"),
         }
     }
 
@@ -350,9 +374,68 @@ mod tests {
             let c = t.claim(off(7), now);
             match c {
                 Claim::Granted { deliveries, .. } => assert_eq!(deliveries, expected),
-                Claim::InFlight => panic!("should redeliver"),
+                other => panic!("should redeliver, got {other:?}"),
             }
             now += 40; // advance past each visibility window
+        }
+    }
+
+    #[test]
+    fn generation_exhaustion_refuses_to_grant_rather_than_reuse() {
+        // At the generation ceiling, claim refuses instead of reusing a generation (which
+        // would let a redelivery share the prior holder's token and double-ack).
+        let mut t = LeaseTable::new(cfg());
+        t.next_generation = u64::MAX;
+        assert_eq!(t.claim(off(5), 0), Claim::Exhausted);
+        assert_eq!(t.in_flight(), 0);
+    }
+
+    #[test]
+    fn initial_grant_respects_the_hard_cap_even_when_visibility_is_larger() {
+        let mut t = LeaseTable::new(LeaseConfig {
+            visibility_nanos: 100,
+            hard_cap_nanos: 30,
+        });
+        let tok = token(t.claim(off(7), 0));
+        // The deadline is clamped to attempt_start + hard_cap = 30, not now + 100.
+        assert!(t.expired(29).is_empty());
+        assert_eq!(t.expired(30), vec![off(7)]);
+        assert_eq!(t.extend(&tok, 10), ExtendOutcome::Extended(30));
+        assert_eq!(t.extend(&tok, 30), ExtendOutcome::CapReached);
+    }
+
+    #[test]
+    fn the_hard_cap_resets_per_delivery_attempt() {
+        let mut t = LeaseTable::new(cfg()); // visibility 30, hard cap 100
+        let tok1 = token(t.claim(off(7), 0)); // attempt 1: cap at 100
+        assert_eq!(t.extend(&tok1, 90), ExtendOutcome::Extended(100));
+        // Expire and redeliver at 200: attempt 2 gets a FRESH cap at 300.
+        let tok2 = token(t.claim(off(7), 200));
+        assert_eq!(t.extend(&tok2, 290), ExtendOutcome::Extended(300));
+        assert_eq!(t.extend(&tok2, 300), ExtendOutcome::CapReached);
+    }
+
+    #[test]
+    fn leases_for_different_offsets_are_independent() {
+        let mut t = LeaseTable::new(cfg());
+        let a = token(t.claim(off(1), 0));
+        let b = token(t.claim(off(2), 0));
+        assert_ne!(a.generation, b.generation);
+        assert_eq!(t.ack(&a), AckOutcome::Acked);
+        assert_eq!(t.in_flight(), 1); // b untouched
+        assert_eq!(t.claim(off(2), 5), Claim::InFlight);
+        assert_eq!(t.ack(&b), AckOutcome::Acked);
+        assert_eq!(t.in_flight(), 0);
+    }
+
+    #[test]
+    fn a_lease_is_reclaimable_exactly_at_its_deadline() {
+        let mut t = LeaseTable::new(cfg()); // visibility 30 -> deadline 30
+        t.claim(off(7), 0);
+        assert_eq!(t.claim(off(7), 29), Claim::InFlight);
+        match t.claim(off(7), 30) {
+            Claim::Granted { deliveries, .. } => assert_eq!(deliveries, 2),
+            other => panic!("at-deadline should redeliver, got {other:?}"),
         }
     }
 
