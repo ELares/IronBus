@@ -98,8 +98,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@cargo-deny
-      - run: cargo deny --workspace check
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.19.8
+      - run: cargo deny check
 
   spdx:
     name: SPDX headers
@@ -111,7 +113,7 @@ jobs:
           set -euo pipefail
           miss=0
           while IFS= read -r f; do
-            head -1 "$f" | grep -qxF '// SPDX-License-Identifier: MIT OR Apache-2.0' || { echo "missing SPDX: $f"; miss=1; }
+            head -3 "$f" | tr -d '\r' | grep -qF '// SPDX-License-Identifier: MIT OR Apache-2.0' || { echo "missing SPDX: $f"; miss=1; }
           done < <(git ls-files '*.rs')
           if [ "$miss" = "1" ]; then
             echo "::error::all Rust sources must start with: // SPDX-License-Identifier: MIT OR Apache-2.0"

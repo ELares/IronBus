@@ -20,10 +20,11 @@ allow = [
 multiple-versions = "warn"
 wildcards = "deny"
 # Per #139, zstd-sys is the only vendored-C crate allowed on the default path.
-# A C-FFI allowlist is enforced here once dependencies are introduced.
+# A C-FFI allowlist will be enforced here once dependencies are introduced (tracked in #102).
 
 [advisories]
 yanked = "deny"
+unmaintained = "all"
 
 [sources]
 unknown-registry = "deny"
