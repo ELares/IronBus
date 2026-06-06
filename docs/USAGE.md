@@ -42,6 +42,7 @@ resume" below), so it is NOT fsynced on every ack.
 | `--max-connections <n>` | `256` | Connection cap; a flood cannot spawn unbounded threads. Must be at least 1. |
 | `--checkpoint-interval <n>` | `1024` | At most this many messages may be redelivered after an abrupt crash; the cursor is also flushed on a clean disconnect. A lower value persists the consumer cursor more eagerly at the cost of more checkpoint writes. |
 | `--max-deliver <n>` | `5` | Delivery attempts a message gets before it is dead-lettered (parked). Must be at least 1. |
+| `--max-in-flight <n>` | `1024` | The max-ack-pending window: at most this many messages may be leased above the committed cursor at once. Must be at least 1. |
 | `--health-addr <host:port>` | off | If set, also serve the health and metrics HTTP endpoints on this loopback port. |
 
 ## Produce
