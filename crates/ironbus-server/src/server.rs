@@ -6,7 +6,9 @@
 //! is shared behind a `Mutex`, which serializes all access into the single logical writer
 //! the storage layer requires; group-commit batching behind a dedicated append actor is a
 //! throughput follow-up. Concurrency is bounded by a connection cap so a connection flood
-//! cannot spawn unbounded threads.
+//! cannot spawn unbounded threads. CAVEAT: a produce holds the engine `Mutex` across its
+//! fsync, so one stalled disk head-of-line-blocks every connection; the append-actor +
+//! group-commit follow-up removes this.
 
 use crate::engine::Engine;
 use crate::session::Session;
@@ -23,6 +25,21 @@ pub type SharedEngine<F, C> = Arc<Mutex<Engine<F, C>>>;
 
 /// How long the accept loop blocks before re-checking the shutdown flag.
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
+
+/// Idle timeout on an accepted connection: a client must make progress (a ping suffices)
+/// within this window or the connection is closed, bounding slow-client (slowloris) holds
+/// on the connection cap.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Decrements the active-connection count on drop, so the count is released on both a
+/// normal handler return and a panic unwind.
+struct ConnectionSlot<'a>(&'a AtomicUsize);
+
+impl Drop for ConnectionSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Serves connections on `listener` until `shutdown` is set, spawning one thread per
 /// connection (up to `max_connections` concurrently; further connections are refused). Each
@@ -55,14 +72,18 @@ where
                 let engine = Arc::clone(engine);
                 let active = Arc::clone(&active);
                 std::thread::spawn(move || {
+                    // The guard decrements the slot on return AND on a panic unwind, so a
+                    // panicking handler can never permanently leak a connection-cap slot.
+                    let _slot = ConnectionSlot(&active);
                     let _ = handle_connection(stream, &engine);
-                    active.fetch_sub(1, Ordering::AcqRel);
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(ACCEPT_POLL);
             }
-            Err(e) => return Err(e),
+            // A transient accept failure (fd exhaustion, an aborted/interrupted connection)
+            // must not tear down the whole listener: back off briefly and keep serving.
+            Err(_) => std::thread::sleep(ACCEPT_POLL),
         }
     }
     Ok(())
@@ -79,6 +100,10 @@ where
     C: Clock,
 {
     stream.set_nonblocking(false)?; // the handler reads blocking
+                                    // Bound how long a stalled client can hold this slot (slowloris defense): a read or
+                                    // write that makes no progress within the window errors out and closes the connection.
+    stream.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
+    stream.set_write_timeout(Some(CONNECTION_TIMEOUT))?;
     let mut session = Session::new();
     let mut inbuf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -118,7 +143,7 @@ mod tests {
     use ironbus_core::lease::LeaseConfig;
     use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameType};
     use ironbus_proto::message::{encode_pub, PubBody};
-    use ironbus_storage::fs::StdFs;
+    use ironbus_storage::fs::InMemoryFs;
     use ironbus_storage::log::LogConfig;
 
     fn config() -> EngineConfig {
@@ -151,15 +176,28 @@ mod tests {
     }
 
     #[test]
+    fn a_panicking_handler_releases_its_connection_slot() {
+        // The drop-guard must release the slot on a panic unwind, not just a normal return,
+        // so a panicking handler can never permanently leak a connection-cap slot.
+        let active = Arc::new(AtomicUsize::new(0));
+        active.fetch_add(1, Ordering::AcqRel);
+        let a = Arc::clone(&active);
+        let handle = std::thread::spawn(move || {
+            let _slot = ConnectionSlot(&a);
+            panic!("simulate a handler panic");
+        });
+        assert!(handle.join().is_err(), "the handler panicked");
+        assert_eq!(
+            active.load(Ordering::Acquire),
+            0,
+            "the connection slot was released on unwind"
+        );
+    }
+
+    #[test]
     fn produce_over_tcp_appends_to_the_engine() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = Engine::open(
-            StdFs::new(dir.path().to_path_buf()),
-            SystemClock::new(),
-            config(),
-        )
-        .unwrap();
-        let shared: SharedEngine<StdFs, SystemClock> = Arc::new(Mutex::new(engine));
+        let engine = Engine::open(InMemoryFs::new(), SystemClock::new(), config()).unwrap();
+        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -210,14 +248,8 @@ mod tests {
 
     #[test]
     fn a_malformed_frame_closes_the_connection() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = Engine::open(
-            StdFs::new(dir.path().to_path_buf()),
-            SystemClock::new(),
-            config(),
-        )
-        .unwrap();
-        let shared: SharedEngine<StdFs, SystemClock> = Arc::new(Mutex::new(engine));
+        let engine = Engine::open(InMemoryFs::new(), SystemClock::new(), config()).unwrap();
+        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
