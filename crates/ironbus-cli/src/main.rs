@@ -256,21 +256,31 @@ enum Disposition {
     Term,
 }
 
+/// The chosen `sub` disposition verb (before the nack delay is known). A typed slot keeps the
+/// build-the-`Disposition` match exhaustive and compiler-checked, so a verb can never be
+/// silently dropped to a peek by a typo.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DispositionKind {
+    Ack,
+    Nack,
+    Term,
+}
+
 /// Records a chosen `sub` disposition, rejecting a second one (the three are exclusive).
-fn set_dispose(slot: &mut Option<&'static str>, verb: &'static str) -> Result<(), CliError> {
+fn set_dispose(slot: &mut Option<DispositionKind>, kind: DispositionKind) -> Result<(), CliError> {
     if slot.is_some() {
         return Err(CliError::Usage(
             "sub takes at most one of `--ack`, `--nack`, `--term`".to_string(),
         ));
     }
-    *slot = Some(verb);
+    *slot = Some(kind);
     Ok(())
 }
 
 fn run_sub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut addr = DEFAULT_ADDR.to_string();
     let mut max = DEFAULT_FETCH;
-    let mut dispose: Option<&'static str> = None;
+    let mut dispose: Option<DispositionKind> = None;
     let mut delay_ms: Option<u64> = None;
     let mut i = 0;
     while i < args.len() {
@@ -283,15 +293,15 @@ fn run_sub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
                     .map_err(|_| CliError::Usage(format!("`--max` needs a number, got `{raw}`")))?;
             }
             "--ack" => {
-                set_dispose(&mut dispose, "ack")?;
+                set_dispose(&mut dispose, DispositionKind::Ack)?;
                 i += 1;
             }
             "--nack" => {
-                set_dispose(&mut dispose, "nack")?;
+                set_dispose(&mut dispose, DispositionKind::Nack)?;
                 i += 1;
             }
             "--term" => {
-                set_dispose(&mut dispose, "term")?;
+                set_dispose(&mut dispose, DispositionKind::Term)?;
                 i += 1;
             }
             "--delay-ms" => {
@@ -310,18 +320,18 @@ fn run_sub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             }
         }
     }
-    if delay_ms.is_some() && dispose != Some("nack") {
+    if delay_ms.is_some() && dispose != Some(DispositionKind::Nack) {
         return Err(CliError::Usage(
             "`--delay-ms` is only valid with `--nack`".to_string(),
         ));
     }
     let disposition = match dispose {
-        Some("ack") => Disposition::Ack,
-        Some("nack") => Disposition::Nack {
+        Some(DispositionKind::Ack) => Disposition::Ack,
+        Some(DispositionKind::Nack) => Disposition::Nack {
             delay_ms: delay_ms.unwrap_or(0),
         },
-        Some("term") => Disposition::Term,
-        _ => Disposition::Peek,
+        Some(DispositionKind::Term) => Disposition::Term,
+        None => Disposition::Peek,
     };
     cmd_sub(&addr, max, disposition, out)
 }
@@ -687,6 +697,31 @@ mod tests {
         .unwrap_err();
         assert_eq!(e.exit_code(), EXIT_USAGE);
         assert!(matches!(e, CliError::Usage(m) if m.contains("--delay-ms")));
+    }
+
+    #[test]
+    fn nack_delay_is_order_independent() {
+        // `--delay-ms` before `--nack` must be accepted (the validation runs after the parse
+        // loop). With no broker it then fails to connect (exit 5), proving the flags parsed
+        // rather than tripping a usage error (exit 1).
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "sub".to_string(),
+                "--addr".to_string(),
+                "127.0.0.1:1".to_string(),
+                "--delay-ms".to_string(),
+                "7".to_string(),
+                "--nack".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(
+            e.exit_code(),
+            EXIT_UNREACHABLE,
+            "parsed then failed to connect: {e}"
+        );
     }
 
     #[test]
