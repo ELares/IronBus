@@ -12,13 +12,14 @@
 //! one response, so a slow or hostile client cannot wedge the loop. `GET /metrics` exposes a
 //! few engine gauges (committed offset, durable head, consumer lag, in-flight, writer health)
 //! in Prometheus text format, including the `ironbus_fsync_seconds` produce-fsync latency
-//! histogram. The drop/skip/loss counters are follow-ups (#16).
+//! histogram, and the per-reason recovery-loss series `ironbus_recovery_loss_bytes` (#16).
 
 use crate::engine::Counters;
 use crate::metrics::{LatencyHistogram, FSYNC_BUCKET_LE_SECONDS};
 use crate::server::SharedEngine;
 use ironbus_core::clock::Clock;
 use ironbus_storage::fs::Filesystem;
+use ironbus_storage::loss::ReasonCode;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -144,6 +145,10 @@ where
                     in_flight: g.in_flight(),
                     healthy: g.is_healthy(),
                     recovered_truncated: g.recovered_truncated_bytes(),
+                    recovery_loss: {
+                        let r = g.loss_report();
+                        ReasonCode::ALL.map(|rc| r.bytes_skipped_for(rc))
+                    },
                     // -1 is the unambiguous "none yet" sentinel (offsets are never negative).
                     last_dead_lettered: g
                         .last_dead_lettered_offset()
@@ -166,6 +171,8 @@ struct MetricsSnapshot {
     in_flight: usize,
     healthy: bool,
     recovered_truncated: u64,
+    /// Bytes dropped at the last recovery, per [`ReasonCode`] in code order.
+    recovery_loss: [u64; 5],
     /// The most recent dead-letter offset, or -1 if none (the exposition sentinel).
     last_dead_lettered: i64,
     counters: Counters,
@@ -181,6 +188,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         in_flight,
         healthy,
         recovered_truncated,
+        recovery_loss,
         last_dead_lettered,
         counters,
         fsync,
@@ -230,8 +238,28 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         dead_lettered = counters.dead_lettered,
         acks = counters.acks,
     );
+    body.push_str(&recovery_loss_lines(&recovery_loss));
     body.push_str(&fsync_histogram_lines(&fsync));
     body
+}
+
+/// Renders the per-reason recovery-loss gauge `ironbus_recovery_loss_bytes{reason=...}` from the
+/// last recovery's loss report: one line per reason in code order, zero where a reason did not
+/// occur. The grand total equals `ironbus_recovery_truncated_bytes`.
+fn recovery_loss_lines(by_reason: &[u64; 5]) -> String {
+    let mut s = String::from(
+        "# HELP ironbus_recovery_loss_bytes Bytes dropped at the last recovery, by reason.
+         # TYPE ironbus_recovery_loss_bytes gauge
+",
+    );
+    for (reason, bytes) in ReasonCode::ALL.iter().zip(by_reason.iter()) {
+        let _ = writeln!(
+            s,
+            "ironbus_recovery_loss_bytes{{reason=\"{}\"}} {bytes}",
+            reason.metric_label()
+        );
+    }
+    s
 }
 
 /// Renders the `ironbus_fsync_seconds` Prometheus histogram (cumulative `le` buckets in
@@ -385,6 +413,20 @@ mod tests {
         assert!(m.contains("\nironbus_in_flight 0\n"), "{m}");
         assert!(m.contains("\nironbus_writer_healthy 1\n"), "{m}");
         assert!(m.contains("\nironbus_recovery_truncated_bytes 0\n"), "{m}");
+        // The per-reason recovery-loss series is present, one line per reason, zero on a clean
+        // start (no recovery loss).
+        assert!(
+            m.contains("# TYPE ironbus_recovery_loss_bytes gauge"),
+            "{m}"
+        );
+        assert!(
+            m.contains("\nironbus_recovery_loss_bytes{reason=\"torn_tail\"} 0\n"),
+            "{m}"
+        );
+        assert!(
+            m.contains("\nironbus_recovery_loss_bytes{reason=\"corrupt_record_body\"} 0\n"),
+            "{m}"
+        );
         assert!(
             m.contains("\nironbus_last_dead_lettered_offset -1\n"),
             "{m}"
