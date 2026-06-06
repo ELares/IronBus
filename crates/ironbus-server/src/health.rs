@@ -11,7 +11,8 @@
 //! request line, blocks with read and write timeouts plus a total deadline, and closes after
 //! one response, so a slow or hostile client cannot wedge the loop. `GET /metrics` exposes a
 //! few engine gauges (committed offset, durable head, consumer lag, in-flight, writer health)
-//! in Prometheus text format. The drop/skip/loss counters and fsync histograms are follow-ups (#16).
+//! in Prometheus text format, including the `ironbus_fsync_seconds` produce-fsync latency
+//! histogram. The drop/skip/loss counters are follow-ups (#16).
 
 use crate::engine::Counters;
 use crate::metrics::{LatencyHistogram, FSYNC_BUCKET_LE_SECONDS};
