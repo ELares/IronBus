@@ -394,6 +394,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         if max == 0 || start_v >= flushed {
             return Ok(Vec::new());
         }
+        // The empty/at-end check above precedes the out-of-range check below, which is
+        // safe while `flushed >= oldest` always holds (it does: `flushed` is `next_offset`,
+        // never below the last segment's base, never below the oldest base). Once front
+        // reaping can advance `oldest` past a small `flushed`, reorder these two so a
+        // reaped offset reports OffsetOutOfRange instead of an empty read.
         let oldest = self.segments.first().map_or(0, |slot| slot.base_offset);
         if start_v < oldest {
             return Err(StorageError::OffsetOutOfRange {
@@ -953,6 +958,120 @@ mod tests {
                 oldest: 5
             }
         ));
+    }
+
+    #[test]
+    fn a_roll_makes_records_readable_without_an_explicit_sync() {
+        // A roll seals (fsyncs) the old segment, so its records become durable and
+        // readable even though the caller never called sync.
+        let mut log = open_mem(small_config());
+        for i in 0..8u8 {
+            log.append(&rec(&[i; 20])).unwrap(); // no sync anywhere
+        }
+        assert!(log.active_segment_id() >= 1, "should have rolled");
+        let flushed = log.flushed_offset().get();
+        assert!(flushed > 0, "the roll advanced the flush mark");
+        assert!(
+            flushed < 8,
+            "records appended after the roll are not yet synced"
+        );
+        let records = log.read_from(Offset::ZERO, 100).unwrap();
+        assert_eq!(records.len() as u64, flushed);
+        for (i, r) in records.iter().enumerate() {
+            assert_eq!(r.offset, Offset::new(i as u64));
+        }
+    }
+
+    #[test]
+    fn read_skips_an_unsynced_tail_in_the_active_segment() {
+        let mut log = open_mem(LogConfig::default());
+        log.append(&rec(b"a")).unwrap();
+        log.append(&rec(b"b")).unwrap();
+        log.sync().unwrap();
+        log.append(&rec(b"c")).unwrap(); // synced...
+                                         // ...not yet: only a and b are durable.
+        let records = log.read_from(Offset::ZERO, 100).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].payload, b"b");
+    }
+
+    #[test]
+    fn reads_serve_the_durable_prefix_from_a_frozen_writer() {
+        let mut log = open_mem(small_config());
+        // Pre-create the file the first roll targets, so that roll fails and freezes.
+        log.filesystem().create_new(&segment_file_name(1)).unwrap();
+        let mut froze = false;
+        for i in 0..30u8 {
+            if log.append(&rec(&[i; 20])).is_err() {
+                froze = true;
+                break;
+            }
+            log.sync().unwrap();
+        }
+        assert!(froze, "a roll should have been attempted and failed");
+        assert!(matches!(
+            log.append(&rec(b"x")),
+            Err(StorageError::WriterFrozen)
+        ));
+        // Reads ignore the writer and still serve the flushed prefix.
+        let records = log.read_from(Offset::ZERO, 100).unwrap();
+        assert!(!records.is_empty());
+        assert_eq!(records.len() as u64, log.flushed_offset().get());
+    }
+
+    #[test]
+    fn read_three_segments_crossing_two_boundaries() {
+        let mut log = open_mem(small_config());
+        let n: usize = 20;
+        for i in 0..n {
+            log.append(&rec(&[u8::try_from(i).unwrap(); 20])).unwrap();
+        }
+        log.sync().unwrap();
+        assert!(log.active_segment_id() >= 2, "three or more segments");
+        let all = log.read_from(Offset::ZERO, 100).unwrap();
+        assert_eq!(all.len(), n);
+        // A read starting in an early segment and spanning into a later one.
+        let mid = log.read_from(Offset::new(3), 12).unwrap();
+        assert_eq!(mid.len(), 12);
+        assert_eq!(mid[0].offset, Offset::new(3));
+        assert_eq!(mid[11].offset, Offset::new(14));
+    }
+
+    #[test]
+    fn read_exactly_at_the_flushed_minus_one_offset() {
+        let mut log = open_mem(LogConfig::default());
+        for i in 0..3u8 {
+            log.append(&rec(&[i; 4])).unwrap();
+        }
+        log.sync().unwrap();
+        assert_eq!(log.flushed_offset(), Offset::new(3));
+        let records = log.read_from(Offset::new(2), 10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].offset, Offset::new(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdfs_read_across_segments() {
+        use crate::fs::StdFs;
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(
+            StdFs::new(dir.path().to_path_buf()),
+            ManualClock::new(),
+            small_config(),
+        )
+        .unwrap();
+        let n: usize = 10;
+        for i in 0..n {
+            log.append(&rec(&[u8::try_from(i).unwrap(); 20])).unwrap();
+        }
+        log.sync().unwrap();
+        assert!(log.active_segment_id() >= 1);
+        let records = log.read_from(Offset::ZERO, 100).unwrap();
+        assert_eq!(records.len(), n);
+        for (i, r) in records.iter().enumerate() {
+            assert_eq!(r.offset, Offset::new(i as u64));
+        }
     }
 
     #[cfg(unix)]
