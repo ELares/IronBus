@@ -21,6 +21,9 @@ use ironbus_core::format::{RECORD_HEADER_LEN, SEGMENT_HEADER_LEN};
 use ironbus_core::types::{Offset, RecordFlags, Seq};
 use ironbus_storage::fault::FaultFs;
 use ironbus_storage::fs::{Filesystem, InMemoryFs};
+use ironbus_storage::invariants::{
+    check_longest_valid_prefix, check_no_acked_loss, check_pure_recovery,
+};
 use ironbus_storage::io::RandomAccessFile;
 use ironbus_storage::log::{Append, Log, LogConfig};
 use ironbus_storage::naming::segment_file_name;
@@ -521,6 +524,61 @@ fn recovery_is_idempotent_after_a_fault_during_recovery() {
     assert_prefix(&log, n - 1);
 }
 
+#[test]
+fn recovery_is_a_pure_function_of_the_durable_bytes() {
+    // I4 (#120): recovering twice from IDENTICAL durable bytes yields identical records. Build
+    // a log with a torn tail, capture each segment file's bytes, then recover from two
+    // INDEPENDENT disks loaded with those same bytes and assert the records match via the
+    // shared checker.
+    let log = apply(
+        InMemoryFs::new(),
+        big_config(),
+        &(0..7)
+            .map(|_| Op::Append)
+            .chain([Op::Sync])
+            .collect::<Vec<_>>(),
+    );
+    let src = log.into_filesystem();
+    // Tear a few bytes off the active segment so recovery must truncate (a non-clean image).
+    let last = src.list().unwrap().into_iter().last().unwrap();
+    let f = src.open(&last).unwrap();
+    let torn = f.len().unwrap() - 3;
+    f.set_len(torn).unwrap();
+    f.sync_data().unwrap();
+
+    // Snapshot every segment file's bytes.
+    let images: Vec<(String, Vec<u8>)> = src
+        .list()
+        .unwrap()
+        .into_iter()
+        .map(|n| {
+            let bytes = src.open(&n).unwrap().snapshot();
+            (n, bytes)
+        })
+        .collect();
+    let build = || {
+        let disk = InMemoryFs::new();
+        for (name, bytes) in &images {
+            let file = disk.create_new(name).unwrap();
+            file.write_all_at(bytes, 0).unwrap();
+            file.sync_all().unwrap();
+        }
+        disk.sync_dir().unwrap();
+        disk
+    };
+
+    let first = Log::open(build(), ManualClock::new(), big_config())
+        .unwrap()
+        .read_from(Offset::ZERO, usize::MAX)
+        .unwrap();
+    let second = Log::open(build(), ManualClock::new(), big_config())
+        .unwrap()
+        .read_from(Offset::ZERO, usize::MAX)
+        .unwrap();
+    assert!(!first.is_empty(), "the recovery is non-trivial");
+    check_pure_recovery(&first, &second).unwrap();
+}
+
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
         3 => Just(Op::Append),
@@ -549,6 +607,13 @@ proptest! {
         prop_assert!(recovered <= appended);
         let records = log.read_from(Offset::ZERO, usize::MAX).unwrap();
         prop_assert_eq!(records.len() as u64, recovered);
+        // Assert the resilience invariants through the shared checkers (#120): the recovered
+        // run is the longest valid prefix (I2) and every durable (acked) offset survived (I1).
+        let i2 = check_longest_valid_prefix(&records);
+        prop_assert!(i2.is_ok(), "{i2:?}");
+        let acked: Vec<u64> = (0..durable).collect();
+        let i1 = check_no_acked_loss(&records, &acked);
+        prop_assert!(i1.is_ok(), "{i1:?}");
         for (i, record) in records.iter().enumerate() {
             let i = u64::try_from(i).unwrap();
             prop_assert_eq!(record.offset, Offset::new(i));
