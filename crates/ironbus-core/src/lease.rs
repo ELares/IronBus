@@ -130,6 +130,20 @@ pub enum ExtendOutcome {
     Fenced,
 }
 
+/// The outcome of a [`LeaseTable::nack`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NackOutcome {
+    /// The lease was requeued for redelivery at the returned monotonic deadline.
+    Requeued {
+        /// The monotonic time at which the message becomes reclaimable again.
+        deadline: u64,
+    },
+    /// The token was stale; the nack is a no-op (the message already redelivered or was acked).
+    Fenced,
+    /// The generation space is exhausted; the nack is refused rather than reusing a token.
+    Exhausted,
+}
+
 /// Tracks the in-flight leases for one work-group over a single log.
 #[derive(Clone, Debug, Default)]
 pub struct LeaseTable {
@@ -240,6 +254,37 @@ impl LeaseTable {
         }
     }
 
+    /// Nacks the lease named by `token`: requeues the message for redelivery at `now` plus
+    /// `delay_nanos`. The nacking holder is fenced with a fresh generation (so a later ack of
+    /// the same token is rejected, which prevents a nack-then-ack from committing an
+    /// unprocessed message), and the delivery count is kept so the next claim escalates it for
+    /// the `MaxDeliver` decision. A stale token is a no-op.
+    ///
+    /// `delay_nanos` is a retry backoff, not an in-attempt visibility extension, so unlike
+    /// `claim` and `extend` it is intentionally not clamped to the per-attempt hard cap: a
+    /// nack ends the current attempt and schedules the next, which may legitimately fall
+    /// further out than the visibility cap of a single attempt allows.
+    pub fn nack(&mut self, token: &LeaseToken, now: u64, delay_nanos: u64) -> NackOutcome {
+        let off = token.offset.get();
+        // Confirm the token owns the current lease before consuming a generation.
+        match self.leases.get(&off) {
+            Some(lease) if lease.generation == token.generation => {}
+            _ => return NackOutcome::Fenced,
+        }
+        let generation = self.next_generation;
+        // Refuse rather than reuse a generation, exactly as `claim` does, so fencing holds.
+        let Some(next_generation) = generation.checked_add(1) else {
+            return NackOutcome::Exhausted;
+        };
+        self.next_generation = next_generation;
+        let deadline = now.saturating_add(delay_nanos);
+        if let Some(lease) = self.leases.get_mut(&off) {
+            lease.generation = generation;
+            lease.deadline = deadline;
+        }
+        NackOutcome::Requeued { deadline }
+    }
+
     /// The offsets whose visibility has expired at `now` (deadline at or before `now`),
     /// in ascending order. These are reclaimable: the janitor redelivers them by
     /// claiming them again.
@@ -275,6 +320,49 @@ mod tests {
             Claim::Granted { token, .. } => token,
             other => panic!("expected a grant, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_nack_requeues_and_fences_the_holder() {
+        let mut t = LeaseTable::new(cfg());
+        let tok0 = token(t.claim(off(0), 0));
+        // Nack at now=10 with a 5 ns delay: requeued to deadline 15.
+        match t.nack(&tok0, 10, 5) {
+            NackOutcome::Requeued { deadline } => assert_eq!(deadline, 15),
+            other => panic!("expected Requeued, got {other:?}"),
+        }
+        // The nacking holder is fenced: its token can no longer ack.
+        assert_eq!(t.ack(&tok0), AckOutcome::Fenced);
+        // Reclaimable at the deadline; redelivery bumps the generation and the delivery count.
+        assert_eq!(t.expired(15), vec![off(0)]);
+        match t.claim(off(0), 15) {
+            Claim::Granted {
+                token: tok1,
+                deliveries,
+            } => {
+                assert_eq!(deliveries, 2, "redelivery escalates the delivery count");
+                assert_ne!(tok1.generation, tok0.generation);
+            }
+            other => panic!("expected Granted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stale_nack_is_fenced() {
+        let mut t = LeaseTable::new(cfg());
+        let tok0 = token(t.claim(off(0), 0));
+        // Redeliver by re-claiming after expiry, so tok0 is now stale.
+        let _ = t.claim(off(0), 1000);
+        assert_eq!(t.nack(&tok0, 1000, 0), NackOutcome::Fenced);
+    }
+
+    #[test]
+    fn an_immediate_nack_is_reclaimable_at_once() {
+        let mut t = LeaseTable::new(cfg());
+        let tok0 = token(t.claim(off(0), 5));
+        // delay 0: deadline becomes now, so it is expired immediately.
+        assert_eq!(t.nack(&tok0, 5, 0), NackOutcome::Requeued { deadline: 5 });
+        assert_eq!(t.expired(5), vec![off(0)]);
     }
 
     #[test]

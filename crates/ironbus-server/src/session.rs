@@ -13,7 +13,7 @@
 //! offset; other `Ok`s have an empty body; an `Err` carries a UTF-8 message. A malformed
 //! frame envelope is unrecoverable for a length-prefixed stream, so it ends the session.
 
-use crate::engine::{AckResult, Engine, EngineError, Poll};
+use crate::engine::{AckResult, Engine, EngineError, NackResult, Poll};
 use ironbus_core::clock::Clock;
 use ironbus_core::types::RecordFlags;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
@@ -109,13 +109,11 @@ impl Session {
                 Ok(())
             }
             Some(FrameType::Pub) => self.handle_pub(engine, body, out),
-            Some(FrameType::Ack) => {
-                self.handle_ack(engine, body, out);
-                Ok(())
-            }
+            Some(FrameType::Ack) => self.handle_ack(engine, body, out),
             Some(FrameType::Flow) => self.handle_flow(engine, body, out),
-            // Recognized but not yet wired (nack/term/progress), or response-only verbs a
-            // client should not send.
+            // Sub/Unsub (not yet wired) and the standalone Nack frame type (a client sends a
+            // nack as an Ack frame with the Nack op, handled above), or a response-only verb
+            // (Info/Pong/Ok/Err/Deliver) a client should not send.
             Some(_) => {
                 reply_err(out, "verb not supported on this connection");
                 Ok(())
@@ -169,39 +167,71 @@ impl Session {
         }
     }
 
-    /// Acks a delivered message. NOTE: acks are not connection-scoped, the generation token
-    /// is the sole authority, so any session presenting a matching `(offset, generation)`
-    /// commits it. Per-connection ack ownership is tracked as #175 for the consumer path.
+    /// Acks or nacks a delivered message. NOTE: acknowledgements are not connection-scoped,
+    /// the generation token is the sole authority, so any session presenting a matching
+    /// `(offset, generation)` commits or requeues it. Per-connection ack ownership is tracked
+    /// as #175 for the consumer path.
     fn handle_ack<F: Filesystem, C: Clock>(
         &mut self,
         engine: &mut Engine<F, C>,
         body: &[u8],
         out: &mut Vec<u8>,
-    ) {
+    ) -> Result<(), SessionError> {
         if !self.connected {
             reply_err(out, "not connected");
-            return;
+            return Ok(());
         }
         let Ok(ack) = decode_ack(body) else {
             reply_err(out, "malformed ack body");
-            return;
+            return Ok(());
         };
-        // This PR wires the `ack` op (commit). nack/term/progress are the streaming path.
-        if ack.op != AckOp::Ack {
-            reply_err(out, "only ack is supported on this connection");
-            return;
-        }
         let token = ironbus_core::lease::LeaseToken {
             offset: ironbus_core::types::Offset::new(ack.offset),
             generation: ack.generation,
         };
-        // The Ok body is a status byte so the client knows the truth: 1 = committed,
-        // 0 = fenced (the token was stale, the message will redeliver, do NOT drop state).
-        let status = match engine.ack(&token) {
-            AckResult::Acked => 1u8,
-            AckResult::Fenced => 0u8,
-        };
-        reply(out, FrameType::Ok, &[status]);
+        // The Ok body is a one-byte status: for ack, 1 = committed, 0 = fenced; for nack,
+        // 1 = requeued, 0 = fenced. A fenced token means the message already redelivered or
+        // was acked, so the client must NOT drop its state.
+        match ack.op {
+            AckOp::Ack => {
+                let status = match engine.ack(&token) {
+                    AckResult::Acked => 1u8,
+                    AckResult::Fenced => 0u8,
+                };
+                reply(out, FrameType::Ok, &[status]);
+                Ok(())
+            }
+            AckOp::Nack => match engine.nack(&token, ack.delay_ms) {
+                Ok(NackResult::Requeued) => {
+                    reply(out, FrameType::Ok, &[1]);
+                    Ok(())
+                }
+                Ok(NackResult::Fenced) => {
+                    reply(out, FrameType::Ok, &[0]);
+                    Ok(())
+                }
+                // Generation exhaustion is fatal: it wedges every future claim and nack, so
+                // end the session rather than let the client hammer a dead engine, exactly as
+                // the produce path does, instead of masquerading it as a transient failure.
+                Err(e) if e.is_fatal() => {
+                    reply_err(out, "fatal storage error");
+                    Err(SessionError::EngineFatal(e))
+                }
+                Err(_) => {
+                    reply_err(out, "nack failed");
+                    Ok(())
+                }
+            },
+            // term (stop without dead-lettering) and progress (extend the lease) are the next
+            // slice of the ack vocabulary; recognized but not yet wired.
+            AckOp::Term | AckOp::Progress => {
+                reply_err(
+                    out,
+                    "term and progress are not yet supported on this connection",
+                );
+                Ok(())
+            }
+        }
     }
     /// Fetches up to the requested number of messages and streams them as DELIVER frames,
     /// terminated by an `Ok` whose body is the count delivered (so the client knows the
