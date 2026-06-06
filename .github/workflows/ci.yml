@@ -124,6 +124,7 @@ jobs:
   cross-build:
     name: musl build (${{ matrix.target }})
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -140,20 +141,33 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cross
+      # The global RUSTFLAGS "-D warnings" is forwarded into the cross container, so this
+      # job also gates each edge target for warning-clean compilation, not only static linking.
       - name: cross build the static ironbus binary
-        run: cross build --release --locked -p ironbus-cli --target ${{ matrix.target }}
-      - name: assert the binary is statically linked
+        run: |
+          # Remove any cached binary so the static-link assertion below can only ever inspect a
+          # freshly produced artifact, never a stale one cargo declined to relink.
+          rm -f "target/${{ matrix.target }}/release/ironbus"
+          cross build --release --locked -p ironbus-cli --target ${{ matrix.target }}
+      - name: assert the binary is statically linked (no interpreter, no NEEDED libs)
         run: |
           set -euo pipefail
           bin="target/${{ matrix.target }}/release/ironbus"
           test -x "$bin"
-          info="$(file "$bin")"
-          echo "$info"
-          if echo "$info" | grep -q "dynamically linked"; then
-            echo "::error::$bin is dynamically linked, expected a static musl binary"
+          # A static (including static-PIE) ELF carries no PT_INTERP segment and no NEEDED
+          # shared library. Checking the ELF structure with readelf is robust across file(1)
+          # versions and target arches: a static-PIE musl binary is reported "dynamically
+          # linked" by older file and "static-pie linked" by newer file, so that substring
+          # cannot prove staticness, whereas the absence of PT_INTERP and NEEDED always can.
+          if readelf -l "$bin" | grep -q 'INTERP'; then
+            echo "::error::$bin has a PT_INTERP segment, it is dynamically linked"
             exit 1
           fi
-          echo "ok: $bin is a static executable"
+          if readelf -d "$bin" 2>/dev/null | grep -q 'NEEDED'; then
+            echo "::error::$bin lists NEEDED shared libraries, it is not static"
+            exit 1
+          fi
+          echo "ok: $bin is a static executable (no interpreter, no NEEDED libs)"
       - uses: actions/upload-artifact@v4
         with:
           name: ironbus-${{ matrix.target }}
