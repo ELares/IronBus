@@ -469,8 +469,8 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     }
 
     /// Whether the broker is healthy: the durable log writer is not frozen. A frozen writer
-    /// (currently, after a failed segment roll; an fsync-failure freeze is tracked in #191)
-    /// keeps serving reads but refuses writes, so it is not ready.
+    /// (after a fatal fsync or a failed segment roll) keeps serving reads but refuses writes,
+    /// so it is not ready.
     #[must_use]
     pub fn is_healthy(&self) -> bool {
         self.log.is_writable()
@@ -1155,5 +1155,41 @@ mod tests {
             vec![2],
             "only the uncheckpointed tail redelivers"
         );
+    }
+
+    #[test]
+    fn a_freezing_produce_is_fatal_and_marks_the_engine_unhealthy() {
+        use ironbus_storage::fault::FaultFs;
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        let msg = |payload: &'static [u8]| Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload,
+        };
+        // A first produce is durable (its fsync succeeds) and the engine is healthy.
+        assert_eq!(e.produce(&msg(b"a")).unwrap(), Offset::new(0));
+        assert!(e.is_healthy());
+
+        // Arm a fatal fsync: the next produce appends, but its sync freezes the writer, so
+        // produce returns a FATAL error. The session layer turns a fatal produce error into
+        // an EngineFatal that ends the connection rather than a soft "produce failed", which
+        // is exactly why the freeze must surface as fatal here and not a transient IO error.
+        control.set_fail_sync(true);
+        let err = e.produce(&msg(b"b")).unwrap_err();
+        assert!(
+            err.is_fatal(),
+            "a freezing produce must be fatal so the session ends, got {err:?}"
+        );
+        assert!(matches!(
+            err,
+            EngineError::Storage(StorageError::WriterFrozen)
+        ));
+
+        // The engine now reports unhealthy (the /readyz 503 signal) and stays fatal forever.
+        assert!(!e.is_healthy());
+        assert!(e.produce(&msg(b"c")).unwrap_err().is_fatal());
     }
 }

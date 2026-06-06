@@ -272,11 +272,14 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             .active_id
             .checked_add(1)
             .ok_or(StorageError::SegmentFull)?;
-        // Take the active writer out and seal it. From here, an error leaves `active`
-        // as `None`, freezing the writer rather than risking a corrupt resume.
+        // Take the active writer out and seal it. From here, any error leaves `active` as
+        // `None` and the writer frozen; surface `WriterFrozen` (the fatal, never-retried
+        // state) rather than the raw IO error, so the in-flight produce ends its session
+        // instead of retrying against a dead writer.
         let old = self.active.take().ok_or(StorageError::WriterFrozen)?;
-        old.seal()?;
-        self.start_segment(next_id, self.next_seq, self.next_offset)?;
+        old.seal().map_err(|_| StorageError::WriterFrozen)?;
+        self.start_segment(next_id, self.next_seq, self.next_offset)
+            .map_err(|_| StorageError::WriterFrozen)?;
         // Sealing fsynced every record in the old segment, so the flush mark advances to
         // the start of the new segment even without an explicit sync.
         self.flushed_offset = self.next_offset;
@@ -364,10 +367,19 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// acknowledged once this returns.
     ///
     /// # Errors
-    /// Propagates the IO error, or [`StorageError::WriterFrozen`] if the writer is
-    /// frozen. A fatal sync must freeze the writer read-only.
+    /// Returns [`StorageError::WriterFrozen`] if the writer is already frozen, or if this
+    /// sync fails its durability barrier: a failed fsync freezes the writer read-only, and
+    /// the freezing sync itself surfaces `WriterFrozen` (the fatal, never-retried state)
+    /// rather than the raw IO error, so the in-flight produce ends its session instead of
+    /// retrying against a dead writer.
     pub fn sync(&mut self) -> Result<(), StorageError> {
-        self.active()?.sync()?;
+        // A fatal sync (a failed durability barrier) freezes the writer read-only and is never
+        // retried: drop the active segment so every later append and sync returns WriterFrozen,
+        // and a health check sees the degraded state. Reads keep serving the durable prefix.
+        if self.active()?.sync().is_err() {
+            self.active = None;
+            return Err(StorageError::WriterFrozen);
+        }
         // All appended records are now durable and become visible to readers.
         self.flushed_offset = self.next_offset;
         Ok(())
@@ -387,10 +399,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     }
 
     /// Whether the writer is still live (an active segment is open). The writer freezes
-    /// (`active` becomes `None`) when a segment roll fails; this reports that degraded state
-    /// without a failing write, so a health check can surface it. NOTE: freezing on a fatal
-    /// `fdatasync` failure is the intended contract but is not yet wired here (tracked in #191),
-    /// so this does not yet catch an fsync failure.
+    /// (`active` becomes `None`) when a fatal `fdatasync` fails (see [`Log::sync`]) or a segment
+    /// roll fails; this reports that degraded state without a failing write, so a health check
+    /// can surface it. Reads keep serving the durable prefix from a frozen writer.
     #[must_use]
     pub fn is_writable(&self) -> bool {
         self.active.is_some()
@@ -811,8 +822,9 @@ mod tests {
             }
             log.sync().unwrap();
         }
-        // The roll's create_new hit AlreadyExists.
-        assert!(matches!(roll_err, Some(StorageError::Io(_))));
+        // The roll's create_new hit AlreadyExists, which froze the writer: the freezing
+        // append surfaces the fatal `WriterFrozen`, not a soft IO error.
+        assert!(matches!(roll_err, Some(StorageError::WriterFrozen)));
         // The writer is frozen: further writes refuse, getters stay sane (no panic).
         assert!(matches!(
             log.append(&rec(b"x")),
@@ -1033,6 +1045,77 @@ mod tests {
         let records = log.read_from(Offset::ZERO, 100).unwrap();
         assert!(!records.is_empty());
         assert_eq!(records.len() as u64, log.flushed_offset().get());
+    }
+
+    #[test]
+    fn a_fatal_fsync_freezes_the_writer_and_reads_keep_serving_the_flushed_prefix() {
+        use crate::fault::FaultFs;
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut log = Log::open(fs, ManualClock::new(), LogConfig::default()).unwrap();
+        // One durable record (its sync succeeds).
+        log.append(&rec(b"durable")).unwrap();
+        log.sync().unwrap();
+        assert!(log.is_writable());
+        let flushed = log.flushed_offset();
+        assert_eq!(flushed, Offset::new(1));
+
+        // Append another, then arm a fatal fsync: the freezing sync surfaces the fatal
+        // WriterFrozen (not a soft IO error), so the in-flight produce ends its session.
+        log.append(&rec(b"unsynced")).unwrap();
+        control.set_fail_sync(true);
+        assert!(
+            matches!(log.sync(), Err(StorageError::WriterFrozen)),
+            "the freezing fsync surfaces the fatal WriterFrozen, not a soft IO error"
+        );
+
+        // The writer is now frozen: it refuses every further write and is not writable, so a
+        // health check (is_writable) sees the degraded state.
+        assert!(!log.is_writable(), "a fatal fsync freezes the writer");
+        assert!(matches!(
+            log.append(&rec(b"x")),
+            Err(StorageError::WriterFrozen)
+        ));
+        assert!(matches!(log.sync(), Err(StorageError::WriterFrozen)));
+
+        // The in-process flush mark is unchanged (the unsynced record was never flushed), so
+        // an in-process reader keeps serving exactly the acked prefix. This is the live-handle
+        // property; durability across a restart is covered by the recovery tests.
+        assert_eq!(log.flushed_offset(), flushed);
+        let records = log.read_from(Offset::ZERO, 100).unwrap();
+        assert_eq!(records.len() as u64, flushed.get());
+    }
+
+    #[test]
+    fn a_fatal_fsync_during_a_roll_freezes_the_writer() {
+        use crate::fault::FaultFs;
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        // Arm the sync failure, then append (never calling sync) until the active segment
+        // fills and the next append must roll. The roll seals the old segment, whose fsync
+        // now faults, freezing the writer from inside the roll path (not an explicit sync).
+        control.set_fail_sync(true);
+        let mut froze = false;
+        for i in 0..30u8 {
+            match log.append(&rec(&[i; 20])) {
+                Ok(_) => {}
+                Err(StorageError::WriterFrozen) => {
+                    froze = true;
+                    break;
+                }
+                Err(other) => panic!("a freezing roll must be fatal, got {other:?}"),
+            }
+        }
+        assert!(froze, "a roll's seal fsync should have frozen the writer");
+        // Frozen: not writable, and every further write and sync is the fatal WriterFrozen.
+        assert!(!log.is_writable());
+        assert!(matches!(
+            log.append(&rec(b"x")),
+            Err(StorageError::WriterFrozen)
+        ));
+        assert!(matches!(log.sync(), Err(StorageError::WriterFrozen)));
+        // The only fsync attempt was the roll's, and it faulted, so nothing became durable:
+        // the flush mark is unchanged at the start.
+        assert_eq!(log.flushed_offset(), Offset::ZERO);
     }
 
     #[test]
