@@ -246,6 +246,11 @@ jobs:
       # a broken release workflow is caught here rather than at a tag where it cannot be retried
       # cheaply. actionlint runs shellcheck on each `run:` block.
       - name: install and run actionlint
+        env:
+          # SC2015 (A && B || C is not if-then-else) is an info note on the intentional
+          # `grep ... && bad=1 || true` assertion pattern in the IO-free lint, where the
+          # assignment cannot fail; exclude it so the gate flags real shell bugs, not it.
+          SHELLCHECK_OPTS: --exclude=SC2015
         run: |
           set -euo pipefail
           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12

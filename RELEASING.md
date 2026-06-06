@@ -21,6 +21,10 @@ so a tagged release does not run unproven steps.
    The `Release` workflow can also be run from the Actions tab (`workflow_dispatch`) against an
    existing tag.
 
+   Re-running the workflow for a tag that already has a published release fails at the
+   `gh release create` step (it does not clobber); delete the existing release first
+   (`gh release delete vX.Y.Z`) to rebuild it.
+
 ## What the release produces
 
 For each of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, and
