@@ -420,9 +420,13 @@ impl Client {
     /// this connection still holds in its previous group are abandoned (they redeliver there
     /// after the visibility timeout).
     ///
+    /// The name's shape (graphic ASCII, length) and the per-engine group cap are validated
+    /// by the server when the group is first used, so a malformed or excess group name is
+    /// reported by the next [`Client::fetch`] as a [`ClientError::Server`], not here.
+    ///
     /// # Errors
-    /// Returns [`ClientError::Server`] if the server rejects the name (not UTF-8, malformed,
-    /// or the group cap reached), or a connection error.
+    /// Returns [`ClientError::Server`] if the server rejects the subscription, or a frame or
+    /// connection error.
     pub fn subscribe(&mut self, group: &str) -> Result<(), ClientError> {
         let mut body = Vec::new();
         encode_sub(
