@@ -254,11 +254,14 @@ mod tests {
         /// A message is dead-lettered exactly when a finite cap is exceeded.
         #[test]
         fn dead_letter_iff_a_finite_cap_is_exceeded(
-            max in 0u32..20,
-            allow in any::<bool>(),
+            // Generate only VALID configs directly: max == 0 (unlimited) requires the opt-in,
+            // so force `allow` true there. The earlier `prop_assume!(max != 0 || allow)`
+            // rejected ~2.5% of inputs, which exhausts proptest's global-reject budget under a
+            // deep (nightly) sweep; constraining the strategy rejects nothing.
+            (max, allow) in (0u32..20, any::<bool>())
+                .prop_map(|(max, allow)| (max, allow || max == 0)),
             deliveries in 1u32..40,
         ) {
-            prop_assume!(max != 0 || allow);
             let c = DeliveryConfig::new(max, allow, vec![]).unwrap();
             let expected = if max != 0 && deliveries > max {
                 Disposition::DeadLetter

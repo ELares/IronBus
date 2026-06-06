@@ -6,6 +6,9 @@ to follow Semantic Versioning once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Fixed
+- The `dead_letter_iff_a_finite_cap_is_exceeded` delivery proptest no longer relies on a `prop_assume!` that rejected ~2.5% of inputs: under a deep (nightly) sweep that exhausted proptest's global-reject budget and aborted the test. The strategy now generates only valid configs (max == 0 forces the unlimited opt-in), so it rejects nothing and is robust at any case count (refs #21).
+
 ### Added
 - `ironbus serve --visibility-timeout-ms <n>` (#91): tune how long a delivered message stays in flight before it may redeliver (default 30000 ms), instead of the hardcoded lease default. Must be at least 1 (a zero window is a hot redelivery loop). The lease hard cap is derived as the larger of 5 minutes and the visibility window, so it is never below one redelivery window.
 - Determinism meta-test (refs #119): a storage gate asserting that two runs of the same fixed produce/sync workload, under a fresh manual clock, produce a byte-identical disk image. This pins the deterministic-simulation foundation, the on-disk format must be a pure function of its inputs, and fails the moment a `SystemTime`, `Instant::now`, or ambient RNG leaks into a header, record, or footer (the design routes IO and the clock through seams).
