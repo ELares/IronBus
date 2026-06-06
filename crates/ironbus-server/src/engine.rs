@@ -39,6 +39,51 @@ pub struct EngineConfig {
     pub max_in_flight: u32,
 }
 
+/// An error from the engine.
+#[derive(Debug)]
+pub enum EngineError {
+    /// A storage-layer error (append, sync, recovery, or read).
+    Storage(StorageError),
+    /// `max_in_flight` was zero, which would deliver nothing: rejected at open.
+    ZeroMaxInFlight,
+    /// The lease generation space is exhausted (after `u64::MAX` grants, unreachable in any
+    /// real deployment): the engine refuses to deliver rather than silently wedge.
+    GenerationExhausted,
+    /// An internal invariant broke: a deliverable offset had no record in the log.
+    MissingRecord {
+        /// The offset that should have held a record.
+        offset: u64,
+    },
+}
+
+impl core::fmt::Display for EngineError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            EngineError::Storage(e) => write!(f, "storage error: {e}"),
+            EngineError::ZeroMaxInFlight => write!(f, "max_in_flight must be greater than zero"),
+            EngineError::GenerationExhausted => write!(f, "lease generation space is exhausted"),
+            EngineError::MissingRecord { offset } => {
+                write!(f, "no record at deliverable offset {offset}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EngineError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            EngineError::Storage(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<StorageError> for EngineError {
+    fn from(e: StorageError) -> Self {
+        EngineError::Storage(e)
+    }
+}
+
 /// A message handed to a consumer by [`Engine::poll`], plus the token to ack it with.
 #[derive(Clone, Debug)]
 pub struct Delivery {
@@ -93,8 +138,12 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// follow-up work), which is safe at-least-once behavior.
     ///
     /// # Errors
-    /// Propagates a storage error from opening the log.
-    pub fn open(fs: F, clock: C, config: EngineConfig) -> Result<Engine<F, C>, StorageError> {
+    /// Returns [`EngineError::ZeroMaxInFlight`] for a zero window, or a storage error from
+    /// opening the log.
+    pub fn open(fs: F, clock: C, config: EngineConfig) -> Result<Engine<F, C>, EngineError> {
+        if config.max_in_flight == 0 {
+            return Err(EngineError::ZeroMaxInFlight);
+        }
         let log = Log::open(fs, clock, config.log)?;
         Ok(Engine {
             log,
@@ -110,7 +159,7 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     ///
     /// # Errors
     /// Propagates a storage error from the append or sync.
-    pub fn produce(&mut self, message: &Append<'_>) -> Result<Offset, StorageError> {
+    pub fn produce(&mut self, message: &Append<'_>) -> Result<Offset, EngineError> {
         let offset = self.log.append(message)?;
         self.log.sync()?;
         Ok(offset)
@@ -121,8 +170,9 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// and reported as [`Poll::Parked`].
     ///
     /// # Errors
-    /// Propagates a storage error from reading the record.
-    pub fn poll(&mut self, now: u64) -> Result<Poll, StorageError> {
+    /// Returns [`EngineError::GenerationExhausted`] if the lease space is exhausted, or a
+    /// storage error from reading the record.
+    pub fn poll(&mut self, now: u64) -> Result<Poll, EngineError> {
         let committed = self.cursor.committed().get();
         let flushed = self.log.flushed_offset().get();
         // The delivery window: at most `max_in_flight` offsets above the committed cursor,
@@ -142,11 +192,12 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
                 Claim::InFlight => {
                     offset += 1;
                 }
-                Claim::Exhausted => return Ok(Poll::Idle),
+                Claim::Exhausted => return Err(EngineError::GenerationExhausted),
                 Claim::Granted { token, deliveries } => {
                     let Some(record) = self.log.read_from(off, 1)?.into_iter().next() else {
                         // Unreachable: `off` is below the flushed offset, so a record exists.
-                        return Ok(Poll::Idle);
+                        // Surface it loudly rather than silently stalling if an invariant breaks.
+                        return Err(EngineError::MissingRecord { offset });
                     };
                     return Ok(match self.delivery.disposition(deliveries) {
                         Disposition::Deliver => Poll::Message(Delivery {
@@ -345,6 +396,82 @@ mod tests {
         // The poison message is committed past and never redelivers.
         assert_eq!(e.committed_offset(), Offset::new(1));
         assert!(matches!(e.poll(80).unwrap(), Poll::Idle));
+    }
+
+    #[test]
+    fn open_rejects_a_zero_in_flight_window() {
+        // `matches!` avoids needing `Engine: Debug` for the Ok side.
+        assert!(matches!(
+            Engine::open(InMemoryFs::new(), ManualClock::new(), config(0, 5)),
+            Err(EngineError::ZeroMaxInFlight)
+        ));
+    }
+
+    #[test]
+    fn the_default_max_deliver_parks_only_on_the_sixth_claim() {
+        // max_deliver = 5: delivered exactly 5 times, parked on the 6th claim.
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"poison");
+        let mut now = 0u64;
+        for expected in 1..=5u32 {
+            let d = message(e.poll(now).unwrap());
+            assert_eq!(d.deliveries, expected);
+            now += 40; // expire each attempt without acking
+        }
+        // The sixth claim exceeds max_deliver and parks.
+        match e.poll(now).unwrap() {
+            Poll::Parked { offset, .. } => assert_eq!(offset, Offset::new(0)),
+            other => panic!("expected Parked on the 6th, got {other:?}"),
+        }
+        assert_eq!(e.committed_offset(), Offset::new(1));
+        assert_eq!(e.in_flight(), 0, "a parked message holds no lease");
+    }
+
+    #[test]
+    fn a_full_retry_then_ack_cycle_works() {
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"x");
+        let d1 = message(e.poll(0).unwrap());
+        assert_eq!(d1.deliveries, 1);
+        let d2 = message(e.poll(40).unwrap()); // expired, redelivered
+        assert_eq!(d2.deliveries, 2);
+        let d3 = message(e.poll(80).unwrap()); // expired again, redelivered
+        assert_eq!(d3.deliveries, 3);
+        // Finally ack the latest token; earlier tokens are fenced.
+        assert_eq!(e.ack(&d1.token), AckResult::Fenced);
+        assert_eq!(e.ack(&d2.token), AckResult::Fenced);
+        assert_eq!(e.ack(&d3.token), AckResult::Acked);
+        assert_eq!(e.committed_offset(), Offset::new(1));
+        assert_eq!(e.in_flight(), 0);
+    }
+
+    #[test]
+    fn in_flight_never_exceeds_the_window_under_out_of_order_churn() {
+        let mut e = open(config(3, 5)); // window of 3
+        for _ in 0..20 {
+            produce(&mut e, b"m");
+        }
+        let mut now = 0u64;
+        let mut held: Vec<LeaseToken> = Vec::new();
+        for round in 0..40 {
+            // Deliver as much as the window allows.
+            while let Poll::Message(d) = e.poll(now).unwrap() {
+                held.push(d.token);
+            }
+            assert!(
+                e.in_flight() <= 3,
+                "in_flight {} exceeded the window",
+                e.in_flight()
+            );
+            // Ack one held token out of order (the middle one), if any.
+            if !held.is_empty() {
+                let idx = (round * 7 + 1) % held.len();
+                let tok = held.remove(idx);
+                e.ack(&tok);
+            }
+            now += 5;
+        }
+        assert!(e.in_flight() <= 3);
     }
 
     #[test]
