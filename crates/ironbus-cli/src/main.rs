@@ -1251,4 +1251,88 @@ mod tests {
         handle2.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_redelivers_only_the_uncommitted_tail() {
+        // Durability across a restart with a PARTIAL ack: produce three messages, ack only the
+        // first, then restart on the same data dir. The acked message stays committed (never
+        // redelivers), and the uncommitted tail (offsets 1 and 2) redelivers. The core
+        // no-acked-write-lost / uncommitted-tail-redelivers invariant, end to end over the wire.
+        let dir = std::env::temp_dir().join(format!("ironbus-cli-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let shared = open_disk_engine(
+            &dir,
+            64,
+            1,
+            DEFAULT_MAX_DELIVER,
+            DEFAULT_MAX_SEGMENT_BYTES,
+            DEFAULT_VISIBILITY_MS,
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            move || serve(&listener, &shared, &shutdown, 16).unwrap()
+        });
+        let a = addr.to_string();
+        for (i, payload) in [&b"m0"[..], b"m1", b"m2"].into_iter().enumerate() {
+            let mut out = Vec::new();
+            cmd_pub(&a, b"", payload, &mut out).unwrap();
+            assert_eq!(String::from_utf8(out).unwrap(), format!("{i}\n"));
+        }
+        // A credit of 1 leases and acks exactly the first message (offset 0); the cursor is
+        // checkpointed (checkpoint_interval = 1, plus the clean disconnect).
+        let mut acked = Vec::new();
+        cmd_sub(&a, 1, Disposition::Ack, &mut acked).unwrap();
+        let acked = String::from_utf8(acked).unwrap();
+        assert!(
+            acked.contains("payload=m0"),
+            "acked the first message: {acked}"
+        );
+        assert!(acked.contains("ack committed"), "committed: {acked}");
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+
+        // Restart on the same dir: only the uncommitted tail (offsets 1 and 2) redelivers.
+        let reopened = open_disk_engine(
+            &dir,
+            64,
+            1,
+            DEFAULT_MAX_DELIVER,
+            DEFAULT_MAX_SEGMENT_BYTES,
+            DEFAULT_VISIBILITY_MS,
+        )
+        .unwrap();
+        let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let shutdown2 = Arc::new(AtomicBool::new(false));
+        let handle2 = std::thread::spawn({
+            let shutdown2 = Arc::clone(&shutdown2);
+            move || serve(&listener2, &reopened, &shutdown2, 16).unwrap()
+        });
+        let a2 = addr2.to_string();
+        let mut tail = Vec::new();
+        cmd_sub(&a2, 10, Disposition::Peek, &mut tail).unwrap();
+        let tail = String::from_utf8(tail).unwrap();
+        assert!(
+            tail.contains("fetched 2 message(s)"),
+            "the two uncommitted messages redeliver: {tail}"
+        );
+        assert!(
+            tail.contains("payload=m1") && tail.contains("payload=m2"),
+            "the tail content redelivers: {tail}"
+        );
+        assert!(
+            !tail.contains("payload=m0"),
+            "the acked message must not redeliver after a restart: {tail}"
+        );
+
+        shutdown2.store(true, Ordering::Release);
+        handle2.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
