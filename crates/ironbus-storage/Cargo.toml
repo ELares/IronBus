@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+crc32c = "0.6"
 ironbus-core = { path = "../ironbus-core", version = "0.0.0" }
 
 [dev-dependencies]
