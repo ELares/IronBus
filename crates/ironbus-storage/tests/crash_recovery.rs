@@ -473,10 +473,11 @@ fn a_torn_write_during_append_is_truncated_by_recovery() {
 
 #[test]
 fn recovery_is_idempotent_after_a_fault_during_recovery() {
-    // Build a synced log with a torn tail on a SHARED in-memory disk, then crash (fault)
-    // DURING recovery: the tail-truncation's sync_all returns EIO, so the first reopen fails.
-    // A second reopen, with the fault cleared, recovers the same valid prefix. Recovery is
-    // idempotent and retryable, never leaving the log unopenable.
+    // Build a synced log with a torn tail on a SHARED in-memory disk. A fault during the
+    // first recovery makes its truncation's sync_all fail, so the first reopen errors. Then
+    // model the crash (a power loss) that accompanies that failed sync: the durable image
+    // still holds the torn tail, so a second reopen must RE-RUN recovery's truncation and
+    // recover the same valid prefix. Recovery is idempotent, never leaving the log unopenable.
     let disk = InMemoryFs::new();
     let n = 6u64;
     {
@@ -502,8 +503,17 @@ fn recovery_is_idempotent_after_a_fault_during_recovery() {
         "a fault during recovery surfaces as a clean error"
     );
 
-    // Idempotent retry: a clean reopen of the same disk recovers the valid prefix.
+    // Model the crash that accompanies the failed sync: the live image reverts to durable,
+    // which still holds the torn tail (the first recovery's truncation never synced). Without
+    // this, the shared live image would already be truncated and the retry would skip the
+    // truncation branch, testing nothing.
+    disk.simulate_power_loss();
+    // Idempotent retry: a clean reopen RE-RUNS recovery's truncation and recovers the prefix.
     let log = Log::open(disk.clone(), ManualClock::new(), big_config()).unwrap();
+    assert!(
+        log.recovered_truncated_bytes() > 0,
+        "the retry actually re-entered recovery's truncation branch"
+    );
     assert_eq!(log.flushed_offset(), Offset::new(n - 1));
     assert_prefix(&log, n - 1);
 }
