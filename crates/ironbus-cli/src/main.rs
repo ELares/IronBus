@@ -30,6 +30,8 @@ use ironbus_core::lease::LeaseConfig;
 #[cfg(unix)]
 use ironbus_server::engine::{Engine, EngineConfig};
 #[cfg(unix)]
+use ironbus_server::health::serve_health;
+#[cfg(unix)]
 use ironbus_server::server::{serve, SharedEngine};
 #[cfg(unix)]
 use ironbus_storage::fs::StdFs;
@@ -38,7 +40,7 @@ use ironbus_storage::log::LogConfig;
 #[cfg(unix)]
 use std::net::TcpListener;
 #[cfg(unix)]
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
 use std::sync::{Arc, Mutex};
 
@@ -76,7 +78,8 @@ const USAGE: &str = "\
 ironbus: a durable edge message queue.
 
 USAGE:
-    ironbus serve --data-dir <dir> [--addr <host:port>] [--max-connections <n>] [--checkpoint-interval <n>]
+    ironbus serve --data-dir <dir> [--addr <host:port>] [--max-connections <n>]
+                  [--checkpoint-interval <n>] [--health-addr <host:port>]
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
     ironbus sub   [--addr <host:port>] [--max <n>] [--ack | --nack [--delay-ms <n>] | --term]
     ironbus help
@@ -395,6 +398,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut data_dir: Option<String> = None;
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
     let mut checkpoint_interval = DEFAULT_CHECKPOINT_INTERVAL;
+    let mut health_addr: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -414,6 +418,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
                     ))
                 })?;
             }
+            "--health-addr" => health_addr = Some(take_value("--health-addr", args, &mut i)?),
             flag if flag.starts_with("--") => {
                 return Err(CliError::Usage(format!("unknown flag `{flag}` for serve")))
             }
@@ -437,6 +442,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         Path::new(&data_dir),
         max_connections,
         checkpoint_interval,
+        health_addr.as_deref(),
         out,
     )
 }
@@ -447,6 +453,7 @@ fn cmd_serve(
     data_dir: &Path,
     max_connections: usize,
     checkpoint_interval: u64,
+    health_addr: Option<&str>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     let shared = open_disk_engine(data_dir, DEFAULT_MAX_IN_FLIGHT, checkpoint_interval)?;
@@ -463,9 +470,36 @@ fn cmd_serve(
     // The flag is never flipped here: the broker runs until the process is signalled.
     // Durability holds across an abrupt termination because every ack is fsynced first, so
     // a clean-shutdown handler is a follow-up, not a correctness requirement.
-    let shutdown = AtomicBool::new(false);
-    serve(&listener, &shared, &shutdown, max_connections)
-        .map_err(|e| CliError::Internal(format!("serve loop failed: {e}")))?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Optionally start the health endpoints on their own loopback HTTP port.
+    let health_handle = if let Some(haddr) = health_addr {
+        let health_listener = TcpListener::bind(haddr)
+            .map_err(|e| CliError::Internal(format!("cannot bind health {haddr}: {e}")))?;
+        let health_local = health_listener
+            .local_addr()
+            .map_err(|e| CliError::Internal(format!("cannot read health address: {e}")))?;
+        writeln!(
+            out,
+            "ironbus health endpoints on {health_local} (/healthz, /readyz)"
+        )?;
+        let engine = Arc::clone(&shared);
+        let shutdown = Arc::clone(&shutdown);
+        Some(std::thread::spawn(move || {
+            let _ = serve_health(&health_listener, &engine, &shutdown);
+        }))
+    } else {
+        None
+    };
+
+    let result = serve(&listener, &shared, &shutdown, max_connections)
+        .map_err(|e| CliError::Internal(format!("serve loop failed: {e}")));
+    // The wire serve returns only when shutdown is set, so flip it for the health thread too.
+    shutdown.store(true, Ordering::Release);
+    if let Some(h) = health_handle {
+        let _ = h.join();
+    }
+    result?;
     Ok(())
 }
 
@@ -475,9 +509,17 @@ fn cmd_serve(
     data_dir: &Path,
     max_connections: usize,
     checkpoint_interval: u64,
+    health_addr: Option<&str>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
-    let _ = (addr, data_dir, max_connections, checkpoint_interval, out);
+    let _ = (
+        addr,
+        data_dir,
+        max_connections,
+        checkpoint_interval,
+        health_addr,
+        out,
+    );
     Err(CliError::Internal(
         "ironbus serve requires a Unix host in v1: on-disk storage is Unix-only".to_string(),
     ))

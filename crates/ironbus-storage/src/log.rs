@@ -386,6 +386,14 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         self.clock.now_monotonic_nanos()
     }
 
+    /// Whether the writer is still live (an active segment is open). A fatal sync freezes the
+    /// writer read-only (`active` becomes `None`); this reports that degraded state without a
+    /// failing write, so a health check can surface it.
+    #[must_use]
+    pub fn is_writable(&self) -> bool {
+        self.active.is_some()
+    }
+
     /// Reads up to `max` records starting at log offset `start`, crossing segment
     /// boundaries, and stops at the flushed (durable) offset. Returns fewer records than
     /// `max` if the flushed end is reached first, and an empty vector if `start` is at or
