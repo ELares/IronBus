@@ -2,7 +2,7 @@
 
 **A single durable, crash-safe message queue for the edge, in one static Rust binary.**
 
-> Status: planning and design. This repository is intentionally code-free. The entire product is being designed in the open, as GitHub issues, before a single line of product code is committed. Start at the [vision EPIC (#1)](https://github.com/ELares/IronBus/issues/1).
+> Status: early implementation. The architecture is vetted in the GitHub issues; the code is now being built one small, reviewed, CI-gated PR at a time. Start at the [vision EPIC (#1)](https://github.com/ELares/IronBus/issues/1).
 
 IronBus is one durable, ordered queue (think a single AWS SQS queue) that lives on the device, survives power loss and corrupt files on its own, and fans out to many consumers. It ships as a single static binary you can drop onto a Raspberry Pi. It takes the best small, composable ideas from MQTT, NATS, Kafka, Pulsar, Redpanda, RocksDB, Redis Streams, and SQS, and leaves behind the operational weight and the silent durability footguns that do not survive a battery-less edge node.
 
@@ -122,7 +122,7 @@ A fresh-eyes second pass over every issue resolved over one hundred design quest
 | License | Dual `MIT OR Apache-2.0` across the whole workspace. |
 | MSRV | Rust 1.78, may rise only in a minor release, new floor always at least 6 months old. |
 
-The full, immutable record of these decisions will live in an [ADR index (#130)](https://github.com/ELares/IronBus/issues/130) and as `rfcs/NNNN-slug.md` files once the code-free phase ends.
+The full, immutable record of these decisions will live in an [ADR index (#130)](https://github.com/ELares/IronBus/issues/130) and as `rfcs/NNNN-slug.md` files as the project is built out.
 
 ---
 
@@ -198,12 +198,12 @@ Browse by [milestone](https://github.com/ELares/IronBus/milestones) or by [label
 
 ## Project status and how to get involved
 
-IronBus is in the planning and documentation phase. There is no code yet, by design, so that the architecture is vetted before it is built. The best way to help right now is to read the design issues and challenge the decisions: every decision states the alternative it rejected and why, so disagreement is easy to ground.
+IronBus is in early implementation. The architecture was vetted in the design issues before code began, and the code now lands as small, reviewed, CI-gated pull requests. The best way to help right now is to read the design issues and challenge the decisions: every decision states the alternative it rejected and why, so disagreement is easy to ground.
 
-The planned shape of the codebase (to be ratified by the first RFC, not yet committed) is a small Rust workspace: `ironbus-core` (I/O-free types and logic), `ironbus-storage`, `ironbus-proto`, `ironbus-server`, `ironbus-client`, and `ironbus-cli`. Releases are planned to be reproducible, signed (cosign keyless plus an offline signature), and shipped with an embedded SBOM and a fail-closed verifying installer. Contribution, security, and code-of-conduct policies are defined in the [governance issue (#22)](https://github.com/ELares/IronBus/issues/22), including a Developer Certificate of Origin sign-off, a Contributor Covenant code of conduct, and private security disclosure through GitHub Security Advisories.
+The codebase is a small Rust workspace: `ironbus-core` (I/O-free types and logic), `ironbus-storage`, `ironbus-proto`, `ironbus-server`, `ironbus-client`, and `ironbus-cli`. Releases are planned to be reproducible, signed (cosign keyless plus an offline signature), and shipped with an embedded SBOM and a fail-closed verifying installer. Contribution, security, and code-of-conduct policies are defined in the [governance issue (#22)](https://github.com/ELares/IronBus/issues/22), including a Developer Certificate of Origin sign-off, a Contributor Covenant code of conduct, and private security disclosure through GitHub Security Advisories.
 
 ---
 
 ## License
 
-IronBus will be dual-licensed under your choice of [MIT](https://opensource.org/license/mit) or [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0), as decided in the [governance issue (#22)](https://github.com/ELares/IronBus/issues/22). The license files will be added with the first code.
+IronBus will be dual-licensed under your choice of [MIT](https://opensource.org/license/mit) or [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0), as decided in the [governance issue (#22)](https://github.com/ELares/IronBus/issues/22). See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).

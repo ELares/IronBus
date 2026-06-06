@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -37,7 +37,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   test:
     name: test (${{ matrix.os }})
@@ -50,7 +50,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features
+      - run: cargo test --workspace --all-features --locked
 
   msrv:
     name: msrv (1.78)
@@ -59,7 +59,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.78.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace --all-features
+      - run: cargo build --workspace --all-features --locked
 
   core-no-io:
     name: ironbus-core is IO-free
@@ -67,19 +67,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: forbid std::fs, std::net, tokio in ironbus-core sources
+      - uses: Swatinem/rust-cache@v2
+      - name: forbid filesystem, network, process, and async-runtime usage in sources
         run: |
           set -euo pipefail
-          if grep -rnE '(use[ ]+tokio|tokio::|std::fs::|std::net::|use[ ]+std::fs|use[ ]+std::net)' crates/ironbus-core/src; then
-            echo "::error::ironbus-core must stay IO-free (no std::fs, std::net, or tokio)"
+          src=crates/ironbus-core
+          bad=0
+          grep -rnE --include='*.rs' '(tokio|async_std|smol|mio)::' "$src" && bad=1 || true
+          grep -rnE --include='*.rs' 'use[[:space:]]+(tokio|async_std|smol|mio)([[:space:]]|;|::|$)' "$src" && bad=1 || true
+          grep -rnE --include='*.rs' 'std::(fs|net|process)' "$src" && bad=1 || true
+          grep -rnE --include='*.rs' 'use[[:space:]]+std::\{[^}]*(fs|net|process)' "$src" && bad=1 || true
+          if [ "$bad" = "1" ]; then
+            echo "::error::ironbus-core must stay IO-free (no filesystem, network, process, or async runtime)"
             exit 1
           fi
-      - name: forbid tokio/mio in the ironbus-core dependency tree
+          echo "ironbus-core sources are IO-free"
+      - name: forbid async-runtime crates in the ironbus-core dependency tree
         run: |
           set -euo pipefail
-          deps="$(cargo tree -p ironbus-core -e normal --prefix none | awk '{print $1}' | sort -u)"
-          if echo "$deps" | grep -qxE 'tokio|mio'; then
-            echo "::error::ironbus-core must not depend on tokio or mio"
+          deps="$(cargo tree -p ironbus-core -e normal,build --prefix none --locked | awk '{print $1}' | sort -u)"
+          if echo "$deps" | grep -qxE 'tokio|mio|async-std|smol'; then
+            echo "::error::ironbus-core must not depend on an async runtime"
             echo "$deps"
             exit 1
           fi
+          echo "ironbus-core dependency tree is runtime-free"

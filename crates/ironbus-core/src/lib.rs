@@ -1,5 +1,6 @@
 //! Core types and IO-free logic for IronBus.
 //!
-//! This crate is intentionally IO-free: it must not depend on tokio, an async
-//! runtime, `std::fs`, or `std::net`. A CI lint enforces this.
+//! This crate performs no input or output: it must not touch the filesystem or
+//! the network, spawn processes, or pull in an async runtime. A CI lint enforces
+//! this, so the engine logic stays pure and deterministic.
 #![forbid(unsafe_code)]
