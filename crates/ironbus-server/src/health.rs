@@ -4,8 +4,8 @@
 //! Three routes on a loopback HTTP port (#16): `GET /healthz` is liveness (this loop is
 //! running, so the process is up) and `GET /readyz` is readiness (the broker's durable log
 //! writer is live, an active segment is open, so it can still accept writes; a writer frozen
-//! by a failed segment roll answers `503`). NOTE: a frozen-on-fatal-fsync writer is NOT yet
-//! caught here, that is tracked in #191. Everything else is `404`, and a non-`GET` is `405`.
+//! by a fatal fsync or a failed segment roll answers `503`). Everything else is `404`, and a
+//! non-`GET` is `405`.
 //! `/readyz` takes the engine lock, so its latency tracks an in-flight produce fsync (a slow
 //! disk shows up as readiness latency, which is the intent). The parser reads only the bounded
 //! request line, blocks with read and write timeouts plus a total deadline, and closes after
