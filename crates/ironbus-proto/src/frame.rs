@@ -47,12 +47,25 @@ pub enum FrameType {
     Nack,
     /// Flow-control credit grant.
     Flow,
-    /// Generic success response.
+    /// Generic, body-less success response. Reserved for an acknowledgement that carries
+    /// no payload; never overload it with a typed body. A response that carries data uses
+    /// its own self-describing frame ([`FrameType::PubAck`], [`FrameType::AckStatus`],
+    /// [`FrameType::FlowEnd`]) so a generic reader is never ambiguous (#179).
     Ok,
-    /// Generic error response.
+    /// Generic error response. Body: a UTF-8 message.
     Err,
     /// Server delivers a message to a consumer.
     Deliver,
+    /// Producer publish acknowledgement. Body: the assigned durable `offset` as a
+    /// little-endian `u64` (8 bytes).
+    PubAck,
+    /// Consumer acknowledgement status (the response to an Ack, Nack, Term, or Progress).
+    /// Body: a one-byte status (0 = fenced, 1 = committed/requeued/extended, 2 = progress
+    /// cap reached).
+    AckStatus,
+    /// End of a Flow delivery batch. Body: the number of messages delivered in the batch
+    /// as a little-endian `u32` (4 bytes).
+    FlowEnd,
 }
 
 impl FrameType {
@@ -73,6 +86,9 @@ impl FrameType {
             FrameType::Ok => 11,
             FrameType::Err => 12,
             FrameType::Deliver => 13,
+            FrameType::PubAck => 14,
+            FrameType::AckStatus => 15,
+            FrameType::FlowEnd => 16,
         }
     }
 
@@ -94,6 +110,9 @@ impl FrameType {
             11 => FrameType::Ok,
             12 => FrameType::Err,
             13 => FrameType::Deliver,
+            14 => FrameType::PubAck,
+            15 => FrameType::AckStatus,
+            16 => FrameType::FlowEnd,
             _ => return None,
         })
     }
@@ -226,7 +245,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 13] = [
+    const ALL_TYPES: [FrameType; 16] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -240,6 +259,9 @@ mod tests {
         FrameType::Ok,
         FrameType::Err,
         FrameType::Deliver,
+        FrameType::PubAck,
+        FrameType::AckStatus,
+        FrameType::FlowEnd,
     ];
 
     #[test]
@@ -271,6 +293,9 @@ mod tests {
         assert_eq!(FrameType::Ok.as_u8(), 11);
         assert_eq!(FrameType::Err.as_u8(), 12);
         assert_eq!(FrameType::Deliver.as_u8(), 13);
+        assert_eq!(FrameType::PubAck.as_u8(), 14);
+        assert_eq!(FrameType::AckStatus.as_u8(), 15);
+        assert_eq!(FrameType::FlowEnd.as_u8(), 16);
     }
 
     #[test]
@@ -456,7 +481,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 14u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 17u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);

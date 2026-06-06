@@ -9,9 +9,12 @@
 //! acknowledge (`Ack`), the handshake (`Connect`/`Info`), and keepalive (`Ping`/`Pong`).
 //! The streaming consumer-fetch path and capability negotiation are follow-ups.
 //!
-//! Response body conventions: an `Ok` to a `Pub` carries the 8-byte little-endian assigned
-//! offset; other `Ok`s have an empty body; an `Err` carries a UTF-8 message. A malformed
-//! frame envelope is unrecoverable for a length-prefixed stream, so it ends the session.
+//! Response frames are self-describing per verb (#179): a `Pub` is answered by a `PubAck`
+//! whose body is the 8-byte little-endian assigned offset; an `Ack`/`Nack`/`Term`/`Progress`
+//! by an `AckStatus` whose body is a one-byte status; a `Flow` batch by a `FlowEnd` whose
+//! body is the 4-byte little-endian delivered count; and `Err` carries a UTF-8 message. A
+//! malformed frame envelope is unrecoverable for a length-prefixed stream, so it ends the
+//! session.
 
 use crate::engine::{AckResult, Engine, EngineError, NackResult, Poll, ProgressResult};
 use ironbus_core::clock::Clock;
@@ -158,7 +161,7 @@ impl Session {
         };
         match engine.produce(&append) {
             Ok(offset) => {
-                reply(out, FrameType::Ok, &offset.get().to_le_bytes());
+                reply(out, FrameType::PubAck, &offset.get().to_le_bytes());
                 Ok(())
             }
             // A fatal error (frozen writer) would fail every future produce, so end the
@@ -203,7 +206,7 @@ impl Session {
         // the one delivered) is fenced (status 0) without touching the engine, so a second
         // connection cannot commit or requeue another consumer's message.
         if self.leased.get(&ack.offset) != Some(&ack.generation) {
-            reply(out, FrameType::Ok, &[0]);
+            reply(out, FrameType::AckStatus, &[0]);
             return Ok(());
         }
         // Each op replies a one-byte status whose exact meaning is documented per arm below
@@ -217,18 +220,18 @@ impl Session {
                     AckResult::Fenced => 0u8,
                 };
                 self.leased.remove(&ack.offset);
-                reply(out, FrameType::Ok, &[status]);
+                reply(out, FrameType::AckStatus, &[status]);
                 Ok(())
             }
             AckOp::Nack => match engine.nack(&token, ack.delay_ms) {
                 Ok(NackResult::Requeued) => {
                     self.leased.remove(&ack.offset);
-                    reply(out, FrameType::Ok, &[1]);
+                    reply(out, FrameType::AckStatus, &[1]);
                     Ok(())
                 }
                 Ok(NackResult::Fenced) => {
                     self.leased.remove(&ack.offset);
-                    reply(out, FrameType::Ok, &[0]);
+                    reply(out, FrameType::AckStatus, &[0]);
                     Ok(())
                 }
                 // Generation exhaustion is fatal: it wedges every future claim and nack, so
@@ -251,7 +254,7 @@ impl Session {
                     AckResult::Fenced => 0u8,
                 };
                 self.leased.remove(&ack.offset);
-                reply(out, FrameType::Ok, &[status]);
+                reply(out, FrameType::AckStatus, &[status]);
                 Ok(())
             }
             // Progress extends the lease (the consumer is still working). 1 = extended,
@@ -266,13 +269,13 @@ impl Session {
                         0u8
                     }
                 };
-                reply(out, FrameType::Ok, &[status]);
+                reply(out, FrameType::AckStatus, &[status]);
                 Ok(())
             }
         }
     }
     /// Fetches up to the requested number of messages and streams them as DELIVER frames,
-    /// terminated by an `Ok` whose body is the count delivered (so the client knows the
+    /// terminated by a `FlowEnd` whose body is the count delivered (so the client knows the
     /// batch is complete). The credit count is a little-endian `u32`.
     fn handle_flow<F: Filesystem, C: Clock>(
         &mut self,
@@ -324,8 +327,8 @@ impl Session {
                     return Err(SessionError::EngineFatal(e));
                 }
                 Err(_) => {
-                    // The Err is this batch's terminator; do NOT also send Ok (that would
-                    // desync the client, which expects exactly one terminator per Flow).
+                    // The Err is this batch's terminator; do NOT also send a FlowEnd (that
+                    // would desync the client, which expects exactly one terminator per Flow).
                     reply_err(out, "fetch failed");
                     return Ok(());
                 }
@@ -335,7 +338,7 @@ impl Session {
         // dead-letter), keeping `leased` bounded to the in-flight window.
         let committed = engine.committed_offset().get();
         self.leased.retain(|&offset, _| offset >= committed);
-        reply(out, FrameType::Ok, &delivered.to_le_bytes());
+        reply(out, FrameType::FlowEnd, &delivered.to_le_bytes());
         Ok(())
     }
 }
@@ -450,8 +453,8 @@ mod tests {
         .unwrap()
     }
 
-    /// Sends one acknowledgement op and returns the Ok status body, asserting the reply is a
-    /// single Ok frame.
+    /// Sends one acknowledgement op and returns the status body, asserting the reply is a
+    /// single `AckStatus` frame.
     fn ack_reply<C: Clock>(
         s: &mut Session,
         e: &mut Engine<InMemoryFs, C>,
@@ -476,8 +479,8 @@ mod tests {
         assert_eq!(replies.len(), 1, "exactly one reply frame");
         assert_eq!(
             replies[0].0,
-            FrameType::Ok,
-            "expected Ok, got {:?}",
+            FrameType::AckStatus,
+            "expected AckStatus, got {:?}",
             replies[0].0
         );
         replies[0].1.clone()
@@ -654,7 +657,7 @@ mod tests {
         assert_eq!(delivered_tokens(&out).len(), 1);
 
         // Expire it; the next fetch's claim is delivery 2 > max_deliver, so it is parked
-        // (committed past) and NOT delivered: an empty batch (Ok with no Deliver frames).
+        // (committed past) and NOT delivered: an empty batch (FlowEnd with no Deliver frames).
         clock.advance_monotonic_nanos(40);
         out.clear();
         s.process(
@@ -675,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_fetches_messages_as_deliver_frames_then_ok() {
+    fn flow_fetches_messages_as_deliver_frames_then_flow_end() {
         let mut e = engine();
         let mut s = Session::new();
         let mut out = Vec::new();
@@ -684,7 +687,7 @@ mod tests {
         produce(&mut e, b"a");
         produce(&mut e, b"b");
         out.clear();
-        // Fetch up to 5: two messages are available, then the batch terminates with Ok(2).
+        // Fetch up to 5: two messages are available, then the batch terminates with FlowEnd(2).
         s.process(
             &mut e,
             &frame(FrameType::Flow, &5u32.to_le_bytes()),
@@ -692,18 +695,22 @@ mod tests {
         )
         .unwrap();
         let frames = decode_all(&out);
-        assert_eq!(frames.len(), 3, "two Deliver frames then an Ok terminator");
+        assert_eq!(
+            frames.len(),
+            3,
+            "two Deliver frames then a FlowEnd terminator"
+        );
         assert_eq!(frames[0].0, FrameType::Deliver);
         let d0 = decode_deliver(&frames[0].1).unwrap();
         assert_eq!(d0.offset, 0);
         assert_eq!(d0.payload, b"a");
         assert_eq!(frames[1].0, FrameType::Deliver);
         assert_eq!(decode_deliver(&frames[1].1).unwrap().payload, b"b");
-        assert_eq!(frames[2].0, FrameType::Ok);
+        assert_eq!(frames[2].0, FrameType::FlowEnd);
         assert_eq!(
             frames[2].1,
             2u32.to_le_bytes(),
-            "Ok carries the delivered count"
+            "FlowEnd carries the delivered count"
         );
     }
 
@@ -723,7 +730,7 @@ mod tests {
         .unwrap();
         let frames = decode_all(&out);
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].0, FrameType::Ok);
+        assert_eq!(frames[0].0, FrameType::FlowEnd);
         assert_eq!(frames[0].1, 0u32.to_le_bytes());
     }
 
@@ -834,13 +841,13 @@ mod tests {
 
         let consumed = s.process(&mut e, &input, &mut out).unwrap();
         assert_eq!(consumed, input.len());
-        // Two responses: Info, then Ok with offset 0.
+        // Two responses: Info, then PubAck with offset 0.
         let info = decode_frame(&out).unwrap();
         let FrameDecode::Frame { consumed: c0, .. } = info else {
             panic!("info incomplete");
         };
         let (ty, body) = one_response(&out[c0..]);
-        assert_eq!(ty, FrameType::Ok);
+        assert_eq!(ty, FrameType::PubAck);
         assert_eq!(body, 0u64.to_le_bytes());
         // The message is durable in the engine and deliverable.
         match e.poll(0).unwrap() {
@@ -963,7 +970,7 @@ mod tests {
         s.process(&mut e, &frame(FrameType::Ack, &ack_body), &mut out)
             .unwrap();
         let (ty, body) = one_response(&out);
-        assert_eq!(ty, FrameType::Ok);
+        assert_eq!(ty, FrameType::AckStatus);
         assert_eq!(body, vec![0u8], "status 0 = fenced");
         assert_eq!(e.committed_offset().get(), 0);
     }
