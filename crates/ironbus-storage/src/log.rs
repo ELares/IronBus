@@ -12,7 +12,7 @@
 use crate::fs::Filesystem;
 use crate::io::RandomAccessFile;
 use crate::naming::{segment_file_name, segment_ids};
-use crate::segment::{OwnedRecord, SegmentReader, SegmentScan, SegmentWriter, StorageError};
+use crate::segment::{OwnedRecord, RecoveryScan, SegmentReader, SegmentWriter, StorageError};
 use ironbus_core::clock::Clock;
 use ironbus_core::codec::RecordView;
 use ironbus_core::segment::SegmentHeader;
@@ -143,11 +143,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // A corrupt or unreadable segment fails its scan here, not silently at read time.
         let mut next_base_offset = 0u64;
         let mut next_base_seq = 0u64;
-        let mut highest: Option<SegmentScan> = None;
+        let mut highest: Option<RecoveryScan> = None;
         let mut slots: Vec<SegmentSlot> = Vec::with_capacity(ids.len());
         let total = ids.len();
         for (i, &id) in ids.iter().enumerate() {
-            let scan = SegmentReader::open(fs.open(&segment_file_name(id))?)?.scan()?;
+            let scan = SegmentReader::open(fs.open(&segment_file_name(id))?)?.scan_recovery()?;
             let header = scan.header;
             if header.segment_id != id {
                 return Err(StorageError::SegmentIdMismatch {
@@ -167,23 +167,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     found_base_seq: base_seq,
                 });
             }
-            for (index, r) in scan.records.iter().enumerate() {
-                let expected = base_seq
-                    .checked_add(u64::try_from(index).map_err(|_| StorageError::SegmentFull)?)
-                    .ok_or(StorageError::SegmentFull)?;
-                if r.seq.get() != expected {
-                    return Err(StorageError::RecoveredSequenceMismatch {
-                        index,
-                        expected,
-                        found: r.seq.get(),
-                    });
-                }
-            }
             let is_last = i + 1 == total;
             if !is_last && scan.footer.is_none() {
                 return Err(StorageError::UnsealedPredecessor { segment_id: id });
             }
-            let count = u64::try_from(scan.records.len()).map_err(|_| StorageError::SegmentFull)?;
+            let count = scan.record_count;
             next_base_offset = base_offset
                 .checked_add(count)
                 .ok_or(StorageError::SegmentFull)?;
@@ -233,8 +221,8 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 file.sync_all()?;
             }
             let record_count =
-                u32::try_from(scan.records.len()).map_err(|_| StorageError::SegmentFull)?;
-            let last_seq = scan.records.last().map_or(header.base_seq, |r| r.seq);
+                u32::try_from(scan.record_count).map_err(|_| StorageError::SegmentFull)?;
+            let last_seq = scan.last_seq;
             log.active = Some(SegmentWriter::resume(
                 file,
                 header,

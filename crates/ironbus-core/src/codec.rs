@@ -143,6 +143,48 @@ pub fn encode(rec: &RecordView<'_>, out: &mut Vec<u8>) -> Result<usize, EncodeEr
     Ok(total)
 }
 
+/// Returns the total on-disk length of the record whose frame begins at the start of
+/// `header`, validating the magic, version, and header CRC, WITHOUT needing the record
+/// body. `header` need only contain the first [`RECORD_HEADER_LEN`] bytes of the frame.
+///
+/// Streaming recovery uses this to read exactly one record at a time: read the header,
+/// learn the length, then read that many bytes and [`decode`] them, so peak memory is
+/// one record rather than the whole segment (#156). The header validation here is the
+/// same first half [`decode`] performs, so a header this rejects, `decode` rejects too;
+/// a `codec` test pins that the returned length equals `decode`'s consumed length.
+///
+/// # Errors
+/// Returns [`DecodeError::Truncated`] if `header` is shorter than a record header, and
+/// the corrupt variants ([`DecodeError::BadMagic`], [`DecodeError::UnsupportedVersion`],
+/// [`DecodeError::BadHeaderCrc`], [`DecodeError::TooLarge`]) for a bad or oversize header.
+pub fn decoded_len(header: &[u8]) -> Result<usize, DecodeError> {
+    if header.len() < RECORD_HEADER_LEN {
+        return Err(DecodeError::Truncated);
+    }
+    if read_u16(header, off::MAGIC) != RECORD_MAGIC {
+        return Err(DecodeError::BadMagic);
+    }
+    let version = header[off::VERSION];
+    if version != FORMAT_VERSION {
+        return Err(DecodeError::UnsupportedVersion(version));
+    }
+    let stored_header_crc = read_u32(header, off::HEADER_CRC);
+    if crc32c::crc32c(&header[RECORD_HEADER_CRC_RANGE]) != stored_header_crc {
+        return Err(DecodeError::BadHeaderCrc);
+    }
+    // Sum the three attacker-controlled u32 lengths in u64 so the total cannot overflow
+    // usize on a 32-bit target before it is bounded by the 1 GiB ceiling (matches `decode`).
+    let total64 = u64::from(read_u32(header, off::KEY_LEN))
+        + u64::from(read_u32(header, off::HDR_LEN))
+        + u64::from(read_u32(header, off::PAYLOAD_LEN))
+        + RECORD_HEADER_LEN as u64
+        + RECORD_TRAILER_LEN as u64;
+    if total64 > u64::from(MAX_RECORD_BYTES_CEILING) {
+        return Err(DecodeError::TooLarge);
+    }
+    usize::try_from(total64).map_err(|_| DecodeError::TooLarge)
+}
+
 /// Decodes one record frame from the front of `input`.
 ///
 /// On success returns the decoded [`RecordView`] (borrowing `input`) and the total
@@ -242,6 +284,30 @@ mod tests {
         let n = encode(&rec, &mut buf).unwrap();
         assert_eq!(n, buf.len());
         buf
+    }
+
+    #[test]
+    fn decoded_len_matches_decode_consumed() {
+        // The streaming-recovery length helper must return exactly the byte count
+        // `decode` consumes for a valid frame, and reject the same bad headers `decode`
+        // does, so a header it accepts is one `decode` can finish (#156).
+        let buf = sample();
+        let (_, consumed) = decode(&buf).unwrap();
+        assert_eq!(decoded_len(&buf).unwrap(), consumed);
+        // Only the header bytes are needed to learn the length.
+        assert_eq!(decoded_len(&buf[..RECORD_HEADER_LEN]).unwrap(), consumed);
+
+        // A header shorter than RECORD_HEADER_LEN is Truncated, not a wrong length.
+        assert!(matches!(
+            decoded_len(&buf[..RECORD_HEADER_LEN - 1]),
+            Err(DecodeError::Truncated)
+        ));
+        // A flipped header byte inside the CRC-covered region (the seq, not the magic or
+        // version) fails the header CRC in the helper exactly as in decode.
+        let mut bad = buf.clone();
+        bad[10] ^= 0xff;
+        assert!(matches!(decoded_len(&bad), Err(DecodeError::BadHeaderCrc)));
+        assert!(decode(&bad).is_err());
     }
 
     #[test]

@@ -9,7 +9,7 @@
 
 use crate::io::RandomAccessFile;
 use ironbus_core::codec::{self, DecodeError, RecordView};
-use ironbus_core::format::{SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN};
+use ironbus_core::format::{RECORD_HEADER_LEN, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN};
 use ironbus_core::segment::{SegmentError, SegmentFooter, SegmentHeader};
 use ironbus_core::types::{Offset, RecordFlags, Seq};
 use std::io;
@@ -349,6 +349,40 @@ pub struct SegmentScan {
     pub valid_end: u64,
 }
 
+/// The metadata [`Log::recover`] needs to resume a segment, without materializing record
+/// payloads. A streaming scan ([`SegmentReader::scan_recovery`]) produces it by reading
+/// one record at a time, so recovery memory is bounded by the largest single record
+/// instead of the whole record region (#156). `record_count`, `last_seq`, and `valid_end`
+/// match what [`SegmentReader::scan`] would report; the per-record bytes are validated
+/// (header and body CRC, sequence continuity) and then dropped.
+#[derive(Debug, Clone)]
+pub struct RecoveryScan {
+    /// The validated segment header.
+    pub header: SegmentHeader,
+    /// The sealed footer, if the segment was cleanly sealed (same trust rules as `scan`).
+    pub footer: Option<SegmentFooter>,
+    /// How many valid records precede the first torn or corrupt frame.
+    pub record_count: u64,
+    /// The sequence of the last valid record, or the segment's `base_seq` if there are none.
+    pub last_seq: Seq,
+    /// `true` if every byte up to the footer or end was a valid record (no torn tail).
+    pub clean: bool,
+    /// The byte offset at which the valid record region ends (the durable prefix length).
+    pub valid_end: u64,
+}
+
+/// The running result of a streaming body walk: see [`SegmentReader::scan_body_streaming`].
+struct BodyWalk {
+    /// Valid records seen before the first torn or corrupt frame.
+    count: u64,
+    /// The last valid record's sequence (or the caller's base seq if none).
+    last_seq: Seq,
+    /// Bytes consumed relative to the walk's start offset.
+    cursor: u64,
+    /// `true` if the region decoded cleanly with no torn or corrupt tail.
+    clean: bool,
+}
+
 /// Reads a segment file: validates the header and scans its records.
 #[derive(Debug)]
 pub struct SegmentReader<F: RandomAccessFile> {
@@ -491,6 +525,138 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             cursor += consumed;
         }
         Ok((records, cursor as u64, clean))
+    }
+
+    /// Like [`SegmentReader::scan`], but returns only the metadata [`Log::recover`] needs
+    /// and reads one record at a time, so peak memory is the largest single record rather
+    /// than the whole record region (#156). The footer is trusted under the exact same
+    /// rules as `scan`; the body is validated identically (header and body CRC, sequence
+    /// continuity) but record payloads are dropped instead of collected.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::FooterSegmentMismatch`] if a body-consistent footer names a
+    /// different segment, [`StorageError::RecoveredSequenceMismatch`] if a valid frame
+    /// carries an out-of-order sequence, or an IO error.
+    pub fn scan_recovery(&self) -> Result<RecoveryScan, StorageError> {
+        let header_end = SEGMENT_HEADER_LEN as u64;
+        let footer_len = SEGMENT_FOOTER_LEN as u64;
+
+        // Decode the trailing 32 bytes as a footer CANDIDATE only, validated against the
+        // body below before being trusted (identical to `scan`).
+        let candidate = if self.file_len >= header_end + footer_len {
+            let mut fbuf = [0u8; SEGMENT_FOOTER_LEN];
+            self.file
+                .read_exact_at(&mut fbuf, self.file_len - footer_len)?;
+            SegmentFooter::decode(&fbuf).ok()
+        } else {
+            None
+        };
+
+        if let Some(footer) = candidate {
+            let body_end = self.file_len - footer_len;
+            let walk = self.scan_body_streaming(header_end, body_end)?;
+            let ends_at_footer = walk.clean && header_end + walk.cursor == body_end;
+            let body_matches =
+                u64::from(footer.record_count) == walk.count && footer.last_seq == walk.last_seq;
+            if ends_at_footer && body_matches {
+                if footer.segment_id != self.header.segment_id {
+                    return Err(StorageError::FooterSegmentMismatch {
+                        header: self.header.segment_id,
+                        footer: footer.segment_id,
+                    });
+                }
+                return Ok(RecoveryScan {
+                    header: self.header,
+                    footer: Some(footer),
+                    record_count: walk.count,
+                    last_seq: walk.last_seq,
+                    clean: true,
+                    valid_end: body_end,
+                });
+            }
+            // The candidate does not describe the body: recover the valid prefix from the
+            // full file (the candidate bytes are then just record data or a torn tail).
+        }
+
+        let walk = self.scan_body_streaming(header_end, self.file_len)?;
+        Ok(RecoveryScan {
+            header: self.header,
+            footer: None,
+            record_count: walk.count,
+            last_seq: walk.last_seq,
+            clean: walk.clean,
+            valid_end: header_end + walk.cursor,
+        })
+    }
+
+    /// Streams `[start, end)` one record at a time, validating each frame and the
+    /// sequence run, stopping at the first torn or corrupt frame. Peak memory is one
+    /// record (a reused scratch buffer), never the whole region. Returns the valid
+    /// record count, the last valid sequence, the bytes consumed, and whether the region
+    /// decoded cleanly. A valid frame with an out-of-order sequence is a hard error, the
+    /// same structural check `Log::recover` applies to a buffered scan.
+    fn scan_body_streaming(&self, start: u64, end: u64) -> Result<BodyWalk, StorageError> {
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut pos = start;
+        let mut count = 0u64;
+        let mut last_seq = self.header.base_seq;
+        let mut clean = true;
+        while pos < end {
+            let remaining = end - pos;
+            if remaining < RECORD_HEADER_LEN as u64 {
+                // Fewer bytes than a record header: a torn tail, not a whole record.
+                clean = false;
+                break;
+            }
+            // Read just the header to learn the frame length without buffering the body.
+            scratch.resize(RECORD_HEADER_LEN, 0);
+            self.file.read_exact_at(&mut scratch, pos)?;
+            let Ok(total) = codec::decoded_len(&scratch) else {
+                // A corrupt header ends the valid prefix; recovery skips the rest.
+                clean = false;
+                break;
+            };
+            if total as u64 > remaining {
+                // The frame would run past the region: a torn tail.
+                clean = false;
+                break;
+            }
+            // Read the rest of the frame after the header, then validate the whole record.
+            scratch.resize(total, 0);
+            self.file.read_exact_at(
+                &mut scratch[RECORD_HEADER_LEN..],
+                pos + RECORD_HEADER_LEN as u64,
+            )?;
+            let Ok((view, consumed)) = codec::decode(&scratch) else {
+                // A corrupt body (or trailer) ends the valid prefix.
+                clean = false;
+                break;
+            };
+            // Sequence continuity: a CRC-valid frame with the wrong seq is a recycled or
+            // mixed-up file, a hard error, not a torn tail (matches the buffered recover).
+            let expected = self
+                .header
+                .base_seq
+                .get()
+                .checked_add(count)
+                .ok_or(StorageError::SegmentFull)?;
+            if view.seq.get() != expected {
+                return Err(StorageError::RecoveredSequenceMismatch {
+                    index: usize::try_from(count).map_err(|_| StorageError::SegmentFull)?,
+                    expected,
+                    found: view.seq.get(),
+                });
+            }
+            last_seq = view.seq;
+            count += 1;
+            pos += consumed as u64;
+        }
+        Ok(BodyWalk {
+            count,
+            last_seq,
+            cursor: pos - start,
+            clean,
+        })
     }
 }
 
@@ -766,6 +932,133 @@ mod tests {
         assert!(matches!(
             w.append(&rec(1, b"y")),
             Err(StorageError::SegmentFull)
+        ));
+    }
+
+    /// The streaming `scan_recovery` must agree with the buffered `scan` on everything
+    /// recovery consumes: record count, last sequence, `valid_end`, `clean`, and the footer.
+    fn assert_scans_agree(file: &Arc<InMemoryFile>) {
+        let buffered = SegmentReader::open(Arc::clone(file))
+            .unwrap()
+            .scan()
+            .unwrap();
+        let streamed = SegmentReader::open(Arc::clone(file))
+            .unwrap()
+            .scan_recovery()
+            .unwrap();
+        assert_eq!(
+            streamed.record_count,
+            buffered.records.len() as u64,
+            "record_count"
+        );
+        let expected_last = buffered
+            .records
+            .last()
+            .map_or(buffered.header.base_seq, |r| r.seq);
+        assert_eq!(streamed.last_seq, expected_last, "last_seq");
+        assert_eq!(streamed.valid_end, buffered.valid_end, "valid_end");
+        assert_eq!(streamed.clean, buffered.clean, "clean");
+        assert_eq!(streamed.footer, buffered.footer, "footer");
+        assert_eq!(
+            streamed.header.segment_id, buffered.header.segment_id,
+            "header"
+        );
+    }
+
+    #[test]
+    fn scan_recovery_agrees_with_scan_across_shapes() {
+        // Clean unsealed.
+        let clean = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&clean), header()).unwrap();
+        w.append(&rec(0, b"one")).unwrap();
+        w.append(&rec(1, b"two")).unwrap();
+        w.append(&rec(2, b"three")).unwrap();
+        w.sync().unwrap();
+        assert_scans_agree(&clean);
+
+        // Sealed.
+        let sealed = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&sealed), header()).unwrap();
+        w.append(&rec(0, b"a")).unwrap();
+        w.append(&rec(1, b"b")).unwrap();
+        w.seal().unwrap();
+        assert_scans_agree(&sealed);
+
+        // Empty sealed.
+        let empty = Arc::new(InMemoryFile::new());
+        let w = SegmentWriter::create(Arc::clone(&empty), header()).unwrap();
+        w.seal().unwrap();
+        assert_scans_agree(&empty);
+
+        // Header only, no records, unsealed.
+        let bare = Arc::new(InMemoryFile::new());
+        let _w = SegmentWriter::create(Arc::clone(&bare), header()).unwrap();
+        assert_scans_agree(&bare);
+
+        // Torn tail: chop a few bytes off the last record so it no longer decodes.
+        let torn = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&torn), header()).unwrap();
+        w.append(&rec(0, b"keep")).unwrap();
+        w.append(&rec(1, b"gone")).unwrap();
+        w.sync().unwrap();
+        let len = torn.len().unwrap();
+        torn.set_len(len - 3).unwrap();
+        assert_scans_agree(&torn);
+
+        // Corrupt body: flip a payload byte in the last record so its body CRC fails.
+        let corrupt = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&corrupt), header()).unwrap();
+        w.append(&rec(0, b"good")).unwrap();
+        w.append(&rec(1, b"bad!")).unwrap();
+        w.sync().unwrap();
+        let mut bytes = corrupt.snapshot();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        corrupt.write_all_at(&bytes, 0).unwrap();
+        assert_scans_agree(&corrupt);
+    }
+
+    #[test]
+    fn scan_recovery_bounds_memory_to_one_record() {
+        // A segment of many records is scanned without ever buffering the whole region:
+        // recovery only reports count, last_seq, and valid_end, which still match scan.
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        for i in 0..200u64 {
+            w.append(&rec(i, b"payload-bytes")).unwrap();
+        }
+        w.sync().unwrap();
+        let streamed = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .scan_recovery()
+            .unwrap();
+        assert_eq!(streamed.record_count, 200);
+        assert_eq!(streamed.last_seq, Seq::new(199));
+        assert!(streamed.clean);
+        assert_scans_agree(&file);
+    }
+
+    #[test]
+    fn scan_recovery_reports_a_recycled_frame_with_a_bad_seq() {
+        // A CRC-valid frame whose sequence is out of order is a recycled or mixed file,
+        // a hard error in recovery, not a silently truncated tail.
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        w.append(&rec(0, b"first")).unwrap();
+        // Append a second record carrying seq 5 instead of 1: a valid frame, wrong order.
+        w.append(&rec(5, b"jump")).unwrap();
+        w.sync().unwrap();
+        let err = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .scan_recovery()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::RecoveredSequenceMismatch {
+                index: 1,
+                expected: 1,
+                found: 5,
+            }
         ));
     }
 }
