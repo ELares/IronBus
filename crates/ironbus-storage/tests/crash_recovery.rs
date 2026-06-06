@@ -548,10 +548,11 @@ proptest! {
 }
 
 proptest! {
-    /// A fatal fsync injected at an arbitrary point of an arbitrary workload, then a power
+    /// A fatal fsync forced after an arbitrary clean prefix of an arbitrary workload (and
+    /// asserted to actually freeze the writer, so the case is never vacuous), then a power
     /// loss, recovers exactly the prefix that was durable at the fault: no acknowledged
     /// record is lost, none is invented, and the recovered records are a valid monotone run.
-    /// This sweeps the fsync-EIO crash class over many workloads and fault points (the
+    /// This sweeps the fsync-EIO crash class over many workloads and freeze points (the
     /// seeded sim lane), where the point gates above pin specific cases.
     #[test]
     fn a_sync_fault_at_any_point_loses_no_acked_record(
@@ -577,29 +578,41 @@ proptest! {
         }
         let durable_at_fault = log.flushed_offset().get();
 
-        // Phase 2: arm a fatal fsync, then apply the rest. The first sync (or a roll's seal)
-        // freezes the writer; later ops just fail. No durable progress is possible while
-        // armed, so the durable mark cannot advance past `durable_at_fault`.
+        // Phase 2: arm a fatal fsync and FORCE it to fire with an explicit sync, so every
+        // generated case actually exercises the freeze and the property never passes
+        // vacuously (and a shrunk failure still exercises it). The freezing sync surfaces
+        // WriterFrozen and the writer stays frozen for the rest.
         control.set_fail_sync(true);
+        prop_assert!(
+            matches!(
+                log.sync(),
+                Err(ironbus_storage::segment::StorageError::WriterFrozen)
+            ),
+            "the armed fsync must freeze the writer"
+        );
+        prop_assert!(!log.is_writable(), "the writer is frozen after the fatal fsync");
+        // Any further ops on the frozen writer fail and cannot advance durability.
         for op in &ops[k..] {
             match op {
                 Op::Append => {
-                    let r = log.append(&Append {
+                    let _ = log.append(&Append {
                         timestamp_ms: next,
                         flags: RecordFlags::EMPTY,
                         key: b"",
                         headers: b"",
                         payload: &payload(next),
                     });
-                    if r.is_ok() {
-                        next += 1;
-                    }
                 }
                 Op::Sync => {
                     let _ = log.sync();
                 }
             }
         }
+        prop_assert_eq!(
+            log.flushed_offset().get(),
+            durable_at_fault,
+            "a frozen writer makes no durable progress"
+        );
         control.set_fail_sync(false);
         let appended = log.next_offset().get();
 
