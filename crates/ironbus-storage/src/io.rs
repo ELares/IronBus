@@ -342,3 +342,139 @@ mod tests {
         assert_eq!(&buf, b"data");
     }
 }
+
+/// A production [`RandomAccessFile`] backed by an OS file, using cursor-free
+/// positioned IO (`pread`/`pwrite`) so concurrent readers never contend on a shared
+/// file cursor. Available on Unix targets (the v1 production targets are Linux musl
+/// and macOS); Windows is a v1 non-goal and gets only the trait and [`InMemoryFile`].
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct StdFile {
+    file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl StdFile {
+    /// Opens an existing file for reading and writing.
+    ///
+    /// # Errors
+    /// Propagates the underlying IO error.
+    pub fn open(path: &std::path::Path) -> io::Result<StdFile> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        Ok(StdFile { file })
+    }
+
+    /// Creates a new file (truncating any existing one) for reading and writing.
+    ///
+    /// # Errors
+    /// Propagates the underlying IO error.
+    pub fn create(path: &std::path::Path) -> io::Result<StdFile> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        Ok(StdFile { file })
+    }
+
+    /// Wraps an already-open file.
+    #[must_use]
+    pub fn from_file(file: std::fs::File) -> StdFile {
+        StdFile { file }
+    }
+}
+
+#[cfg(unix)]
+impl RandomAccessFile for StdFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        std::os::unix::fs::FileExt::read_at(&self.file, buf, offset)
+    }
+
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        std::os::unix::fs::FileExt::write_all_at(&self.file, buf, offset)
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        self.file.sync_data()
+    }
+
+    fn sync_all(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.file.set_len(len)
+    }
+}
+
+/// Fsyncs the directory at `path` so a newly created, renamed, or removed entry in
+/// it is crash-durable. Without this, a power loss after creating a segment file but
+/// before syncing its directory can leave the file absent on restart.
+///
+/// # Errors
+/// Propagates the underlying IO error.
+#[cfg(unix)]
+pub fn sync_dir(path: &std::path::Path) -> io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(all(test, unix))]
+mod std_file_tests {
+    use super::*;
+
+    #[test]
+    fn stdfile_roundtrip_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg.log");
+        let f = StdFile::create(&path).unwrap();
+        f.write_all_at(b"hello world", 0).unwrap();
+        f.sync_data().unwrap();
+        let mut buf = [0u8; 11];
+        f.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"hello world");
+        assert_eq!(f.len().unwrap(), 11);
+        drop(f);
+        // Reopen and verify the bytes persisted.
+        let g = StdFile::open(&path).unwrap();
+        let mut b2 = [0u8; 5];
+        assert_eq!(g.read_at(&mut b2, 6).unwrap(), 5);
+        assert_eq!(&b2, b"world");
+    }
+
+    #[test]
+    fn stdfile_set_len_truncate_and_extend() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = StdFile::create(&dir.path().join("x")).unwrap();
+        f.write_all_at(b"abcdef", 0).unwrap();
+        f.set_len(3).unwrap();
+        assert_eq!(f.len().unwrap(), 3);
+        f.set_len(5).unwrap();
+        let mut buf = [9u8; 5];
+        f.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, &[b'a', b'b', b'c', 0, 0]);
+    }
+
+    #[test]
+    fn stdfile_read_past_end_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = StdFile::create(&dir.path().join("e")).unwrap();
+        let mut buf = [0u8; 4];
+        assert_eq!(f.read_at(&mut buf, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn sync_dir_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = StdFile::create(&dir.path().join("f")).unwrap();
+        f.sync_all().unwrap();
+        sync_dir(dir.path()).unwrap();
+    }
+}
