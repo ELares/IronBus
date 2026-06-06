@@ -139,9 +139,13 @@ enum CliError {
     Unreachable(String),
     /// An internal or runtime failure, including an unsupported platform (exit 70).
     Internal(String),
-    /// An offline verb's data directory does not exist (exit 2).
+    /// An offline verb's data directory does not exist (exit 2). Constructed only on Unix,
+    /// where the offline verbs run; documented in the exit-code scheme on every platform.
+    #[cfg_attr(not(unix), allow(dead_code))]
     NotFound(String),
-    /// An offline verb's data directory is structurally corrupt (exit 4).
+    /// An offline verb's data directory is structurally corrupt (exit 4). Constructed only
+    /// on Unix, where the offline verbs run; documented on every platform.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Corrupt(String),
 }
 
