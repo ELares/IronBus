@@ -266,28 +266,43 @@ fn escape_label(value: &str) -> String {
 
 /// Renders the per-work-group consumer series (#15, #16): committed offset, lag, and
 /// in-flight depth labeled by `group`, so an operator sees lag broken down by cursor. Lag is
-/// the durable head minus the group's committed offset.
+/// the durable head minus the group's committed offset. The Prometheus text format requires
+/// all samples of one metric family to be contiguous, so each metric is emitted as a whole
+/// block (one HELP/TYPE then every group's sample), not interleaved per group.
 fn group_consumer_lines(groups: &[GroupConsumerStat], flushed: u64) -> String {
     let mut s = String::from(
         "# HELP ironbus_group_committed_offset The committed offset of a work-group's cursor.\n\
-         # TYPE ironbus_group_committed_offset gauge\n\
-         # HELP ironbus_group_consumer_lag Durable records not yet committed by a work-group.\n\
-         # TYPE ironbus_group_consumer_lag gauge\n\
-         # HELP ironbus_group_in_flight Messages leased but not yet acked in a work-group.\n\
-         # TYPE ironbus_group_in_flight gauge\n",
+         # TYPE ironbus_group_committed_offset gauge\n",
     );
     for stat in groups {
-        let label = escape_label(&stat.group);
+        let _ = writeln!(
+            s,
+            "ironbus_group_committed_offset{{group=\"{}\"}} {}",
+            escape_label(&stat.group),
+            stat.committed
+        );
+    }
+    s.push_str(
+        "# HELP ironbus_group_consumer_lag Durable records not yet committed by a work-group.\n\
+         # TYPE ironbus_group_consumer_lag gauge\n",
+    );
+    for stat in groups {
         let lag = flushed.saturating_sub(stat.committed);
         let _ = writeln!(
             s,
-            "ironbus_group_committed_offset{{group=\"{label}\"}} {}",
-            stat.committed
+            "ironbus_group_consumer_lag{{group=\"{}\"}} {lag}",
+            escape_label(&stat.group)
         );
-        let _ = writeln!(s, "ironbus_group_consumer_lag{{group=\"{label}\"}} {lag}");
+    }
+    s.push_str(
+        "# HELP ironbus_group_in_flight Messages leased but not yet acked in a work-group.\n\
+         # TYPE ironbus_group_in_flight gauge\n",
+    );
+    for stat in groups {
         let _ = writeln!(
             s,
-            "ironbus_group_in_flight{{group=\"{label}\"}} {}",
+            "ironbus_group_in_flight{{group=\"{}\"}} {}",
+            escape_label(&stat.group),
             stat.in_flight
         );
     }
@@ -588,6 +603,17 @@ mod tests {
         assert!(
             m.contains("ironbus_group_in_flight{group=\"billing\"} 1"),
             "{m}"
+        );
+        // The Prometheus text format requires a metric family to be contiguous: every
+        // committed-offset sample must precede every lag sample, which must precede every
+        // in-flight sample. A strict parser rejects an interleaved family.
+        let last_committed = m.rfind("\nironbus_group_committed_offset{").unwrap();
+        let first_lag = m.find("\nironbus_group_consumer_lag{").unwrap();
+        let last_lag = m.rfind("\nironbus_group_consumer_lag{").unwrap();
+        let first_in_flight = m.find("\nironbus_group_in_flight{").unwrap();
+        assert!(
+            last_committed < first_lag && last_lag < first_in_flight,
+            "per-group metric families must be contiguous, not interleaved: {m}"
         );
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
