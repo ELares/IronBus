@@ -52,7 +52,7 @@ const DEFAULT_FETCH: u32 = 10;
 /// The default connection cap for `serve`.
 const DEFAULT_MAX_CONNECTIONS: usize = 256;
 /// The default in-flight window for the `serve` engine.
-#[cfg(unix)]
+/// The default max-ack-pending window for `serve`.
 const DEFAULT_MAX_IN_FLIGHT: u32 = 1024;
 
 /// The default max delivery attempts before a poison message is dead-lettered.
