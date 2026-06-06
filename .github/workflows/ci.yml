@@ -120,3 +120,42 @@ jobs:
             exit 1
           fi
           echo "all Rust sources carry the SPDX header"
+
+  cross-build:
+    name: musl build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: cross build the static ironbus binary
+        run: cross build --release --locked -p ironbus-cli --target ${{ matrix.target }}
+      - name: assert the binary is statically linked
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/ironbus"
+          test -x "$bin"
+          info="$(file "$bin")"
+          echo "$info"
+          if echo "$info" | grep -q "dynamically linked"; then
+            echo "::error::$bin is dynamically linked, expected a static musl binary"
+            exit 1
+          fi
+          echo "ok: $bin is a static executable"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ironbus-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/ironbus
+          if-no-files-found: error
