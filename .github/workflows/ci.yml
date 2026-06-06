@@ -173,3 +173,30 @@ jobs:
           name: ironbus-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/ironbus
           if-no-files-found: error
+
+  parse-32bit:
+    name: parser tests (32-bit ${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - i686-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      # ironbus-core parses untrusted bytes; the record and segment codecs do their length
+      # arithmetic in u64 specifically so a 32-bit usize cannot overflow (the #147 fix). The
+      # 64-bit test matrix never exercises that path, so run ironbus-core's tests on a 32-bit
+      # target here: a future usize-width regression in a parser is caught, not only built. The
+      # global RUSTFLAGS "-D warnings" is forwarded into the cross container, so this also gates
+      # a warning-clean 32-bit compile. i686 binaries run natively on the x86_64 runner (no qemu).
+      - name: cross test the byte parsers on a 32-bit target
+        run: cross test --locked -p ironbus-core --target ${{ matrix.target }}
