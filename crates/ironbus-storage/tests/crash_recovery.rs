@@ -881,3 +881,52 @@ proptest! {
         }
     }
 }
+
+/// Seals the highest segment of `disk` and leaves no successor, modelling a crash between a
+/// roll's seal and the creation of the next segment: the highest segment gains a footer and
+/// recovery must roll forward (create, write, and sync a fresh segment header).
+fn seal_highest_segment_with_no_successor(disk: &InMemoryFs, id: u64) {
+    use ironbus_storage::segment::{SegmentReader, SegmentWriter};
+    let name = segment_file_name(id);
+    let scan = SegmentReader::open(disk.open(&name).unwrap())
+        .unwrap()
+        .scan_recovery()
+        .unwrap();
+    let file = disk.open(&name).unwrap();
+    let writer = SegmentWriter::resume(
+        file,
+        scan.header,
+        scan.valid_end,
+        u32::try_from(scan.record_count).unwrap(),
+        scan.last_seq,
+    );
+    writer.seal().unwrap();
+    disk.sync_dir().unwrap();
+}
+
+#[test]
+fn recovery_fails_closed_when_a_fault_strikes_the_roll_forward() {
+    use ironbus_storage::segment::StorageError;
+    // A sealed highest segment with no successor forces recovery to roll forward, which creates,
+    // writes, and syncs a fresh segment header. Each write-side fault on that path (a clean write
+    // failure, a torn header write, a failed header fsync) must fail the recovery CLOSED with a
+    // clean typed error, never a panic or a silent partial recovery (#231). The acked records in
+    // the sealed segment are untouched on disk, so the broker simply refuses to start.
+    for fault in [Fault::FailWrite, Fault::TornWrite(8), Fault::FailSync] {
+        let log = apply(
+            InMemoryFs::new(),
+            big_config(),
+            &[Op::Append, Op::Append, Op::Sync],
+        );
+        let disk = log.into_filesystem();
+        seal_highest_segment_with_no_successor(&disk, 0);
+
+        let (faultfs, control) = FaultFs::new(disk);
+        arm_fault(&control, &fault);
+        let err = Log::open(faultfs, ManualClock::new(), big_config()).unwrap_err();
+        assert!(
+            matches!(err, StorageError::Io(_)),
+            "fault {fault:?} during roll-forward must fail closed cleanly, got {err:?}"
+        );
+    }
+}
