@@ -1,0 +1,32 @@
+name: nightly
+
+# The per-PR pipeline runs the crash gates and codec proptests at proptest's default case
+# count; this nightly lane re-runs them with a far deeper sweep, so a rare non-determinism or
+# a crash-class regression that only a specific seed exposes is caught within a day (#21, #123).
+on:
+  schedule:
+    - cron: "0 4 * * *" # daily at 04:00 UTC
+  workflow_dispatch: {} # manual trigger, also used to validate the lane on demand
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  deep-sweep:
+    name: deep crash-gate and codec sweep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: run the workspace tests with a deep proptest sweep
+        env:
+          # ~195x the proptest default (256), so the crash gates, recovery prefix checks,
+          # determinism meta-test, and codec round-trips each explore far more inputs.
+          PROPTEST_CASES: "50000"
+        run: cargo test --workspace --all-features --locked
