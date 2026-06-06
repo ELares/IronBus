@@ -657,7 +657,8 @@ fn open_disk_engine(
         fs,
         SystemClock::new(),
         EngineConfig {
-            log: LogConfig { max_segment_bytes },
+            log: LogConfig::new(max_segment_bytes)
+                .map_err(|e| CliError::Internal(format!("log config: {e}")))?,
             lease: LeaseConfig::from_millis(visibility_ms, visibility_ms.max(DEFAULT_HARD_CAP_MS)),
             delivery,
             max_in_flight,
