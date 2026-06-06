@@ -428,7 +428,8 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     }
 
     /// Whether the broker is healthy: the durable log writer is not frozen. A frozen writer
-    /// (after a fatal fsync) keeps serving reads but refuses writes, so it is not ready.
+    /// (currently, after a failed segment roll; an fsync-failure freeze is tracked in #191)
+    /// keeps serving reads but refuses writes, so it is not ready.
     #[must_use]
     pub fn is_healthy(&self) -> bool {
         self.log.is_writable()

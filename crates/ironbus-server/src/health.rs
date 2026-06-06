@@ -3,11 +3,14 @@
 //!
 //! Two routes on a loopback HTTP port (#16): `GET /healthz` is liveness (this loop is
 //! running, so the process is up) and `GET /readyz` is readiness (the broker's durable log
-//! writer is not frozen, so it can still accept writes). Everything else is `404`, and a
-//! non-`GET` is `405`. The parser reads only the bounded request line, sets read and write
-//! timeouts, and closes after one response, so a slow or hostile client cannot wedge the
-//! loop. This is the first slice of the observability surface; `OpenMetrics` `/metrics` and
-//! structured introspection are follow-ups under #16.
+//! writer is live, an active segment is open, so it can still accept writes; a writer frozen
+//! by a failed segment roll answers `503`). NOTE: a frozen-on-fatal-fsync writer is NOT yet
+//! caught here, that is tracked in #191. Everything else is `404`, and a non-`GET` is `405`.
+//! `/readyz` takes the engine lock, so its latency tracks an in-flight produce fsync (a slow
+//! disk shows up as readiness latency, which is the intent). The parser reads only the bounded
+//! request line, blocks with read and write timeouts plus a total deadline, and closes after
+//! one response, so a slow or hostile client cannot wedge the loop. This is the first slice of
+//! the observability surface; `OpenMetrics` `/metrics` and introspection are follow-ups (#16).
 
 use crate::server::SharedEngine;
 use ironbus_core::clock::Clock;
@@ -63,15 +66,30 @@ where
     F: Filesystem,
     C: Clock,
 {
+    // The accepted socket inherits the listener's non-blocking flag; reads must block for the
+    // timeouts to apply (the wire handler does the same), else a request split across TCP
+    // segments is dropped and the timeouts are a no-op.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
     stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
 
-    // Read the request line into a bounded buffer (chunked, so a dribble cannot run forever).
+    // Bound the TOTAL time to read the request line, not only each read: a client dribbling one
+    // byte just inside each per-read window would otherwise hold this connection (and, since
+    // the accept loop is inline, every other probe) for hours.
+    let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
     let mut buf = vec![0u8; MAX_REQUEST_LINE];
     let mut len = 0;
     let newline = loop {
         if len == buf.len() {
             return respond(&mut stream, 414, "URI Too Long", "request line too long");
+        }
+        if std::time::Instant::now() >= deadline {
+            return respond(
+                &mut stream,
+                408,
+                "Request Timeout",
+                "request line not received in time",
+            );
         }
         let n = stream.read(&mut buf[len..])?;
         if n == 0 {
@@ -208,6 +226,29 @@ mod tests {
         let na = request(addr, "POST /healthz HTTP/1.1\r\n\r\n");
         assert!(na.starts_with("HTTP/1.1 405 Method Not Allowed"), "{na}");
 
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_request_split_across_tcp_segments_is_handled() {
+        let (addr, shutdown, handle) = start();
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        // Send the request line in two segments with a gap, so the server does two reads. With
+        // the accepted socket left non-blocking, the second read would WouldBlock and drop the
+        // connection; a blocking socket waits for the rest. This pins the set_nonblocking(false).
+        c.write_all(b"GET /heal").unwrap();
+        c.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        c.write_all(b"thz HTTP/1.1\r\n\r\n").unwrap();
+        let mut out = Vec::new();
+        c.read_to_end(&mut out).unwrap();
+        let resp = String::from_utf8_lossy(&out);
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "split request handled: {resp}"
+        );
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }

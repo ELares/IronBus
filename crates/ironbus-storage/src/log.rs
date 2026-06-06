@@ -386,9 +386,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         self.clock.now_monotonic_nanos()
     }
 
-    /// Whether the writer is still live (an active segment is open). A fatal sync freezes the
-    /// writer read-only (`active` becomes `None`); this reports that degraded state without a
-    /// failing write, so a health check can surface it.
+    /// Whether the writer is still live (an active segment is open). The writer freezes
+    /// (`active` becomes `None`) when a segment roll fails; this reports that degraded state
+    /// without a failing write, so a health check can surface it. NOTE: freezing on a fatal
+    /// `fdatasync` failure is the intended contract but is not yet wired here (tracked in #191),
+    /// so this does not yet catch an fsync failure.
     #[must_use]
     pub fn is_writable(&self) -> bool {
         self.active.is_some()
