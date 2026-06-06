@@ -299,6 +299,29 @@ pub fn decode_deliver(body: &[u8]) -> Result<DeliverBody<'_>, BodyError> {
     })
 }
 
+/// A consumer's subscription request (the SUB frame body): the work-group name the consumer
+/// joins for subsequent FLOW fetches and ACKs. The entire body is the name; an empty name
+/// selects the default group (the same one an unsubscribed consumer reads). The server
+/// validates the name's shape and bounds (graphic ASCII, length, group cap) when the group is
+/// first used, per #240; this codec only carries the bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubBody<'a> {
+    /// The work-group name the consumer subscribes to (empty selects the default group).
+    pub group: &'a [u8],
+}
+
+/// Encodes a SUB body onto the end of `out`: the whole body is the work-group name.
+pub fn encode_sub(sub: &SubBody<'_>, out: &mut Vec<u8>) {
+    out.extend_from_slice(sub.group);
+}
+
+/// Decodes a SUB body: the entire body is the work-group name. Infallible (any byte string is
+/// a syntactically valid frame body); the server validates the name when the group is used.
+#[must_use]
+pub fn decode_sub(body: &[u8]) -> SubBody<'_> {
+    SubBody { group: body }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +339,16 @@ mod tests {
         let mut buf = Vec::new();
         encode_pub(&msg, &mut buf).unwrap();
         assert_eq!(decode_pub(&buf).unwrap(), msg);
+    }
+
+    #[test]
+    fn sub_round_trips() {
+        for group in [&b""[..], b"orders", b"a-very/long.name_1:2"] {
+            let mut buf = Vec::new();
+            encode_sub(&SubBody { group }, &mut buf);
+            assert_eq!(decode_sub(&buf), SubBody { group });
+            assert_eq!(buf, group, "the SUB body is exactly the group name");
+        }
     }
 
     #[test]
