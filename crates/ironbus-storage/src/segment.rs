@@ -73,6 +73,13 @@ pub enum StorageError {
     /// The log writer is frozen: a fatal IO error left it without a valid active
     /// segment, so it refuses further writes rather than risk corruption.
     WriterFrozen,
+    /// A read requested an offset older than the oldest record still retained.
+    OffsetOutOfRange {
+        /// The requested offset.
+        requested: u64,
+        /// The oldest offset still present in the log.
+        oldest: u64,
+    },
 }
 
 impl core::fmt::Display for StorageError {
@@ -117,6 +124,10 @@ impl core::fmt::Display for StorageError {
                 "record {index} has sequence {found}, expected {expected}"
             ),
             StorageError::WriterFrozen => write!(f, "log writer is frozen after a fatal error"),
+            StorageError::OffsetOutOfRange { requested, oldest } => write!(
+                f,
+                "read offset {requested} is older than the oldest retained offset {oldest}"
+            ),
         }
     }
 }
