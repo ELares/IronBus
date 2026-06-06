@@ -427,6 +427,14 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
         self.leases.in_flight()
     }
 
+    /// Whether the broker is healthy: the durable log writer is not frozen. A frozen writer
+    /// (currently, after a failed segment roll; an fsync-failure freeze is tracked in #191)
+    /// keeps serving reads but refuses writes, so it is not ready.
+    #[must_use]
+    pub fn is_healthy(&self) -> bool {
+        self.log.is_writable()
+    }
+
     /// Consumes the engine and returns its filesystem, so the log can be reopened.
     #[must_use]
     pub fn into_filesystem(self) -> F {
