@@ -167,7 +167,8 @@ impl Session {
         }
     }
 
-    /// Acks or nacks a delivered message. NOTE: acknowledgements are not connection-scoped,
+    /// Handles a consumer acknowledgement (ack, nack, term, or progress) for a delivered
+    /// message. NOTE: acknowledgements are not connection-scoped,
     /// the generation token is the sole authority, so any session presenting a matching
     /// `(offset, generation)` commits or requeues it. Per-connection ack ownership is tracked
     /// as #175 for the consumer path.
@@ -189,9 +190,10 @@ impl Session {
             offset: ironbus_core::types::Offset::new(ack.offset),
             generation: ack.generation,
         };
-        // The Ok body is a one-byte status: for ack, 1 = committed, 0 = fenced; for nack,
-        // 1 = requeued, 0 = fenced. A fenced token means the message already redelivered or
-        // was acked, so the client must NOT drop its state.
+        // Each op replies a one-byte status whose exact meaning is documented per arm below
+        // (e.g. progress can reply 2 = cap reached). A status of 0 always means fenced: the
+        // token was stale (the message already redelivered or was acked), so the client must
+        // NOT drop its state.
         match ack.op {
             AckOp::Ack => {
                 let status = match engine.ack(&token) {
@@ -417,6 +419,113 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    /// Sends one acknowledgement op and returns the Ok status body, asserting the reply is a
+    /// single Ok frame.
+    fn ack_reply<C: Clock>(
+        s: &mut Session,
+        e: &mut Engine<InMemoryFs, C>,
+        op: AckOp,
+        offset: u64,
+        generation: u64,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        encode_ack(
+            &AckBody {
+                op,
+                offset,
+                generation,
+                delay_ms: 0,
+            },
+            &mut body,
+        );
+        let mut out = Vec::new();
+        s.process(e, &frame(FrameType::Ack, &body), &mut out)
+            .unwrap();
+        let replies = decode_all(&out);
+        assert_eq!(replies.len(), 1, "exactly one reply frame");
+        assert_eq!(
+            replies[0].0,
+            FrameType::Ok,
+            "expected Ok, got {:?}",
+            replies[0].0
+        );
+        replies[0].1.clone()
+    }
+
+    #[test]
+    fn progress_then_cap_then_term_over_the_wire() {
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_with(Arc::clone(&clock), 5);
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        produce(&mut e, b"x");
+
+        // Fetch to lease offset 0 (deadline = now(0) + 30, hard cap at 100).
+        out.clear();
+        s.process(
+            &mut e,
+            &frame(FrameType::Flow, &1u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let toks = delivered_tokens(&out);
+        assert_eq!(toks.len(), 1);
+        let (offset, generation) = toks[0];
+
+        // Progress at t=25 extends the lease: status byte 1.
+        clock.advance_monotonic_nanos(25);
+        assert_eq!(
+            ack_reply(&mut s, &mut e, AckOp::Progress, offset, generation),
+            vec![1]
+        );
+        // Progress at t=100 (attempt_start 0 + hard cap 100) cannot extend: status byte 2.
+        clock.advance_monotonic_nanos(75);
+        assert_eq!(
+            ack_reply(&mut s, &mut e, AckOp::Progress, offset, generation),
+            vec![2]
+        );
+        // Term drops it (status byte 1) and commits past it.
+        assert_eq!(
+            ack_reply(&mut s, &mut e, AckOp::Term, offset, generation),
+            vec![1]
+        );
+        assert_eq!(e.committed_offset().get(), 1);
+        // A term of the now-stale token is fenced: status byte 0.
+        assert_eq!(
+            ack_reply(&mut s, &mut e, AckOp::Term, offset, generation),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn term_before_connect_is_rejected() {
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_with(Arc::clone(&clock), 5);
+        let mut s = Session::new();
+        let mut body = Vec::new();
+        encode_ack(
+            &AckBody {
+                op: AckOp::Term,
+                offset: 0,
+                generation: 0,
+                delay_ms: 0,
+            },
+            &mut body,
+        );
+        let mut out = Vec::new();
+        s.process(&mut e, &frame(FrameType::Ack, &body), &mut out)
+            .unwrap();
+        let replies = decode_all(&out);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            replies[0].0,
+            FrameType::Err,
+            "term before connect is rejected"
+        );
     }
 
     /// Decodes every Deliver frame in a Flow response and returns (offset, generation).
