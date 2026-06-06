@@ -279,8 +279,8 @@ impl Client {
 
     /// Nacks a fetched message by its offset and fencing generation, asking the broker to
     /// redeliver it after `delay_ms` (immediately if zero). Returns `true` if the broker
-    /// requeued it, `false` if the token was fenced (stale: it already redelivered or was
-    /// acked, so do not drop local state).
+    /// requeued it, `false` if the token was fenced (stale: it already redelivered, was
+    /// acked, or you nacked it before; either way do not drop local state).
     ///
     /// # Errors
     /// Returns a [`ClientError`] on an IO error, a server error, or a wrong-shape reply.

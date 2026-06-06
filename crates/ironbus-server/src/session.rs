@@ -109,13 +109,11 @@ impl Session {
                 Ok(())
             }
             Some(FrameType::Pub) => self.handle_pub(engine, body, out),
-            Some(FrameType::Ack) => {
-                self.handle_ack(engine, body, out);
-                Ok(())
-            }
+            Some(FrameType::Ack) => self.handle_ack(engine, body, out),
             Some(FrameType::Flow) => self.handle_flow(engine, body, out),
-            // Recognized but not yet wired (nack/term/progress), or response-only verbs a
-            // client should not send.
+            // Sub/Unsub (not yet wired) and the standalone Nack frame type (a client sends a
+            // nack as an Ack frame with the Nack op, handled above), or a response-only verb
+            // (Info/Pong/Ok/Err/Deliver) a client should not send.
             Some(_) => {
                 reply_err(out, "verb not supported on this connection");
                 Ok(())
@@ -178,14 +176,14 @@ impl Session {
         engine: &mut Engine<F, C>,
         body: &[u8],
         out: &mut Vec<u8>,
-    ) {
+    ) -> Result<(), SessionError> {
         if !self.connected {
             reply_err(out, "not connected");
-            return;
+            return Ok(());
         }
         let Ok(ack) = decode_ack(body) else {
             reply_err(out, "malformed ack body");
-            return;
+            return Ok(());
         };
         let token = ironbus_core::lease::LeaseToken {
             offset: ironbus_core::types::Offset::new(ack.offset),
@@ -201,11 +199,28 @@ impl Session {
                     AckResult::Fenced => 0u8,
                 };
                 reply(out, FrameType::Ok, &[status]);
+                Ok(())
             }
             AckOp::Nack => match engine.nack(&token, ack.delay_ms) {
-                Ok(NackResult::Requeued) => reply(out, FrameType::Ok, &[1]),
-                Ok(NackResult::Fenced) => reply(out, FrameType::Ok, &[0]),
-                Err(_) => reply_err(out, "the lease generation space is exhausted"),
+                Ok(NackResult::Requeued) => {
+                    reply(out, FrameType::Ok, &[1]);
+                    Ok(())
+                }
+                Ok(NackResult::Fenced) => {
+                    reply(out, FrameType::Ok, &[0]);
+                    Ok(())
+                }
+                // Generation exhaustion is fatal: it wedges every future claim and nack, so
+                // end the session rather than let the client hammer a dead engine, exactly as
+                // the produce path does, instead of masquerading it as a transient failure.
+                Err(e) if e.is_fatal() => {
+                    reply_err(out, "fatal storage error");
+                    Err(SessionError::EngineFatal(e))
+                }
+                Err(_) => {
+                    reply_err(out, "nack failed");
+                    Ok(())
+                }
             },
             // term (stop without dead-lettering) and progress (extend the lease) are the next
             // slice of the ack vocabulary; recognized but not yet wired.
@@ -214,6 +229,7 @@ impl Session {
                     out,
                     "term and progress are not yet supported on this connection",
                 );
+                Ok(())
             }
         }
     }

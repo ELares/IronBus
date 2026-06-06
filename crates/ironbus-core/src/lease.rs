@@ -259,6 +259,11 @@ impl LeaseTable {
     /// the same token is rejected, which prevents a nack-then-ack from committing an
     /// unprocessed message), and the delivery count is kept so the next claim escalates it for
     /// the `MaxDeliver` decision. A stale token is a no-op.
+    ///
+    /// `delay_nanos` is a retry backoff, not an in-attempt visibility extension, so unlike
+    /// `claim` and `extend` it is intentionally not clamped to the per-attempt hard cap: a
+    /// nack ends the current attempt and schedules the next, which may legitimately fall
+    /// further out than the visibility cap of a single attempt allows.
     pub fn nack(&mut self, token: &LeaseToken, now: u64, delay_nanos: u64) -> NackOutcome {
         let off = token.offset.get();
         // Confirm the token owns the current lease before consuming a generation.
