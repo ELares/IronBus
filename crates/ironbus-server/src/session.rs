@@ -617,6 +617,20 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].0, 0);
         assert_ne!(second[0].1, first[0].1, "redelivery fences the old token");
+
+        // The session map now holds only the NEW generation, so acking the OLD one is fenced
+        // by the session guard (status 0, nothing committed); the current one commits.
+        assert_eq!(
+            ack_reply(&mut s, &mut e, AckOp::Ack, first[0].0, first[0].1),
+            vec![0u8],
+            "the stale generation is fenced by the session guard"
+        );
+        assert_eq!(e.committed_offset().get(), 0);
+        assert_eq!(
+            ack_reply(&mut s, &mut e, AckOp::Ack, second[0].0, second[0].1),
+            vec![1u8]
+        );
+        assert_eq!(e.committed_offset().get(), 1);
     }
 
     #[test]
@@ -1018,16 +1032,32 @@ mod tests {
         assert_eq!(toks.len(), 1);
         let (offset, generation) = toks[0];
 
-        // B never received this lease: its ack is fenced (status 0) and commits nothing.
+        // B never received this lease: every disposition from B is fenced (status 0) by the
+        // guard that runs before the op match, and commits/requeues nothing.
         assert_eq!(
             ack_reply(&mut b, &mut e, AckOp::Ack, offset, generation),
             vec![0u8],
             "B cannot commit A's message"
         );
         assert_eq!(
+            ack_reply(&mut b, &mut e, AckOp::Nack, offset, generation),
+            vec![0u8],
+            "B cannot requeue A's message"
+        );
+        assert_eq!(
+            ack_reply(&mut b, &mut e, AckOp::Term, offset, generation),
+            vec![0u8],
+            "B cannot drop A's message"
+        );
+        assert_eq!(
+            ack_reply(&mut b, &mut e, AckOp::Progress, offset, generation),
+            vec![0u8],
+            "B cannot extend A's lease"
+        );
+        assert_eq!(
             e.committed_offset().get(),
             0,
-            "B's foreign ack committed nothing"
+            "none of B's foreign ops committed"
         );
 
         // A, the owner, commits it.
