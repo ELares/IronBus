@@ -20,6 +20,7 @@ use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, 
 use ironbus_proto::message::{decode_ack, decode_pub, encode_deliver, AckOp, DeliverBody};
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
+use std::collections::HashMap;
 
 /// A session error that ends the connection.
 #[derive(Debug)]
@@ -48,6 +49,12 @@ impl std::error::Error for SessionError {}
 #[derive(Debug, Default)]
 pub struct Session {
     connected: bool,
+    /// The leases this session was delivered via Flow and may still act on, keyed by offset
+    /// to its granted generation. Acks are scoped to this map (#175), so one connection cannot
+    /// ack a message delivered to another. Keying by offset bounds it to one entry per offset
+    /// (a redelivery overwrites the stale generation), and committed offsets are pruned per
+    /// batch, so it stays within the in-flight window.
+    leased: HashMap<u64, u64>,
 }
 
 impl Session {
@@ -168,10 +175,11 @@ impl Session {
     }
 
     /// Handles a consumer acknowledgement (ack, nack, term, or progress) for a delivered
-    /// message. NOTE: acknowledgements are not connection-scoped,
-    /// the generation token is the sole authority, so any session presenting a matching
-    /// `(offset, generation)` commits or requeues it. Per-connection ack ownership is tracked
-    /// as #175 for the consumer path.
+    /// message. Acks are connection-scoped (#175): the session tracks the lease tokens it
+    /// handed out via Flow, and an op whose `(offset, generation)` was not delivered to THIS
+    /// session is fenced (status 0) without touching the engine, so a second connection cannot
+    /// commit or requeue a message destined for another consumer. The generation token still
+    /// fences a stale op on an own-but-already-redelivered lease.
     fn handle_ack<F: Filesystem, C: Clock>(
         &mut self,
         engine: &mut Engine<F, C>,
@@ -190,6 +198,14 @@ impl Session {
             offset: ironbus_core::types::Offset::new(ack.offset),
             generation: ack.generation,
         };
+        // Connection-scoped ownership (#175): only the session this lease was delivered to may
+        // act on it. A token this session never received (or whose generation does not match
+        // the one delivered) is fenced (status 0) without touching the engine, so a second
+        // connection cannot commit or requeue another consumer's message.
+        if self.leased.get(&ack.offset) != Some(&ack.generation) {
+            reply(out, FrameType::Ok, &[0]);
+            return Ok(());
+        }
         // Each op replies a one-byte status whose exact meaning is documented per arm below
         // (e.g. progress can reply 2 = cap reached). A status of 0 always means fenced: the
         // token was stale (the message already redelivered or was acked), so the client must
@@ -200,15 +216,18 @@ impl Session {
                     AckResult::Acked => 1u8,
                     AckResult::Fenced => 0u8,
                 };
+                self.leased.remove(&ack.offset);
                 reply(out, FrameType::Ok, &[status]);
                 Ok(())
             }
             AckOp::Nack => match engine.nack(&token, ack.delay_ms) {
                 Ok(NackResult::Requeued) => {
+                    self.leased.remove(&ack.offset);
                     reply(out, FrameType::Ok, &[1]);
                     Ok(())
                 }
                 Ok(NackResult::Fenced) => {
+                    self.leased.remove(&ack.offset);
                     reply(out, FrameType::Ok, &[0]);
                     Ok(())
                 }
@@ -231,6 +250,7 @@ impl Session {
                     AckResult::Acked => 1u8,
                     AckResult::Fenced => 0u8,
                 };
+                self.leased.remove(&ack.offset);
                 reply(out, FrameType::Ok, &[status]);
                 Ok(())
             }
@@ -241,7 +261,10 @@ impl Session {
                 let status = match engine.progress(&token) {
                     ProgressResult::Extended => 1u8,
                     ProgressResult::CapReached => 2u8,
-                    ProgressResult::Fenced => 0u8,
+                    ProgressResult::Fenced => {
+                        self.leased.remove(&ack.offset);
+                        0u8
+                    }
                 };
                 reply(out, FrameType::Ok, &[status]);
                 Ok(())
@@ -286,6 +309,8 @@ impl Session {
                         break;
                     }
                     reply(out, FrameType::Deliver, &frame_body);
+                    // Record ownership so only this session can later act on this lease (#175).
+                    self.leased.insert(d.offset.get(), d.token.generation);
                     delivered += 1;
                 }
                 // A parked (poison, over max-deliver) message is committed past by the
@@ -306,6 +331,10 @@ impl Session {
                 }
             }
         }
+        // Drop ownership of any offset now committed (acked here, or committed past on a
+        // dead-letter), keeping `leased` bounded to the in-flight window.
+        let committed = engine.committed_offset().get();
+        self.leased.retain(|&offset, _| offset >= committed);
         reply(out, FrameType::Ok, &delivered.to_le_bytes());
         Ok(())
     }
@@ -832,38 +861,26 @@ mod tests {
     fn ack_commits_a_delivered_message() {
         let mut e = engine();
         let mut s = Session::new();
-        // Connect + produce + deliver out of band, then ack via the session.
         let mut out = Vec::new();
         s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
-        e.produce(&Append {
-            timestamp_ms: 0,
-            flags: RecordFlags::EMPTY,
-            key: b"",
-            headers: b"",
-            payload: b"m",
-        })
-        .unwrap();
-        let token = match e.poll(0).unwrap() {
-            Poll::Message(d) => d.token,
-            other => panic!("expected a delivery, got {other:?}"),
-        };
-        let mut ack_body = Vec::new();
-        encode_ack(
-            &AckBody {
-                op: AckOp::Ack,
-                offset: token.offset.get(),
-                generation: token.generation,
-                delay_ms: 0,
-            },
-            &mut ack_body,
-        );
+        produce(&mut e, b"m");
+        // Deliver THROUGH the session (Flow) so it owns the lease, then ack it.
         out.clear();
-        s.process(&mut e, &frame(FrameType::Ack, &ack_body), &mut out)
-            .unwrap();
-        let (ty, body) = one_response(&out);
-        assert_eq!(ty, FrameType::Ok);
-        assert_eq!(body, vec![1u8], "status 1 = committed");
+        s.process(
+            &mut e,
+            &frame(FrameType::Flow, &1u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let toks = delivered_tokens(&out);
+        assert_eq!(toks.len(), 1);
+        let (offset, generation) = toks[0];
+        assert_eq!(
+            ack_reply(&mut s, &mut e, AckOp::Ack, offset, generation),
+            vec![1u8],
+            "status 1 = committed"
+        );
         assert_eq!(e.committed_offset().get(), 1);
     }
 
@@ -917,7 +934,8 @@ mod tests {
         s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
         out.clear();
-        // A never-delivered token is stale: fenced, status 0, the client must not drop state.
+        // A token never delivered to this session is fenced: status 0, the client must not
+        // drop state (and nothing is committed).
         let mut ack_body = Vec::new();
         encode_ack(
             &AckBody {
@@ -976,40 +994,49 @@ mod tests {
     }
 
     #[test]
-    fn a_second_connection_can_ack_a_message_delivered_to_the_first() {
-        // Documents the current model (issue #175): acks are not connection-scoped; the
-        // generation token is the sole authority, so any session with a valid token commits.
+    fn a_second_connection_cannot_ack_a_message_delivered_to_another() {
+        // #175 regression: acks are connection-scoped. A message delivered to session A cannot
+        // be committed by session B presenting the same token; only A, the owner, can ack it.
         let mut e = engine();
-        e.produce(&Append {
-            timestamp_ms: 0,
-            flags: RecordFlags::EMPTY,
-            key: b"",
-            headers: b"",
-            payload: b"m",
-        })
-        .unwrap();
-        let token = match e.poll(0).unwrap() {
-            Poll::Message(d) => d.token,
-            other => panic!("expected a delivery, got {other:?}"),
-        };
-        // A fresh session B (never delivered the message) acks it with the token.
+        let mut a = Session::new();
         let mut b = Session::new();
         let mut out = Vec::new();
+        a.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
         b.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
-        let mut ack_body = Vec::new();
-        encode_ack(
-            &AckBody {
-                op: AckOp::Ack,
-                offset: token.offset.get(),
-                generation: token.generation,
-                delay_ms: 0,
-            },
-            &mut ack_body,
+        produce(&mut e, b"m");
+        // Deliver to A via its Flow.
+        out.clear();
+        a.process(
+            &mut e,
+            &frame(FrameType::Flow, &1u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let toks = delivered_tokens(&out);
+        assert_eq!(toks.len(), 1);
+        let (offset, generation) = toks[0];
+
+        // B never received this lease: its ack is fenced (status 0) and commits nothing.
+        assert_eq!(
+            ack_reply(&mut b, &mut e, AckOp::Ack, offset, generation),
+            vec![0u8],
+            "B cannot commit A's message"
         );
-        b.process(&mut e, &frame(FrameType::Ack, &ack_body), &mut out)
-            .unwrap();
-        assert_eq!(e.committed_offset().get(), 1, "B committed A's message");
+        assert_eq!(
+            e.committed_offset().get(),
+            0,
+            "B's foreign ack committed nothing"
+        );
+
+        // A, the owner, commits it.
+        assert_eq!(
+            ack_reply(&mut a, &mut e, AckOp::Ack, offset, generation),
+            vec![1u8],
+            "A owns the lease and commits"
+        );
+        assert_eq!(e.committed_offset().get(), 1);
     }
 
     #[test]
