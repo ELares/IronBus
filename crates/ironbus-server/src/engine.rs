@@ -197,6 +197,9 @@ pub enum ProgressResult {
 pub struct Counters {
     /// Messages appended by `produce`.
     pub produced: u64,
+    /// Logical message bytes appended by `produce` (key + headers + payload, excluding the
+    /// record framing). A throughput and flash-wear signal alongside the record count.
+    pub produced_bytes: u64,
     /// Message deliveries handed out by `poll` (a redelivery counts again).
     pub delivered: u64,
     /// Deliveries that were a redelivery (the message had been delivered before).
@@ -472,6 +475,11 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
         self.fsync
             .observe(self.log.now_monotonic().saturating_sub(started));
         self.counters.produced += 1;
+        let bytes = message.key.len() + message.headers.len() + message.payload.len();
+        self.counters.produced_bytes = self
+            .counters
+            .produced_bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
         Ok(offset)
     }
 
