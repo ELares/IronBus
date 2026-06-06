@@ -13,11 +13,11 @@
 //! offset; other `Ok`s have an empty body; an `Err` carries a UTF-8 message. A malformed
 //! frame envelope is unrecoverable for a length-prefixed stream, so it ends the session.
 
-use crate::engine::{AckResult, Engine, EngineError};
+use crate::engine::{AckResult, Engine, EngineError, Poll};
 use ironbus_core::clock::Clock;
 use ironbus_core::types::RecordFlags;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
-use ironbus_proto::message::{decode_ack, decode_pub, AckOp};
+use ironbus_proto::message::{decode_ack, decode_pub, encode_deliver, AckOp, DeliverBody};
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
 
@@ -113,8 +113,9 @@ impl Session {
                 self.handle_ack(engine, body, out);
                 Ok(())
             }
-            // Recognized but not yet wired (streaming consumer path), or response-only verbs
-            // a client should not send.
+            Some(FrameType::Flow) => self.handle_flow(engine, body, out),
+            // Recognized but not yet wired (nack/term/progress), or response-only verbs a
+            // client should not send.
             Some(_) => {
                 reply_err(out, "verb not supported on this connection");
                 Ok(())
@@ -202,6 +203,63 @@ impl Session {
         };
         reply(out, FrameType::Ok, &[status]);
     }
+    /// Fetches up to the requested number of messages and streams them as DELIVER frames,
+    /// terminated by an `Ok` whose body is the count delivered (so the client knows the
+    /// batch is complete). The credit count is a little-endian `u32`.
+    fn handle_flow<F: Filesystem, C: Clock>(
+        &mut self,
+        engine: &mut Engine<F, C>,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        let Ok(credit_bytes) = <[u8; 4]>::try_from(body) else {
+            reply_err(out, "flow credit must be a u32");
+            return Ok(());
+        };
+        let credits = u32::from_le_bytes(credit_bytes);
+        let mut delivered = 0u32;
+        for _ in 0..credits {
+            match engine.poll_now() {
+                Ok(Poll::Message(d)) => {
+                    let msg = DeliverBody {
+                        offset: d.offset.get(),
+                        generation: d.token.generation,
+                        flags: d.record.flags.bits(),
+                        timestamp_ms: d.record.timestamp_ms,
+                        key: &d.record.key,
+                        headers: &d.record.headers,
+                        payload: &d.record.payload,
+                    };
+                    let mut frame_body = Vec::new();
+                    // The record's key/headers came through PUB (u16-bounded), so this cannot
+                    // exceed the field limit; on the impossible error, stop the batch.
+                    if encode_deliver(&msg, &mut frame_body).is_err() {
+                        break;
+                    }
+                    reply(out, FrameType::Deliver, &frame_body);
+                    delivered += 1;
+                }
+                // A parked (poison) message is skipped from delivery; keep draining credits.
+                Ok(Poll::Parked { .. }) => {}
+                // Nothing more deliverable right now: end the batch early.
+                Ok(Poll::Idle) => break,
+                Err(e) if e.is_fatal() => {
+                    reply_err(out, "fatal storage error");
+                    return Err(SessionError::EngineFatal(e));
+                }
+                Err(_) => {
+                    reply_err(out, "fetch failed");
+                    break;
+                }
+            }
+        }
+        reply(out, FrameType::Ok, &delivered.to_le_bytes());
+        Ok(())
+    }
 }
 
 /// Encodes a response frame. Bodies here are tiny (<= 8 bytes, or a short literal), well
@@ -223,7 +281,7 @@ mod tests {
     use ironbus_core::clock::ManualClock;
     use ironbus_core::delivery::DeliveryConfig;
     use ironbus_core::lease::LeaseConfig;
-    use ironbus_proto::message::{encode_ack, encode_pub, AckBody, PubBody};
+    use ironbus_proto::message::{decode_deliver, encode_ack, encode_pub, AckBody, PubBody};
     use ironbus_storage::fs::InMemoryFs;
     use ironbus_storage::log::LogConfig;
 
@@ -258,6 +316,154 @@ mod tests {
         let mut v = Vec::new();
         encode_frame(ty, body, &mut v).unwrap();
         v
+    }
+
+    /// Decodes every complete frame in `out`.
+    fn decode_all(out: &[u8]) -> Vec<(FrameType, Vec<u8>)> {
+        let mut frames = Vec::new();
+        let mut off = 0;
+        while off < out.len() {
+            match decode_frame(&out[off..]).unwrap() {
+                FrameDecode::Frame {
+                    type_tag,
+                    body,
+                    consumed,
+                } => {
+                    frames.push((FrameType::from_u8(type_tag).unwrap(), body.to_vec()));
+                    off += consumed;
+                }
+                FrameDecode::Incomplete { .. } => break,
+            }
+        }
+        frames
+    }
+
+    fn produce(e: &mut Engine<InMemoryFs, ManualClock>, payload: &[u8]) {
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn flow_fetches_messages_as_deliver_frames_then_ok() {
+        let mut e = engine();
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        produce(&mut e, b"a");
+        produce(&mut e, b"b");
+        out.clear();
+        // Fetch up to 5: two messages are available, then the batch terminates with Ok(2).
+        s.process(
+            &mut e,
+            &frame(FrameType::Flow, &5u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let frames = decode_all(&out);
+        assert_eq!(frames.len(), 3, "two Deliver frames then an Ok terminator");
+        assert_eq!(frames[0].0, FrameType::Deliver);
+        let d0 = decode_deliver(&frames[0].1).unwrap();
+        assert_eq!(d0.offset, 0);
+        assert_eq!(d0.payload, b"a");
+        assert_eq!(frames[1].0, FrameType::Deliver);
+        assert_eq!(decode_deliver(&frames[1].1).unwrap().payload, b"b");
+        assert_eq!(frames[2].0, FrameType::Ok);
+        assert_eq!(
+            frames[2].1,
+            2u32.to_le_bytes(),
+            "Ok carries the delivered count"
+        );
+    }
+
+    #[test]
+    fn flow_with_nothing_available_replies_ok_zero() {
+        let mut e = engine();
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        s.process(
+            &mut e,
+            &frame(FrameType::Flow, &3u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let frames = decode_all(&out);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, FrameType::Ok);
+        assert_eq!(frames[0].1, 0u32.to_le_bytes());
+    }
+
+    #[test]
+    fn flow_before_connect_is_rejected() {
+        let mut e = engine();
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &mut e,
+            &frame(FrameType::Flow, &1u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Err);
+    }
+
+    #[test]
+    fn end_to_end_produce_fetch_ack_over_the_session() {
+        let mut e = engine();
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        // Produce via the session (PUB).
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                payload: b"round-trip",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        s.process(&mut e, &frame(FrameType::Pub, &pub_body), &mut out)
+            .unwrap();
+        out.clear();
+        // Fetch it.
+        s.process(
+            &mut e,
+            &frame(FrameType::Flow, &1u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let frames = decode_all(&out);
+        let delivered = decode_deliver(&frames[0].1).unwrap();
+        assert_eq!(delivered.payload, b"round-trip");
+        // Ack it with the delivered token; the cursor commits.
+        let mut ack_body = Vec::new();
+        encode_ack(
+            &AckBody {
+                op: AckOp::Ack,
+                offset: delivered.offset,
+                generation: delivered.generation,
+                delay_ms: 0,
+            },
+            &mut ack_body,
+        );
+        out.clear();
+        s.process(&mut e, &frame(FrameType::Ack, &ack_body), &mut out)
+            .unwrap();
+        assert_eq!(e.committed_offset().get(), 1);
     }
 
     #[test]

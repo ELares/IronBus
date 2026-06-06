@@ -380,6 +380,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         self.flushed_offset
     }
 
+    /// The current monotonic time from the log's clock, for the consumer's lease deadlines.
+    #[must_use]
+    pub fn now_monotonic(&self) -> u64 {
+        self.clock.now_monotonic_nanos()
+    }
+
     /// Reads up to `max` records starting at log offset `start`, crossing segment
     /// boundaries, and stops at the flushed (durable) offset. Returns fewer records than
     /// `max` if the flushed end is reached first, and an empty vector if `start` is at or

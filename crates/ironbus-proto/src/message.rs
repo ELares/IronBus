@@ -234,6 +234,69 @@ pub fn decode_ack(body: &[u8]) -> Result<AckBody, BodyError> {
     })
 }
 
+/// A message delivered to a consumer (the DELIVER frame body): the message plus the
+/// `offset` that names it and the lease `generation` (fencing token) to ack it with.
+///
+/// Layout: `offset: u64`, `generation: u64`, then a `PubBody`-shaped tail (`flags: u8`,
+/// `timestamp_ms: u64`, `key` and `headers` as u16-length fields, then the payload).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeliverBody<'a> {
+    /// The log offset of the delivered message.
+    pub offset: u64,
+    /// The lease generation to carry on the ack (the fencing token).
+    pub generation: u64,
+    /// Record flags as stored.
+    pub flags: u8,
+    /// Producer timestamp, milliseconds since the Unix epoch.
+    pub timestamp_ms: u64,
+    /// The routing or ordering key (empty if none).
+    pub key: &'a [u8],
+    /// The headers blob (empty if none).
+    pub headers: &'a [u8],
+    /// The message payload.
+    pub payload: &'a [u8],
+}
+
+/// Encodes a DELIVER body onto the end of `out`.
+///
+/// # Errors
+/// Returns [`BodyError::FieldTooLarge`] if the key or headers exceed `u16::MAX`.
+pub fn encode_deliver(msg: &DeliverBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
+    out.extend_from_slice(&msg.offset.to_le_bytes());
+    out.extend_from_slice(&msg.generation.to_le_bytes());
+    out.push(msg.flags);
+    out.extend_from_slice(&msg.timestamp_ms.to_le_bytes());
+    push_var(out, msg.key)?;
+    push_var(out, msg.headers)?;
+    out.extend_from_slice(msg.payload);
+    Ok(())
+}
+
+/// Decodes a DELIVER body. The payload is whatever remains after the framed fields, so
+/// `body` MUST be exactly one frame's body.
+///
+/// # Errors
+/// Returns a [`BodyError`] on a short or inconsistent body.
+pub fn decode_deliver(body: &[u8]) -> Result<DeliverBody<'_>, BodyError> {
+    let mut r = Reader::new(body);
+    let offset = r.u64()?;
+    let generation = r.u64()?;
+    let flags = r.u8()?;
+    let timestamp_ms = r.u64()?;
+    let key = r.var()?;
+    let headers = r.var()?;
+    let payload = r.rest();
+    Ok(DeliverBody {
+        offset,
+        generation,
+        flags,
+        timestamp_ms,
+        key,
+        headers,
+        payload,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +314,22 @@ mod tests {
         let mut buf = Vec::new();
         encode_pub(&msg, &mut buf).unwrap();
         assert_eq!(decode_pub(&buf).unwrap(), msg);
+    }
+
+    #[test]
+    fn deliver_round_trips() {
+        let msg = DeliverBody {
+            offset: 12_345,
+            generation: 9,
+            flags: 0,
+            timestamp_ms: 42,
+            key: b"key",
+            headers: b"",
+            payload: b"delivered payload",
+        };
+        let mut buf = Vec::new();
+        encode_deliver(&msg, &mut buf).unwrap();
+        assert_eq!(decode_deliver(&buf).unwrap(), msg);
     }
 
     #[test]
@@ -399,11 +478,27 @@ mod tests {
             prop_assert_eq!(decode_ack(&buf).unwrap(), ack);
         }
 
-        /// Decoding arbitrary bytes as a PUB or ACK never panics.
+        /// Decoding arbitrary bytes as a PUB, ACK, or DELIVER never panics.
         #[test]
         fn decoding_arbitrary_bytes_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..64)) {
             let _ = decode_pub(&bytes);
             let _ = decode_ack(&bytes);
+            let _ = decode_deliver(&bytes);
+        }
+
+        #[test]
+        fn any_deliver_round_trips(
+            offset in any::<u64>(),
+            generation in any::<u64>(),
+            flags in any::<u8>(),
+            timestamp_ms in any::<u64>(),
+            key in prop::collection::vec(any::<u8>(), 0..200),
+            payload in prop::collection::vec(any::<u8>(), 0..512),
+        ) {
+            let msg = DeliverBody { offset, generation, flags, timestamp_ms, key: &key, headers: b"", payload: &payload };
+            let mut buf = Vec::new();
+            encode_deliver(&msg, &mut buf).unwrap();
+            prop_assert_eq!(decode_deliver(&buf).unwrap(), msg);
         }
     }
 }

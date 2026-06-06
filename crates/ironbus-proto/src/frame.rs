@@ -51,6 +51,8 @@ pub enum FrameType {
     Ok,
     /// Generic error response.
     Err,
+    /// Server delivers a message to a consumer.
+    Deliver,
 }
 
 impl FrameType {
@@ -70,6 +72,7 @@ impl FrameType {
             FrameType::Flow => 10,
             FrameType::Ok => 11,
             FrameType::Err => 12,
+            FrameType::Deliver => 13,
         }
     }
 
@@ -90,6 +93,7 @@ impl FrameType {
             10 => FrameType::Flow,
             11 => FrameType::Ok,
             12 => FrameType::Err,
+            13 => FrameType::Deliver,
             _ => return None,
         })
     }
@@ -222,7 +226,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 12] = [
+    const ALL_TYPES: [FrameType; 13] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -235,6 +239,7 @@ mod tests {
         FrameType::Flow,
         FrameType::Ok,
         FrameType::Err,
+        FrameType::Deliver,
     ];
 
     #[test]
@@ -265,6 +270,7 @@ mod tests {
         assert_eq!(FrameType::Flow.as_u8(), 10);
         assert_eq!(FrameType::Ok.as_u8(), 11);
         assert_eq!(FrameType::Err.as_u8(), 12);
+        assert_eq!(FrameType::Deliver.as_u8(), 13);
     }
 
     #[test]
@@ -450,7 +456,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 13u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 14u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);
