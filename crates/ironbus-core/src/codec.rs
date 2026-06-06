@@ -15,6 +15,7 @@ use crate::format::{
     header_offsets as off, FORMAT_VERSION, MAX_RECORD_BYTES_CEILING, RECORD_HEADER_CRC_RANGE,
     RECORD_HEADER_LEN, RECORD_MAGIC, RECORD_TRAILER_LEN,
 };
+use crate::raw::{read_u16, read_u32, read_u64};
 use crate::types::{RecordFlags, Seq};
 
 /// A borrowed view of a record, used both as the input to [`encode`] and the
@@ -89,21 +90,6 @@ impl core::fmt::Display for DecodeError {
     }
 }
 impl std::error::Error for DecodeError {}
-
-#[inline]
-fn read_u16(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([b[at], b[at + 1]])
-}
-#[inline]
-fn read_u32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
-}
-#[inline]
-fn read_u64(b: &[u8], at: usize) -> u64 {
-    let mut a = [0u8; 8];
-    a.copy_from_slice(&b[at..at + 8]);
-    u64::from_le_bytes(a)
-}
 
 /// Encodes `rec` into a complete record frame appended to `out`.
 ///

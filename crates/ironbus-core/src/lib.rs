@@ -7,7 +7,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub(crate) mod raw;
+
 pub mod clock;
 pub mod codec;
 pub mod format;
+pub mod segment;
 pub mod types;
