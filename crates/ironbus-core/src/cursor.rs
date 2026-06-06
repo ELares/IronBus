@@ -103,6 +103,13 @@ impl AckCursor {
         &self.ahead
     }
 
+    /// The minimum length in bytes of an [`AckCursor::encode_snapshot`] output: the fixed
+    /// header (a 1-byte version plus the 8-byte committed watermark) and the trailing 4-byte
+    /// crc32c, with no acked-ahead runs. A payload shorter than this cannot be a snapshot, so
+    /// a caller framing a snapshot alongside an older committed-only format can tell them
+    /// apart by length.
+    pub const SNAPSHOT_MIN_LEN: usize = 1 + 8 + 4;
+
     /// Encodes a durable snapshot of this cursor for a consumer-state store (#60): a 1-byte
     /// version, the committed watermark, the run-length acked-ahead ranges, then a trailing
     /// crc32c over everything before it. The run count is implicit (the bytes between the
@@ -130,11 +137,11 @@ impl AckCursor {
     /// structurally invalid snapshot.
     pub fn decode_snapshot(input: &[u8]) -> Result<AckCursor, SnapshotError> {
         // version (1) + committed (8) + crc (4) = 13 fixed bytes, plus 16 per ahead range.
-        const FIXED: usize = 1 + 8 + 4;
-        if input.len() < FIXED {
+        let fixed = Self::SNAPSHOT_MIN_LEN;
+        if input.len() < fixed {
             return Err(SnapshotError::Truncated);
         }
-        let runs_len = input.len() - FIXED;
+        let runs_len = input.len() - fixed;
         if runs_len % 16 != 0 {
             return Err(SnapshotError::BadLength { len: input.len() });
         }

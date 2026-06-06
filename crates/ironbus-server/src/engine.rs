@@ -24,7 +24,7 @@ use ironbus_core::lease::{
     AckOutcome, Claim, ExtendOutcome, LeaseConfig, LeaseTable, LeaseToken, NackOutcome,
 };
 use ironbus_core::types::Offset;
-use ironbus_storage::checkpoint::Checkpoint;
+use ironbus_storage::checkpoint::{Checkpoint, MAX_PAYLOAD};
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::{Append, Log, LogConfig};
 use ironbus_storage::loss::LossReport;
@@ -212,10 +212,11 @@ pub struct Engine<F: Filesystem, C: Clock> {
 const CURSOR_CHECKPOINT: &str = "cursor.ckpt";
 
 impl<F: Filesystem, C: Clock> Engine<F, C> {
-    /// Opens the engine, recovering the durable log and the durable committed cursor (so a
-    /// restart resumes from the last checkpoint, redelivering only the uncommitted tail).
-    /// The lease table starts empty, so anything that was in flight at the crash
-    /// redelivers, which is safe at-least-once behavior.
+    /// Opens the engine, recovering the durable log and the durable consumer cursor (its
+    /// committed watermark plus the acked-ahead set), so a restart resumes from the last
+    /// checkpoint and redelivers only genuinely unacked offsets, not the acked-ahead ones.
+    /// The lease table starts empty, so anything that was merely in flight (delivered but
+    /// unacked) at the crash redelivers, which is safe at-least-once behavior.
     ///
     /// # Errors
     /// Returns [`EngineError::ZeroMaxInFlight`] for a zero window, or a storage error from
@@ -238,28 +239,53 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
             }
         };
         let (checkpoint, recovered) = Checkpoint::open(checkpoint_file)?;
-        // The committed cursor is the LEADING 8 little-endian bytes of the payload; reading
-        // a prefix (not requiring an exact length) keeps recovery working once the payload
-        // is extended to also carry the resilience counters, rather than silently resetting
-        // the cursor to zero and redelivering the whole log.
-        let recovered_offset = recovered
-            .as_deref()
-            .and_then(|p| p.get(..8))
-            .and_then(|s| <[u8; 8]>::try_from(s).ok())
-            .map_or(0, u64::from_le_bytes);
+        // Reconstruct the durable consumer cursor from the checkpoint payload. The current
+        // format is the full `AckCursor` snapshot (#235): the committed watermark plus the
+        // acked-ahead set, so out-of-order acks survive a restart instead of redelivering.
+        // A payload too short to be a snapshot is the legacy committed-only format (#182):
+        // its leading 8 little-endian bytes are the committed offset, with no ahead set.
+        let recovered_cursor = match recovered.as_deref() {
+            Some(p) if p.len() >= AckCursor::SNAPSHOT_MIN_LEN => AckCursor::decode_snapshot(p).ok(),
+            Some(p) => {
+                let committed = p
+                    .get(..8)
+                    .and_then(|s| <[u8; 8]>::try_from(s).ok())
+                    .map_or(0, u64::from_le_bytes);
+                Some(AckCursor::resume(Offset::new(committed)))
+            }
+            None => None,
+        };
         let flushed = log.flushed_offset().get();
-        // The committed cursor can never legitimately exceed the durable log head; if it
-        // does, the log recovered below a valid checkpoint (corruption/truncation). Clamping
-        // down is at-least-once-safe (duplicates, never loss), but assert loudly in debug.
+        // The committed cursor can never legitimately exceed the durable log head, and every
+        // acked-ahead range must reference a durable record; if either is above the head the
+        // log recovered below a valid checkpoint (corruption/truncation). Clamping down (and
+        // dropping ahead ranges above the head) is at-least-once-safe (duplicates, never
+        // loss), but assert the watermark loudly in debug.
+        let recovered_committed = recovered_cursor.as_ref().map_or(0, |c| c.committed().get());
         debug_assert!(
-            recovered_offset <= flushed,
-            "checkpoint committed {recovered_offset} exceeds the durable head {flushed}"
+            recovered_committed <= flushed,
+            "checkpoint committed {recovered_committed} exceeds the durable head {flushed}"
         );
-        let committed = recovered_offset.min(flushed);
+        let committed = recovered_committed.min(flushed);
+        let ahead: Vec<(u64, u64)> = recovered_cursor
+            .as_ref()
+            .map(|c| {
+                c.ahead_ranges()
+                    .iter()
+                    .copied()
+                    .filter(|&(start, end)| start > committed && end <= flushed)
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Filtering a valid ahead set keeps it valid (sorted, disjoint, non-adjacent, above
+        // the watermark), so `resume_with_ahead` succeeds; fall back to a bare resume rather
+        // than panic if a future change ever violates that.
+        let cursor = AckCursor::resume_with_ahead(Offset::new(committed), ahead)
+            .unwrap_or_else(|_| AckCursor::resume(Offset::new(committed)));
 
         Ok(Engine {
             log,
-            cursor: AckCursor::resume(Offset::new(committed)),
+            cursor,
             leases: LeaseTable::new(config.lease),
             delivery: config.delivery,
             max_in_flight: config.max_in_flight,
@@ -281,13 +307,45 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// Propagates a storage error from writing the checkpoint.
     pub fn checkpoint_cursor(&mut self) -> Result<(), EngineError> {
         let committed = self.cursor.committed().get();
-        // Skip a redundant write when nothing advanced since the last checkpoint, so a forced
-        // checkpoint (e.g. on a connection close that did no acking) is a no-op.
-        if committed > self.last_checkpointed {
-            self.checkpoint.write(&committed.to_le_bytes())?;
+        // Persist when the watermark advanced OR there is an acked-ahead set to capture: an
+        // out-of-order ack moves the ahead set without advancing the watermark, and the
+        // clean-disconnect flush is the right place to record it so those acks are not
+        // redelivered after a restart. A forced checkpoint with nothing new (a connection
+        // close that did no acking) stays a no-op.
+        if committed > self.last_checkpointed || !self.cursor.ahead_ranges().is_empty() {
+            let payload = self.cursor_checkpoint_payload();
+            self.checkpoint.write(&payload)?;
             self.last_checkpointed = committed;
         }
         Ok(())
+    }
+
+    /// Builds the checkpoint payload for the current cursor: the full [`AckCursor`] snapshot
+    /// (the committed watermark plus the acked-ahead set) when it fits a checkpoint slot,
+    /// else the watermark plus the leading acked-ahead runs that fit. Dropping the overflow
+    /// runs only redelivers those already-acked messages after a crash (at-least-once safe);
+    /// it never loses an ack below the watermark. A pathological ahead set (many disjoint
+    /// out-of-order acks) is the only case that overflows; the in-flight window bounds it.
+    fn cursor_checkpoint_payload(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.cursor.encode_snapshot(&mut buf);
+        if buf.len() <= MAX_PAYLOAD {
+            return buf;
+        }
+        // A slot holds MAX_PAYLOAD bytes: the fixed snapshot header and crc, plus 16 per run.
+        let max_runs = MAX_PAYLOAD.saturating_sub(AckCursor::SNAPSHOT_MIN_LEN) / 16;
+        let kept: Vec<(u64, u64)> = self
+            .cursor
+            .ahead_ranges()
+            .iter()
+            .copied()
+            .take(max_runs)
+            .collect();
+        let capped = AckCursor::resume_with_ahead(self.cursor.committed(), kept)
+            .unwrap_or_else(|_| AckCursor::resume(self.cursor.committed()));
+        let mut out = Vec::new();
+        capped.encode_snapshot(&mut out);
+        out
     }
 
     /// Checkpoints the committed cursor if it has advanced at least `checkpoint_interval`
@@ -300,7 +358,8 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     pub fn maybe_checkpoint(&mut self) -> Result<bool, EngineError> {
         let committed = self.cursor.committed().get();
         if committed.saturating_sub(self.last_checkpointed) >= self.checkpoint_interval.max(1) {
-            self.checkpoint.write(&committed.to_le_bytes())?;
+            let payload = self.cursor_checkpoint_payload();
+            self.checkpoint.write(&payload)?;
             self.last_checkpointed = committed;
             Ok(true)
         } else {
@@ -872,6 +931,147 @@ mod tests {
         let d = message(e.poll(0).unwrap());
         assert_eq!(d.offset, Offset::new(1));
         assert_eq!(d.record.payload, b"b");
+    }
+
+    #[test]
+    fn an_out_of_order_acked_ahead_set_survives_a_checkpoint_and_reopen() {
+        // Ack offsets 1, 2, 3 but leave a gap at 0: the committed watermark stays at 0 while
+        // the acked-ahead set holds [1, 4). After a checkpoint and reopen, only the gap (0)
+        // redelivers; the acked-ahead messages do NOT, because the snapshot persisted them.
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b", b"c", b"d"] {
+            produce(&mut e, p);
+        }
+        // Poll all four, holding their tokens, then ack 1, 2, 3 (not 0).
+        let mut tokens = Vec::new();
+        for _ in 0..4 {
+            tokens.push(message(e.poll(0).unwrap()).token);
+        }
+        for i in [1usize, 2, 3] {
+            assert_eq!(e.ack(&tokens[i]), AckResult::Acked);
+        }
+        assert_eq!(
+            e.committed_offset(),
+            Offset::new(0),
+            "the gap at 0 holds the watermark"
+        );
+        e.checkpoint_cursor().unwrap();
+        let fs = e.into_filesystem();
+
+        let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(e.committed_offset(), Offset::new(0));
+        // Drain: only offset 0 ("a") is deliverable; 1..4 are acked-ahead and skipped.
+        let mut delivered = Vec::new();
+        loop {
+            match e.poll(0).unwrap() {
+                Poll::Message(d) => {
+                    delivered.push((d.offset.get(), d.record.payload.clone()));
+                    e.ack(&d.token);
+                }
+                Poll::Idle => break,
+                Poll::Parked { offset, .. } => panic!("unexpected park at {}", offset.get()),
+            }
+        }
+        assert_eq!(
+            delivered,
+            vec![(0, b"a".to_vec())],
+            "only the gap redelivers; the persisted acked-ahead set is not"
+        );
+        // Acking the gap collapses the whole prefix: the queue is fully consumed.
+        assert_eq!(e.committed_offset(), Offset::new(4));
+    }
+
+    #[test]
+    fn an_acked_ahead_set_larger_than_the_checkpoint_slot_degrades_safely() {
+        // Produce 20 and ack every odd offset (1, 3, ... 19), leaving even gaps. The cursor
+        // then holds 10 disjoint acked-ahead runs, more than a 64-byte checkpoint slot fits.
+        // The checkpoint keeps the watermark plus the leading runs that fit and drops the
+        // rest: the dropped acks safely redeliver, the kept ones do not, and nothing below
+        // the watermark is ever lost.
+        let mut e = open(config(20, 5));
+        for i in 0..20u8 {
+            produce(&mut e, &[i]);
+        }
+        let mut tokens = Vec::new();
+        for _ in 0..20 {
+            tokens.push(message(e.poll(0).unwrap()).token);
+        }
+        for i in (1..20usize).step_by(2) {
+            assert_eq!(e.ack(&tokens[i]), AckResult::Acked);
+        }
+        assert_eq!(e.committed_offset(), Offset::new(0));
+        assert!(
+            e.cursor.ahead_runs() > 3,
+            "the test needs more runs than the slot holds, got {}",
+            e.cursor.ahead_runs()
+        );
+        e.checkpoint_cursor().unwrap();
+        let fs = e.into_filesystem();
+
+        let mut e = Engine::open(fs, ManualClock::new(), config(20, 5)).unwrap();
+        assert_eq!(e.committed_offset(), Offset::new(0));
+        let mut redelivered = std::collections::BTreeSet::new();
+        loop {
+            match e.poll(0).unwrap() {
+                Poll::Message(d) => {
+                    redelivered.insert(d.offset.get());
+                    e.ack(&d.token);
+                }
+                Poll::Idle => break,
+                Poll::Parked { offset, .. } => panic!("unexpected park at {}", offset.get()),
+            }
+        }
+        // A 64-byte slot holds the leading 3 acked-ahead runs (offsets 1, 3, 5), so those are
+        // NOT redelivered; every other acked offset was dropped from the snapshot and safely
+        // redelivers, as does every even gap.
+        for kept in [1u64, 3, 5] {
+            assert!(
+                !redelivered.contains(&kept),
+                "kept acked-ahead {kept} must not redeliver"
+            );
+        }
+        for dropped in [7u64, 9, 19] {
+            assert!(
+                redelivered.contains(&dropped),
+                "dropped acked-ahead {dropped} must safely redeliver"
+            );
+        }
+        assert!(redelivered.contains(&0), "the even gaps redeliver");
+        // The fully drained queue commits everything: no offset below the watermark is lost.
+        assert_eq!(e.committed_offset(), Offset::new(20));
+    }
+
+    #[test]
+    fn a_legacy_committed_only_checkpoint_still_resumes() {
+        // A pre-snapshot (#182) checkpoint stored only the 8-byte committed offset. The new
+        // open path must still read it: a payload shorter than a snapshot is the legacy form.
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b", b"c", b"d"] {
+            produce(&mut e, p);
+        }
+        let fs = e.into_filesystem();
+        // Overwrite the checkpoint with a legacy committed-only payload (committed = 2).
+        {
+            let file = fs.open(CURSOR_CHECKPOINT).unwrap();
+            let (mut cp, _) = Checkpoint::open(file).unwrap();
+            cp.write(&2u64.to_le_bytes()).unwrap();
+        }
+        let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(
+            e.committed_offset(),
+            Offset::new(2),
+            "the legacy 8-byte committed offset resumes"
+        );
+        let mut delivered = Vec::new();
+        while let Poll::Message(d) = e.poll(0).unwrap() {
+            delivered.push(d.offset.get());
+            e.ack(&d.token);
+        }
+        assert_eq!(
+            delivered,
+            vec![2, 3],
+            "only the uncommitted tail redelivers"
+        );
     }
 
     #[test]
