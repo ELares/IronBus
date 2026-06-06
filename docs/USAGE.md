@@ -44,6 +44,7 @@ resume" below), so it is NOT fsynced on every ack.
 | `--max-deliver <n>` | `5` | Delivery attempts a message gets before it is dead-lettered (parked). Must be at least 1. |
 | `--max-in-flight <n>` | `1024` | The max-ack-pending window: at most this many messages may be leased above the committed cursor at once. Must be at least 1. |
 | `--max-segment-bytes <n>` | `67108864` | The soft per-segment size cap (64 MiB). Must be at least 4096 (smaller caps proliferate segments). |
+| `--visibility-timeout-ms <n>` | `30000` | How long a delivered message stays in flight before it may redeliver. Must be at least 1. The lease hard cap is the larger of 5 minutes and this. |
 | `--health-addr <host:port>` | off | If set, also serve the health and metrics HTTP endpoints on this loopback port. |
 
 ## Produce

@@ -7,6 +7,7 @@ to follow Semantic Versioning once it reaches a tagged release.
 ## [Unreleased]
 
 ### Added
+- `ironbus serve --visibility-timeout-ms <n>` (#91): tune how long a delivered message stays in flight before it may redeliver (default 30000 ms), instead of the hardcoded lease default. Must be at least 1 (a zero window is a hot redelivery loop). The lease hard cap is derived as the larger of 5 minutes and the visibility window, so it is never below one redelivery window.
 - Determinism meta-test (refs #119): a storage gate asserting that two runs of the same fixed produce/sync workload, under a fresh manual clock, produce a byte-identical disk image. This pins the deterministic-simulation foundation, the on-disk format must be a pure function of its inputs, and fails the moment a `SystemTime`, `Instant::now`, or ambient RNG leaks into a header, record, or footer (the design routes IO and the clock through seams).
 - `ironbus serve --max-segment-bytes <n>` (#91, refs #162): tune the soft per-segment size cap (default 64 MiB), instead of the hardcoded storage default. Rejected below 4096 bytes as a usage error, since smaller caps make segments proliferate one record at a time (the operator-facing half of the #162 LogConfig-floor footgun).
 - `ironbus serve --max-in-flight <n>` (#91): tune the max-ack-pending window (at most this many messages leased above the committed cursor at once), instead of the hardcoded 1024. Must be at least 1 (a zero window delivers nothing).
