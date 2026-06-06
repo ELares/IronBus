@@ -4,8 +4,10 @@
 //! [`InMemoryFs`](crate::fs::InMemoryFs) (or any [`Filesystem`]) in a [`FaultFs`], then arm a
 //! fault through the shared [`FaultControl`]; the next matching operation fails deterministically
 //! (no ambient randomness). It injects fsync failures (the fsyncgate / EIO mode), clean write
-//! failures, and one-shot torn (partial) writes; page-cache reordering and both-slots-torn are
-//! follow-ups under #164.
+//! failures, one-shot torn (partial) writes, short reads (a `read_at` returning fewer bytes than
+//! asked while data remains), and read errors (an injected `read_at` IO error). A seeded fault
+//! scheduler that drives these primitives from one PRNG is a follow-up (#151); page-cache
+//! reordering and both-slots-torn are follow-ups under #164.
 
 use crate::fs::Filesystem;
 use crate::io::RandomAccessFile;
@@ -19,8 +21,13 @@ use std::sync::Arc;
 pub struct FaultControl {
     fail_sync: Arc<AtomicBool>,
     fail_write: Arc<AtomicBool>,
+    fail_read: Arc<AtomicBool>,
     torn_write_armed: Arc<AtomicBool>,
     torn_write_prefix: Arc<AtomicU64>,
+    /// While non-zero, every `read_at` returns at most this many bytes (a short read). Zero
+    /// disables it. The model never returns zero bytes while data remains (that would be a
+    /// spurious EOF, not a short read), so the limit must be at least 1 to take effect.
+    short_read_limit: Arc<AtomicU64>,
 }
 
 impl FaultControl {
@@ -34,6 +41,20 @@ impl FaultControl {
     /// IO error WITHOUT writing any bytes, modelling a write that fails cleanly.
     pub fn set_fail_write(&self, fail: bool) {
         self.fail_write.store(fail, Ordering::SeqCst);
+    }
+
+    /// Arms (or disarms) read failure: while armed, every `read_at` returns an injected IO error
+    /// instead of reading, modelling a read that hits a bad block.
+    pub fn set_fail_read(&self, fail: bool) {
+        self.fail_read.store(fail, Ordering::SeqCst);
+    }
+
+    /// Arms (or disarms) short reads: while `limit` is non-zero, every `read_at` returns at most
+    /// `limit` bytes even when more are available, so a caller that does not loop over a partial
+    /// read is exposed. `0` disables it. A short read never returns zero bytes while data remains
+    /// (that would be a spurious EOF), so a `limit` of `0` simply means "off".
+    pub fn set_short_read(&self, limit: u64) {
+        self.short_read_limit.store(limit, Ordering::SeqCst);
     }
 
     /// Arms a one-shot torn write: the NEXT `write_all_at` persists only the first
@@ -51,6 +72,14 @@ impl FaultControl {
 
     fn write_should_fail(&self) -> bool {
         self.fail_write.load(Ordering::SeqCst)
+    }
+
+    fn read_should_fail(&self) -> bool {
+        self.fail_read.load(Ordering::SeqCst)
+    }
+
+    fn short_read_limit(&self) -> u64 {
+        self.short_read_limit.load(Ordering::SeqCst)
     }
 
     /// If a torn write is armed, consume it (one-shot) and return its byte prefix.
@@ -129,10 +158,10 @@ impl<F: Filesystem> Filesystem for FaultFs<F> {
     }
 }
 
-/// A [`RandomAccessFile`] that wraps another and injects sync and write faults while the
-/// shared [`FaultControl`] is armed: a failed fsync, a clean write failure, or a one-shot torn
-/// write that persists a byte prefix then errors. Reads, length, and truncation delegate
-/// unchanged.
+/// A [`RandomAccessFile`] that wraps another and injects faults while the shared
+/// [`FaultControl`] is armed: a failed fsync, a clean write failure, a one-shot torn write that
+/// persists a byte prefix then errors, a read error, or a short read that returns fewer bytes
+/// than asked. Length and truncation delegate unchanged.
 #[derive(Debug)]
 pub struct FaultFile<F> {
     inner: F,
@@ -147,8 +176,22 @@ fn injected_write_error() -> io::Error {
     io::Error::other("injected fault: write failed")
 }
 
+fn injected_read_error() -> io::Error {
+    io::Error::other("injected fault: read failed")
+}
+
 impl<F: RandomAccessFile> RandomAccessFile for FaultFile<F> {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        if self.control.read_should_fail() {
+            return Err(injected_read_error());
+        }
+        let limit = self.control.short_read_limit();
+        if limit > 0 {
+            // Cap the read to `limit` bytes: the inner read returns at most that many, so a
+            // caller that does not loop over a partial read sees fewer bytes than it asked for.
+            let cap = usize::try_from(limit).unwrap_or(usize::MAX).min(buf.len());
+            return self.inner.read_at(&mut buf[..cap], offset);
+        }
         self.inner.read_at(buf, offset)
     }
 
@@ -306,6 +349,66 @@ mod tests {
         control.set_fail_write(false);
         f.write_all_at(b"abc", 0).unwrap();
         assert_eq!(f.len().unwrap(), 3);
+    }
+
+    #[test]
+    fn arming_read_failure_fails_reads_only() {
+        let (fs, control) = faulted();
+        let f = fs.create_new("seg").unwrap();
+        f.write_all_at(b"hello", 0).unwrap();
+        control.set_fail_read(true);
+        let mut buf = [0u8; 5];
+        assert!(f.read_at(&mut buf, 0).is_err(), "reads fault while armed");
+        // Only reads are injected: writes and syncs still go through.
+        f.write_all_at(b"!", 5).unwrap();
+        f.sync_all().unwrap();
+        control.set_fail_read(false);
+        // Disarmed, the read flows to the inner file again.
+        let n = f.read_at(&mut buf, 0).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn a_short_read_returns_fewer_bytes_but_read_exact_still_fills() {
+        let (fs, control) = faulted();
+        let f = fs.create_new("seg").unwrap();
+        f.write_all_at(b"0123456789", 0).unwrap();
+        // Cap every read to 3 bytes even though 10 are available.
+        control.set_short_read(3);
+        let mut buf = [0u8; 10];
+        let n = f.read_at(&mut buf, 0).unwrap();
+        assert_eq!(
+            n, 3,
+            "a short read returns at most the cap, not the full request"
+        );
+        assert_eq!(&buf[..3], b"012");
+        // read_exact_at loops over the short reads and still fills the whole buffer.
+        let mut full = [0u8; 10];
+        f.read_exact_at(&mut full, 0).unwrap();
+        assert_eq!(&full, b"0123456789");
+        // Disarmed, a single read returns everything again.
+        control.set_short_read(0);
+        let mut all = [0u8; 10];
+        assert_eq!(f.read_at(&mut all, 0).unwrap(), 10);
+    }
+
+    #[test]
+    fn a_short_read_at_the_end_still_signals_eof_not_a_spurious_zero() {
+        let (fs, control) = faulted();
+        let f = fs.create_new("seg").unwrap();
+        f.write_all_at(b"ab", 0).unwrap();
+        control.set_short_read(4);
+        // Reading past the end returns 0 (real EOF), and reading the 2 available returns 2 (the
+        // short cap of 4 does not invent bytes).
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            f.read_at(&mut buf, 2).unwrap(),
+            0,
+            "past the end is a real EOF"
+        );
+        assert_eq!(f.read_at(&mut buf, 0).unwrap(), 2);
+        assert_eq!(&buf[..2], b"ab");
     }
 
     #[test]
