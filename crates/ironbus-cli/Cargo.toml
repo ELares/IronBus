@@ -1,0 +1,16 @@
+[package]
+name = "ironbus-cli"
+description = "IronBus command-line interface: broker and diagnostics."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ironbus"
+path = "src/main.rs"
+
+[lints]
+workspace = true

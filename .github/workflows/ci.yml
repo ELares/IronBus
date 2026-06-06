@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features
+
+  msrv:
+    name: msrv (1.78)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.78.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-features
+
+  core-no-io:
+    name: ironbus-core is IO-free
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: forbid std::fs, std::net, tokio in ironbus-core sources
+        run: |
+          set -euo pipefail
+          if grep -rnE '(use[ ]+tokio|tokio::|std::fs::|std::net::|use[ ]+std::fs|use[ ]+std::net)' crates/ironbus-core/src; then
+            echo "::error::ironbus-core must stay IO-free (no std::fs, std::net, or tokio)"
+            exit 1
+          fi
+      - name: forbid tokio/mio in the ironbus-core dependency tree
+        run: |
+          set -euo pipefail
+          deps="$(cargo tree -p ironbus-core -e normal --prefix none | awk '{print $1}' | sort -u)"
+          if echo "$deps" | grep -qxE 'tokio|mio'; then
+            echo "::error::ironbus-core must not depend on tokio or mio"
+            echo "$deps"
+            exit 1
+          fi
