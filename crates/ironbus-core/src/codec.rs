@@ -162,6 +162,10 @@ pub fn encode(rec: &RecordView<'_>, out: &mut Vec<u8>) -> Result<usize, EncodeEr
 /// On success returns the decoded [`RecordView`] (borrowing `input`) and the total
 /// number of bytes the frame occupied, so the caller can advance to the next frame.
 ///
+/// `decode` borrows sub-slices of `input` and allocates nothing; bounding the
+/// per-record size further than the 1 GiB format ceiling (for example the 16 MiB
+/// default) is the caller's responsibility.
+///
 /// # Errors
 /// Returns a [`DecodeError`] describing the first inconsistency found. A
 /// [`DecodeError::Truncated`] means more bytes may complete the frame; the other
@@ -173,6 +177,9 @@ pub fn decode(input: &[u8]) -> Result<(RecordView<'_>, usize), DecodeError> {
     if read_u16(input, off::MAGIC) != RECORD_MAGIC {
         return Err(DecodeError::BadMagic);
     }
+    // Exact-match: a version-1 reader cannot parse a future layout, so it rejects
+    // any other version loudly rather than guessing. Intentional; do not relax to
+    // `>` without a versioned layout.
     let version = input[off::VERSION];
     if version != FORMAT_VERSION {
         return Err(DecodeError::UnsupportedVersion(version));
@@ -182,23 +189,39 @@ pub fn decode(input: &[u8]) -> Result<(RecordView<'_>, usize), DecodeError> {
         return Err(DecodeError::BadHeaderCrc);
     }
 
-    let key_len = read_u32(input, off::KEY_LEN) as usize;
-    let hdr_len = read_u32(input, off::HDR_LEN) as usize;
-    let payload_len = read_u32(input, off::PAYLOAD_LEN) as usize;
-    let body_len = key_len + hdr_len + payload_len;
-    let total = RECORD_HEADER_LEN + body_len + RECORD_TRAILER_LEN;
-    if u32::try_from(total).map_or(true, |t| t > MAX_RECORD_BYTES_CEILING) {
+    let key_len_u32 = read_u32(input, off::KEY_LEN);
+    let hdr_len_u32 = read_u32(input, off::HDR_LEN);
+    let payload_len_u32 = read_u32(input, off::PAYLOAD_LEN);
+    // Sum the three attacker-controlled u32 lengths in u64 so the total cannot
+    // overflow usize on a 32-bit target before it is bounded by the ceiling.
+    let total64 = u64::from(key_len_u32)
+        + u64::from(hdr_len_u32)
+        + u64::from(payload_len_u32)
+        + RECORD_HEADER_LEN as u64
+        + RECORD_TRAILER_LEN as u64;
+    if total64 > u64::from(MAX_RECORD_BYTES_CEILING) {
         return Err(DecodeError::TooLarge);
     }
+    // total64 is now <= 1 GiB, so it and every length fit usize on all targets.
+    let total = usize::try_from(total64).map_err(|_| DecodeError::TooLarge)?;
     if input.len() < total {
         return Err(DecodeError::Truncated);
+    }
+    let key_len = usize::try_from(key_len_u32).map_err(|_| DecodeError::TooLarge)?;
+    let hdr_len = usize::try_from(hdr_len_u32).map_err(|_| DecodeError::TooLarge)?;
+    let body_len = total - RECORD_HEADER_LEN - RECORD_TRAILER_LEN;
+
+    // HAS_KEY is a derived, frozen bit: it must agree with the key length. A frame
+    // where they disagree was written by a buggy or hostile writer.
+    let flags = RecordFlags::from_bits(input[off::FLAGS]);
+    if flags.contains(RecordFlags::HAS_KEY) != (key_len != 0) {
+        return Err(DecodeError::BadLength);
     }
 
     let body = &input[RECORD_HEADER_LEN..RECORD_HEADER_LEN + body_len];
     let trailer = &input[RECORD_HEADER_LEN + body_len..total];
     let stored_body_crc = read_u32(trailer, 0);
-    let stored_total = read_u32(trailer, 4) as usize;
-    if stored_total != total {
+    if u64::from(read_u32(trailer, 4)) != total64 {
         return Err(DecodeError::BadLength);
     }
     if crc32c::crc32c(body) != stored_body_crc {
@@ -208,7 +231,7 @@ pub fn decode(input: &[u8]) -> Result<(RecordView<'_>, usize), DecodeError> {
     let view = RecordView {
         seq: Seq::new(read_u64(input, off::SEQ)),
         timestamp_ms: read_u64(input, off::TIMESTAMP),
-        flags: RecordFlags::from_bits(input[off::FLAGS]),
+        flags,
         key: &body[..key_len],
         headers: &body[key_len..key_len + hdr_len],
         payload: &body[key_len + hdr_len..],
@@ -293,6 +316,104 @@ mod tests {
         buf[body] ^= 0x01;
         assert_eq!(decode(&buf), Err(DecodeError::BadBodyCrc));
     }
+
+    /// Builds a 36-byte header with the given fields and a valid header CRC, so a
+    /// test can craft frames that pass the header-CRC check.
+    fn build_header(key_len: u32, hdr_len: u32, payload_len: u32, flags: u8) -> Vec<u8> {
+        let mut h = vec![0u8; RECORD_HEADER_LEN];
+        h[off::MAGIC..off::MAGIC + 2].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
+        h[off::VERSION] = FORMAT_VERSION;
+        h[off::FLAGS] = flags;
+        h[off::KEY_LEN..off::KEY_LEN + 4].copy_from_slice(&key_len.to_le_bytes());
+        h[off::HDR_LEN..off::HDR_LEN + 4].copy_from_slice(&hdr_len.to_le_bytes());
+        h[off::PAYLOAD_LEN..off::PAYLOAD_LEN + 4].copy_from_slice(&payload_len.to_le_bytes());
+        let crc = crc32c::crc32c(&h[RECORD_HEADER_CRC_RANGE]);
+        h[off::HEADER_CRC..off::HEADER_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn crafted_huge_lengths_are_rejected_not_panicked() {
+        // key_len = hdr_len = u32::MAX with a valid header CRC must be TooLarge, never
+        // a slice-out-of-bounds panic (regression for the 32-bit usize overflow).
+        let h = build_header(u32::MAX, u32::MAX, 0, 0);
+        assert_eq!(decode(&h), Err(DecodeError::TooLarge));
+    }
+
+    #[test]
+    fn ceiling_boundary() {
+        // 36 = RECORD_HEADER_LEN and 8 = RECORD_TRAILER_LEN (pinned by format::tests).
+        let body_at = MAX_RECORD_BYTES_CEILING - 36 - 8;
+        // A declared total of exactly the ceiling is not TooLarge; it is Truncated
+        // here because we do not supply a 1 GiB buffer. One byte over is TooLarge.
+        assert_eq!(
+            decode(&build_header(body_at, 0, 0, 0)),
+            Err(DecodeError::Truncated)
+        );
+        assert_eq!(
+            decode(&build_header(body_at + 1, 0, 0, 0)),
+            Err(DecodeError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn has_key_inconsistency_is_rejected() {
+        // key_len = 0 but HAS_KEY set, with valid header and body CRCs: malformed.
+        let mut frame = build_header(0, 0, 1, RecordFlags::HAS_KEY.bits());
+        frame.extend_from_slice(b"x");
+        frame.extend_from_slice(&crc32c::crc32c(b"x").to_le_bytes());
+        frame.extend_from_slice(&(36u32 + 1 + 8).to_le_bytes());
+        assert_eq!(decode(&frame), Err(DecodeError::BadLength));
+    }
+
+    #[test]
+    fn all_empty_record_roundtrips() {
+        let rec = RecordView {
+            seq: Seq::new(0),
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"",
+        };
+        let mut buf = Vec::new();
+        let n = encode(&rec, &mut buf).unwrap();
+        assert_eq!(n, RECORD_HEADER_LEN + RECORD_TRAILER_LEN);
+        let (got, consumed) = decode(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert!(got.key.is_empty() && got.headers.is_empty() && got.payload.is_empty());
+    }
+
+    #[test]
+    fn two_frames_decode_sequentially() {
+        let r1 = RecordView {
+            seq: Seq::new(1),
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"a",
+            headers: b"",
+            payload: b"one",
+        };
+        let r2 = RecordView {
+            seq: Seq::new(2),
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"hh",
+            payload: b"two!",
+        };
+        let mut buf = Vec::new();
+        encode(&r1, &mut buf).unwrap();
+        let first_len = buf.len();
+        encode(&r2, &mut buf).unwrap();
+        let (g1, c1) = decode(&buf).unwrap();
+        assert_eq!(c1, first_len);
+        assert_eq!(g1.payload, b"one");
+        let (g2, c2) = decode(&buf[c1..]).unwrap();
+        assert_eq!(c1 + c2, buf.len());
+        assert_eq!(g2.seq, Seq::new(2));
+        assert_eq!(g2.payload, b"two!");
+    }
 }
 
 #[cfg(test)]
@@ -306,12 +427,14 @@ mod proptests {
             seq in any::<u64>(),
             ts in any::<u64>(),
             extra_flag in any::<bool>(),
+            unknown_bit in any::<bool>(),
             key in proptest::collection::vec(any::<u8>(), 0..300),
             headers in proptest::collection::vec(any::<u8>(), 0..300),
             payload in proptest::collection::vec(any::<u8>(), 0..1024),
         ) {
             // Only COMPRESSED is a caller-controlled bit here; HAS_KEY is derived.
-            let flags = if extra_flag { RecordFlags::COMPRESSED } else { RecordFlags::EMPTY };
+            let mut flags = if extra_flag { RecordFlags::COMPRESSED } else { RecordFlags::EMPTY };
+            if unknown_bit { flags = RecordFlags::from_bits(flags.bits() | 0b0100_0000); }
             let rec = RecordView {
                 seq: Seq::new(seq), timestamp_ms: ts, flags,
                 key: &key, headers: &headers, payload: &payload,
@@ -328,6 +451,7 @@ mod proptests {
             prop_assert_eq!(got.payload, &payload[..]);
             prop_assert_eq!(got.flags.contains(RecordFlags::COMPRESSED), extra_flag);
             prop_assert_eq!(got.flags.contains(RecordFlags::HAS_KEY), !key.is_empty());
+            prop_assert_eq!(got.flags.unknown_bits().bits(), if unknown_bit { 0b0100_0000 } else { 0 });
         }
 
         #[test]
@@ -348,8 +472,11 @@ mod proptests {
             // A single bit flip must never yield a clean decode with the same payload.
             match decode(&buf) {
                 Err(_) => {}
-                Ok((got, _)) => prop_assert!(got.payload != &payload[..],
-                    "a corrupted frame decoded to the original payload"),
+                Ok((got, consumed)) => {
+                    prop_assert_eq!(consumed, buf.len());
+                    prop_assert!(got.payload != &payload[..],
+                        "a corrupted frame decoded to the original payload");
+                }
             }
         }
     }
