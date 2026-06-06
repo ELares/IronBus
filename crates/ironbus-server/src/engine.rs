@@ -21,6 +21,7 @@ use ironbus_core::cursor::AckCursor;
 use ironbus_core::delivery::{DeliveryConfig, Disposition};
 use ironbus_core::lease::{AckOutcome, Claim, LeaseConfig, LeaseTable, LeaseToken};
 use ironbus_core::types::Offset;
+use ironbus_storage::checkpoint::Checkpoint;
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::{Append, Log, LogConfig};
 use ironbus_storage::segment::{OwnedRecord, StorageError};
@@ -84,6 +85,12 @@ impl From<StorageError> for EngineError {
     }
 }
 
+impl From<std::io::Error> for EngineError {
+    fn from(e: std::io::Error) -> Self {
+        EngineError::Storage(StorageError::Io(e))
+    }
+}
+
 /// A message handed to a consumer by [`Engine::poll`], plus the token to ack it with.
 #[derive(Clone, Debug)]
 pub struct Delivery {
@@ -130,28 +137,79 @@ pub struct Engine<F: Filesystem, C: Clock> {
     leases: LeaseTable,
     delivery: DeliveryConfig,
     max_in_flight: u32,
+    checkpoint: Checkpoint<F::File>,
 }
 
+/// The file name of the work-group's durable committed-cursor checkpoint.
+const CURSOR_CHECKPOINT: &str = "cursor.ckpt";
+
 impl<F: Filesystem, C: Clock> Engine<F, C> {
-    /// Opens the engine, recovering the durable log. The committed cursor and the lease
-    /// table start empty: a restart redelivers everything (the durable consumer cursor is
-    /// follow-up work), which is safe at-least-once behavior.
+    /// Opens the engine, recovering the durable log and the durable committed cursor (so a
+    /// restart resumes from the last checkpoint, redelivering only the uncommitted tail).
+    /// The lease table starts empty, so anything that was in flight at the crash
+    /// redelivers, which is safe at-least-once behavior.
     ///
     /// # Errors
     /// Returns [`EngineError::ZeroMaxInFlight`] for a zero window, or a storage error from
-    /// opening the log.
+    /// opening the log or the cursor checkpoint.
     pub fn open(fs: F, clock: C, config: EngineConfig) -> Result<Engine<F, C>, EngineError> {
         if config.max_in_flight == 0 {
             return Err(EngineError::ZeroMaxInFlight);
         }
         let log = Log::open(fs, clock, config.log)?;
+
+        // Open (creating if absent) the cursor checkpoint through the log's filesystem.
+        let checkpoint_file = {
+            let fs = log.filesystem();
+            if fs.exists(CURSOR_CHECKPOINT)? {
+                fs.open(CURSOR_CHECKPOINT)?
+            } else {
+                let file = fs.create_new(CURSOR_CHECKPOINT)?;
+                fs.sync_dir()?; // the new file's directory entry must be durable
+                file
+            }
+        };
+        let (checkpoint, recovered) = Checkpoint::open(checkpoint_file)?;
+        // The committed cursor is the LEADING 8 little-endian bytes of the payload; reading
+        // a prefix (not requiring an exact length) keeps recovery working once the payload
+        // is extended to also carry the resilience counters, rather than silently resetting
+        // the cursor to zero and redelivering the whole log.
+        let recovered_offset = recovered
+            .as_deref()
+            .and_then(|p| p.get(..8))
+            .and_then(|s| <[u8; 8]>::try_from(s).ok())
+            .map_or(0, u64::from_le_bytes);
+        let flushed = log.flushed_offset().get();
+        // The committed cursor can never legitimately exceed the durable log head; if it
+        // does, the log recovered below a valid checkpoint (corruption/truncation). Clamping
+        // down is at-least-once-safe (duplicates, never loss), but assert loudly in debug.
+        debug_assert!(
+            recovered_offset <= flushed,
+            "checkpoint committed {recovered_offset} exceeds the durable head {flushed}"
+        );
+        let committed = recovered_offset.min(flushed);
+
         Ok(Engine {
             log,
-            cursor: AckCursor::new(),
+            cursor: AckCursor::resume(Offset::new(committed)),
             leases: LeaseTable::new(config.lease),
             delivery: config.delivery,
             max_in_flight: config.max_in_flight,
+            checkpoint,
         })
+    }
+
+    /// Durably records the current committed offset, so a later [`Engine::open`] resumes
+    /// from here. The checkpoint is an optimization: it may lag the true committed cursor
+    /// (a crash then redelivers a few already-processed messages, which at-least-once
+    /// permits), but it never records an offset that was not committed.
+    ///
+    /// # Errors
+    /// Propagates a storage error from writing the checkpoint.
+    pub fn checkpoint_cursor(&mut self) -> Result<(), EngineError> {
+        let committed = self.cursor.committed().get();
+        self.checkpoint.write(&committed.to_le_bytes())?;
+        Ok(())
     }
 
     /// Appends a message and makes it durable before returning its offset (so a producer's
@@ -475,6 +533,109 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_then_reopen_resumes_from_the_committed_offset() {
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b", b"c"] {
+            produce(&mut e, p);
+        }
+        // Consume and ack the first two, then checkpoint the cursor.
+        let d0 = message(e.poll(0).unwrap());
+        e.ack(&d0.token);
+        let d1 = message(e.poll(0).unwrap());
+        e.ack(&d1.token);
+        assert_eq!(e.committed_offset(), Offset::new(2));
+        e.checkpoint_cursor().unwrap();
+        let fs = e.into_filesystem();
+
+        // Reopen: the committed cursor resumes at 2, so only the uncommitted tail (c)
+        // redelivers, NOT a and b, and nothing in [2, flushed) is skipped.
+        let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(e.committed_offset(), Offset::new(2));
+        // Drain the whole window: exactly offset 2 ("c") is deliverable.
+        let mut delivered = Vec::new();
+        while let Poll::Message(d) = e.poll(0).unwrap() {
+            delivered.push((d.offset.get(), d.record.payload.clone()));
+        }
+        assert_eq!(
+            delivered,
+            vec![(2, b"c".to_vec())],
+            "only the uncommitted tail redelivers"
+        );
+    }
+
+    #[test]
+    fn messages_produced_after_a_checkpoint_survive_and_deliver_after_reopen() {
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"a");
+        let d0 = message(e.poll(0).unwrap());
+        e.ack(&d0.token); // committed = 1
+        e.checkpoint_cursor().unwrap();
+        // Produce more AFTER the checkpoint; these are durable but uncommitted.
+        produce(&mut e, b"b");
+        produce(&mut e, b"c");
+        let fs = e.into_filesystem();
+
+        // Reopen: resume at 1, and the post-checkpoint tail (b, c) must all survive.
+        let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(e.committed_offset(), Offset::new(1));
+        let mut delivered = Vec::new();
+        while let Poll::Message(d) = e.poll(0).unwrap() {
+            delivered.push((d.offset.get(), d.record.payload.clone()));
+        }
+        assert_eq!(
+            delivered,
+            vec![(1, b"b".to_vec()), (2, b"c".to_vec())],
+            "no produced-and-durable message is lost across the restart"
+        );
+    }
+
+    #[test]
+    fn a_fully_consumed_checkpointed_queue_is_idle_after_reopen() {
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b"] {
+            produce(&mut e, p);
+        }
+        for _ in 0..2 {
+            let d = message(e.poll(0).unwrap());
+            e.ack(&d.token);
+        }
+        assert_eq!(e.committed_offset(), Offset::new(2));
+        e.checkpoint_cursor().unwrap();
+        let fs = e.into_filesystem();
+
+        let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(e.committed_offset(), Offset::new(2));
+        assert!(
+            matches!(e.poll(0).unwrap(), Poll::Idle),
+            "nothing left to deliver"
+        );
+    }
+
+    #[test]
+    fn a_stale_checkpoint_only_redelivers_the_uncheckpointed_tail() {
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b", b"c"] {
+            produce(&mut e, p);
+        }
+        // Ack 0, checkpoint (committed=1), then ack 1 WITHOUT a second checkpoint.
+        let d0 = message(e.poll(0).unwrap());
+        e.ack(&d0.token);
+        e.checkpoint_cursor().unwrap();
+        let d1 = message(e.poll(0).unwrap());
+        e.ack(&d1.token);
+        assert_eq!(e.committed_offset(), Offset::new(2));
+        let fs = e.into_filesystem();
+
+        // The checkpoint lagged at 1, so reopen resumes at 1 and redelivers b (already
+        // processed) and c: a lagging checkpoint costs duplicates, never loss.
+        let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(e.committed_offset(), Offset::new(1));
+        let d = message(e.poll(0).unwrap());
+        assert_eq!(d.offset, Offset::new(1));
+        assert_eq!(d.record.payload, b"b");
+    }
+
+    #[test]
     fn reopen_recovers_the_durable_log_and_redelivers_uncommitted_messages() {
         let mut e = open(config(10, 5));
         for p in [b"a", b"b"] {
@@ -493,5 +654,39 @@ mod tests {
         assert_eq!(d.record.payload, b"a");
         let d_b = message(e.poll(0).unwrap());
         assert_eq!(d_b.record.payload, b"b");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_cursor_resumes_on_a_real_directory() {
+        use ironbus_storage::fs::StdFs;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let put = |e: &mut Engine<StdFs, ManualClock>, payload: &[u8]| {
+            e.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload,
+            })
+            .unwrap();
+        };
+
+        let mut e =
+            Engine::open(StdFs::new(root.clone()), ManualClock::new(), config(10, 5)).unwrap();
+        put(&mut e, b"a");
+        put(&mut e, b"b");
+        let d0 = message(e.poll(0).unwrap());
+        e.ack(&d0.token);
+        e.checkpoint_cursor().unwrap();
+        drop(e);
+
+        let mut e = Engine::open(StdFs::new(root), ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(e.committed_offset(), Offset::new(1));
+        let d = message(e.poll(0).unwrap());
+        assert_eq!(d.offset, Offset::new(1));
+        assert_eq!(d.record.payload, b"b");
     }
 }
