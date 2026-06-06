@@ -9,9 +9,12 @@
 //! acknowledge (`Ack`), the handshake (`Connect`/`Info`), and keepalive (`Ping`/`Pong`).
 //! The streaming consumer-fetch path and capability negotiation are follow-ups.
 //!
-//! Response body conventions: an `Ok` to a `Pub` carries the 8-byte little-endian assigned
-//! offset; other `Ok`s have an empty body; an `Err` carries a UTF-8 message. A malformed
-//! frame envelope is unrecoverable for a length-prefixed stream, so it ends the session.
+//! Response frames are self-describing per verb (#179): a `Pub` is answered by a `PubAck`
+//! whose body is the 8-byte little-endian assigned offset; an `Ack`/`Nack`/`Term`/`Progress`
+//! by an `AckStatus` whose body is a one-byte status; a `Flow` batch by a `FlowEnd` whose
+//! body is the 4-byte little-endian delivered count; and `Err` carries a UTF-8 message. A
+//! malformed frame envelope is unrecoverable for a length-prefixed stream, so it ends the
+//! session.
 
 use crate::engine::{AckResult, Engine, EngineError, NackResult, Poll, ProgressResult};
 use ironbus_core::clock::Clock;
@@ -272,7 +275,7 @@ impl Session {
         }
     }
     /// Fetches up to the requested number of messages and streams them as DELIVER frames,
-    /// terminated by an `Ok` whose body is the count delivered (so the client knows the
+    /// terminated by a `FlowEnd` whose body is the count delivered (so the client knows the
     /// batch is complete). The credit count is a little-endian `u32`.
     fn handle_flow<F: Filesystem, C: Clock>(
         &mut self,
@@ -324,8 +327,8 @@ impl Session {
                     return Err(SessionError::EngineFatal(e));
                 }
                 Err(_) => {
-                    // The Err is this batch's terminator; do NOT also send Ok (that would
-                    // desync the client, which expects exactly one terminator per Flow).
+                    // The Err is this batch's terminator; do NOT also send a FlowEnd (that
+                    // would desync the client, which expects exactly one terminator per Flow).
                     reply_err(out, "fetch failed");
                     return Ok(());
                 }
@@ -450,8 +453,8 @@ mod tests {
         .unwrap()
     }
 
-    /// Sends one acknowledgement op and returns the Ok status body, asserting the reply is a
-    /// single Ok frame.
+    /// Sends one acknowledgement op and returns the status body, asserting the reply is a
+    /// single `AckStatus` frame.
     fn ack_reply<C: Clock>(
         s: &mut Session,
         e: &mut Engine<InMemoryFs, C>,
@@ -654,7 +657,7 @@ mod tests {
         assert_eq!(delivered_tokens(&out).len(), 1);
 
         // Expire it; the next fetch's claim is delivery 2 > max_deliver, so it is parked
-        // (committed past) and NOT delivered: an empty batch (Ok with no Deliver frames).
+        // (committed past) and NOT delivered: an empty batch (FlowEnd with no Deliver frames).
         clock.advance_monotonic_nanos(40);
         out.clear();
         s.process(
@@ -675,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_fetches_messages_as_deliver_frames_then_ok() {
+    fn flow_fetches_messages_as_deliver_frames_then_flow_end() {
         let mut e = engine();
         let mut s = Session::new();
         let mut out = Vec::new();
@@ -684,7 +687,7 @@ mod tests {
         produce(&mut e, b"a");
         produce(&mut e, b"b");
         out.clear();
-        // Fetch up to 5: two messages are available, then the batch terminates with Ok(2).
+        // Fetch up to 5: two messages are available, then the batch terminates with FlowEnd(2).
         s.process(
             &mut e,
             &frame(FrameType::Flow, &5u32.to_le_bytes()),
