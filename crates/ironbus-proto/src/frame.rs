@@ -167,16 +167,28 @@ pub fn encode_frame(
     Ok(())
 }
 
-/// Decodes one frame from the front of `input`.
+/// Decodes one frame from the front of `input`, validating the length against the absolute
+/// [`MAX_FRAME_LEN`] cap.
 ///
-/// Returns [`FrameDecode::Incomplete`] when more bytes are needed (a partial stream), and
-/// validates the length against [`MAX_FRAME_LEN`] before trusting it, so a hostile prefix
-/// cannot force a large read or allocation.
+/// Returns [`FrameDecode::Incomplete`] when more bytes are needed (a partial stream); the
+/// length is checked before it is trusted, so a hostile prefix cannot force a large read.
 ///
 /// # Errors
 /// Returns [`FrameError::FrameTooLarge`] if the length prefix exceeds the cap, or
 /// [`FrameError::EmptyFrame`] if it is zero.
 pub fn decode_frame(input: &[u8]) -> Result<FrameDecode<'_>, FrameError> {
+    decode_frame_with_cap(input, MAX_FRAME_LEN)
+}
+
+/// Like [`decode_frame`] but rejects a frame longer than `max_len` (a per-connection
+/// negotiated maximum). The effective cap is `min(max_len, MAX_FRAME_LEN)`, so a caller can
+/// only tighten the absolute cap, never raise it.
+///
+/// # Errors
+/// Returns [`FrameError::FrameTooLarge`] if the length prefix exceeds the effective cap, or
+/// [`FrameError::EmptyFrame`] if it is zero.
+pub fn decode_frame_with_cap(input: &[u8], max_len: u32) -> Result<FrameDecode<'_>, FrameError> {
+    let cap = max_len.min(MAX_FRAME_LEN);
     if input.len() < LEN_PREFIX {
         return Ok(FrameDecode::Incomplete { needed: LEN_PREFIX });
     }
@@ -186,7 +198,7 @@ pub fn decode_frame(input: &[u8]) -> Result<FrameDecode<'_>, FrameError> {
     if frame_len == 0 {
         return Err(FrameError::EmptyFrame);
     }
-    if frame_len > MAX_FRAME_LEN {
+    if frame_len > cap {
         return Err(FrameError::FrameTooLarge {
             len: u64::from(frame_len),
         });
@@ -235,6 +247,24 @@ mod tests {
         }
         assert_eq!(FrameType::from_u8(0), None);
         assert_eq!(FrameType::from_u8(255), None);
+    }
+
+    #[test]
+    fn type_tags_have_their_exact_frozen_wire_values() {
+        // Pin the on-the-wire numbers so a future reorder or insertion breaks a test here,
+        // not a deployed protocol. These values are part of the frozen wire contract.
+        assert_eq!(FrameType::Connect.as_u8(), 1);
+        assert_eq!(FrameType::Info.as_u8(), 2);
+        assert_eq!(FrameType::Ping.as_u8(), 3);
+        assert_eq!(FrameType::Pong.as_u8(), 4);
+        assert_eq!(FrameType::Pub.as_u8(), 5);
+        assert_eq!(FrameType::Sub.as_u8(), 6);
+        assert_eq!(FrameType::Unsub.as_u8(), 7);
+        assert_eq!(FrameType::Ack.as_u8(), 8);
+        assert_eq!(FrameType::Nack.as_u8(), 9);
+        assert_eq!(FrameType::Flow.as_u8(), 10);
+        assert_eq!(FrameType::Ok.as_u8(), 11);
+        assert_eq!(FrameType::Err.as_u8(), 12);
     }
 
     #[test]
@@ -334,6 +364,57 @@ mod tests {
             })
         );
         assert!(out.is_empty(), "nothing is written on rejection");
+    }
+
+    #[test]
+    fn a_frame_at_exactly_the_cap_decodes() {
+        // The largest legal frame: total length == MAX_FRAME_LEN (body == cap - 1 type byte).
+        let body = vec![0x5a_u8; MAX_FRAME_LEN as usize - 1];
+        let mut buf = Vec::new();
+        encode_frame(FrameType::Pub, &body, &mut buf).unwrap();
+        match decode_frame(&buf).unwrap() {
+            FrameDecode::Frame {
+                type_tag,
+                body: out,
+                consumed,
+            } => {
+                assert_eq!(FrameType::from_u8(type_tag), Some(FrameType::Pub));
+                assert_eq!(out.len(), MAX_FRAME_LEN as usize - 1);
+                assert_eq!(consumed, buf.len());
+            }
+            FrameDecode::Incomplete { .. } => panic!("a cap-sized frame should decode"),
+        }
+    }
+
+    #[test]
+    fn trailing_bytes_after_a_frame_are_not_consumed() {
+        let mut buf = Vec::new();
+        encode_frame(FrameType::Ack, b"id", &mut buf).unwrap();
+        let frame_len = buf.len();
+        buf.extend_from_slice(b"leftover junk");
+        match decode_frame(&buf).unwrap() {
+            FrameDecode::Frame { body, consumed, .. } => {
+                assert_eq!(body, b"id");
+                assert_eq!(
+                    consumed, frame_len,
+                    "consumes exactly one frame, not the junk"
+                );
+                assert_eq!(&buf[consumed..], b"leftover junk");
+            }
+            FrameDecode::Incomplete { .. } => panic!("complete"),
+        }
+    }
+
+    #[test]
+    fn a_negotiated_cap_rejects_a_frame_above_it_but_below_the_absolute_max() {
+        let mut buf = Vec::new();
+        encode_frame(FrameType::Pub, &vec![0u8; 1000], &mut buf).unwrap();
+        // The absolute decoder accepts it; a tighter per-connection cap rejects it.
+        assert!(matches!(decode_frame(&buf), Ok(FrameDecode::Frame { .. })));
+        assert!(matches!(
+            decode_frame_with_cap(&buf, 100),
+            Err(FrameError::FrameTooLarge { .. })
+        ));
     }
 
     proptest! {
