@@ -226,7 +226,9 @@ mod tests {
     fn the_reader_agrees_with_online_recovery_on_the_same_bytes() {
         let config = LogConfig::new(LogConfig::MIN_MAX_SEGMENT_BYTES).unwrap();
         let mut log = Log::open(InMemoryFs::new(), ManualClock::new(), config).unwrap();
-        for i in 0..6u8 {
+        // Enough records under the tiny cap to roll several segments, so agreement is
+        // proven across the chain stitch, not just within one segment.
+        for i in 0..8u8 {
             append(&mut log, &[i; 8]);
         }
         log.sync().unwrap();
@@ -234,6 +236,11 @@ mod tests {
 
         // Read offline first (read-only), capturing its view.
         let reader = OfflineReader::open(fs).unwrap();
+        assert!(
+            reader.segment_ids().len() > 1,
+            "agreement must span multiple segments, got {}",
+            reader.segment_ids().len()
+        );
         let offline_head = reader.durable_head();
         let offline_records = all_records(&reader);
         let offline_loss = reader.loss_report().clone();
