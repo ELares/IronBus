@@ -64,6 +64,13 @@ pub enum EngineError {
         /// The offset that should have held a record.
         offset: u64,
     },
+    /// A new work-group could not be created: the per-engine group cap is reached (#240).
+    TooManyGroups {
+        /// The cap that was reached.
+        max: usize,
+    },
+    /// A work-group name was empty, too long, or held a non-graphic-ASCII byte (#240).
+    InvalidGroupName,
 }
 
 impl core::fmt::Display for EngineError {
@@ -74,6 +81,15 @@ impl core::fmt::Display for EngineError {
             EngineError::GenerationExhausted => write!(f, "lease generation space is exhausted"),
             EngineError::MissingRecord { offset } => {
                 write!(f, "no record at deliverable offset {offset}")
+            }
+            EngineError::TooManyGroups { max } => {
+                write!(f, "work-group limit {max} reached")
+            }
+            EngineError::InvalidGroupName => {
+                write!(
+                    f,
+                    "invalid work-group name (1 to {MAX_GROUP_NAME_LEN} graphic ASCII bytes)"
+                )
             }
         }
     }
@@ -194,6 +210,26 @@ pub struct Counters {
 /// The durable, unnamed default work-group: the one the wire protocol uses today, the one
 /// persisted in `cursor.ckpt`. Named groups (#9) are independent in-memory cursors.
 const DEFAULT_GROUP: &str = "";
+
+/// The most work-groups one engine holds at once, including the durable default (#240):
+/// bounds total consumer-state memory once the wire can name groups, so an unauthenticated
+/// client cannot exhaust memory by naming endless groups.
+const MAX_GROUPS: usize = 1024;
+
+/// The longest a named work-group name may be (#240): bounds per-name memory.
+const MAX_GROUP_NAME_LEN: usize = 128;
+
+/// Validates a new work-group name: 1 to [`MAX_GROUP_NAME_LEN`] graphic-ASCII bytes (no
+/// spaces, control bytes, or non-ASCII), so a client cannot exhaust memory or smuggle
+/// control characters through a name. The default group (`""`) is pre-created and never
+/// validated here.
+fn validate_group_name(name: &str) -> Result<(), EngineError> {
+    let len = name.len();
+    if len == 0 || len > MAX_GROUP_NAME_LEN || !name.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(EngineError::InvalidGroupName);
+    }
+    Ok(())
+}
 
 /// Per-work-group consumer state over the shared log: an independent committed cursor and
 /// in-flight lease table. A broadcast subscriber is a group of one (it sees every message);
@@ -447,6 +483,15 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// # Errors
     /// As [`Engine::poll`].
     pub fn poll_in(&mut self, group: &str, now: u64) -> Result<Poll, EngineError> {
+        // Create a new group only if it is well-named and the group cap allows it (#240):
+        // this bounds memory once the wire can name groups. The default group and any
+        // existing group are exempt (already present, so they never hit this gate).
+        if !self.groups.contains_key(group) {
+            validate_group_name(group)?;
+            if self.groups.len() >= MAX_GROUPS {
+                return Err(EngineError::TooManyGroups { max: MAX_GROUPS });
+            }
+        }
         let lease_config = self.lease_config;
         let g = self
             .groups
@@ -530,11 +575,11 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// its lease slot, independent of every other group. The token must be one delivered by
     /// [`Engine::poll_in`] for the same `group` (generations are per-group).
     pub fn ack_in(&mut self, group: &str, token: &LeaseToken) -> AckResult {
-        let lease_config = self.lease_config;
-        let g = self
-            .groups
-            .entry(group.to_string())
-            .or_insert_with(|| WorkGroup::new(lease_config));
+        // Never create a group on ack: a consumer must `poll_in` (which is capped) before
+        // it can ack, so an ack on an unknown group is a fence, not a new allocation.
+        let Some(g) = self.groups.get_mut(group) else {
+            return AckResult::Fenced;
+        };
         match g.leases.ack(token) {
             AckOutcome::Acked => {
                 g.cursor.ack(token.offset);
@@ -574,11 +619,10 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
         // backoff schedule. Any other value is an explicit delay in milliseconds (0 = retry
         // immediately), converted to nanoseconds and saturated rather than overflowed.
         let explicit_nanos = (delay_ms != u64::MAX).then(|| delay_ms.saturating_mul(1_000_000));
-        let lease_config = self.lease_config;
-        let g = self
-            .groups
-            .entry(group.to_string())
-            .or_insert_with(|| WorkGroup::new(lease_config));
+        // Never create a group on nack (see `ack_in`): unknown group is a fence.
+        let Some(g) = self.groups.get_mut(group) else {
+            return Ok(NackResult::Fenced);
+        };
         let attempt = g.leases.deliveries(token).unwrap_or(0);
         let delay_nanos = self.delivery.effective_nack_delay(attempt, explicit_nanos);
         Ok(match g.leases.nack(token, now, delay_nanos) {
@@ -615,11 +659,10 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// window. See [`Engine::progress`].
     pub fn progress_in(&mut self, group: &str, token: &LeaseToken) -> ProgressResult {
         let now = self.log.now_monotonic();
-        let lease_config = self.lease_config;
-        let g = self
-            .groups
-            .entry(group.to_string())
-            .or_insert_with(|| WorkGroup::new(lease_config));
+        // Never create a group on progress (see `ack_in`): unknown group is a fence.
+        let Some(g) = self.groups.get_mut(group) else {
+            return ProgressResult::Fenced;
+        };
         match g.leases.extend(token, now) {
             ExtendOutcome::Extended(_) => ProgressResult::Extended,
             ExtendOutcome::CapReached => ProgressResult::CapReached,
@@ -1244,6 +1287,69 @@ mod tests {
         assert_eq!(e.ack_in("y", &dy.token), AckResult::Acked);
         assert_eq!(e.committed_offset_in("y"), Offset::new(1));
         assert_eq!(e.in_flight(), 0);
+    }
+
+    #[test]
+    fn a_new_group_past_the_cap_is_rejected() {
+        // The group cap bounds memory once the wire can name groups (#240). The default
+        // group already counts, so MAX_GROUPS - 1 named groups fit; one more is rejected.
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"a");
+        for i in 0..(MAX_GROUPS - 1) {
+            let name = format!("g{i}");
+            // Each first poll of a fresh group is fine (delivers offset 0, or idle).
+            e.poll_in(&name, 0).unwrap();
+        }
+        assert_eq!(
+            e.groups.len(),
+            MAX_GROUPS,
+            "default + MAX_GROUPS-1 named groups"
+        );
+        let err = e.poll_in("one-too-many", 0).unwrap_err();
+        assert!(
+            matches!(err, EngineError::TooManyGroups { max } if max == MAX_GROUPS),
+            "the cap rejects a new group, got {err}"
+        );
+        // An already-existing group still works (it is not a new allocation).
+        assert!(e.poll_in("g0", 0).is_ok());
+        // The default group is never blocked by the cap.
+        assert!(e.poll(0).is_ok());
+    }
+
+    #[test]
+    fn an_invalid_group_name_is_rejected_before_allocation() {
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"a");
+        let too_long = "g".repeat(MAX_GROUP_NAME_LEN + 1);
+        for bad in [too_long.as_str(), "has space", "ctrl\tchar", "café"] {
+            assert!(
+                matches!(
+                    e.poll_in(bad, 0).unwrap_err(),
+                    EngineError::InvalidGroupName
+                ),
+                "name {bad:?} must be rejected"
+            );
+        }
+        // None of the rejected names allocated a group: only the default exists.
+        assert_eq!(e.groups.len(), 1);
+        // A well-formed name is accepted.
+        assert!(e.poll_in("valid-name_1.2:3", 0).is_ok());
+        assert_eq!(e.groups.len(), 2);
+    }
+
+    #[test]
+    fn ack_nack_progress_on_an_unknown_group_never_create_it() {
+        // Acking/nacking/progressing a group that was never polled is a fence, and crucially
+        // does NOT allocate the group (only the capped poll_in path creates groups) (#240).
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"a");
+        let d = message(e.poll_in("x", 0).unwrap()); // creates x, holds a token for x
+        assert_eq!(e.ack_in("ghost", &d.token), AckResult::Fenced);
+        assert_eq!(e.nack_in("ghost", &d.token, 0).unwrap(), NackResult::Fenced);
+        assert_eq!(e.progress_in("ghost", &d.token), ProgressResult::Fenced);
+        // groups holds only the default and x; ghost was never created.
+        assert_eq!(e.groups.len(), 2);
+        assert!(!e.groups.contains_key("ghost"));
     }
 
     #[test]
