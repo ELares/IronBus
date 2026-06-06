@@ -113,7 +113,8 @@ USAGE:
                   [--max-segment-bytes <n>] [--visibility-timeout-ms <n>]
                   [--health-addr <host:port>]
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
-    ironbus sub   [--addr <host:port>] [--max <n>] [--ack | --nack [--delay-ms <n>] | --term]
+    ironbus sub   [--addr <host:port>] [--group <name>] [--max <n>]
+                  [--ack | --nack [--delay-ms <n>] | --term]
     ironbus peek  --data-dir <dir> [--from-offset <n>] [--limit <n>] [--json]
     ironbus dump  --data-dir <dir> [--limit <n>] [--json]
     ironbus help
@@ -345,6 +346,7 @@ fn set_dispose(slot: &mut Option<DispositionKind>, kind: DispositionKind) -> Res
 
 fn run_sub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut addr = DEFAULT_ADDR.to_string();
+    let mut group = String::new();
     let mut max = DEFAULT_FETCH;
     let mut dispose: Option<DispositionKind> = None;
     let mut delay_ms: Option<u64> = None;
@@ -352,6 +354,7 @@ fn run_sub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     while i < args.len() {
         match args[i].as_str() {
             "--addr" => addr = take_value("--addr", args, &mut i)?,
+            "--group" => group = take_value("--group", args, &mut i)?,
             "--max" => {
                 let raw = take_value("--max", args, &mut i)?;
                 max = raw
@@ -397,16 +400,23 @@ fn run_sub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         Some(DispositionKind::Term) => Disposition::Term,
         None => Disposition::Peek,
     };
-    cmd_sub(&addr, max, disposition, out)
+    cmd_sub(&addr, &group, max, disposition, out)
 }
 
 fn cmd_sub(
     addr: &str,
+    group: &str,
     max: u32,
     disposition: Disposition,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     let mut client = connect(addr)?;
+    // Join the named work-group before fetching (#9); an empty name keeps the default group.
+    if !group.is_empty() {
+        client
+            .subscribe(group)
+            .map_err(|e| classify(addr, "subscribing to", &e))?;
+    }
     let messages = client
         .fetch(max)
         .map_err(|e| classify(addr, "fetching from", &e))?;
@@ -1167,7 +1177,7 @@ mod tests {
         assert_eq!(String::from_utf8(published).unwrap(), "0\n");
 
         let mut consumed = Vec::new();
-        cmd_sub(&a, 10, Disposition::Ack, &mut consumed).unwrap();
+        cmd_sub(&a, "", 10, Disposition::Ack, &mut consumed).unwrap();
         let text = String::from_utf8(consumed).unwrap();
         assert!(text.contains("#0 gen="), "missing offset line: {text}");
         assert!(text.contains("key=the-key"), "missing key: {text}");
@@ -1183,9 +1193,34 @@ mod tests {
 
         // Acked: a second sub sees nothing.
         let mut again = Vec::new();
-        cmd_sub(&a, 10, Disposition::Peek, &mut again).unwrap();
+        cmd_sub(&a, "", 10, Disposition::Peek, &mut again).unwrap();
         assert_eq!(String::from_utf8(again).unwrap(), "fetched 0 message(s)\n");
 
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn sub_with_a_group_fetches_from_that_group() {
+        let (addr, shutdown, handle) = start_inmem_server();
+        let a = addr.to_string();
+        let mut published = Vec::new();
+        cmd_pub(&a, b"", b"grouped", &mut published).unwrap();
+        // A named group fetches and acks the message.
+        let mut consumed = Vec::new();
+        cmd_sub(&a, "team-a", 10, Disposition::Ack, &mut consumed).unwrap();
+        let text = String::from_utf8(consumed).unwrap();
+        assert!(text.contains("payload=grouped"), "group fetch: {text}");
+        assert!(text.contains("ack committed"), "{text}");
+        // A different group has an independent cursor, so it still sees the message.
+        let mut other = Vec::new();
+        cmd_sub(&a, "team-b", 10, Disposition::Peek, &mut other).unwrap();
+        assert!(
+            String::from_utf8(other)
+                .unwrap()
+                .contains("payload=grouped"),
+            "a second group independently sees the message"
+        );
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
@@ -1194,7 +1229,7 @@ mod tests {
     fn sub_on_an_empty_queue_reports_zero() {
         let (addr, shutdown, handle) = start_inmem_server();
         let mut buf = Vec::new();
-        cmd_sub(&addr.to_string(), 5, Disposition::Ack, &mut buf).unwrap();
+        cmd_sub(&addr.to_string(), "", 5, Disposition::Ack, &mut buf).unwrap();
         assert_eq!(String::from_utf8(buf).unwrap(), "fetched 0 message(s)\n");
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
@@ -1529,10 +1564,10 @@ mod tests {
         // visibility means the redelivery is the nack's doing, not a timeout).
         cmd_pub(&a, b"", b"retry", &mut Vec::new()).unwrap();
         let mut nout = Vec::new();
-        cmd_sub(&a, 10, Disposition::Nack { delay_ms: None }, &mut nout).unwrap();
+        cmd_sub(&a, "", 10, Disposition::Nack { delay_ms: None }, &mut nout).unwrap();
         assert!(String::from_utf8(nout).unwrap().contains("nack requeued"));
         let mut aout = Vec::new();
-        cmd_sub(&a, 10, Disposition::Ack, &mut aout).unwrap();
+        cmd_sub(&a, "", 10, Disposition::Ack, &mut aout).unwrap();
         let atext = String::from_utf8(aout).unwrap();
         assert!(atext.contains("payload=retry"), "redelivered: {atext}");
         assert!(atext.contains("ack committed"), "acked: {atext}");
@@ -1540,10 +1575,10 @@ mod tests {
         // Term: the message is dropped (committed past) and a re-fetch is empty.
         cmd_pub(&a, b"", b"drop", &mut Vec::new()).unwrap();
         let mut tout = Vec::new();
-        cmd_sub(&a, 10, Disposition::Term, &mut tout).unwrap();
+        cmd_sub(&a, "", 10, Disposition::Term, &mut tout).unwrap();
         assert!(String::from_utf8(tout).unwrap().contains("term dropped"));
         let mut eout = Vec::new();
-        cmd_sub(&a, 10, Disposition::Peek, &mut eout).unwrap();
+        cmd_sub(&a, "", 10, Disposition::Peek, &mut eout).unwrap();
         assert_eq!(String::from_utf8(eout).unwrap(), "fetched 0 message(s)\n");
 
         shutdown.store(true, Ordering::Release);
@@ -1585,7 +1620,7 @@ mod tests {
 
         // Delivery 1: peeked (leased), not acked.
         let mut first = Vec::new();
-        cmd_sub(&a, 10, Disposition::Peek, &mut first).unwrap();
+        cmd_sub(&a, "", 10, Disposition::Peek, &mut first).unwrap();
         assert!(
             String::from_utf8(first).unwrap().contains("payload=poison"),
             "the first delivery is served"
@@ -1595,7 +1630,7 @@ mod tests {
         // the re-fetch is empty.
         std::thread::sleep(std::time::Duration::from_millis(500));
         let mut second = Vec::new();
-        cmd_sub(&a, 10, Disposition::Peek, &mut second).unwrap();
+        cmd_sub(&a, "", 10, Disposition::Peek, &mut second).unwrap();
         assert_eq!(
             String::from_utf8(second).unwrap(),
             "fetched 0 message(s)\n",
@@ -1652,7 +1687,7 @@ mod tests {
 
         // First fetch: capped at the window of 2 despite a credit of 10 and 4 available.
         let mut batch1 = Vec::new();
-        cmd_sub(&a, 10, Disposition::Ack, &mut batch1).unwrap();
+        cmd_sub(&a, "", 10, Disposition::Ack, &mut batch1).unwrap();
         let batch1 = String::from_utf8(batch1).unwrap();
         assert!(
             batch1.contains("fetched 2 message(s)"),
@@ -1665,7 +1700,7 @@ mod tests {
 
         // The acks freed the window; the next fetch delivers the next two.
         let mut batch2 = Vec::new();
-        cmd_sub(&a, 10, Disposition::Ack, &mut batch2).unwrap();
+        cmd_sub(&a, "", 10, Disposition::Ack, &mut batch2).unwrap();
         let batch2 = String::from_utf8(batch2).unwrap();
         assert!(
             batch2.contains("fetched 2 message(s)"),
@@ -1678,7 +1713,7 @@ mod tests {
 
         // All four committed: the stream is drained.
         let mut batch3 = Vec::new();
-        cmd_sub(&a, 10, Disposition::Peek, &mut batch3).unwrap();
+        cmd_sub(&a, "", 10, Disposition::Peek, &mut batch3).unwrap();
         assert_eq!(
             String::from_utf8(batch3).unwrap(),
             "fetched 0 message(s)\n",
@@ -1720,7 +1755,7 @@ mod tests {
         assert_eq!(String::from_utf8(published).unwrap(), "0\n");
 
         let mut consumed = Vec::new();
-        cmd_sub(&a, 10, Disposition::Ack, &mut consumed).unwrap();
+        cmd_sub(&a, "", 10, Disposition::Ack, &mut consumed).unwrap();
         let text = String::from_utf8(consumed).unwrap();
         assert!(text.contains("payload=on-disk"), "missing payload: {text}");
         assert!(text.contains("ack committed"), "missing ack: {text}");
@@ -1751,7 +1786,7 @@ mod tests {
         let a2 = addr2.to_string();
 
         let mut after_restart = Vec::new();
-        cmd_sub(&a2, 10, Disposition::Peek, &mut after_restart).unwrap();
+        cmd_sub(&a2, "", 10, Disposition::Peek, &mut after_restart).unwrap();
         assert_eq!(
             String::from_utf8(after_restart).unwrap(),
             "fetched 0 message(s)\n",
@@ -1806,7 +1841,7 @@ mod tests {
         // A credit of 1 leases and acks exactly the first message (offset 0); the cursor is
         // checkpointed (checkpoint_interval = 1, plus the clean disconnect).
         let mut acked = Vec::new();
-        cmd_sub(&a, 1, Disposition::Ack, &mut acked).unwrap();
+        cmd_sub(&a, "", 1, Disposition::Ack, &mut acked).unwrap();
         let acked = String::from_utf8(acked).unwrap();
         assert!(
             acked.contains("payload=m0"),
@@ -1835,7 +1870,7 @@ mod tests {
         });
         let a2 = addr2.to_string();
         let mut tail = Vec::new();
-        cmd_sub(&a2, 10, Disposition::Peek, &mut tail).unwrap();
+        cmd_sub(&a2, "", 10, Disposition::Peek, &mut tail).unwrap();
         let tail = String::from_utf8(tail).unwrap();
         assert!(
             tail.contains("fetched 2 message(s)"),

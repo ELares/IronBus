@@ -13,7 +13,7 @@
 
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
-    decode_deliver, encode_ack, encode_pub, AckBody, AckOp, BodyError, PubBody,
+    decode_deliver, encode_ack, encode_pub, encode_sub, AckBody, AckOp, BodyError, PubBody, SubBody,
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -414,6 +414,49 @@ impl Client {
         }
     }
 
+    /// Subscribes this connection to a named work-group (#9): subsequent [`Client::fetch`]
+    /// calls and acks route to that group, so the same log can fan out to a broadcast
+    /// consumer and a competing group. An empty name selects the default group. Any leases
+    /// this connection still holds in its previous group are abandoned (they redeliver there
+    /// after the visibility timeout).
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the name (not UTF-8, malformed,
+    /// or the group cap reached), or a connection error.
+    pub fn subscribe(&mut self, group: &str) -> Result<(), ClientError> {
+        let mut body = Vec::new();
+        encode_sub(
+            &SubBody {
+                group: group.as_bytes(),
+            },
+            &mut body,
+        );
+        self.send(FrameType::Sub, &body)?;
+        match self.read_frame()? {
+            (FrameType::Ok, _) => Ok(()),
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Reverts this connection to the default work-group (#9), abandoning any leases it
+    /// still holds in the named group (they redeliver there after the visibility timeout).
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] on a server error, or a connection error.
+    pub fn unsubscribe(&mut self) -> Result<(), ClientError> {
+        self.send(FrameType::Unsub, &[])?;
+        match self.read_frame()? {
+            (FrameType::Ok, _) => Ok(()),
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
     fn send(&mut self, frame_type: FrameType, body: &[u8]) -> Result<(), ClientError> {
         let mut frame = Vec::new();
         encode_frame(frame_type, body, &mut frame).map_err(ClientError::Frame)?;
@@ -555,6 +598,55 @@ mod tests {
         // Nothing left to fetch.
         assert!(c.fetch(10).unwrap().is_empty());
 
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn subscribed_groups_each_see_every_message() {
+        // Broadcast fan-out end to end (#9): two connections subscribed to different
+        // groups each independently receive every message; neither acks.
+        let (addr, shutdown, handle) = start_server();
+        let mut producer = Client::connect(addr).unwrap();
+        for p in [&b"a"[..], &b"b"[..]] {
+            producer
+                .produce(&PubBody {
+                    flags: 0,
+                    timestamp_ms: 0,
+                    key: b"",
+                    headers: b"",
+                    payload: p,
+                })
+                .unwrap();
+        }
+        for group in ["alpha", "beta"] {
+            let mut c = Client::connect(addr).unwrap();
+            c.subscribe(group).unwrap();
+            let payloads: Vec<Vec<u8>> = c
+                .fetch(10)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.payload)
+                .collect();
+            assert_eq!(
+                payloads,
+                vec![b"a".to_vec(), b"b".to_vec()],
+                "group {group} independently sees the whole log"
+            );
+        }
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fetching_an_invalid_group_surfaces_a_server_error() {
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+        // The name is valid UTF-8, so SUB is accepted; the engine rejects its shape on the
+        // first fetch (a space is not a graphic-ASCII group name), surfaced as a server error.
+        c.subscribe("has space").unwrap();
+        let err = c.fetch(10).unwrap_err();
+        assert!(matches!(err, ClientError::Server(_)), "got {err:?}");
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
