@@ -38,6 +38,10 @@ pub struct EngineConfig {
     /// The max-ack-pending window: at most this many offsets above the committed cursor
     /// may be in flight at once. Bounds in-flight work and the poll scan.
     pub max_in_flight: u32,
+    /// Checkpoint the committed cursor after it advances at least this many offsets since the
+    /// last checkpoint, bounding how many messages a crash redelivers. A value of 0 is treated
+    /// as 1 (checkpoint on every advance). A clean disconnect also flushes the cursor.
+    pub checkpoint_interval: u64,
 }
 
 /// An error from the engine.
@@ -152,6 +156,8 @@ pub struct Engine<F: Filesystem, C: Clock> {
     delivery: DeliveryConfig,
     max_in_flight: u32,
     checkpoint: Checkpoint<F::File>,
+    checkpoint_interval: u64,
+    last_checkpointed: u64,
 }
 
 /// The file name of the work-group's durable committed-cursor checkpoint.
@@ -210,6 +216,8 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
             delivery: config.delivery,
             max_in_flight: config.max_in_flight,
             checkpoint,
+            checkpoint_interval: config.checkpoint_interval,
+            last_checkpointed: committed,
         })
     }
 
@@ -222,8 +230,31 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// Propagates a storage error from writing the checkpoint.
     pub fn checkpoint_cursor(&mut self) -> Result<(), EngineError> {
         let committed = self.cursor.committed().get();
-        self.checkpoint.write(&committed.to_le_bytes())?;
+        // Skip a redundant write when nothing advanced since the last checkpoint, so a forced
+        // checkpoint (e.g. on a connection close that did no acking) is a no-op.
+        if committed > self.last_checkpointed {
+            self.checkpoint.write(&committed.to_le_bytes())?;
+            self.last_checkpointed = committed;
+        }
         Ok(())
+    }
+
+    /// Checkpoints the committed cursor if it has advanced at least `checkpoint_interval`
+    /// offsets since the last checkpoint, returning whether a checkpoint was written. This
+    /// bounds how many messages a crash redelivers to roughly `checkpoint_interval` while
+    /// keeping the checkpoint write rate far below one per ack (edge flash endurance).
+    ///
+    /// # Errors
+    /// Propagates a storage error from writing the checkpoint.
+    pub fn maybe_checkpoint(&mut self) -> Result<bool, EngineError> {
+        let committed = self.cursor.committed().get();
+        if committed.saturating_sub(self.last_checkpointed) >= self.checkpoint_interval.max(1) {
+            self.checkpoint.write(&committed.to_le_bytes())?;
+            self.last_checkpointed = committed;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Appends a message and makes it durable before returning its offset (so a producer's
@@ -353,6 +384,7 @@ mod tests {
             },
             delivery: DeliveryConfig::new(max_deliver, false, vec![]).unwrap(),
             max_in_flight,
+            checkpoint_interval: 1024,
         }
     }
 
@@ -712,5 +744,49 @@ mod tests {
         let d = message(e.poll(0).unwrap());
         assert_eq!(d.offset, Offset::new(1));
         assert_eq!(d.record.payload, b"b");
+    }
+
+    #[test]
+    fn maybe_checkpoint_bounds_replay_and_reopen_resumes() {
+        // interval = 2: a single ack does not reach the threshold (reopen would redeliver),
+        // but the second ack does and persists the cursor, so reopen resumes past both. This
+        // is the bounded-replay-window contract.
+        let mut c = config(10, 5);
+        c.checkpoint_interval = 2;
+        let mut e = open(c);
+        for p in [&b"a"[..], b"b", b"c"] {
+            produce(&mut e, p);
+        }
+        let d0 = message(e.poll(0).unwrap());
+        e.ack(&d0.token);
+        assert_eq!(e.committed_offset(), Offset::new(1));
+        assert!(
+            !e.maybe_checkpoint().unwrap(),
+            "1 < interval 2: no checkpoint yet"
+        );
+
+        let d1 = message(e.poll(0).unwrap());
+        e.ack(&d1.token);
+        assert_eq!(e.committed_offset(), Offset::new(2));
+        assert!(
+            e.maybe_checkpoint().unwrap(),
+            "2 >= interval 2: checkpoints"
+        );
+
+        let fs = e.into_filesystem();
+        let mut c2 = config(10, 5);
+        c2.checkpoint_interval = 2;
+        let mut e = Engine::open(fs, ManualClock::new(), c2).unwrap();
+        // The checkpoint persisted committed = 2, so only the uncommitted tail (c) redelivers.
+        assert_eq!(e.committed_offset(), Offset::new(2));
+        let mut delivered = Vec::new();
+        while let Poll::Message(d) = e.poll(0).unwrap() {
+            delivered.push(d.offset.get());
+        }
+        assert_eq!(
+            delivered,
+            vec![2],
+            "only the uncheckpointed tail redelivers"
+        );
     }
 }

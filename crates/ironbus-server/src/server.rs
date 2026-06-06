@@ -6,9 +6,10 @@
 //! is shared behind a `Mutex`, which serializes all access into the single logical writer
 //! the storage layer requires; group-commit batching behind a dedicated append actor is a
 //! throughput follow-up. Concurrency is bounded by a connection cap so a connection flood
-//! cannot spawn unbounded threads. CAVEAT: a produce holds the engine `Mutex` across its
-//! fsync, so one stalled disk head-of-line-blocks every connection; the append-actor +
-//! group-commit follow-up removes this.
+//! cannot spawn unbounded threads. CAVEAT: a produce, and an interval or close-path cursor
+//! checkpoint, holds the engine `Mutex` across its fsync, so one stalled disk
+//! head-of-line-blocks every connection; the append-actor + group-commit follow-up removes
+//! this.
 
 use crate::engine::Engine;
 use crate::session::Session;
@@ -110,6 +111,10 @@ where
     loop {
         let n = stream.read(&mut chunk)?;
         if n == 0 {
+            // The client closed: flush the committed cursor so a clean reconnect resumes past
+            // acked messages. Best-effort: the checkpoint is a lagging optimization.
+            let mut guard = engine.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = guard.checkpoint_cursor();
             return Ok(()); // the client closed the connection
         }
         inbuf.extend_from_slice(&chunk[..n]);
@@ -118,7 +123,14 @@ where
         // Hold the engine lock only for the (synchronous, non-blocking) dispatch.
         let result = {
             let mut guard = engine.lock().unwrap_or_else(PoisonError::into_inner);
-            session.process(&mut guard, &inbuf, &mut out)
+            let r = session.process(&mut guard, &inbuf, &mut out);
+            if r.is_ok() {
+                // Persist the committed cursor on the configured interval so a crash redelivers
+                // a bounded tail. Best-effort: a checkpoint write failure only costs redelivery
+                // on restart, never correctness, so it must not fail the connection.
+                let _ = guard.maybe_checkpoint();
+            }
+            r
         };
         if let Ok(consumed) = result {
             inbuf.drain(..consumed);
@@ -152,6 +164,7 @@ mod tests {
             lease: LeaseConfig::default(),
             delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
             max_in_flight: 16,
+            checkpoint_interval: 1024,
         }
     }
 
@@ -319,6 +332,85 @@ mod tests {
 
         // The message was committed: nothing left to deliver.
         assert_eq!(shared.lock().unwrap().committed_offset().get(), 1);
+    }
+
+    #[test]
+    fn a_clean_disconnect_checkpoints_the_cursor() {
+        // The default interval is 1024, so a single ack does NOT trigger maybe_checkpoint:
+        // the committed cursor can only become durable here via the close-path checkpoint the
+        // server forces when the client disconnects. Reopening then proves that path fired.
+        let engine = Engine::open(InMemoryFs::new(), SystemClock::new(), config()).unwrap();
+        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
+
+        // Drive one connection through handle_connection directly so we can JOIN it: when it
+        // returns, the EOF-triggered checkpoint is deterministically complete (no race).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn({
+            let shared = Arc::clone(&shared);
+            move || {
+                let (stream, _) = listener.accept().unwrap();
+                handle_connection(stream, &shared)
+            }
+        });
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = Vec::new();
+        c.write_all(&frame(FrameType::Connect, b"")).unwrap();
+        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::Info);
+
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                payload: b"persist-me",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        c.write_all(&frame(FrameType::Pub, &pub_body)).unwrap();
+        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::Ok);
+
+        c.write_all(&frame(FrameType::Flow, &1u32.to_le_bytes()))
+            .unwrap();
+        let (ty, body) = read_one_frame(&mut c, &mut buf);
+        assert_eq!(ty, FrameType::Deliver);
+        let delivered = decode_deliver(&body).unwrap();
+        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::Ok);
+
+        let mut ack_body = Vec::new();
+        encode_ack(
+            &AckBody {
+                op: AckOp::Ack,
+                offset: delivered.offset,
+                generation: delivered.generation,
+                delay_ms: 0,
+            },
+            &mut ack_body,
+        );
+        c.write_all(&frame(FrameType::Ack, &ack_body)).unwrap();
+        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::Ok);
+
+        // Clean disconnect: handle_connection reads EOF, forces the checkpoint, and returns.
+        drop(c);
+        server.join().unwrap().unwrap();
+
+        // Reopen the SAME filesystem: the committed cursor (1) was persisted by the close
+        // path, so the engine resumes at 1 rather than redelivering the acked message.
+        let Ok(mutex) = Arc::try_unwrap(shared) else {
+            panic!("engine still shared after join");
+        };
+        let fs = mutex.into_inner().unwrap().into_filesystem();
+        let reopened = Engine::open(fs, SystemClock::new(), config()).unwrap();
+        assert_eq!(
+            reopened.committed_offset().get(),
+            1,
+            "a clean disconnect must persist the committed cursor"
+        );
     }
 
     #[test]
