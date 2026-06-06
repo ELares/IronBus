@@ -2,3 +2,4 @@
 //! Wire protocol frames and codecs for IronBus.
 
 pub mod frame;
+pub mod message;
