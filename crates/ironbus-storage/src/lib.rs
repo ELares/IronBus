@@ -5,6 +5,7 @@
 pub mod checkpoint;
 pub mod fault;
 pub mod fs;
+pub mod invariants;
 pub mod io;
 pub mod log;
 pub mod loss;
