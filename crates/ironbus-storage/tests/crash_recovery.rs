@@ -471,6 +471,53 @@ fn a_torn_write_during_append_is_truncated_by_recovery() {
     assert_prefix(&log, durable);
 }
 
+#[test]
+fn recovery_is_idempotent_after_a_fault_during_recovery() {
+    // Build a synced log with a torn tail on a SHARED in-memory disk. A fault during the
+    // first recovery makes its truncation's sync_all fail, so the first reopen errors. Then
+    // model the crash (a power loss) that accompanies that failed sync: the durable image
+    // still holds the torn tail, so a second reopen must RE-RUN recovery's truncation and
+    // recover the same valid prefix. Recovery is idempotent, never leaving the log unopenable.
+    let disk = InMemoryFs::new();
+    let n = 6u64;
+    {
+        let mut log = Log::open(disk.clone(), ManualClock::new(), big_config()).unwrap();
+        for i in 0..n {
+            append_at(&mut log, i);
+        }
+        log.sync().unwrap();
+    }
+    // Tear a few bytes off the last record so recovery must truncate it.
+    let seg = disk.open(&segment_file_name(0)).unwrap();
+    let len = seg.len().unwrap();
+    seg.set_len(len - 3).unwrap();
+    seg.sync_data().unwrap();
+    drop(seg);
+
+    // Crash during recovery: wrap a shared handle in a FaultFs, arm a sync fault. Recovery's
+    // set_len succeeds but its sync_all faults, so the first open fails cleanly (no panic).
+    let (faultfs, control) = FaultFs::new(disk.clone());
+    control.set_fail_sync(true);
+    assert!(
+        Log::open(faultfs, ManualClock::new(), big_config()).is_err(),
+        "a fault during recovery surfaces as a clean error"
+    );
+
+    // Model the crash that accompanies the failed sync: the live image reverts to durable,
+    // which still holds the torn tail (the first recovery's truncation never synced). Without
+    // this, the shared live image would already be truncated and the retry would skip the
+    // truncation branch, testing nothing.
+    disk.simulate_power_loss();
+    // Idempotent retry: a clean reopen RE-RUNS recovery's truncation and recovers the prefix.
+    let log = Log::open(disk.clone(), ManualClock::new(), big_config()).unwrap();
+    assert!(
+        log.recovered_truncated_bytes() > 0,
+        "the retry actually re-entered recovery's truncation branch"
+    );
+    assert_eq!(log.flushed_offset(), Offset::new(n - 1));
+    assert_prefix(&log, n - 1);
+}
+
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
         3 => Just(Op::Append),
