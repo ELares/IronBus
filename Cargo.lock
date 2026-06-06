@@ -176,6 +176,7 @@ name = "ironbus-server"
 version = "0.0.0"
 dependencies = [
  "ironbus-core",
+ "ironbus-proto",
  "ironbus-storage",
  "tempfile",
 ]
