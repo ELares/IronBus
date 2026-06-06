@@ -33,12 +33,32 @@ pub enum StorageError {
     },
     /// The segment is full: its record count or byte length would overflow.
     SegmentFull,
-    /// Recovery found the active (highest) segment already sealed. This single-active
-    /// segment version cannot continue past a seal; rolling to the next segment is
-    /// follow-up work.
-    ActiveSegmentSealed {
-        /// The id of the sealed segment.
+    /// Recovery found a non-final segment that is not sealed, so two segments would be
+    /// appendable at once.
+    UnsealedPredecessor {
+        /// The id of the unsealed predecessor.
         segment_id: u64,
+    },
+    /// Recovery found a segment whose stored id does not match its file name.
+    SegmentIdMismatch {
+        /// The segment id taken from the file name.
+        file_id: u64,
+        /// The segment id stored in the header.
+        header_id: u64,
+    },
+    /// Recovery found a segment whose base does not continue from its predecessor, so
+    /// the offset or sequence space has a gap or overlap.
+    SegmentChainBroken {
+        /// The id of the segment that broke the chain.
+        segment_id: u64,
+        /// The base offset the segment should have had.
+        expected_base_offset: u64,
+        /// The base offset it actually carried.
+        found_base_offset: u64,
+        /// The base sequence the segment should have had.
+        expected_base_seq: u64,
+        /// The base sequence it actually carried.
+        found_base_seq: u64,
     },
     /// Recovery found a record whose sequence number breaks the contiguous run from the
     /// segment `base_seq`, so the segment is structurally inconsistent.
@@ -50,6 +70,9 @@ pub enum StorageError {
         /// The sequence actually stored.
         found: u64,
     },
+    /// The log writer is frozen: a fatal IO error left it without a valid active
+    /// segment, so it refuses further writes rather than risk corruption.
+    WriterFrozen,
 }
 
 impl core::fmt::Display for StorageError {
@@ -65,9 +88,26 @@ impl core::fmt::Display for StorageError {
                 )
             }
             StorageError::SegmentFull => write!(f, "segment is full"),
-            StorageError::ActiveSegmentSealed { segment_id } => {
-                write!(f, "active segment {segment_id} is already sealed")
+            StorageError::UnsealedPredecessor { segment_id } => {
+                write!(f, "predecessor segment {segment_id} is not sealed")
             }
+            StorageError::SegmentIdMismatch { file_id, header_id } => {
+                write!(
+                    f,
+                    "segment file {file_id} holds a header for segment {header_id}"
+                )
+            }
+            StorageError::SegmentChainBroken {
+                segment_id,
+                expected_base_offset,
+                found_base_offset,
+                expected_base_seq,
+                found_base_seq,
+            } => write!(
+                f,
+                "segment {segment_id} base ({found_base_offset},{found_base_seq}) \
+                 does not continue from ({expected_base_offset},{expected_base_seq})"
+            ),
             StorageError::RecoveredSequenceMismatch {
                 index,
                 expected,
@@ -76,6 +116,7 @@ impl core::fmt::Display for StorageError {
                 f,
                 "record {index} has sequence {found}, expected {expected}"
             ),
+            StorageError::WriterFrozen => write!(f, "log writer is frozen after a fatal error"),
         }
     }
 }
