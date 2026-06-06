@@ -561,8 +561,17 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// # Errors
     /// As [`Engine::poll`].
     pub fn poll_now(&mut self) -> Result<Poll, EngineError> {
+        self.poll_now_in(DEFAULT_GROUP)
+    }
+
+    /// Like [`Engine::poll_now`] but for a named work-group (#9): reads the engine's own
+    /// monotonic clock and polls `group`.
+    ///
+    /// # Errors
+    /// As [`Engine::poll_in`].
+    pub fn poll_now_in(&mut self, group: &str) -> Result<Poll, EngineError> {
         let now = self.log.now_monotonic();
-        self.poll(now)
+        self.poll_in(group, now)
     }
 
     /// Acks the message named by `token`: removes its lease (fenced if stale) and advances

@@ -20,7 +20,9 @@ use crate::engine::{AckResult, Engine, EngineError, NackResult, Poll, ProgressRe
 use ironbus_core::clock::Clock;
 use ironbus_core::types::RecordFlags;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
-use ironbus_proto::message::{decode_ack, decode_pub, encode_deliver, AckOp, DeliverBody};
+use ironbus_proto::message::{
+    decode_ack, decode_pub, decode_sub, encode_deliver, AckOp, DeliverBody,
+};
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
 use std::collections::HashMap;
@@ -52,6 +54,10 @@ impl std::error::Error for SessionError {}
 #[derive(Debug, Default)]
 pub struct Session {
     connected: bool,
+    /// The work-group this connection is subscribed to, set by SUB and cleared by UNSUB.
+    /// Empty selects the default group (#9), so an unsubscribed consumer behaves exactly as
+    /// before. FLOW fetches and ACKs route to this group.
+    subscription: String,
     /// The leases this session was delivered via Flow and may still act on, keyed by offset
     /// to its granted generation. Acks are scoped to this map (#175), so one connection cannot
     /// ack a message delivered to another. Keying by offset bounds it to one entry per offset
@@ -121,9 +127,17 @@ impl Session {
             Some(FrameType::Pub) => self.handle_pub(engine, body, out),
             Some(FrameType::Ack) => self.handle_ack(engine, body, out),
             Some(FrameType::Flow) => self.handle_flow(engine, body, out),
-            // Sub/Unsub (not yet wired) and the standalone Nack frame type (a client sends a
-            // nack as an Ack frame with the Nack op, handled above), or a response-only verb
-            // (Info/Pong/Ok/Err/Deliver) a client should not send.
+            Some(FrameType::Sub) => {
+                self.handle_sub(body, out);
+                Ok(())
+            }
+            Some(FrameType::Unsub) => {
+                self.handle_unsub(out);
+                Ok(())
+            }
+            // The standalone Nack frame type (a client sends a nack as an Ack frame with the
+            // Nack op, handled above), or a response-only verb (Info/Pong/Ok/Err/Deliver) a
+            // client should not send.
             Some(_) => {
                 reply_err(out, "verb not supported on this connection");
                 Ok(())
@@ -215,7 +229,7 @@ impl Session {
         // NOT drop its state.
         match ack.op {
             AckOp::Ack => {
-                let status = match engine.ack(&token) {
+                let status = match engine.ack_in(&self.subscription, &token) {
                     AckResult::Acked => 1u8,
                     AckResult::Fenced => 0u8,
                 };
@@ -223,7 +237,7 @@ impl Session {
                 reply(out, FrameType::AckStatus, &[status]);
                 Ok(())
             }
-            AckOp::Nack => match engine.nack(&token, ack.delay_ms) {
+            AckOp::Nack => match engine.nack_in(&self.subscription, &token, ack.delay_ms) {
                 Ok(NackResult::Requeued) => {
                     self.leased.remove(&ack.offset);
                     reply(out, FrameType::AckStatus, &[1]);
@@ -249,7 +263,7 @@ impl Session {
             // Term is an intentional drop: commit past the message (the same mechanism as
             // ack) so it never redelivers and is not dead-lettered. 1 = dropped, 0 = fenced.
             AckOp::Term => {
-                let status = match engine.term(&token) {
+                let status = match engine.term_in(&self.subscription, &token) {
                     AckResult::Acked => 1u8,
                     AckResult::Fenced => 0u8,
                 };
@@ -261,7 +275,7 @@ impl Session {
             // 2 = cap reached (the lease will expire and the message redeliver on schedule),
             // 0 = fenced.
             AckOp::Progress => {
-                let status = match engine.progress(&token) {
+                let status = match engine.progress_in(&self.subscription, &token) {
                     ProgressResult::Extended => 1u8,
                     ProgressResult::CapReached => 2u8,
                     ProgressResult::Fenced => {
@@ -294,7 +308,7 @@ impl Session {
         let credits = u32::from_le_bytes(credit_bytes);
         let mut delivered = 0u32;
         for _ in 0..credits {
-            match engine.poll_now() {
+            match engine.poll_now_in(&self.subscription) {
                 Ok(Poll::Message(d)) => {
                     let msg = DeliverBody {
                         offset: d.offset.get(),
@@ -336,10 +350,40 @@ impl Session {
         }
         // Drop ownership of any offset now committed (acked here, or committed past on a
         // dead-letter), keeping `leased` bounded to the in-flight window.
-        let committed = engine.committed_offset().get();
+        let committed = engine.committed_offset_in(&self.subscription).get();
         self.leased.retain(|&offset, _| offset >= committed);
         reply(out, FrameType::FlowEnd, &delivered.to_le_bytes());
         Ok(())
+    }
+
+    fn handle_sub(&mut self, body: &[u8], out: &mut Vec<u8>) {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return;
+        }
+        let Ok(group) = core::str::from_utf8(decode_sub(body).group) else {
+            reply_err(out, "subscription name must be valid UTF-8");
+            return;
+        };
+        // Switching subscriptions abandons this connection's in-flight leases in the
+        // previous group (they redeliver there after the visibility timeout), so the new
+        // subscription starts with no outstanding leases. The name's shape and the group
+        // cap are validated by the engine on the first FLOW (#240), surfaced as an Err.
+        group.clone_into(&mut self.subscription);
+        self.leased.clear();
+        reply(out, FrameType::Ok, &[]);
+    }
+
+    fn handle_unsub(&mut self, out: &mut Vec<u8>) {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return;
+        }
+        // Revert to the default group and drop any outstanding named-group leases (they
+        // redeliver in that group after the visibility timeout).
+        self.subscription.clear();
+        self.leased.clear();
+        reply(out, FrameType::Ok, &[]);
     }
 }
 
@@ -712,6 +756,140 @@ mod tests {
             2u32.to_le_bytes(),
             "FlowEnd carries the delivered count"
         );
+    }
+
+    /// Reads the payloads of the `Deliver` frames in a response, ignoring the `FlowEnd`.
+    fn delivered_payloads(out: &[u8]) -> Vec<Vec<u8>> {
+        decode_all(out)
+            .iter()
+            .filter(|(t, _)| *t == FrameType::Deliver)
+            .map(|(_, b)| decode_deliver(b).unwrap().payload.to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn two_groups_over_the_wire_each_see_every_message() {
+        // Broadcast fan-out over the wire (#9, golden-path #133 step 4): two connections
+        // subscribed to different groups each independently receive every message. Neither
+        // acks, so if the groups shared one cursor and lease set the second would find the
+        // offsets in-flight and get nothing; getting both proves the groups are independent.
+        let mut e = engine();
+        produce(&mut e, b"a");
+        produce(&mut e, b"b");
+        for group in [&b"alpha"[..], &b"beta"[..]] {
+            let mut s = Session::new();
+            let mut out = Vec::new();
+            s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+                .unwrap();
+            out.clear();
+            s.process(&mut e, &frame(FrameType::Sub, group), &mut out)
+                .unwrap();
+            assert_eq!(one_response(&out).0, FrameType::Ok, "SUB is acked");
+            out.clear();
+            s.process(
+                &mut e,
+                &frame(FrameType::Flow, &5u32.to_le_bytes()),
+                &mut out,
+            )
+            .unwrap();
+            assert_eq!(
+                delivered_payloads(&out),
+                vec![b"a".to_vec(), b"b".to_vec()],
+                "group {group:?} independently sees the whole log"
+            );
+        }
+    }
+
+    #[test]
+    fn ack_in_a_subscribed_group_commits_only_that_group() {
+        let mut e = engine();
+        produce(&mut e, b"a");
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        s.process(&mut e, &frame(FrameType::Sub, b"workers"), &mut out)
+            .unwrap();
+        out.clear();
+        s.process(
+            &mut e,
+            &frame(FrameType::Flow, &5u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let frames = decode_all(&out);
+        let d = decode_deliver(&frames[0].1).unwrap();
+        assert_eq!(d.offset, 0);
+        let ack = AckBody {
+            offset: d.offset,
+            generation: d.generation,
+            op: AckOp::Ack,
+            delay_ms: 0,
+        };
+        let mut body = Vec::new();
+        encode_ack(&ack, &mut body);
+        out.clear();
+        s.process(&mut e, &frame(FrameType::Ack, &body), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out),
+            (FrameType::AckStatus, vec![1]),
+            "committed"
+        );
+        // The subscribed group committed past 0; the default group is untouched.
+        assert_eq!(e.committed_offset_in("workers").get(), 1);
+        assert_eq!(e.committed_offset().get(), 0);
+    }
+
+    #[test]
+    fn unsubscribe_reverts_to_the_default_group() {
+        let mut e = engine();
+        produce(&mut e, b"a");
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        // Consume the message in a named group (lease, no ack).
+        s.process(&mut e, &frame(FrameType::Sub, b"temp"), &mut out)
+            .unwrap();
+        out.clear();
+        s.process(
+            &mut e,
+            &frame(FrameType::Flow, &5u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(delivered_payloads(&out), vec![b"a".to_vec()]);
+        // Unsubscribe: back to the default group, which has consumed nothing.
+        out.clear();
+        s.process(&mut e, &frame(FrameType::Unsub, b""), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        out.clear();
+        s.process(
+            &mut e,
+            &frame(FrameType::Flow, &5u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            delivered_payloads(&out),
+            vec![b"a".to_vec()],
+            "the default group sees offset 0 fresh"
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_subscription_name_is_rejected() {
+        let mut e = engine();
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        s.process(&mut e, &frame(FrameType::Sub, &[0xff, 0xfe]), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Err);
     }
 
     #[test]
@@ -1096,8 +1274,8 @@ mod tests {
         s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
         out.clear();
-        // Sub is recognized but not wired on this connection.
-        s.process(&mut e, &frame(FrameType::Sub, b""), &mut out)
+        // Info is a response-only verb; a client must not send it.
+        s.process(&mut e, &frame(FrameType::Info, b""), &mut out)
             .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Err);
     }
