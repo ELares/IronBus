@@ -546,3 +546,84 @@ proptest! {
         }
     }
 }
+
+proptest! {
+    /// A fatal fsync injected at an arbitrary point of an arbitrary workload, then a power
+    /// loss, recovers exactly the prefix that was durable at the fault: no acknowledged
+    /// record is lost, none is invented, and the recovered records are a valid monotone run.
+    /// This sweeps the fsync-EIO crash class over many workloads and fault points (the
+    /// seeded sim lane), where the point gates above pin specific cases.
+    #[test]
+    fn a_sync_fault_at_any_point_loses_no_acked_record(
+        ops in prop::collection::vec(op_strategy(), 0..40),
+        roll in any::<bool>(),
+        fault_after in 0usize..40,
+    ) {
+        let config = if roll { small_config() } else { big_config() };
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut log = Log::open(fs, ManualClock::new(), config).unwrap();
+        let mut next = 0u64;
+        let k = fault_after.min(ops.len());
+
+        // Phase 1: apply a clean prefix of the workload, establishing the durable mark.
+        for op in &ops[..k] {
+            match op {
+                Op::Append => {
+                    append_at(&mut log, next);
+                    next += 1;
+                }
+                Op::Sync => log.sync().unwrap(),
+            }
+        }
+        let durable_at_fault = log.flushed_offset().get();
+
+        // Phase 2: arm a fatal fsync, then apply the rest. The first sync (or a roll's seal)
+        // freezes the writer; later ops just fail. No durable progress is possible while
+        // armed, so the durable mark cannot advance past `durable_at_fault`.
+        control.set_fail_sync(true);
+        for op in &ops[k..] {
+            match op {
+                Op::Append => {
+                    let r = log.append(&Append {
+                        timestamp_ms: next,
+                        flags: RecordFlags::EMPTY,
+                        key: b"",
+                        headers: b"",
+                        payload: &payload(next),
+                    });
+                    if r.is_ok() {
+                        next += 1;
+                    }
+                }
+                Op::Sync => {
+                    let _ = log.sync();
+                }
+            }
+        }
+        control.set_fail_sync(false);
+        let appended = log.next_offset().get();
+
+        // The crash drops every unsynced byte; reopen and check the invariant.
+        let faultfs = log.into_filesystem();
+        faultfs.inner().simulate_power_loss();
+        let log = Log::open(faultfs, ManualClock::new(), config).unwrap();
+        let recovered = log.flushed_offset().get();
+        prop_assert!(
+            recovered >= durable_at_fault,
+            "lost an acked record: recovered {} < durable {}",
+            recovered,
+            durable_at_fault
+        );
+        prop_assert!(recovered <= appended, "invented a record beyond what was appended");
+        prop_assert_eq!(recovered, durable_at_fault, "recovered exactly the durable prefix");
+        let records = log.read_from(Offset::ZERO, usize::MAX).unwrap();
+        prop_assert_eq!(records.len() as u64, recovered);
+        for (i, record) in records.iter().enumerate() {
+            let i = u64::try_from(i).unwrap();
+            prop_assert_eq!(record.offset, Offset::new(i));
+            prop_assert_eq!(record.seq, Seq::new(i));
+            let expected = payload(i);
+            prop_assert_eq!(record.payload.as_slice(), expected.as_slice());
+        }
+    }
+}
