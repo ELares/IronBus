@@ -7,5 +7,6 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod codec;
 pub mod format;
 pub mod types;
