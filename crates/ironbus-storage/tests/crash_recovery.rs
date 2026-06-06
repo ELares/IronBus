@@ -378,9 +378,12 @@ fn fatal_fsync_freeze_during_a_roll_loses_no_acked_record() {
     faultfs.inner().simulate_power_loss();
     let log = Log::open(faultfs, ManualClock::new(), small_config()).unwrap();
     let recovered = log.flushed_offset().get();
-    assert!(
-        recovered >= acked,
-        "lost an acked record across the roll freeze: recovered {recovered} < acked {acked}"
+    // Exactly the acked prefix: the seal faulted before segment 1 was ever created, so no
+    // uncommitted record can survive (no acked record lost, none invented). This mirrors the
+    // tight assertion in the non-roll gate.
+    assert_eq!(
+        recovered, acked,
+        "the roll freeze must recover exactly the acked prefix"
     );
     assert_prefix(&log, recovered);
 }
