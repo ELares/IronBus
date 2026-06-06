@@ -172,6 +172,22 @@ pub enum ProgressResult {
 }
 
 /// A single-topic, single-work-group queue engine.
+/// Monotonic in-memory operational counters since process start, exposed via `/metrics`.
+/// They are statistics, not durable state: a restart resets them to zero.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Counters {
+    /// Messages appended by `produce`.
+    pub produced: u64,
+    /// Message deliveries handed out by `poll` (a redelivery counts again).
+    pub delivered: u64,
+    /// Deliveries that were a redelivery (the message had been delivered before).
+    pub redelivered: u64,
+    /// Messages dead-lettered (parked past `MaxDeliver`); the resilience drop signal.
+    pub dead_lettered: u64,
+    /// Commits via `ack` (a `term` commits through the same path and is counted here).
+    pub acks: u64,
+}
+
 pub struct Engine<F: Filesystem, C: Clock> {
     log: Log<F, C>,
     cursor: AckCursor,
@@ -181,6 +197,7 @@ pub struct Engine<F: Filesystem, C: Clock> {
     checkpoint: Checkpoint<F::File>,
     checkpoint_interval: u64,
     last_checkpointed: u64,
+    counters: Counters,
 }
 
 /// The file name of the work-group's durable committed-cursor checkpoint.
@@ -241,6 +258,7 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
             checkpoint,
             checkpoint_interval: config.checkpoint_interval,
             last_checkpointed: committed,
+            counters: Counters::default(),
         })
     }
 
@@ -288,6 +306,7 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     pub fn produce(&mut self, message: &Append<'_>) -> Result<Offset, EngineError> {
         let offset = self.log.append(message)?;
         self.log.sync()?;
+        self.counters.produced += 1;
         Ok(offset)
     }
 
@@ -325,23 +344,31 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
                         // Surface it loudly rather than silently stalling if an invariant breaks.
                         return Err(EngineError::MissingRecord { offset });
                     };
-                    return Ok(match self.delivery.disposition(deliveries) {
-                        Disposition::Deliver => Poll::Message(Delivery {
-                            offset: off,
-                            token,
-                            deliveries,
-                            record,
-                        }),
+                    let poll = match self.delivery.disposition(deliveries) {
+                        Disposition::Deliver => {
+                            self.counters.delivered += 1;
+                            if deliveries > 1 {
+                                self.counters.redelivered += 1;
+                            }
+                            Poll::Message(Delivery {
+                                offset: off,
+                                token,
+                                deliveries,
+                                record,
+                            })
+                        }
                         Disposition::DeadLetter => {
                             // Park: drop the lease and commit past it so it never redelivers.
                             self.leases.ack(&token);
                             self.cursor.ack(off);
+                            self.counters.dead_lettered += 1;
                             Poll::Parked {
                                 offset: off,
                                 record,
                             }
                         }
-                    });
+                    };
+                    return Ok(poll);
                 }
             }
         }
@@ -364,6 +391,7 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
         match self.leases.ack(token) {
             AckOutcome::Acked => {
                 self.cursor.ack(token.offset);
+                self.counters.acks += 1;
                 AckResult::Acked
             }
             AckOutcome::Fenced => AckResult::Fenced,
@@ -426,6 +454,12 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     #[must_use]
     pub fn flushed_offset(&self) -> Offset {
         self.log.flushed_offset()
+    }
+
+    /// A snapshot of the operational counters (monotonic since process start).
+    #[must_use]
+    pub fn counters(&self) -> Counters {
+        self.counters
     }
 
     /// The number of messages currently in flight (leased, not yet acked).
@@ -1006,6 +1040,77 @@ mod tests {
         clock.advance_monotonic_nanos(150);
         let d3 = message(e.poll_now().unwrap());
         assert_eq!(d3.deliveries, 3);
+    }
+
+    #[test]
+    fn counters_track_delivery_and_redelivery() {
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(
+            InMemoryFs::new(),
+            std::sync::Arc::clone(&clock),
+            config(10, 5),
+        )
+        .unwrap();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"x",
+        })
+        .unwrap();
+        assert_eq!(e.counters().produced, 1);
+
+        // First delivery (visibility 30 ns).
+        let d1 = message(e.poll_now().unwrap());
+        assert_eq!(d1.deliveries, 1);
+        assert_eq!(e.counters().delivered, 1);
+        assert_eq!(e.counters().redelivered, 0);
+
+        // Let the lease expire, then re-poll: the SAME message is delivered a second time, so
+        // `delivered` is 2 (once per delivery) and `redelivered` is 1.
+        clock.advance_monotonic_nanos(40);
+        let d2 = message(e.poll_now().unwrap());
+        assert_eq!(d2.deliveries, 2);
+        assert_eq!(e.counters().delivered, 2);
+        assert_eq!(e.counters().redelivered, 1);
+    }
+
+    #[test]
+    fn counters_track_a_dead_letter() {
+        let clock = std::sync::Arc::new(ManualClock::new());
+        // max_deliver = 1: the second delivery attempt is dead-lettered.
+        let mut e = Engine::open(
+            InMemoryFs::new(),
+            std::sync::Arc::clone(&clock),
+            config(10, 1),
+        )
+        .unwrap();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"poison",
+        })
+        .unwrap();
+        // First delivery (attempt 1, within the cap).
+        let _ = message(e.poll_now().unwrap());
+        assert_eq!(e.counters().delivered, 1);
+        // Expire and re-poll: attempt 2 exceeds max_deliver, so it is parked, not delivered.
+        clock.advance_monotonic_nanos(40);
+        assert!(matches!(e.poll_now().unwrap(), Poll::Parked { .. }));
+        assert_eq!(e.counters().dead_lettered, 1);
+        assert_eq!(
+            e.counters().delivered,
+            1,
+            "the parked poison attempt is not a delivery"
+        );
+        assert_eq!(
+            e.counters().redelivered,
+            0,
+            "the parked poison attempt is counted only in dead_lettered"
+        );
     }
 
     #[test]

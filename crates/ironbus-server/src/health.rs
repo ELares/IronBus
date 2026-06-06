@@ -13,6 +13,7 @@
 //! few engine gauges (committed offset, durable head, consumer lag, in-flight, writer health)
 //! in Prometheus text format. The drop/skip/loss counters and fsync histograms are follow-ups (#16).
 
+use crate::engine::Counters;
 use crate::server::SharedEngine;
 use ironbus_core::clock::Clock;
 use ironbus_storage::fs::Filesystem;
@@ -132,39 +133,75 @@ where
             }
         }
         "/metrics" => {
-            let (committed, flushed, in_flight, healthy) = {
+            let (committed, flushed, in_flight, healthy, counters) = {
                 let g = engine.lock().unwrap_or_else(PoisonError::into_inner);
                 (
                     g.committed_offset().get(),
                     g.flushed_offset().get(),
                     g.in_flight(),
                     g.is_healthy(),
+                    g.counters(),
                 )
             };
-            // Consumer lag: durable records produced but not yet committed.
-            let lag = flushed.saturating_sub(committed);
-            let body = format!(
-                "# HELP ironbus_committed_offset The committed consumer cursor; every offset below it is acked.\n\
-                 # TYPE ironbus_committed_offset gauge\n\
-                 ironbus_committed_offset {committed}\n\
-                 # HELP ironbus_flushed_offset The durable log head; the offset of the next record to be written.\n\
-                 # TYPE ironbus_flushed_offset gauge\n\
-                 ironbus_flushed_offset {flushed}\n\
-                 # HELP ironbus_consumer_lag Durable records produced but not yet committed.\n\
-                 # TYPE ironbus_consumer_lag gauge\n\
-                 ironbus_consumer_lag {lag}\n\
-                 # HELP ironbus_in_flight Messages delivered (leased) but not yet acked.\n\
-                 # TYPE ironbus_in_flight gauge\n\
-                 ironbus_in_flight {in_flight}\n\
-                 # HELP ironbus_writer_healthy 1 if the durable log writer is live, 0 if frozen.\n\
-                 # TYPE ironbus_writer_healthy gauge\n\
-                 ironbus_writer_healthy {healthy_value}\n",
-                healthy_value = u8::from(healthy),
-            );
-            respond(&mut stream, 200, "OK", &body)
+            respond(
+                &mut stream,
+                200,
+                "OK",
+                &metrics_body(committed, flushed, in_flight, healthy, counters),
+            )
         }
         _ => respond(&mut stream, 404, "Not Found", "unknown endpoint"),
     }
+}
+
+/// Renders the Prometheus text exposition body from an engine snapshot. Consumer lag is the
+/// durable records produced but not yet committed (`flushed - committed`).
+fn metrics_body(
+    committed: u64,
+    flushed: u64,
+    in_flight: usize,
+    healthy: bool,
+    counters: Counters,
+) -> String {
+    let lag = flushed.saturating_sub(committed);
+    format!(
+        "# HELP ironbus_committed_offset The committed consumer cursor; every offset below it is acked.\n\
+         # TYPE ironbus_committed_offset gauge\n\
+         ironbus_committed_offset {committed}\n\
+         # HELP ironbus_flushed_offset The durable log head; the offset of the next record to be written.\n\
+         # TYPE ironbus_flushed_offset gauge\n\
+         ironbus_flushed_offset {flushed}\n\
+         # HELP ironbus_consumer_lag Durable records produced but not yet committed.\n\
+         # TYPE ironbus_consumer_lag gauge\n\
+         ironbus_consumer_lag {lag}\n\
+         # HELP ironbus_in_flight Messages delivered (leased) but not yet acked.\n\
+         # TYPE ironbus_in_flight gauge\n\
+         ironbus_in_flight {in_flight}\n\
+         # HELP ironbus_writer_healthy 1 if the durable log writer is live, 0 if frozen.\n\
+         # TYPE ironbus_writer_healthy gauge\n\
+         ironbus_writer_healthy {healthy_value}\n\
+         # HELP ironbus_produced_total Messages appended by produce.\n\
+         # TYPE ironbus_produced_total counter\n\
+         ironbus_produced_total {produced}\n\
+         # HELP ironbus_delivered_total Message deliveries handed out (a redelivery counts again).\n\
+         # TYPE ironbus_delivered_total counter\n\
+         ironbus_delivered_total {delivered}\n\
+         # HELP ironbus_redelivered_total Deliveries that were a redelivery.\n\
+         # TYPE ironbus_redelivered_total counter\n\
+         ironbus_redelivered_total {redelivered}\n\
+         # HELP ironbus_dead_lettered_total Messages dead-lettered past MaxDeliver.\n\
+         # TYPE ironbus_dead_lettered_total counter\n\
+         ironbus_dead_lettered_total {dead_lettered}\n\
+         # HELP ironbus_acks_total Commits via ack (a term commits through the same path).\n\
+         # TYPE ironbus_acks_total counter\n\
+         ironbus_acks_total {acks}\n",
+        healthy_value = u8::from(healthy),
+        produced = counters.produced,
+        delivered = counters.delivered,
+        redelivered = counters.redelivered,
+        dead_lettered = counters.dead_lettered,
+        acks = counters.acks,
+    )
 }
 
 fn respond(stream: &mut TcpStream, code: u16, reason: &str, body: &str) -> std::io::Result<()> {
@@ -292,6 +329,9 @@ mod tests {
         assert!(m.contains("\nironbus_consumer_lag 2\n"), "{m}");
         assert!(m.contains("\nironbus_in_flight 0\n"), "{m}");
         assert!(m.contains("\nironbus_writer_healthy 1\n"), "{m}");
+        assert!(m.contains("\nironbus_produced_total 2\n"), "{m}");
+        assert!(m.contains("\nironbus_delivered_total 0\n"), "{m}");
+        assert!(m.contains("\nironbus_dead_lettered_total 0\n"), "{m}");
 
         // Lease one message: in-flight reflects the outstanding lease.
         let token = {
@@ -303,6 +343,11 @@ mod tests {
         };
         let leased = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
         assert!(leased.contains("\nironbus_in_flight 1\n"), "{leased}");
+        assert!(leased.contains("\nironbus_delivered_total 1\n"), "{leased}");
+        assert!(
+            leased.contains("\nironbus_redelivered_total 0\n"),
+            "{leased}"
+        );
 
         // Ack it: the committed cursor advances and the lag shrinks.
         {
@@ -313,6 +358,7 @@ mod tests {
         assert!(acked.contains("\nironbus_committed_offset 1\n"), "{acked}");
         assert!(acked.contains("\nironbus_consumer_lag 1\n"), "{acked}");
         assert!(acked.contains("\nironbus_in_flight 0\n"), "{acked}");
+        assert!(acked.contains("\nironbus_acks_total 1\n"), "{acked}");
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
