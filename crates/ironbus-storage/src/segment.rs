@@ -139,6 +139,32 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         })
     }
 
+    /// Resumes appending to an existing, already-validated segment at its recovered
+    /// write head, without rewriting the header.
+    ///
+    /// Recovery scans the segment, truncates any torn tail, and calls this with the
+    /// recovered state: `write_pos` is the byte offset just past the last intact record
+    /// (`SegmentScan::valid_end`), `record_count` is how many records precede it, and
+    /// `last_seq` is that last record's sequence, or the header `base_seq` if the
+    /// segment is empty. The caller guarantees those match the bytes on disk; this
+    /// constructor performs no IO.
+    #[must_use]
+    pub fn resume(
+        file: F,
+        header: SegmentHeader,
+        write_pos: u64,
+        record_count: u32,
+        last_seq: Seq,
+    ) -> SegmentWriter<F> {
+        SegmentWriter {
+            file,
+            header,
+            write_pos,
+            record_count,
+            last_seq,
+        }
+    }
+
     /// The log offset the NEXT appended record will receive. Saturates at
     /// `u64::MAX` if the offset space is exhausted; [`SegmentWriter::append`] refuses
     /// to mint a wrapped offset and returns [`StorageError::SegmentFull`] instead.
