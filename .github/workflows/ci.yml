@@ -202,3 +202,56 @@ jobs:
       # a warning-clean 32-bit compile. i686 binaries run natively on the x86_64 runner (no qemu).
       - name: cross test the byte parsers on a 32-bit target
         run: cross test --locked -p ironbus-core --target ${{ matrix.target }}
+
+  sbom:
+    name: cargo-auditable SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: sbom
+      - name: install musl tooling and cargo-auditable
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          cargo install --locked cargo-auditable rust-audit-info
+      # Prove the release SBOM path: a cargo-auditable build of the musl binary embeds the
+      # dependency manifest, and rust-audit-info can extract it. This is exactly what the
+      # release workflow ships, so a break in the SBOM toolchain is caught per-PR, not at a tag.
+      - name: build with an embedded SBOM and verify it lists the workspace crates
+        run: |
+          set -euo pipefail
+          cargo auditable build --release --locked -p ironbus-cli --target x86_64-unknown-linux-musl
+          bin="target/x86_64-unknown-linux-musl/release/ironbus"
+          test -x "$bin"
+          rust-audit-info "$bin" > sbom.json
+          test -s sbom.json
+          grep -q 'ironbus-core' sbom.json
+          grep -q 'ironbus-cli' sbom.json
+          echo "ok: embedded cargo-auditable SBOM present and lists the workspace crates"
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # Lint every workflow (CI, nightly, release) for schema, expression, and shell errors, so
+      # a broken release workflow is caught here rather than at a tag where it cannot be retried
+      # cheaply. actionlint runs shellcheck on each `run:` block.
+      - name: install and run actionlint
+        env:
+          # SC2015 (A && B || C is not if-then-else) is an info note on the intentional
+          # `grep ... && bad=1 || true` assertion pattern in the IO-free lint, where the
+          # assignment cannot fail; exclude it so the gate flags real shell bugs, not it.
+          SHELLCHECK_OPTS: --exclude=SC2015
+        run: |
+          set -euo pipefail
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          "$(go env GOPATH)/bin/actionlint" -color

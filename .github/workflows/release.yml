@@ -1,0 +1,146 @@
+name: Release
+
+# Build, sign, and publish the static musl edge binaries for a tagged release (#17, #22). The
+# three triples match the CI cross-build matrix, so the release path reuses the same proven
+# static-link setup. Each binary ships with a SHA256 checksum, a cargo-auditable SBOM, and a
+# keyless Sigstore build-provenance attestation (verifiable with `gh attestation verify`).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build the release for"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: release-${{ matrix.target }}
+      - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2
+        with:
+          tool: cross
+      - name: cross build the static ironbus binary
+        run: |
+          set -euo pipefail
+          # Inspect only a freshly produced artifact, never a stale cached one.
+          rm -f "target/${{ matrix.target }}/release/ironbus"
+          cross build --release --locked -p ironbus-cli --target "${{ matrix.target }}"
+      - name: assert the binary is statically linked
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/ironbus"
+          test -x "$bin"
+          # A static (including static-PIE) ELF carries no PT_INTERP segment and no NEEDED lib.
+          if readelf -l "$bin" | grep -q 'INTERP'; then
+            echo "::error::$bin has a PT_INTERP segment, it is dynamically linked"
+            exit 1
+          fi
+          if readelf -d "$bin" 2>/dev/null | grep -q 'NEEDED'; then
+            echo "::error::$bin lists NEEDED shared libraries, it is not static"
+            exit 1
+          fi
+      - name: stage the artifact and its checksum
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          out="dist/ironbus-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/ironbus" "$out"
+          ( cd dist && sha256sum "ironbus-${{ matrix.target }}" > "ironbus-${{ matrix.target }}.sha256" )
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ironbus-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # create the GitHub Release
+      id-token: write # keyless Sigstore signing via OIDC
+      attestations: write # store the build-provenance attestation
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: release-sbom
+      - name: generate the cargo-auditable SBOM
+        run: |
+          set -euo pipefail
+          # The dependency graph is target-independent for this pure-Rust workspace, so one
+          # auditable build yields the released SBOM (the same crates ship in every triple).
+          cargo install --locked cargo-auditable rust-audit-info
+          cargo auditable build --release --locked -p ironbus-cli
+          mkdir -p dist
+          rust-audit-info target/release/ironbus > dist/ironbus.sbom.json
+          test -s dist/ironbus.sbom.json
+          grep -q 'ironbus-core' dist/ironbus.sbom.json
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+      - name: collect the built artifacts
+        run: |
+          set -euo pipefail
+          find artifacts -type f -name 'ironbus-*' -exec cp {} dist/ \;
+          ls -l dist
+      - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: |
+            dist/ironbus-x86_64-unknown-linux-musl
+            dist/ironbus-aarch64-unknown-linux-musl
+            dist/ironbus-armv7-unknown-linux-musleabihf
+            dist/ironbus.sbom.json
+      - name: create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "$TAG" \
+            --verify-tag \
+            --notes "Static musl binaries for the three edge triples (x86_64, aarch64, armv7), each with a SHA256 checksum, a cargo-auditable SBOM (ironbus.sbom.json), and a keyless Sigstore build-provenance attestation. Verify with: gh attestation verify <binary> --repo $REPO. See CHANGELOG.md for changes." \
+            dist/ironbus-x86_64-unknown-linux-musl \
+            dist/ironbus-x86_64-unknown-linux-musl.sha256 \
+            dist/ironbus-aarch64-unknown-linux-musl \
+            dist/ironbus-aarch64-unknown-linux-musl.sha256 \
+            dist/ironbus-armv7-unknown-linux-musleabihf \
+            dist/ironbus-armv7-unknown-linux-musleabihf.sha256 \
+            dist/ironbus.sbom.json
