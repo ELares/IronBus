@@ -8,5 +8,8 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[dev-dependencies]
+proptest = "1"
+
 [lints]
 workspace = true
