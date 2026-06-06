@@ -29,6 +29,7 @@ use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::{Append, Log, LogConfig};
 use ironbus_storage::loss::LossReport;
 use ironbus_storage::segment::{OwnedRecord, StorageError};
+use std::collections::BTreeMap;
 
 /// Tunables for an [`Engine`].
 #[derive(Clone, Debug)]
@@ -190,10 +191,37 @@ pub struct Counters {
     pub acks: u64,
 }
 
-pub struct Engine<F: Filesystem, C: Clock> {
-    log: Log<F, C>,
+/// The durable, unnamed default work-group: the one the wire protocol uses today, the one
+/// persisted in `cursor.ckpt`. Named groups (#9) are independent in-memory cursors.
+const DEFAULT_GROUP: &str = "";
+
+/// Per-work-group consumer state over the shared log: an independent committed cursor and
+/// in-flight lease table. A broadcast subscriber is a group of one (it sees every message);
+/// a competing group is shared by several members (each message goes to one member). The
+/// lease generation space is per-group, so a [`LeaseToken`] is only meaningful within the
+/// group it was delivered from.
+struct WorkGroup {
     cursor: AckCursor,
     leases: LeaseTable,
+}
+
+impl WorkGroup {
+    fn new(config: LeaseConfig) -> WorkGroup {
+        WorkGroup {
+            cursor: AckCursor::new(),
+            leases: LeaseTable::new(config),
+        }
+    }
+}
+
+pub struct Engine<F: Filesystem, C: Clock> {
+    log: Log<F, C>,
+    /// Per-work-group consumer state, keyed by group name. The default group (`""`) is the
+    /// durable one (checkpointed to `cursor.ckpt`); named groups are independent
+    /// broadcast/competing cursors, in-memory for now (durable per-group state is #60).
+    groups: BTreeMap<String, WorkGroup>,
+    /// The lease configuration, kept to build a new group's lease table on first use.
+    lease_config: LeaseConfig,
     delivery: DeliveryConfig,
     max_in_flight: u32,
     checkpoint: Checkpoint<F::File>,
@@ -285,8 +313,14 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
 
         Ok(Engine {
             log,
-            cursor,
-            leases: LeaseTable::new(config.lease),
+            groups: BTreeMap::from([(
+                DEFAULT_GROUP.to_string(),
+                WorkGroup {
+                    cursor,
+                    leases: LeaseTable::new(config.lease),
+                },
+            )]),
+            lease_config: config.lease,
             delivery: config.delivery,
             max_in_flight: config.max_in_flight,
             checkpoint,
@@ -306,13 +340,17 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// # Errors
     /// Propagates a storage error from writing the checkpoint.
     pub fn checkpoint_cursor(&mut self) -> Result<(), EngineError> {
-        let committed = self.cursor.committed().get();
+        let Some(group) = self.groups.get(DEFAULT_GROUP) else {
+            return Ok(());
+        };
+        let committed = group.cursor.committed().get();
         // Persist when the watermark advanced OR there is an acked-ahead set to capture: an
         // out-of-order ack moves the ahead set without advancing the watermark, and the
         // clean-disconnect flush is the right place to record it so those acks are not
         // redelivered after a restart. A forced checkpoint with nothing new (a connection
-        // close that did no acking) stays a no-op.
-        if committed > self.last_checkpointed || !self.cursor.ahead_ranges().is_empty() {
+        // close that did no acking) stays a no-op. Only the default group is durable today.
+        let has_ahead = !group.cursor.ahead_ranges().is_empty();
+        if committed > self.last_checkpointed || has_ahead {
             let payload = self.cursor_checkpoint_payload();
             self.checkpoint.write(&payload)?;
             self.last_checkpointed = committed;
@@ -327,22 +365,24 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// it never loses an ack below the watermark. A pathological ahead set (many disjoint
     /// out-of-order acks) is the only case that overflows; the in-flight window bounds it.
     fn cursor_checkpoint_payload(&self) -> Vec<u8> {
+        let Some(cursor) = self.groups.get(DEFAULT_GROUP).map(|g| &g.cursor) else {
+            return Vec::new();
+        };
         let mut buf = Vec::new();
-        self.cursor.encode_snapshot(&mut buf);
+        cursor.encode_snapshot(&mut buf);
         if buf.len() <= MAX_PAYLOAD {
             return buf;
         }
         // A slot holds MAX_PAYLOAD bytes: the fixed snapshot header and crc, plus 16 per run.
         let max_runs = MAX_PAYLOAD.saturating_sub(AckCursor::SNAPSHOT_MIN_LEN) / 16;
-        let kept: Vec<(u64, u64)> = self
-            .cursor
+        let kept: Vec<(u64, u64)> = cursor
             .ahead_ranges()
             .iter()
             .copied()
             .take(max_runs)
             .collect();
-        let capped = AckCursor::resume_with_ahead(self.cursor.committed(), kept)
-            .unwrap_or_else(|_| AckCursor::resume(self.cursor.committed()));
+        let capped = AckCursor::resume_with_ahead(cursor.committed(), kept)
+            .unwrap_or_else(|_| AckCursor::resume(cursor.committed()));
         let mut out = Vec::new();
         capped.encode_snapshot(&mut out);
         out
@@ -356,7 +396,10 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// # Errors
     /// Propagates a storage error from writing the checkpoint.
     pub fn maybe_checkpoint(&mut self) -> Result<bool, EngineError> {
-        let committed = self.cursor.committed().get();
+        let committed = self
+            .groups
+            .get(DEFAULT_GROUP)
+            .map_or(0, |g| g.cursor.committed().get());
         if committed.saturating_sub(self.last_checkpointed) >= self.checkpoint_interval.max(1) {
             let payload = self.cursor_checkpoint_payload();
             self.checkpoint.write(&payload)?;
@@ -392,7 +435,24 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// Returns [`EngineError::GenerationExhausted`] if the lease space is exhausted, or a
     /// storage error from reading the record.
     pub fn poll(&mut self, now: u64) -> Result<Poll, EngineError> {
-        let committed = self.cursor.committed().get();
+        self.poll_in(DEFAULT_GROUP, now)
+    }
+
+    /// Like [`Engine::poll`] but for a named work-group (#9): the group has its own committed
+    /// cursor and in-flight lease set over the shared log, so a broadcast subscriber sees every
+    /// message and a competing group shares the work, each independent of the others. The group
+    /// is created (at offset 0) on first use. The returned token is only meaningful within
+    /// `group` (the lease generation space is per-group).
+    ///
+    /// # Errors
+    /// As [`Engine::poll`].
+    pub fn poll_in(&mut self, group: &str, now: u64) -> Result<Poll, EngineError> {
+        let lease_config = self.lease_config;
+        let g = self
+            .groups
+            .entry(group.to_string())
+            .or_insert_with(|| WorkGroup::new(lease_config));
+        let committed = g.cursor.committed().get();
         let flushed = self.log.flushed_offset().get();
         // The delivery window: at most `max_in_flight` offsets above the committed cursor,
         // and never past the durable end.
@@ -403,11 +463,11 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
         let mut offset = committed;
         while offset < window_end {
             let off = Offset::new(offset);
-            if self.cursor.is_acked(off) {
+            if g.cursor.is_acked(off) {
                 offset += 1;
                 continue;
             }
-            match self.leases.claim(off, now) {
+            match g.leases.claim(off, now) {
                 Claim::InFlight => {
                     offset += 1;
                 }
@@ -433,8 +493,8 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
                         }
                         Disposition::DeadLetter => {
                             // Park: drop the lease and commit past it so it never redelivers.
-                            self.leases.ack(&token);
-                            self.cursor.ack(off);
+                            g.leases.ack(&token);
+                            g.cursor.ack(off);
                             self.counters.dead_lettered += 1;
                             self.last_dead_lettered = Some(off);
                             Poll::Parked {
@@ -463,9 +523,21 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// Acks the message named by `token`: removes its lease (fenced if stale) and advances
     /// the committed cursor over any newly contiguous prefix.
     pub fn ack(&mut self, token: &LeaseToken) -> AckResult {
-        match self.leases.ack(token) {
+        self.ack_in(DEFAULT_GROUP, token)
+    }
+
+    /// Acks `token` in a named work-group (#9): commits it in that group's cursor and frees
+    /// its lease slot, independent of every other group. The token must be one delivered by
+    /// [`Engine::poll_in`] for the same `group` (generations are per-group).
+    pub fn ack_in(&mut self, group: &str, token: &LeaseToken) -> AckResult {
+        let lease_config = self.lease_config;
+        let g = self
+            .groups
+            .entry(group.to_string())
+            .or_insert_with(|| WorkGroup::new(lease_config));
+        match g.leases.ack(token) {
             AckOutcome::Acked => {
-                self.cursor.ack(token.offset);
+                g.cursor.ack(token.offset);
                 self.counters.acks += 1;
                 AckResult::Acked
             }
@@ -483,14 +555,33 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// # Errors
     /// Returns [`EngineError::GenerationExhausted`] if the lease generation space is spent.
     pub fn nack(&mut self, token: &LeaseToken, delay_ms: u64) -> Result<NackResult, EngineError> {
+        self.nack_in(DEFAULT_GROUP, token, delay_ms)
+    }
+
+    /// Nacks `token` in a named work-group (#9), requeueing it for redelivery within that
+    /// group only. See [`Engine::nack`] for the `delay_ms` convention.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::GenerationExhausted`] if the lease generation space is spent.
+    pub fn nack_in(
+        &mut self,
+        group: &str,
+        token: &LeaseToken,
+        delay_ms: u64,
+    ) -> Result<NackResult, EngineError> {
         let now = self.log.now_monotonic();
         // u64::MAX is the wire sentinel for "no explicit delay": fall back to the configured
         // backoff schedule. Any other value is an explicit delay in milliseconds (0 = retry
         // immediately), converted to nanoseconds and saturated rather than overflowed.
         let explicit_nanos = (delay_ms != u64::MAX).then(|| delay_ms.saturating_mul(1_000_000));
-        let attempt = self.leases.deliveries(token).unwrap_or(0);
+        let lease_config = self.lease_config;
+        let g = self
+            .groups
+            .entry(group.to_string())
+            .or_insert_with(|| WorkGroup::new(lease_config));
+        let attempt = g.leases.deliveries(token).unwrap_or(0);
         let delay_nanos = self.delivery.effective_nack_delay(attempt, explicit_nanos);
-        Ok(match self.leases.nack(token, now, delay_nanos) {
+        Ok(match g.leases.nack(token, now, delay_nanos) {
             NackOutcome::Requeued { .. } => NackResult::Requeued,
             NackOutcome::Fenced => NackResult::Fenced,
             NackOutcome::Exhausted => return Err(EngineError::GenerationExhausted),
@@ -503,15 +594,33 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// dead-letter-policy split can diverge them); sharing the commit path keeps the cursor
     /// and lease invariants identical to a normal ack.
     pub fn term(&mut self, token: &LeaseToken) -> AckResult {
-        self.ack(token)
+        self.term_in(DEFAULT_GROUP, token)
+    }
+
+    /// Terminates `token` in a named work-group (#9): an intentional drop that commits past
+    /// it in that group without dead-lettering. Mechanically a commit, like
+    /// [`Engine::ack_in`].
+    pub fn term_in(&mut self, group: &str, token: &LeaseToken) -> AckResult {
+        self.ack_in(group, token)
     }
 
     /// Extends the lease named by `token` by one visibility window (the consumer is still
     /// working), clamped to the hard cap from the attempt start. A stale token is fenced; a
     /// lease already at its cap returns [`ProgressResult::CapReached`].
     pub fn progress(&mut self, token: &LeaseToken) -> ProgressResult {
+        self.progress_in(DEFAULT_GROUP, token)
+    }
+
+    /// Extends the lease named by `token` in a named work-group (#9) by one visibility
+    /// window. See [`Engine::progress`].
+    pub fn progress_in(&mut self, group: &str, token: &LeaseToken) -> ProgressResult {
         let now = self.log.now_monotonic();
-        match self.leases.extend(token, now) {
+        let lease_config = self.lease_config;
+        let g = self
+            .groups
+            .entry(group.to_string())
+            .or_insert_with(|| WorkGroup::new(lease_config));
+        match g.leases.extend(token, now) {
             ExtendOutcome::Extended(_) => ProgressResult::Extended,
             ExtendOutcome::CapReached => ProgressResult::CapReached,
             ExtendOutcome::Fenced => ProgressResult::Fenced,
@@ -521,7 +630,16 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// The committed offset: every offset below it is acked, and where a restart resumes.
     #[must_use]
     pub fn committed_offset(&self) -> Offset {
-        self.cursor.committed()
+        self.committed_offset_in(DEFAULT_GROUP)
+    }
+
+    /// The committed offset of a named work-group (#9), or offset 0 for a group that has
+    /// never been polled (it would start at the beginning of the log).
+    #[must_use]
+    pub fn committed_offset_in(&self, group: &str) -> Offset {
+        self.groups
+            .get(group)
+            .map_or(Offset::ZERO, |g| g.cursor.committed())
     }
 
     /// The durable log head: the offset of the next record to be written. Consumer lag is
@@ -569,7 +687,7 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// The number of messages currently in flight (leased, not yet acked).
     #[must_use]
     pub fn in_flight(&self) -> usize {
-        self.leases.in_flight()
+        self.groups.values().map(|g| g.leases.in_flight()).sum()
     }
 
     /// Whether the broker is healthy: the durable log writer is not frozen. A frozen writer
@@ -1000,10 +1118,10 @@ mod tests {
             assert_eq!(e.ack(&tokens[i]), AckResult::Acked);
         }
         assert_eq!(e.committed_offset(), Offset::new(0));
+        let default_runs = e.groups[DEFAULT_GROUP].cursor.ahead_runs();
         assert!(
-            e.cursor.ahead_runs() > 3,
-            "the test needs more runs than the slot holds, got {}",
-            e.cursor.ahead_runs()
+            default_runs > 3,
+            "the test needs more runs than the slot holds, got {default_runs}"
         );
         e.checkpoint_cursor().unwrap();
         let fs = e.into_filesystem();
@@ -1072,6 +1190,60 @@ mod tests {
             vec![2, 3],
             "only the uncommitted tail redelivers"
         );
+    }
+
+    #[test]
+    fn named_groups_consume_the_log_independently() {
+        // Two named groups each see every message and advance their own cursor: broadcast
+        // fan-out over the single log (#9). The default group is untouched by either.
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b", b"c"] {
+            produce(&mut e, p);
+        }
+        // Group "x" consumes and acks all three.
+        for expected in 0..3u64 {
+            let d = message(e.poll_in("x", 0).unwrap());
+            assert_eq!(d.offset, Offset::new(expected));
+            assert_eq!(e.ack_in("x", &d.token), AckResult::Acked);
+        }
+        assert_eq!(e.committed_offset_in("x"), Offset::new(3));
+        // Group "y" is independent: it has consumed nothing and still sees the whole log.
+        assert_eq!(e.committed_offset_in("y"), Offset::new(0));
+        let d = message(e.poll_in("y", 0).unwrap());
+        assert_eq!(
+            d.offset,
+            Offset::new(0),
+            "y starts at the beginning, independent of x"
+        );
+        // The default (durable) group is also independent and untouched.
+        assert_eq!(e.committed_offset(), Offset::new(0));
+        assert!(matches!(e.poll(0).unwrap(), Poll::Message(_)));
+    }
+
+    #[test]
+    fn named_group_leases_are_independent_across_groups() {
+        // A message leased (delivered, unacked) in one group is still deliverable in another:
+        // each group has its own in-flight set, so groups do not block each other (#9).
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"a");
+        let dx = message(e.poll_in("x", 0).unwrap());
+        assert_eq!(dx.offset, Offset::new(0));
+        // y can still claim offset 0; x's lease does not block it.
+        let dy = message(e.poll_in("y", 0).unwrap());
+        assert_eq!(dy.offset, Offset::new(0));
+        // in_flight counts both groups' leases.
+        assert_eq!(e.in_flight(), 2);
+        // Each group commits its own delivery independently.
+        assert_eq!(e.ack_in("x", &dx.token), AckResult::Acked);
+        assert_eq!(e.committed_offset_in("x"), Offset::new(1));
+        assert_eq!(
+            e.committed_offset_in("y"),
+            Offset::new(0),
+            "acking in x does not commit y"
+        );
+        assert_eq!(e.ack_in("y", &dy.token), AckResult::Acked);
+        assert_eq!(e.committed_offset_in("y"), Offset::new(1));
+        assert_eq!(e.in_flight(), 0);
     }
 
     #[test]
