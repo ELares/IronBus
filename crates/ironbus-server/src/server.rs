@@ -253,8 +253,12 @@ mod tests {
         .unwrap();
         client.write_all(&frame(FrameType::Pub, &pub_body)).unwrap();
         let (ty, body) = read_one_frame(&mut client, &mut buf);
-        assert_eq!(ty, FrameType::Ok);
-        assert_eq!(body, 0u64.to_le_bytes(), "Ok carries the assigned offset 0");
+        assert_eq!(ty, FrameType::PubAck);
+        assert_eq!(
+            body,
+            0u64.to_le_bytes(),
+            "PubAck carries the assigned offset 0"
+        );
 
         drop(client);
         shutdown.store(true, Ordering::Release);
@@ -301,16 +305,16 @@ mod tests {
         )
         .unwrap();
         c.write_all(&frame(FrameType::Pub, &pub_body)).unwrap();
-        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::Ok);
+        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::PubAck);
 
-        // Fetch: a Deliver frame then the Ok terminator.
+        // Fetch: a Deliver frame then the FlowEnd terminator.
         c.write_all(&frame(FrameType::Flow, &1u32.to_le_bytes()))
             .unwrap();
         let (ty, body) = read_one_frame(&mut c, &mut buf);
         assert_eq!(ty, FrameType::Deliver);
         let delivered = decode_deliver(&body).unwrap();
         assert_eq!(delivered.payload, b"e2e");
-        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::Ok); // batch terminator
+        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::FlowEnd); // batch terminator
 
         // Ack it.
         let mut ack_body = Vec::new();
@@ -324,7 +328,7 @@ mod tests {
             &mut ack_body,
         );
         c.write_all(&frame(FrameType::Ack, &ack_body)).unwrap();
-        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::Ok);
+        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::AckStatus);
 
         drop(c);
         shutdown.store(true, Ordering::Release);
@@ -373,14 +377,14 @@ mod tests {
         )
         .unwrap();
         c.write_all(&frame(FrameType::Pub, &pub_body)).unwrap();
-        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::Ok);
+        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::PubAck);
 
         c.write_all(&frame(FrameType::Flow, &1u32.to_le_bytes()))
             .unwrap();
         let (ty, body) = read_one_frame(&mut c, &mut buf);
         assert_eq!(ty, FrameType::Deliver);
         let delivered = decode_deliver(&body).unwrap();
-        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::Ok);
+        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::FlowEnd);
 
         let mut ack_body = Vec::new();
         encode_ack(
@@ -393,7 +397,7 @@ mod tests {
             &mut ack_body,
         );
         c.write_all(&frame(FrameType::Ack, &ack_body)).unwrap();
-        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::Ok);
+        assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::AckStatus);
 
         // Clean disconnect: handle_connection reads EOF, forces the checkpoint, and returns.
         drop(c);

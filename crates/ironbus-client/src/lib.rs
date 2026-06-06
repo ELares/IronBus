@@ -199,7 +199,7 @@ impl Client {
         encode_pub(message, &mut body).map_err(ClientError::Body)?;
         self.send(FrameType::Pub, &body)?;
         match self.read_frame()? {
-            (FrameType::Ok, body) => {
+            (FrameType::PubAck, body) => {
                 let bytes = <[u8; 8]>::try_from(body.as_slice()).map_err(|_| {
                     ClientError::BadResponse("produce reply was not an eight-byte offset")
                 })?;
@@ -244,8 +244,8 @@ impl Client {
                         payload: d.payload.to_vec(),
                     });
                 }
-                // The Ok terminates the batch (its body is the delivered count).
-                (FrameType::Ok, _) => return Ok(messages),
+                // The FlowEnd frame terminates the batch (its body is the delivered count).
+                (FrameType::FlowEnd, _) => return Ok(messages),
                 (FrameType::Err, body) => {
                     return Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
                 }
@@ -272,11 +272,12 @@ impl Client {
         );
         self.send(FrameType::Ack, &body)?;
         match self.read_frame()? {
-            // The ack reply is exactly one status byte (1 = committed, 0 = fenced). Demanding
-            // that length rejects a wrong-shape Ok (such as an eight-byte pub offset whose low
-            // byte is 1) that would otherwise be misread as a commit and silently drop the
-            // message, violating at-least-once.
-            (FrameType::Ok, body) => match body.as_slice() {
+            // The ack reply is a distinct AckStatus frame (#179) carrying exactly one status
+            // byte (1 = committed, 0 = fenced). The frame TYPE now disambiguates the reply, so a
+            // pub offset arrives as a PubAck (handled as Unexpected below), never as a same-tagged
+            // eight-byte body that could be misread as a commit; the length check still rejects a
+            // malformed AckStatus.
+            (FrameType::AckStatus, body) => match body.as_slice() {
                 [status] => Ok(*status == 1),
                 _ => Err(ClientError::BadResponse(
                     "ack reply was not a one-byte status",
@@ -316,7 +317,7 @@ impl Client {
         );
         self.send(FrameType::Ack, &body)?;
         match self.read_frame()? {
-            (FrameType::Ok, body) => match body.as_slice() {
+            (FrameType::AckStatus, body) => match body.as_slice() {
                 [status] => Ok(*status == 1),
                 _ => Err(ClientError::BadResponse(
                     "nack reply was not a one-byte status",
@@ -348,7 +349,7 @@ impl Client {
         );
         self.send(FrameType::Ack, &body)?;
         match self.read_frame()? {
-            (FrameType::Ok, body) => match body.as_slice() {
+            (FrameType::AckStatus, body) => match body.as_slice() {
                 [status] => Ok(*status == 1),
                 _ => Err(ClientError::BadResponse(
                     "term reply was not a one-byte status",
@@ -383,7 +384,7 @@ impl Client {
         );
         self.send(FrameType::Ack, &body)?;
         match self.read_frame()? {
-            (FrameType::Ok, body) => match body.as_slice() {
+            (FrameType::AckStatus, body) => match body.as_slice() {
                 [1] => Ok(ProgressOutcome::Extended),
                 [2] => Ok(ProgressOutcome::CapReached),
                 [0] => Ok(ProgressOutcome::Fenced),
@@ -616,7 +617,7 @@ mod tests {
     #[test]
     fn a_fenced_ack_returns_false() {
         let mut script = frame(FrameType::Info, b"");
-        script.extend(frame(FrameType::Ok, &[0u8])); // fenced
+        script.extend(frame(FrameType::AckStatus, &[0u8])); // fenced
         let (addr, handle) = raw_server(script);
         let mut c = Client::connect(addr).unwrap();
         assert!(!c.ack(7, 3).unwrap());
@@ -625,15 +626,18 @@ mod tests {
     }
 
     #[test]
-    fn an_eight_byte_ok_is_not_misread_as_a_committed_ack() {
-        // A pub-shaped eight-byte Ok whose low byte is 1 must NOT read as a commit.
+    fn a_pub_ack_in_response_to_an_ack_is_unexpected_not_misread() {
+        // With distinct response frames (#179), a pub offset arrives as a PubAck, a frame
+        // type the ack path never accepts. The eight-byte body whose low byte is 1 can no
+        // longer masquerade as a one-byte committed AckStatus: the TYPE disambiguates, so
+        // this is a clean Unexpected, not a body-length guess.
         let mut script = frame(FrameType::Info, b"");
-        script.extend(frame(FrameType::Ok, &1u64.to_le_bytes()));
+        script.extend(frame(FrameType::PubAck, &1u64.to_le_bytes()));
         let (addr, handle) = raw_server(script);
         let mut c = Client::connect(addr).unwrap();
         match c.ack(0, 0).unwrap_err() {
-            ClientError::BadResponse(_) => {}
-            other => panic!("expected BadResponse, got {other:?}"),
+            ClientError::Unexpected(FrameType::PubAck) => {}
+            other => panic!("expected Unexpected(PubAck), got {other:?}"),
         }
         drop(c);
         handle.join().unwrap();
