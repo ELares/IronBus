@@ -133,7 +133,7 @@ where
             }
         }
         "/metrics" => {
-            let (committed, flushed, in_flight, healthy, recovered_truncated, counters) = {
+            let (committed, flushed, in_flight, healthy, recovered_truncated, last_dead, counters) = {
                 let g = engine.lock().unwrap_or_else(PoisonError::into_inner);
                 (
                     g.committed_offset().get(),
@@ -141,9 +141,13 @@ where
                     g.in_flight(),
                     g.is_healthy(),
                     g.recovered_truncated_bytes(),
+                    g.last_dead_lettered_offset(),
                     g.counters(),
                 )
             };
+            // -1 is the unambiguous "none yet" sentinel (offsets are never negative).
+            let last_dead_lettered =
+                last_dead.map_or(-1i64, |o| i64::try_from(o.get()).unwrap_or(i64::MAX));
             respond(
                 &mut stream,
                 200,
@@ -154,6 +158,7 @@ where
                     in_flight,
                     healthy,
                     recovered_truncated,
+                    last_dead_lettered,
                     counters,
                 ),
             )
@@ -170,6 +175,7 @@ fn metrics_body(
     in_flight: usize,
     healthy: bool,
     recovered_truncated: u64,
+    last_dead_lettered: i64,
     counters: Counters,
 ) -> String {
     let lag = flushed.saturating_sub(committed);
@@ -192,6 +198,9 @@ fn metrics_body(
          # HELP ironbus_recovery_truncated_bytes Bytes dropped from a torn or unsynced tail at the last recovery (startup).\n\
          # TYPE ironbus_recovery_truncated_bytes gauge\n\
          ironbus_recovery_truncated_bytes {recovered_truncated}\n\
+         # HELP ironbus_last_dead_lettered_offset The log offset of the most recently dead-lettered message, or -1 if none.\n\
+         # TYPE ironbus_last_dead_lettered_offset gauge\n\
+         ironbus_last_dead_lettered_offset {last_dead_lettered}\n\
          # HELP ironbus_produced_total Messages appended by produce.\n\
          # TYPE ironbus_produced_total counter\n\
          ironbus_produced_total {produced}\n\
@@ -342,6 +351,10 @@ mod tests {
         assert!(m.contains("\nironbus_in_flight 0\n"), "{m}");
         assert!(m.contains("\nironbus_writer_healthy 1\n"), "{m}");
         assert!(m.contains("\nironbus_recovery_truncated_bytes 0\n"), "{m}");
+        assert!(
+            m.contains("\nironbus_last_dead_lettered_offset -1\n"),
+            "{m}"
+        );
         assert!(m.contains("\nironbus_produced_total 2\n"), "{m}");
         assert!(m.contains("\nironbus_delivered_total 0\n"), "{m}");
         assert!(m.contains("\nironbus_dead_lettered_total 0\n"), "{m}");
