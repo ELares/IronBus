@@ -201,7 +201,9 @@ pub struct AckBody {
     pub offset: u64,
     /// The lease generation the message was delivered under (the fencing token).
     pub generation: u64,
-    /// For a nack, how long to defer redelivery, in milliseconds; zero otherwise.
+    /// For a nack, the redelivery delay in milliseconds, where `u64::MAX` is the sentinel for
+    /// "no explicit delay" (the broker then applies its backoff schedule for the attempt) and
+    /// any other value is an explicit delay (0 = redeliver immediately). Zero for non-nack ops.
     pub delay_ms: u64,
 }
 

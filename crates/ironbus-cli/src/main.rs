@@ -261,8 +261,8 @@ enum Disposition {
     Peek,
     /// Commit each message (`--ack`).
     Ack,
-    /// Requeue each message for redelivery after `delay_ms` (`--nack`).
-    Nack { delay_ms: u64 },
+    /// Requeue each message for redelivery; `None` uses the broker's backoff schedule (`--nack`).
+    Nack { delay_ms: Option<u64> },
     /// Drop each message without dead-lettering (`--term`).
     Term,
 }
@@ -338,9 +338,7 @@ fn run_sub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     }
     let disposition = match dispose {
         Some(DispositionKind::Ack) => Disposition::Ack,
-        Some(DispositionKind::Nack) => Disposition::Nack {
-            delay_ms: delay_ms.unwrap_or(0),
-        },
+        Some(DispositionKind::Nack) => Disposition::Nack { delay_ms },
         Some(DispositionKind::Term) => Disposition::Term,
         None => Disposition::Peek,
     };
@@ -744,7 +742,7 @@ mod tests {
         // visibility means the redelivery is the nack's doing, not a timeout).
         cmd_pub(&a, b"", b"retry", &mut Vec::new()).unwrap();
         let mut nout = Vec::new();
-        cmd_sub(&a, 10, Disposition::Nack { delay_ms: 0 }, &mut nout).unwrap();
+        cmd_sub(&a, 10, Disposition::Nack { delay_ms: None }, &mut nout).unwrap();
         assert!(String::from_utf8(nout).unwrap().contains("nack requeued"));
         let mut aout = Vec::new();
         cmd_sub(&a, 10, Disposition::Ack, &mut aout).unwrap();

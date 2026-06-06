@@ -370,26 +370,23 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
         }
     }
 
-    /// Nacks the message named by `token`: requeues it for redelivery after `delay_ms`
-    /// (immediately if zero), fencing the nacking holder. The `MaxDeliver` / dead-letter
-    /// decision is made by [`Engine::poll`] when the message is next claimed, so a message
-    /// nacked past its delivery cap is parked rather than looping. `MaxDeliver` is enforced
-    /// there, not here.
+    /// Nacks the message named by `token`, requeueing it for redelivery and fencing the
+    /// nacking holder. `delay_ms` follows the wire convention: `u64::MAX` means no explicit
+    /// delay, so the server applies its configured backoff schedule for this attempt; any
+    /// other value is an explicit delay in milliseconds (0 = immediate) that overrides the
+    /// schedule. The `MaxDeliver` / dead-letter decision is made by [`Engine::poll`] when the
+    /// message is next claimed, so a message nacked past its cap is parked, not looped.
     ///
     /// # Errors
     /// Returns [`EngineError::GenerationExhausted`] if the lease generation space is spent.
     pub fn nack(&mut self, token: &LeaseToken, delay_ms: u64) -> Result<NackResult, EngineError> {
         let now = self.log.now_monotonic();
-        let delay_nanos = if delay_ms == 0 {
-            // No explicit client delay: apply the configured escalating backoff for this
-            // attempt (an empty schedule yields 0, i.e. immediate, the prior behavior).
-            let attempt = self.leases.deliveries(token).unwrap_or(0);
-            self.delivery.nack_backoff(attempt)
-        } else {
-            // An explicit client delay (milliseconds) overrides the schedule; saturate rather
-            // than overflow on an absurd value.
-            delay_ms.saturating_mul(1_000_000)
-        };
+        // u64::MAX is the wire sentinel for "no explicit delay": fall back to the configured
+        // backoff schedule. Any other value is an explicit delay in milliseconds (0 = retry
+        // immediately), converted to nanoseconds and saturated rather than overflowed.
+        let explicit_nanos = (delay_ms != u64::MAX).then(|| delay_ms.saturating_mul(1_000_000));
+        let attempt = self.leases.deliveries(token).unwrap_or(0);
+        let delay_nanos = self.delivery.effective_nack_delay(attempt, explicit_nanos);
         Ok(match self.leases.nack(token, now, delay_nanos) {
             NackOutcome::Requeued { .. } => NackResult::Requeued,
             NackOutcome::Fenced => NackResult::Fenced,
@@ -917,7 +914,8 @@ mod tests {
         .unwrap();
         let d = message(e.poll_now().unwrap());
         assert_eq!(d.deliveries, 1);
-        assert_eq!(e.nack(&d.token, 0).unwrap(), NackResult::Requeued);
+        // u64::MAX = no explicit delay, so the schedule governs (50 ns for attempt 1).
+        assert_eq!(e.nack(&d.token, u64::MAX).unwrap(), NackResult::Requeued);
         // The backoff deadline (now + 50) is in the future, so nothing redelivers yet.
         assert!(
             matches!(e.poll_now().unwrap(), Poll::Idle),
@@ -953,6 +951,46 @@ mod tests {
             matches!(e.poll_now().unwrap(), Poll::Idle),
             "an explicit client delay overrides the backoff schedule"
         );
+        // At the client's 1 ms mark it does redeliver, proving the explicit delay governed.
+        clock.advance_monotonic_nanos(1_000_000 - 50);
+        let d2 = message(e.poll_now().unwrap());
+        assert_eq!(d2.offset, d.offset);
+        assert_eq!(d2.deliveries, 2);
+    }
+
+    #[test]
+    fn the_backoff_schedule_escalates_across_attempts() {
+        // schedule [50, 200]: attempt 1 -> 50, attempt 2 -> 200, later clamps to 200.
+        let mut cfg = config(10, 9);
+        cfg.delivery = DeliveryConfig::new(9, false, vec![50, 200]).unwrap();
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(InMemoryFs::new(), std::sync::Arc::clone(&clock), cfg).unwrap();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"x",
+        })
+        .unwrap();
+        // Attempt 1 nack: schedule[0] = 50.
+        let d1 = message(e.poll_now().unwrap());
+        assert_eq!(d1.deliveries, 1);
+        e.nack(&d1.token, u64::MAX).unwrap();
+        assert!(matches!(e.poll_now().unwrap(), Poll::Idle));
+        clock.advance_monotonic_nanos(50);
+        // Attempt 2 nack: schedule[1] = 200 (escalated), so 50 more is NOT enough.
+        let d2 = message(e.poll_now().unwrap());
+        assert_eq!(d2.deliveries, 2);
+        e.nack(&d2.token, u64::MAX).unwrap();
+        clock.advance_monotonic_nanos(50);
+        assert!(
+            matches!(e.poll_now().unwrap(), Poll::Idle),
+            "attempt 2 waits the longer schedule[1]"
+        );
+        clock.advance_monotonic_nanos(150);
+        let d3 = message(e.poll_now().unwrap());
+        assert_eq!(d3.deliveries, 3);
     }
 
     #[test]
