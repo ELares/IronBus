@@ -62,6 +62,15 @@ const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 /// pathologically (one record each), so reject it as a misconfiguration.
 const MIN_MAX_SEGMENT_BYTES: u64 = 4096;
 
+/// The default visibility timeout for `serve` (30 s, matching the lease default).
+const DEFAULT_VISIBILITY_MS: u64 = 30_000;
+
+/// The default lease hard cap for `serve` (5 minutes). The effective cap is the larger of
+/// this and the visibility timeout, so it is never below one redelivery window. Used only by
+/// the Unix on-disk broker, so it is cfg-gated to keep the non-Unix build free of a dead const.
+#[cfg(unix)]
+const DEFAULT_HARD_CAP_MS: u64 = 300_000;
+
 /// The default max delivery attempts before a poison message is dead-lettered.
 const DEFAULT_MAX_DELIVER: u32 = 5;
 /// The default cursor-checkpoint interval for the `serve` engine: at most this many messages
@@ -90,7 +99,8 @@ ironbus: a durable edge message queue.
 USAGE:
     ironbus serve --data-dir <dir> [--addr <host:port>] [--max-connections <n>]
                   [--checkpoint-interval <n>] [--max-deliver <n>] [--max-in-flight <n>]
-                  [--max-segment-bytes <n>] [--health-addr <host:port>]
+                  [--max-segment-bytes <n>] [--visibility-timeout-ms <n>]
+                  [--health-addr <host:port>]
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
     ironbus sub   [--addr <host:port>] [--max <n>] [--ack | --nack [--delay-ms <n>] | --term]
     ironbus help
@@ -412,6 +422,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut max_deliver = DEFAULT_MAX_DELIVER;
     let mut max_in_flight = DEFAULT_MAX_IN_FLIGHT;
     let mut max_segment_bytes = DEFAULT_MAX_SEGMENT_BYTES;
+    let mut visibility_ms = DEFAULT_VISIBILITY_MS;
     let mut health_addr: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
@@ -450,6 +461,14 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
                     CliError::Usage(format!("`--max-segment-bytes` needs a number, got `{raw}`"))
                 })?;
             }
+            "--visibility-timeout-ms" => {
+                let raw = take_value("--visibility-timeout-ms", args, &mut i)?;
+                visibility_ms = raw.parse::<u64>().map_err(|_| {
+                    CliError::Usage(format!(
+                        "`--visibility-timeout-ms` needs a number, got `{raw}`"
+                    ))
+                })?;
+            }
             "--health-addr" => health_addr = Some(take_value("--health-addr", args, &mut i)?),
             flag if flag.starts_with("--") => {
                 return Err(CliError::Usage(format!("unknown flag `{flag}` for serve")))
@@ -463,13 +482,33 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     }
     let data_dir =
         data_dir.ok_or_else(|| CliError::Usage("serve requires `--data-dir <dir>`".to_string()))?;
-    if max_connections == 0 {
+    let config = ServeConfig {
+        max_connections,
+        checkpoint_interval,
+        max_deliver,
+        max_in_flight,
+        max_segment_bytes,
+        visibility_ms,
+    };
+    validate_serve_config(&config)?;
+    cmd_serve(
+        &addr,
+        Path::new(&data_dir),
+        config,
+        health_addr.as_deref(),
+        out,
+    )
+}
+
+/// Rejects an out-of-range `serve` tuning value with a usage error before the broker opens.
+fn validate_serve_config(config: &ServeConfig) -> Result<(), CliError> {
+    if config.max_connections == 0 {
         // A zero cap binds and looks healthy but refuses every connection: reject it.
         return Err(CliError::Usage(
             "`--max-connections` must be at least 1".to_string(),
         ));
     }
-    if max_deliver == 0 || max_deliver == u32::MAX {
+    if config.max_deliver == 0 || config.max_deliver == u32::MAX {
         // Both 0 and u32::MAX mean unlimited delivery (the lease counter saturates at the max,
         // so a poison message loops forever); require an explicit bounded count rather than
         // silently enabling it, or surfacing it as an internal error, from the CLI.
@@ -479,31 +518,26 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
                 .to_string(),
         ));
     }
-    if max_in_flight == 0 {
+    if config.max_in_flight == 0 {
         // A zero window delivers nothing; the engine rejects it, so catch it as a usage error.
         return Err(CliError::Usage(
             "`--max-in-flight` must be at least 1".to_string(),
         ));
     }
-    if max_segment_bytes < MIN_MAX_SEGMENT_BYTES {
+    if config.max_segment_bytes < MIN_MAX_SEGMENT_BYTES {
         return Err(CliError::Usage(format!(
             "`--max-segment-bytes` must be at least {MIN_MAX_SEGMENT_BYTES} (smaller caps make \
              segments proliferate one record at a time)"
         )));
     }
-    cmd_serve(
-        &addr,
-        Path::new(&data_dir),
-        ServeConfig {
-            max_connections,
-            checkpoint_interval,
-            max_deliver,
-            max_in_flight,
-            max_segment_bytes,
-        },
-        health_addr.as_deref(),
-        out,
-    )
+    if config.visibility_ms == 0 {
+        // A zero visibility timeout makes every delivered message instantly redeliverable,
+        // a hot redelivery loop; require a positive window.
+        return Err(CliError::Usage(
+            "`--visibility-timeout-ms` must be at least 1".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// The broker tuning knobs parsed from the `serve` flags.
@@ -514,6 +548,7 @@ struct ServeConfig {
     max_deliver: u32,
     max_in_flight: u32,
     max_segment_bytes: u64,
+    visibility_ms: u64,
 }
 
 #[cfg(unix)]
@@ -530,6 +565,7 @@ fn cmd_serve(
         config.checkpoint_interval,
         config.max_deliver,
         config.max_segment_bytes,
+        config.visibility_ms,
     )?;
     let listener = TcpListener::bind(addr)
         .map_err(|e| CliError::Internal(format!("cannot bind {addr}: {e}")))?;
@@ -593,6 +629,7 @@ fn cmd_serve(
         config.max_deliver,
         config.max_in_flight,
         config.max_segment_bytes,
+        config.visibility_ms,
         health_addr,
         out,
     );
@@ -609,6 +646,7 @@ fn open_disk_engine(
     checkpoint_interval: u64,
     max_deliver: u32,
     max_segment_bytes: u64,
+    visibility_ms: u64,
 ) -> Result<SharedEngine<StdFs, SystemClock>, CliError> {
     std::fs::create_dir_all(data_dir)
         .map_err(|e| CliError::Internal(format!("cannot create {}: {e}", data_dir.display())))?;
@@ -620,7 +658,7 @@ fn open_disk_engine(
         SystemClock::new(),
         EngineConfig {
             log: LogConfig { max_segment_bytes },
-            lease: LeaseConfig::default(),
+            lease: LeaseConfig::from_millis(visibility_ms, visibility_ms.max(DEFAULT_HARD_CAP_MS)),
             delivery,
             max_in_flight,
             checkpoint_interval,
@@ -926,6 +964,46 @@ mod tests {
     }
 
     #[test]
+    fn serve_rejects_a_non_numeric_visibility_timeout() {
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--visibility-timeout-ms".to_string(),
+                "soon".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--visibility-timeout-ms"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_rejects_a_zero_visibility_timeout() {
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-cli-vt0-never-created".to_string(),
+                "--visibility-timeout-ms".to_string(),
+                "0".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("at least 1"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn an_unreachable_broker_maps_to_exit_five() {
         // Port 1 on loopback refuses immediately, so this does not hang on the connect timeout.
         let mut buf = Vec::new();
@@ -1034,8 +1112,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ironbus-cli-it-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let shared =
-            open_disk_engine(&dir, 64, 1, DEFAULT_MAX_DELIVER, DEFAULT_MAX_SEGMENT_BYTES).unwrap();
+        let shared = open_disk_engine(
+            &dir,
+            64,
+            1,
+            DEFAULT_MAX_DELIVER,
+            DEFAULT_MAX_SEGMENT_BYTES,
+            DEFAULT_VISIBILITY_MS,
+        )
+        .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1062,8 +1147,15 @@ mod tests {
         // persisted the committed cursor synchronously when it acked offset 0, so a clean
         // restart RESUMES past the acked message (it does not redeliver), and the durable log
         // continues at offset 1 rather than overwriting offset 0.
-        let reopened =
-            open_disk_engine(&dir, 64, 1, DEFAULT_MAX_DELIVER, DEFAULT_MAX_SEGMENT_BYTES).unwrap();
+        let reopened = open_disk_engine(
+            &dir,
+            64,
+            1,
+            DEFAULT_MAX_DELIVER,
+            DEFAULT_MAX_SEGMENT_BYTES,
+            DEFAULT_VISIBILITY_MS,
+        )
+        .unwrap();
         let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr2 = listener2.local_addr().unwrap();
         let shutdown2 = Arc::new(AtomicBool::new(false));
