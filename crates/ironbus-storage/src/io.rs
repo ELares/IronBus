@@ -532,3 +532,48 @@ mod std_file_tests {
         sync_dir(dir.path()).unwrap();
     }
 }
+
+/// Sharing a file behind a reference forwards to the inner implementation, so the
+/// single writer and the lock-free readers can hold the same file.
+impl<F: RandomAccessFile + ?Sized> RandomAccessFile for &F {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        (**self).read_at(buf, offset)
+    }
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        (**self).write_all_at(buf, offset)
+    }
+    fn sync_data(&self) -> io::Result<()> {
+        (**self).sync_data()
+    }
+    fn sync_all(&self) -> io::Result<()> {
+        (**self).sync_all()
+    }
+    fn len(&self) -> io::Result<u64> {
+        (**self).len()
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        (**self).set_len(len)
+    }
+}
+
+/// Sharing a file behind an [`std::sync::Arc`] forwards to the inner implementation.
+impl<F: RandomAccessFile + ?Sized> RandomAccessFile for std::sync::Arc<F> {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        (**self).read_at(buf, offset)
+    }
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        (**self).write_all_at(buf, offset)
+    }
+    fn sync_data(&self) -> io::Result<()> {
+        (**self).sync_data()
+    }
+    fn sync_all(&self) -> io::Result<()> {
+        (**self).sync_all()
+    }
+    fn len(&self) -> io::Result<u64> {
+        (**self).len()
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        (**self).set_len(len)
+    }
+}
