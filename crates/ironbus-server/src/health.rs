@@ -184,7 +184,7 @@ fn respond(stream: &mut TcpStream, code: u16, reason: &str, body: &str) -> std::
 mod tests {
     use super::*;
     use crate::clock::SystemClock;
-    use crate::engine::{Engine, EngineConfig};
+    use crate::engine::{AckResult, Engine, EngineConfig, Poll};
     use ironbus_core::delivery::DeliveryConfig;
     use ironbus_core::lease::LeaseConfig;
     use ironbus_core::types::RecordFlags;
@@ -283,14 +283,37 @@ mod tests {
                 .unwrap();
             }
         }
+        // Anchor each assertion to a full line so a future value like 20 cannot false-match 2.
         let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
         assert!(m.starts_with("HTTP/1.1 200 OK"), "{m}");
         assert!(m.contains("# TYPE ironbus_consumer_lag gauge"), "{m}");
-        assert!(m.contains("ironbus_flushed_offset 2"), "{m}");
-        assert!(m.contains("ironbus_committed_offset 0"), "{m}");
-        assert!(m.contains("ironbus_consumer_lag 2"), "{m}");
-        assert!(m.contains("ironbus_in_flight 0"), "{m}");
-        assert!(m.contains("ironbus_writer_healthy 1"), "{m}");
+        assert!(m.contains("\nironbus_flushed_offset 2\n"), "{m}");
+        assert!(m.contains("\nironbus_committed_offset 0\n"), "{m}");
+        assert!(m.contains("\nironbus_consumer_lag 2\n"), "{m}");
+        assert!(m.contains("\nironbus_in_flight 0\n"), "{m}");
+        assert!(m.contains("\nironbus_writer_healthy 1\n"), "{m}");
+
+        // Lease one message: in-flight reflects the outstanding lease.
+        let token = {
+            let mut g = engine.lock().unwrap();
+            match g.poll_now().unwrap() {
+                Poll::Message(d) => d.token,
+                other => panic!("expected a message, got {other:?}"),
+            }
+        };
+        let leased = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(leased.contains("\nironbus_in_flight 1\n"), "{leased}");
+
+        // Ack it: the committed cursor advances and the lag shrinks.
+        {
+            let mut g = engine.lock().unwrap();
+            assert_eq!(g.ack(&token), AckResult::Acked);
+        }
+        let acked = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(acked.contains("\nironbus_committed_offset 1\n"), "{acked}");
+        assert!(acked.contains("\nironbus_consumer_lag 1\n"), "{acked}");
+        assert!(acked.contains("\nironbus_in_flight 0\n"), "{acked}");
+
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
