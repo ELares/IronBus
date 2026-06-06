@@ -912,6 +912,30 @@ fn recovery_fails_closed_when_a_fault_strikes_the_roll_forward() {
     // failure, a torn header write, a failed header fsync) must fail the recovery CLOSED with a
     // clean typed error, never a panic or a silent partial recovery (#231). The acked records in
     // the sealed segment are untouched on disk, so the broker simply refuses to start.
+    // Anti-vacuity: the same construction WITHOUT a fault genuinely rolls forward (the highest
+    // segment is sealed, so recovery creates segment 1), proving the faulted cases below really
+    // exercise the roll-forward write path and do not error for an unrelated reason.
+    {
+        let log = apply(
+            InMemoryFs::new(),
+            big_config(),
+            &[Op::Append, Op::Append, Op::Sync],
+        );
+        let disk = log.into_filesystem();
+        seal_highest_segment_with_no_successor(&disk, 0);
+        let log = Log::open(disk, ManualClock::new(), big_config()).unwrap();
+        assert_eq!(
+            log.active_segment_id(),
+            1,
+            "the sealed-highest state rolls forward to a fresh segment 1"
+        );
+        assert_eq!(
+            log.next_offset(),
+            Offset::new(2),
+            "both records carried forward"
+        );
+    }
+
     for fault in [Fault::FailWrite, Fault::TornWrite(8), Fault::FailSync] {
         let log = apply(
             InMemoryFs::new(),
