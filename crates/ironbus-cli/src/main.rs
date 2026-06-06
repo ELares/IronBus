@@ -38,6 +38,12 @@ use ironbus_storage::fs::StdFs;
 #[cfg(unix)]
 use ironbus_storage::log::LogConfig;
 #[cfg(unix)]
+use ironbus_storage::loss::LossReport;
+#[cfg(unix)]
+use ironbus_storage::offline::OfflineReader;
+#[cfg(unix)]
+use ironbus_storage::segment::{OwnedRecord, StorageError};
+#[cfg(unix)]
 use std::net::TcpListener;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -92,6 +98,11 @@ const DEFAULT_NACK_BACKOFF_NANOS: [u64; 5] = [
 const EXIT_USAGE: u8 = 1;
 const EXIT_UNREACHABLE: u8 = 5;
 const EXIT_INTERNAL: u8 = 70;
+/// The data directory (or path) an offline verb was pointed at does not exist.
+const EXIT_NOT_FOUND: u8 = 2;
+/// An offline verb found the data directory structurally corrupt (a broken segment chain
+/// or an undecodable header), distinct from a clean torn tail it can still read past.
+const EXIT_CORRUPT: u8 = 4;
 
 const USAGE: &str = "\
 ironbus: a durable edge message queue.
@@ -103,6 +114,8 @@ USAGE:
                   [--health-addr <host:port>]
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
     ironbus sub   [--addr <host:port>] [--max <n>] [--ack | --nack [--delay-ms <n>] | --term]
+    ironbus peek  --data-dir <dir> [--from-offset <n>] [--limit <n>] [--json]
+    ironbus dump  --data-dir <dir> [--limit <n>] [--json]
     ironbus help
 
 Notes:
@@ -111,7 +124,11 @@ Notes:
     publishes an empty message, which is a valid record).
     sub prints one line per message; at most one disposition applies to the batch:
     --ack commits, --nack requeues (after --delay-ms), --term drops without dead-lettering.
-    Exit codes: 0 clean, 1 usage, 5 broker unreachable, 70 internal.";
+    peek and dump decode a stopped broker's data directory with no server running; they
+    read only up to the durable high-water mark and mark, never hide, any torn or corrupt
+    tail. peek shows a window (default 10 records); dump streams every record, one per line
+    (NDJSON with --json). Both bound memory to one segment at a time.
+    Exit codes: 0 clean, 1 usage, 2 not found, 4 corrupt data, 5 broker unreachable, 70 internal.";
 
 /// A command-line failure, mapped to a frozen exit code by [`main`].
 #[derive(Debug)]
@@ -122,6 +139,10 @@ enum CliError {
     Unreachable(String),
     /// An internal or runtime failure, including an unsupported platform (exit 70).
     Internal(String),
+    /// An offline verb's data directory does not exist (exit 2).
+    NotFound(String),
+    /// An offline verb's data directory is structurally corrupt (exit 4).
+    Corrupt(String),
 }
 
 impl CliError {
@@ -130,6 +151,8 @@ impl CliError {
             CliError::Usage(_) => EXIT_USAGE,
             CliError::Unreachable(_) => EXIT_UNREACHABLE,
             CliError::Internal(_) => EXIT_INTERNAL,
+            CliError::NotFound(_) => EXIT_NOT_FOUND,
+            CliError::Corrupt(_) => EXIT_CORRUPT,
         }
     }
 }
@@ -137,9 +160,11 @@ impl CliError {
 impl core::fmt::Display for CliError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            CliError::Usage(m) | CliError::Unreachable(m) | CliError::Internal(m) => {
-                write!(f, "{m}")
-            }
+            CliError::Usage(m)
+            | CliError::Unreachable(m)
+            | CliError::Internal(m)
+            | CliError::NotFound(m)
+            | CliError::Corrupt(m) => write!(f, "{m}"),
         }
     }
 }
@@ -179,6 +204,8 @@ fn run(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         "pub" => run_pub(rest, out),
         "sub" => run_sub(rest, out),
         "serve" => run_serve(rest, out),
+        "peek" => run_peek(rest, out),
+        "dump" => run_dump(rest, out),
         "help" | "--help" | "-h" => {
             writeln!(out, "{USAGE}")?;
             Ok(())
@@ -669,18 +696,432 @@ fn open_disk_engine(
     Ok(Arc::new(Mutex::new(engine)))
 }
 
+/// The default number of records `peek` shows when `--limit` is not given.
+const DEFAULT_PEEK_LIMIT: u64 = 10;
+
+/// Parses and runs `peek`: show a bounded window of durable records from a data directory, with
+/// no server running.
+///
+/// # Errors
+/// Returns a [`CliError`] for a usage problem, a missing directory (not found), a corrupt
+/// segment chain (corrupt), or an IO failure (internal).
+fn run_peek(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let mut data_dir: Option<String> = None;
+    let mut from_offset: u64 = 0;
+    let mut limit: u64 = DEFAULT_PEEK_LIMIT;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data-dir" => data_dir = Some(take_value("--data-dir", args, &mut i)?),
+            "--from-offset" | "--offset" => {
+                let raw = take_value("--from-offset", args, &mut i)?;
+                from_offset = raw.parse::<u64>().map_err(|_| {
+                    CliError::Usage(format!("`--from-offset` needs a number, got `{raw}`"))
+                })?;
+            }
+            "--limit" => {
+                let raw = take_value("--limit", args, &mut i)?;
+                limit = raw.parse::<u64>().map_err(|_| {
+                    CliError::Usage(format!("`--limit` needs a number, got `{raw}`"))
+                })?;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!("unknown flag `{flag}` for peek")));
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "peek takes no positional arguments, got `{other}`"
+                )));
+            }
+        }
+    }
+    let data_dir =
+        data_dir.ok_or_else(|| CliError::Usage("peek requires `--data-dir <dir>`".to_string()))?;
+    cmd_inspect(Path::new(&data_dir), from_offset, Some(limit), json, out)
+}
+
+/// Parses and runs `dump`: stream every durable record from a data directory, one per line
+/// (NDJSON with `--json`), with no server running, honoring `--limit`.
+///
+/// # Errors
+/// As [`run_peek`].
+fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let mut data_dir: Option<String> = None;
+    let mut limit: Option<u64> = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data-dir" => data_dir = Some(take_value("--data-dir", args, &mut i)?),
+            "--limit" => {
+                let raw = take_value("--limit", args, &mut i)?;
+                limit = Some(raw.parse::<u64>().map_err(|_| {
+                    CliError::Usage(format!("`--limit` needs a number, got `{raw}`"))
+                })?);
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!("unknown flag `{flag}` for dump")));
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "dump takes no positional arguments, got `{other}`"
+                )));
+            }
+        }
+    }
+    let data_dir =
+        data_dir.ok_or_else(|| CliError::Usage("dump requires `--data-dir <dir>`".to_string()))?;
+    cmd_inspect(Path::new(&data_dir), 0, limit, json, out)
+}
+
+/// Decodes a data directory offline and writes its durable records (from `from_offset`, at most
+/// `limit` of them) to `out`, then a final note for any torn or corrupt tail recovery would
+/// skip, so the holes are shown, not hidden. Shared by `peek` (a bounded window) and `dump`
+/// (the whole log). Memory is bounded to one segment at a time; a per-record streaming reader
+/// for a multi-GB segment within a fixed RAM ceiling is tracked in #92.
+#[cfg(unix)]
+fn cmd_inspect(
+    data_dir: &Path,
+    from_offset: u64,
+    limit: Option<u64>,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let reader = OfflineReader::open(StdFs::new(data_dir.to_path_buf()))
+        .map_err(|e| map_offline_err(data_dir, &e))?;
+    let mut shown: u64 = 0;
+    'segments: for &id in reader.segment_ids() {
+        if limit.is_some_and(|max| shown >= max) {
+            break;
+        }
+        let records = reader
+            .read_segment(id)
+            .map_err(|e| map_offline_err(data_dir, &e))?;
+        for record in &records {
+            if record.offset.get() < from_offset {
+                continue;
+            }
+            if limit.is_some_and(|max| shown >= max) {
+                break 'segments;
+            }
+            write_record(record, json, out)?;
+            shown += 1;
+        }
+    }
+    write_loss(reader.loss_report(), json, out)?;
+    Ok(())
+}
+
+/// Writes one record as a human line or a single NDJSON object. `crc` is always `ok` because
+/// the offline reader only yields records that passed their CRC; `codec` is always `none`
+/// until on-disk compression (#12) lands.
+#[cfg(unix)]
+fn write_record(record: &OwnedRecord, json: bool, out: &mut impl Write) -> Result<(), CliError> {
+    if json {
+        writeln!(
+            out,
+            "{{\"offset\":{},\"ts_ms\":{},\"bytes\":{},\"key_bytes\":{},\"crc\":\"ok\",\"codec\":\"none\"}}",
+            record.offset.get(),
+            record.timestamp_ms,
+            record.payload.len(),
+            record.key.len(),
+        )?;
+    } else {
+        writeln!(
+            out,
+            "offset={} ts_ms={} bytes={} key_bytes={} crc=ok codec=none",
+            record.offset.get(),
+            record.timestamp_ms,
+            record.payload.len(),
+            record.key.len(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Writes a final summary of any torn or corrupt tail the durable prefix dropped (marking the
+/// holes, not hiding them). Nothing is written for a clean directory, so a clean `dump --json`
+/// stays pure record NDJSON.
+#[cfg(unix)]
+fn write_loss(report: &LossReport, json: bool, out: &mut impl Write) -> Result<(), CliError> {
+    if report.is_empty() {
+        return Ok(());
+    }
+    if json {
+        write!(
+            out,
+            "{{\"loss\":{{\"bytes\":{},\"events\":[",
+            report.total_bytes_skipped()
+        )?;
+        for (n, e) in report.events.iter().enumerate() {
+            if n > 0 {
+                write!(out, ",")?;
+            }
+            write!(
+                out,
+                "{{\"segment\":{},\"start\":{},\"end\":{},\"reason\":\"{}\"}}",
+                e.segment_id,
+                e.byte_offset_start,
+                e.byte_offset_end,
+                e.reason_code.metric_label(),
+            )?;
+        }
+        writeln!(out, "]}}}}")?;
+    } else {
+        writeln!(
+            out,
+            "note: {} byte(s) past the durable head are torn or corrupt and were not shown ({} event(s))",
+            report.total_bytes_skipped(),
+            report.events.len(),
+        )?;
+        for e in &report.events {
+            writeln!(
+                out,
+                "  segment {} bytes [{}, {}) reason={}",
+                e.segment_id,
+                e.byte_offset_start,
+                e.byte_offset_end,
+                e.reason_code.metric_label(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Maps an offline-reader storage error to the frozen offline exit-code scheme: a missing data
+/// directory is not-found (2), a broken segment chain or an undecodable header is corruption
+/// (4), and anything else is an internal failure (70).
+#[cfg(unix)]
+fn map_offline_err(data_dir: &Path, e: &StorageError) -> CliError {
+    let at = data_dir.display();
+    match e {
+        StorageError::Io(io) if io.kind() == io::ErrorKind::NotFound => {
+            CliError::NotFound(format!("no data directory at {at}"))
+        }
+        StorageError::Io(io) => CliError::Internal(format!("reading {at}: {io}")),
+        StorageError::Record(_)
+        | StorageError::Segment(_)
+        | StorageError::FooterSegmentMismatch { .. }
+        | StorageError::UnsealedPredecessor { .. }
+        | StorageError::SegmentIdMismatch { .. }
+        | StorageError::SegmentChainBroken { .. } => {
+            CliError::Corrupt(format!("corrupt data directory at {at}: {e}"))
+        }
+        other => CliError::Internal(format!("reading {at}: {other}")),
+    }
+}
+
+/// `peek` / `dump` require Unix in v1 (the on-disk storage uses positioned IO the Windows path
+/// does not yet implement), matching `serve`.
+#[cfg(not(unix))]
+fn cmd_inspect(
+    data_dir: &Path,
+    from_offset: u64,
+    limit: Option<u64>,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let _ = (data_dir, from_offset, limit, json, out);
+    Err(CliError::Internal(
+        "ironbus peek/dump require a Unix host in v1: on-disk storage is Unix-only".to_string(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ironbus_core::delivery::DeliveryConfig;
     use ironbus_core::lease::LeaseConfig;
+    #[cfg(unix)]
+    use ironbus_core::types::RecordFlags;
     use ironbus_server::engine::{Engine, EngineConfig};
     use ironbus_server::server::{serve, SharedEngine};
     use ironbus_storage::fs::InMemoryFs;
+    #[cfg(unix)]
+    use ironbus_storage::log::Append;
     use ironbus_storage::log::LogConfig;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// Builds a real on-disk data directory with `n` durable records via the engine, for
+    /// the offline `peek` / `dump` verbs to read back.
+    #[cfg(unix)]
+    fn make_data_dir(tag: &str, n: usize) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ironbus-cli-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shared = open_disk_engine(
+            &dir,
+            64,
+            1,
+            DEFAULT_MAX_DELIVER,
+            DEFAULT_MAX_SEGMENT_BYTES,
+            DEFAULT_VISIBILITY_MS,
+        )
+        .unwrap();
+        {
+            let mut g = shared.lock().unwrap();
+            for i in 0..n {
+                let payload = format!("msg-{i}");
+                g.produce(&Append {
+                    timestamp_ms: 100 + u64::try_from(i).unwrap(),
+                    flags: RecordFlags::EMPTY,
+                    key: b"k",
+                    headers: b"",
+                    payload: payload.as_bytes(),
+                })
+                .unwrap();
+            }
+        }
+        drop(shared);
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peek_shows_a_window_of_records() {
+        let dir = make_data_dir("peek", 5);
+        let mut buf = Vec::new();
+        run_peek(
+            &[
+                "--data-dir".to_string(),
+                dir.display().to_string(),
+                "--limit".to_string(),
+                "3".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "--limit honored: {text}");
+        assert!(lines[0].contains("offset=0"), "{text}");
+        assert!(lines[2].contains("offset=2"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peek_honors_from_offset() {
+        let dir = make_data_dir("peekoff", 5);
+        let mut buf = Vec::new();
+        run_peek(
+            &[
+                "--data-dir".to_string(),
+                dir.display().to_string(),
+                "--from-offset".to_string(),
+                "3".to_string(),
+                "--limit".to_string(),
+                "10".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "offsets 3 and 4 only: {text}");
+        assert!(lines[0].contains("offset=3"), "{text}");
+        assert!(lines[1].contains("offset=4"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_streams_all_records_as_ndjson() {
+        let dir = make_data_dir("dump", 4);
+        let mut buf = Vec::new();
+        run_dump(
+            &[
+                "--data-dir".to_string(),
+                dir.display().to_string(),
+                "--json".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "one NDJSON line per record: {text}");
+        for (i, line) in lines.iter().enumerate() {
+            assert!(
+                line.starts_with('{') && line.ends_with('}'),
+                "ndjson: {line}"
+            );
+            assert!(line.contains(&format!("\"offset\":{i}")), "{line}");
+            assert!(line.contains("\"crc\":\"ok\""), "{line}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_marks_a_torn_tail_rather_than_hiding_it() {
+        let dir = make_data_dir("torn", 4);
+        // Tear three bytes off the active segment so its last record no longer parses.
+        let seg = dir.join("seg-0000000000000000.log");
+        let f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
+        let len = f.metadata().unwrap().len();
+        f.set_len(len - 3).unwrap();
+        f.sync_all().unwrap();
+        let mut buf = Vec::new();
+        run_dump(
+            &["--data-dir".to_string(), dir.display().to_string()],
+            &mut buf,
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("offset=2"),
+            "the durable prefix is shown: {text}"
+        );
+        assert!(
+            !text.contains("offset=3"),
+            "the torn record is not shown: {text}"
+        );
+        assert!(
+            text.contains("note:") && text.contains("torn"),
+            "the hole is marked, not hidden: {text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_data_dir_is_not_found() {
+        let dir =
+            std::env::temp_dir().join(format!("ironbus-cli-absent-{}-xyz", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut buf = Vec::new();
+        let e = run_peek(
+            &["--data-dir".to_string(), dir.display().to_string()],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_NOT_FOUND, "{e}");
+    }
+
+    #[test]
+    fn peek_requires_a_data_dir() {
+        let mut buf = Vec::new();
+        let e = run_peek(&[], &mut buf).unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+    }
+
+    #[test]
+    fn dump_requires_a_data_dir() {
+        let mut buf = Vec::new();
+        let e = run_dump(&[], &mut buf).unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+    }
 
     /// Starts an in-process broker over an in-memory filesystem (cross-platform), returning
     /// the bound address, a shutdown flag, and the serve thread handle.
