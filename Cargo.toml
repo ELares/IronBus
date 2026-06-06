@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ELares/IronBus"
+authors = ["The IronBus Authors"]
+
+# Lints applied to every crate via `[lints] workspace = true`.
+# unsafe_code is a warning (denied in CI via -D warnings), so every unsafe block
+# must be opted in explicitly with `#[allow(unsafe_code)]` plus a safety comment.
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
