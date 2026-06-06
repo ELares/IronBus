@@ -421,6 +421,13 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
         self.cursor.committed()
     }
 
+    /// The durable log head: the offset of the next record to be written. Consumer lag is
+    /// this minus the committed offset.
+    #[must_use]
+    pub fn flushed_offset(&self) -> Offset {
+        self.log.flushed_offset()
+    }
+
     /// The number of messages currently in flight (leased, not yet acked).
     #[must_use]
     pub fn in_flight(&self) -> usize {
