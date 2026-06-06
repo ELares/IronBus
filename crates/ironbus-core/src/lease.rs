@@ -254,6 +254,17 @@ impl LeaseTable {
         }
     }
 
+    /// The delivery count (attempt number, 1 for the first delivery) of the lease named by
+    /// `token`, if the token still owns it. The server indexes the nack backoff schedule by
+    /// this attempt number.
+    #[must_use]
+    pub fn deliveries(&self, token: &LeaseToken) -> Option<u32> {
+        self.leases
+            .get(&token.offset.get())
+            .filter(|lease| lease.generation == token.generation)
+            .map(|lease| lease.deliveries)
+    }
+
     /// Nacks the lease named by `token`: requeues the message for redelivery at `now` plus
     /// `delay_nanos`. The nacking holder is fenced with a fresh generation (so a later ack of
     /// the same token is rejected, which prevents a nack-then-ack from committing an
@@ -354,6 +365,19 @@ mod tests {
         // Redeliver by re-claiming after expiry, so tok0 is now stale.
         let _ = t.claim(off(0), 1000);
         assert_eq!(t.nack(&tok0, 1000, 0), NackOutcome::Fenced);
+    }
+
+    #[test]
+    fn deliveries_reports_the_attempt_for_a_live_token() {
+        let mut t = LeaseTable::new(cfg());
+        let tok0 = token(t.claim(off(0), 0));
+        assert_eq!(t.deliveries(&tok0), Some(1));
+        // Redeliver after expiry: attempt 2 under a fresh token; the old token is stale.
+        let tok1 = token(t.claim(off(0), 1000));
+        assert_eq!(t.deliveries(&tok1), Some(2));
+        assert_eq!(t.deliveries(&tok0), None, "stale token has no live attempt");
+        t.ack(&tok1);
+        assert_eq!(t.deliveries(&tok1), None, "no lease after ack");
     }
 
     #[test]

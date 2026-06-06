@@ -290,9 +290,10 @@ impl Client {
     }
 
     /// Nacks a fetched message by its offset and fencing generation, asking the broker to
-    /// redeliver it after `delay_ms` (immediately if zero). Returns `true` if the broker
-    /// requeued it, `false` if the token was fenced (stale: it already redelivered, was
-    /// acked, or you nacked it before; either way do not drop local state).
+    /// redeliver it. `delay_ms` is `Some(ms)` for an explicit delay (`Some(0)` = immediate) or
+    /// `None` to let the broker apply its configured backoff schedule for the attempt. Returns
+    /// `true` if the broker requeued it, `false` if the token was fenced (stale: it already
+    /// redelivered, was acked, or you nacked it before; either way do not drop local state).
     ///
     /// # Errors
     /// Returns a [`ClientError`] on an IO error, a server error, or a wrong-shape reply.
@@ -300,7 +301,7 @@ impl Client {
         &mut self,
         offset: u64,
         generation: u64,
-        delay_ms: u64,
+        delay_ms: Option<u64>,
     ) -> Result<bool, ClientError> {
         let mut body = Vec::new();
         encode_ack(
@@ -308,7 +309,8 @@ impl Client {
                 op: AckOp::Nack,
                 offset,
                 generation,
-                delay_ms,
+                // u64::MAX is the wire sentinel for "no explicit delay, use the server schedule".
+                delay_ms: delay_ms.unwrap_or(u64::MAX),
             },
             &mut body,
         );
@@ -703,7 +705,8 @@ mod tests {
 
         // Nack with no delay: the broker requeues it (the default 30s visibility means it
         // would not otherwise redeliver within this test, so the nack is what brings it back).
-        assert!(c.nack(first[0].offset, first[0].generation, 0).unwrap());
+        // None: no explicit delay; the in-process server has an empty schedule, so immediate.
+        assert!(c.nack(first[0].offset, first[0].generation, None).unwrap());
 
         let second = c.fetch(10).unwrap();
         assert_eq!(second.len(), 1);
