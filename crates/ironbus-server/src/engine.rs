@@ -1043,6 +1043,77 @@ mod tests {
     }
 
     #[test]
+    fn counters_track_delivery_and_redelivery() {
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(
+            InMemoryFs::new(),
+            std::sync::Arc::clone(&clock),
+            config(10, 5),
+        )
+        .unwrap();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"x",
+        })
+        .unwrap();
+        assert_eq!(e.counters().produced, 1);
+
+        // First delivery (visibility 30 ns).
+        let d1 = message(e.poll_now().unwrap());
+        assert_eq!(d1.deliveries, 1);
+        assert_eq!(e.counters().delivered, 1);
+        assert_eq!(e.counters().redelivered, 0);
+
+        // Let the lease expire, then re-poll: the SAME message is delivered a second time, so
+        // `delivered` is 2 (once per delivery) and `redelivered` is 1.
+        clock.advance_monotonic_nanos(40);
+        let d2 = message(e.poll_now().unwrap());
+        assert_eq!(d2.deliveries, 2);
+        assert_eq!(e.counters().delivered, 2);
+        assert_eq!(e.counters().redelivered, 1);
+    }
+
+    #[test]
+    fn counters_track_a_dead_letter() {
+        let clock = std::sync::Arc::new(ManualClock::new());
+        // max_deliver = 1: the second delivery attempt is dead-lettered.
+        let mut e = Engine::open(
+            InMemoryFs::new(),
+            std::sync::Arc::clone(&clock),
+            config(10, 1),
+        )
+        .unwrap();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"poison",
+        })
+        .unwrap();
+        // First delivery (attempt 1, within the cap).
+        let _ = message(e.poll_now().unwrap());
+        assert_eq!(e.counters().delivered, 1);
+        // Expire and re-poll: attempt 2 exceeds max_deliver, so it is parked, not delivered.
+        clock.advance_monotonic_nanos(40);
+        assert!(matches!(e.poll_now().unwrap(), Poll::Parked { .. }));
+        assert_eq!(e.counters().dead_lettered, 1);
+        assert_eq!(
+            e.counters().delivered,
+            1,
+            "the parked poison attempt is not a delivery"
+        );
+        assert_eq!(
+            e.counters().redelivered,
+            0,
+            "the parked poison attempt is counted only in dead_lettered"
+        );
+    }
+
+    #[test]
     fn maybe_checkpoint_bounds_replay_and_reopen_resumes() {
         // interval = 2: a single ack does not reach the threshold (reopen would redeliver),
         // but the second ack does and persists the cursor, so reopen resumes past both. This
