@@ -19,3 +19,15 @@ unsafe_code = "warn"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+
+# Size-optimized, reproducible release profile (#101): minimize the static musl binary for
+# scarce edge flash. `opt-level = "s"` (not "z", which is gated on a #19 throughput check),
+# fat LTO and a single codegen unit for size and deterministic codegen, `panic = "abort"`
+# (binding: handlers are panic-free by construction, see #7), and strip the symbols. The
+# byte-identical two-runner reproducibility gate is a follow-up under #101.
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
