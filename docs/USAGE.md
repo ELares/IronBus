@@ -132,6 +132,7 @@ ironbus_in_flight             leased but not yet acked
 ironbus_writer_healthy        1 live, 0 frozen
 ironbus_recovery_truncated_bytes  bytes dropped from a torn tail at the last recovery
 ironbus_last_dead_lettered_offset offset of the most recent dead-letter (-1 if none)
+ironbus_fsync_seconds          histogram of the produce fsync (durability barrier) latency
 ironbus_produced_total        messages appended
 ironbus_delivered_total       deliveries handed out (a redelivery counts again)
 ironbus_redelivered_total     deliveries that were a redelivery
