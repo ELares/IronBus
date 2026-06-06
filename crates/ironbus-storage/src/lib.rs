@@ -10,4 +10,5 @@ pub mod io;
 pub mod log;
 pub mod loss;
 pub mod naming;
+pub mod offline;
 pub mod segment;
