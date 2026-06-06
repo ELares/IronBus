@@ -198,8 +198,9 @@ pub struct Engine<F: Filesystem, C: Clock> {
     checkpoint_interval: u64,
     last_checkpointed: u64,
     counters: Counters,
-    /// The offset of the most recently dead-lettered message, or `None` if none has been
-    /// dead-lettered. A gauge-style companion to the `dead_lettered` counter.
+    /// The log offset of the most recently dead-lettered (parked past `MaxDeliver`) message,
+    /// or `None` if none has been dead-lettered. A gauge-style companion to the
+    /// `dead_lettered` counter.
     last_dead_lettered: Option<Offset>,
 }
 
