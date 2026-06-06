@@ -91,6 +91,61 @@ pub mod header_offsets {
     pub const HEADER_CRC: usize = 32;
 }
 
+/// Byte offsets of each field within the 64-byte segment header (little-endian). The
+/// header is 4 KiB-aligned at the start of a segment file. Bytes `[44, 60)` are
+/// reserved (zero) and `header_crc` covers `[0, 60)`.
+pub mod segment_header_offsets {
+    /// Offset of the 8-byte `magic` field (`SEGMENT_MAGIC`).
+    pub const MAGIC: usize = 0;
+    /// Offset of the `version: u8` field.
+    pub const VERSION: usize = 8;
+    /// Offset of the `checksum_algo: u8` field.
+    pub const CHECKSUM_ALGO: usize = 9;
+    /// Offset of the `flags: u16` field.
+    pub const FLAGS: usize = 10;
+    /// Offset of the `segment_id: u64` field.
+    pub const SEGMENT_ID: usize = 12;
+    /// Offset of the `base_seq: u64` field.
+    pub const BASE_SEQ: usize = 20;
+    /// Offset of the `base_offset: u64` field.
+    pub const BASE_OFFSET: usize = 28;
+    /// Offset of the `created_unix_ms: u64` field.
+    pub const CREATED_MS: usize = 36;
+    /// Offset of the `header_crc: u32` field. The CRC covers bytes `[0, 60)`.
+    pub const HEADER_CRC: usize = 60;
+}
+
+/// Byte range the segment header CRC32C covers: `[0, 60)`.
+pub const SEGMENT_HEADER_CRC_RANGE: core::ops::Range<usize> = 0..60;
+
+/// Two-byte magic at the start of a segment footer (`b"SF"` = `0x4653`,
+/// little-endian), distinct from the record magic so a torn tail cannot be mistaken
+/// for a footer on a CRC collision alone.
+pub const SEGMENT_FOOTER_MAGIC: u16 = 0x4653;
+
+/// Byte offsets of each field within the 32-byte segment footer (little-endian),
+/// written when the segment is sealed. Bytes `[24, 28)` are reserved (zero) and
+/// `footer_crc` covers `[0, 28)`.
+pub mod segment_footer_offsets {
+    /// Offset of the 2-byte `magic` field (`SEGMENT_FOOTER_MAGIC`).
+    pub const MAGIC: usize = 0;
+    /// Offset of the `version: u8` field.
+    pub const VERSION: usize = 2;
+    /// Offset of the `checksum_algo: u8` field.
+    pub const CHECKSUM_ALGO: usize = 3;
+    /// Offset of the `segment_id: u64` field (binds the footer to its header).
+    pub const SEGMENT_ID: usize = 4;
+    /// Offset of the `last_seq: u64` field.
+    pub const LAST_SEQ: usize = 12;
+    /// Offset of the `record_count: u32` field.
+    pub const RECORD_COUNT: usize = 20;
+    /// Offset of the `footer_crc: u32` field. The CRC covers bytes `[0, 28)`.
+    pub const FOOTER_CRC: usize = 28;
+}
+
+/// Byte range the segment footer CRC32C covers: `[0, 28)`.
+pub const SEGMENT_FOOTER_CRC_RANGE: core::ops::Range<usize> = 0..28;
+
 #[cfg(test)]
 mod tests {
     use super::header_offsets as off;
@@ -122,6 +177,33 @@ mod tests {
         // header ends right after it.
         assert_eq!(off::HEADER_CRC, RECORD_HEADER_CRC_RANGE.end);
         assert_eq!(off::HEADER_CRC + 4, RECORD_HEADER_LEN);
+    }
+
+    #[test]
+    fn segment_header_and_footer_offsets() {
+        use segment_footer_offsets as foff;
+        use segment_header_offsets as hoff;
+        assert_eq!(hoff::MAGIC, 0);
+        assert_eq!(hoff::VERSION, 8);
+        assert_eq!(hoff::CHECKSUM_ALGO, 9);
+        assert_eq!(hoff::FLAGS, 10);
+        assert_eq!(hoff::SEGMENT_ID, 12);
+        assert_eq!(hoff::BASE_SEQ, 20);
+        assert_eq!(hoff::BASE_OFFSET, 28);
+        assert_eq!(hoff::CREATED_MS, 36);
+        assert_eq!(hoff::HEADER_CRC, 60);
+        assert_eq!(hoff::HEADER_CRC + 4, SEGMENT_HEADER_LEN);
+        assert_eq!(SEGMENT_HEADER_CRC_RANGE, 0..60);
+        assert_eq!(foff::MAGIC, 0);
+        assert_eq!(foff::VERSION, 2);
+        assert_eq!(foff::CHECKSUM_ALGO, 3);
+        assert_eq!(foff::SEGMENT_ID, 4);
+        assert_eq!(foff::LAST_SEQ, 12);
+        assert_eq!(foff::RECORD_COUNT, 20);
+        assert_eq!(foff::FOOTER_CRC, 28);
+        assert_eq!(foff::FOOTER_CRC + 4, SEGMENT_FOOTER_LEN);
+        assert_eq!(SEGMENT_FOOTER_CRC_RANGE, 0..28);
+        assert_eq!(SEGMENT_FOOTER_MAGIC, 0x4653);
     }
 
     #[test]
