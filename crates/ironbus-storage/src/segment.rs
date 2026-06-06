@@ -8,7 +8,7 @@
 //! the foundation of recovery.
 
 use crate::io::RandomAccessFile;
-use crate::loss::ReasonCode;
+use crate::loss::{CapViolation, ReasonCode};
 use ironbus_core::codec::{self, DecodeError, RecordView};
 use ironbus_core::format::{RECORD_HEADER_LEN, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN};
 use ironbus_core::segment::{SegmentError, SegmentFooter, SegmentHeader};
@@ -81,6 +81,9 @@ pub enum StorageError {
         /// The oldest offset still present in the log.
         oldest: u64,
     },
+    /// Recovery would drop more than the bounded-loss caps allow, so it fails closed rather
+    /// than accept unbounded silent loss (#120, I3).
+    ExcessiveRecoveryLoss(CapViolation),
 }
 
 impl core::fmt::Display for StorageError {
@@ -129,6 +132,9 @@ impl core::fmt::Display for StorageError {
                 f,
                 "read offset {requested} is older than the oldest retained offset {oldest}"
             ),
+            StorageError::ExcessiveRecoveryLoss(v) => {
+                write!(f, "recovery exceeded the bounded-loss cap: {v}")
+            }
         }
     }
 }
@@ -138,6 +144,7 @@ impl std::error::Error for StorageError {
             StorageError::Io(e) => Some(e),
             StorageError::Record(e) => Some(e),
             StorageError::Segment(e) => Some(e),
+            StorageError::ExcessiveRecoveryLoss(e) => Some(e),
             _ => None,
         }
     }
