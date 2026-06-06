@@ -8,5 +8,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[dependencies]
+crc32c = "0.6"
+
+[dev-dependencies]
+proptest = "1"
+
 [lints]
 workspace = true
