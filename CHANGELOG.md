@@ -7,6 +7,7 @@ to follow Semantic Versioning once it reaches a tagged release.
 ## [Unreleased]
 
 ### Added
+- `ironbus-storage::fs`: a `Filesystem` seam (open, create-new, list, remove, exists, sync-dir) over one flat data directory of segment files, with an `InMemoryFs` that models directory-entry durability (a created-but-not-dir-synced file vanishes on power loss; a removal that was not dir-synced is undone) and a Unix `StdFs` that rejects names escaping the data directory. This is the substrate for the multi-segment log and recovery.
 - `ironbus-storage::segment`: `SegmentWriter` (append records, sync, seal with footer) and `SegmentReader` (validate header, scan records, recover the valid prefix on a torn or corrupt tail), wiring the record and segment codecs to the `RandomAccessFile` seam. Tests cover round-trip, seal/scan, empty sealed segments, torn-tail recovery, power-loss (only synced records survive), and rejection of a footer bound to a different segment.
 - Cargo workspace skeleton with six crates: `ironbus-core`, `ironbus-storage`,
   `ironbus-proto`, `ironbus-server`, `ironbus-client`, and `ironbus-cli` (binary

@@ -2,5 +2,6 @@
 //! Storage engine for IronBus: segmented log, durability, recovery.
 #![warn(missing_docs)]
 
+pub mod fs;
 pub mod io;
 pub mod segment;
