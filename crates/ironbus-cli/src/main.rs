@@ -55,6 +55,13 @@ const DEFAULT_MAX_CONNECTIONS: usize = 256;
 /// The default max-ack-pending window for `serve`.
 const DEFAULT_MAX_IN_FLIGHT: u32 = 1024;
 
+/// The default segment size cap for `serve` (64 MiB, matching the storage default).
+const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The smallest segment size cap `serve` accepts: below this, segments proliferate
+/// pathologically (one record each), so reject it as a misconfiguration.
+const MIN_MAX_SEGMENT_BYTES: u64 = 4096;
+
 /// The default max delivery attempts before a poison message is dead-lettered.
 const DEFAULT_MAX_DELIVER: u32 = 5;
 /// The default cursor-checkpoint interval for the `serve` engine: at most this many messages
@@ -83,7 +90,7 @@ ironbus: a durable edge message queue.
 USAGE:
     ironbus serve --data-dir <dir> [--addr <host:port>] [--max-connections <n>]
                   [--checkpoint-interval <n>] [--max-deliver <n>] [--max-in-flight <n>]
-                  [--health-addr <host:port>]
+                  [--max-segment-bytes <n>] [--health-addr <host:port>]
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
     ironbus sub   [--addr <host:port>] [--max <n>] [--ack | --nack [--delay-ms <n>] | --term]
     ironbus help
@@ -404,6 +411,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut checkpoint_interval = DEFAULT_CHECKPOINT_INTERVAL;
     let mut max_deliver = DEFAULT_MAX_DELIVER;
     let mut max_in_flight = DEFAULT_MAX_IN_FLIGHT;
+    let mut max_segment_bytes = DEFAULT_MAX_SEGMENT_BYTES;
     let mut health_addr: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
@@ -434,6 +442,12 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
                 let raw = take_value("--max-in-flight", args, &mut i)?;
                 max_in_flight = raw.parse::<u32>().map_err(|_| {
                     CliError::Usage(format!("`--max-in-flight` needs a number, got `{raw}`"))
+                })?;
+            }
+            "--max-segment-bytes" => {
+                let raw = take_value("--max-segment-bytes", args, &mut i)?;
+                max_segment_bytes = raw.parse::<u64>().map_err(|_| {
+                    CliError::Usage(format!("`--max-segment-bytes` needs a number, got `{raw}`"))
                 })?;
             }
             "--health-addr" => health_addr = Some(take_value("--health-addr", args, &mut i)?),
@@ -471,6 +485,12 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             "`--max-in-flight` must be at least 1".to_string(),
         ));
     }
+    if max_segment_bytes < MIN_MAX_SEGMENT_BYTES {
+        return Err(CliError::Usage(format!(
+            "`--max-segment-bytes` must be at least {MIN_MAX_SEGMENT_BYTES} (smaller caps make \
+             segments proliferate one record at a time)"
+        )));
+    }
     cmd_serve(
         &addr,
         Path::new(&data_dir),
@@ -479,6 +499,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             checkpoint_interval,
             max_deliver,
             max_in_flight,
+            max_segment_bytes,
         },
         health_addr.as_deref(),
         out,
@@ -492,6 +513,7 @@ struct ServeConfig {
     checkpoint_interval: u64,
     max_deliver: u32,
     max_in_flight: u32,
+    max_segment_bytes: u64,
 }
 
 #[cfg(unix)]
@@ -507,6 +529,7 @@ fn cmd_serve(
         config.max_in_flight,
         config.checkpoint_interval,
         config.max_deliver,
+        config.max_segment_bytes,
     )?;
     let listener = TcpListener::bind(addr)
         .map_err(|e| CliError::Internal(format!("cannot bind {addr}: {e}")))?;
@@ -569,6 +592,7 @@ fn cmd_serve(
         config.checkpoint_interval,
         config.max_deliver,
         config.max_in_flight,
+        config.max_segment_bytes,
         health_addr,
         out,
     );
@@ -584,6 +608,7 @@ fn open_disk_engine(
     max_in_flight: u32,
     checkpoint_interval: u64,
     max_deliver: u32,
+    max_segment_bytes: u64,
 ) -> Result<SharedEngine<StdFs, SystemClock>, CliError> {
     std::fs::create_dir_all(data_dir)
         .map_err(|e| CliError::Internal(format!("cannot create {}: {e}", data_dir.display())))?;
@@ -594,7 +619,7 @@ fn open_disk_engine(
         fs,
         SystemClock::new(),
         EngineConfig {
-            log: LogConfig::default(),
+            log: LogConfig { max_segment_bytes },
             lease: LeaseConfig::default(),
             delivery,
             max_in_flight,
@@ -861,6 +886,46 @@ mod tests {
     }
 
     #[test]
+    fn serve_rejects_a_non_numeric_max_segment_bytes() {
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--max-segment-bytes".to_string(),
+                "big".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--max-segment-bytes"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_rejects_a_tiny_max_segment_bytes() {
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-cli-msb-never-created".to_string(),
+                "--max-segment-bytes".to_string(),
+                "100".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("at least"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn an_unreachable_broker_maps_to_exit_five() {
         // Port 1 on loopback refuses immediately, so this does not hang on the connect timeout.
         let mut buf = Vec::new();
@@ -969,7 +1034,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ironbus-cli-it-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let shared = open_disk_engine(&dir, 64, 1, DEFAULT_MAX_DELIVER).unwrap();
+        let shared =
+            open_disk_engine(&dir, 64, 1, DEFAULT_MAX_DELIVER, DEFAULT_MAX_SEGMENT_BYTES).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -996,7 +1062,8 @@ mod tests {
         // persisted the committed cursor synchronously when it acked offset 0, so a clean
         // restart RESUMES past the acked message (it does not redeliver), and the durable log
         // continues at offset 1 rather than overwriting offset 0.
-        let reopened = open_disk_engine(&dir, 64, 1, DEFAULT_MAX_DELIVER).unwrap();
+        let reopened =
+            open_disk_engine(&dir, 64, 1, DEFAULT_MAX_DELIVER, DEFAULT_MAX_SEGMENT_BYTES).unwrap();
         let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr2 = listener2.local_addr().unwrap();
         let shutdown2 = Arc::new(AtomicBool::new(false));
