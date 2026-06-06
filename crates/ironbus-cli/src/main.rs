@@ -1104,6 +1104,72 @@ mod tests {
         handle.join().unwrap();
     }
 
+    #[test]
+    fn a_poison_message_is_dead_lettered_after_exceeding_max_deliver() {
+        // The golden-path poison case end to end over the wire: a short visibility timeout
+        // (so the redelivery is fast) and max_deliver = 1. The first peek leases the message
+        // (delivery 1); after the timeout the next fetch is delivery 2, which exceeds the cap,
+        // so the engine dead-letters it (parked, not redelivered) and records the drop with
+        // its offset. This is platform-agnostic (in-memory fs) but uses the real clock for the
+        // visibility timeout, with a 10x sleep margin so it is not flaky.
+        let engine = Engine::open(
+            InMemoryFs::new(),
+            SystemClock::new(),
+            EngineConfig {
+                log: LogConfig::default(),
+                lease: LeaseConfig::from_millis(50, 300_000),
+                delivery: DeliveryConfig::new(1, false, Vec::new()).unwrap(),
+                max_in_flight: 16,
+                checkpoint_interval: 1024,
+            },
+        )
+        .unwrap();
+        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            let shared = Arc::clone(&shared);
+            move || serve(&listener, &shared, &shutdown, 16).unwrap()
+        });
+        let a = addr.to_string();
+
+        cmd_pub(&a, b"", b"poison", &mut Vec::new()).unwrap();
+
+        // Delivery 1: peeked (leased), not acked.
+        let mut first = Vec::new();
+        cmd_sub(&a, 10, Disposition::Peek, &mut first).unwrap();
+        assert!(
+            String::from_utf8(first).unwrap().contains("payload=poison"),
+            "the first delivery is served"
+        );
+
+        // Past the visibility timeout, delivery 2 exceeds max_deliver = 1: dead-lettered, so
+        // the re-fetch is empty.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let mut second = Vec::new();
+        cmd_sub(&a, 10, Disposition::Peek, &mut second).unwrap();
+        assert_eq!(
+            String::from_utf8(second).unwrap(),
+            "fetched 0 message(s)\n",
+            "the poison message is dead-lettered, not redelivered"
+        );
+
+        // The engine recorded the drop and its offset (the resilience signal).
+        {
+            let g = shared.lock().unwrap();
+            assert_eq!(g.counters().dead_lettered, 1, "exactly one dead-letter");
+            assert!(
+                g.last_dead_lettered_offset().is_some_and(|o| o.get() == 0),
+                "the dead-lettered offset is reported"
+            );
+        }
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn serve_on_disk_round_trips_and_survives_a_restart() {
