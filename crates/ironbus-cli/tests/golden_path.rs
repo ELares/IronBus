@@ -11,6 +11,7 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 /// The built `ironbus` binary (Cargo sets this for the crate's integration tests).
 const BIN: &str = env!("CARGO_BIN_EXE_ironbus");
@@ -30,7 +31,7 @@ impl Drop for ChildGuard {
 /// 1` persists the cursor synchronously on each ack, so a restart resume is deterministic (no
 /// race with the asynchronous close-path checkpoint).
 fn start_broker(data_dir: &str) -> (ChildGuard, String) {
-    let mut child = Command::new(BIN)
+    let child = Command::new(BIN)
         .args([
             "serve",
             "--data-dir",
@@ -44,15 +45,26 @@ fn start_broker(data_dir: &str) -> (ChildGuard, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn ironbus serve");
+    // Guard the child IMMEDIATELY: a bare std::process::Child does not kill on drop, so any
+    // panic below (a read error, a timeout, an unparseable line) would otherwise orphan the
+    // broker. With the guard in scope, every early exit kills and reaps it.
+    let mut guard = ChildGuard(child);
 
-    let stdout = child.stdout.take().expect("piped stdout");
-    let mut line = String::new();
-    let n = BufReader::new(stdout)
-        .read_line(&mut line)
-        .expect("read the listening line");
+    // Read the listening line on a worker thread bounded by a timeout, so a broker that wedges
+    // without printing (and without exiting) fails the test promptly instead of hanging it.
+    let stdout = guard.0.stdout.take().expect("piped stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let n = BufReader::new(stdout).read_line(&mut line).unwrap_or(0);
+        let _ = tx.send((n, line));
+    });
+    let (n, line) = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("ironbus serve did not print a listening line within 10s");
     if n == 0 {
         let mut err = String::new();
-        if let Some(mut se) = child.stderr.take() {
+        if let Some(mut se) = guard.0.stderr.take() {
             let _ = se.read_to_string(&mut err);
         }
         panic!("ironbus serve exited before it listened: {err}");
@@ -66,7 +78,7 @@ fn start_broker(data_dir: &str) -> (ChildGuard, String) {
     else {
         panic!("could not parse the listening line: {line:?}");
     };
-    (ChildGuard(child), addr.to_string())
+    (guard, addr.to_string())
 }
 
 /// Runs one `ironbus` subcommand to completion, returning its stdout and exit code.
