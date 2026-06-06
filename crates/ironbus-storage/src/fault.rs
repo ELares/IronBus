@@ -131,3 +131,94 @@ impl<F: RandomAccessFile> RandomAccessFile for FaultFile<F> {
         self.inner.set_len(len)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::InMemoryFs;
+
+    fn faulted() -> (FaultFs<InMemoryFs>, FaultControl) {
+        FaultFs::new(InMemoryFs::new())
+    }
+
+    #[test]
+    fn unarmed_syncs_and_io_pass_through() {
+        let (fs, _control) = faulted();
+        let f = fs.create_new("seg").unwrap();
+        f.write_all_at(b"hello", 0).unwrap();
+        // A round-trip read returns exactly what was written.
+        let mut buf = [0u8; 5];
+        assert_eq!(f.read_at(&mut buf, 0).unwrap(), 5);
+        assert_eq!(&buf, b"hello");
+        // Unarmed, both syncs succeed and the length is the inner length.
+        f.sync_data().unwrap();
+        f.sync_all().unwrap();
+        assert_eq!(f.len().unwrap(), 5);
+    }
+
+    #[test]
+    fn arming_fails_both_sync_data_and_sync_all_but_not_io() {
+        let (fs, control) = faulted();
+        let f = fs.create_new("seg").unwrap();
+        f.write_all_at(b"x", 0).unwrap();
+        control.set_fail_sync(true);
+        assert!(f.sync_data().is_err(), "sync_data faults while armed");
+        assert!(f.sync_all().is_err(), "sync_all faults while armed");
+        // Only fsync is injected: writes and reads still go through.
+        f.write_all_at(b"y", 1).unwrap();
+        let mut buf = [0u8; 2];
+        f.read_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"xy");
+    }
+
+    #[test]
+    fn disarming_restores_passthrough() {
+        let (fs, control) = faulted();
+        let f = fs.create_new("seg").unwrap();
+        control.set_fail_sync(true);
+        assert!(f.sync_data().is_err());
+        control.set_fail_sync(false);
+        // Disarmed, the syncs flow to the inner file again.
+        f.sync_data().unwrap();
+        f.sync_all().unwrap();
+    }
+
+    #[test]
+    fn the_control_is_shared_across_files_and_clones() {
+        let (fs, control) = faulted();
+        let a = fs.create_new("a").unwrap();
+        let b = fs.create_new("b").unwrap();
+        // Arming through a clone of the handle affects every file the FaultFs handed out.
+        let cloned = control.clone();
+        cloned.set_fail_sync(true);
+        assert!(a.sync_all().is_err());
+        assert!(b.sync_all().is_err());
+    }
+
+    #[test]
+    fn directory_operations_delegate_even_while_armed() {
+        let (fs, control) = faulted();
+        fs.create_new("one").unwrap();
+        fs.create_new("two").unwrap();
+        // Arming fsync faults must not touch the directory-level operations.
+        control.set_fail_sync(true);
+        assert!(fs.exists("one").unwrap());
+        let mut names = fs.list().unwrap();
+        names.sort();
+        assert_eq!(names, vec!["one".to_string(), "two".to_string()]);
+        fs.remove("one").unwrap();
+        assert!(!fs.exists("one").unwrap());
+        fs.sync_dir().unwrap();
+    }
+
+    #[test]
+    fn set_len_and_len_delegate_while_armed() {
+        let (fs, control) = faulted();
+        let f = fs.create_new("seg").unwrap();
+        f.write_all_at(&[0u8; 10], 0).unwrap();
+        control.set_fail_sync(true);
+        // Truncation and length delegate unchanged even while syncs fault.
+        f.set_len(4).unwrap();
+        assert_eq!(f.len().unwrap(), 4);
+    }
+}
