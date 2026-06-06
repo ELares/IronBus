@@ -12,6 +12,7 @@ pub(crate) mod raw;
 pub mod clock;
 pub mod codec;
 pub mod cursor;
+pub mod delivery;
 pub mod format;
 pub mod lease;
 pub mod segment;
