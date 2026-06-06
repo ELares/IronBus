@@ -1,0 +1,350 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Crash-injection gates for the storage log (issues #21, #55).
+//!
+//! These make the resilience claims falsifiable: at every durability boundary, after a
+//! power loss or after tail/arbitrary corruption, recovery must yield a consistent,
+//! monotonic prefix with no acknowledged record lost and bounded, valid loss, and it
+//! must never panic or hang. They run per-PR under `cargo test`.
+//!
+//! Crash classes covered here, over the in-memory disk model:
+//! - power loss before fsync (every unsynced write may vanish), at every op boundary;
+//! - a torn tail (the file truncated mid-record);
+//! - tail corruption (the last record's bytes damaged);
+//! - mid-log rot and arbitrary single-byte corruption anywhere in the segment.
+//!
+//! Block-layer fault injection (an fsync that returns EIO, page-cache reordering, a
+//! both-slots-torn checkpoint) needs a fault-injecting file layer and is tracked
+//! separately.
+
+use ironbus_core::clock::ManualClock;
+use ironbus_core::format::{RECORD_HEADER_LEN, SEGMENT_HEADER_LEN};
+use ironbus_core::types::{Offset, RecordFlags, Seq};
+use ironbus_storage::fs::{Filesystem, InMemoryFs};
+use ironbus_storage::io::RandomAccessFile;
+use ironbus_storage::log::{Append, Log, LogConfig};
+use ironbus_storage::naming::segment_file_name;
+use proptest::prelude::*;
+
+/// A large cap so durability is driven only by `sync` (no rolling).
+fn big_config() -> LogConfig {
+    LogConfig {
+        max_segment_bytes: 1 << 30,
+    }
+}
+
+/// A small cap so a handful of records force rolling.
+fn small_config() -> LogConfig {
+    LogConfig {
+        max_segment_bytes: 256,
+    }
+}
+
+/// A deterministic, fixed-size payload for record `i`.
+fn payload(i: u64) -> Vec<u8> {
+    i.to_le_bytes().to_vec()
+}
+
+fn append_at(log: &mut Log<InMemoryFs, ManualClock>, i: u64) {
+    let p = payload(i);
+    log.append(&Append {
+        timestamp_ms: i,
+        flags: RecordFlags::EMPTY,
+        key: b"",
+        headers: b"",
+        payload: &p,
+    })
+    .unwrap();
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Op {
+    Append,
+    Sync,
+}
+
+/// Opens a fresh log on `fs` and applies `ops`, numbering appends from 0.
+fn apply(fs: InMemoryFs, config: LogConfig, ops: &[Op]) -> Log<InMemoryFs, ManualClock> {
+    let mut log = Log::open(fs, ManualClock::new(), config).unwrap();
+    let mut next = 0u64;
+    for op in ops {
+        match op {
+            Op::Append => {
+                append_at(&mut log, next);
+                next += 1;
+            }
+            Op::Sync => log.sync().unwrap(),
+        }
+    }
+    log
+}
+
+/// Reopens the log and asserts the recovered records are exactly the durable prefix:
+/// contiguous offsets and sequences from zero, correct payloads, length in
+/// `[durable, appended]`. With the in-memory model power loss reverts to the durable
+/// image exactly, so `recovered == durable`.
+fn assert_recovers_durable_prefix(fs: InMemoryFs, config: LogConfig, durable: u64, appended: u64) {
+    let log = Log::open(fs, ManualClock::new(), config).unwrap();
+    let recovered = log.flushed_offset().get();
+    assert!(
+        recovered >= durable,
+        "lost an acknowledged record: recovered {recovered} < durable {durable}"
+    );
+    assert!(
+        recovered <= appended,
+        "invented a record: recovered {recovered} > appended {appended}"
+    );
+    assert_eq!(recovered, durable, "in-memory power loss is exact");
+    assert_prefix(&log, recovered);
+}
+
+/// Asserts the readable records are a contiguous, correctly-numbered prefix of length
+/// `expected`.
+fn assert_prefix(log: &Log<InMemoryFs, ManualClock>, expected: u64) {
+    let records = log.read_from(Offset::ZERO, usize::MAX).unwrap();
+    assert_eq!(records.len() as u64, expected);
+    for (i, record) in records.iter().enumerate() {
+        let i = u64::try_from(i).unwrap();
+        assert_eq!(record.offset, Offset::new(i));
+        assert_eq!(record.seq, Seq::new(i));
+        assert_eq!(record.payload, payload(i));
+    }
+}
+
+/// The fixed workload replayed prefix-by-prefix in the every-boundary tests.
+fn boundary_workload() -> Vec<Op> {
+    use Op::{Append, Sync};
+    vec![
+        Append, Append, Append, Sync, Append, Append, Sync, Append, Sync, Append, Append, Append,
+        Append, Sync, Append, Append,
+    ]
+}
+
+#[test]
+fn power_loss_at_every_boundary_no_roll() {
+    let ops = boundary_workload();
+    for k in 0..=ops.len() {
+        let log = apply(InMemoryFs::new(), big_config(), &ops[..k]);
+        let durable = log.flushed_offset().get();
+        let appended = log.next_offset().get();
+        log.filesystem().simulate_power_loss();
+        let fs = log.into_filesystem();
+        assert_recovers_durable_prefix(fs, big_config(), durable, appended);
+    }
+}
+
+#[test]
+fn power_loss_at_every_boundary_with_rolling() {
+    let ops = boundary_workload();
+    for k in 0..=ops.len() {
+        let log = apply(InMemoryFs::new(), small_config(), &ops[..k]);
+        let durable = log.flushed_offset().get();
+        let appended = log.next_offset().get();
+        log.filesystem().simulate_power_loss();
+        let fs = log.into_filesystem();
+        assert_recovers_durable_prefix(fs, small_config(), durable, appended);
+    }
+}
+
+#[test]
+fn last_record_corruption_drops_only_that_record() {
+    // Append and sync N records (all durable), then damage the last record's bytes.
+    // Recovery must drop exactly that record and keep the intact prefix.
+    let n = 6u64;
+    let ops: Vec<Op> = (0..n).map(|_| Op::Append).chain([Op::Sync]).collect();
+    let log = apply(InMemoryFs::new(), big_config(), &ops);
+    let fs = log.into_filesystem();
+
+    let file = fs.open(&segment_file_name(0)).unwrap();
+    let mut bytes = file.snapshot();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    file.set_len(0).unwrap();
+    file.write_all_at(&bytes, 0).unwrap();
+    file.sync_data().unwrap();
+
+    let log = Log::open(fs, ManualClock::new(), big_config()).unwrap();
+    assert_eq!(log.flushed_offset(), Offset::new(n - 1));
+    assert_prefix(&log, n - 1);
+}
+
+#[test]
+fn tail_truncation_drops_the_partial_record() {
+    // A torn write that left only a prefix of the last record's bytes on disk.
+    let n = 6u64;
+    let ops: Vec<Op> = (0..n).map(|_| Op::Append).chain([Op::Sync]).collect();
+    let log = apply(InMemoryFs::new(), big_config(), &ops);
+    let fs = log.into_filesystem();
+
+    let file = fs.open(&segment_file_name(0)).unwrap();
+    let len = file.len().unwrap();
+    file.set_len(len - 3).unwrap(); // chop a few bytes off the last record
+    file.sync_data().unwrap();
+
+    let log = Log::open(fs, ManualClock::new(), big_config()).unwrap();
+    assert_eq!(log.flushed_offset(), Offset::new(n - 1));
+    assert_prefix(&log, n - 1);
+}
+
+/// Flips the byte at `in_frame` bytes into record `k` of an n-record sealed segment,
+/// then asserts recovery stops exactly before record k (its prefix kept).
+fn assert_corruption_in_record_stops_before_it(n: u64, k: u64, in_frame: usize) {
+    let ops: Vec<Op> = (0..n).map(|_| Op::Append).chain([Op::Sync]).collect();
+    let log = apply(InMemoryFs::new(), big_config(), &ops);
+    let fs = log.into_filesystem();
+
+    let file = fs.open(&segment_file_name(0)).unwrap();
+    let mut bytes = file.snapshot();
+    let header = SEGMENT_HEADER_LEN;
+    let frame = (bytes.len() - header) / usize::try_from(n).unwrap();
+    let target = header + usize::try_from(k).unwrap() * frame + in_frame;
+    bytes[target] ^= 0xff;
+    file.set_len(0).unwrap();
+    file.write_all_at(&bytes, 0).unwrap();
+    file.sync_data().unwrap();
+
+    let log = Log::open(fs, ManualClock::new(), big_config()).unwrap();
+    assert_eq!(log.flushed_offset(), Offset::new(k));
+    assert_prefix(&log, k);
+}
+
+#[test]
+fn mid_log_header_corruption_stops_at_the_first_bad_record() {
+    // A byte in record 3's frame header, exercising the record HEADER checksum.
+    assert_corruption_in_record_stops_before_it(8, 3, RECORD_HEADER_LEN / 2);
+}
+
+#[test]
+fn mid_log_body_corruption_stops_at_the_first_bad_record() {
+    // A byte in record 3's payload, exercising the record BODY checksum (the header
+    // checksum cannot see this byte, so it proves body-CRC verification runs).
+    assert_corruption_in_record_stops_before_it(8, 3, RECORD_HEADER_LEN + 1);
+}
+
+#[test]
+fn recovery_rejects_a_synthesized_sequence_gap() {
+    // The harness must be able to falsify a broken sequence-contiguity guard itself, not
+    // lean on a separate unit test: hand-build a segment whose second record skips a
+    // sequence number and assert recovery rejects it.
+    use ironbus_core::codec::RecordView;
+    use ironbus_core::segment::SegmentHeader;
+    use ironbus_storage::segment::{SegmentWriter, StorageError};
+
+    let fs = InMemoryFs::new();
+    let file = fs.create_new(&segment_file_name(0)).unwrap();
+    let header = SegmentHeader {
+        segment_id: 0,
+        base_seq: Seq::new(0),
+        base_offset: Offset::ZERO,
+        created_unix_ms: 0,
+        flags: 0,
+    };
+    let mut writer = SegmentWriter::create(file, header).unwrap();
+    writer
+        .append(&RecordView {
+            seq: Seq::new(0),
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"a",
+        })
+        .unwrap();
+    writer
+        .append(&RecordView {
+            seq: Seq::new(5), // a gap: the contiguous next sequence is 1
+            timestamp_ms: 5,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"b",
+        })
+        .unwrap();
+    writer.sync().unwrap();
+    drop(writer);
+
+    let err = Log::open(fs, ManualClock::new(), big_config()).unwrap_err();
+    assert!(matches!(
+        err,
+        StorageError::RecoveredSequenceMismatch {
+            index: 1,
+            expected: 1,
+            found: 5
+        }
+    ));
+}
+
+fn op_strategy() -> impl Strategy<Value = Op> {
+    prop_oneof![
+        3 => Just(Op::Append),
+        1 => Just(Op::Sync),
+    ]
+}
+
+proptest! {
+    /// Power loss after an arbitrary workload, under either config, recovers exactly
+    /// the durable prefix.
+    #[test]
+    fn power_loss_recovers_the_durable_prefix(
+        ops in prop::collection::vec(op_strategy(), 0..40),
+        roll in any::<bool>(),
+    ) {
+        let config = if roll { small_config() } else { big_config() };
+        let log = apply(InMemoryFs::new(), config, &ops);
+        let durable = log.flushed_offset().get();
+        let appended = log.next_offset().get();
+        log.filesystem().simulate_power_loss();
+        let fs = log.into_filesystem();
+
+        let log = Log::open(fs, ManualClock::new(), config).unwrap();
+        let recovered = log.flushed_offset().get();
+        prop_assert_eq!(recovered, durable);
+        prop_assert!(recovered <= appended);
+        let records = log.read_from(Offset::ZERO, usize::MAX).unwrap();
+        prop_assert_eq!(records.len() as u64, recovered);
+        for (i, record) in records.iter().enumerate() {
+            let i = u64::try_from(i).unwrap();
+            prop_assert_eq!(record.offset, Offset::new(i));
+            prop_assert_eq!(record.seq, Seq::new(i));
+            let expected = payload(i);
+            prop_assert_eq!(record.payload.as_slice(), expected.as_slice());
+        }
+    }
+
+    /// A single corrupted byte anywhere in the segment never panics or hangs: recovery
+    /// either fails cleanly (a damaged header) or returns a valid, monotonic prefix that
+    /// never reads past the corruption.
+    #[test]
+    fn arbitrary_byte_corruption_yields_a_valid_prefix_or_clean_error(
+        n in 1u64..12,
+        idx in any::<prop::sample::Index>(),
+        xor in 1u8..=255,
+    ) {
+        let ops: Vec<Op> = (0..n).map(|_| Op::Append).chain([Op::Sync]).collect();
+        let log = apply(InMemoryFs::new(), big_config(), &ops);
+        let fs = log.into_filesystem();
+
+        let file = fs.open(&segment_file_name(0)).unwrap();
+        let mut bytes = file.snapshot();
+        let pos = idx.index(bytes.len());
+        bytes[pos] ^= xor;
+        file.set_len(0).unwrap();
+        file.write_all_at(&bytes, 0).unwrap();
+        file.sync_data().unwrap();
+
+        // A damaged header is a clean, reported error; otherwise a valid prefix of <= n.
+        if let Ok(log) = Log::open(fs, ManualClock::new(), big_config()) {
+            let records = log.read_from(Offset::ZERO, usize::MAX).unwrap();
+            prop_assert!(records.len() as u64 <= n);
+            for (i, record) in records.iter().enumerate() {
+                let i = u64::try_from(i).unwrap();
+                prop_assert_eq!(record.offset, Offset::new(i));
+                prop_assert_eq!(record.seq, Seq::new(i));
+                // Every SURVIVED record has intact bytes (the corruption fell in a record
+                // that was dropped, or in the segment header), so a checksum that wrongly
+                // accepted a corrupt record would surface here as a mismatched payload.
+                let expected = payload(i);
+                prop_assert_eq!(record.payload.as_slice(), expected.as_slice());
+            }
+        }
+    }
+}
