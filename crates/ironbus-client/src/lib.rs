@@ -5,6 +5,11 @@
 //! request/response: it sends a frame and reads the response, framing the byte stream with
 //! a persistent buffer so a read that delivers several frames at once is never lost. It is
 //! blocking and minimal, matching the edge-first server.
+//!
+//! Connect, read, and write timeouts (see [`ClientConfig`]) bound every blocking call, so a
+//! silent or slow broker surfaces as an error rather than wedging the caller forever. The
+//! client also never trusts the peer's framing: it rejects an unknown frame type, a
+//! wrong-shape response body, and more deliveries than it asked for.
 
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
@@ -12,11 +17,12 @@ use ironbus_proto::message::{
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
 /// An error from the client.
 #[derive(Debug)]
 pub enum ClientError {
-    /// An underlying IO or connection error.
+    /// An underlying IO or connection error (including a timeout).
     Io(io::Error),
     /// A malformed frame from the server (the connection cannot continue).
     Frame(FrameError),
@@ -24,8 +30,12 @@ pub enum ClientError {
     Body(BodyError),
     /// The server replied with an error: the UTF-8 message it sent.
     Server(String),
-    /// The server replied with an unexpected frame type for the request.
+    /// The server replied with an unexpected (but known) frame type for the request.
     Unexpected(FrameType),
+    /// The server sent a frame whose type tag this client does not recognize.
+    UnknownFrameType(u8),
+    /// The response had the expected type but a malformed shape for the request.
+    BadResponse(&'static str),
     /// The connection closed before a complete response arrived.
     Closed,
 }
@@ -38,6 +48,10 @@ impl core::fmt::Display for ClientError {
             ClientError::Body(e) => write!(f, "message body error: {e}"),
             ClientError::Server(m) => write!(f, "server error: {m}"),
             ClientError::Unexpected(t) => write!(f, "unexpected response frame {t:?}"),
+            ClientError::UnknownFrameType(tag) => {
+                write!(f, "unknown response frame type tag {tag}")
+            }
+            ClientError::BadResponse(why) => write!(f, "malformed response: {why}"),
             ClientError::Closed => write!(f, "connection closed mid-response"),
         }
     }
@@ -48,6 +62,31 @@ impl std::error::Error for ClientError {}
 impl From<io::Error> for ClientError {
     fn from(e: io::Error) -> Self {
         ClientError::Io(e)
+    }
+}
+
+/// Connection tunables: the timeouts that bound every blocking call.
+///
+/// The defaults are conservative but finite, so a misbehaving broker fails the call instead
+/// of hanging the caller indefinitely. Set a field to `None` to block forever on that
+/// operation (the pre-timeout behavior), which is rarely what you want.
+#[derive(Clone, Debug)]
+pub struct ClientConfig {
+    /// Cap on the initial TCP connect. `None` uses the OS default, which can be minutes.
+    pub connect_timeout: Option<Duration>,
+    /// Cap on each blocking read while awaiting a response. `None` blocks forever.
+    pub read_timeout: Option<Duration>,
+    /// Cap on each blocking write while sending a request. `None` blocks forever.
+    pub write_timeout: Option<Duration>,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        ClientConfig {
+            connect_timeout: Some(Duration::from_secs(10)),
+            read_timeout: Some(Duration::from_secs(30)),
+            write_timeout: Some(Duration::from_secs(30)),
+        }
     }
 }
 
@@ -78,12 +117,28 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connects to a broker at `addr` and completes the handshake.
+    /// Connects to a broker at `addr` with the default [`ClientConfig`] and completes the
+    /// handshake.
     ///
     /// # Errors
-    /// Returns a [`ClientError`] on a connection failure or an unexpected handshake reply.
+    /// Returns a [`ClientError`] on a connection failure, a timeout, or an unexpected
+    /// handshake reply.
     pub fn connect<A: ToSocketAddrs>(addr: A) -> Result<Client, ClientError> {
-        let stream = TcpStream::connect(addr)?;
+        Client::connect_with(addr, &ClientConfig::default())
+    }
+
+    /// Connects to a broker at `addr` using `config` and completes the handshake.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on a connection failure, a timeout, or an unexpected
+    /// handshake reply.
+    pub fn connect_with<A: ToSocketAddrs>(
+        addr: A,
+        config: &ClientConfig,
+    ) -> Result<Client, ClientError> {
+        let stream = Client::dial(addr, config.connect_timeout)?;
+        stream.set_read_timeout(config.read_timeout)?;
+        stream.set_write_timeout(config.write_timeout)?;
         let mut client = Client {
             stream,
             buf: Vec::new(),
@@ -98,6 +153,31 @@ impl Client {
         }
     }
 
+    /// Resolves `addr` and connects to the first address that accepts, honoring an optional
+    /// connect timeout so a black-holed host cannot block for the OS default.
+    fn dial<A: ToSocketAddrs>(
+        addr: A,
+        timeout: Option<Duration>,
+    ) -> Result<TcpStream, ClientError> {
+        let mut last_err: Option<io::Error> = None;
+        for sa in addr.to_socket_addrs()? {
+            let attempt = match timeout {
+                Some(t) => TcpStream::connect_timeout(&sa, t),
+                None => TcpStream::connect(sa),
+            };
+            match attempt {
+                Ok(stream) => return Ok(stream),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(ClientError::Io(last_err.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no socket address to connect to",
+            )
+        })))
+    }
+
     /// Produces a message and returns its assigned log offset.
     ///
     /// # Errors
@@ -108,8 +188,9 @@ impl Client {
         self.send(FrameType::Pub, &body)?;
         match self.read_frame()? {
             (FrameType::Ok, body) => {
-                let bytes = <[u8; 8]>::try_from(body.as_slice())
-                    .map_err(|_| ClientError::Unexpected(FrameType::Ok))?;
+                let bytes = <[u8; 8]>::try_from(body.as_slice()).map_err(|_| {
+                    ClientError::BadResponse("produce reply was not an eight-byte offset")
+                })?;
                 Ok(u64::from_le_bytes(bytes))
             }
             (FrameType::Err, body) => {
@@ -123,13 +204,23 @@ impl Client {
     /// none if the queue is empty within the consumer window).
     ///
     /// # Errors
-    /// Returns a [`ClientError`] on an IO error or a server error.
+    /// Returns a [`ClientError`] on an IO error, a server error, or a server that delivers
+    /// more messages than the requested credit.
     pub fn fetch(&mut self, max: u32) -> Result<Vec<Message>, ClientError> {
         self.send(FrameType::Flow, &max.to_le_bytes())?;
+        // The credit we granted is the hard ceiling on what we will accept back.
+        let limit = usize::try_from(max).unwrap_or(usize::MAX);
         let mut messages = Vec::new();
         loop {
             match self.read_frame()? {
                 (FrameType::Deliver, body) => {
+                    // Never accept more deliveries than the credit we granted: a buggy or
+                    // hostile server could otherwise stream Deliver frames without bound.
+                    if messages.len() >= limit {
+                        return Err(ClientError::BadResponse(
+                            "server delivered more messages than the requested credit",
+                        ));
+                    }
                     let d = decode_deliver(&body).map_err(ClientError::Body)?;
                     messages.push(Message {
                         offset: d.offset,
@@ -155,7 +246,7 @@ impl Client {
     /// if the ack committed, `false` if it was fenced (stale: the message will redeliver).
     ///
     /// # Errors
-    /// Returns a [`ClientError`] on an IO error or a server error.
+    /// Returns a [`ClientError`] on an IO error, a server error, or a wrong-shape reply.
     pub fn ack(&mut self, offset: u64, generation: u64) -> Result<bool, ClientError> {
         let mut body = Vec::new();
         encode_ack(
@@ -169,7 +260,16 @@ impl Client {
         );
         self.send(FrameType::Ack, &body)?;
         match self.read_frame()? {
-            (FrameType::Ok, body) => Ok(body.first() == Some(&1)),
+            // The ack reply is exactly one status byte (1 = committed, 0 = fenced). Demanding
+            // that length rejects a wrong-shape Ok (such as an eight-byte pub offset whose low
+            // byte is 1) that would otherwise be misread as a commit and silently drop the
+            // message, violating at-least-once.
+            (FrameType::Ok, body) => match body.as_slice() {
+                [status] => Ok(*status == 1),
+                _ => Err(ClientError::BadResponse(
+                    "ack reply was not a one-byte status",
+                )),
+            },
             (FrameType::Err, body) => {
                 Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
             }
@@ -180,11 +280,14 @@ impl Client {
     /// Sends a keepalive ping and waits for the pong.
     ///
     /// # Errors
-    /// Returns a [`ClientError`] on an IO error or an unexpected reply.
+    /// Returns a [`ClientError`] on an IO error, a server error, or an unexpected reply.
     pub fn ping(&mut self) -> Result<(), ClientError> {
         self.send(FrameType::Ping, &[])?;
         match self.read_frame()? {
             (FrameType::Pong, _) => Ok(()),
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -206,9 +309,10 @@ impl Client {
                     body,
                     consumed,
                 } => {
-                    // An unknown type from a newer server has no client handler.
+                    // An unknown tag (e.g. from a newer server) has no client handler; name
+                    // the raw tag rather than pretending it was some known frame.
                     let ty = FrameType::from_u8(type_tag)
-                        .ok_or(ClientError::Unexpected(FrameType::Err))?;
+                        .ok_or(ClientError::UnknownFrameType(type_tag))?;
                     let body = body.to_vec();
                     self.buf.drain(..consumed);
                     return Ok((ty, body));
@@ -229,6 +333,7 @@ mod tests {
     use super::*;
     use ironbus_core::delivery::DeliveryConfig;
     use ironbus_core::lease::LeaseConfig;
+    use ironbus_proto::message::{encode_deliver, DeliverBody};
     use ironbus_server::clock::SystemClock;
     use ironbus_server::engine::{Engine, EngineConfig};
     use ironbus_server::server::{serve, SharedEngine};
@@ -262,6 +367,43 @@ mod tests {
             move || serve(&listener, &shared, &shutdown, 16).unwrap()
         });
         (addr, shutdown, handle)
+    }
+
+    /// Encodes one framed reply (length prefix, type, body).
+    fn frame(ty: FrameType, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_frame(ty, body, &mut out).unwrap();
+        out
+    }
+
+    /// Encodes a frame with an arbitrary (possibly unknown) raw type tag by hand:
+    /// `[len: u32 LE][tag: u8][body]`, where `len` counts the tag byte plus the body.
+    fn raw_frame(tag: u8, body: &[u8]) -> Vec<u8> {
+        let len = u32::try_from(1 + body.len()).unwrap();
+        let mut out = len.to_le_bytes().to_vec();
+        out.push(tag);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A one-shot listener that, on the single connection it accepts, writes `script` and
+    /// then drains (discarding) until the client closes. The client drives request/response
+    /// purely off its own buffer, so emitting every reply frame up front is read back in
+    /// order. Lets a test stand in a hostile or buggy server with exact control of the bytes.
+    fn raw_server(script: Vec<u8>) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.write_all(&script).unwrap();
+            let mut sink = [0u8; 1024];
+            while let Ok(n) = sock.read(&mut sink) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        (addr, handle)
     }
 
     #[test]
@@ -300,6 +442,124 @@ mod tests {
         let mut c = Client::connect(addr).unwrap();
         assert!(c.fetch(5).unwrap().is_empty());
         shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_multi_message_fetch_returns_every_message() {
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+        for i in 0..3u8 {
+            c.produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"k",
+                headers: b"",
+                payload: &[i],
+            })
+            .unwrap();
+        }
+        let messages = c.fetch(10).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].payload, vec![0]);
+        assert_eq!(messages[1].payload, vec![1]);
+        assert_eq!(messages[2].payload, vec![2]);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_server_error_reply_is_surfaced() {
+        let mut script = frame(FrameType::Info, b"");
+        script.extend(frame(FrameType::Err, b"boom"));
+        let (addr, handle) = raw_server(script);
+        let mut c = Client::connect(addr).unwrap();
+        match c
+            .produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                payload: b"x",
+            })
+            .unwrap_err()
+        {
+            ClientError::Server(m) => assert_eq!(m, "boom"),
+            other => panic!("expected Server, got {other:?}"),
+        }
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_fenced_ack_returns_false() {
+        let mut script = frame(FrameType::Info, b"");
+        script.extend(frame(FrameType::Ok, &[0u8])); // fenced
+        let (addr, handle) = raw_server(script);
+        let mut c = Client::connect(addr).unwrap();
+        assert!(!c.ack(7, 3).unwrap());
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn an_eight_byte_ok_is_not_misread_as_a_committed_ack() {
+        // A pub-shaped eight-byte Ok whose low byte is 1 must NOT read as a commit.
+        let mut script = frame(FrameType::Info, b"");
+        script.extend(frame(FrameType::Ok, &1u64.to_le_bytes()));
+        let (addr, handle) = raw_server(script);
+        let mut c = Client::connect(addr).unwrap();
+        match c.ack(0, 0).unwrap_err() {
+            ClientError::BadResponse(_) => {}
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_rejects_more_deliveries_than_the_requested_credit() {
+        fn deliver(offset: u64) -> Vec<u8> {
+            let mut body = Vec::new();
+            encode_deliver(
+                &DeliverBody {
+                    offset,
+                    generation: 1,
+                    flags: 0,
+                    timestamp_ms: 0,
+                    key: b"",
+                    headers: b"",
+                    payload: b"m",
+                },
+                &mut body,
+            )
+            .unwrap();
+            frame(FrameType::Deliver, &body)
+        }
+        let mut script = frame(FrameType::Info, b"");
+        script.extend(deliver(0));
+        script.extend(deliver(1)); // one past the credit of 1
+        let (addr, handle) = raw_server(script);
+        let mut c = Client::connect(addr).unwrap();
+        match c.fetch(1).unwrap_err() {
+            ClientError::BadResponse(_) => {}
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn an_unknown_frame_type_is_reported_with_its_tag() {
+        let mut script = frame(FrameType::Info, b"");
+        script.extend(raw_frame(200, b"")); // tag 200 is not a known FrameType
+        let (addr, handle) = raw_server(script);
+        let mut c = Client::connect(addr).unwrap();
+        match c.ping().unwrap_err() {
+            ClientError::UnknownFrameType(200) => {}
+            other => panic!("expected UnknownFrameType(200), got {other:?}"),
+        }
+        drop(c);
         handle.join().unwrap();
     }
 }
