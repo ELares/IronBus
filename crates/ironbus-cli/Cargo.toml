@@ -12,5 +12,12 @@ authors.workspace = true
 name = "ironbus"
 path = "src/main.rs"
 
+[dependencies]
+ironbus-core = { path = "../ironbus-core", version = "0.0.0" }
+ironbus-proto = { path = "../ironbus-proto", version = "0.0.0" }
+ironbus-client = { path = "../ironbus-client", version = "0.0.0" }
+ironbus-server = { path = "../ironbus-server", version = "0.0.0" }
+ironbus-storage = { path = "../ironbus-storage", version = "0.0.0" }
+
 [lints]
 workspace = true
