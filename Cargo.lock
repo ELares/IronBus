@@ -155,6 +155,12 @@ version = "0.0.0"
 [[package]]
 name = "ironbus-client"
 version = "0.0.0"
+dependencies = [
+ "ironbus-core",
+ "ironbus-proto",
+ "ironbus-server",
+ "ironbus-storage",
+]
 
 [[package]]
 name = "ironbus-core"
