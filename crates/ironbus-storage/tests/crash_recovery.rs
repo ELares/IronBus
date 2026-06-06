@@ -471,6 +471,43 @@ fn a_torn_write_during_append_is_truncated_by_recovery() {
     assert_prefix(&log, durable);
 }
 
+#[test]
+fn recovery_is_idempotent_after_a_fault_during_recovery() {
+    // Build a synced log with a torn tail on a SHARED in-memory disk, then crash (fault)
+    // DURING recovery: the tail-truncation's sync_all returns EIO, so the first reopen fails.
+    // A second reopen, with the fault cleared, recovers the same valid prefix. Recovery is
+    // idempotent and retryable, never leaving the log unopenable.
+    let disk = InMemoryFs::new();
+    let n = 6u64;
+    {
+        let mut log = Log::open(disk.clone(), ManualClock::new(), big_config()).unwrap();
+        for i in 0..n {
+            append_at(&mut log, i);
+        }
+        log.sync().unwrap();
+    }
+    // Tear a few bytes off the last record so recovery must truncate it.
+    let seg = disk.open(&segment_file_name(0)).unwrap();
+    let len = seg.len().unwrap();
+    seg.set_len(len - 3).unwrap();
+    seg.sync_data().unwrap();
+    drop(seg);
+
+    // Crash during recovery: wrap a shared handle in a FaultFs, arm a sync fault. Recovery's
+    // set_len succeeds but its sync_all faults, so the first open fails cleanly (no panic).
+    let (faultfs, control) = FaultFs::new(disk.clone());
+    control.set_fail_sync(true);
+    assert!(
+        Log::open(faultfs, ManualClock::new(), big_config()).is_err(),
+        "a fault during recovery surfaces as a clean error"
+    );
+
+    // Idempotent retry: a clean reopen of the same disk recovers the valid prefix.
+    let log = Log::open(disk.clone(), ManualClock::new(), big_config()).unwrap();
+    assert_eq!(log.flushed_offset(), Offset::new(n - 1));
+    assert_prefix(&log, n - 1);
+}
+
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
         3 => Just(Op::Append),

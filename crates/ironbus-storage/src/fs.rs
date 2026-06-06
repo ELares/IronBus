@@ -90,9 +90,12 @@ struct DirState {
 /// set and reverts every surviving file to its own last-synced content. With this the
 /// simulation can prove recovery never resurrects a half-created segment and never
 /// loses a durably created one.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct InMemoryFs {
-    state: Mutex<DirState>,
+    /// Shared behind an `Arc`, so cloning a handle aliases the SAME disk. A test can keep a
+    /// probe handle to drive [`InMemoryFs::simulate_power_loss`] or inspect the durable image
+    /// after the fs has been moved into an engine or wrapped in a fault layer.
+    state: Arc<Mutex<DirState>>,
 }
 
 impl InMemoryFs {
@@ -262,6 +265,28 @@ mod tests {
 
     fn write_all(f: &Arc<InMemoryFile>, bytes: &[u8]) {
         f.write_all_at(bytes, 0).unwrap();
+    }
+
+    #[test]
+    fn a_clone_aliases_the_same_disk() {
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        // A file created and synced through one handle is visible on the clone, durably.
+        let f = fs.create_new("seg").unwrap();
+        write_all(&f, b"hello");
+        f.sync_data().unwrap();
+        fs.sync_dir().unwrap();
+        assert!(probe.exists("seg").unwrap());
+        // A power loss driven through the clone reverts the other handle's view too: the
+        // synced bytes survive, an unsynced overwrite does not.
+        f.write_all_at(b"WORLD", 0).unwrap(); // unsynced
+        probe.simulate_power_loss();
+        let mut buf = [0u8; 5];
+        fs.open("seg").unwrap().read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(
+            &buf, b"hello",
+            "the unsynced overwrite was reverted on both handles"
+        );
     }
 
     #[test]
