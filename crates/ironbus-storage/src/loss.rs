@@ -205,6 +205,18 @@ impl LossReport {
             .fold(0u64, |acc, e| acc.saturating_add(e.bytes_skipped))
     }
 
+    /// The records dropped by events with `reason` (saturating estimate): the per-reason
+    /// complement of [`LossReport::bytes_skipped_for`], for the `ironbus_recovery_loss_records`
+    /// metric series so an operator sees not just how many bytes recovery dropped but how
+    /// many records, by reason.
+    #[must_use]
+    pub fn records_lost_for(&self, reason: ReasonCode) -> u64 {
+        self.events
+            .iter()
+            .filter(|e| e.reason_code == reason)
+            .fold(0u64, |acc, e| acc.saturating_add(e.records_lost_estimate))
+    }
+
     /// The global loss cap in bytes for a log holding `durable_bytes` of durable data, using
     /// the default fraction ([`LossReport::GLOBAL_LOSS_CAP_NUMERATOR`] over
     /// [`LossReport::GLOBAL_LOSS_CAP_DENOMINATOR`], 1%). Integer math, rounding down.
@@ -450,6 +462,24 @@ mod tests {
         let labels: std::collections::BTreeSet<_> =
             ReasonCode::ALL.iter().map(|rc| rc.metric_label()).collect();
         assert_eq!(labels.len(), 5, "labels are distinct");
+    }
+
+    #[test]
+    fn records_lost_for_sums_per_reason() {
+        // Per-reason record counts mirror the per-reason byte counts: distinct estimates
+        // sum by reason and across all reasons to the grand total.
+        let mut r = LossReport::new();
+        r.push(LossEvent::span(0, 0, 10, 2, ReasonCode::TornTail));
+        r.push(LossEvent::span(1, 0, 30, 7, ReasonCode::CorruptRecordBody));
+        r.push(LossEvent::span(2, 0, 5, 3, ReasonCode::TornTail));
+        assert_eq!(r.records_lost_for(ReasonCode::TornTail), 5);
+        assert_eq!(r.records_lost_for(ReasonCode::CorruptRecordBody), 7);
+        assert_eq!(r.records_lost_for(ReasonCode::SequenceGap), 0);
+        let by_reason: u64 = ReasonCode::ALL
+            .iter()
+            .map(|&rc| r.records_lost_for(rc))
+            .sum();
+        assert_eq!(by_reason, r.total_records_lost_estimate());
     }
 
     #[test]
