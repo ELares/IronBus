@@ -14,7 +14,7 @@
 //! in Prometheus text format, including the `ironbus_fsync_seconds` produce-fsync latency
 //! histogram, and the per-reason recovery-loss series `ironbus_recovery_loss_bytes` (#16).
 
-use crate::engine::Counters;
+use crate::engine::{Counters, GroupConsumerStat};
 use crate::metrics::{LatencyHistogram, FSYNC_BUCKET_LE_SECONDS};
 use crate::server::SharedEngine;
 use ironbus_core::clock::Clock;
@@ -155,6 +155,7 @@ where
                         .map_or(-1i64, |o| i64::try_from(o.get()).unwrap_or(i64::MAX)),
                     counters: g.counters(),
                     fsync: g.fsync_histogram(),
+                    groups: g.group_consumer_stats(),
                 }
             };
             respond(&mut stream, 200, "OK", &metrics_body(snapshot))
@@ -164,7 +165,7 @@ where
 }
 
 /// A consistent snapshot of the metric inputs, read under one engine lock.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct MetricsSnapshot {
     committed: u64,
     flushed: u64,
@@ -177,6 +178,8 @@ struct MetricsSnapshot {
     last_dead_lettered: i64,
     counters: Counters,
     fsync: LatencyHistogram,
+    /// Per-work-group consumer position, for the lag-by-cursor series (#15, #16).
+    groups: Vec<GroupConsumerStat>,
 }
 
 /// Renders the Prometheus text exposition body from an engine snapshot. Consumer lag is the
@@ -192,6 +195,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         last_dead_lettered,
         counters,
         fsync,
+        groups,
     } = snapshot;
     let lag = flushed.saturating_sub(committed);
     let mut body = format!(
@@ -240,7 +244,54 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
     );
     body.push_str(&recovery_loss_lines(&recovery_loss));
     body.push_str(&fsync_histogram_lines(&fsync));
+    body.push_str(&group_consumer_lines(&groups, flushed));
     body
+}
+
+/// Escapes a work-group name for a Prometheus label value: backslash, double-quote, and
+/// newline per the exposition format. Group names are graphic ASCII (no newlines), but the
+/// escape is applied unconditionally so a future relaxation cannot break the exposition.
+fn escape_label(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Renders the per-work-group consumer series (#15, #16): committed offset, lag, and
+/// in-flight depth labeled by `group`, so an operator sees lag broken down by cursor. Lag is
+/// the durable head minus the group's committed offset.
+fn group_consumer_lines(groups: &[GroupConsumerStat], flushed: u64) -> String {
+    let mut s = String::from(
+        "# HELP ironbus_group_committed_offset The committed offset of a work-group's cursor.\n\
+         # TYPE ironbus_group_committed_offset gauge\n\
+         # HELP ironbus_group_consumer_lag Durable records not yet committed by a work-group.\n\
+         # TYPE ironbus_group_consumer_lag gauge\n\
+         # HELP ironbus_group_in_flight Messages leased but not yet acked in a work-group.\n\
+         # TYPE ironbus_group_in_flight gauge\n",
+    );
+    for stat in groups {
+        let label = escape_label(&stat.group);
+        let lag = flushed.saturating_sub(stat.committed);
+        let _ = writeln!(
+            s,
+            "ironbus_group_committed_offset{{group=\"{label}\"}} {}",
+            stat.committed
+        );
+        let _ = writeln!(s, "ironbus_group_consumer_lag{{group=\"{label}\"}} {lag}");
+        let _ = writeln!(
+            s,
+            "ironbus_group_in_flight{{group=\"{label}\"}} {}",
+            stat.in_flight
+        );
+    }
+    s
 }
 
 /// Renders the per-reason recovery-loss gauge `ironbus_recovery_loss_bytes{reason=...}` from the
@@ -470,6 +521,74 @@ mod tests {
         assert!(acked.contains("\nironbus_in_flight 0\n"), "{acked}");
         assert!(acked.contains("\nironbus_acks_total 1\n"), "{acked}");
 
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn group_label_escapes_special_chars() {
+        // A group name may contain a quote or backslash (both graphic ASCII); the label
+        // must escape them so the Prometheus exposition stays well-formed.
+        assert_eq!(escape_label("plain"), "plain");
+        assert_eq!(escape_label("a\"b"), "a\\\"b");
+        assert_eq!(escape_label("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn metrics_expose_per_group_consumer_lag() {
+        // Lag broken down by cursor (#15, #16): with consumer groups, /metrics carries a
+        // per-group committed/lag/in-flight series, not just the default group.
+        let (addr, shutdown, handle, engine) = start();
+        {
+            let mut g = engine.lock().unwrap();
+            for payload in [&b"a"[..], &b"b"[..], &b"c"[..]] {
+                g.produce(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                })
+                .unwrap();
+            }
+            // Group "orders" consumes and acks the first message: committed advances to 1.
+            match g.poll_in("orders", 0).unwrap() {
+                Poll::Message(d) => assert_eq!(g.ack_in("orders", &d.token), AckResult::Acked),
+                other => panic!("expected a message, got {other:?}"),
+            }
+            // Group "billing" leases one but does not ack: 1 in-flight, committed stays 0.
+            assert!(matches!(g.poll_in("billing", 0).unwrap(), Poll::Message(_)));
+        }
+        let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(m.starts_with("HTTP/1.1 200 OK"), "{m}");
+        assert!(m.contains("# TYPE ironbus_group_consumer_lag gauge"), "{m}");
+        // The default group is always present.
+        assert!(
+            m.contains("ironbus_group_committed_offset{group=\"\"} 0"),
+            "{m}"
+        );
+        // orders: committed 1, lag 3-1=2, no in-flight (it acked).
+        assert!(
+            m.contains("ironbus_group_committed_offset{group=\"orders\"} 1"),
+            "{m}"
+        );
+        assert!(
+            m.contains("ironbus_group_consumer_lag{group=\"orders\"} 2"),
+            "{m}"
+        );
+        assert!(
+            m.contains("ironbus_group_in_flight{group=\"orders\"} 0"),
+            "{m}"
+        );
+        // billing: committed 0, lag 3, one in-flight lease.
+        assert!(
+            m.contains("ironbus_group_consumer_lag{group=\"billing\"} 3"),
+            "{m}"
+        );
+        assert!(
+            m.contains("ironbus_group_in_flight{group=\"billing\"} 1"),
+            "{m}"
+        );
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }

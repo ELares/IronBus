@@ -207,6 +207,18 @@ pub struct Counters {
     pub acks: u64,
 }
 
+/// A snapshot of one work-group's consumer position, for the metrics endpoint (#16): an
+/// operator sees committed offset, lag, and in-flight depth broken down by cursor (#15).
+#[derive(Clone, Debug)]
+pub struct GroupConsumerStat {
+    /// The work-group name (`""` is the default group).
+    pub group: String,
+    /// The group's committed offset (every offset below it is acked in this group).
+    pub committed: u64,
+    /// The group's in-flight (delivered, not yet acked) message count.
+    pub in_flight: usize,
+}
+
 /// The durable, unnamed default work-group: the one the wire protocol uses today, the one
 /// persisted in `cursor.ckpt`. Named groups (#9) are independent in-memory cursors.
 const DEFAULT_GROUP: &str = "";
@@ -740,6 +752,21 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     #[must_use]
     pub fn in_flight(&self) -> usize {
         self.groups.values().map(|g| g.leases.in_flight()).sum()
+    }
+
+    /// Per-work-group consumer stats for the metrics endpoint (#16): committed offset and
+    /// in-flight depth for each group, so an operator sees lag broken down by cursor (#15).
+    /// The lag itself is derived against the durable head ([`Engine::flushed_offset`]).
+    #[must_use]
+    pub fn group_consumer_stats(&self) -> Vec<GroupConsumerStat> {
+        self.groups
+            .iter()
+            .map(|(group, g)| GroupConsumerStat {
+                group: group.clone(),
+                committed: g.cursor.committed().get(),
+                in_flight: g.leases.in_flight(),
+            })
+            .collect()
     }
 
     /// Whether the broker is healthy: the durable log writer is not frozen. A frozen writer
