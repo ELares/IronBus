@@ -355,6 +355,7 @@ mod tests {
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
                 max_in_flight: 16,
+                checkpoint_interval: 1024,
             },
         )
         .unwrap();

@@ -110,6 +110,10 @@ where
     loop {
         let n = stream.read(&mut chunk)?;
         if n == 0 {
+            // The client closed: flush the committed cursor so a clean reconnect resumes past
+            // acked messages. Best-effort: the checkpoint is a lagging optimization.
+            let mut guard = engine.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = guard.checkpoint_cursor();
             return Ok(()); // the client closed the connection
         }
         inbuf.extend_from_slice(&chunk[..n]);
@@ -118,7 +122,14 @@ where
         // Hold the engine lock only for the (synchronous, non-blocking) dispatch.
         let result = {
             let mut guard = engine.lock().unwrap_or_else(PoisonError::into_inner);
-            session.process(&mut guard, &inbuf, &mut out)
+            let r = session.process(&mut guard, &inbuf, &mut out);
+            if r.is_ok() {
+                // Persist the committed cursor on the configured interval so a crash redelivers
+                // a bounded tail. Best-effort: a checkpoint write failure only costs redelivery
+                // on restart, never correctness, so it must not fail the connection.
+                let _ = guard.maybe_checkpoint();
+            }
+            r
         };
         if let Ok(consumed) = result {
             inbuf.drain(..consumed);
@@ -152,6 +163,7 @@ mod tests {
             lease: LeaseConfig::default(),
             delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
             max_in_flight: 16,
+            checkpoint_interval: 1024,
         }
     }
 

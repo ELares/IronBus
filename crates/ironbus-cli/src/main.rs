@@ -52,6 +52,10 @@ const DEFAULT_MAX_CONNECTIONS: usize = 256;
 /// The default in-flight window for the `serve` engine.
 #[cfg(unix)]
 const DEFAULT_MAX_IN_FLIGHT: u32 = 1024;
+/// The default cursor-checkpoint interval for the `serve` engine: at most this many messages
+/// are redelivered after an abrupt crash (a clean disconnect flushes the cursor sooner).
+#[cfg(unix)]
+const DEFAULT_CHECKPOINT_INTERVAL: u64 = 1024;
 
 /// Frozen exit codes (subset in use for these verbs), per issue #91.
 const EXIT_USAGE: u8 = 1;
@@ -342,7 +346,7 @@ fn cmd_serve(
     max_connections: usize,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
-    let shared = open_disk_engine(data_dir, DEFAULT_MAX_IN_FLIGHT)?;
+    let shared = open_disk_engine(data_dir, DEFAULT_MAX_IN_FLIGHT, DEFAULT_CHECKPOINT_INTERVAL)?;
     let listener = TcpListener::bind(addr)
         .map_err(|e| CliError::Internal(format!("cannot bind {addr}: {e}")))?;
     let local = listener
@@ -380,6 +384,7 @@ fn cmd_serve(
 fn open_disk_engine(
     data_dir: &Path,
     max_in_flight: u32,
+    checkpoint_interval: u64,
 ) -> Result<SharedEngine<StdFs, SystemClock>, CliError> {
     std::fs::create_dir_all(data_dir)
         .map_err(|e| CliError::Internal(format!("cannot create {}: {e}", data_dir.display())))?;
@@ -394,6 +399,7 @@ fn open_disk_engine(
             lease: LeaseConfig::default(),
             delivery,
             max_in_flight,
+            checkpoint_interval,
         },
     )
     .map_err(|e| CliError::Internal(format!("opening broker at {}: {e}", data_dir.display())))?;
@@ -428,6 +434,7 @@ mod tests {
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, Vec::new()).unwrap(),
                 max_in_flight: 16,
+                checkpoint_interval: 1024,
             },
         )
         .unwrap();
@@ -576,7 +583,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ironbus-cli-it-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let shared = open_disk_engine(&dir, 64).unwrap();
+        let shared = open_disk_engine(&dir, 64, 1).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -599,12 +606,11 @@ mod tests {
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
 
-        // Restart: reopen the SAME data dir. The append was fsynced before its offset was
-        // returned, so the record is durable: a fresh publish continues at offset 1 rather
-        // than overwriting offset 0. The committed cursor is NOT yet persisted on ack by the
-        // server (the durable-cursor wiring is tracked as a follow-up), so the acked message
-        // redelivers: safe at-least-once (a duplicate, never a loss).
-        let reopened = open_disk_engine(&dir, 64).unwrap();
+        // Restart: reopen the SAME data dir. With checkpoint_interval = 1, the server
+        // persisted the committed cursor synchronously when it acked offset 0, so a clean
+        // restart RESUMES past the acked message (it does not redeliver), and the durable log
+        // continues at offset 1 rather than overwriting offset 0.
+        let reopened = open_disk_engine(&dir, 64, 1).unwrap();
         let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr2 = listener2.local_addr().unwrap();
         let shutdown2 = Arc::new(AtomicBool::new(false));
@@ -614,12 +620,12 @@ mod tests {
         });
         let a2 = addr2.to_string();
 
-        let mut redelivered = Vec::new();
-        cmd_sub(&a2, 10, false, &mut redelivered).unwrap();
-        let rtext = String::from_utf8(redelivered).unwrap();
-        assert!(
-            rtext.contains("#0 ") && rtext.contains("payload=on-disk"),
-            "durable record did not survive restart: {rtext}"
+        let mut after_restart = Vec::new();
+        cmd_sub(&a2, 10, false, &mut after_restart).unwrap();
+        assert_eq!(
+            String::from_utf8(after_restart).unwrap(),
+            "fetched 0 message(s)\n",
+            "acked message redelivered after restart: cursor was not checkpointed"
         );
 
         let mut next = Vec::new();

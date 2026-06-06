@@ -302,6 +302,7 @@ mod tests {
                 },
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
                 max_in_flight: 10,
+                checkpoint_interval: 1024,
             },
         )
         .unwrap()
@@ -369,6 +370,7 @@ mod tests {
                 },
                 delivery: DeliveryConfig::new(max_deliver, false, vec![]).unwrap(),
                 max_in_flight: 10,
+                checkpoint_interval: 1024,
             },
         )
         .unwrap()
