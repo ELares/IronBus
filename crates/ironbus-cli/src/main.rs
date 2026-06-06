@@ -82,7 +82,8 @@ ironbus: a durable edge message queue.
 
 USAGE:
     ironbus serve --data-dir <dir> [--addr <host:port>] [--max-connections <n>]
-                  [--checkpoint-interval <n>] [--max-deliver <n>] [--health-addr <host:port>]
+                  [--checkpoint-interval <n>] [--max-deliver <n>] [--max-in-flight <n>]
+                  [--health-addr <host:port>]
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
     ironbus sub   [--addr <host:port>] [--max <n>] [--ack | --nack [--delay-ms <n>] | --term]
     ironbus help
@@ -402,6 +403,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
     let mut checkpoint_interval = DEFAULT_CHECKPOINT_INTERVAL;
     let mut max_deliver = DEFAULT_MAX_DELIVER;
+    let mut max_in_flight = DEFAULT_MAX_IN_FLIGHT;
     let mut health_addr: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
@@ -426,6 +428,12 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
                 let raw = take_value("--max-deliver", args, &mut i)?;
                 max_deliver = raw.parse::<u32>().map_err(|_| {
                     CliError::Usage(format!("`--max-deliver` needs a number, got `{raw}`"))
+                })?;
+            }
+            "--max-in-flight" => {
+                let raw = take_value("--max-in-flight", args, &mut i)?;
+                max_in_flight = raw.parse::<u32>().map_err(|_| {
+                    CliError::Usage(format!("`--max-in-flight` needs a number, got `{raw}`"))
                 })?;
             }
             "--health-addr" => health_addr = Some(take_value("--health-addr", args, &mut i)?),
@@ -457,32 +465,48 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
                 .to_string(),
         ));
     }
+    if max_in_flight == 0 {
+        // A zero window delivers nothing; the engine rejects it, so catch it as a usage error.
+        return Err(CliError::Usage(
+            "`--max-in-flight` must be at least 1".to_string(),
+        ));
+    }
     cmd_serve(
         &addr,
         Path::new(&data_dir),
-        max_connections,
-        checkpoint_interval,
-        max_deliver,
+        ServeConfig {
+            max_connections,
+            checkpoint_interval,
+            max_deliver,
+            max_in_flight,
+        },
         health_addr.as_deref(),
         out,
     )
+}
+
+/// The broker tuning knobs parsed from the `serve` flags.
+#[derive(Clone, Copy)]
+struct ServeConfig {
+    max_connections: usize,
+    checkpoint_interval: u64,
+    max_deliver: u32,
+    max_in_flight: u32,
 }
 
 #[cfg(unix)]
 fn cmd_serve(
     addr: &str,
     data_dir: &Path,
-    max_connections: usize,
-    checkpoint_interval: u64,
-    max_deliver: u32,
+    config: ServeConfig,
     health_addr: Option<&str>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     let shared = open_disk_engine(
         data_dir,
-        DEFAULT_MAX_IN_FLIGHT,
-        checkpoint_interval,
-        max_deliver,
+        config.max_in_flight,
+        config.checkpoint_interval,
+        config.max_deliver,
     )?;
     let listener = TcpListener::bind(addr)
         .map_err(|e| CliError::Internal(format!("cannot bind {addr}: {e}")))?;
@@ -519,7 +543,7 @@ fn cmd_serve(
         None
     };
 
-    let result = serve(&listener, &shared, &shutdown, max_connections)
+    let result = serve(&listener, &shared, &shutdown, config.max_connections)
         .map_err(|e| CliError::Internal(format!("serve loop failed: {e}")));
     // The wire serve returns only when shutdown is set, so flip it for the health thread too.
     shutdown.store(true, Ordering::Release);
@@ -534,18 +558,17 @@ fn cmd_serve(
 fn cmd_serve(
     addr: &str,
     data_dir: &Path,
-    max_connections: usize,
-    checkpoint_interval: u64,
-    max_deliver: u32,
+    config: ServeConfig,
     health_addr: Option<&str>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     let _ = (
         addr,
         data_dir,
-        max_connections,
-        checkpoint_interval,
-        max_deliver,
+        config.max_connections,
+        config.checkpoint_interval,
+        config.max_deliver,
+        config.max_in_flight,
         health_addr,
         out,
     );
@@ -793,6 +816,46 @@ mod tests {
         assert_eq!(e.exit_code(), EXIT_USAGE);
         match e {
             CliError::Usage(m) => assert!(m.contains("unlimited"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_rejects_a_non_numeric_max_in_flight() {
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--max-in-flight".to_string(),
+                "lots".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--max-in-flight"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_rejects_a_zero_max_in_flight() {
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-cli-mif0-never-created".to_string(),
+                "--max-in-flight".to_string(),
+                "0".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("at least 1"), "{m}"),
             other => panic!("expected Usage, got {other:?}"),
         }
     }
