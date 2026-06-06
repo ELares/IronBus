@@ -277,6 +277,44 @@ impl Client {
         }
     }
 
+    /// Nacks a fetched message by its offset and fencing generation, asking the broker to
+    /// redeliver it after `delay_ms` (immediately if zero). Returns `true` if the broker
+    /// requeued it, `false` if the token was fenced (stale: it already redelivered or was
+    /// acked, so do not drop local state).
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, a server error, or a wrong-shape reply.
+    pub fn nack(
+        &mut self,
+        offset: u64,
+        generation: u64,
+        delay_ms: u64,
+    ) -> Result<bool, ClientError> {
+        let mut body = Vec::new();
+        encode_ack(
+            &AckBody {
+                op: AckOp::Nack,
+                offset,
+                generation,
+                delay_ms,
+            },
+            &mut body,
+        );
+        self.send(FrameType::Ack, &body)?;
+        match self.read_frame()? {
+            (FrameType::Ok, body) => match body.as_slice() {
+                [status] => Ok(*status == 1),
+                _ => Err(ClientError::BadResponse(
+                    "nack reply was not a one-byte status",
+                )),
+            },
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
     /// Sends a keepalive ping and waits for the pong.
     ///
     /// # Errors
@@ -561,6 +599,46 @@ mod tests {
             other => panic!("expected UnknownFrameType(200), got {other:?}"),
         }
         drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_nacked_message_is_redelivered_against_a_real_server() {
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+        let off = c
+            .produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                payload: b"retry-me",
+            })
+            .unwrap();
+
+        let first = c.fetch(10).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].payload, b"retry-me");
+
+        // Nack with no delay: the broker requeues it (the default 30s visibility means it
+        // would not otherwise redeliver within this test, so the nack is what brings it back).
+        assert!(c.nack(first[0].offset, first[0].generation, 0).unwrap());
+
+        let second = c.fetch(10).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].offset, off);
+        assert_eq!(second[0].payload, b"retry-me");
+        assert_ne!(
+            second[0].generation, first[0].generation,
+            "redelivery fences the old generation"
+        );
+
+        // The stale (nacked) token can no longer commit; the fresh one does.
+        assert!(!c.ack(first[0].offset, first[0].generation).unwrap());
+        assert!(c.ack(second[0].offset, second[0].generation).unwrap());
+        assert!(c.fetch(10).unwrap().is_empty());
+
+        shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
 }

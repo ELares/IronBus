@@ -19,7 +19,7 @@
 use ironbus_core::clock::Clock;
 use ironbus_core::cursor::AckCursor;
 use ironbus_core::delivery::{DeliveryConfig, Disposition};
-use ironbus_core::lease::{AckOutcome, Claim, LeaseConfig, LeaseTable, LeaseToken};
+use ironbus_core::lease::{AckOutcome, Claim, LeaseConfig, LeaseTable, LeaseToken, NackOutcome};
 use ironbus_core::types::Offset;
 use ironbus_storage::checkpoint::Checkpoint;
 use ironbus_storage::fs::Filesystem;
@@ -145,6 +145,15 @@ pub enum AckResult {
     /// The ack matched the current lease; the message is committed.
     Acked,
     /// The token was stale (already acked, or redelivered); the ack was ignored.
+    Fenced,
+}
+
+/// The outcome of [`Engine::nack`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NackResult {
+    /// The message was requeued for redelivery (immediately, or after the requested delay).
+    Requeued,
+    /// The token was stale (already acked, or redelivered); the nack was ignored.
     Fenced,
 }
 
@@ -345,6 +354,26 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
             }
             AckOutcome::Fenced => AckResult::Fenced,
         }
+    }
+
+    /// Nacks the message named by `token`: requeues it for redelivery after `delay_ms`
+    /// (immediately if zero), fencing the nacking holder. The `MaxDeliver` / dead-letter
+    /// decision is made by [`Engine::poll`] when the message is next claimed, so a message
+    /// nacked past its delivery cap is parked rather than looping. `MaxDeliver` is enforced
+    /// there, not here.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::GenerationExhausted`] if the lease generation space is spent.
+    pub fn nack(&mut self, token: &LeaseToken, delay_ms: u64) -> Result<NackResult, EngineError> {
+        let now = self.log.now_monotonic();
+        // Convert the wire delay (milliseconds) to the monotonic-nanosecond units the lease
+        // deadlines use, saturating rather than overflowing on an absurd delay.
+        let delay_nanos = delay_ms.saturating_mul(1_000_000);
+        Ok(match self.leases.nack(token, now, delay_nanos) {
+            NackOutcome::Requeued { .. } => NackResult::Requeued,
+            NackOutcome::Fenced => NackResult::Fenced,
+            NackOutcome::Exhausted => return Err(EngineError::GenerationExhausted),
+        })
     }
 
     /// The committed offset: every offset below it is acked, and where a restart resumes.
@@ -744,6 +773,36 @@ mod tests {
         let d = message(e.poll(0).unwrap());
         assert_eq!(d.offset, Offset::new(1));
         assert_eq!(d.record.payload, b"b");
+    }
+
+    #[test]
+    fn a_nacked_message_redelivers_with_an_escalated_delivery_count() {
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"work");
+        // poll_now and nack share the engine's own clock, so a zero-delay nack is reclaimable
+        // at the same instant and redelivers on the next poll.
+        let d0 = message(e.poll_now().unwrap());
+        assert_eq!(d0.deliveries, 1);
+        assert_eq!(e.nack(&d0.token, 0).unwrap(), NackResult::Requeued);
+        // The nacking token is fenced: a late ack cannot commit the unprocessed message.
+        assert_eq!(e.ack(&d0.token), AckResult::Fenced);
+        // Redelivered: same offset, escalated delivery count, a fresh generation.
+        let d1 = message(e.poll_now().unwrap());
+        assert_eq!(d1.offset, d0.offset);
+        assert_eq!(d1.deliveries, 2);
+        assert_ne!(d1.token.generation, d0.token.generation);
+        // The fresh token commits normally.
+        assert_eq!(e.ack(&d1.token), AckResult::Acked);
+        assert_eq!(e.committed_offset().get(), 1);
+    }
+
+    #[test]
+    fn a_stale_nack_is_fenced() {
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"work");
+        let d0 = message(e.poll_now().unwrap());
+        e.ack(&d0.token); // commit, so the token is now stale
+        assert_eq!(e.nack(&d0.token, 0).unwrap(), NackResult::Fenced);
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //! offset; other `Ok`s have an empty body; an `Err` carries a UTF-8 message. A malformed
 //! frame envelope is unrecoverable for a length-prefixed stream, so it ends the session.
 
-use crate::engine::{AckResult, Engine, EngineError, Poll};
+use crate::engine::{AckResult, Engine, EngineError, NackResult, Poll};
 use ironbus_core::clock::Clock;
 use ironbus_core::types::RecordFlags;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
@@ -169,9 +169,10 @@ impl Session {
         }
     }
 
-    /// Acks a delivered message. NOTE: acks are not connection-scoped, the generation token
-    /// is the sole authority, so any session presenting a matching `(offset, generation)`
-    /// commits it. Per-connection ack ownership is tracked as #175 for the consumer path.
+    /// Acks or nacks a delivered message. NOTE: acknowledgements are not connection-scoped,
+    /// the generation token is the sole authority, so any session presenting a matching
+    /// `(offset, generation)` commits or requeues it. Per-connection ack ownership is tracked
+    /// as #175 for the consumer path.
     fn handle_ack<F: Filesystem, C: Clock>(
         &mut self,
         engine: &mut Engine<F, C>,
@@ -186,22 +187,35 @@ impl Session {
             reply_err(out, "malformed ack body");
             return;
         };
-        // This PR wires the `ack` op (commit). nack/term/progress are the streaming path.
-        if ack.op != AckOp::Ack {
-            reply_err(out, "only ack is supported on this connection");
-            return;
-        }
         let token = ironbus_core::lease::LeaseToken {
             offset: ironbus_core::types::Offset::new(ack.offset),
             generation: ack.generation,
         };
-        // The Ok body is a status byte so the client knows the truth: 1 = committed,
-        // 0 = fenced (the token was stale, the message will redeliver, do NOT drop state).
-        let status = match engine.ack(&token) {
-            AckResult::Acked => 1u8,
-            AckResult::Fenced => 0u8,
-        };
-        reply(out, FrameType::Ok, &[status]);
+        // The Ok body is a one-byte status: for ack, 1 = committed, 0 = fenced; for nack,
+        // 1 = requeued, 0 = fenced. A fenced token means the message already redelivered or
+        // was acked, so the client must NOT drop its state.
+        match ack.op {
+            AckOp::Ack => {
+                let status = match engine.ack(&token) {
+                    AckResult::Acked => 1u8,
+                    AckResult::Fenced => 0u8,
+                };
+                reply(out, FrameType::Ok, &[status]);
+            }
+            AckOp::Nack => match engine.nack(&token, ack.delay_ms) {
+                Ok(NackResult::Requeued) => reply(out, FrameType::Ok, &[1]),
+                Ok(NackResult::Fenced) => reply(out, FrameType::Ok, &[0]),
+                Err(_) => reply_err(out, "the lease generation space is exhausted"),
+            },
+            // term (stop without dead-lettering) and progress (extend the lease) are the next
+            // slice of the ack vocabulary; recognized but not yet wired.
+            AckOp::Term | AckOp::Progress => {
+                reply_err(
+                    out,
+                    "term and progress are not yet supported on this connection",
+                );
+            }
+        }
     }
     /// Fetches up to the requested number of messages and streams them as DELIVER frames,
     /// terminated by an `Ok` whose body is the count delivered (so the client knows the
