@@ -198,6 +198,9 @@ pub struct Engine<F: Filesystem, C: Clock> {
     checkpoint_interval: u64,
     last_checkpointed: u64,
     counters: Counters,
+    /// The offset of the most recently dead-lettered message, or `None` if none has been
+    /// dead-lettered. A gauge-style companion to the `dead_lettered` counter.
+    last_dead_lettered: Option<Offset>,
 }
 
 /// The file name of the work-group's durable committed-cursor checkpoint.
@@ -259,6 +262,7 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
             checkpoint_interval: config.checkpoint_interval,
             last_checkpointed: committed,
             counters: Counters::default(),
+            last_dead_lettered: None,
         })
     }
 
@@ -362,6 +366,7 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
                             self.leases.ack(&token);
                             self.cursor.ack(off);
                             self.counters.dead_lettered += 1;
+                            self.last_dead_lettered = Some(off);
                             Poll::Parked {
                                 offset: off,
                                 record,
@@ -467,6 +472,14 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     #[must_use]
     pub fn counters(&self) -> Counters {
         self.counters
+    }
+
+    /// The log offset of the most recently dead-lettered (parked past `MaxDeliver`) message,
+    /// or `None` if none has been dead-lettered. Pairs with the `dead_lettered` counter to
+    /// report not just how many messages were dropped but which one most recently.
+    #[must_use]
+    pub fn last_dead_lettered_offset(&self) -> Option<Offset> {
+        self.last_dead_lettered
     }
 
     /// The number of messages currently in flight (leased, not yet acked).
@@ -620,6 +633,11 @@ mod tests {
     fn a_message_over_max_deliver_is_parked() {
         let mut e = open(config(10, 1)); // max_deliver 1
         produce(&mut e, b"poison");
+        assert_eq!(
+            e.last_dead_lettered_offset(),
+            None,
+            "none dead-lettered yet"
+        );
         // First delivery.
         let d = message(e.poll(0).unwrap());
         assert_eq!(d.deliveries, 1);
@@ -631,6 +649,9 @@ mod tests {
             }
             other => panic!("expected Parked, got {other:?}"),
         }
+        // The dead-lettered offset is now reported alongside the counter.
+        assert_eq!(e.last_dead_lettered_offset(), Some(Offset::new(0)));
+        assert_eq!(e.counters().dead_lettered, 1);
         // The poison message is committed past and never redelivers.
         assert_eq!(e.committed_offset(), Offset::new(1));
         assert!(matches!(e.poll(80).unwrap(), Poll::Idle));
