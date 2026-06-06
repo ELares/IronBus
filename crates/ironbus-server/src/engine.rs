@@ -456,6 +456,13 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
         self.log.flushed_offset()
     }
 
+    /// Bytes dropped from a torn or unsynced tail at recovery (startup): the raw
+    /// recovery-loss signal an operator can surface, zero on a clean start.
+    #[must_use]
+    pub fn recovered_truncated_bytes(&self) -> u64 {
+        self.log.recovered_truncated_bytes()
+    }
+
     /// A snapshot of the operational counters (monotonic since process start).
     #[must_use]
     pub fn counters(&self) -> Counters {

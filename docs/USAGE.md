@@ -130,6 +130,7 @@ ironbus_flushed_offset        the durable log head
 ironbus_consumer_lag          flushed minus committed (the headline lag signal)
 ironbus_in_flight             leased but not yet acked
 ironbus_writer_healthy        1 live, 0 frozen
+ironbus_recovery_truncated_bytes  bytes dropped from a torn tail at the last recovery
 ironbus_produced_total        messages appended
 ironbus_delivered_total       deliveries handed out (a redelivery counts again)
 ironbus_redelivered_total     deliveries that were a redelivery
