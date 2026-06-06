@@ -844,6 +844,13 @@ proptest! {
     /// invariants. It must NEVER panic; it either recovers a valid prefix (I2) that preserves
     /// every durably acked record (I1), or fails closed with a typed error. A buggy recovery
     /// that lost an acked record, read past a torn tail, or panicked on an IO fault fails here.
+    ///
+    /// Coverage note: recovering a CLEAN image always READS, so the read faults (`FailRead`,
+    /// `ShortRead`) fire on every case. The write and sync faults fire only when recovery itself
+    /// writes or syncs, which a clean image seldom triggers (a truncation `sync_all` needs a torn
+    /// tail; a roll-forward header write needs a sealed highest segment). Forcing those write
+    /// paths under the write/sync/torn faults is the targeted follow-up #231; here those arms
+    /// assert the invariant holds whether or not the fault triggers.
     #[test]
     fn recovery_under_an_arbitrary_seeded_fault_holds_the_invariants(
         ops in prop::collection::vec(op_strategy(), 0..30),
