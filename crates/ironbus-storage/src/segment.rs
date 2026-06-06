@@ -8,6 +8,7 @@
 //! the foundation of recovery.
 
 use crate::io::RandomAccessFile;
+use crate::loss::ReasonCode;
 use ironbus_core::codec::{self, DecodeError, RecordView};
 use ironbus_core::format::{RECORD_HEADER_LEN, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN};
 use ironbus_core::segment::{SegmentError, SegmentFooter, SegmentHeader};
@@ -367,6 +368,9 @@ pub struct RecoveryScan {
     pub last_seq: Seq,
     /// `true` if every byte up to the footer or end was a valid record (no torn tail).
     pub clean: bool,
+    /// Why the valid prefix ended early, if it did: the reason the bytes after `valid_end`
+    /// were dropped (a torn tail or a corrupt frame). `None` for a clean or sealed segment.
+    pub tail_reason: Option<ReasonCode>,
     /// The byte offset at which the valid record region ends (the durable prefix length).
     pub valid_end: u64,
 }
@@ -381,6 +385,8 @@ struct BodyWalk {
     cursor: u64,
     /// `true` if the region decoded cleanly with no torn or corrupt tail.
     clean: bool,
+    /// Why the walk stopped early, if it did (torn tail or corrupt frame). `None` when clean.
+    tail_reason: Option<ReasonCode>,
 }
 
 /// Reads a segment file: validates the header and scans its records.
@@ -571,6 +577,7 @@ impl<F: RandomAccessFile> SegmentReader<F> {
                     record_count: walk.count,
                     last_seq: walk.last_seq,
                     clean: true,
+                    tail_reason: None,
                     valid_end: body_end,
                 });
             }
@@ -585,6 +592,7 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             record_count: walk.count,
             last_seq: walk.last_seq,
             clean: walk.clean,
+            tail_reason: walk.tail_reason,
             valid_end: header_end + walk.cursor,
         })
     }
@@ -600,25 +608,26 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         let mut pos = start;
         let mut count = 0u64;
         let mut last_seq = self.header.base_seq;
-        let mut clean = true;
+        let mut tail_reason: Option<ReasonCode> = None;
         while pos < end {
             let remaining = end - pos;
             if remaining < RECORD_HEADER_LEN as u64 {
                 // Fewer bytes than a record header: a torn tail, not a whole record.
-                clean = false;
+                tail_reason = Some(ReasonCode::TornTail);
                 break;
             }
             // Read just the header to learn the frame length without buffering the body.
             scratch.resize(RECORD_HEADER_LEN, 0);
             self.file.read_exact_at(&mut scratch, pos)?;
             let Ok(total) = codec::decoded_len(&scratch) else {
-                // A corrupt header ends the valid prefix; recovery skips the rest.
-                clean = false;
+                // A bad magic, version, or header CRC: a corrupt header ends the valid prefix.
+                tail_reason = Some(ReasonCode::CorruptRecordHeader);
                 break;
             };
             if total as u64 > remaining {
-                // The frame would run past the region: a torn tail.
-                clean = false;
+                // The header is intact but the frame would run past the region: a torn tail
+                // (the body was never fully written).
+                tail_reason = Some(ReasonCode::TornTail);
                 break;
             }
             // Read the rest of the frame after the header, then validate the whole record.
@@ -628,8 +637,8 @@ impl<F: RandomAccessFile> SegmentReader<F> {
                 pos + RECORD_HEADER_LEN as u64,
             )?;
             let Ok((view, consumed)) = codec::decode(&scratch) else {
-                // A corrupt body (or trailer) ends the valid prefix.
-                clean = false;
+                // The header was intact but the body or trailer failed: a corrupt body.
+                tail_reason = Some(ReasonCode::CorruptRecordBody);
                 break;
             };
             // Sequence continuity: a CRC-valid frame with the wrong seq is a recycled or
@@ -655,7 +664,8 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             count,
             last_seq,
             cursor: pos - start,
-            clean,
+            clean: tail_reason.is_none(),
+            tail_reason,
         })
     }
 }
