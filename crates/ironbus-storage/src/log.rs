@@ -90,6 +90,10 @@ pub struct Log<F: Filesystem, C: Clock> {
     flushed_offset: Offset,
     /// Every segment in the log, sorted by base offset, for offset-to-segment lookup.
     segments: Vec<SegmentSlot>,
+    /// Bytes dropped from a torn or unsynced active-segment tail at recovery: the silent
+    /// loss that recovery truncates to reach the last intact record. Zero for a fresh log
+    /// or a clean recovery.
+    recovered_truncated_bytes: u64,
 }
 
 impl<F: Filesystem, C: Clock> Log<F, C> {
@@ -117,6 +121,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     next_seq: Seq::new(0),
                     flushed_offset: Offset::ZERO,
                     segments: Vec::new(),
+                    recovered_truncated_bytes: 0,
                 };
                 log.start_segment(FIRST_SEGMENT_ID, Seq::new(0), Offset::ZERO)?;
                 Ok(log)
@@ -206,6 +211,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             // Everything recovered is durable, so the flush mark is the recovered head.
             flushed_offset: next_offset,
             segments: slots,
+            recovered_truncated_bytes: 0,
         };
 
         if scan.footer.is_some() {
@@ -218,7 +224,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             // set_len changes the length, so it needs sync_all, not sync_data.
             let name = segment_file_name(last_id);
             let file = log.fs.open(&name)?;
-            if scan.valid_end < file.len()? {
+            let len = file.len()?;
+            if scan.valid_end < len {
+                // Record the silent loss before dropping it, so an operator can see that a
+                // torn or unsynced tail was discarded at recovery.
+                log.recovered_truncated_bytes = len - scan.valid_end;
                 file.set_len(scan.valid_end)?;
                 file.sync_all()?;
             }
@@ -390,6 +400,15 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     #[must_use]
     pub fn flushed_offset(&self) -> Offset {
         self.flushed_offset
+    }
+
+    /// Bytes dropped from a torn or unsynced active-segment tail at recovery: the silent
+    /// loss that recovery truncated to reach the last intact record. Zero for a fresh log
+    /// or a clean recovery. This is the raw recovery-loss signal an operator can surface;
+    /// the structured loss report is later work (#120).
+    #[must_use]
+    pub fn recovered_truncated_bytes(&self) -> u64 {
+        self.recovered_truncated_bytes
     }
 
     /// The current monotonic time from the log's clock, for the consumer's lease deadlines.
@@ -1134,6 +1153,44 @@ mod tests {
         assert_eq!(mid.len(), 12);
         assert_eq!(mid[0].offset, Offset::new(3));
         assert_eq!(mid[11].offset, Offset::new(14));
+    }
+
+    #[test]
+    fn recovery_reports_the_truncated_tail_bytes() {
+        let mut log = open_mem(LogConfig::default());
+        for i in 0..4u8 {
+            log.append(&rec(&[i; 8])).unwrap();
+        }
+        log.sync().unwrap();
+        let fs = log.into_filesystem();
+
+        // A clean reopen reports zero loss.
+        let clean = Log::open(fs, ManualClock::new(), LogConfig::default()).unwrap();
+        assert_eq!(clean.recovered_truncated_bytes(), 0);
+        assert_eq!(clean.flushed_offset(), Offset::new(4));
+        let fs = clean.into_filesystem();
+
+        // Tear three bytes off the last record: recovery drops the partial tail and reports
+        // exactly the number of bytes it discarded (the pre-recovery length minus the
+        // post-recovery length).
+        let file = fs.open(&segment_file_name(0)).unwrap();
+        let torn_len = file.len().unwrap() - 3;
+        file.set_len(torn_len).unwrap();
+        file.sync_data().unwrap();
+        let torn = Log::open(fs, ManualClock::new(), LogConfig::default()).unwrap();
+        assert_eq!(
+            torn.flushed_offset(),
+            Offset::new(3),
+            "the torn record is dropped"
+        );
+        let post_len = torn
+            .filesystem()
+            .open(&segment_file_name(0))
+            .unwrap()
+            .len()
+            .unwrap();
+        assert!(torn.recovered_truncated_bytes() > 0);
+        assert_eq!(torn.recovered_truncated_bytes(), torn_len - post_len);
     }
 
     #[test]

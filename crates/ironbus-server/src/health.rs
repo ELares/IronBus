@@ -133,13 +133,14 @@ where
             }
         }
         "/metrics" => {
-            let (committed, flushed, in_flight, healthy, counters) = {
+            let (committed, flushed, in_flight, healthy, recovered_truncated, counters) = {
                 let g = engine.lock().unwrap_or_else(PoisonError::into_inner);
                 (
                     g.committed_offset().get(),
                     g.flushed_offset().get(),
                     g.in_flight(),
                     g.is_healthy(),
+                    g.recovered_truncated_bytes(),
                     g.counters(),
                 )
             };
@@ -147,7 +148,14 @@ where
                 &mut stream,
                 200,
                 "OK",
-                &metrics_body(committed, flushed, in_flight, healthy, counters),
+                &metrics_body(
+                    committed,
+                    flushed,
+                    in_flight,
+                    healthy,
+                    recovered_truncated,
+                    counters,
+                ),
             )
         }
         _ => respond(&mut stream, 404, "Not Found", "unknown endpoint"),
@@ -161,6 +169,7 @@ fn metrics_body(
     flushed: u64,
     in_flight: usize,
     healthy: bool,
+    recovered_truncated: u64,
     counters: Counters,
 ) -> String {
     let lag = flushed.saturating_sub(committed);
@@ -180,6 +189,9 @@ fn metrics_body(
          # HELP ironbus_writer_healthy 1 if the durable log writer is live, 0 if frozen.\n\
          # TYPE ironbus_writer_healthy gauge\n\
          ironbus_writer_healthy {healthy_value}\n\
+         # HELP ironbus_recovery_truncated_bytes Bytes dropped from a torn or unsynced tail at the last recovery (startup).\n\
+         # TYPE ironbus_recovery_truncated_bytes gauge\n\
+         ironbus_recovery_truncated_bytes {recovered_truncated}\n\
          # HELP ironbus_produced_total Messages appended by produce.\n\
          # TYPE ironbus_produced_total counter\n\
          ironbus_produced_total {produced}\n\
@@ -329,6 +341,7 @@ mod tests {
         assert!(m.contains("\nironbus_consumer_lag 2\n"), "{m}");
         assert!(m.contains("\nironbus_in_flight 0\n"), "{m}");
         assert!(m.contains("\nironbus_writer_healthy 1\n"), "{m}");
+        assert!(m.contains("\nironbus_recovery_truncated_bytes 0\n"), "{m}");
         assert!(m.contains("\nironbus_produced_total 2\n"), "{m}");
         assert!(m.contains("\nironbus_delivered_total 0\n"), "{m}");
         assert!(m.contains("\nironbus_dead_lettered_total 0\n"), "{m}");
