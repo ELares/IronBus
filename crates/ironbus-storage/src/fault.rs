@@ -52,6 +52,15 @@ impl<F: Filesystem> FaultFs<F> {
             control,
         )
     }
+
+    /// Borrows the wrapped filesystem, so a test can reach through the fault layer to the
+    /// underlying disk: for example to drive `simulate_power_loss` on an
+    /// [`InMemoryFs`](crate::fs::InMemoryFs) after arming a fault, or to inspect its durable
+    /// image. The fault layer holds no state of its own beyond the shared [`FaultControl`].
+    #[must_use]
+    pub fn inner(&self) -> &F {
+        &self.inner
+    }
 }
 
 impl<F: Filesystem> Filesystem for FaultFs<F> {
@@ -220,5 +229,17 @@ mod tests {
         // Truncation and length delegate unchanged even while syncs fault.
         f.set_len(4).unwrap();
         assert_eq!(f.len().unwrap(), 4);
+    }
+
+    #[test]
+    fn inner_reaches_the_wrapped_filesystem() {
+        let (fs, _control) = faulted();
+        // A file created through the fault layer is visible on the inner filesystem, and
+        // inner() hands back that same wrapped filesystem.
+        let f = fs.create_new("seg").unwrap();
+        f.write_all_at(b"abc", 0).unwrap();
+        let inner = fs.inner();
+        assert!(inner.exists("seg").unwrap());
+        assert_eq!(inner.list().unwrap(), vec!["seg".to_string()]);
     }
 }
