@@ -170,12 +170,24 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
             }
         };
         let (checkpoint, recovered) = Checkpoint::open(checkpoint_file)?;
-        // The committed cursor is 8 little-endian bytes; clamp it to the durable log head
-        // so it can never resume past a record that did not survive (belt and suspenders).
-        let committed = recovered
-            .and_then(|p| <[u8; 8]>::try_from(p.as_slice()).ok())
-            .map_or(0, u64::from_le_bytes)
-            .min(log.flushed_offset().get());
+        // The committed cursor is the LEADING 8 little-endian bytes of the payload; reading
+        // a prefix (not requiring an exact length) keeps recovery working once the payload
+        // is extended to also carry the resilience counters, rather than silently resetting
+        // the cursor to zero and redelivering the whole log.
+        let recovered_offset = recovered
+            .as_deref()
+            .and_then(|p| p.get(..8))
+            .and_then(|s| <[u8; 8]>::try_from(s).ok())
+            .map_or(0, u64::from_le_bytes);
+        let flushed = log.flushed_offset().get();
+        // The committed cursor can never legitimately exceed the durable log head; if it
+        // does, the log recovered below a valid checkpoint (corruption/truncation). Clamping
+        // down is at-least-once-safe (duplicates, never loss), but assert loudly in debug.
+        debug_assert!(
+            recovered_offset <= flushed,
+            "checkpoint committed {recovered_offset} exceeds the durable head {flushed}"
+        );
+        let committed = recovered_offset.min(flushed);
 
         Ok(Engine {
             log,
@@ -536,12 +548,45 @@ mod tests {
         let fs = e.into_filesystem();
 
         // Reopen: the committed cursor resumes at 2, so only the uncommitted tail (c)
-        // redelivers, NOT a and b.
+        // redelivers, NOT a and b, and nothing in [2, flushed) is skipped.
         let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
         assert_eq!(e.committed_offset(), Offset::new(2));
-        let d = message(e.poll(0).unwrap());
-        assert_eq!(d.offset, Offset::new(2));
-        assert_eq!(d.record.payload, b"c");
+        // Drain the whole window: exactly offset 2 ("c") is deliverable.
+        let mut delivered = Vec::new();
+        while let Poll::Message(d) = e.poll(0).unwrap() {
+            delivered.push((d.offset.get(), d.record.payload.clone()));
+        }
+        assert_eq!(
+            delivered,
+            vec![(2, b"c".to_vec())],
+            "only the uncommitted tail redelivers"
+        );
+    }
+
+    #[test]
+    fn messages_produced_after_a_checkpoint_survive_and_deliver_after_reopen() {
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"a");
+        let d0 = message(e.poll(0).unwrap());
+        e.ack(&d0.token); // committed = 1
+        e.checkpoint_cursor().unwrap();
+        // Produce more AFTER the checkpoint; these are durable but uncommitted.
+        produce(&mut e, b"b");
+        produce(&mut e, b"c");
+        let fs = e.into_filesystem();
+
+        // Reopen: resume at 1, and the post-checkpoint tail (b, c) must all survive.
+        let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(e.committed_offset(), Offset::new(1));
+        let mut delivered = Vec::new();
+        while let Poll::Message(d) = e.poll(0).unwrap() {
+            delivered.push((d.offset.get(), d.record.payload.clone()));
+        }
+        assert_eq!(
+            delivered,
+            vec![(1, b"b".to_vec()), (2, b"c".to_vec())],
+            "no produced-and-durable message is lost across the restart"
+        );
     }
 
     #[test]
