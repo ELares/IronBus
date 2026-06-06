@@ -579,6 +579,45 @@ fn recovery_is_a_pure_function_of_the_durable_bytes() {
     check_pure_recovery(&first, &second).unwrap();
 }
 
+#[test]
+fn recovery_recovers_the_full_prefix_under_persistent_short_reads() {
+    // Cap every read to a single byte: recovery's read_exact_at must loop over the short reads
+    // and still recover the whole durable prefix, so no acked record is lost to a partial read
+    // (#151). This exercises the storage IO layer's short-read handling end to end.
+    let n = 6u64;
+    let ops: Vec<Op> = (0..n).map(|_| Op::Append).chain([Op::Sync]).collect();
+    let log = apply(InMemoryFs::new(), big_config(), &ops);
+    let disk = log.into_filesystem();
+
+    let (faultfs, control) = FaultFs::new(disk);
+    control.set_short_read(1);
+    let log = Log::open(faultfs, ManualClock::new(), big_config()).unwrap();
+    assert_eq!(
+        log.flushed_offset(),
+        Offset::new(n),
+        "every durable record recovered"
+    );
+    assert_prefix(&log, n);
+}
+
+#[test]
+fn recovery_fails_cleanly_under_an_injected_read_error() {
+    // An injected read error during recovery surfaces as a clean StorageError, never a panic or
+    // silent partial recovery (#151).
+    let n = 6u64;
+    let ops: Vec<Op> = (0..n).map(|_| Op::Append).chain([Op::Sync]).collect();
+    let log = apply(InMemoryFs::new(), big_config(), &ops);
+    let disk = log.into_filesystem();
+
+    let (faultfs, control) = FaultFs::new(disk);
+    control.set_fail_read(true);
+    let err = Log::open(faultfs, ManualClock::new(), big_config()).unwrap_err();
+    assert!(
+        matches!(err, ironbus_storage::segment::StorageError::Io(_)),
+        "an injected read error must surface as a clean IO error, got {err:?}"
+    );
+}
+
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
         3 => Just(Op::Append),
