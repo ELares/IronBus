@@ -7,8 +7,8 @@
 
 use crate::format::{
     segment_footer_offsets as foff, segment_header_offsets as hoff, CHECKSUM_ALGO_CRC32C,
-    FORMAT_VERSION, SEGMENT_FOOTER_CRC_RANGE, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_CRC_RANGE,
-    SEGMENT_HEADER_LEN, SEGMENT_MAGIC,
+    FORMAT_VERSION, SEGMENT_FOOTER_CRC_RANGE, SEGMENT_FOOTER_LEN, SEGMENT_FOOTER_MAGIC,
+    SEGMENT_HEADER_CRC_RANGE, SEGMENT_HEADER_LEN, SEGMENT_MAGIC,
 };
 use crate::raw::{read_u16, read_u32, read_u64};
 use crate::types::{Offset, Seq};
@@ -24,19 +24,20 @@ pub struct SegmentHeader {
     pub base_offset: Offset,
     /// Wall-clock creation time, milliseconds since the Unix epoch.
     pub created_unix_ms: u64,
-    /// Segment flag bits (reserved; zero in version 1).
+    /// Segment flag bits. Reserved in version 1 (zero); preserved on read but not
+    /// interpreted, so a future writer can add flags without older readers corrupting them.
     pub flags: u16,
 }
 
 /// The fixed 32-byte footer written when a segment is sealed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentFooter {
-    /// Number of records in the sealed segment.
-    pub record_count: u64,
+    /// Identifier of the segment this footer belongs to (must match the header).
+    pub segment_id: u64,
     /// Sequence number of the last record in the sealed segment.
     pub last_seq: Seq,
-    /// Wall-clock seal time, milliseconds since the Unix epoch.
-    pub sealed_unix_ms: u64,
+    /// Number of records in the sealed segment.
+    pub record_count: u32,
 }
 
 /// An error decoding a segment header or footer.
@@ -45,7 +46,7 @@ pub struct SegmentFooter {
 pub enum SegmentError {
     /// The input is shorter than the fixed structure.
     Truncated,
-    /// The segment magic did not match (header only).
+    /// The segment header or footer magic did not match.
     BadMagic,
     /// The format version is not understood by this build.
     UnsupportedVersion(u8),
@@ -130,32 +131,47 @@ impl SegmentFooter {
     #[must_use]
     pub fn encode(&self) -> [u8; SEGMENT_FOOTER_LEN] {
         let mut f = [0u8; SEGMENT_FOOTER_LEN];
-        f[foff::RECORD_COUNT..foff::RECORD_COUNT + 8]
-            .copy_from_slice(&self.record_count.to_le_bytes());
+        f[foff::MAGIC..foff::MAGIC + 2].copy_from_slice(&SEGMENT_FOOTER_MAGIC.to_le_bytes());
+        f[foff::VERSION] = FORMAT_VERSION;
+        f[foff::CHECKSUM_ALGO] = CHECKSUM_ALGO_CRC32C;
+        f[foff::SEGMENT_ID..foff::SEGMENT_ID + 8].copy_from_slice(&self.segment_id.to_le_bytes());
         f[foff::LAST_SEQ..foff::LAST_SEQ + 8].copy_from_slice(&self.last_seq.get().to_le_bytes());
-        f[foff::SEALED_MS..foff::SEALED_MS + 8].copy_from_slice(&self.sealed_unix_ms.to_le_bytes());
+        f[foff::RECORD_COUNT..foff::RECORD_COUNT + 4]
+            .copy_from_slice(&self.record_count.to_le_bytes());
         let crc = crc32c::crc32c(&f[SEGMENT_FOOTER_CRC_RANGE]);
         f[foff::FOOTER_CRC..foff::FOOTER_CRC + 4].copy_from_slice(&crc.to_le_bytes());
         f
     }
 
     /// Decodes a footer from the first 32 bytes of `bytes` (the last 32 bytes of a
-    /// sealed segment).
+    /// sealed segment). The caller should also verify `segment_id` matches the header
+    /// and `last_seq >= header.base_seq`.
     ///
     /// # Errors
-    /// Returns [`SegmentError::Truncated`] if too short, or [`SegmentError::BadCrc`]
-    /// if the footer CRC does not match.
+    /// Returns a [`SegmentError`] if too short, the magic, version, or checksum
+    /// algorithm is wrong, or the footer CRC does not match.
     pub fn decode(bytes: &[u8]) -> Result<SegmentFooter, SegmentError> {
         if bytes.len() < SEGMENT_FOOTER_LEN {
             return Err(SegmentError::Truncated);
+        }
+        if read_u16(bytes, foff::MAGIC) != SEGMENT_FOOTER_MAGIC {
+            return Err(SegmentError::BadMagic);
+        }
+        let version = bytes[foff::VERSION];
+        if version != FORMAT_VERSION {
+            return Err(SegmentError::UnsupportedVersion(version));
+        }
+        let algo = bytes[foff::CHECKSUM_ALGO];
+        if algo != CHECKSUM_ALGO_CRC32C {
+            return Err(SegmentError::UnsupportedChecksumAlgo(algo));
         }
         if crc32c::crc32c(&bytes[SEGMENT_FOOTER_CRC_RANGE]) != read_u32(bytes, foff::FOOTER_CRC) {
             return Err(SegmentError::BadCrc);
         }
         Ok(SegmentFooter {
-            record_count: read_u64(bytes, foff::RECORD_COUNT),
+            segment_id: read_u64(bytes, foff::SEGMENT_ID),
             last_seq: Seq::new(read_u64(bytes, foff::LAST_SEQ)),
-            sealed_unix_ms: read_u64(bytes, foff::SEALED_MS),
+            record_count: read_u32(bytes, foff::RECORD_COUNT),
         })
     }
 }
@@ -185,9 +201,9 @@ mod tests {
     #[test]
     fn footer_roundtrip() {
         let f = SegmentFooter {
-            record_count: 42,
+            segment_id: 9,
             last_seq: Seq::new(141),
-            sealed_unix_ms: 1_700_000_005_000,
+            record_count: 42,
         };
         let bytes = f.encode();
         assert_eq!(bytes.len(), SEGMENT_FOOTER_LEN);
@@ -233,9 +249,9 @@ mod tests {
     #[test]
     fn footer_corruption_caught() {
         let f = SegmentFooter {
-            record_count: 1,
+            segment_id: 1,
             last_seq: Seq::new(1),
-            sealed_unix_ms: 0,
+            record_count: 1,
         };
         let mut b = f.encode();
         b[foff::RECORD_COUNT] ^= 0x01;
@@ -250,9 +266,9 @@ mod tests {
             Err(SegmentError::Truncated)
         );
         let fb = SegmentFooter {
-            record_count: 0,
+            segment_id: 0,
             last_seq: Seq::new(0),
-            sealed_unix_ms: 0,
+            record_count: 0,
         }
         .encode();
         assert_eq!(
@@ -275,9 +291,20 @@ mod proptests {
         }
 
         #[test]
-        fn footer_roundtrip(rc in any::<u64>(), ls in any::<u64>(), ts in any::<u64>()) {
-            let f = SegmentFooter { record_count: rc, last_seq: Seq::new(ls), sealed_unix_ms: ts };
+        fn footer_roundtrip(id in any::<u64>(), ls in any::<u64>(), rc in any::<u32>()) {
+            let f = SegmentFooter { segment_id: id, last_seq: Seq::new(ls), record_count: rc };
             prop_assert_eq!(SegmentFooter::decode(&f.encode()).unwrap(), f);
+        }
+
+        #[test]
+        fn footer_bit_flip_always_rejected(id in any::<u64>(), idx in any::<prop::sample::Index>(), bit in 0u8..8) {
+            let f = SegmentFooter { segment_id: id, last_seq: Seq::new(7), record_count: 3 };
+            let mut b = f.encode();
+            let i = idx.index(b.len());
+            b[i] ^= 1u8 << bit;
+            // CRC32C catches every single-bit error in a 32-byte structure, and magic
+            // and version flips are caught structurally, so a flip is always rejected.
+            prop_assert!(SegmentFooter::decode(&b).is_err());
         }
 
         #[test]
@@ -286,10 +313,9 @@ mod proptests {
             let mut b = h.encode();
             let i = idx.index(b.len());
             b[i] ^= 1u8 << bit;
-            match SegmentHeader::decode(&b) {
-                Err(_) => {}
-                Ok(got) => prop_assert_eq!(got, h),
-            }
+            // CRC32C catches every single-bit error in a 64-byte structure, and magic,
+            // version, and checksum-algo flips are caught structurally.
+            prop_assert!(SegmentHeader::decode(&b).is_err());
         }
     }
 }
