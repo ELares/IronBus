@@ -12,7 +12,18 @@ authors.workspace = true
 crc32c = "0.6"
 
 [dev-dependencies]
+criterion = "0.5"
 proptest = "1"
 
 [lints]
 workspace = true
+
+# Informational micro-benches for the IO-free hot-path codecs (#112). Run on demand via
+# `cargo bench -p ironbus-core`; not wired into per-PR CI. The regression gate is #114.
+[[bench]]
+name = "codec"
+harness = false
+
+[[bench]]
+name = "cursor"
+harness = false
