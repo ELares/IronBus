@@ -635,17 +635,18 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         );
         // Discover and resume each NAMED work-group from its own `cursor-<hex>.ckpt` (#60),
         // so a broadcast or competing group keeps its position across a restart instead of
-        // redelivering the whole log. Bounded by the group cap as a defense against a
-        // tampered directory holding more checkpoint files than the runtime cap allows.
+        // redelivering the whole log. Recovery is deliberately NOT bounded by `max_groups`: the
+        // cap gates only NEW group creation (the `poll_in` allocation path), never the resume of
+        // groups that are already durable on disk. Capping recovery would silently DROP the
+        // committed cursors of the groups past the cap whenever an operator LOWERS `--max-groups`
+        // below the on-disk group count, resetting those groups to offset 0 and redelivering the
+        // whole already-acked log. Loading every existing group unconditionally keeps a config
+        // change from corrupting durable state; the cap still bounds unbounded runtime growth from
+        // wire-named groups created after open.
         let mut group_last_checkpointed = BTreeMap::new();
         {
             let fs = log.filesystem();
             for name in fs.list()? {
-                // The group cap (`0` = unlimited) also bounds recovery, so a tampered directory
-                // holding more checkpoint files than the runtime cap allows cannot exceed it.
-                if config.max_groups != 0 && groups.len() >= config.max_groups {
-                    break;
-                }
                 let Some(gname) = parse_group_checkpoint_name(&name) else {
                     continue;
                 };
@@ -2234,6 +2235,45 @@ mod tests {
             e.groups.len(),
             DEFAULT_MAX_GROUPS + 16 + 1,
             "default + all named"
+        );
+    }
+
+    #[test]
+    fn lowering_the_group_cap_still_recovers_every_durable_group() {
+        // Recovery must load EVERY durable named group regardless of `max_groups`: the cap gates
+        // only NEW group creation, never the resume of groups already on disk. Otherwise an
+        // operator who LOWERS --max-groups below the on-disk group count would silently reset the
+        // dropped groups to offset 0 and redeliver the whole already-acked log. Create three named
+        // groups committed to distinct offsets under a generous cap, then reopen under a cap of 2
+        // (below the three) and assert all three keep their committed cursors.
+        let mut e = open(config_with_max_groups(100));
+        for p in [&b"0"[..], b"1", b"2", b"3"] {
+            produce(&mut e, p);
+        }
+        // Advance each group to a distinct committed offset, then make it durable.
+        for (group, acks) in [("g-a", 1u32), ("g-b", 2), ("g-c", 3)] {
+            for _ in 0..acks {
+                let d = message(e.poll_in(group, 0).unwrap());
+                e.ack_in(group, &d.token);
+            }
+            e.checkpoint_group(group).unwrap();
+        }
+        assert_eq!(e.committed_offset_in("g-a"), Offset::new(1));
+        assert_eq!(e.committed_offset_in("g-b"), Offset::new(2));
+        assert_eq!(e.committed_offset_in("g-c"), Offset::new(3));
+        let fs = e.into_filesystem();
+
+        // Reopen under a cap of 2 (default plus room for only one named under the old, buggy
+        // recovery that applied the cap to the resume scan): every group must still recover, none
+        // reset to 0.
+        let e = Engine::open(fs, ManualClock::new(), config_with_max_groups(2)).unwrap();
+        assert_eq!(e.committed_offset_in("g-a"), Offset::new(1), "g-a survived");
+        assert_eq!(e.committed_offset_in("g-b"), Offset::new(2), "g-b survived");
+        assert_eq!(e.committed_offset_in("g-c"), Offset::new(3), "g-c survived");
+        assert_eq!(
+            e.groups.len(),
+            4,
+            "default plus three recovered groups, despite a cap of 2"
         );
     }
 
