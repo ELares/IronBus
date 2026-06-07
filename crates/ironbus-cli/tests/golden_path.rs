@@ -2,14 +2,15 @@
 //! Golden-path acceptance slice (#133): drive the real `ironbus` binary end to end through the
 //! parts of the promised story that are reachable today. The scenarios run: a single default-group
 //! consumer (boot, produce, consume, restart, resume past the acked messages while the durable log
-//! continues); the step-4 fan-out (one log to a broadcast group and a competing group, each
-//! advancing independently and resuming durably across a restart); step-9 offline inspection
-//! (`peek`/`dump` over a stopped broker agrees with recovery up to the durable head); and steps 6
-//! and 7, power-cut recovery (a torn tail is truncated, the durable prefix survives, and the loss
-//! is reported consistently offline and online); and step-5 overload (the durable log spills to
-//! disk and absorbs the accepted prefix, then sheds drop-new once it is at or over its byte cap,
-//! with the client shed count agreeing exactly with the server's reject counter). Only the
-//! installer (step 1) remains.
+//! continues); the step-2 health probes (`/healthz` and `/readyz` come up and report healthy,
+//! bound to loopback only, with an unknown path returning a real 404); the step-4 fan-out (one log
+//! to a broadcast group and a competing group, each advancing independently and resuming durably
+//! across a restart); step-9 offline inspection (`peek`/`dump` over a stopped broker agrees with
+//! recovery up to the durable head); and steps 6 and 7, power-cut recovery (a torn tail is
+//! truncated, the durable prefix survives, and the loss is reported consistently offline and
+//! online); and step-5 overload (the durable log spills to disk and absorbs the accepted prefix,
+//! then sheds drop-new once it is at or over its byte cap, with the client shed count agreeing
+//! exactly with the server's reject counter). Only the installer (step 1) remains.
 //!
 //! `serve` is Unix only in v1 (on-disk storage uses positioned IO the Windows path lacks), so
 //! this whole acceptance test is gated to Unix.
@@ -627,6 +628,90 @@ fn golden_path_power_cut_recovers_the_durable_prefix_and_reports_loss() {
     );
 
     drop(broker2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Splits a minimal HTTP/1.0 response (as returned by [`http_get`]) into its status line and its
+/// body, so a test can assert the exact status AND the exact body marker, not merely a 200. The
+/// header block ends at the first blank line (`\r\n\r\n`); everything after it is the body.
+fn split_status_and_body(resp: &str) -> (&str, &str) {
+    let status = resp.lines().next().unwrap_or("").trim_end();
+    let body = resp
+        .split_once("\r\n\r\n")
+        .map_or("", |(_, body)| body)
+        .trim_end();
+    (status, body)
+}
+
+#[test]
+fn golden_path_health_endpoints_come_up_on_loopback() {
+    // #133 step 2: boot zero-config and assert the health endpoints come up, report healthy, and
+    // are bound to LOOPBACK only (#16, #18). Drive the real `ironbus` binary: serve binds the
+    // health HTTP port on an ephemeral loopback address (`--health-addr 127.0.0.1:0`) and prints
+    // it, then `/healthz` is liveness and `/readyz` is readiness. The markers are exact (the
+    // status line AND the body health.rs returns), so the test cannot pass on an empty or wrong
+    // response, and an UNKNOWN path must NOT be a blanket 200, proving the router is real.
+    let dir = std::env::temp_dir().join(format!("ironbus-golden-health-{}", std::process::id()));
+    let data_dir = dir.to_str().expect("utf8 temp path").to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // 1. Boot the broker with the health endpoints on an ephemeral loopback port.
+    let (broker, _wire, health) = start_broker_with_health(&data_dir);
+
+    // 2. The bound health address is LOOPBACK only: an IPv4 `127.x` or the IPv6 `::1` (never a
+    //    routable interface). The serve flag pins 127.0.0.1, so a regression that bound 0.0.0.0
+    //    or a public address (no-auth-on-loopback would then leak) fails here.
+    let host = health
+        .rsplit_once(':')
+        .map_or(health.as_str(), |(host, _port)| host);
+    assert!(
+        host.starts_with("127.") || host == "::1" || host == "[::1]",
+        "the health endpoints are bound to loopback only, got {health}"
+    );
+
+    // 3. GET /healthz: liveness. health.rs answers `HTTP/1.1 200 OK` with the body `ok` for a
+    //    live loop. Assert BOTH the status line carries 200 AND the body is exactly `ok`.
+    let resp = http_get(&health, "/healthz");
+    let (status, body) = split_status_and_body(&resp);
+    assert_eq!(
+        status, "HTTP/1.1 200 OK",
+        "/healthz reports healthy with a 200 status line: {resp:?}"
+    );
+    assert_eq!(
+        body, "ok",
+        "/healthz body is the exact healthy marker: {resp:?}"
+    );
+
+    // 4. GET /readyz: readiness. A freshly booted broker's writer is live (an active segment is
+    //    open), so health.rs answers `HTTP/1.1 200 OK` with the body `ready` (a frozen writer
+    //    would answer 503 "writer frozen"). `http_get` already retries a just-spawned health
+    //    thread, so a brief readiness lag converges; we then assert the EXACT ready marker.
+    let resp = http_get(&health, "/readyz");
+    let (status, body) = split_status_and_body(&resp);
+    assert_eq!(
+        status, "HTTP/1.1 200 OK",
+        "/readyz reports ready with a 200 status line once the broker is up: {resp:?}"
+    );
+    assert_eq!(
+        body, "ready",
+        "/readyz body is the exact ready marker: {resp:?}"
+    );
+
+    // 5. An UNKNOWN path is NOT a blanket 200: health.rs routes everything else to 404 with the
+    //    body `unknown endpoint`. This proves the router is real (a 200-for-everything stub would
+    //    fail here), so the healthy assertions above are non-vacuous.
+    let resp = http_get(&health, "/nope");
+    let (status, body) = split_status_and_body(&resp);
+    assert_eq!(
+        status, "HTTP/1.1 404 Not Found",
+        "an unknown path is a real 404, not a blanket 200: {resp:?}"
+    );
+    assert_eq!(
+        body, "unknown endpoint",
+        "the 404 body is the exact unknown-endpoint marker: {resp:?}"
+    );
+
+    drop(broker);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
