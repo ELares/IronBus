@@ -27,6 +27,7 @@ for f in *.dot; do dot -Tpdf "$f" -o "${f%.dot}.pdf"; done
 ## Reference docs
 
 - [Invariants and glossary](INVARIANTS.md): the shared invariants every subsystem must hold (I1 to I8), the resilience invariant checkers, and the canonical glossary of load-bearing terms, each cross-checked against the code (#131).
+- [Threat model and security posture](THREAT_MODEL.md): the enumerated edge threat model, the implemented DoS and resource-exhaustion mitigations cited to the code, and an honest statement of the current no-auth / no-TLS / no-at-rest-encryption posture versus the specified controls (#106 to #109), each cross-checked against the source (#105).
 
 ## Notes
 
