@@ -24,14 +24,15 @@ use ironbus_core::segment::SegmentError;
 /// callers are unchanged.
 pub const MAX_PAYLOAD: usize = 64;
 
-/// The per-slot payload cap for the resilience-counters checkpoint (#98): a version byte plus the
-/// fixed set of `u64` counters, with generous headroom for future fields. The current snapshot is
-/// 1 + 8 * 11 = 89 bytes; 128 leaves room for several more counters before the cap is reached.
+/// The per-slot payload cap for the resilience-counters checkpoint (#98, #307): a version byte plus
+/// the fixed set of `u64` counters, with generous headroom for future fields. The current snapshot is
+/// 1 + 8 * 15 = 121 bytes (the 11 #306 operational counters plus the four #307 recovery-loss fields);
+/// 256 leaves room for ~16 more `u64` counters before the cap is reached.
 /// (The cap matters: a snapshot that exceeds it would make `write` return `Truncated`, which the
 /// graceful-shutdown flush propagates, so the cap must stay comfortably ahead of the field count.)
 /// The counters snapshot is an OBSERVABILITY aid, never correctness state, so a torn or missing one
 /// recovers as all-zeros and never blocks broker startup.
-pub const COUNTERS_PAYLOAD: usize = 128;
+pub const COUNTERS_PAYLOAD: usize = 256;
 
 const SEQ_LEN: usize = 8;
 const LEN_LEN: usize = 2;
