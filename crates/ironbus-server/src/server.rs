@@ -199,6 +199,7 @@ mod tests {
             delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
             max_in_flight: 16,
             consumer_credit: 64,
+            consumer_credit_bytes: 0,
             checkpoint_interval: 1024,
             max_retained_bytes: 0,
             max_age_ms: 0,

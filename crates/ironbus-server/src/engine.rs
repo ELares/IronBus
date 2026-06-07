@@ -89,10 +89,30 @@ pub struct EngineConfig {
     /// The default is a small, memory-justified number ([`DEFAULT_CONSUMER_CREDIT`] = 64), NOT the
     /// MQTT absent-value 65535: at the #19 working point (10k msg/s x 5 ms service = 50 in-flight by
     /// Little's Law) 64 gives ~28% headroom. A value of `0` is treated as 1 (a hard floor of one, so
-    /// a consumer always makes progress) by [`Engine::open`]. Per-consumer BYTE budgets and the
-    /// `max_deliver`-to-DLQ poison cap are tracked separately (the byte budget is a #65 follow-up;
-    /// the poison cap already lives in [`DeliveryConfig`]).
+    /// a consumer always makes progress) by [`Engine::open`]. The parallel per-consumer BYTE budget
+    /// is [`EngineConfig::consumer_credit_bytes`]; the `max_deliver`-to-DLQ poison cap lives in
+    /// [`DeliveryConfig`].
     pub consumer_credit: u32,
+    /// The per-CONSUMER (per-connection) standing in-flight BYTE budget (refs #65, #275, #10, #20):
+    /// the most un-acked PAYLOAD bytes a single connection may hold at once, the RAM-side companion
+    /// to the message-count credit ([`EngineConfig::consumer_credit`]). A large-payload consumer must
+    /// not blow the RAM ceiling despite a small in-flight message count, so the EFFECTIVE per-Flow
+    /// bound is `min(message credits remaining, byte credits remaining)`, with a hard floor of ONE
+    /// message: a single message larger than the whole budget is still delivered (so it never wedges
+    /// the consumer), but no further message is sent until bytes free up.
+    ///
+    /// Like the message credit, it is enforced per session and DERIVED from the connection-scoped
+    /// in-flight set's total bytes (not a separately mutated counter, so it cannot drift): a delivery
+    /// occupies its bytes; an ack, a successful nack/term, the per-batch prune of committed offsets,
+    /// and the start-of-Flow prune of leases the engine no longer holds all restore them. A
+    /// redelivered message re-occupies its bytes exactly once. A message's byte size is its key plus
+    /// headers plus payload length, matching the produced-bytes accounting.
+    ///
+    /// The default is [`DEFAULT_CONSUMER_CREDIT_BYTES`] (8 MiB). A value of `0` means UNLIMITED (the
+    /// byte budget is OFF, only the message credit binds), matching the `0` = unlimited / off
+    /// convention of the other byte bounds ([`EngineConfig::max_retained_bytes`],
+    /// `LogConfig::max_total_bytes`).
+    pub consumer_credit_bytes: u64,
     /// Checkpoint the committed cursor after it advances at least this many offsets since the
     /// last checkpoint, bounding how many messages a crash redelivers. A value of 0 is treated
     /// as 1 (checkpoint on every advance). A clean disconnect also flushes the cursor.
@@ -378,6 +398,15 @@ const DEFAULT_GROUP: &str = "";
 /// [`EngineConfig::consumer_credit`].
 pub const DEFAULT_CONSUMER_CREDIT: u32 = 64;
 
+/// The default per-consumer in-flight BYTE budget (refs #65, #275, #10, #20): the most un-acked
+/// PAYLOAD bytes one connection may hold at once before a Flow stops delivering to it, the RAM-side
+/// companion to [`DEFAULT_CONSUMER_CREDIT`]. 8 MiB: at the 64-message default that is a 128 KiB
+/// average message before the byte budget binds before the message count, generous for the small
+/// records an edge broker carries yet a firm RAM ceiling for a large-payload consumer. A single
+/// message larger than this is still delivered (the hard floor of one), so the budget never wedges a
+/// consumer. `0` means UNLIMITED (the byte budget is off). See [`EngineConfig::consumer_credit_bytes`].
+pub const DEFAULT_CONSUMER_CREDIT_BYTES: u64 = 8 * 1024 * 1024;
+
 /// The default cap on the number of live work-groups per engine, INCLUDING the durable default
 /// (refs #240, #9, #10): bounds total consumer-state memory once the wire can name groups, so an
 /// unauthenticated client cannot exhaust memory by naming endless groups. A non-zero, defensible
@@ -570,6 +599,12 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// [`crate::session::Session`], which tracks its own remaining credit against its
     /// connection-scoped `leased` set (#175). See [`EngineConfig::consumer_credit`].
     consumer_credit: u32,
+    /// The per-CONSUMER (per-connection) standing in-flight BYTE budget (refs #65, #275, #10), the
+    /// RAM-side companion to `consumer_credit`. Like the message credit, the engine itself does NOT
+    /// decrement it; it advertises the budget to each [`crate::session::Session`], which derives its
+    /// remaining byte budget from the total bytes of its connection-scoped `leased` set. `0` means
+    /// unlimited (only the message credit binds). See [`EngineConfig::consumer_credit_bytes`].
+    consumer_credit_bytes: u64,
     checkpoint: Checkpoint<F::File>,
     checkpoint_interval: u64,
     /// The consumer-safe retention bounds (size, age, count) the produce path enforces against the
@@ -727,6 +762,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // Floor the per-consumer credit to 1 (#65): a zero ceiling would deliver nothing to any
             // connection, wedging every consumer. The hard floor of one guarantees forward progress.
             consumer_credit: config.consumer_credit.max(1),
+            // The per-consumer BYTE budget (#275) is NOT floored: `0` means unlimited (the byte
+            // budget is off, only the message credit binds), matching the other byte bounds. A
+            // non-zero budget never wedges a consumer because the session always delivers at least
+            // ONE message even if it exceeds the budget (the floor-of-one in `handle_flow`).
+            consumer_credit_bytes: config.consumer_credit_bytes,
             checkpoint,
             checkpoint_interval: config.checkpoint_interval,
             retention: RetentionBounds {
@@ -1832,6 +1872,18 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.consumer_credit
     }
 
+    /// The per-CONSUMER (per-connection) standing in-flight BYTE budget (refs #65, #275, #10): the
+    /// most un-acked payload bytes one connection may hold at once, the RAM-side companion to
+    /// [`Engine::consumer_credit`]. A [`crate::session::Session`] reads this once and enforces it
+    /// against the total bytes of its connection-scoped `leased` set, so the effective per-Flow bound
+    /// is `min(message credits remaining, byte credits remaining)` with a hard floor of one message.
+    /// `0` means UNLIMITED (the byte budget is off, only the message credit binds). See
+    /// [`EngineConfig::consumer_credit_bytes`].
+    #[must_use]
+    pub fn consumer_credit_bytes(&self) -> u64 {
+        self.consumer_credit_bytes
+    }
+
     /// Whether `token` still names an ACTIVE (live and NOT yet expired) lease in `group` owned by
     /// exactly this `(offset, generation)` at the engine's current monotonic time (refs #65, #175):
     /// `true` only if the offset is currently leased, its generation matches the token, AND its
@@ -1905,6 +1957,7 @@ mod tests {
             delivery: DeliveryConfig::new(max_deliver, false, vec![]).unwrap(),
             max_in_flight,
             consumer_credit: DEFAULT_CONSUMER_CREDIT,
+            consumer_credit_bytes: DEFAULT_CONSUMER_CREDIT_BYTES,
             checkpoint_interval: 1024,
             max_retained_bytes: 0,
             max_age_ms: 0,
@@ -4567,5 +4620,36 @@ mod tests {
         assert_eq!(e.busy_keys_in("g"), 1, "acking one frees its key");
         e.ack_in("g", &d1.token);
         assert_eq!(e.busy_keys_in("g"), 0);
+    }
+
+    // ----- Per-consumer BYTE budget passthrough (refs #65, #275) -----
+
+    #[test]
+    fn consumer_credit_bytes_passes_through_unfloored() {
+        // The engine advertises the configured byte budget verbatim: unlike the message credit (which
+        // is floored to 1), the byte budget is NOT floored, so `0` survives as the unlimited sentinel.
+        let mut cfg = config(10, 5);
+        cfg.consumer_credit_bytes = 4096;
+        let e = open(cfg);
+        assert_eq!(e.consumer_credit_bytes(), 4096);
+    }
+
+    #[test]
+    fn a_zero_consumer_credit_bytes_means_unlimited() {
+        // `0` = unlimited (the byte budget is off), matching the other byte bounds. The engine keeps
+        // it as `0` rather than flooring it; the session reads `0` and never lets the byte budget bind.
+        let mut cfg = config(10, 5);
+        cfg.consumer_credit_bytes = 0;
+        let e = open(cfg);
+        assert_eq!(e.consumer_credit_bytes(), 0, "0 is preserved as unlimited");
+    }
+
+    #[test]
+    fn the_default_consumer_credit_bytes_is_eight_mib() {
+        // The test `config` helper uses the production default, so the default 8 MiB byte budget
+        // flows through unchanged.
+        let e = open(config(10, 5));
+        assert_eq!(e.consumer_credit_bytes(), DEFAULT_CONSUMER_CREDIT_BYTES);
+        assert_eq!(DEFAULT_CONSUMER_CREDIT_BYTES, 8 * 1024 * 1024);
     }
 }
