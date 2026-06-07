@@ -602,11 +602,26 @@ mod tests {
         start_server_with_credit(64)
     }
 
-    /// Starts an in-process broker with an explicit per-consumer `consumer_credit`, for the #65
-    /// credit tests; the roomy `max_in_flight` of 16 keeps the per-group window from being the
-    /// binding bound for the small credits these tests use.
+    /// Starts an in-process broker with an explicit per-consumer `consumer_credit` and an UNLIMITED
+    /// byte budget, for the #65 credit tests; the roomy `max_in_flight` of 16 keeps the per-group
+    /// window from being the binding bound for the small credits these tests use.
     fn start_server_with_credit(
         consumer_credit: u32,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        // The #65 tests exercise the message-count bound, so the byte budget must not bind (0 = off).
+        start_server_with_credit_and_bytes(consumer_credit, 0)
+    }
+
+    /// Starts an in-process broker with an explicit per-consumer message credit AND byte budget, for
+    /// the #275 byte-budget end-to-end tests; the roomy `max_in_flight` of 16 keeps the per-group
+    /// window from binding for the small credits these tests use.
+    fn start_server_with_credit_and_bytes(
+        consumer_credit: u32,
+        consumer_credit_bytes: u64,
     ) -> (
         std::net::SocketAddr,
         Arc<AtomicBool>,
@@ -621,6 +636,7 @@ mod tests {
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
                 max_in_flight: 16,
                 consumer_credit,
+                consumer_credit_bytes,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
@@ -1160,6 +1176,97 @@ mod tests {
             b.fetch(1000).unwrap().messages.len(),
             2,
             "B keeps making progress while A holds its slots"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn the_byte_budget_binds_over_a_real_server() {
+        // End to end (#275): a roomy message credit (64) but a tight BYTE budget (200) with 100-byte
+        // payloads. A single client fetching with a huge requested credit gets only 2 messages (the
+        // in-flight bytes reach the 200-byte budget), NOT the 64 the message credit would allow.
+        // Acking frees the bytes so the next fetch delivers again. The default 30s visibility means
+        // nothing redelivers within the test, so a non-empty second fetch is freed bytes, not expiry.
+        let (addr, shutdown, handle) = start_server_with_credit_and_bytes(64, 200);
+        let mut producer = Client::connect(addr).unwrap();
+        let payload = [0xab_u8; 100];
+        for _ in 0..10 {
+            producer
+                .produce(&PubBody {
+                    flags: 0,
+                    timestamp_ms: 0,
+                    key: b"",
+                    headers: b"",
+                    payload: &payload,
+                })
+                .unwrap();
+        }
+        let mut c = Client::connect(addr).unwrap();
+        let first = c.fetch(1000).unwrap().messages;
+        assert_eq!(
+            first.len(),
+            2,
+            "the 200-byte budget caps the fetch at 2x100 bytes, not the message credit of 64"
+        );
+        // Saturated on bytes: a second fetch gets nothing while the 200 bytes stay un-acked.
+        assert!(
+            c.fetch(1000).unwrap().messages.is_empty(),
+            "in-flight bytes have reached the budget, so no more deliveries until an ack"
+        );
+        // Ack both: their 200 bytes free.
+        for m in &first {
+            assert!(c.ack(m.offset, m.generation).unwrap());
+        }
+        let second = c.fetch(1000).unwrap().messages;
+        assert_eq!(
+            second.len(),
+            2,
+            "acking the two freed their bytes, so the next fetch delivers two more"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn the_byte_budget_floor_of_one_over_a_real_server() {
+        // End to end (#275): the hard floor of ONE. A 100-byte budget with a single 500-byte payload
+        // (larger than the whole budget) still delivers that one message, so an over-budget message
+        // never wedges the consumer. A second over-budget message waits until the first frees bytes.
+        let (addr, shutdown, handle) = start_server_with_credit_and_bytes(64, 100);
+        let mut producer = Client::connect(addr).unwrap();
+        let big = [0xcd_u8; 500];
+        for _ in 0..2 {
+            producer
+                .produce(&PubBody {
+                    flags: 0,
+                    timestamp_ms: 0,
+                    key: b"",
+                    headers: b"",
+                    payload: &big,
+                })
+                .unwrap();
+        }
+        let mut c = Client::connect(addr).unwrap();
+        let first = c.fetch(1000).unwrap().messages;
+        assert_eq!(
+            first.len(),
+            1,
+            "the floor-of-one delivers one over-budget message so it never wedges the consumer"
+        );
+        // Only one: the second over-budget message waits until the first frees its bytes.
+        assert!(
+            c.fetch(1000).unwrap().messages.is_empty(),
+            "the floor is one; the second over-budget message waits for bytes to free"
+        );
+        // Ack the first; its bytes free, so the second now passes the floor and delivers.
+        assert!(c.ack(first[0].offset, first[0].generation).unwrap());
+        assert_eq!(
+            c.fetch(1000).unwrap().messages.len(),
+            1,
+            "freeing the first over-budget message lets the second through (again by the floor)"
         );
 
         shutdown.store(true, Ordering::Release);

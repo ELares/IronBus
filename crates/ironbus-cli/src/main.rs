@@ -70,6 +70,14 @@ const DEFAULT_MAX_IN_FLIGHT: u32 = 1024;
 /// Flow bound is min(this, the per-group `--max-in-flight` window). Floored to 1 by the engine.
 const DEFAULT_CONSUMER_CREDIT: u32 = ironbus_server::engine::DEFAULT_CONSUMER_CREDIT;
 
+/// The default per-CONSUMER (per-connection) in-flight BYTE budget for `serve` (#275), aliased to
+/// the engine's [`ironbus_server::engine::DEFAULT_CONSUMER_CREDIT_BYTES`] so the CLI default and the
+/// engine default are a single source of truth and cannot drift. It is the most un-acked payload
+/// bytes one connection may hold at once, the RAM-side companion to the message-count credit; the
+/// effective Flow bound is min(message credit, byte budget) with a hard floor of one message. `0`
+/// means unlimited (the byte budget is off, only the message credit binds).
+const DEFAULT_CONSUMER_CREDIT_BYTES: u64 = ironbus_server::engine::DEFAULT_CONSUMER_CREDIT_BYTES;
+
 /// The default segment size cap for `serve` (64 MiB, matching the storage default).
 const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -173,7 +181,7 @@ USAGE:
     ironbus serve --data-dir <dir> [--addr <host:port>] [--max-connections <n>]
                   [--checkpoint-interval <n>] [--max-deliver <n>] [--allow-unlimited-deliver]
                   [--backoff-ms <ms,ms,...>] [--max-in-flight <n>]
-                  [--consumer-credit <n>]
+                  [--consumer-credit <n>] [--consumer-credit-bytes <n>]
                   [--max-segment-bytes <n>] [--max-total-bytes <bytes>]
                   [--max-retained-bytes <bytes>] [--max-age-ms <ms>] [--max-messages <n>]
                   [--max-groups <n>] [--disk-full-policy <drop-new|drop-oldest>]
@@ -191,7 +199,11 @@ Notes:
     --max-in-flight bounds the per-GROUP in-flight (max-ack-pending) window; --consumer-credit
     (default 64) bounds the per-CONNECTION un-acked set, so in a competing group one stuck
     consumer cannot consume a peer's budget. A fetch delivers min(requested, consumer credit,
-    group window).
+    group window). --consumer-credit-bytes (default 8388608, 8 MiB; 0 = unlimited) is the parallel
+    per-CONNECTION un-acked BYTE budget, so a large-payload consumer cannot blow the RAM ceiling
+    despite a small message count: a fetch also stops once a connection's in-flight bytes reach the
+    budget, with a hard floor of one message (a single over-budget message is still delivered so it
+    never wedges the consumer).
     --max-deliver (default 5) caps delivery attempts before a poison message is dead-lettered.
     0 (and the maximum 4294967295) mean unlimited delivery, allowed ONLY with
     --allow-unlimited-deliver, which also prints a startup WARN: an unlimited cap lets a single
@@ -657,6 +669,10 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
 
 /// Parses the `serve` flag list into a [`ParsedServe`]. Split out of [`run_serve`] so the
 /// flag-parsing loop is one self-contained concern (and stays under the per-function line bound).
+// One flat arm per `serve` flag plus the defaults block: a single linear concern (parse the flags
+// into a `ServeConfig`) that reads better unbroken than split across helpers, so the line count is
+// allowed past the default ceiling. Adding `--consumer-credit-bytes` (#275) pushed it just over.
+#[allow(clippy::too_many_lines)]
 fn parse_serve_flags(args: &[String]) -> Result<ParsedServe, CliError> {
     let mut addr = DEFAULT_ADDR.to_string();
     let mut data_dir: Option<String> = None;
@@ -668,6 +684,7 @@ fn parse_serve_flags(args: &[String]) -> Result<ParsedServe, CliError> {
     let mut backoff_ms: Vec<u64> = Vec::new();
     let mut max_in_flight = DEFAULT_MAX_IN_FLIGHT;
     let mut consumer_credit = DEFAULT_CONSUMER_CREDIT;
+    let mut consumer_credit_bytes = DEFAULT_CONSUMER_CREDIT_BYTES;
     let mut max_segment_bytes = DEFAULT_MAX_SEGMENT_BYTES;
     let mut max_total_bytes = DEFAULT_MAX_TOTAL_BYTES;
     let mut max_retained_bytes = DEFAULT_MAX_RETAINED_BYTES;
@@ -700,6 +717,9 @@ fn parse_serve_flags(args: &[String]) -> Result<ParsedServe, CliError> {
             "--max-in-flight" => max_in_flight = take_number("--max-in-flight", args, &mut i)?,
             "--consumer-credit" => {
                 consumer_credit = take_number("--consumer-credit", args, &mut i)?;
+            }
+            "--consumer-credit-bytes" => {
+                consumer_credit_bytes = take_number("--consumer-credit-bytes", args, &mut i)?;
             }
             "--max-segment-bytes" => {
                 max_segment_bytes = take_number("--max-segment-bytes", args, &mut i)?;
@@ -749,6 +769,7 @@ fn parse_serve_flags(args: &[String]) -> Result<ParsedServe, CliError> {
             backoff_ms,
             max_in_flight,
             consumer_credit,
+            consumer_credit_bytes,
             max_segment_bytes,
             max_total_bytes,
             max_retained_bytes,
@@ -861,6 +882,12 @@ struct ServeConfig {
     /// effective Flow bound is min(this, the per-group `max_in_flight` window). Default 64 (NOT
     /// 65535), floored to 1 by the engine.
     consumer_credit: u32,
+    /// Per-CONSUMER (per-connection) standing in-flight BYTE budget (#275): the most un-acked
+    /// payload bytes one connection may hold at once, the RAM-side companion to `consumer_credit`.
+    /// The effective Flow bound is min(message credit, byte budget) with a hard floor of one message
+    /// (a single over-budget message is still delivered so it never wedges the consumer). Default
+    /// 8 MiB; `0` = unlimited (the byte budget is off, only the message credit binds).
+    consumer_credit_bytes: u64,
     max_segment_bytes: u64,
     /// Hard durable-log total byte cap, the drop-new shed backstop (#10). `0` means unlimited
     /// (the cap is off), which is the default and preserves the spill-by-default behavior.
@@ -1013,6 +1040,7 @@ fn cmd_serve(
         &config.backoff_ms,
         config.max_in_flight,
         config.consumer_credit,
+        config.consumer_credit_bytes,
         config.max_segment_bytes,
         config.max_total_bytes,
         config.max_retained_bytes,
@@ -1078,6 +1106,10 @@ fn open_disk_engine(
             // The effective Flow bound is min(this, the per-group max_in_flight window). Floored to
             // 1 by the engine. Default 64 (NOT 65535), memory-justified by Little's Law (#19).
             consumer_credit: config.consumer_credit,
+            // The per-CONSUMER (per-connection) in-flight BYTE budget (#275): the RAM-side companion
+            // to the message-count credit. The effective Flow bound is min(message credit, byte
+            // budget) with a hard floor of one message. Default 8 MiB; `0` = unlimited (off).
+            consumer_credit_bytes: config.consumer_credit_bytes,
             checkpoint_interval: config.checkpoint_interval,
             // Consumer-safe retention (#13, #80), each `0` = disabled (off), the default. Size in
             // record bytes, age in milliseconds (against the engine clock), count in messages; the
@@ -1485,6 +1517,7 @@ mod tests {
             backoff_ms: Vec::new(),
             max_in_flight,
             consumer_credit: DEFAULT_CONSUMER_CREDIT,
+            consumer_credit_bytes: DEFAULT_CONSUMER_CREDIT_BYTES,
             max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
             max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
             max_retained_bytes: DEFAULT_MAX_RETAINED_BYTES,
@@ -1680,6 +1713,7 @@ mod tests {
                 delivery: DeliveryConfig::new(1, false, Vec::new()).unwrap(), // max_deliver = 1
                 max_in_flight: 16,
                 consumer_credit: 64,
+                consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
@@ -1838,6 +1872,7 @@ mod tests {
                 delivery: DeliveryConfig::new(5, false, Vec::new()).unwrap(),
                 max_in_flight: 16,
                 consumer_credit: 64,
+                consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
@@ -2066,6 +2101,7 @@ mod tests {
             backoff_ms: Vec::new(),
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             consumer_credit: DEFAULT_CONSUMER_CREDIT,
+            consumer_credit_bytes: DEFAULT_CONSUMER_CREDIT_BYTES,
             max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
             max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
             max_retained_bytes: DEFAULT_MAX_RETAINED_BYTES,
@@ -2543,6 +2579,87 @@ mod tests {
         );
     }
 
+    // ----- Per-consumer BYTE budget flag (#275) -----
+
+    #[test]
+    fn serve_parses_the_consumer_credit_bytes_flag() {
+        // The --consumer-credit-bytes flag (#275) parses its value into the ServeConfig, so the
+        // engine receives the configured byte budget.
+        let parsed = parse_serve_flags(&[
+            "--data-dir".to_string(),
+            "/tmp/ironbus-cli-ccb-never-served".to_string(),
+            "--consumer-credit-bytes".to_string(),
+            "65536".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.config.consumer_credit_bytes, 65536);
+    }
+
+    #[test]
+    fn the_consumer_credit_bytes_default_is_eight_mib() {
+        // Omitted, the flag defaults to 8 MiB, aliased to the engine default so the two never drift.
+        let parsed = parse_serve_flags(&["--data-dir".to_string(), "/tmp/x".to_string()]).unwrap();
+        assert_eq!(
+            parsed.config.consumer_credit_bytes,
+            DEFAULT_CONSUMER_CREDIT_BYTES
+        );
+        assert_eq!(DEFAULT_CONSUMER_CREDIT_BYTES, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn serve_accepts_a_zero_consumer_credit_bytes_meaning_unlimited() {
+        // `0` = unlimited (the byte budget is off), matching the `0` = off convention of the other
+        // byte bounds. Unlike --consumer-credit (where 0 is a usage error), a 0 byte budget is a
+        // valid, meaningful value (only the message credit binds), so it must parse and validate.
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-cli-ccb0-never-served".to_string(),
+                "--consumer-credit-bytes".to_string(),
+                "0".to_string(),
+                "--addr".to_string(),
+                "127.0.0.1:1".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_ne!(
+            e.exit_code(),
+            EXIT_USAGE,
+            "an explicit --consumer-credit-bytes 0 (unlimited) parses and validates: {e}"
+        );
+        let _ = std::fs::remove_dir_all("/tmp/ironbus-cli-ccb0-never-served");
+    }
+
+    #[test]
+    fn serve_rejects_a_non_numeric_consumer_credit_bytes() {
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--consumer-credit-bytes".to_string(),
+                "lots".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--consumer-credit-bytes"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_lists_the_consumer_credit_bytes_flag() {
+        assert!(
+            USAGE.contains("--consumer-credit-bytes"),
+            "USAGE must document --consumer-credit-bytes"
+        );
+    }
+
     #[test]
     fn serve_accepts_repeated_key_shared_group_flags() {
         // The repeatable --key-shared-group flag (#64) parses and validates; the only failure is
@@ -2773,6 +2890,7 @@ mod tests {
                 delivery: DeliveryConfig::new(1, false, Vec::new()).unwrap(),
                 max_in_flight: 16,
                 consumer_credit: 64,
+                consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
@@ -2843,6 +2961,7 @@ mod tests {
                 delivery: DeliveryConfig::new(5, false, Vec::new()).unwrap(),
                 max_in_flight: 2,
                 consumer_credit: 64,
+                consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,

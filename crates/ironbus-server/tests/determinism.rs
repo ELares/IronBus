@@ -21,6 +21,9 @@ fn config() -> EngineConfig {
         delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
         max_in_flight: 16,
         consumer_credit: 64,
+        // Unlimited byte budget (#275): `0` = off, so the determinism image is unchanged by the new
+        // field (the message-count credit alone bounds delivery in this image).
+        consumer_credit_bytes: 0,
         // Checkpoint on every commit, so the durable cursor checkpoint is exercised and part
         // of the compared image.
         checkpoint_interval: 1,

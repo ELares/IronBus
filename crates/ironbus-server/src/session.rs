@@ -52,27 +52,51 @@ impl core::fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
+/// One entry in a session's connection-scoped in-flight set (#175, #275): the generation the lease
+/// was granted under (the fencing token half) and the message's byte size (its key plus headers plus
+/// payload length, matching the engine's produced-bytes accounting). The generation fences acks to
+/// the exact lease this connection received; the byte size lets the per-consumer byte budget be
+/// DERIVED from the in-flight set rather than tracked in a separate, driftable counter.
+#[derive(Clone, Copy, Debug)]
+struct Lease {
+    /// The lease generation this connection was granted, for fencing acks (#175).
+    generation: u64,
+    /// The message's byte size (key + headers + payload), for the per-consumer byte budget (#275).
+    bytes: u64,
+}
+
 /// Per-connection session state over a shared [`Engine`].
 ///
-/// # Per-consumer credit (refs #65, #9, #10)
+/// # Per-consumer credit (refs #65, #275, #9, #10)
 ///
 /// Each session has its own standing in-flight credit: a connection may hold at most
 /// `credit_ceiling` un-acked messages at once (the ceiling comes from
 /// [`Engine::consumer_credit`], read once on the first Flow and cached, default 64, NOT 65535).
 /// The accounting is DERIVED from the connection-scoped `leased` set (#175) rather than a separate
 /// counter, so it can never drift from true ownership: the messages this connection currently holds
-/// ARE exactly the entries in `leased`, so its remaining credit is always
+/// ARE exactly the entries in `leased`, so its remaining message credit is always
 /// `credit_ceiling - leased.len()`.
 ///
+/// A parallel per-consumer BYTE budget (#275) caps the un-acked PAYLOAD bytes a connection may hold,
+/// the RAM-side companion to the message count (the ceiling comes from
+/// [`Engine::consumer_credit_bytes`], read once on the first Flow and cached, default 8 MiB, `0` =
+/// unlimited). It too is DERIVED from `leased`: each entry carries the byte size of its message, so
+/// the bytes in flight are always the sum of `leased`'s values, and the byte budget cannot drift any
+/// more than the message count can. The EFFECTIVE per-Flow credit is
+/// `min(message credits remaining, byte credits remaining)`, with a hard floor of ONE message: a
+/// single message larger than the whole byte budget is still delivered (so an over-budget message
+/// never wedges the consumer), but no further message is sent until bytes free up.
+///
 /// A Flow fetch (see [`Session::handle_flow`]) delivers at most
-/// `min(requested_credit, ceiling - already_held, whatever the group makes available)`, so the
-/// EFFECTIVE bound is the MIN of the producer-side group window
-/// ([`crate::engine::EngineConfig::max_in_flight`]) and this per-consumer ceiling. Each delivery
-/// inserts into `leased` (decrementing the remaining credit); an ack, a successful nack/term, the
-/// per-batch prune of committed offsets, and the start-of-Flow prune of leases the engine no longer
-/// holds (redelivery accounting) all REMOVE from `leased`, restoring credit. At zero remaining
-/// credit a Flow delivers nothing until the consumer frees a slot, even if the group has messages
-/// and other consumers are draining.
+/// `min(requested_credit, message credits remaining, byte credits remaining, whatever the group
+/// makes available)` (subject to the floor of one), so the EFFECTIVE bound is the MIN of the
+/// producer-side group window ([`crate::engine::EngineConfig::max_in_flight`]), this per-consumer
+/// message ceiling, and this per-consumer byte budget. Each delivery inserts into `leased` (occupying
+/// one message slot and its bytes); an ack, a successful nack/term, the per-batch prune of committed
+/// offsets, and the start-of-Flow prune of leases the engine no longer holds (redelivery accounting)
+/// all REMOVE from `leased`, restoring BOTH the message slot and its bytes. At zero remaining message
+/// credit OR a full byte budget a Flow delivers nothing (beyond the floor of one) until the consumer
+/// frees a slot, even if the group has messages and other consumers are draining.
 ///
 /// ## Per-consumer isolation
 ///
@@ -91,7 +115,9 @@ impl std::error::Error for SessionError {}
 /// ACTIVELY (via [`Engine::holds_active_lease_in`]), which FREES this consumer's slot; the redelivery to whoever
 /// next polls is counted against THAT consumer's credit when their Flow inserts it. No message is
 /// lost or double-counted, and at-least-once is preserved (the message is still leased and will
-/// redeliver until acked).
+/// redeliver until acked). The freed slot restores BOTH the message credit and the message's bytes;
+/// when the message is recounted against whoever next claims it, it re-occupies exactly its bytes
+/// once (the redelivery overwrites the same offset key in `leased`, so the byte total never doubles).
 #[derive(Debug, Default)]
 pub struct Session {
     connected: bool,
@@ -99,19 +125,27 @@ pub struct Session {
     /// Empty selects the default group (#9), so an unsubscribed consumer behaves exactly as
     /// before. FLOW fetches and ACKs route to this group.
     subscription: String,
-    /// The leases this session was delivered via Flow and may still act on, keyed by offset
-    /// to its granted generation. Acks are scoped to this map (#175), so one connection cannot
-    /// ack a message delivered to another. Keying by offset bounds it to one entry per offset
-    /// (a redelivery overwrites the stale generation), and committed offsets are pruned per
-    /// batch, so it stays within the in-flight window. Its size IS this connection's in-flight
-    /// occupancy, so the per-consumer credit (#65) is derived from it directly.
-    leased: HashMap<u64, u64>,
+    /// The leases this session was delivered via Flow and may still act on, keyed by offset to the
+    /// granted generation AND the message's byte size (#65, #275). Acks are scoped to this map
+    /// (#175), so one connection cannot ack a message delivered to another. Keying by offset bounds
+    /// it to one entry per offset (a redelivery overwrites the stale lease), and committed offsets
+    /// are pruned per batch, so it stays within the in-flight window. Its SIZE is this connection's
+    /// in-flight message count and the SUM of its `bytes` is its in-flight byte total, so BOTH the
+    /// per-consumer message credit and the byte budget (#275) are derived from it directly and cannot
+    /// drift.
+    leased: HashMap<u64, Lease>,
     /// The per-CONSUMER (per-connection) in-flight credit ceiling (#65), cached from
     /// [`Engine::consumer_credit`] on the first Flow. `None` until then: the engine is the source of
     /// truth for the ceiling (so a `serve` flag sets it once for every connection), and a session is
     /// created before it has an engine handle. Once set it never changes for the life of the
-    /// connection. The remaining credit at any moment is `ceiling - leased.len()`.
+    /// connection. The remaining message credit at any moment is `ceiling - leased.len()`.
     credit_ceiling: Option<u32>,
+    /// The per-CONSUMER (per-connection) in-flight BYTE budget (#275), cached from
+    /// [`Engine::consumer_credit_bytes`] on the first Flow alongside `credit_ceiling`. `None` until
+    /// then, for the same reason. Once set it never changes for the life of the connection. `0` means
+    /// UNLIMITED (the byte budget is off, only the message credit binds). The remaining byte budget
+    /// at any moment is `ceiling_bytes - (sum of leased values' bytes)`.
+    credit_ceiling_bytes: Option<u64>,
     /// This connection's stable `key_shared` member identity (#64): the rendezvous-hash seed the
     /// engine routes a key's records to. Minted once per connection by the server from an atomic
     /// counter, so two concurrently-live connections never collide. Only consulted for a group
@@ -304,7 +338,7 @@ impl Session {
         // act on it. A token this session never received (or whose generation does not match
         // the one delivered) is fenced (status 0) without touching the engine, so a second
         // connection cannot commit or requeue another consumer's message.
-        if self.leased.get(&ack.offset) != Some(&ack.generation) {
+        if self.leased.get(&ack.offset).map(|l| l.generation) != Some(ack.generation) {
             reply(out, FrameType::AckStatus, &[0]);
             return Ok(());
         }
@@ -382,6 +416,28 @@ impl Session {
             .get_or_insert_with(|| engine.consumer_credit())
     }
 
+    /// The per-CONSUMER (per-connection) in-flight BYTE budget (#275) for this session, cached from
+    /// the engine on the first call alongside [`Session::credit_ceiling`]. The engine is the source
+    /// of truth (a `serve` flag sets it once for every connection). `0` means unlimited.
+    fn credit_ceiling_bytes<F: Filesystem, C: Clock + Clone>(
+        &mut self,
+        engine: &Engine<F, C>,
+    ) -> u64 {
+        *self
+            .credit_ceiling_bytes
+            .get_or_insert_with(|| engine.consumer_credit_bytes())
+    }
+
+    /// The total in-flight PAYLOAD bytes this connection currently holds un-acked (#275): the sum of
+    /// every leased message's byte size. The byte budget is DERIVED from this, never a separate
+    /// counter, so it cannot drift from true ownership. Saturating so it can never wrap.
+    fn in_flight_bytes(&self) -> u64 {
+        self.leased
+            .values()
+            .map(|l| l.bytes)
+            .fold(0u64, u64::saturating_add)
+    }
+
     /// Drops every `leased` entry the engine no longer holds as an ACTIVE (live and not expired)
     /// lease for this exact `(offset, generation)` (#65 redelivery accounting): a lease that was
     /// committed past, redelivered (to this or another consumer) under a fresh generation, OR has
@@ -392,12 +448,12 @@ impl Session {
     /// its slot. Pure bookkeeping: it never mutates engine state.
     fn release_stale_leases<F: Filesystem, C: Clock + Clone>(&mut self, engine: &Engine<F, C>) {
         let group = self.subscription.clone();
-        self.leased.retain(|&offset, &mut generation| {
+        self.leased.retain(|&offset, lease| {
             engine.holds_active_lease_in(
                 &group,
                 &ironbus_core::lease::LeaseToken {
                     offset: ironbus_core::types::Offset::new(offset),
-                    generation,
+                    generation: lease.generation,
                 },
             )
         });
@@ -407,16 +463,18 @@ impl Session {
     /// terminated by a `FlowEnd` whose body is the count delivered (so the client knows the
     /// batch is complete). The credit count is a little-endian `u32`.
     ///
-    /// The batch is bounded by the PER-CONSUMER credit (#65): it delivers at most
-    /// `min(requested_credit, ceiling - already_held, whatever the group makes available)`. Before
-    /// counting, it releases any stale leases (expired-and-redelivered, or committed) so this
-    /// connection's remaining credit reflects only what it still truly holds (redelivery
-    /// accounting). Each delivery occupies one of this connection's slots until it is acked,
-    /// nacked, termed, or expires, so a single connection can never hold more than its ceiling
-    /// un-acked, and one stuck consumer cannot consume a peer's budget (per-consumer isolation).
-    /// The advisory frames (dead-letter, truncation) still count against the REQUESTED credit (they
-    /// bound the total frames a batch streams) but do NOT occupy an in-flight slot, since they
-    /// commit past or reset rather than lease.
+    /// The batch is bounded by the PER-CONSUMER credit (#65, #275): it delivers at most
+    /// `min(requested_credit, message ceiling - already held, byte budget remaining, whatever the
+    /// group makes available)`, with a hard floor of ONE message so a single over-budget message
+    /// never wedges the consumer. Before counting, it releases any stale leases
+    /// (expired-and-redelivered, or committed) so this connection's remaining credit reflects only
+    /// what it still truly holds (redelivery accounting). Each delivery occupies one of this
+    /// connection's message slots AND its bytes until it is acked, nacked, termed, or expires, so a
+    /// single connection can never hold more than its message ceiling un-acked (nor, beyond the floor
+    /// of one message, more than its byte budget), and one stuck consumer cannot consume a peer's
+    /// budget (per-consumer isolation). The advisory frames (dead-letter, truncation) still count
+    /// against the REQUESTED credit (they bound the total frames a batch streams) but do NOT occupy
+    /// an in-flight slot or any bytes, since they commit past or reset rather than lease.
     fn handle_flow<F: Filesystem, C: Clock + Clone>(
         &mut self,
         engine: &mut Engine<F, C>,
@@ -448,8 +506,26 @@ impl Session {
         let held = u32::try_from(self.leased.len()).unwrap_or(u32::MAX);
         let remaining = ceiling.saturating_sub(held);
         let credits = requested.min(remaining);
+        // The per-consumer BYTE budget (#275): `0` means unlimited (the byte budget is off, only the
+        // message credit binds). When set, a delivery is refused once this connection's in-flight
+        // bytes have reached the budget, EXCEPT the floor-of-one: a connection holding nothing
+        // in-flight always gets at least one message even if it alone exceeds the budget, so a single
+        // over-budget message never wedges the consumer. The check is BEFORE each poll because a poll
+        // that returns Poll::Message has already leased the message in the engine (its size is not
+        // knowable until then); delivering when at-or-below budget lets the in-flight total overshoot
+        // by at most one message, which is the standard credit semantics and stays bounded.
+        let ceiling_bytes = self.credit_ceiling_bytes(engine);
         let mut delivered = 0u32;
         for _ in 0..credits {
+            // The byte budget binds (#275): stop once in-flight bytes have reached the budget, unless
+            // this connection holds nothing in-flight (the floor-of-one). A budget of 0 is unlimited,
+            // so it never binds.
+            if ceiling_bytes != 0
+                && !self.leased.is_empty()
+                && self.in_flight_bytes() >= ceiling_bytes
+            {
+                break;
+            }
             // Member-aware poll (#64): for a key_shared group this routes by the connection's
             // member id; for a plain competing group it is identical to poll_now_in, so the
             // KeyOrdering::None path is unchanged.
@@ -471,8 +547,17 @@ impl Session {
                         break;
                     }
                     reply(out, FrameType::Deliver, &frame_body);
-                    // Record ownership so only this session can later act on this lease (#175).
-                    self.leased.insert(d.offset.get(), d.token.generation);
+                    // Record ownership so only this session can later act on this lease (#175), and
+                    // the message's byte size so the byte budget (#275) is derived from `leased`. The
+                    // size is key + headers + payload, matching the engine's produced-bytes accounting.
+                    let bytes = lease_bytes(&d.record);
+                    self.leased.insert(
+                        d.offset.get(),
+                        Lease {
+                            generation: d.token.generation,
+                            bytes,
+                        },
+                    );
                     delivered += 1;
                 }
                 // A parked (poison, over max-deliver) message is committed past by the engine
@@ -609,6 +694,20 @@ impl Session {
     }
 }
 
+/// The byte size a delivered message occupies against the per-consumer byte budget (#275): its key
+/// plus headers plus payload length, matching the engine's produced-bytes accounting (the framing
+/// and fixed-header overhead is deliberately excluded, so the budget tracks the consumer's PAYLOAD
+/// RAM, the thing #20 cross-checks against the RAM ceiling). Saturating so an impossibly large record
+/// can never wrap the total.
+fn lease_bytes(record: &ironbus_storage::segment::OwnedRecord) -> u64 {
+    let len = record
+        .key
+        .len()
+        .saturating_add(record.headers.len())
+        .saturating_add(record.payload.len());
+    u64::try_from(len).unwrap_or(u64::MAX)
+}
+
 /// Encodes a response frame. Bodies here are tiny (<= 8 bytes, or a short literal), well
 /// under [`MAX_FRAME_LEN`](ironbus_proto::frame::MAX_FRAME_LEN), so the encode cannot fail;
 /// the debug assert pins that invariant against a future large-body call site.
@@ -646,6 +745,7 @@ mod tests {
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
                 max_in_flight: 10,
                 consumer_credit: 64,
+                consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
@@ -720,6 +820,7 @@ mod tests {
                 delivery: DeliveryConfig::new(max_deliver, false, vec![]).unwrap(),
                 max_in_flight: 10,
                 consumer_credit: 64,
+                consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
@@ -752,6 +853,7 @@ mod tests {
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
                 max_in_flight: 64,
                 consumer_credit: 64,
+                consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
@@ -1600,6 +1702,7 @@ mod tests {
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
                 max_in_flight: 10,
                 consumer_credit: 64,
+                consumer_credit_bytes: 0,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
@@ -1912,6 +2015,42 @@ mod tests {
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
                 max_in_flight,
                 consumer_credit,
+                // Unlimited byte budget (#275): the message-credit tests below exercise the
+                // message-count bound in isolation, so the byte budget must never bind here.
+                consumer_credit_bytes: 0,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                disk_full_policy: DiskFullPolicy::DropNew,
+            },
+        )
+        .unwrap()
+    }
+
+    /// An engine with an explicit per-consumer message credit AND byte budget (#275), so the byte
+    /// budget can be made the binding constraint. A roomy `max_in_flight` keeps the per-group window
+    /// from binding; a long visibility timeout keeps leases live unless the test advances the clock.
+    fn engine_credit_bytes(
+        clock: Arc<ManualClock>,
+        consumer_credit: u32,
+        consumer_credit_bytes: u64,
+        max_in_flight: u32,
+    ) -> Engine<InMemoryFs, Arc<ManualClock>> {
+        Engine::open(
+            InMemoryFs::new(),
+            clock,
+            EngineConfig {
+                log: LogConfig::default(),
+                lease: LeaseConfig {
+                    visibility_nanos: 30,
+                    hard_cap_nanos: 100,
+                },
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight,
+                consumer_credit,
+                consumer_credit_bytes,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
@@ -2212,5 +2351,253 @@ mod tests {
             assert_eq!(ack_reply(&mut s, &mut e, AckOp::Ack, o, g), vec![1u8]);
         }
         assert_eq!(e.committed_offset().get(), 2);
+    }
+
+    // ----- Per-consumer BYTE budget (refs #65, #275, #10, #20) -----
+
+    /// Produces a record whose total byte size (key + headers + payload) is exactly `size`: an empty
+    /// key and headers, so the payload alone carries the bytes the per-consumer byte budget counts.
+    fn produce_sized<C: Clock + Clone>(e: &mut Engine<InMemoryFs, C>, size: usize) {
+        produce(e, &vec![0xab; size]);
+    }
+
+    #[test]
+    fn the_byte_budget_binds_before_the_message_credit() {
+        // The byte budget binds (#275): a roomy MESSAGE credit (64) but a tight BYTE budget (200)
+        // with 100-byte messages stops the batch at 2 messages (in-flight reaches 200 = the budget,
+        // so the third is refused), even though message credit and the group window are far from
+        // exhausted. The byte budget is the binding constraint. Delivery proceeds while in-flight
+        // bytes are BELOW the budget and stops once they reach it, so the in-flight total is bounded
+        // by the budget rounded up to a whole message.
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_credit_bytes(Arc::clone(&clock), 64, 200, 64);
+        let mut s = connected_session(&mut e);
+        for _ in 0..10 {
+            produce_sized(&mut e, 100);
+        }
+        let batch = fetch(&mut s, &mut e, 100);
+        assert_eq!(
+            batch.len(),
+            2,
+            "the byte budget of 200 caps the batch at 2x100 bytes, not the message credit of 64"
+        );
+        // Saturated on bytes: a second Flow delivers nothing until bytes free up.
+        assert!(
+            fetch(&mut s, &mut e, 100).is_empty(),
+            "in-flight bytes have reached the budget, so no more deliveries"
+        );
+    }
+
+    #[test]
+    fn the_floor_of_one_lets_a_single_over_budget_message_through() {
+        // The hard floor of ONE (#275): a single message LARGER than the whole byte budget is still
+        // delivered when the connection holds nothing in-flight, so an over-budget message never
+        // wedges the consumer. Budget 100, one 500-byte message: it is delivered.
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_credit_bytes(Arc::clone(&clock), 64, 100, 64);
+        let mut s = connected_session(&mut e);
+        produce_sized(&mut e, 500);
+        produce_sized(&mut e, 500);
+        let batch = fetch(&mut s, &mut e, 100);
+        assert_eq!(
+            batch.len(),
+            1,
+            "the floor-of-one delivers one over-budget message so it never wedges the consumer"
+        );
+        // But ONLY one: with one over-budget message in flight, the floor no longer applies, so the
+        // second over-budget message waits until the first frees its bytes.
+        assert!(
+            fetch(&mut s, &mut e, 100).is_empty(),
+            "the floor is one; the second over-budget message waits for bytes to free"
+        );
+    }
+
+    #[test]
+    fn acking_restores_the_byte_budget() {
+        // The byte budget is restored on ack exactly like the message credit (#275): a budget of 100
+        // with 100-byte messages holds exactly one (in-flight reaches the budget, so a second is
+        // refused); acking it frees its 100 bytes so the next Flow delivers one more.
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_credit_bytes(Arc::clone(&clock), 64, 100, 64);
+        let mut s = connected_session(&mut e);
+        for _ in 0..5 {
+            produce_sized(&mut e, 100);
+        }
+        let first = fetch(&mut s, &mut e, 100);
+        assert_eq!(first.len(), 1, "100 bytes in flight reaches the budget");
+        assert!(fetch(&mut s, &mut e, 100).is_empty(), "byte-saturated");
+        // Ack frees the 100 bytes.
+        assert_eq!(
+            ack_reply(&mut s, &mut e, AckOp::Ack, first[0].0, first[0].1),
+            vec![1u8],
+            "the ack commits and frees the message's bytes"
+        );
+        let second = fetch(&mut s, &mut e, 100);
+        assert_eq!(
+            second.len(),
+            1,
+            "acking freed exactly the message's bytes, so the next Flow delivers one"
+        );
+    }
+
+    #[test]
+    fn nack_and_term_each_restore_the_byte_budget() {
+        // A successful nack and a successful term both restore the message's bytes (#275), exactly
+        // like the message credit: a byte-saturated consumer that nacks or terms can fetch again.
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_credit_bytes(Arc::clone(&clock), 64, 100, 64);
+        let mut s = connected_session(&mut e);
+        for _ in 0..3 {
+            produce_sized(&mut e, 100);
+        }
+        // Term path: fetch one (byte budget now full), term it (frees its bytes), fetch one more.
+        let first = fetch(&mut s, &mut e, 10);
+        assert_eq!(first.len(), 1, "100 bytes in flight caps the batch");
+        assert!(fetch(&mut s, &mut e, 10).is_empty(), "byte-saturated");
+        assert_eq!(
+            ack_reply(&mut s, &mut e, AckOp::Term, first[0].0, first[0].1),
+            vec![1u8],
+            "term drops it and frees its bytes"
+        );
+        let second = fetch(&mut s, &mut e, 10);
+        assert_eq!(second.len(), 1, "term freed the bytes");
+        // Nack path: nack with no delay (immediately reclaimable), which frees the bytes.
+        assert_eq!(
+            ack_reply(&mut s, &mut e, AckOp::Nack, second[0].0, second[0].1),
+            vec![1u8],
+            "nack requeues and frees its bytes"
+        );
+        let third = fetch(&mut s, &mut e, 10);
+        assert_eq!(third.len(), 1, "the freed bytes let the next Flow deliver");
+    }
+
+    #[test]
+    fn an_expired_lease_restores_the_byte_budget_on_start_of_flow_release() {
+        // The byte budget is restored on the start-of-Flow stale-lease release (#275), the redelivery
+        // accounting seam: a byte-saturated consumer whose lease EXPIRES has its bytes freed by the
+        // next Flow's stale-lease prune, so it can fetch again. Budget 100, one 100-byte message.
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_credit_bytes(Arc::clone(&clock), 64, 100, 64);
+        let mut s = connected_session(&mut e);
+        produce_sized(&mut e, 100);
+        produce_sized(&mut e, 50);
+        let first = fetch(&mut s, &mut e, 10);
+        assert_eq!(first.len(), 1, "the 100-byte message fills the budget");
+        assert!(fetch(&mut s, &mut e, 10).is_empty(), "byte-saturated");
+        // Expire the lease: the next Flow's stale-lease prune frees the 100 bytes, so the 50-byte
+        // message (offset 1) is now deliverable. The expired message also redelivers, but to whoever
+        // next polls; here the same consumer re-claims offset 0 first (lower offset), then offset 1.
+        clock.advance_monotonic_nanos(40);
+        let after = fetch(&mut s, &mut e, 10);
+        assert!(
+            !after.is_empty(),
+            "the start-of-Flow stale-lease prune freed the bytes, so delivery resumes"
+        );
+        // The first re-delivered offset is 0 (the expired message, re-occupying its 100 bytes once).
+        assert_eq!(after[0].0, 0, "the expired message redelivers first");
+    }
+
+    #[test]
+    fn a_redelivery_re_occupies_its_bytes_exactly_once() {
+        // A redelivered message re-occupies its bytes ONCE (#275): the redelivery overwrites the same
+        // offset key in `leased`, so the byte total never doubles. Budget 100, one 100-byte message
+        // re-fetched after expiry still holds exactly 100 bytes, not 200.
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_credit_bytes(Arc::clone(&clock), 64, 100, 64);
+        let mut s = connected_session(&mut e);
+        produce_sized(&mut e, 100);
+        let first = fetch(&mut s, &mut e, 10);
+        assert_eq!(first.len(), 1);
+        // Expire and re-fetch: the same offset redelivers, re-occupying exactly its 100 bytes.
+        clock.advance_monotonic_nanos(40);
+        let second = fetch(&mut s, &mut e, 10);
+        assert_eq!(second.len(), 1, "the own expired message redelivers");
+        assert_eq!(second[0].0, 0, "same offset");
+        assert_ne!(second[0].1, first[0].1, "fresh generation");
+        // Still exactly 100 bytes in flight (one slot), so a second Flow delivers nothing: the
+        // redelivery did not leak a second 100-byte occupancy.
+        assert!(
+            fetch(&mut s, &mut e, 10).is_empty(),
+            "the redelivery re-occupied its bytes once, not twice"
+        );
+    }
+
+    #[test]
+    fn the_effective_credit_is_the_min_of_message_and_byte_both_directions() {
+        // The effective per-Flow credit is min(message credits remaining, byte credits remaining),
+        // verified BOTH directions (#275).
+        let clock = Arc::new(ManualClock::new());
+        // Direction 1: bytes bind. Message credit 64 (roomy), byte budget 200 with 100-byte
+        // messages, group window 64 -> 2 deliveries (the byte budget is the min).
+        {
+            let mut e = engine_credit_bytes(Arc::clone(&clock), 64, 200, 64);
+            let mut s = connected_session(&mut e);
+            for _ in 0..10 {
+                produce_sized(&mut e, 100);
+            }
+            assert_eq!(
+                fetch(&mut s, &mut e, 100).len(),
+                2,
+                "bytes bind: min(64 msgs, 200/100 bytes) = 2"
+            );
+        }
+        // Direction 2: the message credit binds. Message credit 2 (tight), byte budget 100_000
+        // (roomy) with 100-byte messages, group window 64 -> 2 deliveries (the message credit is the
+        // min).
+        {
+            let mut e = engine_credit_bytes(Arc::clone(&clock), 2, 100_000, 64);
+            let mut s = connected_session(&mut e);
+            for _ in 0..10 {
+                produce_sized(&mut e, 100);
+            }
+            assert_eq!(
+                fetch(&mut s, &mut e, 100).len(),
+                2,
+                "the message credit binds: min(2 msgs, roomy bytes) = 2"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_byte_budget_is_unlimited() {
+        // `0` = unlimited (#275): the byte budget is off, so only the message credit binds. A roomy
+        // message credit (64) with a zero byte budget and many large messages delivers up to the
+        // group window, never stopping on bytes.
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_credit_bytes(Arc::clone(&clock), 64, 0, 64);
+        let mut s = connected_session(&mut e);
+        for _ in 0..10 {
+            produce_sized(&mut e, 100_000);
+        }
+        let batch = fetch(&mut s, &mut e, 100);
+        assert_eq!(
+            batch.len(),
+            10,
+            "a zero byte budget is unlimited, so only the message credit (and availability) bounds"
+        );
+    }
+
+    #[test]
+    fn the_default_byte_budget_does_not_bind_small_messages() {
+        // The default 8 MiB byte budget is generous for the small records an edge broker carries: a
+        // handful of tiny messages all deliver, the byte budget never binding. Wired with the real
+        // production default const so the default path is exercised, not a test-local 0.
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_credit_bytes(
+            Arc::clone(&clock),
+            64,
+            crate::engine::DEFAULT_CONSUMER_CREDIT_BYTES,
+            64,
+        );
+        let mut s = connected_session(&mut e);
+        for _ in 0..5 {
+            produce(&mut e, b"small");
+        }
+        let batch = fetch(&mut s, &mut e, 100);
+        assert_eq!(
+            batch.len(),
+            5,
+            "the default 8 MiB byte budget does not bind a handful of small messages"
+        );
     }
 }
