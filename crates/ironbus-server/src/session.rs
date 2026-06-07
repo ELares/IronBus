@@ -52,6 +52,45 @@ impl core::fmt::Display for SessionError {
 impl std::error::Error for SessionError {}
 
 /// Per-connection session state over a shared [`Engine`].
+///
+/// # Per-consumer credit (refs #65, #9, #10)
+///
+/// Each session has its own standing in-flight credit: a connection may hold at most
+/// `credit_ceiling` un-acked messages at once (the ceiling comes from
+/// [`Engine::consumer_credit`], read once on the first Flow and cached, default 64, NOT 65535).
+/// The accounting is DERIVED from the connection-scoped `leased` set (#175) rather than a separate
+/// counter, so it can never drift from true ownership: the messages this connection currently holds
+/// ARE exactly the entries in `leased`, so its remaining credit is always
+/// `credit_ceiling - leased.len()`.
+///
+/// A Flow fetch (see [`Session::handle_flow`]) delivers at most
+/// `min(requested_credit, ceiling - already_held, whatever the group makes available)`, so the
+/// EFFECTIVE bound is the MIN of the producer-side group window
+/// ([`crate::engine::EngineConfig::max_in_flight`]) and this per-consumer ceiling. Each delivery
+/// inserts into `leased` (decrementing the remaining credit); an ack, a successful nack/term, the
+/// per-batch prune of committed offsets, and the start-of-Flow prune of leases the engine no longer
+/// holds (redelivery accounting) all REMOVE from `leased`, restoring credit. At zero remaining
+/// credit a Flow delivers nothing until the consumer frees a slot, even if the group has messages
+/// and other consumers are draining.
+///
+/// ## Per-consumer isolation
+///
+/// Because the credit and the `leased` set are per CONNECTION, one stuck consumer that fills its
+/// ceiling and stops acking pins ONLY its own slots; it never touches another connection's `leased`
+/// set or its remaining credit, so it cannot reduce a peer's available deliveries. When the
+/// per-group window is the binding constraint instead, both consumers share the same group
+/// backpressure, which is the intended behavior.
+///
+/// ## Redelivery accounting
+///
+/// When one of this session's leases expires, the engine redelivers the message to whoever next
+/// polls (the same or another consumer), under a fresh generation. The stale `(offset, generation)`
+/// this session still holds is no longer a live lease the engine recognizes. At the start of each
+/// Flow, [`Session::release_stale_leases`] drops every `leased` entry the engine no longer holds
+/// ACTIVELY (via [`Engine::holds_active_lease_in`]), which FREES this consumer's slot; the redelivery to whoever
+/// next polls is counted against THAT consumer's credit when their Flow inserts it. No message is
+/// lost or double-counted, and at-least-once is preserved (the message is still leased and will
+/// redeliver until acked).
 #[derive(Debug, Default)]
 pub struct Session {
     connected: bool,
@@ -63,8 +102,15 @@ pub struct Session {
     /// to its granted generation. Acks are scoped to this map (#175), so one connection cannot
     /// ack a message delivered to another. Keying by offset bounds it to one entry per offset
     /// (a redelivery overwrites the stale generation), and committed offsets are pruned per
-    /// batch, so it stays within the in-flight window.
+    /// batch, so it stays within the in-flight window. Its size IS this connection's in-flight
+    /// occupancy, so the per-consumer credit (#65) is derived from it directly.
     leased: HashMap<u64, u64>,
+    /// The per-CONSUMER (per-connection) in-flight credit ceiling (#65), cached from
+    /// [`Engine::consumer_credit`] on the first Flow. `None` until then: the engine is the source of
+    /// truth for the ceiling (so a `serve` flag sets it once for every connection), and a session is
+    /// created before it has an engine handle. Once set it never changes for the life of the
+    /// connection. The remaining credit at any moment is `ceiling - leased.len()`.
+    credit_ceiling: Option<u32>,
 }
 
 impl Session {
@@ -304,9 +350,50 @@ impl Session {
             }
         }
     }
+    /// The per-CONSUMER (per-connection) in-flight credit ceiling (#65) for this session, cached
+    /// from the engine on the first call. The engine is the source of truth (a `serve` flag sets it
+    /// once for every connection), and it is already floored to at least 1.
+    fn credit_ceiling<F: Filesystem, C: Clock + Clone>(&mut self, engine: &Engine<F, C>) -> u32 {
+        *self
+            .credit_ceiling
+            .get_or_insert_with(|| engine.consumer_credit())
+    }
+
+    /// Drops every `leased` entry the engine no longer holds as an ACTIVE (live and not expired)
+    /// lease for this exact `(offset, generation)` (#65 redelivery accounting): a lease that was
+    /// committed past, redelivered (to this or another consumer) under a fresh generation, OR has
+    /// merely EXPIRED is no longer actively this connection's, so its slot must be freed before the
+    /// remaining credit is computed. Freeing on expiry is what lets the message be recounted against
+    /// whoever next claims it (possibly this same consumer, which then re-occupies exactly one slot
+    /// because the re-claim overwrites the same offset key). A still-active, unexpired lease keeps
+    /// its slot. Pure bookkeeping: it never mutates engine state.
+    fn release_stale_leases<F: Filesystem, C: Clock + Clone>(&mut self, engine: &Engine<F, C>) {
+        let group = self.subscription.clone();
+        self.leased.retain(|&offset, &mut generation| {
+            engine.holds_active_lease_in(
+                &group,
+                &ironbus_core::lease::LeaseToken {
+                    offset: ironbus_core::types::Offset::new(offset),
+                    generation,
+                },
+            )
+        });
+    }
+
     /// Fetches up to the requested number of messages and streams them as DELIVER frames,
     /// terminated by a `FlowEnd` whose body is the count delivered (so the client knows the
     /// batch is complete). The credit count is a little-endian `u32`.
+    ///
+    /// The batch is bounded by the PER-CONSUMER credit (#65): it delivers at most
+    /// `min(requested_credit, ceiling - already_held, whatever the group makes available)`. Before
+    /// counting, it releases any stale leases (expired-and-redelivered, or committed) so this
+    /// connection's remaining credit reflects only what it still truly holds (redelivery
+    /// accounting). Each delivery occupies one of this connection's slots until it is acked,
+    /// nacked, termed, or expires, so a single connection can never hold more than its ceiling
+    /// un-acked, and one stuck consumer cannot consume a peer's budget (per-consumer isolation).
+    /// The advisory frames (dead-letter, truncation) still count against the REQUESTED credit (they
+    /// bound the total frames a batch streams) but do NOT occupy an in-flight slot, since they
+    /// commit past or reset rather than lease.
     fn handle_flow<F: Filesystem, C: Clock + Clone>(
         &mut self,
         engine: &mut Engine<F, C>,
@@ -321,7 +408,23 @@ impl Session {
             reply_err(out, "flow credit must be a u32");
             return Ok(());
         };
-        let credits = u32::from_le_bytes(credit_bytes);
+        let requested = u32::from_le_bytes(credit_bytes);
+        // Redelivery accounting (#65): free the slots of any leases this connection no longer holds
+        // (expired-and-redelivered, or committed) BEFORE computing remaining credit, so a stuck
+        // consumer's expired leases stop counting against it and its peers stay isolated.
+        self.release_stale_leases(engine);
+        // The per-consumer remaining credit: the ceiling minus what this connection already holds
+        // un-acked. The effective batch bound is min(requested, remaining); the per-group
+        // `max_in_flight` window further caps it inside the engine's poll (a full window returns
+        // Poll::Idle, ending the batch early), so the delivered total is the MIN of the requested
+        // credit, this consumer's remaining credit, and whatever the group makes available. Bounding
+        // the WHOLE loop by `credits` (not `requested`) is what stops the engine from leasing an
+        // offset this connection has no credit to deliver: at zero remaining credit the loop body
+        // never runs, so a saturated consumer gets an empty batch even with messages available.
+        let ceiling = self.credit_ceiling(engine);
+        let held = u32::try_from(self.leased.len()).unwrap_or(u32::MAX);
+        let remaining = ceiling.saturating_sub(held);
+        let credits = requested.min(remaining);
         let mut delivered = 0u32;
         for _ in 0..credits {
             match engine.poll_now_in(&self.subscription) {
@@ -476,6 +579,7 @@ mod tests {
                 },
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
                 max_in_flight: 10,
+                consumer_credit: 64,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
@@ -548,6 +652,7 @@ mod tests {
                 },
                 delivery: DeliveryConfig::new(max_deliver, false, vec![]).unwrap(),
                 max_in_flight: 10,
+                consumer_credit: 64,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
@@ -578,6 +683,7 @@ mod tests {
                 },
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
                 max_in_flight: 64,
+                consumer_credit: 64,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
@@ -1265,6 +1371,7 @@ mod tests {
                 },
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
                 max_in_flight: 10,
+                consumer_credit: 64,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
@@ -1551,5 +1658,329 @@ mod tests {
         s.process(&mut e, &frame(FrameType::Info, b""), &mut out)
             .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Err);
+    }
+
+    // ----- Per-consumer credit and in-flight window (refs #65, #9, #10) -----
+
+    /// An engine with an explicit per-consumer `consumer_credit` and a roomy per-group
+    /// `max_in_flight`, so the per-CONSUMER credit is the binding constraint (not the group window)
+    /// and the #65 credit behavior is exercised in isolation. A long visibility timeout keeps
+    /// leases live unless the test advances the clock past it.
+    fn engine_credit(
+        clock: Arc<ManualClock>,
+        consumer_credit: u32,
+        max_in_flight: u32,
+    ) -> Engine<InMemoryFs, Arc<ManualClock>> {
+        Engine::open(
+            InMemoryFs::new(),
+            clock,
+            EngineConfig {
+                log: LogConfig::default(),
+                lease: LeaseConfig {
+                    visibility_nanos: 30,
+                    hard_cap_nanos: 100,
+                },
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight,
+                consumer_credit,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Connects a fresh session and returns it. The credit ceiling is read from the engine on the
+    /// first Flow, so a session built here starts with full credit.
+    fn connected_session<C: Clock + Clone>(e: &mut Engine<InMemoryFs, C>) -> Session {
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        s
+    }
+
+    /// Runs one Flow of `credit` for `s` against `e` and returns the (offset, generation) of each
+    /// delivered message in the batch.
+    fn fetch<C: Clock + Clone>(
+        s: &mut Session,
+        e: &mut Engine<InMemoryFs, C>,
+        credit: u32,
+    ) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        s.process(e, &frame(FrameType::Flow, &credit.to_le_bytes()), &mut out)
+            .unwrap();
+        delivered_tokens(&out)
+    }
+
+    #[test]
+    fn a_flow_is_capped_at_the_per_consumer_credit() {
+        // A single connection cannot hold more than its credit un-acked: a Flow asking for a huge
+        // credit is capped at the connection's ceiling (4 here), not the group window (roomy at 64)
+        // nor the requested credit (1000).
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_credit(Arc::clone(&clock), 4, 64);
+        let mut s = connected_session(&mut e);
+        for _ in 0..20 {
+            produce(&mut e, b"m");
+        }
+        let batch = fetch(&mut s, &mut e, 1000);
+        assert_eq!(
+            batch.len(),
+            4,
+            "the per-consumer credit of 4 caps the batch, not the requested 1000 or the group 64"
+        );
+        // A second Flow with the credit still full delivers nothing: at zero remaining credit a
+        // Flow delivers nothing even though 16 messages remain available in the group.
+        let batch2 = fetch(&mut s, &mut e, 1000);
+        assert!(
+            batch2.is_empty(),
+            "a saturated consumer gets an empty batch until it frees a slot"
+        );
+    }
+
+    #[test]
+    fn acking_restores_per_consumer_credit() {
+        // After acking, the connection's credit frees and it can fetch more. With a credit of 2,
+        // the first Flow delivers 2; acking one frees a slot so the next Flow delivers exactly 1.
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_credit(Arc::clone(&clock), 2, 64);
+        let mut s = connected_session(&mut e);
+        for _ in 0..10 {
+            produce(&mut e, b"m");
+        }
+        let batch = fetch(&mut s, &mut e, 100);
+        assert_eq!(batch.len(), 2, "credit 2 caps the first batch");
+        // Saturated: nothing more until a slot frees.
+        assert!(fetch(&mut s, &mut e, 100).is_empty(), "no credit left");
+        // Ack one of the two: status 1 (committed), freeing exactly one slot.
+        let (offset, generation) = batch[0];
+        assert_eq!(
+            ack_reply(&mut s, &mut e, AckOp::Ack, offset, generation),
+            vec![1u8],
+            "the ack commits and frees a slot"
+        );
+        // Exactly one delivery is now available again (the freed slot), not two.
+        let batch2 = fetch(&mut s, &mut e, 100);
+        assert_eq!(
+            batch2.len(),
+            1,
+            "acking one freed exactly one credit, so the next Flow delivers exactly one"
+        );
+    }
+
+    #[test]
+    fn nack_and_term_each_restore_per_consumer_credit() {
+        // A successful nack and a successful term both free the consumer's slot (#65), exactly like
+        // an ack: a credit-1 consumer that nacks (then waits out the requeue delay) or terms can
+        // fetch again.
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_credit(Arc::clone(&clock), 1, 64);
+        let mut s = connected_session(&mut e);
+        for _ in 0..3 {
+            produce(&mut e, b"m");
+        }
+        // Term path: fetch one (credit now full), term it (frees the slot), fetch one more.
+        let first = fetch(&mut s, &mut e, 10);
+        assert_eq!(first.len(), 1, "credit 1 caps the batch");
+        assert!(fetch(&mut s, &mut e, 10).is_empty(), "saturated");
+        assert_eq!(
+            ack_reply(&mut s, &mut e, AckOp::Term, first[0].0, first[0].1),
+            vec![1u8],
+            "term drops it and frees the slot"
+        );
+        let second = fetch(&mut s, &mut e, 10);
+        assert_eq!(second.len(), 1, "term freed the slot");
+        // Nack path: nack the second with no delay (the engine has an empty schedule, so it is
+        // immediately reclaimable), which frees the slot; a later fetch redelivers it.
+        assert_eq!(
+            ack_reply(&mut s, &mut e, AckOp::Nack, second[0].0, second[0].1),
+            vec![1u8],
+            "nack requeues and frees the slot"
+        );
+        let third = fetch(&mut s, &mut e, 10);
+        assert_eq!(third.len(), 1, "the freed slot lets the next Flow deliver");
+    }
+
+    #[test]
+    fn one_stuck_consumer_does_not_starve_a_peer_in_the_same_group() {
+        // THE core property (#65, per-consumer isolation from #10): two connections in the SAME
+        // competing group, each with a credit of 2. Consumer A fills its credit and goes stuck (it
+        // never acks). Consumer B still receives its FULL credit of deliveries; A's held leases do
+        // not reduce B's available budget. The group window is roomy (64), so the only binding
+        // bound is each consumer's own credit.
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_credit(Arc::clone(&clock), 2, 64);
+        let mut a = connected_session(&mut e);
+        let mut b = connected_session(&mut e);
+        for _ in 0..10 {
+            produce(&mut e, b"m");
+        }
+        // A fills its credit (2) and never acks: it is now stuck at its ceiling.
+        let a_batch = fetch(&mut a, &mut e, 100);
+        assert_eq!(a_batch.len(), 2, "A holds its full credit of 2");
+        assert!(
+            fetch(&mut a, &mut e, 100).is_empty(),
+            "A is saturated and stuck"
+        );
+        // B, in the same group, still gets its full credit of 2: A's stuck leases did not touch B.
+        let b_batch = fetch(&mut b, &mut e, 100);
+        assert_eq!(
+            b_batch.len(),
+            2,
+            "B receives its full credit; the stuck consumer A did not starve it"
+        );
+        // The two consumers hold disjoint offsets (a competing group hands each message to one
+        // member), proving the budgets are independent, not shared.
+        let a_offsets: std::collections::BTreeSet<u64> = a_batch.iter().map(|&(o, _)| o).collect();
+        let b_offsets: std::collections::BTreeSet<u64> = b_batch.iter().map(|&(o, _)| o).collect();
+        assert!(
+            a_offsets.is_disjoint(&b_offsets),
+            "A and B hold disjoint offsets: {a_offsets:?} vs {b_offsets:?}"
+        );
+        // B can keep draining as long as it acks; A staying stuck never blocks B. Ack B's two and
+        // fetch two more: B makes unbounded progress while A holds its slots forever.
+        for &(o, g) in &b_batch {
+            assert_eq!(ack_reply(&mut b, &mut e, AckOp::Ack, o, g), vec![1u8]);
+        }
+        assert_eq!(
+            fetch(&mut b, &mut e, 100).len(),
+            2,
+            "B keeps draining at its full credit while A stays stuck"
+        );
+    }
+
+    #[test]
+    fn an_expired_lease_frees_the_original_consumer_and_is_recounted_on_redelivery() {
+        // Redelivery accounting (#65): a leased message whose lease EXPIRES frees the original
+        // consumer's slot, and on redelivery counts against whoever next receives it. No message is
+        // lost or double-counted; at-least-once holds. Credit 1 each, so the accounting is exact.
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_credit(Arc::clone(&clock), 1, 64);
+        let mut a = connected_session(&mut e);
+        let mut b = connected_session(&mut e);
+        produce(&mut e, b"only");
+        // A leases offset 0 (its single credit is now spent) and goes stuck.
+        let a_first = fetch(&mut a, &mut e, 10);
+        assert_eq!(a_first.len(), 1, "A leases offset 0");
+        assert_eq!(a_first[0].0, 0);
+        assert!(fetch(&mut a, &mut e, 10).is_empty(), "A is saturated");
+        // The lease expires (visibility 30 ns). B fetches: the message redelivers to B under a NEW
+        // generation, counting against B's credit. At-least-once: the message is not lost.
+        clock.advance_monotonic_nanos(40);
+        let b_first = fetch(&mut b, &mut e, 10);
+        assert_eq!(b_first.len(), 1, "the expired message redelivers to B");
+        assert_eq!(b_first[0].0, 0, "same offset, redelivered");
+        assert_ne!(
+            b_first[0].1, a_first[0].1,
+            "redelivery fences A's generation with a fresh one for B"
+        );
+        // B is now saturated (its one credit holds offset 0); A, whose lease expired, has had its
+        // slot freed by the start-of-Flow stale-lease prune, so A can fetch again. But the only
+        // message is in flight to B, so A gets nothing until it expires again: A's credit is free
+        // (proving the slot was released) yet no double-delivery occurs.
+        assert!(fetch(&mut b, &mut e, 10).is_empty(), "B is now saturated");
+        let a_after = fetch(&mut a, &mut e, 10);
+        assert!(
+            a_after.is_empty(),
+            "A's slot is free but offset 0 is leased to B, so no double-delivery"
+        );
+        // A's stale token is fenced (B owns the live lease now): status 0, nothing committed.
+        assert_eq!(
+            ack_reply(&mut a, &mut e, AckOp::Ack, a_first[0].0, a_first[0].1),
+            vec![0u8],
+            "A's stale generation is fenced"
+        );
+        assert_eq!(
+            e.committed_offset().get(),
+            0,
+            "nothing committed by the fence"
+        );
+        // B, the live holder, acks and commits exactly once: no double-count.
+        assert_eq!(
+            ack_reply(&mut b, &mut e, AckOp::Ack, b_first[0].0, b_first[0].1),
+            vec![1u8],
+            "B owns the live lease and commits"
+        );
+        assert_eq!(
+            e.committed_offset().get(),
+            1,
+            "the message is committed exactly once across the expire-and-redeliver"
+        );
+    }
+
+    #[test]
+    fn a_redelivery_to_the_same_consumer_still_counts_as_one_slot() {
+        // An own expired lease redelivered back to the SAME consumer re-occupies exactly ONE slot,
+        // not two (#65): the redelivery overwrites the same offset key, so a credit-1 consumer that
+        // re-fetches its own expired message holds one, not zero-then-overflow.
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_credit(Arc::clone(&clock), 1, 64);
+        let mut s = connected_session(&mut e);
+        produce(&mut e, b"x");
+        let first = fetch(&mut s, &mut e, 10);
+        assert_eq!(first.len(), 1);
+        // Expire and re-fetch: the same offset redelivers to the same consumer under a new
+        // generation, still occupying exactly its one slot.
+        clock.advance_monotonic_nanos(40);
+        let second = fetch(&mut s, &mut e, 10);
+        assert_eq!(second.len(), 1, "the own expired message redelivers");
+        assert_eq!(second[0].0, 0, "same offset");
+        assert_ne!(second[0].1, first[0].1, "fresh generation");
+        // Still exactly one slot held: a second Flow delivers nothing (credit 1 is full), proving
+        // the redelivery did not leak a second slot.
+        assert!(
+            fetch(&mut s, &mut e, 10).is_empty(),
+            "the redelivery re-occupied one slot, not two"
+        );
+        // Acking the live token commits and frees the slot.
+        assert_eq!(
+            ack_reply(&mut s, &mut e, AckOp::Ack, second[0].0, second[0].1),
+            vec![1u8]
+        );
+        assert_eq!(e.committed_offset().get(), 1);
+    }
+
+    #[test]
+    fn the_effective_bound_is_the_min_of_the_group_window_and_the_consumer_credit() {
+        // The effective Flow bound is min(producer-side group window, consumer credit). Here the
+        // GROUP window (2) is smaller than the consumer credit (64), so a single consumer is capped
+        // at the group window, exactly as before #65 (no regression to the per-group bound).
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_credit(Arc::clone(&clock), 64, 2);
+        let mut s = connected_session(&mut e);
+        for _ in 0..10 {
+            produce(&mut e, b"m");
+        }
+        let batch = fetch(&mut s, &mut e, 100);
+        assert_eq!(
+            batch.len(),
+            2,
+            "the group window of 2 is the binding bound when it is below the consumer credit"
+        );
+    }
+
+    #[test]
+    fn the_default_single_consumer_flow_path_is_unchanged() {
+        // The existing single-consumer Flow path (credit defaulted) still works: a connect, a
+        // produce, and a fetch deliver the message, with the default credit large enough not to be
+        // the binding bound for a small batch.
+        let mut e = engine(); // consumer_credit defaulted to 64 in the test helper
+        let mut s = connected_session(&mut e);
+        produce(&mut e, b"a");
+        produce(&mut e, b"b");
+        let batch = fetch(&mut s, &mut e, 10);
+        assert_eq!(
+            batch.len(),
+            2,
+            "both messages delivered on the default path"
+        );
+        for (o, g) in batch {
+            assert_eq!(ack_reply(&mut s, &mut e, AckOp::Ack, o, g), vec![1u8]);
+        }
+        assert_eq!(e.committed_offset().get(), 2);
     }
 }

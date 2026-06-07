@@ -265,6 +265,21 @@ impl LeaseTable {
             .map(|lease| lease.deliveries)
     }
 
+    /// Whether `token` names a lease that is BOTH still owned by this exact generation AND not yet
+    /// expired at monotonic time `now` (`now` is before its deadline). It is `false` once the lease
+    /// was acked or redelivered under a newer generation (a generation mismatch), AND also once the
+    /// lease's visibility window has elapsed (the deadline is at or before `now`), even though the
+    /// generation still matches: an expired lease is reclaimable, so it no longer "actively" holds
+    /// the message for its current holder. The per-consumer credit accounting (#65) uses this to
+    /// free a consumer's slot the moment its lease expires, so the redelivery is recounted against
+    /// whoever next claims it (which may be the same consumer). A no-op for an unknown offset.
+    #[must_use]
+    pub fn holds_active(&self, token: &LeaseToken, now: u64) -> bool {
+        self.leases
+            .get(&token.offset.get())
+            .is_some_and(|lease| lease.generation == token.generation && now < lease.deadline)
+    }
+
     /// Nacks the lease named by `token`: requeues the message for redelivery at `now` plus
     /// `delay_nanos`. The nacking holder is fenced with a fresh generation (so a later ack of
     /// the same token is rejected, which prevents a nack-then-ack from committing an
@@ -425,6 +440,42 @@ mod tests {
             }
         );
         assert_ne!(token(second).generation, first.generation);
+    }
+
+    #[test]
+    fn holds_active_is_true_only_for_a_live_unexpired_owning_token() {
+        // The per-consumer credit (#65) frees a slot when its lease is no longer ACTIVE:
+        // holds_active must distinguish a live, unexpired, generation-matching lease (true) from an
+        // expired one (false, even though the generation still matches), a superseded generation
+        // (false), and an acked or unknown offset (false).
+        let mut t = LeaseTable::new(cfg());
+        let tok = token(t.claim(off(7), 0)); // deadline = 30
+                                             // Live and unexpired within the window.
+        assert!(t.holds_active(&tok, 10), "live and unexpired");
+        assert!(t.holds_active(&tok, 29), "still before the deadline");
+        // At and past the deadline: expired, so NOT active even though the generation matches.
+        assert!(
+            !t.holds_active(&tok, 30),
+            "the deadline is exclusive: expired"
+        );
+        assert!(!t.holds_active(&tok, 40), "well past the deadline: expired");
+        // Redeliver under a new generation: the old token is no longer active at any time.
+        let tok2 = token(t.claim(off(7), 40)); // generation bumped, deadline = 70
+        assert!(
+            !t.holds_active(&tok, 50),
+            "the old generation is superseded"
+        );
+        assert!(t.holds_active(&tok2, 50), "the new generation is active");
+        // Ack the live lease: no lease remains, so holds_active is false.
+        assert_eq!(t.ack(&tok2), AckOutcome::Acked);
+        assert!(!t.holds_active(&tok2, 50), "no lease after ack");
+        // An offset never leased is never active.
+        assert!(!t.holds_active(&token_at(off(99), 0), 0), "unknown offset");
+    }
+
+    /// A bare token for an offset/generation, for `holds_active` negative cases (no claim needed).
+    fn token_at(offset: Offset, generation: u64) -> LeaseToken {
+        LeaseToken { offset, generation }
     }
 
     #[test]

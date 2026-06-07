@@ -20,6 +20,7 @@ fn config() -> EngineConfig {
         lease: LeaseConfig::from_millis(1000, 5000),
         delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
         max_in_flight: 16,
+        consumer_credit: 64,
         // Checkpoint on every commit, so the durable cursor checkpoint is exercised and part
         // of the compared image.
         checkpoint_interval: 1,
