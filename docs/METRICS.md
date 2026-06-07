@@ -105,17 +105,21 @@ always reported, never silently accepted.
 ironbus_recovery_truncated_bytes              total bytes dropped at the last recovery (the grand total)
 ironbus_recovery_loss_bytes{reason=...}       bytes dropped at the last recovery, by reason
 ironbus_recovery_loss_records{reason=...}     records dropped at the last recovery, by reason
-ironbus_quarantine_bytes                      corrupt bytes copied into the forensic quarantine store at the last recovery
+ironbus_quarantine_bytes                      persisted on-disk bytes of the forensic quarantine store (surviving restart)
 ```
 
-`ironbus_quarantine_bytes` (#134) is the byte total the forensic **quarantine
-store** copied (copy-not-move, capped) from a corruption skip into the
-`quarantine/` subdirectory for offline analysis. A clean torn tail is not
-quarantined (there is no forensic value), so this counts only genuine corruption.
-It is a gauge (set at startup), best-effort, and never affects what recovery
-recovered: a quarantine write failure leaves it below the dropped bytes without
-failing `Log::open`. Like the other recovery-loss gauges it is excluded from the
-frozen `_total` counter set by construction.
+`ironbus_quarantine_bytes` (#134, #315) is the **persisted on-disk footprint** of
+the forensic **quarantine store**: the total bytes of the corrupt-byte copies
+(copy-not-move, capped) that corruption skips have left in the `quarantine/`
+subdirectory for offline analysis. A clean torn tail is not quarantined (there is
+no forensic value), so this counts only genuine corruption. It is a gauge seeded
+at startup from a one-time read-only scan of the durable blobs, so unlike a
+this-recovery-only count it **survives a restart**: a clean reopen with no new
+corruption skip still surfaces the real disk pressure prior recoveries' forensic
+copies create, rather than reading 0. It is best-effort and never affects what
+recovery recovered: the scan is read-only and a missing or unreadable quarantine
+dir degrades to 0 without failing `Log::open`. Like the other recovery-loss gauges
+it is excluded from the frozen `_total` counter set by construction.
 
 The `reason` label is confined to the fixed `ReasonCode` enum (`torn_tail`,
 `corrupt_record_header`, `corrupt_record_body`, `sequence_gap`,
@@ -210,6 +214,7 @@ fixed-bucket one.
 ```
 ironbus_consumer_lag_records{consumer=...}     per-consumer durable records produced but not yet committed
 ironbus_consumer_lag_records{consumer="__overflow__"}   the folded lag of all over-cap consumers (only present once a label is dropped)
+ironbus_consumer_overflow_saturated            gauge, 1 once the __overflow__ fold became a monotonic lower bound (see below)
 ```
 
 `ironbus_consumer_lag_records` is maintained **incrementally**: the durable head
@@ -253,6 +258,16 @@ lag is **not** folded into the `__overflow__` total, so that total becomes a
 never wrong-high and never grows as folded consumers make progress. Saturation is
 the rare past-1024-distinct-over-cap-consumer case; in the common case the
 overflow total is exact.
+
+`ironbus_consumer_overflow_saturated` (#321) surfaces exactly that saturation as a
+scrape-visible **gauge** (`0` or `1`), so a Prometheus scraper can alert on it
+directly rather than only via a Rust accessor. It is **1** once more than the
+overflow-ledger capacity of **distinct** over-cap consumers have been seen over
+the broker's lifetime, i.e. once `ironbus_consumer_lag_records{consumer="__overflow__"}`
+has become a monotonic **lower bound** rather than the exact folded lag; **0** in
+the common case (over-cap cardinality within the ledger capacity). It is a gauge
+with **no `_total` suffix**, so it is excluded from the frozen resilience-counter
+taxonomy by construction.
 
 ### Self-monitoring series
 

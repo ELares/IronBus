@@ -256,21 +256,27 @@ fn a_quarantine_write_failure_does_not_fail_recovery() {
 }
 
 #[test]
-fn the_quarantine_byte_total_survives_a_reopen_of_a_clean_log() {
-    // After a corruption skip captured a blob, reopening the (now clean, truncated) log recovers
-    // cleanly with no new corruption, and a fresh quarantine store still accounts the prior blob's
-    // bytes, so a tool reading ironbus_quarantine_bytes sees the persisted forensic footprint.
+fn the_gauge_reflects_the_persisted_quarantine_footprint_after_a_clean_reopen() {
+    // The gauge is the PERSISTED on-disk footprint, surviving restart (#315). After a corruption
+    // skip captured a blob, reopening the (now clean, truncated) log recovers cleanly with NO new
+    // corruption, yet the gauge still reports the prior blob's bytes from a read-only scan-on-open,
+    // so a tool reading ironbus_quarantine_bytes sees the real disk pressure the forensic copies
+    // create rather than 0.
     let n = 5u64;
     let (bytes, corrupt_start, corrupt_end) = corrupt_body_segment(n);
     let span = (corrupt_end - corrupt_start) as u64;
     let fs = disk_with_segment0(&bytes);
 
     let log = Log::open(fs, ManualClock::new(), config()).unwrap();
-    assert_eq!(log.quarantined_bytes(), span);
+    assert_eq!(
+        log.quarantined_bytes(),
+        span,
+        "first open captured the span"
+    );
     let fs = log.into_filesystem();
 
     // Reopen: the live segment is now clean (truncated), so recovery is clean and captures nothing
-    // new, but the prior blob still occupies the quarantine store.
+    // NEW, but the prior blob still occupies the quarantine store, so the gauge reflects it.
     let reopened = Log::open(fs, ManualClock::new(), config()).unwrap();
     assert!(
         reopened.loss_report().is_empty(),
@@ -278,8 +284,8 @@ fn the_quarantine_byte_total_survives_a_reopen_of_a_clean_log() {
     );
     assert_eq!(
         reopened.quarantined_bytes(),
-        0,
-        "a clean reopen captures nothing new"
+        span,
+        "the gauge reflects the PERSISTED footprint after a clean reopen (not 0)"
     );
     // The prior blob persists in the quarantine subdir.
     let fs = reopened.into_filesystem();
@@ -289,5 +295,37 @@ fn the_quarantine_byte_total_survives_a_reopen_of_a_clean_log() {
         blobs.len(),
         1,
         "the prior forensic blob persists across the reopen"
+    );
+}
+
+#[test]
+fn the_scan_on_open_never_materializes_the_quarantine_subdir_for_a_clean_log() {
+    // The #315 scan-on-open must preserve the #134 contract that a clean log (no corruption skip,
+    // ever) never creates the quarantine/ subdir: the read-only scan probes subdir_exists FIRST and
+    // degrades to 0 without side effects. A pristine fresh log and a reopen of it both stay clean.
+    let good = good_unsealed_segment(5);
+    let fs = disk_with_segment0(&good);
+
+    let log = Log::open(fs, ManualClock::new(), config()).unwrap();
+    assert!(
+        log.loss_report().is_empty(),
+        "a good segment recovers clean"
+    );
+    assert_eq!(log.quarantined_bytes(), 0, "no blobs, so the gauge is 0");
+    let fs = log.into_filesystem();
+    assert!(
+        !fs.subdir_exists(QUARANTINE_SUBDIR).unwrap(),
+        "the clean open never materialized the quarantine subdir"
+    );
+
+    // A reopen of the still-clean log likewise leaves the subdir un-created.
+    let reopened = Log::open(fs, ManualClock::new(), config()).unwrap();
+    assert_eq!(reopened.quarantined_bytes(), 0);
+    assert!(
+        !reopened
+            .into_filesystem()
+            .subdir_exists(QUARANTINE_SUBDIR)
+            .unwrap(),
+        "the clean reopen never materialized the quarantine subdir"
     );
 }

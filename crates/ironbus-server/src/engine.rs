@@ -2923,10 +2923,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.log.loss_report()
     }
 
-    /// Total bytes copied into the forensic quarantine store at the last recovery (#134): the
-    /// corrupt regions a corruption skip dropped, captured (copy-not-move, capped) under
-    /// `quarantine/` for offline analysis. Zero on a clean start or when the only loss was a clean
-    /// torn tail. Exposed on `/metrics` as the `ironbus_quarantine_bytes` gauge.
+    /// The PERSISTED on-disk footprint of the forensic quarantine store (#134, #315): the total
+    /// bytes of the corruption-skip copies `quarantine/` currently holds (capped, copy-not-move),
+    /// seeded at open from a read-only scan of the durable blobs so it SURVIVES a restart and
+    /// reflects real disk pressure even when this recovery had no new corruption skip, plus any new
+    /// capture this recovery made. Zero only when the quarantine dir is absent, empty, or
+    /// unreadable. Exposed on `/metrics` as the `ironbus_quarantine_bytes` gauge.
     #[must_use]
     pub fn quarantined_bytes(&self) -> u64 {
         self.log.quarantined_bytes()
