@@ -86,7 +86,7 @@ producer ─▶ wire protocol ─▶ ring buffer + credit-based backpressure
 | Consumer model | [#9](https://github.com/ELares/IronBus/issues/9) | Cursors, groups, acks, redelivery, visibility timeout, dead-letter queue |
 | Backpressure | [#10](https://github.com/ELares/IronBus/issues/10) | Credit-based flow control, spill-to-disk, overflow policy, load shedding |
 | Wire protocol | [#11](https://github.com/ELares/IronBus/issues/11) | Length-framed binary protocol, verbs, capability negotiation |
-| Compression | [#12](https://github.com/ELares/IronBus/issues/12) | zstd default, per-batch, lz4 fallback, dictionaries deferred to a later milestone |
+| Compression | [#12](https://github.com/ELares/IronBus/issues/12) | lz4_flex default (pure Rust), per-batch; zstd opt-in only behind a feature, never on the default path; dictionaries deferred to a later milestone (#139) |
 | Retention | [#13](https://github.com/ELares/IronBus/issues/13) | Time, size, and count retention, whole-segment deletion, lifecycle |
 | Configuration | [#14](https://github.com/ELares/IronBus/issues/14) | Layered config, hot reload, profiles, safe zero-config defaults |
 | CLI | [#15](https://github.com/ELares/IronBus/issues/15) | pub, sub, bench, info, lag, offline data inspection, scrub, live TUI |
