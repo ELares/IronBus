@@ -356,12 +356,36 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         truncations = counters.truncations,
         truncated_records = counters.truncated_records,
     );
+    body.push_str(&skip_loss_reconciliation_lines(&counters));
     body.push_str(&recovery_loss_lines(&recovery_loss));
     body.push_str(&recovery_loss_records_lines(&recovery_loss_records));
     body.push_str(&fsync_histogram_lines(&fsync));
     body.push_str(&group_consumer_lines(&groups, flushed));
     body.push_str(&registry);
     body
+}
+
+/// Renders the skip/loss reconciliation surface (#307): the new `_total` repair counter
+/// `ironbus_counter_checkpoint_repair_total` (incremented when a reconciliation on open raised a
+/// skip/loss value above its durable snapshot) plus the two reconciled gauges `ironbus_bytes_skipped`
+/// and `ironbus_last_skip_offset`, each reconciled across a restart to `max(snapshot, replay)` so it
+/// never resumes lower than before a crash. Held in its own block (out of the main format above) so
+/// the repair counter's TYPE/HELP stay contiguous and the renderer stays under the line cap.
+fn skip_loss_reconciliation_lines(counters: &Counters) -> String {
+    format!(
+        "# HELP ironbus_counter_checkpoint_repair_total Reconciliations on open where checkpoint-plus-replay raised a skip/loss counter above its durable snapshot (#307).\n\
+         # TYPE ironbus_counter_checkpoint_repair_total counter\n\
+         ironbus_counter_checkpoint_repair_total {repairs}\n\
+         # HELP ironbus_bytes_skipped Bytes lost to the skip/loss family, reconciled across restart to max(snapshot, durable loss report) so it never resumes lower than before a crash (#307).\n\
+         # TYPE ironbus_bytes_skipped gauge\n\
+         ironbus_bytes_skipped {bytes_skipped}\n\
+         # HELP ironbus_last_skip_offset The highest log offset any skip/loss event reached, reconciled across restart to max(checkpoint, replay) (#307).\n\
+         # TYPE ironbus_last_skip_offset gauge\n\
+         ironbus_last_skip_offset {last_skip_offset}\n",
+        repairs = counters.counter_checkpoint_repairs,
+        bytes_skipped = counters.bytes_skipped,
+        last_skip_offset = counters.last_skip_offset,
+    )
 }
 
 /// Renders the bounded metric registry section (#97): the fixed-bucket
@@ -1808,6 +1832,36 @@ mod tests {
         handle.join().unwrap();
     }
 
+    #[test]
+    fn metrics_render_the_reconciliation_counter_and_skip_loss_gauges() {
+        // The checkpoint-plus-replay reconciliation surface (#307) renders on /metrics: the new
+        // `_total` repair counter (with TYPE/HELP, so the frozen-taxonomy parser accepts it) and the
+        // two reconciled gauges, all zero on a clean fresh broker (no crash, no skip/loss).
+        let (addr, shutdown, handle, _engine) = start();
+        let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(m.starts_with("HTTP/1.1 200 OK"), "{m}");
+        assert!(
+            m.contains("# TYPE ironbus_counter_checkpoint_repair_total counter"),
+            "{m}"
+        );
+        assert!(
+            m.contains("\nironbus_counter_checkpoint_repair_total 0\n"),
+            "the repair counter is present and zero on a clean broker: {m}"
+        );
+        // The reconciled gauges are gauges (NOT `_total`), so they are excluded from the frozen
+        // counter set by construction, and zero with no skip/loss.
+        assert!(m.contains("\n# TYPE ironbus_bytes_skipped gauge\n"), "{m}");
+        assert!(m.contains("\nironbus_bytes_skipped 0\n"), "{m}");
+        assert!(
+            m.contains("\n# TYPE ironbus_last_skip_offset gauge\n"),
+            "{m}"
+        );
+        assert!(m.contains("\nironbus_last_skip_offset 0\n"), "{m}");
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
     /// The COMPLETE, FROZEN set of resilience-counter metric names `/metrics` renders (#96). Every
     /// name here is an `ironbus_*_total` counter whose increment marks one resilience event the
     /// taxonomy guarantees is never silent (a shed, drop, skip, dead-letter, or reclamation). This
@@ -1827,6 +1881,12 @@ mod tests {
         "ironbus_segments_force_reaped_total",
         "ironbus_truncations_total",
         "ironbus_truncated_records_total",
+        // The checkpoint-plus-replay reconciliation/repair counter (#307): a reconciliation on open
+        // raised a skip/loss counter above its durable snapshot (the snapshot alone would have
+        // resumed too low across a hard crash). A lower-bound-recovery signal, never a silent drop,
+        // so it belongs in the frozen taxonomy. The reconciled gauges (`ironbus_bytes_skipped`,
+        // `ironbus_last_skip_offset`) are NOT `_total`, so they are excluded by construction.
+        "ironbus_counter_checkpoint_repair_total",
         // The metric-registry cardinality-cap counter (#97): a consumer lag label refused a distinct
         // series at the 1024-series cap was folded into `__overflow__`. A cardinality-pressure
         // signal, never a silent drop, so it belongs in the frozen taxonomy. The histograms
