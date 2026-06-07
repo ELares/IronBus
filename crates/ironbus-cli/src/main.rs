@@ -64,6 +64,10 @@ const DEFAULT_MAX_IN_FLIGHT: u32 = 1024;
 /// The default segment size cap for `serve` (64 MiB, matching the storage default).
 const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The default durable-log total byte cap for `serve` (0 = unlimited, matching the storage
+/// default): the spill-by-default behavior is unchanged until an operator opts in to the shed.
+const DEFAULT_MAX_TOTAL_BYTES: u64 = 0;
+
 /// The smallest segment size cap `serve` accepts: below this, segments proliferate
 /// pathologically (one record each), so reject it as a misconfiguration.
 const MIN_MAX_SEGMENT_BYTES: u64 = 4096;
@@ -110,8 +114,8 @@ ironbus: a durable edge message queue.
 USAGE:
     ironbus serve --data-dir <dir> [--addr <host:port>] [--max-connections <n>]
                   [--checkpoint-interval <n>] [--max-deliver <n>] [--max-in-flight <n>]
-                  [--max-segment-bytes <n>] [--visibility-timeout-ms <n>]
-                  [--health-addr <host:port>]
+                  [--max-segment-bytes <n>] [--max-total-bytes <bytes>]
+                  [--visibility-timeout-ms <n>] [--health-addr <host:port>]
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
     ironbus sub   [--addr <host:port>] [--group <name>] [--max <n>]
                   [--ack | --nack [--delay-ms <n>] | --term]
@@ -474,6 +478,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut max_deliver = DEFAULT_MAX_DELIVER;
     let mut max_in_flight = DEFAULT_MAX_IN_FLIGHT;
     let mut max_segment_bytes = DEFAULT_MAX_SEGMENT_BYTES;
+    let mut max_total_bytes = DEFAULT_MAX_TOTAL_BYTES;
     let mut visibility_ms = DEFAULT_VISIBILITY_MS;
     let mut health_addr: Option<String> = None;
     let mut i = 0;
@@ -513,6 +518,12 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
                     CliError::Usage(format!("`--max-segment-bytes` needs a number, got `{raw}`"))
                 })?;
             }
+            "--max-total-bytes" => {
+                let raw = take_value("--max-total-bytes", args, &mut i)?;
+                max_total_bytes = raw.parse::<u64>().map_err(|_| {
+                    CliError::Usage(format!("`--max-total-bytes` needs a number, got `{raw}`"))
+                })?;
+            }
             "--visibility-timeout-ms" => {
                 let raw = take_value("--visibility-timeout-ms", args, &mut i)?;
                 visibility_ms = raw.parse::<u64>().map_err(|_| {
@@ -540,6 +551,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         max_deliver,
         max_in_flight,
         max_segment_bytes,
+        max_total_bytes,
         visibility_ms,
     };
     validate_serve_config(&config)?;
@@ -600,6 +612,9 @@ struct ServeConfig {
     max_deliver: u32,
     max_in_flight: u32,
     max_segment_bytes: u64,
+    /// Hard durable-log total byte cap, the drop-new shed backstop (#10). `0` means unlimited
+    /// (the cap is off), which is the default and preserves the spill-by-default behavior.
+    max_total_bytes: u64,
     visibility_ms: u64,
 }
 
@@ -617,6 +632,7 @@ fn cmd_serve(
         config.checkpoint_interval,
         config.max_deliver,
         config.max_segment_bytes,
+        config.max_total_bytes,
         config.visibility_ms,
     )?;
     let listener = TcpListener::bind(addr)
@@ -681,6 +697,7 @@ fn cmd_serve(
         config.max_deliver,
         config.max_in_flight,
         config.max_segment_bytes,
+        config.max_total_bytes,
         config.visibility_ms,
         health_addr,
         out,
@@ -698,6 +715,7 @@ fn open_disk_engine(
     checkpoint_interval: u64,
     max_deliver: u32,
     max_segment_bytes: u64,
+    max_total_bytes: u64,
     visibility_ms: u64,
 ) -> Result<SharedEngine<StdFs, SystemClock>, CliError> {
     std::fs::create_dir_all(data_dir)
@@ -709,8 +727,11 @@ fn open_disk_engine(
         fs,
         SystemClock::new(),
         EngineConfig {
+            // Both caps are honored: `new` validates and sets the segment cap, the builder
+            // layers on the durable-log total byte cap (the drop-new shed; `0` = unlimited).
             log: LogConfig::new(max_segment_bytes)
-                .map_err(|e| CliError::Internal(format!("log config: {e}")))?,
+                .map_err(|e| CliError::Internal(format!("log config: {e}")))?
+                .with_max_total_bytes(max_total_bytes),
             lease: LeaseConfig::from_millis(visibility_ms, visibility_ms.max(DEFAULT_HARD_CAP_MS)),
             delivery,
             max_in_flight,
@@ -990,6 +1011,7 @@ mod tests {
             1,
             DEFAULT_MAX_DELIVER,
             DEFAULT_MAX_SEGMENT_BYTES,
+            DEFAULT_MAX_TOTAL_BYTES,
             DEFAULT_VISIBILITY_MS,
         )
         .unwrap();
@@ -1435,6 +1457,53 @@ mod tests {
     }
 
     #[test]
+    fn serve_rejects_a_non_numeric_max_total_bytes() {
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--max-total-bytes".to_string(),
+                "lots".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--max-total-bytes"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_accepts_a_zero_max_total_bytes_meaning_unlimited() {
+        // 0 is the default (unlimited) and an explicit 0 must parse the same, then fail only on
+        // the unrelated unreachable bind path proves it was accepted, not rejected as usage.
+        // Here we point at a never-created data dir with a valid wire addr; the flag parsing and
+        // validation pass (no usage error), so the failure is internal/bind, never EXIT_USAGE.
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-cli-mtb0-never-served".to_string(),
+                "--max-total-bytes".to_string(),
+                "0".to_string(),
+                "--addr".to_string(),
+                "127.0.0.1:1".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_ne!(
+            e.exit_code(),
+            EXIT_USAGE,
+            "an explicit --max-total-bytes 0 (unlimited) parses and validates: {e}"
+        );
+        let _ = std::fs::remove_dir_all("/tmp/ironbus-cli-mtb0-never-served");
+    }
+
+    #[test]
     fn serve_rejects_a_tiny_max_segment_bytes() {
         let mut buf = Vec::new();
         let e = run(
@@ -1750,6 +1819,7 @@ mod tests {
             1,
             DEFAULT_MAX_DELIVER,
             DEFAULT_MAX_SEGMENT_BYTES,
+            DEFAULT_MAX_TOTAL_BYTES,
             DEFAULT_VISIBILITY_MS,
         )
         .unwrap();
@@ -1785,6 +1855,7 @@ mod tests {
             1,
             DEFAULT_MAX_DELIVER,
             DEFAULT_MAX_SEGMENT_BYTES,
+            DEFAULT_MAX_TOTAL_BYTES,
             DEFAULT_VISIBILITY_MS,
         )
         .unwrap();
@@ -1834,6 +1905,7 @@ mod tests {
             1,
             DEFAULT_MAX_DELIVER,
             DEFAULT_MAX_SEGMENT_BYTES,
+            DEFAULT_MAX_TOTAL_BYTES,
             DEFAULT_VISIBILITY_MS,
         )
         .unwrap();
@@ -1870,6 +1942,7 @@ mod tests {
             1,
             DEFAULT_MAX_DELIVER,
             DEFAULT_MAX_SEGMENT_BYTES,
+            DEFAULT_MAX_TOTAL_BYTES,
             DEFAULT_VISIBILITY_MS,
         )
         .unwrap();

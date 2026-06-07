@@ -6,8 +6,10 @@
 //! advancing independently and resuming durably across a restart); step-9 offline inspection
 //! (`peek`/`dump` over a stopped broker agrees with recovery up to the durable head); and steps 6
 //! and 7, power-cut recovery (a torn tail is truncated, the durable prefix survives, and the loss
-//! is reported consistently offline and online). Only the overload spill (step 5) and the
-//! installer (step 1) remain.
+//! is reported consistently offline and online); and step-5 overload (the durable log spills to
+//! disk and absorbs the accepted prefix, then sheds drop-new once it is at or over its byte cap,
+//! with the client shed count agreeing exactly with the server's reject counter). Only the
+//! installer (step 1) remains.
 //!
 //! `serve` is Unix only in v1 (on-disk storage uses positioned IO the Windows path lacks), so
 //! this whole acceptance test is gated to Unix.
@@ -88,12 +90,20 @@ fn start_broker(data_dir: &str) -> (ChildGuard, String) {
 
 /// Runs one `ironbus` subcommand to completion, returning its stdout and exit code.
 fn run(args: &[&str]) -> (String, i32) {
+    let (stdout, _stderr, code) = run_err(args);
+    (stdout, code)
+}
+
+/// Like [`run`] but also returns stderr, so a test can read the human error a failed subcommand
+/// printed (for example the shed producer's "at capacity" message) alongside the exit code.
+fn run_err(args: &[&str]) -> (String, String, i32) {
     let out = Command::new(BIN)
         .args(args)
         .output()
         .expect("run an ironbus subcommand");
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
         out.status.code().unwrap_or(-1),
     )
 }
@@ -391,18 +401,28 @@ fn golden_path_offline_inspection_agrees_with_recovery() {
 /// port, returning `(guard, wire_addr, health_addr)`. The broker prints the wire listening line
 /// then the health line, so this reads both (order-independently) under a timeout.
 fn start_broker_with_health(data_dir: &str) -> (ChildGuard, String, String) {
+    start_broker_with_health_args(data_dir, &[])
+}
+
+/// Like [`start_broker_with_health`] but threads `extra` serve flags (for example a
+/// `--max-total-bytes` cap) onto the same boot path, so a test can configure the broker without
+/// duplicating the spawn-and-parse logic. The base flags (ephemeral wire and health ports,
+/// `--checkpoint-interval 1`) are always present; `extra` is appended verbatim.
+fn start_broker_with_health_args(data_dir: &str, extra: &[&str]) -> (ChildGuard, String, String) {
+    let mut args = vec![
+        "serve",
+        "--data-dir",
+        data_dir,
+        "--addr",
+        "127.0.0.1:0",
+        "--health-addr",
+        "127.0.0.1:0",
+        "--checkpoint-interval",
+        "1",
+    ];
+    args.extend_from_slice(extra);
     let child = Command::new(BIN)
-        .args([
-            "serve",
-            "--data-dir",
-            data_dir,
-            "--addr",
-            "127.0.0.1:0",
-            "--health-addr",
-            "127.0.0.1:0",
-            "--checkpoint-interval",
-            "1",
-        ])
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -607,5 +627,123 @@ fn golden_path_power_cut_recovers_the_durable_prefix_and_reports_loss() {
     );
 
     drop(broker2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn golden_path_overload_spills_then_sheds_at_the_byte_cap() {
+    // #133 step 5: under overload, the durable log SPILLS to disk and absorbs the accepted
+    // prefix, then SHEDS (drop-new) once it is at or over its byte cap (#10). Drive the real
+    // binary: boot with a small `--max-total-bytes` so only a few small records fit, then pub a
+    // fixed batch and watch the split. The shed is non-fatal (the connection stays open and the
+    // server replies a distinct "at capacity" Err), so a shed `pub` exits non-zero but the
+    // broker keeps serving. The load-bearing, NON-VACUOUS checks are: the client shed count
+    // EQUALS the server's `ironbus_produce_rejected_total`, and every accepted record is durably
+    // consumable in order. Acking does not free cap space (retention is #13, not built), so once
+    // the cap engages every later pub is shed regardless of consumption: we do not consume
+    // between pubs.
+    //
+    // The split is deterministic. Each `pub` carries an empty key, empty headers, and a 2-byte
+    // payload (`m0`..`m9`), so each durable record is 46 bytes on disk (36-byte header + 0 key +
+    // 0 headers + 2 payload + 8-byte trailer). The cap check rejects a produce when the durable
+    // record bytes are at or over the cap AND non-zero, but the FIRST record on an empty log
+    // always writes. With a 100-byte cap: record 0 writes (log empty), record 1 writes (46 < 100
+    // -> 92), record 2 writes (92 < 100 -> 138), and from record 3 on the log is over the cap, so
+    // every further pub is shed. That is exactly three accepted, the rest shed.
+    const CAP: u64 = 100;
+    const N: usize = 10;
+    let dir = std::env::temp_dir().join(format!("ironbus-golden-overload-{}", std::process::id()));
+    let data_dir = dir.to_str().expect("utf8 temp path").to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // 1. Boot the broker with a small total-byte cap and the health endpoints (for /metrics).
+    let (broker, addr, health) =
+        start_broker_with_health_args(&data_dir, &["--max-total-bytes", &CAP.to_string()]);
+
+    // 2. Produce N small records. A record that spilled exits 0 and prints its durable offset; a
+    //    shed record exits non-zero (the server's "at capacity" Err maps to ClientError::Server,
+    //    which the CLI classifies as an internal failure, exit 70) and its stderr names the shed.
+    let mut accepted: Vec<String> = Vec::new();
+    let mut shed = 0u64;
+    for i in 0..N {
+        let payload = format!("m{i}");
+        let (out, err, code) = run_err(&["pub", "--addr", &addr, &payload]);
+        if code == 0 {
+            assert_eq!(
+                out.trim(),
+                accepted.len().to_string(),
+                "an accepted pub prints the next durable offset (no gaps in the accepted prefix)"
+            );
+            accepted.push(payload);
+        } else {
+            shed += 1;
+            assert!(
+                err.contains("at capacity"),
+                "a shed pub names the deliberate shed, not a transient failure: stderr {err:?}"
+            );
+        }
+    }
+
+    // 3. Non-vacuity: the log SPILLED (at least one accepted) AND the cap ENGAGED (at least one
+    //    shed). Without both, the scenario would not exercise spill-then-shed.
+    assert!(
+        !accepted.is_empty(),
+        "at least one pub spilled to disk and was accepted"
+    );
+    assert!(shed >= 1, "at least one pub was shed once the cap engaged");
+    assert_eq!(
+        accepted.len() + usize::try_from(shed).expect("shed fits usize"),
+        N,
+        "every pub either spilled or was shed, none lost track of"
+    );
+
+    // 4. LOAD-BEARING: the client shed count equals the server's shed counter EXACTLY. The
+    //    rejections the producer saw are precisely the produces the broker dropped, no more, no
+    //    fewer (never a silent drop the counter missed, never a phantom rejection it overcounted).
+    let metrics = http_get(&health, "/metrics");
+    let rejected = metric_value(&metrics, "ironbus_produce_rejected_total")
+        .expect("/metrics exposes ironbus_produce_rejected_total");
+    assert_eq!(
+        rejected, shed,
+        "the server's produce-rejected counter equals the client's observed shed count: {metrics}"
+    );
+
+    // 5. The broker is STILL ALIVE after the shed: a further pub is promptly rejected again
+    //    (never a hang, never a silent success). This is the "never a silent drop and never an
+    //    indefinite hang" requirement. The counter advances by exactly one for this one rejection.
+    let (_out, err, code) = run_err(&["pub", "--addr", &addr, "after-shed"]);
+    assert_ne!(
+        code, 0,
+        "a pub over the engaged cap is rejected, not accepted"
+    );
+    assert!(
+        err.contains("at capacity"),
+        "the further pub is shed too, not a silent success: stderr {err:?}"
+    );
+    let metrics2 = http_get(&health, "/metrics");
+    let rejected2 = metric_value(&metrics2, "ironbus_produce_rejected_total")
+        .expect("/metrics still exposes the counter after the further shed");
+    assert_eq!(
+        rejected2,
+        rejected + 1,
+        "the further shed incremented the live counter by exactly one: {metrics2}"
+    );
+
+    // 6. LOAD-BEARING: every accepted record is durably consumable, in order, and nothing else.
+    //    The accepted prefix survived the overload exactly; nothing accepted was lost, and no
+    //    shed record leaked into the log. A credit far above the batch drains it in one fetch.
+    let (out, code) = run(&["sub", "--addr", &addr, "--max", "100", "--ack"]);
+    assert_eq!(code, 0, "sub exit code: {out}");
+    assert_eq!(
+        payloads(&out),
+        accepted,
+        "the consumable log is exactly the accepted prefix, in order: {out}"
+    );
+    assert!(
+        out.contains(&format!("fetched {} message(s)", accepted.len())),
+        "exactly the accepted records were delivered, none extra: {out}"
+    );
+
+    drop(broker);
     let _ = std::fs::remove_dir_all(&dir);
 }
