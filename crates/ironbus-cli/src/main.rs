@@ -73,6 +73,16 @@ const DEFAULT_MAX_TOTAL_BYTES: u64 = 0;
 /// opts in, so existing behavior is unchanged.
 const DEFAULT_MAX_RETAINED_BYTES: u64 = 0;
 
+/// The default consumer-safe AGE-retention bound for `serve`, in MILLISECONDS (0 = disabled,
+/// matching the engine default): the broker never reaps a segment for age until an operator opts
+/// in. Milliseconds (not a duration string) so the flag takes a bare integer.
+const DEFAULT_MAX_AGE_MS: u64 = 0;
+
+/// The default consumer-safe COUNT-retention bound for `serve`, in messages (0 = disabled,
+/// matching the engine default): the broker never reaps a segment for count until an operator
+/// opts in.
+const DEFAULT_MAX_MESSAGES: u64 = 0;
+
 /// The smallest segment size cap `serve` accepts: below this, segments proliferate
 /// pathologically (one record each), so reject it as a misconfiguration.
 const MIN_MAX_SEGMENT_BYTES: u64 = 4096;
@@ -120,7 +130,7 @@ USAGE:
     ironbus serve --data-dir <dir> [--addr <host:port>] [--max-connections <n>]
                   [--checkpoint-interval <n>] [--max-deliver <n>] [--max-in-flight <n>]
                   [--max-segment-bytes <n>] [--max-total-bytes <bytes>]
-                  [--max-retained-bytes <bytes>]
+                  [--max-retained-bytes <bytes>] [--max-age-ms <ms>] [--max-messages <n>]
                   [--visibility-timeout-ms <n>] [--health-addr <host:port>]
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
     ironbus sub   [--addr <host:port>] [--group <name>] [--max <n>]
@@ -131,6 +141,11 @@ USAGE:
 
 Notes:
     The default address is 127.0.0.1:7777 (loopback only).
+    Retention reaps whole old, fully-consumed sealed segments under three composable, consumer-safe
+    bounds, each 0 = off (the default): --max-retained-bytes (durable record bytes),
+    --max-age-ms (a segment whose newest record is older than this many milliseconds), and
+    --max-messages (total record count). A segment is reaped if ANY enabled bound trips, oldest
+    first, never below the slowest consumer's committed offset, never the active segment.
     pub reads the payload from the argument, or from stdin if omitted (an empty input
     publishes an empty message, which is a valid record).
     sub prints one line per message; at most one disposition applies to the batch:
@@ -498,6 +513,8 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut max_segment_bytes = DEFAULT_MAX_SEGMENT_BYTES;
     let mut max_total_bytes = DEFAULT_MAX_TOTAL_BYTES;
     let mut max_retained_bytes = DEFAULT_MAX_RETAINED_BYTES;
+    let mut max_age_ms = DEFAULT_MAX_AGE_MS;
+    let mut max_messages = DEFAULT_MAX_MESSAGES;
     let mut visibility_ms = DEFAULT_VISIBILITY_MS;
     let mut health_addr: Option<String> = None;
     let mut i = 0;
@@ -521,6 +538,12 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             }
             "--max-retained-bytes" => {
                 max_retained_bytes = take_number("--max-retained-bytes", args, &mut i)?;
+            }
+            "--max-age-ms" => {
+                max_age_ms = take_number("--max-age-ms", args, &mut i)?;
+            }
+            "--max-messages" => {
+                max_messages = take_number("--max-messages", args, &mut i)?;
             }
             "--visibility-timeout-ms" => {
                 visibility_ms = take_number("--visibility-timeout-ms", args, &mut i)?;
@@ -546,6 +569,8 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         max_segment_bytes,
         max_total_bytes,
         max_retained_bytes,
+        max_age_ms,
+        max_messages,
         visibility_ms,
     };
     validate_serve_config(&config)?;
@@ -613,6 +638,14 @@ struct ServeConfig {
     /// segments while the durable log is over this many RECORD bytes. `0` means unlimited
     /// (retention off), the default, so existing behavior is unchanged.
     max_retained_bytes: u64,
+    /// Consumer-safe AGE-retention bound (#13, #80), in MILLISECONDS: the broker reaps an old
+    /// fully-consumed sealed segment whose newest record is older than this. `0` = disabled, the
+    /// default. Milliseconds (not a duration string) so the flag is a bare integer.
+    max_age_ms: u64,
+    /// Consumer-safe COUNT-retention bound (#13, #80): the broker reaps old fully-consumed sealed
+    /// segments while the log's total record count is over this many messages. `0` = disabled,
+    /// the default.
+    max_messages: u64,
     visibility_ms: u64,
 }
 
@@ -689,6 +722,8 @@ fn cmd_serve(
         config.max_segment_bytes,
         config.max_total_bytes,
         config.max_retained_bytes,
+        config.max_age_ms,
+        config.max_messages,
         config.visibility_ms,
         health_addr,
         out,
@@ -727,8 +762,12 @@ fn open_disk_engine(
             delivery,
             max_in_flight: config.max_in_flight,
             checkpoint_interval: config.checkpoint_interval,
-            // Consumer-safe size retention (#13, #80): `0` = unlimited (off), the default.
+            // Consumer-safe retention (#13, #80), each `0` = disabled (off), the default. Size in
+            // record bytes, age in milliseconds (against the engine clock), count in messages; the
+            // bounds compose, so a segment is reaped if ANY enabled bound trips.
             max_retained_bytes: config.max_retained_bytes,
+            max_age_ms: config.max_age_ms,
+            max_messages: config.max_messages,
         },
     )
     .map_err(|e| CliError::Internal(format!("opening broker at {}: {e}", data_dir.display())))?;
@@ -1004,6 +1043,8 @@ mod tests {
             max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
             max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
             max_retained_bytes: DEFAULT_MAX_RETAINED_BYTES,
+            max_age_ms: DEFAULT_MAX_AGE_MS,
+            max_messages: DEFAULT_MAX_MESSAGES,
             visibility_ms: DEFAULT_VISIBILITY_MS,
         }
     }
@@ -1187,6 +1228,8 @@ mod tests {
                 max_in_flight: 16,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
             },
         )
         .unwrap();
@@ -1559,6 +1602,86 @@ mod tests {
     }
 
     #[test]
+    fn serve_rejects_a_non_numeric_max_age_ms() {
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--max-age-ms".to_string(),
+                "soon".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--max-age-ms"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_rejects_a_non_numeric_max_messages() {
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--max-messages".to_string(),
+                "many".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--max-messages"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_accepts_max_age_ms_and_max_messages_values() {
+        // Both new retention flags parse and validate (no usage error); the only failure is the
+        // unrelated bind on an unreachable addr, proving the flags were accepted, not rejected.
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-cli-age-count-never-served".to_string(),
+                "--max-age-ms".to_string(),
+                "60000".to_string(),
+                "--max-messages".to_string(),
+                "100000".to_string(),
+                "--addr".to_string(),
+                "127.0.0.1:1".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_ne!(
+            e.exit_code(),
+            EXIT_USAGE,
+            "valid --max-age-ms and --max-messages parse and validate: {e}"
+        );
+        let _ = std::fs::remove_dir_all("/tmp/ironbus-cli-age-count-never-served");
+    }
+
+    #[test]
+    fn usage_lists_the_age_and_count_retention_flags() {
+        // Both new retention flags are documented in the USAGE string, so `ironbus help` surfaces
+        // them alongside the byte bound.
+        assert!(
+            USAGE.contains("--max-age-ms"),
+            "USAGE must document --max-age-ms"
+        );
+        assert!(
+            USAGE.contains("--max-messages"),
+            "USAGE must document --max-messages"
+        );
+    }
+
+    #[test]
     fn serve_rejects_a_tiny_max_segment_bytes() {
         let mut buf = Vec::new();
         let e = run(
@@ -1738,6 +1861,8 @@ mod tests {
                 max_in_flight: 16,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
             },
         )
         .unwrap();
@@ -1803,6 +1928,8 @@ mod tests {
                 max_in_flight: 2,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
             },
         )
         .unwrap();

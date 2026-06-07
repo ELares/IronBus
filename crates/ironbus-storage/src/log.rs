@@ -155,11 +155,33 @@ pub struct Append<'a> {
     pub payload: &'a [u8],
 }
 
-/// What a [`Log::reap_to_size`] pass reclaimed: how many whole sealed segments it unlinked
-/// and the total durable RECORD bytes those segments held (the same quantity
-/// [`Log::durable_record_bytes`] dropped by). Both are zero when nothing was reaped (the
-/// bound is off, the log is already under it, or the oldest sealed segment is still needed by
-/// a consumer).
+/// The three composable retention bounds the segment reaper enforces (refs #13, #80). A sealed
+/// segment is eligible to delete when ANY ENABLED bound says it should be (the log is over the
+/// byte bound, OR over the count bound, OR the segment is older than the age bound); each bound is
+/// independently disabled by setting it to `0`, and all three at `0` is the default (retention
+/// OFF, nothing reaped). Eligibility never overrides consumer-safety: the reaper still deletes
+/// only whole sealed segments entirely below the protect floor, oldest first, never the active
+/// segment (see [`Log::reap`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetentionBounds {
+    /// Delete oldest sealed segments while the log's total durable RECORD bytes exceed this. `0`
+    /// means UNLIMITED (the byte bound is off). This is the bound [`Log::reap_to_size`] enforces.
+    pub max_bytes: u64,
+    /// Delete a sealed segment whose MAXIMUM record timestamp is older than `now - max_age_ms`,
+    /// i.e. EVERY record in it is older than this many milliseconds. The max (not the min) is used
+    /// so a segment is deleted only once ALL its records have aged out. `0` means DISABLED. `now`
+    /// comes from the log's clock seam, so the deterministic simulation drives it.
+    pub max_age_ms: u64,
+    /// Delete oldest sealed segments while the log's total durable RECORD COUNT exceeds this. `0`
+    /// means DISABLED.
+    pub max_messages: u64,
+}
+
+/// What a reap pass ([`Log::reap`] or [`Log::reap_to_size`]) reclaimed: how many whole sealed
+/// segments it unlinked and the total durable RECORD bytes those segments held (the same quantity
+/// [`Log::durable_record_bytes`] dropped by). Both are zero when nothing was reaped (every bound
+/// is off, the log is already under them, or the oldest sealed segment is still needed by a
+/// consumer).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReapOutcome {
     /// The number of whole sealed segments unlinked this pass.
@@ -170,13 +192,43 @@ pub struct ReapOutcome {
     pub bytes_reaped: u64,
 }
 
-/// An in-memory directory entry: a segment id and the log offset of its first record.
-/// Held sorted by `base_offset` (which is monotonic with the id) so a read can binary
-/// search for the segment that holds a given offset.
+/// An in-memory directory entry: a segment id, the log offset of its first record, and the
+/// per-segment retention metadata the reaper consults without rescanning the file. Held sorted
+/// by `base_offset` (which is monotonic with the id) so a read can binary search for the segment
+/// that holds a given offset.
+///
+/// `record_count` and `max_timestamp_ms` are populated when a segment is SEALED on a roll (from
+/// the active writer's running totals) and recomputed at recovery from the streaming scan, so the
+/// count- and time-retention bounds are O(1) to evaluate per sealed segment.
 #[derive(Clone, Copy, Debug)]
 struct SegmentSlot {
     id: u64,
     base_offset: u64,
+    /// How many records this segment holds. Meaningful for a SEALED segment (set on its roll or
+    /// at recovery); the active segment's live count is read from the writer, so the slot's value
+    /// for the active segment is `0` until it is sealed.
+    record_count: u64,
+    /// The maximum producer timestamp (milliseconds since the Unix epoch) across this segment's
+    /// records, or `0` if it is empty. Tracked as the MAX (producer timestamps are not monotonic)
+    /// so the age-retention reaper deletes a segment only when ALL its records are older than the
+    /// bound. Meaningful for a SEALED segment, like `record_count`.
+    max_timestamp_ms: u64,
+}
+
+/// The validated segment chain `Log::recover` rebuilds from a streaming scan of every segment:
+/// the in-memory slots (with their per-segment retention metadata), the running totals the live
+/// log tracks (durable record bytes and count), the next base offset and sequence past the prefix,
+/// and the highest segment's scan (the active segment, unless a seal-only crash rolls it forward).
+struct RecoveredChain {
+    slots: Vec<SegmentSlot>,
+    next_base_offset: u64,
+    next_base_seq: u64,
+    /// Total durable record-region bytes across the recovered prefix, for the I3 global loss cap.
+    durable_bytes: u64,
+    /// Total durable record COUNT across the recovered prefix: the running count-retention total.
+    total_record_count: u64,
+    /// The highest segment's recovery scan (always present: `recover` is only called non-empty).
+    highest: RecoveryScan,
 }
 
 /// A single durable, ordered log backed by one data directory of segment files.
@@ -205,6 +257,12 @@ pub struct Log<F: Filesystem, C: Clock> {
     /// is this plus the active segment's record bytes; tracking it here keeps the durable-log
     /// byte cap check O(1) per append instead of an O(segments) scan. Updated on each roll.
     sealed_record_bytes: u64,
+    /// Total durable RECORD COUNT across EVERY segment (sealed predecessors plus the active one),
+    /// maintained the way `sealed_record_bytes` is but covering the active segment too:
+    /// initialized at recovery, incremented on each append, and decremented by a reaped segment's
+    /// count on a reap. Keeps the count-retention bound O(1) to check instead of an O(segments)
+    /// scan. Exposed by [`Log::durable_record_count`].
+    total_record_count: u64,
     /// Bytes dropped from a torn or unsynced active-segment tail at recovery: the silent
     /// loss that recovery truncates to reach the last intact record. Zero for a fresh log
     /// or a clean recovery.
@@ -241,6 +299,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     flushed_offset: Offset::ZERO,
                     segments: Vec::new(),
                     sealed_record_bytes: 0,
+                    total_record_count: 0,
                     recovered_truncated_bytes: 0,
                     loss_report: LossReport::new(),
                 };
@@ -251,22 +310,18 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         }
     }
 
-    fn recover(
-        fs: F,
-        clock: C,
-        config: LogConfig,
-        ids: &[u64],
-        last_id: u64,
-    ) -> Result<Log<F, C>, StorageError> {
-        // Walk every segment in ascending order, validating the chain: each segment's
-        // stored id matches its file name, its base continues from its predecessor, its
-        // records are a contiguous sequence run, and every NON-final segment is sealed.
-        // A corrupt or unreadable segment fails its scan here, not silently at read time.
+    /// Walks every segment in ascending order from a streaming recovery scan, validating the
+    /// chain (each segment's stored id matches its file name, its base continues from its
+    /// predecessor, its records are a contiguous sequence run, and every NON-final segment is
+    /// sealed) and accumulating the in-memory slots plus the running byte and record-count totals.
+    /// A corrupt or unreadable segment fails its scan here, not silently at read time. The
+    /// per-segment retention metadata (record count, max timestamp) is recomputed from the scan so
+    /// the reaper behaves identically after a reopen.
+    fn scan_recover_chain(fs: &F, ids: &[u64]) -> Result<RecoveredChain, StorageError> {
         let mut next_base_offset = 0u64;
         let mut next_base_seq = 0u64;
-        // Total durable record-region bytes across the recovered prefix, for the I3 global
-        // loss cap (the byte count loss is measured against).
         let mut durable_bytes = 0u64;
+        let mut total_record_count = 0u64;
         let mut highest: Option<RecoveryScan> = None;
         let mut slots: Vec<SegmentSlot> = Vec::with_capacity(ids.len());
         let total = ids.len();
@@ -281,7 +336,14 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             }
             let base_offset = header.base_offset.get();
             let base_seq = header.base_seq.get();
-            slots.push(SegmentSlot { id, base_offset });
+            // The highest (active unless rolled forward) segment's slot is corrected when it is
+            // installed as the writer or sealed; the rest are sealed predecessors.
+            slots.push(SegmentSlot {
+                id,
+                base_offset,
+                record_count: scan.record_count,
+                max_timestamp_ms: scan.max_timestamp_ms,
+            });
             if i > 0 && (base_offset != next_base_offset || base_seq != next_base_seq) {
                 return Err(StorageError::SegmentChainBroken {
                     segment_id: id,
@@ -304,12 +366,39 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 .ok_or(StorageError::SegmentFull)?;
             durable_bytes = durable_bytes
                 .saturating_add(scan.valid_end.saturating_sub(SEGMENT_HEADER_LEN as u64));
+            total_record_count = total_record_count.saturating_add(count);
             if is_last {
                 highest = Some(scan);
             }
         }
-        // `highest` is Some because `open` only calls `recover` with a non-empty list.
-        let scan = highest.ok_or(StorageError::WriterFrozen)?;
+        // `highest` is Some because `open` only calls `recover` (hence this) with a non-empty list.
+        let highest = highest.ok_or(StorageError::WriterFrozen)?;
+        Ok(RecoveredChain {
+            slots,
+            next_base_offset,
+            next_base_seq,
+            durable_bytes,
+            total_record_count,
+            highest,
+        })
+    }
+
+    fn recover(
+        fs: F,
+        clock: C,
+        config: LogConfig,
+        ids: &[u64],
+        last_id: u64,
+    ) -> Result<Log<F, C>, StorageError> {
+        let chain = Self::scan_recover_chain(&fs, ids)?;
+        let RecoveredChain {
+            slots,
+            next_base_offset,
+            next_base_seq,
+            durable_bytes,
+            total_record_count,
+            highest: scan,
+        } = chain;
         let header = scan.header;
         let next_offset = Offset::new(next_base_offset);
         let next_seq = Seq::new(next_base_seq);
@@ -331,6 +420,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             flushed_offset: next_offset,
             segments: slots,
             sealed_record_bytes,
+            total_record_count,
             recovered_truncated_bytes: 0,
             loss_report: LossReport::new(),
         };
@@ -365,12 +455,16 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             let record_count =
                 u32::try_from(scan.record_count).map_err(|_| StorageError::SegmentFull)?;
             let last_seq = scan.last_seq;
+            // Resume the writer with the recovered running record max timestamp, so a record
+            // appended after recovery keeps the segment's max correct (and the slot stays exact
+            // when this segment is later sealed on a roll).
             log.active = Some(SegmentWriter::resume(
                 file,
                 header,
                 scan.valid_end,
                 record_count,
                 last_seq,
+                scan.max_timestamp_ms,
             ));
         }
 
@@ -412,9 +506,13 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         self.fs.sync_dir()?; // ...and so is its directory entry.
         self.active = Some(writer);
         self.active_id = id;
+        // A fresh active segment starts empty; its per-segment retention metadata is filled in
+        // when it is later sealed on a roll (from the writer's running totals).
         self.segments.push(SegmentSlot {
             id,
             base_offset: base_offset.get(),
+            record_count: 0,
+            max_timestamp_ms: 0,
         });
         Ok(())
     }
@@ -435,6 +533,15 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // The segment about to be sealed contributes its record bytes to the sealed total, so
         // the live durable-record-bytes total stays O(1) without rescanning every segment.
         let old_record_bytes = old.write_pos().saturating_sub(SEGMENT_HEADER_LEN as u64);
+        // Freeze the sealed segment's retention metadata into its slot from the writer's running
+        // totals, so the count- and time-retention reaper can consult it O(1) (no file rescan).
+        // The active segment is always the LAST slot (the most recent `start_segment` pushed it).
+        let old_record_count = u64::from(old.record_count());
+        let old_max_timestamp_ms = old.max_timestamp_ms();
+        if let Some(slot) = self.segments.last_mut() {
+            slot.record_count = old_record_count;
+            slot.max_timestamp_ms = old_max_timestamp_ms;
+        }
         old.seal().map_err(|_| StorageError::WriterFrozen)?;
         self.sealed_record_bytes = self.sealed_record_bytes.saturating_add(old_record_bytes);
         self.start_segment(next_id, self.next_seq, self.next_offset)
@@ -460,6 +567,15 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             w.write_pos().saturating_sub(SEGMENT_HEADER_LEN as u64)
         });
         self.sealed_record_bytes.saturating_add(active_record_bytes)
+    }
+
+    /// The log's total durable RECORD COUNT across every segment (sealed predecessors and the
+    /// active one). This is the quantity the count-retention bound ([`RetentionBounds::max_messages`])
+    /// is measured against. Cheap (O(1)): it reads the running total maintained on append and
+    /// reap, never rescanning every segment. It matches a fresh reopen's recomputed count.
+    #[must_use]
+    pub fn durable_record_count(&self) -> u64 {
+        self.total_record_count
     }
 
     /// The log offset the next appended record will receive.
@@ -552,6 +668,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // The ids advance only after the write returns Ok.
         self.next_seq = next_seq;
         self.next_offset = next_offset;
+        // Maintain the running total record count the same way the byte total is maintained, so
+        // the count-retention bound stays O(1). The active segment's records live in the writer's
+        // running count; the slot's count is filled in only when the segment is sealed.
+        self.total_record_count = self.total_record_count.saturating_add(1);
         Ok(offset)
     }
 
@@ -663,87 +783,114 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         Ok(out)
     }
 
-    /// Reclaims disk by deleting whole OLD SEALED segments while the durable log exceeds
-    /// `max_retained_bytes`, but NEVER deletes a segment any consumer still needs (the
-    /// consumer-safe size-retention reaper, refs #13, #80). This is the drain side of the
-    /// overflow policy that complements the byte-cap shed ([`LogConfig::max_total_bytes`], #259):
-    /// the cap sheds new produces when the log is full, this frees space as consumers drain.
+    /// Reclaims disk by deleting whole OLD SEALED segments under any of three composable retention
+    /// [`RetentionBounds`] (size, age, count), but NEVER a segment any consumer still needs (the
+    /// consumer-safe segment reaper, refs #13, #80). This is the drain side of the overflow policy
+    /// that complements the byte-cap shed ([`LogConfig::max_total_bytes`], #259): the cap sheds new
+    /// produces when the log is full, this frees space as consumers drain.
     ///
-    /// `protect_below_offset` is the floor below which records are safe to drop: every consumer
-    /// has committed at least this far, so no consumer still needs any record with an offset
-    /// strictly below it. The caller passes the MINIMUM committed offset across every consumer
-    /// group, so the slowest group's unconsumed records are never reaped.
+    /// `protect_below_offset` is the floor below which records are safe to drop: every consumer has
+    /// committed at least this far, so no consumer still needs any record with an offset strictly
+    /// below it. The caller passes the MINIMUM committed offset across every consumer group, so the
+    /// slowest group's unconsumed records are never reaped.
     ///
     /// Looping from the OLDEST sealed segment, a segment `segments[0]` is unlinked only while ALL
     /// of these hold:
-    /// - `max_retained_bytes != 0` (a zero bound is UNLIMITED: nothing is reaped, the default);
-    /// - the log is still over the bound (`durable_record_bytes() > max_retained_bytes`);
+    /// - SOME enabled bound says it should go: the log is over the byte bound
+    ///   (`durable_record_bytes() > bounds.max_bytes`, with `max_bytes != 0`), OR over the count
+    ///   bound (`durable_record_count() > bounds.max_messages`, with `max_messages != 0`), OR the
+    ///   oldest sealed segment is older than the age bound (its MAXIMUM record timestamp is below
+    ///   `now - bounds.max_age_ms`, with `max_age_ms != 0`, so EVERY record in it has aged out).
+    ///   When every bound is `0` (the default), nothing is ever eligible and the reaper is OFF.
     /// - more than one segment exists, so the ACTIVE segment (the last slot) is never reaped;
     /// - the oldest sealed segment is ENTIRELY consumed: since segments are contiguous,
     ///   `segments[0]` ends exactly where `segments[1]` begins, so every record in `segments[0]`
     ///   has offset `< segments[1].base_offset`. The segment is fully consumed iff
-    ///   `segments[1].base_offset <= protect_below_offset`, which guarantees every record in it
-    ///   is below the protect floor and so needed by no consumer.
+    ///   `segments[1].base_offset <= protect_below_offset`, which guarantees every record in it is
+    ///   below the protect floor and so needed by no consumer.
     ///
-    /// The loop stops as soon as the bound is satisfied, the next oldest segment is not fully
-    /// consumed (`segments[1].base_offset > protect_below_offset`), or only the active segment
-    /// remains. A whole segment is unlinked or left untouched; a record inside a segment is never
-    /// rewritten or partially removed.
+    /// The loop stops as soon as no enabled bound is satisfied for the oldest segment, the next
+    /// oldest segment is not fully consumed (`segments[1].base_offset > protect_below_offset`), or
+    /// only the active segment remains. A whole segment is unlinked or left untouched; a record
+    /// inside a segment is never rewritten or partially removed.
+    ///
+    /// `now` is read from the log's clock seam (so the deterministic simulation drives it, never
+    /// the host wall clock), once per pass, and compared against each oldest segment's running
+    /// max timestamp (set when the segment was sealed and recomputed at recovery). The max (not
+    /// the min) timestamp is used so age never deletes a segment that still holds a record newer
+    /// than the bound.
     ///
     /// Each unlink is crash-safe and ordered so disk and memory never disagree: the segment file
     /// is removed and the directory fsynced (so the removal is durable) BEFORE the slot leaves
-    /// `segments` and `sealed_record_bytes` is decremented. A crash after some unlinks leaves a
-    /// shorter contiguous chain with a non-zero start, which recovery already accepts; a crash
-    /// mid-unlink is fine because the unlink is atomic and the in-memory state was not yet
-    /// changed, so the next open simply recomputes the running total from what survived.
+    /// `segments` and the running `sealed_record_bytes`/`total_record_count` totals are
+    /// decremented. A crash after some unlinks leaves a shorter contiguous chain with a non-zero
+    /// start, which recovery already accepts; a crash mid-unlink is fine because the unlink is
+    /// atomic and the in-memory state was not yet changed, so the next open simply recomputes the
+    /// running totals from what survived.
     ///
-    /// The byte accounting decrements `sealed_record_bytes` by each reaped segment's record
-    /// region, read as `valid_end - SEGMENT_HEADER_LEN` from a streaming recovery scan: this is
-    /// EXACTLY the per-segment term the sealed-bytes total accumulated on each roll (a sealed
-    /// segment's `valid_end` is the start of its footer, so it excludes both the 64-byte header
-    /// and the 32-byte footer), so after a reap the running total still equals a fresh reopen's
-    /// recomputed value.
+    /// The byte accounting decrements `sealed_record_bytes` by each reaped segment's record region,
+    /// read as `valid_end - SEGMENT_HEADER_LEN` from a streaming recovery scan: this is EXACTLY the
+    /// per-segment term the sealed-bytes total accumulated on each roll (a sealed segment's
+    /// `valid_end` is the start of its footer, so it excludes both the 64-byte header and the
+    /// 32-byte footer). The count accounting decrements `total_record_count` by the same scan's
+    /// `record_count`. Both cross-check the slot's stored metadata, so after a reap the running
+    /// totals still equal a fresh reopen's recomputed values.
     ///
     /// Returns a [`ReapOutcome`] reporting the segments and bytes reclaimed (zero for a no-op).
     ///
     /// # Errors
     /// Returns [`StorageError`] from reading a segment's length, unlinking it, or the directory
     /// sync. On such an error the in-memory state is left consistent with disk: any segment
-    /// removed-and-synced before the failure has already been dropped from `segments` and
-    /// `sealed_record_bytes`; the failing segment is NOT removed from memory, so it is never
-    /// orphaned. This is best-effort space reclamation, so a caller may log and continue, but a
-    /// real IO error is surfaced (never swallowed into silent state corruption).
-    pub fn reap_to_size(
+    /// removed-and-synced before the failure has already been dropped from `segments` and the
+    /// running totals; the failing segment is NOT removed from memory, so it is never orphaned.
+    /// This is best-effort space reclamation, so a caller may log and continue, but a real IO error
+    /// is surfaced (never swallowed into silent state corruption).
+    pub fn reap(
         &mut self,
-        max_retained_bytes: u64,
+        bounds: RetentionBounds,
         protect_below_offset: u64,
     ) -> Result<ReapOutcome, StorageError> {
         let mut outcome = ReapOutcome::default();
-        // A zero bound is unlimited: retention is off, so reap nothing (the default).
-        if max_retained_bytes == 0 {
+        // Every bound off (the default) is unlimited: retention is off, so reap nothing.
+        if bounds.max_bytes == 0 && bounds.max_age_ms == 0 && bounds.max_messages == 0 {
             return Ok(outcome);
         }
-        while self.durable_record_bytes() > max_retained_bytes {
-            // Never reap the active segment: keep at least the last slot. With only one slot the
-            // single segment IS the active one, so stop.
-            let Some(next_base) = self.segments.get(1).map(|slot| slot.base_offset) else {
+        // `now` is read once per pass from the clock seam (never the host wall clock), so the
+        // deterministic simulation drives the age check.
+        let now_ms = self.clock.now_unix_millis();
+        // Loop while a SECOND slot exists: that keeps the ACTIVE segment (the last slot) off the
+        // table, so with only one slot (the single segment IS the active one) the loop ends.
+        while let Some(next_base) = self.segments.get(1).map(|slot| slot.base_offset) {
+            let oldest = self.segments[0];
+            // Is the OLDEST sealed segment eligible under any enabled bound? Size and count are
+            // log-wide totals; age is per-segment (the oldest segment's max timestamp).
+            let over_bytes =
+                bounds.max_bytes != 0 && self.durable_record_bytes() > bounds.max_bytes;
+            let over_count =
+                bounds.max_messages != 0 && self.durable_record_count() > bounds.max_messages;
+            // Aged out iff the bound is set AND the segment's NEWEST record is older than the
+            // bound: `max_timestamp_ms < now - max_age_ms`. Rearranged to avoid underflow when
+            // `now < max_age_ms` (then nothing is old enough): `max_timestamp_ms + max_age_ms < now`.
+            let aged_out = bounds.max_age_ms != 0
+                && oldest.max_timestamp_ms.saturating_add(bounds.max_age_ms) < now_ms;
+            if !(over_bytes || over_count || aged_out) {
                 break;
-            };
+            }
             // The oldest segment is fully consumed only if it ends at or below the protect floor.
             // Its end is exactly the next segment's base (contiguous), so every record in it is
             // strictly below `next_base <= protect_below_offset`, hence needed by no consumer.
             if next_base > protect_below_offset {
                 break;
             }
-            let oldest = self.segments[0];
             let name = segment_file_name(oldest.id);
-            // The reaped segment's durable RECORD bytes, read the SAME way the sealed total was
-            // accumulated (`valid_end - SEGMENT_HEADER_LEN`), so the decrement is exact. A
-            // streaming recovery scan avoids materializing record payloads.
+            // The reaped segment's durable RECORD bytes and COUNT, read the SAME way the running
+            // totals were accumulated (`valid_end - SEGMENT_HEADER_LEN` and `record_count`), so
+            // both decrements are exact. A streaming recovery scan avoids materializing payloads.
             let scan = SegmentReader::open(self.fs.open(&name)?)?.scan_recovery()?;
             let segment_record_bytes = scan.valid_end.saturating_sub(SEGMENT_HEADER_LEN as u64);
+            let segment_record_count = scan.record_count;
             // Unlink, then dir-sync so the removal is durable, BEFORE touching in-memory state:
-            // if either fails the slot stays and the running total is untouched, so memory never
+            // if either fails the slot stays and the running totals are untouched, so memory never
             // claims a segment is gone while it survives on disk.
             self.fs.remove(&name)?;
             self.fs.sync_dir()?;
@@ -751,10 +898,34 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             self.sealed_record_bytes = self
                 .sealed_record_bytes
                 .saturating_sub(segment_record_bytes);
+            self.total_record_count = self.total_record_count.saturating_sub(segment_record_count);
             outcome.segments_reaped = outcome.segments_reaped.saturating_add(1);
             outcome.bytes_reaped = outcome.bytes_reaped.saturating_add(segment_record_bytes);
         }
         Ok(outcome)
+    }
+
+    /// The size-only segment reaper: deletes whole old sealed segments while the durable log
+    /// exceeds `max_retained_bytes` (refs #13, #80). A thin wrapper over [`Log::reap`] with only
+    /// the byte bound set, preserved for callers and tests that want the byte bound alone; `0`
+    /// means UNLIMITED (the byte bound is off, the default). See [`Log::reap`] for the full
+    /// consumer-safety, ordering, and accounting contract.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] from reading a segment's length, unlinking it, or the directory
+    /// sync, leaving the in-memory state consistent with disk (see [`Log::reap`]).
+    pub fn reap_to_size(
+        &mut self,
+        max_retained_bytes: u64,
+        protect_below_offset: u64,
+    ) -> Result<ReapOutcome, StorageError> {
+        self.reap(
+            RetentionBounds {
+                max_bytes: max_retained_bytes,
+                ..RetentionBounds::default()
+            },
+            protect_below_offset,
+        )
     }
 
     /// The index in `segments` of the segment whose range holds `offset` (the slot with
@@ -835,6 +1006,17 @@ mod tests {
     fn rec(payload: &[u8]) -> Append<'_> {
         Append {
             timestamp_ms: 7,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload,
+        }
+    }
+
+    // A record carrying an explicit producer timestamp, for the age-retention tests.
+    fn rec_at(ts: u64, payload: &[u8]) -> Append<'_> {
+        Append {
+            timestamp_ms: ts,
             flags: RecordFlags::EMPTY,
             key: b"",
             headers: b"",
@@ -2166,5 +2348,376 @@ mod tests {
             Log::open(StdFs::new(root.clone()), ManualClock::new(), small_config()).unwrap();
         assert_eq!(reopened.next_offset().get(), head);
         assert_eq!(reopened.durable_record_bytes(), live_bytes);
+    }
+
+    // ---- Count-, time-, and composed-retention tests (refs #13, #80) ----
+
+    use std::sync::Arc;
+
+    // Opens a small-segment log over a shared `ManualClock` the caller can drive (for age tests).
+    fn open_mem_clock(clock: Arc<ManualClock>) -> Log<InMemoryFs, Arc<ManualClock>> {
+        Log::open(InMemoryFs::new(), clock, small_config()).unwrap()
+    }
+
+    #[test]
+    fn count_retention_reaps_oldest_until_under_the_bound() {
+        // With max_messages set and everything consumed, producing past it reaps the OLDEST sealed
+        // segments until the total record count is at or under the bound; never the active segment,
+        // never below the protect floor.
+        let mut log = rolled_log(20);
+        let head = log.next_offset().get();
+        let active_id = log.active_segment_id();
+        assert_eq!(log.durable_record_count(), 20, "all 20 records counted");
+        let bounds = RetentionBounds {
+            max_messages: 6,
+            ..RetentionBounds::default()
+        };
+        let outcome = log.reap(bounds, head).unwrap();
+        assert!(outcome.segments_reaped >= 1, "reaped at least one segment");
+        assert!(
+            log.durable_record_count() <= 6,
+            "count brought to or under the bound: {} <= 6",
+            log.durable_record_count()
+        );
+        // The active segment is never reaped.
+        assert_eq!(log.active_segment_id(), active_id);
+        assert!(log
+            .filesystem()
+            .exists(&segment_file_name(active_id))
+            .unwrap());
+        // The oldest segments are gone; the surviving prefix starts above offset 0.
+        let surviving = segment_ids(log.filesystem()).unwrap();
+        assert!(!surviving.contains(&0), "segment 0 reaped: {surviving:?}");
+    }
+
+    #[test]
+    fn count_retention_never_reaps_below_the_protect_floor() {
+        // A zero protect floor pins every record; even far over the count bound, nothing is reaped.
+        let mut log = rolled_log(20);
+        let before = log.durable_record_count();
+        let segs_before = segment_ids(log.filesystem()).unwrap();
+        let bounds = RetentionBounds {
+            max_messages: 1,
+            ..RetentionBounds::default()
+        };
+        let outcome = log.reap(bounds, 0).unwrap();
+        assert_eq!(
+            outcome,
+            ReapOutcome::default(),
+            "protect floor 0 reaps nothing"
+        );
+        assert_eq!(log.durable_record_count(), before);
+        assert_eq!(segment_ids(log.filesystem()).unwrap(), segs_before);
+    }
+
+    #[test]
+    fn count_retention_after_a_reap_matches_a_fresh_reopen() {
+        // The running total count decrements by exactly the reaped segments' counts, cross-checked
+        // against a fresh reopen's recomputed count.
+        let mut log = rolled_log(24);
+        let bounds = RetentionBounds {
+            max_messages: 8,
+            ..RetentionBounds::default()
+        };
+        log.reap(bounds, log.next_offset().get()).unwrap();
+        let live_count = log.durable_record_count();
+        let live_bytes = log.durable_record_bytes();
+        let fs = log.into_filesystem();
+        let reopened = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        assert_eq!(
+            reopened.durable_record_count(),
+            live_count,
+            "the running count equals the recomputed count after a reap"
+        );
+        assert_eq!(
+            reopened.durable_record_bytes(),
+            live_bytes,
+            "bytes also exact"
+        );
+    }
+
+    #[test]
+    fn age_retention_reaps_a_fully_aged_segment_and_advances_with_the_clock() {
+        // A segment is age-eligible only when its MAXIMUM record timestamp is older than
+        // now - max_age. Old segments are reaped first; a recent record in a later segment must NOT
+        // make it eligible; advancing the clock makes more segments eligible.
+        let clock = Arc::new(ManualClock::new());
+        let mut log = open_mem_clock(Arc::clone(&clock));
+        // Fill several segments with OLD records (timestamp 100), then a batch of NEW records
+        // (timestamp 10_000) so the newest segments are not yet aged.
+        for i in 0..10u8 {
+            log.append(&rec_at(100, &[i; 20])).unwrap();
+        }
+        for i in 0..10u8 {
+            log.append(&rec_at(10_000, &[i; 20])).unwrap();
+        }
+        log.sync().unwrap();
+        assert!(log.active_segment_id() >= 2, "spans several segments");
+        let head = log.next_offset().get();
+        let segs_before = segment_ids(log.filesystem()).unwrap().len();
+        let count_before = log.durable_record_count();
+
+        // now = 5_000, max_age = 1_000: a segment is eligible iff max_ts < 4_000. The old segments
+        // (max_ts 100) qualify; any segment holding a 10_000-ts record does not.
+        let bounds = RetentionBounds {
+            max_age_ms: 1_000,
+            ..RetentionBounds::default()
+        };
+        clock.set_unix_millis(5_000);
+        let outcome = log.reap(bounds, head).unwrap();
+        assert!(
+            outcome.segments_reaped >= 1,
+            "the aged-out old segments are reaped"
+        );
+        let segs_after_first = segment_ids(log.filesystem()).unwrap().len();
+        assert!(segs_after_first < segs_before, "some old segments reaped");
+        // The 10 NEW records all survive: no segment holding a 10_000-ts record was reaped.
+        let surviving_records: u64 = segment_ids(log.filesystem())
+            .unwrap()
+            .iter()
+            .map(|id| read_back(log.filesystem(), *id).len() as u64)
+            .sum();
+        assert!(
+            surviving_records >= 10,
+            "the 10 new records survive at clock 5_000: {surviving_records}"
+        );
+        // A second pass at the SAME clock reaps nothing more (the new segments are not yet aged).
+        assert_eq!(
+            log.reap(bounds, head).unwrap(),
+            ReapOutcome::default(),
+            "no further reap until the clock advances"
+        );
+
+        // Advance past the new records' age: now everything below the head is older than
+        // now - max_age, so the reaper trims down toward the active segment.
+        clock.set_unix_millis(20_000);
+        let outcome2 = log.reap(bounds, head).unwrap();
+        assert!(
+            outcome2.segments_reaped >= 1,
+            "advancing the clock makes the previously-too-new segments eligible"
+        );
+        assert!(
+            log.durable_record_count() < count_before,
+            "the total count dropped as segments were reaped over time"
+        );
+        // The active segment always survives.
+        assert!(log
+            .filesystem()
+            .exists(&segment_file_name(log.active_segment_id()))
+            .unwrap());
+    }
+
+    #[test]
+    fn age_retention_uses_the_max_timestamp_not_the_min() {
+        // A segment with one OLD record and one RECENT record must NOT be reaped: the max
+        // timestamp (the recent one) is not past the bound, even though an old record precedes it.
+        let clock = Arc::new(ManualClock::new());
+        // A segment cap that holds exactly two of these records, so the first segment carries one
+        // old and one recent record.
+        let cfg = LogConfig {
+            max_segment_bytes: 200,
+            max_total_bytes: 0,
+        };
+        let mut log = Log::open(InMemoryFs::new(), Arc::clone(&clock), cfg).unwrap();
+        // Segment 0: an old record (ts 100) then a recent record (ts 9_000).
+        log.append(&rec_at(100, &[0u8; 20])).unwrap();
+        log.append(&rec_at(9_000, &[1u8; 20])).unwrap();
+        // Force a roll by producing more so segment 0 is sealed with max_ts 9_000.
+        for i in 0..6u8 {
+            log.append(&rec_at(9_000, &[i; 20])).unwrap();
+        }
+        log.sync().unwrap();
+        assert!(log.active_segment_id() >= 1, "segment 0 is sealed");
+        let head = log.next_offset().get();
+        let segs_before = segment_ids(log.filesystem()).unwrap();
+
+        // now = 5_000, max_age = 1_000: eligible iff max_ts < 4_000. Segment 0's max_ts is 9_000,
+        // so it is NOT eligible despite holding an old record. Nothing is reaped.
+        clock.set_unix_millis(5_000);
+        let bounds = RetentionBounds {
+            max_age_ms: 1_000,
+            ..RetentionBounds::default()
+        };
+        let outcome = log.reap(bounds, head).unwrap();
+        assert_eq!(
+            outcome,
+            ReapOutcome::default(),
+            "a segment whose MAX timestamp is recent is not reaped (max, not min)"
+        );
+        assert_eq!(segment_ids(log.filesystem()).unwrap(), segs_before);
+
+        // Advance past the recent record's age: now max_ts 9_000 < now - max_age, so it is reaped.
+        clock.set_unix_millis(11_000);
+        let outcome2 = log.reap(bounds, head).unwrap();
+        assert!(
+            outcome2.segments_reaped >= 1,
+            "once even the newest record has aged out, the segment is reaped"
+        );
+    }
+
+    #[test]
+    fn age_retention_recomputes_after_a_reopen() {
+        // The per-segment max timestamp is recomputed at recovery, so the age reaper behaves
+        // identically after a reopen.
+        let clock = Arc::new(ManualClock::new());
+        let mut log = open_mem_clock(Arc::clone(&clock));
+        for i in 0..10u8 {
+            log.append(&rec_at(100, &[i; 20])).unwrap();
+        }
+        for i in 0..10u8 {
+            log.append(&rec_at(10_000, &[i; 20])).unwrap();
+        }
+        log.sync().unwrap();
+        let head = log.next_offset().get();
+        let fs = log.into_filesystem();
+
+        // Reopen over a fresh clock set to 5_000: the recomputed max timestamps drive the same
+        // decision as before the reopen (old segments eligible, new ones not).
+        let clock2 = Arc::new(ManualClock::at_unix_millis(5_000));
+        let mut reopened = Log::open(fs, Arc::clone(&clock2), small_config()).unwrap();
+        assert_eq!(
+            reopened.next_offset().get(),
+            head,
+            "head unchanged after reopen"
+        );
+        let bounds = RetentionBounds {
+            max_age_ms: 1_000,
+            ..RetentionBounds::default()
+        };
+        let outcome = reopened.reap(bounds, head).unwrap();
+        assert!(
+            outcome.segments_reaped >= 1,
+            "recomputed max timestamps still make the old segments age-eligible"
+        );
+        // The new (10_000-ts) records survive.
+        let surviving: u64 = segment_ids(reopened.filesystem())
+            .unwrap()
+            .iter()
+            .map(|id| read_back(reopened.filesystem(), *id).len() as u64)
+            .sum();
+        assert!(surviving >= 10, "the new records survive: {surviving}");
+    }
+
+    #[test]
+    fn each_bound_independently_triggers_a_reap() {
+        // Composition: size OR count OR age each ALONE triggers a reap (the others disabled).
+        let head_of = |log: &Log<InMemoryFs, ManualClock>| log.next_offset().get();
+
+        // Size only.
+        let mut log = rolled_log(20);
+        let one = log.durable_record_bytes() / 20;
+        let out = log
+            .reap(
+                RetentionBounds {
+                    max_bytes: 3 * one,
+                    ..RetentionBounds::default()
+                },
+                head_of(&log),
+            )
+            .unwrap();
+        assert!(out.segments_reaped >= 1, "size bound alone reaps");
+
+        // Count only.
+        let mut log = rolled_log(20);
+        let out = log
+            .reap(
+                RetentionBounds {
+                    max_messages: 5,
+                    ..RetentionBounds::default()
+                },
+                head_of(&log),
+            )
+            .unwrap();
+        assert!(out.segments_reaped >= 1, "count bound alone reaps");
+
+        // Age only.
+        let clock = Arc::new(ManualClock::new());
+        let mut log = open_mem_clock(Arc::clone(&clock));
+        for i in 0..20u8 {
+            log.append(&rec_at(100, &[i; 20])).unwrap();
+        }
+        log.sync().unwrap();
+        let head = log.next_offset().get();
+        clock.set_unix_millis(10_000);
+        let out = log
+            .reap(
+                RetentionBounds {
+                    max_age_ms: 1_000,
+                    ..RetentionBounds::default()
+                },
+                head,
+            )
+            .unwrap();
+        assert!(out.segments_reaped >= 1, "age bound alone reaps");
+    }
+
+    #[test]
+    fn every_bound_disabled_reaps_nothing() {
+        // The #261 default-off behavior is preserved: all three bounds 0 reaps nothing, even with
+        // everything consumed and many segments.
+        let mut log = rolled_log(20);
+        let before = log.durable_record_bytes();
+        let count_before = log.durable_record_count();
+        let segs_before = segment_ids(log.filesystem()).unwrap();
+        let outcome = log
+            .reap(RetentionBounds::default(), log.next_offset().get())
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ReapOutcome::default(),
+            "all bounds off reaps nothing"
+        );
+        assert_eq!(log.durable_record_bytes(), before);
+        assert_eq!(log.durable_record_count(), count_before);
+        assert_eq!(segment_ids(log.filesystem()).unwrap(), segs_before);
+    }
+
+    #[test]
+    fn composed_bounds_still_gate_on_consumer_safety() {
+        // Even with size, age, and count ALL tripped, a protect floor of 0 (no consumer has
+        // committed) blocks every delete: consumer-safety gates every bound.
+        let clock = Arc::new(ManualClock::new());
+        let mut log = open_mem_clock(Arc::clone(&clock));
+        for i in 0..20u8 {
+            log.append(&rec_at(100, &[i; 20])).unwrap();
+        }
+        log.sync().unwrap();
+        clock.set_unix_millis(10_000);
+        let before = log.durable_record_bytes();
+        let segs_before = segment_ids(log.filesystem()).unwrap();
+        let bounds = RetentionBounds {
+            max_bytes: 1,
+            max_age_ms: 1,
+            max_messages: 1,
+        };
+        let outcome = log.reap(bounds, 0).unwrap();
+        assert_eq!(
+            outcome,
+            ReapOutcome::default(),
+            "consumer-safety blocks every delete even with all bounds tripped"
+        );
+        assert_eq!(log.durable_record_bytes(), before);
+        assert_eq!(segment_ids(log.filesystem()).unwrap(), segs_before);
+    }
+
+    #[test]
+    fn count_retention_never_reaps_the_active_segment() {
+        // A single-segment log over a tiny count bound, everything consumed: the active segment is
+        // never reaped, so nothing happens.
+        let mut log = open_mem(LogConfig::default());
+        for i in 0..4u8 {
+            log.append(&rec(&[i; 8])).unwrap();
+        }
+        log.sync().unwrap();
+        assert_eq!(log.active_segment_id(), 0, "still a single segment");
+        let before = log.durable_record_count();
+        let bounds = RetentionBounds {
+            max_messages: 1,
+            ..RetentionBounds::default()
+        };
+        let outcome = log.reap(bounds, log.next_offset().get()).unwrap();
+        assert_eq!(outcome, ReapOutcome::default());
+        assert_eq!(log.durable_record_count(), before);
+        assert!(log.filesystem().exists(&segment_file_name(0)).unwrap());
     }
 }

@@ -234,6 +234,12 @@ pub struct SegmentWriter<F: RandomAccessFile> {
     write_pos: u64,
     record_count: u32,
     last_seq: Seq,
+    /// The maximum producer timestamp (milliseconds since the Unix epoch) across every record
+    /// appended so far, or `0` if the segment is empty. Timestamps are producer-supplied and NOT
+    /// necessarily monotonic, so the MAX (not the last) is tracked: the age-retention reaper
+    /// deletes a sealed segment only when ALL its records are older than the bound, which the max
+    /// answers. Maintained on each [`SegmentWriter::append`] so the running value is O(1).
+    max_timestamp_ms: u64,
 }
 
 impl<F: RandomAccessFile> SegmentWriter<F> {
@@ -250,6 +256,7 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
             write_pos: SEGMENT_HEADER_LEN as u64,
             record_count: 0,
             last_seq: header.base_seq,
+            max_timestamp_ms: 0,
         })
     }
 
@@ -258,10 +265,11 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
     ///
     /// Recovery scans the segment, truncates any torn tail, and calls this with the
     /// recovered state: `write_pos` is the byte offset just past the last intact record
-    /// (`SegmentScan::valid_end`), `record_count` is how many records precede it, and
+    /// (`SegmentScan::valid_end`), `record_count` is how many records precede it,
     /// `last_seq` is that last record's sequence, or the header `base_seq` if the
-    /// segment is empty. The caller guarantees those match the bytes on disk; this
-    /// constructor performs no IO.
+    /// segment is empty, and `max_timestamp_ms` is the maximum record timestamp recovery
+    /// observed (or `0` if the segment is empty). The caller guarantees those match the
+    /// bytes on disk; this constructor performs no IO.
     #[must_use]
     pub fn resume(
         file: F,
@@ -269,6 +277,7 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         write_pos: u64,
         record_count: u32,
         last_seq: Seq,
+        max_timestamp_ms: u64,
     ) -> SegmentWriter<F> {
         SegmentWriter {
             file,
@@ -276,6 +285,7 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
             write_pos,
             record_count,
             last_seq,
+            max_timestamp_ms,
         }
     }
 
@@ -296,6 +306,15 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
     #[must_use]
     pub fn record_count(&self) -> u32 {
         self.record_count
+    }
+
+    /// The maximum producer timestamp (milliseconds since the Unix epoch) across every record
+    /// appended so far, or `0` if the segment is empty. Tracked as the MAX (not the last) because
+    /// producer timestamps are not necessarily monotonic; the age-retention reaper deletes a
+    /// sealed segment only when ALL its records are older than the bound, which the max answers.
+    #[must_use]
+    pub fn max_timestamp_ms(&self) -> u64 {
+        self.max_timestamp_ms
     }
 
     /// The current write position (the byte length of the segment so far).
@@ -334,6 +353,10 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         self.write_pos = end;
         self.record_count += 1;
         self.last_seq = record.seq;
+        // Track the MAX timestamp (not the last): producer timestamps are not monotonic, and the
+        // age-retention reaper needs the newest record's timestamp to know when the whole segment
+        // has aged out.
+        self.max_timestamp_ms = self.max_timestamp_ms.max(record.timestamp_ms);
         Ok(Offset::new(offset))
     }
 
@@ -397,6 +420,11 @@ pub struct RecoveryScan {
     pub footer: Option<SegmentFooter>,
     /// How many valid records precede the first torn or corrupt frame.
     pub record_count: u64,
+    /// The maximum producer timestamp (milliseconds since the Unix epoch) across the valid
+    /// records, or `0` if there are none. Recovery recomputes the per-segment max so the
+    /// age-retention reaper behaves identically after a reopen. The max (not the last) is tracked
+    /// because producer timestamps are not necessarily monotonic.
+    pub max_timestamp_ms: u64,
     /// The sequence of the last valid record, or the segment's `base_seq` if there are none.
     pub last_seq: Seq,
     /// `true` if every byte up to the footer or end was a valid record (no torn tail).
@@ -412,6 +440,8 @@ pub struct RecoveryScan {
 struct BodyWalk {
     /// Valid records seen before the first torn or corrupt frame.
     count: u64,
+    /// The maximum producer timestamp across the valid records (or `0` if none).
+    max_timestamp_ms: u64,
     /// The last valid record's sequence (or the caller's base seq if none).
     last_seq: Seq,
     /// Bytes consumed relative to the walk's start offset.
@@ -608,6 +638,7 @@ impl<F: RandomAccessFile> SegmentReader<F> {
                     header: self.header,
                     footer: Some(footer),
                     record_count: walk.count,
+                    max_timestamp_ms: walk.max_timestamp_ms,
                     last_seq: walk.last_seq,
                     clean: true,
                     tail_reason: None,
@@ -623,6 +654,7 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             header: self.header,
             footer: None,
             record_count: walk.count,
+            max_timestamp_ms: walk.max_timestamp_ms,
             last_seq: walk.last_seq,
             clean: walk.clean,
             tail_reason: walk.tail_reason,
@@ -633,13 +665,15 @@ impl<F: RandomAccessFile> SegmentReader<F> {
     /// Streams `[start, end)` one record at a time, validating each frame and the
     /// sequence run, stopping at the first torn or corrupt frame. Peak memory is one
     /// record (a reused scratch buffer), never the whole region. Returns the valid
-    /// record count, the last valid sequence, the bytes consumed, and whether the region
-    /// decoded cleanly. A valid frame with an out-of-order sequence is a hard error, the
-    /// same structural check `Log::recover` applies to a buffered scan.
+    /// record count, the maximum record timestamp, the last valid sequence, the bytes
+    /// consumed, and whether the region decoded cleanly. A valid frame with an
+    /// out-of-order sequence is a hard error, the same structural check `Log::recover`
+    /// applies to a buffered scan.
     fn scan_body_streaming(&self, start: u64, end: u64) -> Result<BodyWalk, StorageError> {
         let mut scratch: Vec<u8> = Vec::new();
         let mut pos = start;
         let mut count = 0u64;
+        let mut max_timestamp_ms = 0u64;
         let mut last_seq = self.header.base_seq;
         let mut tail_reason: Option<ReasonCode> = None;
         while pos < end {
@@ -690,11 +724,16 @@ impl<F: RandomAccessFile> SegmentReader<F> {
                 });
             }
             last_seq = view.seq;
+            // Accumulate the MAX timestamp across the valid prefix (not the last): producer
+            // timestamps are not monotonic, so recovery must reconstruct the same max the writer
+            // tracked, for the age-retention reaper.
+            max_timestamp_ms = max_timestamp_ms.max(view.timestamp_ms);
             count += 1;
             pos += consumed as u64;
         }
         Ok(BodyWalk {
             count,
+            max_timestamp_ms,
             last_seq,
             cursor: pos - start,
             clean: tail_reason.is_none(),
@@ -999,6 +1038,18 @@ mod tests {
             .last()
             .map_or(buffered.header.base_seq, |r| r.seq);
         assert_eq!(streamed.last_seq, expected_last, "last_seq");
+        // The streamed max timestamp must equal the buffered scan's max over the same valid
+        // prefix (0 if empty), so recovery reconstructs exactly what the writer tracked.
+        let expected_max_ts = buffered
+            .records
+            .iter()
+            .map(|r| r.timestamp_ms)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            streamed.max_timestamp_ms, expected_max_ts,
+            "max_timestamp_ms"
+        );
         assert_eq!(streamed.valid_end, buffered.valid_end, "valid_end");
         assert_eq!(streamed.clean, buffered.clean, "clean");
         assert_eq!(streamed.footer, buffered.footer, "footer");
@@ -1079,6 +1130,41 @@ mod tests {
         assert_eq!(streamed.last_seq, Seq::new(199));
         assert!(streamed.clean);
         assert_scans_agree(&file);
+    }
+
+    fn rec_at(seq: u64, ts: u64, payload: &[u8]) -> RecordView<'_> {
+        RecordView {
+            seq: Seq::new(seq),
+            timestamp_ms: ts,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload,
+        }
+    }
+
+    #[test]
+    fn writer_tracks_the_max_timestamp_not_the_last() {
+        // Producer timestamps are not monotonic: the writer must keep the MAX across the segment,
+        // not the last appended record's timestamp. An empty segment reports 0.
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        assert_eq!(w.max_timestamp_ms(), 0, "empty segment");
+        w.append(&rec_at(0, 100, b"a")).unwrap();
+        assert_eq!(w.max_timestamp_ms(), 100);
+        w.append(&rec_at(1, 300, b"b")).unwrap();
+        assert_eq!(w.max_timestamp_ms(), 300);
+        // A later record with an OLDER timestamp must not lower the running max.
+        w.append(&rec_at(2, 50, b"c")).unwrap();
+        assert_eq!(w.max_timestamp_ms(), 300, "max, not last");
+        w.sync().unwrap();
+        // Recovery reconstructs the same max from a streaming scan.
+        let scan = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .scan_recovery()
+            .unwrap();
+        assert_eq!(scan.max_timestamp_ms, 300, "recovered max");
+        assert_eq!(scan.record_count, 3);
     }
 
     #[test]
