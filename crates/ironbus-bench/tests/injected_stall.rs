@@ -8,15 +8,18 @@
 //! FAILS if the tail does not move, which is exactly the regression (a reintroduced coordinated
 //! omission) it exists to catch.
 //!
-//! # Why a RELATIVE margin, not an absolute floor
+//! # How the threshold is chosen (and kept non-flaky)
 //!
 //! The IronBus broker fsyncs every produce (durability), so its baseline per-message latency floor
 //! is whatever the host disk's fsync costs (sub-millisecond on a fast SSD, ~10 ms on a slow CI
-//! disk). An absolute "tail must exceed N ms" floor would be fragile across disks. So the self-test
-//! is SELF-CALIBRATING: it runs a healthy baseline AND a stalled run with the SAME config and
-//! asserts the stall LIFTED the tail by a large fraction of the 200 ms freeze, on top of whatever
-//! the healthy baseline was. A harness committing coordinated omission would record the same tail
-//! with and without the freeze, so the lift would be ~0 and the test would fail.
+//! disk). The self-test runs a healthy baseline AND a stalled run with the SAME (deliberately low,
+//! sustainable) config, and compares each to a FIXED SEPARATION FLOOR at 0.6 of the 200 ms freeze
+//! (120 ms): the stalled p99.9 and max must clear it, and the healthy baseline p99.9 must stay
+//! below it (the non-vacuity bound). Empirically the two populations are far apart (healthy tail
+//! ~30 ms, stalled tail ~210 ms), so the floor sits in a wide gap, which is robust across disks and
+//! non-flaky. Comparing each population to the fixed floor, rather than subtracting two noisy
+//! upper-tail percentiles, is what removes the flakiness. A harness committing coordinated omission
+//! would record the same low tail with and without the freeze and fail to clear the floor.
 //!
 //! Unix only: it needs `SIGSTOP`/`SIGCONT`, and the shipped broker is Unix-only anyway.
 #![cfg(unix)]
@@ -102,14 +105,9 @@ fn an_injected_sigstop_shows_up_in_the_recorded_tail() {
     // Guard the broker so a panic below never leaks a (possibly frozen) serve process.
     let broker =
         Broker::spawn(&bin, &data_dir, &[]).expect("spawn ironbus serve for the stall run");
-    let outcome = run_with_injected_stall(
-        &broker,
-        &data_dir,
-        &config,
-        STALL,
-        Duration::from_millis(3_000),
-    )
-    .expect("the injected-stall run completed");
+    let outcome =
+        run_with_injected_stall(&broker, &data_dir, &config, STALL, Duration::from_secs(3))
+            .expect("the injected-stall run completed");
     drop(broker);
     cleanup(&data_dir);
 
