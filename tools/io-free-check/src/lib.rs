@@ -19,6 +19,13 @@
 //! Together (AST source walk + dep-tree) they form the structural invariant. A full
 //! compiler-level lint (a custom `dylint`/driver that resolves every path against the
 //! real name resolver) would be strictly stronger and is a possible future hardening.
+//!
+//! Known residual gap: IO written as `std::*` INSIDE a local `macro_rules!` body is
+//! caught by neither half. `syn` exposes a macro body as opaque tokens, so the walk
+//! does not see `std::fs::read(...)` hidden in a macro definition, and `std::*` needs
+//! no dependency so the dep-tree check shows nothing either. Only a name-resolving
+//! `dylint` would catch it. `ironbus-core` has no such macro today (the baseline is
+//! clean), so this one contrived case relies on code review rather than the gate.
 
 use std::collections::BTreeSet;
 use std::fmt;

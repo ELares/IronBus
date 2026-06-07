@@ -83,7 +83,9 @@ jobs:
       # ironbus-core's OWN source, so IO that arrives by re-export from a dependency is invisible to
       # it. The dep-tree check below catches that. Together (AST source walk + dep-tree) they are the
       # structural invariant. A compiler-level dylint that resolves every path against the real name
-      # resolver would be strictly stronger and is a possible future hardening.
+      # resolver would be strictly stronger and is a possible future hardening. Residual gap: std::*
+      # IO hidden inside a local `macro_rules!` body is caught by neither half (syn sees a macro body
+      # as opaque tokens; std::* needs no dependency), so that one contrived case relies on review.
       - name: forbid async-runtime crates in the ironbus-core dependency tree
         run: |
           set -euo pipefail
