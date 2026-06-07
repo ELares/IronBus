@@ -1,0 +1,6 @@
+# cargo-fuzz build output and machine-discovered data (corpora, crash artifacts, coverage).
+# Cargo.lock IS committed for reproducible nightly soaks, matching this repo's supply-chain rigor.
+target/
+corpus/
+artifacts/
+coverage/

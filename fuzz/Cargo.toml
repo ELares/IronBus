@@ -1,0 +1,47 @@
+[package]
+name = "ironbus-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ironbus-core = { path = "../crates/ironbus-core" }
+ironbus-proto = { path = "../crates/ironbus-proto" }
+ironbus-storage = { path = "../crates/ironbus-storage" }
+
+[[bin]]
+name = "record_codec"
+path = "fuzz_targets/record_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cursor_snapshot"
+path = "fuzz_targets/cursor_snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segment_scan"
+path = "fuzz_targets/segment_scan.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent workspace (which is `crates/*`): a cargo-fuzz crate must build with the
+# nightly sanitizer toolchain, separately from the merge-blocking stable workspace.
+[workspace]
