@@ -11,7 +11,8 @@
 //! this whole acceptance test is gated to Unix.
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -381,5 +382,220 @@ fn golden_path_offline_inspection_agrees_with_recovery() {
         "dump --json shows nothing past the durable high-water mark: {json_out}"
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Like [`start_broker`] but also opens the health endpoints on their own ephemeral loopback
+/// port, returning `(guard, wire_addr, health_addr)`. The broker prints the wire listening line
+/// then the health line, so this reads both (order-independently) under a timeout.
+fn start_broker_with_health(data_dir: &str) -> (ChildGuard, String, String) {
+    let child = Command::new(BIN)
+        .args([
+            "serve",
+            "--data-dir",
+            data_dir,
+            "--addr",
+            "127.0.0.1:0",
+            "--health-addr",
+            "127.0.0.1:0",
+            "--checkpoint-interval",
+            "1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ironbus serve");
+    let mut guard = ChildGuard(child);
+    let stdout = guard.0.stdout.take().expect("piped stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        for _ in 0..2 {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut wire = None;
+    let mut health = None;
+    for _ in 0..2 {
+        let line = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("ironbus serve did not print its addresses within 10s");
+        if let Some(a) = line
+            .split("listening on ")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .map(str::trim)
+        {
+            wire = Some(a.to_string());
+        } else if let Some(a) = line
+            .split("health endpoints on ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .map(str::trim)
+        {
+            health = Some(a.to_string());
+        }
+    }
+    let (Some(wire), Some(health)) = (wire, health) else {
+        let mut err = String::new();
+        if let Some(mut se) = guard.0.stderr.take() {
+            let _ = se.read_to_string(&mut err);
+        }
+        panic!("could not parse wire+health addresses; stderr: {err}");
+    };
+    (guard, wire, health)
+}
+
+/// Minimal blocking HTTP/1.0 GET against a loopback `host:port`, returning the full response
+/// (headers and body). Used to read the broker's `/metrics` exposition.
+fn http_get(addr: &str, path: &str) -> String {
+    let mut stream = TcpStream::connect(addr).expect("connect to health endpoint");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    write!(
+        stream,
+        "GET {path} HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("send GET");
+    let mut body = String::new();
+    stream
+        .read_to_string(&mut body)
+        .expect("read health response");
+    body
+}
+
+/// Reads a Prometheus gauge/counter value by exact metric name from an exposition body, skipping
+/// the `# HELP` / `# TYPE` lines (the sample line is `<name> <value>`).
+fn metric_value(body: &str, name: &str) -> Option<u64> {
+    let prefix = format!("{name} ");
+    body.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|v| v.parse().ok())
+    })
+}
+
+/// Reads the byte count from a `dump`/`peek` human loss note (`note: <n> byte(s) ...`).
+fn dump_loss_bytes(out: &str) -> Option<u64> {
+    out.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("note: ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|v| v.parse().ok())
+    })
+}
+
+/// Appends `garbage` to the active (lexicographically-last) `seg-*.log` in `data_dir`, modeling a
+/// power cut that left a partial record never completed at the tail. Segments grow (they are not
+/// pre-allocated), so this lands the torn bytes immediately past the last durable record.
+fn append_torn_tail(data_dir: &str, garbage: &[u8]) {
+    let seg = std::fs::read_dir(data_dir)
+        .expect("read data dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().and_then(|e| e.to_str()) == Some("log")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("seg-"))
+        })
+        .max()
+        .expect("an active segment file");
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&seg)
+        .expect("open the active segment for append");
+    f.write_all(garbage).expect("append the torn tail");
+    f.sync_all().expect("persist the torn tail");
+}
+
+#[test]
+fn golden_path_power_cut_recovers_the_durable_prefix_and_reports_loss() {
+    // #133 steps 6 and 7: a power cut leaves a torn tail (a partial record never completed) in
+    // the active segment. On restart, recovery must truncate the torn tail (never read past it),
+    // preserve the durable prefix (I1: no acked record lost), and report the loss in BOTH the
+    // offline reader (dump) and the online recovery counter (/metrics), and the two must AGREE on
+    // the byte count. Records are fsynced before pub returns, so the four below are durable.
+    const TORN: usize = 40;
+    let dir = std::env::temp_dir().join(format!("ironbus-golden-powercut-{}", std::process::id()));
+    let data_dir = dir.to_str().expect("utf8 temp path").to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Produce four durable records, then stop the broker.
+    let (broker, addr) = start_broker(&data_dir);
+    for (i, p) in ["m0", "m1", "m2", "m3"].iter().enumerate() {
+        let (out, code) = run(&["pub", "--addr", &addr, p]);
+        assert_eq!(code, 0, "pub exit code");
+        assert_eq!(out.trim(), i.to_string(), "pub returned the durable offset");
+    }
+    drop(broker);
+
+    // Simulate the power cut: append a torn tail (0xFF bytes, which cannot start a valid record
+    // since they are not the 0x4942 record magic) past the last durable record.
+    append_torn_tail(&data_dir, &[0xFF_u8; TORN]);
+
+    // Offline (broker stopped): dump shows the four durable records AND reports the torn tail,
+    // never reading past the durable head.
+    let (dumped, code) = run(&["dump", "--data-dir", &data_dir]);
+    assert_eq!(
+        code, 0,
+        "dump over a torn dir still succeeds (the tail is reported, not fatal)"
+    );
+    assert_eq!(
+        offline_offsets(&dumped),
+        vec![0, 1, 2, 3],
+        "the durable prefix is intact and nothing past the head is read: {dumped}"
+    );
+    let offline_loss =
+        dump_loss_bytes(&dumped).expect("dump reports a torn-tail loss note over a torn dir");
+    assert_eq!(
+        offline_loss, TORN as u64,
+        "the reported loss equals the torn-tail length"
+    );
+    assert!(
+        dumped.contains("torn or corrupt"),
+        "the loss note names the cause: {dumped}"
+    );
+
+    // Online: restart the broker. Recovery truncates the torn tail and records the dropped bytes,
+    // which /metrics exposes; it must agree with the offline dump's loss.
+    let (broker2, addr2, health2) = start_broker_with_health(&data_dir);
+    let metrics = http_get(&health2, "/metrics");
+    let truncated = metric_value(&metrics, "ironbus_recovery_truncated_bytes")
+        .expect("/metrics exposes ironbus_recovery_truncated_bytes");
+    assert_eq!(
+        truncated, offline_loss,
+        "the online recovery counter agrees with the offline loss report"
+    );
+
+    // The durable prefix survived and is fully consumable after the power cut.
+    let (out, code) = run(&["sub", "--addr", &addr2, "--max", "10", "--ack"]);
+    assert_eq!(code, 0, "sub exit code");
+    let mut got = payloads(&out);
+    got.sort();
+    assert_eq!(
+        got,
+        ["m0", "m1", "m2", "m3"],
+        "every durable record survived the power cut"
+    );
+
+    // Recovery truncated the torn tail, so the durable log continues cleanly from offset 4.
+    let (out, code) = run(&["pub", "--addr", &addr2, "m4"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.trim(),
+        "4",
+        "the durable log continues from the truncated head"
+    );
+
+    drop(broker2);
     let _ = std::fs::remove_dir_all(&dir);
 }
