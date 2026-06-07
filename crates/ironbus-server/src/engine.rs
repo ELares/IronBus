@@ -1465,6 +1465,101 @@ mod tests {
     }
 
     #[test]
+    fn a_both_slots_torn_checkpoint_falls_back_to_redeliver_from_zero() {
+        // The #164 "both-slots-torn checkpoint" crash class, gated end-to-end through the
+        // engine (refs #21). The cursor checkpoint is a two-slot file (#235): a single torn
+        // write can only damage one slot, so recovery falls back to the other. This models
+        // the worse case where BOTH slots are corrupt at once (media rot, or a double fault),
+        // and asserts the engine fails SAFE: open never errors or panics, the unreadable
+        // cursor is discarded, and every durable record redelivers from zero exactly once
+        // (at-least-once: duplicates are allowed, a lost ack is not).
+        use ironbus_storage::io::RandomAccessFile;
+
+        // Drive a queue so BOTH checkpoint slots hold a real, distinct snapshot: ack two and
+        // checkpoint (writes one slot), then ack two more and checkpoint (writes the other).
+        fn drive(e: &mut Engine<InMemoryFs, ManualClock>) {
+            for p in [&b"a"[..], b"b", b"c", b"d"] {
+                produce(e, p);
+            }
+            for _ in 0..2 {
+                let d = message(e.poll(0).unwrap());
+                e.ack(&d.token);
+            }
+            e.checkpoint_cursor().unwrap(); // seq 1 -> one slot, committed = 2
+            for _ in 0..2 {
+                let d = message(e.poll(0).unwrap());
+                e.ack(&d.token);
+            }
+            e.checkpoint_cursor().unwrap(); // seq 2 -> the other slot, committed = 4
+        }
+
+        // Control: the identical lifecycle with an INTACT checkpoint resumes at the head and
+        // redelivers nothing. This proves the fallback below is caused by the corruption, not
+        // by the checkpoint never having been meaningful (guards against a vacuous pass).
+        let mut control = open(config(10, 5));
+        drive(&mut control);
+        assert_eq!(control.committed_offset(), Offset::new(4));
+        let mut reopened =
+            Engine::open(control.into_filesystem(), ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(
+            reopened.committed_offset(),
+            Offset::new(4),
+            "an intact checkpoint resumes at the committed head"
+        );
+        assert!(
+            matches!(reopened.poll(0).unwrap(), Poll::Idle),
+            "an intact checkpoint redelivers nothing"
+        );
+
+        // Now corrupt BOTH slots of the on-disk cursor.ckpt: flip the first payload byte of
+        // each slot so each slot's crc32c fails and decodes to nothing.
+        let mut victim = open(config(10, 5));
+        drive(&mut victim);
+        let fs = victim.into_filesystem();
+        let ckpt = fs.open(CURSOR_CHECKPOINT).unwrap();
+        let mut bytes = ckpt.snapshot();
+        assert!(
+            bytes.len() >= 24 && bytes.len() % 2 == 0,
+            "the checkpoint is two equal fixed-size slots"
+        );
+        let slot = bytes.len() / 2;
+        bytes[10] ^= 0xff; // a crc-covered payload byte in the first slot
+        bytes[slot + 10] ^= 0xff; // and in the second slot
+        ckpt.write_all_at(&bytes, 0).unwrap();
+        ckpt.sync_all().unwrap();
+
+        // Reopen over the doubly-torn checkpoint: it must open cleanly (no error, no panic),
+        // discard the unreadable cursor, and redeliver every durable record from zero, each
+        // as a fresh first delivery.
+        let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(
+            e.committed_offset(),
+            Offset::new(0),
+            "a both-slots-torn checkpoint discards the cursor and resumes from zero"
+        );
+        let mut delivered = Vec::new();
+        while let Poll::Message(d) = e.poll(0).unwrap() {
+            assert_eq!(
+                d.deliveries, 1,
+                "redelivery from zero is a fresh first delivery"
+            );
+            delivered.push((d.offset.get(), d.record.payload.clone()));
+            e.ack(&d.token);
+        }
+        assert_eq!(
+            delivered,
+            vec![
+                (0, b"a".to_vec()),
+                (1, b"b".to_vec()),
+                (2, b"c".to_vec()),
+                (3, b"d".to_vec()),
+            ],
+            "every durable record redelivers after the checkpoint is lost"
+        );
+        assert_eq!(e.committed_offset(), Offset::new(4));
+    }
+
+    #[test]
     fn named_groups_consume_the_log_independently() {
         // Two named groups each see every message and advance their own cursor: broadcast
         // fan-out over the single log (#9). The default group is untouched by either.
