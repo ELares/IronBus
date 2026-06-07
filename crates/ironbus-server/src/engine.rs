@@ -382,6 +382,18 @@ pub struct Counters {
     pub redelivered: u64,
     /// Messages dead-lettered (parked past `MaxDeliver`); the resilience drop signal.
     pub dead_lettered: u64,
+    /// Below-earliest TRUNCATION events served to a consumer (#82, #84): each is one
+    /// [`Poll::Truncated`] returned because a group's cursor had fallen below the oldest retained
+    /// record (its data was force-reaped out from under it by the disk-full drop-oldest policy) and
+    /// the engine reset the cursor up to `earliest_retained`. The resilience SKIP signal: a consumer
+    /// silently losing a span would be the silent-loss this taxonomy forbids, so the skip is counted
+    /// the moment it is surfaced. Distinct from `recovery_*` (startup torn-tail loss): this is a
+    /// runtime skip served to a LIVE consumer. Each event spans `truncated_records` records.
+    pub truncations: u64,
+    /// RECORDS skipped by below-earliest truncations (#82, #84): the sum of the `skipped` span over
+    /// every [`Poll::Truncated`] event, the record-count complement of `truncations`. The operator's
+    /// "how much did consumers lose to force-reap" signal. Saturating.
+    pub truncated_records: u64,
     /// Commits via `ack` (a `term` commits through the same path and is counted here).
     pub acks: u64,
     /// Whole old SEALED segments reclaimed by consumer-safe retention, by the size, age, or count bound (refs #13, #80):
@@ -1514,6 +1526,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             let skipped = earliest - committed;
             g.cursor = AckCursor::resume(Offset::new(earliest));
             g.leases = LeaseTable::new(lease_config);
+            // Count the skip the moment it is surfaced (#96): a consumer losing this span must never
+            // be silent. One truncation event, spanning `skipped` records.
+            self.counters.truncations = self.counters.truncations.saturating_add(1);
+            self.counters.truncated_records =
+                self.counters.truncated_records.saturating_add(skipped);
             return Ok(Poll::Truncated {
                 earliest_retained: Offset::new(earliest),
                 skipped,
@@ -1852,6 +1869,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             if let Some(router) = g.router.as_mut() {
                 router.retain_above(Offset::new(earliest));
             }
+            // The same skip count as the plain-competing path (#96): one event, `skipped` records.
+            self.counters.truncations = self.counters.truncations.saturating_add(1);
+            self.counters.truncated_records =
+                self.counters.truncated_records.saturating_add(skipped);
             return Ok(Poll::Truncated {
                 earliest_retained: Offset::new(earliest),
                 skipped,
@@ -4321,6 +4342,10 @@ mod tests {
         let earliest = e.earliest_retained_offset();
         assert!(earliest.get() > 0, "the stuck consumer's data was reaped");
 
+        // No truncation has been surfaced yet, so the skip counters are zero (#96).
+        assert_eq!(e.counters().truncations, 0);
+        assert_eq!(e.counters().truncated_records, 0);
+
         // The stuck consumer's NEXT poll is a truncation, resetting to earliest_retained.
         let now = 100;
         match e.poll_in("stuck", now).unwrap() {
@@ -4335,6 +4360,14 @@ mod tests {
         }
         // The cursor is now at earliest_retained.
         assert_eq!(e.committed_offset_in("stuck"), earliest);
+        // Exactly one truncation event was counted, spanning the whole reaped span (#96): the skip
+        // is never silent.
+        assert_eq!(e.counters().truncations, 1, "one truncation event counted");
+        assert_eq!(
+            e.counters().truncated_records,
+            earliest.get(),
+            "the records counter equals the skipped span"
+        );
 
         // The NEXT poll delivers normally from earliest_retained, NOT another truncation.
         match e.poll_in("stuck", now).unwrap() {
@@ -4351,6 +4384,12 @@ mod tests {
                 Poll::Parked { .. } => {}
             }
         }
+        // The same gap never re-counts: the skip counter stays at one event (#96).
+        assert_eq!(
+            e.counters().truncations,
+            1,
+            "the same gap is not re-counted"
+        );
     }
 
     #[test]
