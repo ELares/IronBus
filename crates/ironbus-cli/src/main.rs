@@ -171,7 +171,8 @@ ironbus: a durable edge message queue.
 
 USAGE:
     ironbus serve --data-dir <dir> [--addr <host:port>] [--max-connections <n>]
-                  [--checkpoint-interval <n>] [--max-deliver <n>] [--max-in-flight <n>]
+                  [--checkpoint-interval <n>] [--max-deliver <n>] [--allow-unlimited-deliver]
+                  [--backoff-ms <ms,ms,...>] [--max-in-flight <n>]
                   [--consumer-credit <n>]
                   [--max-segment-bytes <n>] [--max-total-bytes <bytes>]
                   [--max-retained-bytes <bytes>] [--max-age-ms <ms>] [--max-messages <n>]
@@ -191,6 +192,14 @@ Notes:
     (default 64) bounds the per-CONNECTION un-acked set, so in a competing group one stuck
     consumer cannot consume a peer's budget. A fetch delivers min(requested, consumer credit,
     group window).
+    --max-deliver (default 5) caps delivery attempts before a poison message is dead-lettered.
+    0 (and the maximum 4294967295) mean unlimited delivery, allowed ONLY with
+    --allow-unlimited-deliver, which also prints a startup WARN: an unlimited cap lets a single
+    poison payload redeliver forever and is never dead-lettered.
+    --backoff-ms <ms,ms,...> sets the escalating per-attempt nack/redelivery delay schedule
+    (e.g. 100,500,2000), indexed by attempt and clamped to the last entry; it applies when a nack
+    carries no explicit delay. Omitted, a built-in default schedule is used; a single 0 disables
+    backoff (retry as soon as the visibility timeout allows).
     Retention reaps whole old, fully-consumed sealed segments under three composable, consumer-safe
     bounds, each 0 = off (the default): --max-retained-bytes (durable record bytes),
     --max-age-ms (a segment whose newest record is older than this many milliseconds), and
@@ -329,6 +338,32 @@ where
     let raw = take_value(flag, args, i)?;
     raw.parse::<T>()
         .map_err(|_| CliError::Usage(format!("`{flag}` needs a number, got `{raw}`")))
+}
+
+/// Like [`take_number`] but parses a comma-separated LIST of `u64` values (e.g. `100,500,2000`),
+/// for the `--backoff-ms` schedule (#63). Whitespace around a value is tolerated; an empty list,
+/// an empty element (a stray comma), or a non-numeric element is a usage error, so a typo is
+/// caught before the broker opens rather than silently dropping a stage of the schedule.
+fn take_number_list(flag: &str, args: &[String], i: &mut usize) -> Result<Vec<u64>, CliError> {
+    let raw = take_value(flag, args, i)?;
+    let mut values = Vec::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        let value = trimmed.parse::<u64>().map_err(|_| {
+            CliError::Usage(format!(
+                "`{flag}` needs a comma-separated list of numbers, got `{raw}`"
+            ))
+        })?;
+        values.push(value);
+    }
+    if values.is_empty() {
+        // `split(',')` always yields at least one element, so this only trips on an empty string,
+        // which `parse` already rejects; kept as a defensive guard so the list is never empty.
+        return Err(CliError::Usage(format!(
+            "`{flag}` needs at least one number"
+        )));
+    }
+    Ok(values)
 }
 
 /// Classifies a client error against the frozen exit-code scheme. A connection-level failure
@@ -597,12 +632,40 @@ fn cmd_sub(
     Ok(())
 }
 
+/// The fully-parsed `serve` invocation: the assembled tuning config plus the connection-level
+/// arguments (the bind address, the optional data dir and health address, and the declared
+/// `key_shared` groups) that are not part of [`ServeConfig`].
+struct ParsedServe {
+    addr: String,
+    data_dir: Option<String>,
+    config: ServeConfig,
+    key_shared_groups: Vec<String>,
+    health_addr: Option<String>,
+}
+
 fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let parsed = parse_serve_flags(args)?;
+    finish_serve(
+        &parsed.addr,
+        parsed.data_dir.as_deref(),
+        &parsed.config,
+        &parsed.key_shared_groups,
+        parsed.health_addr.as_deref(),
+        out,
+    )
+}
+
+/// Parses the `serve` flag list into a [`ParsedServe`]. Split out of [`run_serve`] so the
+/// flag-parsing loop is one self-contained concern (and stays under the per-function line bound).
+fn parse_serve_flags(args: &[String]) -> Result<ParsedServe, CliError> {
     let mut addr = DEFAULT_ADDR.to_string();
     let mut data_dir: Option<String> = None;
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
     let mut checkpoint_interval = DEFAULT_CHECKPOINT_INTERVAL;
     let mut max_deliver = DEFAULT_MAX_DELIVER;
+    let mut allow_unlimited_deliver = false;
+    // Empty = use the built-in default schedule; --backoff-ms sets an explicit one.
+    let mut backoff_ms: Vec<u64> = Vec::new();
     let mut max_in_flight = DEFAULT_MAX_IN_FLIGHT;
     let mut consumer_credit = DEFAULT_CONSUMER_CREDIT;
     let mut max_segment_bytes = DEFAULT_MAX_SEGMENT_BYTES;
@@ -628,6 +691,12 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
                 checkpoint_interval = take_number("--checkpoint-interval", args, &mut i)?;
             }
             "--max-deliver" => max_deliver = take_number("--max-deliver", args, &mut i)?,
+            // A bare boolean flag (no value): advance ONE token, not two, or the loop spins.
+            "--allow-unlimited-deliver" => {
+                allow_unlimited_deliver = true;
+                i += 1;
+            }
+            "--backoff-ms" => backoff_ms = take_number_list("--backoff-ms", args, &mut i)?,
             "--max-in-flight" => max_in_flight = take_number("--max-in-flight", args, &mut i)?,
             "--consumer-credit" => {
                 consumer_credit = take_number("--consumer-credit", args, &mut i)?;
@@ -641,15 +710,9 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             "--max-retained-bytes" => {
                 max_retained_bytes = take_number("--max-retained-bytes", args, &mut i)?;
             }
-            "--max-age-ms" => {
-                max_age_ms = take_number("--max-age-ms", args, &mut i)?;
-            }
-            "--max-messages" => {
-                max_messages = take_number("--max-messages", args, &mut i)?;
-            }
-            "--max-groups" => {
-                max_groups = take_number("--max-groups", args, &mut i)?;
-            }
+            "--max-age-ms" => max_age_ms = take_number("--max-age-ms", args, &mut i)?,
+            "--max-messages" => max_messages = take_number("--max-messages", args, &mut i)?,
+            "--max-groups" => max_groups = take_number("--max-groups", args, &mut i)?,
             "--disk-full-policy" => {
                 disk_full_policy_arg = take_value("--disk-full-policy", args, &mut i)?;
             }
@@ -675,29 +738,29 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             "`--disk-full-policy` must be `drop-new` or `drop-oldest`, got `{disk_full_policy_arg}`"
         ))
     })?;
-    let config = ServeConfig {
-        max_connections,
-        checkpoint_interval,
-        max_deliver,
-        max_in_flight,
-        consumer_credit,
-        max_segment_bytes,
-        max_total_bytes,
-        max_retained_bytes,
-        max_age_ms,
-        max_messages,
-        max_groups,
-        disk_full_policy,
-        visibility_ms,
-    };
-    finish_serve(
-        &addr,
-        data_dir.as_deref(),
-        config,
-        &key_shared_groups,
-        health_addr.as_deref(),
-        out,
-    )
+    Ok(ParsedServe {
+        addr,
+        data_dir,
+        config: ServeConfig {
+            max_connections,
+            checkpoint_interval,
+            max_deliver,
+            allow_unlimited_deliver,
+            backoff_ms,
+            max_in_flight,
+            consumer_credit,
+            max_segment_bytes,
+            max_total_bytes,
+            max_retained_bytes,
+            max_age_ms,
+            max_messages,
+            max_groups,
+            disk_full_policy,
+            visibility_ms,
+        },
+        key_shared_groups,
+        health_addr,
+    })
 }
 
 /// Resolves the required `--data-dir`, validates the assembled config, and dispatches to the
@@ -705,14 +768,14 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
 fn finish_serve(
     addr: &str,
     data_dir: Option<&str>,
-    config: ServeConfig,
+    config: &ServeConfig,
     key_shared_groups: &[String],
     health_addr: Option<&str>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     let data_dir =
         data_dir.ok_or_else(|| CliError::Usage("serve requires `--data-dir <dir>`".to_string()))?;
-    validate_serve_config(&config)?;
+    validate_serve_config(config)?;
     cmd_serve(
         addr,
         Path::new(data_dir),
@@ -731,13 +794,16 @@ fn validate_serve_config(config: &ServeConfig) -> Result<(), CliError> {
             "`--max-connections` must be at least 1".to_string(),
         ));
     }
-    if config.max_deliver == 0 || config.max_deliver == u32::MAX {
+    if (config.max_deliver == 0 || config.max_deliver == u32::MAX)
+        && !config.allow_unlimited_deliver
+    {
         // Both 0 and u32::MAX mean unlimited delivery (the lease counter saturates at the max,
-        // so a poison message loops forever); require an explicit bounded count rather than
-        // silently enabling it, or surfacing it as an internal error, from the CLI.
+        // so a poison message loops forever). Unlimited is reachable but must be DELIBERATE: it is
+        // allowed only behind `--allow-unlimited-deliver` (which also emits a startup WARN, see
+        // `cmd_serve`), else it is a usage error before the broker opens (#63).
         return Err(CliError::Usage(
             "`--max-deliver` must be at least 1 and below 4294967295 (0 and that maximum both \
-             mean unlimited delivery, which is not supported)"
+             mean unlimited delivery; pass `--allow-unlimited-deliver` to enable it deliberately)"
                 .to_string(),
         ));
     }
@@ -772,11 +838,23 @@ fn validate_serve_config(config: &ServeConfig) -> Result<(), CliError> {
 }
 
 /// The broker tuning knobs parsed from the `serve` flags.
-#[derive(Clone, Copy)]
+// Not `Copy`: `backoff_ms` is a `Vec`. The config is moved (never re-used after the move) through
+// `finish_serve`/`cmd_serve`, so `Clone` suffices.
+#[derive(Clone)]
 struct ServeConfig {
     max_connections: usize,
     checkpoint_interval: u64,
     max_deliver: u32,
+    /// Allow `--max-deliver 0` (unlimited delivery, refs #63). A poison message under an unlimited
+    /// cap redelivers forever, so it is opt-in: without this flag a zero (or `u32::MAX`) cap is a
+    /// usage error; with it, the broker starts and emits a startup WARN.
+    allow_unlimited_deliver: bool,
+    /// The escalating per-attempt nack backoff schedule in MILLISECONDS (refs #63), indexed by
+    /// delivery attempt and clamped to the last entry. Applied when a nack carries no explicit
+    /// delay, so a flapping consumer backs off instead of hot-looping a retry. Empty means use the
+    /// built-in [`DEFAULT_NACK_BACKOFF_NANOS`] schedule; a single `0` disables backoff (retry as
+    /// soon as the visibility timeout allows).
+    backoff_ms: Vec<u64>,
     max_in_flight: u32,
     /// Per-CONSUMER (per-connection) standing in-flight credit (#65): the most un-acked messages one
     /// connection may hold at once, the consumer-side half of credit-based flow control. The
@@ -815,12 +893,12 @@ struct ServeConfig {
 fn cmd_serve(
     addr: &str,
     data_dir: &Path,
-    config: ServeConfig,
+    config: &ServeConfig,
     key_shared_groups: &[String],
     health_addr: Option<&str>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
-    let shared = open_disk_engine(data_dir, &config, key_shared_groups)?;
+    let shared = open_disk_engine(data_dir, config, key_shared_groups)?;
     let listener = TcpListener::bind(addr)
         .map_err(|e| CliError::Internal(format!("cannot bind {addr}: {e}")))?;
     let local = listener
@@ -831,6 +909,16 @@ fn cmd_serve(
         "ironbus listening on {local}, data dir {}",
         data_dir.display()
     )?;
+    if config.allow_unlimited_deliver && (config.max_deliver == 0 || config.max_deliver == u32::MAX)
+    {
+        // Unlimited delivery is opt-in but LOUD (#63): a single poison payload can redeliver
+        // forever, so the operator who chose it sees it on every startup.
+        writeln!(
+            out,
+            "WARN: --max-deliver is unlimited (--allow-unlimited-deliver): a poison message can \
+             redeliver forever and is never dead-lettered"
+        )?;
+    }
     // The flag is never flipped here: the broker runs until the process is signalled.
     // Durability holds across an abrupt termination because every ack is fsynced first, so
     // a clean-shutdown handler is a follow-up, not a correctness requirement.
@@ -871,7 +959,7 @@ fn cmd_serve(
 fn cmd_serve(
     addr: &str,
     data_dir: &Path,
-    config: ServeConfig,
+    config: &ServeConfig,
     key_shared_groups: &[String],
     health_addr: Option<&str>,
     out: &mut impl Write,
@@ -882,6 +970,8 @@ fn cmd_serve(
         config.max_connections,
         config.checkpoint_interval,
         config.max_deliver,
+        config.allow_unlimited_deliver,
+        &config.backoff_ms,
         config.max_in_flight,
         config.consumer_credit,
         config.max_segment_bytes,
@@ -913,10 +1003,22 @@ fn open_disk_engine(
     std::fs::create_dir_all(data_dir)
         .map_err(|e| CliError::Internal(format!("cannot create {}: {e}", data_dir.display())))?;
     let fs = StdFs::new(data_dir.to_path_buf());
+    // An explicit --backoff-ms wins; an empty schedule (the flag was not passed) uses the built-in
+    // default. Each stage is milliseconds on the wire, nanoseconds in the engine; saturate rather
+    // than overflow on an absurd value.
+    let backoff_nanos: Vec<u64> = if config.backoff_ms.is_empty() {
+        DEFAULT_NACK_BACKOFF_NANOS.to_vec()
+    } else {
+        config
+            .backoff_ms
+            .iter()
+            .map(|ms| ms.saturating_mul(1_000_000))
+            .collect()
+    };
     let delivery = DeliveryConfig::new(
         config.max_deliver,
-        false,
-        DEFAULT_NACK_BACKOFF_NANOS.to_vec(),
+        config.allow_unlimited_deliver,
+        backoff_nanos,
     )
     .map_err(|e| CliError::Internal(format!("delivery config: {e:?}")))?;
     let visibility_ms = config.visibility_ms;
@@ -1340,6 +1442,8 @@ mod tests {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             checkpoint_interval,
             max_deliver: DEFAULT_MAX_DELIVER,
+            allow_unlimited_deliver: false,
+            backoff_ms: Vec::new(),
             max_in_flight,
             consumer_credit: DEFAULT_CONSUMER_CREDIT,
             max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
@@ -1908,6 +2012,150 @@ mod tests {
         assert_eq!(e.exit_code(), EXIT_USAGE);
         match e {
             CliError::Usage(m) => assert!(m.contains("unlimited"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    // A platform-independent baseline `ServeConfig` for the validation-level tests (the engine and
+    // socket are never opened, so it needs no Unix gate). Defaults mirror the production defaults.
+    fn validation_config() -> ServeConfig {
+        ServeConfig {
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
+            max_deliver: DEFAULT_MAX_DELIVER,
+            allow_unlimited_deliver: false,
+            backoff_ms: Vec::new(),
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            consumer_credit: DEFAULT_CONSUMER_CREDIT,
+            max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
+            max_retained_bytes: DEFAULT_MAX_RETAINED_BYTES,
+            max_age_ms: DEFAULT_MAX_AGE_MS,
+            max_messages: DEFAULT_MAX_MESSAGES,
+            max_groups: DEFAULT_MAX_GROUPS,
+            disk_full_policy: DiskFullPolicyArg::DropNew,
+            visibility_ms: DEFAULT_VISIBILITY_MS,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unlimited_max_deliver_without_the_opt_in() {
+        // 0 and u32::MAX both mean unlimited; without --allow-unlimited-deliver each is a usage
+        // error, and the message points the operator at the opt-in flag (#63).
+        for max in [0, u32::MAX] {
+            let cfg = ServeConfig {
+                max_deliver: max,
+                allow_unlimited_deliver: false,
+                ..validation_config()
+            };
+            match validate_serve_config(&cfg) {
+                Err(CliError::Usage(m)) => {
+                    assert!(m.contains("--allow-unlimited-deliver"), "{m}");
+                }
+                other => panic!("expected a usage error for max_deliver={max}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_accepts_unlimited_max_deliver_with_the_opt_in() {
+        // The same unlimited caps are accepted once the operator opts in (#63). The accompanying
+        // startup WARN is emitted by cmd_serve; validation only stops rejecting.
+        for max in [0, u32::MAX] {
+            let cfg = ServeConfig {
+                max_deliver: max,
+                allow_unlimited_deliver: true,
+                ..validation_config()
+            };
+            assert!(
+                validate_serve_config(&cfg).is_ok(),
+                "unlimited max_deliver={max} should be accepted with the opt-in"
+            );
+        }
+    }
+
+    #[test]
+    fn the_delivery_config_rejects_unlimited_without_the_opt_in() {
+        // The core DeliveryConfig is the typed-error layer the CLI relies on (#63): unlimited
+        // without the flag is the typed ConfigError, not a panic.
+        use ironbus_core::delivery::ConfigError;
+        assert_eq!(
+            DeliveryConfig::new(0, false, Vec::new()).unwrap_err(),
+            ConfigError::UnlimitedDeliverNotAllowed
+        );
+        // With the opt-in it builds.
+        assert!(DeliveryConfig::new(0, true, Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn serve_parses_the_allow_unlimited_deliver_flag() {
+        // The flag is a bare boolean (no value). Parsing must NOT reject it as an unknown flag; the
+        // config then fails on the missing --data-dir, proving the flag itself parsed cleanly.
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--max-deliver".to_string(),
+                "0".to_string(),
+                "--allow-unlimited-deliver".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        // It got past flag parsing and config validation (unlimited is now allowed) to the
+        // data-dir requirement, so the flag both parsed and lifted the unlimited rejection.
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--data-dir"), "{m}"),
+            other => panic!("expected the data-dir usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn take_number_list_parses_a_comma_separated_schedule() {
+        let args = vec!["--backoff-ms".to_string(), "100, 500 ,2000".to_string()];
+        let mut i = 0;
+        let list = take_number_list("--backoff-ms", &args, &mut i).unwrap();
+        assert_eq!(list, vec![100, 500, 2000]);
+        assert_eq!(i, 2, "advances past the flag and its value");
+        // A single value is a one-element schedule.
+        let args = vec!["--backoff-ms".to_string(), "0".to_string()];
+        let mut i = 0;
+        assert_eq!(
+            take_number_list("--backoff-ms", &args, &mut i).unwrap(),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn take_number_list_rejects_a_bad_element() {
+        // A non-numeric element or a stray comma (empty element) is a usage error, so a typo is
+        // caught before the broker opens.
+        for raw in ["100,nope,2000", "100,,200", ""] {
+            let args = vec!["--backoff-ms".to_string(), raw.to_string()];
+            let mut i = 0;
+            match take_number_list("--backoff-ms", &args, &mut i) {
+                Err(CliError::Usage(m)) => assert!(m.contains("--backoff-ms"), "{m}"),
+                other => panic!("expected a usage error for `{raw}`, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn serve_rejects_a_bad_backoff_ms() {
+        // End to end through the flag parser: a malformed --backoff-ms is a usage error (exit 1).
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--backoff-ms".to_string(),
+                "100,bad,2000".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--backoff-ms"), "{m}"),
             other => panic!("expected Usage, got {other:?}"),
         }
     }
