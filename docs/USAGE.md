@@ -269,6 +269,12 @@ a re-ack at or below the current commit is an idempotent no-op success. This ver
 ONLY for a broadcast group: a competing or `key_shared` group is hard-rejected (committing a
 shared cursor past peers' still-in-flight messages would silently drop them).
 
+A broadcast group is enforced as a true group-of-one: it accepts AT MOST ONE active
+subscriber at a time, so a cumulative ack only ever commits past that single consumer's own
+in-flight leases. A second concurrent SUB to a broadcast group is rejected, and marking a
+group broadcast is refused if it already carries competing in-flight state. The slot frees on
+UNSUB or disconnect, so a replacement consumer can take over.
+
 ## Offline inspection
 
 `peek` and `dump` decode a stopped broker's data directory with no server running, so you

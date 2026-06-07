@@ -124,6 +124,10 @@ where
     // is already gone (a shutdown drain races a disconnect) these are no-ops, never a hang. Routed
     // to the session's group (#60), default-group if unsubscribed.
     let _ = session.leave_current_key_shared(engine);
+    // Deregister this connection's active subscription (#288) so a broadcast group's group-of-one
+    // slot frees for the next subscriber on disconnect, not just on an explicit UNSUB. Best-effort,
+    // like the key_shared leave: a no-op for an unsubscribed connection or a gone actor.
+    let _ = session.leave_current_subscription(engine);
     let group = session.subscription().to_string();
     let _ = engine.with(move |e| {
         let _ = e.checkpoint_group(&group);

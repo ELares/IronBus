@@ -190,6 +190,13 @@ pub struct Session {
     /// group (#64), so leave-on-switch / leave-on-disconnect is exact: it only leaves a group it
     /// actually joined, and only joins once per subscription. `false` for a plain competing group.
     joined_key_shared: bool,
+    /// Whether this connection is currently REGISTERED as an active subscriber of `subscription`
+    /// (#288), so the broadcast group-of-one cap is exact and a deregister only ever targets a
+    /// group this connection actually registered with. Set when a SUB to a NAMED group succeeds
+    /// (the engine accepted the subscriber), cleared on UNSUB / subscription switch / disconnect.
+    /// The default group (`""`) is never registered (its consumers do not SUB), so this stays
+    /// `false` for an unsubscribed connection.
+    registered_subscription: bool,
 }
 
 impl Session {
@@ -826,14 +833,49 @@ impl Session {
             reply_err(out, "subscription name must be valid UTF-8");
             return Ok(());
         };
-        // Leave the previous key_shared group (if any) before switching: its keys re-route to
-        // their new owners, and the in-flight leases this connection held there drain or expire.
+        // Register as an active subscriber of the NEW group FIRST (#288), so the BROADCAST
+        // group-of-one cap is enforced BEFORE any of this connection's state is torn down. A
+        // broadcast group already holding a different subscriber rejects here with
+        // `BroadcastGroupBusy`; the SUB is refused and this connection keeps its CURRENT
+        // subscription intact (it was never left), so a rejected second consumer cannot strand the
+        // connection. The default group (`""`) and any plain competing / key_shared group accept
+        // any number of subscribers, so this only ever rejects a second SUB to a broadcast group.
+        // Registering before deregistering the old group is safe because the engine keys the
+        // subscriber set per group and per member: a same-group re-SUB is idempotent, and a switch
+        // briefly holds both registrations before the old one is dropped below.
+        let new_group = group.to_string();
+        let member = self.member_id;
+        if !new_group.is_empty() {
+            let sub = new_group.clone();
+            match engine.with(move |e| e.subscribe_in(&sub, member))? {
+                Ok(()) => {}
+                // The broadcast group-of-one cap rejected a second subscriber: surface the typed
+                // reason and leave this connection on its existing subscription (it was never left).
+                // `subscribe_in` only ever returns this rejection (name/cap are still validated on
+                // the first FLOW, as before), so SUB stays infallible for the name/cap checks.
+                Err(e) => {
+                    reply_err(out, &e.to_string());
+                    return Ok(());
+                }
+            }
+        }
+        // The new group is accepted. Deregister the OLD subscription (if it was a different named
+        // group) and leave its key_shared membership before switching, so its keys re-route and its
+        // broadcast slot frees. Done AFTER the new registration succeeds so a rejected SUB never
+        // tears down a working subscription.
+        let old_group = self.subscription.clone();
         self.leave_current_key_shared(engine)?;
+        if self.registered_subscription && old_group != new_group {
+            engine.with(move |e| {
+                e.unsubscribe_in(&old_group, member);
+            })?;
+        }
         // Switching subscriptions abandons this connection's in-flight leases in the
         // previous group (they redeliver there after the visibility timeout), so the new
         // subscription starts with no outstanding leases. The name's shape and the group
         // cap are validated by the engine on the first FLOW (#240), surfaced as an Err.
         group.clone_into(&mut self.subscription);
+        self.registered_subscription = !new_group.is_empty();
         self.leased.clear();
         // If the new group is configured key_shared (#64), put it into that mode and join as a
         // member so this connection's keys route to it. A failure to enable the mode (an invalid
@@ -842,7 +884,6 @@ impl Session {
         // enable + join" decision is one actor job, so SUB stays a single round-trip; it returns
         // whether this connection joined so the session can record it for leave-on-switch.
         let sub = self.subscription.clone();
-        let member = self.member_id;
         let joined = engine.with(move |e| {
             if e.is_configured_key_shared(&sub)
                 && e.set_key_ordering_in(&sub, KeyOrdering::KeyShared).is_ok()
@@ -870,6 +911,9 @@ impl Session {
         // Leave the key_shared group (if any) so its keys re-route, then revert to the default
         // group and drop any outstanding named-group leases (they redeliver after the timeout).
         self.leave_current_key_shared(engine)?;
+        // Deregister this connection as an active subscriber (#288), freeing the group's broadcast
+        // slot for a later subscriber. A no-op for an unregistered (default-group) connection.
+        self.leave_current_subscription(engine)?;
         // The named group this connection is leaving. Captured BEFORE clearing the subscription so
         // the explicit-Unsub eviction (#277) can target it: if it is now fully caught up with no
         // in-flight leases, it is immediately reclaimable rather than waiting out the idle window.
@@ -910,6 +954,33 @@ impl Session {
                 e.leave_member_in(&group, member);
             })?;
             self.joined_key_shared = false;
+        }
+        Ok(())
+    }
+
+    /// Deregisters this connection as an active subscriber of its current group (#288), if it had
+    /// registered one. Idempotent and a no-op for an unregistered (default-group) connection, so it
+    /// is safe to call on every subscription switch, UNSUB, and connection close. Freeing the slot
+    /// lets a later consumer take over a broadcast group whose previous lone subscriber has left.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::ActorGone`] if the actor exited before the deregister could run. A
+    /// no-op (no round-trip) when this connection had not registered a subscription.
+    pub fn leave_current_subscription<
+        F: Filesystem + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+    ) -> Result<(), SessionError> {
+        if self.registered_subscription {
+            let group = self.subscription.clone();
+            let member = self.member_id;
+            engine.with(move |e| {
+                e.unsubscribe_in(&group, member);
+            })?;
+            self.registered_subscription = false;
         }
         Ok(())
     }
@@ -1525,6 +1596,63 @@ mod tests {
             e.with(|eng| eng.committed_offset()).unwrap(),
             Offset::new(0),
             "the rejected work-group ack commits nothing"
+        );
+    }
+
+    #[test]
+    fn exploit_a_a_second_sub_to_a_broadcast_group_is_rejected_over_the_wire() {
+        // EXPLOIT A end to end (#288): the silent-drop sequence needs TWO concurrent subscribers on
+        // a broadcast group. Over the wire, the second SUB is now rejected with a typed Err, so the
+        // sequence (A leases 0, B leases 1, B acks 1, cumulative ack to 2 skips A's offset 0) can
+        // never begin. No produced record is silently dropped: the lone consumer drains them all.
+        let e = DirectEngine::new(engine());
+        for p in [&b"a"[..], b"b", b"c"] {
+            produce(&e, p);
+        }
+        e.with(|eng| eng.set_broadcast_in("g", true))
+            .unwrap()
+            .unwrap();
+        // Consumer A (member 1) subscribes: accepted, it is the lone subscriber, and leases offset 0.
+        let mut a = connect_and_sub(&e, MemberId::new(1), b"g");
+        let mut out = Vec::new();
+        a.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_payloads(&out),
+            vec![b"a".to_vec()],
+            "A leases offset 0"
+        );
+        assert_eq!(e.with(|eng| eng.subscriber_count_in("g")).unwrap(), 1);
+        // Consumer B (member 2) subscribes to the SAME broadcast group: the SUB is REJECTED (the
+        // exploit's step 3), so B never gets to lease offset 1.
+        let mut b = Session::with_member_id(MemberId::new(2));
+        let mut out = Vec::new();
+        b.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        b.process(&e, &frame(FrameType::Sub, b"g"), &mut out)
+            .unwrap();
+        let (ty, msg) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::Err,
+            "the second SUB to a broadcast group is rejected"
+        );
+        assert!(
+            String::from_utf8_lossy(&msg).contains("group-of-one"),
+            "the typed reason is surfaced: {}",
+            String::from_utf8_lossy(&msg)
+        );
+        // Still exactly one subscriber; B never registered.
+        assert_eq!(e.with(|eng| eng.subscriber_count_in("g")).unwrap(), 1);
+        // The lone consumer A drains the rest in order: no offset is skipped.
+        let mut out = Vec::new();
+        a.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_payloads(&out),
+            vec![b"b".to_vec(), b"c".to_vec()],
+            "every remaining record is delivered to the lone consumer, none silently dropped"
         );
     }
 

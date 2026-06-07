@@ -218,6 +218,20 @@ pub enum EngineError {
     /// them. It is therefore offered only to broadcast consumers (a group of one that sees every
     /// message in order) and hard-rejected for any competing or `key_shared` work-group.
     CumulativeAckOnWorkGroup,
+    /// The group-of-one invariant a BROADCAST group rests on was violated (#288): either a SECOND
+    /// concurrent subscriber tried to join a broadcast group, or a flip to broadcast
+    /// ([`Engine::set_broadcast_in`] with `true`) was attempted on a group that already carries
+    /// COMPETING in-flight state (live in-flight leases or an out-of-order acked-ahead set) or more
+    /// than one active subscriber. A broadcast group must be a true group-of-one, because a
+    /// cumulative ack commits its single cursor straight to an offset; if a SECOND consumer held an
+    /// in-flight message below that offset, the commit would silently drop it (the redelivery gate
+    /// is the cursor). Rejected here so the engine never enters the unsafe multi-member-broadcast
+    /// state rather than discovering the loss later. The group's mode and membership are left
+    /// exactly as they were on rejection.
+    BroadcastGroupBusy {
+        /// The broadcast group that already has an active subscriber or unsafe competing state.
+        group: String,
+    },
     /// A BROADCAST cumulative ack named an `up_to` offset OUTSIDE the durable, retained window
     /// (#288): either PAST the durable head (`up_to > flushed`, committing past records that do
     /// not exist yet, which a later truncation could never reconcile) or BELOW the earliest
@@ -258,6 +272,12 @@ impl core::fmt::Display for EngineError {
             EngineError::CumulativeAckOnWorkGroup => write!(
                 f,
                 "cumulative ack is not allowed on a competing work-group (broadcast consumers only)"
+            ),
+            EngineError::BroadcastGroupBusy { group } => write!(
+                f,
+                "broadcast group `{group}` is a group-of-one: it already has an active subscriber \
+                 or competing in-flight state, so a second subscriber or a flip to broadcast is \
+                 refused"
             ),
             EngineError::CumulativeAckOutOfRange {
                 up_to,
@@ -841,6 +861,16 @@ struct WorkGroup {
     /// each clear the other mode. `false` (plain competing) by default, so an unconfigured group is
     /// unaffected and the cumulative-ack guard rejects it exactly as before.
     broadcast: bool,
+    /// The set of currently-ACTIVE subscribers (#288), one entry per live connection subscribed
+    /// to this group (keyed by the connection's stable [`MemberId`], so a re-subscribe by the same
+    /// connection is idempotent). It enforces the BROADCAST group-of-one invariant: a broadcast
+    /// group accepts AT MOST ONE subscriber, so a cumulative ack can only ever commit past the
+    /// single consumer's OWN in-flight leases, never a peer's. A plain competing or `key_shared`
+    /// group ignores the cap (any number may subscribe). The session registers on SUB
+    /// ([`Engine::subscribe_in`]) and deregisters on UNSUB / subscription switch / disconnect
+    /// ([`Engine::unsubscribe_in`]). Empty for the default group (its implicit consumers do not SUB)
+    /// and for any group no connection currently holds.
+    subscribers: std::collections::BTreeSet<MemberId>,
     /// The engine-clock-seam (monotonic, nanoseconds) timestamp of this group's LAST ACTIVITY
     /// (#277): updated whenever a poll, ack, nack, progress, or term touches the group. The idle
     /// eviction sweep ([`Engine::sweep_idle_groups`]) measures the idle window against it. Seeded
@@ -864,6 +894,7 @@ impl WorkGroup {
             leases: LeaseTable::new(config),
             router: None,
             broadcast: false,
+            subscribers: std::collections::BTreeSet::new(),
             last_activity: now,
         }
     }
@@ -2224,8 +2255,16 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// `CumulativeAck` frame, #288); negotiating broadcast on `Sub`/`Connect` is the #11 follow-up.
     ///
     /// # Errors
-    /// Returns [`EngineError::InvalidGroupName`] or [`EngineError::TooManyGroups`] if a new group
-    /// would have to be created and fails the name or cap check.
+    /// - [`EngineError::InvalidGroupName`] or [`EngineError::TooManyGroups`] if a new group would
+    ///   have to be created and fails the name or cap check.
+    /// - [`EngineError::BroadcastGroupBusy`] when flipping an EXISTING group to broadcast
+    ///   (`broadcast == true`) that already carries COMPETING state a cumulative ack could then
+    ///   commit past: live in-flight leases, an out-of-order acked-ahead set, or more than one
+    ///   active subscriber. Clearing the router alone would NOT make such a group a true
+    ///   group-of-one (the populated lease table and the multi-member subscriber set would remain,
+    ///   reopening the silent-drop trap #63 guards), so the flip is refused and the group keeps its
+    ///   prior mode. Marking a FRESH or already-quiescent group broadcast (the configure-time
+    ///   `--broadcast-group` path, before any consumer leases anything) is always allowed.
     pub fn set_broadcast_in(&mut self, group: &str, broadcast: bool) -> Result<(), EngineError> {
         if !self.groups.contains_key(group) {
             validate_group_name(group)?;
@@ -2233,6 +2272,26 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 return Err(EngineError::TooManyGroups {
                     max: self.max_groups,
                 });
+            }
+        }
+        // Guard the flip to broadcast (#288): a group-of-one is only safe if the group is not
+        // already carrying competing multi-member in-flight state. An existing group with live
+        // in-flight leases, an out-of-order acked-ahead set, or more than one active subscriber
+        // could have those leases held by DIFFERENT consumers, so a later cumulative ack would
+        // commit (and silently drop) a peer's still-in-flight message. Refuse the flip and leave
+        // the group's mode untouched; the operator must drain the group (or mark it broadcast
+        // before any consumer competes on it) first. A flip to NON-broadcast is always safe, and a
+        // group being newly created here is empty, so the configure-time path is unaffected.
+        if broadcast {
+            if let Some(g) = self.groups.get(group) {
+                if g.leases.in_flight() != 0
+                    || !g.cursor.ahead_ranges().is_empty()
+                    || g.subscribers.len() > 1
+                {
+                    return Err(EngineError::BroadcastGroupBusy {
+                        group: group.to_string(),
+                    });
+                }
             }
         }
         let now = self.log.now_monotonic();
@@ -2248,6 +2307,61 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             g.router = None;
         }
         Ok(())
+    }
+
+    /// Registers `member` as an ACTIVE subscriber of `group` (#288), enforcing the BROADCAST
+    /// group-of-one invariant: a broadcast group accepts AT MOST ONE subscriber, so a cumulative
+    /// ack can only ever commit past that single consumer's OWN in-flight leases, never a peer's.
+    /// A plain competing or `key_shared` group accepts any number of subscribers (the cap binds
+    /// only when the group is broadcast). Idempotent per connection: a re-SUB by the SAME `member`
+    /// to a broadcast group it already holds is accepted (it is still the lone subscriber).
+    ///
+    /// This NEVER creates the group: like SUB itself (the engine creates a named group on the first
+    /// FLOW, not on SUB), an unknown group is a no-op success here. That is safe for the cap because
+    /// a broadcast group ALWAYS exists already (it was created by [`Engine::set_broadcast_in`] at
+    /// configure time, before any consumer subscribes), so the second-subscriber reject still fires
+    /// on every broadcast group. A name that the engine will later reject is surfaced on the first
+    /// FLOW exactly as before, so SUB stays infallible for the name/cap checks.
+    ///
+    /// # Errors
+    /// [`EngineError::BroadcastGroupBusy`] if `group` already exists, is broadcast, and a DIFFERENT
+    /// member is already its active subscriber. The subscriber set is left unchanged on rejection.
+    pub fn subscribe_in(&mut self, group: &str, member: MemberId) -> Result<(), EngineError> {
+        let Some(g) = self.groups.get_mut(group) else {
+            // An unknown group cannot be broadcast (broadcast requires an existing group), so there
+            // is nothing to cap yet. Do not create it: the first FLOW creates it, preserving the
+            // "SUB alone does not create the group" invariant. The session re-registers via the
+            // FLOW path is not needed because the cap only ever binds a broadcast group.
+            return Ok(());
+        };
+        // A broadcast group is a group-of-one: reject a SECOND, DIFFERENT subscriber. A re-SUB by
+        // the member that already holds the group is fine (the set membership is idempotent), so
+        // `contains` short-circuits the "already mine" case before the cap check.
+        if g.broadcast && !g.subscribers.contains(&member) && !g.subscribers.is_empty() {
+            return Err(EngineError::BroadcastGroupBusy {
+                group: group.to_string(),
+            });
+        }
+        g.subscribers.insert(member);
+        Ok(())
+    }
+
+    /// Removes `member` from `group`'s active-subscriber set (#288): the connection unsubscribed,
+    /// switched groups, or disconnected, so its broadcast slot frees for a later subscriber.
+    /// Idempotent and a no-op for an unknown group or a member that was never registered, so it is
+    /// safe to call on every subscription switch, UNSUB, and connection close.
+    pub fn unsubscribe_in(&mut self, group: &str, member: MemberId) {
+        if let Some(g) = self.groups.get_mut(group) {
+            g.subscribers.remove(&member);
+        }
+    }
+
+    /// The number of ACTIVE subscribers currently registered on `group` (#288), or `0` for an
+    /// unknown group. A broadcast group is capped at one by [`Engine::subscribe_in`]; this exposes
+    /// the count for tests and operability.
+    #[must_use]
+    pub fn subscriber_count_in(&self, group: &str) -> usize {
+        self.groups.get(group).map_or(0, |g| g.subscribers.len())
     }
 
     /// Whether `group` is a BROADCAST consumer (#288): a group-of-one that sees every record in
@@ -3924,6 +4038,190 @@ mod tests {
         let msg = EngineError::CumulativeAckOnWorkGroup.to_string();
         assert!(msg.contains("cumulative ack"), "{msg}");
         assert!(msg.contains("broadcast"), "{msg}");
+    }
+
+    #[test]
+    fn a_broadcast_group_rejects_a_second_concurrent_subscriber() {
+        // The group-of-one invariant enforced in code (#288): a broadcast group accepts AT MOST ONE
+        // active subscriber, so a cumulative ack can only ever commit past that single consumer's
+        // OWN in-flight leases, never a peer's. A second SUB is rejected with the typed error.
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b", b"c"] {
+            produce(&mut e, p);
+        }
+        e.set_broadcast_in("g", true).unwrap();
+        // Consumer A subscribes: accepted, it is the lone subscriber.
+        e.subscribe_in("g", MemberId::new(1)).unwrap();
+        assert_eq!(e.subscriber_count_in("g"), 1);
+        // Consumer B subscribes to the SAME broadcast group: REJECTED (the second subscriber).
+        assert!(
+            matches!(
+                e.subscribe_in("g", MemberId::new(2)),
+                Err(EngineError::BroadcastGroupBusy { ref group }) if group == "g"
+            ),
+            "a second subscriber to a broadcast group must be rejected"
+        );
+        // The reject changed nothing: A is still the lone subscriber.
+        assert_eq!(e.subscriber_count_in("g"), 1);
+        // A re-SUB by the SAME member is idempotent, NOT a second subscriber.
+        e.subscribe_in("g", MemberId::new(1)).unwrap();
+        assert_eq!(e.subscriber_count_in("g"), 1);
+        // Once A leaves, B may take over the slot.
+        e.unsubscribe_in("g", MemberId::new(1));
+        assert_eq!(e.subscriber_count_in("g"), 0);
+        e.subscribe_in("g", MemberId::new(2)).unwrap();
+        assert_eq!(e.subscriber_count_in("g"), 1);
+    }
+
+    #[test]
+    fn exploit_a_no_offset_is_silently_dropped_under_the_subscriber_cap() {
+        // EXPLOIT A (the silent-drop sequence the cap now blocks, #288): with two concurrent
+        // subscribers a broadcast group could lease offset 0 to A (unacked) and offset 1 to B, B
+        // acks 1, a cumulative ack to 2 jumps the cursor past A's still-in-flight offset 0, and when
+        // A's lease expires offset 0 is skipped forever. The subscriber cap blocks step 3 (B's SUB),
+        // so the sequence cannot even begin: every produced record stays deliverable to the lone
+        // consumer and NONE is skipped.
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b", b"c"] {
+            produce(&mut e, p);
+        }
+        e.set_broadcast_in("g", true).unwrap();
+        // A subscribes and leases offset 0 (in-flight, unacked).
+        e.subscribe_in("g", MemberId::new(1)).unwrap();
+        let d0 = message(e.poll_in("g", 0).unwrap());
+        assert_eq!(d0.offset, Offset::new(0));
+        // B's SUB (the exploit's step 3) is REJECTED before it can lease offset 1.
+        assert!(matches!(
+            e.subscribe_in("g", MemberId::new(2)),
+            Err(EngineError::BroadcastGroupBusy { .. })
+        ));
+        // Drive the lone consumer to completion: offset 0 (A's lease, now acked) then 1, 2. Because
+        // the second subscriber never joined, the cumulative ack the lone consumer issues only ever
+        // commits past its OWN in-flight leases, so nothing is skipped.
+        assert_eq!(e.ack_in("g", &d0.token), AckResult::Acked);
+        let head = e.flushed_offset();
+        e.cumulative_ack_in("g", head).unwrap();
+        assert_eq!(
+            e.committed_offset_in("g"),
+            Offset::new(3),
+            "every produced record is committed, none skipped"
+        );
+        // No record below the head is left undelivered-and-uncommitted: the cursor reached the head.
+        assert_eq!(e.committed_offset_in("g"), head);
+    }
+
+    #[test]
+    fn exploit_b_flipping_a_live_competing_group_to_broadcast_is_rejected() {
+        // EXPLOIT B (#288): a group accrues COMPETING out-of-order in-flight lease state, then is
+        // flipped to broadcast (`set_broadcast_in(g, true)`), then cumulative-acked past the
+        // in-flight leases for the same silent drop. The flip guard now refuses the flip while the
+        // group carries that competing state, so the unsafe cumulative ack is never reachable.
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b", b"c"] {
+            produce(&mut e, p);
+        }
+        // Two consumers compete on a plain group "g": lease offset 0 (held, unacked) and offset 1.
+        let d0 = message(e.poll_in("g", 0).unwrap());
+        let d1 = message(e.poll_in("g", 0).unwrap());
+        assert_eq!(d0.offset, Offset::new(0));
+        assert_eq!(d1.offset, Offset::new(1));
+        // Ack offset 1 only: the cursor now has an out-of-order acked-ahead set [1,2), committed 0,
+        // and offset 0 is still in flight. This is the competing signature.
+        assert_eq!(e.ack_in("g", &d1.token), AckResult::Acked);
+        assert_eq!(e.committed_offset_in("g"), Offset::new(0));
+        // Flipping to broadcast is REJECTED: the populated lease table / ahead set would let a
+        // cumulative ack commit past offset 0 (a peer's in-flight message).
+        assert!(
+            matches!(
+                e.set_broadcast_in("g", true),
+                Err(EngineError::BroadcastGroupBusy { ref group }) if group == "g"
+            ),
+            "flipping a live competing group to broadcast must be rejected"
+        );
+        // The group is NOT broadcast, so the cumulative ack is still hard-rejected as a work-group:
+        // the silent drop is unreachable, and offset 0 stays deliverable.
+        assert!(!e.is_broadcast_in("g"));
+        assert!(matches!(
+            e.cumulative_ack_in("g", Offset::new(2)),
+            Err(EngineError::CumulativeAckOnWorkGroup)
+        ));
+        assert_eq!(
+            e.committed_offset_in("g"),
+            Offset::new(0),
+            "offset 0 was never committed past; it is not silently dropped"
+        );
+    }
+
+    #[test]
+    fn flipping_a_group_with_in_flight_leases_to_broadcast_is_rejected() {
+        // The flip guard also refuses a group holding a contiguous in-flight lease that was NOT
+        // acked-ahead: a single live lease is still competing state a flip-then-cumulative-ack could
+        // commit past if a peer held it. The operator must drain first (#288).
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"a");
+        produce(&mut e, b"b");
+        // Lease offset 0 and hold it (in-flight, unacked) on a plain group.
+        let d0 = message(e.poll_in("g", 0).unwrap());
+        assert_eq!(d0.offset, Offset::new(0));
+        assert!(matches!(
+            e.set_broadcast_in("g", true),
+            Err(EngineError::BroadcastGroupBusy { .. })
+        ));
+        assert!(!e.is_broadcast_in("g"), "the flip was refused");
+        // After the lease is acked (the group is drained), the flip to broadcast is allowed.
+        assert_eq!(e.ack_in("g", &d0.token), AckResult::Acked);
+        e.set_broadcast_in("g", true).unwrap();
+        assert!(e.is_broadcast_in("g"));
+    }
+
+    #[test]
+    fn a_lone_broadcast_consumer_cumulative_acks_past_its_own_in_flight_leases() {
+        // The LEGITIMATE case still works (#288): a single broadcast consumer that has leased
+        // messages in order (its OWN in-flight leases) can cumulative-ack PAST them. Acking past
+        // your own in-flight leases is the consumer's explicit "I am done up to here" and is safe,
+        // because there is no peer holding a message below the watermark.
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b", b"c", b"d"] {
+            produce(&mut e, p);
+        }
+        // Mark broadcast at configure time (a fresh, quiescent group): allowed.
+        e.set_broadcast_in("g", true).unwrap();
+        // The lone consumer subscribes and leases offsets 0,1,2 in order (its own in-flight leases),
+        // none acked per-message.
+        e.subscribe_in("g", MemberId::new(1)).unwrap();
+        let d0 = message(e.poll_in("g", 0).unwrap());
+        let d1 = message(e.poll_in("g", 0).unwrap());
+        let d2 = message(e.poll_in("g", 0).unwrap());
+        assert_eq!(
+            (d0.offset, d1.offset, d2.offset),
+            (Offset::new(0), Offset::new(1), Offset::new(2))
+        );
+        assert_eq!(
+            e.in_flight(),
+            3,
+            "three of the consumer's own leases in flight"
+        );
+        // Cumulative-ack past its own in-flight leases up to 3 (exclusive): committed jumps to 3.
+        e.cumulative_ack_in("g", Offset::new(3)).unwrap();
+        assert_eq!(e.committed_offset_in("g"), Offset::new(3));
+        // The next poll delivers offset 3, not a redelivery of the cumulatively-acked prefix.
+        let d3 = message(e.poll_in("g", 0).unwrap());
+        assert_eq!(d3.offset, Offset::new(3));
+        assert_eq!(
+            d3.deliveries, 1,
+            "the cumulatively-acked prefix is not redelivered"
+        );
+    }
+
+    #[test]
+    fn the_broadcast_busy_rejection_renders_a_distinct_message() {
+        // The new typed error has a self-describing Display, distinct from the work-group reject.
+        let msg = EngineError::BroadcastGroupBusy {
+            group: "g".to_string(),
+        }
+        .to_string();
+        assert!(msg.contains("broadcast group"), "{msg}");
+        assert!(msg.contains("group-of-one"), "{msg}");
     }
 
     // A config with an explicit work-group cap (#240), so a test exercises the bound without

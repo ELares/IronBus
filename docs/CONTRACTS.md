@@ -386,6 +386,17 @@ the cursor untouched; a successful (or idempotent re-ack) commit answers `Ok`. T
 idempotent and monotonic: an `up_to` at or below the current commit (within the window) is a
 no-op success and the watermark never moves backwards.
 
+The group-of-one invariant a broadcast group rests on is ENFORCED in code, not just
+documented (#288): a broadcast group accepts AT MOST ONE active subscriber, so a cumulative
+ack can only ever commit past that single consumer's OWN in-flight leases, never a peer's. A
+SECOND concurrent `Sub` to a broadcast group answers a typed `Err` (`BroadcastGroupBusy`) and
+does not join, and marking a group broadcast (`serve --broadcast-group`) is REFUSED with the
+same error when the group already carries competing in-flight state (live in-flight leases, an
+out-of-order acked-ahead set, or more than one active subscriber) that a later cumulative ack
+could silently commit past. A consumer's slot frees on `Unsub`, a subscription switch, or
+disconnect, so the next subscriber may take over. The single-consumer cumulative ack past the
+consumer's own in-flight leases stays valid.
+
 ---
 
 ## Config models
