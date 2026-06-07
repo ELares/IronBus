@@ -936,6 +936,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let dlq_config = LogConfig {
             max_segment_bytes: config.log.max_segment_bytes,
             max_total_bytes: 0,
+            // The DLQ is already the durable forensic sink for dropped messages; it needs no second
+            // forensic quarantine of its own.
+            max_quarantine_bytes: 0,
         };
         // Eagerly open (recovering its high-water mark) the DLQ sink IF its subdirectory already
         // exists from a prior run, so the idempotency key is present before the first poison
@@ -2365,6 +2368,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     #[must_use]
     pub fn loss_report(&self) -> &LossReport {
         self.log.loss_report()
+    }
+
+    /// Total bytes copied into the forensic quarantine store at the last recovery (#134): the
+    /// corrupt regions a corruption skip dropped, captured (copy-not-move, capped) under
+    /// `quarantine/` for offline analysis. Zero on a clean start or when the only loss was a clean
+    /// torn tail. Exposed on `/metrics` as the `ironbus_quarantine_bytes` gauge.
+    #[must_use]
+    pub fn quarantined_bytes(&self) -> u64 {
+        self.log.quarantined_bytes()
     }
 
     /// A snapshot of the operational counters (monotonic since process start).
@@ -4287,6 +4299,7 @@ mod tests {
         cfg.log = LogConfig {
             max_segment_bytes: 160,
             max_total_bytes: 0,
+            ..LogConfig::default()
         };
         cfg.max_retained_bytes = max_retained_bytes;
         cfg
@@ -4614,6 +4627,7 @@ mod tests {
             // A small segment cap so ~6 16-byte records roll: the cap then spans several segments.
             max_segment_bytes: 160,
             max_total_bytes,
+            ..LogConfig::default()
         };
         cfg.disk_full_policy = policy;
         cfg

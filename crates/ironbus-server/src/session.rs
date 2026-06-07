@@ -855,6 +855,7 @@ mod tests {
                 log: LogConfig {
                     max_segment_bytes: 160,
                     max_total_bytes,
+                    ..LogConfig::default()
                 },
                 lease: LeaseConfig {
                     visibility_nanos: 30,

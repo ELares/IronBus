@@ -164,6 +164,7 @@ where
                     in_flight: g.in_flight(),
                     healthy: g.is_healthy(),
                     recovered_truncated: g.recovered_truncated_bytes(),
+                    quarantined: g.quarantined_bytes(),
                     recovery_loss: {
                         let r = g.loss_report();
                         ReasonCode::ALL.map(|rc| r.bytes_skipped_for(rc))
@@ -233,6 +234,8 @@ struct MetricsSnapshot {
     in_flight: usize,
     healthy: bool,
     recovered_truncated: u64,
+    /// Bytes copied into the forensic quarantine store at the last recovery (#134).
+    quarantined: u64,
     /// Bytes dropped at the last recovery, per [`ReasonCode`] in code order.
     recovery_loss: [u64; 5],
     /// Records dropped at the last recovery, per [`ReasonCode`] in code order.
@@ -256,6 +259,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         in_flight,
         healthy,
         recovered_truncated,
+        quarantined,
         recovery_loss,
         recovery_loss_records,
         last_dead_lettered,
@@ -284,6 +288,9 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
          # HELP ironbus_recovery_truncated_bytes Bytes dropped from a torn or unsynced tail at the last recovery (startup).\n\
          # TYPE ironbus_recovery_truncated_bytes gauge\n\
          ironbus_recovery_truncated_bytes {recovered_truncated}\n\
+         # HELP ironbus_quarantine_bytes Corrupt bytes copied into the forensic quarantine store at the last recovery (capped, copy-not-move).\n\
+         # TYPE ironbus_quarantine_bytes gauge\n\
+         ironbus_quarantine_bytes {quarantined}\n\
          # HELP ironbus_last_dead_lettered_offset The log offset of the most recently dead-lettered message, or -1 if none.\n\
          # TYPE ironbus_last_dead_lettered_offset gauge\n\
          ironbus_last_dead_lettered_offset {last_dead_lettered}\n\
@@ -913,6 +920,26 @@ mod tests {
         handle.join().unwrap();
     }
 
+    #[test]
+    fn metrics_exposes_the_quarantine_gauge() {
+        // The forensic quarantine gauge (#134): present and zero on a clean start, with a clean
+        // (no leading whitespace) TYPE line so a strict Prometheus parser accepts it. It is a gauge,
+        // not a `_total`, so it is excluded from the frozen resilience-counter set by construction
+        // (the_resilience_counter_taxonomy_is_frozen stays green).
+        let (addr, shutdown, handle, _engine) = start();
+        let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(m.starts_with("HTTP/1.1 200 OK"), "{m}");
+        assert!(
+            m.contains("\n# TYPE ironbus_quarantine_bytes gauge\n"),
+            "{m}"
+        );
+        assert!(m.contains("\nironbus_quarantine_bytes 0\n"), "{m}");
+        // It must NOT carry the `_total` counter suffix (that would pull it into the frozen set).
+        assert!(!m.contains("ironbus_quarantine_bytes_total"), "{m}");
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
     /// Like [`start`] but with a hard durable-log byte cap, so the rejection path is exercised.
     fn start_with_cap(
         max_total_bytes: u64,
@@ -1136,6 +1163,7 @@ mod tests {
                 log: LogConfig {
                     max_segment_bytes: 160,
                     max_total_bytes: 0,
+                    ..LogConfig::default()
                 },
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
@@ -1312,6 +1340,7 @@ mod tests {
                 log: LogConfig {
                     max_segment_bytes: 160,
                     max_total_bytes,
+                    ..LogConfig::default()
                 },
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),

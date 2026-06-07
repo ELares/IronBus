@@ -19,6 +19,7 @@ fn small_config() -> LogConfig {
     LogConfig {
         max_segment_bytes: 256,
         max_total_bytes: 0,
+        ..LogConfig::default()
     }
 }
 
