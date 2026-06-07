@@ -54,6 +54,7 @@ loss report).
 | `ironbus_segments_force_reaped_total` | A whole old sealed segment is **force-reaped** by the disk-full **drop-oldest** policy to make room for an over-cap `produce`, ignoring consumer safety. | **Drop-oldest**: the data-loss-bearing reclamation. May delete records a slow consumer has not consumed; that consumer then sees a one-time truncation. |
 | `ironbus_truncations_total` | A consumer's cursor had fallen **below the oldest retained record** (its data was force-reaped out from under it) and `poll` surfaces a one-time `Poll::Truncated`, resetting the cursor up to `earliest_retained`. One event per surfaced truncation (the same gap never re-counts). | **Skip**: a live consumer loses the span `[old_cursor, earliest_retained)`. Counted the moment it is surfaced so the skip is never silent. The consumer-side complement of `segments_force_reaped`. |
 | `ironbus_truncated_records_total` | The sum of the skipped record span over every `Poll::Truncated`. | The **record count** lost to truncations (the span of `ironbus_truncations_total`). |
+| `ironbus_consumer_labels_dropped_total` | A new consumer is refused a distinct `ironbus_consumer_lag_records{consumer}` series because the **1024-series cardinality cap** was reached; its lag is folded into `{consumer="__overflow__"}` instead (#97). | **Cardinality shed**: the registry refuses an unbounded number of distinct consumer labels (which would OOM the very node metrics protect), but the dropped label and its lag are never silent. An operator's cardinality-pressure signal. |
 
 ### Recovery-loss series (startup, per reason)
 
@@ -107,6 +108,88 @@ The fsync latency histogram is `ironbus_fsync_seconds` (cumulative `le` buckets,
 plus `_sum` and `_count`): the produce-time durability-barrier latency. A latency
 distribution, not a resilience event, so it is also outside the frozen counter
 set.
+
+## The bounded metric registry (#97)
+
+The registry (`crates/ironbus-server/src/registry.rs`) makes leaving metrics on
+permanently affordable on a few-hundred-MB ARM box: the append and scrape hot
+paths never allocate, the registry has a **hard memory ceiling** independent of
+the record count and disk size, and per-consumer lag is O(1) to update and
+O(number of series) to scrape (it is **never** computed by scanning the log).
+
+### Fixed histogram buckets (compile-time, not runtime-configurable)
+
+Two registry histograms share ONE fixed, compile-time bucket set in seconds, and
+that set is **not** runtime-configurable (a runtime-tunable bucket set would
+unbound the per-series memory):
+
+```
+{0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5}  (plus +Inf)
+```
+
+- `ironbus_fsync_duration_seconds`: the produce-time fsync (durability-barrier)
+  latency, over the fixed buckets above.
+- `ironbus_append_duration_seconds`: the whole durable-append (append + fsync)
+  latency, over the **same** fixed buckets.
+
+Each is a Prometheus histogram (cumulative `le` buckets, `+Inf`, `_sum`,
+`_count`). The legacy `ironbus_fsync_seconds` histogram (its own bounds) is kept
+unchanged for backward compatibility; the new `_duration_` series is the #97
+fixed-bucket one.
+
+### Per-consumer lag, with a hard cardinality cap
+
+```
+ironbus_consumer_lag_records{consumer=...}     per-consumer durable records produced but not yet committed
+ironbus_consumer_lag_records{consumer="__overflow__"}   the folded lag of all over-cap consumers (only present once a label is dropped)
+```
+
+`ironbus_consumer_lag_records` is maintained **incrementally**: the durable head
+advances on append (O(1), one shared counter, regardless of the number of
+series) and a consumer's commit floor advances on commit (O(1)); lag is
+`head - committed`, the difference of two incrementally-maintained counts, so a
+scrape is O(number of series) and never walks the log or the disk.
+
+There is a **hard cap of 1024 distinct consumer series**. Past the cap a new
+consumer is refused its own series, its lag folds into
+`{consumer="__overflow__"}` (so the **total lag stays visible**), and
+`ironbus_consumer_labels_dropped_total` (in the frozen taxonomy above)
+increments. An unbounded consumer cardinality would OOM the very node the
+metrics protect, so the cap and the overflow fold are mandatory.
+
+### Self-monitoring series
+
+```
+ironbus_build_info{version=...}      the build version as a label; the value is always 1
+ironbus_start_time_seconds           the broker start time in Unix seconds (captured once at open)
+ironbus_uptime_seconds               seconds since the broker started (monotonic-derived, never regresses on a wall-clock step)
+```
+
+Both `ironbus_start_time_seconds` and `ironbus_uptime_seconds` derive from the
+injected clock seam (never a raw `SystemTime::now`/`Instant::now`), so the
+deterministic simulation stays reproducible and uptime never goes backwards on
+an NTP step.
+
+### The memory ceiling (signed off against the #19 / #115 edge RAM budget)
+
+The registry's resident cost is a **fixed** sub-100-series core plus the capped
+consumer-series array, asserted by a test
+(`the_registry_memory_ceiling_is_fixed_and_bounded`):
+
+```
+ceiling = MAX_CONSUMER_SERIES (1024) x per-series cost (80 bytes, fixed-width inline label)
+        + the fixed core state (two histograms + scalars, < 1 KiB)
+       ~= 80 KiB + < 1 KiB  <  128 KiB
+```
+
+The per-series cost is fixed (an inline 64-byte label buffer plus fixed-width
+bookkeeping, identical on 32-bit and 64-bit targets), so the ceiling is
+INDEPENDENT of the record count, the disk size, and the number of live
+consumers (the array is preallocated at the cap). At ~81 KiB it is a small fixed
+slice of the 64 MiB `tiny`-profile RAM ceiling in
+[RAM_BUDGET.md](RAM_BUDGET.md) (well under 0.2% of it), so leaving the full
+metric surface on permanently is affordable on a 64 MiB edge node. This is the
+#19 sign-off the issue requires.
 
 ## Dispositions that are deliberately NOT counted (and why)
 
