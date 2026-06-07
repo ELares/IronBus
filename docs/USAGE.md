@@ -47,14 +47,24 @@ resume" below), so it is NOT fsynced on every ack.
 | `--max-connections <n>` | `256` | Connection cap; a flood cannot spawn unbounded threads. Must be at least 1. |
 | `--checkpoint-interval <n>` | `1024` | At most this many messages may be redelivered after an abrupt crash; the cursor is also flushed on a clean disconnect. A lower value persists the consumer cursor more eagerly at the cost of more checkpoint writes. |
 | `--max-deliver <n>` | `5` | Delivery attempts a message gets before it is dead-lettered (parked). Must be at least 1. |
-| `--max-in-flight <n>` | `1024` | The max-ack-pending window: at most this many messages may be leased above the committed cursor at once. Must be at least 1. |
+| `--allow-unlimited-deliver` | off | Value-less opt-in that permits `--max-deliver 0` (unlimited delivery, never dead-lettered), with a startup WARN. Without it, an unlimited `--max-deliver` is rejected as a usage error. |
+| `--backoff-ms <a,b,c>` | `100,500,2000,10000,30000` | A comma-separated per-attempt nack/redelivery backoff schedule in milliseconds, indexed by attempt and clamped to the last entry, applied when a nack carries no explicit `--delay-ms`. A single `0` disables backoff. |
+| `--max-in-flight <n>` | `1024` | The per-group max-ack-pending window: at most this many messages may be leased above the committed cursor at once. Must be at least 1. |
+| `--consumer-credit <n>` | `64` | The per-connection un-acked message credit: the most messages one connection may hold un-acked at once. The effective per-fetch credit is the smaller of this and the per-group `--max-in-flight` window. Must be at least 1. |
+| `--consumer-credit-bytes <n>` | `8388608` (8 MiB) | The per-connection un-acked byte budget (key plus headers plus payload), the RAM-side companion to `--consumer-credit`; `0` means unlimited. A single message larger than the whole budget is still delivered when nothing is in flight, so it never wedges. |
 | `--max-segment-bytes <n>` | `67108864` | The soft per-segment size cap (64 MiB). Must be at least 4096 (smaller caps proliferate segments). |
 | `--max-total-bytes <bytes>` | `0` (unlimited) | The hard durable-log byte cap. At or over it, a produce is rejected (drop-new shed) with an `at capacity` error. See "Bounding disk use" below. |
 | `--max-retained-bytes <bytes>` | `0` (off) | Size-based retention: reclaim whole old SEALED segments, once every group has committed past them, while the durable log exceeds this many record bytes. See "Bounding disk use" below. |
 | `--max-age-ms <ms>` | `0` (off) | Time-based retention: reclaim a fully-consumed sealed segment once its newest record is older than this many milliseconds. See "Bounding disk use" below. |
 | `--max-messages <n>` | `0` (off) | Count-based retention: reclaim oldest fully-consumed sealed segments once the total durable record count exceeds this bound. See "Bounding disk use" below. |
+| `--max-groups <n>` | `1024` | Cap on the number of live work-groups; a new named group past the cap is rejected (the default group is exempt and never counted). `0` means unlimited. |
+| `--disk-full-policy <drop-new\|drop-oldest>` | `drop-new` | What an over-cap produce does once `--max-total-bytes` is hit: `drop-new` sheds it (preserving older data); `drop-oldest` force-reaps the oldest sealed segment to make room, then accepts it. |
+| `--key-shared-group <name>` | none | Repeatable: declares a named competing group that runs in `key_shared` ordering, so a record's key routes to one live member and same-key records keep their order while the group drains in parallel across keys. Pass once per group. |
 | `--visibility-timeout-ms <n>` | `30000` | How long a delivered message stays in flight before it may redeliver. Must be at least 1. The lease hard cap is the larger of 5 minutes and this. |
 | `--health-addr <host:port>` | off | If set, also serve the health and metrics HTTP endpoints on this loopback port. |
+
+For the exhaustive flag map (value types, every default cited to its `main.rs` constant, and
+the validation rules), see the complete CLI reference in [`CLI.md`](CLI.md).
 
 ### Durability across platforms
 
@@ -174,14 +184,21 @@ produce time).
 The consumer cursor is a lagging checkpoint, not a per-ack fsync. It becomes durable
 when a consumer's connection closes cleanly (the disconnect flushes it) or after
 `--checkpoint-interval` cumulative commits (default 1024). So a clean restart resumes
-past acked messages, but an abrupt stop can redeliver up to `--checkpoint-interval`
-recently-acked messages. Note there is no graceful-shutdown drain yet, so signalling the
-broker (SIGTERM/SIGINT) IS an abrupt stop. This is safe at-least-once (a duplicate, never
-a loss), and `--checkpoint-interval` is exactly the knob that trades that redelivery
+past acked messages, but an ABRUPT crash (a power cut or a kill) can redeliver up to
+`--checkpoint-interval` recently-acked messages. This is safe at-least-once (a duplicate,
+never a loss), and `--checkpoint-interval` is exactly the knob that trades that redelivery
 window against checkpoint write amplification; a lower value (even `1`) persists the
-cursor more eagerly. The everyday `pub`/`sub` flow resumes cleanly because each
-short-lived `sub` connection closes and flushes the cursor; a long-lived consumer that is
-still connected when the broker is signalled gets the redelivery behavior instead.
+cursor more eagerly.
+
+Signalling the broker is NOT an abrupt stop: `serve` installs a SIGINT/SIGTERM/SIGHUP
+handler that does a graceful shutdown. It stops accepting connections, flushes every
+work-group's committed cursor, and exits 0, so a restart after a clean operator stop does
+not redeliver already-acked messages even from a long-lived consumer that was still
+connected. The graceful stop flushes the cursor only: there is no in-flight drain, so any
+message that was leased but not yet acked when the signal arrived still redelivers after
+the restart, which is the correct at-least-once behavior. The everyday `pub`/`sub` flow
+also resumes cleanly because each short-lived `sub` connection closes and flushes its
+cursor on disconnect.
 
 ## Consumer groups
 
