@@ -410,6 +410,103 @@ mod tests {
         assert_eq!(back.schema_version, LossReport::SCHEMA_VERSION);
     }
 
+    /// The frozen golden for the `ironbus.loss-report.v1` schema: the EXACT serialized JSON of a
+    /// representative report, byte for byte (pretty-printed for a human-readable, reviewable
+    /// diff). This is the external contract the doc `docs/schemas/loss-report.v1.md` names. The
+    /// weaker `json_round_trips_and_is_stable` above asserts only that three substrings appear,
+    /// so it would not catch a field RENAME, a field REMOVAL, a field REORDER, or a `serde`
+    /// rename attribute creeping in. This golden pins the whole shape: any such change is a CI
+    /// failure here, forcing a deliberate `schema_version` bump rather than a silent break.
+    ///
+    /// The fixture exercises two events with distinct reasons so the per-event field set, the
+    /// event ordering, and two of the five `ReasonCode` variant names are all pinned at once.
+    #[test]
+    fn golden_loss_report_v1_serialization_is_frozen() {
+        // The frozen golden. Editing this string is a deliberate, reviewed schema change; a
+        // change to the struct that is NOT mirrored here fails the assert.
+        const GOLDEN: &str = r#"{
+  "schema_version": 1,
+  "events": [
+    {
+      "segment_id": 0,
+      "byte_offset_start": 4096,
+      "byte_offset_end": 8192,
+      "bytes_skipped": 4096,
+      "records_lost_estimate": 1,
+      "reason_code": "TornTail"
+    },
+    {
+      "segment_id": 2,
+      "byte_offset_start": 65536,
+      "byte_offset_end": 131072,
+      "bytes_skipped": 65536,
+      "records_lost_estimate": 7,
+      "reason_code": "CorruptRecordBody"
+    }
+  ]
+}"#;
+
+        let mut r = LossReport::new();
+        r.push(LossEvent::span(0, 4096, 8192, 1, ReasonCode::TornTail));
+        r.push(LossEvent::span(
+            2,
+            65_536,
+            131_072,
+            7,
+            ReasonCode::CorruptRecordBody,
+        ));
+
+        let json = serde_json::to_string_pretty(&r).unwrap();
+        assert_eq!(
+            json, GOLDEN,
+            "the ironbus.loss-report.v1 JSON shape changed without a reviewed schema bump; if this \
+             is intentional, bump LossReport::SCHEMA_VERSION, update docs/schemas/loss-report.v1.md, \
+             and freeze a new golden"
+        );
+
+        // The golden also round-trips back to the exact value (the schema is symmetric).
+        let back: LossReport = serde_json::from_str(GOLDEN).unwrap();
+        assert_eq!(back, r);
+        assert_eq!(back.schema_version, LossReport::SCHEMA_VERSION);
+    }
+
+    /// Freeze the on-the-wire `serde` representation of every `ReasonCode` variant alongside its
+    /// stable numeric `code()` and `metric_label()`. The numeric codes are already pinned by
+    /// `reason_codes_are_stable_and_distinct`; this adds the third leg, the JSON variant NAME a
+    /// `LossReport` consumer parses, so a `#[serde(rename = ...)]` or a variant rename can never
+    /// silently change the externally-frozen `ironbus.loss-report.v1` reason vocabulary. Each
+    /// triple (code, label, json-name) is the frozen contract `docs/schemas/loss-report.v1.md`
+    /// enumerates.
+    #[test]
+    fn golden_reason_code_vocabulary_is_frozen() {
+        // (numeric code, metric label, serde JSON name), in code order. Append-only: a new reason
+        // adds a row; an existing row never changes.
+        let frozen: [(u16, &str, &str); 5] = [
+            (1, "torn_tail", "\"TornTail\""),
+            (2, "corrupt_record_header", "\"CorruptRecordHeader\""),
+            (3, "corrupt_record_body", "\"CorruptRecordBody\""),
+            (4, "corrupt_segment_header", "\"CorruptSegmentHeader\""),
+            (5, "sequence_gap", "\"SequenceGap\""),
+        ];
+        assert_eq!(
+            ReasonCode::ALL.len(),
+            frozen.len(),
+            "a ReasonCode variant was added or removed without updating the frozen vocabulary"
+        );
+        for (rc, &(code, label, json_name)) in ReasonCode::ALL.iter().zip(frozen.iter()) {
+            assert_eq!(rc.code(), code, "frozen numeric code for {rc:?}");
+            assert_eq!(rc.metric_label(), label, "frozen metric label for {rc:?}");
+            assert_eq!(
+                serde_json::to_string(rc).unwrap(),
+                json_name,
+                "frozen serde JSON name for {rc:?}"
+            );
+            // The JSON name round-trips back to the same variant.
+            let back: ReasonCode = serde_json::from_str(json_name).unwrap();
+            assert_eq!(back, *rc, "reason code JSON name round-trips for {rc:?}");
+        }
+    }
+
     #[test]
     fn check_caps_accepts_loss_within_bounds() {
         let mut r = LossReport::new();

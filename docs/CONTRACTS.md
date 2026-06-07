@@ -469,6 +469,11 @@ format (`serde_json`) is a dev-only dependency, so the static edge binary does n
 There is NO frozen byte layout for the report (it is serde-serialized, not a fixed binary
 frame), so only the field set and the frozen numeric reason codes are normative here.
 
+This report is the versioned, externally-frozen `ironbus.loss-report.v1` schema; the
+[loss-report.v1 schema doc](schemas/loss-report.v1.md) is its standalone normative reference
+(the canonical JSON form, the golden tests that freeze it, and the versioning policy). The
+tables below are the in-catalog summary.
+
 ### LossReport
 
 | field            | type            | notes |
