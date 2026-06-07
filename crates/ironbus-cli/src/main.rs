@@ -200,11 +200,12 @@ USAGE:
                   [--max-retained-bytes <bytes>] [--max-age-ms <ms>] [--max-messages <n>]
                   [--max-groups <n>] [--group-idle-evict-ms <ms>]
                   [--disk-full-policy <drop-new|drop-oldest>]
-                  [--key-shared-group <name>]...
+                  [--key-shared-group <name>]... [--broadcast-group <name>]...
                   [--visibility-timeout-ms <n>] [--health-addr <host:port>] [--enable-admin]
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
     ironbus sub   [--addr <host:port>] [--group <name>] [--max <n>]
                   [--ack | --nack [--delay-ms <n>] | --term]
+    ironbus cumulative-ack [--addr <host:port>] [--group <name>] --up-to <offset>
     ironbus peek  --data-dir <dir> [--from-offset <n>] [--limit <n>] [--json]
     ironbus dump  --data-dir <dir> [--limit <n>] [--json] [--dlq]
     ironbus help
@@ -251,6 +252,14 @@ Notes:
     key_shared ordering: a record's key routes to one live member, so same-key records keep their
     order while the group drains in parallel across keys. A group not named here stays plain
     competing distribution (the default), unaffected.
+    --broadcast-group <name> (repeatable, default none) marks the named group BROADCAST: a
+    group-of-one that sees every record in order, so it accepts the cumulative-ack verb
+    (ack-all-up-to-offset). A broadcast group is mutually exclusive with key_shared. A group not
+    named here stays plain competing distribution and rejects cumulative ack.
+    cumulative-ack commits a BROADCAST group's cursor up to (exclusive) --up-to in one move, the
+    safe broadcast half of the ack-all-up-to-offset verb. The server rejects it for a competing or
+    key_shared group, and rejects an --up-to past the durable head or below the earliest retained
+    offset; a re-ack at or below the current commit is an idempotent no-op success.
     --enable-admin (default off) turns on the read-only /admin introspection endpoint on the health
     server (so it needs --health-addr): a JSON snapshot of broker counters, per-group lag/in-flight,
     DLQ state, and the effective config bounds, for debugging. It is READ-ONLY (GET only, no path
@@ -356,6 +365,7 @@ fn run(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     match cmd.as_str() {
         "pub" => run_pub(rest, out),
         "sub" => run_sub(rest, out),
+        "cumulative-ack" => run_cumulative_ack(rest, out),
         "serve" => run_serve(rest, out),
         "peek" => run_peek(rest, out),
         "dump" => run_dump(rest, out),
@@ -675,6 +685,59 @@ fn cmd_sub(
     Ok(())
 }
 
+/// Parses and runs `cumulative-ack`: send a BROADCAST cumulative ack (ack-all-up-to-offset, #288)
+/// for a group, committing its cursor up to the exclusive `--up-to` offset in one move.
+///
+/// # Errors
+/// Returns [`CliError::Usage`] for a bad flag or a missing `--up-to`, [`CliError::Unreachable`] if
+/// the broker is down, or [`CliError::Internal`] if the broker rejects the verb (the group is not a
+/// broadcast consumer, or `--up-to` is outside the retained window).
+fn run_cumulative_ack(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let mut addr = DEFAULT_ADDR.to_string();
+    let mut group = String::new();
+    let mut up_to: Option<u64> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--addr" => addr = take_value("--addr", args, &mut i)?,
+            "--group" => group = take_value("--group", args, &mut i)?,
+            "--up-to" => up_to = Some(take_number("--up-to", args, &mut i)?),
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!(
+                    "unknown flag `{flag}` for cumulative-ack"
+                )))
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "cumulative-ack takes no positional arguments, got `{other}`"
+                )))
+            }
+        }
+    }
+    let up_to = up_to
+        .ok_or_else(|| CliError::Usage("cumulative-ack requires `--up-to <offset>`".to_string()))?;
+    cmd_cumulative_ack(&addr, &group, up_to, out)
+}
+
+fn cmd_cumulative_ack(
+    addr: &str,
+    group: &str,
+    up_to: u64,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let mut client = connect(addr)?;
+    client
+        .cumulative_ack(group, up_to)
+        .map_err(|e| classify(addr, "cumulative-acking to", &e))?;
+    let named = if group.is_empty() {
+        "default group".to_string()
+    } else {
+        format!("group `{group}`")
+    };
+    writeln!(out, "cumulative ack committed {named} up to offset {up_to}")?;
+    Ok(())
+}
+
 /// An injectable environment-variable lookup (#89): maps an env-var NAME to its value, or `None`
 /// if it is unset. A `serve` setting reads its `IRONBUS_<FLAG>` var through this seam rather than
 /// touching `std::env` directly, so a test can drive the env layer deterministically with a fixed
@@ -788,14 +851,18 @@ fn resolve_bool(flag: &str, cli_set: bool, env: &EnvFn<'_>) -> Result<bool, CliE
 }
 
 /// The fully-parsed `serve` invocation: the assembled tuning config plus the connection-level
-/// arguments (the bind address, the optional data dir and health address, and the declared
-/// `key_shared` groups) that are not part of [`ServeConfig`].
+/// arguments (the bind address, the optional data dir and health address, the declared
+/// `key_shared` groups, and the declared broadcast groups) that are not part of [`ServeConfig`].
 #[derive(Debug)]
 struct ParsedServe {
     addr: String,
     data_dir: Option<String>,
     config: ServeConfig,
     key_shared_groups: Vec<String>,
+    /// The work-group names declared BROADCAST (#288): each is a group-of-one that sees every
+    /// record in order, marked broadcast at open so it accepts the cumulative-ack verb. CLI-only
+    /// (no env mapping), repeatable like `--key-shared-group`.
+    broadcast_groups: Vec<String>,
     health_addr: Option<String>,
 }
 
@@ -809,6 +876,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         parsed.data_dir.as_deref(),
         &parsed.config,
         &parsed.key_shared_groups,
+        &parsed.broadcast_groups,
         parsed.health_addr.as_deref(),
         out,
     )
@@ -845,6 +913,7 @@ struct ServeFlags {
     enable_admin: bool,
     health_addr: Option<String>,
     key_shared_groups: Vec<String>,
+    broadcast_groups: Vec<String>,
 }
 
 /// Collects the `serve` arg list into [`ServeFlags`], each knob `Some` only if its flag appeared.
@@ -908,6 +977,10 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             "--key-shared-group" => {
                 f.key_shared_groups
                     .push(take_value("--key-shared-group", args, &mut i)?);
+            }
+            "--broadcast-group" => {
+                f.broadcast_groups
+                    .push(take_value("--broadcast-group", args, &mut i)?);
             }
             "--visibility-timeout-ms" => {
                 f.visibility_ms = Some(take_number("--visibility-timeout-ms", args, &mut i)?);
@@ -1053,6 +1126,7 @@ fn parse_serve_flags_with_env(args: &[String], env: &EnvFn<'_>) -> Result<Parsed
             enable_admin: resolve_bool("--enable-admin", f.enable_admin, env)?,
         },
         key_shared_groups: f.key_shared_groups,
+        broadcast_groups: f.broadcast_groups,
         health_addr: resolve_opt_string("--health-addr", f.health_addr, env),
     })
 }
@@ -1064,6 +1138,7 @@ fn finish_serve(
     data_dir: Option<&str>,
     config: &ServeConfig,
     key_shared_groups: &[String],
+    broadcast_groups: &[String],
     health_addr: Option<&str>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -1075,6 +1150,7 @@ fn finish_serve(
         Path::new(data_dir),
         config,
         key_shared_groups,
+        broadcast_groups,
         health_addr,
         out,
     )
@@ -1222,6 +1298,7 @@ fn cmd_serve(
     data_dir: &Path,
     config: &ServeConfig,
     key_shared_groups: &[String],
+    broadcast_groups: &[String],
     health_addr: Option<&str>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -1232,7 +1309,7 @@ fn cmd_serve(
     // released by the OS when it drops on return (and unconditionally on process exit).
     dirlock::prepare_data_dir(data_dir).map_err(|e| map_dir_error(&e))?;
     let _dir_lock = dirlock::DirLock::acquire(data_dir).map_err(|e| map_dir_error(&e))?;
-    let engine = open_disk_engine(data_dir, config, key_shared_groups)?;
+    let engine = open_disk_engine(data_dir, config, key_shared_groups, broadcast_groups)?;
     // The engine is owned by the append actor (#177); connection handlers and the health server reach
     // it only through the bounded-channel handle, so no handler holds a lock across an fsync. The
     // actor's join handle yields the engine back on its clean exit (a Shutdown drain), which is how
@@ -1363,6 +1440,7 @@ fn cmd_serve(
     data_dir: &Path,
     config: &ServeConfig,
     key_shared_groups: &[String],
+    broadcast_groups: &[String],
     health_addr: Option<&str>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -1388,6 +1466,9 @@ fn cmd_serve(
         config.disk_full_policy,
         config.visibility_ms,
         key_shared_groups,
+        // Read the broadcast groups under cfg(not(unix)) too: a field/param read only on cfg(unix)
+        // breaks the Windows `-D warnings` build invisibly to a macOS reviewer (#288 note).
+        broadcast_groups,
         health_addr,
         out,
     );
@@ -1399,11 +1480,14 @@ fn cmd_serve(
 /// Opens (creating the directory if absent) the on-disk broker engine rooted at `data_dir`.
 /// `key_shared_groups` (#64) are declared server-side: each is put into `key_shared` ordering when
 /// a consumer first subscribes; an empty slice leaves every group plain competing (the default).
+/// `broadcast_groups` (#288) are marked BROADCAST at open (a group-of-one that sees every record in
+/// order), so each accepts the cumulative-ack verb; an empty slice leaves every group competing.
 #[cfg(unix)]
 fn open_disk_engine(
     data_dir: &Path,
     config: &ServeConfig,
     key_shared_groups: &[String],
+    broadcast_groups: &[String],
 ) -> Result<Engine<StdFs, SystemClock>, CliError> {
     std::fs::create_dir_all(data_dir)
         .map_err(|e| CliError::Internal(format!("cannot create {}: {e}", data_dir.display())))?;
@@ -1478,6 +1562,15 @@ fn open_disk_engine(
     // Declare the key_shared groups (#64) server-side: a configured group enters key_shared mode
     // when a consumer first subscribes. An empty slice is a no-op, so every group stays competing.
     engine.set_configured_key_shared_groups(key_shared_groups.iter().cloned());
+    // Mark the declared broadcast groups (#288): each is a group-of-one that sees every record in
+    // order, marked at open so it accepts the cumulative-ack verb. A bad name or the group cap is a
+    // fatal misconfiguration here (the broker should not start with an unhonored broadcast group).
+    // An empty slice is a no-op, so every group stays plain competing.
+    for group in broadcast_groups {
+        engine
+            .set_broadcast_in(group, true)
+            .map_err(|e| CliError::Usage(format!("--broadcast-group `{group}`: {e}")))?;
+    }
     Ok(engine)
 }
 
@@ -1922,7 +2015,7 @@ mod tests {
     fn make_data_dir(tag: &str, n: usize) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("ironbus-cli-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut engine = open_disk_engine(&dir, &test_serve_config(64, 1), &[]).unwrap();
+        let mut engine = open_disk_engine(&dir, &test_serve_config(64, 1), &[], &[]).unwrap();
         for i in 0..n {
             let payload = format!("msg-{i}");
             engine
@@ -2307,6 +2400,92 @@ mod tests {
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
+    }
+
+    /// Builds an in-memory engine with one group marked BROADCAST (#288), for the cumulative-ack
+    /// CLI test: the group accepts the verb, so `cmd_cumulative_ack` drives the real engine path.
+    fn engine_with_broadcast_group(group: &str) -> Engine<InMemoryFs, SystemClock> {
+        let mut engine = Engine::open(
+            InMemoryFs::new(),
+            SystemClock::new(),
+            EngineConfig {
+                log: LogConfig::default(),
+                lease: LeaseConfig::default(),
+                delivery: DeliveryConfig::new(5, false, Vec::new()).unwrap(),
+                max_in_flight: 16,
+                consumer_credit: 64,
+                consumer_credit_bytes: 0,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                max_groups: DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
+            },
+        )
+        .unwrap();
+        engine.set_broadcast_in(group, true).unwrap();
+        engine
+    }
+
+    #[test]
+    fn cumulative_ack_subcommand_drives_the_engine_path() {
+        // The `cumulative-ack` subcommand (#288) commits a broadcast group's cursor up to --up-to,
+        // and the server rejects it for a competing group. Drives the real engine over the wire.
+        let (addr, shutdown, handle, actor) =
+            serve_engine(engine_with_broadcast_group("bcast"), 16);
+        let a = addr.to_string();
+        // Produce four records so up_to == 3 is within the durable head.
+        for _ in 0..4 {
+            let mut published = Vec::new();
+            cmd_pub(&a, b"", b"x", &mut published).unwrap();
+        }
+        // Cumulative ack the broadcast group up to 3: succeeds and prints the committed line.
+        let mut out = Vec::new();
+        run_cumulative_ack(
+            &[
+                "--addr".to_string(),
+                a.clone(),
+                "--group".to_string(),
+                "bcast".to_string(),
+                "--up-to".to_string(),
+                "3".to_string(),
+            ],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("cumulative ack committed group `bcast` up to offset 3"),
+            "cumulative-ack output: {text}"
+        );
+        // A competing group (the default, not broadcast) is rejected: the verb maps the server Err
+        // to an internal CliError, so the call fails (the safety trap holds through the CLI too).
+        let mut out = Vec::new();
+        let err = run_cumulative_ack(
+            &[
+                "--addr".to_string(),
+                a.clone(),
+                "--up-to".to_string(),
+                "2".to_string(),
+            ],
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("competing work-group"),
+            "expected a work-group rejection, got: {err}"
+        );
+        // A missing --up-to is a usage error before any connection.
+        let mut out = Vec::new();
+        let usage = run_cumulative_ack(&["--group".to_string(), "bcast".to_string()], &mut out)
+            .unwrap_err();
+        assert!(matches!(usage, CliError::Usage(_)), "got {usage:?}");
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+        let _ = recover_engine(actor);
     }
 
     #[test]
@@ -3767,7 +3946,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ironbus-cli-it-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let engine = open_disk_engine(&dir, &test_serve_config(64, 1), &[]).unwrap();
+        let engine = open_disk_engine(&dir, &test_serve_config(64, 1), &[], &[]).unwrap();
         let (addr, shutdown, handle, actor) = serve_engine(engine, 16);
 
         let a = addr.to_string();
@@ -3792,7 +3971,7 @@ mod tests {
         // committed cursor when it acked offset 0, so a clean restart RESUMES past the acked message
         // (it does not redeliver), and the durable log continues at offset 1 rather than overwriting
         // offset 0.
-        let reopened = open_disk_engine(&dir, &test_serve_config(64, 1), &[]).unwrap();
+        let reopened = open_disk_engine(&dir, &test_serve_config(64, 1), &[], &[]).unwrap();
         let (addr2, shutdown2, handle2, actor2) = serve_engine(reopened, 16);
         let a2 = addr2.to_string();
 
@@ -3828,7 +4007,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ironbus-cli-restart-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let engine = open_disk_engine(&dir, &test_serve_config(64, 1), &[]).unwrap();
+        let engine = open_disk_engine(&dir, &test_serve_config(64, 1), &[], &[]).unwrap();
         let (addr, shutdown, handle, actor) = serve_engine(engine, 16);
         let a = addr.to_string();
         for (i, payload) in [&b"m0"[..], b"m1", b"m2"].into_iter().enumerate() {
@@ -3852,7 +4031,7 @@ mod tests {
         drop(recover_engine(actor));
 
         // Restart on the same dir: only the uncommitted tail (offsets 1 and 2) redelivers.
-        let reopened = open_disk_engine(&dir, &test_serve_config(64, 1), &[]).unwrap();
+        let reopened = open_disk_engine(&dir, &test_serve_config(64, 1), &[], &[]).unwrap();
         let (addr2, shutdown2, handle2, actor2) = serve_engine(reopened, 16);
         let a2 = addr2.to_string();
         let mut tail = Vec::new();

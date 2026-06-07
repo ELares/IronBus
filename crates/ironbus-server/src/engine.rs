@@ -218,6 +218,23 @@ pub enum EngineError {
     /// them. It is therefore offered only to broadcast consumers (a group of one that sees every
     /// message in order) and hard-rejected for any competing or `key_shared` work-group.
     CumulativeAckOnWorkGroup,
+    /// A BROADCAST cumulative ack named an `up_to` offset OUTSIDE the durable, retained window
+    /// (#288): either PAST the durable head (`up_to > flushed`, committing past records that do
+    /// not exist yet, which a later truncation could never reconcile) or BELOW the earliest
+    /// retained offset (`up_to < earliest_retained`, naming records the log has already reaped, a
+    /// stale or replayed ack). Rejected with this typed error rather than committing a meaningless
+    /// cursor; the broadcast group's committed offset is left unchanged. An idempotent re-ack (an
+    /// `up_to` at or below the current commit but still within the window) is NOT this error: it is
+    /// a no-op success.
+    CumulativeAckOutOfRange {
+        /// The rejected `up_to` offset.
+        up_to: u64,
+        /// The oldest offset still retained in the durable log (the lower bound, inclusive).
+        earliest_retained: u64,
+        /// The durable head: the offset of the next record to be written (the upper bound,
+        /// inclusive, since committing exactly up to the head commits every existing record).
+        durable_head: u64,
+    },
 }
 
 impl core::fmt::Display for EngineError {
@@ -241,6 +258,15 @@ impl core::fmt::Display for EngineError {
             EngineError::CumulativeAckOnWorkGroup => write!(
                 f,
                 "cumulative ack is not allowed on a competing work-group (broadcast consumers only)"
+            ),
+            EngineError::CumulativeAckOutOfRange {
+                up_to,
+                earliest_retained,
+                durable_head,
+            } => write!(
+                f,
+                "cumulative ack up_to {up_to} is outside the retained window \
+                 [{earliest_retained}, {durable_head}]"
             ),
         }
     }
@@ -806,6 +832,15 @@ struct WorkGroup {
     /// key to one live member and enforces per-key serialization; when absent, delivery is the
     /// unchanged claim-the-next-deliverable competing path.
     router: Option<KeyRouter>,
+    /// Whether this group is a BROADCAST consumer (#288): a group-of-one that sees every record in
+    /// order, as opposed to a competing or `key_shared` work-group that several members drain out
+    /// of order. Only a broadcast group accepts a cumulative ack ([`Engine::cumulative_ack_in`]):
+    /// committing its single cursor up to an offset is well-defined and drops nothing because no
+    /// peer holds an in-flight message below it. Mutually exclusive with `router` (a broadcast
+    /// group is never `key_shared`): [`Engine::set_broadcast_in`] and [`Engine::set_key_ordering_in`]
+    /// each clear the other mode. `false` (plain competing) by default, so an unconfigured group is
+    /// unaffected and the cumulative-ack guard rejects it exactly as before.
+    broadcast: bool,
     /// The engine-clock-seam (monotonic, nanoseconds) timestamp of this group's LAST ACTIVITY
     /// (#277): updated whenever a poll, ack, nack, progress, or term touches the group. The idle
     /// eviction sweep ([`Engine::sweep_idle_groups`]) measures the idle window against it. Seeded
@@ -817,10 +852,18 @@ struct WorkGroup {
 
 impl WorkGroup {
     fn new(config: LeaseConfig, now: u64) -> WorkGroup {
+        WorkGroup::resume(AckCursor::new(), config, now)
+    }
+
+    /// Builds a work-group around an already-recovered `cursor` (the durable-resume path at open,
+    /// #60), plain competing (`router: None`, `broadcast: false`): the mode is re-applied
+    /// server-side after open, never restored from disk here.
+    fn resume(cursor: AckCursor, config: LeaseConfig, now: u64) -> WorkGroup {
         WorkGroup {
-            cursor: AckCursor::new(),
+            cursor,
             leases: LeaseTable::new(config),
             router: None,
+            broadcast: false,
             last_activity: now,
         }
     }
@@ -973,12 +1016,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let mut groups = BTreeMap::new();
         groups.insert(
             DEFAULT_GROUP.to_string(),
-            WorkGroup {
-                cursor,
-                leases: LeaseTable::new(config.lease),
-                router: None,
-                last_activity: opened_at,
-            },
+            WorkGroup::resume(cursor, config.lease, opened_at),
         );
         // Discover and resume each NAMED work-group from its own `cursor-<hex>.ckpt` (#60),
         // so a broadcast or competing group keeps its position across a restart instead of
@@ -1003,15 +1041,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 let (_, recovered) = Checkpoint::open(fs.open(&name)?)?;
                 let gcursor = resume_cursor_from_snapshot(recovered.as_deref(), flushed);
                 group_last_checkpointed.insert(gname.clone(), gcursor.committed().get());
-                groups.insert(
-                    gname,
-                    WorkGroup {
-                        cursor: gcursor,
-                        leases: LeaseTable::new(config.lease),
-                        router: None,
-                        last_activity: opened_at,
-                    },
-                );
+                groups.insert(gname, WorkGroup::resume(gcursor, config.lease, opened_at));
             }
         }
 
@@ -1461,12 +1491,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .insert(group.to_string(), cursor.committed().get());
         self.groups.insert(
             group.to_string(),
-            WorkGroup {
-                cursor,
-                leases: LeaseTable::new(self.lease_config),
-                router: None,
-                last_activity: now,
-            },
+            WorkGroup::resume(cursor, self.lease_config, now),
         );
         Ok(())
     }
@@ -2173,10 +2198,64 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 if g.router.is_none() {
                     g.router = Some(KeyRouter::new());
                 }
+                // key_shared and broadcast are mutually exclusive (#288): a key_shared group is a
+                // competing group that drains out of order across members, so it can never accept a
+                // cumulative ack. Clear the broadcast flag if it was set.
+                g.broadcast = false;
             }
             KeyOrdering::None => g.router = None,
         }
         Ok(())
+    }
+
+    /// Marks a work-group as a BROADCAST consumer, or clears it back to plain competing (#288). A
+    /// broadcast group is a GROUP-OF-ONE that sees every record in order, the only group shape for
+    /// which a cumulative ack ([`Engine::cumulative_ack_in`]) is safe: committing its single cursor
+    /// up to an offset drops nothing because no peer holds an in-flight message below it. Marking a
+    /// group broadcast clears any `key_shared` router (the two modes are mutually exclusive); a
+    /// broadcast group then drains by the unchanged plain-competing claim path (a lone consumer
+    /// claims every record in order), and its only added power is the cumulative-ack verb. Clearing
+    /// it back to `false` reverts to plain competing distribution. The group is created if absent
+    /// (subject to the same name and cap checks as [`Engine::poll_in`]).
+    ///
+    /// Like [`Engine::set_key_ordering_in`], this is the v1 mode-wiring seam: the broadcast mode is
+    /// server-side per-group configuration, set before a consumer polls, NOT a wire-negotiated
+    /// field on the frozen `Sub` frame. The cumulative-ack VERB itself is on the wire (the tag-19
+    /// `CumulativeAck` frame, #288); negotiating broadcast on `Sub`/`Connect` is the #11 follow-up.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::InvalidGroupName`] or [`EngineError::TooManyGroups`] if a new group
+    /// would have to be created and fails the name or cap check.
+    pub fn set_broadcast_in(&mut self, group: &str, broadcast: bool) -> Result<(), EngineError> {
+        if !self.groups.contains_key(group) {
+            validate_group_name(group)?;
+            if self.max_groups != 0 && self.groups.len() >= self.max_groups {
+                return Err(EngineError::TooManyGroups {
+                    max: self.max_groups,
+                });
+            }
+        }
+        let now = self.log.now_monotonic();
+        let lease_config = self.lease_config;
+        let g = self
+            .groups
+            .entry(group.to_string())
+            .or_insert_with(|| WorkGroup::new(lease_config, now));
+        g.broadcast = broadcast;
+        // A broadcast group is never key_shared: drop any router so the cumulative-ack guard sees a
+        // genuine group-of-one, not a competing cursor wearing the broadcast flag.
+        if broadcast {
+            g.router = None;
+        }
+        Ok(())
+    }
+
+    /// Whether `group` is a BROADCAST consumer (#288): a group-of-one that sees every record in
+    /// order and therefore accepts a cumulative ack. `false` for an unknown group or a plain
+    /// competing / `key_shared` work-group.
+    #[must_use]
+    pub fn is_broadcast_in(&self, group: &str) -> bool {
+        self.groups.get(group).is_some_and(|g| g.broadcast)
     }
 
     /// A work-group's current ordering mode (#64). A group that has never been configured (or one
@@ -2461,30 +2540,84 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         }
     }
 
-    /// Cumulative ack (ack-all-up-to-`offset`) in a named work-group: the `JetStream` `AckAll`
-    /// trap, HARD-REJECTED here (#63). A competing or `key_shared` work-group shares one commit
-    /// cursor while its members drain out of order, so acking up to an offset would commit past
-    /// (and silently drop) messages still in flight to peers. Cumulative ack is therefore offered
-    /// only to BROADCAST consumers (a group of one that sees every message in order), and IronBus
-    /// has no broadcast-consumer cursor yet, so this guard rejects EVERY cumulative ack with the
-    /// typed [`EngineError::CumulativeAckOnWorkGroup`]. It exists so a caller (the wire layer, a
-    /// client, a future broadcast path) has a single, typed, non-panicking rejection point rather
-    /// than a bare TODO. The broadcast cumulative-ack feature is tracked as a follow-up (#288).
+    /// Cumulative ack (ack-all-up-to-`up_to`) in a named work-group (#288, the broadcast half of
+    /// the `JetStream` `AckAll` verb, refs #63). `up_to` is EXCLUSIVE: every offset strictly below
+    /// it becomes committed in one move.
+    ///
+    /// The work-group HARD-REJECT is sacrosanct: a competing or `key_shared` group (and any group
+    /// that has NOT been marked broadcast via [`Engine::set_broadcast_in`], including an unknown
+    /// group) shares one commit cursor while its members drain out of order, so acking up to an
+    /// offset would commit past (and silently drop) messages still in flight to peers. Such a group
+    /// is rejected with the typed [`EngineError::CumulativeAckOnWorkGroup`] and its cursor is left
+    /// untouched.
+    ///
+    /// Only a BROADCAST group, a group-of-one that sees every record in order, accepts the verb. For
+    /// it, `up_to` is validated against the durable, retained window: an `up_to` PAST the durable
+    /// head or BELOW the earliest-retained offset is rejected with the typed
+    /// [`EngineError::CumulativeAckOutOfRange`] (never a panic), and the commit is IDEMPOTENT and
+    /// MONOTONIC: an `up_to` at or below the current commit (but still within the window) is a no-op
+    /// success and the watermark never moves backwards. On a successful advance the group's single
+    /// cursor jumps to `up_to` (any contiguous acked-ahead run is absorbed) and the activity stamp
+    /// is refreshed so the idle sweep does not reclaim the group mid-stream.
     ///
     /// # Errors
-    /// Always returns [`EngineError::CumulativeAckOnWorkGroup`]: no group is a broadcast consumer
-    /// today, so a cumulative ack is never valid.
-    pub fn cumulative_ack_in(&mut self, _group: &str, _up_to: Offset) -> Result<(), EngineError> {
-        // Every live group is a competing/key_shared work-group; none is a broadcast consumer, so
-        // cumulative ack is unconditionally rejected. When the broadcast consumer cursor lands, the
-        // broadcast branch commits its own single-member cursor up to `up_to` here.
-        Err(EngineError::CumulativeAckOnWorkGroup)
+    /// - [`EngineError::CumulativeAckOnWorkGroup`] if `group` is not a broadcast consumer (a
+    ///   competing or `key_shared` work-group, or an unknown group).
+    /// - [`EngineError::CumulativeAckOutOfRange`] if `up_to` is past the durable head or below the
+    ///   earliest-retained offset.
+    pub fn cumulative_ack_in(&mut self, group: &str, up_to: Offset) -> Result<(), EngineError> {
+        // The work-group rejection (#63) is the safety trap and stays UNCHANGED: only a group that
+        // is live AND marked broadcast may proceed. An unknown group, a plain competing group, and a
+        // key_shared group all fall here with the cursor untouched.
+        if !self.is_broadcast_in(group) {
+            return Err(EngineError::CumulativeAckOnWorkGroup);
+        }
+        // Validate `up_to` against the durable, retained window BEFORE touching the cursor, so a bad
+        // offset leaves the committed position exactly as it was. The window is
+        // [earliest_retained, durable_head]: committing exactly up to the head commits every record
+        // that exists (the head is the next-to-write offset, so `up_to == head` is in range), while
+        // an `up_to` below the oldest retained record names reaped (or never-seen) offsets. Read
+        // both bounds immutably before the mutable group borrow.
+        let durable_head = self.log.flushed_offset().get();
+        let earliest_retained = self.log.earliest_offset().get();
+        let up_to_raw = up_to.get();
+        if up_to_raw > durable_head || up_to_raw < earliest_retained {
+            return Err(EngineError::CumulativeAckOutOfRange {
+                up_to: up_to_raw,
+                earliest_retained,
+                durable_head,
+            });
+        }
+        let now = self.log.now_monotonic();
+        // The group is broadcast (the guard above proved it is present), so the lookup never misses;
+        // fall back to the rejection rather than panic if an invariant ever breaks.
+        let Some(g) = self.groups.get_mut(group) else {
+            return Err(EngineError::CumulativeAckOnWorkGroup);
+        };
+        // A cumulative ack IS activity: refresh the stamp so the idle sweep does not reclaim the
+        // group out from under a consumer that is committing via cumulative ack rather than poll.
+        g.last_activity = now;
+        let before = g.cursor.committed().get();
+        // Commit the single broadcast cursor up to `up_to`. `commit_up_to` is idempotent and
+        // monotonic: an `up_to` at or below `committed` is a no-op success (the re-ack case) and the
+        // watermark never regresses. The redelivery gate is the cursor (`poll_in` skips `is_acked`
+        // offsets), so committing past leases that were never per-message acked simply stops their
+        // redelivery; any such lease expires through the visibility timeout without re-serving.
+        if g.cursor.commit_up_to(up_to) {
+            // Count each newly-committed offset as an ack (the same `acks` counter per-message acks
+            // drive), so the resilience taxonomy is unchanged: no new counter is introduced.
+            let advanced = g.cursor.committed().get().saturating_sub(before);
+            self.counters.acks = self.counters.acks.saturating_add(advanced);
+        }
+        Ok(())
     }
 
-    /// Cumulative ack in the default work-group, rejected as [`Engine::cumulative_ack_in`].
+    /// Cumulative ack in the default work-group (#288): delegates to [`Engine::cumulative_ack_in`]
+    /// with the default group name, so the default group is a broadcast consumer only if it was
+    /// marked one via [`Engine::set_broadcast_in`] (otherwise the work-group reject applies).
     ///
     /// # Errors
-    /// Always returns [`EngineError::CumulativeAckOnWorkGroup`] (the default group is a work-group).
+    /// As [`Engine::cumulative_ack_in`].
     pub fn cumulative_ack(&mut self, up_to: Offset) -> Result<(), EngineError> {
         self.cumulative_ack_in(DEFAULT_GROUP, up_to)
     }
@@ -3597,12 +3730,17 @@ mod tests {
     fn cumulative_ack_is_rejected_on_a_work_group() {
         // Cumulative ack (ack-all-up-to-offset) is the JetStream AckAll trap on a shared,
         // out-of-order-draining cursor: it is hard-rejected for competing work-groups (#63).
-        // Every live group today is a work-group, so the guard rejects every cumulative ack
-        // with the typed error and never panics.
+        // Only a group MARKED broadcast (#288) accepts it; a competing/key_shared/unknown group is
+        // rejected with the typed error and never panics. The cursor is left untouched.
         let mut e = open(config(10, 5));
         produce(&mut e, b"a");
         produce(&mut e, b"b");
-        // The default group is a work-group: rejected.
+        // An unknown group (never polled, never marked broadcast): rejected.
+        assert!(matches!(
+            e.cumulative_ack_in("never-seen", Offset::new(1)),
+            Err(EngineError::CumulativeAckOnWorkGroup)
+        ));
+        // The default group is a plain competing work-group (not broadcast): rejected.
         assert!(matches!(
             e.cumulative_ack(Offset::new(2)),
             Err(EngineError::CumulativeAckOnWorkGroup)
@@ -3622,6 +3760,161 @@ mod tests {
         let d = message(e.poll(0).unwrap());
         assert_eq!(e.ack(&d.token), AckResult::Acked);
         assert_eq!(e.committed_offset(), Offset::new(1));
+    }
+
+    #[test]
+    fn broadcast_cumulative_ack_commits_the_cursor_up_to() {
+        // A broadcast group (a group-of-one that sees every record in order, #288) accepts the
+        // cumulative ack: committing its single cursor up to `up_to` is safe and visible.
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b", b"c", b"d"] {
+            produce(&mut e, p);
+        }
+        e.set_broadcast_in("bcast", true).unwrap();
+        assert!(e.is_broadcast_in("bcast"));
+        assert_eq!(e.committed_offset_in("bcast"), Offset::new(0));
+        // Commit up to 3 (exclusive): offsets 0,1,2 are now committed; 3 is the next to deliver.
+        e.cumulative_ack_in("bcast", Offset::new(3)).unwrap();
+        assert_eq!(e.committed_offset_in("bcast"), Offset::new(3));
+        // The next poll delivers offset 3, not a redelivery of the cumulatively-acked prefix.
+        let d = message(e.poll_in("bcast", 0).unwrap());
+        assert_eq!(d.offset, Offset::new(3));
+        assert_eq!(d.deliveries, 1, "the acked prefix is not redelivered");
+        // Other groups are untouched: the default group still sees the whole log from zero.
+        assert_eq!(e.committed_offset(), Offset::new(0));
+    }
+
+    #[test]
+    fn broadcast_cumulative_ack_is_idempotent_and_never_regresses() {
+        // A re-ack at the same or a lower `up_to` is a no-op SUCCESS, never an error or a regression
+        // (#288). The committed watermark only ever moves forward.
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b", b"c", b"d", b"e"] {
+            produce(&mut e, p);
+        }
+        e.set_broadcast_in("b", true).unwrap();
+        e.cumulative_ack_in("b", Offset::new(4)).unwrap();
+        assert_eq!(e.committed_offset_in("b"), Offset::new(4));
+        // Same offset again: Ok, still 4.
+        e.cumulative_ack_in("b", Offset::new(4)).unwrap();
+        assert_eq!(e.committed_offset_in("b"), Offset::new(4));
+        // A LOWER offset: Ok (no error), and the watermark holds at 4 (no regression).
+        e.cumulative_ack_in("b", Offset::new(1)).unwrap();
+        assert_eq!(e.committed_offset_in("b"), Offset::new(4), "no regression");
+        // up_to == 0 is the trivial idempotent no-op.
+        e.cumulative_ack_in("b", Offset::new(0)).unwrap();
+        assert_eq!(e.committed_offset_in("b"), Offset::new(4));
+        // A forward move still works after the no-ops.
+        e.cumulative_ack_in("b", Offset::new(5)).unwrap();
+        assert_eq!(e.committed_offset_in("b"), Offset::new(5));
+    }
+
+    #[test]
+    fn broadcast_cumulative_ack_rejects_past_the_durable_head() {
+        // An `up_to` past the durable head names records that do not exist yet: rejected with the
+        // typed out-of-range error (no panic), and the cursor is untouched (#288).
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b"] {
+            produce(&mut e, p);
+        }
+        e.set_broadcast_in("b", true).unwrap();
+        // The head is 2 (offsets 0 and 1 exist). up_to == 2 is in range (commits both); up_to == 3
+        // is one past the head.
+        assert!(matches!(
+            e.cumulative_ack_in("b", Offset::new(3)),
+            Err(EngineError::CumulativeAckOutOfRange {
+                up_to: 3,
+                durable_head: 2,
+                ..
+            })
+        ));
+        assert_eq!(
+            e.committed_offset_in("b"),
+            Offset::new(0),
+            "a rejected ack commits nothing"
+        );
+        // Exactly at the head is accepted: it commits every existing record.
+        e.cumulative_ack_in("b", Offset::new(2)).unwrap();
+        assert_eq!(e.committed_offset_in("b"), Offset::new(2));
+    }
+
+    #[test]
+    fn broadcast_cumulative_ack_rejects_below_the_earliest_retained() {
+        // The disk-full drop-oldest policy force-reaps the oldest segment under a stuck consumer, so
+        // the earliest retained offset rises above 0. A broadcast cumulative ack below it names
+        // reaped records: rejected with the typed out-of-range error, cursor untouched (#288).
+        let one = one_record_bytes();
+        let mut e = open(config_disk_full(4 * one, DiskFullPolicy::DropOldest));
+        // A stuck consumer leases offset 0 and never acks, so the consumer-safe reaper cannot
+        // reclaim segment 0 and DropOldest force-reaps it once the byte cap is exceeded.
+        produce(&mut e, &[0xab; 16]);
+        assert!(matches!(e.poll_in("stuck", 0).unwrap(), Poll::Message(_)));
+        for _ in 0..20 {
+            e.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: &[0xab; 16],
+            })
+            .expect("drop-oldest accepts the produce");
+        }
+        let earliest = e.earliest_retained_offset().get();
+        assert!(earliest > 0, "drop-oldest should have reaped a prefix");
+        e.set_broadcast_in("b", true).unwrap();
+        // An up_to strictly below the earliest retained offset is rejected, cursor untouched.
+        assert!(matches!(
+            e.cumulative_ack_in("b", Offset::new(earliest - 1)),
+            Err(EngineError::CumulativeAckOutOfRange {
+                earliest_retained,
+                ..
+            }) if earliest_retained == earliest
+        ));
+        assert_eq!(
+            e.committed_offset_in("b"),
+            Offset::new(0),
+            "a rejected ack commits nothing"
+        );
+        // Exactly at the earliest retained offset is in range (the lower bound is inclusive).
+        e.cumulative_ack_in("b", Offset::new(earliest)).unwrap();
+        assert_eq!(e.committed_offset_in("b"), Offset::new(earliest));
+    }
+
+    #[test]
+    fn marking_broadcast_clears_key_shared_and_vice_versa() {
+        // Broadcast and key_shared are mutually exclusive (#288): each mode-set clears the other, so
+        // a group can never be both a competing key_shared cursor AND accept a cumulative ack.
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"a");
+        // key_shared first, then broadcast: the router is dropped and the cumulative ack is accepted.
+        e.set_key_ordering_in("g", KeyOrdering::KeyShared).unwrap();
+        assert_eq!(e.key_ordering_in("g"), KeyOrdering::KeyShared);
+        e.set_broadcast_in("g", true).unwrap();
+        assert!(e.is_broadcast_in("g"));
+        assert_eq!(
+            e.key_ordering_in("g"),
+            KeyOrdering::None,
+            "broadcast cleared the router"
+        );
+        e.cumulative_ack_in("g", Offset::new(1)).unwrap();
+        assert_eq!(e.committed_offset_in("g"), Offset::new(1));
+        // Now flip back to key_shared: the broadcast flag is cleared, so the cumulative ack is
+        // rejected again (the work-group guard is restored).
+        e.set_key_ordering_in("g", KeyOrdering::KeyShared).unwrap();
+        assert!(!e.is_broadcast_in("g"), "key_shared cleared broadcast");
+        assert!(matches!(
+            e.cumulative_ack_in("g", Offset::new(1)),
+            Err(EngineError::CumulativeAckOnWorkGroup)
+        ));
+        // Clearing broadcast back to false also restores the work-group rejection.
+        e.set_broadcast_in("g", false).unwrap();
+        e.set_broadcast_in("g", true).unwrap();
+        e.set_broadcast_in("g", false).unwrap();
+        assert!(!e.is_broadcast_in("g"));
+        assert!(matches!(
+            e.cumulative_ack_in("g", Offset::new(1)),
+            Err(EngineError::CumulativeAckOnWorkGroup)
+        ));
     }
 
     #[test]

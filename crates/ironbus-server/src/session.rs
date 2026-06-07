@@ -24,8 +24,8 @@ use ironbus_core::lease::LeaseToken;
 use ironbus_core::types::Offset;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
-    decode_ack, decode_pub, decode_sub, encode_dead_letter, encode_deliver, encode_truncated,
-    AckOp, DeadLetterBody, DeliverBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER,
+    decode_ack, decode_cumulative_ack, decode_pub, decode_sub, encode_dead_letter, encode_deliver,
+    encode_truncated, AckOp, DeadLetterBody, DeliverBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER,
 };
 use ironbus_storage::fs::Filesystem;
 use std::collections::HashMap;
@@ -303,6 +303,11 @@ impl Session {
             }
             Some(FrameType::Pub) => self.handle_pub(engine, body, out).map(|()| false),
             Some(FrameType::Ack) => self.handle_ack(engine, body, out).map(|()| true),
+            // A cumulative ack commits the broadcast cursor (when accepted), so it returns `true` to
+            // run the interval checkpoint, exactly like a per-message Ack (#288).
+            Some(FrameType::CumulativeAck) => {
+                self.handle_cumulative_ack(engine, body, out).map(|()| true)
+            }
             Some(FrameType::Flow) => self.handle_flow(engine, body, out).map(|()| true),
             Some(FrameType::Sub) => self.handle_sub(engine, body, out).map(|()| false),
             Some(FrameType::Unsub) => self.handle_unsub(engine, out).map(|()| true),
@@ -472,6 +477,61 @@ impl Session {
                     }
                 };
                 reply(out, FrameType::AckStatus, &[status]);
+                Ok(())
+            }
+        }
+    }
+
+    /// Handles a BROADCAST cumulative ack (the tag-19 `CumulativeAck` frame, #288): commits the
+    /// named broadcast group's single cursor up to the body's exclusive `up_to` offset. The body
+    /// carries its own group name (it does not depend on a prior SUB), so a broadcast consumer can
+    /// drive the verb on any group it owns. The engine enforces the safety contract: only a group
+    /// MARKED broadcast accepts the verb (a competing or `key_shared` group is rejected with the
+    /// work-group error, unchanged from #63), `up_to` is validated against the durable head and the
+    /// earliest-retained offset, and a re-ack is an idempotent no-op success. A success replies the
+    /// generic `Ok`; a rejection replies a typed `Err` with the engine's reason; a fatal engine
+    /// error ends the session, exactly like the produce and nack paths.
+    fn handle_cumulative_ack<
+        F: Filesystem + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        let Ok(ack) = decode_cumulative_ack(body) else {
+            reply_err(out, "malformed cumulative-ack body");
+            return Ok(());
+        };
+        let Ok(group) = core::str::from_utf8(ack.group) else {
+            reply_err(out, "cumulative-ack group name must be valid UTF-8");
+            return Ok(());
+        };
+        let group = group.to_string();
+        let up_to = Offset::new(ack.up_to);
+        match engine.with(move |e| e.cumulative_ack_in(&group, up_to))? {
+            Ok(()) => {
+                // A committed (or idempotent no-op) cumulative ack: the generic body-less success.
+                reply(out, FrameType::Ok, &[]);
+                Ok(())
+            }
+            // A fatal engine error (a frozen writer surfaced through a storage fault) wedges every
+            // future op, so end the session rather than masquerade it as a transient rejection.
+            Err(e) if e.is_fatal() => {
+                reply_err(out, "fatal storage error");
+                Err(SessionError::EngineFatal(e))
+            }
+            // The work-group reject (#63) and the out-of-range reject (#288) are both client-visible,
+            // recoverable rejections: surface the engine's typed reason so the client learns why and
+            // the connection stays open.
+            Err(e) => {
+                reply_err(out, &e.to_string());
                 Ok(())
             }
         }
@@ -1381,6 +1441,91 @@ mod tests {
                 "group {group:?} independently sees the whole log"
             );
         }
+    }
+
+    #[test]
+    fn cumulative_ack_over_the_wire_commits_a_broadcast_group_and_rejects_a_work_group() {
+        // The tag-19 CumulativeAck verb (#288) end to end through the session: the body carries its
+        // own group name and the exclusive `up_to`. A group marked broadcast accepts it (reply Ok and
+        // the cursor moves); a competing group is rejected with a typed Err and its cursor is
+        // untouched; a re-ack is an idempotent Ok no-op.
+        use ironbus_proto::message::{encode_cumulative_ack, CumulativeAckBody};
+        let e = DirectEngine::new(engine());
+        for p in [&b"a"[..], b"b", b"c", b"d"] {
+            produce(&e, p);
+        }
+        // Mark the "bcast" group broadcast server-side (the v1 mode-wiring seam).
+        e.with(|eng| eng.set_broadcast_in("bcast", true))
+            .unwrap()
+            .unwrap();
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        // Cumulative ack the broadcast group up to 3 (exclusive): reply Ok, cursor moves to 3.
+        let mut body = Vec::new();
+        encode_cumulative_ack(
+            &CumulativeAckBody {
+                up_to: 3,
+                group: b"bcast",
+            },
+            &mut body,
+        );
+        s.process(&e, &frame(FrameType::CumulativeAck, &body), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "broadcast ack is Ok");
+        assert_eq!(
+            e.with(|eng| eng.committed_offset_in("bcast")).unwrap(),
+            Offset::new(3)
+        );
+        // A re-ack at a lower offset is an idempotent Ok no-op (no regression).
+        out.clear();
+        let mut body = Vec::new();
+        encode_cumulative_ack(
+            &CumulativeAckBody {
+                up_to: 1,
+                group: b"bcast",
+            },
+            &mut body,
+        );
+        s.process(&e, &frame(FrameType::CumulativeAck, &body), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "re-ack is Ok");
+        assert_eq!(
+            e.with(|eng| eng.committed_offset_in("bcast")).unwrap(),
+            Offset::new(3),
+            "no regression"
+        );
+        // A competing group (default, never marked broadcast) is rejected with a typed Err and its
+        // cursor is untouched, so the work-group safety trap holds over the wire too (#63).
+        out.clear();
+        let mut body = Vec::new();
+        encode_cumulative_ack(
+            &CumulativeAckBody {
+                up_to: 2,
+                group: b"",
+            },
+            &mut body,
+        );
+        s.process(&e, &frame(FrameType::CumulativeAck, &body), &mut out)
+            .unwrap();
+        let (ty, msg) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::Err,
+            "a work-group cumulative ack is rejected"
+        );
+        assert!(
+            String::from_utf8_lossy(&msg).contains("competing work-group"),
+            "the typed reason is surfaced: {}",
+            String::from_utf8_lossy(&msg)
+        );
+        assert_eq!(
+            e.with(|eng| eng.committed_offset()).unwrap(),
+            Offset::new(0),
+            "the rejected work-group ack commits nothing"
+        );
     }
 
     /// Produces a keyed record through the engine, for the `key_shared` session tests.

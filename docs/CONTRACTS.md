@@ -285,8 +285,9 @@ test in `frame.rs`. They start at 1 and are contiguous.
 | 16  | `FlowEnd`   | server to client | the count delivered in the batch as a 4-byte LE u32 |
 | 17  | `DeadLetter`| server to client | `DeadLetterBody` (9 bytes, below) |
 | 18  | `Truncated` | server to client | `TruncatedBody` (16 bytes, below) |
+| 19  | `CumulativeAck` | client to server | `CumulativeAckBody` (below): the exclusive `up_to` offset then the group name |
 
-`from_u8` returns `None` for tag 0 and for tags 19 and above (unknown, still framed by the
+`from_u8` returns `None` for tag 0 and for tags 20 and above (unknown, still framed by the
 envelope).
 
 ### PubBody (wire body of `Pub`)
@@ -362,6 +363,28 @@ Trailing bytes are rejected.
 The entire frame body is the work-group name bytes (no length prefix of its own). An
 empty name selects the default group. The server validates the name's shape and the group
 cap when the group is first used (#240); the codec only carries the bytes.
+
+### CumulativeAckBody (wire body of `CumulativeAck`, tag 19)
+
+The broadcast cumulative ack (ack-all-up-to-offset, #288): the safe broadcast half of the
+`JetStream` `AckAll` verb. The leading 8-byte `up_to` is the EXCLUSIVE commit offset; the
+remainder of the body is the work-group name (the same whole-tail-is-the-name shape as
+`SubBody`).
+
+| field   | type  | width | notes |
+|---------|-------|-------|-------|
+| `up_to` | u64   | 8     | the exclusive offset to commit the broadcast cursor up to (every offset strictly below it is acked), little-endian |
+| `group` | bytes | rest  | the work-group name (empty selects the default group); the remainder of the body |
+
+A body shorter than the 8-byte `up_to` is rejected (`BodyError::Truncated`); a body of
+exactly 8 bytes is the default group (empty name). The server accepts the verb ONLY for a
+group marked BROADCAST (a group-of-one that sees every record in order); a competing or
+`key_shared` work-group is rejected with `EngineError::CumulativeAckOnWorkGroup`, and an
+`up_to` past the durable head or below the earliest-retained offset is rejected with
+`EngineError::CumulativeAckOutOfRange`. Both rejections answer a typed `Err` frame and leave
+the cursor untouched; a successful (or idempotent re-ack) commit answers `Ok`. The commit is
+idempotent and monotonic: an `up_to` at or below the current commit (within the window) is a
+no-op success and the watermark never moves backwards.
 
 ---
 
@@ -526,7 +549,8 @@ code; the code is canonical.
   `CONNECT 0x08`, `PING 0x09`, `PONG 0x0A`, `ERR 0x0B`. The frozen implementation tags are
   `Connect 1`, `Info 2`, `Ping 3`, `Pong 4`, `Pub 5`, `Sub 6`, `Unsub 7`, `Ack 8`,
   `Nack 9`, `Flow 10`, `Ok 11`, `Err 12`, `Deliver 13`, `PubAck 14`, `AckStatus 15`,
-  `FlowEnd 16`, `DeadLetter 17`, `Truncated 18`. None of the draft's numbers match.
+  `FlowEnd 16`, `DeadLetter 17`, `Truncated 18`, `CumulativeAck 19`. None of the draft's
+  numbers match.
 - **Deliver/MSG.** The draft's `MSG` carried `offset, attempt, header list, key, payload`.
   The real `DeliverBody` carries `offset, generation, flags, timestamp_ms, key, headers,
   payload` and has NO `attempt` field on the wire.

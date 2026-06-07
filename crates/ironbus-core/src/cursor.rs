@@ -215,6 +215,54 @@ impl AckCursor {
         true
     }
 
+    /// Commits the watermark up to the EXCLUSIVE offset `up_to` (every offset strictly below
+    /// `up_to` becomes acked), the cumulative-ack ("ack-all-up-to-offset") move for a BROADCAST
+    /// consumer (#288): a group-of-one that sees every record in order can commit its single
+    /// cursor straight to an offset without the gap-filling an out-of-order [`AckCursor::ack`]
+    /// sequence does. Returns `true` if the watermark advanced, `false` if `up_to` was at or below
+    /// the current watermark (an idempotent re-ack, a no-op success).
+    ///
+    /// The watermark NEVER moves backwards: an `up_to` at or below `committed` is ignored. Any
+    /// acked-ahead ranges the new watermark now subsumes are dropped (their offsets are below the
+    /// watermark, so they are committed); a range straddling `up_to` is clipped to begin at
+    /// `up_to`. The caller is responsible for validating `up_to` against the durable head and the
+    /// earliest-retained offset BEFORE calling this (the cursor is pure and has no view of the
+    /// log); this method only maintains the cursor's own shape invariants.
+    pub fn commit_up_to(&mut self, up_to: Offset) -> bool {
+        let up_to = up_to.get();
+        // Idempotent / monotonic: an up_to at or below the watermark is a no-op success. This is
+        // the re-ack case (the same or a lower offset is acked again) and the only way the cursor
+        // could otherwise regress, so it is refused here.
+        if up_to <= self.committed {
+            return false;
+        }
+        self.committed = up_to;
+        // Drop every ahead range now fully below the watermark, and clip a range that straddles
+        // `up_to` so it starts at the watermark (its lower offsets are committed). A range whose
+        // start is at or above `up_to` is untouched; ranges stay sorted, so the first surviving
+        // range bounds the rest. retain_mut keeps the in-place clip and the drop in one pass.
+        self.ahead.retain_mut(|(s, e)| {
+            if *e <= up_to {
+                false
+            } else {
+                *s = (*s).max(up_to);
+                true
+            }
+        });
+        // A range that now begins exactly at the watermark is contiguous: advance over it (and any
+        // further contiguous run), exactly as an in-order ack would, so the cursor's "first ahead
+        // range starts strictly above committed" invariant holds.
+        while let Some(&(start, end)) = self.ahead.first() {
+            if start == self.committed {
+                self.committed = end;
+                self.ahead.remove(0);
+            } else {
+                break;
+            }
+        }
+        true
+    }
+
     fn contains_ahead(&self, offset: u64) -> bool {
         self.ahead.iter().any(|&(s, e)| offset >= s && offset < e)
     }
@@ -371,6 +419,89 @@ mod tests {
         // Filling 1 collapses the whole run: committed jumps to 4.
         assert!(c.ack(off(1)));
         assert_eq!(c.committed(), off(4));
+        assert_eq!(c.ahead_len(), 0);
+    }
+
+    #[test]
+    fn commit_up_to_advances_the_watermark() {
+        let mut c = AckCursor::new();
+        // Commit up to an exclusive offset: every offset strictly below it is acked.
+        assert!(c.commit_up_to(off(5)));
+        assert_eq!(c.committed(), off(5));
+        assert!(c.is_acked(off(4)) && !c.is_acked(off(5)));
+        assert_eq!(c.ahead_len(), 0);
+    }
+
+    #[test]
+    fn commit_up_to_is_idempotent_and_never_regresses() {
+        let mut c = AckCursor::new();
+        assert!(c.commit_up_to(off(10)));
+        assert_eq!(c.committed(), off(10));
+        // A re-ack at the same offset is a no-op success, not a regression.
+        assert!(!c.commit_up_to(off(10)));
+        assert_eq!(c.committed(), off(10));
+        // A lower up_to is also a no-op success: the watermark holds.
+        assert!(!c.commit_up_to(off(3)));
+        assert_eq!(c.committed(), off(10));
+        // up_to == 0 on a fresh cursor is the trivial no-op.
+        let mut fresh = AckCursor::new();
+        assert!(!fresh.commit_up_to(off(0)));
+        assert_eq!(fresh.committed(), off(0));
+    }
+
+    #[test]
+    fn commit_up_to_subsumes_and_clips_the_ahead_set() {
+        let mut c = AckCursor::new();
+        // Ahead set: 2..5 and 7..9 (gaps at 0,1,5,6). Committed stays at 0.
+        for o in [2u64, 3, 4, 7, 8] {
+            c.ack(off(o));
+        }
+        assert_eq!(c.committed(), off(0));
+        assert_eq!(c.ahead_ranges(), &[(2, 5), (7, 9)]);
+        // Commit up to 3 (exclusive): 2..5 straddles, so it clips to 3..5; since 3 is now contiguous
+        // with the watermark, the advance loop absorbs the whole clipped 3..5 run, so committed
+        // jumps to 5. The 7..9 run is untouched (still a gap at 5,6 below it).
+        assert!(c.commit_up_to(off(3)));
+        assert_eq!(
+            c.committed(),
+            off(5),
+            "the clipped contiguous run is absorbed"
+        );
+        assert_eq!(c.ahead_ranges(), &[(7, 9)]);
+        assert!(c.is_acked(off(4)) && !c.is_acked(off(5)) && !c.is_acked(off(6)));
+        // Commit past the second run: 7..9 is fully subsumed (offsets 7,8 are below the watermark).
+        assert!(c.commit_up_to(off(9)));
+        assert_eq!(c.committed(), off(9));
+        assert_eq!(c.ahead_len(), 0);
+        assert!(c.is_acked(off(7)) && c.is_acked(off(8)));
+    }
+
+    #[test]
+    fn commit_up_to_into_a_gap_does_not_absorb_a_non_contiguous_run() {
+        let mut c = AckCursor::new();
+        // Ahead set: 5..7 (gaps at 0..5). Committed stays at 0.
+        c.ack(off(5));
+        c.ack(off(6));
+        assert_eq!(c.ahead_ranges(), &[(5, 7)]);
+        // Commit up to 3 (exclusive): lands in the gap below 5, so the 5..7 run is NOT contiguous
+        // and stays put. Committed is exactly 3; 3 and 4 remain unacked gaps.
+        assert!(c.commit_up_to(off(3)));
+        assert_eq!(c.committed(), off(3));
+        assert_eq!(c.ahead_ranges(), &[(5, 7)]);
+        assert!(!c.is_acked(off(3)) && !c.is_acked(off(4)));
+        assert!(c.is_acked(off(5)) && c.is_acked(off(6)));
+    }
+
+    #[test]
+    fn commit_up_to_then_advance_over_a_contiguous_run() {
+        let mut c = AckCursor::new();
+        // Ahead set has 5..7. Committing up to exactly 5 makes it contiguous, so the watermark
+        // jumps the whole run to 7 in one call (no separate ack needed).
+        c.ack(off(5));
+        c.ack(off(6));
+        assert_eq!(c.ahead_ranges(), &[(5, 7)]);
+        assert!(c.commit_up_to(off(5)));
+        assert_eq!(c.committed(), off(7), "the contiguous run is absorbed");
         assert_eq!(c.ahead_len(), 0);
     }
 
@@ -733,6 +864,40 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>()
                 .len() as u64;
             prop_assert_eq!(c.ahead_len(), distinct_ahead);
+        }
+
+        /// Interleaving per-message acks with cumulative `commit_up_to` jumps keeps every cursor
+        /// invariant: the watermark is monotonic non-decreasing (never regresses, even on a lower
+        /// `up_to`), the ahead set stays sorted/disjoint/non-adjacent/above-committed, and every
+        /// offset below the watermark reads as acked. This is the broadcast cumulative-ack safety
+        /// contract at the cursor level (#288): a commit-up-to never silently drops a gap below it.
+        #[test]
+        fn commit_up_to_interleaved_with_acks_holds_invariants(
+            ops in prop::collection::vec((any::<bool>(), 0u64..40), 0..80),
+        ) {
+            let mut c = AckCursor::new();
+            let mut last_committed = 0u64;
+            for &(is_commit, o) in &ops {
+                if is_commit {
+                    c.commit_up_to(off(o));
+                } else {
+                    c.ack(off(o));
+                }
+                // Monotonic: the watermark never moves backwards under either op.
+                prop_assert!(c.committed().get() >= last_committed, "committed regressed");
+                last_committed = c.committed().get();
+                // Shape: ranges non-empty, sorted, disjoint, non-adjacent, strictly above committed.
+                let mut prev_end = c.committed().get();
+                for &(s, e) in &c.ahead {
+                    prop_assert!(s < e, "range is non-empty");
+                    prop_assert!(s > prev_end, "ranges are above committed, disjoint, non-adjacent");
+                    prev_end = e;
+                }
+                // No silent skip: every offset below the watermark is acked.
+                for below in c.committed().get().saturating_sub(5)..c.committed().get() {
+                    prop_assert!(c.is_acked(off(below)), "offset {below} below committed must be acked");
+                }
+            }
         }
 
         #[test]

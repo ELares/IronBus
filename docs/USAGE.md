@@ -81,6 +81,7 @@ resume" below), so it is NOT fsynced on every ack.
 | `--max-groups <n>` | `1024` | Cap on the number of live work-groups; a new named group past the cap is rejected (the default group is exempt and never counted). `0` means unlimited. |
 | `--disk-full-policy <drop-new\|drop-oldest>` | `drop-new` | What an over-cap produce does once `--max-total-bytes` is hit: `drop-new` sheds it (preserving older data); `drop-oldest` force-reaps the oldest sealed segment to make room, then accepts it. |
 | `--key-shared-group <name>` | none | Repeatable: declares a named competing group that runs in `key_shared` ordering, so a record's key routes to one live member and same-key records keep their order while the group drains in parallel across keys. Pass once per group. |
+| `--broadcast-group <name>` | none | Repeatable: marks a named group BROADCAST (a group-of-one that sees every record in order), so it accepts the `cumulative-ack` verb. Mutually exclusive with `key_shared`. Pass once per group. |
 | `--visibility-timeout-ms <n>` | `30000` | How long a delivered message stays in flight before it may redeliver. Must be at least 1. The lease hard cap is the larger of 5 minutes and this. |
 | `--health-addr <host:port>` | off | If set, also serve the health and metrics HTTP endpoints on this loopback port. |
 
@@ -248,6 +249,25 @@ Per-group cursors are durable: each named group checkpoints to its own
 so a group resumes past its acked messages after a restart instead of redelivering the
 whole log from offset 0. The same `--checkpoint-interval` and clean-disconnect flush rules
 from "Restart and resume" apply per group.
+
+### Cumulative ack for a broadcast group
+
+A group declared BROADCAST (a group-of-one that sees every record in order) can commit its
+cursor up to an offset in ONE move with the `cumulative-ack` verb (ack-all-up-to-offset),
+instead of acking each message. Mark the group broadcast at `serve` time, then commit:
+
+```sh
+ironbus serve --data-dir /var/lib/ironbus --broadcast-group analytics &
+# ... produce and consume on the analytics group ...
+# Commit the analytics cursor up to (exclusive) offset 100 in one call:
+ironbus cumulative-ack --group analytics --up-to 100
+```
+
+`--up-to` is EXCLUSIVE (every offset strictly below it is acked). The broker validates it
+against the durable head and the earliest-retained offset and rejects an out-of-range value;
+a re-ack at or below the current commit is an idempotent no-op success. This verb is offered
+ONLY for a broadcast group: a competing or `key_shared` group is hard-rejected (committing a
+shared cursor past peers' still-in-flight messages would silently drop them).
 
 ## Offline inspection
 
