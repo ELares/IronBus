@@ -1111,9 +1111,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     ///
     /// This is deliberately NOT called on every counter increment (an fsync per produce/ack would
     /// destroy throughput). It is called on the cursor-checkpoint cadence ([`Engine::maybe_checkpoint`])
-    /// and the graceful-shutdown flush ([`Engine::checkpoint_all_groups`] /
-    /// [`Engine::checkpoint_cursor`]), so the resumed counters are a MONOTONIC LOWER BOUND that loses
-    /// at most the increments since the last snapshot on a crash, which observability tolerates.
+    /// and the graceful-shutdown flush ([`Engine::checkpoint_all_groups`]), so the resumed counters
+    /// are a MONOTONIC LOWER BOUND that loses at most the increments since the last snapshot on a
+    /// crash, which observability tolerates.
     ///
     /// # Errors
     /// Propagates a storage error from writing the snapshot. Callers that piggyback it on a cursor
