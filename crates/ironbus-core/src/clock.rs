@@ -110,6 +110,21 @@ impl Clock for ManualClock {
     }
 }
 
+/// Cloning snapshots both clocks at their current values; the clone is an INDEPENDENT clock
+/// thereafter (advancing one does not advance the other). The engine clones its clock to give a
+/// secondary durable store (the DLQ sink, #63) its own time source, and that sink only needs the
+/// wall clock to stamp segment-creation timestamps, so an independent clone is correct. Tests that
+/// must drive both from one place share an `Arc<ManualClock>` instead, whose `Clone` aliases the
+/// SAME clock.
+impl Clone for ManualClock {
+    fn clone(&self) -> ManualClock {
+        ManualClock {
+            unix_millis: AtomicU64::new(self.unix_millis.load(Ordering::SeqCst)),
+            monotonic_nanos: AtomicU64::new(self.monotonic_nanos.load(Ordering::SeqCst)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

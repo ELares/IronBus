@@ -89,7 +89,7 @@ impl Session {
     /// # Errors
     /// Returns [`SessionError::BadFrame`] if a frame envelope is malformed; the caller must
     /// then close the connection (a length-prefixed stream cannot resync).
-    pub fn process<F: Filesystem, C: Clock>(
+    pub fn process<F: Filesystem, C: Clock + Clone>(
         &mut self,
         engine: &mut Engine<F, C>,
         input: &[u8],
@@ -113,7 +113,7 @@ impl Session {
         }
     }
 
-    fn dispatch<F: Filesystem, C: Clock>(
+    fn dispatch<F: Filesystem, C: Clock + Clone>(
         &mut self,
         engine: &mut Engine<F, C>,
         type_tag: u8,
@@ -158,7 +158,7 @@ impl Session {
         }
     }
 
-    fn handle_pub<F: Filesystem, C: Clock>(
+    fn handle_pub<F: Filesystem, C: Clock + Clone>(
         &mut self,
         engine: &mut Engine<F, C>,
         body: &[u8],
@@ -213,7 +213,7 @@ impl Session {
     /// session is fenced (status 0) without touching the engine, so a second connection cannot
     /// commit or requeue a message destined for another consumer. The generation token still
     /// fences a stale op on an own-but-already-redelivered lease.
-    fn handle_ack<F: Filesystem, C: Clock>(
+    fn handle_ack<F: Filesystem, C: Clock + Clone>(
         &mut self,
         engine: &mut Engine<F, C>,
         body: &[u8],
@@ -307,7 +307,7 @@ impl Session {
     /// Fetches up to the requested number of messages and streams them as DELIVER frames,
     /// terminated by a `FlowEnd` whose body is the count delivered (so the client knows the
     /// batch is complete). The credit count is a little-endian `u32`.
-    fn handle_flow<F: Filesystem, C: Clock>(
+    fn handle_flow<F: Filesystem, C: Clock + Clone>(
         &mut self,
         engine: &mut Engine<F, C>,
         body: &[u8],
@@ -522,7 +522,7 @@ mod tests {
         frames
     }
 
-    fn produce<C: Clock>(e: &mut Engine<InMemoryFs, C>, payload: &[u8]) {
+    fn produce<C: Clock + Clone>(e: &mut Engine<InMemoryFs, C>, payload: &[u8]) {
         e.produce(&Append {
             timestamp_ms: 0,
             flags: RecordFlags::EMPTY,
@@ -677,7 +677,7 @@ mod tests {
 
     /// Sends one acknowledgement op and returns the status body, asserting the reply is a
     /// single `AckStatus` frame.
-    fn ack_reply<C: Clock>(
+    fn ack_reply<C: Clock + Clone>(
         s: &mut Session,
         e: &mut Engine<InMemoryFs, C>,
         op: AckOp,
@@ -1215,7 +1215,7 @@ mod tests {
     /// Encodes and sends one `Pub` over the session and returns the single response frame,
     /// asserting `process` did NOT end the session (a non-fatal reply keeps the connection
     /// open).
-    fn pub_reply<C: Clock>(
+    fn pub_reply<C: Clock + Clone>(
         s: &mut Session,
         e: &mut Engine<InMemoryFs, C>,
         payload: &[u8],

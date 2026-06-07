@@ -3,6 +3,7 @@
 #![warn(missing_docs)]
 
 pub mod checkpoint;
+pub mod dlq;
 pub mod fault;
 pub mod fs;
 pub mod invariants;

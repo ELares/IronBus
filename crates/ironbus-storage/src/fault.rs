@@ -156,6 +156,20 @@ impl<F: Filesystem> Filesystem for FaultFs<F> {
     fn sync_dir(&self) -> io::Result<()> {
         self.inner.sync_dir()
     }
+
+    fn subdir(&self, name: &str) -> io::Result<FaultFs<F>> {
+        // The subdirectory shares the SAME `FaultControl`, so a fault armed through the parent's
+        // control also fires on the dead-letter sink under the subdir. This is what lets a test
+        // inject a crash on the DLQ append between the append and the source-cursor commit (#63).
+        Ok(FaultFs {
+            inner: self.inner.subdir(name)?,
+            control: self.control.clone(),
+        })
+    }
+
+    fn subdir_exists(&self, name: &str) -> io::Result<bool> {
+        self.inner.subdir_exists(name)
+    }
 }
 
 /// A [`RandomAccessFile`] that wraps another and injects faults while the shared

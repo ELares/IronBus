@@ -727,6 +727,19 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         self.clock.now_monotonic_nanos()
     }
 
+    /// Clones the log's clock, so a SECONDARY durable store (the DLQ sink, #63) opened from the
+    /// same data directory shares the same kind of time source without the caller threading a
+    /// clock separately. For a `ManualClock` the clone is an independent snapshot; for an
+    /// `Arc<ManualClock>` it aliases the same clock; either is correct for the sink, which uses the
+    /// clock only to stamp segment-creation timestamps.
+    #[must_use]
+    pub fn clock_clone(&self) -> C
+    where
+        C: Clone,
+    {
+        self.clock.clone()
+    }
+
     /// Whether the writer is still live (an active segment is open). The writer freezes
     /// (`active` becomes `None`) when a fatal `fdatasync` fails (see [`Log::sync`]) or a segment
     /// roll fails; this reports that degraded state without a failing write, so a health check

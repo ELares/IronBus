@@ -48,7 +48,7 @@ pub fn serve_health<F, C>(
 ) -> std::io::Result<()>
 where
     F: Filesystem,
-    C: Clock,
+    C: Clock + Clone,
 {
     listener.set_nonblocking(true)?;
     while !shutdown.load(Ordering::Acquire) {
@@ -70,7 +70,7 @@ where
 fn handle<F, C>(mut stream: TcpStream, engine: &SharedEngine<F, C>) -> std::io::Result<()>
 where
     F: Filesystem,
-    C: Clock,
+    C: Clock + Clone,
 {
     // The accepted socket inherits the listener's non-blocking flag; reads must block for the
     // timeouts to apply (the wire handler does the same), else a request split across TCP
@@ -157,6 +157,7 @@ where
                     last_dead_lettered: g
                         .last_dead_lettered_offset()
                         .map_or(-1i64, |o| i64::try_from(o.get()).unwrap_or(i64::MAX)),
+                    dlq_records: g.dlq_records(),
                     counters: g.counters(),
                     fsync: g.fsync_histogram(),
                     groups: g.group_consumer_stats(),
@@ -182,6 +183,8 @@ struct MetricsSnapshot {
     recovery_loss_records: [u64; 5],
     /// The most recent dead-letter offset, or -1 if none (the exposition sentinel).
     last_dead_lettered: i64,
+    /// The number of records durably written to the DLQ sink (the dead-letter depth, #63).
+    dlq_records: u64,
     counters: Counters,
     fsync: LatencyHistogram,
     /// Per-work-group consumer position, for the lag-by-cursor series (#15, #16).
@@ -200,6 +203,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         recovery_loss,
         recovery_loss_records,
         last_dead_lettered,
+        dlq_records,
         counters,
         fsync,
         groups,
@@ -245,6 +249,9 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
          # HELP ironbus_dead_lettered_total Messages dead-lettered past MaxDeliver.\n\
          # TYPE ironbus_dead_lettered_total counter\n\
          ironbus_dead_lettered_total {dead_lettered}\n\
+         # HELP ironbus_dlq_records_total Records durably written to the dead-letter sink (the DLQ depth, survives restart).\n\
+         # TYPE ironbus_dlq_records_total counter\n\
+         ironbus_dlq_records_total {dlq_records}\n\
          # HELP ironbus_acks_total Commits via ack (a term commits through the same path).\n\
          # TYPE ironbus_acks_total counter\n\
          ironbus_acks_total {acks}\n\
@@ -572,6 +579,12 @@ mod tests {
         assert!(m.contains("\nironbus_produce_rejected_total 0\n"), "{m}");
         assert!(m.contains("\nironbus_delivered_total 0\n"), "{m}");
         assert!(m.contains("\nironbus_dead_lettered_total 0\n"), "{m}");
+        // The DLQ depth counter is present and zero on a broker that has never dead-lettered.
+        assert!(
+            m.contains("# TYPE ironbus_dlq_records_total counter"),
+            "{m}"
+        );
+        assert!(m.contains("\nironbus_dlq_records_total 0\n"), "{m}");
         // The fsync histogram: two produces above, so count and the +Inf bucket are 2. The
         // bucket distribution is timing-dependent under the system clock, so it is not pinned.
         assert!(m.contains("# TYPE ironbus_fsync_seconds histogram"), "{m}");
@@ -710,6 +723,74 @@ mod tests {
         assert!(m1.contains("\nironbus_produce_rejected_total 2\n"), "{m1}");
         // The successful produce was counted once and nothing more (the sheds did not inflate it).
         assert!(m1.contains("\nironbus_produced_total 1\n"), "{m1}");
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn metrics_renders_and_increments_dlq_records() {
+        use ironbus_core::clock::ManualClock;
+        // Build a broker over a manual clock so a redelivery's lease can be expired deterministically,
+        // dead-letter one message into the durable DLQ sink, then serve /metrics over it (the metric
+        // body is clock-agnostic). The DLQ depth counter must render and read 1.
+        let clock = Arc::new(ManualClock::new());
+        let engine = Engine::open(
+            InMemoryFs::new(),
+            Arc::clone(&clock),
+            EngineConfig {
+                log: LogConfig::default(),
+                // Tiny visibility/cap so a redelivery is reclaimable a few ns later.
+                lease: LeaseConfig {
+                    visibility_nanos: 30,
+                    hard_cap_nanos: 100,
+                },
+                delivery: DeliveryConfig::new(1, false, vec![]).unwrap(), // max_deliver = 1
+                max_in_flight: 16,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
+            },
+        )
+        .unwrap();
+        let shared: SharedEngine<InMemoryFs, Arc<ManualClock>> = Arc::new(Mutex::new(engine));
+        {
+            let mut g = shared.lock().unwrap();
+            g.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"poison",
+            })
+            .unwrap();
+            // First delivery, expire, then the second poll dead-letters it into the DLQ.
+            let _ = g.poll_now().unwrap();
+            clock.advance_monotonic_nanos(40);
+            assert!(matches!(g.poll_now().unwrap(), Poll::Parked { .. }));
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            let shared = Arc::clone(&shared);
+            move || serve_health(&listener, &shared, &shutdown).unwrap()
+        });
+
+        let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            m.contains("# TYPE ironbus_dlq_records_total counter"),
+            "{m}"
+        );
+        assert!(
+            m.contains("\nironbus_dlq_records_total 1\n"),
+            "the DLQ depth counter should read 1 after one dead-letter: {m}"
+        );
+        // The in-band advisory counter also fired.
+        assert!(m.contains("\nironbus_dead_lettered_total 1\n"), "{m}");
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();

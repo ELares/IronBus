@@ -10,7 +10,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// A clock backed by the operating system: wall time from `SystemTime`, monotonic time
 /// from `Instant` relative to when the clock was created.
-#[derive(Debug)]
+///
+/// `Clone` copies the monotonic origin, so a clone keeps reporting monotonic time from the SAME
+/// origin (its readings stay consistent with the original's). This lets the engine hand a
+/// secondary durable store (the DLQ sink, #63) its own clock with no behavior change.
+#[derive(Clone, Debug)]
 pub struct SystemClock {
     monotonic_origin: Instant,
 }
