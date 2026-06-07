@@ -12,9 +12,11 @@
 //! It is REAL and HONEST, per the issue's release-gate bar:
 //! - REAL: every step drives the ACTUAL `ironbus` binary over a real loopback TCP socket and a
 //!   real on-disk data dir. The installer step runs the ACTUAL `scripts/install.sh` fail-closed
-//!   `verify_checksum` over the just-built binary, then installs it via the same atomic
-//!   write-then-rename the installer uses and runs the INSTALLED copy for the rest of the run.
-//!   Nothing here is mocked.
+//!   `verify_checksum` over the just-built binary, then installs it via the installer's own
+//!   `install_binary` (the real atomic swap and `ironbus.prev` rollback retention), and runs the
+//!   INSTALLED copy for the rest of the run. Step 10's in-place upgrade likewise installs through
+//!   the real `install_binary`, so the `ironbus.prev` it asserts is the artifact the installer
+//!   itself produced, not one the harness fabricated. Nothing here is mocked.
 //! - HONEST: the parts that genuinely need the physical aarch64 reference device or a real
 //!   `dm-flakey` block layer cannot run in CI, and are NOT faked. The CI run measures
 //!   install-to-first-message and a throughput number on THIS host (x86_64 in CI) and records them
@@ -432,6 +434,36 @@ fn installer_verify(dir: &Path, bin: &str, asset: &str, sums: &str) -> i32 {
         .unwrap_or(-1)
 }
 
+/// Installs `src` at `dest` by invoking the ACTUAL `scripts/install.sh install_binary` (sourced
+/// with `IRONBUS_INSTALL_SH_SOURCED=1`, no network), so it exercises the REAL atomic-swap-plus-
+/// `.prev`-retention the live installer's `main` runs after verification. Returns the exit code
+/// (0 = installed). On an UPGRADE (a binary already at `dest`) the installer retains the prior
+/// binary as `<dest>.prev`; on a fresh install it creates no `.prev`. Panics if the script is
+/// missing or `/bin/sh` cannot be spawned.
+fn installer_install(src: &Path, dest: &Path) -> i32 {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("scripts")
+        .join("install.sh")
+        .canonicalize()
+        .expect("scripts/install.sh must exist at the repo root");
+    let cmd = format!(
+        ". \"$IB_INSTALLER\"; install_binary \"{}\" \"{}\"",
+        src.display(),
+        dest.display()
+    );
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(cmd)
+        .env("IRONBUS_INSTALL_SH_SOURCED", "1")
+        .env("IB_INSTALLER", &script)
+        .status()
+        .expect("failed to run /bin/sh")
+        .code()
+        .unwrap_or(-1)
+}
+
 /// SHA256 of a file as lowercase hex, shelling out to whatever the platform provides (matching the
 /// installer's own `sha256sum || shasum` approach, no crypto dependency).
 fn sha256_hex(path: &Path) -> String {
@@ -460,21 +492,6 @@ fn which(prog: &str) -> bool {
         .arg(format!("command -v {prog}"))
         .output()
         .is_ok_and(|o| o.status.success())
-}
-
-/// Installs `src` to `dest` the way `scripts/install.sh` does: atomic write-then-rename
-/// (`cp` to a sibling temp, `chmod 0755`, `mv -f`), so a reader never sees a partial file and an
-/// interrupted install never leaves a truncated binary. Panics on any IO error.
-fn atomic_install(src: &Path, dest: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let tmp = dest.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::copy(src, &tmp).expect("copy the verified binary to the install dir");
-    let mut perms = std::fs::metadata(&tmp)
-        .expect("stat the staged binary")
-        .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&tmp, perms).expect("chmod the staged binary");
-    std::fs::rename(&tmp, dest).expect("atomically rename the staged binary into place");
 }
 
 /// A self-cleaning scratch directory under the system temp root, unique per run.
@@ -553,10 +570,11 @@ fn golden_path_acceptance_install_to_recovery_to_upgrade() {
             "#103: the installer REJECTS a tampered binary (fail-closed, the tamper invariant)"
         );
 
-        // 1b. Install the REAL just-built binary the way the installer does: compute its digest,
+        // 1b. Install the REAL just-built binary through the ACTUAL installer: compute its digest,
         //     verify it against a SHA256SUMS we write over it (the same verify_checksum path), and
-        //     only then place it atomically. This proves the end-to-end install path over the
-        //     actual artifact, not just the fixture.
+        //     only then place it via the installer's own `install_binary`. This proves the
+        //     end-to-end install path over the actual artifact, not just the fixture. This is a
+        //     FRESH install (the bin dir is empty), so the real installer creates NO ironbus.prev.
         let real_asset = "ironbus-real";
         let staging = scratch.join("staging");
         std::fs::create_dir_all(&staging).expect("create the staging dir");
@@ -572,8 +590,16 @@ fn golden_path_acceptance_install_to_recovery_to_upgrade() {
             0,
             "#103: the real built binary verifies against its own SHA256SUMS before install"
         );
-        atomic_install(&staging.join(real_asset), &installed);
+        assert_eq!(
+            installer_install(&staging.join(real_asset), &installed),
+            0,
+            "#17: the real installer installs the verified binary"
+        );
         assert!(installed.exists(), "#17: the verified binary is installed");
+        assert!(
+            !bin_dir.join("ironbus.prev").exists(),
+            "#17: a FRESH install creates no ironbus.prev (nothing to retain)"
+        );
 
         // 1c. The installed copy is a working binary: `--version` prints `ironbus <semver>`.
         let (ver, code) = run_ok(&installed, &["--version"]);
@@ -700,9 +726,11 @@ fn golden_path_acceptance_install_to_recovery_to_upgrade() {
 
     // ===========================================================================================
     // STEP 4 (#3, #9, #288): FAN OUT to a broadcast consumer and a competing group with a keyed
-    // subset; assert single total durable order, per-group at-least-once, per-key head-of-line.
-    // Invariant proved: one durable order fans out; broadcast sees all in order; a competing group
-    // covers the batch exactly once; same-key records keep their order (head-of-line).
+    // subset; assert single total durable order, per-group at-least-once, and single-consumer keyed
+    // delivery order. Invariant proved: one durable order fans out; broadcast sees all in order; a
+    // competing group covers the batch exactly once; a single drain of a key_shared group keeps
+    // same-key records in produced order (the cross-consumer per-key routing is covered by the
+    // focused `ironbus-server` engine tests, not this single-reader harness).
     // ===========================================================================================
     {
         // The six records (offsets 0..6) are the single durable log. A plain group that fetches
@@ -754,16 +782,28 @@ fn golden_path_acceptance_install_to_recovery_to_upgrade() {
         summary.pass(Step {
             n: 4,
             name: "fan out: broadcast sees all in order; competing group covers the batch once",
-            invariants: "single-total-order,per-group-at-least-once,per-key-head-of-line",
+            invariants: "single-total-order,per-group-at-least-once,single-consumer-keyed-order",
             issues: "#3,#9,#288",
             scope: Scope::Ci,
         });
     }
 
-    // Step 4 continued: per-key HEAD-OF-LINE on a key_shared group needs a broker booted with
+    // Step 4 continued: keyed delivery ORDER on a key_shared group needs a broker booted with
     // `--key-shared-group`, and the broadcast cumulative-ack needs `--broadcast-group`. Use a
     // dedicated short-lived broker so the default boot above stays zero-config. This proves the
-    // keyed-subset ordering and the #288 broadcast cumulative ack on their configured groups.
+    // single-consumer keyed-order property and the #288 broadcast cumulative ack on their
+    // configured groups.
+    //
+    // HONEST SCOPE: this orchestrated harness drains the keyed group with ONE short-lived `sub`
+    // member, which proves same-key records keep their produced order (no reordering on the
+    // key_shared path) but does NOT isolate the CROSS-CONSUMER routing guarantee (a plain group
+    // would pass identically with one reader). The per-key AFFINITY across consumers (every record
+    // for a key routes to a single live member, not a peer, even mid-join) is exercised by the
+    // focused engine tests in `crates/ironbus-server/src/engine.rs`
+    // (`two_keys_to_two_members`, `same_key_always_routes_to_the_same_live_member`,
+    // `a_non_owner_never_takes_a_key_even_when_polling`,
+    // `per_key_order_survives_a_mid_stream_join_that_moves_the_owner`), which a one-shot CLI member
+    // cannot reproduce (two members must be live and polling concurrently to split keys).
     {
         let keyed_dir_path = scratch.join("data-keyed");
         let keyed_dir = keyed_dir_path
@@ -775,8 +815,9 @@ fn golden_path_acceptance_install_to_recovery_to_upgrade() {
             &keyed_dir,
             &["--key-shared-group", "keyed", "--broadcast-group", "watch"],
         );
-        // Produce three records under the SAME key "K" interleaved with another key, so the
-        // key_shared route must keep the same-key records in their produced order.
+        // Produce three records under the SAME key "K" interleaved with another key, so a
+        // single-consumer drain of the key_shared group must keep the same-key records in their
+        // produced order (no reordering).
         for (k, p) in [
             ("K", "k0"),
             ("J", "j0"),
@@ -788,8 +829,10 @@ fn golden_path_acceptance_install_to_recovery_to_upgrade() {
             assert_eq!(code, 0, "#9: keyed produce of {p} accepted");
             let _ = out;
         }
-        // A single member of the key_shared group drains the lot; the same-key subsequence is in
-        // produced order (head-of-line within a key), which is what key_shared guarantees.
+        // A SINGLE member of the key_shared group drains the lot; the same-key subsequence is in
+        // produced order. This asserts single-consumer keyed delivery order (no reordering on the
+        // key_shared path); the cross-consumer per-key affinity is covered by the focused engine
+        // tests noted above, not by this one-reader drain.
         let (out, code) = run_ok(
             &installed,
             &[
@@ -802,7 +845,7 @@ fn golden_path_acceptance_install_to_recovery_to_upgrade() {
         assert_eq!(
             k_subseq,
             vec!["k0", "k1", "k2"],
-            "#9,head-of-line: same-key records keep their produced order in the key_shared group: {out}"
+            "#9,single-consumer keyed order: same-key records keep their produced order when one member drains the key_shared group: {out}"
         );
         // The #288 broadcast cumulative-ack on the configured broadcast group "watch": fetch the
         // batch, then commit the cursor up to the head in one move; a re-fetch then sees nothing.
@@ -1298,21 +1341,25 @@ fn golden_path_acceptance_install_to_recovery_to_upgrade() {
     }
 
     // ===========================================================================================
-    // STEP 10 (#17): UPGRADE in place (atomic swap, ironbus.prev retained); assert the data dir
-    // opens cleanly with no migration within the major version.
-    // Invariant proved: an in-place atomic binary swap keeps a backup and the SAME data dir opens
+    // STEP 10 (#17): UPGRADE in place via the REAL installer (atomic swap; the prior binary is
+    // retained as the REAL `ironbus.prev` the installer itself creates); assert the data dir opens
+    // cleanly with no migration within the major version.
+    // Invariant proved: an in-place atomic binary swap retains a genuine rollback copy
+    // (`ironbus.prev`, a real product feature of `scripts/install.sh`) and the SAME data dir opens
     // cleanly (no format migration within the major version).
     // ===========================================================================================
     {
-        // Simulate the in-place upgrade: the installer's atomic swap renames the live binary to
-        // `ironbus.prev` and moves the new (re-verified) binary into place. We use the SAME built
-        // binary as the "new" version (the v1 format is frozen, so a same-major upgrade reads the
-        // same data dir with no migration); the point under test is the SWAP MECHANICS and the
-        // CLEAN REOPEN, not a version bump.
+        // The in-place upgrade through the REAL installer: re-verify the new artifact (the
+        // installer never places an unverified binary, even on upgrade), then run the ACTUAL
+        // `scripts/install.sh install_binary`, which on an upgrade retains the prior binary as
+        // `ironbus.prev` (a real product feature, #133 step 10 rollback safety) before atomically
+        // swapping the new (re-verified) binary into place. We use the SAME built binary as the
+        // "new" version (the v1 format is frozen, so a same-major upgrade reads the same data dir
+        // with no migration); the point under test is the real SWAP MECHANICS, the REAL `.prev`
+        // retention, and the CLEAN REOPEN, not a version bump.
         let prev = bin_dir.join("ironbus.prev");
-        // Re-verify the new artifact before the swap (the installer never places an unverified
-        // binary, even on upgrade), then retain the current binary as ironbus.prev and atomically
-        // move the new one into place.
+        // The exact bytes currently installed: the upgrade must retain THESE verbatim as .prev.
+        let prior_bytes = std::fs::read(&installed).expect("read the currently-installed binary");
         let staging = scratch.join("staging-upgrade");
         std::fs::create_dir_all(&staging).expect("create the upgrade staging dir");
         let asset = "ironbus-upgrade";
@@ -1325,13 +1372,28 @@ fn golden_path_acceptance_install_to_recovery_to_upgrade() {
             0,
             "#17: the upgrade artifact is re-verified before the swap (fail-closed on upgrade too)"
         );
-        // Retain the current binary as ironbus.prev (the rollback copy), then atomically install
-        // the new one over the live path.
-        std::fs::rename(&installed, &prev).expect("retain the current binary as ironbus.prev");
-        atomic_install(&staging.join(asset), &installed);
+        assert!(
+            !prev.exists(),
+            "#17: no ironbus.prev exists before the upgrade (it is a REAL artifact the installer creates, not fabricated here)"
+        );
+        // Install the re-verified upgrade via the REAL installer (not a fabricated rename): it is
+        // an UPGRADE (a binary already lives at `installed`), so install.sh retains the prior
+        // binary as ironbus.prev itself.
+        assert_eq!(
+            installer_install(&staging.join(asset), &installed),
+            0,
+            "#17: the real installer performs the in-place upgrade"
+        );
+        // Assert the REAL artifact the installer produced: ironbus.prev exists and holds the EXACT
+        // prior binary bytes (the genuine rollback copy), not a copy the harness made.
         assert!(
             prev.exists(),
-            "#17: the previous binary is retained as ironbus.prev (rollback)"
+            "#17: the REAL installer retained the previous binary as ironbus.prev (rollback)"
+        );
+        assert_eq!(
+            std::fs::read(&prev).expect("read ironbus.prev"),
+            prior_bytes,
+            "#17: ironbus.prev holds the EXACT previous binary bytes (a real rollback copy, not fabricated)"
         );
         assert!(installed.exists(), "#17: the upgraded binary is in place");
 

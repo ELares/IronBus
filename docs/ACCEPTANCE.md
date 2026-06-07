@@ -28,8 +28,9 @@ The run is REAL: nothing is mocked. Every step spawns `ironbus serve`, connects
 a real client over TCP, and produces and consumes over the wire against the
 actual on-disk segments. The installer step runs the actual
 [`scripts/install.sh`](../scripts/install.sh) fail-closed `verify_checksum`
-function over the just-built binary, then installs a copy of that binary through
-the same atomic write-then-rename the installer uses, and runs the INSTALLED
+function over the just-built binary, then installs it through the installer's own
+`install_binary` (the same atomic write-then-rename, and the same
+`ironbus.prev` rollback retention exercised in step 10), and runs the INSTALLED
 copy for the rest of the run.
 
 The run is HONEST about what cannot run in CI. The parts that genuinely require
@@ -66,13 +67,13 @@ points at one invariant and one issue.
 | 1 | Install via the fail-closed installer; a tampered artifact is rejected; capture install-to-first-message | installer fail-closed (never places an unverified binary) | #17, #103, #1 | CI runs the install + tamper-reject + measures the time; the `< 60 s` BOUND is device-only |
 | 2 | Boot zero-config; `/healthz` and `/readyz` come up bound to loopback only | loopback-only bind, a real router (404 for unknown paths) | #16, #18 | CI |
 | 3 | Produce N mixed-size records; every ack carries a durable offset (ack implies durable) | I2 | #3, #6 | CI |
-| 4 | Fan out to a broadcast consumer and a competing group with a keyed subset | single total durable order, per-group at-least-once, per-key head-of-line | #3, #9, #288 | CI |
+| 4 | Fan out to a broadcast consumer and a competing group with a keyed subset | single total durable order, per-group at-least-once, single-consumer keyed delivery order (the cross-consumer per-key `key_shared` routing is covered by the focused `ironbus-server` engine tests) | #3, #9, #288 | CI |
 | 5 | Overload producers past the ring: spill-to-disk then drop-new with a REPORTED counter | spill-then-shed, reported-not-silent, no indefinite hang | #10, #13 | CI |
 | 6 | Power-cut mid-batch | a simulated power cut is applied | #21 | CI runs the SIMULATED unsynced-tail cut; the real `dm-flakey` cut is device-only |
 | 7 | Recover: consistent durable prefix, torn-tail truncation, structured loss report; the Prometheus counter and the on-disk report agree | I1, I3, counter-equals-report | #7, #8, #16 | CI |
 | 8 | Resume via stored cursor; a consumer below earliest_retained gets exactly one truncation and resets | durable-cursor resume, one-time truncation | #11, #13 | CI |
 | 9 | Inspect offline with the broker stopped: peek/dump reads only to the durable HWM and reports the same loss as recovery; fixed exit codes | offline inspection agrees with recovery, the fixed exit-code scheme | #15 | CI |
-| 10 | Upgrade in place (atomic swap, `ironbus.prev` retained); the data dir opens cleanly with no migration within the major version | atomic swap, clean reopen with no migration | #17 | CI |
+| 10 | Upgrade in place via the REAL `scripts/install.sh` (atomic swap, the prior binary retained as `ironbus.prev` by the installer itself); the data dir opens cleanly with no migration within the major version | atomic swap, real `ironbus.prev` rollback retention, clean reopen with no migration | #17 | CI |
 
 ## Running it in CI (x86_64)
 

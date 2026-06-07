@@ -47,6 +47,28 @@ fn run_verify(dir: &std::path::Path, bin: &str, asset: &str, sums: &str) -> i32 
     status.code().unwrap_or(-1)
 }
 
+/// Source the installer and invoke its pure `install_binary <src> <dest>` helper, returning the
+/// process exit code (0 = installed). This exercises the EXACT atomic-swap-plus-`.prev`-retention
+/// code path the live installer's `main` calls, with no network and no checksum step (the caller
+/// has already verified; `install_binary` is the post-verification install), so the rollback-safety
+/// behavior is proved over the real script.
+fn run_install_binary(src: &std::path::Path, dest: &std::path::Path) -> i32 {
+    let script = installer_path();
+    let cmd = format!(
+        ". \"$IB_INSTALLER\"; install_binary \"{}\" \"{}\"",
+        src.display(),
+        dest.display()
+    );
+    let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(cmd)
+        .env("IRONBUS_INSTALL_SH_SOURCED", "1")
+        .env("IB_INSTALLER", &script)
+        .status()
+        .expect("failed to run /bin/sh");
+    status.code().unwrap_or(-1)
+}
+
 /// `sha256sum`/`shasum`-style line for a payload, as the release `SHA256SUMS` carries it.
 fn sums_line(payload: &[u8], name: &str) -> String {
     use std::fmt::Write as _;
@@ -207,13 +229,81 @@ fn a_malformed_checksum_line_is_rejected() {
     assert_ne!(code, 0, "a malformed checksum line MUST be rejected");
 }
 
+#[test]
+fn an_upgrade_retains_the_prior_binary_as_ironbus_prev() {
+    // ROLLBACK SAFETY (#133 step 10): installing over an existing binary must retain the PRIOR
+    // bytes as `ironbus.prev` next to the destination, so an operator can roll back. This proves
+    // the REAL product invariant via the installer's own `install_binary`, not a harness rename.
+    let dir = tempdir::TempDir::new("ib-prev-upgrade");
+    let dest = dir.path().join("ironbus");
+    let prev = dir.path().join("ironbus.prev");
+
+    // A prior install: there is already a binary at the destination.
+    let old_bytes = b"ironbus v1 (the prior installed binary)";
+    std::fs::write(&dest, old_bytes).unwrap();
+    assert!(!prev.exists(), "no .prev exists before the upgrade");
+
+    // Upgrade: install a NEW binary's bytes over it.
+    let new_bytes = b"ironbus v2 (the upgrade)";
+    let src = dir.path().join("staged-new");
+    std::fs::write(&src, new_bytes).unwrap();
+    let code = run_install_binary(&src, &dest);
+    assert_eq!(code, 0, "install_binary must succeed on an upgrade");
+
+    // The destination now holds the NEW bytes, and the PRIOR bytes are retained verbatim as
+    // ironbus.prev (the rollback copy).
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        new_bytes,
+        "the upgrade installed the new binary at the destination"
+    );
+    assert!(
+        prev.exists(),
+        "an upgrade MUST retain the prior binary as ironbus.prev (#133 step 10 rollback)"
+    );
+    assert_eq!(
+        std::fs::read(&prev).unwrap(),
+        old_bytes,
+        "ironbus.prev holds the EXACT prior binary bytes (a real rollback copy)"
+    );
+}
+
+#[test]
+fn a_fresh_install_creates_no_ironbus_prev() {
+    // On a FRESH install (no prior binary at the destination) the installer must NOT fabricate an
+    // `ironbus.prev`: there is nothing to roll back to, so a spurious `.prev` would be a lie.
+    let dir = tempdir::TempDir::new("ib-prev-fresh");
+    let dest = dir.path().join("ironbus");
+    let prev = dir.path().join("ironbus.prev");
+    assert!(
+        !dest.exists(),
+        "the destination starts empty (a fresh install)"
+    );
+
+    let bytes = b"ironbus v1 (the first install)";
+    let src = dir.path().join("staged-fresh");
+    std::fs::write(&src, bytes).unwrap();
+    let code = run_install_binary(&src, &dest);
+    assert_eq!(code, 0, "install_binary must succeed on a fresh install");
+
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        bytes,
+        "the fresh install placed the binary at the destination"
+    );
+    assert!(
+        !prev.exists(),
+        "a FRESH install MUST NOT create an ironbus.prev (nothing to retain)"
+    );
+}
+
 /// A minimal, dependency-free temp-dir module (the workspace forbids adding new crates casually,
 /// so the test brings its own RAII temp dir under the system temp root).
 mod tempdir {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    // The six tests in this file run in parallel under one test process, so `process::id()` is
+    // The tests in this file run in parallel under one test process, so `process::id()` is
     // identical for every fixture and `SystemTime::now()` is too coarse on the CI macOS runner to
     // separate two dirs created in the same tick. A collision used to share one directory (because
     // `create_dir_all` is idempotent), and whichever `TempDir` dropped first would `remove_dir_all`

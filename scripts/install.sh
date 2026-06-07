@@ -133,6 +133,43 @@ download() {
     fi
 }
 
+# Atomically install the already-verified binary <src> at <dest>, retaining any prior binary as
+# `<dest>.prev` for rollback (#133 step 10). This is pure (no network) and is unit-tested in
+# isolation (see crates/ironbus-cli/tests/installer_verify.rs), so it must stay side-effect-free at
+# definition time and be POSIX-sh portable.
+#
+#   install_binary <src> <dest>
+#
+# CONTRACT (the caller has ALREADY passed fail-closed verification before calling this, so this
+# function never weakens verify-before-install):
+#   - Stages <src> next to <dest> as a sibling temp, chmods it 0755, so a reader never sees a
+#     partial file and an interrupted install never leaves a truncated binary at <dest>.
+#   - UPGRADE (a file already exists at <dest>): retains the CURRENT <dest> as `<dest>.prev` (an
+#     atomic same-directory `mv`, so the prior binary is never half-moved) BEFORE swapping the new
+#     binary into place, so an operator can roll back to the prior known-good bytes.
+#   - FRESH install (nothing at <dest>): retains nothing, so no spurious `.prev` is created.
+# Returns non-zero (without installing) on any IO error.
+install_binary() {
+    src="$1"
+    dest="$2"
+    tmp_dest="${dest}.tmp.$$"
+    cp "$src" "$tmp_dest" || { log "could not stage the binary next to $dest"; return 1; }
+    chmod 0755 "$tmp_dest" || { log "could not chmod the staged binary"; rm -f "$tmp_dest"; return 1; }
+
+    if [ -e "$dest" ]; then
+        prev_dest="${dest}.prev"
+        if ! mv -f "$dest" "$prev_dest"; then
+            log "could not retain the previous binary as $prev_dest"
+            rm -f "$tmp_dest"
+            return 1
+        fi
+        log "retained the previous binary as $prev_dest (rollback copy)"
+    fi
+
+    mv -f "$tmp_dest" "$dest" || { log "could not install to $dest"; return 1; }
+    return 0
+}
+
 # Build the release asset base URL for a tag (or the /latest/download redirect).
 asset_base_url() {
     version="$1"
@@ -211,12 +248,11 @@ main() {
     mkdir -p "$bin_dir" || die "could not create install dir: $bin_dir"
 
     dest="${bin_dir}/ironbus"
-    # Install atomically: write next to the target, chmod, then rename, so a reader never sees a
-    # partial file and an interrupted install does not leave a truncated binary at $dest.
-    tmp_dest="${dest}.tmp.$$"
-    cp "${workdir}/${asset}" "$tmp_dest" || die "could not write to $bin_dir"
-    chmod 0755 "$tmp_dest" || die "could not chmod the binary"
-    mv -f "$tmp_dest" "$dest" || die "could not install to $dest"
+    # Install atomically, retaining any prior binary as `ironbus.prev` for rollback (#133 step 10).
+    # This runs ONLY after the fail-closed checksum (and optional provenance) verification above has
+    # passed, so it never weakens verify-before-install: the new binary is fully verified before the
+    # `.prev` retention or the swap touch the install dir.
+    install_binary "${workdir}/${asset}" "$dest" || die "could not install to $dest"
 
     log "installed verified ironbus to $dest"
     case ":${PATH}:" in
