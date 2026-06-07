@@ -111,10 +111,11 @@ where
     loop {
         let n = stream.read(&mut chunk)?;
         if n == 0 {
-            // The client closed: flush the committed cursor so a clean reconnect resumes past
-            // acked messages. Best-effort: the checkpoint is a lagging optimization.
+            // The client closed: flush its work-group's committed cursor so a clean reconnect
+            // resumes past acked messages. Best-effort: the checkpoint is a lagging
+            // optimization. Routed to the session's group (#60), default-group if unsubscribed.
             let mut guard = engine.lock().unwrap_or_else(PoisonError::into_inner);
-            let _ = guard.checkpoint_cursor();
+            let _ = guard.checkpoint_group(session.subscription());
             return Ok(()); // the client closed the connection
         }
         inbuf.extend_from_slice(&chunk[..n]);
@@ -125,10 +126,11 @@ where
             let mut guard = engine.lock().unwrap_or_else(PoisonError::into_inner);
             let r = session.process(&mut guard, &inbuf, &mut out);
             if r.is_ok() {
-                // Persist the committed cursor on the configured interval so a crash redelivers
-                // a bounded tail. Best-effort: a checkpoint write failure only costs redelivery
-                // on restart, never correctness, so it must not fail the connection.
-                let _ = guard.maybe_checkpoint();
+                // Persist the session's work-group cursor on the configured interval so a
+                // crash redelivers a bounded tail. Best-effort: a checkpoint write failure only
+                // costs redelivery on restart, never correctness, so it must not fail the
+                // connection. Routed to the session's group (#60).
+                let _ = guard.maybe_checkpoint_group(session.subscription());
             }
             r
         };
