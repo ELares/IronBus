@@ -1556,12 +1556,20 @@ mod tests {
         // documented.
         let mut rendered: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for line in m.lines() {
-            if line.starts_with("ironbus_") && line.ends_with("_total 0") {
-                // Strip the trailing " 0" value (every counter is zero on a fresh broker).
-                let name = line.split_whitespace().next().unwrap_or("");
-                if name.ends_with("_total") {
-                    rendered.insert(name);
-                }
+            // A counter SAMPLE line is `ironbus_<...>_total <value>` with no label set. Match ANY
+            // unsigned value, not just `0`: a counter that happens to be non-zero on a fresh broker
+            // must NOT silently escape the exact-set check (a `_total 0` filter would skip it). A
+            // `# HELP`/`# TYPE` line (first token `#`) and a labeled line (name ends in `}`) are
+            // excluded by the `ironbus_*_total` name shape.
+            let Some((name, value)) = line.split_once(' ') else {
+                continue;
+            };
+            if name.starts_with("ironbus_")
+                && name.ends_with("_total")
+                && !value.is_empty()
+                && value.bytes().all(|b| b.is_ascii_digit())
+            {
+                rendered.insert(name);
             }
         }
         let expected: std::collections::BTreeSet<&str> =

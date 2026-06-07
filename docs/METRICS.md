@@ -117,9 +117,9 @@ and in `FROZEN_RESILIENCE_COUNTERS`, never as a silent change.
 
 ## See also
 
-- [USAGE.md](USAGE.md) — the operator guide; the "Health and metrics" section
+- [USAGE.md](USAGE.md): the operator guide; the "Health and metrics" section
   links here for the full catalog.
-- [THREAT_MODEL.md](THREAT_MODEL.md) — the trust model the metrics endpoint
+- [THREAT_MODEL.md](THREAT_MODEL.md): the trust model the metrics endpoint
   shares, and the bounded-loss fail-closed recovery control.
-- [INVARIANTS.md](INVARIANTS.md) — the resilience invariants (I1 to I8) the
+- [INVARIANTS.md](INVARIANTS.md): the resilience invariants (I1 to I8) the
   counters make observable.
