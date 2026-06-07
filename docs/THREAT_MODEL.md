@@ -249,7 +249,7 @@ the binary today; do not assume any of them.
 
 | Specified control | Status | Tracking issue |
 | --- | --- | --- |
-| Connection-scoped authentication; three authorization scopes (publish / subscribe / admin) | Specified, not implemented | #106 |
+| Connection-scoped authentication; three authorization scopes (publish / subscribe / admin), specified in [AUTHENTICATION.md](AUTHENTICATION.md) | Specified, not implemented | #106 |
 | TLS 1.3 transport; localhost-default bind enforced as an invariant; pre-auth DoS defenses (per-source rate limits, half-open caps, failed-auth backoff) | Specified, not implemented | #107 |
 | Optional at-rest AEAD encryption (AES-256-GCM / ChaCha20-Poly1305) and its interaction with checksums and recovery | Specified, not implemented | #108 |
 | Secret handling and redaction, security audit events, crypto SBOM posture, fail-closed on unsafe secret-file permissions | Specified, not implemented | #109 |
