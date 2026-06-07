@@ -357,10 +357,10 @@ Listed so a contributor does not mistake a spec for a guarantee.
   is enforced (`codec::decode` in `crates/ironbus-core/src/codec.rs` verifies the
   header then body CRC32C before the xxh3-64, and CRC32C gates resync). The
   "before decrypt" and "before decompress" halves are not enforced because
-  encryption-at-rest and compression are not implemented yet: only the
-  `COMPRESSED` flag bit (and a reserved future encryption bit) exist in
-  `crates/ironbus-core/src/types.rs`. Tracking: compression #12 / #139,
-  encryption-at-rest #18.
+  encryption-at-rest and compression are not implemented yet: of the relevant
+  record flag bits in `crates/ironbus-core/src/types.rs` only `COMPRESSED` is
+  defined (no encryption bit is allocated yet; the flags byte simply has
+  reserved space). Tracking: compression #12 / #139, encryption-at-rest #18.
 
 - **Opt-in ack-on-buffer durability mode (I2 exception).** The README lists
   `fdatasync` (default), `interval`, and `none` durability modes; only the
