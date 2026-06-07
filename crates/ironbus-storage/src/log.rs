@@ -54,11 +54,31 @@ pub struct LogConfig {
     /// and does not freeze the writer (see [`StorageError::AtCapacity`]); once retention frees
     /// space (#13), a later produce succeeds.
     pub max_total_bytes: u64,
+
+    /// Total byte budget for the forensic QUARANTINE store (#134): the capped, copy-not-move
+    /// capture of the corrupt bytes a recovery corruption skip dropped, kept under `quarantine/`
+    /// for offline analysis. When a capture would push the store over this, it evicts OLDEST blobs
+    /// first (FIFO) to make room; a single corrupt span larger than the whole budget is skipped, so
+    /// the forensic copy can never exhaust a small edge disk.
+    ///
+    /// `0` means UNLIMITED (the budget is off), matching the `0`-as-off convention of the other
+    /// byte caps; [`LogConfig::DEFAULT_MAX_QUARANTINE_BYTES`] (256 MiB) is the finite default. The
+    /// store is purely best-effort and forensic: this never affects what recovery recovers, and a
+    /// quarantine failure never fails [`Log::open`]. The percentage-aware ceiling the issue
+    /// describes (`min(256 MiB, 5% of the data-directory filesystem)`) is computed by the server at
+    /// config time, since the IO-free storage core cannot stat the host filesystem (refs #134).
+    pub max_quarantine_bytes: u64,
 }
 
 impl LogConfig {
     /// The frozen v1 default segment size, 64 MiB.
     pub const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+
+    /// The default total byte budget for the forensic quarantine store (#134), 256 MiB: the upper
+    /// half of the issue's `min(256 MiB, 5% of FS)` ceiling. A finite default so a forensic copy
+    /// is bounded out of the box; an operator can lower it (for a tiny edge disk) or set `0` to
+    /// disable the cap entirely.
+    pub const DEFAULT_MAX_QUARANTINE_BYTES: u64 = 256 * 1024 * 1024;
 
     /// The smallest sane `max_segment_bytes`: the segment header and footer plus room for at
     /// least two minimum-size records, so a segment can always hold more than one record. A
@@ -87,7 +107,17 @@ impl LogConfig {
         Ok(LogConfig {
             max_segment_bytes,
             max_total_bytes: 0,
+            max_quarantine_bytes: LogConfig::DEFAULT_MAX_QUARANTINE_BYTES,
         })
+    }
+
+    /// Sets the forensic quarantine byte budget ([`LogConfig::max_quarantine_bytes`]) and returns
+    /// the updated config. `0` disables the cap (unlimited). Most callers keep the default; this is
+    /// for an operator who wants a smaller forensic budget on a tiny edge disk, or none at all.
+    #[must_use]
+    pub fn with_max_quarantine_bytes(mut self, max_quarantine_bytes: u64) -> LogConfig {
+        self.max_quarantine_bytes = max_quarantine_bytes;
+        self
     }
 
     /// Sets the hard durable-log byte cap (`max_total_bytes`) and returns the updated config.
@@ -135,6 +165,9 @@ impl Default for LogConfig {
             // Unlimited durable-log byte cap by default: spill-by-default behavior is
             // unchanged, an operator opts in to the shed.
             max_total_bytes: 0,
+            // A finite forensic quarantine budget by default, so a corrupt-byte copy is bounded
+            // out of the box (#134).
+            max_quarantine_bytes: LogConfig::DEFAULT_MAX_QUARANTINE_BYTES,
         }
     }
 }
@@ -271,6 +304,12 @@ pub struct Log<F: Filesystem, C: Clock> {
     /// `recovered_truncated_bytes`, but as per-segment events carrying the byte span and the
     /// reason. Empty for a fresh log or a clean recovery.
     loss_report: LossReport,
+    /// Total bytes copied into the forensic quarantine store at recovery (#134): the corrupt
+    /// regions a corruption skip dropped, captured for offline analysis. Zero for a fresh log, a
+    /// clean recovery, or a recovery whose only loss was a clean torn tail (which is not
+    /// quarantined). Best-effort: a quarantine write failure leaves this lower than the dropped
+    /// bytes WITHOUT failing the open. Exposed for the `ironbus_quarantine_bytes` gauge.
+    quarantined_bytes: u64,
 }
 
 impl<F: Filesystem, C: Clock> Log<F, C> {
@@ -302,6 +341,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     total_record_count: 0,
                     recovered_truncated_bytes: 0,
                     loss_report: LossReport::new(),
+                    quarantined_bytes: 0,
                 };
                 log.start_segment(FIRST_SEGMENT_ID, Seq::new(0), Offset::ZERO)?;
                 Ok(log)
@@ -423,6 +463,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             total_record_count,
             recovered_truncated_bytes: 0,
             loss_report: LossReport::new(),
+            quarantined_bytes: 0,
         };
 
         if scan.footer.is_some() {
@@ -447,8 +488,21 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 // definition, not fully parseable, but at least the frame at `valid_end` is gone.
                 log.recovered_truncated_bytes = len - scan.valid_end;
                 let reason = scan.tail_reason.unwrap_or(ReasonCode::TornTail);
-                log.loss_report
-                    .push(LossEvent::span(last_id, scan.valid_end, len, 1, reason));
+                let event = LossEvent::span(last_id, scan.valid_end, len, 1, reason);
+                log.loss_report.push(event);
+                // Quarantine the corrupt bytes BEFORE truncating them away, while `file` still holds
+                // the full image (#134). This is a COPY: it only ever reads `file`, and the
+                // truncation below is unchanged. It is best-effort and forensic, so any quarantine
+                // failure is swallowed and never affects the truncation or the open; a clean torn
+                // tail is not quarantined (see `quarantine::is_corruption_skip`).
+                if crate::quarantine::is_corruption_skip(reason) {
+                    log.quarantined_bytes = crate::quarantine::quarantine_corrupt_span(
+                        &log.fs,
+                        &file,
+                        &event,
+                        log.config.max_quarantine_bytes,
+                    );
+                }
                 file.set_len(scan.valid_end)?;
                 file.sync_all()?;
             }
@@ -735,6 +789,17 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     #[must_use]
     pub fn loss_report(&self) -> &LossReport {
         &self.loss_report
+    }
+
+    /// Total bytes copied into the forensic quarantine store at recovery (#134): the corrupt
+    /// regions a corruption skip dropped, captured (copy-not-move, capped) under `quarantine/` for
+    /// offline analysis. Zero for a fresh log, a clean recovery, or a recovery whose only loss was
+    /// a clean torn tail. Best-effort: a quarantine write failure leaves this BELOW the dropped
+    /// bytes without failing the open, so this is a forensic signal, not a correctness invariant.
+    /// The metrics endpoint exposes it as the `ironbus_quarantine_bytes` gauge.
+    #[must_use]
+    pub fn quarantined_bytes(&self) -> u64 {
+        self.quarantined_bytes
     }
 
     /// The current monotonic time from the log's clock, for the consumer's lease deadlines.
@@ -1055,6 +1120,7 @@ mod tests {
         LogConfig {
             max_segment_bytes: 128,
             max_total_bytes: 0,
+            ..LogConfig::default()
         }
     }
 
@@ -1335,6 +1401,7 @@ mod tests {
         let mut log = open_mem(LogConfig {
             max_segment_bytes: 80,
             max_total_bytes: 0,
+            ..LogConfig::default()
         });
         let big = vec![0xab; 4096];
         assert_eq!(log.append(&rec(&big)).unwrap(), Offset::new(0));
@@ -2057,6 +2124,7 @@ mod tests {
         let config = LogConfig {
             max_segment_bytes: 4096,
             max_total_bytes: 0,
+            ..LogConfig::default()
         };
         let mut log = open_mem(config);
         for i in 0..3u8 {
@@ -2788,6 +2856,7 @@ mod tests {
         let cfg = LogConfig {
             max_segment_bytes: 200,
             max_total_bytes: 0,
+            ..LogConfig::default()
         };
         let mut log = Log::open(InMemoryFs::new(), Arc::clone(&clock), cfg).unwrap();
         // Segment 0: an old record (ts 100) then a recent record (ts 9_000).
