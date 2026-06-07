@@ -40,24 +40,37 @@ all-zeros and never blocks startup or touches the durable log, cursors, or DLQ
 (recovery-loss gauges are independently repopulated from the last recovery's
 loss report).
 
-For the **skip/loss family** (`ironbus_truncated_records_total` and the
-reconciled gauges `ironbus_bytes_skipped` / `ironbus_last_skip_offset`) the
-snapshot lower bound is strengthened to a strict cross-restart **monotonic
-non-decreasing** guarantee by **checkpoint-plus-replay reconciliation** (#307).
-On open the broker takes, for each of these values,
-`max(snapshot, replay)` where the *replay* value is what the durable log / loss
-report implies: the loss report's total records and bytes skipped, and (for the
-offset) the recovered head a torn-tail recovery landed on. Because it is a pure
-`max`, reconciliation can only **raise** a value, never lower it (so #306's lower
-bound is preserved), and `ironbus_last_skip_offset = max(checkpoint, replay)`. It
-is best-effort on the read side and **never blocks recovery**: an absent or
-malformed loss report degrades to an empty report (replay all-zeros) and the
-snapshot value stands, exactly like #306's corrupt-never-blocks-recovery on the
-write side. The operational counters (produced, delivered, acks, dead-lettered,
-reaped, …) cannot be replay-derived from the log, so for them the snapshot
-lower bound is the only viable design and is complete as-is.
+For the **recovery-loss family** the snapshot lower bound is strengthened to a
+strict cross-restart **monotonic non-decreasing** guarantee by
+**checkpoint-plus-replay reconciliation** (#307). These are the values that are
+genuinely **replay-reconstructable** from a durable artifact (the `LossReport`
+the last recovery rebuilds): the reconciled gauges `ironbus_records_skipped`
+and `ironbus_bytes_skipped` (the loss report's total records and bytes skipped),
+and the recovery-head component of `ironbus_last_skip_offset`. On open the broker
+takes, for each, `max(snapshot, replay)` where the *replay* value is what the
+durable log / loss report implies. Because it is a pure `max`, reconciliation can
+only **raise** a value, never lower it (so #306's lower bound is preserved). It is
+best-effort on the read side and **never blocks recovery**: an absent or malformed
+loss report degrades to an empty report (replay all-zeros) and the snapshot value
+stands, exactly like #306's corrupt-never-blocks-recovery on the write side.
 
-Each reconciliation that actually raises a skip/loss value above its snapshot
+The reconciled values are **checkpoint-plus-replay reconciled** (true cross-restart
+monotonic, even across a `kill -9`): `ironbus_records_skipped`,
+`ironbus_bytes_skipped`, and the recovery-head contribution to
+`ironbus_last_skip_offset`. Everything else retains the **snapshot-only lower
+bound** from #306: the operational counters (produced, delivered, acks,
+dead-lettered, reaped, …) cannot be replay-derived from the log, and so cannot the
+**consumer-truncation** counters `ironbus_truncations_total` /
+`ironbus_truncated_records_total` (a force-reap-driven, transient, consumer-cursor
+quantity that is not in the durable loss report) nor the consumer-truncation
+contribution to `ironbus_last_skip_offset`. For all of those a `kill -9` can still
+lose the increments since the last cadence snapshot; that is the only viable design
+for a non-replay-derivable quantity. (`ironbus_truncated_records_total` is
+deliberately **not** reconciled against the recovery loss report: they are
+different quantities, and maxing them would conflate consumer truncation with
+recovery loss.)
+
+Each reconciliation that actually raises a recovery-loss value above its snapshot
 increments `ironbus_counter_checkpoint_repair_total` once, so an operator can see
 the lower-bound recovery firing after a hard crash (a clean shutdown whose
 snapshot already dominates the replay increments nothing).
@@ -75,8 +88,8 @@ snapshot already dominates the replay increments nothing).
 | `ironbus_segments_reaped_total` | A whole old **sealed** segment is reclaimed by **consumer-safe** retention (the size, age, or count bound). | **Reclaim, loss-free**: only fully-consumed segments are freed. Space reclamation, never consumer-visible loss. |
 | `ironbus_segments_force_reaped_total` | A whole old sealed segment is **force-reaped** by the disk-full **drop-oldest** policy to make room for an over-cap `produce`, ignoring consumer safety. | **Drop-oldest**: the data-loss-bearing reclamation. May delete records a slow consumer has not consumed; that consumer then sees a one-time truncation. |
 | `ironbus_truncations_total` | A consumer's cursor had fallen **below the oldest retained record** (its data was force-reaped out from under it) and `poll` surfaces a one-time `Poll::Truncated`, resetting the cursor up to `earliest_retained`. One event per surfaced truncation (the same gap never re-counts). | **Skip**: a live consumer loses the span `[old_cursor, earliest_retained)`. Counted the moment it is surfaced so the skip is never silent. The consumer-side complement of `segments_force_reaped`. |
-| `ironbus_truncated_records_total` | The sum of the skipped record span over every `Poll::Truncated`. | The **record count** lost to truncations (the span of `ironbus_truncations_total`). Reconciled on open to `max(snapshot, loss-report records)`, so it never resumes lower than before a crash (#307). |
-| `ironbus_counter_checkpoint_repair_total` | A reconciliation on open raised a skip/loss value (`ironbus_truncated_records_total`, `ironbus_bytes_skipped`, or `ironbus_last_skip_offset`) above its durable snapshot, because the **checkpoint-plus-replay** lower bound (`max(snapshot, durable log / loss report)`) implied a higher value than the cadence snapshot alone (#307). Zero when the snapshot already dominated the replay (the clean-shutdown case). | **Lower-bound recovery**: the signal that a hard crash (`kill -9`) lost post-snapshot skip/loss increments and reconciliation restored them from the durable log, so the counter never silently resumes lower than before the crash. |
+| `ironbus_truncated_records_total` | The sum of the skipped record span over every `Poll::Truncated`. | The **record count** lost to truncations (the span of `ironbus_truncations_total`). A **consumer-truncation** quantity, not in the durable loss report, so it keeps #306's snapshot-only lower bound and is **not** replay-reconciled (#307). |
+| `ironbus_counter_checkpoint_repair_total` | A reconciliation on open raised a **recovery-loss** value (`ironbus_records_skipped`, `ironbus_bytes_skipped`, or the recovery-head component of `ironbus_last_skip_offset`) above its durable snapshot, because the **checkpoint-plus-replay** lower bound (`max(snapshot, durable log / loss report)`) implied a higher value than the cadence snapshot alone (#307). Zero when the snapshot already dominated the replay (the clean-shutdown case). | **Lower-bound recovery**: the signal that a hard crash (`kill -9`) lost post-snapshot recovery-loss increments and reconciliation restored them from the durable log, so the counter never silently resumes lower than before the crash. |
 | `ironbus_consumer_labels_dropped_total` | A new consumer is refused a distinct `ironbus_consumer_lag_records{consumer}` series because the **1024-series cardinality cap** was reached; its lag is folded into `{consumer="__overflow__"}` instead (#97). | **Cardinality shed**: the registry refuses an unbounded number of distinct consumer labels (which would OOM the very node metrics protect), but the dropped label and its lag are never silent. An operator's cardinality-pressure signal. |
 
 ### Recovery-loss series (startup, per reason)
@@ -122,19 +135,30 @@ ironbus_consumer_lag                 flushed minus committed (the headline lag s
 ironbus_in_flight                    leased but not yet acked
 ironbus_writer_healthy               1 live, 0 frozen (the integrity-freeze gauge)
 ironbus_last_dead_lettered_offset    offset of the most recent dead-letter (-1 if none)
-ironbus_bytes_skipped                bytes lost to the skip/loss family, reconciled to max(snapshot, durable loss report) so it never resumes lower than before a crash (#307)
+ironbus_records_skipped              records lost to recovery loss (the durable loss report total), reconciled to max(snapshot, durable loss report) so it never resumes lower than before a crash (#307)
+ironbus_bytes_skipped                bytes lost to recovery loss, reconciled to max(snapshot, durable loss report) so it never resumes lower than before a crash (#307)
 ironbus_last_skip_offset             highest log offset any skip/loss event reached, reconciled to max(checkpoint, replay) (#307)
 ironbus_group_committed_offset{group=...}   per-work-group committed offset
 ironbus_group_consumer_lag{group=...}       per-work-group lag
 ironbus_group_in_flight{group=...}          per-work-group in-flight depth
 ```
 
-`ironbus_bytes_skipped` and `ironbus_last_skip_offset` are the byte-span and
-high-water-mark companions of `ironbus_truncated_records_total`. They are gauges
-(not `_total`), so they are outside the frozen counter set, but they share the
-skip/loss family's cross-restart reconciliation: on open each is raised to
-`max(snapshot, replay-from-the-durable-log)`, so neither resumes lower than
-before a crash, and a raise increments `ironbus_counter_checkpoint_repair_total`.
+`ironbus_records_skipped` and `ironbus_bytes_skipped` are the **recovery-loss**
+record-count and byte-span gauges (the durable loss report totals). They are
+gauges (not `_total`), so they are outside the frozen counter set, but they are
+fully **checkpoint-plus-replay reconciled**: on open each is raised to
+`max(snapshot, replay-from-the-durable-loss-report)`, so neither resumes lower
+than before a crash, and a raise increments
+`ironbus_counter_checkpoint_repair_total`.
+
+`ironbus_last_skip_offset` is the highest log offset any skip/loss event reached
+(a high-water mark). Its **replay** value is the recovered head a torn-tail
+recovery landed on, i.e. an **upper bound** on the highest skipped offset, not the
+exact last skip offset (recovery truncates to the last intact record, and any loss
+reached up to that head). On open it is raised to `max(checkpoint, replay)`, so its
+recovery-derived contribution is reconciled across a restart; its runtime
+consumer-truncation contribution (raised to `earliest_retained` on a below-earliest
+truncation) is not replay-derivable and keeps only the #306 snapshot lower bound.
 
 The fsync latency histogram is `ironbus_fsync_seconds` (cumulative `le` buckets,
 plus `_sum` and `_count`): the produce-time durability-barrier latency. A latency

@@ -402,6 +402,12 @@ pub struct Counters {
     /// RECORDS skipped by below-earliest truncations (#82, #84): the sum of the `skipped` span over
     /// every [`Poll::Truncated`] event, the record-count complement of `truncations`. The operator's
     /// "how much did consumers lose to force-reap" signal. Saturating.
+    ///
+    /// CONSUMER-TRUNCATION-derived (#307): this count comes from a force-reap-driven, transient,
+    /// consumer-cursor-dependent runtime event. It is NOT in the durable `LossReport` and NOT
+    /// replay-derivable from the log, so it is NOT reconciled on open: like the operational counters
+    /// it keeps #306's snapshot-only MONOTONIC LOWER BOUND (a `kill -9` can lose the post-snapshot
+    /// increments). The replay-reconcilable RECOVERY-LOSS records live in `records_skipped`.
     pub truncated_records: u64,
     /// Commits via `ack` (a `term` commits through the same path and is counted here).
     pub acks: u64,
@@ -417,26 +423,44 @@ pub struct Counters {
     /// is the data-loss-bearing reclamation an operator watches when running `DropOldest`. Zero
     /// under the default `DropNew` policy. Saturating.
     pub segments_force_reaped: u64,
-    /// BYTES lost to the skip/loss family (#307, #98): the byte-span complement of the recovery
-    /// loss the durable log implies. Unlike the runtime-only truncation counters, this is
-    /// RECONCILED on open against the durable loss report (the replay value), so it is "not lower
-    /// than before the crash" even across a `kill -9`: the recovered value is
-    /// `max(snapshot, loss_report.total_bytes_skipped())`. It is the durable, monotonic skip/loss
-    /// byte total, distinct from the per-recovery `ironbus_recovery_loss_bytes` GAUGE (which reports
-    /// only the LAST recovery). Saturating; never lowered by reconciliation (always a `max`).
+    /// RECOVERY-LOSS records the durable log implies (#307, #98): the record-count of the loss the
+    /// last recovery dropped (a torn tail or corrupt-skip span the durable `LossReport` records),
+    /// distinct from the CONSUMER-TRUNCATION `truncated_records`. RECOVERY-LOSS-derived, so it is
+    /// genuinely REPLAY-RECONSTRUCTABLE: reconciled on open to
+    /// `max(snapshot, loss_report.total_records_lost_estimate())`, giving a strict cross-restart
+    /// MONOTONIC NON-DECREASING guarantee even across a `kill -9` (the durable loss report survives,
+    /// so the post-snapshot increment is re-derived on the next open). It has NO runtime increment:
+    /// it exists only to be reconciled from the durable log. Exposed as the `ironbus_records_skipped`
+    /// gauge (NOT `_total`, so it stays out of the frozen counter set). Saturating; never lowered.
+    pub records_skipped: u64,
+    /// RECOVERY-LOSS BYTES the durable log implies (#307, #98): the byte-span complement of
+    /// `records_skipped`, the bytes the last recovery dropped. RECOVERY-LOSS-derived, so it is
+    /// genuinely REPLAY-RECONSTRUCTABLE: reconciled on open to
+    /// `max(snapshot, loss_report.total_bytes_skipped())`, so it is "not lower than before the crash"
+    /// even across a `kill -9` (the durable loss report survives). It has NO runtime increment. It is
+    /// the durable, monotonic recovery-loss byte total, distinct from the per-recovery
+    /// `ironbus_recovery_loss_bytes` GAUGE (which reports only the LAST recovery). Exposed as the
+    /// `ironbus_bytes_skipped` gauge. Saturating; never lowered by reconciliation (always a `max`).
     pub bytes_skipped: u64,
-    /// The HIGHEST log offset any skip/loss event reached (#307, #98): a watermark, not a sum. It
-    /// is set at runtime to `max(self, earliest_retained)` whenever a below-earliest truncation
-    /// resets a consumer up to the oldest retained record, and RECONCILED on open to
-    /// `max(checkpoint, replay)` where the replay value is the durable head the log recovered to
-    /// when recovery dropped a torn tail. The reconciliation never lowers it (always a `max`), so it
-    /// is monotonic non-decreasing across an arbitrary crash. Exposed as `ironbus_last_skip_offset`.
+    /// The HIGHEST log offset any skip/loss event reached (#307, #98): a watermark, not a sum.
+    ///
+    /// It has TWO contributions with DIFFERENT durability guarantees. At runtime it is raised to
+    /// `max(self, earliest_retained)` on a below-earliest CONSUMER TRUNCATION (a transient,
+    /// non-replay-derivable event, so that contribution keeps #306's snapshot-only lower bound). On
+    /// open it is RECONCILED to `max(checkpoint, replay)` where the replay value is the RECOVERY head
+    /// the durable log recovered to when it dropped a torn tail (a recovery-loss-derived, durable,
+    /// replay-reconstructable UPPER BOUND on the highest skipped offset). The reconciliation never
+    /// lowers it (always a `max`), so the watermark is monotonic non-decreasing; the recovery-derived
+    /// contribution is genuinely restored across a `kill -9`, the consumer-truncation contribution is
+    /// only a snapshot lower bound. Exposed as `ironbus_last_skip_offset`.
     pub last_skip_offset: u64,
     /// Reconciliation/repair events on open (#307): incremented once each time [`Engine::open`]
     /// RECONCILES the durable counters snapshot with what the durable log / loss report implies and
-    /// the replay value RAISES a skip/loss value above the snapshot (so the snapshot alone would have
-    /// resumed too low). Zero when the snapshot already dominated the replay (the common
-    /// clean-shutdown case). Exposed as `ironbus_counter_checkpoint_repair_total`, the
+    /// the replay value RAISES a RECOVERY-LOSS value (`records_skipped`, `bytes_skipped`, or the
+    /// recovery-head component of `last_skip_offset`) above the snapshot (so the snapshot alone would
+    /// have resumed too low). Zero when the snapshot already dominated the replay (the common
+    /// clean-shutdown case). It tracks ONLY the replay-reconcilable recovery-loss family, never the
+    /// snapshot-only `truncated_records`. Exposed as `ironbus_counter_checkpoint_repair_total`, the
     /// frozen-taxonomy `_total` counter an operator watches to see the checkpoint-plus-replay lower
     /// bound actually firing after a hard crash. Saturating.
     pub counter_checkpoint_repairs: u64,
@@ -453,11 +477,11 @@ const COUNTERS_SNAPSHOT_VERSION: u8 = 1;
 /// appends one field here (and at the end of [`Counters::encode_snapshot`] /
 /// [`Counters::decode_snapshot`]), so an old snapshot still decodes (the new trailing field reads
 /// as zero) and a new snapshot still decodes on an old binary (the trailing field is ignored).
-/// The skip/loss reconciliation family (#307) appended three trailing fields (`bytes_skipped`,
-/// `last_skip_offset`, `counter_checkpoint_repairs`), so a `counters.ckpt` written before #307
-/// still decodes (the three new fields read as zero) and reconciliation re-derives the skip/loss
-/// values from the durable loss report on the next open.
-const COUNTERS_FIELD_COUNT: usize = 14;
+/// The skip/loss reconciliation family (#307) appended four trailing fields (`records_skipped`,
+/// `bytes_skipped`, `last_skip_offset`, `counter_checkpoint_repairs`), so a `counters.ckpt` written
+/// before #307 still decodes (the four new fields read as zero) and reconciliation re-derives the
+/// replay-reconcilable recovery-loss values from the durable loss report on the next open.
+const COUNTERS_FIELD_COUNT: usize = 15;
 
 impl Counters {
     /// Serializes the counters into a small versioned little-endian byte string for the durable
@@ -482,7 +506,9 @@ impl Counters {
             self.segments_reaped,
             self.segments_force_reaped,
             // The skip/loss reconciliation family (#307) is appended LAST so an older snapshot still
-            // decodes (these read as zero) and reconciliation re-derives them from the loss report.
+            // decodes (these read as zero) and reconciliation re-derives the recovery-loss ones from
+            // the durable loss report.
+            self.records_skipped,
             self.bytes_skipped,
             self.last_skip_offset,
             self.counter_checkpoint_repairs,
@@ -525,10 +551,12 @@ impl Counters {
             segments_force_reaped: field(10),
             // The skip/loss reconciliation family (#307), appended at the END: a pre-#307 snapshot
             // is too short to contain these, so `field` reads them as zero (the tolerant decode),
-            // and reconciliation on open re-derives them from the durable loss report.
-            bytes_skipped: field(11),
-            last_skip_offset: field(12),
-            counter_checkpoint_repairs: field(13),
+            // and reconciliation on open re-derives the recovery-loss ones from the durable loss
+            // report.
+            records_skipped: field(11),
+            bytes_skipped: field(12),
+            last_skip_offset: field(13),
+            counter_checkpoint_repairs: field(14),
         }
     }
 }
@@ -927,7 +955,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
 
         // Open and recover the durable resilience-counters checkpoint (#98), seeding the in-memory
         // counters from the last snapshot (or all-zeros if it is missing or torn) AND reconciling the
-        // skip/loss family with the durable log / loss report (#307). Factored out to keep `open`
+        // recovery-loss family with the durable log / loss report (#307). Factored out to keep `open`
         // readable; the never-block-recovery contract and the checkpoint-plus-replay max live there.
         let (counters_checkpoint, counters) = Self::open_counters_checkpoint(&log)?;
 
@@ -1092,10 +1120,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// only errors it can return are genuine IO failures from creating or reading the file (the same
     /// failures that would already have failed opening the log itself), not a corrupt snapshot.
     ///
-    /// After seeding, it reconciles the SKIP/LOSS counter family with the durable log / loss report
-    /// (#307) via [`Engine::reconcile_skip_loss_counters`], so the recovered value is "not lower than
-    /// before the crash" even across a `kill -9`. That step is a pure in-memory `max` (it never lowers
-    /// a counter and never fails recovery), so the never-block-recovery contract is preserved.
+    /// After seeding, it reconciles the RECOVERY-LOSS counter family with the durable log / loss
+    /// report (#307) via [`Engine::reconcile_skip_loss_counters`], so the recovered value is "not lower
+    /// than before the crash" even across a `kill -9`. That step is a pure in-memory `max` (it never
+    /// lowers a counter and never fails recovery), so the never-block-recovery contract is preserved.
+    /// The CONSUMER-TRUNCATION `truncated_records` is not replay-derivable and keeps its snapshot-only
+    /// lower bound.
     ///
     /// # Errors
     /// Propagates a genuine IO error from creating or opening the counters checkpoint file.
@@ -1116,10 +1146,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let mut counters = recovered
             .as_deref()
             .map_or_else(Counters::default, Counters::decode_snapshot);
-        // Checkpoint-plus-replay reconciliation for the SKIP/LOSS family (#307): raise the snapshot's
-        // skip/loss values to at least what the just-recovered durable log / loss report implies, so a
-        // hard crash that lost the post-snapshot increments still resumes a value never lower than
-        // before the crash. A pure `max` over already-recovered values, so it cannot fail recovery.
+        // Checkpoint-plus-replay reconciliation for the RECOVERY-LOSS family (#307): raise the
+        // snapshot's recovery-loss values (records/bytes skipped and the offset watermark) to at least
+        // what the just-recovered durable log / loss report implies, so a hard crash that lost the
+        // post-snapshot increments still resumes a value never lower than before the crash. A pure
+        // `max` over already-recovered values, so it cannot fail recovery. The consumer-truncation
+        // `truncated_records` is NOT replay-derivable and is deliberately left at its snapshot value.
         Self::reconcile_skip_loss_counters(
             &mut counters,
             log.loss_report(),
@@ -1128,22 +1160,32 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         Ok((counters_checkpoint, counters))
     }
 
-    /// Checkpoint-plus-replay reconciliation for the SKIP/LOSS counter family (#307), the explicit,
-    /// unified form of the lower bound #306 left implicit. The durable counters snapshot (#306) is a
-    /// MONOTONIC LOWER BOUND: a `kill -9` between the last cadence snapshot and the crash loses the
-    /// increments in that window, so the snapshot alone can resume a skip/loss counter LOWER than it
-    /// stood at crash time. This reconciliation raises each reconciled value to
+    /// Checkpoint-plus-replay reconciliation for the RECOVERY-LOSS counter family (#307), the
+    /// explicit, unified form of the lower bound #306 left implicit. The durable counters snapshot
+    /// (#306) is a MONOTONIC LOWER BOUND: a `kill -9` between the last cadence snapshot and the crash
+    /// loses the increments in that window, so the snapshot alone can resume a counter LOWER than it
+    /// stood at crash time. This reconciliation raises each RECOVERY-LOSS value to
     /// `max(snapshot, replay)` where the replay value is what the durable log / loss report implies,
-    /// restoring a strict cross-restart MONOTONIC NON-DECREASING property for the skip/loss family.
+    /// restoring a strict cross-restart MONOTONIC NON-DECREASING property for that family.
     ///
-    /// The replay sources are the just-recovered durable artifacts (no extra IO):
-    /// - `records_skipped` (the existing `truncated_records`) is raised to at least the loss report's
-    ///   total estimated records lost.
+    /// HONEST SCOPE (#307): only the RECOVERY-LOSS-derived counters are reconciled, because only they
+    /// are replay-reconstructable from a durable artifact (the `LossReport`). The replay sources are
+    /// the just-recovered durable artifacts (no extra IO):
+    /// - `records_skipped` is raised to at least the loss report's total estimated records lost.
     /// - `bytes_skipped` is raised to at least the loss report's total bytes skipped (the same total
     ///   the `ironbus_recovery_loss_bytes` gauge family is repopulated from in `health.rs`).
-    /// - `last_skip_offset` is raised to `max(checkpoint, replay)`, the durable head recovery landed
-    ///   on when it dropped a torn tail (a loss reached up to the recovered head). With NO recovery
-    ///   loss the replay offset is `0`, so a clean log leaves the snapshot untouched.
+    /// - `last_skip_offset` is raised to `max(checkpoint, replay)`, where the replay value is the
+    ///   durable head recovery landed on when it dropped a torn tail (a recovery loss reached up to
+    ///   the recovered head, an UPPER BOUND on the highest skipped offset). With NO recovery loss the
+    ///   replay offset is `0`, so a clean log leaves the snapshot untouched. (Its runtime
+    ///   CONSUMER-TRUNCATION contribution, `max(self, earliest)`, is not replay-derivable and so keeps
+    ///   only the snapshot lower bound.)
+    ///
+    /// DELIBERATELY NOT reconciled: `truncated_records` (and `truncations`) are CONSUMER-TRUNCATION
+    /// counts, a transient force-reap-driven runtime quantity that is NOT in the durable `LossReport`
+    /// and NOT replay-derivable. Maxing it against a RECOVERY torn-tail estimate would conflate two
+    /// different quantities (and could spuriously raise a consumer-truncation count from an unrelated
+    /// recovery loss). Like the operational counters, it retains #306's snapshot-only lower bound.
     ///
     /// It is a pure `max` over in-memory values, so it can only RAISE a counter, never lower one
     /// (preserving #306's lower bound), and it can NEVER fail recovery: a missing or malformed loss
@@ -1155,21 +1197,23 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     fn reconcile_skip_loss_counters(counters: &mut Counters, loss: &LossReport, flushed: u64) {
         let replay_records = loss.total_records_lost_estimate();
         let replay_bytes = loss.total_bytes_skipped();
-        // A loss reached up to the recovered head, so the head is the highest skipped offset; with no
-        // loss there is no skip offset to replay, so the snapshot value stands unchanged.
+        // A recovery loss reached up to the recovered head, so the head is the highest skipped offset;
+        // with no loss there is no recovery skip offset to replay, so the snapshot value stands.
         let replay_offset = if loss.is_empty() { 0 } else { flushed };
 
-        let reconciled_records = counters.truncated_records.max(replay_records);
+        // Only the RECOVERY-LOSS-derived counters are reconciled. `truncated_records`
+        // (consumer-truncation) is intentionally left at its snapshot value.
+        let reconciled_records = counters.records_skipped.max(replay_records);
         let reconciled_bytes = counters.bytes_skipped.max(replay_bytes);
         let reconciled_offset = counters.last_skip_offset.max(replay_offset);
 
         // A repair is any reconciled value strictly above the snapshot value: the snapshot alone
         // would have resumed too low, so the replay raised it. Detected BEFORE the assignment.
-        let repaired = reconciled_records > counters.truncated_records
+        let repaired = reconciled_records > counters.records_skipped
             || reconciled_bytes > counters.bytes_skipped
             || reconciled_offset > counters.last_skip_offset;
 
-        counters.truncated_records = reconciled_records;
+        counters.records_skipped = reconciled_records;
         counters.bytes_skipped = reconciled_bytes;
         counters.last_skip_offset = reconciled_offset;
         if repaired {
@@ -1860,7 +1904,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             self.counters.truncated_records =
                 self.counters.truncated_records.saturating_add(skipped);
             // Raise the skip-offset watermark to the offset this consumer skipped up to (#307): the
-            // monotonic high-water mark the cross-restart reconciliation reconciles against.
+            // CONSUMER-TRUNCATION contribution to the high-water mark. This runtime increment is not
+            // replay-derivable, so it keeps #306's snapshot-only lower bound; the recovery-head
+            // contribution is what `reconcile_skip_loss_counters` restores across a crash.
             self.counters.last_skip_offset = self.counters.last_skip_offset.max(earliest);
             // The reset advanced this group's committed cursor UP to `earliest`, so push the new
             // floor to the lag registry (#97), keeping the consumer-lag series correct after a
@@ -2213,7 +2259,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             self.counters.truncated_records =
                 self.counters.truncated_records.saturating_add(skipped);
             // Raise the skip-offset watermark to the offset this consumer skipped up to (#307), the
-            // same monotonic high-water mark the plain-competing path maintains.
+            // same CONSUMER-TRUNCATION contribution the plain-competing path maintains (snapshot-only,
+            // not replay-derivable; the recovery-head contribution is restored on reconcile).
             self.counters.last_skip_offset = self.counters.last_skip_offset.max(earliest);
             // The reset advanced this group's committed cursor UP to `earliest`, so push the new
             // floor to the lag registry (#97), keeping the consumer-lag series correct (#84).
@@ -4376,6 +4423,7 @@ mod tests {
             segments_reaped: 10,
             segments_force_reaped: 11,
             // The skip/loss reconciliation family (#307), appended at the end of the snapshot.
+            records_skipped: 77,
             bytes_skipped: 4096,
             last_skip_offset: 1234,
             counter_checkpoint_repairs: 2,
@@ -4430,10 +4478,15 @@ mod tests {
         let reopened = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
         let c = reopened.counters();
         // The durable loss report drove the reconciliation above the zero snapshot.
+        let replay_records = reopened.loss_report().total_records_lost_estimate();
         let replay_bytes = reopened.loss_report().total_bytes_skipped();
         assert!(
             replay_bytes > 0,
             "the torn tail produced a non-empty loss report"
+        );
+        assert_eq!(
+            c.records_skipped, replay_records,
+            "records_skipped reconciled up to the durable loss report records total"
         );
         assert_eq!(
             c.bytes_skipped, replay_bytes,
@@ -4467,7 +4520,7 @@ mod tests {
         // Checkpoint BELOW the replay on `last_skip_offset` (records/bytes already dominate, so this
         // case isolates the OFFSET max): the replay offset wins and a repair is counted.
         let mut low = Counters {
-            truncated_records: replay_records + 100,
+            records_skipped: replay_records + 100,
             bytes_skipped: replay_bytes + 100,
             last_skip_offset: replay_offset - 1,
             ..Counters::default()
@@ -4482,10 +4535,10 @@ mod tests {
             "raising the offset counts one repair"
         );
 
-        // Checkpoint ABOVE the replay on EVERY skip/loss value: the snapshot wins everywhere, NEVER
-        // lowered, and no repair fires.
+        // Checkpoint ABOVE the replay on EVERY recovery-loss value: the snapshot wins everywhere,
+        // NEVER lowered, and no repair fires.
         let mut high = Counters {
-            truncated_records: replay_records + 5,
+            records_skipped: replay_records + 5,
             bytes_skipped: replay_bytes + 5,
             last_skip_offset: replay_offset + 5,
             ..Counters::default()
@@ -4498,11 +4551,34 @@ mod tests {
             replay_offset + 5,
             "max keeps the larger snapshot (never lowered below #306's bound)"
         );
-        assert_eq!(high.truncated_records, replay_records + 5);
+        assert_eq!(high.records_skipped, replay_records + 5);
         assert_eq!(high.bytes_skipped, replay_bytes + 5);
         assert_eq!(
             high.counter_checkpoint_repairs, 0,
             "no repair when the snapshot already dominates the replay"
+        );
+
+        // The CONSUMER-TRUNCATION counter `truncated_records` is DELIBERATELY not reconciled: a
+        // snapshot value below any replay survives untouched (no recovery-loss estimate may raise it).
+        let mut consumer = Counters {
+            truncated_records: 3,
+            records_skipped: replay_records + 5,
+            bytes_skipped: replay_bytes + 5,
+            last_skip_offset: replay_offset + 5,
+            ..Counters::default()
+        };
+        Engine::<InMemoryFs, ManualClock>::reconcile_skip_loss_counters(
+            &mut consumer,
+            &report,
+            flushed,
+        );
+        assert_eq!(
+            consumer.truncated_records, 3,
+            "truncated_records is consumer-truncation-derived and is never reconciled from the loss report"
+        );
+        assert_eq!(
+            consumer.counter_checkpoint_repairs, 0,
+            "leaving truncated_records alone counts no repair"
         );
     }
 
@@ -4541,6 +4617,7 @@ mod tests {
         // fail recovery. Driven directly so the "snapshot stands, open succeeds" path is unambiguous.
         let snapshot = Counters {
             truncated_records: 42,
+            records_skipped: 33,
             bytes_skipped: 1000,
             last_skip_offset: 5,
             counter_checkpoint_repairs: 3,
@@ -4581,6 +4658,7 @@ mod tests {
         let reopened = Engine::open(fs, ManualClock::new(), config(10, 5))
             .expect("a corrupt counters file never fails recovery");
         let c = reopened.counters();
+        assert_eq!(c.records_skipped, 0);
         assert_eq!(c.bytes_skipped, 0);
         assert_eq!(c.last_skip_offset, 0);
         assert_eq!(c.counter_checkpoint_repairs, 0);
@@ -4588,27 +4666,36 @@ mod tests {
 
     #[test]
     fn reconciled_skip_loss_counters_never_resume_lower_across_an_arbitrary_crash() {
-        // The strict cross-restart MONOTONIC NON-DECREASING property (#307): for an arbitrary crash
-        // point (here: an arbitrary number of durable records and an arbitrary torn-tail size,
-        // standing in for a `kill -9` that lost the post-snapshot increments), the reconciled
-        // skip/loss family on reopen is NEVER lower than it was before the crash. Reconciliation is a
-        // pure `max` over the snapshot and the durable-log replay, so this holds at every crash point;
-        // the test exhausts a grid of (record_count, tear_bytes) crash points to prove it across the
-        // input space without a proptest dependency.
+        // The strict cross-restart MONOTONIC NON-DECREASING property for the RECOVERY-LOSS family
+        // (#307), with REAL TEETH: each iteration first establishes a NON-ZERO recovery-loss value in
+        // the durable snapshot, then loses a post-snapshot crash the way a `kill -9` would, and proves
+        // the reconciled value on reopen is still at least the pre-crash value.
+        //
+        // The recipe (over a grid of record-count x tear-size crash points, no proptest dependency):
+        //   1. Produce records, tear the durable tail, and reopen. Recovery drops the torn tail and
+        //      DURABLY truncates the segment (set_len + sync), so the loss report on THIS open is
+        //      non-empty and reconciliation raises records_skipped / bytes_skipped / last_skip_offset
+        //      above zero.
+        //   2. Checkpoint that recovered state: the durable snapshot now holds the NON-ZERO
+        //      recovery-loss values. This is `before` (the value at the moment of the next crash).
+        //   3. A `kill -9`: drop WITHOUT another flush. Because step 1 already truncated the torn tail
+        //      on disk, the log is now CLEAN, so the replay loss report on the next open is EMPTY
+        //      (replay == 0, strictly BELOW the non-zero snapshot).
+        //   4. Reopen. The reconciliation is max(snapshot, replay) = max(non-zero, 0) = non-zero, so
+        //      `after >= before`. Crucially, a `.min()` reconciliation would compute
+        //      min(non-zero, 0) == 0 < before and FAIL this test: the assertions are non-trivial.
+        let mut exercised = 0u32;
         for records in 2u8..=8 {
             for tear in [1u64, 2, 3, 5, 8, 13] {
                 let fs = InMemoryFs::new();
-                let mut e = Engine::open(fs.clone(), ManualClock::new(), config(64, 5)).unwrap();
-                for _ in 0..records {
-                    produce(&mut e, &[0xcd; 24]);
+                {
+                    let mut e =
+                        Engine::open(fs.clone(), ManualClock::new(), config(64, 5)).unwrap();
+                    for _ in 0..records {
+                        produce(&mut e, &[0xcd; 24]);
+                    }
+                    drop(e);
                 }
-                // Flush the counters snapshot at a cadence point, then keep mutating AFTER it: those
-                // post-snapshot increments are exactly what a hard crash would lose, so the snapshot
-                // alone resumes a LOWER bound. The reconciliation must restore it.
-                e.checkpoint_all_groups().unwrap();
-                let before = e.counters();
-                // A hard crash: drop without another flush, then tear the durable tail.
-                drop(e);
                 let seg_len = fs.open(&segment_file_name(0)).unwrap().len().unwrap();
                 // Only tear within the segment body (never below the header), so the log still opens.
                 if tear >= seg_len {
@@ -4616,34 +4703,131 @@ mod tests {
                 }
                 tear_segment_tail(&fs, tear);
 
+                // Step 1+2: reopen recovers the torn tail (non-empty loss report), reconciliation
+                // raises the recovery-loss family above zero, and the checkpoint persists it.
+                let before = {
+                    let mut e1 =
+                        Engine::open(fs.clone(), ManualClock::new(), config(64, 5)).unwrap();
+                    let c1 = e1.counters();
+                    // The first recovery actually produced a non-zero recovery loss, so the pre-crash
+                    // values this test must preserve are genuinely > 0 (not the vacuous `>= 0`).
+                    assert!(
+                        c1.records_skipped > 0 && c1.bytes_skipped > 0 && c1.last_skip_offset > 0,
+                        "the torn tail seeded a non-zero recovery-loss snapshot \
+                         (records={records}, tear={tear}): {c1:?}"
+                    );
+                    e1.checkpoint_all_groups().unwrap();
+                    // Step 3 (the `kill -9`): drop WITHOUT another flush. The tail was already
+                    // truncated, so the reopened log is clean and the replay drops to zero.
+                    c1
+                };
+
+                // Step 4: reopen against the now-clean log. The replay loss report is empty.
                 let reopened = Engine::open(fs, ManualClock::new(), config(64, 5)).unwrap();
-                let after = reopened.counters();
-                // The strict monotonic-non-decreasing property for every reconciled skip/loss value.
                 assert!(
-                    after.truncated_records >= before.truncated_records,
-                    "records_skipped regressed: {} < {} (records={records}, tear={tear})",
-                    after.truncated_records,
-                    before.truncated_records
+                    reopened.loss_report().is_empty(),
+                    "the second reopen sees a clean log: the torn tail was durably truncated \
+                     (records={records}, tear={tear})"
+                );
+                let after = reopened.counters();
+                // The replay this open offers is strictly below the snapshot, so a `.min()` would
+                // REGRESS every value to 0. The `max` keeps the snapshot: the non-trivial property.
+                assert!(
+                    after.records_skipped >= before.records_skipped && before.records_skipped > 0,
+                    "records_skipped regressed: {} < {} (records={records}, tear={tear}); \
+                     a .min() reconciliation would drop it to the empty replay",
+                    after.records_skipped,
+                    before.records_skipped
                 );
                 assert!(
-                    after.bytes_skipped >= before.bytes_skipped,
+                    after.bytes_skipped >= before.bytes_skipped && before.bytes_skipped > 0,
                     "bytes_skipped regressed: {} < {} (records={records}, tear={tear})",
                     after.bytes_skipped,
                     before.bytes_skipped
                 );
                 assert!(
-                    after.last_skip_offset >= before.last_skip_offset,
+                    after.last_skip_offset >= before.last_skip_offset
+                        && before.last_skip_offset > 0,
                     "last_skip_offset regressed: {} < {} (records={records}, tear={tear})",
                     after.last_skip_offset,
                     before.last_skip_offset
                 );
-                // The repair counter is itself monotonic (a repair can only add).
-                assert!(
-                    after.counter_checkpoint_repairs >= before.counter_checkpoint_repairs,
-                    "repair counter regressed (records={records}, tear={tear})"
-                );
+                exercised += 1;
             }
         }
+        // The grid must actually exercise the non-zero recovery-loss path (guards against a future
+        // refactor making every iteration `continue` and silently re-vacuating the test).
+        assert!(
+            exercised >= 30,
+            "the crash grid exercised too few non-zero recovery-loss crash points: {exercised}"
+        );
+    }
+
+    #[test]
+    fn consumer_truncation_records_keep_only_the_snapshot_lower_bound() {
+        // The WEAKER property for the CONSUMER-TRUNCATION counter `truncated_records` (#307): it is a
+        // force-reap-driven runtime quantity that is NOT in the durable loss report and NOT
+        // replay-derivable, so unlike the recovery-loss family it gets ONLY #306's snapshot-only
+        // lower bound, not full cross-restart monotonicity. This test asserts exactly that weaker
+        // bound: a value that was produced by the REAL force-reap path and snapshotted survives a
+        // clean reopen, and the recovery-loss reconciliation never touches it.
+        let one = one_record_bytes();
+        let fs = InMemoryFs::new();
+        let truncated_before;
+        {
+            let mut e = Engine::open(
+                fs.clone(),
+                ManualClock::new(),
+                config_disk_full(4 * one, DiskFullPolicy::DropOldest),
+            )
+            .unwrap();
+            // Drive a genuine below-earliest truncation: a stuck consumer leases offset 0, the
+            // producer races past the byte cap (force-reaping the stuck consumer's records), then its
+            // next poll surfaces the one-time truncation that increments `truncated_records`.
+            produce(&mut e, &[0xab; 16]);
+            assert!(matches!(e.poll_in("stuck", 0).unwrap(), Poll::Message(_)));
+            for _ in 0..20 {
+                produce(&mut e, &[0xab; 16]);
+            }
+            match e.poll_in("stuck", 100).unwrap() {
+                Poll::Truncated { .. } => {}
+                other => panic!("expected a real consumer truncation, got {other:?}"),
+            }
+            truncated_before = e.counters().truncated_records;
+            assert!(
+                truncated_before > 0 && e.counters().truncations == 1,
+                "the force-reap path produced a non-zero consumer-truncation count"
+            );
+            // Flush the snapshot durably, then a CLEAN shutdown (no torn tail): the log stays intact.
+            e.checkpoint_all_groups().unwrap();
+        }
+
+        // Reopen the same data dir. The log is clean (no recovery loss), so the recovery-loss
+        // reconciliation is a no-op and the consumer-truncation count is preserved by the #306
+        // snapshot lower bound alone, NOT reconciled or raised from any loss report.
+        let reopened = Engine::open(
+            fs,
+            ManualClock::new(),
+            config_disk_full(4 * one, DiskFullPolicy::DropOldest),
+        )
+        .unwrap();
+        let after = reopened.counters();
+        assert!(
+            reopened.loss_report().is_empty(),
+            "a clean reopen has no recovery loss to reconcile against"
+        );
+        assert_eq!(
+            after.truncated_records, truncated_before,
+            "the snapshot lower bound preserves the consumer-truncation count across a clean reopen"
+        );
+        assert_eq!(
+            after.truncations, 1,
+            "the truncation EVENT count keeps the same snapshot-only lower bound"
+        );
+        // The recovery-loss family stayed at zero and no repair fired: the consumer-truncation count
+        // is deliberately outside the reconciliation.
+        assert_eq!(after.records_skipped, 0, "no recovery loss to reconcile");
+        assert_eq!(after.counter_checkpoint_repairs, 0);
     }
 
     #[test]
