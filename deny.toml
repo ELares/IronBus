@@ -14,6 +14,9 @@ allow = [
   "Unicode-3.0",
   "Unicode-DFS-2016",
   "Zlib",
+  # Boost Software License: permissive, no attribution clause on binaries. Pulled in by
+  # xxhash-rust (the pure-Rust xxh3-64 used for the large-payload record checksum, #146).
+  "BSL-1.0",
 ]
 
 [bans]
