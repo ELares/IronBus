@@ -13,7 +13,8 @@
 
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
-    decode_deliver, encode_ack, encode_pub, encode_sub, AckBody, AckOp, BodyError, PubBody, SubBody,
+    decode_dead_letter, decode_deliver, encode_ack, encode_pub, encode_sub, AckBody, AckOp,
+    BodyError, PubBody, SubBody,
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -107,6 +108,27 @@ pub struct Message {
     pub headers: Vec<u8>,
     /// The message payload.
     pub payload: Vec<u8>,
+}
+
+/// A dead-letter advisory: the broker dropped a message from delivery because it exceeded
+/// `MaxDeliver` (poison). The consumer learns the offset was skipped rather than silently
+/// never seeing it (#63). The durable DLQ topic write is separate from this notification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeadLetter {
+    /// The log offset of the dead-lettered message.
+    pub offset: u64,
+    /// Why it was dead-lettered (0 = exceeded `MaxDeliver`; other values reserved).
+    pub reason: u8,
+}
+
+/// The result of a [`Client::fetch`]: the messages delivered in the batch, and any in-band
+/// dead-letter advisories for offsets the broker skipped as poison during the same batch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Fetch {
+    /// The messages delivered, in log order.
+    pub messages: Vec<Message>,
+    /// Dead-letter advisories for offsets dropped as poison during this fetch (usually empty).
+    pub dead_letters: Vec<DeadLetter>,
 }
 
 /// The outcome of a [`Client::progress`] call.
@@ -218,19 +240,20 @@ impl Client {
     /// # Errors
     /// Returns a [`ClientError`] on an IO error, a server error, or a server that delivers
     /// more messages than the requested credit.
-    pub fn fetch(&mut self, max: u32) -> Result<Vec<Message>, ClientError> {
+    pub fn fetch(&mut self, max: u32) -> Result<Fetch, ClientError> {
         self.send(FrameType::Flow, &max.to_le_bytes())?;
-        // The credit we granted is the hard ceiling on what we will accept back.
+        // The credit caps the TOTAL frames the server may stream back before FlowEnd: each
+        // granted slot yields at most one delivery OR one dead-letter advisory, so a buggy or
+        // hostile server cannot stream either without bound.
         let limit = usize::try_from(max).unwrap_or(usize::MAX);
         let mut messages = Vec::new();
+        let mut dead_letters = Vec::new();
         loop {
             match self.read_frame()? {
                 (FrameType::Deliver, body) => {
-                    // Never accept more deliveries than the credit we granted: a buggy or
-                    // hostile server could otherwise stream Deliver frames without bound.
-                    if messages.len() >= limit {
+                    if messages.len() + dead_letters.len() >= limit {
                         return Err(ClientError::BadResponse(
-                            "server delivered more messages than the requested credit",
+                            "server streamed more frames than the requested credit",
                         ));
                     }
                     let d = decode_deliver(&body).map_err(ClientError::Body)?;
@@ -244,8 +267,27 @@ impl Client {
                         payload: d.payload.to_vec(),
                     });
                 }
+                // An in-band dead-letter advisory for an offset skipped as poison (#63). It is
+                // not a delivery, so it carries its own offset and does not ack.
+                (FrameType::DeadLetter, body) => {
+                    if messages.len() + dead_letters.len() >= limit {
+                        return Err(ClientError::BadResponse(
+                            "server streamed more frames than the requested credit",
+                        ));
+                    }
+                    let dl = decode_dead_letter(&body).map_err(ClientError::Body)?;
+                    dead_letters.push(DeadLetter {
+                        offset: dl.offset,
+                        reason: dl.reason,
+                    });
+                }
                 // The FlowEnd frame terminates the batch (its body is the delivered count).
-                (FrameType::FlowEnd, _) => return Ok(messages),
+                (FrameType::FlowEnd, _) => {
+                    return Ok(Fetch {
+                        messages,
+                        dead_letters,
+                    })
+                }
                 (FrameType::Err, body) => {
                     return Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
                 }
@@ -502,7 +544,9 @@ mod tests {
     use super::*;
     use ironbus_core::delivery::DeliveryConfig;
     use ironbus_core::lease::LeaseConfig;
-    use ironbus_proto::message::{encode_deliver, DeliverBody};
+    use ironbus_proto::message::{
+        encode_dead_letter, encode_deliver, DeadLetterBody, DeliverBody, DEAD_LETTER_MAX_DELIVER,
+    };
     use ironbus_server::clock::SystemClock;
     use ironbus_server::engine::{Engine, EngineConfig};
     use ironbus_server::server::{serve, SharedEngine};
@@ -593,14 +637,14 @@ mod tests {
             .unwrap();
         assert_eq!(offset, 0);
 
-        let messages = c.fetch(10).unwrap();
+        let messages = c.fetch(10).unwrap().messages;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].payload, b"client-msg");
         assert_eq!(messages[0].offset, 0);
 
         assert!(c.ack(messages[0].offset, messages[0].generation).unwrap());
         // Nothing left to fetch.
-        assert!(c.fetch(10).unwrap().is_empty());
+        assert!(c.fetch(10).unwrap().messages.is_empty());
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
@@ -629,6 +673,7 @@ mod tests {
             let payloads: Vec<Vec<u8>> = c
                 .fetch(10)
                 .unwrap()
+                .messages
                 .into_iter()
                 .map(|m| m.payload)
                 .collect();
@@ -659,7 +704,7 @@ mod tests {
     fn fetching_an_empty_queue_returns_no_messages() {
         let (addr, shutdown, handle) = start_server();
         let mut c = Client::connect(addr).unwrap();
-        assert!(c.fetch(5).unwrap().is_empty());
+        assert!(c.fetch(5).unwrap().messages.is_empty());
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
@@ -678,7 +723,7 @@ mod tests {
             })
             .unwrap();
         }
-        let messages = c.fetch(10).unwrap();
+        let messages = c.fetch(10).unwrap().messages;
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].payload, vec![0]);
         assert_eq!(messages[1].payload, vec![1]);
@@ -772,6 +817,38 @@ mod tests {
     }
 
     #[test]
+    fn fetch_surfaces_a_dead_letter_advisory() {
+        // A poison offset the broker skipped arrives as an in-band DEAD_LETTER frame inside the
+        // Flow batch (#63): fetch returns it in `dead_letters`, separate from `messages`, and
+        // the FlowEnd still terminates the batch normally.
+        let mut dl_body = Vec::new();
+        encode_dead_letter(
+            &DeadLetterBody {
+                offset: 7,
+                reason: DEAD_LETTER_MAX_DELIVER,
+            },
+            &mut dl_body,
+        );
+        let mut script = frame(FrameType::Info, b"");
+        script.extend(frame(FrameType::DeadLetter, &dl_body));
+        script.extend(frame(FrameType::FlowEnd, &0u32.to_le_bytes()));
+        let (addr, handle) = raw_server(script);
+        let mut c = Client::connect(addr).unwrap();
+        let fetched = c.fetch(10).unwrap();
+        assert!(fetched.messages.is_empty(), "no messages in this batch");
+        assert_eq!(
+            fetched.dead_letters,
+            vec![DeadLetter {
+                offset: 7,
+                reason: DEAD_LETTER_MAX_DELIVER
+            }],
+            "the dead-letter advisory is surfaced with its offset and reason"
+        );
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn an_unknown_frame_type_is_reported_with_its_tag() {
         let mut script = frame(FrameType::Info, b"");
         script.extend(raw_frame(200, b"")); // tag 200 is not a known FrameType
@@ -799,7 +876,7 @@ mod tests {
             })
             .unwrap();
 
-        let first = c.fetch(10).unwrap();
+        let first = c.fetch(10).unwrap().messages;
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].payload, b"retry-me");
 
@@ -808,7 +885,7 @@ mod tests {
         // None: no explicit delay; the in-process server has an empty schedule, so immediate.
         assert!(c.nack(first[0].offset, first[0].generation, None).unwrap());
 
-        let second = c.fetch(10).unwrap();
+        let second = c.fetch(10).unwrap().messages;
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].offset, off);
         assert_eq!(second[0].payload, b"retry-me");
@@ -820,7 +897,7 @@ mod tests {
         // The stale (nacked) token can no longer commit; the fresh one does.
         assert!(!c.ack(first[0].offset, first[0].generation).unwrap());
         assert!(c.ack(second[0].offset, second[0].generation).unwrap());
-        assert!(c.fetch(10).unwrap().is_empty());
+        assert!(c.fetch(10).unwrap().messages.is_empty());
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
@@ -840,7 +917,7 @@ mod tests {
             })
             .unwrap();
         }
-        let msgs = c.fetch(10).unwrap();
+        let msgs = c.fetch(10).unwrap().messages;
         assert_eq!(msgs.len(), 2);
 
         // Progress on the first: the lease is extended.
@@ -853,7 +930,7 @@ mod tests {
 
         // Ack the first; now the whole prefix is committed and nothing remains.
         assert!(c.ack(msgs[0].offset, msgs[0].generation).unwrap());
-        assert!(c.fetch(10).unwrap().is_empty());
+        assert!(c.fetch(10).unwrap().messages.is_empty());
 
         // A progress or term on a now-stale token is fenced.
         assert_eq!(
