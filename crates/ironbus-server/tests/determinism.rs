@@ -23,6 +23,8 @@ fn config() -> EngineConfig {
         // Checkpoint on every commit, so the durable cursor checkpoint is exercised and part
         // of the compared image.
         checkpoint_interval: 1,
+        // Retention off (the default), so the determinism image is unchanged.
+        max_retained_bytes: 0,
     }
 }
 

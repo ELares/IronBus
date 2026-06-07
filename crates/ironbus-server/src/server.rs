@@ -167,6 +167,7 @@ mod tests {
             delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
             max_in_flight: 16,
             checkpoint_interval: 1024,
+            max_retained_bytes: 0,
         }
     }
 
