@@ -422,7 +422,9 @@ flagging (beyond the simply-not-yet-built items above). The code wins.
   `StorageError::RecoveredSequenceMismatch` (recovery fails) rather than emitting a
   `SequenceGap` loss event and continuing. So `SequenceGap` is defined in the schema but
   not produced by the current recovery path; the reasons recovery actually emits are
-  `TornTail`, `CorruptRecordHeader`, and `CorruptRecordBody`.
+  `TornTail`, `CorruptRecordHeader`, and `CorruptRecordBody`. (`ReasonCode::CorruptSegmentHeader`,
+  code 4, is likewise defined but never constructed in production: a bad segment header fails
+  the open with a typed `StorageError` rather than being recorded as a loss event.)
 - **The README's "spill to disk then shed" is, for a single durable log, just "shed."**
   There is no second spill buffer to spill *into*; the active segment is already on disk,
   so "spill then shed" collapses to: keep appending until the byte cap, then drop-new
