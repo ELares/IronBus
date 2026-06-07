@@ -417,10 +417,10 @@ fn cmd_sub(
             .subscribe(group)
             .map_err(|e| classify(addr, "subscribing to", &e))?;
     }
-    let messages = client
+    let fetched = client
         .fetch(max)
         .map_err(|e| classify(addr, "fetching from", &e))?;
-    for m in &messages {
+    for m in &fetched.messages {
         writeln!(
             out,
             "#{} gen={} key={} payload={}",
@@ -451,7 +451,18 @@ fn cmd_sub(
             }
         }
     }
-    writeln!(out, "fetched {} message(s)", messages.len())?;
+    // Surface any in-band dead-letter advisories: offsets the broker dropped as poison
+    // (over MaxDeliver) and skipped from delivery (#63), so a consumer is not left silently
+    // never seeing them.
+    for dl in &fetched.dead_letters {
+        let reason = if dl.reason == 0 {
+            "max-deliver"
+        } else {
+            "reserved"
+        };
+        writeln!(out, "dead-letter offset={} reason={reason}", dl.offset)?;
+    }
+    writeln!(out, "fetched {} message(s)", fetched.messages.len())?;
     Ok(())
 }
 
@@ -1633,8 +1644,9 @@ mod tests {
         cmd_sub(&a, "", 10, Disposition::Peek, &mut second).unwrap();
         assert_eq!(
             String::from_utf8(second).unwrap(),
-            "fetched 0 message(s)\n",
-            "the poison message is dead-lettered, not redelivered"
+            "dead-letter offset=0 reason=max-deliver\nfetched 0 message(s)\n",
+            "the consumer is told the poison message was dead-lettered via the in-band advisory \
+             (#63); it is not redelivered"
         );
 
         // The engine recorded the drop and its offset (the resilience signal).
