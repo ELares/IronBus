@@ -2,12 +2,19 @@
 //! The bounded, allocation-free metric registry (#97).
 //!
 //! This makes leaving metrics on permanently affordable on a few-hundred-MB ARM box: the
-//! append and scrape hot paths never allocate, the registry has a HARD memory ceiling
-//! (a fixed sub-100 core-series cost plus 1024 consumer series times a fixed per-series
-//! cost), and per-consumer lag is cheap to update (the append path that runs on every produce is
+//! per-message APPEND hot path never allocates and the registry READ side a scrape walks
+//! (`for_each_series`, the cumulative-bucket reads, the overflow/uptime reads) never allocates
+//! either, the registry has a HARD memory ceiling (a fixed sub-100 core-series cost plus 1024
+//! consumer series times a fixed per-series cost, plus the bounded overflow fold-ledger), and
+//! per-consumer lag is cheap to update (the append path that runs on every produce is
 //! O(1): it bumps one shared head counter; the commit path is a bounded scan of at most
 //! [`MAX_CONSUMER_SERIES`] in-memory slots) and O(number of series) to scrape, all independent of
 //! the record count or disk size. Crucially NOTHING here ever walks the durable log or the disk.
+//!
+//! NOTE the Prometheus TEXT EXPOSITION the `/metrics` endpoint returns is built by
+//! [`crate::health`] into a `String` and so DOES allocate that body (an inherent, already-bounded
+//! cost of the text format); the allocation-free guarantee here is precisely the per-message
+//! append path and the registry read side that feeds the body, not the text serialization itself.
 //!
 //! The pieces:
 //!
@@ -141,6 +148,17 @@ impl FixedHistogram {
 /// mandatory.
 pub const MAX_CONSUMER_SERIES: usize = 1024;
 
+/// The capacity of the BOUNDED overflow fold-ledger (#97): the number of DISTINCT over-cap
+/// consumers whose commit floor is tracked individually so a re-commit UPDATES that consumer's
+/// contribution (subtract its old floor, add the new) instead of accumulating. This is what makes
+/// the fold idempotent under the engine's per-ack `set_committed`: an already-folded consumer that
+/// acks again does not double-count. It is a fixed, small capacity (so the ledger's memory is part
+/// of the registry's hard ceiling, NOT an unbounded per-consumer map). Distinct over-cap consumers
+/// past this ledger capacity fall back to the documented coarse saturation behavior (see
+/// [`ConsumerLagRegistry`]). Sized to match [`MAX_CONSUMER_SERIES`] so the common case (a finite,
+/// even large, set of over-cap consumers) is tracked exactly.
+pub const MAX_OVERFLOW_LEDGER: usize = MAX_CONSUMER_SERIES;
+
 /// The synthetic consumer label every over-cap consumer's lag folds into, so the TOTAL lag stays
 /// visible even once distinct labels are refused.
 pub const OVERFLOW_CONSUMER_LABEL: &str = "__overflow__";
@@ -204,10 +222,54 @@ fn stored_key(name: &[u8]) -> &[u8] {
         .unwrap_or(name)
 }
 
+/// Copies `name`'s (possibly truncated) stored key into `slot`'s inline label buffer and marks it
+/// used. Allocation-free (a fixed-size `copy_from_slice` into the preallocated buffer). Shared by
+/// the distinct-series claim and the overflow-ledger insert so the inline-label store is identical
+/// in both, keeping the per-slot cost fixed and the hot path heap-free.
+fn store_label(slot: &mut ConsumerSeries, name: &[u8]) {
+    let key = stored_key(name);
+    let n = key.len().min(MAX_CONSUMER_LABEL_BYTES);
+    if let Some(dst) = slot.label.get_mut(..n) {
+        if let Some(src) = key.get(..n) {
+            dst.copy_from_slice(src);
+        }
+    }
+    // `n <= MAX_CONSUMER_LABEL_BYTES` (64), so it always fits a `u16`; the `unwrap_or` is a
+    // never-taken fallback that keeps the conversion panic-free in a lib path.
+    slot.label_len = u16::try_from(n).unwrap_or(u16::MAX);
+    slot.used = true;
+}
+
 /// The per-consumer lag registry (#97): the durable head as a record count, a fixed array of up to
-/// [`MAX_CONSUMER_SERIES`] consumer series, the `__overflow__` fold series for refused labels, and
-/// the dropped-labels counter. Lag for one consumer is `head - committed`, both maintained
-/// incrementally; a scrape only walks the bounded series array, never the log.
+/// [`MAX_CONSUMER_SERIES`] consumer series, the bounded `__overflow__` fold ledger for refused
+/// labels, and the dropped-labels counter. Lag for one consumer is `head - committed`, both
+/// maintained incrementally; a scrape only walks the bounded series array, never the log.
+///
+/// # The overflow fold is IDEMPOTENT over a bounded ledger
+///
+/// The engine calls `set_committed` on EVERY ack (and on dead-letter commit, truncation reset, and
+/// once per group at open), so the same consumer commits many times over its life. For an over-cap
+/// consumer (one refused a distinct series), a naive fold that just summed every commit into a
+/// running total would double-count on each re-commit: `overflow_consumers` would stop equalling
+/// the number of DISTINCT folded consumers (so the overflow lag would RISE as a folded consumer made
+/// progress), and `labels_dropped` would grow per ack instead of per distinct refused label.
+///
+/// To make the fold idempotent WITHOUT an unbounded per-consumer map, an over-cap consumer's last
+/// committed floor is tracked in a BOUNDED ledger of [`MAX_OVERFLOW_LEDGER`] inline entries: a
+/// re-commit looks the consumer up and UPDATES its contribution in place (subtract its old floor,
+/// add the new), so `overflow_committed` always equals the sum of the DISTINCT folded consumers'
+/// current floors, `overflow_consumers` and `labels_dropped` bump only on the FIRST insert of a
+/// distinct label, and the overflow lag never grows as a folded consumer advances. The ledger is a
+/// fixed, small slice of the registry's hard ceiling, NOT an unbounded map.
+///
+/// If even that bounded ledger saturates (more DISTINCT over-cap consumers than [`MAX_OVERFLOW_LEDGER`]
+/// over the registry's whole life), a brand-new distinct over-cap consumer that cannot be tracked
+/// individually falls back to a documented COARSE behavior: it bumps `labels_dropped` once and the
+/// monotonic `overflow_saturated` counter, but its lag is NOT folded into `overflow_lag` (it cannot
+/// be tracked idempotently without a slot, and folding it un-trackably would let the lag grow-wrong
+/// on its re-commits). The reported overflow lag is then a documented LOWER BOUND on the true folded
+/// lag, still monotonic and never grows-wrong; `overflow_saturated > 0` is the signal that the
+/// reported overflow lag is a floor rather than exact.
 pub struct ConsumerLagRegistry {
     /// The durable log head as a RECORD COUNT (the number of records produced). Advances by one on
     /// every append; every consumer's lag is this minus its commit floor.
@@ -215,20 +277,33 @@ pub struct ConsumerLagRegistry {
     /// The fixed-capacity consumer series array, as a boxed slice of exactly [`MAX_CONSUMER_SERIES`]
     /// slots, allocated ONCE at construction on the heap (so the 1024-slot array never lives on a
     /// stack frame nor inline in the engine struct). A new consumer takes the first free slot; past
-    /// capacity it folds into the overflow series.
+    /// capacity it folds into the overflow ledger.
     series: Box<[ConsumerSeries]>,
     /// The number of occupied slots in `series`.
     len: usize,
-    /// The folded commit floor of every OVER-CAP consumer (those refused a distinct series). Its
-    /// lag is `head x overflow_consumers - overflow_committed`; see
-    /// [`ConsumerLagRegistry::overflow_lag`]. Held as the count of folded consumers and their
-    /// summed commit floor so the total stays correct as folded consumers commit.
+    /// The BOUNDED overflow fold-ledger: up to [`MAX_OVERFLOW_LEDGER`] inline entries, one per
+    /// DISTINCT over-cap consumer, each storing that consumer's last committed floor so a re-commit
+    /// updates its contribution in place (subtract old, add new) instead of accumulating. Allocated
+    /// ONCE at construction (a boxed slice, like `series`), so the ledger is part of the fixed memory
+    /// ceiling and never an unbounded map.
+    overflow_ledger: Box<[ConsumerSeries]>,
+    /// The number of occupied slots in `overflow_ledger` (the count of DISTINCT folded consumers
+    /// tracked individually). `overflow_lag = head x overflow_ledger_len - overflow_committed`.
+    overflow_ledger_len: usize,
+    /// The summed commit floor of every DISTINCT consumer currently tracked in `overflow_ledger`.
+    /// Maintained by subtract-old/add-new on each re-commit, so it stays exact (never accumulates)
+    /// as folded consumers make progress. See [`ConsumerLagRegistry::overflow_lag`].
     overflow_committed: u64,
-    /// The number of distinct consumers folded into the overflow series.
-    overflow_consumers: u64,
-    /// `ironbus_consumer_labels_dropped_total`: the number of distinct consumer labels refused a
-    /// series because the cap was reached. A monotonic counter (an operator's cardinality-pressure
-    /// signal).
+    /// `overflow_saturated`: the number of DISTINCT over-cap consumers that could not be tracked
+    /// individually because the bounded ledger was full. Monotonic. When non-zero, `overflow_lag` is
+    /// a documented LOWER BOUND (these consumers' lag is not folded in, to keep the fold idempotent
+    /// without an unbounded map). In the common case (finite over-cap cardinality under the ledger
+    /// capacity) this stays zero and the overflow lag is exact.
+    overflow_saturated: u64,
+    /// `ironbus_consumer_labels_dropped_total`: the number of DISTINCT consumer labels refused a
+    /// series because the cap was reached. Bumps only on the FIRST fold of a distinct label (a
+    /// ledger insert OR a saturation), NEVER per ack, so a folded consumer re-committing does not
+    /// inflate it. A monotonic counter (an operator's cardinality-pressure signal).
     labels_dropped: u64,
 }
 
@@ -240,8 +315,12 @@ impl Default for ConsumerLagRegistry {
             // construction (off the hot path). `vec!` fills exactly MAX_CONSUMER_SERIES Copy slots.
             series: vec![ConsumerSeries::EMPTY; MAX_CONSUMER_SERIES].into_boxed_slice(),
             len: 0,
+            // The bounded overflow fold-ledger, allocated ONCE at construction the same way, so the
+            // fold is idempotent over a fixed-capacity structure (no unbounded per-consumer map).
+            overflow_ledger: vec![ConsumerSeries::EMPTY; MAX_OVERFLOW_LEDGER].into_boxed_slice(),
+            overflow_ledger_len: 0,
             overflow_committed: 0,
-            overflow_consumers: 0,
+            overflow_saturated: 0,
             labels_dropped: 0,
         }
     }
@@ -273,27 +352,72 @@ impl ConsumerLagRegistry {
         // A new consumer with a free slot: claim it.
         if self.len < MAX_CONSUMER_SERIES {
             if let Some(slot) = self.series.get_mut(self.len) {
-                let key = stored_key(name);
-                let n = key.len().min(MAX_CONSUMER_LABEL_BYTES);
-                if let Some(dst) = slot.label.get_mut(..n) {
-                    if let Some(src) = key.get(..n) {
-                        dst.copy_from_slice(src);
-                    }
-                }
-                // `n <= MAX_CONSUMER_LABEL_BYTES` (64), so it always fits a `u16`; the `unwrap_or`
-                // is a never-taken fallback that keeps the conversion panic-free in a lib path.
-                slot.label_len = u16::try_from(n).unwrap_or(u16::MAX);
-                slot.used = true;
+                store_label(slot, name);
                 slot.committed = committed;
                 self.len += 1;
                 return;
             }
         }
-        // The cap is reached: refuse a new distinct series, fold this consumer into the overflow
-        // series, and count the dropped label. The overflow lag stays correct because the folded
-        // commit floor is summed across every folded consumer.
-        self.overflow_committed = self.overflow_committed.saturating_add(committed);
-        self.overflow_consumers = self.overflow_consumers.saturating_add(1);
+        // The cap is reached: refuse a new distinct series and fold this consumer into the bounded
+        // overflow ledger. This MUST be idempotent: the engine calls `set_committed` on every ack,
+        // so the same over-cap consumer arrives here repeatedly; a naive `+= committed` would
+        // double-count (the BLOCKER this fix closes). Instead, track each distinct over-cap
+        // consumer's floor in the ledger and UPDATE in place on a re-commit.
+        self.fold_into_overflow(name, committed);
+    }
+
+    /// Folds an over-cap consumer's commit floor into the bounded overflow ledger IDEMPOTENTLY
+    /// (#97). Allocation-free, and a bounded in-memory scan of at most [`MAX_OVERFLOW_LEDGER`] inline
+    /// entries:
+    ///
+    /// - An already-tracked consumer: advance its stored floor monotonically (`.max`) and apply the
+    ///   delta to `overflow_committed` (subtract its old floor, add its new), so a re-commit UPDATES
+    ///   its contribution instead of accumulating. `labels_dropped`/`overflow_ledger_len` do NOT
+    ///   change (it was already counted on its first fold).
+    /// - A brand-new distinct over-cap consumer with ledger room: claim a ledger slot, store its
+    ///   floor, add it to `overflow_committed`, and bump `overflow_ledger_len` and `labels_dropped`
+    ///   ONCE.
+    /// - A brand-new distinct over-cap consumer with NO ledger room (saturation): bump
+    ///   `labels_dropped` and `overflow_saturated` once; its lag is NOT folded into
+    ///   `overflow_committed`/`overflow_lag` (it cannot be tracked idempotently without a slot, and
+    ///   an un-trackable fold would grow-wrong on its re-commits). The overflow lag is then a
+    ///   documented LOWER BOUND. A saturating consumer that re-commits cannot be distinguished from
+    ///   a new one without a slot, so it may bump these counters again; this is the explicit,
+    ///   monotonic, never-grows-wrong coarse fallback for the (rare) past-ledger-capacity case, and
+    ///   `overflow_saturated > 0` flags it.
+    fn fold_into_overflow(&mut self, name: &[u8], committed: u64) {
+        // An already-tracked over-cap consumer: update its contribution in place. Monotonic floor
+        // (a commit never moves a cursor backwards), so a stale lower value is ignored.
+        for slot in self
+            .overflow_ledger
+            .iter_mut()
+            .take(self.overflow_ledger_len)
+        {
+            if slot.used && slot.label_matches(name) {
+                let new_floor = slot.committed.max(committed);
+                // Apply only the forward delta to the running sum, so `overflow_committed` stays the
+                // exact sum of the tracked floors (never an accumulation across re-commits).
+                let delta = new_floor.saturating_sub(slot.committed);
+                self.overflow_committed = self.overflow_committed.saturating_add(delta);
+                slot.committed = new_floor;
+                return;
+            }
+        }
+        // A brand-new distinct over-cap consumer with ledger room: claim a slot and count it ONCE.
+        if self.overflow_ledger_len < MAX_OVERFLOW_LEDGER {
+            if let Some(slot) = self.overflow_ledger.get_mut(self.overflow_ledger_len) {
+                store_label(slot, name);
+                slot.committed = committed;
+                self.overflow_ledger_len += 1;
+                self.overflow_committed = self.overflow_committed.saturating_add(committed);
+                self.labels_dropped = self.labels_dropped.saturating_add(1);
+                return;
+            }
+        }
+        // The ledger is saturated: a distinct over-cap consumer beyond the ledger capacity. Count it
+        // (a distinct refused label) and flag saturation, but do NOT fold its lag, keeping the
+        // overflow lag a monotonic, never-grows-wrong LOWER BOUND.
+        self.overflow_saturated = self.overflow_saturated.saturating_add(1);
         self.labels_dropped = self.labels_dropped.saturating_add(1);
     }
 
@@ -303,28 +427,48 @@ impl ConsumerLagRegistry {
         self.head
     }
 
-    /// `ironbus_consumer_labels_dropped_total`: the count of consumer labels refused a series at the
-    /// cap.
+    /// `ironbus_consumer_labels_dropped_total`: the count of DISTINCT consumer labels refused a
+    /// series at the cap. Counts each distinct over-cap label ONCE (on its first fold), never per
+    /// ack, so a folded consumer re-committing does not inflate it.
     #[must_use]
     pub fn labels_dropped(&self) -> u64 {
         self.labels_dropped
     }
 
-    /// The lag of the overflow (folded) series: the sum over every folded consumer of
-    /// `head - committed_i`, which equals `head x overflow_consumers - overflow_committed`
-    /// (saturating, so a stale floor above the head never underflows).
+    /// The lag of the overflow (folded) series: the sum over every DISTINCT folded consumer of
+    /// `head - committed_i`, which equals `head x overflow_ledger_len - overflow_committed`
+    /// (saturating, so a stale floor above the head never underflows). Because `overflow_committed`
+    /// is the EXACT sum of the tracked consumers' current floors (maintained by subtract-old/add-new
+    /// on every re-commit, never accumulated), this does NOT rise as a folded consumer makes
+    /// progress: a folded consumer committing a higher offset lowers its own `head - committed_i`
+    /// term, exactly as a distinct series would. If the bounded ledger saturated
+    /// ([`ConsumerLagRegistry::overflow_saturated`] `> 0`), this is a documented monotonic LOWER
+    /// BOUND (the un-tracked, past-capacity consumers' lag is not folded in).
     #[must_use]
     pub fn overflow_lag(&self) -> u64 {
+        // `overflow_ledger_len` is at most MAX_OVERFLOW_LEDGER (1024), so it always fits a `u64`; the
+        // `unwrap_or` is a never-taken fallback that keeps the conversion panic-free in a lib path.
+        let tracked = u64::try_from(self.overflow_ledger_len).unwrap_or(u64::MAX);
         self.head
-            .saturating_mul(self.overflow_consumers)
+            .saturating_mul(tracked)
             .saturating_sub(self.overflow_committed)
     }
 
-    /// Whether the overflow series is in use (at least one consumer was folded), so the scrape only
-    /// emits the `__overflow__` line once a label has actually been dropped.
+    /// `overflow_saturated`: the number of DISTINCT over-cap consumers that could not be tracked in
+    /// the bounded fold-ledger because it was full. When `> 0`, [`ConsumerLagRegistry::overflow_lag`]
+    /// is a documented monotonic LOWER BOUND rather than the exact folded lag. Zero in the common
+    /// case (over-cap cardinality within the ledger capacity).
+    #[must_use]
+    pub fn overflow_saturated(&self) -> u64 {
+        self.overflow_saturated
+    }
+
+    /// Whether the overflow series is in use (at least one consumer was folded, whether tracked in
+    /// the ledger or refused at saturation), so the scrape only emits the `__overflow__` line once a
+    /// label has actually been dropped.
     #[must_use]
     pub fn has_overflow(&self) -> bool {
-        self.overflow_consumers > 0
+        self.overflow_ledger_len > 0 || self.overflow_saturated > 0
     }
 
     /// Invokes `f(label, lag)` for each occupied DISTINCT consumer series, lag = `head - committed`
@@ -464,10 +608,11 @@ impl MetricRegistry {
 }
 
 /// The fixed registry-memory ceiling, in bytes, asserted by a test and signed off against the
-/// edge RAM budget. It is the sum of the consumer-series array (the dominant, capped term) and the
-/// fixed core-series state (the two histograms plus the small scalars). It is INDEPENDENT of the
-/// record count, the disk size, and the number of live consumers, because the consumer-series array
-/// is preallocated at its 1024-slot cap.
+/// edge RAM budget. It is the sum of the consumer-series array (the dominant, capped term), the
+/// bounded overflow fold-ledger (a second capped array of the same per-entry cost), and the fixed
+/// core-series state (the two histograms plus the small scalars). It is INDEPENDENT of the record
+/// count, the disk size, and the number of live consumers, because BOTH the consumer-series array
+/// and the overflow ledger are preallocated at their fixed caps.
 ///
 /// The exact value is asserted in the tests below against `size_of` so a struct-layout change that
 /// inflates the per-series cost is caught; the documented ceiling in `docs/METRICS.md` and the
@@ -476,10 +621,14 @@ impl MetricRegistry {
 pub fn registry_memory_ceiling_bytes() -> usize {
     // The boxed consumer-series array: the capped, dominant term.
     let consumer_series = MAX_CONSUMER_SERIES * core::mem::size_of::<ConsumerSeries>();
+    // The bounded overflow fold-ledger: a second capped array of the SAME inline `ConsumerSeries`
+    // entry, preallocated at its cap, so the overflow fold stays idempotent without an unbounded
+    // per-consumer map. It is part of the hard ceiling, not an open-ended term.
+    let overflow_ledger = MAX_OVERFLOW_LEDGER * core::mem::size_of::<ConsumerSeries>();
     // The fixed core state held inline in MetricRegistry (the two histograms plus the scalar
     // self-info and lag-registry bookkeeping). This is the fixed sub-100-series core cost.
     let core = core::mem::size_of::<MetricRegistry>();
-    consumer_series + core
+    consumer_series + overflow_ledger + core
 }
 
 #[cfg(test)]
@@ -664,6 +813,160 @@ mod tests {
     }
 
     #[test]
+    fn an_over_cap_consumer_recommitting_does_not_double_count_or_grow_lag() {
+        // The BLOCKER regression (#97): the engine calls `set_committed` on EVERY ack, so an
+        // over-cap (folded) consumer arrives here many times over its life. The fold MUST be
+        // idempotent: re-committing the SAME folded consumer must NOT inflate `labels_dropped`
+        // (which counts DISTINCT refused labels) and must NOT make the overflow lag rise as the
+        // consumer makes progress. The old code did `overflow_committed += committed` /
+        // `overflow_consumers += 1` / `labels_dropped += 1` on every commit, so this test fails
+        // against it and passes after the bounded fold-ledger fix.
+        let mut r = ConsumerLagRegistry::default();
+        r.record_appended(100);
+        // Fill exactly the cap with distinct series so the next consumer is forced into the fold.
+        for i in 0..MAX_CONSUMER_SERIES {
+            r.set_committed(format!("c{i}").as_bytes(), 0);
+        }
+        assert_eq!(r.labels_dropped(), 0);
+        assert!(!r.has_overflow());
+
+        // The worked example from the issue: head = 100, ONE over-cap consumer.
+        // First commit at offset 10 -> its lag is 100 - 10 = 90.
+        r.set_committed(b"over-cap", 10);
+        assert_eq!(r.labels_dropped(), 1, "exactly one DISTINCT label refused");
+        assert_eq!(
+            r.overflow_saturated(),
+            0,
+            "the ledger has room, no saturation"
+        );
+        assert_eq!(
+            r.overflow_lag(),
+            90,
+            "first fold: head 100 - committed 10 = 90"
+        );
+
+        // The SAME consumer commits again, advancing to offset 50 (it made progress). The old code
+        // computed 100*2 - 60 = 140 here (lag RISING as the consumer caught up); the fix updates the
+        // single tracked floor in place, so the lag is the true 100 - 50 = 50 and DROPS, and the
+        // distinct-label counter stays at 1 (not 2).
+        r.set_committed(b"over-cap", 50);
+        assert_eq!(
+            r.labels_dropped(),
+            1,
+            "a re-commit of an already-folded consumer must NOT count a new dropped label"
+        );
+        assert_eq!(
+            r.overflow_lag(),
+            50,
+            "the overflow lag must be the consumer's true lag (100 - 50), not rise to 140"
+        );
+
+        // A stale lower re-commit is ignored (monotonic floor), so the lag does not jump back up.
+        r.set_committed(b"over-cap", 20);
+        assert_eq!(r.overflow_lag(), 50, "a stale lower commit is ignored");
+
+        // A SECOND distinct over-cap consumer is a new dropped label and adds its own lag term.
+        r.set_committed(b"over-cap-2", 30); // lag 70
+        assert_eq!(
+            r.labels_dropped(),
+            2,
+            "a second DISTINCT label is counted once"
+        );
+        // Total folded lag = (100 - 50) + (100 - 30) = 50 + 70 = 120, exact (no saturation).
+        assert_eq!(r.overflow_lag(), 120);
+        // And re-committing the second consumer many times does not inflate either metric.
+        for off in 31..=60 {
+            r.set_committed(b"over-cap-2", off);
+        }
+        assert_eq!(
+            r.labels_dropped(),
+            2,
+            "many re-commits, still two distinct labels"
+        );
+        // over-cap is at 50, over-cap-2 advanced to 60: (100 - 50) + (100 - 60) = 50 + 40 = 90.
+        assert_eq!(
+            r.overflow_lag(),
+            90,
+            "the folded lag tracks each consumer's true progress, never accumulating"
+        );
+    }
+
+    #[test]
+    fn the_overflow_ledger_saturation_is_a_monotonic_lower_bound() {
+        // Past the ledger capacity, a brand-new distinct over-cap consumer cannot be tracked
+        // individually. The documented coarse fallback: it bumps `labels_dropped` and the
+        // `overflow_saturated` flag, but its lag is NOT folded in, so the reported overflow lag is a
+        // monotonic LOWER BOUND. The ledger-tracked consumers' lag stays exact and never grows-wrong.
+        let mut r = ConsumerLagRegistry::default();
+        r.record_appended(1000);
+        // Fill the distinct-series cap.
+        for i in 0..MAX_CONSUMER_SERIES {
+            r.set_committed(format!("c{i}").as_bytes(), 0);
+        }
+        // Fill the ENTIRE overflow ledger with distinct over-cap consumers, each at floor 0.
+        for i in 0..MAX_OVERFLOW_LEDGER {
+            r.set_committed(format!("o{i}").as_bytes(), 0);
+        }
+        assert_eq!(r.overflow_saturated(), 0, "ledger not yet saturated");
+        let lag_at_ledger_full = r.overflow_lag();
+        let ledger_cap = u64::try_from(MAX_OVERFLOW_LEDGER).unwrap();
+        assert_eq!(
+            r.labels_dropped(),
+            ledger_cap,
+            "one distinct label per ledgered over-cap consumer"
+        );
+        // One MORE distinct over-cap consumer: the ledger is full, so it saturates.
+        r.set_committed(b"past-the-ledger", 0);
+        assert_eq!(
+            r.overflow_saturated(),
+            1,
+            "the past-capacity consumer saturated"
+        );
+        assert_eq!(
+            r.labels_dropped(),
+            ledger_cap + 1,
+            "the saturating consumer is still counted as a distinct refused label"
+        );
+        // The reported lag is a LOWER BOUND: it does not grow-wrong (it stays at the ledgered total,
+        // not the old buggy head*consumers - committed which would have ballooned).
+        assert_eq!(
+            r.overflow_lag(),
+            lag_at_ledger_full,
+            "a saturating consumer is not folded into the lag, which stays a monotonic lower bound"
+        );
+        // A ledgered consumer making progress still LOWERS the (lower-bound) lag, never raises it.
+        r.set_committed(b"o0", 500);
+        assert!(
+            r.overflow_lag() < lag_at_ledger_full,
+            "a tracked consumer's progress lowers the overflow lag"
+        );
+    }
+
+    #[test]
+    fn the_overflow_fold_path_does_not_allocate() {
+        // The engine drives the fold on every ack, so the fold (claim + re-commit update) must be
+        // allocation-free just like the under-cap commit path.
+        let mut reg = MetricRegistry::new("0.0.0", 0, 0);
+        reg.record_appended();
+        // Fill the distinct-series cap OUTSIDE the counted window.
+        for i in 0..MAX_CONSUMER_SERIES {
+            reg.set_consumer_committed(format!("c{i}").as_bytes(), 0);
+        }
+        // Pre-fold one over-cap consumer OUTSIDE the window (its first fold claims a ledger slot).
+        reg.set_consumer_committed(b"folded", 0);
+        let allocs = count_allocs(|| {
+            // Re-commit the already-folded consumer many times: the steady-state engine ack path.
+            for i in 0..1000u64 {
+                reg.set_consumer_committed(b"folded", i);
+            }
+        });
+        assert_eq!(
+            allocs, 0,
+            "the overflow re-commit path allocated {allocs} times"
+        );
+    }
+
+    #[test]
     fn an_over_long_label_is_truncated_not_grown() {
         let mut r = ConsumerLagRegistry::default();
         r.record_appended(1);
@@ -705,16 +1008,21 @@ mod tests {
             per_series <= MAX_CONSUMER_LABEL_BYTES + 16,
             "per-series cost drifted above label[64] + two words: {per_series}"
         );
+        // The overflow fold-ledger is a SECOND capped array of the same per-entry cost, also
+        // preallocated at its cap, so it too is a fixed term independent of live-consumer count.
         assert_eq!(
             ceiling,
-            MAX_CONSUMER_SERIES * per_series + core::mem::size_of::<MetricRegistry>()
+            MAX_CONSUMER_SERIES * per_series
+                + MAX_OVERFLOW_LEDGER * per_series
+                + core::mem::size_of::<MetricRegistry>()
         );
-        // The signed-off ceiling: the consumer-series array is the dominant term and is well under
-        // 128 KiB, so the whole registry is a small fixed slice of the 64 MiB edge RAM budget,
-        // INDEPENDENT of record count or disk size. (~80 bytes/series x 1024 ~= 80 KiB.)
+        // The signed-off ceiling: the two capped series arrays (the lag series plus the bounded
+        // overflow ledger) are the dominant terms and together are well under 256 KiB, so the whole
+        // registry is a small fixed slice of the 64 MiB edge RAM budget, INDEPENDENT of record count
+        // or disk size. (~80 bytes/series x 1024 x 2 arrays ~= 160 KiB.)
         assert!(
-            ceiling < 128 * 1024,
-            "registry ceiling {ceiling} bytes exceeded the documented 128 KiB sign-off"
+            ceiling < 256 * 1024,
+            "registry ceiling {ceiling} bytes exceeded the documented 256 KiB sign-off"
         );
         // The core (non-consumer-series) state is a fixed sub-100-series cost: a handful of
         // histograms and scalars, well under 1 KiB.

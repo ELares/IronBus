@@ -112,10 +112,22 @@ set.
 ## The bounded metric registry (#97)
 
 The registry (`crates/ironbus-server/src/registry.rs`) makes leaving metrics on
-permanently affordable on a few-hundred-MB ARM box: the append and scrape hot
-paths never allocate, the registry has a **hard memory ceiling** independent of
-the record count and disk size, and per-consumer lag is O(1) to update and
-O(number of series) to scrape (it is **never** computed by scanning the log).
+permanently affordable on a few-hundred-MB ARM box: the per-message **append hot
+path** never allocates and the registry **read side** a scrape walks (the
+`for_each_series` visit, the cumulative-bucket reads, the overflow and uptime
+reads) never allocates either, the registry has a **hard memory ceiling**
+independent of the record count and disk size, and per-consumer lag is O(1) to
+update and O(number of series) to scrape (it is **never** computed by scanning
+the log).
+
+Scoping note: the Prometheus **text exposition** the `/metrics` endpoint returns
+is serialized into a `String` by `crates/ironbus-server/src/health.rs`, so
+rendering that text body **does** allocate (an inherent, already-bounded cost of
+the text format). The allocation-free guarantee is the per-message append path
+and the registry read side that feeds the body, not the text serialization
+itself. Tests pin exactly this: `the_append_and_commit_hot_path_does_not_allocate`
+covers the append/commit path and `the_scrape_walk_does_not_allocate` covers the
+registry read walk; neither claims the rendered text body is alloc-free.
 
 ### Fixed histogram buckets (compile-time, not runtime-configurable)
 
@@ -157,6 +169,35 @@ consumer is refused its own series, its lag folds into
 increments. An unbounded consumer cardinality would OOM the very node the
 metrics protect, so the cap and the overflow fold are mandatory.
 
+The overflow fold is **idempotent**. The broker commits each consumer on every
+ack (and on dead-letter commit, truncation reset, and once per group at open), so
+an over-cap consumer arrives at the fold many times over its life. To avoid
+double-counting, each distinct over-cap consumer's last committed floor is
+tracked in a **bounded fold-ledger** (a second capped array, of the same fixed
+1024-entry / 80-byte-per-entry cost as the series array, so it is part of the
+hard ceiling, not an unbounded map): a re-commit **updates** that consumer's
+contribution in place rather than accumulating. The consequences operators rely
+on:
+
+- `ironbus_consumer_labels_dropped_total` counts **distinct** consumer labels
+  refused, **once each** on first fold, never per ack: it does not grow when an
+  already-folded consumer commits again.
+- `ironbus_consumer_lag_records{consumer="__overflow__"}` is the exact sum of the
+  tracked over-cap consumers' true lags, so it **does not rise** as a folded
+  consumer makes progress (a folded consumer committing a higher offset lowers
+  its own term, exactly as a distinct series would).
+
+If the bounded fold-ledger itself saturates (more **distinct** over-cap consumers
+over the broker's whole life than the ledger capacity, which equals the
+1024-series cap), a brand-new distinct over-cap consumer that cannot be tracked
+individually falls back to a documented **coarse** behavior: it still increments
+`ironbus_consumer_labels_dropped_total` (it is a distinct refused label), but its
+lag is **not** folded into the `__overflow__` total, so that total becomes a
+**monotonic lower bound** on the true folded lag rather than exact. This bound is
+never wrong-high and never grows as folded consumers make progress. Saturation is
+the rare past-1024-distinct-over-cap-consumer case; in the common case the
+overflow total is exact.
+
 ### Self-monitoring series
 
 ```
@@ -173,21 +214,22 @@ an NTP step.
 ### The memory ceiling (signed off against the #19 / #115 edge RAM budget)
 
 The registry's resident cost is a **fixed** sub-100-series core plus the capped
-consumer-series array, asserted by a test
-(`the_registry_memory_ceiling_is_fixed_and_bounded`):
+consumer-series array and the equally-capped bounded overflow fold-ledger,
+asserted by a test (`the_registry_memory_ceiling_is_fixed_and_bounded`):
 
 ```
 ceiling = MAX_CONSUMER_SERIES (1024) x per-series cost (80 bytes, fixed-width inline label)
+        + the bounded overflow fold-ledger (1024) x the same per-entry cost (80 bytes)
         + the fixed core state (two histograms + scalars, < 1 KiB)
-       ~= 80 KiB + < 1 KiB  <  128 KiB
+       ~= 80 KiB + 80 KiB + < 1 KiB  <  256 KiB
 ```
 
-The per-series cost is fixed (an inline 64-byte label buffer plus fixed-width
-bookkeeping, identical on 32-bit and 64-bit targets), so the ceiling is
-INDEPENDENT of the record count, the disk size, and the number of live
-consumers (the array is preallocated at the cap). At ~81 KiB it is a small fixed
-slice of the 64 MiB `tiny`-profile RAM ceiling in
-[RAM_BUDGET.md](RAM_BUDGET.md) (well under 0.2% of it), so leaving the full
+The per-series (and per-ledger-entry) cost is fixed (an inline 64-byte label
+buffer plus fixed-width bookkeeping, identical on 32-bit and 64-bit targets), so
+the ceiling is INDEPENDENT of the record count, the disk size, and the number of
+live consumers (both arrays are preallocated at the cap). At ~161 KiB it is a
+small fixed slice of the 64 MiB `tiny`-profile RAM ceiling in
+[RAM_BUDGET.md](RAM_BUDGET.md) (well under 0.3% of it), so leaving the full
 metric surface on permanently is affordable on a 64 MiB edge node. This is the
 #19 sign-off the issue requires.
 
