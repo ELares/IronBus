@@ -111,10 +111,10 @@ fn build_disk(shape: Shape) -> InMemoryFs {
             let last_seg = active_segment_id(log.filesystem());
             let durable = run_workload(shape).into_filesystem();
             durable.simulate_power_loss();
-            let floor = durable
-                .open(&segment_file_name(last_seg))
-                .map(|f| f.len().unwrap())
-                .unwrap_or(0);
+            let floor = match durable.open(&segment_file_name(last_seg)) {
+                Ok(f) => f.len().unwrap(),
+                Err(_) => 0,
+            };
             let file = log.filesystem().open(&segment_file_name(last_seg)).unwrap();
             let len = file.len().unwrap();
             let new_len = len.saturating_sub(bytes).max(floor.min(len));
