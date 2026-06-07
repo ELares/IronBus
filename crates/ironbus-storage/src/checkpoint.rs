@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! A crash-safe checkpoint for small durable state (the committed consumer cursor, and
-//! later the resilience counters).
+//! the resilience counters).
 //!
 //! The checkpoint is two fixed-size slots. Each write goes to the slot the sequence
 //! number selects, alternating, and is CRC32C-protected over its sequence, length, and
@@ -10,27 +10,37 @@
 //! invented one: for an at-least-once cursor that just means some already-processed
 //! messages redeliver, which is safe. It never advances past a value that was not fully,
 //! durably written.
+//!
+//! The per-slot payload cap is a const generic, so the same crash-safe machinery serves the
+//! small cursor snapshot ([`MAX_PAYLOAD`], the default) and the slightly larger resilience-counter
+//! snapshot ([`COUNTERS_PAYLOAD`], #98) without duplicating the dual-slot logic.
 
 use crate::io::RandomAccessFile;
 use crate::segment::StorageError;
 use ironbus_core::segment::SegmentError;
 
-/// The most payload bytes a checkpoint slot holds (room for the committed offset plus the
-/// resilience counters that extend it later).
+/// The most payload bytes the cursor checkpoint slot holds (the committed watermark plus the
+/// acked-ahead set). Also the DEFAULT payload cap for a [`Checkpoint`], so the existing cursor
+/// callers are unchanged.
 pub const MAX_PAYLOAD: usize = 64;
+
+/// The per-slot payload cap for the resilience-counters checkpoint (#98): room for the fixed set
+/// of `u64` counters plus a version byte and headroom for future fields, comfortably above the
+/// current snapshot length. The counters snapshot is an OBSERVABILITY aid, never correctness state,
+/// so a torn or missing one recovers as all-zeros and never blocks broker startup.
+pub const COUNTERS_PAYLOAD: usize = 96;
 
 const SEQ_LEN: usize = 8;
 const LEN_LEN: usize = 2;
 const CRC_LEN: usize = 4;
-/// Bytes per slot: sequence, payload length, payload, CRC.
-const SLOT_LEN: usize = SEQ_LEN + LEN_LEN + MAX_PAYLOAD + CRC_LEN;
-/// The checkpoint file is two slots.
-pub const CHECKPOINT_LEN: u64 = (SLOT_LEN * 2) as u64;
+/// The fixed per-slot framing overhead (sequence + payload length + CRC), so a slot is
+/// `SLOT_OVERHEAD + PAYLOAD_CAP` bytes.
+const SLOT_OVERHEAD: usize = SEQ_LEN + LEN_LEN + CRC_LEN;
 
-/// Reads `[seq, len, payload]` from a slot and returns the payload if the slot is valid: a
-/// nonzero sequence, an in-range length, and a matching CRC over the meaningful bytes.
-fn decode_slot(slot: &[u8]) -> Option<(u64, Vec<u8>)> {
-    if slot.len() != SLOT_LEN {
+/// Reads `[seq, len, payload]` from a `CAP`-payload slot and returns the payload if the slot is
+/// valid: a nonzero sequence, an in-range length, and a matching CRC over the meaningful bytes.
+fn decode_slot<const CAP: usize>(slot: &[u8]) -> Option<(u64, Vec<u8>)> {
+    if slot.len() != SLOT_OVERHEAD + CAP {
         return None;
     }
     let seq = u64::from_le_bytes(slot[0..SEQ_LEN].try_into().ok()?);
@@ -40,11 +50,11 @@ fn decode_slot(slot: &[u8]) -> Option<(u64, Vec<u8>)> {
     let len = usize::from(u16::from_le_bytes(
         slot[SEQ_LEN..SEQ_LEN + LEN_LEN].try_into().ok()?,
     ));
-    if len > MAX_PAYLOAD {
+    if len > CAP {
         return None;
     }
     let payload_start = SEQ_LEN + LEN_LEN;
-    let crc_start = payload_start + MAX_PAYLOAD;
+    let crc_start = payload_start + CAP;
     let stored_crc = u32::from_le_bytes(slot[crc_start..crc_start + CRC_LEN].try_into().ok()?);
     // The CRC covers the sequence, the length field, and the meaningful payload bytes
     // (the padding and the CRC field itself are excluded).
@@ -54,30 +64,48 @@ fn decode_slot(slot: &[u8]) -> Option<(u64, Vec<u8>)> {
     Some((seq, slot[payload_start..payload_start + len].to_vec()))
 }
 
-fn encode_slot(seq: u64, payload: &[u8]) -> [u8; SLOT_LEN] {
-    let mut slot = [0u8; SLOT_LEN];
+fn encode_slot<const CAP: usize>(seq: u64, payload: &[u8]) -> Vec<u8> {
+    let mut slot = vec![0u8; SLOT_OVERHEAD + CAP];
     slot[0..SEQ_LEN].copy_from_slice(&seq.to_le_bytes());
-    // payload.len() <= MAX_PAYLOAD is guaranteed by the caller, so this conversion fits.
-    debug_assert!(payload.len() <= MAX_PAYLOAD, "encode_slot payload over cap");
+    // payload.len() <= CAP is guaranteed by the caller, so this conversion fits.
+    debug_assert!(payload.len() <= CAP, "encode_slot payload over cap");
     let len = payload.len();
     let len_field = u16::try_from(len).unwrap_or(u16::MAX);
     slot[SEQ_LEN..SEQ_LEN + LEN_LEN].copy_from_slice(&len_field.to_le_bytes());
     let payload_start = SEQ_LEN + LEN_LEN;
     slot[payload_start..payload_start + len].copy_from_slice(payload);
     let crc = crc32c::crc32c(&slot[0..payload_start + len]);
-    let crc_start = payload_start + MAX_PAYLOAD;
+    let crc_start = payload_start + CAP;
     slot[crc_start..crc_start + CRC_LEN].copy_from_slice(&crc.to_le_bytes());
     slot
 }
 
-/// A two-slot crash-safe checkpoint over a [`RandomAccessFile`].
+/// A two-slot crash-safe checkpoint over a [`RandomAccessFile`], with a const-generic per-slot
+/// payload cap (`PAYLOAD_CAP`). Two concrete aliases are exported: [`Checkpoint`] (the cursor
+/// checkpoint, [`MAX_PAYLOAD`]) and [`CountersCheckpoint`] (the resilience-counters checkpoint,
+/// [`COUNTERS_PAYLOAD`], #98). Pinning the cap through an alias keeps every call site free of an
+/// explicit const generic, so `Checkpoint::open` infers exactly as before the cap became generic.
 #[derive(Debug)]
-pub struct Checkpoint<F: RandomAccessFile> {
+pub struct SlotCheckpoint<F: RandomAccessFile, const PAYLOAD_CAP: usize> {
     file: F,
     next_seq: u64,
 }
 
-impl<F: RandomAccessFile> Checkpoint<F> {
+/// The crash-safe checkpoint for the committed consumer cursor (the historical checkpoint): a
+/// [`MAX_PAYLOAD`]-per-slot [`SlotCheckpoint`].
+pub type Checkpoint<F> = SlotCheckpoint<F, MAX_PAYLOAD>;
+
+/// The crash-safe checkpoint for the resilience COUNTERS (#98): a [`COUNTERS_PAYLOAD`]-per-slot
+/// [`SlotCheckpoint`]. It is an OBSERVABILITY aid only: a torn or missing snapshot recovers as
+/// all-zeros and never blocks broker startup or touches the durable log, cursors, or DLQ.
+pub type CountersCheckpoint<F> = SlotCheckpoint<F, COUNTERS_PAYLOAD>;
+
+impl<F: RandomAccessFile, const PAYLOAD_CAP: usize> SlotCheckpoint<F, PAYLOAD_CAP> {
+    /// Bytes per slot for this cap: sequence, payload length, payload, CRC.
+    const SLOT_LEN: usize = SLOT_OVERHEAD + PAYLOAD_CAP;
+    /// The whole checkpoint file is two slots.
+    const FILE_LEN: u64 = (Self::SLOT_LEN * 2) as u64;
+
     /// Opens a checkpoint file, reading both slots to recover the latest durable value.
     /// A fresh (zeroed or short) file recovers nothing. Returns the checkpoint plus the
     /// recovered payload, if any.
@@ -88,14 +116,17 @@ impl<F: RandomAccessFile> Checkpoint<F> {
     ///
     /// # Errors
     /// Propagates an IO error.
-    pub fn open(file: F) -> Result<(Checkpoint<F>, Option<Vec<u8>>), StorageError> {
+    pub fn open(
+        file: F,
+    ) -> Result<(SlotCheckpoint<F, PAYLOAD_CAP>, Option<Vec<u8>>), StorageError> {
+        let slot_len = Self::SLOT_LEN;
         let len = file.len()?;
-        let mut buf = vec![0u8; SLOT_LEN * 2];
-        if len >= CHECKPOINT_LEN {
+        let mut buf = vec![0u8; slot_len * 2];
+        if len >= Self::FILE_LEN {
             file.read_exact_at(&mut buf, 0)?;
         }
-        let a = decode_slot(&buf[0..SLOT_LEN]);
-        let b = decode_slot(&buf[SLOT_LEN..SLOT_LEN * 2]);
+        let a = decode_slot::<PAYLOAD_CAP>(&buf[0..slot_len]);
+        let b = decode_slot::<PAYLOAD_CAP>(&buf[slot_len..slot_len * 2]);
         // The higher valid sequence wins.
         let best = match (a, b) {
             (Some((sa, pa)), Some((sb, pb))) => {
@@ -115,7 +146,7 @@ impl<F: RandomAccessFile> Checkpoint<F> {
             ),
             None => (1, None),
         };
-        Ok((Checkpoint { file, next_seq }, payload))
+        Ok((SlotCheckpoint { file, next_seq }, payload))
     }
 
     /// Durably writes a new checkpoint payload (fsync). The previous value remains intact
@@ -123,15 +154,15 @@ impl<F: RandomAccessFile> Checkpoint<F> {
     ///
     /// # Errors
     /// Returns [`StorageError::Segment`] with [`SegmentError::Truncated`] if the payload
-    /// exceeds [`MAX_PAYLOAD`], or an IO error.
+    /// exceeds `PAYLOAD_CAP`, or an IO error.
     pub fn write(&mut self, payload: &[u8]) -> Result<(), StorageError> {
-        if payload.len() > MAX_PAYLOAD {
+        if payload.len() > PAYLOAD_CAP {
             return Err(StorageError::Segment(SegmentError::Truncated));
         }
         let seq = self.next_seq;
         let slot_index = seq % 2;
-        let offset = slot_index * SLOT_LEN as u64;
-        let slot = encode_slot(seq, payload);
+        let offset = slot_index * Self::SLOT_LEN as u64;
+        let slot = encode_slot::<PAYLOAD_CAP>(seq, payload);
         self.file.write_all_at(&slot, offset)?;
         self.file.sync_all()?;
         self.next_seq = seq.checked_add(1).ok_or(StorageError::SegmentFull)?;
@@ -146,12 +177,26 @@ mod tests {
     use proptest::prelude::*;
     use std::sync::Arc;
 
+    // These tests exercise the DEFAULT (cursor) payload cap, so they bind the const-generic slot
+    // helpers and length constants at `MAX_PAYLOAD` for the byte-offset arithmetic below.
+    const SLOT_LEN: usize = SLOT_OVERHEAD + MAX_PAYLOAD;
+    const CHECKPOINT_LEN: u64 = (SLOT_LEN * 2) as u64;
+
+    fn decode_slot(slot: &[u8]) -> Option<(u64, Vec<u8>)> {
+        super::decode_slot::<MAX_PAYLOAD>(slot)
+    }
+
+    fn encode_slot(seq: u64, payload: &[u8]) -> Vec<u8> {
+        super::encode_slot::<MAX_PAYLOAD>(seq, payload)
+    }
+
     fn fresh() -> Arc<InMemoryFile> {
         Arc::new(InMemoryFile::new())
     }
 
     fn reopen(file: &Arc<InMemoryFile>) -> Option<Vec<u8>> {
-        Checkpoint::open(Arc::clone(file)).unwrap().1
+        let cp: (Checkpoint<Arc<InMemoryFile>>, _) = Checkpoint::open(Arc::clone(file)).unwrap();
+        cp.1
     }
 
     #[test]
@@ -339,5 +384,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    // The larger-cap counters checkpoint (#98) reuses the identical dual-slot crash-safe
+    // machinery, so a handful of tests confirm the bigger slot round-trips and stays torn-safe.
+
+    #[test]
+    fn a_counters_checkpoint_round_trips_a_full_size_payload() {
+        let file = fresh();
+        let (mut cp, recovered) = CountersCheckpoint::open(Arc::clone(&file)).unwrap();
+        assert_eq!(recovered, None);
+        let payload = vec![0x42; COUNTERS_PAYLOAD];
+        cp.write(&payload).unwrap();
+        let reopened = CountersCheckpoint::open(Arc::clone(&file)).unwrap().1;
+        assert_eq!(reopened, Some(payload));
+    }
+
+    #[test]
+    fn a_counters_checkpoint_over_its_cap_is_rejected() {
+        let file = fresh();
+        let (mut cp, _) = CountersCheckpoint::open(Arc::clone(&file)).unwrap();
+        let big = vec![0u8; COUNTERS_PAYLOAD + 1];
+        assert!(matches!(
+            cp.write(&big),
+            Err(StorageError::Segment(SegmentError::Truncated))
+        ));
+    }
+
+    #[test]
+    fn a_torn_counters_slot_falls_back_to_the_previous_value() {
+        let file = fresh();
+        let (mut cp, _) = CountersCheckpoint::open(Arc::clone(&file)).unwrap();
+        cp.write(&[1u8; COUNTERS_PAYLOAD]).unwrap(); // seq 1 -> slot 1
+        cp.write(&[2u8; COUNTERS_PAYLOAD]).unwrap(); // seq 2 -> slot 0
+        let counters_slot_len = SLOT_OVERHEAD + COUNTERS_PAYLOAD;
+        // Corrupt slot 0 (the newest, seq 2): flip a CRC-covered payload byte.
+        let mut bytes = file.snapshot();
+        bytes[SEQ_LEN + LEN_LEN] ^= 0xff;
+        file.set_len(0).unwrap();
+        file.write_all_at(&bytes, 0).unwrap();
+        file.sync_data().unwrap();
+        assert_eq!(bytes.len(), counters_slot_len * 2);
+        // Recovery regresses to the previous durable value, never a torn one.
+        assert_eq!(
+            CountersCheckpoint::open(Arc::clone(&file)).unwrap().1,
+            Some(vec![1u8; COUNTERS_PAYLOAD])
+        );
+    }
+
+    #[test]
+    fn a_fresh_counters_checkpoint_recovers_nothing() {
+        let file = fresh();
+        assert_eq!(CountersCheckpoint::open(Arc::clone(&file)).unwrap().1, None);
     }
 }
