@@ -281,16 +281,19 @@ the events land.
 
 ## #15 diagnostics must redact (constrains #15)
 
-The #15 admin / data-introspection surface ([CLI.md](CLI.md): `dump`, `peek`, the
-`/admin` snapshot, and any future `info` / `consumer ls`) **must redact stored
-credentials.** The constraint is already half-satisfied by construction and half
-specified:
+The #15 admin / data-introspection surface (the offline `dump` / `peek` readers in
+[CLI.md](CLI.md), the `/admin` operational snapshot in
+[AUTHENTICATION.md](AUTHENTICATION.md), and any future `info` / `consumer ls`)
+**must redact stored credentials.** The constraint is already half-satisfied by
+construction and half specified:
 
 - **Already true by construction:** the offline `dump` / `peek` readers print only
   **sizes**, never the raw key or payload bytes (CLI.md, "Offline output shapes":
   "Only sizes are printed, never the raw key or payload bytes"), and the `/admin`
-  snapshot is documented to expose "no secret material" (it predates any secret being
-  loadable). So no message-payload secret leaks through a dump today.
+  snapshot exposes only stored offsets and operational state (durable head, cursors,
+  lag, per-group state, DLQ depth, and the config echo), never key or payload bytes
+  (AUTHENTICATION.md, the `admin`-gated stored-data introspection), and it predates any
+  secret being loadable. So no message-payload secret leaks through a dump today.
 - **Specified for when credentials exist:** once the #106 identity table is loaded into
   the broker, any diagnostic that echoes configuration (the `/admin` config echo, a
   future `config` dump) **must render every credential field as the redacting newtype's
