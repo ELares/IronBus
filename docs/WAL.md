@@ -113,10 +113,34 @@ directory of self-describing files is the authority, no manifest required").
   at-least-once safe) but never advances to a torn or invented one.
 - Created: `cursor.ckpt` is created (and the directory fsynced) on `Engine::open` if
   absent. A named group's file is created lazily on its first checkpoint write.
-- Reaped: never deleted by IronBus. They are tiny fixed-size files
-  (`CHECKPOINT_LEN`), overwritten in place, not retired.
+- Reaped: never deleted by IronBus. They are tiny fixed-size files, overwritten in
+  place, not retired.
 
-### 4. The `dlq/` subdirectory (a second segmented log)
+### 4. The resilience-counters checkpoint (`counters.ckpt`)
+
+- `counters.ckpt` holds a durable snapshot of the resilience [counters](METRICS.md)
+  (#98), so a restart resumes the operational history (produced, dead-lettered,
+  reaped, truncated, etc.) instead of zeroing it.
+- Format: the SAME fixed two-slot, CRC32C-protected, alternating-write file as the
+  cursor checkpoints (`checkpoint.rs`), only with a slightly larger per-slot payload to
+  hold the fixed set of `u64`s plus a version byte. The payload is `Counters::encode_snapshot`:
+  a 1-byte version then the counters little-endian, decoded tolerantly so a short or
+  trailing-padded payload never panics.
+- Written: NOT on every counter increment (an fsync per produce/ack would kill
+  throughput). It is snapshotted on the cursor-checkpoint cadence (`maybe_checkpoint`)
+  and on the graceful-shutdown flush (`checkpoint_all_groups`). So the resumed counters
+  are a monotonic **lower bound**: a crash loses at most the increments since the last
+  snapshot, which observability tolerates.
+- Recovery / safety: strictly an observability aid, NEVER correctness state. A torn or
+  missing `counters.ckpt` recovers as all-zeros and never blocks `Engine::open` or
+  affects the durable log, cursors, or DLQ. A counters write failure on the cadence is
+  swallowed (lost history, never lost correctness); the explicit shutdown flush surfaces
+  it but runs after the cursor flushes.
+- Created: on `Engine::open` if absent (and the directory fsynced), exactly like the
+  cursor checkpoint.
+- Reaped: never deleted; a tiny fixed-size file overwritten in place.
+
+### 5. The `dlq/` subdirectory (a second segmented log)
 
 - The dead-letter sink (`dlq.rs`) is a *second* `Log` rooted at the `dlq/`
   subdirectory, so a poison record uses the exact same framed, CRC32C'd, recoverable

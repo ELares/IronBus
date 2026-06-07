@@ -28,9 +28,17 @@ secret material and no mutating action.
 
 Every name below is an `ironbus_*_total` counter. The set is frozen: the test
 asserts `/metrics` renders **exactly** this set (plus the gauges and the fsync
-histogram below). Counters are monotonic in-memory statistics since process
-start; a restart resets them to zero (recovery-loss gauges are repopulated from
-the last recovery's loss report).
+histogram below). Counters are monotonic statistics (they only increase). They
+are **durable across a restart** (#98): the broker snapshots them to a CRC'd
+`counters.ckpt` on the cursor-checkpoint cadence and on the graceful-shutdown
+flush, and seeds them from that snapshot at startup, so a restart no longer
+zeroes the operational history. Because the snapshot is on a cadence (not an
+fsync per increment), a crash loses at most the increments since the last
+snapshot: the resumed value is a monotonic **lower bound**. The counters are
+strictly an observability aid, so a torn or missing `counters.ckpt` recovers as
+all-zeros and never blocks startup or touches the durable log, cursors, or DLQ
+(recovery-loss gauges are independently repopulated from the last recovery's
+loss report).
 
 | Counter | Event that increments it | Resilience meaning |
 |---------|--------------------------|--------------------|

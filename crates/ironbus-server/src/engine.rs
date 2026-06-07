@@ -25,7 +25,7 @@ use ironbus_core::lease::{
     AckOutcome, Claim, ExtendOutcome, LeaseConfig, LeaseTable, LeaseToken, NackOutcome,
 };
 use ironbus_core::types::Offset;
-use ironbus_storage::checkpoint::{Checkpoint, MAX_PAYLOAD};
+use ironbus_storage::checkpoint::{Checkpoint, CountersCheckpoint, MAX_PAYLOAD};
 use ironbus_storage::dlq::{DlqSink, DLQ_SUBDIR};
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::{Append, Log, LogConfig, RetentionBounds};
@@ -363,9 +363,17 @@ pub enum ProgressResult {
 }
 
 /// A single-topic, single-work-group queue engine.
-/// Monotonic in-memory operational counters since process start, exposed via `/metrics`.
-/// They are statistics, not durable state: a restart resets them to zero.
-#[derive(Clone, Copy, Debug, Default)]
+/// Monotonic operational counters exposed via `/metrics`. They are an OBSERVABILITY aid, not
+/// correctness state: each only ever increases (so Prometheus reads them as a counter, never a
+/// gauge that could roll backward). They are DURABLE across a clean restart (#98): the engine
+/// snapshots them to a CRC'd `counters.ckpt` on the checkpoint cadence and the graceful-shutdown
+/// flush, and seeds them from that snapshot at [`Engine::open`], so a restart no longer zeroes the
+/// operational history. Because the snapshot is taken on a cadence (NOT fsynced on every
+/// increment, which would kill throughput), a crash between an increment and the next snapshot
+/// loses at most the increments since the last snapshot: the resumed value is a MONOTONIC LOWER
+/// BOUND, acceptable for observability. A torn or missing snapshot recovers as all-zeros and NEVER
+/// blocks startup or touches the durable log, cursors, or DLQ.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counters {
     /// Messages appended by `produce`.
     pub produced: u64,
@@ -408,6 +416,82 @@ pub struct Counters {
     /// is the data-loss-bearing reclamation an operator watches when running `DropOldest`. Zero
     /// under the default `DropNew` policy. Saturating.
     pub segments_force_reaped: u64,
+}
+
+/// The durable counters-snapshot format version (#98). A future field addition bumps this only if
+/// the decode rule must change; today the format is forward-compatible by construction (a shorter
+/// payload zero-fills missing trailing fields, a longer one ignores extra trailing bytes), so a
+/// version mismatch is tolerated, not rejected: the snapshot is an observability aid, and refusing
+/// to read a newer snapshot would lose history for no safety gain.
+const COUNTERS_SNAPSHOT_VERSION: u8 = 1;
+
+/// The number of `u64` counter fields serialized, in the fixed wire order below. Adding a counter
+/// appends one field here (and at the end of [`Counters::encode_snapshot`] /
+/// [`Counters::decode_snapshot`]), so an old snapshot still decodes (the new trailing field reads
+/// as zero) and a new snapshot still decodes on an old binary (the trailing field is ignored).
+const COUNTERS_FIELD_COUNT: usize = 11;
+
+impl Counters {
+    /// Serializes the counters into a small versioned little-endian byte string for the durable
+    /// snapshot (#98): a 1-byte version then the fixed set of `u64`s in a frozen order. The result
+    /// is `1 + 8 * COUNTERS_FIELD_COUNT` bytes, well under the counters checkpoint slot cap, so it
+    /// always fits one slot.
+    fn encode_snapshot(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + 8 * COUNTERS_FIELD_COUNT);
+        buf.push(COUNTERS_SNAPSHOT_VERSION);
+        // The frozen field order. Appending a NEW counter goes at the END so older snapshots stay
+        // decodable (the missing trailing field reads as zero).
+        for v in [
+            self.produced,
+            self.produced_bytes,
+            self.produce_rejected,
+            self.delivered,
+            self.redelivered,
+            self.dead_lettered,
+            self.truncations,
+            self.truncated_records,
+            self.acks,
+            self.segments_reaped,
+            self.segments_force_reaped,
+        ] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Reconstructs the counters from a durable snapshot payload, TOLERANTLY: a payload that is
+    /// empty, too short, the wrong version, or carries trailing bytes never errors. A missing
+    /// trailing `u64` field reads as zero (forward/backward compatible across a field addition);
+    /// extra trailing bytes are ignored. This is the never-block-recovery contract (#98): the
+    /// counters are an observability aid, so a corrupt or partial snapshot degrades to fewer (or
+    /// zero) recovered fields rather than failing the broker open. The CRC and torn-slot fallback
+    /// are handled one layer down by the checkpoint, so a payload that reaches here already passed
+    /// its CRC; this decode is the second belt that a wrong-shaped-but-CRC-valid payload (e.g. a
+    /// future or downgraded format) still cannot panic or corrupt anything.
+    fn decode_snapshot(payload: &[u8]) -> Counters {
+        // Reads the i-th u64 field (0-based) after the 1-byte version, or 0 if the payload is too
+        // short to contain it.
+        let field = |i: usize| -> u64 {
+            let start = 1 + i * 8;
+            payload
+                .get(start..start + 8)
+                .and_then(|s| <[u8; 8]>::try_from(s).ok())
+                .map_or(0, u64::from_le_bytes)
+        };
+        Counters {
+            produced: field(0),
+            produced_bytes: field(1),
+            produce_rejected: field(2),
+            delivered: field(3),
+            redelivered: field(4),
+            dead_lettered: field(5),
+            truncations: field(6),
+            truncated_records: field(7),
+            acks: field(8),
+            segments_reaped: field(9),
+            segments_force_reaped: field(10),
+        }
+    }
 }
 
 /// A snapshot of one work-group's consumer position, for the metrics endpoint (#16): an
@@ -693,6 +777,13 @@ pub struct Engine<F: Filesystem, C: Clock> {
     consumer_credit_bytes: u64,
     checkpoint: Checkpoint<F::File>,
     checkpoint_interval: u64,
+    /// The durable resilience-counters checkpoint (#98): a CRC'd dual-slot `counters.ckpt` written
+    /// on the cursor-checkpoint cadence and the graceful-shutdown flush, recovered at
+    /// [`Engine::open`] to seed `counters`. It is strictly an OBSERVABILITY aid: a torn or missing
+    /// snapshot recovers as all-zeros and never blocks open or affects the durable log, cursors, or
+    /// DLQ. It is NOT fsynced per increment (that would kill throughput), so the resumed counters
+    /// are a monotonic LOWER BOUND, losing at most the increments since the last snapshot on a crash.
+    counters_checkpoint: CountersCheckpoint<F::File>,
     /// The consumer-safe retention bounds (size, age, count) the produce path enforces against the
     /// minimum committed offset (refs #13, #80). All `0` (the default) means retention is off, so
     /// the produce path never reaps. See [`EngineConfig::max_retained_bytes`],
@@ -746,6 +837,10 @@ pub struct Engine<F: Filesystem, C: Clock> {
 /// The file name of the work-group's durable committed-cursor checkpoint.
 const CURSOR_CHECKPOINT: &str = "cursor.ckpt";
 
+/// The file name of the durable resilience-counters checkpoint (#98). It never collides with the
+/// cursor checkpoints (`cursor.ckpt` and `cursor-<hex>.ckpt`).
+const COUNTERS_CHECKPOINT: &str = "counters.ckpt";
+
 // The engine requires `C: Clone` so it can hand the secondary durable DLQ sink (#63) its own clock
 // (see `Log::clock_clone`). Every shipped clock (`ManualClock`, `Arc<ManualClock>`, `SystemClock`)
 // is `Clone`, so this is not a usability regression.
@@ -777,6 +872,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             }
         };
         let (checkpoint, recovered) = Checkpoint::open(checkpoint_file)?;
+
+        // Open and recover the durable resilience-counters checkpoint (#98), seeding the in-memory
+        // counters from the last snapshot (or all-zeros if it is missing or torn). Factored out to
+        // keep `open` readable; the never-block-recovery contract lives in the helper.
+        let (counters_checkpoint, counters) = Self::open_counters_checkpoint(&log)?;
+
         let flushed = log.flushed_offset().get();
         // The open-time monotonic instant, used to seed each group's last-activity (#277), so a
         // group recovered at open is treated as just-active and the idle eviction sweep cannot
@@ -867,6 +968,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             consumer_credit_bytes: config.consumer_credit_bytes,
             checkpoint,
             checkpoint_interval: config.checkpoint_interval,
+            counters_checkpoint,
             retention: RetentionBounds {
                 max_bytes: config.max_retained_bytes,
                 max_age_ms: config.max_age_ms,
@@ -879,7 +981,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // sweep is a no-op unless an operator opts in.
             group_idle_evict_nanos: config.group_idle_evict_ms.saturating_mul(1_000_000),
             last_checkpointed: default_committed,
-            counters: Counters::default(),
+            // Seeded from the durable counters snapshot (#98), all-zeros if it was missing or torn.
+            counters,
             fsync: LatencyHistogram::default(),
             last_dead_lettered: None,
             dlq,
@@ -897,6 +1000,41 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// data directory never materializes the DLQ subdirectory.
     fn dlq_dir_exists(log: &Log<F, C>) -> bool {
         log.filesystem().subdir_exists(DLQ_SUBDIR).unwrap_or(false)
+    }
+
+    /// Opens (creating if absent) the durable resilience-counters checkpoint (#98) and recovers the
+    /// last snapshot, returning the checkpoint handle plus the seeded [`Counters`]. A restart
+    /// resumes the operational history instead of zeroing it. The recovered counters are a MONOTONIC
+    /// LOWER BOUND: the snapshot is written on a cadence, not per increment, so a crash loses at
+    /// most the increments since the last snapshot.
+    ///
+    /// The counters are strictly an OBSERVABILITY aid, never correctness state, so this NEVER fails
+    /// the open on a damaged snapshot: a torn slot is discarded by `CountersCheckpoint::open` (the
+    /// CRC dual-slot fallback) and a wrong-shaped-but-CRC-valid payload decodes as all-zeros via the
+    /// tolerant `Counters::decode_snapshot`. It does not touch the durable log, cursors, or DLQ. The
+    /// only errors it can return are genuine IO failures from creating or reading the file (the same
+    /// failures that would already have failed opening the log itself), not a corrupt snapshot.
+    ///
+    /// # Errors
+    /// Propagates a genuine IO error from creating or opening the counters checkpoint file.
+    fn open_counters_checkpoint(
+        log: &Log<F, C>,
+    ) -> Result<(CountersCheckpoint<F::File>, Counters), EngineError> {
+        let counters_file = {
+            let fs = log.filesystem();
+            if fs.exists(COUNTERS_CHECKPOINT)? {
+                fs.open(COUNTERS_CHECKPOINT)?
+            } else {
+                let file = fs.create_new(COUNTERS_CHECKPOINT)?;
+                fs.sync_dir()?; // the new file's directory entry must be durable
+                file
+            }
+        };
+        let (counters_checkpoint, recovered) = CountersCheckpoint::open(counters_file)?;
+        let counters = recovered
+            .as_deref()
+            .map_or_else(Counters::default, Counters::decode_snapshot);
+        Ok((counters_checkpoint, counters))
     }
 
     /// Durably records the current committed offset, so a later [`Engine::open`] resumes
@@ -953,10 +1091,38 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             let payload = self.cursor_checkpoint_payload();
             self.checkpoint.write(&payload)?;
             self.last_checkpointed = committed;
+            // Piggyback the resilience-counters snapshot on the cursor-checkpoint cadence (#98), so
+            // the counters become durable on the same low-frequency rhythm without a per-increment
+            // fsync. Best-effort: a counters write failure only loses some observability history on
+            // a later crash, never correctness, so it must NOT fail the cursor checkpoint that just
+            // succeeded. The counters are an observability aid, not durable correctness state.
+            let _ = self.checkpoint_counters();
             Ok(true)
         } else {
             Ok(false)
         }
+    }
+
+    /// Durably snapshots the current resilience [`Counters`] to `counters.ckpt` (#98), so a later
+    /// [`Engine::open`] resumes the operational history instead of zeroing it. It uses the SAME
+    /// crash-safe dual-slot CRC discipline as the cursor checkpoint: a torn write reverts to the
+    /// prior slot, and on recovery a torn or missing snapshot decodes as all-zeros, so it can never
+    /// block startup.
+    ///
+    /// This is deliberately NOT called on every counter increment (an fsync per produce/ack would
+    /// destroy throughput). It is called on the cursor-checkpoint cadence ([`Engine::maybe_checkpoint`])
+    /// and the graceful-shutdown flush ([`Engine::checkpoint_all_groups`]), so the resumed counters
+    /// are a MONOTONIC LOWER BOUND that loses at most the increments since the last snapshot on a
+    /// crash, which observability tolerates.
+    ///
+    /// # Errors
+    /// Propagates a storage error from writing the snapshot. Callers that piggyback it on a cursor
+    /// checkpoint IGNORE this error on purpose (lost history, not lost correctness); the explicit
+    /// shutdown flush surfaces it so a disk failure is not silently swallowed there.
+    pub fn checkpoint_counters(&mut self) -> Result<(), EngineError> {
+        let payload = self.counters.encode_snapshot();
+        self.counters_checkpoint.write(&payload)?;
+        Ok(())
     }
 
     /// Durably records a work-group's committed cursor (#60), so a later [`Engine::open`]
@@ -1026,8 +1192,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// against the cost of redelivering already-acked messages. On the first per-group write error it
     /// stops and propagates, so a disk failure is surfaced rather than swallowed.
     ///
+    /// It is also the graceful-shutdown flush point for the resilience COUNTERS (#98): the final
+    /// counters snapshot is written here AFTER every cursor is flushed, so a restart after a clean
+    /// stop shows the final counts, not a stale cadence snapshot. The counters flush is explicit
+    /// (its error is surfaced) but runs LAST, so a counters disk failure never prevents the
+    /// correctness-critical cursor flush from completing first.
+    ///
     /// # Errors
-    /// Propagates the first storage error from writing a group's checkpoint.
+    /// Propagates the first storage error from writing a group's checkpoint, or from the final
+    /// counters snapshot.
     pub fn checkpoint_all_groups(&mut self) -> Result<(), EngineError> {
         // Snapshot the names first so the checkpoint calls (which take `&mut self`) do not borrow
         // the live `groups` map across the loop.
@@ -1035,6 +1208,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         for name in names {
             self.checkpoint_group(&name)?;
         }
+        // Flush the resilience counters LAST, so the cursor flushes (correctness) always complete
+        // first. A restart after this clean stop resumes the final counts (#98).
+        self.checkpoint_counters()?;
         Ok(())
     }
 
@@ -3698,6 +3874,237 @@ mod tests {
             0,
             "the parked poison attempt is counted only in dead_lettered"
         );
+    }
+
+    // ---- Durable resilience counters (#98) ----
+
+    /// Drives produce/poll/ack/dead-letter on a fresh engine to bump several counters, returning
+    /// the engine so a test can checkpoint and reopen it over the shared in-memory filesystem.
+    fn drive_counters(e: &mut Engine<InMemoryFs, std::sync::Arc<ManualClock>>) {
+        // Three good messages: produced = 3, produced_bytes = 3, delivered = 3, acks = 3.
+        for p in [&b"a"[..], b"b", b"c"] {
+            e.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: p,
+            })
+            .unwrap();
+        }
+        for _ in 0..3 {
+            let d = message(e.poll_now().unwrap());
+            assert_eq!(e.ack(&d.token), AckResult::Acked);
+        }
+    }
+
+    #[test]
+    fn counters_persist_across_a_reopen() {
+        // Produce/deliver/ack to bump several counters, dead-letter one to bump dead_lettered,
+        // checkpoint, reopen on the SHARED in-memory fs, and assert the counters RESUMED (not
+        // zeroed). This is the headline #98 contract: a restart no longer zeroes the history.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(
+            InMemoryFs::new(),
+            std::sync::Arc::clone(&clock),
+            config(10, 1),
+        )
+        .unwrap();
+        drive_counters(&mut e);
+        // Dead-letter one poison message (max_deliver = 1): produced = 4, dead_lettered = 1.
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"poison",
+        })
+        .unwrap();
+        let _ = message(e.poll_now().unwrap()); // attempt 1
+        clock.advance_monotonic_nanos(40);
+        assert!(matches!(e.poll_now().unwrap(), Poll::Parked { .. })); // attempt 2 -> parked
+        let before = e.counters();
+        assert_eq!(before.produced, 4);
+        // 3 good deliveries plus the poison's first (within-cap) delivery attempt; the parked
+        // second attempt is dead_lettered, not delivered.
+        assert_eq!(before.delivered, 4);
+        assert_eq!(before.acks, 3);
+        assert_eq!(before.dead_lettered, 1);
+
+        // The graceful-shutdown flush persists the counters (and cursors).
+        e.checkpoint_all_groups().unwrap();
+        let fs = e.into_filesystem();
+
+        // Reopen on the same fs: the counters resume from the snapshot, byte-for-byte.
+        let e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 1)).unwrap();
+        assert_eq!(
+            e.counters(),
+            before,
+            "the resilience counters resumed from the durable snapshot, not zeroed"
+        );
+    }
+
+    #[test]
+    fn a_missing_counters_file_opens_with_zero_counters() {
+        // A data directory with a durable cursor but NO counters.ckpt (a pre-#98 broker, or one
+        // that crashed before its first counters snapshot) opens cleanly with zero counters: the
+        // missing snapshot is never a hard failure.
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"a");
+        let d = message(e.poll(0).unwrap());
+        e.ack(&d.token);
+        e.checkpoint_cursor().unwrap(); // writes cursor.ckpt
+        let fs = e.into_filesystem();
+        // Delete the counters checkpoint so the reopen finds it absent.
+        fs.remove(COUNTERS_CHECKPOINT).unwrap();
+        assert!(!fs.exists(COUNTERS_CHECKPOINT).unwrap());
+
+        let e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(
+            e.counters(),
+            Counters::default(),
+            "a missing counters snapshot recovers as all-zeros"
+        );
+        // The cursor is unaffected: it resumed normally.
+        assert_eq!(e.committed_offset(), Offset::new(1));
+    }
+
+    #[test]
+    fn a_torn_counters_file_opens_with_zero_counters_and_the_log_is_unaffected() {
+        // A corrupt counters.ckpt (BOTH slots torn) must NOT block open or panic, and must not
+        // affect the durable log or the cursor: the counters degrade to zero, everything else
+        // recovers exactly. This is the never-block-recovery safety contract (#98).
+        use ironbus_storage::io::RandomAccessFile;
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b"] {
+            produce(&mut e, p);
+        }
+        let d0 = message(e.poll(0).unwrap());
+        e.ack(&d0.token); // committed = 1
+                          // Persist both the cursor and the counters.
+        e.checkpoint_cursor().unwrap();
+        e.checkpoint_counters().unwrap();
+        let before_counters = e.counters();
+        assert!(before_counters.produced >= 2, "counters were bumped");
+        let fs = e.into_filesystem();
+
+        // Corrupt EVERY byte region of counters.ckpt so neither slot's CRC can validate.
+        let ckpt = fs.open(COUNTERS_CHECKPOINT).unwrap();
+        let mut bytes = ckpt.snapshot();
+        assert!(!bytes.is_empty(), "the counters checkpoint was written");
+        for b in &mut bytes {
+            *b ^= 0xff;
+        }
+        ckpt.set_len(0).unwrap();
+        ckpt.write_all_at(&bytes, 0).unwrap();
+        ckpt.sync_all().unwrap();
+
+        // Open must SUCCEED (never a hard error), recover zero counters, and leave the log and
+        // cursor untouched.
+        let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(
+            e.counters(),
+            Counters::default(),
+            "a torn counters snapshot recovers as all-zeros, never a hard failure"
+        );
+        // The cursor resumed from its (intact) checkpoint: committed = 1, only the tail redelivers.
+        assert_eq!(e.committed_offset(), Offset::new(1));
+        let mut delivered = Vec::new();
+        while let Poll::Message(d) = e.poll(0).unwrap() {
+            delivered.push(d.offset.get());
+        }
+        assert_eq!(
+            delivered,
+            vec![1],
+            "the durable log and cursor are unaffected by the torn counters file"
+        );
+    }
+
+    #[test]
+    fn the_graceful_shutdown_flush_persists_the_latest_counts() {
+        // A clean stop (checkpoint_all_groups) flushes the LATEST counters, so a restart after the
+        // clean stop shows the final counts, not a stale cadence snapshot. The default checkpoint
+        // interval (1024) means no interval checkpoint fires for this small workload, so ONLY the
+        // shutdown flush makes the counters durable.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(
+            InMemoryFs::new(),
+            std::sync::Arc::clone(&clock),
+            config(10, 5),
+        )
+        .unwrap();
+        drive_counters(&mut e); // produced/delivered/acks = 3 each, no interval checkpoint fires
+        let final_counts = e.counters();
+        e.checkpoint_all_groups().unwrap(); // the graceful-shutdown flush
+        let fs = e.into_filesystem();
+
+        let e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 5)).unwrap();
+        assert_eq!(
+            e.counters(),
+            final_counts,
+            "the graceful-shutdown flush persisted the final counts"
+        );
+        assert_eq!(e.counters().produced, 3);
+        assert_eq!(e.counters().acks, 3);
+    }
+
+    #[test]
+    fn the_increment_path_does_not_fsync_per_increment() {
+        // The counters snapshot must NOT be written on every counter increment (an fsync per
+        // produce/ack would kill throughput): only the cadence and shutdown flush persist it. This
+        // pins that a produce/poll/ack does NOT touch counters.ckpt, by capturing its on-disk bytes
+        // before and after a burst of increments WITHOUT a checkpoint call. The probe handle
+        // ALIASES the same in-memory disk the engine writes to (a cloned `InMemoryFs`).
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let probe = InMemoryFs::new();
+        let mut e =
+            Engine::open(probe.clone(), std::sync::Arc::clone(&clock), config(10, 5)).unwrap();
+        // Read the freshly-created (never-written) counters.ckpt bytes via the probe handle.
+        let snapshot_after_open = probe.open(COUNTERS_CHECKPOINT).unwrap().snapshot();
+        // A burst of increments WITHOUT any checkpoint call.
+        drive_counters(&mut e);
+        assert_eq!(e.counters().produced, 3, "the in-memory counters DID move");
+        let snapshot_after_increments = probe.open(COUNTERS_CHECKPOINT).unwrap().snapshot();
+        assert_eq!(
+            snapshot_after_open, snapshot_after_increments,
+            "an increment must NOT write counters.ckpt (no per-increment fsync)"
+        );
+        // And after an explicit checkpoint, the on-disk snapshot DOES change (proving the test is
+        // not vacuous: the write path works, it is just not on the increment path).
+        e.checkpoint_counters().unwrap();
+        let snapshot_after_checkpoint = probe.open(COUNTERS_CHECKPOINT).unwrap().snapshot();
+        assert_ne!(
+            snapshot_after_increments, snapshot_after_checkpoint,
+            "an explicit checkpoint DOES write counters.ckpt"
+        );
+    }
+
+    #[test]
+    fn the_counters_snapshot_round_trips_every_field() {
+        // The encode/decode round-trips every counter field, and the tolerant decode treats a short
+        // or empty payload as zero-filled (the never-block-recovery decode contract).
+        let counters = Counters {
+            produced: 11,
+            produced_bytes: 222,
+            produce_rejected: 3,
+            delivered: 44,
+            redelivered: 5,
+            dead_lettered: 6,
+            truncations: 7,
+            truncated_records: 88,
+            acks: 99,
+            segments_reaped: 10,
+            segments_force_reaped: 11,
+        };
+        let encoded = counters.encode_snapshot();
+        assert_eq!(Counters::decode_snapshot(&encoded), counters);
+        // An empty or too-short payload decodes to all-zeros, never panics.
+        assert_eq!(Counters::decode_snapshot(&[]), Counters::default());
+        assert_eq!(Counters::decode_snapshot(&[1, 2, 3]), Counters::default());
+        // Trailing garbage past the known fields is ignored (forward compatibility).
+        let mut padded = encoded.clone();
+        padded.extend_from_slice(&[0xAB; 16]);
+        assert_eq!(Counters::decode_snapshot(&padded), counters);
     }
 
     #[test]
