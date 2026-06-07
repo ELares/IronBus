@@ -19,6 +19,11 @@ CI also cross-compiles a static musl binary for `x86_64`, `aarch64`, and `armv7`
 every change (see the `musl build` jobs), so an edge deployment can ship one static
 file with no runtime dependencies.
 
+The untrusted-byte parsers (the record-frame decoder, the wire-frame decoder, the cursor
+snapshot decoder, and the segment scanner) are continuously fuzzed by a cargo-fuzz harness
+under `fuzz/`; a nightly CI job soaks every target under AddressSanitizer. See
+[`fuzz/README.md`](../fuzz/README.md) to run a soak locally.
+
 > The broker (`ironbus serve`) is Unix only in v1: its on-disk storage uses positioned
 > IO that the Windows path does not yet implement. `pub` and `sub` are cross platform.
 
@@ -94,6 +99,8 @@ fetched 1 message(s)
 ```
 
 The `gen` is the lease fencing token; it must be carried back on the acknowledgement.
+Pass `--group <name>` to consume as a named work-group instead of the default cursor
+(see "Consumer groups" below).
 At most one disposition applies to the whole fetched batch:
 
 | Disposition | Effect |
@@ -113,6 +120,17 @@ commit an already-reprocessed message. A message that fails past the delivery ca
 (`MaxDeliver`, default 5) is parked and surfaced on the metrics endpoint rather than
 looping forever.
 
+When the broker parks an offset as poison during a fetch, `sub` prints an in-band
+advisory line so the consumer is not left silently never seeing it:
+
+```
+dead-letter offset=7 reason=max-deliver
+```
+
+The advisory is emitted alongside the deliveries in the same batch (the credit caps the
+total of deliveries plus advisories), so a consumer that polls a queue learns exactly
+which offsets were dropped past `MaxDeliver`.
+
 ## Restart and resume
 
 The durable log always survives a restart, so a fresh publish after restarting on the
@@ -130,6 +148,66 @@ window against checkpoint write amplification; a lower value (even `1`) persists
 cursor more eagerly. The everyday `pub`/`sub` flow resumes cleanly because each
 short-lived `sub` connection closes and flushes the cursor; a long-lived consumer that is
 still connected when the broker is signalled gets the redelivery behavior instead.
+
+## Consumer groups
+
+The single durable log fans out to many named work-groups. Pass `--group <name>` to
+`sub` to consume as that group; an empty (omitted) name keeps the default group, so
+existing callers are unchanged.
+
+```sh
+# A broadcast consumer: its own group, so it sees every message.
+ironbus sub --addr 127.0.0.1:7777 --group analytics --max 10 --ack
+
+# A competing group: several members share one group name, so each message goes to
+# exactly one member. Run more than one of these to split the work.
+ironbus sub --addr 127.0.0.1:7777 --group workers --max 10 --ack
+```
+
+Each group has its own committed cursor and its own in-flight lease set over the shared
+log, and every group advances independently: a broadcast group (used by one consumer)
+sees every message, while a competing group (shared by several members) hands each
+message to exactly one member. Group names are 1 to 128 graphic-ASCII bytes; the broker
+enforces the shape and a per-broker group cap on the first fetch and surfaces a bad name
+as an error.
+
+Per-group cursors are durable: each named group checkpoints to its own
+`cursor-<hex(name)>.ckpt` file under `--data-dir` (the default group keeps `cursor.ckpt`),
+so a group resumes past its acked messages after a restart instead of redelivering the
+whole log from offset 0. The same `--checkpoint-interval` and clean-disconnect flush rules
+from "Restart and resume" apply per group.
+
+## Offline inspection
+
+`peek` and `dump` decode a stopped broker's data directory with no server running, so you
+can inspect what is durably stored without starting (or interfering with) the broker. They
+read only up to the durable high-water mark and never mutate the directory.
+
+```sh
+# A bounded window of records (default 10), optionally from an offset.
+ironbus peek --data-dir /var/lib/ironbus --from-offset 0 --limit 10
+
+# Every record, one per line (NDJSON with --json).
+ironbus dump --data-dir /var/lib/ironbus --json
+```
+
+Each record line carries the offset, the timestamp, the payload byte length, the key byte
+length, the CRC status (always `ok`, since the reader only yields records that passed their
+checksum), and the codec (always `none` until on-disk compression lands):
+
+```
+offset=0 ts_ms=100 bytes=5 key_bytes=6 crc=ok codec=none
+```
+
+| Verb | Flags | Shows |
+|------|-------|-------|
+| `peek` | `--data-dir <dir>` (required), `--from-offset <n>`, `--limit <n>`, `--json` | A bounded window of records (default 10), from `--from-offset`. |
+| `dump` | `--data-dir <dir>` (required), `--limit <n>`, `--json` | Every record, one per line (NDJSON with `--json`). |
+
+Both mark, never hide, a torn or corrupt tail: a trailing note (a `{"loss":...}` object in
+`--json` mode) reports the dropped byte span and the reason, so the holes are shown rather
+than silently skipped. A clean directory prints no note. Both bound memory to one segment
+at a time. The offline verbs are Unix only in v1, like `serve`.
 
 ## Health and metrics
 
@@ -178,5 +256,14 @@ curl -s http://127.0.0.1:9090/metrics | grep ironbus_consumer_lag
 
 ## Exit codes
 
-`pub`, `sub`, and `serve` follow a fixed scheme: `0` clean, `1` usage error, `5` broker
-unreachable, `70` internal. A script can branch on these without parsing output.
+Every verb follows one fixed scheme, so a script can branch on the code without parsing
+output:
+
+| Code | Meaning |
+|------|---------|
+| `0` | Clean. |
+| `1` | Usage error (bad or missing arguments). |
+| `2` | Not found: an offline verb's `--data-dir` does not exist (`peek` / `dump`). |
+| `4` | Corrupt: an offline verb found the data directory structurally corrupt, distinct from a clean torn tail it can read past (`peek` / `dump`). |
+| `5` | Broker unreachable. |
+| `70` | Internal error (including an unsupported platform). |
