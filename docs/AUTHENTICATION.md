@@ -194,9 +194,10 @@ to keep the blast radius of a leaked admin credential to administration alone.
 ### Verb-to-scope mapping (constrains the #11 verb set)
 
 The frozen #11 verb set (see [CONTRACTS.md](CONTRACTS.md), "FrameType tags") maps to
-scopes as follows. Server-to-client frames (`Info`, `Deliver`, `PubAck`,
+scopes as follows. Server-to-client frames (`Info`, `Pong`, `Deliver`, `PubAck`,
 `AckStatus`, `FlowEnd`, `DeadLetter`, `Truncated`, `Err`, `Ok`) are responses, not
-client requests, so they are not scope-gated.
+client requests, so they are not scope-gated (`Pong` is the server reply to a
+client `Ping`).
 
 | Client verb (tag) | Required scope |
 | --- | --- |
@@ -273,8 +274,8 @@ the wire or in config.
 
 This is the deliberate v1 trade: no expiry timer means no surprise mass-expiry
 outage on an edge fleet with skewed clocks, and no dependence on a correct wall
-clock for a security property (consistent with the project invariant that
-correctness never consults the wall clock; see [INVARIANTS.md](INVARIANTS.md), I6).
+clock for a security property (in the same clock-seam spirit as invariant I6,
+where ordering never consults the wall clock; see [INVARIANTS.md](INVARIANTS.md), I6).
 Short-lived / auto-expiring credentials (and any nkey/JWT lifetime semantics) are
 explicitly out of v1 scope and are the natural follow-up if a time-bounded
 credential is later required.
@@ -386,8 +387,8 @@ None of the following exists in the binary today. Do not assume any of it.
   tag set this spec gates.
 - [COMPATIBILITY.md](COMPATIBILITY.md): the empty-handshake / no-negotiation status
   the populated `Connect` body (#11) changes.
-- [INVARIANTS.md](INVARIANTS.md): I6 (correctness never consults the wall clock),
-  which the no-expiry-timer rotation honors.
+- [INVARIANTS.md](INVARIANTS.md): I6 (ordering never consults the wall clock),
+  whose clock-seam discipline the no-expiry-timer rotation honors.
 - [CLI.md](CLI.md): the `serve --enable-admin` flag and the `/admin`, `/healthz`,
   `/readyz`, `/metrics` endpoints this spec scope-gates.
 - The README "Secure by default" section and the security epic #18.
