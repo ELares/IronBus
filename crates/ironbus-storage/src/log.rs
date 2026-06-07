@@ -304,11 +304,14 @@ pub struct Log<F: Filesystem, C: Clock> {
     /// `recovered_truncated_bytes`, but as per-segment events carrying the byte span and the
     /// reason. Empty for a fresh log or a clean recovery.
     loss_report: LossReport,
-    /// Total bytes copied into the forensic quarantine store at recovery (#134): the corrupt
-    /// regions a corruption skip dropped, captured for offline analysis. Zero for a fresh log, a
-    /// clean recovery, or a recovery whose only loss was a clean torn tail (which is not
-    /// quarantined). Best-effort: a quarantine write failure leaves this lower than the dropped
-    /// bytes WITHOUT failing the open. Exposed for the `ironbus_quarantine_bytes` gauge.
+    /// The PERSISTED on-disk footprint of the forensic quarantine store (#134, #315): the total
+    /// bytes of the corruption-skip blobs `quarantine/` currently holds, seeded at open from a
+    /// one-time read-only scan of the durable blobs (so it SURVIVES a restart and reflects real disk
+    /// pressure even when this recovery had no new corruption skip) and advanced by any new capture
+    /// this recovery makes. Zero only when the quarantine dir is absent, empty, or unreadable.
+    /// Best-effort: the scan and any capture are read-only/forensic and never fail the open, so a
+    /// quarantine error leaves this at most stale, never blocking recovery. Exposed for the
+    /// `ironbus_quarantine_bytes` gauge.
     quarantined_bytes: u64,
 }
 
@@ -327,6 +330,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         let ids = segment_ids(&fs)?;
         match ids.last().copied() {
             None => {
+                // Even with no live segments, a prior recovery's quarantine blobs may still occupy
+                // disk (the reaper can delete every segment while the forensic copies are retained),
+                // so seed the gauge from the persisted footprint here too (#315). Read-only and
+                // best-effort, scanned before `fs` moves into the log.
+                let persisted_quarantine_bytes = crate::quarantine::persisted_bytes(&fs);
                 let mut log = Log {
                     fs,
                     clock,
@@ -341,7 +349,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     total_record_count: 0,
                     recovered_truncated_bytes: 0,
                     loss_report: LossReport::new(),
-                    quarantined_bytes: 0,
+                    quarantined_bytes: persisted_quarantine_bytes,
                 };
                 log.start_segment(FIRST_SEGMENT_ID, Seq::new(0), Offset::ZERO)?;
                 Ok(log)
@@ -448,6 +456,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         let highest_record_bytes = scan.valid_end.saturating_sub(SEGMENT_HEADER_LEN as u64);
         let sealed_record_bytes = durable_bytes.saturating_sub(highest_record_bytes);
 
+        // Seed the gauge from the PERSISTED on-disk footprint of prior recoveries (#315) BEFORE `fs`
+        // moves into the log, so a clean reopen with no new corruption skip still surfaces the real
+        // disk pressure the forensic copies create.
+        let persisted_quarantine_bytes = crate::quarantine::persisted_bytes(&fs);
+
         let mut log = Log {
             fs,
             clock,
@@ -463,7 +476,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             total_record_count,
             recovered_truncated_bytes: 0,
             loss_report: LossReport::new(),
-            quarantined_bytes: 0,
+            // The persisted footprint (#315). This scan is best-effort and strictly read-only (a
+            // missing or unreadable quarantine dir degrades to 0), so it preserves the #134 never-
+            // blocks-recovery and copy-not-move properties. A new corruption skip below ADDS its
+            // capture on top, so the total stays the true persisted on-disk footprint.
+            quarantined_bytes: persisted_quarantine_bytes,
         };
 
         if scan.footer.is_some() {
@@ -496,12 +513,21 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 // failure is swallowed and never affects the truncation or the open; a clean torn
                 // tail is not quarantined (see `quarantine::is_corruption_skip`).
                 if crate::quarantine::is_corruption_skip(reason) {
-                    log.quarantined_bytes = crate::quarantine::quarantine_corrupt_span(
+                    let captured = crate::quarantine::quarantine_corrupt_span(
                         &log.fs,
                         &file,
                         &event,
                         log.config.max_quarantine_bytes,
                     );
+                    // Reflect the new blob in the PERSISTED total (#315). A capture under a cap can
+                    // evict older blobs to make room, so re-derive the gauge from the true on-disk
+                    // footprint (the seeded scan plus this capture, net of any eviction) rather than
+                    // a naive add. The re-scan is read-only and best-effort, so it never affects the
+                    // truncation below or the open. The cheap `captured > 0` guard skips the re-scan
+                    // when nothing was captured (a cap skip or a best-effort give-up).
+                    if captured > 0 {
+                        log.quarantined_bytes = crate::quarantine::persisted_bytes(&log.fs);
+                    }
                 }
                 file.set_len(scan.valid_end)?;
                 file.sync_all()?;
@@ -791,12 +817,15 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         &self.loss_report
     }
 
-    /// Total bytes copied into the forensic quarantine store at recovery (#134): the corrupt
-    /// regions a corruption skip dropped, captured (copy-not-move, capped) under `quarantine/` for
-    /// offline analysis. Zero for a fresh log, a clean recovery, or a recovery whose only loss was
-    /// a clean torn tail. Best-effort: a quarantine write failure leaves this BELOW the dropped
-    /// bytes without failing the open, so this is a forensic signal, not a correctness invariant.
-    /// The metrics endpoint exposes it as the `ironbus_quarantine_bytes` gauge.
+    /// The PERSISTED on-disk footprint of the forensic quarantine store (#134, #315): the total
+    /// bytes of the corruption-skip blobs `quarantine/` currently holds (copy-not-move, capped),
+    /// seeded at open from a one-time read-only scan of the durable blobs and advanced by any new
+    /// capture this recovery made. Unlike the original this-recovery-only count, it SURVIVES a
+    /// restart, so a clean reopen with no new corruption skip still surfaces the real disk pressure
+    /// prior recoveries' forensic copies create. Zero only when the quarantine dir is absent, empty,
+    /// or unreadable. Best-effort: the scan and any capture are forensic and never fail the open, so
+    /// this is a disk-pressure signal, not a correctness invariant. The metrics endpoint exposes it
+    /// as the `ironbus_quarantine_bytes` gauge.
     #[must_use]
     pub fn quarantined_bytes(&self) -> u64 {
         self.quarantined_bytes

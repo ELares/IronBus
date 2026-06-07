@@ -241,7 +241,8 @@ struct MetricsSnapshot {
     in_flight: usize,
     healthy: bool,
     recovered_truncated: u64,
-    /// Bytes copied into the forensic quarantine store at the last recovery (#134).
+    /// The persisted on-disk footprint of the forensic quarantine store (#134, #315): the
+    /// corrupt-byte copies prior recoveries left, surviving restart.
     quarantined: u64,
     /// Bytes dropped at the last recovery, per [`ReasonCode`] in code order.
     recovery_loss: [u64; 5],
@@ -301,7 +302,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
          # HELP ironbus_recovery_truncated_bytes Bytes dropped from a torn or unsynced tail at the last recovery (startup).\n\
          # TYPE ironbus_recovery_truncated_bytes gauge\n\
          ironbus_recovery_truncated_bytes {recovered_truncated}\n\
-         # HELP ironbus_quarantine_bytes Corrupt bytes copied into the forensic quarantine store at the last recovery (capped, copy-not-move).\n\
+         # HELP ironbus_quarantine_bytes Persisted on-disk bytes of the forensic quarantine store (capped, copy-not-move); the corrupt-byte copies prior recoveries left, surviving restart.\n\
          # TYPE ironbus_quarantine_bytes gauge\n\
          ironbus_quarantine_bytes {quarantined}\n\
          # HELP ironbus_last_dead_lettered_offset The log offset of the most recently dead-lettered message, or -1 if none.\n\
