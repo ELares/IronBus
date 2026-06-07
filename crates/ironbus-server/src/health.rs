@@ -233,6 +233,9 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
          # HELP ironbus_produced_bytes_total Logical message bytes appended by produce (key + headers + payload).\n\
          # TYPE ironbus_produced_bytes_total counter\n\
          ironbus_produced_bytes_total {produced_bytes}\n\
+         # HELP ironbus_produce_rejected_total Produces rejected because the durable log was at its byte cap (the drop-new shed).\n\
+         # TYPE ironbus_produce_rejected_total counter\n\
+         ironbus_produce_rejected_total {produce_rejected}\n\
          # HELP ironbus_delivered_total Message deliveries handed out (a redelivery counts again).\n\
          # TYPE ironbus_delivered_total counter\n\
          ironbus_delivered_total {delivered}\n\
@@ -248,6 +251,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         healthy_value = u8::from(healthy),
         produced = counters.produced,
         produced_bytes = counters.produced_bytes,
+        produce_rejected = counters.produce_rejected,
         delivered = counters.delivered,
         redelivered = counters.redelivered,
         dead_lettered = counters.dead_lettered,
@@ -548,6 +552,12 @@ mod tests {
         );
         assert!(m.contains("\nironbus_produced_total 2\n"), "{m}");
         assert!(m.contains("\nironbus_produced_bytes_total 2\n"), "{m}");
+        // The drop-new shed counter is present and zero on an uncapped, healthy broker.
+        assert!(
+            m.contains("# TYPE ironbus_produce_rejected_total counter"),
+            "{m}"
+        );
+        assert!(m.contains("\nironbus_produce_rejected_total 0\n"), "{m}");
         assert!(m.contains("\nironbus_delivered_total 0\n"), "{m}");
         assert!(m.contains("\nironbus_dead_lettered_total 0\n"), "{m}");
         // The fsync histogram: two produces above, so count and the +Inf bucket are 2. The
@@ -585,6 +595,105 @@ mod tests {
         assert!(acked.contains("\nironbus_consumer_lag 1\n"), "{acked}");
         assert!(acked.contains("\nironbus_in_flight 0\n"), "{acked}");
         assert!(acked.contains("\nironbus_acks_total 1\n"), "{acked}");
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    /// Like [`start`] but with a hard durable-log byte cap, so the rejection path is exercised.
+    fn start_with_cap(
+        max_total_bytes: u64,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        SharedEngine<InMemoryFs, SystemClock>,
+    ) {
+        let engine = Engine::open(
+            InMemoryFs::new(),
+            SystemClock::new(),
+            EngineConfig {
+                log: LogConfig::default().with_max_total_bytes(max_total_bytes),
+                lease: LeaseConfig::default(),
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight: 16,
+                checkpoint_interval: 1024,
+            },
+        )
+        .unwrap();
+        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let engine = Arc::clone(&shared);
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            move || serve_health(&listener, &shared, &shutdown).unwrap()
+        });
+        (addr, shutdown, handle, engine)
+    }
+
+    #[test]
+    fn metrics_renders_and_increments_produce_rejected() {
+        let payload = &b"capacity-probe"[..];
+        // Measure one record's framed durable bytes, then cap the broker at exactly one record
+        // so the SECOND produce is rejected by the drop-new shed.
+        let one = {
+            let (_addr, sd, h, eng) = start();
+            let bytes = {
+                let mut g = eng.lock().unwrap();
+                g.produce(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                })
+                .unwrap();
+                g.durable_record_bytes()
+            };
+            sd.store(true, Ordering::Release);
+            h.join().unwrap();
+            bytes
+        };
+
+        let (addr, shutdown, handle, engine) = start_with_cap(one);
+        // First produce fits; the metric starts at zero.
+        {
+            let mut g = engine.lock().unwrap();
+            g.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload,
+            })
+            .unwrap();
+        }
+        let m0 = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(m0.contains("\nironbus_produce_rejected_total 0\n"), "{m0}");
+
+        // Two over-cap produces are rejected (the writer stays live), so the counter reads 2.
+        {
+            let mut g = engine.lock().unwrap();
+            for _ in 0..2 {
+                let err = g
+                    .produce(&Append {
+                        timestamp_ms: 0,
+                        flags: RecordFlags::EMPTY,
+                        key: b"",
+                        headers: b"",
+                        payload,
+                    })
+                    .unwrap_err();
+                assert!(err.is_at_capacity(), "got {err:?}");
+            }
+            assert!(g.is_healthy(), "the shed never freezes the writer");
+        }
+        let m1 = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(m1.contains("\nironbus_produce_rejected_total 2\n"), "{m1}");
+        // The successful produce was counted once and nothing more (the sheds did not inflate it).
+        assert!(m1.contains("\nironbus_produced_total 1\n"), "{m1}");
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();

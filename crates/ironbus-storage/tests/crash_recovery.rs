@@ -35,6 +35,7 @@ use proptest::prelude::*;
 fn big_config() -> LogConfig {
     LogConfig {
         max_segment_bytes: 1 << 30,
+        max_total_bytes: 0,
     }
 }
 
@@ -42,6 +43,7 @@ fn big_config() -> LogConfig {
 fn small_config() -> LogConfig {
     LogConfig {
         max_segment_bytes: 256,
+        max_total_bytes: 0,
     }
 }
 
