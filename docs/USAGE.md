@@ -49,6 +49,10 @@ resume" below), so it is NOT fsynced on every ack.
 | `--max-deliver <n>` | `5` | Delivery attempts a message gets before it is dead-lettered (parked). Must be at least 1. |
 | `--max-in-flight <n>` | `1024` | The max-ack-pending window: at most this many messages may be leased above the committed cursor at once. Must be at least 1. |
 | `--max-segment-bytes <n>` | `67108864` | The soft per-segment size cap (64 MiB). Must be at least 4096 (smaller caps proliferate segments). |
+| `--max-total-bytes <bytes>` | `0` (unlimited) | The hard durable-log byte cap. At or over it, a produce is rejected (drop-new shed) with an `at capacity` error. See "Bounding disk use" below. |
+| `--max-retained-bytes <bytes>` | `0` (off) | Size-based retention: reclaim whole old SEALED segments, once every group has committed past them, while the durable log exceeds this many record bytes. See "Bounding disk use" below. |
+| `--max-age-ms <ms>` | `0` (off) | Time-based retention: reclaim a fully-consumed sealed segment once its newest record is older than this many milliseconds. See "Bounding disk use" below. |
+| `--max-messages <n>` | `0` (off) | Count-based retention: reclaim oldest fully-consumed sealed segments once the total durable record count exceeds this bound. See "Bounding disk use" below. |
 | `--visibility-timeout-ms <n>` | `30000` | How long a delivered message stays in flight before it may redeliver. Must be at least 1. The lease hard cap is the larger of 5 minutes and this. |
 | `--health-addr <host:port>` | off | If set, also serve the health and metrics HTTP endpoints on this loopback port. |
 
@@ -70,6 +74,36 @@ IronBus does not silently downgrade the barrier. If a filesystem cannot honour
 `503`), and the broker stops acknowledging rather than letting an ack outrun a real
 flush. Production durability targets Linux musl; macOS is supported for development and
 CI, where the `F_FULLFSYNC` barrier still applies.
+
+### Bounding disk use
+
+By default the durable log spills to disk without bound: it grows as fast as producers
+publish, and nothing is reclaimed. Four `serve` flags bound that growth. They are off by
+default (each defaults to `0`), so an existing `serve` is unchanged until an operator opts
+in. The model is spill, then shed, with retention draining behind it:
+
+- The log spills to disk by default (no cap).
+- `--max-total-bytes <bytes>` is the hard byte cap (the drop-new shed). When the durable
+  log is at or over it, a produce is rejected before any write: nothing is appended, no
+  offset advances, and the producer is told promptly with an `at capacity` error rather
+  than a silent drop or a hang. The writer stays live, so a later produce succeeds once
+  retention frees space. `0` (the default) means unlimited.
+- Retention reclaims space as consumers drain. The three retention bounds are
+  `--max-retained-bytes <bytes>` (reclaim while the log exceeds this many durable record
+  bytes), `--max-age-ms <ms>` (reclaim a segment whose newest record is older than this
+  many milliseconds), and `--max-messages <n>` (reclaim while the total durable record
+  count exceeds this bound). Each is `0` = off by default; they compose, so a segment is
+  reclaimed if ANY enabled bound trips.
+
+Retention is consumer-safe: it never deletes a record a group still needs. The reclaim
+unit is a whole sealed segment, never a partial one and never the active segment. A
+segment is reclaimed oldest first, and only once every consumer group has committed past
+it, so the slowest group's records are never reaped. There is no disk-full drop-oldest
+policy: when the cap is full, IronBus sheds the new produce, it does not delete old
+acknowledged records.
+
+The two relevant metrics on `/metrics` are `ironbus_produce_rejected_total` (produces shed
+by the byte cap) and `ironbus_segments_reaped_total` (segments reclaimed by retention).
 
 ## Produce
 
@@ -239,6 +273,8 @@ ironbus_delivered_total       deliveries handed out (a redelivery counts again)
 ironbus_redelivered_total     deliveries that were a redelivery
 ironbus_dead_lettered_total   messages parked past MaxDeliver (the drop signal)
 ironbus_acks_total            commits via ack (a term commits through the same path)
+ironbus_produce_rejected_total produces shed by the durable-log byte cap (see "Bounding disk use")
+ironbus_segments_reaped_total segments reclaimed by consumer-safe retention
 ```
 
 ## A complete example
