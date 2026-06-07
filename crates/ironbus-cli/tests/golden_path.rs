@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Golden-path acceptance slice (#133): drive the real `ironbus` binary end to end through the
-//! part of the promised story that is reachable today. Two scenarios run: a single default-group
-//! consumer (boot, produce, consume, restart, resume past the acked messages while the durable
-//! log continues), and the step-4 fan-out (one log to a broadcast group and a competing group,
-//! each advancing independently and resuming durably across a restart). The rest of #133
-//! (overload spill, a simulated power cut, the loss report, the installer) is not built yet and
-//! stays open.
+//! parts of the promised story that are reachable today. The scenarios run: a single default-group
+//! consumer (boot, produce, consume, restart, resume past the acked messages while the durable log
+//! continues); the step-4 fan-out (one log to a broadcast group and a competing group, each
+//! advancing independently and resuming durably across a restart); step-9 offline inspection
+//! (`peek`/`dump` over a stopped broker agrees with recovery up to the durable head); and steps 6
+//! and 7, power-cut recovery (a torn tail is truncated, the durable prefix survives, and the loss
+//! is reported consistently offline and online). Only the overload spill (step 5) and the
+//! installer (step 1) remain.
 //!
 //! `serve` is Unix only in v1 (on-disk storage uses positioned IO the Windows path lacks), so
 //! this whole acceptance test is gated to Unix.
@@ -453,22 +455,30 @@ fn start_broker_with_health(data_dir: &str) -> (ChildGuard, String, String) {
 }
 
 /// Minimal blocking HTTP/1.0 GET against a loopback `host:port`, returning the full response
-/// (headers and body). Used to read the broker's `/metrics` exposition.
+/// (headers and body). Used to read the broker's `/metrics` exposition. Retries briefly so a
+/// just-spawned health thread that has not yet entered its accept loop does not flake a slow runner.
 fn http_get(addr: &str, path: &str) -> String {
-    let mut stream = TcpStream::connect(addr).expect("connect to health endpoint");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("set read timeout");
+    for _ in 0..40 {
+        if let Ok(body) = http_get_once(addr, path) {
+            if !body.is_empty() {
+                return body;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("health endpoint {addr} did not answer GET {path} in time");
+}
+
+fn http_get_once(addr: &str, path: &str) -> std::io::Result<String> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     write!(
         stream,
         "GET {path} HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
-    )
-    .expect("send GET");
+    )?;
     let mut body = String::new();
-    stream
-        .read_to_string(&mut body)
-        .expect("read health response");
-    body
+    stream.read_to_string(&mut body)?;
+    Ok(body)
 }
 
 /// Reads a Prometheus gauge/counter value by exact metric name from an exposition body, skipping
