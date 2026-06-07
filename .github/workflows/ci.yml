@@ -52,6 +52,41 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo test --workspace --all-features --locked
 
+  acceptance:
+    name: golden-path acceptance gate (#133)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: acceptance
+      # The single scripted GOLDEN-PATH acceptance run (#133): install via the fail-closed
+      # installer, boot zero-config, produce, fan out, overload, simulated power-cut, recover with a
+      # bounded reported loss, resume, inspect offline, and upgrade in place, driving the REAL
+      # `ironbus` binary over real loopback sockets and a real on-disk data dir, end to end. It is a
+      # HARD release gate (this job must pass). The device-only steps (the < 60 s
+      # install-to-first-message on the reference aarch64 device, the real dm-flakey power cut, the
+      # device throughput SLO) are NOT run here; they are the manual runbook in docs/ACCEPTANCE.md,
+      # the SAME harness run on the device. `--nocapture` surfaces the machine-readable PASS/FAIL
+      # summary (the captured loss report, install-to-first-message, and throughput numbers) in the
+      # job log. The harness writes the same JSON to the path in IRONBUS_ACCEPTANCE_SUMMARY, which we
+      # upload as an artifact for the #19 SLO table / #1 success-criteria tooling to consume.
+      - name: run the golden-path acceptance scenario (CI-runnable steps)
+        env:
+          IRONBUS_ACCEPTANCE_SUMMARY: ${{ runner.temp }}/acceptance-summary.json
+        run: |
+          cargo test -p ironbus-cli --locked --test acceptance -- --nocapture --exact \
+            golden_path_acceptance_install_to_recovery_to_upgrade
+      - name: upload the machine-readable acceptance summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: golden-path-acceptance-summary
+          path: ${{ runner.temp }}/acceptance-summary.json
+          if-no-files-found: warn
+
   msrv:
     name: msrv (1.78)
     runs-on: ubuntu-latest
