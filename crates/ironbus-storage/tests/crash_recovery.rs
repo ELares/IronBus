@@ -10,7 +10,9 @@
 //! - power loss before fsync (every unsynced write may vanish), at every op boundary;
 //! - a torn tail (the file truncated mid-record);
 //! - tail corruption (the last record's bytes damaged);
-//! - mid-log rot and arbitrary single-byte corruption anywhere in the segment.
+//! - mid-log rot and arbitrary single-byte corruption anywhere in the segment;
+//! - a reordered / partial unsynced tail (a hole punched into the unsynced region), where
+//!   recovery must truncate at the first gap and never lose a durable record below it.
 //!
 //! Block-layer fault injection (an fsync that returns EIO, page-cache reordering, a
 //! both-slots-torn checkpoint) needs a fault-injecting file layer and is tracked
@@ -697,6 +699,82 @@ proptest! {
                 let expected = payload(i);
                 prop_assert_eq!(record.payload.as_slice(), expected.as_slice());
             }
+        }
+    }
+
+    /// Power cut with a reordered / partial unsynced tail (#21 crash class): a real power
+    /// loss may persist only SOME of the unsynced tail bytes, leaving a hole (a later append
+    /// landed while an earlier one did not). Model it by zeroing an arbitrary span strictly
+    /// inside the unsynced region, with the durable prefix left intact. Recovery must lose no
+    /// acked record (I1: it recovers at least the durable prefix), must be a contiguous valid
+    /// run from offset 0 (I2: it stops at the hole and never reads past it), and every
+    /// survived record's payload is intact. The stronger guarantee over the all-or-nothing
+    /// power-loss gate above: a partial tail is not just dropped wholesale, it is truncated at
+    /// the first gap without ever losing a durable record below it.
+    #[test]
+    fn power_cut_with_a_holed_unsynced_tail_loses_no_acked_record(
+        durable in 1u64..10,
+        unsynced in 1u64..10,
+        at in any::<prop::sample::Index>(),
+        hole_len in 1usize..8,
+    ) {
+        // Durable prefix: append `durable` records and sync them.
+        let durable_ops: Vec<Op> = (0..durable).map(|_| Op::Append).chain([Op::Sync]).collect();
+        let mut log = apply(InMemoryFs::new(), big_config(), &durable_ops);
+        prop_assert_eq!(log.flushed_offset().get(), durable);
+        let durable_len = log
+            .filesystem()
+            .open(&segment_file_name(0))
+            .unwrap()
+            .len()
+            .unwrap();
+        // The unsynced tail: append more WITHOUT syncing.
+        for i in durable..(durable + unsynced) {
+            append_at(&mut log, i);
+        }
+        let current_len = log
+            .filesystem()
+            .open(&segment_file_name(0))
+            .unwrap()
+            .len()
+            .unwrap();
+        prop_assert!(current_len > durable_len);
+        let fs = log.into_filesystem();
+
+        // Punch a zeroed hole strictly inside the unsynced region [durable_len, current_len),
+        // so the durable prefix is untouched.
+        let region = usize::try_from(current_len - durable_len).unwrap();
+        let start = durable_len + u64::try_from(at.index(region)).unwrap();
+        let end = (start + u64::try_from(hole_len).unwrap()).min(current_len);
+        let file = fs.open(&segment_file_name(0)).unwrap();
+        let mut bytes = file.snapshot();
+        let (s_idx, e_idx) = (usize::try_from(start).unwrap(), usize::try_from(end).unwrap());
+        for b in &mut bytes[s_idx..e_idx] {
+            *b = 0;
+        }
+        file.set_len(0).unwrap();
+        file.write_all_at(&bytes, 0).unwrap();
+        file.sync_data().unwrap();
+
+        // Recover: the durable prefix survives, the holed tail truncates at the first gap.
+        let log = Log::open(fs, ManualClock::new(), big_config()).unwrap();
+        let recovered = log.flushed_offset().get();
+        prop_assert!(
+            recovered >= durable,
+            "a holed unsynced tail lost an acked record: recovered {recovered} < durable {durable}"
+        );
+        prop_assert!(recovered <= durable + unsynced);
+        let records = log.read_from(Offset::ZERO, usize::MAX).unwrap();
+        prop_assert_eq!(records.len() as u64, recovered);
+        check_longest_valid_prefix(&records).map_err(|v| TestCaseError::fail(v.to_string()))?;
+        let acked: Vec<u64> = (0..durable).collect();
+        check_no_acked_loss(&records, &acked).map_err(|v| TestCaseError::fail(v.to_string()))?;
+        for (i, record) in records.iter().enumerate() {
+            let i = u64::try_from(i).unwrap();
+            prop_assert_eq!(record.offset, Offset::new(i));
+            prop_assert_eq!(record.seq, Seq::new(i));
+            let expected = payload(i);
+            prop_assert_eq!(record.payload.as_slice(), expected.as_slice());
         }
     }
 }
