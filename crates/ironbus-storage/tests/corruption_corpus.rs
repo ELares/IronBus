@@ -534,6 +534,16 @@ fn truncated_footer_recovers_records_unsealed() {
     for (i, record) in rec.records.iter().enumerate() {
         assert_eq!(record.payload, payload(i as u64));
     }
+    // Pin the structured loss too (#298 review): the 28 leftover footer bytes (the 32-byte footer
+    // minus the 4 chopped) parse as neither a footer nor a record, so recovery reports exactly one
+    // TornTail over [body-end, file-end) and truncates to the body end. A regression that lost or
+    // mis-spanned that loss event would now fail.
+    assert_single_loss(
+        &rec,
+        ReasonCode::TornTail,
+        (good.len() - SEGMENT_FOOTER_LEN) as u64,
+        (good.len() - 4) as u64,
+    );
 }
 
 #[test]
