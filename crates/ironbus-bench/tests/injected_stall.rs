@@ -51,6 +51,12 @@ const MAX_STALL: Duration = Duration::from_secs(2);
 /// far from saturated, so the healthy tail stays near the op-latency floor with little queueing,
 /// which keeps a wide gap below the freeze on any disk.
 const UTILIZATION: f64 = 0.1;
+/// The arrival-rate band. The self-test only needs to demonstrate the stall in the tail, not drive
+/// peak throughput, so the rate is kept modest: a fast disk is capped here rather than driving the
+/// broker at hundreds of msg/s through a freeze (which stresses the post-thaw backlog drain and is
+/// unnecessary for the proof). A slow disk is floored so a run still gathers samples in bounded time.
+const MIN_RATE_HZ: f64 = 5.0;
+const MAX_RATE_HZ: f64 = 50.0;
 /// The separation floor as a fraction of the chosen freeze: the stalled p99.9 and max must clear it,
 /// the healthy baseline p99.9 must stay below it.
 const STALL_SEPARATION_FRACTION: f64 = 0.6;
@@ -81,7 +87,7 @@ fn calibrated_config(op_latency_us: f64) -> RunConfig {
     // rate (per second) = utilization / op_latency(seconds). Clamp into a sane band so a tiny or
     // huge measurement cannot produce an absurd rate.
     let latency_seconds = (op_latency_us / 1e6).max(1e-6);
-    let rate = (UTILIZATION / latency_seconds).clamp(5.0, 5_000.0);
+    let rate = (UTILIZATION / latency_seconds).clamp(MIN_RATE_HZ, MAX_RATE_HZ);
     let duration = Duration::from_secs_f64(TARGET_SAMPLES / rate).clamp(MIN_RUN, MAX_RUN);
     RunConfig {
         target_rate_hz: rate,
