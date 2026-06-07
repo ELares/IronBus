@@ -316,7 +316,13 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
          ironbus_segments_reaped_total {segments_reaped}\n\
          # HELP ironbus_segments_force_reaped_total Old sealed segments force-reaped by the disk-full drop-oldest policy (may drop a slow consumer's unconsumed records).\n\
          # TYPE ironbus_segments_force_reaped_total counter\n\
-         ironbus_segments_force_reaped_total {segments_force_reaped}\n",
+         ironbus_segments_force_reaped_total {segments_force_reaped}\n\
+         # HELP ironbus_truncations_total Below-earliest truncation events served to a consumer because its records were force-reaped out from under it (the resilience skip signal).\n\
+         # TYPE ironbus_truncations_total counter\n\
+         ironbus_truncations_total {truncations}\n\
+         # HELP ironbus_truncated_records_total Records skipped by below-earliest truncations (the record-count span of ironbus_truncations_total).\n\
+         # TYPE ironbus_truncated_records_total counter\n\
+         ironbus_truncated_records_total {truncated_records}\n",
         healthy_value = u8::from(healthy),
         produced = counters.produced,
         produced_bytes = counters.produced_bytes,
@@ -327,6 +333,8 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         acks = counters.acks,
         segments_reaped = counters.segments_reaped,
         segments_force_reaped = counters.segments_force_reaped,
+        truncations = counters.truncations,
+        truncated_records = counters.truncated_records,
     );
     body.push_str(&recovery_loss_lines(&recovery_loss));
     body.push_str(&recovery_loss_records_lines(&recovery_loss_records));
@@ -523,7 +531,9 @@ fn admin_broker_section(s: &mut String, snapshot: &AdminSnapshot) {
             \"dead_lettered\":{dead_lettered},\
             \"acks\":{acks},\
             \"segments_reaped\":{segments_reaped},\
-            \"segments_force_reaped\":{segments_force_reaped}\
+            \"segments_force_reaped\":{segments_force_reaped},\
+            \"truncations\":{truncations},\
+            \"truncated_records\":{truncated_records}\
         }},",
         healthy = snapshot.healthy,
         flushed = snapshot.flushed,
@@ -543,6 +553,8 @@ fn admin_broker_section(s: &mut String, snapshot: &AdminSnapshot) {
         acks = counters.acks,
         segments_reaped = counters.segments_reaped,
         segments_force_reaped = counters.segments_force_reaped,
+        truncations = counters.truncations,
+        truncated_records = counters.truncated_records,
     );
 }
 
@@ -1403,6 +1415,184 @@ mod tests {
             !m1.contains("\nironbus_segments_force_reaped_total 0\n"),
             "the force-reaped counter must have incremented past zero: {m1}"
         );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn metrics_renders_and_increments_truncations() {
+        // The below-earliest truncation counters render on /metrics and increment when a consumer's
+        // cursor falls below the oldest retained record (its data was force-reaped out from under it
+        // by the disk-full drop-oldest policy) and the engine surfaces a one-time Poll::Truncated
+        // (#82, #84, #96). This is the resilience SKIP signal: a consumer losing a span must never be
+        // silent.
+        let payload = &[0xab_u8; 16][..];
+        let one = {
+            let (_a, sd, h, eng) = start_with_drop_oldest(0);
+            let bytes = {
+                let mut g = eng.lock().unwrap();
+                g.produce(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                })
+                .unwrap();
+                g.durable_record_bytes()
+            };
+            sd.store(true, Ordering::Release);
+            h.join().unwrap();
+            bytes
+        };
+
+        let (addr, shutdown, handle, engine) = start_with_drop_oldest(4 * one);
+        // Both truncation counters are present and zero before anything is truncated.
+        let m0 = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            m0.contains("# TYPE ironbus_truncations_total counter"),
+            "{m0}"
+        );
+        assert!(m0.contains("\nironbus_truncations_total 0\n"), "{m0}");
+        assert!(
+            m0.contains("# TYPE ironbus_truncated_records_total counter"),
+            "{m0}"
+        );
+        assert!(m0.contains("\nironbus_truncated_records_total 0\n"), "{m0}");
+
+        let skipped = {
+            let mut g = engine.lock().unwrap();
+            // The "slow" group leases offset 0 and never acks, pinning its cursor at 0. The
+            // drop-oldest policy then force-reaps the oldest segments out from under it as the log
+            // grows past the cap.
+            g.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload,
+            })
+            .unwrap();
+            assert!(matches!(g.poll_now_in("slow").unwrap(), Poll::Message(_)));
+            for _ in 0..20 {
+                g.produce(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                })
+                .expect("drop-oldest accepts the produce");
+            }
+            assert!(
+                g.counters().segments_force_reaped >= 1,
+                "the drop-oldest policy force-reaped at least one segment"
+            );
+            // The slow group's next poll is a one-time truncation: its cursor (0) is now below the
+            // oldest retained record, so the engine resets it up and reports the skipped span.
+            let skipped = match g.poll_now_in("slow").unwrap() {
+                Poll::Truncated { skipped, .. } => skipped,
+                other => panic!("expected a truncation, got {other:?}"),
+            };
+            assert!(skipped >= 1, "at least one record was skipped");
+            // Exactly one truncation event was counted, spanning `skipped` records.
+            assert_eq!(g.counters().truncations, 1, "one truncation event");
+            assert_eq!(
+                g.counters().truncated_records,
+                skipped,
+                "the record span matches the surfaced skip"
+            );
+            skipped
+        };
+
+        let m1 = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(m1.contains("\nironbus_truncations_total 1\n"), "{m1}");
+        assert!(
+            m1.contains(&format!("\nironbus_truncated_records_total {skipped}\n")),
+            "the records counter equals the skipped span: {m1}"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    /// The COMPLETE, FROZEN set of resilience-counter metric names `/metrics` renders (#96). Every
+    /// name here is an `ironbus_*_total` counter whose increment marks one resilience event the
+    /// taxonomy guarantees is never silent (a shed, drop, skip, dead-letter, or reclamation). This
+    /// set is the observability CONTRACT: adding, removing, or renaming a resilience counter MUST be
+    /// a deliberate, test-gated edit here, so the taxonomy can never silently drift. See
+    /// `docs/METRICS.md` for the per-counter meaning.
+    const FROZEN_RESILIENCE_COUNTERS: &[&str] = &[
+        "ironbus_produced_total",
+        "ironbus_produced_bytes_total",
+        "ironbus_produce_rejected_total",
+        "ironbus_delivered_total",
+        "ironbus_redelivered_total",
+        "ironbus_dead_lettered_total",
+        "ironbus_dlq_records_total",
+        "ironbus_acks_total",
+        "ironbus_segments_reaped_total",
+        "ironbus_segments_force_reaped_total",
+        "ironbus_truncations_total",
+        "ironbus_truncated_records_total",
+    ];
+
+    #[test]
+    fn the_resilience_counter_taxonomy_is_frozen() {
+        // Render /metrics and extract the COMPLETE set of `ironbus_*_total` counter names it emits,
+        // then assert it equals FROZEN_RESILIENCE_COUNTERS exactly. A counter added without updating
+        // the frozen set (or removed/renamed without it) fails here, so the resilience taxonomy and
+        // its documented contract can never silently drift (#96). Modeled on the frozen wire-tag
+        // tests, which pin the on-the-wire numbers the same way.
+        let (addr, shutdown, handle, _engine) = start();
+        let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(m.starts_with("HTTP/1.1 200 OK"), "{m}");
+
+        // Collect every distinct counter name: a sample line `ironbus_x_total <value>` (no label,
+        // no `_bucket`/`_sum`/`_count` histogram suffix), confined to the `_total` counter suffix so
+        // the gauges and the fsync histogram are excluded by construction. Asserting against the
+        // SAMPLE lines (not the HELP/TYPE lines) proves each counter is actually exposed, not just
+        // documented.
+        let mut rendered: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for line in m.lines() {
+            // A counter SAMPLE line is `ironbus_<...>_total <value>` with no label set. Match ANY
+            // unsigned value, not just `0`: a counter that happens to be non-zero on a fresh broker
+            // must NOT silently escape the exact-set check (a `_total 0` filter would skip it). A
+            // `# HELP`/`# TYPE` line (first token `#`) and a labeled line (name ends in `}`) are
+            // excluded by the `ironbus_*_total` name shape.
+            let Some((name, value)) = line.split_once(' ') else {
+                continue;
+            };
+            if name.starts_with("ironbus_")
+                && name.ends_with("_total")
+                && !value.is_empty()
+                && value.bytes().all(|b| b.is_ascii_digit())
+            {
+                rendered.insert(name);
+            }
+        }
+        let expected: std::collections::BTreeSet<&str> =
+            FROZEN_RESILIENCE_COUNTERS.iter().copied().collect();
+        assert_eq!(
+            rendered, expected,
+            "the rendered resilience-counter set drifted from the frozen taxonomy; \
+             update FROZEN_RESILIENCE_COUNTERS and docs/METRICS.md deliberately. \
+             rendered={rendered:?} expected={expected:?}"
+        );
+
+        // Each frozen counter also carries a `# TYPE ... counter` declaration, so the exposition is
+        // valid Prometheus (a strict parser needs the type line), and a `# HELP` line documenting it.
+        for name in FROZEN_RESILIENCE_COUNTERS {
+            assert!(
+                m.contains(&format!("# TYPE {name} counter")),
+                "missing TYPE line for {name}: {m}"
+            );
+            assert!(
+                m.contains(&format!("# HELP {name} ")),
+                "missing HELP line for {name}: {m}"
+            );
+        }
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();

@@ -292,7 +292,16 @@ ironbus_dead_lettered_total   messages parked past MaxDeliver (the drop signal)
 ironbus_acks_total            commits via ack (a term commits through the same path)
 ironbus_produce_rejected_total produces shed by the durable-log byte cap (see "Bounding disk use")
 ironbus_segments_reaped_total segments reclaimed by consumer-safe retention
+ironbus_segments_force_reaped_total segments force-reaped by the disk-full drop-oldest policy
+ironbus_truncations_total      below-earliest truncations served to a consumer (the skip signal)
+ironbus_truncated_records_total records skipped by those truncations
 ```
+
+Every resilience event the broker sheds, drops, skips, dead-letters, truncates,
+force-reaps, or loses on recovery increments a stable-named counter, so no
+resilience event is ever silent. The full per-counter catalog, the
+shed-vs-drop-vs-skip-vs-dead-letter taxonomy, and the frozen-taxonomy contract
+are in [METRICS.md](METRICS.md).
 
 ## A complete example
 
