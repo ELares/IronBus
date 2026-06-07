@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Golden-path acceptance slice (#133): drive the real `ironbus` binary end to end through the
-//! part of the promised story that is reachable today: boot the broker, produce, fan a batch
-//! out to a consumer that acks, restart, and resume past the acked messages while the durable
-//! log continues. The full #133 scenario (broadcast + competing groups, overload spill, a
-//! simulated power cut, the loss report, the installer) is not built yet and stays open.
+//! part of the promised story that is reachable today. Two scenarios run: a single default-group
+//! consumer (boot, produce, consume, restart, resume past the acked messages while the durable
+//! log continues), and the step-4 fan-out (one log to a broadcast group and a competing group,
+//! each advancing independently and resuming durably across a restart). The rest of #133
+//! (overload spill, a simulated power cut, the loss report, the installer) is not built yet and
+//! stays open.
 //!
 //! `serve` is Unix only in v1 (on-disk storage uses positioned IO the Windows path lacks), so
 //! this whole acceptance test is gated to Unix.
@@ -145,6 +147,108 @@ fn golden_path_produce_consume_restart_resume() {
         "3",
         "the durable log continued across the restart"
     );
+
+    drop(broker2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Extracts the `mN` payloads from a `sub` run's stdout. Each delivered message prints a line
+/// `#<n> gen=<g> key=<k> payload=<value>`, so the value is the token right after `payload=`.
+fn payloads(out: &str) -> Vec<String> {
+    out.lines()
+        .filter_map(|l| l.split("payload=").nth(1))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn golden_path_broadcast_and_competing_groups_fan_out() {
+    // #133 step 4: one durable log fans out to a BROADCAST group (its own cursor, sees every
+    // message) and a COMPETING group (several members sharing one cursor, each message to one
+    // member), every group advancing independently, and both resuming past their acks after a
+    // restart via the durable per-group cursors (#9, #60, #248). Sequential `sub` calls keep it
+    // deterministic: each consumer fully acks before the next runs, so the competing members get
+    // disjoint sets. `--checkpoint-interval 1` checkpoints each group synchronously per ack, so
+    // the restart resume below races nothing.
+    let dir = std::env::temp_dir().join(format!("ironbus-golden-groups-{}", std::process::id()));
+    let data_dir = dir.to_str().expect("utf8 temp path").to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (broker, addr) = start_broker(&data_dir);
+
+    // Produce four messages onto the single log.
+    for (i, payload) in ["m0", "m1", "m2", "m3"].iter().enumerate() {
+        let (out, code) = run(&["pub", "--addr", &addr, payload]);
+        assert_eq!(code, 0, "pub exit code");
+        assert_eq!(out.trim(), i.to_string(), "pub returned the durable offset");
+    }
+
+    // Broadcast group "bcast": its own cursor, so it sees the whole batch and acks it.
+    let (out, code) = run(&[
+        "sub", "--addr", &addr, "--group", "bcast", "--max", "10", "--ack",
+    ]);
+    assert_eq!(code, 0, "bcast sub exit code");
+    assert!(
+        out.contains("fetched 4 message(s)"),
+        "the broadcast group sees the whole batch: {out}"
+    );
+    let mut bcast = payloads(&out);
+    bcast.sort();
+    assert_eq!(
+        bcast,
+        ["m0", "m1", "m2", "m3"],
+        "the broadcast group received every message"
+    );
+
+    // Competing group "work": two members sharing one cursor. Member 1 takes (and acks) two;
+    // member 2 then drains the rest. The two acks advance the shared cursor, so the members'
+    // sets are disjoint and together cover the batch exactly once (per-group at-least-once).
+    let (out1, code) = run(&[
+        "sub", "--addr", &addr, "--group", "work", "--max", "2", "--ack",
+    ]);
+    assert_eq!(code, 0, "work member 1 exit code");
+    let (out2, code) = run(&[
+        "sub", "--addr", &addr, "--group", "work", "--max", "10", "--ack",
+    ]);
+    assert_eq!(code, 0, "work member 2 exit code");
+    let m1 = payloads(&out1);
+    let m2 = payloads(&out2);
+    assert_eq!(
+        m1.len(),
+        2,
+        "member 1 took exactly its credit of two: {out1}"
+    );
+    let mut combined: Vec<String> = m1.iter().chain(&m2).cloned().collect();
+    combined.sort();
+    assert_eq!(
+        combined,
+        ["m0", "m1", "m2", "m3"],
+        "the competing members together consumed the batch exactly once, none dropped or doubled"
+    );
+
+    // The two groups advanced INDEPENDENTLY over the same log: a fresh fetch on each now sees
+    // nothing, proving neither group's progress consumed the other's view.
+    for g in ["bcast", "work"] {
+        let (out, code) = run(&["sub", "--addr", &addr, "--group", g, "--max", "10"]);
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("fetched 0 message(s)"),
+            "group {g} fully consumed its own view: {out}"
+        );
+    }
+
+    // Restart: the durable per-group cursors resume both groups past their acks (#248).
+    drop(broker);
+    let (broker2, addr2) = start_broker(&data_dir);
+    for g in ["bcast", "work"] {
+        let (out, code) = run(&["sub", "--addr", &addr2, "--group", g, "--max", "10"]);
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("fetched 0 message(s)"),
+            "group {g}'s durable cursor resumed past its acks after the restart: {out}"
+        );
+    }
 
     drop(broker2);
     let _ = std::fs::remove_dir_all(&dir);
