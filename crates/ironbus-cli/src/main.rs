@@ -50,7 +50,7 @@ use std::net::TcpListener;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// The default broker address: loopback only, so a zero-config broker is never exposed off
 /// the host without an explicit choice.
@@ -919,10 +919,15 @@ fn cmd_serve(
              redeliver forever and is never dead-lettered"
         )?;
     }
-    // The flag is never flipped here: the broker runs until the process is signalled.
-    // Durability holds across an abrupt termination because every ack is fsynced first, so
-    // a clean-shutdown handler is a follow-up, not a correctness requirement.
+    // The shared shutdown flag the serve loop polls. The wire serve uses a non-blocking accept that
+    // re-checks this flag every ~50 ms (its ACCEPT_POLL), so flipping it breaks the accept loop
+    // within a bounded time rather than only after the next connection. A SIGINT/SIGTERM/SIGHUP
+    // handler flips it for a graceful stop (#195); the broker then stops accepting and, on exit
+    // below, flushes every group's committed cursor so a restart does not redeliver acked messages.
+    // Durability across an ABRUPT termination still holds (every ack is fsynced first); this handler
+    // additionally makes a CLEAN operator stop non-redelivering by flushing the lagging cursor.
     let shutdown = Arc::new(AtomicBool::new(false));
+    install_signal_handler(&shutdown)?;
 
     // Optionally start the health endpoints on their own loopback HTTP port.
     let health_handle = if let Some(haddr) = health_addr {
@@ -946,13 +951,47 @@ fn cmd_serve(
 
     let result = serve(&listener, &shared, &shutdown, config.max_connections)
         .map_err(|e| CliError::Internal(format!("serve loop failed: {e}")));
-    // The wire serve returns only when shutdown is set, so flip it for the health thread too.
+    // The wire serve returns only when shutdown is set (a signal, or a fatal listener error that
+    // ends the loop), so flip it for the health thread too.
     shutdown.store(true, Ordering::Release);
     if let Some(h) = health_handle {
         let _ = h.join();
     }
     result?;
+    // Graceful-shutdown cursor flush (#195): the serve loop has stopped accepting and every
+    // connection handler has been signalled to wind down. Force a final checkpoint of EVERY live
+    // work-group's committed cursor so a restart after this clean stop resumes past the acked
+    // messages rather than redelivering up to `--checkpoint-interval` of them. A long-lived
+    // consumer still connected at the signal does not get to run its own close-path flush (its
+    // handler thread is detached, not joined), so this server-side flush is what makes the clean
+    // stop non-redelivering. It runs on a normal serve exit only; a serve error returned above.
+    {
+        let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .checkpoint_all_groups()
+            .map_err(|e| CliError::Internal(format!("flushing cursors on shutdown: {e}")))?;
+    }
     Ok(())
+}
+
+/// Installs the process-wide signal handler that flips `shutdown` on SIGINT, SIGTERM, or SIGHUP, so
+/// `serve` performs a graceful stop (#195): the serve loop's next poll observes the flag, stops
+/// accepting, and the broker flushes its cursors before exiting 0. The `ironbus` binary runs exactly
+/// one subcommand per process, so this is installed at most once per process. `try_set_handler` (not
+/// `set_handler`) is used so the install is fallible-not-panicking: a `MultipleHandlers` error (a
+/// handler already present, which the single-subcommand binary never produces but a future caller
+/// might) is surfaced as an internal error rather than a panic, keeping the no-panic library bar.
+/// `ctrlc` catches SIGINT; its `termination` feature (enabled in `Cargo.toml`) adds SIGTERM and
+/// SIGHUP, so the one handler covers all three signals an operator stop might deliver.
+#[cfg(unix)]
+fn install_signal_handler(shutdown: &Arc<AtomicBool>) -> Result<(), CliError> {
+    let flag = Arc::clone(shutdown);
+    ctrlc::try_set_handler(move || {
+        // Async-signal context: a single atomic store, nothing else. The serve loop polls this flag
+        // on its next accept cycle and unwinds the accept-stop, cursor-flush, exit-0 path itself.
+        flag.store(true, Ordering::Release);
+    })
+    .map_err(|e| CliError::Internal(format!("cannot install the shutdown signal handler: {e}")))
 }
 
 #[cfg(not(unix))]
