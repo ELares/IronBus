@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! A blocking, thread-per-connection TCP server that drives [`Session`]s over the engine.
+//! A blocking, thread-per-connection TCP server that drives [`Session`]s over the append actor.
 //!
 //! Edge boxes carry a bounded number of local connections, so a thread per connection over
-//! blocking IO keeps the binary small (no async runtime) and the model simple. The engine
-//! is shared behind a `Mutex`, which serializes all access into the single logical writer
-//! the storage layer requires; group-commit batching behind a dedicated append actor is a
-//! throughput follow-up. Concurrency is bounded by a connection cap so a connection flood
-//! cannot spawn unbounded threads. CAVEAT: a produce, and an interval or close-path cursor
-//! checkpoint, holds the engine `Mutex` across its fsync, so one stalled disk
-//! head-of-line-blocks every connection; the append-actor + group-commit follow-up removes
-//! this.
+//! blocking IO keeps the binary small (no async runtime) and the model simple. The engine is owned
+//! by a single APPEND ACTOR (#177); connection handlers fan in over a bounded channel and SEND
+//! commands instead of locking the engine, so no handler holds a lock across an fsync. A produce is
+//! group-committed by the actor (one `fdatasync` per drained batch), which removes the per-produce
+//! fsync and the head-of-line block: a stalled disk no longer blocks every connection. Pings (and
+//! anything that needs no engine state) are answered by the handler WITHOUT the actor, so a stalled
+//! produce fsync never blocks another connection's ping. Concurrency is bounded by a connection cap
+//! so a connection flood cannot spawn unbounded threads.
 
-use crate::engine::Engine;
+use crate::actor::EngineHandle;
 use crate::session::Session;
 use ironbus_core::clock::Clock;
 use ironbus_core::keyshared::MemberId;
@@ -19,11 +19,8 @@ use ironbus_storage::fs::Filesystem;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
-
-/// A shared, single-writer engine: the `Mutex` serializes all access.
-pub type SharedEngine<F, C> = Arc<Mutex<Engine<F, C>>>;
 
 /// How long the accept loop blocks before re-checking the shutdown flag.
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
@@ -52,7 +49,7 @@ impl Drop for ConnectionSlot<'_> {
 /// per-connection IO error closes only that connection.
 pub fn serve<F, C>(
     listener: &TcpListener,
-    engine: &SharedEngine<F, C>,
+    engine: &EngineHandle<F, C>,
     shutdown: &AtomicBool,
     max_connections: usize,
 ) -> std::io::Result<()>
@@ -76,7 +73,9 @@ where
                     continue;
                 }
                 active.fetch_add(1, Ordering::AcqRel);
-                let engine = Arc::clone(engine);
+                // Each handler gets its own cheap clone of the actor handle (a `SyncSender` clone);
+                // they all fan into the same single actor, preserving the single-writer rule.
+                let engine = engine.clone();
                 let active = Arc::clone(&active);
                 let member_id = MemberId::new(next_member.fetch_add(1, Ordering::Relaxed));
                 std::thread::spawn(move || {
@@ -101,12 +100,12 @@ where
 /// closes or the session ends.
 fn handle_connection<F, C>(
     mut stream: TcpStream,
-    engine: &SharedEngine<F, C>,
+    engine: &EngineHandle<F, C>,
     member_id: MemberId,
 ) -> std::io::Result<()>
 where
-    F: Filesystem,
-    C: Clock + Clone,
+    F: Filesystem + 'static,
+    C: Clock + Clone + 'static,
 {
     stream.set_nonblocking(false)?; // the handler reads blocking
                                     // Bound how long a stalled client can hold this slot (slowloris defense): a read or
@@ -118,64 +117,79 @@ where
     // whether the client closed cleanly, a read/write timed out, or a malformed frame ended the
     // session, this connection must leave any key_shared group it joined (#64) and flush its cursor.
     let outcome = connection_loop(&mut stream, engine, &mut session);
-    {
-        // Leave any key_shared group (#64) so this member's keys re-route to their new owners
-        // (its in-flight records drain or expire, the drain-or-expire guard), then flush its
-        // work-group's committed cursor so a clean reconnect resumes past acked messages.
-        // Best-effort: the checkpoint is a lagging optimization. Routed to the session's group
-        // (#60), default-group if unsubscribed.
-        let mut guard = engine.lock().unwrap_or_else(PoisonError::into_inner);
-        session.leave_current_key_shared(&mut guard);
-        let _ = guard.checkpoint_group(session.subscription());
-    }
+    // Leave any key_shared group (#64) so this member's keys re-route to their new owners (its
+    // in-flight records drain or expire, the drain-or-expire guard), then flush its work-group's
+    // committed cursor so a clean reconnect resumes past acked messages. Both go through the actor
+    // (the single writer). Best-effort: the checkpoint is a lagging optimization, and if the actor
+    // is already gone (a shutdown drain races a disconnect) these are no-ops, never a hang. Routed
+    // to the session's group (#60), default-group if unsubscribed.
+    let _ = session.leave_current_key_shared(engine);
+    let group = session.subscription().to_string();
+    let _ = engine.with(move |e| {
+        let _ = e.checkpoint_group(&group);
+    });
     outcome
 }
 
 /// The per-connection read/dispatch loop, factored out so [`handle_connection`] can run its
 /// cleanup (`key_shared` leave, cursor flush) on EVERY exit path: a clean close, a read/write
 /// error, or a session-ending malformed frame. Returns when the client closes or the session ends.
+///
+/// The `needed` hint from [`Session::process`] avoids the O(n^2) re-decode of a trickled near-cap
+/// frame (#176): after a pass leaves a partial trailing frame needing `needed` bytes, the loop does
+/// not re-run `process` until the buffer has reached that length, so each frame is decoded a constant
+/// number of times no matter how the client drips it.
 fn connection_loop<F, C>(
     stream: &mut TcpStream,
-    engine: &SharedEngine<F, C>,
+    engine: &EngineHandle<F, C>,
     session: &mut Session,
 ) -> std::io::Result<()>
 where
-    F: Filesystem,
-    C: Clock + Clone,
+    F: Filesystem + 'static,
+    C: Clock + Clone + 'static,
 {
     let mut inbuf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
+    // The minimum buffer length before re-running `process` is worth it: `0` means run on any new
+    // byte; a larger value is the trailing partial frame's `needed` hint, so a near-cap frame
+    // trickled byte-by-byte is decoded once it is whole, not once per byte (#176).
+    let mut needed: usize = 0;
     loop {
         let n = stream.read(&mut chunk)?;
         if n == 0 {
             return Ok(()); // the client closed the connection
         }
         inbuf.extend_from_slice(&chunk[..n]);
+        // Skip the dispatch until the buffer can make progress on the known-partial trailing frame.
+        if inbuf.len() < needed {
+            continue;
+        }
 
         let mut out = Vec::new();
-        // Hold the engine lock only for the (synchronous, non-blocking) dispatch.
-        let result = {
-            let mut guard = engine.lock().unwrap_or_else(PoisonError::into_inner);
-            let r = session.process(&mut guard, &inbuf, &mut out);
-            if r.is_ok() {
-                // Persist the session's work-group cursor on the configured interval so a
-                // crash redelivers a bounded tail. Best-effort: a checkpoint write failure only
-                // costs redelivery on restart, never correctness, so it must not fail the
-                // connection. Routed to the session's group (#60).
-                let _ = guard.maybe_checkpoint_group(session.subscription());
-            }
-            r
-        };
-        if let Ok(consumed) = result {
-            inbuf.drain(..consumed);
-            if !out.is_empty() {
-                stream.write_all(&out)?;
-            }
-        } else {
-            // A malformed frame or a fatal engine error: flush any queued response and
-            // close (a length-prefixed stream cannot resync).
+        let Ok(progress) = session.process(engine, &inbuf, &mut out) else {
+            // A malformed frame, a fatal engine error, or a gone actor: flush any queued response
+            // and close (a length-prefixed stream cannot resync).
             let _ = stream.write_all(&out);
             return Ok(());
+        };
+        inbuf.drain(..progress.consumed);
+        // Persist the session's work-group cursor on the configured interval so a crash redelivers a
+        // bounded tail. ONLY when this pass actually advanced a committed cursor (an ack/flow/unsub):
+        // a ping- or connect-only pass skips the checkpoint entirely, so it never sends a command to
+        // the actor and therefore CANNOT be head-of-line-blocked by another connection's stalled
+        // produce fsync (#177 invariant 4). Best-effort: a checkpoint write failure only costs
+        // redelivery on restart, never correctness, so it must not fail the connection. Routed to the
+        // session's group (#60); a gone actor is a no-op, never a hang.
+        if progress.committed_progress {
+            let group = session.subscription().to_string();
+            let _ = engine.with(move |e| {
+                let _ = e.maybe_checkpoint_group(&group);
+            });
+        }
+        // Remember how many bytes the trailing partial frame needs before the next pass.
+        needed = progress.needed;
+        if !out.is_empty() {
+            stream.write_all(&out)?;
         }
     }
 }
@@ -183,6 +197,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::{spawn_actor, EngineHandle, DEFAULT_CHANNEL_BOUND};
     use crate::clock::SystemClock;
     use crate::engine::{DiskFullPolicy, Engine, EngineConfig, Poll};
     use ironbus_core::delivery::DeliveryConfig;
@@ -257,17 +272,39 @@ mod tests {
         );
     }
 
+    /// Opens an in-memory engine and spawns the append actor over it, returning a handle plus the
+    /// actor's join handle (which yields the engine back on a clean exit so a test can inspect it).
+    fn spawn_inmem() -> (
+        EngineHandle<InMemoryFs, SystemClock>,
+        std::thread::JoinHandle<Engine<InMemoryFs, SystemClock>>,
+    ) {
+        let engine = Engine::open(InMemoryFs::new(), SystemClock::new(), config()).unwrap();
+        spawn_actor(engine, DEFAULT_CHANNEL_BOUND)
+    }
+
+    /// Drops the last handle held by the test and joins the actor, recovering the engine. The server
+    /// thread holds its own clone of the handle, so the caller must have already joined the server
+    /// (or dropped its handle) for the actor's command channel to disconnect and the actor to exit.
+    fn recover_engine(
+        handle: EngineHandle<InMemoryFs, SystemClock>,
+        actor: std::thread::JoinHandle<Engine<InMemoryFs, SystemClock>>,
+    ) -> Engine<InMemoryFs, SystemClock> {
+        // An explicit shutdown drains the actor deterministically (flush + checkpoint), then the
+        // join yields the owned engine.
+        let _ = handle.shutdown();
+        drop(handle);
+        actor.join().unwrap()
+    }
+
     #[test]
     fn produce_over_tcp_appends_to_the_engine() {
-        let engine = Engine::open(InMemoryFs::new(), SystemClock::new(), config()).unwrap();
-        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
-
+        let (handle, actor) = spawn_inmem();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let server = std::thread::spawn({
-            let engine = Arc::clone(&shared);
+            let engine = handle.clone();
             let shutdown = Arc::clone(&shutdown);
             move || serve(&listener, &engine, &shutdown, 16).unwrap()
         });
@@ -307,7 +344,7 @@ mod tests {
         server.join().unwrap();
 
         // The message is durable in the engine and deliverable.
-        let mut engine = shared.lock().unwrap();
+        let mut engine = recover_engine(handle, actor);
         match engine.poll(0).unwrap() {
             Poll::Message(d) => assert_eq!(d.record.payload, b"net"),
             other => panic!("expected the produced message, got {other:?}"),
@@ -316,13 +353,12 @@ mod tests {
 
     #[test]
     fn full_produce_fetch_ack_round_trip_over_tcp() {
-        let engine = Engine::open(InMemoryFs::new(), SystemClock::new(), config()).unwrap();
-        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
+        let (handle, actor) = spawn_inmem();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
         let server = std::thread::spawn({
-            let engine = Arc::clone(&shared);
+            let engine = handle.clone();
             let shutdown = Arc::clone(&shutdown);
             move || serve(&listener, &engine, &shutdown, 16).unwrap()
         });
@@ -377,7 +413,8 @@ mod tests {
         server.join().unwrap();
 
         // The message was committed: nothing left to deliver.
-        assert_eq!(shared.lock().unwrap().committed_offset().get(), 1);
+        let engine = recover_engine(handle, actor);
+        assert_eq!(engine.committed_offset().get(), 1);
     }
 
     #[test]
@@ -385,18 +422,17 @@ mod tests {
         // The default interval is 1024, so a single ack does NOT trigger maybe_checkpoint:
         // the committed cursor can only become durable here via the close-path checkpoint the
         // server forces when the client disconnects. Reopening then proves that path fired.
-        let engine = Engine::open(InMemoryFs::new(), SystemClock::new(), config()).unwrap();
-        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
+        let (handle, actor) = spawn_inmem();
 
         // Drive one connection through handle_connection directly so we can JOIN it: when it
         // returns, the EOF-triggered checkpoint is deterministically complete (no race).
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn({
-            let shared = Arc::clone(&shared);
+            let engine = handle.clone();
             move || {
                 let (stream, _) = listener.accept().unwrap();
-                handle_connection(stream, &shared, MemberId::new(0))
+                handle_connection(stream, &engine, MemberId::new(0))
             }
         });
 
@@ -441,16 +477,15 @@ mod tests {
         c.write_all(&frame(FrameType::Ack, &ack_body)).unwrap();
         assert_eq!(read_one_frame(&mut c, &mut buf).0, FrameType::AckStatus);
 
-        // Clean disconnect: handle_connection reads EOF, forces the checkpoint, and returns.
+        // Clean disconnect: handle_connection reads EOF, forces the checkpoint (through the actor),
+        // and returns.
         drop(c);
         server.join().unwrap().unwrap();
 
-        // Reopen the SAME filesystem: the committed cursor (1) was persisted by the close
-        // path, so the engine resumes at 1 rather than redelivering the acked message.
-        let Ok(mutex) = Arc::try_unwrap(shared) else {
-            panic!("engine still shared after join");
-        };
-        let fs = mutex.into_inner().unwrap().into_filesystem();
+        // Recover the engine's filesystem and reopen it: the committed cursor (1) was persisted by
+        // the close path, so the engine resumes at 1 rather than redelivering the acked message.
+        let engine = recover_engine(handle, actor);
+        let fs = engine.into_filesystem();
         let reopened = Engine::open(fs, SystemClock::new(), config()).unwrap();
         assert_eq!(
             reopened.committed_offset().get(),
@@ -461,13 +496,12 @@ mod tests {
 
     #[test]
     fn a_malformed_frame_closes_the_connection() {
-        let engine = Engine::open(InMemoryFs::new(), SystemClock::new(), config()).unwrap();
-        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
+        let (handle, actor) = spawn_inmem();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
         let server = std::thread::spawn({
-            let engine = Arc::clone(&shared);
+            let engine = handle.clone();
             let shutdown = Arc::clone(&shutdown);
             move || serve(&listener, &engine, &shutdown, 16).unwrap()
         });
@@ -488,5 +522,95 @@ mod tests {
 
         shutdown.store(true, Ordering::Release);
         server.join().unwrap();
+        let _ = recover_engine(handle, actor);
+    }
+
+    #[test]
+    fn a_stalled_produce_fsync_does_not_block_another_connections_ping() {
+        // The #177 acceptance test: a stalled produce `sync_data` on ONE producer's group must not
+        // head-of-line-block another connection's ping. Pre-#177 every connection waited on the same
+        // engine `Mutex`, which a produce held across its fsync, so a stalled disk froze pings too.
+        // Now the engine is owned by the append actor and pings are answered by the connection handler
+        // WITHOUT touching the actor, so a producer parked in the actor's group-commit fsync cannot
+        // delay another connection's ping. We prove it with the fault fs's sync GATE (no wall-clock
+        // sleep): producer A's produce parks mid-fsync, and meanwhile B's ping returns Pong.
+        use ironbus_core::clock::ManualClock;
+        use ironbus_proto::message::{encode_pub, PubBody};
+        use ironbus_storage::fault::FaultFs;
+
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let engine = Engine::open(fs, ManualClock::new(), config()).unwrap();
+        let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = std::thread::spawn({
+            let engine = handle.clone();
+            let shutdown = Arc::clone(&shutdown);
+            move || serve(&listener, &engine, &shutdown, 16).unwrap()
+        });
+
+        // Connection A: connect, then publish. Close the sync gate FIRST so A's produce parks inside
+        // the actor's group-commit fsync and never returns until we open the gate.
+        control.close_sync_gate();
+        let mut a = TcpStream::connect(addr).unwrap();
+        a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut abuf = Vec::new();
+        a.write_all(&frame(FrameType::Connect, b"")).unwrap();
+        assert_eq!(read_one_frame(&mut a, &mut abuf).0, FrameType::Info);
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                payload: b"stalled",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        // A's produce blocks in the actor's fsync; A does NOT get a PubAck yet. Send it from a thread
+        // (it would otherwise block this test thread waiting for the never-arriving PubAck).
+        let a_producer = std::thread::spawn(move || {
+            a.write_all(&frame(FrameType::Pub, &pub_body)).unwrap();
+            // This read blocks until the gate opens and the PubAck finally arrives.
+            let (ty, _) = read_one_frame(&mut a, &mut abuf);
+            assert_eq!(
+                ty,
+                FrameType::PubAck,
+                "A's produce eventually acks once durable"
+            );
+            a
+        });
+
+        // Wait until A's produce is actually parked inside the closed gate (no wall-clock sleep).
+        control.wait_for_sync_gate_entered(1);
+
+        // Connection B: while A's fsync is stalled, B's ping must be answered. This is the head-of-line
+        // property: the ping never reaches the actor, so the stalled produce cannot block it.
+        let mut b = TcpStream::connect(addr).unwrap();
+        b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut bbuf = Vec::new();
+        b.write_all(&frame(FrameType::Connect, b"")).unwrap();
+        assert_eq!(read_one_frame(&mut b, &mut bbuf).0, FrameType::Info);
+        b.write_all(&frame(FrameType::Ping, b"")).unwrap();
+        assert_eq!(
+            read_one_frame(&mut b, &mut bbuf).0,
+            FrameType::Pong,
+            "B's ping is answered while A's produce fsync is stalled (no head-of-line block)"
+        );
+
+        // Release the gate: A's produce now completes (its PubAck arrives) and its thread joins.
+        control.open_sync_gate();
+        let a = a_producer.join().unwrap();
+        drop(a);
+        drop(b);
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+        // Drain and stop the actor (it owns the fault-fs engine).
+        let _ = handle.shutdown();
+        drop(handle);
+        let _ = actor.join();
     }
 }

@@ -16,17 +16,18 @@
 //! malformed frame envelope is unrecoverable for a length-prefixed stream, so it ends the
 //! session.
 
-use crate::engine::{AckResult, Engine, EngineError, NackResult, Poll, ProgressResult};
+use crate::actor::{ActorGone, EngineAccess, OwnedAppend, ProduceOutcome};
+use crate::engine::{AckResult, EngineError, NackResult, Poll, ProgressResult};
 use ironbus_core::clock::Clock;
 use ironbus_core::keyshared::{KeyOrdering, MemberId};
-use ironbus_core::types::RecordFlags;
+use ironbus_core::lease::LeaseToken;
+use ironbus_core::types::Offset;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
     decode_ack, decode_pub, decode_sub, encode_dead_letter, encode_deliver, encode_truncated,
     AckOp, DeadLetterBody, DeliverBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER,
 };
 use ironbus_storage::fs::Filesystem;
-use ironbus_storage::log::Append;
 use std::collections::HashMap;
 
 /// A session error that ends the connection.
@@ -39,6 +40,10 @@ pub enum SessionError {
     /// invariant): retrying is pointless, so the session ends. The real error is carried
     /// for the caller to log.
     EngineFatal(EngineError),
+    /// The append actor is no longer running (it exited or panicked), so no engine command can
+    /// be served: the session ends cleanly rather than hanging on a dead actor. This is the
+    /// typed "actor gone" path (#177): a closed channel is an error, never a panic.
+    ActorGone,
 }
 
 impl core::fmt::Display for SessionError {
@@ -46,11 +51,41 @@ impl core::fmt::Display for SessionError {
         match self {
             SessionError::BadFrame(e) => write!(f, "malformed frame, closing session: {e}"),
             SessionError::EngineFatal(e) => write!(f, "fatal engine error, closing session: {e}"),
+            SessionError::ActorGone => {
+                write!(f, "the append actor is gone, closing session")
+            }
         }
     }
 }
 
+impl From<ActorGone> for SessionError {
+    fn from(_: ActorGone) -> Self {
+        SessionError::ActorGone
+    }
+}
+
 impl std::error::Error for SessionError {}
+
+/// The result of one [`Session::process`] pass over a connection's input buffer: how much was
+/// consumed and the minimum buffer length before the next pass can make progress on the partial
+/// trailing frame. The `needed` hint is what lets the connection loop avoid the O(n^2) re-decode of
+/// a trickled near-cap frame (#176): it only re-calls `process` once the buffer reaches `needed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Progress {
+    /// The number of input bytes consumed (the complete frames at the front were dispatched).
+    pub consumed: usize,
+    /// The minimum length the POST-DRAIN buffer (after `consumed` bytes are drained) must reach
+    /// before another `process` pass can make progress on the trailing partial frame. `0` when no
+    /// partial frame remains (everything decoded cleanly), so the next pass should run as soon as
+    /// ANY new byte arrives.
+    pub needed: usize,
+    /// Whether this pass processed any frame that may have advanced a work-group's committed cursor
+    /// (an `Ack`/`Flow`), so the caller knows whether the interval checkpoint is worth running. It is
+    /// `false` for a ping-only (or connect-only) pass, which is what keeps a ping off the actor's
+    /// checkpoint path entirely: a ping never triggers a `maybe_checkpoint` command, so a stalled
+    /// produce fsync on another connection cannot head-of-line-block it (invariant 4, #177).
+    pub committed_progress: bool,
+}
 
 /// One entry in a session's connection-scoped in-flight set (#175, #275): the generation the lease
 /// was granted under (the fencing token half) and the message's byte size (its key plus headers plus
@@ -184,24 +219,49 @@ impl Session {
         &self.subscription
     }
 
-    /// Processes the complete frames at the front of `input`, dispatching each to `engine`
-    /// and appending response frames to `out`. Returns the number of input bytes consumed;
-    /// a partial trailing frame is not consumed and should be retried once more bytes
-    /// arrive.
+    /// Processes the complete frames at the front of `input`, dispatching each to the engine (via
+    /// the append actor `engine`) and appending response frames to `out`. Returns a [`Progress`]:
+    /// the number of input bytes consumed, plus the `needed` hint, the minimum TOTAL input length
+    /// before the next call can make progress on the partial trailing frame (`0` when nothing
+    /// partial remains). A partial trailing frame is not consumed and should be retried once more
+    /// bytes arrive.
+    ///
+    /// # The `needed` hint (#176 O(n^2) re-decode fix)
+    ///
+    /// Without the hint a connection re-runs `process` over its whole input buffer on every read,
+    /// so a client trickling a near-cap frame byte-by-byte forces a full re-decode per byte: O(n^2)
+    /// in the frame size. The `needed` value is the frame parser's [`FrameDecode::Incomplete`]
+    /// hint, the total length the trailing frame needs; the caller skips re-calling `process` until
+    /// the buffer has at least that many bytes, so each frame is decoded at most a constant number
+    /// of times regardless of how it is trickled.
     ///
     /// # Errors
-    /// Returns [`SessionError::BadFrame`] if a frame envelope is malformed; the caller must
-    /// then close the connection (a length-prefixed stream cannot resync).
-    pub fn process<F: Filesystem, C: Clock + Clone>(
+    /// Returns [`SessionError::BadFrame`] if a frame envelope is malformed (the caller must then
+    /// close the connection, a length-prefixed stream cannot resync), [`SessionError::EngineFatal`]
+    /// on an unrecoverable engine error, or [`SessionError::ActorGone`] if the append actor exited.
+    pub fn process<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
         &mut self,
-        engine: &mut Engine<F, C>,
+        engine: &E,
         input: &[u8],
         out: &mut Vec<u8>,
-    ) -> Result<usize, SessionError> {
+    ) -> Result<Progress, SessionError> {
         let mut consumed = 0;
+        let mut committed_progress = false;
         loop {
             match decode_frame(&input[consumed..]).map_err(SessionError::BadFrame)? {
-                FrameDecode::Incomplete { .. } => return Ok(consumed),
+                // The trailing frame is partial: report how many bytes it needs so the caller does
+                // not re-decode until at least that many have arrived (the #176 fix). `needed` is
+                // relative to the UNCONSUMED remainder (`&input[consumed..]`): the caller drains the
+                // `consumed` prefix, after which the partial frame sits at the front of its buffer
+                // and needs exactly `needed` bytes there, so the threshold the caller compares its
+                // post-drain buffer length against is this `needed` directly.
+                FrameDecode::Incomplete { needed } => {
+                    return Ok(Progress {
+                        consumed,
+                        needed,
+                        committed_progress,
+                    });
+                }
                 FrameDecode::Frame {
                     type_tag,
                     body,
@@ -209,61 +269,61 @@ impl Session {
                 } => {
                     // A fatal engine error ends the session AFTER its Err response is
                     // queued (the caller flushes `out`, then closes).
-                    self.dispatch(engine, type_tag, body, out)?;
+                    committed_progress |= self.dispatch(engine, type_tag, body, out)?;
                     consumed += n;
                 }
             }
         }
     }
 
-    fn dispatch<F: Filesystem, C: Clock + Clone>(
+    /// Dispatches one decoded frame, returning whether it may have advanced a work-group's committed
+    /// cursor (so the caller knows whether to run the interval checkpoint). A `Ping`/`Connect`/`Pub`
+    /// returns `false`: a ping changes no cursor (and must not reach the actor's checkpoint path, so a
+    /// stalled produce fsync cannot block it, #177); a produce advances the durable head but not a
+    /// COMMITTED cursor. An `Ack`/`Flow`/`Unsub` returns `true` (an ack commits, a flow can commit
+    /// past a dead-letter, an unsub may evict a caught-up group).
+    fn dispatch<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
         &mut self,
-        engine: &mut Engine<F, C>,
+        engine: &E,
         type_tag: u8,
         body: &[u8],
         out: &mut Vec<u8>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<bool, SessionError> {
         match FrameType::from_u8(type_tag) {
             // A repeated Connect is idempotent today (the handshake carries no negotiated
             // state yet); once Connect carries capabilities, decide whether to reject one.
             Some(FrameType::Connect) => {
                 self.connected = true;
                 reply(out, FrameType::Info, &[]);
-                Ok(())
+                Ok(false)
             }
             Some(FrameType::Ping) => {
                 reply(out, FrameType::Pong, &[]);
-                Ok(())
+                Ok(false)
             }
-            Some(FrameType::Pub) => self.handle_pub(engine, body, out),
-            Some(FrameType::Ack) => self.handle_ack(engine, body, out),
-            Some(FrameType::Flow) => self.handle_flow(engine, body, out),
-            Some(FrameType::Sub) => {
-                self.handle_sub(engine, body, out);
-                Ok(())
-            }
-            Some(FrameType::Unsub) => {
-                self.handle_unsub(engine, out);
-                Ok(())
-            }
+            Some(FrameType::Pub) => self.handle_pub(engine, body, out).map(|()| false),
+            Some(FrameType::Ack) => self.handle_ack(engine, body, out).map(|()| true),
+            Some(FrameType::Flow) => self.handle_flow(engine, body, out).map(|()| true),
+            Some(FrameType::Sub) => self.handle_sub(engine, body, out).map(|()| false),
+            Some(FrameType::Unsub) => self.handle_unsub(engine, out).map(|()| true),
             // The standalone Nack frame type (a client sends a nack as an Ack frame with the
             // Nack op, handled above), or a response-only verb (Info/Pong/Ok/Err/Deliver) a
             // client should not send.
             Some(_) => {
                 reply_err(out, "verb not supported on this connection");
-                Ok(())
+                Ok(false)
             }
             // An unknown tag is forward-compatible at the envelope level but has no handler.
             None => {
                 reply_err(out, "unknown frame type");
-                Ok(())
+                Ok(false)
             }
         }
     }
 
-    fn handle_pub<F: Filesystem, C: Clock + Clone>(
+    fn handle_pub<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
         &mut self,
-        engine: &mut Engine<F, C>,
+        engine: &E,
         body: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<(), SessionError> {
@@ -275,23 +335,27 @@ impl Session {
             reply_err(out, "malformed pub body");
             return Ok(());
         };
-        let append = Append {
+        // Hand the produce to the append actor as an OWNED payload (the wire body borrows the
+        // connection's input buffer, which the actor cannot hold) and AWAIT its outcome. The reply
+        // arrives only after the covering group-commit fsync, so the PubAck is ack-implies-durable
+        // (I2): the actor never replies Appended before the fdatasync that made the record durable.
+        // The codec already normalized the HAS_KEY bit and preserved unknown bits for forward
+        // compatibility; the storage layer never acts on unknown bits.
+        let append = OwnedAppend {
             timestamp_ms: msg.timestamp_ms,
-            // The codec normalizes the HAS_KEY bit and preserves unknown bits for
-            // forward compatibility; the storage layer never acts on unknown bits.
-            flags: RecordFlags::from_bits(msg.flags),
-            key: msg.key,
-            headers: msg.headers,
-            payload: msg.payload,
+            flags: msg.flags,
+            key: msg.key.to_vec(),
+            headers: msg.headers.to_vec(),
+            payload: msg.payload.to_vec(),
         };
-        match engine.produce(&append) {
-            Ok(offset) => {
+        match engine.produce(append)? {
+            ProduceOutcome::Appended(offset) => {
                 reply(out, FrameType::PubAck, &offset.get().to_le_bytes());
                 Ok(())
             }
             // A fatal error (frozen writer) would fail every future produce, so end the
             // session rather than masquerade as a transient failure.
-            Err(e) if e.is_fatal() => {
+            ProduceOutcome::Fatal(e) => {
                 reply_err(out, "fatal storage error");
                 Err(SessionError::EngineFatal(e))
             }
@@ -299,11 +363,11 @@ impl Session {
             // producer can tell a deliberate shed from a transient failure. The connection
             // stays open, so the producer can keep going (a later produce succeeds once
             // retention frees space).
-            Err(e) if e.is_at_capacity() => {
+            ProduceOutcome::AtCapacity => {
                 reply_err(out, "at capacity");
                 Ok(())
             }
-            Err(_) => {
+            ProduceOutcome::Failed(_) => {
                 reply_err(out, "produce failed");
                 Ok(())
             }
@@ -316,9 +380,9 @@ impl Session {
     /// session is fenced (status 0) without touching the engine, so a second connection cannot
     /// commit or requeue a message destined for another consumer. The generation token still
     /// fences a stale op on an own-but-already-redelivered lease.
-    fn handle_ack<F: Filesystem, C: Clock + Clone>(
+    fn handle_ack<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
         &mut self,
-        engine: &mut Engine<F, C>,
+        engine: &E,
         body: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<(), SessionError> {
@@ -330,8 +394,8 @@ impl Session {
             reply_err(out, "malformed ack body");
             return Ok(());
         };
-        let token = ironbus_core::lease::LeaseToken {
-            offset: ironbus_core::types::Offset::new(ack.offset),
+        let token = LeaseToken {
+            offset: Offset::new(ack.offset),
             generation: ack.generation,
         };
         // Connection-scoped ownership (#175): only the session this lease was delivered to may
@@ -342,13 +406,15 @@ impl Session {
             reply(out, FrameType::AckStatus, &[0]);
             return Ok(());
         }
-        // Each op replies a one-byte status whose exact meaning is documented per arm below
-        // (e.g. progress can reply 2 = cap reached). A status of 0 always means fenced: the
-        // token was stale (the message already redelivered or was acked), so the client must
-        // NOT drop its state.
+        // The group is sent to the actor by value (the engine job is `'static`); cloning the
+        // subscription name per ack is cheap against the round-trip and keeps the session state in
+        // the handler. Each op replies a one-byte status documented per arm below (e.g. progress can
+        // reply 2 = cap reached). A status of 0 always means fenced: the token was stale (the message
+        // already redelivered or was acked), so the client must NOT drop its state.
+        let group = self.subscription.clone();
         match ack.op {
             AckOp::Ack => {
-                let status = match engine.ack_in(&self.subscription, &token) {
+                let status = match engine.with(move |e| e.ack_in(&group, &token))? {
                     AckResult::Acked => 1u8,
                     AckResult::Fenced => 0u8,
                 };
@@ -356,33 +422,36 @@ impl Session {
                 reply(out, FrameType::AckStatus, &[status]);
                 Ok(())
             }
-            AckOp::Nack => match engine.nack_in(&self.subscription, &token, ack.delay_ms) {
-                Ok(NackResult::Requeued) => {
-                    self.leased.remove(&ack.offset);
-                    reply(out, FrameType::AckStatus, &[1]);
-                    Ok(())
+            AckOp::Nack => {
+                let delay = ack.delay_ms;
+                match engine.with(move |e| e.nack_in(&group, &token, delay))? {
+                    Ok(NackResult::Requeued) => {
+                        self.leased.remove(&ack.offset);
+                        reply(out, FrameType::AckStatus, &[1]);
+                        Ok(())
+                    }
+                    Ok(NackResult::Fenced) => {
+                        self.leased.remove(&ack.offset);
+                        reply(out, FrameType::AckStatus, &[0]);
+                        Ok(())
+                    }
+                    // Generation exhaustion is fatal: it wedges every future claim and nack, so
+                    // end the session rather than let the client hammer a dead engine, exactly as
+                    // the produce path does, instead of masquerading it as a transient failure.
+                    Err(e) if e.is_fatal() => {
+                        reply_err(out, "fatal storage error");
+                        Err(SessionError::EngineFatal(e))
+                    }
+                    Err(_) => {
+                        reply_err(out, "nack failed");
+                        Ok(())
+                    }
                 }
-                Ok(NackResult::Fenced) => {
-                    self.leased.remove(&ack.offset);
-                    reply(out, FrameType::AckStatus, &[0]);
-                    Ok(())
-                }
-                // Generation exhaustion is fatal: it wedges every future claim and nack, so
-                // end the session rather than let the client hammer a dead engine, exactly as
-                // the produce path does, instead of masquerading it as a transient failure.
-                Err(e) if e.is_fatal() => {
-                    reply_err(out, "fatal storage error");
-                    Err(SessionError::EngineFatal(e))
-                }
-                Err(_) => {
-                    reply_err(out, "nack failed");
-                    Ok(())
-                }
-            },
+            }
             // Term is an intentional drop: commit past the message (the same mechanism as
             // ack) so it never redelivers and is not dead-lettered. 1 = dropped, 0 = fenced.
             AckOp::Term => {
-                let status = match engine.term_in(&self.subscription, &token) {
+                let status = match engine.with(move |e| e.term_in(&group, &token))? {
                     AckResult::Acked => 1u8,
                     AckResult::Fenced => 0u8,
                 };
@@ -394,7 +463,7 @@ impl Session {
             // 2 = cap reached (the lease will expire and the message redeliver on schedule),
             // 0 = fenced.
             AckOp::Progress => {
-                let status = match engine.progress_in(&self.subscription, &token) {
+                let status = match engine.with(move |e| e.progress_in(&group, &token))? {
                     ProgressResult::Extended => 1u8,
                     ProgressResult::CapReached => 2u8,
                     ProgressResult::Fenced => {
@@ -409,23 +478,47 @@ impl Session {
     }
     /// The per-CONSUMER (per-connection) in-flight credit ceiling (#65) for this session, cached
     /// from the engine on the first call. The engine is the source of truth (a `serve` flag sets it
-    /// once for every connection), and it is already floored to at least 1.
-    fn credit_ceiling<F: Filesystem, C: Clock + Clone>(&mut self, engine: &Engine<F, C>) -> u32 {
-        *self
-            .credit_ceiling
-            .get_or_insert_with(|| engine.consumer_credit())
+    /// once for every connection), and it is already floored to at least 1. Reads through the actor
+    /// once, then caches, so the round-trip is paid only on the first Flow.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::ActorGone`] if the actor exited before the read.
+    fn credit_ceiling<
+        F: Filesystem + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+    ) -> Result<u32, SessionError> {
+        if let Some(c) = self.credit_ceiling {
+            return Ok(c);
+        }
+        let c = engine.with(|e| e.consumer_credit())?;
+        self.credit_ceiling = Some(c);
+        Ok(c)
     }
 
     /// The per-CONSUMER (per-connection) in-flight BYTE budget (#275) for this session, cached from
     /// the engine on the first call alongside [`Session::credit_ceiling`]. The engine is the source
     /// of truth (a `serve` flag sets it once for every connection). `0` means unlimited.
-    fn credit_ceiling_bytes<F: Filesystem, C: Clock + Clone>(
+    ///
+    /// # Errors
+    /// Returns [`SessionError::ActorGone`] if the actor exited before the read.
+    fn credit_ceiling_bytes<
+        F: Filesystem + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
         &mut self,
-        engine: &Engine<F, C>,
-    ) -> u64 {
-        *self
-            .credit_ceiling_bytes
-            .get_or_insert_with(|| engine.consumer_credit_bytes())
+        engine: &E,
+    ) -> Result<u64, SessionError> {
+        if let Some(c) = self.credit_ceiling_bytes {
+            return Ok(c);
+        }
+        let c = engine.with(|e| e.consumer_credit_bytes())?;
+        self.credit_ceiling_bytes = Some(c);
+        Ok(c)
     }
 
     /// The total in-flight PAYLOAD bytes this connection currently holds un-acked (#275): the sum of
@@ -446,17 +539,49 @@ impl Session {
     /// whoever next claims it (possibly this same consumer, which then re-occupies exactly one slot
     /// because the re-claim overwrites the same offset key). A still-active, unexpired lease keeps
     /// its slot. Pure bookkeeping: it never mutates engine state.
-    fn release_stale_leases<F: Filesystem, C: Clock + Clone>(&mut self, engine: &Engine<F, C>) {
+    ///
+    /// It batches the whole check into ONE actor round-trip (not one per lease): it sends the live
+    /// `(offset, generation)` pairs, the actor returns the subset the engine still holds active, and
+    /// the session retains only those. A no-op (no round-trip) when nothing is leased.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::ActorGone`] if the actor exited before the check.
+    fn release_stale_leases<
+        F: Filesystem + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+    ) -> Result<(), SessionError> {
+        if self.leased.is_empty() {
+            return Ok(());
+        }
         let group = self.subscription.clone();
-        self.leased.retain(|&offset, lease| {
-            engine.holds_active_lease_in(
-                &group,
-                &ironbus_core::lease::LeaseToken {
-                    offset: ironbus_core::types::Offset::new(offset),
-                    generation: lease.generation,
-                },
-            )
-        });
+        let pairs: Vec<(u64, u64)> = self
+            .leased
+            .iter()
+            .map(|(&offset, lease)| (offset, lease.generation))
+            .collect();
+        // One job checks every pair on the engine and returns the offsets still held ACTIVE, so the
+        // whole stale-lease prune is a single round-trip rather than one per in-flight message.
+        let live: std::collections::HashSet<u64> = engine.with(move |e| {
+            pairs
+                .into_iter()
+                .filter(|&(offset, generation)| {
+                    e.holds_active_lease_in(
+                        &group,
+                        &LeaseToken {
+                            offset: Offset::new(offset),
+                            generation,
+                        },
+                    )
+                })
+                .map(|(offset, _)| offset)
+                .collect()
+        })?;
+        self.leased.retain(|offset, _| live.contains(offset));
+        Ok(())
     }
 
     /// Fetches up to the requested number of messages and streams them as DELIVER frames,
@@ -475,9 +600,9 @@ impl Session {
     /// budget (per-consumer isolation). The advisory frames (dead-letter, truncation) still count
     /// against the REQUESTED credit (they bound the total frames a batch streams) but do NOT occupy
     /// an in-flight slot or any bytes, since they commit past or reset rather than lease.
-    fn handle_flow<F: Filesystem, C: Clock + Clone>(
+    fn handle_flow<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
         &mut self,
-        engine: &mut Engine<F, C>,
+        engine: &E,
         body: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<(), SessionError> {
@@ -493,7 +618,7 @@ impl Session {
         // Redelivery accounting (#65): free the slots of any leases this connection no longer holds
         // (expired-and-redelivered, or committed) BEFORE computing remaining credit, so a stuck
         // consumer's expired leases stop counting against it and its peers stay isolated.
-        self.release_stale_leases(engine);
+        self.release_stale_leases(engine)?;
         // The per-consumer remaining credit: the ceiling minus what this connection already holds
         // un-acked. The effective batch bound is min(requested, remaining); the per-group
         // `max_in_flight` window further caps it inside the engine's poll (a full window returns
@@ -502,7 +627,7 @@ impl Session {
         // the WHOLE loop by `credits` (not `requested`) is what stops the engine from leasing an
         // offset this connection has no credit to deliver: at zero remaining credit the loop body
         // never runs, so a saturated consumer gets an empty batch even with messages available.
-        let ceiling = self.credit_ceiling(engine);
+        let ceiling = self.credit_ceiling(engine)?;
         let held = u32::try_from(self.leased.len()).unwrap_or(u32::MAX);
         let remaining = ceiling.saturating_sub(held);
         let credits = requested.min(remaining);
@@ -514,7 +639,7 @@ impl Session {
         // that returns Poll::Message has already leased the message in the engine (its size is not
         // knowable until then); delivering when at-or-below budget lets the in-flight total overshoot
         // by at most one message, which is the standard credit semantics and stays bounded.
-        let ceiling_bytes = self.credit_ceiling_bytes(engine);
+        let ceiling_bytes = self.credit_ceiling_bytes(engine)?;
         let mut delivered = 0u32;
         for _ in 0..credits {
             // The byte budget binds (#275): stop once in-flight bytes have reached the budget, unless
@@ -528,8 +653,11 @@ impl Session {
             }
             // Member-aware poll (#64): for a key_shared group this routes by the connection's
             // member id; for a plain competing group it is identical to poll_now_in, so the
-            // KeyOrdering::None path is unchanged.
-            match engine.poll_now_in_member(&self.subscription, self.member_id) {
+            // KeyOrdering::None path is unchanged. One poll = one actor round-trip; the actor flushes
+            // any pending produce batch first, so each poll sees a consistent durable head.
+            let group = self.subscription.clone();
+            let member = self.member_id;
+            match engine.with(move |e| e.poll_now_in_member(&group, member))? {
                 Ok(Poll::Message(d)) => {
                     let msg = DeliverBody {
                         offset: d.offset.get(),
@@ -617,29 +745,30 @@ impl Session {
         }
         // Drop ownership of any offset now committed (acked here, or committed past on a
         // dead-letter), keeping `leased` bounded to the in-flight window.
-        let committed = engine.committed_offset_in(&self.subscription).get();
+        let group = self.subscription.clone();
+        let committed = engine.with(move |e| e.committed_offset_in(&group).get())?;
         self.leased.retain(|&offset, _| offset >= committed);
         reply(out, FrameType::FlowEnd, &delivered.to_le_bytes());
         Ok(())
     }
 
-    fn handle_sub<F: Filesystem, C: Clock + Clone>(
+    fn handle_sub<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
         &mut self,
-        engine: &mut Engine<F, C>,
+        engine: &E,
         body: &[u8],
         out: &mut Vec<u8>,
-    ) {
+    ) -> Result<(), SessionError> {
         if !self.connected {
             reply_err(out, "not connected");
-            return;
+            return Ok(());
         }
         let Ok(group) = core::str::from_utf8(decode_sub(body).group) else {
             reply_err(out, "subscription name must be valid UTF-8");
-            return;
+            return Ok(());
         };
         // Leave the previous key_shared group (if any) before switching: its keys re-route to
         // their new owners, and the in-flight leases this connection held there drain or expire.
-        self.leave_current_key_shared(engine);
+        self.leave_current_key_shared(engine)?;
         // Switching subscriptions abandons this connection's in-flight leases in the
         // previous group (they redeliver there after the visibility timeout), so the new
         // subscription starts with no outstanding leases. The name's shape and the group
@@ -649,30 +778,38 @@ impl Session {
         // If the new group is configured key_shared (#64), put it into that mode and join as a
         // member so this connection's keys route to it. A failure to enable the mode (an invalid
         // name or the group cap) is surfaced on the first FLOW as today, so SUB stays infallible
-        // here: only join when the mode is actually active.
-        if engine.is_configured_key_shared(&self.subscription)
-            && engine
-                .set_key_ordering_in(&self.subscription, KeyOrdering::KeyShared)
-                .is_ok()
-        {
-            engine.join_member_in(&self.subscription, self.member_id);
-            self.joined_key_shared = true;
-        }
+        // here: only join when the mode is actually active. The whole "is it key_shared, if so
+        // enable + join" decision is one actor job, so SUB stays a single round-trip; it returns
+        // whether this connection joined so the session can record it for leave-on-switch.
+        let sub = self.subscription.clone();
+        let member = self.member_id;
+        let joined = engine.with(move |e| {
+            if e.is_configured_key_shared(&sub)
+                && e.set_key_ordering_in(&sub, KeyOrdering::KeyShared).is_ok()
+            {
+                e.join_member_in(&sub, member);
+                true
+            } else {
+                false
+            }
+        })?;
+        self.joined_key_shared = joined;
         reply(out, FrameType::Ok, &[]);
+        Ok(())
     }
 
-    fn handle_unsub<F: Filesystem, C: Clock + Clone>(
+    fn handle_unsub<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
         &mut self,
-        engine: &mut Engine<F, C>,
+        engine: &E,
         out: &mut Vec<u8>,
-    ) {
+    ) -> Result<(), SessionError> {
         if !self.connected {
             reply_err(out, "not connected");
-            return;
+            return Ok(());
         }
         // Leave the key_shared group (if any) so its keys re-route, then revert to the default
         // group and drop any outstanding named-group leases (they redeliver after the timeout).
-        self.leave_current_key_shared(engine);
+        self.leave_current_key_shared(engine)?;
         // The named group this connection is leaving. Captured BEFORE clearing the subscription so
         // the explicit-Unsub eviction (#277) can target it: if it is now fully caught up with no
         // in-flight leases, it is immediately reclaimable rather than waiting out the idle window.
@@ -681,9 +818,12 @@ impl Session {
         let leaving = std::mem::take(&mut self.subscription);
         self.leased.clear();
         if !leaving.is_empty() {
-            engine.evict_group_if_idle(&leaving);
+            engine.with(move |e| {
+                e.evict_group_if_idle(&leaving);
+            })?;
         }
         reply(out, FrameType::Ok, &[]);
+        Ok(())
     }
 
     /// Leaves the currently-subscribed `key_shared` group's live-member set (#64), if this
@@ -691,14 +831,27 @@ impl Session {
     /// is safe to call on every subscription switch, UNSUB, and connection close. The engine keeps
     /// the departed member's in-flight records leased until they drain or expire (the drain-or-expire
     /// guard), so its keys do not jump to a new owner mid-record.
-    pub fn leave_current_key_shared<F: Filesystem, C: Clock + Clone>(
+    ///
+    /// # Errors
+    /// Returns [`SessionError::ActorGone`] if the actor exited before the leave could run. A no-op
+    /// (no round-trip) when this connection had not joined a `key_shared` group.
+    pub fn leave_current_key_shared<
+        F: Filesystem + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
         &mut self,
-        engine: &mut Engine<F, C>,
-    ) {
+        engine: &E,
+    ) -> Result<(), SessionError> {
         if self.joined_key_shared {
-            engine.leave_member_in(&self.subscription, self.member_id);
+            let group = self.subscription.clone();
+            let member = self.member_id;
+            engine.with(move |e| {
+                e.leave_member_in(&group, member);
+            })?;
             self.joined_key_shared = false;
         }
+        Ok(())
     }
 }
 
@@ -731,13 +884,15 @@ fn reply_err(out: &mut Vec<u8>, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::DirectEngine;
     use crate::engine::{DiskFullPolicy, Engine, EngineConfig, Poll};
     use ironbus_core::clock::ManualClock;
     use ironbus_core::delivery::DeliveryConfig;
     use ironbus_core::lease::LeaseConfig;
+    use ironbus_core::types::RecordFlags;
     use ironbus_proto::message::{decode_deliver, encode_ack, encode_pub, AckBody, PubBody};
     use ironbus_storage::fs::InMemoryFs;
-    use ironbus_storage::log::LogConfig;
+    use ironbus_storage::log::{Append, LogConfig};
     use std::sync::Arc;
 
     fn engine() -> Engine<InMemoryFs, ManualClock> {
@@ -802,15 +957,16 @@ mod tests {
         frames
     }
 
-    fn produce<C: Clock + Clone>(e: &mut Engine<InMemoryFs, C>, payload: &[u8]) {
-        e.produce(&Append {
-            timestamp_ms: 0,
-            flags: RecordFlags::EMPTY,
-            key: b"",
-            headers: b"",
-            payload,
-        })
-        .unwrap();
+    fn produce<C: Clock + Clone>(e: &DirectEngine<InMemoryFs, C>, payload: &[u8]) {
+        e.engine_mut()
+            .produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload,
+            })
+            .unwrap();
     }
 
     fn engine_with(
@@ -885,32 +1041,29 @@ mod tests {
         let clock = Arc::new(ManualClock::new());
         // Measure one record's framed bytes, then size the cap to ~4 records.
         let one = {
-            let mut probe = engine_drop_oldest(Arc::clone(&clock), 0);
-            produce(&mut probe, &[0xab; 16]);
-            probe.durable_record_bytes()
+            let probe = DirectEngine::new(engine_drop_oldest(Arc::clone(&clock), 0));
+            produce(&probe, &[0xab; 16]);
+            let bytes = probe.engine_mut().durable_record_bytes();
+            bytes
         };
-        let mut e = engine_drop_oldest(Arc::clone(&clock), 4 * one);
+        let e = DirectEngine::new(engine_drop_oldest(Arc::clone(&clock), 4 * one));
         let mut s = Session::new();
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
 
         // Produce offset 0, then the session leases it (a stuck consumer: it never acks).
-        produce(&mut e, &[0xab; 16]);
+        produce(&e, &[0xab; 16]);
         out.clear();
-        s.process(
-            &mut e,
-            &frame(FrameType::Flow, &1u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
         assert_eq!(delivered_tokens(&out).len(), 1, "leased offset 0");
         // The producer races past the cap so DropOldest force-reaps the leased records.
         for _ in 0..20 {
-            produce(&mut e, &[0xab; 16]);
+            produce(&e, &[0xab; 16]);
         }
         assert!(
-            e.earliest_retained_offset().get() > 0,
+            e.engine_mut().earliest_retained_offset().get() > 0,
             "the leased records were force-reaped"
         );
 
@@ -918,12 +1071,8 @@ mod tests {
         // session stays open (process returns Ok). The first Truncated consumes a credit slot, so
         // with a credit of 1 the batch is just the advisory.
         out.clear();
-        s.process(
-            &mut e,
-            &frame(FrameType::Flow, &1u32.to_le_bytes()),
-            &mut out,
-        )
-        .expect("the session stays open after a truncation");
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .expect("the session stays open after a truncation");
         let frames = decode_all(&out);
         let truncated: Vec<_> = frames
             .iter()
@@ -937,7 +1086,10 @@ mod tests {
         // The advisory body decodes to the new earliest-retained offset and the skipped count.
         let body = ironbus_proto::message::decode_truncated(&truncated[0].1)
             .expect("valid Truncated body");
-        assert_eq!(body.earliest_retained, e.earliest_retained_offset().get());
+        assert_eq!(
+            body.earliest_retained,
+            e.engine_mut().earliest_retained_offset().get()
+        );
         assert!(body.skipped > 0, "the consumer skipped a non-empty span");
         assert_eq!(
             frames.last().map(|(ty, _)| *ty),
@@ -947,12 +1099,8 @@ mod tests {
 
         // A later fetch delivers normally and does NOT emit another Truncated frame for the gap.
         out.clear();
-        s.process(
-            &mut e,
-            &frame(FrameType::Flow, &5u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
         let frames2 = decode_all(&out);
         assert!(
             !frames2.iter().any(|(ty, _)| *ty == FrameType::Truncated),
@@ -966,9 +1114,9 @@ mod tests {
 
     /// Sends one acknowledgement op and returns the status body, asserting the reply is a
     /// single `AckStatus` frame.
-    fn ack_reply<C: Clock + Clone>(
+    fn ack_reply<C: Clock + Clone + 'static>(
         s: &mut Session,
-        e: &mut Engine<InMemoryFs, C>,
+        e: &DirectEngine<InMemoryFs, C>,
         op: AckOp,
         offset: u64,
         generation: u64,
@@ -1000,21 +1148,17 @@ mod tests {
     #[test]
     fn progress_then_cap_then_term_over_the_wire() {
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_with(Arc::clone(&clock), 5);
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 5));
         let mut s = Session::new();
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
-        produce(&mut e, b"x");
+        produce(&e, b"x");
 
         // Fetch to lease offset 0 (deadline = now(0) + 30, hard cap at 100).
         out.clear();
-        s.process(
-            &mut e,
-            &frame(FrameType::Flow, &1u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
         let toks = delivered_tokens(&out);
         assert_eq!(toks.len(), 1);
         let (offset, generation) = toks[0];
@@ -1022,24 +1166,24 @@ mod tests {
         // Progress at t=25 extends the lease: status byte 1.
         clock.advance_monotonic_nanos(25);
         assert_eq!(
-            ack_reply(&mut s, &mut e, AckOp::Progress, offset, generation),
+            ack_reply(&mut s, &e, AckOp::Progress, offset, generation),
             vec![1]
         );
         // Progress at t=100 (attempt_start 0 + hard cap 100) cannot extend: status byte 2.
         clock.advance_monotonic_nanos(75);
         assert_eq!(
-            ack_reply(&mut s, &mut e, AckOp::Progress, offset, generation),
+            ack_reply(&mut s, &e, AckOp::Progress, offset, generation),
             vec![2]
         );
         // Term drops it (status byte 1) and commits past it.
         assert_eq!(
-            ack_reply(&mut s, &mut e, AckOp::Term, offset, generation),
+            ack_reply(&mut s, &e, AckOp::Term, offset, generation),
             vec![1]
         );
-        assert_eq!(e.committed_offset().get(), 1);
+        assert_eq!(e.engine_mut().committed_offset().get(), 1);
         // A term of the now-stale token is fenced: status byte 0.
         assert_eq!(
-            ack_reply(&mut s, &mut e, AckOp::Term, offset, generation),
+            ack_reply(&mut s, &e, AckOp::Term, offset, generation),
             vec![0]
         );
     }
@@ -1047,7 +1191,7 @@ mod tests {
     #[test]
     fn term_before_connect_is_rejected() {
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_with(Arc::clone(&clock), 5);
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 5));
         let mut s = Session::new();
         let mut body = Vec::new();
         encode_ack(
@@ -1060,7 +1204,7 @@ mod tests {
             &mut body,
         );
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Ack, &body), &mut out)
+        s.process(&e, &frame(FrameType::Ack, &body), &mut out)
             .unwrap();
         let replies = decode_all(&out);
         assert_eq!(replies.len(), 1);
@@ -1086,33 +1230,25 @@ mod tests {
     #[test]
     fn an_unacked_fetched_message_redelivers_after_the_visibility_timeout() {
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_with(Arc::clone(&clock), 5);
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 5));
         let mut s = Session::new();
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
-        produce(&mut e, b"x");
+        produce(&e, b"x");
 
         // First fetch delivers and leases it (deadline = now(0) + 30).
         out.clear();
-        s.process(
-            &mut e,
-            &frame(FrameType::Flow, &1u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
         let first = delivered_tokens(&out);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].0, 0);
 
         // Re-fetch before the timeout: the lease is still held, nothing redelivers.
         out.clear();
-        s.process(
-            &mut e,
-            &frame(FrameType::Flow, &1u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
         assert!(
             delivered_tokens(&out).is_empty(),
             "in-flight, not redelivered yet"
@@ -1121,12 +1257,8 @@ mod tests {
         // Advance past the visibility timeout: now it redelivers with a NEW generation.
         clock.advance_monotonic_nanos(40);
         out.clear();
-        s.process(
-            &mut e,
-            &frame(FrameType::Flow, &1u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
         let second = delivered_tokens(&out);
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].0, 0);
@@ -1135,54 +1267,46 @@ mod tests {
         // The session map now holds only the NEW generation, so acking the OLD one is fenced
         // by the session guard (status 0, nothing committed); the current one commits.
         assert_eq!(
-            ack_reply(&mut s, &mut e, AckOp::Ack, first[0].0, first[0].1),
+            ack_reply(&mut s, &e, AckOp::Ack, first[0].0, first[0].1),
             vec![0u8],
             "the stale generation is fenced by the session guard"
         );
-        assert_eq!(e.committed_offset().get(), 0);
+        assert_eq!(e.engine_mut().committed_offset().get(), 0);
         assert_eq!(
-            ack_reply(&mut s, &mut e, AckOp::Ack, second[0].0, second[0].1),
+            ack_reply(&mut s, &e, AckOp::Ack, second[0].0, second[0].1),
             vec![1u8]
         );
-        assert_eq!(e.committed_offset().get(), 1);
+        assert_eq!(e.engine_mut().committed_offset().get(), 1);
     }
 
     #[test]
     fn a_poison_message_is_parked_and_skipped_in_the_fetch() {
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_with(Arc::clone(&clock), 1); // max_deliver = 1
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 1)); // max_deliver = 1
         let mut s = Session::new();
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
-        produce(&mut e, b"poison");
+        produce(&e, b"poison");
 
         // First fetch delivers (delivery 1).
         out.clear();
-        s.process(
-            &mut e,
-            &frame(FrameType::Flow, &1u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
         assert_eq!(delivered_tokens(&out).len(), 1);
 
         // Expire it; the next fetch's claim is delivery 2 > max_deliver, so it is parked
         // (committed past) and NOT delivered: an empty batch (FlowEnd with no Deliver frames).
         clock.advance_monotonic_nanos(40);
         out.clear();
-        s.process(
-            &mut e,
-            &frame(FrameType::Flow, &1u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
         assert!(
             delivered_tokens(&out).is_empty(),
             "the poison message is not delivered"
         );
         assert_eq!(
-            e.committed_offset().get(),
+            e.engine_mut().committed_offset().get(),
             1,
             "the poison message is parked past"
         );
@@ -1190,21 +1314,17 @@ mod tests {
 
     #[test]
     fn flow_fetches_messages_as_deliver_frames_then_flow_end() {
-        let mut e = engine();
+        let e = DirectEngine::new(engine());
         let mut s = Session::new();
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
-        produce(&mut e, b"a");
-        produce(&mut e, b"b");
+        produce(&e, b"a");
+        produce(&e, b"b");
         out.clear();
         // Fetch up to 5: two messages are available, then the batch terminates with FlowEnd(2).
-        s.process(
-            &mut e,
-            &frame(FrameType::Flow, &5u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
         let frames = decode_all(&out);
         assert_eq!(
             frames.len(),
@@ -1240,25 +1360,21 @@ mod tests {
         // subscribed to different groups each independently receive every message. Neither
         // acks, so if the groups shared one cursor and lease set the second would find the
         // offsets in-flight and get nothing; getting both proves the groups are independent.
-        let mut e = engine();
-        produce(&mut e, b"a");
-        produce(&mut e, b"b");
+        let e = DirectEngine::new(engine());
+        produce(&e, b"a");
+        produce(&e, b"b");
         for group in [&b"alpha"[..], &b"beta"[..]] {
             let mut s = Session::new();
             let mut out = Vec::new();
-            s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+            s.process(&e, &frame(FrameType::Connect, b""), &mut out)
                 .unwrap();
             out.clear();
-            s.process(&mut e, &frame(FrameType::Sub, group), &mut out)
+            s.process(&e, &frame(FrameType::Sub, group), &mut out)
                 .unwrap();
             assert_eq!(one_response(&out).0, FrameType::Ok, "SUB is acked");
             out.clear();
-            s.process(
-                &mut e,
-                &frame(FrameType::Flow, &5u32.to_le_bytes()),
-                &mut out,
-            )
-            .unwrap();
+            s.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+                .unwrap();
             assert_eq!(
                 delivered_payloads(&out),
                 vec![b"a".to_vec(), b"b".to_vec()],
@@ -1268,20 +1384,25 @@ mod tests {
     }
 
     /// Produces a keyed record through the engine, for the `key_shared` session tests.
-    fn produce_keyed<C: Clock + Clone>(e: &mut Engine<InMemoryFs, C>, key: &[u8], payload: &[u8]) {
-        e.produce(&Append {
-            timestamp_ms: 0,
-            flags: RecordFlags::EMPTY,
-            key,
-            headers: b"",
-            payload,
-        })
-        .unwrap();
+    fn produce_keyed<C: Clock + Clone>(
+        e: &DirectEngine<InMemoryFs, C>,
+        key: &[u8],
+        payload: &[u8],
+    ) {
+        e.engine_mut()
+            .produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key,
+                headers: b"",
+                payload,
+            })
+            .unwrap();
     }
 
     /// Connects and subscribes a fresh session (with the given member id) to `group`, returning it.
     fn connect_and_sub(
-        e: &mut Engine<InMemoryFs, ManualClock>,
+        e: &DirectEngine<InMemoryFs, ManualClock>,
         member: MemberId,
         group: &[u8],
     ) -> Session {
@@ -1301,46 +1422,47 @@ mod tests {
         // End-to-end over the session layer (#64): a configured key_shared group, two member
         // connections, keyed records. A key's records all go to its one owner, in offset order, and
         // the non-owner never sees them. The default (unconfigured) behavior is untouched.
-        let mut e = engine();
-        e.set_configured_key_shared_groups(["shared".to_string()]);
+        let e = DirectEngine::new(engine());
+        e.engine_mut()
+            .set_configured_key_shared_groups(["shared".to_string()]);
         let m1 = MemberId::new(101);
         let m2 = MemberId::new(202);
-        let mut s1 = connect_and_sub(&mut e, m1, b"shared");
-        let mut s2 = connect_and_sub(&mut e, m2, b"shared");
+        let mut s1 = connect_and_sub(&e, m1, b"shared");
+        let mut s2 = connect_and_sub(&e, m2, b"shared");
         // The SUB put the group into key_shared mode and joined both members.
-        assert_eq!(e.key_ordering_in("shared"), KeyOrdering::KeyShared);
+        assert_eq!(
+            e.engine_mut().key_ordering_in("shared"),
+            KeyOrdering::KeyShared
+        );
         // Find a key owned by m1.
         let key = (0..2000u32)
             .map(|n| format!("k{n}").into_bytes())
             .find(|k| {
                 matches!(
-                    e.route_decision_in("shared", m1, k, ironbus_core::types::Offset::ZERO),
+                    e.engine_mut().route_decision_in(
+                        "shared",
+                        m1,
+                        k,
+                        ironbus_core::types::Offset::ZERO
+                    ),
                     Some(ironbus_core::keyshared::RouteDecision::Deliver)
                 )
             })
             .expect("a key owned by m1");
-        produce_keyed(&mut e, &key, b"first");
-        produce_keyed(&mut e, &key, b"second");
+        produce_keyed(&e, &key, b"first");
+        produce_keyed(&e, &key, b"second");
         // m2 (the non-owner) fetches: it gets nothing for this key.
         let mut out = Vec::new();
-        s2.process(
-            &mut e,
-            &frame(FrameType::Flow, &5u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s2.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
         assert!(
             delivered_payloads(&out).is_empty(),
             "the non-owner sees no record for the owner's key"
         );
         // m1 (the owner) fetches: it gets the first record (only one, since the key is then busy).
         out.clear();
-        s1.process(
-            &mut e,
-            &frame(FrameType::Flow, &5u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s1.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
         let got = delivered_payloads(&out);
         assert_eq!(
             got,
@@ -1361,15 +1483,11 @@ mod tests {
             &mut ack_body,
         );
         out.clear();
-        s1.process(&mut e, &frame(FrameType::Ack, &ack_body), &mut out)
+        s1.process(&e, &frame(FrameType::Ack, &ack_body), &mut out)
             .unwrap();
         out.clear();
-        s1.process(
-            &mut e,
-            &frame(FrameType::Flow, &5u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s1.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
         assert_eq!(
             delivered_payloads(&out),
             vec![b"second".to_vec()],
@@ -1381,23 +1499,20 @@ mod tests {
     fn an_unconfigured_group_stays_plain_competing_over_the_wire() {
         // A group NOT in the configured key_shared set keeps plain competing distribution even
         // though another group is key_shared: the default path is unaffected (#64).
-        let mut e = engine();
-        e.set_configured_key_shared_groups(["shared".to_string()]);
-        produce_keyed(&mut e, b"some-key", b"a");
-        produce_keyed(&mut e, b"some-key", b"b");
-        let mut s = connect_and_sub(&mut e, MemberId::new(1), b"plain");
+        let e = DirectEngine::new(engine());
+        e.engine_mut()
+            .set_configured_key_shared_groups(["shared".to_string()]);
+        produce_keyed(&e, b"some-key", b"a");
+        produce_keyed(&e, b"some-key", b"b");
+        let mut s = connect_and_sub(&e, MemberId::new(1), b"plain");
         assert_eq!(
-            e.key_ordering_in("plain"),
+            e.engine_mut().key_ordering_in("plain"),
             KeyOrdering::None,
             "an unconfigured group is not key_shared"
         );
         let mut out = Vec::new();
-        s.process(
-            &mut e,
-            &frame(FrameType::Flow, &5u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
         // Plain competing: both same-key records deliver to the single member with no affinity gate.
         assert_eq!(
             delivered_payloads(&out),
@@ -1409,40 +1524,37 @@ mod tests {
     #[test]
     fn leaving_a_key_shared_group_drops_membership() {
         // UNSUB (and switching subscriptions) leaves the key_shared group's member set (#64).
-        let mut e = engine();
-        e.set_configured_key_shared_groups(["shared".to_string()]);
+        let e = DirectEngine::new(engine());
+        e.engine_mut()
+            .set_configured_key_shared_groups(["shared".to_string()]);
         let m = MemberId::new(5);
-        let mut s = connect_and_sub(&mut e, m, b"shared");
+        let mut s = connect_and_sub(&e, m, b"shared");
         assert!(
-            !e.join_member_in("shared", m),
+            !e.engine_mut().join_member_in("shared", m),
             "the member is already joined via SUB"
         );
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Unsub, b""), &mut out)
+        s.process(&e, &frame(FrameType::Unsub, b""), &mut out)
             .unwrap();
         assert!(
-            e.join_member_in("shared", m),
+            e.engine_mut().join_member_in("shared", m),
             "after UNSUB the member is no longer in the set (re-join changes it)"
         );
     }
 
     #[test]
     fn ack_in_a_subscribed_group_commits_only_that_group() {
-        let mut e = engine();
-        produce(&mut e, b"a");
+        let e = DirectEngine::new(engine());
+        produce(&e, b"a");
         let mut s = Session::new();
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
-        s.process(&mut e, &frame(FrameType::Sub, b"workers"), &mut out)
+        s.process(&e, &frame(FrameType::Sub, b"workers"), &mut out)
             .unwrap();
         out.clear();
-        s.process(
-            &mut e,
-            &frame(FrameType::Flow, &5u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
         let frames = decode_all(&out);
         let d = decode_deliver(&frames[0].1).unwrap();
         assert_eq!(d.offset, 0);
@@ -1455,7 +1567,7 @@ mod tests {
         let mut body = Vec::new();
         encode_ack(&ack, &mut body);
         out.clear();
-        s.process(&mut e, &frame(FrameType::Ack, &body), &mut out)
+        s.process(&e, &frame(FrameType::Ack, &body), &mut out)
             .unwrap();
         assert_eq!(
             one_response(&out),
@@ -1463,41 +1575,33 @@ mod tests {
             "committed"
         );
         // The subscribed group committed past 0; the default group is untouched.
-        assert_eq!(e.committed_offset_in("workers").get(), 1);
-        assert_eq!(e.committed_offset().get(), 0);
+        assert_eq!(e.engine_mut().committed_offset_in("workers").get(), 1);
+        assert_eq!(e.engine_mut().committed_offset().get(), 0);
     }
 
     #[test]
     fn unsubscribe_reverts_to_the_default_group() {
-        let mut e = engine();
-        produce(&mut e, b"a");
+        let e = DirectEngine::new(engine());
+        produce(&e, b"a");
         let mut s = Session::new();
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
         // Consume the message in a named group (lease, no ack).
-        s.process(&mut e, &frame(FrameType::Sub, b"temp"), &mut out)
+        s.process(&e, &frame(FrameType::Sub, b"temp"), &mut out)
             .unwrap();
         out.clear();
-        s.process(
-            &mut e,
-            &frame(FrameType::Flow, &5u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
         assert_eq!(delivered_payloads(&out), vec![b"a".to_vec()]);
         // Unsubscribe: back to the default group, which has consumed nothing.
         out.clear();
-        s.process(&mut e, &frame(FrameType::Unsub, b""), &mut out)
+        s.process(&e, &frame(FrameType::Unsub, b""), &mut out)
             .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Ok);
         out.clear();
-        s.process(
-            &mut e,
-            &frame(FrameType::Flow, &5u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
         assert_eq!(
             delivered_payloads(&out),
             vec![b"a".to_vec()],
@@ -1507,31 +1611,27 @@ mod tests {
 
     #[test]
     fn a_non_utf8_subscription_name_is_rejected() {
-        let mut e = engine();
+        let e = DirectEngine::new(engine());
         let mut s = Session::new();
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
         out.clear();
-        s.process(&mut e, &frame(FrameType::Sub, &[0xff, 0xfe]), &mut out)
+        s.process(&e, &frame(FrameType::Sub, &[0xff, 0xfe]), &mut out)
             .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Err);
     }
 
     #[test]
     fn flow_with_nothing_available_replies_ok_zero() {
-        let mut e = engine();
+        let e = DirectEngine::new(engine());
         let mut s = Session::new();
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
         out.clear();
-        s.process(
-            &mut e,
-            &frame(FrameType::Flow, &3u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s.process(&e, &frame(FrameType::Flow, &3u32.to_le_bytes()), &mut out)
+            .unwrap();
         let frames = decode_all(&out);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].0, FrameType::FlowEnd);
@@ -1540,24 +1640,20 @@ mod tests {
 
     #[test]
     fn flow_before_connect_is_rejected() {
-        let mut e = engine();
+        let e = DirectEngine::new(engine());
         let mut s = Session::new();
         let mut out = Vec::new();
-        s.process(
-            &mut e,
-            &frame(FrameType::Flow, &1u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Err);
     }
 
     #[test]
     fn end_to_end_produce_fetch_ack_over_the_session() {
-        let mut e = engine();
+        let e = DirectEngine::new(engine());
         let mut s = Session::new();
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
         // Produce via the session (PUB).
         let mut pub_body = Vec::new();
@@ -1572,16 +1668,12 @@ mod tests {
             &mut pub_body,
         )
         .unwrap();
-        s.process(&mut e, &frame(FrameType::Pub, &pub_body), &mut out)
+        s.process(&e, &frame(FrameType::Pub, &pub_body), &mut out)
             .unwrap();
         out.clear();
         // Fetch it.
-        s.process(
-            &mut e,
-            &frame(FrameType::Flow, &1u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
         let frames = decode_all(&out);
         let delivered = decode_deliver(&frames[0].1).unwrap();
         assert_eq!(delivered.payload, b"round-trip");
@@ -1597,35 +1689,35 @@ mod tests {
             &mut ack_body,
         );
         out.clear();
-        s.process(&mut e, &frame(FrameType::Ack, &ack_body), &mut out)
+        s.process(&e, &frame(FrameType::Ack, &ack_body), &mut out)
             .unwrap();
-        assert_eq!(e.committed_offset().get(), 1);
+        assert_eq!(e.engine_mut().committed_offset().get(), 1);
     }
 
     #[test]
     fn ping_is_answered_with_pong() {
-        let mut e = engine();
+        let e = DirectEngine::new(engine());
         let mut s = Session::new();
         let mut out = Vec::new();
         let input = frame(FrameType::Ping, b"");
-        let consumed = s.process(&mut e, &input, &mut out).unwrap();
-        assert_eq!(consumed, input.len());
+        let progress = s.process(&e, &input, &mut out).unwrap();
+        assert_eq!(progress.consumed, input.len());
         assert_eq!(one_response(&out).0, FrameType::Pong);
     }
 
     #[test]
     fn connect_is_answered_with_info() {
-        let mut e = engine();
+        let e = DirectEngine::new(engine());
         let mut s = Session::new();
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Info);
     }
 
     #[test]
     fn pub_after_connect_appends_and_replies_ok_with_the_offset() {
-        let mut e = engine();
+        let e = DirectEngine::new(engine());
         let mut s = Session::new();
         let mut out = Vec::new();
         let mut input = frame(FrameType::Connect, b"");
@@ -1643,8 +1735,8 @@ mod tests {
         .unwrap();
         input.extend_from_slice(&frame(FrameType::Pub, &pub_body));
 
-        let consumed = s.process(&mut e, &input, &mut out).unwrap();
-        assert_eq!(consumed, input.len());
+        let progress = s.process(&e, &input, &mut out).unwrap();
+        assert_eq!(progress.consumed, input.len());
         // Two responses: Info, then PubAck with offset 0.
         let info = decode_frame(&out).unwrap();
         let FrameDecode::Frame { consumed: c0, .. } = info else {
@@ -1654,7 +1746,8 @@ mod tests {
         assert_eq!(ty, FrameType::PubAck);
         assert_eq!(body, 0u64.to_le_bytes());
         // The message is durable in the engine and deliverable.
-        match e.poll(0).unwrap() {
+        let polled = e.engine_mut().poll(0).unwrap();
+        match polled {
             Poll::Message(d) => assert_eq!(d.record.payload, b"hello"),
             other => panic!("expected the produced message, got {other:?}"),
         }
@@ -1663,9 +1756,9 @@ mod tests {
     /// Encodes and sends one `Pub` over the session and returns the single response frame,
     /// asserting `process` did NOT end the session (a non-fatal reply keeps the connection
     /// open).
-    fn pub_reply<C: Clock + Clone>(
+    fn pub_reply<C: Clock + Clone + 'static>(
         s: &mut Session,
-        e: &mut Engine<InMemoryFs, C>,
+        e: &DirectEngine<InMemoryFs, C>,
         payload: &[u8],
     ) -> (FrameType, Vec<u8>) {
         let mut body = Vec::new();
@@ -1698,46 +1791,49 @@ mod tests {
         let payload = b"capacity";
         // Measure one record's framed durable bytes on a throwaway engine.
         let one = {
-            let mut probe = engine();
-            produce(&mut probe, payload);
-            probe.durable_record_bytes()
+            let probe = DirectEngine::new(engine());
+            produce(&probe, payload);
+            let bytes = probe.engine_mut().durable_record_bytes();
+            bytes
         };
-        let mut e = Engine::open(
-            InMemoryFs::new(),
-            ManualClock::new(),
-            EngineConfig {
-                log: LogConfig::default().with_max_total_bytes(one),
-                lease: LeaseConfig {
-                    visibility_nanos: 30,
-                    hard_cap_nanos: 100,
+        let e = DirectEngine::new(
+            Engine::open(
+                InMemoryFs::new(),
+                ManualClock::new(),
+                EngineConfig {
+                    log: LogConfig::default().with_max_total_bytes(one),
+                    lease: LeaseConfig {
+                        visibility_nanos: 30,
+                        hard_cap_nanos: 100,
+                    },
+                    delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                    max_in_flight: 10,
+                    consumer_credit: 64,
+                    consumer_credit_bytes: 0,
+                    checkpoint_interval: 1024,
+                    max_retained_bytes: 0,
+                    max_age_ms: 0,
+                    max_messages: 0,
+                    max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                    group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                    disk_full_policy: DiskFullPolicy::DropNew,
                 },
-                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
-                max_in_flight: 10,
-                consumer_credit: 64,
-                consumer_credit_bytes: 0,
-                checkpoint_interval: 1024,
-                max_retained_bytes: 0,
-                max_age_ms: 0,
-                max_messages: 0,
-                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
-                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
-                disk_full_policy: DiskFullPolicy::DropNew,
-            },
-        )
-        .unwrap();
+            )
+            .unwrap(),
+        );
         let mut s = Session::new();
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
 
         // The first produce fits: a PubAck with offset 0.
-        let (ty, body) = pub_reply(&mut s, &mut e, payload);
+        let (ty, body) = pub_reply(&mut s, &e, payload);
         assert_eq!(ty, FrameType::PubAck);
         assert_eq!(body, 0u64.to_le_bytes());
 
         // The second is over the cap: a distinct Err frame marking the capacity shed, NOT the
         // generic "produce failed". The session did NOT end (pub_reply asserts process is Ok).
-        let (ty, body) = pub_reply(&mut s, &mut e, payload);
+        let (ty, body) = pub_reply(&mut s, &e, payload);
         assert_eq!(ty, FrameType::Err);
         assert_eq!(body, b"at capacity");
         assert_ne!(
@@ -1748,20 +1844,20 @@ mod tests {
         // The connection is still usable: a follow-up Ping is answered (the session never
         // closed), and another over-cap produce is still a shed, not a fatal error.
         out.clear();
-        s.process(&mut e, &frame(FrameType::Ping, b""), &mut out)
+        s.process(&e, &frame(FrameType::Ping, b""), &mut out)
             .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Pong);
-        let (ty, body) = pub_reply(&mut s, &mut e, payload);
+        let (ty, body) = pub_reply(&mut s, &e, payload);
         assert_eq!(ty, FrameType::Err);
         assert_eq!(body, b"at capacity");
         // The shed counter reflects both rejections; the one success was counted once.
-        assert_eq!(e.counters().produce_rejected, 2);
-        assert_eq!(e.counters().produced, 1);
+        assert_eq!(e.engine_mut().counters().produce_rejected, 2);
+        assert_eq!(e.engine_mut().counters().produced, 1);
     }
 
     #[test]
     fn pub_before_connect_is_rejected() {
-        let mut e = engine();
+        let e = DirectEngine::new(engine());
         let mut s = Session::new();
         let mut out = Vec::new();
         let mut pub_body = Vec::new();
@@ -1776,63 +1872,110 @@ mod tests {
             &mut pub_body,
         )
         .unwrap();
-        s.process(&mut e, &frame(FrameType::Pub, &pub_body), &mut out)
+        s.process(&e, &frame(FrameType::Pub, &pub_body), &mut out)
             .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Err);
     }
 
     #[test]
     fn ack_commits_a_delivered_message() {
-        let mut e = engine();
+        let e = DirectEngine::new(engine());
         let mut s = Session::new();
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
-        produce(&mut e, b"m");
+        produce(&e, b"m");
         // Deliver THROUGH the session (Flow) so it owns the lease, then ack it.
         out.clear();
-        s.process(
-            &mut e,
-            &frame(FrameType::Flow, &1u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
         let toks = delivered_tokens(&out);
         assert_eq!(toks.len(), 1);
         let (offset, generation) = toks[0];
         assert_eq!(
-            ack_reply(&mut s, &mut e, AckOp::Ack, offset, generation),
+            ack_reply(&mut s, &e, AckOp::Ack, offset, generation),
             vec![1u8],
             "status 1 = committed"
         );
-        assert_eq!(e.committed_offset().get(), 1);
+        assert_eq!(e.engine_mut().committed_offset().get(), 1);
     }
 
     #[test]
     fn a_partial_trailing_frame_is_not_consumed() {
-        let mut e = engine();
+        let e = DirectEngine::new(engine());
         let mut s = Session::new();
         let mut out = Vec::new();
         let ping = frame(FrameType::Ping, b"");
         let mut input = ping.clone();
         input.extend_from_slice(&frame(FrameType::Ping, b"")[..2]); // half of a second frame
-        let consumed = s.process(&mut e, &input, &mut out).unwrap();
-        assert_eq!(consumed, ping.len(), "only the complete frame is consumed");
+        let progress = s.process(&e, &input, &mut out).unwrap();
+        assert_eq!(
+            progress.consumed,
+            ping.len(),
+            "only the complete frame is consumed"
+        );
         assert_eq!(one_response(&out).0, FrameType::Pong);
     }
 
     #[test]
-    fn empty_input_consumes_nothing() {
-        let mut e = engine();
+    fn the_needed_hint_reports_the_trailing_frames_full_length_for_the_n_squared_fix() {
+        // The #176 O(n^2) re-decode fix: after a pass that leaves a partial trailing frame, `process`
+        // reports `needed` (the bytes that frame still wants, relative to the post-drain buffer). The
+        // connection loop uses it to avoid re-decoding a trickled near-cap frame until it is whole.
+        let e = DirectEngine::new(engine());
         let mut s = Session::new();
         let mut out = Vec::new();
-        assert_eq!(s.process(&mut e, &[], &mut out).unwrap(), 0);
+        // A complete Ping, then the first 2 bytes of a 6-byte-ish Pub frame (a partial trailing frame).
+        let ping = frame(FrameType::Ping, b"");
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                payload: b"trickled-payload",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        let full_pub = frame(FrameType::Pub, &pub_body);
+        let mut input = ping.clone();
+        // Enough of the Pub frame for its 4-byte length prefix to be readable (so the parser knows the
+        // full frame length) but not the whole frame: the partial trailing frame.
+        input.extend_from_slice(&full_pub[..6]);
+        let progress = s.process(&e, &input, &mut out).unwrap();
+        assert_eq!(
+            progress.consumed,
+            ping.len(),
+            "the complete ping is consumed"
+        );
+        // After draining the ping prefix, the partial Pub sits at the front and needs its FULL framed
+        // length before another pass can make progress: that is exactly the `needed` hint, so the loop
+        // waits for the whole frame rather than re-decoding per trickled byte.
+        assert_eq!(
+            progress.needed,
+            full_pub.len(),
+            "the needed hint is the trailing frame's full length once its prefix is readable"
+        );
+        assert!(
+            !progress.committed_progress,
+            "a ping advances no committed cursor, so the interval checkpoint (and the actor) is skipped"
+        );
+    }
+
+    #[test]
+    fn empty_input_consumes_nothing() {
+        let e = DirectEngine::new(engine());
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        assert_eq!(s.process(&e, &[], &mut out).unwrap().consumed, 0);
         assert!(out.is_empty());
     }
 
     #[test]
     fn ack_before_connect_is_rejected() {
-        let mut e = engine();
+        let e = DirectEngine::new(engine());
         let mut s = Session::new();
         let mut out = Vec::new();
         let mut ack_body = Vec::new();
@@ -1845,17 +1988,17 @@ mod tests {
             },
             &mut ack_body,
         );
-        s.process(&mut e, &frame(FrameType::Ack, &ack_body), &mut out)
+        s.process(&e, &frame(FrameType::Ack, &ack_body), &mut out)
             .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Err);
     }
 
     #[test]
     fn a_fenced_ack_replies_ok_with_status_zero() {
-        let mut e = engine();
+        let e = DirectEngine::new(engine());
         let mut s = Session::new();
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
         out.clear();
         // A token never delivered to this session is fenced: status 0, the client must not
@@ -1870,28 +2013,28 @@ mod tests {
             },
             &mut ack_body,
         );
-        s.process(&mut e, &frame(FrameType::Ack, &ack_body), &mut out)
+        s.process(&e, &frame(FrameType::Ack, &ack_body), &mut out)
             .unwrap();
         let (ty, body) = one_response(&out);
         assert_eq!(ty, FrameType::AckStatus);
         assert_eq!(body, vec![0u8], "status 0 = fenced");
-        assert_eq!(e.committed_offset().get(), 0);
+        assert_eq!(e.engine_mut().committed_offset().get(), 0);
     }
 
     #[test]
     fn a_malformed_body_does_not_desync_the_stream() {
         // [Connect][Pub with a truncated body][Ping] in one buffer: the bad body is
         // contained (Err reply), and the trailing Ping still gets a Pong.
-        let mut e = engine();
+        let e = DirectEngine::new(engine());
         let mut s = Session::new();
         let mut out = Vec::new();
         let mut input = frame(FrameType::Connect, b"");
         input.extend_from_slice(&frame(FrameType::Pub, b"\x01")); // 1 byte: not a valid pub body
         input.extend_from_slice(&frame(FrameType::Ping, b""));
 
-        let consumed = s.process(&mut e, &input, &mut out).unwrap();
+        let progress = s.process(&e, &input, &mut out).unwrap();
         assert_eq!(
-            consumed,
+            progress.consumed,
             input.len(),
             "all three frames consumed, no desync"
         );
@@ -1921,23 +2064,19 @@ mod tests {
     fn a_second_connection_cannot_ack_a_message_delivered_to_another() {
         // #175 regression: acks are connection-scoped. A message delivered to session A cannot
         // be committed by session B presenting the same token; only A, the owner, can ack it.
-        let mut e = engine();
+        let e = DirectEngine::new(engine());
         let mut a = Session::new();
         let mut b = Session::new();
         let mut out = Vec::new();
-        a.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+        a.process(&e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
-        b.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+        b.process(&e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
-        produce(&mut e, b"m");
+        produce(&e, b"m");
         // Deliver to A via its Flow.
         out.clear();
-        a.process(
-            &mut e,
-            &frame(FrameType::Flow, &1u32.to_le_bytes()),
-            &mut out,
-        )
-        .unwrap();
+        a.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
         let toks = delivered_tokens(&out);
         assert_eq!(toks.len(), 1);
         let (offset, generation) = toks[0];
@@ -1945,62 +2084,62 @@ mod tests {
         // B never received this lease: every disposition from B is fenced (status 0) by the
         // guard that runs before the op match, and commits/requeues nothing.
         assert_eq!(
-            ack_reply(&mut b, &mut e, AckOp::Ack, offset, generation),
+            ack_reply(&mut b, &e, AckOp::Ack, offset, generation),
             vec![0u8],
             "B cannot commit A's message"
         );
         assert_eq!(
-            ack_reply(&mut b, &mut e, AckOp::Nack, offset, generation),
+            ack_reply(&mut b, &e, AckOp::Nack, offset, generation),
             vec![0u8],
             "B cannot requeue A's message"
         );
         assert_eq!(
-            ack_reply(&mut b, &mut e, AckOp::Term, offset, generation),
+            ack_reply(&mut b, &e, AckOp::Term, offset, generation),
             vec![0u8],
             "B cannot drop A's message"
         );
         assert_eq!(
-            ack_reply(&mut b, &mut e, AckOp::Progress, offset, generation),
+            ack_reply(&mut b, &e, AckOp::Progress, offset, generation),
             vec![0u8],
             "B cannot extend A's lease"
         );
         assert_eq!(
-            e.committed_offset().get(),
+            e.engine_mut().committed_offset().get(),
             0,
             "none of B's foreign ops committed"
         );
 
         // A, the owner, commits it.
         assert_eq!(
-            ack_reply(&mut a, &mut e, AckOp::Ack, offset, generation),
+            ack_reply(&mut a, &e, AckOp::Ack, offset, generation),
             vec![1u8],
             "A owns the lease and commits"
         );
-        assert_eq!(e.committed_offset().get(), 1);
+        assert_eq!(e.engine_mut().committed_offset().get(), 1);
     }
 
     #[test]
     fn a_malformed_frame_ends_the_session() {
-        let mut e = engine();
+        let e = DirectEngine::new(engine());
         let mut s = Session::new();
         let mut out = Vec::new();
         let bad = [0u8, 0, 0, 0]; // zero-length prefix
         assert!(matches!(
-            s.process(&mut e, &bad, &mut out),
+            s.process(&e, &bad, &mut out),
             Err(SessionError::BadFrame(_))
         ));
     }
 
     #[test]
     fn an_unsupported_verb_replies_err_without_closing() {
-        let mut e = engine();
+        let e = DirectEngine::new(engine());
         let mut s = Session::new();
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
             .unwrap();
         out.clear();
         // Info is a response-only verb; a client must not send it.
-        s.process(&mut e, &frame(FrameType::Info, b""), &mut out)
+        s.process(&e, &frame(FrameType::Info, b""), &mut out)
             .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Err);
     }
@@ -2079,7 +2218,7 @@ mod tests {
 
     /// Connects a fresh session and returns it. The credit ceiling is read from the engine on the
     /// first Flow, so a session built here starts with full credit.
-    fn connected_session<C: Clock + Clone>(e: &mut Engine<InMemoryFs, C>) -> Session {
+    fn connected_session<C: Clock + Clone + 'static>(e: &DirectEngine<InMemoryFs, C>) -> Session {
         let mut s = Session::new();
         let mut out = Vec::new();
         s.process(e, &frame(FrameType::Connect, b""), &mut out)
@@ -2089,9 +2228,9 @@ mod tests {
 
     /// Runs one Flow of `credit` for `s` against `e` and returns the (offset, generation) of each
     /// delivered message in the batch.
-    fn fetch<C: Clock + Clone>(
+    fn fetch<C: Clock + Clone + 'static>(
         s: &mut Session,
-        e: &mut Engine<InMemoryFs, C>,
+        e: &DirectEngine<InMemoryFs, C>,
         credit: u32,
     ) -> Vec<(u64, u64)> {
         let mut out = Vec::new();
@@ -2106,12 +2245,12 @@ mod tests {
         // credit is capped at the connection's ceiling (4 here), not the group window (roomy at 64)
         // nor the requested credit (1000).
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_credit(Arc::clone(&clock), 4, 64);
-        let mut s = connected_session(&mut e);
+        let e = DirectEngine::new(engine_credit(Arc::clone(&clock), 4, 64));
+        let mut s = connected_session(&e);
         for _ in 0..20 {
-            produce(&mut e, b"m");
+            produce(&e, b"m");
         }
-        let batch = fetch(&mut s, &mut e, 1000);
+        let batch = fetch(&mut s, &e, 1000);
         assert_eq!(
             batch.len(),
             4,
@@ -2119,7 +2258,7 @@ mod tests {
         );
         // A second Flow with the credit still full delivers nothing: at zero remaining credit a
         // Flow delivers nothing even though 16 messages remain available in the group.
-        let batch2 = fetch(&mut s, &mut e, 1000);
+        let batch2 = fetch(&mut s, &e, 1000);
         assert!(
             batch2.is_empty(),
             "a saturated consumer gets an empty batch until it frees a slot"
@@ -2131,24 +2270,24 @@ mod tests {
         // After acking, the connection's credit frees and it can fetch more. With a credit of 2,
         // the first Flow delivers 2; acking one frees a slot so the next Flow delivers exactly 1.
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_credit(Arc::clone(&clock), 2, 64);
-        let mut s = connected_session(&mut e);
+        let e = DirectEngine::new(engine_credit(Arc::clone(&clock), 2, 64));
+        let mut s = connected_session(&e);
         for _ in 0..10 {
-            produce(&mut e, b"m");
+            produce(&e, b"m");
         }
-        let batch = fetch(&mut s, &mut e, 100);
+        let batch = fetch(&mut s, &e, 100);
         assert_eq!(batch.len(), 2, "credit 2 caps the first batch");
         // Saturated: nothing more until a slot frees.
-        assert!(fetch(&mut s, &mut e, 100).is_empty(), "no credit left");
+        assert!(fetch(&mut s, &e, 100).is_empty(), "no credit left");
         // Ack one of the two: status 1 (committed), freeing exactly one slot.
         let (offset, generation) = batch[0];
         assert_eq!(
-            ack_reply(&mut s, &mut e, AckOp::Ack, offset, generation),
+            ack_reply(&mut s, &e, AckOp::Ack, offset, generation),
             vec![1u8],
             "the ack commits and frees a slot"
         );
         // Exactly one delivery is now available again (the freed slot), not two.
-        let batch2 = fetch(&mut s, &mut e, 100);
+        let batch2 = fetch(&mut s, &e, 100);
         assert_eq!(
             batch2.len(),
             1,
@@ -2162,30 +2301,30 @@ mod tests {
         // an ack: a credit-1 consumer that nacks (then waits out the requeue delay) or terms can
         // fetch again.
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_credit(Arc::clone(&clock), 1, 64);
-        let mut s = connected_session(&mut e);
+        let e = DirectEngine::new(engine_credit(Arc::clone(&clock), 1, 64));
+        let mut s = connected_session(&e);
         for _ in 0..3 {
-            produce(&mut e, b"m");
+            produce(&e, b"m");
         }
         // Term path: fetch one (credit now full), term it (frees the slot), fetch one more.
-        let first = fetch(&mut s, &mut e, 10);
+        let first = fetch(&mut s, &e, 10);
         assert_eq!(first.len(), 1, "credit 1 caps the batch");
-        assert!(fetch(&mut s, &mut e, 10).is_empty(), "saturated");
+        assert!(fetch(&mut s, &e, 10).is_empty(), "saturated");
         assert_eq!(
-            ack_reply(&mut s, &mut e, AckOp::Term, first[0].0, first[0].1),
+            ack_reply(&mut s, &e, AckOp::Term, first[0].0, first[0].1),
             vec![1u8],
             "term drops it and frees the slot"
         );
-        let second = fetch(&mut s, &mut e, 10);
+        let second = fetch(&mut s, &e, 10);
         assert_eq!(second.len(), 1, "term freed the slot");
         // Nack path: nack the second with no delay (the engine has an empty schedule, so it is
         // immediately reclaimable), which frees the slot; a later fetch redelivers it.
         assert_eq!(
-            ack_reply(&mut s, &mut e, AckOp::Nack, second[0].0, second[0].1),
+            ack_reply(&mut s, &e, AckOp::Nack, second[0].0, second[0].1),
             vec![1u8],
             "nack requeues and frees the slot"
         );
-        let third = fetch(&mut s, &mut e, 10);
+        let third = fetch(&mut s, &e, 10);
         assert_eq!(third.len(), 1, "the freed slot lets the next Flow deliver");
     }
 
@@ -2197,21 +2336,21 @@ mod tests {
         // not reduce B's available budget. The group window is roomy (64), so the only binding
         // bound is each consumer's own credit.
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_credit(Arc::clone(&clock), 2, 64);
-        let mut a = connected_session(&mut e);
-        let mut b = connected_session(&mut e);
+        let e = DirectEngine::new(engine_credit(Arc::clone(&clock), 2, 64));
+        let mut a = connected_session(&e);
+        let mut b = connected_session(&e);
         for _ in 0..10 {
-            produce(&mut e, b"m");
+            produce(&e, b"m");
         }
         // A fills its credit (2) and never acks: it is now stuck at its ceiling.
-        let a_batch = fetch(&mut a, &mut e, 100);
+        let a_batch = fetch(&mut a, &e, 100);
         assert_eq!(a_batch.len(), 2, "A holds its full credit of 2");
         assert!(
-            fetch(&mut a, &mut e, 100).is_empty(),
+            fetch(&mut a, &e, 100).is_empty(),
             "A is saturated and stuck"
         );
         // B, in the same group, still gets its full credit of 2: A's stuck leases did not touch B.
-        let b_batch = fetch(&mut b, &mut e, 100);
+        let b_batch = fetch(&mut b, &e, 100);
         assert_eq!(
             b_batch.len(),
             2,
@@ -2228,10 +2367,10 @@ mod tests {
         // B can keep draining as long as it acks; A staying stuck never blocks B. Ack B's two and
         // fetch two more: B makes unbounded progress while A holds its slots forever.
         for &(o, g) in &b_batch {
-            assert_eq!(ack_reply(&mut b, &mut e, AckOp::Ack, o, g), vec![1u8]);
+            assert_eq!(ack_reply(&mut b, &e, AckOp::Ack, o, g), vec![1u8]);
         }
         assert_eq!(
-            fetch(&mut b, &mut e, 100).len(),
+            fetch(&mut b, &e, 100).len(),
             2,
             "B keeps draining at its full credit while A stays stuck"
         );
@@ -2243,19 +2382,19 @@ mod tests {
         // consumer's slot, and on redelivery counts against whoever next receives it. No message is
         // lost or double-counted; at-least-once holds. Credit 1 each, so the accounting is exact.
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_credit(Arc::clone(&clock), 1, 64);
-        let mut a = connected_session(&mut e);
-        let mut b = connected_session(&mut e);
-        produce(&mut e, b"only");
+        let e = DirectEngine::new(engine_credit(Arc::clone(&clock), 1, 64));
+        let mut a = connected_session(&e);
+        let mut b = connected_session(&e);
+        produce(&e, b"only");
         // A leases offset 0 (its single credit is now spent) and goes stuck.
-        let a_first = fetch(&mut a, &mut e, 10);
+        let a_first = fetch(&mut a, &e, 10);
         assert_eq!(a_first.len(), 1, "A leases offset 0");
         assert_eq!(a_first[0].0, 0);
-        assert!(fetch(&mut a, &mut e, 10).is_empty(), "A is saturated");
+        assert!(fetch(&mut a, &e, 10).is_empty(), "A is saturated");
         // The lease expires (visibility 30 ns). B fetches: the message redelivers to B under a NEW
         // generation, counting against B's credit. At-least-once: the message is not lost.
         clock.advance_monotonic_nanos(40);
-        let b_first = fetch(&mut b, &mut e, 10);
+        let b_first = fetch(&mut b, &e, 10);
         assert_eq!(b_first.len(), 1, "the expired message redelivers to B");
         assert_eq!(b_first[0].0, 0, "same offset, redelivered");
         assert_ne!(
@@ -2266,31 +2405,31 @@ mod tests {
         // slot freed by the start-of-Flow stale-lease prune, so A can fetch again. But the only
         // message is in flight to B, so A gets nothing until it expires again: A's credit is free
         // (proving the slot was released) yet no double-delivery occurs.
-        assert!(fetch(&mut b, &mut e, 10).is_empty(), "B is now saturated");
-        let a_after = fetch(&mut a, &mut e, 10);
+        assert!(fetch(&mut b, &e, 10).is_empty(), "B is now saturated");
+        let a_after = fetch(&mut a, &e, 10);
         assert!(
             a_after.is_empty(),
             "A's slot is free but offset 0 is leased to B, so no double-delivery"
         );
         // A's stale token is fenced (B owns the live lease now): status 0, nothing committed.
         assert_eq!(
-            ack_reply(&mut a, &mut e, AckOp::Ack, a_first[0].0, a_first[0].1),
+            ack_reply(&mut a, &e, AckOp::Ack, a_first[0].0, a_first[0].1),
             vec![0u8],
             "A's stale generation is fenced"
         );
         assert_eq!(
-            e.committed_offset().get(),
+            e.engine_mut().committed_offset().get(),
             0,
             "nothing committed by the fence"
         );
         // B, the live holder, acks and commits exactly once: no double-count.
         assert_eq!(
-            ack_reply(&mut b, &mut e, AckOp::Ack, b_first[0].0, b_first[0].1),
+            ack_reply(&mut b, &e, AckOp::Ack, b_first[0].0, b_first[0].1),
             vec![1u8],
             "B owns the live lease and commits"
         );
         assert_eq!(
-            e.committed_offset().get(),
+            e.engine_mut().committed_offset().get(),
             1,
             "the message is committed exactly once across the expire-and-redeliver"
         );
@@ -2302,30 +2441,30 @@ mod tests {
         // not two (#65): the redelivery overwrites the same offset key, so a credit-1 consumer that
         // re-fetches its own expired message holds one, not zero-then-overflow.
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_credit(Arc::clone(&clock), 1, 64);
-        let mut s = connected_session(&mut e);
-        produce(&mut e, b"x");
-        let first = fetch(&mut s, &mut e, 10);
+        let e = DirectEngine::new(engine_credit(Arc::clone(&clock), 1, 64));
+        let mut s = connected_session(&e);
+        produce(&e, b"x");
+        let first = fetch(&mut s, &e, 10);
         assert_eq!(first.len(), 1);
         // Expire and re-fetch: the same offset redelivers to the same consumer under a new
         // generation, still occupying exactly its one slot.
         clock.advance_monotonic_nanos(40);
-        let second = fetch(&mut s, &mut e, 10);
+        let second = fetch(&mut s, &e, 10);
         assert_eq!(second.len(), 1, "the own expired message redelivers");
         assert_eq!(second[0].0, 0, "same offset");
         assert_ne!(second[0].1, first[0].1, "fresh generation");
         // Still exactly one slot held: a second Flow delivers nothing (credit 1 is full), proving
         // the redelivery did not leak a second slot.
         assert!(
-            fetch(&mut s, &mut e, 10).is_empty(),
+            fetch(&mut s, &e, 10).is_empty(),
             "the redelivery re-occupied one slot, not two"
         );
         // Acking the live token commits and frees the slot.
         assert_eq!(
-            ack_reply(&mut s, &mut e, AckOp::Ack, second[0].0, second[0].1),
+            ack_reply(&mut s, &e, AckOp::Ack, second[0].0, second[0].1),
             vec![1u8]
         );
-        assert_eq!(e.committed_offset().get(), 1);
+        assert_eq!(e.engine_mut().committed_offset().get(), 1);
     }
 
     #[test]
@@ -2334,12 +2473,12 @@ mod tests {
         // GROUP window (2) is smaller than the consumer credit (64), so a single consumer is capped
         // at the group window, exactly as before #65 (no regression to the per-group bound).
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_credit(Arc::clone(&clock), 64, 2);
-        let mut s = connected_session(&mut e);
+        let e = DirectEngine::new(engine_credit(Arc::clone(&clock), 64, 2));
+        let mut s = connected_session(&e);
         for _ in 0..10 {
-            produce(&mut e, b"m");
+            produce(&e, b"m");
         }
-        let batch = fetch(&mut s, &mut e, 100);
+        let batch = fetch(&mut s, &e, 100);
         assert_eq!(
             batch.len(),
             2,
@@ -2352,27 +2491,27 @@ mod tests {
         // The existing single-consumer Flow path (credit defaulted) still works: a connect, a
         // produce, and a fetch deliver the message, with the default credit large enough not to be
         // the binding bound for a small batch.
-        let mut e = engine(); // consumer_credit defaulted to 64 in the test helper
-        let mut s = connected_session(&mut e);
-        produce(&mut e, b"a");
-        produce(&mut e, b"b");
-        let batch = fetch(&mut s, &mut e, 10);
+        let e = DirectEngine::new(engine()); // consumer_credit defaulted to 64 in the test helper
+        let mut s = connected_session(&e);
+        produce(&e, b"a");
+        produce(&e, b"b");
+        let batch = fetch(&mut s, &e, 10);
         assert_eq!(
             batch.len(),
             2,
             "both messages delivered on the default path"
         );
         for (o, g) in batch {
-            assert_eq!(ack_reply(&mut s, &mut e, AckOp::Ack, o, g), vec![1u8]);
+            assert_eq!(ack_reply(&mut s, &e, AckOp::Ack, o, g), vec![1u8]);
         }
-        assert_eq!(e.committed_offset().get(), 2);
+        assert_eq!(e.engine_mut().committed_offset().get(), 2);
     }
 
     // ----- Per-consumer BYTE budget (refs #65, #275, #10, #20) -----
 
     /// Produces a record whose total byte size (key + headers + payload) is exactly `size`: an empty
     /// key and headers, so the payload alone carries the bytes the per-consumer byte budget counts.
-    fn produce_sized<C: Clock + Clone>(e: &mut Engine<InMemoryFs, C>, size: usize) {
+    fn produce_sized<C: Clock + Clone>(e: &DirectEngine<InMemoryFs, C>, size: usize) {
         produce(e, &vec![0xab; size]);
     }
 
@@ -2385,12 +2524,12 @@ mod tests {
         // bytes are BELOW the budget and stops once they reach it, so the in-flight total is bounded
         // by the budget rounded up to a whole message.
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_credit_bytes(Arc::clone(&clock), 64, 200, 64);
-        let mut s = connected_session(&mut e);
+        let e = DirectEngine::new(engine_credit_bytes(Arc::clone(&clock), 64, 200, 64));
+        let mut s = connected_session(&e);
         for _ in 0..10 {
-            produce_sized(&mut e, 100);
+            produce_sized(&e, 100);
         }
-        let batch = fetch(&mut s, &mut e, 100);
+        let batch = fetch(&mut s, &e, 100);
         assert_eq!(
             batch.len(),
             2,
@@ -2398,7 +2537,7 @@ mod tests {
         );
         // Saturated on bytes: a second Flow delivers nothing until bytes free up.
         assert!(
-            fetch(&mut s, &mut e, 100).is_empty(),
+            fetch(&mut s, &e, 100).is_empty(),
             "in-flight bytes have reached the budget, so no more deliveries"
         );
     }
@@ -2409,11 +2548,11 @@ mod tests {
         // delivered when the connection holds nothing in-flight, so an over-budget message never
         // wedges the consumer. Budget 100, one 500-byte message: it is delivered.
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_credit_bytes(Arc::clone(&clock), 64, 100, 64);
-        let mut s = connected_session(&mut e);
-        produce_sized(&mut e, 500);
-        produce_sized(&mut e, 500);
-        let batch = fetch(&mut s, &mut e, 100);
+        let e = DirectEngine::new(engine_credit_bytes(Arc::clone(&clock), 64, 100, 64));
+        let mut s = connected_session(&e);
+        produce_sized(&e, 500);
+        produce_sized(&e, 500);
+        let batch = fetch(&mut s, &e, 100);
         assert_eq!(
             batch.len(),
             1,
@@ -2422,7 +2561,7 @@ mod tests {
         // But ONLY one: with one over-budget message in flight, the floor no longer applies, so the
         // second over-budget message waits until the first frees its bytes.
         assert!(
-            fetch(&mut s, &mut e, 100).is_empty(),
+            fetch(&mut s, &e, 100).is_empty(),
             "the floor is one; the second over-budget message waits for bytes to free"
         );
     }
@@ -2433,21 +2572,21 @@ mod tests {
         // with 100-byte messages holds exactly one (in-flight reaches the budget, so a second is
         // refused); acking it frees its 100 bytes so the next Flow delivers one more.
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_credit_bytes(Arc::clone(&clock), 64, 100, 64);
-        let mut s = connected_session(&mut e);
+        let e = DirectEngine::new(engine_credit_bytes(Arc::clone(&clock), 64, 100, 64));
+        let mut s = connected_session(&e);
         for _ in 0..5 {
-            produce_sized(&mut e, 100);
+            produce_sized(&e, 100);
         }
-        let first = fetch(&mut s, &mut e, 100);
+        let first = fetch(&mut s, &e, 100);
         assert_eq!(first.len(), 1, "100 bytes in flight reaches the budget");
-        assert!(fetch(&mut s, &mut e, 100).is_empty(), "byte-saturated");
+        assert!(fetch(&mut s, &e, 100).is_empty(), "byte-saturated");
         // Ack frees the 100 bytes.
         assert_eq!(
-            ack_reply(&mut s, &mut e, AckOp::Ack, first[0].0, first[0].1),
+            ack_reply(&mut s, &e, AckOp::Ack, first[0].0, first[0].1),
             vec![1u8],
             "the ack commits and frees the message's bytes"
         );
-        let second = fetch(&mut s, &mut e, 100);
+        let second = fetch(&mut s, &e, 100);
         assert_eq!(
             second.len(),
             1,
@@ -2460,29 +2599,29 @@ mod tests {
         // A successful nack and a successful term both restore the message's bytes (#275), exactly
         // like the message credit: a byte-saturated consumer that nacks or terms can fetch again.
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_credit_bytes(Arc::clone(&clock), 64, 100, 64);
-        let mut s = connected_session(&mut e);
+        let e = DirectEngine::new(engine_credit_bytes(Arc::clone(&clock), 64, 100, 64));
+        let mut s = connected_session(&e);
         for _ in 0..3 {
-            produce_sized(&mut e, 100);
+            produce_sized(&e, 100);
         }
         // Term path: fetch one (byte budget now full), term it (frees its bytes), fetch one more.
-        let first = fetch(&mut s, &mut e, 10);
+        let first = fetch(&mut s, &e, 10);
         assert_eq!(first.len(), 1, "100 bytes in flight caps the batch");
-        assert!(fetch(&mut s, &mut e, 10).is_empty(), "byte-saturated");
+        assert!(fetch(&mut s, &e, 10).is_empty(), "byte-saturated");
         assert_eq!(
-            ack_reply(&mut s, &mut e, AckOp::Term, first[0].0, first[0].1),
+            ack_reply(&mut s, &e, AckOp::Term, first[0].0, first[0].1),
             vec![1u8],
             "term drops it and frees its bytes"
         );
-        let second = fetch(&mut s, &mut e, 10);
+        let second = fetch(&mut s, &e, 10);
         assert_eq!(second.len(), 1, "term freed the bytes");
         // Nack path: nack with no delay (immediately reclaimable), which frees the bytes.
         assert_eq!(
-            ack_reply(&mut s, &mut e, AckOp::Nack, second[0].0, second[0].1),
+            ack_reply(&mut s, &e, AckOp::Nack, second[0].0, second[0].1),
             vec![1u8],
             "nack requeues and frees its bytes"
         );
-        let third = fetch(&mut s, &mut e, 10);
+        let third = fetch(&mut s, &e, 10);
         assert_eq!(third.len(), 1, "the freed bytes let the next Flow deliver");
     }
 
@@ -2492,18 +2631,18 @@ mod tests {
         // accounting seam: a byte-saturated consumer whose lease EXPIRES has its bytes freed by the
         // next Flow's stale-lease prune, so it can fetch again. Budget 100, one 100-byte message.
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_credit_bytes(Arc::clone(&clock), 64, 100, 64);
-        let mut s = connected_session(&mut e);
-        produce_sized(&mut e, 100);
-        produce_sized(&mut e, 50);
-        let first = fetch(&mut s, &mut e, 10);
+        let e = DirectEngine::new(engine_credit_bytes(Arc::clone(&clock), 64, 100, 64));
+        let mut s = connected_session(&e);
+        produce_sized(&e, 100);
+        produce_sized(&e, 50);
+        let first = fetch(&mut s, &e, 10);
         assert_eq!(first.len(), 1, "the 100-byte message fills the budget");
-        assert!(fetch(&mut s, &mut e, 10).is_empty(), "byte-saturated");
+        assert!(fetch(&mut s, &e, 10).is_empty(), "byte-saturated");
         // Expire the lease: the next Flow's stale-lease prune frees the 100 bytes, so the 50-byte
         // message (offset 1) is now deliverable. The expired message also redelivers, but to whoever
         // next polls; here the same consumer re-claims offset 0 first (lower offset), then offset 1.
         clock.advance_monotonic_nanos(40);
-        let after = fetch(&mut s, &mut e, 10);
+        let after = fetch(&mut s, &e, 10);
         assert!(
             !after.is_empty(),
             "the start-of-Flow stale-lease prune freed the bytes, so delivery resumes"
@@ -2518,21 +2657,21 @@ mod tests {
         // offset key in `leased`, so the byte total never doubles. Budget 100, one 100-byte message
         // re-fetched after expiry still holds exactly 100 bytes, not 200.
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_credit_bytes(Arc::clone(&clock), 64, 100, 64);
-        let mut s = connected_session(&mut e);
-        produce_sized(&mut e, 100);
-        let first = fetch(&mut s, &mut e, 10);
+        let e = DirectEngine::new(engine_credit_bytes(Arc::clone(&clock), 64, 100, 64));
+        let mut s = connected_session(&e);
+        produce_sized(&e, 100);
+        let first = fetch(&mut s, &e, 10);
         assert_eq!(first.len(), 1);
         // Expire and re-fetch: the same offset redelivers, re-occupying exactly its 100 bytes.
         clock.advance_monotonic_nanos(40);
-        let second = fetch(&mut s, &mut e, 10);
+        let second = fetch(&mut s, &e, 10);
         assert_eq!(second.len(), 1, "the own expired message redelivers");
         assert_eq!(second[0].0, 0, "same offset");
         assert_ne!(second[0].1, first[0].1, "fresh generation");
         // Still exactly 100 bytes in flight (one slot), so a second Flow delivers nothing: the
         // redelivery did not leak a second 100-byte occupancy.
         assert!(
-            fetch(&mut s, &mut e, 10).is_empty(),
+            fetch(&mut s, &e, 10).is_empty(),
             "the redelivery re-occupied its bytes once, not twice"
         );
     }
@@ -2545,13 +2684,13 @@ mod tests {
         // Direction 1: bytes bind. Message credit 64 (roomy), byte budget 200 with 100-byte
         // messages, group window 64 -> 2 deliveries (the byte budget is the min).
         {
-            let mut e = engine_credit_bytes(Arc::clone(&clock), 64, 200, 64);
-            let mut s = connected_session(&mut e);
+            let e = DirectEngine::new(engine_credit_bytes(Arc::clone(&clock), 64, 200, 64));
+            let mut s = connected_session(&e);
             for _ in 0..10 {
-                produce_sized(&mut e, 100);
+                produce_sized(&e, 100);
             }
             assert_eq!(
-                fetch(&mut s, &mut e, 100).len(),
+                fetch(&mut s, &e, 100).len(),
                 2,
                 "bytes bind: min(64 msgs, 200/100 bytes) = 2"
             );
@@ -2560,13 +2699,13 @@ mod tests {
         // (roomy) with 100-byte messages, group window 64 -> 2 deliveries (the message credit is the
         // min).
         {
-            let mut e = engine_credit_bytes(Arc::clone(&clock), 2, 100_000, 64);
-            let mut s = connected_session(&mut e);
+            let e = DirectEngine::new(engine_credit_bytes(Arc::clone(&clock), 2, 100_000, 64));
+            let mut s = connected_session(&e);
             for _ in 0..10 {
-                produce_sized(&mut e, 100);
+                produce_sized(&e, 100);
             }
             assert_eq!(
-                fetch(&mut s, &mut e, 100).len(),
+                fetch(&mut s, &e, 100).len(),
                 2,
                 "the message credit binds: min(2 msgs, roomy bytes) = 2"
             );
@@ -2579,12 +2718,12 @@ mod tests {
         // message credit (64) with a zero byte budget and many large messages delivers up to the
         // group window, never stopping on bytes.
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_credit_bytes(Arc::clone(&clock), 64, 0, 64);
-        let mut s = connected_session(&mut e);
+        let e = DirectEngine::new(engine_credit_bytes(Arc::clone(&clock), 64, 0, 64));
+        let mut s = connected_session(&e);
         for _ in 0..10 {
-            produce_sized(&mut e, 100_000);
+            produce_sized(&e, 100_000);
         }
-        let batch = fetch(&mut s, &mut e, 100);
+        let batch = fetch(&mut s, &e, 100);
         assert_eq!(
             batch.len(),
             10,
@@ -2598,17 +2737,17 @@ mod tests {
         // handful of tiny messages all deliver, the byte budget never binding. Wired with the real
         // production default const so the default path is exercised, not a test-local 0.
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_credit_bytes(
+        let e = DirectEngine::new(engine_credit_bytes(
             Arc::clone(&clock),
             64,
             crate::engine::DEFAULT_CONSUMER_CREDIT_BYTES,
             64,
-        );
-        let mut s = connected_session(&mut e);
+        ));
+        let mut s = connected_session(&e);
         for _ in 0..5 {
-            produce(&mut e, b"small");
+            produce(&e, b"small");
         }
-        let batch = fetch(&mut s, &mut e, 100);
+        let batch = fetch(&mut s, &e, 100);
         assert_eq!(
             batch.len(),
             5,
@@ -2651,44 +2790,45 @@ mod tests {
         // acks it (caught up, lease-free), then UNSUBs has that group reclaimed RIGHT NOW, freeing
         // its slot. A re-subscribe resumes at the head and redelivers nothing it had acked.
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_evict(Arc::clone(&clock));
-        produce(&mut e, b"a");
-        produce(&mut e, b"b");
-        let mut s = connected_session(&mut e);
+        let e = DirectEngine::new(engine_evict(Arc::clone(&clock)));
+        produce(&e, b"a");
+        produce(&e, b"b");
+        let mut s = connected_session(&e);
         // SUB to "orders", FLOW to drain both, then ACK both: the group is caught up and lease-free.
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Sub, b"orders"), &mut out)
+        s.process(&e, &frame(FrameType::Sub, b"orders"), &mut out)
             .unwrap();
         assert!(
-            !e.has_group("orders"),
+            !e.engine_mut().has_group("orders"),
             "SUB alone does not create the group; the first FLOW does"
         );
-        let batch = fetch(&mut s, &mut e, 10);
+        let batch = fetch(&mut s, &e, 10);
         assert_eq!(batch.len(), 2, "both messages delivered to the named group");
-        assert!(e.has_group("orders"), "the FLOW created the named group");
-        for (offset, generation) in &batch {
-            ack_reply(&mut s, &mut e, AckOp::Ack, *offset, *generation);
-        }
-        assert_eq!(
-            e.committed_offset_in("orders"),
-            e.flushed_offset(),
-            "caught up"
+        assert!(
+            e.engine_mut().has_group("orders"),
+            "the FLOW created the named group"
         );
+        for (offset, generation) in &batch {
+            ack_reply(&mut s, &e, AckOp::Ack, *offset, *generation);
+        }
+        let committed = e.engine_mut().committed_offset_in("orders");
+        let flushed = e.engine_mut().flushed_offset();
+        assert_eq!(committed, flushed, "caught up");
         // UNSUB: the now-idle, caught-up, lease-free named group is reclaimed immediately.
         out.clear();
-        s.process(&mut e, &frame(FrameType::Unsub, b""), &mut out)
+        s.process(&e, &frame(FrameType::Unsub, b""), &mut out)
             .unwrap();
         assert_eq!(one_response(&out).0, FrameType::Ok, "UNSUB is acked");
         assert!(
-            !e.has_group("orders"),
+            !e.engine_mut().has_group("orders"),
             "UNSUB reclaimed the caught-up, lease-free named group"
         );
         // Re-subscribe and produce one more: the re-created group resumes at the head and delivers
         // ONLY the new record, never the acked a/b (the never-lose-committed-position invariant).
-        produce(&mut e, b"c");
-        s.process(&mut e, &frame(FrameType::Sub, b"orders"), &mut out)
+        produce(&e, b"c");
+        s.process(&e, &frame(FrameType::Sub, b"orders"), &mut out)
             .unwrap();
-        let again = fetch(&mut s, &mut e, 10);
+        let again = fetch(&mut s, &e, 10);
         assert_eq!(
             again.len(),
             1,
@@ -2706,20 +2846,20 @@ mod tests {
         // in-flight lease in the engine; UNSUB must NOT reclaim the group while a lease is live, so
         // the in-flight bookkeeping (and the eventual redelivery after the timeout) is never dropped.
         let clock = Arc::new(ManualClock::new());
-        let mut e = engine_evict(Arc::clone(&clock));
-        produce(&mut e, b"a");
-        let mut s = connected_session(&mut e);
+        let e = DirectEngine::new(engine_evict(Arc::clone(&clock)));
+        produce(&e, b"a");
+        let mut s = connected_session(&e);
         let mut out = Vec::new();
-        s.process(&mut e, &frame(FrameType::Sub, b"orders"), &mut out)
+        s.process(&e, &frame(FrameType::Sub, b"orders"), &mut out)
             .unwrap();
-        let batch = fetch(&mut s, &mut e, 10);
+        let batch = fetch(&mut s, &e, 10);
         assert_eq!(batch.len(), 1, "the one message is delivered but NOT acked");
         // UNSUB without acking: the lease is still live in the engine, so the group is kept.
         out.clear();
-        s.process(&mut e, &frame(FrameType::Unsub, b""), &mut out)
+        s.process(&e, &frame(FrameType::Unsub, b""), &mut out)
             .unwrap();
         assert!(
-            e.has_group("orders"),
+            e.engine_mut().has_group("orders"),
             "UNSUB must not reclaim a group with an in-flight lease"
         );
     }

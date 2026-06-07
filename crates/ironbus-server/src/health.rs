@@ -24,10 +24,10 @@
 //! material. Mutating admin actions (consumer reset, DLQ redrive, force-reap) are out of scope and
 //! deferred to a separate mutating-admin surface; this endpoint is strictly GET-only and read-only.
 
+use crate::actor::EngineAccess;
 use crate::engine::{Counters, EngineConfigSnapshot, GroupConsumerStat};
 use crate::metrics::{LatencyHistogram, FSYNC_BUCKET_LE_SECONDS};
 use crate::registry::{FixedHistogram, REGISTRY_BUCKET_LE_SECONDS};
-use crate::server::SharedEngine;
 use ironbus_core::clock::Clock;
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::loss::ReasonCode;
@@ -35,7 +35,6 @@ use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::PoisonError;
 use std::time::Duration;
 
 /// How long to wait between non-blocking accept polls.
@@ -56,15 +55,16 @@ const MAX_REQUEST_LINE: usize = 8 * 1024;
 /// # Errors
 /// Returns an IO error only from configuring the listener; per-connection IO errors are
 /// contained so one bad client never ends the loop.
-pub fn serve_health<F, C>(
+pub fn serve_health<F, C, E>(
     listener: &TcpListener,
-    engine: &SharedEngine<F, C>,
+    engine: &E,
     shutdown: &AtomicBool,
     admin_enabled: bool,
 ) -> std::io::Result<()>
 where
-    F: Filesystem,
-    C: Clock + Clone,
+    F: Filesystem + 'static,
+    C: Clock + Clone + 'static,
+    E: EngineAccess<F, C>,
 {
     listener.set_nonblocking(true)?;
     while !shutdown.load(Ordering::Acquire) {
@@ -83,14 +83,11 @@ where
     Ok(())
 }
 
-fn handle<F, C>(
-    mut stream: TcpStream,
-    engine: &SharedEngine<F, C>,
-    admin_enabled: bool,
-) -> std::io::Result<()>
+fn handle<F, C, E>(mut stream: TcpStream, engine: &E, admin_enabled: bool) -> std::io::Result<()>
 where
-    F: Filesystem,
-    C: Clock + Clone,
+    F: Filesystem + 'static,
+    C: Clock + Clone + 'static,
+    E: EngineAccess<F, C>,
 {
     // The accepted socket inherits the listener's non-blocking flag; reads must block for the
     // timeouts to apply (the wire handler does the same), else a request split across TCP
@@ -146,73 +143,76 @@ where
     match path {
         "/healthz" => respond(&mut stream, 200, "OK", "ok"),
         "/readyz" => {
-            let healthy = engine
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .is_healthy();
-            if healthy {
-                respond(&mut stream, 200, "OK", "ready")
-            } else {
-                respond(&mut stream, 503, "Service Unavailable", "writer frozen")
+            // Read the writer-health flag through the actor (the single owner). If the actor is gone
+            // (a shutdown drain), the broker is not ready: surface 503 rather than hang.
+            match engine.with(|e| e.is_healthy()) {
+                Ok(true) => respond(&mut stream, 200, "OK", "ready"),
+                Ok(false) => respond(&mut stream, 503, "Service Unavailable", "writer frozen"),
+                Err(_) => respond(&mut stream, 503, "Service Unavailable", "shutting down"),
             }
         }
         "/metrics" => {
-            let snapshot = {
-                let g = engine.lock().unwrap_or_else(PoisonError::into_inner);
-                MetricsSnapshot {
-                    committed: g.committed_offset().get(),
-                    flushed: g.flushed_offset().get(),
-                    in_flight: g.in_flight(),
-                    healthy: g.is_healthy(),
-                    recovered_truncated: g.recovered_truncated_bytes(),
-                    quarantined: g.quarantined_bytes(),
-                    recovery_loss: {
-                        let r = g.loss_report();
-                        ReasonCode::ALL.map(|rc| r.bytes_skipped_for(rc))
-                    },
-                    recovery_loss_records: {
-                        let r = g.loss_report();
-                        ReasonCode::ALL.map(|rc| r.records_lost_for(rc))
-                    },
-                    // -1 is the unambiguous "none yet" sentinel (offsets are never negative).
-                    last_dead_lettered: g
-                        .last_dead_lettered_offset()
-                        .map_or(-1i64, |o| i64::try_from(o.get()).unwrap_or(i64::MAX)),
-                    dlq_records: g.dlq_records(),
-                    counters: g.counters(),
-                    fsync: g.fsync_histogram(),
-                    groups: g.group_consumer_stats(),
-                    // The bounded metric registry (#97) is rendered into a String UNDER the lock
-                    // (it walks only the bounded series set and the fixed histograms, so the work is
-                    // O(number of series), independent of the record count or disk size), then the
-                    // body is assembled outside the lock with the rest. The uptime series reads the
-                    // live monotonic clock seam here so it advances between scrapes.
-                    registry: registry_body(g.registry(), g.now_monotonic()),
-                }
-            };
-            respond(&mut stream, 200, "OK", &metrics_body(snapshot))
+            // Build the whole metrics snapshot in ONE actor job so every field is from the same
+            // instant (the actor is the single reader/writer). A gone actor yields 503.
+            let snapshot = engine.with(|g| MetricsSnapshot {
+                committed: g.committed_offset().get(),
+                flushed: g.flushed_offset().get(),
+                in_flight: g.in_flight(),
+                healthy: g.is_healthy(),
+                recovered_truncated: g.recovered_truncated_bytes(),
+                quarantined: g.quarantined_bytes(),
+                recovery_loss: {
+                    let r = g.loss_report();
+                    ReasonCode::ALL.map(|rc| r.bytes_skipped_for(rc))
+                },
+                recovery_loss_records: {
+                    let r = g.loss_report();
+                    ReasonCode::ALL.map(|rc| r.records_lost_for(rc))
+                },
+                // -1 is the unambiguous "none yet" sentinel (offsets are never negative).
+                last_dead_lettered: g
+                    .last_dead_lettered_offset()
+                    .map_or(-1i64, |o| i64::try_from(o.get()).unwrap_or(i64::MAX)),
+                dlq_records: g.dlq_records(),
+                counters: g.counters(),
+                fsync: g.fsync_histogram(),
+                groups: g.group_consumer_stats(),
+                // The bounded metric registry (#97) is rendered into a String inside the actor job
+                // (it walks only the bounded series set and the fixed histograms, so the work is
+                // O(number of series), independent of the record count or disk size), then the body
+                // is assembled outside with the rest. The uptime series reads the live monotonic
+                // clock seam here so it advances between scrapes.
+                registry: registry_body(g.registry(), g.now_monotonic()),
+            });
+            match snapshot {
+                Ok(snapshot) => respond(&mut stream, 200, "OK", &metrics_body(snapshot)),
+                Err(_) => respond(&mut stream, 503, "Service Unavailable", "shutting down"),
+            }
         }
         // The opt-in read-only introspection endpoint (#99). When disabled it is indistinguishable
         // from an unknown path (a 404), so the surface is invisible unless the operator turned it
         // on. The non-GET case was already rejected with 405 above, so this is GET-only.
-        "/admin" if admin_enabled => {
-            let snapshot = admin_snapshot(engine);
-            respond_json(&mut stream, 200, "OK", &admin_body(&snapshot))
-        }
+        "/admin" if admin_enabled => match admin_snapshot(engine) {
+            Ok(snapshot) => respond_json(&mut stream, 200, "OK", &admin_body(&snapshot)),
+            Err(_) => respond(&mut stream, 503, "Service Unavailable", "shutting down"),
+        },
         _ => respond(&mut stream, 404, "Not Found", "unknown endpoint"),
     }
 }
 
-/// Captures the read-only introspection state (#99) under one engine lock, so every field is from
-/// the same instant. Every value comes from an existing read-only accessor; this cannot mutate the
+/// Captures the read-only introspection state (#99) in ONE actor job, so every field is from the
+/// same instant. Every value comes from an existing read-only accessor; this cannot mutate the
 /// engine and carries no secret material.
-fn admin_snapshot<F, C>(engine: &SharedEngine<F, C>) -> AdminSnapshot
+///
+/// # Errors
+/// Returns [`ActorGone`](crate::actor::ActorGone) if the actor exited before the read.
+fn admin_snapshot<F, C, E>(engine: &E) -> Result<AdminSnapshot, crate::actor::ActorGone>
 where
-    F: Filesystem,
-    C: Clock + Clone,
+    F: Filesystem + 'static,
+    C: Clock + Clone + 'static,
+    E: EngineAccess<F, C>,
 {
-    let g = engine.lock().unwrap_or_else(PoisonError::into_inner);
-    AdminSnapshot {
+    engine.with(|g| AdminSnapshot {
         healthy: g.is_healthy(),
         flushed: g.flushed_offset().get(),
         committed: g.committed_offset().get(),
@@ -230,7 +230,7 @@ where
         counters: g.counters(),
         groups: g.group_consumer_stats(),
         config: g.config_snapshot(),
-    }
+    })
 }
 
 /// A consistent snapshot of the metric inputs, read under one engine lock.
@@ -881,6 +881,7 @@ fn respond_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::SharedEngine;
     use crate::clock::SystemClock;
     use crate::engine::{AckResult, DiskFullPolicy, Engine, EngineConfig, Poll};
     use ironbus_core::delivery::DeliveryConfig;

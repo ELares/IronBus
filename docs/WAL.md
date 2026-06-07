@@ -48,15 +48,18 @@ itself, not a WAL-versus-store reconciliation. The cost (and benefit) is that th
 framing, checksum, and recovery path have to be exactly right, which is the work the
 record format and crash-recovery pin down.
 
-### Single-writer, today
+### Single-writer, via the append actor
 
 The storage `Log` is single-writer by contract: one owner appends (invariant I8). In
-the server that single logical writer is realized by sharing the `Engine` behind a
-`Mutex` (`SharedEngine` in `server.rs`); the thread-per-connection model serializes
-every produce through that lock. A produce holds the lock across its `fdatasync`, so a
-stalled disk head-of-line-blocks every connection. This is called out in `server.rs` as
-a known caveat: the dedicated append actor and group-commit batching are a throughput
-follow-up, not present today (see the discrepancies section).
+the server that single logical writer is a dedicated APPEND ACTOR thread that owns the
+`Engine` (`actor.rs`, #177). Connection handlers fan in over a bounded `sync_channel`
+and send commands; they never lock the engine and never hold a lock across an
+`fdatasync`. The actor GROUP-COMMITS a drained batch of produces with one `fdatasync`
+covering the batch, then acks the whole batch (so a `PubAck` still follows the covering
+sync, invariant I2). A produce parked in the actor's fsync no longer head-of-line-blocks
+every connection: pings (and anything needing no engine state) are answered by the
+handler without touching the actor. The earlier `Mutex<Engine>` design held the lock
+across the fsync, which froze every connection on a stalled disk; that is removed.
 
 ---
 
@@ -385,11 +388,13 @@ code.
   `segment_ids_increase_monotonically_and_are_never_recycled`. There are no generation
   tags in the segment header.
 - **A dedicated append actor + commit thread, group-commit batching, admission
-  credits.** #135 (and the README "Concurrency" section) describe a single append actor
-  draining queued appends to a 1 MiB group-commit cap on a dedicated thread, with
-  fsync-headroom admission credits. The shipped server serializes produces through a
-  `Mutex<Engine>` and fsyncs one produce at a time; `server.rs` names the append-actor +
-  group-commit as a throughput follow-up.
+  credits.** The single append actor and group-commit batching are now SHIPPED (#177):
+  `actor.rs` owns the `Engine`, drains a batch of queued produces, and issues one
+  `fdatasync` per drained batch (the storage "one write plus one sync per group"). What
+  is still NOT present from the #135 sketch is the explicit 1 MiB group-commit byte cap
+  (the actor drains whatever is available each pass rather than to a byte target) and the
+  fsync-headroom admission credits; the bounded `sync_channel` provides backpressure in
+  their place. A separate commit thread distinct from the append thread is not split out.
 - **A separate recovery-checkpoint (durable-point) deletion watermark.** #135 gates
   deletion on the minimum of three watermarks, one of which is a `(durable_seq,
   durable_offset)` durable point published by a checkpointer on every roll / 1000 ms

@@ -394,12 +394,22 @@ Honest accounting of what is not defended yet. Each names its tracking issue.
   garbage-collection pause is routinely hundreds of ms) head-of-line-blocks EVERY
   connection, not just the producer that triggered it (this was R2 in the design
   hunt).
-- **Status:** OPEN. The dedicated append actor + group-commit batching that #135
-  and the README "Concurrency" section describe are a throughput follow-up, NOT
-  present today; the single-writer caveat is called out explicitly in
-  [WAL.md](WAL.md) ("Single-writer, today") and in `server.rs`.
-- **Residual risk:** tail-sync latency on worn flash is unbounded under the current
-  design; no experiment yet measures it, and no per-producer pipelining exists.
+- **Status:** FIXED (#177). The `Engine` is now owned by a single append-actor
+  thread (`actor.rs`); connection handlers fan in over a bounded `sync_channel` and
+  send commands instead of locking the engine, so NO handler holds a lock across an
+  fsync. The actor group-commits a drained batch of produces with ONE `fdatasync`
+  and acks the batch only after it (amortizing the fsync), and pings are answered in
+  the handler without touching the actor, so a stalled produce fsync no longer
+  head-of-line-blocks other connections' pings. An acceptance test stalls a
+  producer's `sync_data` (a sync-gating fault fs) and proves another connection's
+  ping still returns; another proves a batch issues one `fdatasync`, not N. I2,
+  single durable order, no-deadlock (a closed channel is a typed `ActorGone`), and
+  the #195 graceful-shutdown drain are preserved.
+- **Residual risk:** a stalled fsync still blocks WORK that needs durable engine
+  state (a producer behind it in the same group, and the actor's serial cursor
+  commits), since the single-writer rule keeps those serial; the bounded channel
+  applies backpressure rather than unbounded buffering. Tail-sync latency on worn
+  flash is still unmeasured.
 
 ### RR-20 Macro-bench injected-stall self-test flaky on shared CI
 
@@ -450,14 +460,16 @@ Honest accounting of what is not defended yet. Each names its tracking issue.
 ### RR-23 No loom coverage
 
 - **Category:** concurrency.
-- **Failure mode:** the concurrent handoffs (the shared-Engine `Mutex`, the
-  cursor, refcounts) are not proven under a concurrency model checker, so a subtle
-  memory-ordering or interleaving bug could hide.
+- **Failure mode:** the concurrent handoffs (the append-actor command/reply
+  channels, the cursor, refcounts) are not proven under a concurrency model checker,
+  so a subtle memory-ordering or interleaving bug could hide.
 - **Status:** OPEN, tracking #122. No `loom` model exists in the tree (noted in
-  [INVARIANTS.md](INVARIANTS.md)). The honest reason: there are no hand-rolled
-  lock-free structures today (concurrency is a coarse `Mutex`, RR-19), so there is
-  little for loom to exercise yet; loom becomes load-bearing only when the
-  lock-free append actor (RR-19) lands.
+  [INVARIANTS.md](INVARIANTS.md)). The honest reason: there are still no hand-rolled
+  lock-free structures. The #177 append actor (RR-19) fans connection handlers into a
+  single owner over a std `sync_channel` (a vetted bounded queue, not a custom
+  lock-free structure) with per-command reply channels, so the handoffs are still
+  ordinary std primitives loom would not exercise differently from std's own tests;
+  loom becomes load-bearing only if a hand-rolled lock-free path is ever introduced.
 - **Residual risk:** low today (coarse locking is simple to reason about), rising
   the moment a lock-free path is introduced.
 
@@ -473,13 +485,13 @@ By category (mitigated vs open, defects counted under their category):
 | Category | Mitigated | Fixed defect | Open |
 | --- | --- | --- | --- |
 | durability | RR-03, RR-05, RR-06, RR-07 | RR-10 | |
-| concurrency | | RR-11 | RR-19, RR-23 |
+| concurrency | | RR-11, RR-19 | RR-23 |
 | resource-exhaustion/DoS | RR-01, RR-02, RR-03, RR-08 | | |
 | recovery | RR-05, RR-06 | RR-10 | |
 | observability | RR-09 | RR-12, RR-14 | RR-20, RR-22 |
 | security | RR-08 | | RR-16, RR-17, RR-18 |
 | operational | RR-04, RR-07 | RR-13, RR-15 | RR-21 |
-| performance | | RR-11 | RR-19, RR-21 |
+| performance | | RR-11, RR-19 | RR-21 |
 
 (Some risks span more than one category and appear in each; the headline counts
 above are by section.)
@@ -490,9 +502,9 @@ Every "mitigated" cites a mechanism and a test verified against the source at th
 time of writing. Every "fixed defect" was checked against the CHANGELOG, the
 closed issue, or the merged PR (RR-10 #240 / CHANGELOG; RR-11 PR #283 review
 thread; RR-12 PR #279 commits; RR-13 PR #289 body; RR-14 #96 / CHANGELOG; RR-15
-PR #301 / CHANGELOG). Every "open" names a tracking issue confirmed open against
-the issue tracker (#106, #107, #108, #98, #122, #132, #284, #292). The design-time
-hunt that preceded coding is the META issue #138; the open architectural items it
-raised that remain open (the single-writer head-of-line block, the joint disk
-budget, the bounded-loss cap on a large log) are reflected above as RR-19, RR-03,
-and RR-05.
+PR #301 / CHANGELOG; RR-19 #177 / CHANGELOG). Every "open" names a tracking issue
+confirmed open against the issue tracker (#106, #107, #108, #98, #122, #132, #284,
+#292). The design-time hunt that preceded coding is the META issue #138; of the
+open architectural items it raised, the single-writer head-of-line block is now
+fixed (RR-19, #177), and the joint disk budget and the bounded-loss cap on a large
+log remain open (RR-03 and RR-05).
