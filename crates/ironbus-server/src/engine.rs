@@ -255,10 +255,13 @@ const GROUP_CKPT_SUFFIX: &str = ".ckpt";
 /// Lowercase-hex-encodes bytes, for embedding a graphic-ASCII work-group name in a safe,
 /// reversible filename (a name may contain `/`, `:`, etc., which are unsafe in a path).
 fn hex_encode(bytes: &[u8]) -> String {
+    // A 16-entry table indexed by a nibble (0..=15): no `Option`, no fallback, and the index
+    // is provably in bounds, so the encoding cannot silently produce a wrong digit.
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
-        s.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
-        s.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
+        s.push(char::from(HEX[usize::from(b >> 4)]));
+        s.push(char::from(HEX[usize::from(b & 0x0f)]));
     }
     s
 }
