@@ -4,8 +4,9 @@
 normative design for optional authenticated encryption of segment payloads at
 rest. None of it is wired into the binary today. The log and the dead-letter
 queue are plaintext on disk right now, exactly as [THREAT_MODEL.md](THREAT_MODEL.md)
-states (no auth, no TLS, no at-rest encryption), and the only record flag bit
-defined today is `COMPRESSED`; no encryption bit is allocated yet (see
+states (no auth, no TLS, no at-rest encryption), and the record flag bits
+defined today are `COMPRESSED`, `HAS_KEY`, and `HAS_XXH3` (the `KNOWN` set per
+[CONTRACTS.md](CONTRACTS.md)); no encryption bit is allocated yet (see
 [INVARIANTS.md](INVARIANTS.md), I7). This spec is the child of the security epic
 #18 and the sibling of the auth spec ([AUTHENTICATION.md](AUTHENTICATION.md),
 #106), the TLS transport spec ([TRANSPORT.md](TRANSPORT.md), #107), and the
@@ -141,12 +142,19 @@ at-rest encryption uses them as follows, and changes no other offset:
 
 Because `header_crc` already covers `[0, 60)`, the suite byte and the key-id are
 integrity-protected the moment they are written, with no new checksum and no
-offset move. A `SEGMENT_ENCRYPTED` flag with a zero `aead_suite`, or an encrypted
-flag on a reader that does not understand the suite value, is an unsupported-format
-rejection (the same refuse-on-unknown discipline the v1 `version` and
-`checksum_algo` already use, per [COMPATIBILITY.md](COMPATIBILITY.md)), never a
-silent plaintext read. A reader that finds `SEGMENT_ENCRYPTED` clear reads the
-body as plaintext exactly as today.
+offset move. A future, encryption-aware reader that meets an `aead_suite` VALUE
+it does not understand refuses with an unsupported-format error, the same
+refuse-on-unknown discipline the v1 `version` and `checksum_algo` VALUES already
+use (per [COMPATIBILITY.md](COMPATIBILITY.md)). A genuinely old, pre-encryption
+reader is protected by a different mechanism, because unknown segment-header and
+record flag BITS are preserve-and-ignore (not refuse-on-unknown), so the
+`SEGMENT_ENCRYPTED` bit alone would not stop it. Instead the 16-byte AEAD tag
+inflates each record's on-disk length beyond what its plaintext `key_len` /
+`hdr_len` / `payload_len` fields declare, so the existing `codec::decode`
+total-length self-check rejects the frame as `BadLength` and recovery classifies
+it as record corruption. Either path is a hard rejection, never a silent
+plaintext read. A reader that finds `SEGMENT_ENCRYPTED` clear reads the body as
+plaintext exactly as today.
 
 A corresponding record-level `ENCRYPTED` flag bit is reserved in the record `flags`
 byte (today only `COMPRESSED`, `HAS_KEY`, `HAS_XXH3` are defined, per CONTRACTS.md;
@@ -199,11 +207,15 @@ prevents it **structurally**, without trusting any RNG:
    under any one key is collision-free by construction.
 
 A 32-bit per-segment counter caps a single segment at 2^32 records before the
-counter would wrap, far above the record count any single segment (default 64 MiB,
-8 MiB edge) can hold, so the counter never wraps within a real segment. The roll
-to a new segment, which the #6 / segment-rolling contract already triggers on size,
-is itself the guarantee that the counter is reset only alongside a fresh
-`segment_id`.
+counter would wrap. This bound is airtight regardless of the configured
+`max_segment_bytes`: a segment's own `record_count` is a `u32`, and
+`SegmentWriter::append` refuses with `SegmentFull` at `record_count == u32::MAX`,
+so a segment can never hold more than `u32::MAX` records no matter how large the
+byte budget is set. The default 64 MiB (8 MiB edge) segment holds far fewer
+(around 1.5M records at 64 MiB), so the counter never approaches the wrap point
+within a real segment. The roll to a new segment, which the #6 / segment-rolling
+contract already triggers on size, is itself the guarantee that the counter is
+reset only alongside a fresh `segment_id`.
 
 The decisive property: **this construction needs no randomness at all.** It does
 not draw a nonce from an RNG, so it cannot be defeated by a low-entropy early-boot
