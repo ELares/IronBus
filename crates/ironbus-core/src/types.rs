@@ -114,13 +114,17 @@ impl RecordFlags {
     pub const COMPRESSED: RecordFlags = RecordFlags(0b0000_0001);
     /// The record carries a routing or ordering key.
     pub const HAS_KEY: RecordFlags = RecordFlags(0b0000_0010);
+    /// The record carries a second xxh3-64 checksum field immediately before its
+    /// trailer (set by the codec when the stored body reaches `XXH3_PAYLOAD_THRESHOLD`).
+    pub const HAS_XXH3: RecordFlags = RecordFlags(0b0000_0100);
 
     /// An empty flag set.
     pub const EMPTY: RecordFlags = RecordFlags(0);
 
     /// The union of every flag this version understands. A writer must never emit
     /// a bit outside this mask.
-    pub const KNOWN: RecordFlags = RecordFlags(Self::COMPRESSED.0 | Self::HAS_KEY.0);
+    pub const KNOWN: RecordFlags =
+        RecordFlags(Self::COMPRESSED.0 | Self::HAS_KEY.0 | Self::HAS_XXH3.0);
 
     /// Builds a flag set from its raw byte.
     #[must_use]
@@ -195,7 +199,10 @@ mod tests {
 
     #[test]
     fn flags_unknown_bits_detected_and_preserved() {
-        assert_eq!(RecordFlags::KNOWN.bits(), 0b11);
+        assert_eq!(RecordFlags::KNOWN.bits(), 0b111);
+        // The xxh3 presence bit is a recognized flag, not an unknown bit.
+        assert!(RecordFlags::KNOWN.contains(RecordFlags::HAS_XXH3));
+        assert_eq!(RecordFlags::HAS_XXH3.unknown_bits(), RecordFlags::EMPTY);
         // A known-only set has no unknown bits.
         assert_eq!(RecordFlags::KNOWN.unknown_bits(), RecordFlags::EMPTY);
         // An unknown high bit is both preserved and reported.

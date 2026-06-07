@@ -7,16 +7,22 @@
 //! `total_len` is the whole frame length, which lets a reader find the trailer and
 //! scan forward or backward.
 //!
-//! The optional second xxh3-64 checksum for large payloads (see the corruption
-//! design) is not encoded yet: the frozen trailer has no field for it. That gap is
-//! tracked separately; this codec implements the mandatory CRC32C path.
+//! A record whose stored body is at least [`XXH3_PAYLOAD_THRESHOLD`] bytes also carries
+//! a second, independent xxh3-64 checksum (issue #8) over the same body byte range the
+//! `body_crc` covers. It is an 8-byte little-endian field placed immediately before the
+//! 8-byte trailer and counted in `total_len`, and its presence is flagged by the
+//! [`RecordFlags::HAS_XXH3`] header bit. A record below the threshold has no field, no
+//! flag, and the exact byte-for-byte layout it had before the field existed. CRC32C
+//! stays the resync-gating checksum: it is verified first, and an xxh3-64 mismatch is a
+//! distinct, typed corruption error.
 
 use crate::format::{
     header_offsets as off, FORMAT_VERSION, MAX_RECORD_BYTES_CEILING, RECORD_HEADER_CRC_RANGE,
-    RECORD_HEADER_LEN, RECORD_MAGIC, RECORD_TRAILER_LEN,
+    RECORD_HEADER_LEN, RECORD_MAGIC, RECORD_TRAILER_LEN, RECORD_XXH3_LEN, XXH3_PAYLOAD_THRESHOLD,
 };
 use crate::raw::{read_u16, read_u32, read_u64};
 use crate::types::{RecordFlags, Seq};
+use xxhash_rust::xxh3::xxh3_64;
 
 /// A borrowed view of a record, used both as the input to [`encode`] and the
 /// output of [`decode`]. It owns no memory; slices borrow the caller's buffer.
@@ -59,6 +65,11 @@ pub enum DecodeError {
     BadHeaderCrc,
     /// The body CRC32C did not match: the body is corrupt.
     BadBodyCrc,
+    /// The body xxh3-64 did not match: the body is corrupt. Distinct from
+    /// [`DecodeError::BadBodyCrc`] so a caller can tell which checksum caught it. CRC32C
+    /// is verified first, so this is reached only when the body passed CRC32C but failed
+    /// the independent xxh3-64 (or the xxh3-64 field itself was corrupted).
+    BadXxh3,
     /// The encoded length fields are internally inconsistent.
     BadLength,
     /// The encoded total length exceeds the format ceiling of 1 GiB.
@@ -84,6 +95,7 @@ impl core::fmt::Display for DecodeError {
             }
             DecodeError::BadHeaderCrc => write!(f, "record header CRC mismatch"),
             DecodeError::BadBodyCrc => write!(f, "record body CRC mismatch"),
+            DecodeError::BadXxh3 => write!(f, "record body xxh3-64 mismatch"),
             DecodeError::BadLength => write!(f, "record frame has inconsistent length fields"),
             DecodeError::TooLarge => write!(f, "record frame exceeds the maximum size"),
         }
@@ -105,7 +117,12 @@ pub fn encode(rec: &RecordView<'_>, out: &mut Vec<u8>) -> Result<usize, EncodeEr
     let payload_len = u32::try_from(rec.payload.len()).map_err(|_| EncodeError::TooLarge)?;
 
     let body_len = rec.key.len() + rec.headers.len() + rec.payload.len();
-    let total = RECORD_HEADER_LEN + body_len + RECORD_TRAILER_LEN;
+    // The xxh3-64 field is added for a stored body at or above the threshold. `body_len`
+    // is the stored size (the bytes actually written: key + headers + payload), so the
+    // checksum protects exactly what lands on disk. See `XXH3_PAYLOAD_THRESHOLD`.
+    let has_xxh3 = body_len >= XXH3_PAYLOAD_THRESHOLD as usize;
+    let xxh3_field = if has_xxh3 { RECORD_XXH3_LEN } else { 0 };
+    let total = RECORD_HEADER_LEN + body_len + xxh3_field + RECORD_TRAILER_LEN;
     let total_u32 = u32::try_from(total).map_err(|_| EncodeError::TooLarge)?;
     if total_u32 > MAX_RECORD_BYTES_CEILING {
         return Err(EncodeError::TooLarge);
@@ -116,6 +133,13 @@ pub fn encode(rec: &RecordView<'_>, out: &mut Vec<u8>) -> Result<usize, EncodeEr
         RecordFlags::from_bits(flags.bits() & !RecordFlags::HAS_KEY.bits())
     } else {
         flags.with(RecordFlags::HAS_KEY)
+    };
+    // HAS_XXH3 is derived from the stored body size, never taken from the caller, so it
+    // always agrees with whether the field is present (decode enforces that agreement).
+    flags = if has_xxh3 {
+        flags.with(RecordFlags::HAS_XXH3)
+    } else {
+        RecordFlags::from_bits(flags.bits() & !RecordFlags::HAS_XXH3.bits())
     };
 
     // Header bytes [0, 32), then the header CRC at [32, 36).
@@ -137,7 +161,14 @@ pub fn encode(rec: &RecordView<'_>, out: &mut Vec<u8>) -> Result<usize, EncodeEr
     out.extend_from_slice(rec.key);
     out.extend_from_slice(rec.headers);
     out.extend_from_slice(rec.payload);
-    let body_crc = crc32c::crc32c(&out[body_start..body_start + body_len]);
+    let body = &out[body_start..body_start + body_len];
+    let body_crc = crc32c::crc32c(body);
+    // The xxh3-64 covers the same body byte range as `body_crc`, and the field precedes
+    // the trailer so the 8-byte trailer (`body_crc` then `total_len`) is unchanged.
+    if has_xxh3 {
+        let xxh3 = xxh3_64(body);
+        out.extend_from_slice(&xxh3.to_le_bytes());
+    }
     out.extend_from_slice(&body_crc.to_le_bytes());
     out.extend_from_slice(&total_u32.to_le_bytes());
     Ok(total)
@@ -172,12 +203,20 @@ pub fn decoded_len(header: &[u8]) -> Result<usize, DecodeError> {
     if crc32c::crc32c(&header[RECORD_HEADER_CRC_RANGE]) != stored_header_crc {
         return Err(DecodeError::BadHeaderCrc);
     }
+    // The flags byte is inside the CRC-protected range, so HAS_XXH3 is trusted here and
+    // its 8-byte field is counted in `total_len`, matching `decode`.
+    let xxh3_field = if RecordFlags::from_bits(header[off::FLAGS]).contains(RecordFlags::HAS_XXH3) {
+        RECORD_XXH3_LEN as u64
+    } else {
+        0
+    };
     // Sum the three attacker-controlled u32 lengths in u64 so the total cannot overflow
     // usize on a 32-bit target before it is bounded by the 1 GiB ceiling (matches `decode`).
     let total64 = u64::from(read_u32(header, off::KEY_LEN))
         + u64::from(read_u32(header, off::HDR_LEN))
         + u64::from(read_u32(header, off::PAYLOAD_LEN))
         + RECORD_HEADER_LEN as u64
+        + xxh3_field
         + RECORD_TRAILER_LEN as u64;
     if total64 > u64::from(MAX_RECORD_BYTES_CEILING) {
         return Err(DecodeError::TooLarge);
@@ -217,15 +256,27 @@ pub fn decode(input: &[u8]) -> Result<(RecordView<'_>, usize), DecodeError> {
         return Err(DecodeError::BadHeaderCrc);
     }
 
+    // The flags byte is inside the CRC-protected header range, so by here it is trusted:
+    // HAS_XXH3 sizes the optional 8-byte checksum field that precedes the trailer.
+    let flags = RecordFlags::from_bits(input[off::FLAGS]);
+    let xxh3_field: usize = if flags.contains(RecordFlags::HAS_XXH3) {
+        RECORD_XXH3_LEN
+    } else {
+        0
+    };
+
     let key_len_u32 = read_u32(input, off::KEY_LEN);
     let hdr_len_u32 = read_u32(input, off::HDR_LEN);
     let payload_len_u32 = read_u32(input, off::PAYLOAD_LEN);
     // Sum the three attacker-controlled u32 lengths in u64 so the total cannot
-    // overflow usize on a 32-bit target before it is bounded by the ceiling.
+    // overflow usize on a 32-bit target before it is bounded by the ceiling. The
+    // optional xxh3 field is counted in `total_len`, so include it here too. The
+    // `usize as u64` widening of the small fixed field sizes never truncates.
     let total64 = u64::from(key_len_u32)
         + u64::from(hdr_len_u32)
         + u64::from(payload_len_u32)
         + RECORD_HEADER_LEN as u64
+        + xxh3_field as u64
         + RECORD_TRAILER_LEN as u64;
     if total64 > u64::from(MAX_RECORD_BYTES_CEILING) {
         return Err(DecodeError::TooLarge);
@@ -237,23 +288,38 @@ pub fn decode(input: &[u8]) -> Result<(RecordView<'_>, usize), DecodeError> {
     }
     let key_len = usize::try_from(key_len_u32).map_err(|_| DecodeError::TooLarge)?;
     let hdr_len = usize::try_from(hdr_len_u32).map_err(|_| DecodeError::TooLarge)?;
-    let body_len = total - RECORD_HEADER_LEN - RECORD_TRAILER_LEN;
+    let body_len = total - RECORD_HEADER_LEN - RECORD_TRAILER_LEN - xxh3_field;
 
     // HAS_KEY is a derived, frozen bit: it must agree with the key length. A frame
     // where they disagree was written by a buggy or hostile writer.
-    let flags = RecordFlags::from_bits(input[off::FLAGS]);
     if flags.contains(RecordFlags::HAS_KEY) != (key_len != 0) {
+        return Err(DecodeError::BadLength);
+    }
+    // HAS_XXH3 is likewise derived: it must agree with the stored body reaching the
+    // threshold. A mismatch is a malformed frame, not a recoverable corruption.
+    if flags.contains(RecordFlags::HAS_XXH3) != (body_len >= XXH3_PAYLOAD_THRESHOLD as usize) {
         return Err(DecodeError::BadLength);
     }
 
     let body = &input[RECORD_HEADER_LEN..RECORD_HEADER_LEN + body_len];
-    let trailer = &input[RECORD_HEADER_LEN + body_len..total];
+    let xxh3_bytes =
+        &input[RECORD_HEADER_LEN + body_len..RECORD_HEADER_LEN + body_len + xxh3_field];
+    let trailer = &input[total - RECORD_TRAILER_LEN..total];
     let stored_body_crc = read_u32(trailer, 0);
     if u64::from(read_u32(trailer, 4)) != total64 {
         return Err(DecodeError::BadLength);
     }
+    // CRC32C is the resync-gating checksum: verify it first. Only a body that passes
+    // CRC32C is then checked against the independent xxh3-64, so a corruption the CRC
+    // catches is always reported as BadBodyCrc, never BadXxh3.
     if crc32c::crc32c(body) != stored_body_crc {
         return Err(DecodeError::BadBodyCrc);
+    }
+    if flags.contains(RecordFlags::HAS_XXH3) {
+        let stored_xxh3 = read_u64(xxh3_bytes, 0);
+        if xxh3_64(body) != stored_xxh3 {
+            return Err(DecodeError::BadXxh3);
+        }
     }
 
     let view = RecordView {
@@ -369,6 +435,122 @@ mod tests {
         assert_eq!(decode(&buf), Err(DecodeError::BadBodyCrc));
     }
 
+    #[test]
+    fn sub_threshold_has_no_xxh3_field_or_flag() {
+        // A stored body one byte below the threshold keeps the exact pre-xxh3 layout:
+        // no HAS_XXH3 flag, and the frame is header + body + 8-byte trailer only.
+        let payload = vec![0xABu8; XXH3_PAYLOAD_THRESHOLD as usize - 1];
+        let rec = RecordView {
+            seq: Seq::new(3),
+            timestamp_ms: 9,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: &payload,
+        };
+        let mut buf = Vec::new();
+        let n = encode(&rec, &mut buf).unwrap();
+        assert_eq!(n, RECORD_HEADER_LEN + payload.len() + RECORD_TRAILER_LEN);
+        assert_eq!(buf.len(), n);
+        let (got, consumed) = decode(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert!(!got.flags.contains(RecordFlags::HAS_XXH3));
+        assert_eq!(got.payload, &payload[..]);
+        // decoded_len agrees with decode for the no-flag path.
+        assert_eq!(decoded_len(&buf).unwrap(), consumed);
+    }
+
+    #[test]
+    fn at_threshold_emits_xxh3_field_and_verifies() {
+        // A stored body exactly at the threshold sets the flag and adds the 8-byte field
+        // before the unchanged 8-byte trailer; decode verifies both checksums.
+        let payload = vec![0x5Au8; XXH3_PAYLOAD_THRESHOLD as usize];
+        let rec = RecordView {
+            seq: Seq::new(11),
+            timestamp_ms: 22,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: &payload,
+        };
+        let mut buf = Vec::new();
+        let n = encode(&rec, &mut buf).unwrap();
+        // header + body + xxh3(8) + trailer(8).
+        assert_eq!(
+            n,
+            RECORD_HEADER_LEN + payload.len() + RECORD_XXH3_LEN + RECORD_TRAILER_LEN
+        );
+        let (got, consumed) = decode(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert!(got.flags.contains(RecordFlags::HAS_XXH3));
+        assert_eq!(got.payload, &payload[..]);
+        // The streaming-length helper must agree on the larger frame too.
+        assert_eq!(decoded_len(&buf[..RECORD_HEADER_LEN]).unwrap(), consumed);
+    }
+
+    #[test]
+    fn over_threshold_body_corruption_is_caught() {
+        // Flip a body byte of an over-threshold record. CRC32C is verified first, so a
+        // body flip is reported as BadBodyCrc (CRC32C stays the resync-gating checksum).
+        let payload = vec![0x11u8; XXH3_PAYLOAD_THRESHOLD as usize + 64];
+        let rec = RecordView {
+            seq: Seq::new(1),
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: &payload,
+        };
+        let mut buf = Vec::new();
+        encode(&rec, &mut buf).unwrap();
+        buf[RECORD_HEADER_LEN + 5] ^= 0x01;
+        assert_eq!(decode(&buf), Err(DecodeError::BadBodyCrc));
+    }
+
+    #[test]
+    fn over_threshold_xxh3_field_corruption_is_caught() {
+        // Flip a byte inside the xxh3 field itself. The body still passes CRC32C, so the
+        // failure surfaces as the distinct BadXxh3 error.
+        let payload = vec![0x22u8; XXH3_PAYLOAD_THRESHOLD as usize];
+        let rec = RecordView {
+            seq: Seq::new(2),
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: &payload,
+        };
+        let mut buf = Vec::new();
+        encode(&rec, &mut buf).unwrap();
+        // The xxh3 field sits immediately before the 8-byte trailer.
+        let xxh3_at = buf.len() - RECORD_TRAILER_LEN - RECORD_XXH3_LEN;
+        buf[xxh3_at] ^= 0xff;
+        assert_eq!(decode(&buf), Err(DecodeError::BadXxh3));
+    }
+
+    #[test]
+    fn xxh3_field_byte_flip_via_proptest_style_full_sweep() {
+        // Flipping any single byte of the xxh3 field of an over-threshold record is caught
+        // as BadXxh3 (the body CRC and total_len are untouched).
+        let payload = vec![0x33u8; XXH3_PAYLOAD_THRESHOLD as usize];
+        let rec = RecordView {
+            seq: Seq::new(4),
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: &payload,
+        };
+        let mut base = Vec::new();
+        encode(&rec, &mut base).unwrap();
+        let xxh3_at = base.len() - RECORD_TRAILER_LEN - RECORD_XXH3_LEN;
+        for i in 0..RECORD_XXH3_LEN {
+            let mut buf = base.clone();
+            buf[xxh3_at + i] ^= 0x01;
+            assert_eq!(decode(&buf), Err(DecodeError::BadXxh3), "byte {i}");
+        }
+    }
+
     /// Builds a 36-byte header with the given fields and a valid header CRC, so a
     /// test can craft frames that pass the header-CRC check.
     fn build_header(key_len: u32, hdr_len: u32, payload_len: u32, flags: u8) -> Vec<u8> {
@@ -473,6 +655,14 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
+    // A payload length that straddles the xxh3 threshold: from a few bytes below it to a
+    // few bytes above, so generated records land on both sides of the flag boundary.
+    fn straddling_len() -> impl Strategy<Value = usize> {
+        let lo = XXH3_PAYLOAD_THRESHOLD as usize - 8;
+        let hi = XXH3_PAYLOAD_THRESHOLD as usize + 8;
+        lo..=hi
+    }
+
     proptest! {
         #[test]
         fn roundtrip(
@@ -530,6 +720,41 @@ mod proptests {
                         "a corrupted frame decoded to the original payload");
                 }
             }
+        }
+
+        #[test]
+        fn roundtrip_straddling_threshold(
+            seq in any::<u64>(),
+            ts in any::<u64>(),
+            len in straddling_len(),
+            byte in any::<u8>(),
+        ) {
+            // Records whose stored body straddles the threshold must round-trip, and the
+            // HAS_XXH3 flag must agree exactly with body length >= threshold.
+            let payload = vec![byte; len];
+            let rec = RecordView {
+                seq: Seq::new(seq), timestamp_ms: ts, flags: RecordFlags::EMPTY,
+                key: b"", headers: b"", payload: &payload,
+            };
+            let mut buf = Vec::new();
+            let n = encode(&rec, &mut buf).unwrap();
+            prop_assert_eq!(n, buf.len());
+            let want_xxh3 = len >= XXH3_PAYLOAD_THRESHOLD as usize;
+            let (got, consumed) = decode(&buf).unwrap();
+            prop_assert_eq!(consumed, buf.len());
+            prop_assert_eq!(got.flags.contains(RecordFlags::HAS_XXH3), want_xxh3);
+            prop_assert_eq!(got.payload, &payload[..]);
+            prop_assert_eq!(decoded_len(&buf[..RECORD_HEADER_LEN]).unwrap(), consumed);
+        }
+
+        #[test]
+        fn arbitrary_bytes_near_threshold_never_panic(
+            data in proptest::collection::vec(any::<u8>(), 0..(XXH3_PAYLOAD_THRESHOLD as usize + 64)),
+        ) {
+            // The decoder must never panic on untrusted input, including buffers sized
+            // around the xxh3 threshold; it returns a typed error or a valid view.
+            let _ = decode(&data);
+            let _ = decoded_len(&data);
         }
     }
 }
