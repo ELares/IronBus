@@ -586,15 +586,16 @@ mod tests {
     use ironbus_proto::message::{
         encode_dead_letter, encode_deliver, DeadLetterBody, DeliverBody, DEAD_LETTER_MAX_DELIVER,
     };
+    use ironbus_server::actor::{spawn_actor, DEFAULT_CHANNEL_BOUND};
     use ironbus_server::clock::SystemClock;
     use ironbus_server::engine::{
         DiskFullPolicy, Engine, EngineConfig, DEFAULT_GROUP_IDLE_EVICT_MS, DEFAULT_MAX_GROUPS,
     };
-    use ironbus_server::server::{serve, SharedEngine};
+    use ironbus_server::server::serve;
     use ironbus_storage::fs::InMemoryFs;
     use ironbus_storage::log::LogConfig;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn start_server() -> (
         std::net::SocketAddr,
@@ -649,13 +650,17 @@ mod tests {
             },
         )
         .unwrap();
-        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
+        // The engine is owned by the append actor (#177); the wire server reaches it through the
+        // handle. The actor join handle is detached (these client tests drive the broker only over the
+        // wire and never inspect the engine): when the server thread drops its handle on stop, the
+        // actor's channel disconnects and it drains and exits on its own.
+        let (handle_engine, _actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = std::thread::spawn({
             let shutdown = Arc::clone(&shutdown);
-            move || serve(&listener, &shared, &shutdown, 16).unwrap()
+            move || serve(&listener, &handle_engine, &shutdown, 16).unwrap()
         });
         (addr, shutdown, handle)
     }

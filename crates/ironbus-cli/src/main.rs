@@ -33,11 +33,13 @@ use ironbus_core::delivery::DeliveryConfig;
 #[cfg(unix)]
 use ironbus_core::lease::LeaseConfig;
 #[cfg(unix)]
+use ironbus_server::actor::{spawn_actor, DEFAULT_CHANNEL_BOUND};
+#[cfg(unix)]
 use ironbus_server::engine::{DiskFullPolicy, Engine, EngineConfig};
 #[cfg(unix)]
 use ironbus_server::health::serve_health;
 #[cfg(unix)]
-use ironbus_server::server::{serve, SharedEngine};
+use ironbus_server::server::serve;
 #[cfg(unix)]
 use ironbus_storage::dlq::{read_dlq_entries, DlqEntry};
 #[cfg(unix)]
@@ -55,7 +57,7 @@ use std::net::TcpListener;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 /// The default broker address: loopback only, so a zero-config broker is never exposed off
 /// the host without an explicit choice.
@@ -1230,7 +1232,12 @@ fn cmd_serve(
     // released by the OS when it drops on return (and unconditionally on process exit).
     dirlock::prepare_data_dir(data_dir).map_err(|e| map_dir_error(&e))?;
     let _dir_lock = dirlock::DirLock::acquire(data_dir).map_err(|e| map_dir_error(&e))?;
-    let shared = open_disk_engine(data_dir, config, key_shared_groups)?;
+    let engine = open_disk_engine(data_dir, config, key_shared_groups)?;
+    // The engine is owned by the append actor (#177); connection handlers and the health server reach
+    // it only through the bounded-channel handle, so no handler holds a lock across an fsync. The
+    // actor's join handle yields the engine back on its clean exit (a Shutdown drain), which is how
+    // the graceful-shutdown cursor flush (#195) completes before the process exits 0.
+    let (shared, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
     let listener = TcpListener::bind(addr)
         .map_err(|e| CliError::Internal(format!("cannot bind {addr}: {e}")))?;
     let local = listener
@@ -1292,7 +1299,7 @@ fn cmd_serve(
                 "ironbus health endpoints on {health_local} (/healthz, /readyz, /metrics)"
             )?;
         }
-        let engine = Arc::clone(&shared);
+        let engine = shared.clone();
         let shutdown = Arc::clone(&shutdown);
         let admin_enabled = config.enable_admin;
         Some(std::thread::spawn(move || {
@@ -1311,19 +1318,22 @@ fn cmd_serve(
         let _ = h.join();
     }
     result?;
-    // Graceful-shutdown cursor flush (#195): the serve loop has stopped accepting and every
-    // connection handler has been signalled to wind down. Force a final checkpoint of EVERY live
-    // work-group's committed cursor so a restart after this clean stop resumes past the acked
-    // messages rather than redelivering up to `--checkpoint-interval` of them. A long-lived
-    // consumer still connected at the signal does not get to run its own close-path flush (its
-    // handler thread is detached, not joined), so this server-side flush is what makes the clean
-    // stop non-redelivering. It runs on a normal serve exit only; a serve error returned above.
-    {
-        let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
-        guard
-            .checkpoint_all_groups()
-            .map_err(|e| CliError::Internal(format!("flushing cursors on shutdown: {e}")))?;
-    }
+    // Graceful-shutdown drain (#195): the serve loop has stopped accepting and every connection
+    // handler has been signalled to wind down. Ask the append actor to flush its pending produce
+    // batch (the one covering fsync) and force a final checkpoint of EVERY live work-group's
+    // committed cursor, so a restart after this clean stop resumes past the acked messages rather
+    // than redelivering up to `--checkpoint-interval` of them AND no acked-but-not-durable record is
+    // lost. A long-lived consumer still connected at the signal does not get to run its own
+    // close-path flush (its handler thread is detached, not joined), so this actor-side drain is what
+    // makes the clean stop non-redelivering. It runs on a normal serve exit only; a serve error
+    // returned above. Dropping our handle plus the shutdown command disconnects the actor's channel,
+    // so it exits and the join completes.
+    let drain = shared
+        .shutdown()
+        .map_err(|_| CliError::Internal("the append actor exited before shutdown".to_string()))?;
+    drain.map_err(|e| CliError::Internal(format!("flushing cursors on shutdown: {e}")))?;
+    drop(shared);
+    let _ = actor.join();
     Ok(())
 }
 
@@ -1394,7 +1404,7 @@ fn open_disk_engine(
     data_dir: &Path,
     config: &ServeConfig,
     key_shared_groups: &[String],
-) -> Result<SharedEngine<StdFs, SystemClock>, CliError> {
+) -> Result<Engine<StdFs, SystemClock>, CliError> {
     std::fs::create_dir_all(data_dir)
         .map_err(|e| CliError::Internal(format!("cannot create {}: {e}", data_dir.display())))?;
     let fs = StdFs::new(data_dir.to_path_buf());
@@ -1468,7 +1478,7 @@ fn open_disk_engine(
     // Declare the key_shared groups (#64) server-side: a configured group enters key_shared mode
     // when a consumer first subscribes. An empty slice is a no-op, so every group stays competing.
     engine.set_configured_key_shared_groups(key_shared_groups.iter().cloned());
-    Ok(Arc::new(Mutex::new(engine)))
+    Ok(engine)
 }
 
 /// The default number of records `peek` shows when `--limit` is not given.
@@ -1829,15 +1839,56 @@ mod tests {
     use ironbus_core::lease::LeaseConfig;
     #[cfg(unix)]
     use ironbus_core::types::RecordFlags;
+    use ironbus_server::actor::{spawn_actor, DEFAULT_CHANNEL_BOUND};
     use ironbus_server::engine::{DiskFullPolicy, Engine, EngineConfig};
-    use ironbus_server::server::{serve, SharedEngine};
+    use ironbus_server::server::serve;
     use ironbus_storage::fs::InMemoryFs;
     #[cfg(unix)]
     use ironbus_storage::log::Append;
     use ironbus_storage::log::LogConfig;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+
+    /// Spawns the append actor over `engine` and a wire server bound to an ephemeral port, returning
+    /// the address, the shutdown flag, the server join handle, and the actor join handle (so the test
+    /// can recover the engine after a clean stop). The actor owns the engine; the server reaches it
+    /// through the handle.
+    #[allow(clippy::type_complexity)]
+    fn serve_engine<F, C>(
+        engine: Engine<F, C>,
+        max_connections: usize,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        std::thread::JoinHandle<Engine<F, C>>,
+    )
+    where
+        F: ironbus_storage::fs::Filesystem + 'static,
+        C: ironbus_core::clock::Clock + Clone + 'static,
+    {
+        let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            move || serve(&listener, &handle, &shutdown, max_connections).unwrap()
+        });
+        (addr, shutdown, server, actor)
+    }
+
+    /// Recovers the engine from the actor after the server has been stopped: the server thread has
+    /// already dropped its handle, so an explicit shutdown drains the actor and the join yields the
+    /// owned engine.
+    fn recover_engine<F, C>(actor: std::thread::JoinHandle<Engine<F, C>>) -> Engine<F, C>
+    where
+        F: ironbus_storage::fs::Filesystem + 'static,
+        C: ironbus_core::clock::Clock + Clone + 'static,
+    {
+        actor.join().unwrap()
+    }
 
     /// A [`ServeConfig`] for a disk-engine test: the given in-flight window and checkpoint
     /// interval, every other knob the production default (retention and the total cap both off).
@@ -1871,12 +1922,11 @@ mod tests {
     fn make_data_dir(tag: &str, n: usize) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("ironbus-cli-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let shared = open_disk_engine(&dir, &test_serve_config(64, 1), &[]).unwrap();
-        {
-            let mut g = shared.lock().unwrap();
-            for i in 0..n {
-                let payload = format!("msg-{i}");
-                g.produce(&Append {
+        let mut engine = open_disk_engine(&dir, &test_serve_config(64, 1), &[]).unwrap();
+        for i in 0..n {
+            let payload = format!("msg-{i}");
+            engine
+                .produce(&Append {
                     timestamp_ms: 100 + u64::try_from(i).unwrap(),
                     flags: RecordFlags::EMPTY,
                     key: b"k",
@@ -1884,9 +1934,8 @@ mod tests {
                     payload: payload.as_bytes(),
                 })
                 .unwrap();
-            }
         }
-        drop(shared);
+        drop(engine);
         dir
     }
 
@@ -2220,14 +2269,10 @@ mod tests {
             },
         )
         .unwrap();
-        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let handle = std::thread::spawn({
-            let shutdown = Arc::clone(&shutdown);
-            move || serve(&listener, &shared, &shutdown, 16).unwrap()
-        });
+        // The actor join handle is detached here (these wire-only tests do not inspect the engine):
+        // when the server thread drops its handle on stop, the actor's channel disconnects and it
+        // drains and exits on its own.
+        let (addr, shutdown, handle, _actor) = serve_engine(engine, 16);
         (addr, shutdown, handle)
     }
 
@@ -3603,15 +3648,7 @@ mod tests {
             },
         )
         .unwrap();
-        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let handle = std::thread::spawn({
-            let shutdown = Arc::clone(&shutdown);
-            let shared = Arc::clone(&shared);
-            move || serve(&listener, &shared, &shutdown, 16).unwrap()
-        });
+        let (addr, shutdown, handle, actor) = serve_engine(engine, 16);
         let a = addr.to_string();
 
         cmd_pub(&a, b"", b"poison", &mut Vec::new()).unwrap();
@@ -3636,18 +3673,16 @@ mod tests {
              (#63); it is not redelivered"
         );
 
-        // The engine recorded the drop and its offset (the resilience signal).
-        {
-            let g = shared.lock().unwrap();
-            assert_eq!(g.counters().dead_lettered, 1, "exactly one dead-letter");
-            assert!(
-                g.last_dead_lettered_offset().is_some_and(|o| o.get() == 0),
-                "the dead-lettered offset is reported"
-            );
-        }
-
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
+        // The engine recorded the drop and its offset (the resilience signal). Recover it from the
+        // actor after the clean stop and inspect it directly.
+        let g = recover_engine(actor);
+        assert_eq!(g.counters().dead_lettered, 1, "exactly one dead-letter");
+        assert!(
+            g.last_dead_lettered_offset().is_some_and(|o| o.get() == 0),
+            "the dead-lettered offset is reported"
+        );
     }
 
     #[test]
@@ -3675,15 +3710,7 @@ mod tests {
             },
         )
         .unwrap();
-        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let handle = std::thread::spawn({
-            let shutdown = Arc::clone(&shutdown);
-            let shared = Arc::clone(&shared);
-            move || serve(&listener, &shared, &shutdown, 16).unwrap()
-        });
+        let (addr, shutdown, handle, _actor) = serve_engine(engine, 16);
         let a = addr.to_string();
 
         for (i, payload) in [&b"a"[..], b"b", b"c", b"d"].into_iter().enumerate() {
@@ -3740,14 +3767,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ironbus-cli-it-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let shared = open_disk_engine(&dir, &test_serve_config(64, 1), &[]).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let handle = std::thread::spawn({
-            let shutdown = Arc::clone(&shutdown);
-            move || serve(&listener, &shared, &shutdown, 16).unwrap()
-        });
+        let engine = open_disk_engine(&dir, &test_serve_config(64, 1), &[]).unwrap();
+        let (addr, shutdown, handle, actor) = serve_engine(engine, 16);
 
         let a = addr.to_string();
         let mut published = Vec::new();
@@ -3762,19 +3783,17 @@ mod tests {
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
+        // Recover and DROP the engine before reopening the same dir, so the actor has drained every
+        // queued checkpoint (the ack at checkpoint_interval = 1 and the close-path flush) and the
+        // StdFs file handles are released. This makes the restart deterministic.
+        drop(recover_engine(actor));
 
-        // Restart: reopen the SAME data dir. With checkpoint_interval = 1, the server
-        // persisted the committed cursor synchronously when it acked offset 0, so a clean
-        // restart RESUMES past the acked message (it does not redeliver), and the durable log
-        // continues at offset 1 rather than overwriting offset 0.
+        // Restart: reopen the SAME data dir. With checkpoint_interval = 1, the server persisted the
+        // committed cursor when it acked offset 0, so a clean restart RESUMES past the acked message
+        // (it does not redeliver), and the durable log continues at offset 1 rather than overwriting
+        // offset 0.
         let reopened = open_disk_engine(&dir, &test_serve_config(64, 1), &[]).unwrap();
-        let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr2 = listener2.local_addr().unwrap();
-        let shutdown2 = Arc::new(AtomicBool::new(false));
-        let handle2 = std::thread::spawn({
-            let shutdown2 = Arc::clone(&shutdown2);
-            move || serve(&listener2, &reopened, &shutdown2, 16).unwrap()
-        });
+        let (addr2, shutdown2, handle2, actor2) = serve_engine(reopened, 16);
         let a2 = addr2.to_string();
 
         let mut after_restart = Vec::new();
@@ -3795,6 +3814,7 @@ mod tests {
 
         shutdown2.store(true, Ordering::Release);
         handle2.join().unwrap();
+        drop(recover_engine(actor2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3808,14 +3828,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ironbus-cli-restart-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let shared = open_disk_engine(&dir, &test_serve_config(64, 1), &[]).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let handle = std::thread::spawn({
-            let shutdown = Arc::clone(&shutdown);
-            move || serve(&listener, &shared, &shutdown, 16).unwrap()
-        });
+        let engine = open_disk_engine(&dir, &test_serve_config(64, 1), &[]).unwrap();
+        let (addr, shutdown, handle, actor) = serve_engine(engine, 16);
         let a = addr.to_string();
         for (i, payload) in [&b"m0"[..], b"m1", b"m2"].into_iter().enumerate() {
             let mut out = Vec::new();
@@ -3834,16 +3848,12 @@ mod tests {
         assert!(acked.contains("ack committed"), "committed: {acked}");
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
+        // Drain the actor and release the StdFs handles before reopening the same dir.
+        drop(recover_engine(actor));
 
         // Restart on the same dir: only the uncommitted tail (offsets 1 and 2) redelivers.
         let reopened = open_disk_engine(&dir, &test_serve_config(64, 1), &[]).unwrap();
-        let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr2 = listener2.local_addr().unwrap();
-        let shutdown2 = Arc::new(AtomicBool::new(false));
-        let handle2 = std::thread::spawn({
-            let shutdown2 = Arc::clone(&shutdown2);
-            move || serve(&listener2, &reopened, &shutdown2, 16).unwrap()
-        });
+        let (addr2, shutdown2, handle2, actor2) = serve_engine(reopened, 16);
         let a2 = addr2.to_string();
         let mut tail = Vec::new();
         cmd_sub(&a2, "", 10, Disposition::Peek, &mut tail).unwrap();
@@ -3863,6 +3873,7 @@ mod tests {
 
         shutdown2.store(true, Ordering::Release);
         handle2.join().unwrap();
+        drop(recover_engine(actor2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

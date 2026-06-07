@@ -13,7 +13,7 @@ use crate::fs::Filesystem;
 use crate::io::RandomAccessFile;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 /// A shared handle for arming and disarming injected faults. Cloning shares the same state,
 /// so a test can keep a handle while the [`FaultFs`] is moved into the engine under test.
@@ -28,6 +28,39 @@ pub struct FaultControl {
     /// disables it. The model never returns zero bytes while data remains (that would be a
     /// spurious EOF, not a short read), so the limit must be at least 1 to take effect.
     short_read_limit: Arc<AtomicU64>,
+    /// A sync gate (#177): while CLOSED, every `sync_data`/`sync_all` BLOCKS until the gate is
+    /// opened, modelling a stalled or degraded disk whose `fdatasync` hangs. Distinct from
+    /// `fail_sync` (which returns an error): the gate STALLS the syncing thread without erroring, so
+    /// a test can prove a stalled produce fsync on one producer does not block other connections'
+    /// pings/acks (the actor + group-commit head-of-line removal), then release it and watch the
+    /// produce complete. A waiter on the gate uses a condvar (no wall-clock sleep), so the test is
+    /// deterministic.
+    sync_gate: Arc<SyncGate>,
+    /// A monotonic count of every `sync_data`/`sync_all` that ran (whether or not it was gated or
+    /// failed), so a test can assert a batch of concurrent produces issued exactly ONE `fdatasync`
+    /// (group commit), not N.
+    sync_count: Arc<AtomicU64>,
+}
+
+/// A condvar-backed gate the sync path waits on while closed (#177): `open` starts open (syncs pass),
+/// `close` makes the next sync block until `open` is called again. A blocked sync also signals it has
+/// ENTERED the gate (so a test can wait for the producer to be parked mid-fsync before proving other
+/// connections still make progress), all without a wall-clock sleep.
+#[derive(Debug)]
+struct SyncGate {
+    /// `(open, entered_count)`: `open` is whether a waiting sync may proceed; `entered_count` counts
+    /// how many syncs have reached the gate while it was closed (for a test to await arrival).
+    state: Mutex<(bool, u64)>,
+    cv: Condvar,
+}
+
+impl Default for SyncGate {
+    fn default() -> Self {
+        SyncGate {
+            state: Mutex::new((true, 0)),
+            cv: Condvar::new(),
+        }
+    }
 }
 
 impl FaultControl {
@@ -64,6 +97,82 @@ impl FaultControl {
     pub fn arm_torn_write(&self, prefix_len: u64) {
         self.torn_write_prefix.store(prefix_len, Ordering::SeqCst);
         self.torn_write_armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Closes the sync gate (#177): the NEXT `sync_data`/`sync_all` blocks until [`open_sync_gate`]
+    /// is called, modelling a stalled disk whose `fdatasync` hangs. Already-passed syncs are
+    /// unaffected; only syncs that reach the gate while it is closed park.
+    ///
+    /// [`open_sync_gate`]: FaultControl::open_sync_gate
+    pub fn close_sync_gate(&self) {
+        let mut state = self
+            .sync_gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.0 = false;
+    }
+
+    /// Opens the sync gate, releasing any parked sync and letting later syncs pass straight through.
+    pub fn open_sync_gate(&self) {
+        let mut state = self
+            .sync_gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.0 = true;
+        self.sync_gate.cv.notify_all();
+    }
+
+    /// Blocks (on the condvar, no wall-clock sleep) until at least `n` syncs have ENTERED the closed
+    /// gate, so a test can deterministically wait for a producer to be parked mid-fsync before
+    /// asserting other connections still make progress. Returns immediately if already reached.
+    pub fn wait_for_sync_gate_entered(&self, n: u64) {
+        let mut state = self
+            .sync_gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.1 < n {
+            state = self
+                .sync_gate
+                .cv
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// The number of `sync_data`/`sync_all` calls that have run, so a test can assert a batch of
+    /// concurrent produces issued exactly ONE `fdatasync` (group commit), not one per produce.
+    #[must_use]
+    pub fn sync_count(&self) -> u64 {
+        self.sync_count.load(Ordering::SeqCst)
+    }
+
+    /// Records that a sync ran and, if the gate is closed, parks the calling thread on the condvar
+    /// until the gate is opened. The entered-count is bumped (and waiters notified) when a sync
+    /// parks, so [`wait_for_sync_gate_entered`] can observe the stall. No wall-clock sleep.
+    ///
+    /// [`wait_for_sync_gate_entered`]: FaultControl::wait_for_sync_gate_entered
+    fn enter_sync_gate(&self) {
+        self.sync_count.fetch_add(1, Ordering::SeqCst);
+        let mut state = self
+            .sync_gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.0 {
+            // Mark arrival and wake any test waiting for the producer to be parked mid-fsync.
+            state.1 = state.1.saturating_add(1);
+            self.sync_gate.cv.notify_all();
+            while !state.0 {
+                state = self
+                    .sync_gate
+                    .cv
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
     }
 
     fn sync_should_fail(&self) -> bool {
@@ -224,6 +333,9 @@ impl<F: RandomAccessFile> RandomAccessFile for FaultFile<F> {
     }
 
     fn sync_data(&self) -> io::Result<()> {
+        // Count the sync and, if the gate is closed, park here until it opens (the stalled-disk model,
+        // #177). Done BEFORE the fail check so a test can either stall a sync (gate) or fail it.
+        self.control.enter_sync_gate();
         if self.control.sync_should_fail() {
             return Err(injected_sync_error());
         }
@@ -231,6 +343,7 @@ impl<F: RandomAccessFile> RandomAccessFile for FaultFile<F> {
     }
 
     fn sync_all(&self) -> io::Result<()> {
+        self.control.enter_sync_gate();
         if self.control.sync_should_fail() {
             return Err(injected_sync_error());
         }
@@ -423,6 +536,56 @@ mod tests {
         );
         assert_eq!(f.read_at(&mut buf, 0).unwrap(), 2);
         assert_eq!(&buf[..2], b"ab");
+    }
+
+    #[test]
+    fn the_sync_gate_stalls_a_sync_until_opened_and_counts_syncs() {
+        // The sync gate (#177): while closed, a sync parks (no error, no wall-clock sleep) until the
+        // gate opens; the sync count tracks every sync so a test can prove group commit issues ONE.
+        let (fs, control) = faulted();
+        let f = fs.create_new("seg").unwrap();
+        f.write_all_at(b"x", 0).unwrap();
+        // Two un-gated syncs pass and are counted.
+        f.sync_data().unwrap();
+        f.sync_all().unwrap();
+        assert_eq!(control.sync_count(), 2, "both syncs counted");
+
+        // Close the gate, run a sync on another thread: it parks (entered the gate) but does not
+        // return until we open the gate. We wait for arrival on the condvar (no sleep), assert it is
+        // still parked, then open and join.
+        control.close_sync_gate();
+        let control2 = control.clone();
+        let syncing = std::thread::spawn(move || {
+            // The file handle is reopened in the thread so it is Send-safe; same inner file.
+            let f = control2_open(&control2);
+            f.sync_data().unwrap();
+        });
+        // Wait until the producer thread is parked inside the closed gate.
+        control.wait_for_sync_gate_entered(1);
+        assert!(
+            !syncing.is_finished(),
+            "the sync is parked on the closed gate, not returned"
+        );
+        assert_eq!(control.sync_count(), 3, "the parked sync was still counted");
+        // Open the gate: the parked sync proceeds and the thread joins.
+        control.open_sync_gate();
+        syncing.join().unwrap();
+    }
+
+    /// Opens the same `seg` file through a fresh `FaultFs` sharing the test's `FaultControl`, so a
+    /// spawned thread has a `Send` handle to sync on. The control is shared, so the gate and counter
+    /// are the same ones the test arms.
+    fn control2_open(control: &FaultControl) -> FaultFile<<InMemoryFs as Filesystem>::File> {
+        // The inner InMemoryFs is not directly reachable here, so the test wires a dedicated helper:
+        // a FaultFile over a throwaway in-memory file that still shares the control's gate/counter.
+        // The gate and counter live in the shared FaultControl, not the file, so any FaultFile under
+        // this control observes them.
+        let inner = InMemoryFs::new();
+        let file = inner.create_new("seg").unwrap();
+        FaultFile {
+            inner: file,
+            control: control.clone(),
+        }
     }
 
     #[test]

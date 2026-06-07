@@ -1343,10 +1343,28 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// nothing is appended and `produced` / `produced_bytes` do not move. Under `DropOldest` this
     /// rejection only happens in the wedge-guard fall-back (only the active segment remains).
     pub fn produce(&mut self, message: &Append<'_>) -> Result<Offset, EngineError> {
-        // Time the WHOLE durable append (append + fsync) for the registry's append-latency
-        // histogram (#97), via the clock seam so the deterministic sim stays reproducible. Read the
-        // start before the append; on a shed/error it is simply unused.
-        let append_started = self.log.now_monotonic();
+        // A single produce is exactly a one-message group commit: append (no sync), then the one
+        // durability barrier that covers it, then the post-sync bookkeeping. The append-actor's
+        // group-commit path (#177) calls the same two primitives but amortizes ONE `commit_batch`
+        // over a drained batch of appends, so this stays the single source of truth for both.
+        let offset = self.append_no_sync(message)?;
+        self.commit_batch()?;
+        Ok(offset)
+    }
+
+    /// Appends `message` durably-pending (write, NO fsync) and records the produce statistics that
+    /// do not depend on the sync, returning its assigned offset. The record is NOT yet durable and
+    /// NOT yet visible to readers (the flushed head only advances in [`Engine::commit_batch`]); the
+    /// caller MUST follow one or more `append_no_sync` calls with exactly one [`Engine::commit_batch`]
+    /// before acking any of them, so the ack-implies-durable invariant (I2) holds. This is the write
+    /// half of group commit (#177): the append actor drains a batch of pending appends through here,
+    /// then issues ONE `commit_batch` covering them all.
+    ///
+    /// # Errors
+    /// As [`Engine::produce`]: a drop-new shed surfaces the non-fatal [`StorageError::AtCapacity`]
+    /// (and increments `produce_rejected`); any other storage error propagates. Nothing is written
+    /// and no statistic moves on an error.
+    pub fn append_no_sync(&mut self, message: &Append<'_>) -> Result<Offset, EngineError> {
         let offset = match self.append_with_policy(message) {
             Ok(offset) => offset,
             Err(e) => {
@@ -1360,18 +1378,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 return Err(EngineError::Storage(e));
             }
         };
-        // Time the durability barrier itself (the fsync), via the clock seam so the
-        // deterministic sim stays reproducible (logical time does not advance in-memory).
-        let started = self.log.now_monotonic();
-        self.log.sync()?;
-        let fsync_nanos = self.log.now_monotonic().saturating_sub(started);
-        self.fsync.observe(fsync_nanos);
-        // Mirror the fsync into the registry's fixed-bucket `ironbus_fsync_duration_seconds`, record
-        // the whole-append latency, and advance the durable head so every consumer's lag (head minus
-        // its commit floor) rises (#97). All three are O(1) and allocation-free.
-        self.registry.observe_fsync_nanos(fsync_nanos);
-        self.registry
-            .observe_append_nanos(self.log.now_monotonic().saturating_sub(append_started));
+        // The record bytes are counted at append time (the bytes are committed to the active
+        // segment), but the durable head and the fsync histogram advance only in `commit_batch`.
         self.registry.record_appended();
         self.counters.produced += 1;
         let bytes = message.key.len() + message.headers.len() + message.payload.len();
@@ -1379,21 +1387,50 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .counters
             .produced_bytes
             .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
-        // Consumer-safe retention (refs #13, #80): after the record is durable, reclaim disk by the size, age, or count bound,
-        // by deleting whole old SEALED segments while the log is over the retention bound, but
-        // never one any consumer still needs. Run on the produce path so space is freed exactly as
-        // the log grows; it is a no-op unless the bound is set. The protect floor is the MINIMUM
-        // committed offset across every group, so the slowest group's records are never reaped.
+        Ok(offset)
+    }
+
+    /// Issues the SINGLE durability barrier (`fdatasync`) that makes every record appended since the
+    /// last commit durable, advances the flushed head so those records become visible to readers, and
+    /// runs the once-per-batch post-sync bookkeeping (the fsync histogram, retention reap, idle-group
+    /// sweep). This is the sync half of group commit (#177): one `commit_batch` amortizes the fsync
+    /// over a whole drained batch of [`Engine::append_no_sync`] calls, which is what removes the
+    /// per-produce fsync and the head-of-line block. It is a cheap no-op fsync when nothing is pending.
+    ///
+    /// After this returns `Ok`, every record appended since the previous commit is durable, so the
+    /// append actor may ack the whole batch (the covering fsync has completed): I2 is preserved.
+    ///
+    /// # Errors
+    /// Propagates a storage error from the sync (a failed durability barrier freezes the writer, the
+    /// fatal `WriterFrozen`), the retention reap, or the idle-group sweep.
+    pub fn commit_batch(&mut self) -> Result<(), EngineError> {
+        // Time the durability barrier itself (the fsync), via the clock seam so the deterministic
+        // sim stays reproducible (logical time does not advance in-memory).
+        let started = self.log.now_monotonic();
+        self.log.sync()?;
+        let fsync_nanos = self.log.now_monotonic().saturating_sub(started);
+        self.fsync.observe(fsync_nanos);
+        // Mirror the one fsync into the registry's fixed-bucket `ironbus_fsync_duration_seconds`, then
+        // record the same barrier as the append latency for the batch (the whole-append latency the
+        // pre-group-commit code measured per message; with group commit one fsync covers the batch,
+        // so the barrier is the shared durable-append cost). Both are O(1) and allocation-free.
+        self.registry.observe_fsync_nanos(fsync_nanos);
+        self.registry.observe_append_nanos(fsync_nanos);
+        // Consumer-safe retention (refs #13, #80): after the records are durable, reclaim disk by the
+        // size, age, or count bound, by deleting whole old SEALED segments while the log is over the
+        // retention bound, but never one any consumer still needs. Run once per group commit so space
+        // is freed as the log grows; it is a no-op unless a bound is set. The protect floor is the
+        // MINIMUM committed offset across every group, so the slowest group's records are never reaped.
         self.reap_for_retention()?;
         // Idle named-group eviction sweep (#277): the produce seam is the second deterministic tick
         // (the poll seam is the first), so a broker that produces but is not being polled still
         // reclaims idle groups against the clock seam. The sweep is a no-op when the window is
         // disabled (`group_idle_evict_ms == 0`). A produce ADVANCES the head, so any group that was
         // caught up is now behind and (correctly) not evictable until it catches up again; the sweep
-        // here therefore reclaims only groups that were already idle AND caught up before this append.
+        // here therefore reclaims only groups that were already idle AND caught up before this batch.
         let now = self.log.now_monotonic();
         self.sweep_idle_groups(now)?;
-        Ok(offset)
+        Ok(())
     }
 
     /// Appends `message` honoring the disk-full overflow policy (#82), returning the storage-level

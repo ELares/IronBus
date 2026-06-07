@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! IronBus broker server.
 
+pub mod actor;
 pub mod clock;
 pub mod engine;
 pub mod health;
