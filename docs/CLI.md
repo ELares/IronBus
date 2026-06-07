@@ -94,6 +94,61 @@ broker opens.
 - `--visibility-timeout-ms` must be at least 1.
 - `--disk-full-policy` must be `drop-new` or `drop-oldest`.
 
+### Environment-variable mapping and precedence (#89)
+
+Every `serve` setting can also be supplied via an environment variable, so the same key
+surface works as a foreground binary, a systemd unit, or a container with no config file.
+The variable name is `IRONBUS_<FLAG>`: the flag name minus its leading `--`, uppercased,
+with each `-` replaced by `_`. The **precedence is flag > env > default**: an explicit
+command-line flag overrides the env var, which overrides the compiled default.
+
+| Flag | Environment variable |
+|------|----------------------|
+| `--addr` | `IRONBUS_ADDR` |
+| `--data-dir` | `IRONBUS_DATA_DIR` |
+| `--max-connections` | `IRONBUS_MAX_CONNECTIONS` |
+| `--checkpoint-interval` | `IRONBUS_CHECKPOINT_INTERVAL` |
+| `--max-deliver` | `IRONBUS_MAX_DELIVER` |
+| `--allow-unlimited-deliver` | `IRONBUS_ALLOW_UNLIMITED_DELIVER` (`true`/`1` or `false`/`0`) |
+| `--backoff-ms` | `IRONBUS_BACKOFF_MS` (comma-separated, e.g. `100,500,2000`) |
+| `--max-in-flight` | `IRONBUS_MAX_IN_FLIGHT` |
+| `--consumer-credit` | `IRONBUS_CONSUMER_CREDIT` |
+| `--consumer-credit-bytes` | `IRONBUS_CONSUMER_CREDIT_BYTES` |
+| `--max-segment-bytes` | `IRONBUS_MAX_SEGMENT_BYTES` |
+| `--max-total-bytes` | `IRONBUS_MAX_TOTAL_BYTES` |
+| `--max-retained-bytes` | `IRONBUS_MAX_RETAINED_BYTES` |
+| `--max-age-ms` | `IRONBUS_MAX_AGE_MS` |
+| `--max-messages` | `IRONBUS_MAX_MESSAGES` |
+| `--max-groups` | `IRONBUS_MAX_GROUPS` |
+| `--group-idle-evict-ms` | `IRONBUS_GROUP_IDLE_EVICT_MS` |
+| `--disk-full-policy` | `IRONBUS_DISK_FULL_POLICY` |
+| `--visibility-timeout-ms` | `IRONBUS_VISIBILITY_TIMEOUT_MS` |
+| `--health-addr` | `IRONBUS_HEALTH_ADDR` |
+| `--enable-admin` | `IRONBUS_ENABLE_ADMIN` (`true`/`1` or `false`/`0`) |
+
+A bad env value (e.g. non-numeric where a number is expected, or an unknown
+`IRONBUS_DISK_FULL_POLICY`) is a usage error (exit 1) that **names the env var**, exactly
+as a bad flag value names the flag. The repeatable `--key-shared-group` is command-line
+only (no single-var mapping, since a list with a per-group meaning does not flatten to one
+scalar). The broader TOML config file, profiles, and hot reload are SEPARATE follow-ups
+(#85/#87/#88) and not yet implemented.
+
+### `serve` data_dir lifecycle and the single-broker lock (#89)
+
+On `serve`, before the broker opens:
+
+- The `--data-dir` is **created (parents too, mode `0700`) if absent**, so a freshly
+  flashed device provisions its queue with no manual `mkdir`.
+- A path that **exists but is not a directory** (e.g. a regular file) is a usage error
+  (exit 1) naming the path.
+- The directory is **probe-write-and-fsync verified writable**; a read-only or unwritable
+  mount is a fatal error (exit 70) naming the path, rather than a silent loss of durability.
+- `serve` then takes an **exclusive advisory lock** (`flock(LOCK_EX|LOCK_NB)`) on a `LOCK`
+  file in the data dir. A second `serve` on the SAME data dir **fails fast** (exit 70,
+  "another ironbus broker is already running on `<dir>`") instead of opening a second writer
+  to the one log, which would interleave appends and corrupt it. The lock is released by the
+  OS when the process exits (clean shutdown or crash), so it never goes stale.
+
 ### `serve` output
 
 On a successful bind it prints (to stdout):
