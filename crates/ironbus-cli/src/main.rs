@@ -194,7 +194,7 @@ USAGE:
                   [--max-groups <n>] [--group-idle-evict-ms <ms>]
                   [--disk-full-policy <drop-new|drop-oldest>]
                   [--key-shared-group <name>]...
-                  [--visibility-timeout-ms <n>] [--health-addr <host:port>]
+                  [--visibility-timeout-ms <n>] [--health-addr <host:port>] [--enable-admin]
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
     ironbus sub   [--addr <host:port>] [--group <name>] [--max <n>]
                   [--ack | --nack [--delay-ms <n>] | --term]
@@ -243,6 +243,11 @@ Notes:
     key_shared ordering: a record's key routes to one live member, so same-key records keep their
     order while the group drains in parallel across keys. A group not named here stays plain
     competing distribution (the default), unaffected.
+    --enable-admin (default off) turns on the read-only /admin introspection endpoint on the health
+    server (so it needs --health-addr): a JSON snapshot of broker counters, per-group lag/in-flight,
+    DLQ state, and the effective config bounds, for debugging. It is READ-ONLY (GET only, no path
+    mutates state) and UNAUTHENTICATED, sharing /metrics's trust model, so run it only on loopback or
+    a trusted network. Off, /admin is a 404 like any unknown path.
     pub reads the payload from the argument, or from stdin if omitted (an empty input
     publishes an empty message, which is a valid record).
     sub prints one line per message; at most one disposition applies to the batch:
@@ -709,6 +714,7 @@ fn parse_serve_flags(args: &[String]) -> Result<ParsedServe, CliError> {
     let mut group_idle_evict_ms = DEFAULT_GROUP_IDLE_EVICT_MS;
     let mut disk_full_policy_arg = DEFAULT_DISK_FULL_POLICY.to_string();
     let mut visibility_ms = DEFAULT_VISIBILITY_MS;
+    let mut enable_admin = false;
     let mut health_addr: Option<String> = None;
     // The groups to run in key_shared ordering (#64), via the repeatable --key-shared-group flag.
     let mut key_shared_groups: Vec<String> = Vec::new();
@@ -762,6 +768,11 @@ fn parse_serve_flags(args: &[String]) -> Result<ParsedServe, CliError> {
                 visibility_ms = take_number("--visibility-timeout-ms", args, &mut i)?;
             }
             "--health-addr" => health_addr = Some(take_value("--health-addr", args, &mut i)?),
+            // A bare boolean flag (no value): advance ONE token, not two, or the loop spins.
+            "--enable-admin" => {
+                enable_admin = true;
+                i += 1;
+            }
             flag if flag.starts_with("--") => {
                 return Err(CliError::Usage(format!("unknown flag `{flag}` for serve")))
             }
@@ -798,6 +809,7 @@ fn parse_serve_flags(args: &[String]) -> Result<ParsedServe, CliError> {
             group_idle_evict_ms,
             disk_full_policy,
             visibility_ms,
+            enable_admin,
         },
         key_shared_groups,
         health_addr,
@@ -940,6 +952,13 @@ struct ServeConfig {
     /// when `max_total_bytes` is set; with no cap, no produce is ever over-cap.
     disk_full_policy: DiskFullPolicyArg,
     visibility_ms: u64,
+    /// Enable the OPT-IN read-only `/admin` introspection endpoint on the health server (#99). OFF
+    /// by default: only with `--enable-admin` (and only when `--health-addr` is set) does `/admin`
+    /// serve a JSON operational snapshot; otherwise it is a 404 like any unknown path. It is
+    /// READ-ONLY and UNAUTHENTICATED, sharing `/metrics`'s trust model (loopback or a trusted
+    /// network, the #105/#107 threat model), so it must run only where `/metrics` is already
+    /// trusted. It exposes no mutating action and no secret material.
+    enable_admin: bool,
 }
 
 #[cfg(unix)]
@@ -982,6 +1001,16 @@ fn cmd_serve(
     let shutdown = Arc::new(AtomicBool::new(false));
     install_signal_handler(&shutdown)?;
 
+    // The opt-in read-only `/admin` introspection endpoint (#99) needs the health server, which
+    // only runs when `--health-addr` is set. A `--enable-admin` with no health address can never
+    // take effect, so warn loudly rather than silently no-op.
+    if config.enable_admin && health_addr.is_none() {
+        writeln!(
+            out,
+            "WARN: --enable-admin has no effect without --health-addr (the /admin endpoint is \
+             served by the health server)"
+        )?;
+    }
     // Optionally start the health endpoints on their own loopback HTTP port.
     let health_handle = if let Some(haddr) = health_addr {
         let health_listener = TcpListener::bind(haddr)
@@ -989,14 +1018,25 @@ fn cmd_serve(
         let health_local = health_listener
             .local_addr()
             .map_err(|e| CliError::Internal(format!("cannot read health address: {e}")))?;
-        writeln!(
-            out,
-            "ironbus health endpoints on {health_local} (/healthz, /readyz, /metrics)"
-        )?;
+        // The admin route is only advertised when opted in, so the default startup line is
+        // unchanged for an operator who has not enabled it.
+        if config.enable_admin {
+            writeln!(
+                out,
+                "ironbus health endpoints on {health_local} (/healthz, /readyz, /metrics, \
+                 /admin [read-only, unauthenticated])"
+            )?;
+        } else {
+            writeln!(
+                out,
+                "ironbus health endpoints on {health_local} (/healthz, /readyz, /metrics)"
+            )?;
+        }
         let engine = Arc::clone(&shared);
         let shutdown = Arc::clone(&shutdown);
+        let admin_enabled = config.enable_admin;
         Some(std::thread::spawn(move || {
-            let _ = serve_health(&health_listener, &engine, &shutdown);
+            let _ = serve_health(&health_listener, &engine, &shutdown, admin_enabled);
         }))
     } else {
         None
@@ -1074,6 +1114,7 @@ fn cmd_serve(
         config.max_messages,
         config.max_groups,
         config.group_idle_evict_ms,
+        config.enable_admin,
         config.disk_full_policy,
         config.visibility_ms,
         key_shared_groups,
@@ -1560,6 +1601,7 @@ mod tests {
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
             disk_full_policy: DiskFullPolicyArg::DropNew,
             visibility_ms: DEFAULT_VISIBILITY_MS,
+            enable_admin: false,
         }
     }
 
@@ -2147,6 +2189,7 @@ mod tests {
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
             disk_full_policy: DiskFullPolicyArg::DropNew,
             visibility_ms: DEFAULT_VISIBILITY_MS,
+            enable_admin: false,
         }
     }
 
@@ -2726,6 +2769,25 @@ mod tests {
             DEFAULT_CONSUMER_CREDIT_BYTES
         );
         assert_eq!(DEFAULT_CONSUMER_CREDIT_BYTES, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn serve_enable_admin_is_off_by_default_and_set_by_the_flag() {
+        // The read-only /admin endpoint (#99) is opt-in: absent the flag it is off.
+        let off = parse_serve_flags(&["--data-dir".to_string(), "/tmp/x".to_string()]).unwrap();
+        assert!(!off.config.enable_admin, "admin is off by default");
+        // `--enable-admin` is a bare boolean (no value): it sets the flag and the loop advances one
+        // token, so a following flag still parses.
+        let on = parse_serve_flags(&[
+            "--data-dir".to_string(),
+            "/tmp/x".to_string(),
+            "--enable-admin".to_string(),
+            "--max-in-flight".to_string(),
+            "8".to_string(),
+        ])
+        .unwrap();
+        assert!(on.config.enable_admin, "admin is on with --enable-admin");
+        assert_eq!(on.config.max_in_flight, 8, "the trailing flag still parses");
     }
 
     #[test]

@@ -13,8 +13,18 @@
 //! few engine gauges (committed offset, durable head, consumer lag, in-flight, writer health)
 //! in Prometheus text format, including the `ironbus_fsync_seconds` produce-fsync latency
 //! histogram, and the per-reason recovery-loss series `ironbus_recovery_loss_bytes` (#16).
+//!
+//! `GET /admin` (#99) is an OPT-IN, READ-ONLY introspection endpoint: a structured JSON snapshot
+//! of operational state (broker-level durable head and counters, per-work-group committed offset,
+//! lag, and in-flight depth, the DLQ state, and an echo of the effective config bounds), derived
+//! entirely from the engine's existing read-only accessors. It is OFF by default and enabled only
+//! when the operator passes `serve --enable-admin`; when disabled it is `404`, exactly like an
+//! unknown path. It is UNAUTHENTICATED, sharing `/metrics`'s trust model (loopback or a trusted
+//! network, the #105/#107 threat model), so it must NEVER expose a mutating action or secret
+//! material. Mutating admin actions (consumer reset, DLQ redrive, force-reap) are out of scope and
+//! deferred to a separate mutating-admin surface; this endpoint is strictly GET-only and read-only.
 
-use crate::engine::{Counters, GroupConsumerStat};
+use crate::engine::{Counters, EngineConfigSnapshot, GroupConsumerStat};
 use crate::metrics::{LatencyHistogram, FSYNC_BUCKET_LE_SECONDS};
 use crate::server::SharedEngine;
 use ironbus_core::clock::Clock;
@@ -38,6 +48,10 @@ const MAX_REQUEST_LINE: usize = 8 * 1024;
 /// Serves the health endpoints over `listener` until `shutdown` is set. Connections are
 /// handled inline (health traffic is low and loopback), each bounded by [`REQUEST_TIMEOUT`].
 ///
+/// `admin_enabled` gates the opt-in read-only `/admin` introspection endpoint (#99): `false`
+/// (the default an operator gets unless they pass `--enable-admin`) makes `/admin` answer `404`
+/// exactly like any unknown path, so the surface is OFF unless deliberately turned on.
+///
 /// # Errors
 /// Returns an IO error only from configuring the listener; per-connection IO errors are
 /// contained so one bad client never ends the loop.
@@ -45,6 +59,7 @@ pub fn serve_health<F, C>(
     listener: &TcpListener,
     engine: &SharedEngine<F, C>,
     shutdown: &AtomicBool,
+    admin_enabled: bool,
 ) -> std::io::Result<()>
 where
     F: Filesystem,
@@ -55,7 +70,7 @@ where
         match listener.accept() {
             Ok((stream, _addr)) => {
                 // One bad client must not end the loop; contain its IO error.
-                let _ = handle(stream, engine);
+                let _ = handle(stream, engine, admin_enabled);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(ACCEPT_POLL);
@@ -67,7 +82,11 @@ where
     Ok(())
 }
 
-fn handle<F, C>(mut stream: TcpStream, engine: &SharedEngine<F, C>) -> std::io::Result<()>
+fn handle<F, C>(
+    mut stream: TcpStream,
+    engine: &SharedEngine<F, C>,
+    admin_enabled: bool,
+) -> std::io::Result<()>
 where
     F: Filesystem,
     C: Clock + Clone,
@@ -165,7 +184,44 @@ where
             };
             respond(&mut stream, 200, "OK", &metrics_body(snapshot))
         }
+        // The opt-in read-only introspection endpoint (#99). When disabled it is indistinguishable
+        // from an unknown path (a 404), so the surface is invisible unless the operator turned it
+        // on. The non-GET case was already rejected with 405 above, so this is GET-only.
+        "/admin" if admin_enabled => {
+            let snapshot = admin_snapshot(engine);
+            respond_json(&mut stream, 200, "OK", &admin_body(&snapshot))
+        }
         _ => respond(&mut stream, 404, "Not Found", "unknown endpoint"),
+    }
+}
+
+/// Captures the read-only introspection state (#99) under one engine lock, so every field is from
+/// the same instant. Every value comes from an existing read-only accessor; this cannot mutate the
+/// engine and carries no secret material.
+fn admin_snapshot<F, C>(engine: &SharedEngine<F, C>) -> AdminSnapshot
+where
+    F: Filesystem,
+    C: Clock + Clone,
+{
+    let g = engine.lock().unwrap_or_else(PoisonError::into_inner);
+    AdminSnapshot {
+        healthy: g.is_healthy(),
+        flushed: g.flushed_offset().get(),
+        committed: g.committed_offset().get(),
+        earliest_retained: g.earliest_retained_offset().get(),
+        durable_record_bytes: g.durable_record_bytes(),
+        durable_record_count: g.durable_record_count(),
+        segment_count: g.segment_count(),
+        recovered_truncated_bytes: g.recovered_truncated_bytes(),
+        // -1 is the unambiguous "none yet" sentinel (offsets are never negative), the same one
+        // `/metrics` uses.
+        last_dead_lettered: g
+            .last_dead_lettered_offset()
+            .map_or(-1i64, |o| i64::try_from(o.get()).unwrap_or(i64::MAX)),
+        dlq_records: g.dlq_records(),
+        counters: g.counters(),
+        groups: g.group_consumer_stats(),
+        config: g.config_snapshot(),
     }
 }
 
@@ -402,10 +458,226 @@ fn fsync_histogram_lines(fsync: &LatencyHistogram) -> String {
     s
 }
 
+/// A consistent snapshot of the read-only introspection state (#99), read under one engine lock so
+/// every field is from the same instant. Every value comes from an existing read-only engine
+/// accessor; nothing here can mutate the engine, and no secret material is carried.
+struct AdminSnapshot {
+    healthy: bool,
+    flushed: u64,
+    committed: u64,
+    earliest_retained: u64,
+    durable_record_bytes: u64,
+    durable_record_count: u64,
+    segment_count: usize,
+    recovered_truncated_bytes: u64,
+    /// The most recent dead-letter offset, or -1 if none (the same sentinel `/metrics` uses).
+    last_dead_lettered: i64,
+    dlq_records: u64,
+    counters: Counters,
+    /// Per-work-group consumer position, the default group `""` included.
+    groups: Vec<GroupConsumerStat>,
+    config: EngineConfigSnapshot,
+}
+
+/// The schema version of the `/admin` JSON body (#99). Pinned so a consumer can detect a
+/// breaking shape change; a future incompatible change bumps it.
+const ADMIN_SCHEMA_VERSION: u32 = 1;
+
+/// Renders the `/admin` JSON snapshot (#99): a structured, read-only view of operational state.
+/// Hand-rendered (no serde dependency, matching the hand-rendered Prometheus text) and strictly a
+/// projection of [`AdminSnapshot`], so it can never mutate engine state. The top-level shape is
+/// `{schema_version, broker, groups[], dlq, config}`. Lag is the durable head minus the group's
+/// committed offset, the same derivation `/metrics` uses.
+fn admin_body(snapshot: &AdminSnapshot) -> String {
+    let mut s = String::new();
+    let _ = write!(s, "{{\"schema_version\":{ADMIN_SCHEMA_VERSION},");
+    admin_broker_section(&mut s, snapshot);
+    admin_groups_section(&mut s, snapshot);
+    admin_dlq_section(&mut s, snapshot);
+    admin_config_section(&mut s, &snapshot.config);
+    s.push('}');
+    s
+}
+
+/// Appends the broker-level `"broker":{...}` object: durable head, committed cursor, retained span,
+/// sizes, and the operational counters. Lag is the durable head minus the committed offset.
+fn admin_broker_section(s: &mut String, snapshot: &AdminSnapshot) {
+    let counters = &snapshot.counters;
+    let _ = write!(
+        s,
+        "\"broker\":{{\
+            \"healthy\":{healthy},\
+            \"flushed_offset\":{flushed},\
+            \"committed_offset\":{committed},\
+            \"earliest_retained_offset\":{earliest_retained},\
+            \"consumer_lag\":{lag},\
+            \"durable_record_bytes\":{durable_record_bytes},\
+            \"durable_record_count\":{durable_record_count},\
+            \"segment_count\":{segment_count},\
+            \"recovery_truncated_bytes\":{recovered_truncated_bytes},\
+            \"produced\":{produced},\
+            \"produced_bytes\":{produced_bytes},\
+            \"produce_rejected\":{produce_rejected},\
+            \"delivered\":{delivered},\
+            \"redelivered\":{redelivered},\
+            \"dead_lettered\":{dead_lettered},\
+            \"acks\":{acks},\
+            \"segments_reaped\":{segments_reaped},\
+            \"segments_force_reaped\":{segments_force_reaped}\
+        }},",
+        healthy = snapshot.healthy,
+        flushed = snapshot.flushed,
+        committed = snapshot.committed,
+        earliest_retained = snapshot.earliest_retained,
+        lag = snapshot.flushed.saturating_sub(snapshot.committed),
+        durable_record_bytes = snapshot.durable_record_bytes,
+        durable_record_count = snapshot.durable_record_count,
+        segment_count = snapshot.segment_count,
+        recovered_truncated_bytes = snapshot.recovered_truncated_bytes,
+        produced = counters.produced,
+        produced_bytes = counters.produced_bytes,
+        produce_rejected = counters.produce_rejected,
+        delivered = counters.delivered,
+        redelivered = counters.redelivered,
+        dead_lettered = counters.dead_lettered,
+        acks = counters.acks,
+        segments_reaped = counters.segments_reaped,
+        segments_force_reaped = counters.segments_force_reaped,
+    );
+}
+
+/// Appends the per-work-group `"groups":[...]` array (the default group `""` included): committed
+/// offset, lag, and in-flight depth per group. Lag is the durable head minus the group's committed.
+fn admin_groups_section(s: &mut String, snapshot: &AdminSnapshot) {
+    s.push_str("\"groups\":[");
+    for (i, stat) in snapshot.groups.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let _ = write!(
+            s,
+            "{{\"name\":\"{}\",\"committed_offset\":{},\"consumer_lag\":{},\"in_flight\":{}}}",
+            escape_json(&stat.group),
+            stat.committed,
+            snapshot.flushed.saturating_sub(stat.committed),
+            stat.in_flight,
+        );
+    }
+    s.push_str("],");
+}
+
+/// Appends the `"dlq":{...}` object: the durable dead-letter depth and the last dead-lettered
+/// offset (`-1` if nothing has been dead-lettered).
+fn admin_dlq_section(s: &mut String, snapshot: &AdminSnapshot) {
+    let _ = write!(
+        s,
+        "\"dlq\":{{\"records\":{},\"last_dead_lettered_offset\":{}}},",
+        snapshot.dlq_records, snapshot.last_dead_lettered,
+    );
+}
+
+/// Appends the `"config":{...}` echo of the effective bounds (no secret material), each `0` keeping
+/// the codebase's off/unlimited convention.
+fn admin_config_section(s: &mut String, config: &EngineConfigSnapshot) {
+    let _ = write!(
+        s,
+        "\"config\":{{\
+            \"max_total_bytes\":{max_total_bytes},\
+            \"max_segment_bytes\":{max_segment_bytes},\
+            \"max_retained_bytes\":{max_retained_bytes},\
+            \"max_age_ms\":{max_age_ms},\
+            \"max_messages\":{max_messages},\
+            \"max_in_flight\":{max_in_flight},\
+            \"consumer_credit\":{consumer_credit},\
+            \"consumer_credit_bytes\":{consumer_credit_bytes},\
+            \"max_deliver\":{max_deliver},\
+            \"max_groups\":{max_groups},\
+            \"group_idle_evict_nanos\":{group_idle_evict_nanos},\
+            \"visibility_nanos\":{visibility_nanos},\
+            \"hard_cap_nanos\":{hard_cap_nanos},\
+            \"disk_full_policy\":\"{disk_full_policy}\"\
+        }}",
+        max_total_bytes = config.max_total_bytes,
+        max_segment_bytes = config.max_segment_bytes,
+        max_retained_bytes = config.max_retained_bytes,
+        max_age_ms = config.max_age_ms,
+        max_messages = config.max_messages,
+        max_in_flight = config.max_in_flight,
+        consumer_credit = config.consumer_credit,
+        consumer_credit_bytes = config.consumer_credit_bytes,
+        max_deliver = config.max_deliver,
+        max_groups = config.max_groups,
+        group_idle_evict_nanos = config.group_idle_evict_nanos,
+        visibility_nanos = config.visibility_nanos,
+        hard_cap_nanos = config.hard_cap_nanos,
+        disk_full_policy = disk_full_policy_label(config.disk_full_policy),
+    );
+}
+
+/// The stable JSON label for a [`crate::engine::DiskFullPolicy`], matching the `--disk-full-policy`
+/// CLI spelling so the echoed value round-trips to the flag an operator would set.
+fn disk_full_policy_label(policy: crate::engine::DiskFullPolicy) -> &'static str {
+    // `DiskFullPolicy` is `#[non_exhaustive]` to downstream crates, but within this crate the
+    // match is exhaustive, so a new variant is a compile error here (a deliberate prompt to give
+    // it a stable JSON label) rather than silently rendering as "unknown".
+    match policy {
+        crate::engine::DiskFullPolicy::DropNew => "drop-new",
+        crate::engine::DiskFullPolicy::DropOldest => "drop-oldest",
+    }
+}
+
+/// Escapes a string for a JSON string value: the two structural characters (`\` and `"`) plus the
+/// control characters JSON requires escaped. Work-group names are graphic ASCII (the engine
+/// validates them), but the escape is applied unconditionally so a future relaxation cannot produce
+/// malformed JSON.
+fn escape_json(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn respond(stream: &mut TcpStream, code: u16, reason: &str, body: &str) -> std::io::Result<()> {
+    respond_with(stream, code, reason, "text/plain; charset=utf-8", body)
+}
+
+/// Like [`respond`] but with the `application/json` content type, for the `/admin` endpoint (#99).
+fn respond_json(
+    stream: &mut TcpStream,
+    code: u16,
+    reason: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    respond_with(
+        stream,
+        code,
+        reason,
+        "application/json; charset=utf-8",
+        body,
+    )
+}
+
+fn respond_with(
+    stream: &mut TcpStream,
+    code: u16,
+    reason: &str,
+    content_type: &str,
+    body: &str,
+) -> std::io::Result<()> {
     let response = format!(
         "HTTP/1.1 {code} {reason}\r\n\
-         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n\
@@ -460,7 +732,7 @@ mod tests {
         let engine = Arc::clone(&shared);
         let handle = std::thread::spawn({
             let shutdown = Arc::clone(&shutdown);
-            move || serve_health(&listener, &shared, &shutdown).unwrap()
+            move || serve_health(&listener, &shared, &shutdown, false).unwrap()
         });
         (addr, shutdown, handle, engine)
     }
@@ -665,7 +937,7 @@ mod tests {
         let engine = Arc::clone(&shared);
         let handle = std::thread::spawn({
             let shutdown = Arc::clone(&shutdown);
-            move || serve_health(&listener, &shared, &shutdown).unwrap()
+            move || serve_health(&listener, &shared, &shutdown, false).unwrap()
         });
         (addr, shutdown, handle, engine)
     }
@@ -789,7 +1061,7 @@ mod tests {
         let handle = std::thread::spawn({
             let shutdown = Arc::clone(&shutdown);
             let shared = Arc::clone(&shared);
-            move || serve_health(&listener, &shared, &shutdown).unwrap()
+            move || serve_health(&listener, &shared, &shutdown, false).unwrap()
         });
 
         let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
@@ -875,7 +1147,7 @@ mod tests {
         let engine = Arc::clone(&shared);
         let handle = std::thread::spawn({
             let shutdown = Arc::clone(&shutdown);
-            move || serve_health(&listener, &shared, &shutdown).unwrap()
+            move || serve_health(&listener, &shared, &shutdown, false).unwrap()
         });
         (addr, shutdown, handle, engine)
     }
@@ -1051,7 +1323,7 @@ mod tests {
         let engine = Arc::clone(&shared);
         let handle = std::thread::spawn({
             let shutdown = Arc::clone(&shutdown);
-            move || serve_health(&listener, &shared, &shutdown).unwrap()
+            move || serve_health(&listener, &shared, &shutdown, false).unwrap()
         });
         (addr, shutdown, handle, engine)
     }
@@ -1246,5 +1518,254 @@ mod tests {
         assert!(r.starts_with("HTTP/1.1 405"), "{r}");
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
+    }
+
+    /// Like [`start`] but with the opt-in `/admin` endpoint ENABLED and a config with several
+    /// NON-default, distinctive bounds, so the admin config echo can be asserted exactly (#99).
+    fn start_with_admin() -> (
+        std::net::SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        SharedEngine<InMemoryFs, SystemClock>,
+    ) {
+        let engine = Engine::open(
+            InMemoryFs::new(),
+            SystemClock::new(),
+            EngineConfig {
+                log: LogConfig::default().with_max_total_bytes(1_000_000),
+                lease: LeaseConfig {
+                    visibility_nanos: 1234,
+                    hard_cap_nanos: 5678,
+                },
+                delivery: DeliveryConfig::new(7, false, vec![]).unwrap(),
+                max_in_flight: 16,
+                consumer_credit: 64,
+                consumer_credit_bytes: 4096,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 2048,
+                max_age_ms: 99,
+                max_messages: 33,
+                max_groups: 100,
+                group_idle_evict_ms: 0,
+                disk_full_policy: DiskFullPolicy::DropOldest,
+            },
+        )
+        .unwrap();
+        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let engine = Arc::clone(&shared);
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            // admin_enabled = true: this harness exercises the opt-in introspection endpoint.
+            move || serve_health(&listener, &shared, &shutdown, true).unwrap()
+        });
+        (addr, shutdown, handle, engine)
+    }
+
+    /// Splits a raw HTTP response into (status line, body), so a JSON body can be parsed apart
+    /// from the headers.
+    fn split_body(raw: &str) -> (&str, &str) {
+        let mut parts = raw.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or("");
+        let body = parts.next().unwrap_or("");
+        let status = head.lines().next().unwrap_or("");
+        (status, body)
+    }
+
+    #[test]
+    fn admin_is_404_when_the_flag_is_off() {
+        // The endpoint is opt-in: with admin disabled (the default `start` harness) `/admin` is
+        // indistinguishable from any unknown path, a 404, so the surface is invisible.
+        let (addr, shutdown, handle, _engine) = start();
+        let r = request(addr, "GET /admin HTTP/1.1\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 404 Not Found"), "{r}");
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn admin_rejects_a_non_get_method() {
+        // The endpoint is GET-only: even with admin ENABLED a non-GET is rejected with 405
+        // (the method check precedes the path match), so no verb can carry a mutation.
+        let (addr, shutdown, handle, _engine) = start_with_admin();
+        for verb in ["POST", "PUT", "DELETE", "PATCH"] {
+            let r = request(addr, &format!("{verb} /admin HTTP/1.1\r\n\r\n"));
+            assert!(
+                r.starts_with("HTTP/1.1 405 Method Not Allowed"),
+                "{verb}: {r}"
+            );
+        }
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn admin_returns_a_json_snapshot_with_correct_values() {
+        let (addr, shutdown, handle, engine) = start_with_admin();
+        // Drive a known broker state: produce 3, group "orders" acks the first (committed 1),
+        // group "billing" leases one without acking (1 in-flight, committed 0).
+        {
+            let mut g = engine.lock().unwrap();
+            for payload in [&b"a"[..], &b"b"[..], &b"c"[..]] {
+                g.produce(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                })
+                .unwrap();
+            }
+            match g.poll_in("orders", 0).unwrap() {
+                Poll::Message(d) => assert_eq!(g.ack_in("orders", &d.token), AckResult::Acked),
+                other => panic!("expected a message, got {other:?}"),
+            }
+            assert!(matches!(g.poll_in("billing", 0).unwrap(), Poll::Message(_)));
+        }
+
+        let r = request(addr, "GET /admin HTTP/1.1\r\n\r\n");
+        let (status, body) = split_body(&r);
+        assert!(status.starts_with("HTTP/1.1 200 OK"), "{r}");
+        assert!(
+            r.contains("Content-Type: application/json"),
+            "the admin body is JSON: {r}"
+        );
+
+        // The body is well-formed, documented JSON: it parses, and the load-bearing fields carry
+        // the values the known broker state produced. Asserting on substrings (not a JSON lib,
+        // which the crate does not depend on) keeps the test dependency-free; each field is
+        // anchored to its key so a value cannot false-match across fields.
+        assert!(body.starts_with('{') && body.ends_with('}'), "{body}");
+        assert!(body.contains("\"schema_version\":1"), "{body}");
+
+        // Broker level: 3 produced, durable head 3, default-group committed 0, lag 3.
+        assert!(body.contains("\"flushed_offset\":3"), "{body}");
+        assert!(body.contains("\"committed_offset\":0"), "{body}");
+        assert!(body.contains("\"consumer_lag\":3"), "{body}");
+        assert!(body.contains("\"produced\":3"), "{body}");
+        assert!(body.contains("\"delivered\":2"), "{body}");
+        assert!(body.contains("\"acks\":1"), "{body}");
+        assert!(body.contains("\"healthy\":true"), "{body}");
+        assert!(body.contains("\"segment_count\":1"), "{body}");
+
+        // Per-group: the default group (""), orders (committed 1, lag 2, in-flight 0), billing
+        // (committed 0, lag 3, in-flight 1).
+        assert!(
+            body.contains("\"name\":\"\""),
+            "default group present: {body}"
+        );
+        assert!(
+            body.contains(
+                "{\"name\":\"orders\",\"committed_offset\":1,\"consumer_lag\":2,\"in_flight\":0}"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "{\"name\":\"billing\",\"committed_offset\":0,\"consumer_lag\":3,\"in_flight\":1}"
+            ),
+            "{body}"
+        );
+
+        // DLQ: nothing dead-lettered yet, so depth 0 and the -1 sentinel.
+        assert!(body.contains("\"records\":0"), "{body}");
+        assert!(body.contains("\"last_dead_lettered_offset\":-1"), "{body}");
+
+        // Config echo: the distinctive non-default bounds the harness configured.
+        assert!(body.contains("\"max_total_bytes\":1000000"), "{body}");
+        assert!(body.contains("\"max_retained_bytes\":2048"), "{body}");
+        assert!(body.contains("\"max_age_ms\":99"), "{body}");
+        assert!(body.contains("\"max_messages\":33"), "{body}");
+        assert!(body.contains("\"max_in_flight\":16"), "{body}");
+        assert!(body.contains("\"consumer_credit\":64"), "{body}");
+        assert!(body.contains("\"consumer_credit_bytes\":4096"), "{body}");
+        assert!(body.contains("\"max_deliver\":7"), "{body}");
+        assert!(body.contains("\"max_groups\":100"), "{body}");
+        assert!(body.contains("\"visibility_nanos\":1234"), "{body}");
+        assert!(body.contains("\"hard_cap_nanos\":5678"), "{body}");
+        assert!(
+            body.contains("\"disk_full_policy\":\"drop-oldest\""),
+            "{body}"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn admin_reports_the_dlq_state_after_a_dead_letter() {
+        use ironbus_core::clock::ManualClock;
+        // A broker that dead-letters one message reports the DLQ depth and last offset on /admin.
+        let clock = Arc::new(ManualClock::new());
+        let engine = Engine::open(
+            InMemoryFs::new(),
+            Arc::clone(&clock),
+            EngineConfig {
+                log: LogConfig::default(),
+                lease: LeaseConfig {
+                    visibility_nanos: 30,
+                    hard_cap_nanos: 100,
+                },
+                delivery: DeliveryConfig::new(1, false, vec![]).unwrap(),
+                max_in_flight: 16,
+                consumer_credit: 64,
+                consumer_credit_bytes: 0,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                disk_full_policy: DiskFullPolicy::DropNew,
+            },
+        )
+        .unwrap();
+        let shared: SharedEngine<InMemoryFs, Arc<ManualClock>> = Arc::new(Mutex::new(engine));
+        {
+            let mut g = shared.lock().unwrap();
+            g.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"poison",
+            })
+            .unwrap();
+            let _ = g.poll_now().unwrap();
+            clock.advance_monotonic_nanos(40);
+            assert!(matches!(g.poll_now().unwrap(), Poll::Parked { .. }));
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            let shared = Arc::clone(&shared);
+            move || serve_health(&listener, &shared, &shutdown, true).unwrap()
+        });
+
+        let r = request(addr, "GET /admin HTTP/1.1\r\n\r\n");
+        let (status, body) = split_body(&r);
+        assert!(status.starts_with("HTTP/1.1 200 OK"), "{r}");
+        // One record dead-lettered into the durable sink: depth 1, last offset 0.
+        assert!(body.contains("\"records\":1"), "{body}");
+        assert!(body.contains("\"last_dead_lettered_offset\":0"), "{body}");
+        assert!(body.contains("\"dead_lettered\":1"), "{body}");
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn admin_group_name_is_json_escaped() {
+        // A group name carrying a quote and a backslash is JSON-escaped so the body stays
+        // well-formed (the engine validates names as graphic ASCII, but the escape is
+        // unconditional for robustness, #99).
+        assert_eq!(escape_json("plain"), "plain");
+        assert_eq!(escape_json("a\"b"), "a\\\"b");
+        assert_eq!(escape_json("a\\b"), "a\\\\b");
+        assert_eq!(escape_json("a\tb"), "a\\tb");
     }
 }
