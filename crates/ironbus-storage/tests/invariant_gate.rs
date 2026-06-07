@@ -79,6 +79,7 @@ impl Shape {
         LogConfig {
             max_segment_bytes: self.max_segment_bytes,
             max_total_bytes: 0,
+            ..LogConfig::default()
         }
     }
 

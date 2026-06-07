@@ -12,4 +12,5 @@ pub mod log;
 pub mod loss;
 pub mod naming;
 pub mod offline;
+pub mod quarantine;
 pub mod segment;
