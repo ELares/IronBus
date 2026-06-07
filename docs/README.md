@@ -2,6 +2,8 @@
 
 This directory holds the architecture and design diagrams for IronBus, rendered as PDFs. They are a visual companion to the design issues; the GitHub issues remain the canonical, authoritative design record. Each diagram is committed both as a Graphviz source (`.dot`) and a rendered `.pdf`, so anyone can regenerate them.
 
+For the byte-level data-model reference (the on-disk, wire, config, runtime, and report contracts derived from and cross-checked against the source), see [CONTRACTS.md](CONTRACTS.md).
+
 Regenerate all PDFs:
 
 ```sh
