@@ -432,6 +432,8 @@ mod tests {
                 max_in_flight: 16,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
             },
         )
         .unwrap();
@@ -624,6 +626,8 @@ mod tests {
                 max_in_flight: 16,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
             },
         )
         .unwrap();
@@ -715,6 +719,33 @@ mod tests {
         std::thread::JoinHandle<()>,
         SharedEngine<InMemoryFs, SystemClock>,
     ) {
+        start_with_bounds(max_retained_bytes, 0)
+    }
+
+    /// Like [`start_with_retention`] but configures the COUNT bound (size off), to exercise the
+    /// shared reaped counter under the count retention mode.
+    fn start_with_count_retention(
+        max_messages: u64,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        SharedEngine<InMemoryFs, SystemClock>,
+    ) {
+        start_with_bounds(0, max_messages)
+    }
+
+    /// A small-segment broker with the given size and count retention bounds (age off), wired to a
+    /// health endpoint, so the reaper path is exercised end to end over either bound.
+    fn start_with_bounds(
+        max_retained_bytes: u64,
+        max_messages: u64,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        SharedEngine<InMemoryFs, SystemClock>,
+    ) {
         let engine = Engine::open(
             InMemoryFs::new(),
             SystemClock::new(),
@@ -728,6 +759,8 @@ mod tests {
                 max_in_flight: 64,
                 checkpoint_interval: 1024,
                 max_retained_bytes,
+                max_age_ms: 0,
+                max_messages,
             },
         )
         .unwrap();
@@ -816,6 +849,56 @@ mod tests {
         assert!(
             !m1.contains("\nironbus_segments_reaped_total 0\n"),
             "the reaped counter must have incremented past zero: {m1}"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn metrics_reaped_counter_increments_under_the_count_bound() {
+        // The shared reaped counter also increments when the COUNT retention mode (not size)
+        // triggers the reap (refs #13, #80): the metric counts reaped segments regardless of bound.
+        let payload = &[0xab_u8; 16][..];
+        let (addr, shutdown, handle, engine) = start_with_count_retention(8);
+        let m0 = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(m0.contains("\nironbus_segments_reaped_total 0\n"), "{m0}");
+
+        // Produce well past the count bound, draining and acking after each produce so the
+        // committed cursor tracks the head (a streaming workload). Count retention then reaps the
+        // old, now-consumed segments.
+        {
+            let mut g = engine.lock().unwrap();
+            for _ in 0..40 {
+                g.produce(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                })
+                .unwrap();
+                loop {
+                    match g.poll_now().unwrap() {
+                        Poll::Message(d) => assert_eq!(g.ack(&d.token), AckResult::Acked),
+                        Poll::Parked { .. } => {}
+                        Poll::Idle => break,
+                    }
+                }
+            }
+            assert!(
+                g.counters().segments_reaped >= 1,
+                "count retention reaped at least one segment"
+            );
+        }
+        let m1 = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            m1.contains("# TYPE ironbus_segments_reaped_total counter"),
+            "{m1}"
+        );
+        assert!(
+            !m1.contains("\nironbus_segments_reaped_total 0\n"),
+            "the reaped counter must have incremented under the count bound: {m1}"
         );
 
         shutdown.store(true, Ordering::Release);

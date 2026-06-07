@@ -453,6 +453,8 @@ mod tests {
                 max_in_flight: 10,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
             },
         )
         .unwrap()
@@ -522,6 +524,8 @@ mod tests {
                 max_in_flight: 10,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
             },
         )
         .unwrap()
@@ -1119,6 +1123,8 @@ mod tests {
                 max_in_flight: 10,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
             },
         )
         .unwrap();

@@ -26,7 +26,7 @@ use ironbus_core::lease::{
 use ironbus_core::types::Offset;
 use ironbus_storage::checkpoint::{Checkpoint, MAX_PAYLOAD};
 use ironbus_storage::fs::Filesystem;
-use ironbus_storage::log::{Append, Log, LogConfig};
+use ironbus_storage::log::{Append, Log, LogConfig, RetentionBounds};
 use ironbus_storage::loss::LossReport;
 use ironbus_storage::segment::{OwnedRecord, StorageError};
 use std::collections::BTreeMap;
@@ -56,6 +56,22 @@ pub struct EngineConfig {
     /// sheds new produces when full, retention frees space as consumers drain. See
     /// [`Log::reap_to_size`].
     pub max_retained_bytes: u64,
+    /// The consumer-safe AGE-retention bound in MILLISECONDS (refs #13, #80): after a successful
+    /// produce, the engine reclaims disk by deleting whole old SEALED segments whose every record
+    /// is older than this many milliseconds (a segment's MAXIMUM record timestamp is below
+    /// `now - max_age_ms`, where `now` comes from the engine clock seam), but NEVER a segment any
+    /// consumer still needs. `0` means DISABLED, the default, so existing behavior is unchanged.
+    /// Composes with `max_retained_bytes` and `max_messages`: a sealed segment is deleted if ANY
+    /// enabled bound says it should be. Milliseconds (not a `Duration`) so the CLI takes a bare
+    /// integer with no duration-parser dependency. See [`Log::reap`].
+    pub max_age_ms: u64,
+    /// The consumer-safe COUNT-retention bound (refs #13, #80): after a successful produce, the
+    /// engine reclaims disk by deleting whole old SEALED segments while the log's TOTAL record
+    /// count exceeds this many messages, oldest first, but NEVER a segment any consumer still
+    /// needs. `0` means DISABLED, the default, so existing behavior is unchanged. Composes with
+    /// `max_retained_bytes` and `max_age_ms`: a sealed segment is deleted if ANY enabled bound
+    /// says it should be. See [`Log::reap`].
+    pub max_messages: u64,
 }
 
 /// An error from the engine.
@@ -427,10 +443,11 @@ pub struct Engine<F: Filesystem, C: Clock> {
     max_in_flight: u32,
     checkpoint: Checkpoint<F::File>,
     checkpoint_interval: u64,
-    /// The consumer-safe size-retention bound in durable RECORD bytes (refs #13, #80): `0`
-    /// (the default) means retention is off, so the produce path never reaps. See
-    /// [`EngineConfig::max_retained_bytes`].
-    max_retained_bytes: u64,
+    /// The consumer-safe retention bounds (size, age, count) the produce path enforces against the
+    /// minimum committed offset (refs #13, #80). All `0` (the default) means retention is off, so
+    /// the produce path never reaps. See [`EngineConfig::max_retained_bytes`],
+    /// [`EngineConfig::max_age_ms`], and [`EngineConfig::max_messages`].
+    retention: RetentionBounds,
     last_checkpointed: u64,
     /// The last durably-checkpointed committed offset per NAMED work-group (#60), for the
     /// interval gate. The default group uses `last_checkpointed`; named groups checkpoint to
@@ -527,7 +544,11 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
             max_in_flight: config.max_in_flight,
             checkpoint,
             checkpoint_interval: config.checkpoint_interval,
-            max_retained_bytes: config.max_retained_bytes,
+            retention: RetentionBounds {
+                max_bytes: config.max_retained_bytes,
+                max_age_ms: config.max_age_ms,
+                max_messages: config.max_messages,
+            },
             last_checkpointed: default_committed,
             counters: Counters::default(),
             fsync: LatencyHistogram::default(),
@@ -721,26 +742,26 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
         Ok(offset)
     }
 
-    /// Reclaims disk by reaping fully-consumed old sealed segments when the durable log is over
-    /// the retention bound (refs #13, #80). A no-op when `max_retained_bytes == 0` (the default,
-    /// retention off). The protect floor is the minimum committed offset across ALL consumer
-    /// groups (the default group `""` always exists, so the min is well-defined), so a record any
-    /// group has not yet consumed is never reaped. Counts the reaped segments (saturating).
+    /// Reclaims disk by reaping fully-consumed old sealed segments when the durable log trips any
+    /// enabled retention bound (size, age, or count) (refs #13, #80). A no-op when every bound is
+    /// `0` (the default, retention off). The protect floor is the minimum committed offset across
+    /// ALL consumer groups (the default group `""` always exists, so the min is well-defined), so
+    /// a record any group has not yet consumed is never reaped. The age bound reads `now` from the
+    /// engine clock seam (shared with the log), so the deterministic sim drives it. Counts the
+    /// reaped segments (saturating), regardless of which bound triggered.
     ///
     /// A reap is best-effort space reclamation, but a real IO error from a sync or unlink is a
-    /// storage error: it propagates rather than being swallowed, since [`Log::reap_to_size`]
-    /// keeps `segments`/`sealed_record_bytes` consistent with disk on a partial failure (the
+    /// storage error: it propagates rather than being swallowed, since [`Log::reap`] keeps
+    /// `segments` and the running byte/count totals consistent with disk on a partial failure (the
     /// in-memory removal happens only after the durable unlink), so propagating never corrupts
     /// state. It is called only after the produce already succeeded and was counted, so a reap
     /// error does not undo a durable record.
     fn reap_for_retention(&mut self) -> Result<(), EngineError> {
-        if self.max_retained_bytes == 0 {
+        if self.retention == RetentionBounds::default() {
             return Ok(());
         }
         let protect_below = self.min_committed_offset();
-        let outcome = self
-            .log
-            .reap_to_size(self.max_retained_bytes, protect_below)?;
+        let outcome = self.log.reap(self.retention, protect_below)?;
         self.counters.segments_reaped = self
             .counters
             .segments_reaped
@@ -1006,6 +1027,14 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
         self.log.durable_record_bytes()
     }
 
+    /// The log's total durable RECORD COUNT (the quantity the count-retention bound,
+    /// [`EngineConfig::max_messages`], is measured against). An operator can compare it to the
+    /// configured count bound to see headroom before retention reaps.
+    #[must_use]
+    pub fn durable_record_count(&self) -> u64 {
+        self.log.durable_record_count()
+    }
+
     /// Bytes dropped from a torn or unsynced tail at recovery (startup): the raw
     /// recovery-loss signal an operator can surface, zero on a clean start.
     #[must_use]
@@ -1097,11 +1126,21 @@ mod tests {
             max_in_flight,
             checkpoint_interval: 1024,
             max_retained_bytes: 0,
+            max_age_ms: 0,
+            max_messages: 0,
         }
     }
 
     fn open(config: EngineConfig) -> Engine<InMemoryFs, ManualClock> {
         Engine::open(InMemoryFs::new(), ManualClock::new(), config).unwrap()
+    }
+
+    // Opens an engine over a shared `ManualClock` the test can drive, for the age-retention path.
+    fn open_with_clock(
+        config: EngineConfig,
+        clock: std::sync::Arc<ManualClock>,
+    ) -> Engine<InMemoryFs, std::sync::Arc<ManualClock>> {
+        Engine::open(InMemoryFs::new(), clock, config).unwrap()
     }
 
     fn produce(e: &mut Engine<InMemoryFs, ManualClock>, payload: &[u8]) -> Offset {
@@ -2546,5 +2585,180 @@ mod tests {
             e.counters().segments_reaped >= 1,
             "once the slow group caught up the old segments are reaped"
         );
+    }
+
+    // ---- Count- and age-based retention end to end (refs #13, #80) ----
+
+    // The small-segment config but with the COUNT bound set (size and age off).
+    fn config_with_count(max_messages: u64) -> EngineConfig {
+        let mut cfg = config_with_retention(0);
+        cfg.max_messages = max_messages;
+        cfg
+    }
+
+    #[test]
+    fn count_retention_reclaims_old_consumed_segments() {
+        // With max_messages set and every group caught up, producing past it reaps old
+        // fully-consumed segments: the durable record count drops to or under the bound and
+        // segments_reaped increments.
+        let mut e = open(config_with_count(8));
+        produce_and_consume_all(&mut e, 40);
+        assert_eq!(e.committed_offset(), Offset::new(40), "all consumed");
+        assert!(
+            e.counters().segments_reaped >= 1,
+            "producing past the count bound reclaimed at least one segment"
+        );
+        assert!(
+            e.durable_record_count() <= 8,
+            "the live record count dropped to or under the bound: {} <= 8",
+            e.durable_record_count()
+        );
+        // The head is unchanged: reaping deletes old records, never the head.
+        assert_eq!(e.flushed_offset(), Offset::new(40));
+    }
+
+    #[test]
+    fn count_retention_blocks_on_a_slow_group_then_unblocks() {
+        // A slow group pinned at offset 0 blocks count-based reaping below its cursor, then once it
+        // catches up the next produce reaps. This pins consumer-safety for the count bound.
+        let mut e = open(config_with_count(4));
+        // The slow group leases offset 0 but never acks: its committed stays 0.
+        produce(&mut e, &[0xab; 16]);
+        let slow_d = match e.poll_in("slow", 0).unwrap() {
+            Poll::Message(d) => d,
+            other => panic!("expected a message, got {other:?}"),
+        };
+        produce_and_consume_all(&mut e, 30);
+        assert_eq!(
+            e.counters().segments_reaped,
+            0,
+            "the slow group at 0 blocks count-based reaping"
+        );
+
+        // The slow group catches up: the floor rises and the next produce reaps.
+        assert_eq!(e.ack_in("slow", &slow_d.token), AckResult::Acked);
+        let mut now = 100u64;
+        while let Poll::Message(d) = e.poll_in("slow", now).unwrap() {
+            assert_eq!(e.ack_in("slow", &d.token), AckResult::Acked);
+            now += 1;
+        }
+        produce_and_consume_all(&mut e, 1);
+        assert!(
+            e.counters().segments_reaped >= 1,
+            "once the slow group caught up the count bound reaps"
+        );
+    }
+
+    #[test]
+    fn age_retention_reclaims_old_consumed_segments_as_the_clock_advances() {
+        // End to end over the engine's clock seam: records produced at an OLD timestamp become
+        // age-eligible once the engine clock advances past now - max_age, and the produce path
+        // reaps them. Uses a shared ManualClock so the test drives `now`, never the host clock.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut cfg = config_with_retention(0);
+        cfg.max_age_ms = 1_000;
+        let mut e = open_with_clock(cfg, std::sync::Arc::clone(&clock));
+
+        // Produce and fully consume many records stamped at timestamp 100 (old). The engine clock
+        // is still 0, so now - max_age underflows to "nothing is old enough": no reap yet.
+        let mut lease_now = 0u64;
+        for _ in 0..40 {
+            e.produce(&Append {
+                timestamp_ms: 100,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: &[0xab; 16],
+            })
+            .unwrap();
+            loop {
+                match e.poll(lease_now).unwrap() {
+                    Poll::Message(d) => assert_eq!(e.ack(&d.token), AckResult::Acked),
+                    Poll::Parked { .. } => {}
+                    Poll::Idle => break,
+                }
+                lease_now += 1;
+            }
+        }
+        assert_eq!(
+            e.counters().segments_reaped,
+            0,
+            "nothing is aged out while the engine clock is at 0"
+        );
+
+        // Advance the wall clock well past the records' age, then produce once more: every
+        // fully-consumed old segment is now older than now - max_age and is reaped.
+        clock.set_unix_millis(1_000_000);
+        e.produce(&Append {
+            timestamp_ms: 1_000_000,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: &[0xab; 16],
+        })
+        .unwrap();
+        // Drain so the cursor stays caught up for the next pass and the protect floor is the head.
+        while let Poll::Message(d) = e.poll(lease_now).unwrap() {
+            assert_eq!(e.ack(&d.token), AckResult::Acked);
+            lease_now += 1;
+        }
+        assert!(
+            e.counters().segments_reaped >= 1,
+            "advancing the engine clock past the age bound reaps the old segments"
+        );
+    }
+
+    #[test]
+    fn age_retention_blocks_on_a_slow_group() {
+        // A slow group still blocks reaping below its cursor under the AGE bound, exactly as under
+        // size: consumer-safety gates every bound.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut cfg = config_with_retention(0);
+        cfg.max_age_ms = 1_000;
+        let mut e = open_with_clock(cfg, std::sync::Arc::clone(&clock));
+
+        // The slow group leases offset 0 but never acks.
+        e.produce(&Append {
+            timestamp_ms: 100,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: &[0xab; 16],
+        })
+        .unwrap();
+        assert!(matches!(e.poll_in("slow", 0).unwrap(), Poll::Message(_)));
+
+        // Produce and fully consume many more in the default group, then advance the clock far past
+        // the age bound. Everything is old, but the slow group pins the floor at 0.
+        let mut lease_now = 0u64;
+        for _ in 0..30 {
+            e.produce(&Append {
+                timestamp_ms: 100,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: &[0xab; 16],
+            })
+            .unwrap();
+            while let Poll::Message(d) = e.poll(lease_now).unwrap() {
+                assert_eq!(e.ack(&d.token), AckResult::Acked);
+                lease_now += 1;
+            }
+        }
+        clock.set_unix_millis(1_000_000);
+        e.produce(&Append {
+            timestamp_ms: 1_000_000,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: &[0xab; 16],
+        })
+        .unwrap();
+        assert_eq!(
+            e.counters().segments_reaped,
+            0,
+            "a slow group blocks age-based reaping below its cursor"
+        );
+        assert_eq!(e.committed_offset_in("slow"), Offset::new(0));
     }
 }
