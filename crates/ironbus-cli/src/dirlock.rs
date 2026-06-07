@@ -83,9 +83,7 @@ pub fn prepare_data_dir(data_dir: &Path) -> Result<(), DirError> {
             // A symlink to a directory still reports `is_dir()` false here (we used `symlink_metadata`
             // to not follow), but the on-disk path resolves through it for the engine, so accept a
             // symlink that ultimately points at a directory and reject only a true non-directory.
-            let resolved_is_dir = std::fs::metadata(data_dir)
-                .map(|m| m.is_dir())
-                .unwrap_or(false);
+            let resolved_is_dir = std::fs::metadata(data_dir).is_ok_and(|m| m.is_dir());
             if !meta.is_dir() && !resolved_is_dir {
                 return Err(DirError::NotADirectory(data_dir.to_path_buf()));
             }
