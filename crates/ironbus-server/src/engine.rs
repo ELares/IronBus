@@ -128,6 +128,21 @@ pub struct EngineConfig {
     /// produce. It has no effect unless `max_total_bytes` is set (with no cap, no produce is ever
     /// over-cap, so neither policy ever triggers).
     pub disk_full_policy: DiskFullPolicy,
+    /// The most work-groups one engine may hold at once, INCLUDING the durable default group `""`
+    /// (refs #240, #9, #10): bounds total consumer-state memory once the wire can name groups, so
+    /// an unauthenticated client cannot exhaust memory by naming endless groups (each group is an
+    /// `AckCursor` plus a `LeaseTable`). A new NAMED group past this cap is rejected with
+    /// [`EngineError::TooManyGroups`] before anything is allocated; the default group is never
+    /// counted against the cap and never rejected, so the engine is always usable.
+    ///
+    /// `0` means UNLIMITED (the cap is OFF), matching the `0` = unlimited / off convention of the
+    /// other bounds ([`EngineConfig::max_retained_bytes`], [`EngineConfig::max_age_ms`],
+    /// [`EngineConfig::max_messages`], and `LogConfig::max_total_bytes`). The default is
+    /// [`DEFAULT_MAX_GROUPS`] (1024), a non-zero defensible bound: a single edge broker is not
+    /// expected to fan out to thousands of distinct consumer groups, and 1024 distinct
+    /// `AckCursor`/`LeaseTable` pairs is a few hundred KiB of state, so the cap is generous for
+    /// real use yet still closes the denial-of-service vector.
+    pub max_groups: usize,
 }
 
 /// An error from the engine.
@@ -352,10 +367,13 @@ const DEFAULT_GROUP: &str = "";
 /// [`EngineConfig::consumer_credit`].
 pub const DEFAULT_CONSUMER_CREDIT: u32 = 64;
 
-/// The most work-groups one engine holds at once, including the durable default (#240):
-/// bounds total consumer-state memory once the wire can name groups, so an unauthenticated
-/// client cannot exhaust memory by naming endless groups.
-const MAX_GROUPS: usize = 1024;
+/// The default cap on the number of live work-groups per engine, INCLUDING the durable default
+/// (refs #240, #9, #10): bounds total consumer-state memory once the wire can name groups, so an
+/// unauthenticated client cannot exhaust memory by naming endless groups. A non-zero, defensible
+/// default (`0` would mean unlimited): a single edge broker is not expected to fan out to thousands
+/// of distinct consumer groups, and 1024 `AckCursor`/`LeaseTable` pairs is a modest, bounded amount
+/// of state. See [`EngineConfig::max_groups`] (where `0` = unlimited).
+pub const DEFAULT_MAX_GROUPS: usize = 1024;
 
 /// The longest a named work-group name may be (#240): bounds per-name memory.
 const MAX_GROUP_NAME_LEN: usize = 128;
@@ -541,6 +559,10 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// `DropOldest` force-reaps the oldest sealed segment to make room then accepts it. See
     /// [`EngineConfig::disk_full_policy`].
     disk_full_policy: DiskFullPolicy,
+    /// The cap on the number of live work-groups, including the default (refs #240, #9, #10):
+    /// a new NAMED group past this is rejected with [`EngineError::TooManyGroups`] before it is
+    /// allocated. `0` means unlimited. See [`EngineConfig::max_groups`].
+    max_groups: usize,
     last_checkpointed: u64,
     /// The last durably-checkpointed committed offset per NAMED work-group (#60), for the
     /// interval gate. The default group uses `last_checkpointed`; named groups checkpoint to
@@ -613,15 +635,18 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         );
         // Discover and resume each NAMED work-group from its own `cursor-<hex>.ckpt` (#60),
         // so a broadcast or competing group keeps its position across a restart instead of
-        // redelivering the whole log. Bounded by the group cap as a defense against a
-        // tampered directory holding more checkpoint files than the runtime cap allows.
+        // redelivering the whole log. Recovery is deliberately NOT bounded by `max_groups`: the
+        // cap gates only NEW group creation (the `poll_in` allocation path), never the resume of
+        // groups that are already durable on disk. Capping recovery would silently DROP the
+        // committed cursors of the groups past the cap whenever an operator LOWERS `--max-groups`
+        // below the on-disk group count, resetting those groups to offset 0 and redelivering the
+        // whole already-acked log. Loading every existing group unconditionally keeps a config
+        // change from corrupting durable state; the cap still bounds unbounded runtime growth from
+        // wire-named groups created after open.
         let mut group_last_checkpointed = BTreeMap::new();
         {
             let fs = log.filesystem();
             for name in fs.list()? {
-                if groups.len() >= MAX_GROUPS {
-                    break;
-                }
                 let Some(gname) = parse_group_checkpoint_name(&name) else {
                     continue;
                 };
@@ -679,6 +704,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 max_messages: config.max_messages,
             },
             disk_full_policy: config.disk_full_policy,
+            max_groups: config.max_groups,
             last_checkpointed: default_committed,
             counters: Counters::default(),
             fsync: LatencyHistogram::default(),
@@ -1034,11 +1060,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     pub fn poll_in(&mut self, group: &str, now: u64) -> Result<Poll, EngineError> {
         // Create a new group only if it is well-named and the group cap allows it (#240):
         // this bounds memory once the wire can name groups. The default group and any
-        // existing group are exempt (already present, so they never hit this gate).
+        // existing group are exempt (already present, so they never hit this gate); a
+        // `max_groups` of `0` means unlimited, so the cap check is skipped entirely.
         if !self.groups.contains_key(group) {
             validate_group_name(group)?;
-            if self.groups.len() >= MAX_GROUPS {
-                return Err(EngineError::TooManyGroups { max: MAX_GROUPS });
+            if self.max_groups != 0 && self.groups.len() >= self.max_groups {
+                return Err(EngineError::TooManyGroups {
+                    max: self.max_groups,
+                });
             }
         }
         // The oldest record still in the durable log: it rises above 0 only once the disk-full
@@ -1510,6 +1539,7 @@ mod tests {
             max_age_ms: 0,
             max_messages: 0,
             disk_full_policy: DiskFullPolicy::DropNew,
+            max_groups: DEFAULT_MAX_GROUPS,
         }
     }
 
@@ -2137,31 +2167,114 @@ mod tests {
         assert_eq!(e.in_flight(), 0);
     }
 
+    // A config with an explicit work-group cap (#240), so a test exercises the bound without
+    // having to allocate `DEFAULT_MAX_GROUPS` groups.
+    fn config_with_max_groups(max_groups: usize) -> EngineConfig {
+        EngineConfig {
+            max_groups,
+            ..config(10, 5)
+        }
+    }
+
     #[test]
     fn a_new_group_past_the_cap_is_rejected() {
-        // The group cap bounds memory once the wire can name groups (#240). The default
-        // group already counts, so MAX_GROUPS - 1 named groups fit; one more is rejected.
-        let mut e = open(config(10, 5));
+        // The group cap bounds memory once the wire can name groups (#240). The default group
+        // already counts against the cap, so with `max_groups == 4` three NAMED groups fit; one
+        // more is rejected with the typed error and allocates nothing.
+        let mut e = open(config_with_max_groups(4));
         produce(&mut e, b"a");
-        for i in 0..(MAX_GROUPS - 1) {
+        for i in 0..3 {
             let name = format!("g{i}");
             // Each first poll of a fresh group is fine (delivers offset 0, or idle).
             e.poll_in(&name, 0).unwrap();
         }
-        assert_eq!(
-            e.groups.len(),
-            MAX_GROUPS,
-            "default + MAX_GROUPS-1 named groups"
-        );
+        assert_eq!(e.groups.len(), 4, "default + 3 named groups fill the cap");
         let err = e.poll_in("one-too-many", 0).unwrap_err();
         assert!(
-            matches!(err, EngineError::TooManyGroups { max } if max == MAX_GROUPS),
+            matches!(err, EngineError::TooManyGroups { max } if max == 4),
             "the cap rejects a new group, got {err}"
         );
-        // An already-existing group still works (it is not a new allocation).
+        // The rejected group allocated nothing: the count did not grow and the name is absent.
+        assert_eq!(e.groups.len(), 4, "the rejected group was not allocated");
+        assert!(!e.groups.contains_key("one-too-many"));
+        // Re-polling an already-live group does NOT count again (it is not a new allocation).
         assert!(e.poll_in("g0", 0).is_ok());
-        // The default group is never blocked by the cap.
+        assert_eq!(e.groups.len(), 4, "re-polling a live group does not grow");
+        // The default group is exempt: it works even though the cap is full.
         assert!(e.poll(0).is_ok());
+        assert!(e.poll_in("", 0).is_ok());
+    }
+
+    #[test]
+    fn the_default_group_is_exempt_even_below_a_cap_of_one() {
+        // `max_groups == 1` leaves no room for any named group, yet the default group `""` is
+        // never counted against the cap and never rejected, so the engine is always usable; the
+        // first NAMED group is rejected.
+        let mut e = open(config_with_max_groups(1));
+        produce(&mut e, b"a");
+        assert!(e.poll(0).is_ok(), "the default group always works");
+        assert!(e.poll_in("", 0).is_ok(), "the default group is exempt");
+        assert!(matches!(
+            e.poll_in("any", 0).unwrap_err(),
+            EngineError::TooManyGroups { max: 1 }
+        ));
+        assert_eq!(e.groups.len(), 1, "only the default group exists");
+    }
+
+    #[test]
+    fn a_zero_cap_means_unlimited_groups() {
+        // `0` = unlimited, matching the `0` = off convention of the other bounds. Far more than
+        // the non-zero default may be created without rejection.
+        let mut e = open(config_with_max_groups(0));
+        produce(&mut e, b"a");
+        for i in 0..(DEFAULT_MAX_GROUPS + 16) {
+            let name = format!("g{i}");
+            e.poll_in(&name, 0).unwrap();
+        }
+        assert_eq!(
+            e.groups.len(),
+            DEFAULT_MAX_GROUPS + 16 + 1,
+            "default + all named"
+        );
+    }
+
+    #[test]
+    fn lowering_the_group_cap_still_recovers_every_durable_group() {
+        // Recovery must load EVERY durable named group regardless of `max_groups`: the cap gates
+        // only NEW group creation, never the resume of groups already on disk. Otherwise an
+        // operator who LOWERS --max-groups below the on-disk group count would silently reset the
+        // dropped groups to offset 0 and redeliver the whole already-acked log. Create three named
+        // groups committed to distinct offsets under a generous cap, then reopen under a cap of 2
+        // (below the three) and assert all three keep their committed cursors.
+        let mut e = open(config_with_max_groups(100));
+        for p in [&b"0"[..], b"1", b"2", b"3"] {
+            produce(&mut e, p);
+        }
+        // Advance each group to a distinct committed offset, then make it durable.
+        for (group, acks) in [("g-a", 1u32), ("g-b", 2), ("g-c", 3)] {
+            for _ in 0..acks {
+                let d = message(e.poll_in(group, 0).unwrap());
+                e.ack_in(group, &d.token);
+            }
+            e.checkpoint_group(group).unwrap();
+        }
+        assert_eq!(e.committed_offset_in("g-a"), Offset::new(1));
+        assert_eq!(e.committed_offset_in("g-b"), Offset::new(2));
+        assert_eq!(e.committed_offset_in("g-c"), Offset::new(3));
+        let fs = e.into_filesystem();
+
+        // Reopen under a cap of 2 (default plus room for only one named under the old, buggy
+        // recovery that applied the cap to the resume scan): every group must still recover, none
+        // reset to 0.
+        let e = Engine::open(fs, ManualClock::new(), config_with_max_groups(2)).unwrap();
+        assert_eq!(e.committed_offset_in("g-a"), Offset::new(1), "g-a survived");
+        assert_eq!(e.committed_offset_in("g-b"), Offset::new(2), "g-b survived");
+        assert_eq!(e.committed_offset_in("g-c"), Offset::new(3), "g-c survived");
+        assert_eq!(
+            e.groups.len(),
+            4,
+            "default plus three recovered groups, despite a cap of 2"
+        );
     }
 
     #[test]
@@ -2183,6 +2296,14 @@ mod tests {
         // A well-formed name is accepted.
         assert!(e.poll_in("valid-name_1.2:3", 0).is_ok());
         assert_eq!(e.groups.len(), 2);
+        // A name exactly at the length boundary (MAX_GROUP_NAME_LEN graphic-ASCII bytes) is
+        // accepted; one byte longer is rejected (covered by `too_long` above).
+        let at_boundary = "g".repeat(MAX_GROUP_NAME_LEN);
+        assert!(
+            e.poll_in(&at_boundary, 0).is_ok(),
+            "the max-length name is valid"
+        );
+        assert_eq!(e.groups.len(), 3);
     }
 
     #[test]

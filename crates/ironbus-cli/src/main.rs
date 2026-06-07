@@ -92,6 +92,13 @@ const DEFAULT_MAX_AGE_MS: u64 = 0;
 /// opts in.
 const DEFAULT_MAX_MESSAGES: u64 = 0;
 
+/// The default cap on the number of live work-groups for `serve` (refs #240, #9, #10), aliased to
+/// the engine's [`ironbus_server::engine::DEFAULT_MAX_GROUPS`] so the CLI default and the engine
+/// default are a single source of truth and cannot drift. It bounds total consumer-state memory
+/// once the wire can name groups, so an unauthenticated client cannot exhaust memory by naming
+/// endless groups. `0` = unlimited (the cap is off); the default is non-zero (1024).
+const DEFAULT_MAX_GROUPS: usize = ironbus_server::engine::DEFAULT_MAX_GROUPS;
+
 /// The default disk-full overflow policy for `serve` (`drop-new`, matching the engine default):
 /// an over-cap produce is shed, the older accepted data preserved, so existing behavior is
 /// unchanged. `drop-oldest` opts in to force-reaping the oldest sealed segment to make room.
@@ -168,7 +175,7 @@ USAGE:
                   [--consumer-credit <n>]
                   [--max-segment-bytes <n>] [--max-total-bytes <bytes>]
                   [--max-retained-bytes <bytes>] [--max-age-ms <ms>] [--max-messages <n>]
-                  [--disk-full-policy <drop-new|drop-oldest>]
+                  [--max-groups <n>] [--disk-full-policy <drop-new|drop-oldest>]
                   [--visibility-timeout-ms <n>] [--health-addr <host:port>]
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
     ironbus sub   [--addr <host:port>] [--group <name>] [--max <n>]
@@ -188,6 +195,9 @@ Notes:
     --max-age-ms (a segment whose newest record is older than this many milliseconds), and
     --max-messages (total record count). A segment is reaped if ANY enabled bound trips, oldest
     first, never below the slowest consumer's committed offset, never the active segment.
+    --max-groups (default 1024, 0 = unlimited) caps the number of live work-groups, including the
+    default group, so once the wire can name groups a client cannot exhaust memory by naming
+    endless groups. A new named group past the cap is rejected; the default group is never counted.
     --disk-full-policy (default drop-new) sets what an over-cap produce does once --max-total-bytes
     is hit: drop-new sheds it (preserving older data); drop-oldest force-reaps the oldest sealed
     segment to make room then accepts it, so a slow consumer whose records are reaped gets a
@@ -595,6 +605,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut max_retained_bytes = DEFAULT_MAX_RETAINED_BYTES;
     let mut max_age_ms = DEFAULT_MAX_AGE_MS;
     let mut max_messages = DEFAULT_MAX_MESSAGES;
+    let mut max_groups = DEFAULT_MAX_GROUPS;
     let mut disk_full_policy_arg = DEFAULT_DISK_FULL_POLICY.to_string();
     let mut visibility_ms = DEFAULT_VISIBILITY_MS;
     let mut health_addr: Option<String> = None;
@@ -628,6 +639,9 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             }
             "--max-messages" => {
                 max_messages = take_number("--max-messages", args, &mut i)?;
+            }
+            "--max-groups" => {
+                max_groups = take_number("--max-groups", args, &mut i)?;
             }
             "--disk-full-policy" => {
                 disk_full_policy_arg = take_value("--disk-full-policy", args, &mut i)?;
@@ -664,6 +678,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         max_retained_bytes,
         max_age_ms,
         max_messages,
+        max_groups,
         disk_full_policy,
         visibility_ms,
     };
@@ -753,6 +768,11 @@ struct ServeConfig {
     /// segments while the log's total record count is over this many messages. `0` = disabled,
     /// the default.
     max_messages: u64,
+    /// The cap on the number of live work-groups, including the default (refs #240, #9, #10):
+    /// bounds consumer-state memory once the wire can name groups, so an unauthenticated client
+    /// cannot exhaust memory by naming endless groups. `0` = unlimited (the cap is off); the
+    /// default is non-zero (1024). A new named group past the cap is rejected by the engine.
+    max_groups: usize,
     /// The disk-full overflow policy (#82): `DropNew` (the default) sheds an over-cap produce,
     /// `DropOldest` force-reaps the oldest sealed segment to make room then accepts it. Honored only
     /// when `max_total_bytes` is set; with no cap, no produce is ever over-cap.
@@ -836,6 +856,7 @@ fn cmd_serve(
         config.max_retained_bytes,
         config.max_age_ms,
         config.max_messages,
+        config.max_groups,
         config.disk_full_policy,
         config.visibility_ms,
         health_addr,
@@ -886,6 +907,10 @@ fn open_disk_engine(
             max_retained_bytes: config.max_retained_bytes,
             max_age_ms: config.max_age_ms,
             max_messages: config.max_messages,
+            // The work-group cap (refs #240, #9, #10): bounds consumer-state memory once the wire
+            // can name groups. `0` = unlimited (off); the default is non-zero (1024). A new named
+            // group past the cap is rejected by the engine before it allocates.
+            max_groups: config.max_groups,
             // The disk-full overflow policy (#82): drop-new (default) sheds, drop-oldest force-reaps
             // the oldest sealed segment then accepts. Honored only when `max_total_bytes` is set.
             disk_full_policy: match config.disk_full_policy {
@@ -1281,6 +1306,7 @@ mod tests {
             max_retained_bytes: DEFAULT_MAX_RETAINED_BYTES,
             max_age_ms: DEFAULT_MAX_AGE_MS,
             max_messages: DEFAULT_MAX_MESSAGES,
+            max_groups: DEFAULT_MAX_GROUPS,
             disk_full_policy: DiskFullPolicyArg::DropNew,
             visibility_ms: DEFAULT_VISIBILITY_MS,
         }
@@ -1474,6 +1500,7 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                max_groups: DEFAULT_MAX_GROUPS,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -1631,6 +1658,7 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                max_groups: DEFAULT_MAX_GROUPS,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -2108,6 +2136,86 @@ mod tests {
     }
 
     #[test]
+    fn serve_rejects_a_non_numeric_max_groups() {
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--max-groups".to_string(),
+                "many".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--max-groups"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_accepts_a_max_groups_value() {
+        // A valid --max-groups parses and validates (no usage error); the only failure is the
+        // unrelated bind on an unreachable addr, proving the flag was accepted, not rejected.
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-cli-mg-never-served".to_string(),
+                "--max-groups".to_string(),
+                "16".to_string(),
+                "--addr".to_string(),
+                "127.0.0.1:1".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_ne!(
+            e.exit_code(),
+            EXIT_USAGE,
+            "a valid --max-groups parses and validates: {e}"
+        );
+        let _ = std::fs::remove_dir_all("/tmp/ironbus-cli-mg-never-served");
+    }
+
+    #[test]
+    fn serve_accepts_a_zero_max_groups_meaning_unlimited() {
+        // `0` = unlimited (the cap is off), matching the `0` = off convention of the other bounds.
+        // An explicit 0 must parse the same as the default, so the only failure is the unrelated
+        // bind path, never EXIT_USAGE.
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-cli-mg0-never-served".to_string(),
+                "--max-groups".to_string(),
+                "0".to_string(),
+                "--addr".to_string(),
+                "127.0.0.1:1".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_ne!(
+            e.exit_code(),
+            EXIT_USAGE,
+            "an explicit --max-groups 0 (unlimited) parses and validates: {e}"
+        );
+        let _ = std::fs::remove_dir_all("/tmp/ironbus-cli-mg0-never-served");
+    }
+
+    #[test]
+    fn usage_lists_the_max_groups_flag() {
+        assert!(
+            USAGE.contains("--max-groups"),
+            "USAGE must document --max-groups"
+        );
+    }
+
+    #[test]
     fn serve_rejects_a_tiny_max_segment_bytes() {
         let mut buf = Vec::new();
         let e = run(
@@ -2290,6 +2398,7 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                max_groups: DEFAULT_MAX_GROUPS,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -2359,6 +2468,7 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                max_groups: DEFAULT_MAX_GROUPS,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )

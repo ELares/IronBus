@@ -587,7 +587,7 @@ mod tests {
         encode_dead_letter, encode_deliver, DeadLetterBody, DeliverBody, DEAD_LETTER_MAX_DELIVER,
     };
     use ironbus_server::clock::SystemClock;
-    use ironbus_server::engine::{DiskFullPolicy, Engine, EngineConfig};
+    use ironbus_server::engine::{DiskFullPolicy, Engine, EngineConfig, DEFAULT_MAX_GROUPS};
     use ironbus_server::server::{serve, SharedEngine};
     use ironbus_storage::fs::InMemoryFs;
     use ironbus_storage::log::LogConfig;
@@ -625,6 +625,7 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                max_groups: DEFAULT_MAX_GROUPS,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )

@@ -584,6 +584,7 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -657,6 +658,7 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -688,6 +690,7 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 disk_full_policy: DiskFullPolicy::DropOldest,
             },
         )
@@ -1376,6 +1379,7 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -1687,6 +1691,7 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
