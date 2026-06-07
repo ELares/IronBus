@@ -162,6 +162,18 @@ fn payloads(out: &str) -> Vec<String> {
         .collect()
 }
 
+/// Extracts the offsets from an offline `peek` / `dump` run's stdout. Each record prints a line
+/// `offset=<n> ts_ms=<t> bytes=<b> key_bytes=<k> crc=ok codec=none`, so the offset is the token
+/// right after `offset=`. A trailing `note:` loss line carries no `offset=` token, so it is
+/// skipped: only real record offsets are returned, in the order the reader emitted them.
+fn offline_offsets(out: &str) -> Vec<u64> {
+    out.lines()
+        .filter_map(|l| l.strip_prefix("offset="))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .filter_map(|tok| tok.parse::<u64>().ok())
+        .collect()
+}
+
 #[test]
 fn golden_path_broadcast_and_competing_groups_fan_out() {
     // #133 step 4: one durable log fans out to a BROADCAST group (its own cursor, sees every
@@ -251,5 +263,123 @@ fn golden_path_broadcast_and_competing_groups_fan_out() {
     }
 
     drop(broker2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn golden_path_offline_inspection_agrees_with_recovery() {
+    // #133 step 9: with the broker STOPPED, the offline inspection verbs (`dump`, `peek`) read
+    // exactly the produced records up to the durable high-water mark and no further, agreeing
+    // with what recovery would resume. Records are fsynced before `pub` returns the offset, so
+    // the data directory is durable even after the broker exits, and the offline reader sees the
+    // committed log without a server running. This drives the REAL `ironbus` binary end to end.
+    const N: u64 = 4;
+
+    let dir = std::env::temp_dir().join(format!("ironbus-golden-offline-{}", std::process::id()));
+    let data_dir = dir.to_str().expect("utf8 temp path").to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // 1. Boot the broker and produce N records; each `pub` returns its durable offset.
+    let (broker, addr) = start_broker(&data_dir);
+    for i in 0..N {
+        let payload = format!("m{i}");
+        let (out, code) = run(&["pub", "--addr", &addr, &payload]);
+        assert_eq!(code, 0, "pub exit code");
+        assert_eq!(out.trim(), i.to_string(), "pub returned the durable offset");
+    }
+
+    // 2. Cleanly stop the broker (drop the kill-guard) before reading the directory offline.
+    drop(broker);
+
+    // 3. With the broker STOPPED, `dump` streams every durable record, one per line. It must show
+    //    exactly offsets 0..N, in order, with no phantom record past the durable high-water mark.
+    let (dump_out, code) = run(&["dump", "--data-dir", &data_dir]);
+    assert_eq!(code, 0, "dump exit code: {dump_out}");
+    let dumped = offline_offsets(&dump_out);
+    let expected: Vec<u64> = (0..N).collect();
+    assert_eq!(
+        dumped, expected,
+        "dump showed exactly the produced offsets 0..N, in order: {dump_out}"
+    );
+    // No phantom records: the offline reader stops at the durable high-water mark.
+    assert!(
+        !dump_out.contains(&format!("offset={N}")),
+        "dump shows nothing past the durable high-water mark: {dump_out}"
+    );
+    // A clean directory has no torn or corrupt tail, so no loss note is emitted.
+    assert!(
+        !dump_out.contains("note:"),
+        "a clean directory reports no loss: {dump_out}"
+    );
+
+    // `peek` with no window shows the same prefix (N < the default window of 10).
+    let (peek_out, code) = run(&["peek", "--data-dir", &data_dir]);
+    assert_eq!(code, 0, "peek exit code: {peek_out}");
+    assert_eq!(
+        offline_offsets(&peek_out),
+        expected,
+        "peek shows the same durable records as dump: {peek_out}"
+    );
+
+    // `peek --limit` shows a bounded subset: the first two records only, and never past N.
+    let (window_out, code) = run(&["peek", "--data-dir", &data_dir, "--limit", "2"]);
+    assert_eq!(code, 0, "peek --limit exit code: {window_out}");
+    assert_eq!(
+        offline_offsets(&window_out),
+        vec![0, 1],
+        "peek --limit bounds the window to the first two records: {window_out}"
+    );
+
+    // `peek --from-offset` plus `--limit` reads a bounded window starting mid-log, still bounded
+    // by the durable high-water mark (offsets 2 and 3 only, never a phantom offset N).
+    let (tail_out, code) = run(&[
+        "peek",
+        "--data-dir",
+        &data_dir,
+        "--from-offset",
+        "2",
+        "--limit",
+        "10",
+    ]);
+    assert_eq!(code, 0, "peek --from-offset exit code: {tail_out}");
+    assert_eq!(
+        offline_offsets(&tail_out),
+        vec![2, 3],
+        "peek --from-offset reads only up to the durable high-water mark: {tail_out}"
+    );
+
+    // 4. `dump --json` produces valid NDJSON: exactly one JSON object per record, offsets 0..N in
+    //    order, each a record object (not the loss object), and nothing past the high-water mark.
+    let (json_out, code) = run(&["dump", "--data-dir", &data_dir, "--json"]);
+    assert_eq!(code, 0, "dump --json exit code: {json_out}");
+    let json_lines: Vec<&str> = json_out.lines().collect();
+    assert_eq!(
+        json_lines.len(),
+        usize::try_from(N).unwrap(),
+        "one NDJSON line per record, no loss object on a clean directory: {json_out}"
+    );
+    for (i, line) in json_lines.iter().enumerate() {
+        assert!(
+            line.starts_with('{') && line.ends_with('}'),
+            "each line is one JSON object: {line}"
+        );
+        assert!(
+            line.contains(&format!("\"offset\":{i}")),
+            "line {i} carries offset {i}: {line}"
+        );
+        assert!(
+            line.contains("\"crc\":\"ok\""),
+            "the offline reader only yields CRC-clean records: {line}"
+        );
+        assert!(
+            !line.contains("\"loss\""),
+            "a clean directory has no loss object: {line}"
+        );
+    }
+    assert!(
+        !json_out.contains(&format!("\"offset\":{N}")),
+        "dump --json shows nothing past the durable high-water mark: {json_out}"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
