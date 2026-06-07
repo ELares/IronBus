@@ -26,6 +26,7 @@ for f in *.dot; do dot -Tpdf "$f" -o "${f%.dot}.pdf"; done
 
 ## Reference docs
 
+- [CLI reference map](CLI.md): the exhaustive command-surface map of the `ironbus` binary, every subcommand, every flag (type, default, unit), every exit code, and online versus offline, each default cited to the `main.rs` constant. The complementary flag-and-exit-code table to the prose guide in [USAGE.md](USAGE.md) (#136).
 - [Invariants and glossary](INVARIANTS.md): the shared invariants every subsystem must hold (I1 to I8), the resilience invariant checkers, and the canonical glossary of load-bearing terms, each cross-checked against the code (#131).
 - [Contract models](CONTRACTS.md): the on-disk, wire, config, runtime, and report byte-level schemas, derived from and cross-checked against the source (#137).
 - [The WAL under load and the on-disk file lifecycle](WAL.md): how the active-segment-is-the-WAL model absorbs a high write rate (segment roll, the O(1) running totals, the shed/drop-oldest overflow policy), the on-disk file classes and their lifecycle (active and sealed `.log`, the cursor checkpoints, the `dlq/` sink), recovery under a crash mid-write, the knobs, and what #135 specifies but the code does not yet implement (#135).
