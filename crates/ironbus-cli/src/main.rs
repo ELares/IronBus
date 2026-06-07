@@ -15,6 +15,11 @@
 //! 5 broker-unreachable, 70 internal (the not-found and corruption codes belong to the
 //! offline verbs not yet implemented).
 
+/// The `serve` data-directory lifecycle and the single-broker lock (#89). Unix-only, like `serve`
+/// itself; the non-Unix `cmd_serve` stub errors out before any of it runs, so the module is gated.
+#[cfg(unix)]
+mod dirlock;
+
 use ironbus_client::{Client, ClientError};
 use ironbus_core::clock::Clock;
 use ironbus_proto::message::PubBody;
@@ -260,6 +265,15 @@ Notes:
     per poison record showing dlq_offset, source_offset, group, attempt, ts_ms, and the
     key/payload sizes (NDJSON with --json). It is read-only and never mutates the directory;
     an empty or never-poisoned broker shows nothing.
+    Every serve setting can also be supplied via an environment variable IRONBUS_<FLAG>, the flag
+    name uppercased with dashes as underscores (--max-total-bytes -> IRONBUS_MAX_TOTAL_BYTES,
+    --data-dir -> IRONBUS_DATA_DIR, --addr -> IRONBUS_ADDR). Precedence is flag > env > default: an
+    explicit flag overrides the env var, which overrides the compiled default. A bad env value (e.g.
+    non-numeric where a number is expected) is a usage error naming the env var. See docs/CLI.md.
+    On serve, the --data-dir is created (parents too, mode 0700) if absent and verified writable; a
+    path that exists but is not a directory, or a read-only mount, is a fatal error naming the path.
+    serve takes an exclusive lock on the data dir, so a second broker on the same data dir fails
+    fast rather than corrupting the log with concurrent writers.
     Exit codes: 0 clean, 1 usage, 2 not found, 4 corrupt data, 5 broker unreachable, 70 internal.";
 
 /// A command-line failure, mapped to a frozen exit code by [`main`].
@@ -378,24 +392,9 @@ where
 /// caught before the broker opens rather than silently dropping a stage of the schedule.
 fn take_number_list(flag: &str, args: &[String], i: &mut usize) -> Result<Vec<u64>, CliError> {
     let raw = take_value(flag, args, i)?;
-    let mut values = Vec::new();
-    for part in raw.split(',') {
-        let trimmed = part.trim();
-        let value = trimmed.parse::<u64>().map_err(|_| {
-            CliError::Usage(format!(
-                "`{flag}` needs a comma-separated list of numbers, got `{raw}`"
-            ))
-        })?;
-        values.push(value);
-    }
-    if values.is_empty() {
-        // `split(',')` always yields at least one element, so this only trips on an empty string,
-        // which `parse` already rejects; kept as a defensive guard so the list is never empty.
-        return Err(CliError::Usage(format!(
-            "`{flag}` needs at least one number"
-        )));
-    }
-    Ok(values)
+    // Shared with the env-var path (`IRONBUS_BACKOFF_MS`, #89) via `parse_u64_list`, so the flag and
+    // the env var accept exactly the same grammar and emit the same error shape (naming the source).
+    parse_u64_list(flag, &raw)
 }
 
 /// Classifies a client error against the frozen exit-code scheme. A connection-level failure
@@ -664,9 +663,122 @@ fn cmd_sub(
     Ok(())
 }
 
+/// An injectable environment-variable lookup (#89): maps an env-var NAME to its value, or `None`
+/// if it is unset. A `serve` setting reads its `IRONBUS_<FLAG>` var through this seam rather than
+/// touching `std::env` directly, so a test can drive the env layer deterministically with a fixed
+/// map (no global, racy process-environment mutation) while production passes a closure over the
+/// real [`std::env::var`]. The precedence is flag > env > default: an explicit CLI flag overrides
+/// the env var, which overrides the compiled default.
+type EnvFn<'a> = dyn Fn(&str) -> Option<String> + 'a;
+
+/// Reads the `IRONBUS_<flag>` env var for `flag` (e.g. `--data-dir` -> `IRONBUS_DATA_DIR`) through
+/// the injected `env` seam, returning the raw string if set. The mapping is the flag name minus its
+/// leading `--`, uppercased, with `-` -> `_`, prefixed `IRONBUS_`; documented in `docs/CLI.md`.
+fn env_var_name(flag: &str) -> String {
+    let base = flag
+        .trim_start_matches('-')
+        .replace('-', "_")
+        .to_uppercase();
+    format!("IRONBUS_{base}")
+}
+
+/// Resolves a STRING setting with the flag > env > default precedence: the explicit CLI `flag`
+/// value if given, else the `IRONBUS_<flag>` env var if set, else `default`.
+fn resolve_string(flag: &str, cli: Option<String>, env: &EnvFn<'_>, default: &str) -> String {
+    cli.or_else(|| env(&env_var_name(flag)))
+        .unwrap_or_else(|| default.to_string())
+}
+
+/// Resolves an OPTIONAL string setting (one with no compiled default, e.g. `--data-dir`,
+/// `--health-addr`): the explicit CLI value if given, else the env var if set, else `None`.
+fn resolve_opt_string(flag: &str, cli: Option<String>, env: &EnvFn<'_>) -> Option<String> {
+    cli.or_else(|| env(&env_var_name(flag)))
+}
+
+/// Resolves a NUMERIC setting with the flag > env > default precedence. If the CLI flag was given
+/// its already-parsed value wins; otherwise the `IRONBUS_<flag>` env var is parsed, and a
+/// non-numeric env value is a usage error NAMING THE ENV VAR (e.g. ``IRONBUS_MAX_TOTAL_BYTES needs
+/// a number, got `x` ``), exactly as a bad flag value names the flag; absent the env var, `default`.
+fn resolve_number<T>(flag: &str, cli: Option<T>, env: &EnvFn<'_>, default: T) -> Result<T, CliError>
+where
+    T: std::str::FromStr,
+{
+    if let Some(value) = cli {
+        return Ok(value);
+    }
+    let name = env_var_name(flag);
+    match env(&name) {
+        Some(raw) => raw
+            .parse::<T>()
+            .map_err(|_| CliError::Usage(format!("`{name}` needs a number, got `{raw}`"))),
+        None => Ok(default),
+    }
+}
+
+/// Resolves a comma-separated `u64` LIST setting (`--backoff-ms`) with flag > env > default. The
+/// CLI list wins if given; else the `IRONBUS_BACKOFF_MS` env var is parsed with the same grammar as
+/// the flag (comma-separated, whitespace-tolerant), a bad element a usage error naming the env var;
+/// absent the env var, the empty list (meaning "use the built-in default schedule").
+fn resolve_number_list(
+    flag: &str,
+    cli: Option<Vec<u64>>,
+    env: &EnvFn<'_>,
+) -> Result<Vec<u64>, CliError> {
+    if let Some(list) = cli {
+        return Ok(list);
+    }
+    let name = env_var_name(flag);
+    match env(&name) {
+        Some(raw) => parse_u64_list(&name, &raw),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Parses a comma-separated `u64` list (the shared `--backoff-ms` grammar), naming `source` (a flag
+/// or an env var) in the error. Whitespace around an element is tolerated; an empty element (a
+/// stray comma) or a non-numeric element is a usage error.
+fn parse_u64_list(source: &str, raw: &str) -> Result<Vec<u64>, CliError> {
+    let mut values = Vec::new();
+    for part in raw.split(',') {
+        let value = part.trim().parse::<u64>().map_err(|_| {
+            CliError::Usage(format!(
+                "`{source}` needs a comma-separated list of numbers, got `{raw}`"
+            ))
+        })?;
+        values.push(value);
+    }
+    if values.is_empty() {
+        return Err(CliError::Usage(format!(
+            "`{source}` needs at least one number"
+        )));
+    }
+    Ok(values)
+}
+
+/// Resolves a BOOLEAN flag with flag > env > default(false). The flag is set on the command line
+/// (no value), else the `IRONBUS_<flag>` env var is read: `1`/`true` (case-insensitive) enables it,
+/// `0`/`false` disables it, any other value is a usage error naming the env var; absent, `false`.
+fn resolve_bool(flag: &str, cli_set: bool, env: &EnvFn<'_>) -> Result<bool, CliError> {
+    if cli_set {
+        return Ok(true);
+    }
+    let name = env_var_name(flag);
+    match env(&name) {
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" => Ok(true),
+            "0" | "false" => Ok(false),
+            other => Err(CliError::Usage(format!(
+                "`{name}` must be `true`/`1` or `false`/`0`, got `{other}`"
+            ))),
+        },
+        None => Ok(false),
+    }
+}
+
 /// The fully-parsed `serve` invocation: the assembled tuning config plus the connection-level
 /// arguments (the bind address, the optional data dir and health address, and the declared
 /// `key_shared` groups) that are not part of [`ServeConfig`].
+#[derive(Debug)]
 struct ParsedServe {
     addr: String,
     data_dir: Option<String>,
@@ -676,7 +788,10 @@ struct ParsedServe {
 }
 
 fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
-    let parsed = parse_serve_flags(args)?;
+    // Production reads the real process environment through the injected seam; tests drive
+    // `parse_serve_flags_with_env` with a fixed map so the env layer is deterministic (#89).
+    let env = |name: &str| std::env::var(name).ok();
+    let parsed = parse_serve_flags_with_env(args, &env)?;
     finish_serve(
         &parsed.addr,
         parsed.data_dir.as_deref(),
@@ -689,88 +804,106 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
 
 /// Parses the `serve` flag list into a [`ParsedServe`]. Split out of [`run_serve`] so the
 /// flag-parsing loop is one self-contained concern (and stays under the per-function line bound).
-// One flat arm per `serve` flag plus the defaults block: a single linear concern (parse the flags
-// into a `ServeConfig`) that reads better unbroken than split across helpers, so the line count is
-// allowed past the default ceiling. Adding `--consumer-credit-bytes` (#275) pushed it just over.
+/// The `serve` flags as EXPLICITLY GIVEN on the command line: each settable knob is `Some` only if
+/// its flag appeared, `None` otherwise, so the env/default layer ([`parse_serve_flags_with_env`])
+/// can fill the unset slots with flag > env > default precedence (#89). The repeatable
+/// `--key-shared-group` is a plain `Vec` (CLI-only, no env mapping); the booleans are `true` only if
+/// their bare flag appeared.
+#[derive(Default)]
+struct ServeFlags {
+    addr: Option<String>,
+    data_dir: Option<String>,
+    max_connections: Option<usize>,
+    checkpoint_interval: Option<u64>,
+    max_deliver: Option<u32>,
+    allow_unlimited_deliver: bool,
+    backoff_ms: Option<Vec<u64>>,
+    max_in_flight: Option<u32>,
+    consumer_credit: Option<u32>,
+    consumer_credit_bytes: Option<u64>,
+    max_segment_bytes: Option<u64>,
+    max_total_bytes: Option<u64>,
+    max_retained_bytes: Option<u64>,
+    max_age_ms: Option<u64>,
+    max_messages: Option<u64>,
+    max_groups: Option<usize>,
+    group_idle_evict_ms: Option<u64>,
+    disk_full_policy: Option<String>,
+    visibility_ms: Option<u64>,
+    enable_admin: bool,
+    health_addr: Option<String>,
+    key_shared_groups: Vec<String>,
+}
+
+/// Collects the `serve` arg list into [`ServeFlags`], each knob `Some` only if its flag appeared.
+/// The env/default resolution is a separate pass so the precedence (flag > env > default) lives in
+/// one place and the parse error for a bad FLAG value still names the flag (#89).
+// One flat arm per `serve` flag: a single linear concern (the arg loop) that reads better unbroken
+// than split across helpers, so the line count is allowed past the default ceiling.
 #[allow(clippy::too_many_lines)]
-fn parse_serve_flags(args: &[String]) -> Result<ParsedServe, CliError> {
-    let mut addr = DEFAULT_ADDR.to_string();
-    let mut data_dir: Option<String> = None;
-    let mut max_connections = DEFAULT_MAX_CONNECTIONS;
-    let mut checkpoint_interval = DEFAULT_CHECKPOINT_INTERVAL;
-    let mut max_deliver = DEFAULT_MAX_DELIVER;
-    let mut allow_unlimited_deliver = false;
-    // Empty = use the built-in default schedule; --backoff-ms sets an explicit one.
-    let mut backoff_ms: Vec<u64> = Vec::new();
-    let mut max_in_flight = DEFAULT_MAX_IN_FLIGHT;
-    let mut consumer_credit = DEFAULT_CONSUMER_CREDIT;
-    let mut consumer_credit_bytes = DEFAULT_CONSUMER_CREDIT_BYTES;
-    let mut max_segment_bytes = DEFAULT_MAX_SEGMENT_BYTES;
-    let mut max_total_bytes = DEFAULT_MAX_TOTAL_BYTES;
-    let mut max_retained_bytes = DEFAULT_MAX_RETAINED_BYTES;
-    let mut max_age_ms = DEFAULT_MAX_AGE_MS;
-    let mut max_messages = DEFAULT_MAX_MESSAGES;
-    let mut max_groups = DEFAULT_MAX_GROUPS;
-    let mut group_idle_evict_ms = DEFAULT_GROUP_IDLE_EVICT_MS;
-    let mut disk_full_policy_arg = DEFAULT_DISK_FULL_POLICY.to_string();
-    let mut visibility_ms = DEFAULT_VISIBILITY_MS;
-    let mut enable_admin = false;
-    let mut health_addr: Option<String> = None;
-    // The groups to run in key_shared ordering (#64), via the repeatable --key-shared-group flag.
-    let mut key_shared_groups: Vec<String> = Vec::new();
+fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
+    let mut f = ServeFlags::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--addr" => addr = take_value("--addr", args, &mut i)?,
-            "--data-dir" => data_dir = Some(take_value("--data-dir", args, &mut i)?),
+            "--addr" => f.addr = Some(take_value("--addr", args, &mut i)?),
+            "--data-dir" => f.data_dir = Some(take_value("--data-dir", args, &mut i)?),
             "--max-connections" => {
-                max_connections = take_number("--max-connections", args, &mut i)?;
+                f.max_connections = Some(take_number("--max-connections", args, &mut i)?);
             }
             "--checkpoint-interval" => {
-                checkpoint_interval = take_number("--checkpoint-interval", args, &mut i)?;
+                f.checkpoint_interval = Some(take_number("--checkpoint-interval", args, &mut i)?);
             }
-            "--max-deliver" => max_deliver = take_number("--max-deliver", args, &mut i)?,
+            "--max-deliver" => f.max_deliver = Some(take_number("--max-deliver", args, &mut i)?),
             // A bare boolean flag (no value): advance ONE token, not two, or the loop spins.
             "--allow-unlimited-deliver" => {
-                allow_unlimited_deliver = true;
+                f.allow_unlimited_deliver = true;
                 i += 1;
             }
-            "--backoff-ms" => backoff_ms = take_number_list("--backoff-ms", args, &mut i)?,
-            "--max-in-flight" => max_in_flight = take_number("--max-in-flight", args, &mut i)?,
+            "--backoff-ms" => {
+                f.backoff_ms = Some(take_number_list("--backoff-ms", args, &mut i)?);
+            }
+            "--max-in-flight" => {
+                f.max_in_flight = Some(take_number("--max-in-flight", args, &mut i)?);
+            }
             "--consumer-credit" => {
-                consumer_credit = take_number("--consumer-credit", args, &mut i)?;
+                f.consumer_credit = Some(take_number("--consumer-credit", args, &mut i)?);
             }
             "--consumer-credit-bytes" => {
-                consumer_credit_bytes = take_number("--consumer-credit-bytes", args, &mut i)?;
+                f.consumer_credit_bytes =
+                    Some(take_number("--consumer-credit-bytes", args, &mut i)?);
             }
             "--max-segment-bytes" => {
-                max_segment_bytes = take_number("--max-segment-bytes", args, &mut i)?;
+                f.max_segment_bytes = Some(take_number("--max-segment-bytes", args, &mut i)?);
             }
             "--max-total-bytes" => {
-                max_total_bytes = take_number("--max-total-bytes", args, &mut i)?;
+                f.max_total_bytes = Some(take_number("--max-total-bytes", args, &mut i)?);
             }
             "--max-retained-bytes" => {
-                max_retained_bytes = take_number("--max-retained-bytes", args, &mut i)?;
+                f.max_retained_bytes = Some(take_number("--max-retained-bytes", args, &mut i)?);
             }
-            "--max-age-ms" => max_age_ms = take_number("--max-age-ms", args, &mut i)?,
-            "--max-messages" => max_messages = take_number("--max-messages", args, &mut i)?,
-            "--max-groups" => max_groups = take_number("--max-groups", args, &mut i)?,
+            "--max-age-ms" => f.max_age_ms = Some(take_number("--max-age-ms", args, &mut i)?),
+            "--max-messages" => {
+                f.max_messages = Some(take_number("--max-messages", args, &mut i)?);
+            }
+            "--max-groups" => f.max_groups = Some(take_number("--max-groups", args, &mut i)?),
             "--group-idle-evict-ms" => {
-                group_idle_evict_ms = take_number("--group-idle-evict-ms", args, &mut i)?;
+                f.group_idle_evict_ms = Some(take_number("--group-idle-evict-ms", args, &mut i)?);
             }
             "--disk-full-policy" => {
-                disk_full_policy_arg = take_value("--disk-full-policy", args, &mut i)?;
+                f.disk_full_policy = Some(take_value("--disk-full-policy", args, &mut i)?);
             }
             "--key-shared-group" => {
-                key_shared_groups.push(take_value("--key-shared-group", args, &mut i)?);
+                f.key_shared_groups
+                    .push(take_value("--key-shared-group", args, &mut i)?);
             }
             "--visibility-timeout-ms" => {
-                visibility_ms = take_number("--visibility-timeout-ms", args, &mut i)?;
+                f.visibility_ms = Some(take_number("--visibility-timeout-ms", args, &mut i)?);
             }
-            "--health-addr" => health_addr = Some(take_value("--health-addr", args, &mut i)?),
+            "--health-addr" => f.health_addr = Some(take_value("--health-addr", args, &mut i)?),
             // A bare boolean flag (no value): advance ONE token, not two, or the loop spins.
             "--enable-admin" => {
-                enable_admin = true;
+                f.enable_admin = true;
                 i += 1;
             }
             flag if flag.starts_with("--") => {
@@ -783,36 +916,132 @@ fn parse_serve_flags(args: &[String]) -> Result<ParsedServe, CliError> {
             }
         }
     }
+    Ok(f)
+}
+
+/// Parses the `serve` flag list with NO env layer, resolving every unset knob to its compiled
+/// default. The convenience entry for unit tests that assert flag parsing and defaults; production
+/// goes through [`parse_serve_flags_with_env`] with the real process environment (#89).
+#[cfg(test)]
+fn parse_serve_flags(args: &[String]) -> Result<ParsedServe, CliError> {
+    parse_serve_flags_with_env(args, &|_| None)
+}
+
+/// Parses the `serve` flag list into a [`ParsedServe`], resolving each knob with the flag > env >
+/// default precedence (#89): an explicit CLI flag wins, else the `IRONBUS_<flag>` env var read
+/// through the injected `env` seam, else the compiled default. A non-numeric env value is a usage
+/// error naming the env var, exactly like a bad flag. Split into a flag-collection pass
+/// ([`collect_serve_flags`]) and this resolution pass so the precedence lives in one place.
+// One `resolve_*` call per knob: a single linear concern (resolve every flag against env/default)
+// that reads better as one flat block than split across helpers, so the line count is allowed past
+// the default ceiling, like `collect_serve_flags`.
+#[allow(clippy::too_many_lines)]
+fn parse_serve_flags_with_env(args: &[String], env: &EnvFn<'_>) -> Result<ParsedServe, CliError> {
+    let f = collect_serve_flags(args)?;
+    // The disk-full policy is an enum string, so it resolves like a string but is then parsed: name
+    // the source (the flag if it was explicit, else the env var) in a bad-value error so the
+    // operator knows where it came from.
+    let policy_from_flag = f.disk_full_policy.is_some();
+    let disk_full_policy_arg = resolve_string(
+        "--disk-full-policy",
+        f.disk_full_policy,
+        env,
+        DEFAULT_DISK_FULL_POLICY,
+    );
     let disk_full_policy = DiskFullPolicyArg::parse(&disk_full_policy_arg).ok_or_else(|| {
+        let source = if policy_from_flag {
+            "--disk-full-policy".to_string()
+        } else {
+            env_var_name("--disk-full-policy")
+        };
         CliError::Usage(format!(
-            "`--disk-full-policy` must be `drop-new` or `drop-oldest`, got `{disk_full_policy_arg}`"
+            "`{source}` must be `drop-new` or `drop-oldest`, got `{disk_full_policy_arg}`"
         ))
     })?;
     Ok(ParsedServe {
-        addr,
-        data_dir,
+        addr: resolve_string("--addr", f.addr, env, DEFAULT_ADDR),
+        data_dir: resolve_opt_string("--data-dir", f.data_dir, env),
         config: ServeConfig {
-            max_connections,
-            checkpoint_interval,
-            max_deliver,
-            allow_unlimited_deliver,
-            backoff_ms,
-            max_in_flight,
-            consumer_credit,
-            consumer_credit_bytes,
-            max_segment_bytes,
-            max_total_bytes,
-            max_retained_bytes,
-            max_age_ms,
-            max_messages,
-            max_groups,
-            group_idle_evict_ms,
+            max_connections: resolve_number(
+                "--max-connections",
+                f.max_connections,
+                env,
+                DEFAULT_MAX_CONNECTIONS,
+            )?,
+            checkpoint_interval: resolve_number(
+                "--checkpoint-interval",
+                f.checkpoint_interval,
+                env,
+                DEFAULT_CHECKPOINT_INTERVAL,
+            )?,
+            max_deliver: resolve_number("--max-deliver", f.max_deliver, env, DEFAULT_MAX_DELIVER)?,
+            allow_unlimited_deliver: resolve_bool(
+                "--allow-unlimited-deliver",
+                f.allow_unlimited_deliver,
+                env,
+            )?,
+            backoff_ms: resolve_number_list("--backoff-ms", f.backoff_ms, env)?,
+            max_in_flight: resolve_number(
+                "--max-in-flight",
+                f.max_in_flight,
+                env,
+                DEFAULT_MAX_IN_FLIGHT,
+            )?,
+            consumer_credit: resolve_number(
+                "--consumer-credit",
+                f.consumer_credit,
+                env,
+                DEFAULT_CONSUMER_CREDIT,
+            )?,
+            consumer_credit_bytes: resolve_number(
+                "--consumer-credit-bytes",
+                f.consumer_credit_bytes,
+                env,
+                DEFAULT_CONSUMER_CREDIT_BYTES,
+            )?,
+            max_segment_bytes: resolve_number(
+                "--max-segment-bytes",
+                f.max_segment_bytes,
+                env,
+                DEFAULT_MAX_SEGMENT_BYTES,
+            )?,
+            max_total_bytes: resolve_number(
+                "--max-total-bytes",
+                f.max_total_bytes,
+                env,
+                DEFAULT_MAX_TOTAL_BYTES,
+            )?,
+            max_retained_bytes: resolve_number(
+                "--max-retained-bytes",
+                f.max_retained_bytes,
+                env,
+                DEFAULT_MAX_RETAINED_BYTES,
+            )?,
+            max_age_ms: resolve_number("--max-age-ms", f.max_age_ms, env, DEFAULT_MAX_AGE_MS)?,
+            max_messages: resolve_number(
+                "--max-messages",
+                f.max_messages,
+                env,
+                DEFAULT_MAX_MESSAGES,
+            )?,
+            max_groups: resolve_number("--max-groups", f.max_groups, env, DEFAULT_MAX_GROUPS)?,
+            group_idle_evict_ms: resolve_number(
+                "--group-idle-evict-ms",
+                f.group_idle_evict_ms,
+                env,
+                DEFAULT_GROUP_IDLE_EVICT_MS,
+            )?,
             disk_full_policy,
-            visibility_ms,
-            enable_admin,
+            visibility_ms: resolve_number(
+                "--visibility-timeout-ms",
+                f.visibility_ms,
+                env,
+                DEFAULT_VISIBILITY_MS,
+            )?,
+            enable_admin: resolve_bool("--enable-admin", f.enable_admin, env)?,
         },
-        key_shared_groups,
-        health_addr,
+        key_shared_groups: f.key_shared_groups,
+        health_addr: resolve_opt_string("--health-addr", f.health_addr, env),
     })
 }
 
@@ -892,8 +1121,8 @@ fn validate_serve_config(config: &ServeConfig) -> Result<(), CliError> {
 
 /// The broker tuning knobs parsed from the `serve` flags.
 // Not `Copy`: `backoff_ms` is a `Vec`. The config is moved (never re-used after the move) through
-// `finish_serve`/`cmd_serve`, so `Clone` suffices.
-#[derive(Clone)]
+// `finish_serve`/`cmd_serve`, so `Clone` suffices. `Debug` lets a test assert on a `ParsedServe`.
+#[derive(Clone, Debug)]
 struct ServeConfig {
     max_connections: usize,
     checkpoint_interval: u64,
@@ -961,6 +1190,20 @@ struct ServeConfig {
     enable_admin: bool,
 }
 
+/// Maps a data-dir lifecycle/lock failure (#89) onto the frozen CLI exit-code scheme. A
+/// non-directory path is an operator MISCONFIGURATION (usage, exit 1); an unwritable mount, a
+/// lock-IO fault, and the "another broker already running" contention are RUNTIME faults that fail
+/// the broker start (internal, exit 70). All carry the typed message naming the data dir.
+#[cfg(unix)]
+fn map_dir_error(e: &dirlock::DirError) -> CliError {
+    match e {
+        dirlock::DirError::NotADirectory(_) => CliError::Usage(e.to_string()),
+        dirlock::DirError::NotWritable(..)
+        | dirlock::DirError::AlreadyLocked(_)
+        | dirlock::DirError::LockIo(..) => CliError::Internal(e.to_string()),
+    }
+}
+
 #[cfg(unix)]
 fn cmd_serve(
     addr: &str,
@@ -970,6 +1213,13 @@ fn cmd_serve(
     health_addr: Option<&str>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
+    // Data-dir lifecycle then the single-broker lock (#89), BEFORE the engine opens. `prepare`
+    // creates the dir (0700) if absent, rejects a non-directory path, and proves it writable; the
+    // lock makes a SECOND `serve` on the same data dir fail fast rather than corrupt the log with
+    // concurrent writers. The `DirLock` is held in `_dir_lock` for the whole serve lifetime and is
+    // released by the OS when it drops on return (and unconditionally on process exit).
+    dirlock::prepare_data_dir(data_dir).map_err(|e| map_dir_error(&e))?;
+    let _dir_lock = dirlock::DirLock::acquire(data_dir).map_err(|e| map_dir_error(&e))?;
     let shared = open_disk_engine(data_dir, config, key_shared_groups)?;
     let listener = TcpListener::bind(addr)
         .map_err(|e| CliError::Internal(format!("cannot bind {addr}: {e}")))?;
@@ -2769,6 +3019,251 @@ mod tests {
             DEFAULT_CONSUMER_CREDIT_BYTES
         );
         assert_eq!(DEFAULT_CONSUMER_CREDIT_BYTES, 8 * 1024 * 1024);
+    }
+
+    // ----- Env-var mapping with flag > env > default precedence (#89) -----
+
+    /// Builds an injected env lookup from a fixed list of (name, value) pairs, so the env layer is
+    /// driven DETERMINISTICALLY without touching (and racing on) the real process environment.
+    fn fixed_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |name: &str| map.get(name).cloned()
+    }
+
+    #[test]
+    fn the_env_var_name_mapping_is_ironbus_uppercase_underscored() {
+        // `--max-total-bytes` -> `IRONBUS_MAX_TOTAL_BYTES`, `--data-dir` -> `IRONBUS_DATA_DIR`,
+        // `--addr` -> `IRONBUS_ADDR`: leading dashes stripped, `-` -> `_`, uppercased, `IRONBUS_`.
+        assert_eq!(env_var_name("--max-total-bytes"), "IRONBUS_MAX_TOTAL_BYTES");
+        assert_eq!(env_var_name("--data-dir"), "IRONBUS_DATA_DIR");
+        assert_eq!(env_var_name("--addr"), "IRONBUS_ADDR");
+        assert_eq!(env_var_name("--enable-admin"), "IRONBUS_ENABLE_ADMIN");
+    }
+
+    #[test]
+    fn env_var_sets_a_value_when_no_flag_is_given() {
+        // No `--max-total-bytes` flag, but `IRONBUS_MAX_TOTAL_BYTES` set: the env value applies.
+        let env = fixed_env(&[
+            ("IRONBUS_MAX_TOTAL_BYTES", "4096"),
+            ("IRONBUS_DATA_DIR", "/tmp/ironbus-env-dd"),
+            ("IRONBUS_ADDR", "127.0.0.1:9999"),
+        ]);
+        let parsed = parse_serve_flags_with_env(&[], &env).expect("env-only serve config resolves");
+        assert_eq!(parsed.config.max_total_bytes, 4096, "env value applied");
+        assert_eq!(parsed.data_dir.as_deref(), Some("/tmp/ironbus-env-dd"));
+        assert_eq!(parsed.addr, "127.0.0.1:9999");
+    }
+
+    #[test]
+    fn an_explicit_flag_overrides_the_env_var() {
+        // The flag wins over the env var (flag > env): `--max-total-bytes 100` beats the env's 4096.
+        let env = fixed_env(&[
+            ("IRONBUS_MAX_TOTAL_BYTES", "4096"),
+            ("IRONBUS_ADDR", "127.0.0.1:9999"),
+        ]);
+        let parsed = parse_serve_flags_with_env(
+            &[
+                "--max-total-bytes".to_string(),
+                "100".to_string(),
+                "--addr".to_string(),
+                "127.0.0.1:1234".to_string(),
+            ],
+            &env,
+        )
+        .unwrap();
+        assert_eq!(parsed.config.max_total_bytes, 100, "the flag overrides env");
+        assert_eq!(parsed.addr, "127.0.0.1:1234", "the flag overrides env");
+    }
+
+    #[test]
+    fn the_default_applies_when_neither_flag_nor_env_is_given() {
+        // Neither a flag nor an env var: the compiled default (flag > env > default).
+        let env = fixed_env(&[]);
+        let parsed = parse_serve_flags_with_env(&[], &env).unwrap();
+        assert_eq!(parsed.config.max_total_bytes, DEFAULT_MAX_TOTAL_BYTES);
+        assert_eq!(parsed.addr, DEFAULT_ADDR);
+        assert_eq!(
+            parsed.data_dir, None,
+            "no data dir from flag, env, or default"
+        );
+    }
+
+    #[test]
+    fn an_invalid_env_value_is_a_typed_error_naming_the_env_var() {
+        // A non-numeric env value where a number is expected is a usage error that NAMES THE ENV VAR
+        // (not the flag), exactly as a bad flag value names the flag.
+        let env = fixed_env(&[("IRONBUS_MAX_TOTAL_BYTES", "not-a-number")]);
+        let e = parse_serve_flags_with_env(&[], &env).unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => {
+                assert!(
+                    m.contains("IRONBUS_MAX_TOTAL_BYTES"),
+                    "names the env var: {m}"
+                );
+                assert!(m.contains("not-a-number"), "echoes the bad value: {m}");
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_env_supplied_bool_and_list_resolve_through_the_seam() {
+        // The boolean (`IRONBUS_ENABLE_ADMIN`) and the comma-separated list (`IRONBUS_BACKOFF_MS`)
+        // resolve through the env seam with the same grammar as their flags.
+        let env = fixed_env(&[
+            ("IRONBUS_ENABLE_ADMIN", "true"),
+            ("IRONBUS_BACKOFF_MS", "100, 500 ,2000"),
+        ]);
+        let parsed = parse_serve_flags_with_env(&[], &env).unwrap();
+        assert!(
+            parsed.config.enable_admin,
+            "env-supplied bool enabled admin"
+        );
+        assert_eq!(
+            parsed.config.backoff_ms,
+            vec![100, 500, 2000],
+            "env list parsed"
+        );
+        // An invalid bool value names the env var.
+        let bad = parse_serve_flags_with_env(&[], &fixed_env(&[("IRONBUS_ENABLE_ADMIN", "maybe")]))
+            .unwrap_err();
+        match bad {
+            CliError::Usage(m) => assert!(m.contains("IRONBUS_ENABLE_ADMIN"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_env_supplied_disk_full_policy_resolves_and_a_bad_one_names_the_env_var() {
+        let parsed = parse_serve_flags_with_env(
+            &[],
+            &fixed_env(&[("IRONBUS_DISK_FULL_POLICY", "drop-oldest")]),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.config.disk_full_policy,
+            DiskFullPolicyArg::DropOldest
+        );
+        let bad = parse_serve_flags_with_env(
+            &[],
+            &fixed_env(&[("IRONBUS_DISK_FULL_POLICY", "drop-everything")]),
+        )
+        .unwrap_err();
+        match bad {
+            CliError::Usage(m) => assert!(m.contains("IRONBUS_DISK_FULL_POLICY"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_and_cli_docs_document_the_env_var_mapping() {
+        // The env-var surface is documented in the usage banner and in docs/CLI.md (#89).
+        assert!(
+            USAGE.contains("IRONBUS_"),
+            "USAGE must document the env-var mapping"
+        );
+    }
+
+    // ----- data_dir lifecycle and the single-broker lock on serve (#89) -----
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_creates_a_missing_data_dir() {
+        // serve creates the data dir (and parents) if absent. We point it at an UNBINDABLE address so
+        // the call errors at the bind step (after the dir is prepared), proving creation happened
+        // without leaving a broker running.
+        let dir = std::env::temp_dir().join(format!(
+            "ironbus-cli-serve-mkdir-{}/nested/leaf",
+            std::process::id()
+        ));
+        let base =
+            std::env::temp_dir().join(format!("ironbus-cli-serve-mkdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(!dir.exists());
+        let mut buf = Vec::new();
+        // Port 0 binds fine, so use a host the OS refuses to bind to force a post-prepare error.
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                dir.display().to_string(),
+                "--addr".to_string(),
+                "240.0.0.1:1".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        // It got past the data-dir lifecycle (the dir now exists) and failed later (bind).
+        assert!(
+            dir.is_dir(),
+            "serve created the missing data dir and parents: {e}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_on_a_non_directory_data_dir_is_a_usage_error() {
+        // A --data-dir that exists but is a regular file is a typed usage error naming the path,
+        // before the broker opens.
+        let base =
+            std::env::temp_dir().join(format!("ironbus-cli-serve-nondir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                file.display().to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE, "{e}");
+        match &e {
+            CliError::Usage(m) => assert!(m.contains("not a directory"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_fails_fast_when_the_data_dir_is_already_locked() {
+        // Hold the single-broker lock, then attempt a serve on the same data dir: it must fail fast
+        // with the typed "already running" error (a non-zero exit), NOT double-open and corrupt.
+        let dir =
+            std::env::temp_dir().join(format!("ironbus-cli-serve-locked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dirlock::prepare_data_dir(&dir).unwrap();
+        let held = dirlock::DirLock::acquire(&dir).unwrap();
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                dir.display().to_string(),
+                "--addr".to_string(),
+                "127.0.0.1:0".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_ne!(e.exit_code(), 0, "a contended serve exits non-zero: {e}");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("already running"),
+            "the typed single-broker error: {msg}"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
