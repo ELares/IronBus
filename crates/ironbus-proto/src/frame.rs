@@ -505,5 +505,48 @@ mod tests {
                 FrameDecode::Incomplete { .. } => prop_assert!(false, "should frame"),
             }
         }
+
+        /// Decoding ARBITRARY bytes never panics and never reads out of bounds: the decoder
+        /// always returns a typed Ok(Frame)/Ok(Incomplete)/Err, the property-level complement
+        /// to the `frame_decode` fuzz target. When it frames, `consumed` stays within the input
+        /// and the reported body length matches `consumed`; when it is Incomplete, it asks for
+        /// strictly more than the input it was given.
+        #[test]
+        fn decode_frame_on_arbitrary_bytes_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..2048)) {
+            match decode_frame(&bytes) {
+                Ok(FrameDecode::Frame { body, consumed, .. }) => {
+                    prop_assert!(consumed <= bytes.len(), "consumed past the input");
+                    prop_assert_eq!(consumed, LEN_PREFIX + 1 + body.len());
+                }
+                Ok(FrameDecode::Incomplete { needed }) => {
+                    prop_assert!(needed > bytes.len(), "incomplete must need more than it has");
+                }
+                Err(_) => {}
+            }
+        }
+
+        /// A declared length over the cap is rejected as a typed `FrameTooLarge`, never an
+        /// allocation blowup: the decoder reads only the 4-byte prefix, so the input here is
+        /// just the prefix and (optionally) a tag byte. The cap is `min(max_len, MAX_FRAME_LEN)`,
+        /// so any declared length strictly above the effective cap is the error, regardless of
+        /// how few body bytes are actually present.
+        #[test]
+        fn decode_frame_with_cap_rejects_an_over_cap_length(
+            declared in 1u32..=u32::MAX,
+            max_len in any::<u32>(),
+            include_tag in any::<bool>(),
+        ) {
+            let cap = max_len.min(MAX_FRAME_LEN);
+            prop_assume!(declared > cap);
+            let mut buf = declared.to_le_bytes().to_vec();
+            if include_tag {
+                buf.push(0x05);
+            }
+            prop_assert_eq!(
+                decode_frame_with_cap(&buf, max_len),
+                Err(FrameError::FrameTooLarge { len: u64::from(declared) }),
+                "an over-cap declared length is a typed error, not an allocation"
+            );
+        }
     }
 }

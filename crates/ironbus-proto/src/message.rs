@@ -572,12 +572,18 @@ mod tests {
             prop_assert_eq!(decode_ack(&buf).unwrap(), ack);
         }
 
-        /// Decoding arbitrary bytes as a PUB, ACK, or DELIVER never panics.
+        /// Decoding arbitrary bytes as any fallible body codec (PUB, ACK, DELIVER, DEAD_LETTER)
+        /// never panics and never reads out of bounds: each returns a typed `BodyError` or a
+        /// valid view, the property-level complement to the per-codec fuzz targets.
         #[test]
         fn decoding_arbitrary_bytes_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..64)) {
             let _ = decode_pub(&bytes);
             let _ = decode_ack(&bytes);
             let _ = decode_deliver(&bytes);
+            let _ = decode_dead_letter(&bytes);
+            // SUB is infallible: any byte string is a valid body, and decoding it recovers the
+            // exact bytes as the group, so it cannot panic either.
+            prop_assert_eq!(decode_sub(&bytes).group, bytes.as_slice());
         }
 
         #[test]
@@ -587,12 +593,34 @@ mod tests {
             flags in any::<u8>(),
             timestamp_ms in any::<u64>(),
             key in prop::collection::vec(any::<u8>(), 0..200),
+            headers in prop::collection::vec(any::<u8>(), 0..200),
             payload in prop::collection::vec(any::<u8>(), 0..512),
         ) {
-            let msg = DeliverBody { offset, generation, flags, timestamp_ms, key: &key, headers: b"", payload: &payload };
+            let msg = DeliverBody { offset, generation, flags, timestamp_ms, key: &key, headers: &headers, payload: &payload };
             let mut buf = Vec::new();
             encode_deliver(&msg, &mut buf).unwrap();
             prop_assert_eq!(decode_deliver(&buf).unwrap(), msg);
+        }
+
+        /// A DEAD_LETTER body round-trips for any offset and reason, and is always exactly the
+        /// fixed 9-byte layout (a u64 offset plus a one-byte reason).
+        #[test]
+        fn any_dead_letter_round_trips(offset in any::<u64>(), reason in any::<u8>()) {
+            let advisory = DeadLetterBody { offset, reason };
+            let mut buf = Vec::new();
+            encode_dead_letter(&advisory, &mut buf);
+            prop_assert_eq!(buf.len(), 9, "DEAD_LETTER is a fixed 9-byte body");
+            prop_assert_eq!(decode_dead_letter(&buf).unwrap(), advisory);
+        }
+
+        /// A SUB body is the whole-body-is-the-group case: any byte string is a valid name and
+        /// round-trips, and the encoded body is exactly the group bytes (no framing of its own).
+        #[test]
+        fn any_sub_round_trips(group in prop::collection::vec(any::<u8>(), 0..512)) {
+            let mut buf = Vec::new();
+            encode_sub(&SubBody { group: &group }, &mut buf);
+            prop_assert_eq!(buf.as_slice(), group.as_slice(), "the SUB body is exactly the group name");
+            prop_assert_eq!(decode_sub(&buf), SubBody { group: &group });
         }
     }
 }
