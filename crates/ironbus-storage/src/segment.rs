@@ -84,6 +84,17 @@ pub enum StorageError {
     /// Recovery would drop more than the bounded-loss caps allow, so it fails closed rather
     /// than accept unbounded silent loss (#120, I3).
     ExcessiveRecoveryLoss(CapViolation),
+    /// The durable log is at or over its configured byte cap, so a produce was REJECTED (the
+    /// drop-new shed of the spill-then-shed overflow policy, refs #10, #13): nothing was
+    /// written and no offset or sequence advanced. This is a NORMAL, recoverable shed, NOT a
+    /// fatal freeze (the writer stays live): a later produce succeeds once retention frees
+    /// space. A producer is told promptly so it never silently drops and never hangs.
+    AtCapacity {
+        /// The log's current total durable record bytes when the produce was rejected.
+        durable_bytes: u64,
+        /// The configured cap (`max_total_bytes`) the log met or exceeded.
+        cap: u64,
+    },
 }
 
 impl core::fmt::Display for StorageError {
@@ -135,6 +146,10 @@ impl core::fmt::Display for StorageError {
             StorageError::ExcessiveRecoveryLoss(v) => {
                 write!(f, "recovery exceeded the bounded-loss cap: {v}")
             }
+            StorageError::AtCapacity { durable_bytes, cap } => write!(
+                f,
+                "durable log is at capacity ({durable_bytes} of {cap} bytes); produce rejected"
+            ),
         }
     }
 }
@@ -162,6 +177,17 @@ impl From<DecodeError> for StorageError {
 impl From<SegmentError> for StorageError {
     fn from(e: SegmentError) -> Self {
         StorageError::Segment(e)
+    }
+}
+
+impl StorageError {
+    /// Whether this is the durable-log byte-cap shed ([`StorageError::AtCapacity`]): a normal,
+    /// recoverable, drop-new rejection, distinct from a transient IO failure or a fatal writer
+    /// freeze. Callers use it to surface a stable, distinct signal to a producer (a shed is not
+    /// a transient failure) without matching the message text.
+    #[must_use]
+    pub fn is_at_capacity(&self) -> bool {
+        matches!(self, StorageError::AtCapacity { .. })
     }
 }
 

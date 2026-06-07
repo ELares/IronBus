@@ -128,6 +128,15 @@ impl EngineError {
                 | EngineError::Storage(StorageError::WriterFrozen)
         )
     }
+
+    /// Whether this is the durable-log byte-cap shed (the non-fatal drop-new rejection): a
+    /// produce was refused because the log is at its byte cap, distinct from a transient
+    /// failure or a fatal freeze. The session uses it to reply a stable, distinct message so a
+    /// producer can tell a shed from a transient failure. It is never fatal.
+    #[must_use]
+    pub fn is_at_capacity(&self) -> bool {
+        matches!(self, EngineError::Storage(e) if e.is_at_capacity())
+    }
 }
 
 /// A message handed to a consumer by [`Engine::poll`], plus the token to ack it with.
@@ -200,6 +209,10 @@ pub struct Counters {
     /// Logical message bytes appended by `produce` (key + headers + payload, excluding the
     /// record framing). A throughput and flash-wear signal alongside the record count.
     pub produced_bytes: u64,
+    /// Produces REJECTED because the durable log was at or over its byte cap (the drop-new
+    /// shed, refs #10, #13): nothing was written and no offset advanced. A rejected produce is
+    /// NOT counted in `produced` or `produced_bytes`; this is the operator's shed-rate signal.
+    pub produce_rejected: u64,
     /// Message deliveries handed out by `poll` (a redelivery counts again).
     pub delivered: u64,
     /// Deliveries that were a redelivery (the message had been delivered before).
@@ -650,9 +663,24 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// ack is post-fsync).
     ///
     /// # Errors
-    /// Propagates a storage error from the append or sync.
+    /// Propagates a storage error from the append or sync. A produce rejected because the
+    /// durable log is at its byte cap surfaces the non-fatal [`StorageError::AtCapacity`]
+    /// (wrapped in [`EngineError::Storage`]) and increments the `produce_rejected` counter;
+    /// nothing is appended and `produced` / `produced_bytes` do not move.
     pub fn produce(&mut self, message: &Append<'_>) -> Result<Offset, EngineError> {
-        let offset = self.log.append(message)?;
+        let offset = match self.log.append(message) {
+            Ok(offset) => offset,
+            Err(e) => {
+                // The drop-new shed: count the rejection (a shed-rate signal) but advance no
+                // produce statistics, since nothing was written. Other storage errors fall
+                // through unchanged; only the at-capacity shed is a counted rejection.
+                if e.is_at_capacity() {
+                    self.counters.produce_rejected =
+                        self.counters.produce_rejected.saturating_add(1);
+                }
+                return Err(EngineError::Storage(e));
+            }
+        };
         // Time the durability barrier itself (the fsync), via the clock seam so the
         // deterministic sim stays reproducible (logical time does not advance in-memory).
         let started = self.log.now_monotonic();
@@ -904,6 +932,14 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     #[must_use]
     pub fn flushed_offset(&self) -> Offset {
         self.log.flushed_offset()
+    }
+
+    /// The log's current total durable RECORD bytes (the quantity the durable-log byte cap,
+    /// `LogConfig::max_total_bytes`, is measured against). An operator can compare it to the
+    /// configured cap to see headroom before the drop-new shed triggers.
+    #[must_use]
+    pub fn durable_record_bytes(&self) -> u64 {
+        self.log.durable_record_bytes()
     }
 
     /// Bytes dropped from a torn or unsynced tail at recovery (startup): the raw
@@ -2206,5 +2242,97 @@ mod tests {
         // The engine now reports unhealthy (the /readyz 503 signal) and stays fatal forever.
         assert!(!e.is_healthy());
         assert!(e.produce(&msg(b"c")).unwrap_err().is_fatal());
+    }
+
+    /// An engine config with a hard durable-log byte cap (`max_total_bytes`), every other knob
+    /// the default test config.
+    fn config_with_total_cap(max_total_bytes: u64) -> EngineConfig {
+        let mut cfg = config(10, 5);
+        cfg.log = cfg.log.with_max_total_bytes(max_total_bytes);
+        cfg
+    }
+
+    #[test]
+    fn an_over_cap_produce_is_rejected_counts_and_advances_nothing() {
+        // Size the cap to hold exactly two records: produce two (they fit), then the third is
+        // rejected with the non-fatal AtCapacity, the rejection counter increments, and the
+        // produce statistics and the durable head do not move.
+        let payload = b"hello";
+        // Measure one record's framed durable bytes on a throwaway engine, so the cap is exact.
+        let one = {
+            let mut probe = open(config(10, 5));
+            produce(&mut probe, payload);
+            probe.durable_record_bytes()
+        };
+
+        let mut e = open(config_with_total_cap(2 * one));
+        assert_eq!(produce(&mut e, payload), Offset::new(0));
+        assert_eq!(produce(&mut e, payload), Offset::new(1));
+        let before = e.counters();
+        assert_eq!(before.produced, 2);
+        assert_eq!(before.produce_rejected, 0);
+        let flushed_before = e.flushed_offset();
+        let bytes_before = e.durable_record_bytes();
+
+        // The third produce is at the cap: rejected, non-fatal, nothing advances.
+        let err = e
+            .produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload,
+            })
+            .unwrap_err();
+        assert!(err.is_at_capacity(), "got {err:?}");
+        assert!(!err.is_fatal(), "the shed is never fatal");
+        assert!(e.is_healthy(), "the writer stays live after a shed");
+
+        let after = e.counters();
+        assert_eq!(after.produce_rejected, 1, "the rejection is counted");
+        assert_eq!(after.produced, before.produced, "produced did not move");
+        assert_eq!(
+            after.produced_bytes, before.produced_bytes,
+            "produced_bytes did not move"
+        );
+        assert_eq!(
+            e.flushed_offset(),
+            flushed_before,
+            "the durable head did not advance"
+        );
+        assert_eq!(
+            e.durable_record_bytes(),
+            bytes_before,
+            "nothing was written"
+        );
+
+        // The writer never froze: a second over-cap produce is still a counted shed (not a
+        // WriterFrozen), proving the rejection is repeatable and non-terminal.
+        let err2 = e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload,
+        });
+        assert!(
+            matches!(err2, Err(ref e) if e.is_at_capacity()),
+            "got {err2:?}"
+        );
+        assert_eq!(e.counters().produce_rejected, 2);
+    }
+
+    #[test]
+    fn under_cap_produces_all_succeed_and_are_counted() {
+        // With a generous cap every produce succeeds and is counted normally, and no rejection
+        // is recorded: the cap is a backstop, not a tax on the happy path.
+        let mut e = open(config_with_total_cap(1 << 20));
+        for i in 0..5u8 {
+            assert_eq!(produce(&mut e, &[i]), Offset::new(u64::from(i)));
+        }
+        let c = e.counters();
+        assert_eq!(c.produced, 5);
+        assert_eq!(c.produce_rejected, 0);
+        assert_eq!(e.flushed_offset(), Offset::new(5));
     }
 }

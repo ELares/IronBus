@@ -39,6 +39,21 @@ pub struct LogConfig {
     /// below that floor is a footgun: a segment could not hold more than one record, so the
     /// log fragments into one-record segments with no diagnostic.
     pub max_segment_bytes: u64,
+
+    /// Hard cap on the log's TOTAL durable RECORD bytes across every segment: the same
+    /// quantity recovery sums as `durable_bytes` (per segment, `valid_end - SEGMENT_HEADER_LEN`,
+    /// so the segment headers and footers are excluded). This is the shed backstop of the
+    /// overflow policy: when the log is at or over this cap, [`Log::append`] rejects a produce
+    /// with [`StorageError::AtCapacity`] and writes nothing, so a produce never silently drops
+    /// and never hangs indefinitely. The check is at-or-over BEFORE the append (like
+    /// `max_segment_bytes`), so the log may exceed the cap by at most the last record. A record
+    /// on an EMPTY log is always written, so an oversized first record is not wedged out.
+    ///
+    /// `0` means UNLIMITED (the cap is off), which is the default and preserves the historical
+    /// spill-by-default behavior: an operator opts in to the cap. The rejection is non-fatal
+    /// and does not freeze the writer (see [`StorageError::AtCapacity`]); once retention frees
+    /// space (#13), a later produce succeeds.
+    pub max_total_bytes: u64,
 }
 
 impl LogConfig {
@@ -55,7 +70,9 @@ impl LogConfig {
 
     /// Builds a [`LogConfig`], rejecting a `max_segment_bytes` below
     /// [`LogConfig::MIN_MAX_SEGMENT_BYTES`]. This is the validating path that keeps a
-    /// degenerate cap (`0`, or a sub-header value) from silently fragmenting the log.
+    /// degenerate cap (`0`, or a sub-header value) from silently fragmenting the log. The
+    /// durable-log byte cap (`max_total_bytes`) is left UNLIMITED (`0`); set it with
+    /// [`LogConfig::with_max_total_bytes`].
     ///
     /// # Errors
     /// Returns [`LogConfigError::MaxSegmentBytesTooSmall`] if `max_segment_bytes` is below the
@@ -67,7 +84,20 @@ impl LogConfig {
                 floor: LogConfig::MIN_MAX_SEGMENT_BYTES,
             });
         }
-        Ok(LogConfig { max_segment_bytes })
+        Ok(LogConfig {
+            max_segment_bytes,
+            max_total_bytes: 0,
+        })
+    }
+
+    /// Sets the hard durable-log byte cap (`max_total_bytes`) and returns the updated config.
+    /// `0` is accepted and means UNLIMITED (the cap is off). Any non-zero value opts in to the
+    /// drop-new shed: an at-or-over-cap produce is rejected with [`StorageError::AtCapacity`].
+    /// See [`LogConfig::max_total_bytes`] for the exact accounting and at-or-over semantics.
+    #[must_use]
+    pub fn with_max_total_bytes(mut self, max_total_bytes: u64) -> LogConfig {
+        self.max_total_bytes = max_total_bytes;
+        self
     }
 }
 
@@ -102,6 +132,9 @@ impl Default for LogConfig {
     fn default() -> LogConfig {
         LogConfig {
             max_segment_bytes: LogConfig::DEFAULT_MAX_SEGMENT_BYTES,
+            // Unlimited durable-log byte cap by default: spill-by-default behavior is
+            // unchanged, an operator opts in to the shed.
+            max_total_bytes: 0,
         }
     }
 }
@@ -152,6 +185,11 @@ pub struct Log<F: Filesystem, C: Clock> {
     flushed_offset: Offset,
     /// Every segment in the log, sorted by base offset, for offset-to-segment lookup.
     segments: Vec<SegmentSlot>,
+    /// Total durable RECORD bytes (per segment, `write_pos - SEGMENT_HEADER_LEN`) across every
+    /// SEALED predecessor, the same quantity recovery sums as `durable_bytes`. The live total
+    /// is this plus the active segment's record bytes; tracking it here keeps the durable-log
+    /// byte cap check O(1) per append instead of an O(segments) scan. Updated on each roll.
+    sealed_record_bytes: u64,
     /// Bytes dropped from a torn or unsynced active-segment tail at recovery: the silent
     /// loss that recovery truncates to reach the last intact record. Zero for a fresh log
     /// or a clean recovery.
@@ -187,6 +225,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     next_seq: Seq::new(0),
                     flushed_offset: Offset::ZERO,
                     segments: Vec::new(),
+                    sealed_record_bytes: 0,
                     recovered_truncated_bytes: 0,
                     loss_report: LossReport::new(),
                 };
@@ -259,6 +298,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         let header = scan.header;
         let next_offset = Offset::new(next_base_offset);
         let next_seq = Seq::new(next_base_seq);
+        // The highest segment's durable record bytes (the same term the loop added for it). It
+        // is the active segment unless we roll forward below, so the sealed total starts as the
+        // sum over every predecessor and the highest's bytes are added back if it gets sealed.
+        let highest_record_bytes = scan.valid_end.saturating_sub(SEGMENT_HEADER_LEN as u64);
+        let sealed_record_bytes = durable_bytes.saturating_sub(highest_record_bytes);
 
         let mut log = Log {
             fs,
@@ -271,14 +315,18 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             // Everything recovered is durable, so the flush mark is the recovered head.
             flushed_offset: next_offset,
             segments: slots,
+            sealed_record_bytes,
             recovered_truncated_bytes: 0,
             loss_report: LossReport::new(),
         };
 
         if scan.footer.is_some() {
             // Crash after sealing the highest segment but before the next was created:
-            // roll forward and create it, continuing the offset and sequence space.
+            // roll forward and create it, continuing the offset and sequence space. The
+            // highest segment is sealed, so its record bytes join the sealed total; the new
+            // active segment is empty.
             let next_id = last_id.checked_add(1).ok_or(StorageError::SegmentFull)?;
+            log.sealed_record_bytes = log.sealed_record_bytes.saturating_add(highest_record_bytes);
             log.start_segment(next_id, next_seq, next_offset)?;
         } else {
             // The active segment is unsealed: drop any torn or unsynced tail and resume.
@@ -369,7 +417,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // state) rather than the raw IO error, so the in-flight produce ends its session
         // instead of retrying against a dead writer.
         let old = self.active.take().ok_or(StorageError::WriterFrozen)?;
+        // The segment about to be sealed contributes its record bytes to the sealed total, so
+        // the live durable-record-bytes total stays O(1) without rescanning every segment.
+        let old_record_bytes = old.write_pos().saturating_sub(SEGMENT_HEADER_LEN as u64);
         old.seal().map_err(|_| StorageError::WriterFrozen)?;
+        self.sealed_record_bytes = self.sealed_record_bytes.saturating_add(old_record_bytes);
         self.start_segment(next_id, self.next_seq, self.next_offset)
             .map_err(|_| StorageError::WriterFrozen)?;
         // Sealing fsynced every record in the old segment, so the flush mark advances to
@@ -380,6 +432,19 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
 
     fn active(&self) -> Result<&SegmentWriter<F::File>, StorageError> {
         self.active.as_ref().ok_or(StorageError::WriterFrozen)
+    }
+
+    /// The log's current total durable RECORD bytes: the sealed predecessors' record bytes
+    /// plus the active segment's (`write_pos - SEGMENT_HEADER_LEN`). This is the same quantity
+    /// recovery sums as `durable_bytes` and the one [`LogConfig::max_total_bytes`] caps. Cheap
+    /// (O(1)): it reads the running sealed total, never rescanning every segment. A frozen
+    /// writer has no active segment, so its active term is zero.
+    #[must_use]
+    pub fn durable_record_bytes(&self) -> u64 {
+        let active_record_bytes = self.active.as_ref().map_or(0, |w| {
+            w.write_pos().saturating_sub(SEGMENT_HEADER_LEN as u64)
+        });
+        self.sealed_record_bytes.saturating_add(active_record_bytes)
     }
 
     /// The log offset the next appended record will receive.
@@ -417,10 +482,30 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// only after [`Log::sync`].
     ///
     /// # Errors
-    /// Returns [`StorageError::SegmentFull`] if the offset or sequence space is
-    /// exhausted or the record is too large to frame, [`StorageError::WriterFrozen`] if
-    /// a prior fatal error froze the writer, or an IO error from the write.
+    /// Returns [`StorageError::AtCapacity`] (non-fatal) if the durable-log byte cap
+    /// ([`LogConfig::max_total_bytes`]) is set and the log is at or over it, in which case
+    /// nothing is written and no offset or sequence advances. Returns
+    /// [`StorageError::SegmentFull`] if the offset or sequence space is exhausted or the
+    /// record is too large to frame, [`StorageError::WriterFrozen`] if a prior fatal error
+    /// froze the writer, or an IO error from the write.
     pub fn append(&mut self, record: &Append<'_>) -> Result<Offset, StorageError> {
+        // Hard durable-log byte cap (the drop-new shed): when the log is at or over the cap,
+        // reject the produce and write nothing, advancing no offset or sequence. The check is
+        // at-or-over BEFORE the append (like the segment cap), so the log overshoots by at most
+        // the last record. A record on an EMPTY log (no durable record bytes yet) is always
+        // written, so an oversized first record is not wedged out. This is non-fatal: the
+        // writer stays live, so a later produce succeeds once retention (#13) frees space.
+        let cap = self.config.max_total_bytes;
+        if cap != 0 {
+            let total = self.durable_record_bytes();
+            if total >= cap && total > 0 {
+                return Err(StorageError::AtCapacity {
+                    durable_bytes: total,
+                    cap,
+                });
+            }
+        }
+
         // Soft size cap: roll before appending if the active segment has reached the cap,
         // but never roll an empty one (so an oversized record still gets written).
         let active = self.active()?;
@@ -592,6 +677,7 @@ mod tests {
     fn small_config() -> LogConfig {
         LogConfig {
             max_segment_bytes: 128,
+            max_total_bytes: 0,
         }
     }
 
@@ -860,6 +946,7 @@ mod tests {
         // triggering an endless roll.
         let mut log = open_mem(LogConfig {
             max_segment_bytes: 80,
+            max_total_bytes: 0,
         });
         let big = vec![0xab; 4096];
         assert_eq!(log.append(&rec(&big)).unwrap(), Offset::new(0));
@@ -867,6 +954,155 @@ mod tests {
         // The next append rolls (the segment is now well past the cap).
         assert_eq!(log.append(&rec(b"small")).unwrap(), Offset::new(1));
         assert_eq!(log.active_segment_id(), 1);
+    }
+
+    // The durable RECORD bytes one `rec(payload)` append adds to the log: the framed record
+    // size, measured against the running total so the cap tests never hardcode the codec's
+    // frame overhead.
+    fn record_bytes(payload: &[u8]) -> u64 {
+        let mut log = open_mem(LogConfig::default());
+        let before = log.durable_record_bytes();
+        log.append(&rec(payload)).unwrap();
+        log.durable_record_bytes() - before
+    }
+
+    #[test]
+    fn unlimited_total_cap_preserves_unlimited_behavior() {
+        // max_total_bytes == 0 is the default: the cap is OFF and many records append freely,
+        // exactly as before this feature. This pins the no-regression requirement.
+        let mut log = open_mem(LogConfig::default());
+        assert_eq!(log.config.max_total_bytes, 0, "default is unlimited");
+        for i in 0..200u32 {
+            let payload = i.to_le_bytes();
+            assert_eq!(
+                log.append(&rec(&payload)).unwrap(),
+                Offset::new(u64::from(i))
+            );
+        }
+        log.sync().unwrap();
+        assert_eq!(log.flushed_offset(), Offset::new(200));
+    }
+
+    #[test]
+    fn durable_record_bytes_counts_records_across_a_roll() {
+        // The running total equals exactly the sum of the framed record bytes, both within one
+        // segment and across a roll (sealed predecessors plus the active segment), never the
+        // segment headers or footers. This is the quantity the cap is measured against.
+        let one = record_bytes(b"payload-xyz");
+        let mut log = open_mem(small_config());
+        let mut appended = 0u64;
+        for i in 0..12u8 {
+            log.append(&rec(&[i; 11])).unwrap();
+            appended += 1;
+            assert_eq!(
+                log.durable_record_bytes(),
+                appended * one,
+                "total tracks each appended record (i={i})"
+            );
+        }
+        assert!(log.active_segment_id() >= 1, "should have rolled");
+        // After a reopen the running total is reconstructed to the same value (recovery sums
+        // durable_bytes), so the cap is enforced consistently across a restart.
+        log.sync().unwrap();
+        let fs = log.into_filesystem();
+        let reopened = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        assert_eq!(reopened.durable_record_bytes(), 12 * one);
+    }
+
+    #[test]
+    fn at_capacity_rejects_the_produce_writes_nothing_and_is_not_fatal() {
+        // A cap that holds exactly two records: the third produce is at-or-over the cap and is
+        // rejected with the non-fatal AtCapacity, nothing is written, and no offset/seq moves.
+        let one = record_bytes(b"abc");
+        let cap = 2 * one;
+        let mut log = open_mem(LogConfig::default().with_max_total_bytes(cap));
+        assert_eq!(log.append(&rec(b"abc")).unwrap(), Offset::new(0));
+        assert_eq!(log.append(&rec(b"abc")).unwrap(), Offset::new(1));
+        log.sync().unwrap();
+        // The log is now AT the cap (2 records == cap), so the next produce is rejected.
+        assert_eq!(log.durable_record_bytes(), cap);
+        let next_offset = log.next_offset();
+        let next_seq = log.next_seq();
+        let err = log.append(&rec(b"abc")).unwrap_err();
+        assert!(
+            matches!(err, StorageError::AtCapacity { durable_bytes, cap: c } if durable_bytes == cap && c == cap),
+            "got {err:?}"
+        );
+        // The rejection is NOT a fatal freeze: the writer stays live and reads keep serving.
+        assert!(err.is_at_capacity(), "AtCapacity reports itself");
+        assert!(log.is_writable(), "the shed does not freeze the writer");
+        // Nothing advanced: no offset, no sequence, the durable head unchanged.
+        assert_eq!(log.next_offset(), next_offset);
+        assert_eq!(log.next_seq(), next_seq);
+        assert_eq!(log.flushed_offset(), Offset::new(2));
+
+        // Reopen and confirm the rejected record is absent (only the two durable records), so
+        // nothing leaked to disk under a reserved id.
+        log.sync().unwrap();
+        let fs = log.into_filesystem();
+        let reopened = Log::open(fs, ManualClock::new(), LogConfig::default()).unwrap();
+        assert_eq!(
+            reopened.flushed_offset(),
+            Offset::new(2),
+            "rejected record absent"
+        );
+        assert_eq!(reopened.next_offset(), Offset::new(2));
+        let records = reopened.read_from(Offset::ZERO, 100).unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn appends_under_the_cap_succeed_then_the_writer_stays_live_for_more() {
+        // Under the cap every produce succeeds; once over, the writer is not frozen, so a later
+        // produce (modeling space freed by retention, simulated here by raising the cap on a
+        // fresh handle) succeeds again.
+        let one = record_bytes(b"z");
+        let cap = 3 * one;
+        let mut log = open_mem(LogConfig::default().with_max_total_bytes(cap));
+        for i in 0..3u8 {
+            assert!(
+                log.append(&rec(&[i])).is_ok(),
+                "under-cap append {i} succeeds"
+            );
+        }
+        log.sync().unwrap();
+        // At the cap: rejected, writer still live.
+        assert!(matches!(
+            log.append(&rec(b"x")),
+            Err(StorageError::AtCapacity { .. })
+        ));
+        assert!(log.is_writable());
+        // The writer never froze: sync still works and a subsequent at-cap produce is still a
+        // shed (not a WriterFrozen), proving the shed is repeatable and non-terminal.
+        log.sync().unwrap();
+        assert!(matches!(
+            log.append(&rec(b"y")),
+            Err(StorageError::AtCapacity { .. })
+        ));
+    }
+
+    #[test]
+    fn an_oversized_first_record_on_an_empty_log_is_always_written() {
+        // The cap is far smaller than a single record, yet the FIRST record on an empty log is
+        // still written (the empty-log exception), so an oversized first record is not wedged
+        // out. The second produce, now over the cap, is rejected.
+        let mut log = open_mem(LogConfig::default().with_max_total_bytes(8));
+        let big = vec![0xcd; 4096];
+        assert_eq!(
+            log.append(&rec(&big)).unwrap(),
+            Offset::new(0),
+            "the first record is written despite exceeding the tiny cap"
+        );
+        log.sync().unwrap();
+        assert!(
+            log.durable_record_bytes() > 8,
+            "the log is now over the cap"
+        );
+        // The log is no longer empty, so the next produce is rejected.
+        assert!(matches!(
+            log.append(&rec(b"more")),
+            Err(StorageError::AtCapacity { .. })
+        ));
     }
 
     #[test]
@@ -1432,6 +1668,7 @@ mod tests {
         // recovery closed, not be accepted as silent loss (#120, I3).
         let config = LogConfig {
             max_segment_bytes: 4096,
+            max_total_bytes: 0,
         };
         let mut log = open_mem(config);
         for i in 0..3u8 {

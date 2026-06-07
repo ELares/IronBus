@@ -192,6 +192,14 @@ impl Session {
                 reply_err(out, "fatal storage error");
                 Err(SessionError::EngineFatal(e))
             }
+            // The durable-log byte cap shed (drop-new): a distinct, stable message so a
+            // producer can tell a deliberate shed from a transient failure. The connection
+            // stays open, so the producer can keep going (a later produce succeeds once
+            // retention frees space).
+            Err(e) if e.is_at_capacity() => {
+                reply_err(out, "at capacity");
+                Ok(())
+            }
             Err(_) => {
                 reply_err(out, "produce failed");
                 Ok(())
@@ -1052,6 +1060,97 @@ mod tests {
             Poll::Message(d) => assert_eq!(d.record.payload, b"hello"),
             other => panic!("expected the produced message, got {other:?}"),
         }
+    }
+
+    /// Encodes and sends one `Pub` over the session and returns the single response frame,
+    /// asserting `process` did NOT end the session (a non-fatal reply keeps the connection
+    /// open).
+    fn pub_reply<C: Clock>(
+        s: &mut Session,
+        e: &mut Engine<InMemoryFs, C>,
+        payload: &[u8],
+    ) -> (FrameType, Vec<u8>) {
+        let mut body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                payload,
+            },
+            &mut body,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        s.process(e, &frame(FrameType::Pub, &body), &mut out)
+            .expect("a non-fatal pub never ends the session");
+        let replies = decode_all(&out);
+        assert_eq!(replies.len(), 1, "exactly one reply frame");
+        replies[0].clone()
+    }
+
+    #[test]
+    fn an_over_cap_pub_replies_at_capacity_and_keeps_the_connection_open() {
+        // Cap the broker at one record's worth of durable bytes, so the SECOND wire produce is
+        // shed. The reply is a distinct "at capacity" Err frame (not "produce failed"), the
+        // session stays open, and a later op still works, the producer can keep going. This is
+        // the wire contract a producer relies on to tell a deliberate shed from a transient
+        // failure or a connection-ending fatal error.
+        let payload = b"capacity";
+        // Measure one record's framed durable bytes on a throwaway engine.
+        let one = {
+            let mut probe = engine();
+            produce(&mut probe, payload);
+            probe.durable_record_bytes()
+        };
+        let mut e = Engine::open(
+            InMemoryFs::new(),
+            ManualClock::new(),
+            EngineConfig {
+                log: LogConfig::default().with_max_total_bytes(one),
+                lease: LeaseConfig {
+                    visibility_nanos: 30,
+                    hard_cap_nanos: 100,
+                },
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight: 10,
+                checkpoint_interval: 1024,
+            },
+        )
+        .unwrap();
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+
+        // The first produce fits: a PubAck with offset 0.
+        let (ty, body) = pub_reply(&mut s, &mut e, payload);
+        assert_eq!(ty, FrameType::PubAck);
+        assert_eq!(body, 0u64.to_le_bytes());
+
+        // The second is over the cap: a distinct Err frame marking the capacity shed, NOT the
+        // generic "produce failed". The session did NOT end (pub_reply asserts process is Ok).
+        let (ty, body) = pub_reply(&mut s, &mut e, payload);
+        assert_eq!(ty, FrameType::Err);
+        assert_eq!(body, b"at capacity");
+        assert_ne!(
+            body, b"produce failed",
+            "a shed must be distinguishable from a transient failure"
+        );
+
+        // The connection is still usable: a follow-up Ping is answered (the session never
+        // closed), and another over-cap produce is still a shed, not a fatal error.
+        out.clear();
+        s.process(&mut e, &frame(FrameType::Ping, b""), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Pong);
+        let (ty, body) = pub_reply(&mut s, &mut e, payload);
+        assert_eq!(ty, FrameType::Err);
+        assert_eq!(body, b"at capacity");
+        // The shed counter reflects both rejections; the one success was counted once.
+        assert_eq!(e.counters().produce_rejected, 2);
+        assert_eq!(e.counters().produced, 1);
     }
 
     #[test]
