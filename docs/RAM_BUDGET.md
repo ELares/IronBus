@@ -188,6 +188,25 @@ A floor independent of load:
   embedded health/metrics server, per-connection thread stacks (one OS thread
   per connection, so this scales with `max_connections` too), and allocator
   arenas.
+- The **bounded metric registry** (#97, `crates/ironbus-server/src/registry.rs`):
+  a hard, fixed ceiling of `1024 consumer series x 80 bytes/series ~= 80 KiB`
+  for the per-consumer lag table, plus an equally-capped bounded overflow
+  fold-ledger (`1024 entries x 80 bytes ~= 80 KiB`) that keeps the `__overflow__`
+  fold idempotent across the broker's per-ack commits, plus a fixed sub-1 KiB
+  core (the two fixed-bucket histograms and the self-monitoring scalars). The
+  per-series (and per-ledger-entry) cost is fixed-width and inline (a 64-byte
+  label buffer plus fixed-width bookkeeping, identical on 32-bit and 64-bit), and
+  both arrays are preallocated at their caps, so the whole registry is **~161 KiB
+  INDEPENDENT of the record count, the disk size, and the number of live
+  consumers**. That is well under 0.3% of the 64 MiB ceiling, so leaving the full
+  metric surface on permanently is affordable. The cap is what makes this
+  bounded: an unbounded consumer cardinality would otherwise grow these terms
+  without limit, so a new consumer past the cap is refused its own series and
+  folded into `__overflow__` (its lag still visible) rather than allocating, and
+  the fold-ledger that makes that fold idempotent is itself capped. A test
+  (`the_registry_memory_ceiling_is_fixed_and_bounded`) asserts the ceiling, and
+  [METRICS.md](METRICS.md) carries the full derivation. This is the registry
+  sign-off the #19 / #115 budget requires.
 
 Call the fixed overhead ~4 MiB as a conservative working figure for the edge
 profile (binary resident pages + runtime + a small allocator slack). This is an

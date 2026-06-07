@@ -808,6 +808,14 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         self.clock.now_monotonic_nanos()
     }
 
+    /// The current wall-clock time from the log's clock, in Unix milliseconds. The engine reads it
+    /// once at open to stamp the metric registry's start-time series (#97); routing it through the
+    /// clock seam (not a raw `SystemTime::now`) keeps the deterministic sim reproducible.
+    #[must_use]
+    pub fn now_unix_millis(&self) -> u64 {
+        self.clock.now_unix_millis()
+    }
+
     /// Clones the log's clock, so a SECONDARY durable store (the DLQ sink, #63) opened from the
     /// same data directory shares the same kind of time source without the caller threading a
     /// clock separately. For a `ManualClock` the clone is an independent snapshot; for an

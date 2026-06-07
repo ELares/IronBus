@@ -17,6 +17,7 @@
 //! committed cursor (the max-ack-pending bound), so in-flight work never grows unbounded.
 
 use crate::metrics::LatencyHistogram;
+use crate::registry::MetricRegistry;
 use ironbus_core::clock::Clock;
 use ironbus_core::cursor::AckCursor;
 use ironbus_core::delivery::{DeliveryConfig, Disposition};
@@ -546,6 +547,12 @@ pub struct EngineConfigSnapshot {
 /// persisted in `cursor.ckpt`. Named groups (#9) are independent in-memory cursors.
 const DEFAULT_GROUP: &str = "";
 
+/// The build version string for the metric registry's `ironbus_build_info` (#97), the crate
+/// version baked in at compile time.
+fn crate_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 /// The default per-consumer in-flight credit (refs #65, #10): the most un-acked messages one
 /// connection may hold at once before a Flow stops delivering to it. A small, memory-justified
 /// number (NOT the MQTT absent-value 65535): by Little's Law at the #19 working point (10k msg/s
@@ -811,6 +818,13 @@ pub struct Engine<F: Filesystem, C: Clock> {
     counters: Counters,
     /// The fsync (durability barrier) latency distribution observed on produce.
     fsync: LatencyHistogram,
+    /// The bounded, allocation-free metric registry (#97): the fixed-bucket fsync-duration and
+    /// append-latency histograms, the capped per-consumer lag registry (incremental on append and
+    /// commit), and the self-monitoring series (build info, start time, monotonic-derived uptime).
+    /// Updated on the produce (append) and ack (commit) hot paths and rendered on `/metrics`. It
+    /// has a HARD memory ceiling independent of the record count or disk size, so leaving metrics on
+    /// permanently is affordable on a few-hundred-MB edge node.
+    registry: MetricRegistry,
     /// The log offset of the most recently dead-lettered (parked past `MaxDeliver`) message,
     /// or `None` if none has been dead-lettered. A gauge-style companion to the
     /// `dead_lettered` counter.
@@ -883,6 +897,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // group recovered at open is treated as just-active and the idle eviction sweep cannot
         // reclaim it before it has had a full idle window of inactivity after the restart.
         let opened_at = log.now_monotonic();
+        // The broker start time as Unix SECONDS for `ironbus_start_time_seconds` (#97), read ONCE
+        // from the clock seam (never a raw `SystemTime::now`); uptime derives from `opened_at`.
+        let start_time_unix_seconds = log.now_unix_millis() / 1_000;
         // The default group's durable cursor, from `cursor.ckpt`, clamped to the head.
         let cursor = resume_cursor_from_snapshot(recovered.as_deref(), flushed);
         let default_committed = cursor.committed().get();
@@ -954,7 +971,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             None
         };
 
-        Ok(Engine {
+        let mut engine = Engine {
             log,
             groups,
             group_last_checkpointed,
@@ -987,13 +1004,31 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // Seeded from the durable counters snapshot (#98), all-zeros if it was missing or torn.
             counters,
             fsync: LatencyHistogram::default(),
+            // The bounded metric registry (#97), from the clock seam; its head and per-consumer
+            // floors are seeded from the recovered state after construction.
+            registry: MetricRegistry::new(crate_version(), start_time_unix_seconds, opened_at),
             last_dead_lettered: None,
             dlq,
             dlq_config,
             // Empty by default: no group is key_shared until an operator configures one (#64), so an
             // unconfigured engine is plain competing everywhere and unchanged.
             key_shared_groups: std::collections::BTreeSet::new(),
-        })
+        };
+        engine.seed_registry_from_recovered_state(flushed);
+        Ok(engine)
+    }
+
+    /// Seeds the metric registry from the recovered durable state (#97), so the per-consumer lag
+    /// series is correct from the FIRST scrape after a restart, not zeroed. The durable head is the
+    /// flushed offset (a record count), and each recovered group's commit floor is its committed
+    /// offset; offsets in this codebase are record counts, so they map directly to the registry's
+    /// record-count head and per-consumer floor. The default group `""` is included.
+    fn seed_registry_from_recovered_state(&mut self, flushed: u64) {
+        self.registry.seed_head(flushed);
+        for (name, g) in &self.groups {
+            self.registry
+                .set_consumer_committed(name.as_bytes(), g.cursor.committed().get());
+        }
     }
 
     /// Whether the `dlq/` subdirectory already exists, so a prior run dead-lettered at least one
@@ -1308,6 +1343,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// nothing is appended and `produced` / `produced_bytes` do not move. Under `DropOldest` this
     /// rejection only happens in the wedge-guard fall-back (only the active segment remains).
     pub fn produce(&mut self, message: &Append<'_>) -> Result<Offset, EngineError> {
+        // Time the WHOLE durable append (append + fsync) for the registry's append-latency
+        // histogram (#97), via the clock seam so the deterministic sim stays reproducible. Read the
+        // start before the append; on a shed/error it is simply unused.
+        let append_started = self.log.now_monotonic();
         let offset = match self.append_with_policy(message) {
             Ok(offset) => offset,
             Err(e) => {
@@ -1325,8 +1364,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // deterministic sim stays reproducible (logical time does not advance in-memory).
         let started = self.log.now_monotonic();
         self.log.sync()?;
-        self.fsync
-            .observe(self.log.now_monotonic().saturating_sub(started));
+        let fsync_nanos = self.log.now_monotonic().saturating_sub(started);
+        self.fsync.observe(fsync_nanos);
+        // Mirror the fsync into the registry's fixed-bucket `ironbus_fsync_duration_seconds`, record
+        // the whole-append latency, and advance the durable head so every consumer's lag (head minus
+        // its commit floor) rises (#97). All three are O(1) and allocation-free.
+        self.registry.observe_fsync_nanos(fsync_nanos);
+        self.registry
+            .observe_append_nanos(self.log.now_monotonic().saturating_sub(append_started));
+        self.registry.record_appended();
         self.counters.produced += 1;
         let bytes = message.key.len() + message.headers.len() + message.payload.len();
         self.counters.produced_bytes = self
@@ -1710,6 +1756,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             self.counters.truncations = self.counters.truncations.saturating_add(1);
             self.counters.truncated_records =
                 self.counters.truncated_records.saturating_add(skipped);
+            // The reset advanced this group's committed cursor UP to `earliest`, so push the new
+            // floor to the lag registry (#97), keeping the consumer-lag series correct after a
+            // below-earliest truncation (the `g` borrow has ended).
+            self.sync_consumer_lag(group, earliest);
             return Ok(Poll::Truncated {
                 earliest_retained: Offset::new(earliest),
                 skipped,
@@ -1823,6 +1873,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         if let Some(router) = g.router.as_mut() {
             router.clear_offset(off);
         }
+        // Committing past the poison advances this group's cursor, so push the new floor to the lag
+        // registry (#97), keeping the consumer-lag series correct after a dead-letter.
+        let committed = g.cursor.committed().get();
+        self.sync_consumer_lag(group, committed);
         self.counters.dead_lettered += 1;
         self.last_dead_lettered = Some(off);
         Ok(Poll::Parked {
@@ -2052,6 +2106,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             self.counters.truncations = self.counters.truncations.saturating_add(1);
             self.counters.truncated_records =
                 self.counters.truncated_records.saturating_add(skipped);
+            // The reset advanced this group's committed cursor UP to `earliest`, so push the new
+            // floor to the lag registry (#97), keeping the consumer-lag series correct (#84).
+            self.sync_consumer_lag(group, earliest);
             return Ok(Poll::Truncated {
                 earliest_retained: Offset::new(earliest),
                 skipped,
@@ -2160,6 +2217,17 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.poll_in_member(group, member, now)
     }
 
+    /// Pushes `group`'s current committed offset (a record count) to the metric registry's
+    /// per-consumer lag series (#97), so the scrape reads `head - committed` without ever walking
+    /// the log. Called at EVERY committed-advancing site (ack, dead-letter commit, below-earliest
+    /// truncation reset). O(1) and allocation-free for an existing consumer; the registry floor is
+    /// monotonic, so a stale lower value is ignored. The first call for a new group claims a fixed
+    /// series slot (or folds into `__overflow__` at the cap).
+    fn sync_consumer_lag(&mut self, group: &str, committed: u64) {
+        self.registry
+            .set_consumer_committed(group.as_bytes(), committed);
+    }
+
     /// Acks the message named by `token`: removes its lease (fenced if stale) and advances
     /// the committed cursor over any newly contiguous prefix.
     pub fn ack(&mut self, token: &LeaseToken) -> AckResult {
@@ -2189,6 +2257,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     router.clear_offset(token.offset);
                 }
                 self.counters.acks += 1;
+                // Maintain this consumer's lag INCREMENTALLY on commit (#97): push the new committed
+                // offset (a record count) to the registry so the scrape reads `head - committed`
+                // without ever walking the log. Read it before the borrow ends.
+                let committed = g.cursor.committed().get();
+                self.sync_consumer_lag(group, committed);
                 AckResult::Acked
             }
             AckOutcome::Fenced => AckResult::Fenced,
@@ -2389,6 +2462,23 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     #[must_use]
     pub fn fsync_histogram(&self) -> LatencyHistogram {
         self.fsync
+    }
+
+    /// The bounded metric registry (#97): the fixed-bucket fsync-duration and append-latency
+    /// histograms, the capped per-consumer lag registry, and the self-monitoring series. The
+    /// `/metrics` rendering reads it under the engine lock to emit those series. The uptime series
+    /// pairs this with [`Engine::now_monotonic`] (the live clock-seam reading).
+    #[must_use]
+    pub fn registry(&self) -> &MetricRegistry {
+        &self.registry
+    }
+
+    /// The engine's current monotonic time (nanoseconds) from the clock seam, for the registry's
+    /// monotonic-derived `ironbus_uptime_seconds` at scrape time. Routed through the seam (never a
+    /// raw `Instant::now`), so the deterministic sim stays reproducible.
+    #[must_use]
+    pub fn now_monotonic(&self) -> u64 {
+        self.log.now_monotonic()
     }
 
     /// The log offset of the most recently dead-lettered (parked past `MaxDeliver`) message,
@@ -2626,6 +2716,75 @@ mod tests {
         assert_eq!(e.committed_offset(), Offset::new(2));
 
         assert!(matches!(e.poll(0).unwrap(), Poll::Idle));
+    }
+
+    #[test]
+    fn the_registry_consumer_lag_is_maintained_incrementally_on_produce_and_ack() {
+        // The #97 per-consumer lag series, exercised through the real produce/ack path: the head
+        // advances on produce, the default consumer's commit floor advances on ack, and lag is
+        // `head - committed`, never scanned. The registry reads must match the engine's own
+        // committed/flushed view.
+        let mut e = open(config(10, 5));
+        // Helper: the lag of the default consumer ("") as the registry reports it.
+        let default_lag = |e: &Engine<InMemoryFs, ManualClock>| -> u64 {
+            let mut lag = None;
+            e.registry().consumer_lag().for_each_series(|consumer, l| {
+                if consumer.is_empty() {
+                    lag = Some(l);
+                }
+            });
+            lag.expect("the default consumer series always exists")
+        };
+        assert_eq!(default_lag(&e), 0, "no records, no lag");
+        produce(&mut e, b"a");
+        produce(&mut e, b"b");
+        produce(&mut e, b"c");
+        // Three records produced, none committed: the registry head is 3, so default lag is 3.
+        assert_eq!(e.registry().consumer_lag().head(), 3);
+        assert_eq!(default_lag(&e), 3);
+        // Ack two records: the default consumer's floor rises to 2, so lag drops to 1, with NO log
+        // scan (the floor moved incrementally).
+        let d0 = message(e.poll(0).unwrap());
+        assert_eq!(e.ack(&d0.token), AckResult::Acked);
+        let d1 = message(e.poll(0).unwrap());
+        assert_eq!(e.ack(&d1.token), AckResult::Acked);
+        assert_eq!(e.committed_offset(), Offset::new(2));
+        assert_eq!(default_lag(&e), 1, "head 3 - committed 2 = 1");
+        // The registry lag equals the engine's own flushed - committed view (the existing scan-free
+        // gauge), proving the incremental series agrees with the source of truth.
+        let engine_lag = e.flushed_offset().get() - e.committed_offset().get();
+        assert_eq!(default_lag(&e), engine_lag);
+    }
+
+    #[test]
+    fn the_registry_is_seeded_from_recovered_state_on_reopen() {
+        // After a restart the per-consumer lag series must be correct from the FIRST scrape, not
+        // zeroed: the head is seeded to the recovered flushed offset and the default group's floor
+        // to its recovered committed offset.
+        let fs = {
+            let mut e = open(config(10, 5));
+            for p in [b"a", b"b", b"c", b"d"] {
+                produce(&mut e, p);
+            }
+            // Ack one so the recovered committed offset is non-zero.
+            let d = message(e.poll(0).unwrap());
+            assert_eq!(e.ack(&d.token), AckResult::Acked);
+            // Make the committed cursor durable (the graceful-shutdown flush), so the reopen resumes
+            // it; the checkpoint interval is too coarse to fire on a single ack.
+            e.checkpoint_all_groups().unwrap();
+            e.into_filesystem()
+        };
+        let e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        // The head is seeded to 4 (four durable records), the default floor to 1 (one acked), so the
+        // recovered lag is 3 from the first scrape.
+        assert_eq!(e.registry().consumer_lag().head(), 4);
+        let mut lag = None;
+        e.registry().consumer_lag().for_each_series(|consumer, l| {
+            if consumer.is_empty() {
+                lag = Some(l);
+            }
+        });
+        assert_eq!(lag, Some(3), "recovered head 4 - recovered committed 1");
     }
 
     #[test]

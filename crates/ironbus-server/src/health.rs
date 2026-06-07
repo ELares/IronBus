@@ -26,6 +26,7 @@
 
 use crate::engine::{Counters, EngineConfigSnapshot, GroupConsumerStat};
 use crate::metrics::{LatencyHistogram, FSYNC_BUCKET_LE_SECONDS};
+use crate::registry::{FixedHistogram, REGISTRY_BUCKET_LE_SECONDS};
 use crate::server::SharedEngine;
 use ironbus_core::clock::Clock;
 use ironbus_storage::fs::Filesystem;
@@ -181,6 +182,12 @@ where
                     counters: g.counters(),
                     fsync: g.fsync_histogram(),
                     groups: g.group_consumer_stats(),
+                    // The bounded metric registry (#97) is rendered into a String UNDER the lock
+                    // (it walks only the bounded series set and the fixed histograms, so the work is
+                    // O(number of series), independent of the record count or disk size), then the
+                    // body is assembled outside the lock with the rest. The uptime series reads the
+                    // live monotonic clock seam here so it advances between scrapes.
+                    registry: registry_body(g.registry(), g.now_monotonic()),
                 }
             };
             respond(&mut stream, 200, "OK", &metrics_body(snapshot))
@@ -248,6 +255,11 @@ struct MetricsSnapshot {
     fsync: LatencyHistogram,
     /// Per-work-group consumer position, for the lag-by-cursor series (#15, #16).
     groups: Vec<GroupConsumerStat>,
+    /// The pre-rendered bounded-metric-registry section (#97): the fixed-bucket fsync-duration and
+    /// append-latency histograms, the capped per-consumer lag series, and the self-monitoring
+    /// series. Rendered under the engine lock (it walks only the bounded series set), then spliced
+    /// into the body.
+    registry: String,
 }
 
 /// Renders the Prometheus text exposition body from an engine snapshot. Consumer lag is the
@@ -267,6 +279,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         counters,
         fsync,
         groups,
+        registry,
     } = snapshot;
     let lag = flushed.saturating_sub(committed);
     let mut body = format!(
@@ -347,7 +360,137 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
     body.push_str(&recovery_loss_records_lines(&recovery_loss_records));
     body.push_str(&fsync_histogram_lines(&fsync));
     body.push_str(&group_consumer_lines(&groups, flushed));
+    body.push_str(&registry);
     body
+}
+
+/// Renders the bounded metric registry section (#97): the fixed-bucket
+/// `ironbus_fsync_duration_seconds` and `ironbus_append_duration_seconds` histograms, the capped
+/// per-consumer `ironbus_consumer_lag_records{consumer}` series (plus the `__overflow__` fold and
+/// `ironbus_consumer_labels_dropped_total`), and the self-monitoring series (`ironbus_build_info`,
+/// `ironbus_start_time_seconds`, `ironbus_uptime_seconds`). It walks only the bounded series set and
+/// the fixed histograms, so it is O(number of series), independent of the record count or disk size.
+/// `now_monotonic` is the live clock-seam reading the uptime is derived from.
+fn registry_body(registry: &crate::registry::MetricRegistry, now_monotonic: u64) -> String {
+    let mut s = String::new();
+    fixed_histogram_lines(
+        &mut s,
+        "ironbus_fsync_duration_seconds",
+        "The fsync (durability barrier) latency on produce, over the fixed registry buckets.",
+        registry.fsync_duration(),
+    );
+    fixed_histogram_lines(
+        &mut s,
+        "ironbus_append_duration_seconds",
+        "The whole durable-append (append + fsync) latency on produce, over the fixed registry buckets.",
+        registry.append_latency(),
+    );
+    consumer_lag_lines(&mut s, registry);
+    self_monitoring_lines(&mut s, registry, now_monotonic);
+    s
+}
+
+/// Renders one fixed-bucket [`FixedHistogram`] as a Prometheus histogram (`name`, cumulative `le`
+/// buckets in seconds over [`REGISTRY_BUCKET_LE_SECONDS`], plus `+Inf`, `_sum`, and `_count`). The
+/// sum is rendered in seconds with nanosecond precision without floating point.
+fn fixed_histogram_lines(s: &mut String, name: &str, help: &str, h: &FixedHistogram) {
+    let _ = writeln!(s, "# HELP {name} {help}");
+    let _ = writeln!(s, "# TYPE {name} histogram");
+    let cumulative = h.cumulative_buckets();
+    for (le, count) in REGISTRY_BUCKET_LE_SECONDS.iter().zip(cumulative.iter()) {
+        let _ = writeln!(s, "{name}_bucket{{le=\"{le}\"}} {count}");
+    }
+    let total = h.count();
+    let nanos = h.sum_nanos();
+    let _ = writeln!(s, "{name}_bucket{{le=\"+Inf\"}} {total}");
+    let _ = writeln!(
+        s,
+        "{name}_sum {}.{:09}",
+        nanos / 1_000_000_000,
+        nanos % 1_000_000_000
+    );
+    let _ = writeln!(s, "{name}_count {total}");
+}
+
+/// Renders the capped per-consumer lag series `ironbus_consumer_lag_records{consumer=...}` (#97):
+/// one gauge sample per distinct consumer, the `{consumer="__overflow__"}` fold for over-cap
+/// consumers (only when a label has actually been dropped, so the line is absent on a healthy
+/// broker), and the `ironbus_consumer_labels_dropped_total` counter. Lag is maintained
+/// incrementally (`head - committed`) and never scanned on scrape.
+fn consumer_lag_lines(s: &mut String, registry: &crate::registry::MetricRegistry) {
+    let lag = registry.consumer_lag();
+    s.push_str(
+        "# HELP ironbus_consumer_lag_records Per-consumer durable records produced but not yet committed (maintained incrementally, capped cardinality).\n\
+         # TYPE ironbus_consumer_lag_records gauge\n",
+    );
+    lag.for_each_series(|consumer, records| {
+        let _ = writeln!(
+            s,
+            "ironbus_consumer_lag_records{{consumer=\"{}\"}} {records}",
+            escape_label(consumer)
+        );
+    });
+    // The overflow fold series is emitted only once a label has been dropped, so a healthy
+    // broker's exposition does not carry it. The total folded lag stays visible here.
+    if lag.has_overflow() {
+        let _ = writeln!(
+            s,
+            "ironbus_consumer_lag_records{{consumer=\"{}\"}} {}",
+            crate::registry::OVERFLOW_CONSUMER_LABEL,
+            lag.overflow_lag()
+        );
+    }
+    let _ = writeln!(
+        s,
+        "# HELP ironbus_consumer_labels_dropped_total Consumer lag labels refused a distinct series at the cardinality cap (folded into __overflow__)."
+    );
+    let _ = writeln!(s, "# TYPE ironbus_consumer_labels_dropped_total counter");
+    let _ = writeln!(
+        s,
+        "ironbus_consumer_labels_dropped_total {}",
+        lag.labels_dropped()
+    );
+}
+
+/// Renders the self-monitoring series (#97): `ironbus_build_info` (the build version as a label,
+/// value 1), `ironbus_start_time_seconds` (the broker start time as Unix seconds, captured once at
+/// open), and `ironbus_uptime_seconds` (monotonic-derived from the clock seam, so it never
+/// regresses on a wall-clock step).
+fn self_monitoring_lines(
+    s: &mut String,
+    registry: &crate::registry::MetricRegistry,
+    now_monotonic: u64,
+) {
+    let _ = writeln!(
+        s,
+        "# HELP ironbus_build_info The build version as a label; the value is always 1."
+    );
+    let _ = writeln!(s, "# TYPE ironbus_build_info gauge");
+    let _ = writeln!(
+        s,
+        "ironbus_build_info{{version=\"{}\"}} 1",
+        escape_label(registry.build_version())
+    );
+    let _ = writeln!(
+        s,
+        "# HELP ironbus_start_time_seconds The broker start time in Unix seconds."
+    );
+    let _ = writeln!(s, "# TYPE ironbus_start_time_seconds gauge");
+    let _ = writeln!(
+        s,
+        "ironbus_start_time_seconds {}",
+        registry.start_time_unix_seconds()
+    );
+    let _ = writeln!(
+        s,
+        "# HELP ironbus_uptime_seconds Seconds since the broker started (monotonic-derived)."
+    );
+    let _ = writeln!(s, "# TYPE ironbus_uptime_seconds gauge");
+    let _ = writeln!(
+        s,
+        "ironbus_uptime_seconds {}",
+        registry.uptime_seconds(now_monotonic)
+    );
 }
 
 /// Escapes a work-group name for a Prometheus label value: backslash, double-quote, and
@@ -936,6 +1079,125 @@ mod tests {
         assert!(m.contains("\nironbus_quarantine_bytes 0\n"), "{m}");
         // It must NOT carry the `_total` counter suffix (that would pull it into the frozen set).
         assert!(!m.contains("ironbus_quarantine_bytes_total"), "{m}");
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn metrics_exposes_the_registry_series() {
+        // The bounded metric registry (#97): the fixed-bucket histograms, the per-consumer lag
+        // series maintained incrementally on produce/ack, and the self-monitoring series, all on
+        // `/metrics`. A clean start is exercised first, then a produce + ack moves the default
+        // consumer's lag.
+        let (addr, shutdown, handle, engine) = start();
+
+        let m0 = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        // The new fixed-bucket histograms are present with the issue's exact 0.0005 s first bound
+        // and the 5 s last bound (proving the #97 bucket set, distinct from the legacy
+        // ironbus_fsync_seconds histogram which keeps its own bounds).
+        assert!(
+            m0.contains("# TYPE ironbus_fsync_duration_seconds histogram"),
+            "{m0}"
+        );
+        assert!(
+            m0.contains("ironbus_fsync_duration_seconds_bucket{le=\"0.0005\"}"),
+            "{m0}"
+        );
+        assert!(
+            m0.contains("ironbus_fsync_duration_seconds_bucket{le=\"5\"}"),
+            "{m0}"
+        );
+        assert!(
+            m0.contains("# TYPE ironbus_append_duration_seconds histogram"),
+            "{m0}"
+        );
+        // The legacy fsync histogram still renders (no existing metric name was removed).
+        assert!(
+            m0.contains("# TYPE ironbus_fsync_seconds histogram"),
+            "{m0}"
+        );
+        // The self-monitoring series are present. build_info carries the crate version label and
+        // value 1; start_time and uptime are gauges.
+        assert!(
+            m0.contains(&format!(
+                "ironbus_build_info{{version=\"{}\"}} 1",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{m0}"
+        );
+        assert!(
+            m0.contains("\n# TYPE ironbus_start_time_seconds gauge\n"),
+            "{m0}"
+        );
+        assert!(
+            m0.contains("\n# TYPE ironbus_uptime_seconds gauge\n"),
+            "{m0}"
+        );
+        // The dropped-labels counter is present and zero (it is in the frozen taxonomy as a
+        // `_total`), and no overflow series exists on a healthy broker.
+        assert!(
+            m0.contains("\nironbus_consumer_labels_dropped_total 0\n"),
+            "{m0}"
+        );
+        assert!(!m0.contains("consumer=\"__overflow__\""), "{m0}");
+        // The default consumer's lag series exists at 0 before any produce.
+        assert!(
+            m0.contains("# TYPE ironbus_consumer_lag_records gauge"),
+            "{m0}"
+        );
+        assert!(
+            m0.contains("ironbus_consumer_lag_records{consumer=\"\"} 0"),
+            "{m0}"
+        );
+
+        // Produce two records: the head advances, so the default consumer lags 2 and the new
+        // histograms record observations.
+        {
+            let mut g = engine.lock().unwrap();
+            for payload in [&b"a"[..], b"b"] {
+                g.produce(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                })
+                .unwrap();
+            }
+        }
+        let m1 = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            m1.contains("ironbus_consumer_lag_records{consumer=\"\"} 2"),
+            "{m1}"
+        );
+        assert!(
+            m1.contains("\nironbus_fsync_duration_seconds_count 2\n"),
+            "{m1}"
+        );
+        assert!(
+            m1.contains("\nironbus_append_duration_seconds_count 2\n"),
+            "{m1}"
+        );
+
+        // Lease and ack one: the default consumer commits one record, so its lag drops to 1
+        // (maintained incrementally on ack, never scanned).
+        let token = {
+            let mut g = engine.lock().unwrap();
+            match g.poll_now().unwrap() {
+                Poll::Message(d) => d.token,
+                other => panic!("expected a message, got {other:?}"),
+            }
+        };
+        {
+            let mut g = engine.lock().unwrap();
+            assert_eq!(g.ack(&token), AckResult::Acked);
+        }
+        let m2 = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            m2.contains("ironbus_consumer_lag_records{consumer=\"\"} 1"),
+            "{m2}"
+        );
+
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
@@ -1565,6 +1827,13 @@ mod tests {
         "ironbus_segments_force_reaped_total",
         "ironbus_truncations_total",
         "ironbus_truncated_records_total",
+        // The metric-registry cardinality-cap counter (#97): a consumer lag label refused a distinct
+        // series at the 1024-series cap was folded into `__overflow__`. A cardinality-pressure
+        // signal, never a silent drop, so it belongs in the frozen taxonomy. The histograms
+        // (`_seconds`/`_bucket`/`_sum`/`_count`) and gauges (`_lag_records`, `_build_info`,
+        // `_start_time_seconds`, `_uptime_seconds`) the registry also adds are NOT `_total`, so they
+        // are excluded from this set by construction (the taxonomy test filters on `_total`).
+        "ironbus_consumer_labels_dropped_total",
     ];
 
     #[test]
