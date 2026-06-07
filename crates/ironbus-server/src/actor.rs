@@ -590,10 +590,17 @@ mod tests {
         // enqueue several produces, wait for the actor to reach the gate, then open it and collect the
         // replies. The fault fs counts exactly one sync for the whole batch.
         let (handle, actor, control) = rig();
-        // Close the gate so the actor's first commit parks; every produce enqueued before it opens
-        // lands in one drained batch.
+        // Close the gate and send ONE primer produce. The actor appends it and parks on the primer's
+        // covering fsync, which is a provable barrier: until we open the gate the actor consumes no
+        // further command. We enqueue the burst WHILE the actor is parked, so every produce is in the
+        // channel before the actor resumes and drains them, guaranteeing they all land in the SAME
+        // batch. (Enqueuing first and racing the actor's initial drain flaked on Windows, where the
+        // actor could drain a partial batch before the rest of the burst had been sent.)
         control.close_sync_gate();
-        let n = 8;
+        let primer = handle.produce_async(append(b"primer")).unwrap();
+        control.wait_for_sync_gate_entered(1);
+        // The actor is now parked on the primer's fsync; the burst queues behind it.
+        let n = 8u64;
         let mut replies = Vec::new();
         for i in 0..n {
             replies.push(
@@ -602,11 +609,15 @@ mod tests {
                     .unwrap(),
             );
         }
-        // Wait until the actor is parked on the ONE covering fsync for the drained batch.
-        control.wait_for_sync_gate_entered(1);
+        // Sampled while the actor is parked: only the primer's sync has run so far.
         let before = control.sync_count();
-        // Open the gate: the single fsync completes and the whole batch is acked.
+        // Open the gate: the primer's fsync completes, then the actor drains the whole queued burst
+        // and makes it durable with ONE covering fsync.
         control.open_sync_gate();
+        match primer.recv().unwrap() {
+            ProduceOutcome::Appended(_) => {}
+            other => panic!("expected Appended primer, got {other:?}"),
+        }
         let mut offsets = Vec::new();
         for r in replies {
             match r.recv().unwrap() {
@@ -614,16 +625,20 @@ mod tests {
                 other => panic!("expected Appended, got {other:?}"),
             }
         }
-        // Exactly ONE fsync covered the whole batch (group commit), not N.
+        // Exactly ONE fsync covered the whole burst (group commit), not N.
         let after = control.sync_count();
         assert_eq!(
-            after - (before - 1),
+            after - before,
             1,
-            "the drained batch issued exactly one fdatasync, not {n}"
+            "the drained burst issued exactly one fdatasync, not {n}"
         );
-        // Single total durable order: the offsets are the contiguous 0..n in arrival order.
+        // Single total durable order: the burst got the contiguous offsets 1..=n after the primer at 0.
         offsets.sort_unstable();
-        assert_eq!(offsets, (0..n).collect::<Vec<_>>(), "contiguous offsets");
+        assert_eq!(
+            offsets,
+            (1..=n).collect::<Vec<_>>(),
+            "contiguous offsets after the primer"
+        );
         let _ = recover(handle, actor);
     }
 
