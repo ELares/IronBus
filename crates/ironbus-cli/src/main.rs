@@ -2042,8 +2042,7 @@ mod tests {
         // error, NOT a panic. `open_disk_engine` maps the engine's typed reject to `CliError::Usage`.
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos());
         let dir = std::env::temp_dir().join(format!(
             "ironbus-cli-bcast-empty-{}-{nanos}",
             std::process::id()
