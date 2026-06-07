@@ -24,8 +24,8 @@ use ironbus_core::lease::LeaseToken;
 use ironbus_core::types::Offset;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
-    decode_ack, decode_pub, decode_sub, encode_dead_letter, encode_deliver, encode_truncated,
-    AckOp, DeadLetterBody, DeliverBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER,
+    decode_ack, decode_cumulative_ack, decode_pub, decode_sub, encode_dead_letter, encode_deliver,
+    encode_truncated, AckOp, DeadLetterBody, DeliverBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER,
 };
 use ironbus_storage::fs::Filesystem;
 use std::collections::HashMap;
@@ -190,6 +190,13 @@ pub struct Session {
     /// group (#64), so leave-on-switch / leave-on-disconnect is exact: it only leaves a group it
     /// actually joined, and only joins once per subscription. `false` for a plain competing group.
     joined_key_shared: bool,
+    /// Whether this connection is currently REGISTERED as an active subscriber of `subscription`
+    /// (#288), so the broadcast group-of-one cap is exact and a deregister only ever targets a
+    /// group this connection actually registered with. Set when a SUB to a NAMED group succeeds
+    /// (the engine accepted the subscriber), cleared on UNSUB / subscription switch / disconnect.
+    /// The default group (`""`) is never registered (its consumers do not SUB), so this stays
+    /// `false` for an unsubscribed connection.
+    registered_subscription: bool,
 }
 
 impl Session {
@@ -303,6 +310,11 @@ impl Session {
             }
             Some(FrameType::Pub) => self.handle_pub(engine, body, out).map(|()| false),
             Some(FrameType::Ack) => self.handle_ack(engine, body, out).map(|()| true),
+            // A cumulative ack commits the broadcast cursor (when accepted), so it returns `true` to
+            // run the interval checkpoint, exactly like a per-message Ack (#288).
+            Some(FrameType::CumulativeAck) => {
+                self.handle_cumulative_ack(engine, body, out).map(|()| true)
+            }
             Some(FrameType::Flow) => self.handle_flow(engine, body, out).map(|()| true),
             Some(FrameType::Sub) => self.handle_sub(engine, body, out).map(|()| false),
             Some(FrameType::Unsub) => self.handle_unsub(engine, out).map(|()| true),
@@ -472,6 +484,61 @@ impl Session {
                     }
                 };
                 reply(out, FrameType::AckStatus, &[status]);
+                Ok(())
+            }
+        }
+    }
+
+    /// Handles a BROADCAST cumulative ack (the tag-19 `CumulativeAck` frame, #288): commits the
+    /// named broadcast group's single cursor up to the body's exclusive `up_to` offset. The body
+    /// carries its own group name (it does not depend on a prior SUB), so a broadcast consumer can
+    /// drive the verb on any group it owns. The engine enforces the safety contract: only a group
+    /// MARKED broadcast accepts the verb (a competing or `key_shared` group is rejected with the
+    /// work-group error, unchanged from #63), `up_to` is validated against the durable head and the
+    /// earliest-retained offset, and a re-ack is an idempotent no-op success. A success replies the
+    /// generic `Ok`; a rejection replies a typed `Err` with the engine's reason; a fatal engine
+    /// error ends the session, exactly like the produce and nack paths.
+    fn handle_cumulative_ack<
+        F: Filesystem + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        let Ok(ack) = decode_cumulative_ack(body) else {
+            reply_err(out, "malformed cumulative-ack body");
+            return Ok(());
+        };
+        let Ok(group) = core::str::from_utf8(ack.group) else {
+            reply_err(out, "cumulative-ack group name must be valid UTF-8");
+            return Ok(());
+        };
+        let group = group.to_string();
+        let up_to = Offset::new(ack.up_to);
+        match engine.with(move |e| e.cumulative_ack_in(&group, up_to))? {
+            Ok(()) => {
+                // A committed (or idempotent no-op) cumulative ack: the generic body-less success.
+                reply(out, FrameType::Ok, &[]);
+                Ok(())
+            }
+            // A fatal engine error (a frozen writer surfaced through a storage fault) wedges every
+            // future op, so end the session rather than masquerade it as a transient rejection.
+            Err(e) if e.is_fatal() => {
+                reply_err(out, "fatal storage error");
+                Err(SessionError::EngineFatal(e))
+            }
+            // The work-group reject (#63) and the out-of-range reject (#288) are both client-visible,
+            // recoverable rejections: surface the engine's typed reason so the client learns why and
+            // the connection stays open.
+            Err(e) => {
+                reply_err(out, &e.to_string());
                 Ok(())
             }
         }
@@ -766,14 +833,49 @@ impl Session {
             reply_err(out, "subscription name must be valid UTF-8");
             return Ok(());
         };
-        // Leave the previous key_shared group (if any) before switching: its keys re-route to
-        // their new owners, and the in-flight leases this connection held there drain or expire.
+        // Register as an active subscriber of the NEW group FIRST (#288), so the BROADCAST
+        // group-of-one cap is enforced BEFORE any of this connection's state is torn down. A
+        // broadcast group already holding a different subscriber rejects here with
+        // `BroadcastGroupBusy`; the SUB is refused and this connection keeps its CURRENT
+        // subscription intact (it was never left), so a rejected second consumer cannot strand the
+        // connection. The default group (`""`) and any plain competing / key_shared group accept
+        // any number of subscribers, so this only ever rejects a second SUB to a broadcast group.
+        // Registering before deregistering the old group is safe because the engine keys the
+        // subscriber set per group and per member: a same-group re-SUB is idempotent, and a switch
+        // briefly holds both registrations before the old one is dropped below.
+        let new_group = group.to_string();
+        let member = self.member_id;
+        if !new_group.is_empty() {
+            let sub = new_group.clone();
+            match engine.with(move |e| e.subscribe_in(&sub, member))? {
+                Ok(()) => {}
+                // The broadcast group-of-one cap rejected a second subscriber: surface the typed
+                // reason and leave this connection on its existing subscription (it was never left).
+                // `subscribe_in` only ever returns this rejection (name/cap are still validated on
+                // the first FLOW, as before), so SUB stays infallible for the name/cap checks.
+                Err(e) => {
+                    reply_err(out, &e.to_string());
+                    return Ok(());
+                }
+            }
+        }
+        // The new group is accepted. Deregister the OLD subscription (if it was a different named
+        // group) and leave its key_shared membership before switching, so its keys re-route and its
+        // broadcast slot frees. Done AFTER the new registration succeeds so a rejected SUB never
+        // tears down a working subscription.
+        let old_group = self.subscription.clone();
         self.leave_current_key_shared(engine)?;
+        if self.registered_subscription && old_group != new_group {
+            engine.with(move |e| {
+                e.unsubscribe_in(&old_group, member);
+            })?;
+        }
         // Switching subscriptions abandons this connection's in-flight leases in the
         // previous group (they redeliver there after the visibility timeout), so the new
         // subscription starts with no outstanding leases. The name's shape and the group
         // cap are validated by the engine on the first FLOW (#240), surfaced as an Err.
         group.clone_into(&mut self.subscription);
+        self.registered_subscription = !new_group.is_empty();
         self.leased.clear();
         // If the new group is configured key_shared (#64), put it into that mode and join as a
         // member so this connection's keys route to it. A failure to enable the mode (an invalid
@@ -782,7 +884,6 @@ impl Session {
         // enable + join" decision is one actor job, so SUB stays a single round-trip; it returns
         // whether this connection joined so the session can record it for leave-on-switch.
         let sub = self.subscription.clone();
-        let member = self.member_id;
         let joined = engine.with(move |e| {
             if e.is_configured_key_shared(&sub)
                 && e.set_key_ordering_in(&sub, KeyOrdering::KeyShared).is_ok()
@@ -810,6 +911,9 @@ impl Session {
         // Leave the key_shared group (if any) so its keys re-route, then revert to the default
         // group and drop any outstanding named-group leases (they redeliver after the timeout).
         self.leave_current_key_shared(engine)?;
+        // Deregister this connection as an active subscriber (#288), freeing the group's broadcast
+        // slot for a later subscriber. A no-op for an unregistered (default-group) connection.
+        self.leave_current_subscription(engine)?;
         // The named group this connection is leaving. Captured BEFORE clearing the subscription so
         // the explicit-Unsub eviction (#277) can target it: if it is now fully caught up with no
         // in-flight leases, it is immediately reclaimable rather than waiting out the idle window.
@@ -850,6 +954,33 @@ impl Session {
                 e.leave_member_in(&group, member);
             })?;
             self.joined_key_shared = false;
+        }
+        Ok(())
+    }
+
+    /// Deregisters this connection as an active subscriber of its current group (#288), if it had
+    /// registered one. Idempotent and a no-op for an unregistered (default-group) connection, so it
+    /// is safe to call on every subscription switch, UNSUB, and connection close. Freeing the slot
+    /// lets a later consumer take over a broadcast group whose previous lone subscriber has left.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::ActorGone`] if the actor exited before the deregister could run. A
+    /// no-op (no round-trip) when this connection had not registered a subscription.
+    pub fn leave_current_subscription<
+        F: Filesystem + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+    ) -> Result<(), SessionError> {
+        if self.registered_subscription {
+            let group = self.subscription.clone();
+            let member = self.member_id;
+            engine.with(move |e| {
+                e.unsubscribe_in(&group, member);
+            })?;
+            self.registered_subscription = false;
         }
         Ok(())
     }
@@ -1381,6 +1512,214 @@ mod tests {
                 "group {group:?} independently sees the whole log"
             );
         }
+    }
+
+    #[test]
+    fn cumulative_ack_over_the_wire_commits_a_broadcast_group_and_rejects_a_work_group() {
+        // The tag-19 CumulativeAck verb (#288) end to end through the session: the body carries its
+        // own group name and the exclusive `up_to`. A group marked broadcast accepts it (reply Ok and
+        // the cursor moves); a competing group is rejected with a typed Err and its cursor is
+        // untouched; a re-ack is an idempotent Ok no-op.
+        use ironbus_proto::message::{encode_cumulative_ack, CumulativeAckBody};
+        let e = DirectEngine::new(engine());
+        for p in [&b"a"[..], b"b", b"c", b"d"] {
+            produce(&e, p);
+        }
+        // Mark the "bcast" group broadcast server-side (the v1 mode-wiring seam).
+        e.with(|eng| eng.set_broadcast_in("bcast", true))
+            .unwrap()
+            .unwrap();
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        // Cumulative ack the broadcast group up to 3 (exclusive): reply Ok, cursor moves to 3.
+        let mut body = Vec::new();
+        encode_cumulative_ack(
+            &CumulativeAckBody {
+                up_to: 3,
+                group: b"bcast",
+            },
+            &mut body,
+        );
+        s.process(&e, &frame(FrameType::CumulativeAck, &body), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "broadcast ack is Ok");
+        assert_eq!(
+            e.with(|eng| eng.committed_offset_in("bcast")).unwrap(),
+            Offset::new(3)
+        );
+        // A re-ack at a lower offset is an idempotent Ok no-op (no regression).
+        out.clear();
+        let mut body = Vec::new();
+        encode_cumulative_ack(
+            &CumulativeAckBody {
+                up_to: 1,
+                group: b"bcast",
+            },
+            &mut body,
+        );
+        s.process(&e, &frame(FrameType::CumulativeAck, &body), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "re-ack is Ok");
+        assert_eq!(
+            e.with(|eng| eng.committed_offset_in("bcast")).unwrap(),
+            Offset::new(3),
+            "no regression"
+        );
+        // A competing group (default, never marked broadcast) is rejected with a typed Err and its
+        // cursor is untouched, so the work-group safety trap holds over the wire too (#63).
+        out.clear();
+        let mut body = Vec::new();
+        encode_cumulative_ack(
+            &CumulativeAckBody {
+                up_to: 2,
+                group: b"",
+            },
+            &mut body,
+        );
+        s.process(&e, &frame(FrameType::CumulativeAck, &body), &mut out)
+            .unwrap();
+        let (ty, msg) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::Err,
+            "a work-group cumulative ack is rejected"
+        );
+        assert!(
+            String::from_utf8_lossy(&msg).contains("competing work-group"),
+            "the typed reason is surfaced: {}",
+            String::from_utf8_lossy(&msg)
+        );
+        assert_eq!(
+            e.with(|eng| eng.committed_offset()).unwrap(),
+            Offset::new(0),
+            "the rejected work-group ack commits nothing"
+        );
+    }
+
+    #[test]
+    fn exploit_a_a_second_sub_to_a_broadcast_group_is_rejected_over_the_wire() {
+        // EXPLOIT A end to end (#288): the silent-drop sequence needs TWO concurrent subscribers on
+        // a broadcast group. Over the wire, the second SUB is now rejected with a typed Err, so the
+        // sequence (A leases 0, B leases 1, B acks 1, cumulative ack to 2 skips A's offset 0) can
+        // never begin. No produced record is silently dropped: the lone consumer drains them all.
+        let e = DirectEngine::new(engine());
+        for p in [&b"a"[..], b"b", b"c"] {
+            produce(&e, p);
+        }
+        e.with(|eng| eng.set_broadcast_in("g", true))
+            .unwrap()
+            .unwrap();
+        // Consumer A (member 1) subscribes: accepted, it is the lone subscriber, and leases offset 0.
+        let mut a = connect_and_sub(&e, MemberId::new(1), b"g");
+        let mut out = Vec::new();
+        a.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_payloads(&out),
+            vec![b"a".to_vec()],
+            "A leases offset 0"
+        );
+        assert_eq!(e.with(|eng| eng.subscriber_count_in("g")).unwrap(), 1);
+        // Consumer B (member 2) subscribes to the SAME broadcast group: the SUB is REJECTED (the
+        // exploit's step 3), so B never gets to lease offset 1.
+        let mut b = Session::with_member_id(MemberId::new(2));
+        let mut out = Vec::new();
+        b.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        b.process(&e, &frame(FrameType::Sub, b"g"), &mut out)
+            .unwrap();
+        let (ty, msg) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::Err,
+            "the second SUB to a broadcast group is rejected"
+        );
+        assert!(
+            String::from_utf8_lossy(&msg).contains("group-of-one"),
+            "the typed reason is surfaced: {}",
+            String::from_utf8_lossy(&msg)
+        );
+        // Still exactly one subscriber; B never registered.
+        assert_eq!(e.with(|eng| eng.subscriber_count_in("g")).unwrap(), 1);
+        // The lone consumer A drains the rest in order: no offset is skipped.
+        let mut out = Vec::new();
+        a.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_payloads(&out),
+            vec![b"b".to_vec(), b"c".to_vec()],
+            "every remaining record is delivered to the lone consumer, none silently dropped"
+        );
+    }
+
+    #[test]
+    fn a_disconnect_frees_a_broadcast_groups_group_of_one_slot_over_the_wire() {
+        // LIVENESS over the wire (#288): the disconnect-deregister must FREE a broadcast group's
+        // group-of-one slot, not just an explicit UNSUB. A SUBs the broadcast group (taking the lone
+        // slot), A's connection DROPS, then B SUBs the SAME group and SUCCEEDS. Without the disconnect
+        // cleanup the slot would stay taken and B's SUB would be rejected `BroadcastGroupBusy`
+        // forever, bricking the group; this pins that a future refactor dropping the cleanup fails
+        // here. It exercises the real SUB frame path and the real per-connection disconnect cleanup
+        // (`leave_current_key_shared` + `leave_current_subscription`), the exact pair the connection
+        // handler runs on EVERY exit (clean close, timeout, or malformed frame) in `server.rs`.
+        let e = DirectEngine::new(engine());
+        for p in [&b"a"[..], b"b", b"c"] {
+            produce(&e, p);
+        }
+        e.with(|eng| eng.set_broadcast_in("g", true))
+            .unwrap()
+            .unwrap();
+        // Consumer A (member 1) subscribes: accepted, it is the lone subscriber.
+        let mut a = connect_and_sub(&e, MemberId::new(1), b"g");
+        assert_eq!(
+            e.with(|eng| eng.subscriber_count_in("g")).unwrap(),
+            1,
+            "A holds the group-of-one slot"
+        );
+        // A's connection DROPS. The server runs this exact cleanup pair on every connection exit
+        // (see `handle_connection`), so calling it here replays an abrupt disconnect, not a graceful
+        // UNSUB. Both are best-effort and idempotent.
+        a.leave_current_key_shared(&e).unwrap();
+        a.leave_current_subscription(&e).unwrap();
+        drop(a);
+        assert_eq!(
+            e.with(|eng| eng.subscriber_count_in("g")).unwrap(),
+            0,
+            "the disconnect freed the slot"
+        );
+        // Consumer B (member 2) subscribes to the SAME broadcast group: it now SUCCEEDS because the
+        // slot was freed on A's disconnect. (If the disconnect cleanup were removed, the slot would
+        // still be held by A and this SUB would answer a typed `BroadcastGroupBusy` Err instead.)
+        let mut b = Session::with_member_id(MemberId::new(2));
+        let mut out = Vec::new();
+        b.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        b.process(&e, &frame(FrameType::Sub, b"g"), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "B's SUB to the freed broadcast group succeeds"
+        );
+        assert_eq!(
+            e.with(|eng| eng.subscriber_count_in("g")).unwrap(),
+            1,
+            "B now holds the group-of-one slot"
+        );
+        // B (the new lone consumer) can drain every record in order: the group is live, not bricked.
+        let mut out = Vec::new();
+        b.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_payloads(&out),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "the freed group still delivers every record to its new lone consumer"
+        );
     }
 
     /// Produces a keyed record through the engine, for the `key_shared` session tests.

@@ -322,6 +322,45 @@ pub fn decode_sub(body: &[u8]) -> SubBody<'_> {
     SubBody { group: body }
 }
 
+/// A consumer cumulative ack (the `CumulativeAck` frame body, #288): ack-all-up-to-offset for a
+/// BROADCAST group. The broadcast half of the `JetStream` `AckAll` verb (refs #63): a broadcast
+/// group is a group-of-one that sees every record in order, so committing its single cursor up to
+/// an exclusive `up_to` offset is well-defined and drops nothing. The server validates `up_to`
+/// against the durable head and the earliest-retained offset, is idempotent on a re-ack, and
+/// HARD-REJECTS the verb on any competing or `key_shared` work-group.
+///
+/// Layout: `up_to: u64` (the exclusive commit offset, little-endian), then `group` (the
+/// work-group name as the remainder of the body, exactly like [`SubBody`]; empty selects the
+/// default group). The fixed `u64` leads so the variable-length name is the tail, mirroring the
+/// whole-body-is-the-name shape of `SubBody`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CumulativeAckBody<'a> {
+    /// The exclusive offset to commit the broadcast cursor up to (every offset strictly below it
+    /// is acked).
+    pub up_to: u64,
+    /// The work-group name (empty selects the default group). Validated server-side.
+    pub group: &'a [u8],
+}
+
+/// Encodes a `CumulativeAck` body onto the end of `out`: the 8-byte LE `up_to` offset, then the
+/// group name as the remainder.
+pub fn encode_cumulative_ack(ack: &CumulativeAckBody<'_>, out: &mut Vec<u8>) {
+    out.extend_from_slice(&ack.up_to.to_le_bytes());
+    out.extend_from_slice(ack.group);
+}
+
+/// Decodes a `CumulativeAck` body: the leading 8-byte LE `up_to` offset, then the remainder is the
+/// group name. The body MUST be exactly one frame's body (any trailing bytes are the group name).
+///
+/// # Errors
+/// Returns [`BodyError::Truncated`] if the body is shorter than the 8-byte `up_to` field.
+pub fn decode_cumulative_ack(body: &[u8]) -> Result<CumulativeAckBody<'_>, BodyError> {
+    let mut r = Reader::new(body);
+    let up_to = r.u64()?;
+    let group = r.rest();
+    Ok(CumulativeAckBody { up_to, group })
+}
+
 /// The dead-letter reason for a message that exceeded `MaxDeliver` (poison). Only this reason
 /// is emitted today; the one-byte reason field leaves room for future causes (#63).
 pub const DEAD_LETTER_MAX_DELIVER: u8 = 0;
@@ -447,6 +486,42 @@ mod tests {
     fn truncated_rejects_a_short_or_overlong_body() {
         assert_eq!(decode_truncated(&[0u8; 15]), Err(BodyError::Truncated));
         assert_eq!(decode_truncated(&[0u8; 17]), Err(BodyError::TrailingBytes));
+    }
+
+    #[test]
+    fn cumulative_ack_round_trips() {
+        for group in [&b""[..], b"orders", b"a-very/long.name_1:2"] {
+            let ack = CumulativeAckBody {
+                up_to: 0x0102_0304_0506_0708,
+                group,
+            };
+            let mut buf = Vec::new();
+            encode_cumulative_ack(&ack, &mut buf);
+            assert_eq!(buf.len(), 8 + group.len(), "u64 up_to then the group tail");
+            assert_eq!(decode_cumulative_ack(&buf).unwrap(), ack);
+            assert_eq!(&buf[..8], &ack.up_to.to_le_bytes(), "up_to leads, LE");
+            assert_eq!(&buf[8..], group, "the group is the body tail");
+        }
+    }
+
+    #[test]
+    fn cumulative_ack_rejects_a_short_body() {
+        // Anything shorter than the leading 8-byte up_to cannot be decoded.
+        for len in 0..8usize {
+            assert_eq!(
+                decode_cumulative_ack(&vec![0u8; len]),
+                Err(BodyError::Truncated),
+                "length {len} is too short for the up_to field"
+            );
+        }
+        // Exactly 8 bytes is the default group (empty name tail), not an error.
+        assert_eq!(
+            decode_cumulative_ack(&[0u8; 8]).unwrap(),
+            CumulativeAckBody {
+                up_to: 0,
+                group: b""
+            }
+        );
     }
 
     #[test]
@@ -645,6 +720,7 @@ mod tests {
             let _ = decode_deliver(&bytes);
             let _ = decode_dead_letter(&bytes);
             let _ = decode_truncated(&bytes);
+            let _ = decode_cumulative_ack(&bytes);
             // SUB is infallible: any byte string is a valid body, and decoding it recovers the
             // exact bytes as the group, so it cannot panic either.
             prop_assert_eq!(decode_sub(&bytes).group, bytes.as_slice());
@@ -686,6 +762,18 @@ mod tests {
             encode_truncated(&advisory, &mut buf);
             prop_assert_eq!(buf.len(), 16, "TRUNCATED is a fixed 16-byte body");
             prop_assert_eq!(decode_truncated(&buf).unwrap(), advisory);
+        }
+
+        /// A CumulativeAck body round-trips for any up_to and group: the 8-byte LE up_to leads,
+        /// then the group is the body tail (any byte string is a valid name, like SUB).
+        #[test]
+        fn any_cumulative_ack_round_trips(up_to in any::<u64>(), group in prop::collection::vec(any::<u8>(), 0..512)) {
+            let ack = CumulativeAckBody { up_to, group: &group };
+            let mut buf = Vec::new();
+            encode_cumulative_ack(&ack, &mut buf);
+            prop_assert_eq!(buf.len(), 8 + group.len());
+            prop_assert_eq!(&buf[..8], &up_to.to_le_bytes());
+            prop_assert_eq!(decode_cumulative_ack(&buf).unwrap(), ack);
         }
 
         /// A SUB body is the whole-body-is-the-group case: any byte string is a valid name and

@@ -78,6 +78,14 @@ pub enum FrameType {
     /// deliveries. Body: the new earliest-retained `offset` the cursor was reset to, then the
     /// number of `skipped` records, each a little-endian `u64` (16 bytes total).
     Truncated,
+    /// Consumer cumulative ack (ack-all-up-to-offset) for a BROADCAST group (#288, refs #63, #11):
+    /// commits the group's single cursor up to an exclusive `up_to` offset, the safe broadcast half
+    /// of the `JetStream` `AckAll` verb (a broadcast group is a group-of-one that sees every record
+    /// in order, so committing past `up_to` drops nothing). The server hard-rejects it on any
+    /// competing or `key_shared` work-group. Body: the exclusive `up_to` offset as a little-endian
+    /// `u64` (8 bytes) followed by the work-group name as the remainder of the body (empty selects
+    /// the default group).
+    CumulativeAck,
 }
 
 impl FrameType {
@@ -103,6 +111,7 @@ impl FrameType {
             FrameType::FlowEnd => 16,
             FrameType::DeadLetter => 17,
             FrameType::Truncated => 18,
+            FrameType::CumulativeAck => 19,
         }
     }
 
@@ -129,6 +138,7 @@ impl FrameType {
             16 => FrameType::FlowEnd,
             17 => FrameType::DeadLetter,
             18 => FrameType::Truncated,
+            19 => FrameType::CumulativeAck,
             _ => return None,
         })
     }
@@ -261,7 +271,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 18] = [
+    const ALL_TYPES: [FrameType; 19] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -280,6 +290,7 @@ mod tests {
         FrameType::FlowEnd,
         FrameType::DeadLetter,
         FrameType::Truncated,
+        FrameType::CumulativeAck,
     ];
 
     #[test]
@@ -316,6 +327,7 @@ mod tests {
         assert_eq!(FrameType::FlowEnd.as_u8(), 16);
         assert_eq!(FrameType::DeadLetter.as_u8(), 17);
         assert_eq!(FrameType::Truncated.as_u8(), 18);
+        assert_eq!(FrameType::CumulativeAck.as_u8(), 19);
     }
 
     #[test]
@@ -501,7 +513,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 19u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 20u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);

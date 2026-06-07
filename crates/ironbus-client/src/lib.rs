@@ -13,8 +13,8 @@
 
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
-    decode_dead_letter, decode_deliver, decode_truncated, encode_ack, encode_pub, encode_sub,
-    AckBody, AckOp, BodyError, PubBody, SubBody,
+    decode_dead_letter, decode_deliver, decode_truncated, encode_ack, encode_cumulative_ack,
+    encode_pub, encode_sub, AckBody, AckOp, BodyError, CumulativeAckBody, PubBody, SubBody,
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -542,6 +542,35 @@ impl Client {
         }
     }
 
+    /// Sends a BROADCAST cumulative ack (the tag-19 `CumulativeAck` verb, #288): commits the named
+    /// broadcast group's single cursor up to the EXCLUSIVE offset `up_to` in one move. The verb is
+    /// safe ONLY for a broadcast group (a group-of-one that sees every record in order); the server
+    /// hard-rejects it for a competing or `key_shared` work-group, and validates `up_to` against the
+    /// durable head and the earliest-retained offset. An empty `group` selects the default group. A
+    /// re-ack at or below the current commit is an idempotent no-op success.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the verb (the group is not a broadcast
+    /// consumer, or `up_to` is outside the retained window), or a frame or connection error.
+    pub fn cumulative_ack(&mut self, group: &str, up_to: u64) -> Result<(), ClientError> {
+        let mut body = Vec::new();
+        encode_cumulative_ack(
+            &CumulativeAckBody {
+                up_to,
+                group: group.as_bytes(),
+            },
+            &mut body,
+        );
+        self.send(FrameType::CumulativeAck, &body)?;
+        match self.read_frame()? {
+            (FrameType::Ok, _) => Ok(()),
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
     fn send(&mut self, frame_type: FrameType, body: &[u8]) -> Result<(), ClientError> {
         let mut frame = Vec::new();
         encode_frame(frame_type, body, &mut frame).map_err(ClientError::Frame)?;
@@ -844,6 +873,37 @@ mod tests {
         let (addr, handle) = raw_server(script);
         let mut c = Client::connect(addr).unwrap();
         assert!(!c.ack(7, 3).unwrap());
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_cumulative_ack_ok_reply_succeeds() {
+        // The broadcast cumulative-ack verb (#288): the server answers Ok, so the call succeeds.
+        let mut script = frame(FrameType::Info, b"");
+        script.extend(frame(FrameType::Ok, b""));
+        let (addr, handle) = raw_server(script);
+        let mut c = Client::connect(addr).unwrap();
+        c.cumulative_ack("bcast", 5).unwrap();
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_cumulative_ack_error_reply_is_surfaced() {
+        // The server rejects the verb (a competing group, or an out-of-range up_to): the typed Err
+        // reason is surfaced to the caller (#288).
+        let mut script = frame(FrameType::Info, b"");
+        script.extend(frame(
+            FrameType::Err,
+            b"cumulative ack is not allowed on a competing work-group (broadcast consumers only)",
+        ));
+        let (addr, handle) = raw_server(script);
+        let mut c = Client::connect(addr).unwrap();
+        match c.cumulative_ack("", 2).unwrap_err() {
+            ClientError::Server(m) => assert!(m.contains("competing work-group"), "{m}"),
+            other => panic!("expected Server, got {other:?}"),
+        }
         drop(c);
         handle.join().unwrap();
     }

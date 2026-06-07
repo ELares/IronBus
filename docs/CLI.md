@@ -28,6 +28,7 @@ flag and code does.
 | `serve` | online (runs the broker) | Unix only in v1 | Open the on-disk log under `--data-dir` and serve the wire protocol on `--addr`. |
 | `pub` | online (connects) | any | Append one message and print its durable offset. |
 | `sub` | online (connects) | any | Fetch up to a credit of messages, print each, optionally dispose of the batch. |
+| `cumulative-ack` | online (connects) | any | Commit a BROADCAST group's cursor up to (exclusive) `--up-to` in one move (ack-all-up-to-offset, #288). |
 | `peek` | offline (reads `--data-dir`) | Unix only in v1 | Show a bounded window of durable records from a stopped broker's data directory. |
 | `dump` | offline (reads `--data-dir`) | Unix only in v1 | Stream every durable record (or, with `--dlq`, the dead-letter sink). |
 | `help` / `--help` / `-h` | neither | any | Print the usage banner. |
@@ -81,6 +82,7 @@ broker opens.
 | `--max-groups <n>` | usize | `1024` (`DEFAULT_MAX_GROUPS`, aliased to `ironbus_server::engine::DEFAULT_MAX_GROUPS`); `0` = unlimited | count | Cap on live work-groups. A new NAMED group past the cap is rejected; the default group is exempt and never counted. |
 | `--disk-full-policy <drop-new\|drop-oldest>` | enum | `drop-new` (`DEFAULT_DISK_FULL_POLICY`) | n/a | What an over-cap produce does once `--max-total-bytes` is hit. `drop-new` sheds it (preserving older data); `drop-oldest` force-reaps the oldest sealed segment to make room then accepts it. Any other value is a usage error. |
 | `--key-shared-group <name>` | string, REPEATABLE | none (empty) | n/a | Run the named competing group in `key_shared` ordering: a record's key routes to one live member, so same-key records keep order while the group drains in parallel across keys. Pass once per group; a group not named stays plain competing. |
+| `--broadcast-group <name>` | string, REPEATABLE | none (empty) | n/a | Mark a NAMED group BROADCAST (#288): a group-of-one that sees every record in order, so it accepts the `cumulative-ack` verb. The group MUST be named: the DEFAULT/empty group (`--broadcast-group ""`) cannot be a broadcast group (its consumers never SUB a name, so the group-of-one subscriber cap could not bind it) and is rejected as a startup usage error. Mutually exclusive with `key_shared`. A broadcast group is enforced as a true group-of-one: it accepts AT MOST ONE active subscriber (a second concurrent SUB is rejected). Pass once per group; a group not named stays plain competing and rejects cumulative ack. An empty/bad name or the group cap is a startup usage error. |
 | `--visibility-timeout-ms <n>` | u64 | `30000` (`DEFAULT_VISIBILITY_MS`) | milliseconds | How long a delivered message stays in flight before it may redeliver. Must be at least 1. The lease hard cap is the larger of 5 minutes (`DEFAULT_HARD_CAP_MS = 300000`) and this. |
 | `--health-addr <host:port>` | string | off (not set) | host:port | If set, also serve `GET /healthz`, `/readyz`, and `/metrics` on this loopback HTTP port. |
 
@@ -246,6 +248,38 @@ The final line is always:
 fetched <n> message(s)
 ```
 
+## `cumulative-ack` (online; any platform)
+
+Sends a BROADCAST cumulative ack (ack-all-up-to-offset, #288), committing a broadcast
+group's single cursor up to the EXCLUSIVE `--up-to` offset in one move. This is the safe
+broadcast half of the `JetStream` `AckAll` verb: a broadcast group is a group-of-one that
+sees every record in order, so committing past `--up-to` drops nothing. The server
+HARD-REJECTS the verb for a competing or `key_shared` work-group (the cumulative-ack safety
+trap), and rejects an `--up-to` past the durable head or below the earliest-retained offset;
+a re-ack at or below the current commit is an idempotent no-op success.
+
+A group is marked broadcast server-side with `serve --broadcast-group <name>`. The group must
+be NAMED: the default/empty group cannot be a broadcast group (`--broadcast-group ""` is a
+startup usage error), because its consumers never SUB a name and so the group-of-one
+subscriber cap could never bind them.
+
+| Flag | Type | Default | Notes |
+|------|------|---------|-------|
+| `--addr <host:port>` | string | `127.0.0.1:7777` | The broker to connect to. |
+| `--group <name>` | string | empty (default group) | The broadcast group to cumulative-ack. |
+| `--up-to <offset>` | u64 | required | The EXCLUSIVE offset to commit the cursor up to (every offset strictly below it is acked). |
+
+On success it prints one line:
+
+```
+cumulative ack committed group `<name>` up to offset <up_to>
+```
+
+(or `default group` for an empty `--group`). A server rejection (the group is not broadcast,
+or `--up-to` is outside the retained window) is mapped to an internal error (exit 70) with
+the broker's typed reason; an unreachable broker is exit 5; a missing `--up-to` is a usage
+error (exit 1).
+
 ## `peek` (offline; Unix only in v1)
 
 Shows a bounded window of durable records from a stopped broker's data directory, with no
@@ -345,6 +379,6 @@ emitted by the current binary; only the six above are mapped in `main.rs`.
   health/metrics endpoints, and worked examples, see [`USAGE.md`](USAGE.md). USAGE.md's
   `serve` flag table is a curated subset; THIS file is the complete flag map (USAGE.md
   omits `--allow-unlimited-deliver`, `--backoff-ms`, `--consumer-credit`, `--max-groups`,
-  `--disk-full-policy`, and `--key-shared-group`).
+  `--disk-full-policy`, `--key-shared-group`, and `--broadcast-group`).
 - The on-disk and wire byte layouts referenced by the offline output shapes are specified
   in [`CONTRACTS.md`](CONTRACTS.md).
