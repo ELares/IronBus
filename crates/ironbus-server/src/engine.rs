@@ -246,6 +246,126 @@ fn validate_group_name(name: &str) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// The filename prefix and suffix of a named work-group's durable cursor checkpoint. The
+/// default group uses `cursor.ckpt` (note `cursor.`, not `cursor-`), so it never matches the
+/// named pattern and the two never collide.
+const GROUP_CKPT_PREFIX: &str = "cursor-";
+const GROUP_CKPT_SUFFIX: &str = ".ckpt";
+
+/// Lowercase-hex-encodes bytes, for embedding a graphic-ASCII work-group name in a safe,
+/// reversible filename (a name may contain `/`, `:`, etc., which are unsafe in a path).
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
+        s.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
+    }
+    s
+}
+
+/// Decodes lowercase or uppercase hex back to bytes, or `None` if the input is not even-length
+/// valid hex.
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    let bytes = s.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = char::from(bytes[i]).to_digit(16)?;
+        let lo = char::from(bytes[i + 1]).to_digit(16)?;
+        out.push(u8::try_from(hi * 16 + lo).ok()?);
+        i += 2;
+    }
+    Some(out)
+}
+
+/// The durable checkpoint filename for a named work-group: `cursor-<hex(name)>.ckpt`.
+fn group_checkpoint_name(group: &str) -> String {
+    format!(
+        "{GROUP_CKPT_PREFIX}{}{GROUP_CKPT_SUFFIX}",
+        hex_encode(group.as_bytes())
+    )
+}
+
+/// Recovers the work-group name from a checkpoint filename, or `None` if it is not a named-group
+/// checkpoint (e.g. the default `cursor.ckpt`, a segment file, or a malformed name).
+fn parse_group_checkpoint_name(name: &str) -> Option<String> {
+    let mid = name
+        .strip_prefix(GROUP_CKPT_PREFIX)?
+        .strip_suffix(GROUP_CKPT_SUFFIX)?;
+    if mid.is_empty() {
+        return None;
+    }
+    String::from_utf8(hex_decode(mid)?).ok()
+}
+
+/// Builds the checkpoint payload for a cursor: the full [`AckCursor`] snapshot (committed
+/// watermark plus the acked-ahead set) when it fits a checkpoint slot, else the watermark plus
+/// the leading acked-ahead runs that fit. Dropping the overflow runs only redelivers those
+/// already-acked messages after a crash (at-least-once safe); it never loses an ack below the
+/// watermark. The in-flight window bounds how large the ahead set can grow.
+fn snapshot_payload(cursor: &AckCursor) -> Vec<u8> {
+    let mut buf = Vec::new();
+    cursor.encode_snapshot(&mut buf);
+    if buf.len() <= MAX_PAYLOAD {
+        return buf;
+    }
+    // A slot holds MAX_PAYLOAD bytes: the fixed snapshot header and crc, plus 16 per run.
+    let max_runs = MAX_PAYLOAD.saturating_sub(AckCursor::SNAPSHOT_MIN_LEN) / 16;
+    let kept: Vec<(u64, u64)> = cursor
+        .ahead_ranges()
+        .iter()
+        .copied()
+        .take(max_runs)
+        .collect();
+    let capped = AckCursor::resume_with_ahead(cursor.committed(), kept)
+        .unwrap_or_else(|_| AckCursor::resume(cursor.committed()));
+    let mut out = Vec::new();
+    capped.encode_snapshot(&mut out);
+    out
+}
+
+/// Reconstructs a work-group cursor from a recovered checkpoint payload, clamped to the durable
+/// log head `flushed`: the committed watermark can never legitimately exceed the head, and every
+/// acked-ahead range must reference a durable record. The current format is the full snapshot
+/// (#235); a payload too short to be a snapshot is the legacy committed-only format (#182), its
+/// leading 8 little-endian bytes the committed offset. Clamping down is at-least-once-safe.
+fn resume_cursor_from_snapshot(recovered: Option<&[u8]>, flushed: u64) -> AckCursor {
+    let recovered_cursor = match recovered {
+        Some(p) if p.len() >= AckCursor::SNAPSHOT_MIN_LEN => AckCursor::decode_snapshot(p).ok(),
+        Some(p) => {
+            let committed = p
+                .get(..8)
+                .and_then(|s| <[u8; 8]>::try_from(s).ok())
+                .map_or(0, u64::from_le_bytes);
+            Some(AckCursor::resume(Offset::new(committed)))
+        }
+        None => None,
+    };
+    let recovered_committed = recovered_cursor.as_ref().map_or(0, |c| c.committed().get());
+    debug_assert!(
+        recovered_committed <= flushed,
+        "checkpoint committed {recovered_committed} exceeds the durable head {flushed}"
+    );
+    let committed = recovered_committed.min(flushed);
+    let ahead: Vec<(u64, u64)> = recovered_cursor
+        .as_ref()
+        .map(|c| {
+            c.ahead_ranges()
+                .iter()
+                .copied()
+                .filter(|&(start, end)| start > committed && end <= flushed)
+                .collect()
+        })
+        .unwrap_or_default();
+    // Filtering a valid ahead set keeps it valid, so `resume_with_ahead` succeeds; fall back to
+    // a bare resume rather than panic if a future change ever violates that.
+    AckCursor::resume_with_ahead(Offset::new(committed), ahead)
+        .unwrap_or_else(|_| AckCursor::resume(Offset::new(committed)))
+}
+
 /// Per-work-group consumer state over the shared log: an independent committed cursor and
 /// in-flight lease table. A broadcast subscriber is a group of one (it sees every message);
 /// a competing group is shared by several members (each message goes to one member). The
@@ -278,6 +398,10 @@ pub struct Engine<F: Filesystem, C: Clock> {
     checkpoint: Checkpoint<F::File>,
     checkpoint_interval: u64,
     last_checkpointed: u64,
+    /// The last durably-checkpointed committed offset per NAMED work-group (#60), for the
+    /// interval gate. The default group uses `last_checkpointed`; named groups checkpoint to
+    /// their own `cursor-<hex>.ckpt` files.
+    group_last_checkpointed: BTreeMap<String, u64>,
     counters: Counters,
     /// The fsync (durability barrier) latency distribution observed on produce.
     fsync: LatencyHistogram,
@@ -318,65 +442,58 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
             }
         };
         let (checkpoint, recovered) = Checkpoint::open(checkpoint_file)?;
-        // Reconstruct the durable consumer cursor from the checkpoint payload. The current
-        // format is the full `AckCursor` snapshot (#235): the committed watermark plus the
-        // acked-ahead set, so out-of-order acks survive a restart instead of redelivering.
-        // A payload too short to be a snapshot is the legacy committed-only format (#182):
-        // its leading 8 little-endian bytes are the committed offset, with no ahead set.
-        let recovered_cursor = match recovered.as_deref() {
-            Some(p) if p.len() >= AckCursor::SNAPSHOT_MIN_LEN => AckCursor::decode_snapshot(p).ok(),
-            Some(p) => {
-                let committed = p
-                    .get(..8)
-                    .and_then(|s| <[u8; 8]>::try_from(s).ok())
-                    .map_or(0, u64::from_le_bytes);
-                Some(AckCursor::resume(Offset::new(committed)))
-            }
-            None => None,
-        };
         let flushed = log.flushed_offset().get();
-        // The committed cursor can never legitimately exceed the durable log head, and every
-        // acked-ahead range must reference a durable record; if either is above the head the
-        // log recovered below a valid checkpoint (corruption/truncation). Clamping down (and
-        // dropping ahead ranges above the head) is at-least-once-safe (duplicates, never
-        // loss), but assert the watermark loudly in debug.
-        let recovered_committed = recovered_cursor.as_ref().map_or(0, |c| c.committed().get());
-        debug_assert!(
-            recovered_committed <= flushed,
-            "checkpoint committed {recovered_committed} exceeds the durable head {flushed}"
+        // The default group's durable cursor, from `cursor.ckpt`, clamped to the head.
+        let cursor = resume_cursor_from_snapshot(recovered.as_deref(), flushed);
+        let default_committed = cursor.committed().get();
+        let mut groups = BTreeMap::new();
+        groups.insert(
+            DEFAULT_GROUP.to_string(),
+            WorkGroup {
+                cursor,
+                leases: LeaseTable::new(config.lease),
+            },
         );
-        let committed = recovered_committed.min(flushed);
-        let ahead: Vec<(u64, u64)> = recovered_cursor
-            .as_ref()
-            .map(|c| {
-                c.ahead_ranges()
-                    .iter()
-                    .copied()
-                    .filter(|&(start, end)| start > committed && end <= flushed)
-                    .collect()
-            })
-            .unwrap_or_default();
-        // Filtering a valid ahead set keeps it valid (sorted, disjoint, non-adjacent, above
-        // the watermark), so `resume_with_ahead` succeeds; fall back to a bare resume rather
-        // than panic if a future change ever violates that.
-        let cursor = AckCursor::resume_with_ahead(Offset::new(committed), ahead)
-            .unwrap_or_else(|_| AckCursor::resume(Offset::new(committed)));
+        // Discover and resume each NAMED work-group from its own `cursor-<hex>.ckpt` (#60),
+        // so a broadcast or competing group keeps its position across a restart instead of
+        // redelivering the whole log. Bounded by the group cap as a defense against a
+        // tampered directory holding more checkpoint files than the runtime cap allows.
+        let mut group_last_checkpointed = BTreeMap::new();
+        {
+            let fs = log.filesystem();
+            for name in fs.list()? {
+                if groups.len() >= MAX_GROUPS {
+                    break;
+                }
+                let Some(gname) = parse_group_checkpoint_name(&name) else {
+                    continue;
+                };
+                if validate_group_name(&gname).is_err() || groups.contains_key(&gname) {
+                    continue;
+                }
+                let (_, recovered) = Checkpoint::open(fs.open(&name)?)?;
+                let gcursor = resume_cursor_from_snapshot(recovered.as_deref(), flushed);
+                group_last_checkpointed.insert(gname.clone(), gcursor.committed().get());
+                groups.insert(
+                    gname,
+                    WorkGroup {
+                        cursor: gcursor,
+                        leases: LeaseTable::new(config.lease),
+                    },
+                );
+            }
+        }
 
         Ok(Engine {
             log,
-            groups: BTreeMap::from([(
-                DEFAULT_GROUP.to_string(),
-                WorkGroup {
-                    cursor,
-                    leases: LeaseTable::new(config.lease),
-                },
-            )]),
+            groups,
+            group_last_checkpointed,
             lease_config: config.lease,
             delivery: config.delivery,
             max_in_flight: config.max_in_flight,
             checkpoint,
             checkpoint_interval: config.checkpoint_interval,
-            last_checkpointed: committed,
+            last_checkpointed: default_committed,
             counters: Counters::default(),
             fsync: LatencyHistogram::default(),
             last_dead_lettered: None,
@@ -416,27 +533,9 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// it never loses an ack below the watermark. A pathological ahead set (many disjoint
     /// out-of-order acks) is the only case that overflows; the in-flight window bounds it.
     fn cursor_checkpoint_payload(&self) -> Vec<u8> {
-        let Some(cursor) = self.groups.get(DEFAULT_GROUP).map(|g| &g.cursor) else {
-            return Vec::new();
-        };
-        let mut buf = Vec::new();
-        cursor.encode_snapshot(&mut buf);
-        if buf.len() <= MAX_PAYLOAD {
-            return buf;
-        }
-        // A slot holds MAX_PAYLOAD bytes: the fixed snapshot header and crc, plus 16 per run.
-        let max_runs = MAX_PAYLOAD.saturating_sub(AckCursor::SNAPSHOT_MIN_LEN) / 16;
-        let kept: Vec<(u64, u64)> = cursor
-            .ahead_ranges()
-            .iter()
-            .copied()
-            .take(max_runs)
-            .collect();
-        let capped = AckCursor::resume_with_ahead(cursor.committed(), kept)
-            .unwrap_or_else(|_| AckCursor::resume(cursor.committed()));
-        let mut out = Vec::new();
-        capped.encode_snapshot(&mut out);
-        out
+        self.groups
+            .get(DEFAULT_GROUP)
+            .map_or_else(Vec::new, |g| snapshot_payload(&g.cursor))
     }
 
     /// Checkpoints the committed cursor if it has advanced at least `checkpoint_interval`
@@ -459,6 +558,89 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
         } else {
             Ok(false)
         }
+    }
+
+    /// Durably records a work-group's committed cursor (#60), so a later [`Engine::open`]
+    /// resumes that group from here. The default group writes `cursor.ckpt` (delegating to
+    /// [`Engine::checkpoint_cursor`]); a named group writes its own `cursor-<hex>.ckpt`. Like the
+    /// default, it is a lagging optimization: a crash redelivers a few already-processed
+    /// messages (at-least-once), never an offset that was not committed. The clean-disconnect
+    /// flush is the right caller.
+    ///
+    /// # Errors
+    /// Propagates a storage error from writing the checkpoint.
+    pub fn checkpoint_group(&mut self, group: &str) -> Result<(), EngineError> {
+        if group == DEFAULT_GROUP {
+            return self.checkpoint_cursor();
+        }
+        let Some(g) = self.groups.get(group) else {
+            return Ok(());
+        };
+        let committed = g.cursor.committed().get();
+        let has_ahead = !g.cursor.ahead_ranges().is_empty();
+        let last = self
+            .group_last_checkpointed
+            .get(group)
+            .copied()
+            .unwrap_or(0);
+        if committed > last || has_ahead {
+            self.write_group_checkpoint(group, committed)?;
+        }
+        Ok(())
+    }
+
+    /// Like [`Engine::maybe_checkpoint`] but for a named work-group (#60): checkpoints it if its
+    /// committed cursor advanced at least `checkpoint_interval` since its last checkpoint, so a
+    /// crash redelivers a bounded tail per group. The default group delegates to
+    /// [`Engine::maybe_checkpoint`].
+    ///
+    /// # Errors
+    /// Propagates a storage error from writing the checkpoint.
+    pub fn maybe_checkpoint_group(&mut self, group: &str) -> Result<bool, EngineError> {
+        if group == DEFAULT_GROUP {
+            return self.maybe_checkpoint();
+        }
+        let Some(g) = self.groups.get(group) else {
+            return Ok(false);
+        };
+        let committed = g.cursor.committed().get();
+        let last = self
+            .group_last_checkpointed
+            .get(group)
+            .copied()
+            .unwrap_or(0);
+        if committed.saturating_sub(last) >= self.checkpoint_interval.max(1) {
+            self.write_group_checkpoint(group, committed)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Writes a named work-group's cursor snapshot to its `cursor-<hex>.ckpt`, creating the file
+    /// (and syncing the directory) on first use. The checkpoint file is reopened per write so
+    /// the crash-safe two-slot sequence continues correctly.
+    fn write_group_checkpoint(&mut self, group: &str, committed: u64) -> Result<(), EngineError> {
+        let payload = match self.groups.get(group) {
+            Some(g) => snapshot_payload(&g.cursor),
+            None => return Ok(()),
+        };
+        let name = group_checkpoint_name(group);
+        let file = {
+            let fs = self.log.filesystem();
+            if fs.exists(&name)? {
+                fs.open(&name)?
+            } else {
+                let f = fs.create_new(&name)?;
+                fs.sync_dir()?; // the new file's directory entry must be durable
+                f
+            }
+        };
+        let (mut cp, _) = Checkpoint::open(file)?;
+        cp.write(&payload)?;
+        self.group_last_checkpointed
+            .insert(group.to_string(), committed);
+        Ok(())
     }
 
     /// Appends a message and makes it durable before returning its offset (so a producer's
@@ -1397,6 +1579,97 @@ mod tests {
     }
 
     #[test]
+    fn a_named_group_cursor_survives_a_restart() {
+        // A named work-group's committed cursor is durable (#60): after a clean-disconnect
+        // flush and reopen, the group resumes past acked messages instead of redelivering the
+        // whole log, while the default group is independent.
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b", b"c"] {
+            produce(&mut e, p);
+        }
+        for expected in 0..2u64 {
+            let d = message(e.poll_in("orders", 0).unwrap());
+            assert_eq!(d.offset, Offset::new(expected));
+            assert_eq!(e.ack_in("orders", &d.token), AckResult::Acked);
+        }
+        assert_eq!(e.committed_offset_in("orders"), Offset::new(2));
+        e.checkpoint_group("orders").unwrap();
+        let fs = e.into_filesystem();
+
+        let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        // The named group resumes at 2; only the uncommitted tail (offset 2) redelivers there.
+        assert_eq!(e.committed_offset_in("orders"), Offset::new(2));
+        let d = message(e.poll_in("orders", 0).unwrap());
+        assert_eq!(d.offset, Offset::new(2));
+        // The default group consumed nothing and resumes at 0, independent of "orders".
+        assert_eq!(e.committed_offset(), Offset::new(0));
+    }
+
+    #[test]
+    fn multiple_named_groups_resume_independently() {
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b", b"c", b"d"] {
+            produce(&mut e, p);
+        }
+        // "fast" acks three, "slow" acks one.
+        for expected in 0..3u64 {
+            let d = message(e.poll_in("fast", 0).unwrap());
+            assert_eq!(d.offset, Offset::new(expected));
+            e.ack_in("fast", &d.token);
+        }
+        let d = message(e.poll_in("slow", 0).unwrap());
+        e.ack_in("slow", &d.token);
+        e.checkpoint_group("fast").unwrap();
+        e.checkpoint_group("slow").unwrap();
+        let fs = e.into_filesystem();
+
+        let e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(e.committed_offset_in("fast"), Offset::new(3));
+        assert_eq!(e.committed_offset_in("slow"), Offset::new(1));
+    }
+
+    #[test]
+    fn a_named_groups_out_of_order_ack_survives_a_restart() {
+        // The named-group snapshot carries the acked-ahead set too (#60, #235): an out-of-order
+        // ack leaving a gap survives a restart, so only the gap redelivers, not the acked-ahead.
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b", b"c"] {
+            produce(&mut e, p);
+        }
+        let mut tokens = Vec::new();
+        for _ in 0..3 {
+            tokens.push(message(e.poll_in("g", 0).unwrap()).token);
+        }
+        // Ack 1 and 2 but not 0: committed stays 0, ahead = [1, 3).
+        assert_eq!(e.ack_in("g", &tokens[1]), AckResult::Acked);
+        assert_eq!(e.ack_in("g", &tokens[2]), AckResult::Acked);
+        assert_eq!(e.committed_offset_in("g"), Offset::new(0));
+        e.checkpoint_group("g").unwrap();
+        let fs = e.into_filesystem();
+
+        let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(e.committed_offset_in("g"), Offset::new(0));
+        // Only the gap (offset 0) redelivers; 1 and 2 are acked-ahead and skipped.
+        let mut delivered = Vec::new();
+        loop {
+            match e.poll_in("g", 0).unwrap() {
+                Poll::Message(d) => {
+                    delivered.push(d.offset.get());
+                    e.ack_in("g", &d.token);
+                }
+                Poll::Idle => break,
+                Poll::Parked { offset, .. } => panic!("unexpected park at {}", offset.get()),
+            }
+        }
+        assert_eq!(
+            delivered,
+            vec![0],
+            "only the gap redelivers in the named group"
+        );
+        assert_eq!(e.committed_offset_in("g"), Offset::new(3));
+    }
+
+    #[test]
     fn reopen_recovers_the_durable_log_and_redelivers_uncommitted_messages() {
         let mut e = open(config(10, 5));
         for p in [b"a", b"b"] {
@@ -1449,6 +1722,62 @@ mod tests {
         let d = message(e.poll(0).unwrap());
         assert_eq!(d.offset, Offset::new(1));
         assert_eq!(d.record.payload, b"b");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_named_group_cursor_resumes_on_a_real_directory() {
+        use ironbus_storage::fs::StdFs;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let put = |e: &mut Engine<StdFs, ManualClock>, payload: &[u8]| {
+            e.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload,
+            })
+            .unwrap();
+        };
+        // A group name with path-unsafe characters (`/` and `:`) proves the hex filename
+        // encoding: the checkpoint must never be a path-traversal or an invalid filename.
+        let group = "team/a:1";
+        let mut e =
+            Engine::open(StdFs::new(root.clone()), ManualClock::new(), config(10, 5)).unwrap();
+        put(&mut e, b"a");
+        put(&mut e, b"b");
+        let d0 = message(e.poll_in(group, 0).unwrap());
+        e.ack_in(group, &d0.token);
+        e.checkpoint_group(group).unwrap();
+        drop(e);
+
+        let mut e = Engine::open(StdFs::new(root), ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(e.committed_offset_in(group), Offset::new(1));
+        let d = message(e.poll_in(group, 0).unwrap());
+        assert_eq!(d.offset, Offset::new(1));
+        assert_eq!(d.record.payload, b"b");
+        // The default group is unaffected on the same real directory.
+        assert_eq!(e.committed_offset(), Offset::new(0));
+    }
+
+    #[test]
+    fn group_checkpoint_filename_round_trips_and_excludes_others() {
+        // The hex filename round-trips any (graphic-ASCII, path-unsafe) name.
+        for g in ["orders", "team/a:1", "x", "A.B-C_d"] {
+            let name = group_checkpoint_name(g);
+            assert_eq!(parse_group_checkpoint_name(&name).as_deref(), Some(g));
+        }
+        // The default cursor file, segment files, an empty name, and bad hex are NOT named-group
+        // checkpoints, so discovery never resurrects a spurious group from them.
+        assert_eq!(parse_group_checkpoint_name("cursor.ckpt"), None);
+        assert_eq!(
+            parse_group_checkpoint_name("seg-0000000000000000.log"),
+            None
+        );
+        assert_eq!(parse_group_checkpoint_name("cursor-.ckpt"), None);
+        assert_eq!(parse_group_checkpoint_name("cursor-zz.ckpt"), None);
+        assert_eq!(parse_group_checkpoint_name("cursor-abc.ckpt"), None);
     }
 
     #[test]

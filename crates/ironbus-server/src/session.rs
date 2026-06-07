@@ -73,6 +73,13 @@ impl Session {
         Session::default()
     }
 
+    /// The work-group this connection is subscribed to (`""` is the default group). Used to
+    /// route the connection's durable cursor checkpoint to the right group (#60).
+    #[must_use]
+    pub fn subscription(&self) -> &str {
+        &self.subscription
+    }
+
     /// Processes the complete frames at the front of `input`, dispatching each to `engine`
     /// and appending response frames to `out`. Returns the number of input bytes consumed;
     /// a partial trailing frame is not consumed and should be retried once more bytes
