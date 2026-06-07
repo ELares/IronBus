@@ -673,8 +673,16 @@ impl Session {
         // Leave the key_shared group (if any) so its keys re-route, then revert to the default
         // group and drop any outstanding named-group leases (they redeliver after the timeout).
         self.leave_current_key_shared(engine);
-        self.subscription.clear();
+        // The named group this connection is leaving. Captured BEFORE clearing the subscription so
+        // the explicit-Unsub eviction (#277) can target it: if it is now fully caught up with no
+        // in-flight leases, it is immediately reclaimable rather than waiting out the idle window.
+        // It is a no-op for the default group, for a group still holding leases (they redeliver or
+        // expire first, then the natural idle sweep reclaims it), and when eviction is disabled.
+        let leaving = std::mem::take(&mut self.subscription);
         self.leased.clear();
+        if !leaving.is_empty() {
+            engine.evict_group_if_idle(&leaving);
+        }
         reply(out, FrameType::Ok, &[]);
     }
 
@@ -751,6 +759,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -826,6 +835,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -859,6 +869,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 disk_full_policy: DiskFullPolicy::DropOldest,
             },
         )
@@ -1708,6 +1719,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -2023,6 +2035,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -2056,6 +2069,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -2598,6 +2612,114 @@ mod tests {
             batch.len(),
             5,
             "the default 8 MiB byte budget does not bind a handful of small messages"
+        );
+    }
+
+    /// An engine with idle named-group eviction ENABLED (#277), for the explicit-Unsub reclaim test.
+    /// The window value is irrelevant to the explicit-Unsub path (it bypasses the idle wait), but it
+    /// must be non-zero so the lifecycle policy is on at all.
+    fn engine_evict(clock: Arc<ManualClock>) -> Engine<InMemoryFs, Arc<ManualClock>> {
+        Engine::open(
+            InMemoryFs::new(),
+            clock,
+            EngineConfig {
+                log: LogConfig::default(),
+                lease: LeaseConfig {
+                    visibility_nanos: 30,
+                    hard_cap_nanos: 100,
+                },
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight: 10,
+                consumer_credit: 64,
+                consumer_credit_bytes: 0,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: 10, // eviction ON; the explicit-Unsub path ignores the window
+                disk_full_policy: DiskFullPolicy::DropNew,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn unsub_reclaims_a_caught_up_named_group_immediately() {
+        // The Unsub interaction (#277): a connection that subscribes to a NAMED group, drains and
+        // acks it (caught up, lease-free), then UNSUBs has that group reclaimed RIGHT NOW, freeing
+        // its slot. A re-subscribe resumes at the head and redelivers nothing it had acked.
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_evict(Arc::clone(&clock));
+        produce(&mut e, b"a");
+        produce(&mut e, b"b");
+        let mut s = connected_session(&mut e);
+        // SUB to "orders", FLOW to drain both, then ACK both: the group is caught up and lease-free.
+        let mut out = Vec::new();
+        s.process(&mut e, &frame(FrameType::Sub, b"orders"), &mut out)
+            .unwrap();
+        assert!(
+            !e.has_group("orders"),
+            "SUB alone does not create the group; the first FLOW does"
+        );
+        let batch = fetch(&mut s, &mut e, 10);
+        assert_eq!(batch.len(), 2, "both messages delivered to the named group");
+        assert!(e.has_group("orders"), "the FLOW created the named group");
+        for (offset, generation) in &batch {
+            ack_reply(&mut s, &mut e, AckOp::Ack, *offset, *generation);
+        }
+        assert_eq!(
+            e.committed_offset_in("orders"),
+            e.flushed_offset(),
+            "caught up"
+        );
+        // UNSUB: the now-idle, caught-up, lease-free named group is reclaimed immediately.
+        out.clear();
+        s.process(&mut e, &frame(FrameType::Unsub, b""), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "UNSUB is acked");
+        assert!(
+            !e.has_group("orders"),
+            "UNSUB reclaimed the caught-up, lease-free named group"
+        );
+        // Re-subscribe and produce one more: the re-created group resumes at the head and delivers
+        // ONLY the new record, never the acked a/b (the never-lose-committed-position invariant).
+        produce(&mut e, b"c");
+        s.process(&mut e, &frame(FrameType::Sub, b"orders"), &mut out)
+            .unwrap();
+        let again = fetch(&mut s, &mut e, 10);
+        assert_eq!(
+            again.len(),
+            1,
+            "only the new record redelivers, nothing acked"
+        );
+        assert_eq!(
+            again[0].0, 2,
+            "resumes at the head (offset 2), not the log start"
+        );
+    }
+
+    #[test]
+    fn unsub_does_not_reclaim_a_group_with_an_unacked_in_flight_lease() {
+        // A connection that drained a named group but did NOT ack still holds that delivery as an
+        // in-flight lease in the engine; UNSUB must NOT reclaim the group while a lease is live, so
+        // the in-flight bookkeeping (and the eventual redelivery after the timeout) is never dropped.
+        let clock = Arc::new(ManualClock::new());
+        let mut e = engine_evict(Arc::clone(&clock));
+        produce(&mut e, b"a");
+        let mut s = connected_session(&mut e);
+        let mut out = Vec::new();
+        s.process(&mut e, &frame(FrameType::Sub, b"orders"), &mut out)
+            .unwrap();
+        let batch = fetch(&mut s, &mut e, 10);
+        assert_eq!(batch.len(), 1, "the one message is delivered but NOT acked");
+        // UNSUB without acking: the lease is still live in the engine, so the group is kept.
+        out.clear();
+        s.process(&mut e, &frame(FrameType::Unsub, b""), &mut out)
+            .unwrap();
+        assert!(
+            e.has_group("orders"),
+            "UNSUB must not reclaim a group with an in-flight lease"
         );
     }
 }

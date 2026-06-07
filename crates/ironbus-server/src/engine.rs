@@ -164,6 +164,29 @@ pub struct EngineConfig {
     /// `AckCursor`/`LeaseTable` pairs is a few hundred KiB of state, so the cap is generous for
     /// real use yet still closes the denial-of-service vector.
     pub max_groups: usize,
+    /// How long a NAMED, NON-default work-group may sit IDLE before it is EVICTED (reclaimed from
+    /// memory), in MILLISECONDS (refs #277, #240, #9): the deferred lifecycle half of #240. The cap
+    /// (`max_groups`) BOUNDS the number of live groups; this RECLAIMS the idle ones, so a long-lived
+    /// broker does not accumulate per-group state (an `AckCursor` plus a `LeaseTable`) for groups no
+    /// consumer touches any more. Eviction is a RUNTIME reclaim only: the durable `cursor-<hex>.ckpt`
+    /// is NEVER deleted, so a later re-subscribe resumes from it (it does not redeliver the whole log).
+    ///
+    /// A group is evicted on a sweep ([`Engine::sweep_idle_groups`], driven from the produce and poll
+    /// seams against the clock seam, NOT a background thread) only if ALL of these hold, so eviction
+    /// can never lose a consumer's committed position:
+    /// - it is a NAMED group (the default group `""` is NEVER evicted),
+    /// - it is FULLY CAUGHT UP (`committed == flushed`, the durable head, with no acked-ahead set), so
+    ///   re-creating it at the head redelivers NOTHING it had acked,
+    /// - it has NO in-flight leases (its `LeaseTable` is empty), so no consumer is mid-work, and
+    /// - it has been IDLE (no poll / ack / nack / progress / term touching it) for at least this many
+    ///   milliseconds, measured on the engine clock seam.
+    ///
+    /// A group that is BEHIND the head is NEVER evicted (evicting it then re-creating it at offset 0
+    /// or at its checkpoint could only ever lose its position or redeliver), so a behind group is, by
+    /// definition, not idle in the meaningful sense. `0` means DISABLED (never evict), the DEFAULT,
+    /// matching the `0` = off convention of the other bounds; an operator opts in by setting a
+    /// non-zero window. See [`Engine::sweep_idle_groups`] and [`EngineConfig::max_groups`].
+    pub group_idle_evict_ms: u64,
 }
 
 /// An error from the engine.
@@ -415,6 +438,13 @@ pub const DEFAULT_CONSUMER_CREDIT_BYTES: u64 = 8 * 1024 * 1024;
 /// of state. See [`EngineConfig::max_groups`] (where `0` = unlimited).
 pub const DEFAULT_MAX_GROUPS: usize = 1024;
 
+/// The default idle window after which a fully-caught-up, lease-free NAMED work-group is evicted
+/// from memory (refs #277, #240), in MILLISECONDS. `0` means DISABLED (never evict), the default:
+/// named groups are only just becoming wire-reachable, eviction is a reclaim not a correctness
+/// requirement, and the SAFE default is to leave it off so an operator opts in deliberately (it
+/// matches the `0` = off convention of the other bounds). See [`EngineConfig::group_idle_evict_ms`].
+pub const DEFAULT_GROUP_IDLE_EVICT_MS: u64 = 0;
+
 /// The longest a named work-group name may be (#240): bounds per-name memory.
 const MAX_GROUP_NAME_LEN: usize = 128;
 
@@ -571,14 +601,22 @@ struct WorkGroup {
     /// key to one live member and enforces per-key serialization; when absent, delivery is the
     /// unchanged claim-the-next-deliverable competing path.
     router: Option<KeyRouter>,
+    /// The engine-clock-seam (monotonic, nanoseconds) timestamp of this group's LAST ACTIVITY
+    /// (#277): updated whenever a poll, ack, nack, progress, or term touches the group. The idle
+    /// eviction sweep ([`Engine::sweep_idle_groups`]) measures the idle window against it. Seeded
+    /// at the group's creation time so a freshly-created group is not instantly evictable. A
+    /// purely monotonic timestamp is enough because the sweep only ever subtracts it from a later
+    /// `now`, never compares it across wall-clock boundaries.
+    last_activity: u64,
 }
 
 impl WorkGroup {
-    fn new(config: LeaseConfig) -> WorkGroup {
+    fn new(config: LeaseConfig, now: u64) -> WorkGroup {
         WorkGroup {
             cursor: AckCursor::new(),
             leases: LeaseTable::new(config),
             router: None,
+            last_activity: now,
         }
     }
 }
@@ -620,6 +658,12 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// a new NAMED group past this is rejected with [`EngineError::TooManyGroups`] before it is
     /// allocated. `0` means unlimited. See [`EngineConfig::max_groups`].
     max_groups: usize,
+    /// The idle window in NANOSECONDS after which a fully-caught-up, lease-free NAMED group is
+    /// evicted from memory (#277): the configured `group_idle_evict_ms` converted to nanoseconds at
+    /// open (the clock seam is in nanoseconds). `0` means DISABLED (never evict). The sweep
+    /// ([`Engine::sweep_idle_groups`]) runs from the produce and poll seams. See
+    /// [`EngineConfig::group_idle_evict_ms`].
+    group_idle_evict_nanos: u64,
     last_checkpointed: u64,
     /// The last durably-checkpointed committed offset per NAMED work-group (#60), for the
     /// interval gate. The default group uses `last_checkpointed`; named groups checkpoint to
@@ -686,6 +730,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         };
         let (checkpoint, recovered) = Checkpoint::open(checkpoint_file)?;
         let flushed = log.flushed_offset().get();
+        // The open-time monotonic instant, used to seed each group's last-activity (#277), so a
+        // group recovered at open is treated as just-active and the idle eviction sweep cannot
+        // reclaim it before it has had a full idle window of inactivity after the restart.
+        let opened_at = log.now_monotonic();
         // The default group's durable cursor, from `cursor.ckpt`, clamped to the head.
         let cursor = resume_cursor_from_snapshot(recovered.as_deref(), flushed);
         let default_committed = cursor.committed().get();
@@ -696,6 +744,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 cursor,
                 leases: LeaseTable::new(config.lease),
                 router: None,
+                last_activity: opened_at,
             },
         );
         // Discover and resume each NAMED work-group from its own `cursor-<hex>.ckpt` (#60),
@@ -727,6 +776,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                         cursor: gcursor,
                         leases: LeaseTable::new(config.lease),
                         router: None,
+                        last_activity: opened_at,
                     },
                 );
             }
@@ -776,6 +826,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             },
             disk_full_policy: config.disk_full_policy,
             max_groups: config.max_groups,
+            // The idle-eviction window (#277), converted from milliseconds to the clock seam's
+            // nanoseconds and saturated rather than overflowed. `0` (disabled) stays 0, so the
+            // sweep is a no-op unless an operator opts in.
+            group_idle_evict_nanos: config.group_idle_evict_ms.saturating_mul(1_000_000),
             last_checkpointed: default_committed,
             counters: Counters::default(),
             fsync: LatencyHistogram::default(),
@@ -962,6 +1016,52 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         Ok(())
     }
 
+    /// Ensures a NAMED work-group is live in memory, RESUMING it from its durable `cursor-<hex>.ckpt`
+    /// if one is present, else creating it fresh at offset 0 (#277, #60). This is the re-creation
+    /// counterpart to [`Engine::open`]'s group recovery: a group EVICTED at runtime (idle sweep or
+    /// explicit Unsub) left its checkpoint durably at the head, so re-creating it here resumes at the
+    /// head and redelivers nothing it had acked, exactly the never-lose-committed-position invariant.
+    /// A group that was never durable (never checkpointed) is created at offset 0, the unchanged
+    /// first-poll behavior.
+    ///
+    /// A no-op if the group is already live or is the default group (always present). The caller has
+    /// already validated the name and the cap, so this only allocates. The recovered committed offset
+    /// seeds the per-group checkpoint-interval bookkeeping so a resumed group does not redundantly
+    /// re-checkpoint its head on the next interval.
+    ///
+    /// # Errors
+    /// Propagates a storage error from opening or reading the group's checkpoint file.
+    fn ensure_group(&mut self, group: &str, now: u64) -> Result<(), EngineError> {
+        if self.groups.contains_key(group) {
+            return Ok(());
+        }
+        let flushed = self.log.flushed_offset().get();
+        let name = group_checkpoint_name(group);
+        // Resume from the durable checkpoint if present (the evicted-then-re-created path), else
+        // start fresh at offset 0 (a genuinely new group). Clamped to the head exactly as `open`.
+        let cursor = {
+            let fs = self.log.filesystem();
+            if fs.exists(&name)? {
+                let (_, recovered) = Checkpoint::open(fs.open(&name)?)?;
+                resume_cursor_from_snapshot(recovered.as_deref(), flushed)
+            } else {
+                AckCursor::new()
+            }
+        };
+        self.group_last_checkpointed
+            .insert(group.to_string(), cursor.committed().get());
+        self.groups.insert(
+            group.to_string(),
+            WorkGroup {
+                cursor,
+                leases: LeaseTable::new(self.lease_config),
+                router: None,
+                last_activity: now,
+            },
+        );
+        Ok(())
+    }
+
     /// Appends a message and makes it durable before returning its offset (so a producer's
     /// ack is post-fsync).
     ///
@@ -1012,6 +1112,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // the log grows; it is a no-op unless the bound is set. The protect floor is the MINIMUM
         // committed offset across every group, so the slowest group's records are never reaped.
         self.reap_for_retention()?;
+        // Idle named-group eviction sweep (#277): the produce seam is the second deterministic tick
+        // (the poll seam is the first), so a broker that produces but is not being polled still
+        // reclaims idle groups against the clock seam. The sweep is a no-op when the window is
+        // disabled (`group_idle_evict_ms == 0`). A produce ADVANCES the head, so any group that was
+        // caught up is now behind and (correctly) not evictable until it catches up again; the sweep
+        // here therefore reclaims only groups that were already idle AND caught up before this append.
+        let now = self.log.now_monotonic();
+        self.sweep_idle_groups(now)?;
         Ok(offset)
     }
 
@@ -1134,6 +1242,168 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .unwrap_or(0)
     }
 
+    /// Evicts (reclaims the in-memory state of) every NAMED work-group that has been IDLE past the
+    /// configured window AND is safe to drop, against the engine clock seam `now` (#277). This is
+    /// the deterministic, NON-threaded lifecycle sweep that completes #240: the cap (`max_groups`)
+    /// bounds the number of live groups, this reclaims the idle ones, so a long-lived broker does
+    /// not accumulate per-group `AckCursor` + `LeaseTable` state for groups no consumer touches.
+    ///
+    /// It runs from the produce and poll seams (never a background thread), so eviction is fully
+    /// clock-driven and deterministic. A no-op when the window is disabled (`group_idle_evict_nanos
+    /// == 0`), so an unconfigured broker is byte-for-byte unchanged.
+    ///
+    /// The NEVER-LOSE-COMMITTED-POSITION invariant: a group is evicted ONLY if it is
+    /// - NAMED (the default group `""` is never evicted; it is the durable wire group), AND
+    /// - PLAIN COMPETING (no `key_shared` router; a `key_shared` group carries live-member state and
+    ///   is left to its membership lifecycle), AND
+    /// - FULLY CAUGHT UP: its committed cursor is at the durable head (`committed == flushed`) with
+    ///   NO acked-ahead set, so once its durable `cursor-<hex>.ckpt` is persisted AT THE HEAD,
+    ///   re-creating the group resumes from that checkpoint and redelivers NOTHING it had acked, AND
+    /// - LEASE-FREE: its `LeaseTable` holds no lease, so no consumer is mid-work, AND
+    /// - IDLE: no poll / ack / nack / progress / term has touched it for at least the window.
+    ///
+    /// A group that is BEHIND the head is NEVER evicted: evicting then re-creating a behind group
+    /// could only lose its position or redeliver, so a behind group is by definition not idle in the
+    /// meaningful sense.
+    ///
+    /// Before dropping a group from memory the sweep DURABLY CHECKPOINTS it at the head (it was
+    /// caught up, so the checkpoint records the head), so BOTH an in-process re-subscribe (which
+    /// re-creates the group by resuming that checkpoint, see [`Engine::group_entry`]) AND a restart
+    /// resume exactly where it left off. The checkpoint file is KEPT, never deleted: deleting it
+    /// would reset a re-created group to offset 0 and redeliver the whole already-acked log. If the
+    /// checkpoint write fails, the group is KEPT in memory (not evicted), so a disk error can never
+    /// cost a committed position. Evicting frees the group's slot against the `max_groups` cap
+    /// immediately.
+    ///
+    /// # Errors
+    /// Propagates a storage error from durably checkpointing an evicted group at the head.
+    fn sweep_idle_groups(&mut self, now: u64) -> Result<(), EngineError> {
+        // Disabled: never evict. The common path is a single comparison, so the sweep is cheap on
+        // every produce/poll when the operator has not opted in.
+        if self.group_idle_evict_nanos == 0 {
+            return Ok(());
+        }
+        let flushed = self.log.flushed_offset().get();
+        let window = self.group_idle_evict_nanos;
+        // Collect the evictable names first (an immutable borrow), then evict them (a mutable
+        // borrow): a BTreeMap cannot be mutated while iterated. The evictable set is bounded by the
+        // group cap, so the temporary vector is small.
+        let evictable: Vec<String> = self
+            .groups
+            .iter()
+            .filter(|&(name, g)| Self::is_evictable(name, g, flushed, now, window))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in evictable {
+            self.evict_group(&name)?;
+        }
+        Ok(())
+    }
+
+    /// Durably persists a caught-up group's cursor at the head and then drops it from memory (#277):
+    /// the shared eviction step used by both the idle sweep and the explicit-`Unsub` reclaim. The
+    /// caller has already proven `group` is evictable (named, plain competing, caught up at the head
+    /// with no acked-ahead set, lease-free), so this only persists and removes.
+    ///
+    /// The ordering is the safety contract: write (and fsync) the `cursor-<hex>.ckpt` at the head
+    /// FIRST, only THEN remove the in-memory group. A failure to persist propagates WITHOUT removing
+    /// the group, so a disk error never costs a committed position; the group stays live and the
+    /// next sweep retries. The checkpoint file is kept (never deleted), so a later re-`Sub` resumes
+    /// from the head and redelivers nothing.
+    ///
+    /// # Errors
+    /// Propagates a storage error from writing the group's checkpoint.
+    fn evict_group(&mut self, group: &str) -> Result<(), EngineError> {
+        let committed = match self.groups.get(group) {
+            Some(g) => g.cursor.committed().get(),
+            None => return Ok(()),
+        };
+        // Persist the cursor at the head BEFORE removing the group. `write_group_checkpoint` is
+        // unconditional (unlike the interval/has-advanced gate of `checkpoint_group`), so the
+        // checkpoint is durably at the head even if no interval checkpoint had fired since the group
+        // caught up. Only after this succeeds do we drop the in-memory state.
+        self.write_group_checkpoint(group, committed)?;
+        self.groups.remove(group);
+        self.group_last_checkpointed.remove(group);
+        Ok(())
+    }
+
+    /// Whether a single work-group is safe to evict on an idle sweep (#277): the predicate behind
+    /// [`Engine::sweep_idle_groups`], factored out so the rule is stated and tested in one place.
+    /// See that method for the never-lose-committed-position invariant each clause upholds.
+    fn is_evictable(name: &str, group: &WorkGroup, flushed: u64, now: u64, window: u64) -> bool {
+        // The default group is the durable wire group: never evicted.
+        if name == DEFAULT_GROUP {
+            return false;
+        }
+        // A key_shared group carries live-member routing state: leave it to its membership
+        // lifecycle (leave-on-unsub / disconnect), not the idle sweep.
+        if group.router.is_some() {
+            return false;
+        }
+        // Fully caught up: committed at the head with no acked-ahead set. A BEHIND group (committed
+        // below the head, or holding an out-of-order acked-ahead set above the head it has not yet
+        // bridged) is never evicted, so re-creation can never lose its position or redeliver.
+        let committed = group.cursor.committed().get();
+        if committed != flushed || !group.cursor.ahead_ranges().is_empty() {
+            return false;
+        }
+        // No in-flight lease: no consumer is mid-work (a lease, even an expired-but-unreclaimed one,
+        // keeps the group alive so its in-flight bookkeeping is never dropped under a holder).
+        if group.leases.in_flight() != 0 {
+            return false;
+        }
+        // Idle for at least the window, measured on the monotonic clock seam. `saturating_sub`
+        // guards a non-monotonic `now` (it never under-reports the idle span into a false eviction).
+        now.saturating_sub(group.last_activity) >= window
+    }
+
+    /// Drives the idle-group eviction sweep from the engine's own clock seam (#277), the
+    /// caller-supplied-`now`-free entry point. The server runs this from the same actor that owns
+    /// the engine, so eviction stays clock-driven and single-writer, never a background thread.
+    /// Equivalent to [`Engine::sweep_idle_groups`] at the current monotonic time; a no-op when the
+    /// idle window is disabled.
+    ///
+    /// # Errors
+    /// Propagates a storage error from durably checkpointing an evicted group at the head.
+    pub fn sweep_idle_groups_now(&mut self) -> Result<(), EngineError> {
+        let now = self.log.now_monotonic();
+        self.sweep_idle_groups(now)
+    }
+
+    /// Evicts a SPECIFIC named work-group RIGHT NOW if it is safe to drop (#277), used by the
+    /// explicit-`Unsub` path: when a connection leaves a named group and it is fully caught up with
+    /// no in-flight leases, that group is immediately reclaimable, so it need not wait out the idle
+    /// window. It enforces EVERY position-safety clause of the idle sweep (named, plain competing,
+    /// fully caught up with no acked-ahead set, lease-free) EXCEPT the idle-window clause, which the
+    /// explicit Unsub stands in for. As in the sweep, the group is durably checkpointed at the head
+    /// before it is dropped, and the `cursor-<hex>.ckpt` is KEPT, so a later re-`Sub` resumes at the
+    /// head and redelivers nothing.
+    ///
+    /// A no-op (returns `false`) when the feature is disabled (`group_idle_evict_ms == 0`), when the
+    /// group is unknown, when any safety clause fails (e.g. it still has in-flight leases that have
+    /// not yet drained or expired), or when the head-checkpoint write fails (the group is kept, so a
+    /// disk error never costs a committed position; the natural idle sweep reclaims it later once it
+    /// qualifies). Returns `true` if the group was evicted.
+    pub fn evict_group_if_idle(&mut self, group: &str) -> bool {
+        // Disabled means the lifecycle policy is off entirely: do not reclaim even on an explicit
+        // Unsub, so an operator who has not opted in sees byte-for-byte unchanged behavior.
+        if self.group_idle_evict_nanos == 0 {
+            return false;
+        }
+        let flushed = self.log.flushed_offset().get();
+        let evictable = match self.groups.get(group) {
+            // `now == last_activity` with a window of 0 makes the idle clause vacuously true, so the
+            // predicate reduces to exactly the position-safety clauses; the explicit Unsub is what
+            // authorizes skipping the idle wait.
+            Some(g) => Self::is_evictable(group, g, flushed, g.last_activity, 0),
+            None => false,
+        };
+        // Persist-then-drop. A checkpoint write error leaves the group live (the `is_ok`), so the
+        // explicit reclaim, like the sweep, never trades a committed position for a disk hiccup.
+        evictable && self.evict_group(group).is_ok()
+    }
+
     /// Claims and returns the next deliverable message, or [`Poll::Idle`] if none is
     /// available within the in-flight window. A poison message (over max-deliver) is parked
     /// and reported as [`Poll::Parked`].
@@ -1154,6 +1424,19 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// # Errors
     /// As [`Engine::poll`].
     pub fn poll_in(&mut self, group: &str, now: u64) -> Result<Poll, EngineError> {
+        // Mark the group being polled active FIRST (if it is already live), so the sweep below never
+        // evicts the very group this poll is about to drain (#277): a poll IS activity, so refreshing
+        // its last-activity before the sweep keeps a self-poll of an otherwise-idle group from
+        // needlessly evicting-and-re-creating it.
+        if let Some(g) = self.groups.get_mut(group) {
+            g.last_activity = now;
+        }
+        // Sweep idle named groups against the clock seam at the START of every poll (#277), BEFORE
+        // the cap gate below, so an evicted slot is freed in time to admit a new group on this same
+        // poll: a group at a previously-full cap can be (re-)created the moment an idle peer is
+        // reclaimed. The just-refreshed `group` is never evicted here, nor is the default group, a
+        // behind group, or a group with in-flight leases.
+        self.sweep_idle_groups(now)?;
         // Create a new group only if it is well-named and the group cap allows it (#240):
         // this bounds memory once the wire can name groups. The default group and any
         // existing group are exempt (already present, so they never hit this gate); a
@@ -1165,6 +1448,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     max: self.max_groups,
                 });
             }
+            // Allocate the group, RESUMING from its durable checkpoint if one is present (#277): a
+            // group EVICTED earlier in this process left its `cursor-<hex>.ckpt` at the head, so the
+            // re-creation resumes at the head and redelivers nothing it had acked. A genuinely new
+            // group has no checkpoint and starts at offset 0 (the unchanged first-poll behavior).
+            self.ensure_group(group, now)?;
         }
         // The oldest record still in the durable log: it rises above 0 only once the disk-full
         // drop-oldest policy (#82) has force-reaped a prefix. Read it BEFORE borrowing the group
@@ -1174,7 +1462,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let g = self
             .groups
             .entry(group.to_string())
-            .or_insert_with(|| WorkGroup::new(lease_config));
+            .or_insert_with(|| WorkGroup::new(lease_config, now));
+        // Stamp last-activity again (#277): redundant for a group refreshed before the sweep, but it
+        // also covers a freshly created/resumed group and the `or_insert_with` fallback, so EVERY
+        // poll (deliverable or idle) keeps the polled group alive against the next sweep.
+        g.last_activity = now;
         let committed = g.cursor.committed().get();
         // Below-earliest truncation signal (#84): if this group's next-deliverable offset (its
         // committed cursor) is below the oldest retained record, its data was force-reaped out from
@@ -1393,11 +1685,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 });
             }
         }
+        let now = self.log.now_monotonic();
         let lease_config = self.lease_config;
         let g = self
             .groups
             .entry(group.to_string())
-            .or_insert_with(|| WorkGroup::new(lease_config));
+            .or_insert_with(|| WorkGroup::new(lease_config, now));
         match ordering {
             // Attach a router only if the group is not already key_shared, so re-applying the mode
             // never wipes the live-member set or the in-flight key map.
@@ -1491,10 +1784,16 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         now: u64,
     ) -> Result<Poll, EngineError> {
         // A non-key_shared group is the unchanged competing path: route straight to `poll_in` so
-        // the default KeyOrdering::None behavior is byte-for-byte the existing code.
+        // the default KeyOrdering::None behavior is byte-for-byte the existing code (it sweeps idle
+        // groups and marks activity there).
         if self.key_ordering_in(group) == KeyOrdering::None {
             return self.poll_in(group, now);
         }
+        // Sweep idle named groups at the start of a key_shared poll too (#277), so the seam fires
+        // regardless of which poll entry point a consumer uses. A key_shared group is never itself
+        // evicted (it carries live-member state), so polling one only ever reclaims OTHER idle
+        // plain groups.
+        self.sweep_idle_groups(now)?;
         // The group exists and is key_shared (the check above created/looked it up), so the cap and
         // name gates have already passed via set_key_ordering_in.
         let earliest = self.log.earliest_offset().get();
@@ -1502,7 +1801,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let g = self
             .groups
             .entry(group.to_string())
-            .or_insert_with(|| WorkGroup::new(lease_config));
+            .or_insert_with(|| WorkGroup::new(lease_config, now));
+        // Mark the key_shared group active (#277); it is never evicted, but keeping its timestamp
+        // current is consistent and cheap.
+        g.last_activity = now;
         let committed = g.cursor.committed().get();
         // The same below-earliest truncation signal as poll_in (#84): reset the cursor up to the
         // oldest retained record and surface the truncation once. The router's in-flight key map is
@@ -1632,11 +1934,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// its lease slot, independent of every other group. The token must be one delivered by
     /// [`Engine::poll_in`] for the same `group` (generations are per-group).
     pub fn ack_in(&mut self, group: &str, token: &LeaseToken) -> AckResult {
+        // The ack marks the group active (#277), so a group being drained is never reclaimed by
+        // the idle sweep mid-stream. Read the clock seam before the mutable group borrow.
+        let now = self.log.now_monotonic();
         // Never create a group on ack: a consumer must `poll_in` (which is capped) before
         // it can ack, so an ack on an unknown group is a fence, not a new allocation.
         let Some(g) = self.groups.get_mut(group) else {
             return AckResult::Fenced;
         };
+        g.last_activity = now;
         match g.leases.ack(token) {
             AckOutcome::Acked => {
                 g.cursor.ack(token.offset);
@@ -1714,6 +2020,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let Some(g) = self.groups.get_mut(group) else {
             return Ok(NackResult::Fenced);
         };
+        // The nack marks the group active (#277): a consumer requeueing work is still using it.
+        g.last_activity = now;
         let attempt = g.leases.deliveries(token).unwrap_or(0);
         let delay_nanos = self.delivery.effective_nack_delay(attempt, explicit_nanos);
         Ok(match g.leases.nack(token, now, delay_nanos) {
@@ -1754,6 +2062,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let Some(g) = self.groups.get_mut(group) else {
             return ProgressResult::Fenced;
         };
+        // Extending a lease marks the group active (#277): a consumer reporting progress is working.
+        g.last_activity = now;
         match g.leases.extend(token, now) {
             ExtendOutcome::Extended(_) => ProgressResult::Extended,
             ExtendOutcome::CapReached => ProgressResult::CapReached,
@@ -1860,6 +2170,23 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.groups.values().map(|g| g.leases.in_flight()).sum()
     }
 
+    /// Whether a work-group is currently LIVE in memory (#277): the default group `""` always is,
+    /// and a named group is live from its first poll until it is evicted by the idle sweep (or the
+    /// explicit-`Unsub` reclaim). A test or an operator uses it to observe that an idle group's slot
+    /// was freed against the `max_groups` cap; it never creates a group.
+    #[must_use]
+    pub fn has_group(&self, group: &str) -> bool {
+        self.groups.contains_key(group)
+    }
+
+    /// The number of work-groups currently live in memory (#277), INCLUDING the durable default
+    /// group, the quantity the `max_groups` cap is measured against. Falls as the idle sweep
+    /// reclaims caught-up groups, so a new group can be created at a previously-full cap.
+    #[must_use]
+    pub fn group_count(&self) -> usize {
+        self.groups.len()
+    }
+
     /// The per-CONSUMER (per-connection) standing in-flight credit ceiling (refs #65, #9, #10):
     /// the most un-acked messages one connection may hold at once. Already floored to at least 1.
     /// A [`crate::session::Session`] reads this once and enforces it against its own
@@ -1964,6 +2291,9 @@ mod tests {
             max_messages: 0,
             disk_full_policy: DiskFullPolicy::DropNew,
             max_groups: DEFAULT_MAX_GROUPS,
+            // Eviction OFF by default in the shared test config (#277); the eviction tests build a
+            // config with a non-zero window explicitly so the golden-path tests stay unaffected.
+            group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
         }
     }
 
@@ -4651,5 +4981,306 @@ mod tests {
         let e = open(config(10, 5));
         assert_eq!(e.consumer_credit_bytes(), DEFAULT_CONSUMER_CREDIT_BYTES);
         assert_eq!(DEFAULT_CONSUMER_CREDIT_BYTES, 8 * 1024 * 1024);
+    }
+
+    // ---- Idle named-group eviction (#277) -------------------------------------------------------
+    //
+    // These tests drive the idle window through the explicit-`now` argument to `poll_in` (which
+    // updates the group's last-activity to that `now` and runs the sweep against it), so they are
+    // fully deterministic without touching the wall clock. The engine's own `now_monotonic` stays
+    // at 0 (the test `ManualClock` is never advanced), so the produce-seam sweep is a no-op in
+    // these tests and only the poll-seam sweep with the explicit `now` evicts.
+
+    // A config with an explicit non-zero idle-eviction window (#277), in milliseconds, but the test
+    // poll path passes `now` in the SAME units as the window (the sweep compares `now -
+    // last_activity` to the configured window converted to nanoseconds). To keep the test
+    // arithmetic in plain integers, the window is given in milliseconds and the test advances `now`
+    // by the nanosecond equivalent.
+    fn config_with_idle_evict_ms(group_idle_evict_ms: u64) -> EngineConfig {
+        EngineConfig {
+            group_idle_evict_ms,
+            ..config(10, 5)
+        }
+    }
+
+    // One millisecond in nanoseconds, the unit `now` is expressed in for these tests (the engine
+    // converts the millisecond window to nanoseconds, and the poll `now` is on the same ns clock).
+    const MS: u64 = 1_000_000;
+
+    #[test]
+    fn an_idle_caught_up_named_group_is_evicted_after_the_window() {
+        // The headline policy: a NAMED group that is fully caught up (committed == head), holds no
+        // lease, and has been idle past the window IS evicted, freeing its slot. Re-creating it
+        // resumes at the head and redelivers nothing it had acked.
+        let mut e = open(config_with_idle_evict_ms(10)); // 10 ms idle window
+        produce(&mut e, b"a");
+        // "g" consumes and acks the only message at now=0, so it is fully caught up with no lease.
+        let d = message(e.poll_in("g", 0).unwrap());
+        assert_eq!(e.ack_in("g", &d.token), AckResult::Acked);
+        assert_eq!(e.committed_offset_in("g"), e.flushed_offset(), "caught up");
+        assert!(e.has_group("g"), "g is live before the window elapses");
+        // A poll of the DEFAULT group well past the window runs the sweep; "g" has been idle since
+        // now=0, so at now = 11 ms it is evicted (10 ms window). The default group is never evicted.
+        let _ = e.poll(11 * MS).unwrap();
+        assert!(!e.has_group("g"), "the idle caught-up group was evicted");
+        assert!(e.has_group(""), "the default group is never evicted");
+        // Re-subscribing (a fresh poll) re-creates the group; it resumes at the head and is idle.
+        assert!(matches!(e.poll_in("g", 12 * MS).unwrap(), Poll::Idle));
+        assert_eq!(
+            e.committed_offset_in("g"),
+            e.flushed_offset(),
+            "the re-created group is at the head, so it redelivers nothing it had acked"
+        );
+    }
+
+    #[test]
+    fn a_group_with_an_in_flight_lease_is_not_evicted() {
+        // A group holding an in-flight lease is mid-work: it is NEVER evicted, even long past the
+        // window, so its in-flight bookkeeping is never dropped under a holder.
+        let mut e = open(config_with_idle_evict_ms(10));
+        produce(&mut e, b"a");
+        // "g" polls offset 0 but does NOT ack it: the lease is in flight and committed < head.
+        let d = message(e.poll_in("g", 0).unwrap());
+        assert_eq!(e.in_flight(), 1);
+        // Sweep far past the window via a default-group poll: "g" is not evicted (it has a lease,
+        // and it is also behind the head).
+        let _ = e.poll(100 * MS).unwrap();
+        assert!(e.has_group("g"), "a group with an in-flight lease is kept");
+        // Acking it later still works (the lease was never dropped by an eviction).
+        assert_eq!(e.ack_in("g", &d.token), AckResult::Acked);
+    }
+
+    #[test]
+    fn a_group_behind_the_head_is_not_evicted() {
+        // A group whose committed cursor is BELOW the head has unconsumed work: it is NEVER evicted
+        // (evicting then re-creating it could only lose its position or redeliver), even when it
+        // holds no lease and is idle past the window.
+        let mut e = open(config_with_idle_evict_ms(10));
+        produce(&mut e, b"a");
+        produce(&mut e, b"b");
+        // "g" consumes and acks ONLY offset 0, leaving offset 1 unconsumed: committed (1) < head (2).
+        let d = message(e.poll_in("g", 0).unwrap());
+        assert_eq!(e.ack_in("g", &d.token), AckResult::Acked);
+        assert!(
+            e.committed_offset_in("g") < e.flushed_offset(),
+            "g is behind the head"
+        );
+        assert_eq!(e.in_flight(), 0, "no lease, yet still behind");
+        // Sweep far past the window: a behind group is kept regardless of idleness.
+        let _ = e.poll(100 * MS).unwrap();
+        assert!(e.has_group("g"), "a behind group is never evicted");
+    }
+
+    #[test]
+    fn the_default_group_is_never_evicted_even_when_idle_and_caught_up() {
+        // The default group `""` is the durable wire group: it is exempt from eviction even when it
+        // is fully caught up, lease-free, and idle far past the window.
+        let mut e = open(config_with_idle_evict_ms(10));
+        produce(&mut e, b"a");
+        let d = message(e.poll(0).unwrap());
+        assert_eq!(e.ack(&d.token), AckResult::Acked);
+        assert_eq!(
+            e.committed_offset(),
+            e.flushed_offset(),
+            "default caught up"
+        );
+        // Many sweeps far past the window never remove the default group.
+        for now in [50 * MS, 100 * MS, 1_000 * MS] {
+            let _ = e.poll(now).unwrap();
+            assert!(e.has_group(""), "the default group is never evicted");
+        }
+    }
+
+    #[test]
+    fn eviction_frees_a_slot_so_a_new_group_can_be_created_at_a_full_cap() {
+        // Eviction reclaims a slot against the `max_groups` cap: with the cap full of idle
+        // caught-up named groups, a sweep evicts one and a NEW group can then be created where the
+        // cap previously rejected it.
+        let mut e = open(EngineConfig {
+            max_groups: 3, // default + 2 named groups fill the cap
+            group_idle_evict_ms: 10,
+            ..config(10, 5)
+        });
+        produce(&mut e, b"a");
+        // Create two named groups, each caught up (acked the one message) and idle since now=0.
+        for name in ["g0", "g1"] {
+            let d = message(e.poll_in(name, 0).unwrap());
+            assert_eq!(e.ack_in(name, &d.token), AckResult::Acked);
+        }
+        assert_eq!(e.group_count(), 3, "default + g0 + g1 fill the cap");
+        // A brand-new named group is rejected at the full cap BEFORE any idle window has elapsed
+        // (now = MS, i.e. 1 ms, is well under the 10 ms window, so the sweep evicts nothing yet).
+        assert!(matches!(
+            e.poll_in("g2", MS).unwrap_err(),
+            EngineError::TooManyGroups { max: 3 }
+        ));
+        // Past the window, the SAME poll that wants to create "g2" first sweeps out the idle g0/g1,
+        // freeing slots, then creates g2 successfully (it delivers the one message at offset 0).
+        let d = message(e.poll_in("g2", 20 * MS).unwrap());
+        assert_eq!(d.offset, Offset::new(0));
+        assert!(
+            e.has_group("g2"),
+            "g2 was created after eviction freed a slot"
+        );
+        assert!(!e.has_group("g0"), "g0 was evicted to free the slot");
+        assert!(!e.has_group("g1"), "g1 was evicted to free the slot");
+    }
+
+    #[test]
+    fn a_re_subscribed_evicted_group_resumes_at_head_and_redelivers_nothing_acked() {
+        // The never-lose-committed-position invariant end to end: a caught-up group is evicted, then
+        // a re-subscribe (re-poll) resumes at the head and redelivers NOTHING it had already acked,
+        // even across more produces.
+        let mut e = open(config_with_idle_evict_ms(10));
+        for p in [&b"a"[..], b"b"] {
+            produce(&mut e, p);
+        }
+        // "g" consumes and acks both messages: caught up at offset 2.
+        for _ in 0..2 {
+            let d = message(e.poll_in("g", 0).unwrap());
+            assert_eq!(e.ack_in("g", &d.token), AckResult::Acked);
+        }
+        assert_eq!(e.committed_offset_in("g"), Offset::new(2));
+        // Evict it via a sweep past the window.
+        let _ = e.poll(20 * MS).unwrap();
+        assert!(!e.has_group("g"), "g evicted while caught up");
+        // Produce one more, then re-subscribe: the re-created group resumes at the head (offset 2,
+        // where it had committed), so it delivers ONLY the new message, never the acked a/b.
+        produce(&mut e, b"c");
+        let d = message(e.poll_in("g", 30 * MS).unwrap());
+        assert_eq!(
+            d.offset,
+            Offset::new(2),
+            "resumes at head; redelivers only the new record, nothing it had acked"
+        );
+        assert_eq!(d.record.payload, b"c");
+    }
+
+    #[test]
+    fn a_zero_idle_window_disables_eviction() {
+        // `0` = disabled: no group is ever evicted regardless of idleness, matching the `0` = off
+        // convention of the other bounds.
+        let mut e = open(config_with_idle_evict_ms(0));
+        produce(&mut e, b"a");
+        let d = message(e.poll_in("g", 0).unwrap());
+        assert_eq!(e.ack_in("g", &d.token), AckResult::Acked);
+        assert_eq!(e.committed_offset_in("g"), e.flushed_offset(), "caught up");
+        // Sweep absurdly far past any window: with eviction disabled, the group is kept.
+        let _ = e.poll(u64::MAX / 2).unwrap();
+        assert!(e.has_group("g"), "a zero window never evicts");
+    }
+
+    #[test]
+    fn polling_an_idle_group_keeps_it_alive_and_does_not_evict_itself() {
+        // A poll IS activity: polling a group that is itself idle past the window refreshes its
+        // last-activity BEFORE the sweep, so the poll keeps it alive rather than evicting and
+        // re-creating it. A consumer that keeps polling its own caught-up group is never reclaimed.
+        let mut e = open(config_with_idle_evict_ms(10));
+        produce(&mut e, b"a");
+        let d = message(e.poll_in("g", 0).unwrap());
+        assert_eq!(e.ack_in("g", &d.token), AckResult::Acked);
+        assert_eq!(e.committed_offset_in("g"), e.flushed_offset(), "caught up");
+        // Keep polling "g" far past the window each time: it is the polled group, so the sweep at
+        // the start of each poll refreshes it first and never evicts it. The committed cursor stays
+        // put (no offset 0 reset), proving it was not evicted-and-recreated-fresh.
+        for now in [20 * MS, 40 * MS, 1_000 * MS] {
+            assert!(matches!(e.poll_in("g", now).unwrap(), Poll::Idle));
+            assert!(e.has_group("g"), "polling g keeps it alive");
+            assert_eq!(
+                e.committed_offset_in("g"),
+                e.flushed_offset(),
+                "g stays caught up; it was never reset"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_unsub_eviction_reclaims_a_caught_up_lease_free_group_immediately() {
+        // `evict_group_if_idle` is the explicit-Unsub reclaim: a caught-up, lease-free named group
+        // is reclaimed RIGHT NOW (no idle-window wait), but every position-safety clause still
+        // holds, so it never evicts a behind, leased, default, or unknown group.
+        let mut e = open(config_with_idle_evict_ms(10));
+        produce(&mut e, b"a");
+        produce(&mut e, b"b");
+        // "caught" acks both: caught up, lease-free -> immediately evictable on unsub.
+        for _ in 0..2 {
+            let d = message(e.poll_in("caught", 0).unwrap());
+            e.ack_in("caught", &d.token);
+        }
+        // "behind" acks only one: still behind -> NOT evictable even on an explicit unsub.
+        let d = message(e.poll_in("behind", 0).unwrap());
+        e.ack_in("behind", &d.token);
+        // "leased" holds an in-flight lease -> NOT evictable on an explicit unsub.
+        let _held = message(e.poll_in("leased", 0).unwrap());
+
+        assert!(
+            e.evict_group_if_idle("caught"),
+            "caught up + lease-free -> evicted now"
+        );
+        assert!(!e.has_group("caught"));
+        assert!(
+            !e.evict_group_if_idle("behind"),
+            "a behind group is never evicted"
+        );
+        assert!(e.has_group("behind"));
+        assert!(
+            !e.evict_group_if_idle("leased"),
+            "a leased group is never evicted"
+        );
+        assert!(e.has_group("leased"));
+        assert!(
+            !e.evict_group_if_idle(""),
+            "the default group is never evicted"
+        );
+        assert!(e.has_group(""));
+        assert!(
+            !e.evict_group_if_idle("ghost"),
+            "an unknown group is a no-op"
+        );
+    }
+
+    #[test]
+    fn explicit_unsub_eviction_is_a_no_op_when_disabled() {
+        // With the window disabled (`0`), even an explicit unsub of a caught-up, lease-free group
+        // does NOT evict: the lifecycle policy is off entirely.
+        let mut e = open(config_with_idle_evict_ms(0));
+        produce(&mut e, b"a");
+        let d = message(e.poll_in("g", 0).unwrap());
+        e.ack_in("g", &d.token);
+        assert!(!e.evict_group_if_idle("g"), "disabled: no reclaim on unsub");
+        assert!(e.has_group("g"));
+    }
+
+    #[test]
+    fn an_out_of_order_acked_ahead_group_is_not_evicted() {
+        // "Fully caught up" requires committed == head AND no acked-ahead set. A group that acked
+        // ahead of a gap (committed below the head, ahead set non-empty) is behind in the meaningful
+        // sense and is NEVER evicted, so the gap's redelivery is never lost. The `is_evictable`
+        // predicate rejects it on BOTH the committed-below-head clause and the non-empty-ahead-set
+        // clause; this proves the group is kept regardless of how the sweep is driven.
+        let mut e = open(config_with_idle_evict_ms(10));
+        for p in [&b"a"[..], b"b"] {
+            produce(&mut e, p);
+        }
+        // Poll both, ack only offset 1 (leaving the gap at 0): committed stays 0, ahead = [1, 2).
+        let _t0 = message(e.poll_in("g", 0).unwrap()).token;
+        let t1 = message(e.poll_in("g", 0).unwrap()).token;
+        assert_eq!(e.ack_in("g", &t1), AckResult::Acked);
+        assert!(
+            e.committed_offset_in("g") < e.flushed_offset(),
+            "behind via the gap at offset 0"
+        );
+        // Drive the sweep far past the window via a default-group poll: the acked-ahead group is
+        // kept (it is behind). An explicit unsub also refuses to reclaim it.
+        let _ = e.poll(100 * MS).unwrap();
+        assert!(
+            e.has_group("g"),
+            "an acked-ahead (behind) group is never evicted by the sweep"
+        );
+        assert!(
+            !e.evict_group_if_idle("g"),
+            "an acked-ahead (behind) group is never evicted on unsub either"
+        );
+        assert!(e.has_group("g"));
     }
 }

@@ -10,7 +10,9 @@ use ironbus_core::clock::ManualClock;
 use ironbus_core::delivery::DeliveryConfig;
 use ironbus_core::lease::LeaseConfig;
 use ironbus_core::types::RecordFlags;
-use ironbus_server::engine::{DiskFullPolicy, Engine, EngineConfig, Poll, DEFAULT_MAX_GROUPS};
+use ironbus_server::engine::{
+    DiskFullPolicy, Engine, EngineConfig, Poll, DEFAULT_GROUP_IDLE_EVICT_MS, DEFAULT_MAX_GROUPS,
+};
 use ironbus_storage::fs::{Filesystem, InMemoryFs};
 use ironbus_storage::log::{Append, LogConfig};
 
@@ -33,6 +35,8 @@ fn config() -> EngineConfig {
         max_messages: 0,
         // The default work-group cap (#240): the determinism image is unchanged by this field.
         max_groups: DEFAULT_MAX_GROUPS,
+        // Idle named-group eviction OFF (#277), the default: the determinism image is unchanged.
+        group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
         // Drop-new (the default): the determinism image is unchanged by the new policy field.
         disk_full_policy: DiskFullPolicy::DropNew,
     }
