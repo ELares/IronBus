@@ -246,7 +246,7 @@ pub struct Counters {
     pub dead_lettered: u64,
     /// Commits via `ack` (a `term` commits through the same path and is counted here).
     pub acks: u64,
-    /// Whole old SEALED segments reclaimed by consumer-safe size retention (refs #13, #80):
+    /// Whole old SEALED segments reclaimed by consumer-safe retention, by the size, age, or count bound (refs #13, #80):
     /// each reap unlinks a fully-consumed oldest segment to free disk once the durable log is
     /// over its retention bound. Zero unless `max_retained_bytes` is set; the operator's
     /// space-reclamation signal. Saturating.
@@ -733,7 +733,7 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
             .counters
             .produced_bytes
             .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
-        // Consumer-safe size retention (refs #13, #80): after the record is durable, reclaim disk
+        // Consumer-safe retention (refs #13, #80): after the record is durable, reclaim disk by the size, age, or count bound,
         // by deleting whole old SEALED segments while the log is over the retention bound, but
         // never one any consumer still needs. Run on the produce path so space is freed exactly as
         // the log grows; it is a no-op unless the bound is set. The protect floor is the MINIMUM

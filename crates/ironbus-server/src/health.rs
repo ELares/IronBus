@@ -248,7 +248,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
          # HELP ironbus_acks_total Commits via ack (a term commits through the same path).\n\
          # TYPE ironbus_acks_total counter\n\
          ironbus_acks_total {acks}\n\
-         # HELP ironbus_segments_reaped_total Old sealed segments reclaimed by consumer-safe size retention.\n\
+         # HELP ironbus_segments_reaped_total Old sealed segments reclaimed by consumer-safe retention (size, age, or count).\n\
          # TYPE ironbus_segments_reaped_total counter\n\
          ironbus_segments_reaped_total {segments_reaped}\n",
         healthy_value = u8::from(healthy),
