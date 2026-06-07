@@ -578,6 +578,22 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         self.total_record_count
     }
 
+    /// The number of segments the log currently holds: every sealed predecessor plus the one
+    /// active segment (a frozen writer's slots still count). It falls as retention or a forced
+    /// reap reclaims old sealed segments. Cheap (O(1)): the slot vector length. Read-only, for
+    /// the introspection endpoint (#99).
+    #[must_use]
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// The log's effective configuration (the segment-size soft cap and the durable-log byte
+    /// hard cap). Read-only echo for the introspection endpoint (#99).
+    #[must_use]
+    pub fn config(&self) -> LogConfig {
+        self.config
+    }
+
     /// The log offset the next appended record will receive.
     #[must_use]
     pub fn next_offset(&self) -> Offset {

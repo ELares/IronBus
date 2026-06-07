@@ -410,6 +410,42 @@ pub struct GroupConsumerStat {
     pub in_flight: usize,
 }
 
+/// A read-only echo of the engine's EFFECTIVE configuration bounds, for the introspection
+/// endpoint (#99). Every field is a plain copy of a value [`Engine::open`] was configured with:
+/// it carries NO secret material and NO mutating handle, so it is safe to expose on the read-only
+/// `/admin` surface. Each `0` keeps the codebase's `0` = unlimited/off convention.
+#[derive(Clone, Copy, Debug)]
+pub struct EngineConfigSnapshot {
+    /// The durable-log total-byte hard cap (`0` = unlimited).
+    pub max_total_bytes: u64,
+    /// The per-segment soft byte cap.
+    pub max_segment_bytes: u64,
+    /// The consumer-safe size-retention bound in RECORD bytes (`0` = off).
+    pub max_retained_bytes: u64,
+    /// The consumer-safe age-retention bound in milliseconds (`0` = off).
+    pub max_age_ms: u64,
+    /// The consumer-safe count-retention bound in records (`0` = off).
+    pub max_messages: u64,
+    /// The per-group max-ack-pending in-flight window.
+    pub max_in_flight: u32,
+    /// The per-consumer in-flight message credit ceiling (already floored to at least 1).
+    pub consumer_credit: u32,
+    /// The per-consumer in-flight byte budget (`0` = unlimited).
+    pub consumer_credit_bytes: u64,
+    /// The max-deliver poison cap before a message is dead-lettered.
+    pub max_deliver: u32,
+    /// The cap on the number of live work-groups, the default included (`0` = unlimited).
+    pub max_groups: usize,
+    /// The idle-eviction window for a named group in NANOSECONDS (`0` = disabled).
+    pub group_idle_evict_nanos: u64,
+    /// The lease visibility timeout in nanoseconds.
+    pub visibility_nanos: u64,
+    /// The lease hard cap (the longest a single attempt's lease may be extended) in nanoseconds.
+    pub hard_cap_nanos: u64,
+    /// The disk-full overflow policy (`DropNew` or `DropOldest`).
+    pub disk_full_policy: DiskFullPolicy,
+}
+
 /// The durable, unnamed default work-group: the one the wire protocol uses today, the one
 /// persisted in `cursor.ckpt`. Named groups (#9) are independent in-memory cursors.
 const DEFAULT_GROUP: &str = "";
@@ -2256,6 +2292,41 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     #[must_use]
     pub fn is_healthy(&self) -> bool {
         self.log.is_writable()
+    }
+
+    /// The number of segments the durable log currently holds (sealed predecessors plus the one
+    /// active segment). A read-only operational gauge for the introspection endpoint (#99): it
+    /// falls as retention or a forced reap reclaims old segments.
+    #[must_use]
+    pub fn segment_count(&self) -> usize {
+        self.log.segment_count()
+    }
+
+    /// A read-only echo of the engine's EFFECTIVE configuration bounds for the introspection
+    /// endpoint (#99): the durable-log byte cap, segment size, retention bounds, per-consumer
+    /// credit, lease windows, delivery cap, and the group/in-flight caps. This is a pure copy of
+    /// the values [`Engine::open`] was configured with (NO secret material, NO mutating handle), so
+    /// an operator can confirm what the broker is actually running with. Every `0` keeps the
+    /// codebase's `0` = unlimited/off convention.
+    #[must_use]
+    pub fn config_snapshot(&self) -> EngineConfigSnapshot {
+        let log = self.log.config();
+        EngineConfigSnapshot {
+            max_total_bytes: log.max_total_bytes,
+            max_segment_bytes: log.max_segment_bytes,
+            max_retained_bytes: self.retention.max_bytes,
+            max_age_ms: self.retention.max_age_ms,
+            max_messages: self.retention.max_messages,
+            max_in_flight: self.max_in_flight,
+            consumer_credit: self.consumer_credit,
+            consumer_credit_bytes: self.consumer_credit_bytes,
+            max_deliver: self.delivery.max_deliver(),
+            max_groups: self.max_groups,
+            group_idle_evict_nanos: self.group_idle_evict_nanos,
+            visibility_nanos: self.lease_config.visibility_nanos,
+            hard_cap_nanos: self.lease_config.hard_cap_nanos,
+            disk_full_policy: self.disk_full_policy,
+        }
     }
 
     /// Consumes the engine and returns its filesystem, so the log can be reopened.
