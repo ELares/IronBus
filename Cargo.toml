@@ -27,7 +27,10 @@ pedantic = { level = "warn", priority = -1 }
 # scarce edge flash. `opt-level = "s"` (not "z", which is gated on a #19 throughput check),
 # fat LTO and a single codegen unit for size and deterministic codegen, `panic = "abort"`
 # (binding: handlers are panic-free by construction, see #7), and strip the symbols. The
-# byte-identical two-runner reproducibility gate is a follow-up under #101.
+# determinism inputs that pair with this profile (`--remap-path-prefix`, `CARGO_INCREMENTAL=0`,
+# `SOURCE_DATE_EPOCH`, `--locked`, embed-the-SBOM-before-strip) are in `.cargo/config.toml` and
+# the reproducible-build invocation in RELEASING.md. The byte-identical two-runner CI gate ships
+# with the release workflow + signing in #103.
 [profile.release]
 opt-level = "s"
 lto = "fat"
