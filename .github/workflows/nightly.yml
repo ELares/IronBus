@@ -75,3 +75,80 @@ jobs:
           name: fuzz-artifacts
           path: fuzz/artifacts/
           if-no-files-found: ignore
+
+  miri:
+    # Run Miri (the MIR interpreter) over the crates it CAN run, to catch undefined behavior the
+    # native test run cannot see: out-of-bounds reads, use-after-free, invalid pointer arithmetic,
+    # and data races in the codecs and the in-memory simulation (#21). Miri interprets the program,
+    # so it cannot execute tests that spawn a process, touch a real file, or do real networking.
+    # The lane is therefore scoped to the IO-free and in-memory-simulation paths only:
+    #   - ironbus-core is fully IO-free (a CI gate forbids fs/net/process there), so its whole lib
+    #     test set runs under Miri.
+    #   - ironbus-storage's lib tests are split: the InMemoryFile / InMemoryFs simulation tests do
+    #     no real IO and run under Miri, while the StdFs / real-directory tests (the `std_file_tests`
+    #     and `std_tests` modules and the three `*_on_a_real_directory` / `stdfs_*` cases in log.rs)
+    #     open real files through foreign functions Miri cannot interpret, so they are skipped by
+    #     name below. The integration tests (which boot the real `ironbus` binary) are out of scope
+    #     because we run only `--lib`.
+    name: miri (IO-free and in-memory paths)
+    runs-on: ubuntu-latest
+    env:
+      # proptest's default failure-persistence calls getcwd to locate the source file, which Miri
+      # rejects under its default isolation, aborting the test binary. Disable isolation so the
+      # in-memory proptests run. Safe here: the job runs only `--lib` over the IO-free core and the
+      # in-memory storage simulation (the real-IO tests are skipped), so no test does real host IO.
+      MIRIFLAGS: -Zmiri-disable-isolation
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly
+          components: miri
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: miri
+      - name: miri-test ironbus-core (fully IO-free)
+        run: cargo +nightly miri test -p ironbus-core --lib
+      - name: miri-test ironbus-storage in-memory simulation lib tests
+        # Skip the real-IO lib tests by name: the `std_file_tests` (io.rs) and `std_tests`
+        # (fs.rs, naming.rs) modules and the three real-directory cases in log.rs open real
+        # files through foreign functions Miri cannot interpret. Everything else is the
+        # InMemoryFile / InMemoryFs simulation, which Miri runs cleanly with isolation ON.
+        run: |
+          cargo +nightly miri test -p ironbus-storage --lib -- \
+            --skip std_file_tests:: \
+            --skip std_tests:: \
+            --skip stdfs_read_across_segments \
+            --skip rolling_and_recovery_on_a_real_directory \
+            --skip reap_and_recovery_on_a_real_directory
+
+  coverage:
+    # Produce an informational LCOV coverage report for the workspace with cargo-llvm-cov and
+    # upload it as a build artifact (#21). This lane is informational only: it has no threshold
+    # gate and adds no external coverage service or token. It succeeds as long as coverage is
+    # collected, so a drop in coverage is visible in the artifact without ever blocking a merge.
+    name: coverage (informational)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: coverage
+      - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2
+        with:
+          tool: cargo-llvm-cov
+      - name: collect workspace coverage to lcov.info
+        # The instrumented build sets its own coverage RUSTFLAGS; clear the inherited
+        # "-D warnings" so it builds from a clean slate rather than risking a clobber.
+        env:
+          RUSTFLAGS: ""
+        run: cargo llvm-cov --workspace --all-features --locked --lcov --output-path lcov.info
+      - name: upload the coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
