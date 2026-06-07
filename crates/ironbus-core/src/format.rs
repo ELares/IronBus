@@ -6,6 +6,14 @@
 //! are record-aligned within a segment: there is no block layer and no fragment
 //! types. See the record-format design (issue #5) for the rationale.
 //!
+//! A record whose stored body is at least [`XXH3_PAYLOAD_THRESHOLD`] bytes carries a
+//! second, independent xxh3-64 checksum (issue #8) in an 8-byte little-endian field
+//! placed immediately before the 8-byte trailer and counted in `total_len`. The
+//! presence of that field is signalled by the [`RecordFlags::HAS_XXH3`] bit on the
+//! header. A record without the bit has the exact byte-for-byte layout it had before
+//! the field existed, so 8-byte-trailer parsing and `total_len`-authoritative framing
+//! are unchanged for it. CRC32C remains the resync-gating checksum.
+//!
 //! This module defines only the layout constants and field offsets. Encoding and
 //! decoding live in a separate module so the numbers here are the single source of
 //! truth that both the codec and its tests refer to.
@@ -22,6 +30,10 @@ pub const RECORD_HEADER_LEN: usize = 36;
 
 /// Size in bytes of a record trailer (`body_crc: u32` then `total_len: u32`).
 pub const RECORD_TRAILER_LEN: usize = 8;
+
+/// Size in bytes of the optional xxh3-64 checksum field (`xxh3: u64`, little-endian)
+/// that precedes the trailer on a record carrying the [`RecordFlags::HAS_XXH3`] bit.
+pub const RECORD_XXH3_LEN: usize = 8;
 
 /// The byte range of the header that the `header_crc` field protects: `[0, 32)`.
 pub const RECORD_HEADER_CRC_RANGE: core::ops::Range<usize> = 0..32;
@@ -49,8 +61,14 @@ pub const MAX_RECORD_BYTES_CEILING: u32 = 1024 * 1024 * 1024;
 /// Compile-time invariant: the default maximum record size never exceeds the ceiling.
 const _: () = assert!(DEFAULT_MAX_RECORD_BYTES <= MAX_RECORD_BYTES_CEILING);
 
-/// Payload size at or above which a second, independent xxh3-64 checksum is added
-/// to a record in addition to the mandatory CRC32C: 64 KiB.
+/// Stored body size at or above which a second, independent xxh3-64 checksum is
+/// added to a record in addition to the mandatory CRC32C: 64 KiB.
+///
+/// The threshold is measured on the STORED body (key + headers + payload as actually
+/// written, i.e. post-compression when the `COMPRESSED` bit is set), not the
+/// uncompressed payload: the xxh3-64 protects the bytes on disk, and resync and verify
+/// operate on those same stored bytes. The xxh3-64 covers the same byte range as the
+/// `body_crc`.
 pub const XXH3_PAYLOAD_THRESHOLD: u32 = 64 * 1024;
 
 /// Default target size at which an active segment is rolled and sealed: 64 MiB.

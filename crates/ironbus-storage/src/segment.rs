@@ -746,7 +746,7 @@ impl<F: RandomAccessFile> SegmentReader<F> {
 mod tests {
     use super::*;
     use crate::io::InMemoryFile;
-    use ironbus_core::format::RECORD_HEADER_LEN;
+    use ironbus_core::format::{RECORD_HEADER_LEN, XXH3_PAYLOAD_THRESHOLD};
     use std::sync::Arc;
 
     fn header() -> SegmentHeader {
@@ -1129,6 +1129,43 @@ mod tests {
         assert_eq!(streamed.record_count, 200);
         assert_eq!(streamed.last_seq, Seq::new(199));
         assert!(streamed.clean);
+        assert_scans_agree(&file);
+    }
+
+    #[test]
+    fn scan_recovery_reads_an_over_threshold_xxh3_record() {
+        // A record whose stored body reaches XXH3_PAYLOAD_THRESHOLD carries the second xxh3-64
+        // checksum field in its frame (#146), making that frame larger than the trailer-only
+        // layout. Both the buffered scan and the streaming recovery scan are purely total_len
+        // driven, so they must walk the larger frame and recover the record intact. This pins the
+        // xxh3-bearing frame end to end through the storage read and recovery paths (the codec
+        // owns the byte layout, but the durability path must not under-test the larger frame),
+        // sandwiched between sub-threshold records so a mis-sized walk would desync the tail.
+        let big = vec![0xa5u8; XXH3_PAYLOAD_THRESHOLD as usize + 37];
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        w.append(&rec(0, b"small")).unwrap();
+        w.append(&rec(1, &big)).unwrap();
+        w.append(&rec(2, b"after")).unwrap();
+        w.sync().unwrap();
+
+        let scan = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .scan()
+            .unwrap();
+        assert!(scan.clean);
+        assert_eq!(scan.records.len(), 3);
+        assert_eq!(scan.records[1].seq, Seq::new(1));
+        assert_eq!(scan.records[1].payload, big.as_slice());
+        assert_eq!(scan.records[2].payload, b"after");
+
+        let streamed = SegmentReader::open(Arc::clone(&file))
+            .unwrap()
+            .scan_recovery()
+            .unwrap();
+        assert!(streamed.clean);
+        assert_eq!(streamed.record_count, 3);
+        assert_eq!(streamed.last_seq, Seq::new(2));
         assert_scans_agree(&file);
     }
 
