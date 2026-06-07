@@ -31,6 +31,34 @@ use ironbus_storage::loss::LossReport;
 use ironbus_storage::segment::{OwnedRecord, StorageError};
 use std::collections::BTreeMap;
 
+/// What the engine does with a produce that would exceed the durable-log byte cap
+/// ([`LogConfig::max_total_bytes`]): the overflow policy (#82). The default, [`DiskFullPolicy::DropNew`],
+/// is the historical drop-new shed; [`DiskFullPolicy::DropOldest`] is the opt-in telemetry-style
+/// reclamation that frees space by deleting the OLDEST sealed segment (even one a slow consumer
+/// has not consumed) and then accepts the produce.
+///
+/// `Block` (stall the producer until space frees) and `Refuse` are out of scope for v1: the README
+/// froze `block` as opt-in-only and we do not add a producer stall here. Only the two drop policies
+/// ship; the enum is `#[non_exhaustive]` so a later block variant is not a breaking change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DiskFullPolicy {
+    /// Reject the over-cap produce (the drop-new shed): nothing is written, the producer is told
+    /// promptly via the non-fatal [`StorageError::AtCapacity`], and the `produce_rejected` counter
+    /// increments. This is the historical behavior and the DEFAULT, so an unconfigured engine is
+    /// unchanged. Durable topics use it: the newest data is shed once the cap is hit, the older
+    /// already-accepted data is preserved.
+    #[default]
+    DropNew,
+    /// Reclaim space then accept the over-cap produce by force-reaping the OLDEST sealed segment,
+    /// IGNORING consumer-safety: it may delete records below a slow group's cursor (so that group
+    /// gets a one-time truncation on its next poll, #84). Telemetry topics use it: the freshest
+    /// data matters most, so the oldest is dropped to make room rather than rejecting the producer.
+    /// If only the active segment remains (nothing left to force out), it FALLS BACK to the
+    /// drop-new rejection, so a single oversized in-flight set cannot wedge the log empty.
+    DropOldest,
+}
+
 /// Tunables for an [`Engine`].
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -72,6 +100,13 @@ pub struct EngineConfig {
     /// `max_retained_bytes` and `max_age_ms`: a sealed segment is deleted if ANY enabled bound
     /// says it should be. See [`Log::reap`].
     pub max_messages: u64,
+    /// The disk-full overflow policy (#82): what an over-cap produce does when the durable-log byte
+    /// cap ([`LogConfig::max_total_bytes`]) is hit. [`DiskFullPolicy::DropNew`] (the default) is the
+    /// historical drop-new shed, so an existing config is unchanged; [`DiskFullPolicy::DropOldest`]
+    /// opts in to force-reaping the oldest sealed segment to make room and then accepting the
+    /// produce. It has no effect unless `max_total_bytes` is set (with no cap, no produce is ever
+    /// over-cap, so neither policy ever triggers).
+    pub disk_full_policy: DiskFullPolicy,
 }
 
 /// An error from the engine.
@@ -190,6 +225,19 @@ pub enum Poll {
         /// The parked message.
         record: OwnedRecord,
     },
+    /// The group's cursor fell BELOW the oldest retained record because the disk-full drop-oldest
+    /// policy force-reaped old segments out from under it (#82, #84). The engine has just reset the
+    /// group's cursor UP to `earliest_retained` (so delivery resumes at the oldest record still
+    /// present) and surfaces this ONCE so the caller emits the in-band truncation advisory; the
+    /// consumer learns it lost the span `[old_cursor, earliest_retained)` rather than silently
+    /// skipping it. The next poll delivers normally from `earliest_retained`; the same gap never
+    /// re-truncates (the reset moved the cursor up to it).
+    Truncated {
+        /// The new earliest-retained offset the group's cursor was reset to.
+        earliest_retained: Offset,
+        /// How many records the group skipped: `earliest_retained - old_cursor`.
+        skipped: u64,
+    },
     /// Nothing is deliverable right now (all caught up, or the in-flight window is full).
     Idle,
 }
@@ -251,6 +299,13 @@ pub struct Counters {
     /// over its retention bound. Zero unless `max_retained_bytes` is set; the operator's
     /// space-reclamation signal. Saturating.
     pub segments_reaped: u64,
+    /// Whole old SEALED segments FORCE-reaped by the disk-full drop-oldest policy (#82): each
+    /// forced reap unlinks the oldest sealed segment to make room for an over-cap produce, IGNORING
+    /// consumer-safety (it may delete records a slow group has not consumed, which then sees a
+    /// one-time truncation, #84). Distinct from `segments_reaped` (consumer-safe retention): this
+    /// is the data-loss-bearing reclamation an operator watches when running `DropOldest`. Zero
+    /// under the default `DropNew` policy. Saturating.
+    pub segments_force_reaped: u64,
 }
 
 /// A snapshot of one work-group's consumer position, for the metrics endpoint (#16): an
@@ -448,6 +503,10 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// the produce path never reaps. See [`EngineConfig::max_retained_bytes`],
     /// [`EngineConfig::max_age_ms`], and [`EngineConfig::max_messages`].
     retention: RetentionBounds,
+    /// The disk-full overflow policy (#82): `DropNew` (the default) sheds an over-cap produce,
+    /// `DropOldest` force-reaps the oldest sealed segment to make room then accepts it. See
+    /// [`EngineConfig::disk_full_policy`].
+    disk_full_policy: DiskFullPolicy,
     last_checkpointed: u64,
     /// The last durably-checkpointed committed offset per NAMED work-group (#60), for the
     /// interval gate. The default group uses `last_checkpointed`; named groups checkpoint to
@@ -549,6 +608,7 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
                 max_age_ms: config.max_age_ms,
                 max_messages: config.max_messages,
             },
+            disk_full_policy: config.disk_full_policy,
             last_checkpointed: default_committed,
             counters: Counters::default(),
             fsync: LatencyHistogram::default(),
@@ -702,13 +762,23 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     /// Appends a message and makes it durable before returning its offset (so a producer's
     /// ack is post-fsync).
     ///
+    /// When the durable-log byte cap is hit, the overflow policy ([`EngineConfig::disk_full_policy`])
+    /// decides the behavior. Under [`DiskFullPolicy::DropNew`] (the default) the over-cap produce is
+    /// rejected (the drop-new shed, behavior unchanged). Under [`DiskFullPolicy::DropOldest`] the
+    /// engine first tries the consumer-safe reaper, then force-reaps the OLDEST sealed segment
+    /// (ignoring consumer-safety, #82) to make room, and retries the append; a consumer whose
+    /// cursor was force-reaped away sees a one-time truncation on its next poll (#84). If only the
+    /// active segment remains (nothing left to force out), `DropOldest` falls back to the drop-new
+    /// rejection, so a single oversized in-flight set cannot wedge the log empty.
+    ///
     /// # Errors
     /// Propagates a storage error from the append or sync. A produce rejected because the
     /// durable log is at its byte cap surfaces the non-fatal [`StorageError::AtCapacity`]
     /// (wrapped in [`EngineError::Storage`]) and increments the `produce_rejected` counter;
-    /// nothing is appended and `produced` / `produced_bytes` do not move.
+    /// nothing is appended and `produced` / `produced_bytes` do not move. Under `DropOldest` this
+    /// rejection only happens in the wedge-guard fall-back (only the active segment remains).
     pub fn produce(&mut self, message: &Append<'_>) -> Result<Offset, EngineError> {
-        let offset = match self.log.append(message) {
+        let offset = match self.append_with_policy(message) {
             Ok(offset) => offset,
             Err(e) => {
                 // The drop-new shed: count the rejection (a shed-rate signal) but advance no
@@ -740,6 +810,86 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
         // committed offset across every group, so the slowest group's records are never reaped.
         self.reap_for_retention()?;
         Ok(offset)
+    }
+
+    /// Appends `message` honoring the disk-full overflow policy (#82), returning the storage-level
+    /// result so [`Engine::produce`] keeps its existing rejection-counting and statistics path.
+    ///
+    /// Under [`DiskFullPolicy::DropNew`] (the default) this is exactly `log.append`: an over-cap
+    /// produce returns [`StorageError::AtCapacity`] and nothing is reaped, so the historical
+    /// behavior is byte-for-byte unchanged.
+    ///
+    /// Under [`DiskFullPolicy::DropOldest`], on an `AtCapacity` rejection it reclaims space and
+    /// retries: first the consumer-safe reap (in case retention is also configured and frees space
+    /// without data loss), then, if the log is still over cap, [`Log::reap_oldest_forced`] to delete
+    /// the OLDEST sealed segment (which may drop a slow group's unconsumed records). The loop is
+    /// bounded: if the consumer-safe reap and the forced reap both free nothing (only the active
+    /// segment remains), it returns the original `AtCapacity`, so `produce` falls back to the
+    /// drop-new rejection and a single oversized in-flight set cannot wedge the log empty. Each
+    /// forced reap increments `segments_force_reaped`.
+    fn append_with_policy(&mut self, message: &Append<'_>) -> Result<Offset, StorageError> {
+        match self.log.append(message) {
+            Ok(offset) => Ok(offset),
+            // Only the at-capacity shed is reclaimable; any other storage error (a frozen writer,
+            // an oversized record) propagates unchanged, and under DropNew the rejection is final.
+            Err(e) if e.is_at_capacity() && self.disk_full_policy == DiskFullPolicy::DropOldest => {
+                self.make_room_then_append(message, e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The `DropOldest` reclaim-then-retry loop for an over-cap produce (#82). On entry the append
+    /// already failed with `at_capacity`. It repeatedly frees space (a consumer-safe reap first,
+    /// then a forced oldest-segment reap) and retries the append, until the append succeeds or no
+    /// reap can free anything (only the active segment remains), in which case it returns the last
+    /// `AtCapacity` so the caller falls back to the drop-new rejection (the wedge guard).
+    fn make_room_then_append(
+        &mut self,
+        message: &Append<'_>,
+        at_capacity: StorageError,
+    ) -> Result<Offset, StorageError> {
+        let mut last = at_capacity;
+        loop {
+            // Prefer the consumer-safe reaper: if retention is also configured, it may free a
+            // fully-consumed segment with NO data loss. The protect floor is the slowest group's
+            // committed offset, so this never drops a needed record.
+            let protect_below = self.min_committed_offset();
+            let safe = self.log.reap(self.retention, protect_below)?;
+            self.counters.segments_reaped = self
+                .counters
+                .segments_reaped
+                .saturating_add(safe.segments_reaped);
+            // If the consumer-safe reap freed nothing, force out the OLDEST sealed segment, even
+            // one a slow consumer still needs (it sees a one-time truncation on its next poll, #84).
+            let mut forced_this_pass = false;
+            if safe.segments_reaped == 0 {
+                match self.log.reap_oldest_forced()? {
+                    Some(_) => {
+                        self.counters.segments_force_reaped =
+                            self.counters.segments_force_reaped.saturating_add(1);
+                        forced_this_pass = true;
+                    }
+                    // Only the active segment remains: nothing left to free, so the wedge guard
+                    // returns the rejection and `produce` sheds (drop-new fall-back).
+                    None => return Err(last),
+                }
+            }
+            // Retry the append now that space was freed. A success ends the loop; another
+            // at-capacity means one freed segment was not enough, so loop and free more (the loop
+            // terminates because each pass either frees a segment or hits the active-only guard).
+            match self.log.append(message) {
+                Ok(offset) => return Ok(offset),
+                Err(e) if e.is_at_capacity() => {
+                    last = e;
+                    // Defensive: if neither reaper made progress this pass, stop rather than spin.
+                    if safe.segments_reaped == 0 && !forced_this_pass {
+                        return Err(last);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Reclaims disk by reaping fully-consumed old sealed segments when the durable log trips any
@@ -810,12 +960,31 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
                 return Err(EngineError::TooManyGroups { max: MAX_GROUPS });
             }
         }
+        // The oldest record still in the durable log: it rises above 0 only once the disk-full
+        // drop-oldest policy (#82) has force-reaped a prefix. Read it BEFORE borrowing the group
+        // mutably (it borrows the log immutably).
+        let earliest = self.log.earliest_offset().get();
         let lease_config = self.lease_config;
         let g = self
             .groups
             .entry(group.to_string())
             .or_insert_with(|| WorkGroup::new(lease_config));
         let committed = g.cursor.committed().get();
+        // Below-earliest truncation signal (#84): if this group's next-deliverable offset (its
+        // committed cursor) is below the oldest retained record, its data was force-reaped out from
+        // under it. Reset the cursor UP to `earliest` (resuming at the oldest record still present,
+        // dropping the now-meaningless acked-ahead set and in-flight leases that referenced reaped
+        // records) and surface the truncation ONCE. After the reset `committed == earliest`, so a
+        // subsequent poll is no longer below earliest and never re-truncates the same gap.
+        if committed < earliest {
+            let skipped = earliest - committed;
+            g.cursor = AckCursor::resume(Offset::new(earliest));
+            g.leases = LeaseTable::new(lease_config);
+            return Ok(Poll::Truncated {
+                earliest_retained: Offset::new(earliest),
+                skipped,
+            });
+        }
         let flushed = self.log.flushed_offset().get();
         // The delivery window: at most `max_in_flight` offsets above the committed cursor,
         // and never past the durable end.
@@ -1019,6 +1188,16 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
         self.log.flushed_offset()
     }
 
+    /// The OLDEST retained log offset: the oldest segment's base offset, the first offset still
+    /// present in the durable log (#82, #84). `0` for a log that has never been reaped. It rises
+    /// above 0 only once the disk-full drop-oldest policy or consumer-safe retention has reclaimed
+    /// a prefix of old segments. A consumer whose committed cursor is below this has had its records
+    /// reclaimed out from under it, so its next poll returns a one-time [`Poll::Truncated`].
+    #[must_use]
+    pub fn earliest_retained_offset(&self) -> Offset {
+        self.log.earliest_offset()
+    }
+
     /// The log's current total durable RECORD bytes (the quantity the durable-log byte cap,
     /// `LogConfig::max_total_bytes`, is measured against). An operator can compare it to the
     /// configured cap to see headroom before the drop-new shed triggers.
@@ -1128,6 +1307,7 @@ mod tests {
             max_retained_bytes: 0,
             max_age_ms: 0,
             max_messages: 0,
+            disk_full_policy: DiskFullPolicy::DropNew,
         }
     }
 
@@ -1500,6 +1680,7 @@ mod tests {
                 }
                 Poll::Idle => break,
                 Poll::Parked { offset, .. } => panic!("unexpected park at {}", offset.get()),
+                Poll::Truncated { .. } => panic!("unexpected truncation"),
             }
         }
         assert_eq!(
@@ -1549,6 +1730,7 @@ mod tests {
                 }
                 Poll::Idle => break,
                 Poll::Parked { offset, .. } => panic!("unexpected park at {}", offset.get()),
+                Poll::Truncated { .. } => panic!("unexpected truncation"),
             }
         }
         // A 64-byte slot holds the leading 3 acked-ahead runs (offsets 1, 3, 5), so those are
@@ -1897,6 +2079,7 @@ mod tests {
                 }
                 Poll::Idle => break,
                 Poll::Parked { offset, .. } => panic!("unexpected park at {}", offset.get()),
+                Poll::Truncated { .. } => panic!("unexpected truncation"),
             }
         }
         assert_eq!(
@@ -2468,6 +2651,7 @@ mod tests {
                         assert_eq!(e.ack(&d.token), AckResult::Acked);
                     }
                     Poll::Parked { .. } => {}
+                    Poll::Truncated { .. } => panic!("unexpected truncation"),
                     Poll::Idle => break,
                 }
                 now += 1;
@@ -2675,6 +2859,7 @@ mod tests {
                 match e.poll(lease_now).unwrap() {
                     Poll::Message(d) => assert_eq!(e.ack(&d.token), AckResult::Acked),
                     Poll::Parked { .. } => {}
+                    Poll::Truncated { .. } => panic!("unexpected truncation"),
                     Poll::Idle => break,
                 }
                 lease_now += 1;
@@ -2760,5 +2945,267 @@ mod tests {
             "a slow group blocks age-based reaping below its cursor"
         );
         assert_eq!(e.committed_offset_in("slow"), Offset::new(0));
+    }
+
+    // ---- Disk-full drop-oldest policy + below-earliest truncation tests (refs #82, #84) ----
+
+    /// An engine config with a small segment cap (so a handful of records roll across segments), a
+    /// durable-log byte cap, and an explicit disk-full overflow policy. Every other knob is the
+    /// default test config.
+    fn config_disk_full(max_total_bytes: u64, policy: DiskFullPolicy) -> EngineConfig {
+        let mut cfg = config(64, 5);
+        cfg.log = LogConfig {
+            // A small segment cap so ~6 16-byte records roll: the cap then spans several segments.
+            max_segment_bytes: 160,
+            max_total_bytes,
+        };
+        cfg.disk_full_policy = policy;
+        cfg
+    }
+
+    // The framed durable bytes of one 16-byte record, measured on a throwaway engine so a byte cap
+    // can be sized exactly in record units.
+    fn one_record_bytes() -> u64 {
+        let mut probe = open(config(10, 5));
+        produce(&mut probe, &[0xab; 16]);
+        probe.durable_record_bytes()
+    }
+
+    #[test]
+    fn drop_oldest_force_reaps_a_stuck_consumer_and_accepts_the_produce() {
+        // A STUCK consumer leases offset 0 but never acks, so its committed stays 0 and the
+        // consumer-safe reaper can never reclaim segment 0. Under DropOldest, producing past the
+        // byte cap FORCE-reaps the stuck consumer's old segments (its earliest data is gone), the
+        // force counter increments, and the produce SUCCEEDS (not rejected).
+        let one = one_record_bytes();
+        // A cap of ~4 records: once the log exceeds it, a further produce must reclaim space.
+        let mut e = open(config_disk_full(4 * one, DiskFullPolicy::DropOldest));
+
+        // The stuck consumer leases offset 0 and never acks.
+        produce(&mut e, &[0xab; 16]);
+        assert!(matches!(e.poll_in("stuck", 0).unwrap(), Poll::Message(_)));
+        assert_eq!(e.committed_offset_in("stuck"), Offset::new(0));
+
+        // A fast producer fills well past the cap. Every produce SUCCEEDS (never rejected),
+        // because DropOldest force-reaps to make room rather than shedding.
+        for _ in 0..20 {
+            e.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: &[0xab; 16],
+            })
+            .expect("drop-oldest accepts the produce");
+        }
+        assert_eq!(e.flushed_offset(), Offset::new(21), "every produce landed");
+        assert_eq!(
+            e.counters().produce_rejected,
+            0,
+            "drop-oldest never sheds while it can force-reap"
+        );
+        assert!(
+            e.counters().segments_force_reaped >= 1,
+            "the stuck consumer's old segments were force-reaped"
+        );
+        // The stuck consumer's earliest data (offset 0) is gone: the log no longer starts at 0.
+        assert!(
+            e.earliest_retained_offset().get() > 0,
+            "the oldest retained offset rose above the stuck consumer's cursor"
+        );
+        // The live durable bytes are held near the cap (force-reaping kept it bounded).
+        assert!(
+            e.durable_record_bytes() <= 5 * one,
+            "the log stays near the cap, not unbounded: {} <= {}",
+            e.durable_record_bytes(),
+            5 * one
+        );
+    }
+
+    #[test]
+    fn drop_new_rejects_the_same_scenario_and_reaps_nothing() {
+        // The DEFAULT DropNew policy, same stuck-consumer scenario: producing past the cap is
+        // REJECTED (the drop-new shed), nothing is force-reaped, and the stuck consumer's earliest
+        // data is PRESERVED (the oldest retained offset stays 0).
+        let one = one_record_bytes();
+        let mut e = open(config_disk_full(4 * one, DiskFullPolicy::DropNew));
+
+        produce(&mut e, &[0xab; 16]);
+        assert!(matches!(e.poll_in("stuck", 0).unwrap(), Poll::Message(_)));
+
+        // Produce until the first rejection.
+        let mut rejected = false;
+        for _ in 0..20 {
+            match e.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: &[0xab; 16],
+            }) {
+                Ok(_) => {}
+                Err(err) => {
+                    assert!(err.is_at_capacity(), "the rejection is the shed: {err:?}");
+                    rejected = true;
+                    break;
+                }
+            }
+        }
+        assert!(rejected, "drop-new sheds once the cap is hit");
+        assert_eq!(
+            e.counters().segments_force_reaped,
+            0,
+            "drop-new never force-reaps"
+        );
+        assert_eq!(
+            e.earliest_retained_offset(),
+            Offset::ZERO,
+            "the stuck consumer's earliest data is preserved under drop-new"
+        );
+        // Offset 0 is still readable for the stuck consumer (its record was not reaped).
+        assert!(matches!(
+            e.poll_now_in("stuck"),
+            Ok(Poll::Idle | Poll::Message(_))
+        ));
+    }
+
+    #[test]
+    fn a_truncated_consumer_gets_exactly_one_truncation_then_delivers() {
+        // After DropOldest force-reaps a stuck consumer's records, its NEXT poll returns a
+        // truncation (resetting its cursor to earliest_retained), then delivers from there. A
+        // SECOND poll does NOT re-truncate the same gap.
+        let one = one_record_bytes();
+        let mut e = open(config_disk_full(4 * one, DiskFullPolicy::DropOldest));
+
+        // The stuck consumer leases offset 0 (committed 0), then the producer races past the cap.
+        produce(&mut e, &[0xab; 16]);
+        assert!(matches!(e.poll_in("stuck", 0).unwrap(), Poll::Message(_)));
+        for _ in 0..20 {
+            e.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: &[0xab; 16],
+            })
+            .unwrap();
+        }
+        let earliest = e.earliest_retained_offset();
+        assert!(earliest.get() > 0, "the stuck consumer's data was reaped");
+
+        // The stuck consumer's NEXT poll is a truncation, resetting to earliest_retained.
+        let now = 100;
+        match e.poll_in("stuck", now).unwrap() {
+            Poll::Truncated {
+                earliest_retained,
+                skipped,
+            } => {
+                assert_eq!(earliest_retained, earliest, "reset to earliest retained");
+                assert_eq!(skipped, earliest.get(), "skipped the whole reaped span");
+            }
+            other => panic!("expected a truncation, got {other:?}"),
+        }
+        // The cursor is now at earliest_retained.
+        assert_eq!(e.committed_offset_in("stuck"), earliest);
+
+        // The NEXT poll delivers normally from earliest_retained, NOT another truncation.
+        match e.poll_in("stuck", now).unwrap() {
+            Poll::Message(d) => assert_eq!(d.offset, earliest, "resumes at the oldest record"),
+            other => panic!("expected a delivery after the reset, got {other:?}"),
+        }
+
+        // Drain a few more; none re-truncates the same gap (the reset moved the cursor up to it).
+        for _ in 0..3 {
+            match e.poll_in("stuck", now).unwrap() {
+                Poll::Message(d) => assert_eq!(e.ack_in("stuck", &d.token), AckResult::Acked),
+                Poll::Idle => break,
+                Poll::Truncated { .. } => panic!("must not re-truncate the same gap"),
+                Poll::Parked { .. } => {}
+            }
+        }
+    }
+
+    #[test]
+    fn a_caught_up_consumer_never_sees_a_truncation() {
+        // A consumer that stays caught up (acking as it goes) keeps its committed at the head, which
+        // never falls below the oldest retained offset, so force-reaping never truncates it.
+        let one = one_record_bytes();
+        let mut e = open(config_disk_full(4 * one, DiskFullPolicy::DropOldest));
+
+        let mut now = 0u64;
+        for _ in 0..30 {
+            e.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: &[0xab; 16],
+            })
+            .unwrap();
+            // Drain and ack everything available: the consumer stays caught up to the head.
+            loop {
+                match e.poll(now).unwrap() {
+                    Poll::Message(d) => {
+                        assert_eq!(e.ack(&d.token), AckResult::Acked);
+                    }
+                    Poll::Truncated { .. } => panic!("a caught-up consumer is never truncated"),
+                    Poll::Parked { .. } => {}
+                    Poll::Idle => break,
+                }
+                now += 1;
+            }
+        }
+        assert_eq!(
+            e.committed_offset(),
+            e.flushed_offset(),
+            "the caught-up consumer is at the head"
+        );
+    }
+
+    #[test]
+    fn drop_oldest_with_only_the_active_segment_falls_back_to_drop_new() {
+        // The wedge guard: if a single in-flight set fills the log so only the ACTIVE segment is
+        // over cap (nothing sealed to force out), DropOldest falls back to the drop-new rejection
+        // rather than wedging the log empty. A tiny cap with a large segment cap (no rolling) hits
+        // this: the first record is on an empty log (always written), the second is over the cap
+        // with only the active segment present, so it sheds.
+        let one = one_record_bytes();
+        let mut cfg = config(10, 5);
+        // A large segment cap so NOTHING rolls: there is only ever the single active segment.
+        cfg.log = LogConfig::default().with_max_total_bytes(one); // cap = one record
+        cfg.disk_full_policy = DiskFullPolicy::DropOldest;
+        let mut e = open(cfg);
+
+        // First record on the empty log is always written (the empty-log carve-out).
+        assert_eq!(produce(&mut e, &[0xab; 16]), Offset::new(0));
+        // The log is now at the cap with only the active segment: the next produce cannot
+        // force-reap (no sealed predecessor), so DropOldest falls back to the drop-new shed.
+        let err = e
+            .produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: &[0xab; 16],
+            })
+            .unwrap_err();
+        assert!(
+            err.is_at_capacity(),
+            "wedge guard falls back to drop-new: {err:?}"
+        );
+        assert_eq!(
+            e.counters().produce_rejected,
+            1,
+            "the fall-back shed is counted"
+        );
+        assert_eq!(
+            e.counters().segments_force_reaped,
+            0,
+            "nothing could be force-reaped"
+        );
+        assert!(
+            e.is_healthy(),
+            "the writer stays live (the shed is non-fatal)"
+        );
     }
 }

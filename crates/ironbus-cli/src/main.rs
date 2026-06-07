@@ -28,7 +28,7 @@ use ironbus_core::delivery::DeliveryConfig;
 #[cfg(unix)]
 use ironbus_core::lease::LeaseConfig;
 #[cfg(unix)]
-use ironbus_server::engine::{Engine, EngineConfig};
+use ironbus_server::engine::{DiskFullPolicy, Engine, EngineConfig};
 #[cfg(unix)]
 use ironbus_server::health::serve_health;
 #[cfg(unix)]
@@ -83,6 +83,33 @@ const DEFAULT_MAX_AGE_MS: u64 = 0;
 /// opts in.
 const DEFAULT_MAX_MESSAGES: u64 = 0;
 
+/// The default disk-full overflow policy for `serve` (`drop-new`, matching the engine default):
+/// an over-cap produce is shed, the older accepted data preserved, so existing behavior is
+/// unchanged. `drop-oldest` opts in to force-reaping the oldest sealed segment to make room.
+const DEFAULT_DISK_FULL_POLICY: &str = "drop-new";
+
+/// The disk-full overflow policy parsed from `serve --disk-full-policy` (#82). A platform-neutral,
+/// `Copy` mirror of the engine's policy enum, so it lives in the (non-Unix-gated) `ServeConfig` and
+/// is validated on every platform; the Unix on-disk path maps it to the engine's `DiskFullPolicy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiskFullPolicyArg {
+    /// Shed an over-cap produce (the drop-new default).
+    DropNew,
+    /// Force-reap the oldest sealed segment to make room, then accept the over-cap produce.
+    DropOldest,
+}
+
+impl DiskFullPolicyArg {
+    /// Parses the `--disk-full-policy` flag value, accepting `drop-new` or `drop-oldest`.
+    fn parse(value: &str) -> Option<DiskFullPolicyArg> {
+        match value {
+            "drop-new" => Some(DiskFullPolicyArg::DropNew),
+            "drop-oldest" => Some(DiskFullPolicyArg::DropOldest),
+            _ => None,
+        }
+    }
+}
+
 /// The smallest segment size cap `serve` accepts: below this, segments proliferate
 /// pathologically (one record each), so reject it as a misconfiguration.
 const MIN_MAX_SEGMENT_BYTES: u64 = 4096;
@@ -131,6 +158,7 @@ USAGE:
                   [--checkpoint-interval <n>] [--max-deliver <n>] [--max-in-flight <n>]
                   [--max-segment-bytes <n>] [--max-total-bytes <bytes>]
                   [--max-retained-bytes <bytes>] [--max-age-ms <ms>] [--max-messages <n>]
+                  [--disk-full-policy <drop-new|drop-oldest>]
                   [--visibility-timeout-ms <n>] [--health-addr <host:port>]
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
     ironbus sub   [--addr <host:port>] [--group <name>] [--max <n>]
@@ -146,6 +174,10 @@ Notes:
     --max-age-ms (a segment whose newest record is older than this many milliseconds), and
     --max-messages (total record count). A segment is reaped if ANY enabled bound trips, oldest
     first, never below the slowest consumer's committed offset, never the active segment.
+    --disk-full-policy (default drop-new) sets what an over-cap produce does once --max-total-bytes
+    is hit: drop-new sheds it (preserving older data); drop-oldest force-reaps the oldest sealed
+    segment to make room then accepts it, so a slow consumer whose records are reaped gets a
+    one-time truncation notice and resumes at the oldest record still present.
     pub reads the payload from the argument, or from stdin if omitted (an empty input
     publishes an empty message, which is a valid record).
     sub prints one line per message; at most one disposition applies to the batch:
@@ -499,6 +531,16 @@ fn cmd_sub(
         };
         writeln!(out, "dead-letter offset={} reason={reason}", dl.offset)?;
     }
+    // Surface any truncation advisories: the broker reset this cursor below the oldest retained
+    // record because the disk-full drop-oldest policy reaped its records (#82, #84), so the
+    // consumer learns it lost a span and where delivery resumed rather than silently skipping.
+    for t in &fetched.truncations {
+        writeln!(
+            out,
+            "truncated: resumed at offset {}, skipped {} record(s)",
+            t.earliest_retained, t.skipped
+        )?;
+    }
     writeln!(out, "fetched {} message(s)", fetched.messages.len())?;
     Ok(())
 }
@@ -515,6 +557,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut max_retained_bytes = DEFAULT_MAX_RETAINED_BYTES;
     let mut max_age_ms = DEFAULT_MAX_AGE_MS;
     let mut max_messages = DEFAULT_MAX_MESSAGES;
+    let mut disk_full_policy_arg = DEFAULT_DISK_FULL_POLICY.to_string();
     let mut visibility_ms = DEFAULT_VISIBILITY_MS;
     let mut health_addr: Option<String> = None;
     let mut i = 0;
@@ -545,6 +588,9 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             "--max-messages" => {
                 max_messages = take_number("--max-messages", args, &mut i)?;
             }
+            "--disk-full-policy" => {
+                disk_full_policy_arg = take_value("--disk-full-policy", args, &mut i)?;
+            }
             "--visibility-timeout-ms" => {
                 visibility_ms = take_number("--visibility-timeout-ms", args, &mut i)?;
             }
@@ -561,6 +607,11 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     }
     let data_dir =
         data_dir.ok_or_else(|| CliError::Usage("serve requires `--data-dir <dir>`".to_string()))?;
+    let disk_full_policy = DiskFullPolicyArg::parse(&disk_full_policy_arg).ok_or_else(|| {
+        CliError::Usage(format!(
+            "`--disk-full-policy` must be `drop-new` or `drop-oldest`, got `{disk_full_policy_arg}`"
+        ))
+    })?;
     let config = ServeConfig {
         max_connections,
         checkpoint_interval,
@@ -571,6 +622,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         max_retained_bytes,
         max_age_ms,
         max_messages,
+        disk_full_policy,
         visibility_ms,
     };
     validate_serve_config(&config)?;
@@ -646,6 +698,10 @@ struct ServeConfig {
     /// segments while the log's total record count is over this many messages. `0` = disabled,
     /// the default.
     max_messages: u64,
+    /// The disk-full overflow policy (#82): `DropNew` (the default) sheds an over-cap produce,
+    /// `DropOldest` force-reaps the oldest sealed segment to make room then accepts it. Honored only
+    /// when `max_total_bytes` is set; with no cap, no produce is ever over-cap.
+    disk_full_policy: DiskFullPolicyArg,
     visibility_ms: u64,
 }
 
@@ -724,6 +780,7 @@ fn cmd_serve(
         config.max_retained_bytes,
         config.max_age_ms,
         config.max_messages,
+        config.disk_full_policy,
         config.visibility_ms,
         health_addr,
         out,
@@ -768,6 +825,12 @@ fn open_disk_engine(
             max_retained_bytes: config.max_retained_bytes,
             max_age_ms: config.max_age_ms,
             max_messages: config.max_messages,
+            // The disk-full overflow policy (#82): drop-new (default) sheds, drop-oldest force-reaps
+            // the oldest sealed segment then accepts. Honored only when `max_total_bytes` is set.
+            disk_full_policy: match config.disk_full_policy {
+                DiskFullPolicyArg::DropNew => DiskFullPolicy::DropNew,
+                DiskFullPolicyArg::DropOldest => DiskFullPolicy::DropOldest,
+            },
         },
     )
     .map_err(|e| CliError::Internal(format!("opening broker at {}: {e}", data_dir.display())))?;
@@ -1021,7 +1084,7 @@ mod tests {
     use ironbus_core::lease::LeaseConfig;
     #[cfg(unix)]
     use ironbus_core::types::RecordFlags;
-    use ironbus_server::engine::{Engine, EngineConfig};
+    use ironbus_server::engine::{DiskFullPolicy, Engine, EngineConfig};
     use ironbus_server::server::{serve, SharedEngine};
     use ironbus_storage::fs::InMemoryFs;
     #[cfg(unix)]
@@ -1045,6 +1108,7 @@ mod tests {
             max_retained_bytes: DEFAULT_MAX_RETAINED_BYTES,
             max_age_ms: DEFAULT_MAX_AGE_MS,
             max_messages: DEFAULT_MAX_MESSAGES,
+            disk_full_policy: DiskFullPolicyArg::DropNew,
             visibility_ms: DEFAULT_VISIBILITY_MS,
         }
     }
@@ -1230,6 +1294,7 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
         .unwrap();
@@ -1863,6 +1928,7 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
         .unwrap();
@@ -1930,6 +1996,7 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
         .unwrap();

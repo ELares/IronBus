@@ -360,6 +360,47 @@ pub fn decode_dead_letter(body: &[u8]) -> Result<DeadLetterBody, BodyError> {
     Ok(DeadLetterBody { offset, reason })
 }
 
+/// A truncation advisory (the `TRUNCATED` frame body): the broker tells a consumer that its
+/// cursor fell BELOW the oldest retained record because the disk-full drop-oldest policy
+/// force-reaped old segments out from under it (#82, #84), so the consumer learns it lost a
+/// span and where delivery resumes rather than silently skipping records. The advisory is
+/// emitted exactly once per gap, just before the resumed deliveries; the consumer's cursor is
+/// reset to `earliest_retained` server-side, so its next ack offsets line up with what follows.
+///
+/// Layout: `earliest_retained: u64`, then `skipped: u64` (a fixed 16-byte layout).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TruncatedBody {
+    /// The new earliest-retained log offset the consumer's cursor was reset to (delivery
+    /// resumes at the oldest record still present).
+    pub earliest_retained: u64,
+    /// How many records the consumer skipped: the size of the gap between where its cursor was
+    /// and `earliest_retained` (`earliest_retained - old_cursor`).
+    pub skipped: u64,
+}
+
+/// Encodes a `TRUNCATED` body onto the end of `out` (a fixed 16-byte layout).
+pub fn encode_truncated(advisory: &TruncatedBody, out: &mut Vec<u8>) {
+    out.extend_from_slice(&advisory.earliest_retained.to_le_bytes());
+    out.extend_from_slice(&advisory.skipped.to_le_bytes());
+}
+
+/// Decodes a `TRUNCATED` body (a fixed 16-byte layout; a short or overlong body is rejected).
+///
+/// # Errors
+/// Returns a [`BodyError`] on a short body or trailing bytes.
+pub fn decode_truncated(body: &[u8]) -> Result<TruncatedBody, BodyError> {
+    let mut r = Reader::new(body);
+    let earliest_retained = r.u64()?;
+    let skipped = r.u64()?;
+    if !r.at_end() {
+        return Err(BodyError::TrailingBytes);
+    }
+    Ok(TruncatedBody {
+        earliest_retained,
+        skipped,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +425,28 @@ mod tests {
             decode_dead_letter(&[0u8; 10]),
             Err(BodyError::TrailingBytes)
         );
+    }
+
+    #[test]
+    fn truncated_round_trips() {
+        let advisory = TruncatedBody {
+            earliest_retained: 0x0102_0304_0506_0708,
+            skipped: 0x1112_1314_1516_1718,
+        };
+        let mut buf = Vec::new();
+        encode_truncated(&advisory, &mut buf);
+        assert_eq!(
+            buf.len(),
+            16,
+            "fixed 16-byte body: u64 offset + u64 skipped"
+        );
+        assert_eq!(decode_truncated(&buf).unwrap(), advisory);
+    }
+
+    #[test]
+    fn truncated_rejects_a_short_or_overlong_body() {
+        assert_eq!(decode_truncated(&[0u8; 15]), Err(BodyError::Truncated));
+        assert_eq!(decode_truncated(&[0u8; 17]), Err(BodyError::TrailingBytes));
     }
 
     #[test]
@@ -572,15 +635,16 @@ mod tests {
             prop_assert_eq!(decode_ack(&buf).unwrap(), ack);
         }
 
-        /// Decoding arbitrary bytes as any fallible body codec (PUB, ACK, DELIVER, DEAD_LETTER)
-        /// never panics and never reads out of bounds: each returns a typed `BodyError` or a
-        /// valid view, the property-level complement to the per-codec fuzz targets.
+        /// Decoding arbitrary bytes as any fallible body codec (PUB, ACK, DELIVER, DEAD_LETTER,
+        /// TRUNCATED) never panics and never reads out of bounds: each returns a typed
+        /// `BodyError` or a valid view, the property-level complement to the per-codec fuzz targets.
         #[test]
         fn decoding_arbitrary_bytes_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..64)) {
             let _ = decode_pub(&bytes);
             let _ = decode_ack(&bytes);
             let _ = decode_deliver(&bytes);
             let _ = decode_dead_letter(&bytes);
+            let _ = decode_truncated(&bytes);
             // SUB is infallible: any byte string is a valid body, and decoding it recovers the
             // exact bytes as the group, so it cannot panic either.
             prop_assert_eq!(decode_sub(&bytes).group, bytes.as_slice());
@@ -611,6 +675,17 @@ mod tests {
             encode_dead_letter(&advisory, &mut buf);
             prop_assert_eq!(buf.len(), 9, "DEAD_LETTER is a fixed 9-byte body");
             prop_assert_eq!(decode_dead_letter(&buf).unwrap(), advisory);
+        }
+
+        /// A TRUNCATED body round-trips for any earliest-retained offset and skipped count, and
+        /// is always exactly the fixed 16-byte layout (two LE u64 fields).
+        #[test]
+        fn any_truncated_round_trips(earliest_retained in any::<u64>(), skipped in any::<u64>()) {
+            let advisory = TruncatedBody { earliest_retained, skipped };
+            let mut buf = Vec::new();
+            encode_truncated(&advisory, &mut buf);
+            prop_assert_eq!(buf.len(), 16, "TRUNCATED is a fixed 16-byte body");
+            prop_assert_eq!(decode_truncated(&buf).unwrap(), advisory);
         }
 
         /// A SUB body is the whole-body-is-the-group case: any byte string is a valid name and
