@@ -20,6 +20,7 @@ use crate::metrics::LatencyHistogram;
 use ironbus_core::clock::Clock;
 use ironbus_core::cursor::AckCursor;
 use ironbus_core::delivery::{DeliveryConfig, Disposition};
+use ironbus_core::keyshared::{KeyOrdering, KeyRouter, MemberId, RouteDecision};
 use ironbus_core::lease::{
     AckOutcome, Claim, ExtendOutcome, LeaseConfig, LeaseTable, LeaseToken, NackOutcome,
 };
@@ -518,9 +519,19 @@ fn resume_cursor_from_snapshot(recovered: Option<&[u8]>, flushed: u64) -> AckCur
 /// a competing group is shared by several members (each message goes to one member). The
 /// lease generation space is per-group, so a [`LeaseToken`] is only meaningful within the
 /// group it was delivered from.
+///
+/// A group is plain competing by default (`router: None`, [`KeyOrdering::None`]). Opting it
+/// into `key_shared` (#64) attaches a [`KeyRouter`]: the same cursor and lease table still
+/// drain the log, but delivery is filtered through the router so a key routes to one live
+/// member and per-key order is preserved.
 struct WorkGroup {
     cursor: AckCursor,
     leases: LeaseTable,
+    /// The `key_shared` router (#64), or `None` for the default [`KeyOrdering::None`] (plain
+    /// competing distribution). When present, [`Engine::poll_in_member`] routes each record's
+    /// key to one live member and enforces per-key serialization; when absent, delivery is the
+    /// unchanged claim-the-next-deliverable competing path.
+    router: Option<KeyRouter>,
 }
 
 impl WorkGroup {
@@ -528,6 +539,7 @@ impl WorkGroup {
         WorkGroup {
             cursor: AckCursor::new(),
             leases: LeaseTable::new(config),
+            router: None,
         }
     }
 }
@@ -585,6 +597,13 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// log, but with NO total-byte cap (a poison record must never be shed, it is the durable
     /// evidence of a dropped message).
     dlq_config: LogConfig,
+    /// The set of group names CONFIGURED to use `key_shared` ordering (#64), declared server-side
+    /// (NOT on the wire). Empty by default, so every group is plain competing
+    /// ([`KeyOrdering::None`]) unless an operator opts it in. A session consults
+    /// [`Engine::is_configured_key_shared`] on SUB and, for a configured group, puts it into
+    /// `key_shared` mode and joins as a member. Held separate from the live per-group router so the
+    /// declared config survives a group that has no current members.
+    key_shared_groups: std::collections::BTreeSet<String>,
 }
 
 /// The file name of the work-group's durable committed-cursor checkpoint.
@@ -631,6 +650,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             WorkGroup {
                 cursor,
                 leases: LeaseTable::new(config.lease),
+                router: None,
             },
         );
         // Discover and resume each NAMED work-group from its own `cursor-<hex>.ckpt` (#60),
@@ -661,6 +681,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     WorkGroup {
                         cursor: gcursor,
                         leases: LeaseTable::new(config.lease),
+                        router: None,
                     },
                 );
             }
@@ -711,6 +732,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             last_dead_lettered: None,
             dlq,
             dlq_config,
+            // Empty by default: no group is key_shared until an operator configures one (#64), so an
+            // unconfigured engine is plain competing everywhere and unchanged.
+            key_shared_groups: std::collections::BTreeSet::new(),
         })
     }
 
@@ -1198,6 +1222,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return Err(EngineError::MissingRecord { offset: off.get() });
         };
         g.cursor.ack(off);
+        // key_shared (#64): committing past a poison offset frees its key (the poll path already
+        // cleared it, so this is idempotent belt-and-suspenders). A no-op for a competing group.
+        if let Some(router) = g.router.as_mut() {
+            router.clear_offset(off);
+        }
         self.counters.dead_lettered += 1;
         self.last_dead_lettered = Some(off);
         Ok(Poll::Parked {
@@ -1245,6 +1274,282 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.poll_in(group, now)
     }
 
+    /// Declares the set of group names that use `key_shared` ordering (#64), server-side. A
+    /// session puts a configured group into `key_shared` mode (and joins it as a member) the first
+    /// time a consumer subscribes; an unconfigured group stays plain competing. Replacing the set
+    /// only affects groups configured AFTER the call (already-`key_shared` groups keep their live
+    /// router); this is the startup-config seam, so the server sets it once when it opens.
+    pub fn set_configured_key_shared_groups<I>(&mut self, groups: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.key_shared_groups = groups.into_iter().collect();
+    }
+
+    /// Whether `group` is CONFIGURED (server-side) to use `key_shared` ordering (#64). Distinct
+    /// from [`Engine::key_ordering_in`], which reports whether the group's LIVE state currently has
+    /// a router attached: a session reads this on SUB to decide whether to enable the mode.
+    #[must_use]
+    pub fn is_configured_key_shared(&self, group: &str) -> bool {
+        self.key_shared_groups.contains(group)
+    }
+
+    /// Sets a work-group's ordering mode (#64): [`KeyOrdering::None`] (the default, plain
+    /// competing distribution) or [`KeyOrdering::KeyShared`] (per-key routing). Switching to
+    /// `key_shared` attaches a fresh [`KeyRouter`] (no members yet); switching back to `None`
+    /// drops it, reverting to plain competing distribution. The group is created if absent
+    /// (subject to the same name and cap checks as [`Engine::poll_in`]), so the server can put a
+    /// group into `key_shared` mode before any consumer polls it.
+    ///
+    /// This is the v1 mode-wiring seam: the mode is server-side per-group configuration, NOT a
+    /// wire-negotiated field, so the frozen `Sub` frame (whose body is exactly the group name) is
+    /// unchanged. A wire-negotiated `key_ordering` on `Sub`/`Connect` is a tracked follow-up.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::InvalidGroupName`] or [`EngineError::TooManyGroups`] if a new group
+    /// would have to be created and fails the name or cap check.
+    pub fn set_key_ordering_in(
+        &mut self,
+        group: &str,
+        ordering: KeyOrdering,
+    ) -> Result<(), EngineError> {
+        if !self.groups.contains_key(group) {
+            validate_group_name(group)?;
+            if self.max_groups != 0 && self.groups.len() >= self.max_groups {
+                return Err(EngineError::TooManyGroups {
+                    max: self.max_groups,
+                });
+            }
+        }
+        let lease_config = self.lease_config;
+        let g = self
+            .groups
+            .entry(group.to_string())
+            .or_insert_with(|| WorkGroup::new(lease_config));
+        match ordering {
+            // Attach a router only if the group is not already key_shared, so re-applying the mode
+            // never wipes the live-member set or the in-flight key map.
+            KeyOrdering::KeyShared => {
+                if g.router.is_none() {
+                    g.router = Some(KeyRouter::new());
+                }
+            }
+            KeyOrdering::None => g.router = None,
+        }
+        Ok(())
+    }
+
+    /// A work-group's current ordering mode (#64). A group that has never been configured (or one
+    /// reverted to plain competing) reports [`KeyOrdering::None`].
+    #[must_use]
+    pub fn key_ordering_in(&self, group: &str) -> KeyOrdering {
+        match self.groups.get(group) {
+            Some(g) if g.router.is_some() => KeyOrdering::KeyShared,
+            _ => KeyOrdering::None,
+        }
+    }
+
+    /// Registers `member` as a live member of a `key_shared` group (#64): the consumer joined, so
+    /// its keys may now route to it. A no-op for a group that is not `key_shared` (plain competing
+    /// distribution has no member set). Returns `true` if the live-member set changed.
+    pub fn join_member_in(&mut self, group: &str, member: MemberId) -> bool {
+        self.groups
+            .get_mut(group)
+            .and_then(|g| g.router.as_mut())
+            .is_some_and(|r| r.join(member))
+    }
+
+    /// Removes `member` from a `key_shared` group's live-member set (#64): the consumer left or
+    /// disconnected, so its keys re-route to their new owners. Any record still in flight to the
+    /// departed member stays leased and drains or expires through the lease layer before its key
+    /// frees, which is the drain-or-expire guard. A no-op for a non-`key_shared` group. Returns
+    /// `true` if the live-member set changed.
+    pub fn leave_member_in(&mut self, group: &str, member: MemberId) -> bool {
+        self.groups
+            .get_mut(group)
+            .and_then(|g| g.router.as_mut())
+            .is_some_and(|r| r.leave(member))
+    }
+
+    /// The number of busy keys (delivered-but-unacked, one per key) in a `key_shared` group (#64),
+    /// or `0` for a plain competing group. A cheap per-group hot-spot signal #16 can surface.
+    #[must_use]
+    pub fn busy_keys_in(&self, group: &str) -> usize {
+        self.groups
+            .get(group)
+            .and_then(|g| g.router.as_ref())
+            .map_or(0, KeyRouter::busy_keys)
+    }
+
+    /// The current `key_shared` routing decision for delivering `offset` (carrying `key`) to
+    /// `member` in `group` (#64), or `None` for a group that is not `key_shared`. A read-only probe
+    /// of the live router: an operator (or a test) can ask whether a key currently routes to a
+    /// member without polling. Reflects the CURRENT live-member set and in-flight key map.
+    #[must_use]
+    pub fn route_decision_in(
+        &self,
+        group: &str,
+        member: MemberId,
+        key: &[u8],
+        offset: Offset,
+    ) -> Option<RouteDecision> {
+        self.groups
+            .get(group)
+            .and_then(|g| g.router.as_ref())
+            .map(|r| r.decide(member, key, offset))
+    }
+
+    /// Like [`Engine::poll_in`] but member-aware, for a `key_shared` group (#64): claims and
+    /// returns the next record whose key routes to `member` under the group's CURRENT live-member
+    /// set, preserving per-key order. A record's key maps to one member by rendezvous hash; a
+    /// record with an EMPTY key keeps plain competing distribution (any member may take it). The
+    /// per-key serialization gate plus the lease layer guarantee a member never receives a key's
+    /// next record until the prior one drains or its lease expires, even across a rebalance.
+    ///
+    /// For a group that is NOT `key_shared`, `member` is irrelevant and this behaves EXACTLY like
+    /// [`Engine::poll_in`] (plain competing distribution), so a caller can route every poll through
+    /// here without affecting a `KeyOrdering::None` group.
+    ///
+    /// # Errors
+    /// As [`Engine::poll_in`].
+    pub fn poll_in_member(
+        &mut self,
+        group: &str,
+        member: MemberId,
+        now: u64,
+    ) -> Result<Poll, EngineError> {
+        // A non-key_shared group is the unchanged competing path: route straight to `poll_in` so
+        // the default KeyOrdering::None behavior is byte-for-byte the existing code.
+        if self.key_ordering_in(group) == KeyOrdering::None {
+            return self.poll_in(group, now);
+        }
+        // The group exists and is key_shared (the check above created/looked it up), so the cap and
+        // name gates have already passed via set_key_ordering_in.
+        let earliest = self.log.earliest_offset().get();
+        let lease_config = self.lease_config;
+        let g = self
+            .groups
+            .entry(group.to_string())
+            .or_insert_with(|| WorkGroup::new(lease_config));
+        let committed = g.cursor.committed().get();
+        // The same below-earliest truncation signal as poll_in (#84): reset the cursor up to the
+        // oldest retained record and surface the truncation once. The router's in-flight key map is
+        // also cleared, since the leases it referenced are gone.
+        if committed < earliest {
+            let skipped = earliest - committed;
+            g.cursor = AckCursor::resume(Offset::new(earliest));
+            g.leases = LeaseTable::new(lease_config);
+            if let Some(router) = g.router.as_mut() {
+                router.retain_above(Offset::new(earliest));
+            }
+            return Ok(Poll::Truncated {
+                earliest_retained: Offset::new(earliest),
+                skipped,
+            });
+        }
+        // Prune any in-flight key entry at or below the committed cursor: a committed offset is
+        // acked, so its key is no longer busy. This keeps the per-key map bounded to the in-flight
+        // window (mirrors how the session prunes its `leased` map past the committed cursor) and
+        // also frees a key whose owner left and whose record was committed past elsewhere.
+        if let Some(router) = g.router.as_mut() {
+            router.retain_above(Offset::new(committed));
+        }
+        let flushed = self.log.flushed_offset().get();
+        let window_end = committed
+            .saturating_add(u64::from(self.max_in_flight))
+            .min(flushed);
+        let mut offset = committed;
+        let mut dead_letter: Option<(Offset, LeaseToken, u32, OwnedRecord)> = None;
+        while offset < window_end {
+            let off = Offset::new(offset);
+            if g.cursor.is_acked(off) {
+                offset += 1;
+                continue;
+            }
+            // An offset already actively leased (to this or another member) is skipped without
+            // reading its record: only a free or expired offset is a routing candidate.
+            if !g.leases.is_claimable(off, now) {
+                offset += 1;
+                continue;
+            }
+            // Read the record to learn its key, then ask the router whether THIS member may take
+            // it now. The read is over a single offset; only candidate (claimable) offsets are read.
+            let Some(record) = self.log.read_from(off, 1)?.into_iter().next() else {
+                return Err(EngineError::MissingRecord { offset });
+            };
+            let Some(router) = g.router.as_ref() else {
+                // Unreachable: the mode check above proved the router is present.
+                return Err(EngineError::MissingRecord { offset });
+            };
+            match router.decide(member, &record.key, off) {
+                // Not this member's key, or the key is busy with an earlier in-flight record: skip
+                // it and keep scanning. A skipped offset stays unclaimed for its true owner.
+                RouteDecision::NotOwner | RouteDecision::KeyBusy => {
+                    offset += 1;
+                    continue;
+                }
+                RouteDecision::Deliver => {}
+            }
+            // Routed to this member and the key is free: commit the claim now.
+            match g.leases.claim(off, now) {
+                // Raced to in-flight between the peek and the claim (no concurrency here, so this is
+                // belt-and-suspenders): skip it.
+                Claim::InFlight => {
+                    offset += 1;
+                }
+                Claim::Exhausted => return Err(EngineError::GenerationExhausted),
+                Claim::Granted { token, deliveries } => match self.delivery.disposition(deliveries)
+                {
+                    Disposition::Deliver => {
+                        // Mark the key busy so its next record is not routed until this drains.
+                        if let Some(router) = g.router.as_mut() {
+                            router.mark_in_flight(&record.key, off);
+                        }
+                        self.counters.delivered += 1;
+                        if deliveries > 1 {
+                            self.counters.redelivered += 1;
+                        }
+                        return Ok(Poll::Message(Delivery {
+                            offset: off,
+                            token,
+                            deliveries,
+                            record,
+                        }));
+                    }
+                    Disposition::DeadLetter => {
+                        // Drop the lease and the key's in-flight entry, then dead-letter outside the
+                        // group borrow exactly as poll_in does.
+                        g.leases.ack(&token);
+                        if let Some(router) = g.router.as_mut() {
+                            router.clear_offset(off);
+                        }
+                        dead_letter = Some((off, token, deliveries, record));
+                        break;
+                    }
+                },
+            }
+        }
+        match dead_letter {
+            Some((off, _token, deliveries, record)) => {
+                self.dead_letter_in(group, off, deliveries, record)
+            }
+            None => Ok(Poll::Idle),
+        }
+    }
+
+    /// Like [`Engine::poll_in_member`] but reads the engine's own monotonic clock (#64).
+    ///
+    /// # Errors
+    /// As [`Engine::poll_in_member`].
+    pub fn poll_now_in_member(
+        &mut self,
+        group: &str,
+        member: MemberId,
+    ) -> Result<Poll, EngineError> {
+        let now = self.log.now_monotonic();
+        self.poll_in_member(group, member, now)
+    }
+
     /// Acks the message named by `token`: removes its lease (fenced if stale) and advances
     /// the committed cursor over any newly contiguous prefix.
     pub fn ack(&mut self, token: &LeaseToken) -> AckResult {
@@ -1263,6 +1568,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         match g.leases.ack(token) {
             AckOutcome::Acked => {
                 g.cursor.ack(token.offset);
+                // key_shared (#64): the key this offset held is now free, so its next record may
+                // route. A no-op for a plain competing group (no router). A nack does NOT clear
+                // it: the same offset redelivers, so the key stays busy and per-key order holds.
+                if let Some(router) = g.router.as_mut() {
+                    router.clear_offset(token.offset);
+                }
                 self.counters.acks += 1;
                 AckResult::Acked
             }
@@ -3758,5 +4069,334 @@ mod tests {
             1,
             "exactly one across two crashes"
         );
+    }
+
+    // ---- key_shared routing (#64) ----
+
+    /// Produces a record with an explicit key, for the `key_shared` tests.
+    fn produce_keyed(
+        e: &mut Engine<InMemoryFs, ManualClock>,
+        key: &[u8],
+        payload: &[u8],
+    ) -> Offset {
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key,
+            headers: b"",
+            payload,
+        })
+        .unwrap()
+    }
+
+    /// Finds two distinct keys that route to two DIFFERENT members under the given membership, so a
+    /// test can assert per-key affinity is non-vacuous. Panics if none found in a generous search.
+    fn two_keys_to_two_members(
+        e: &Engine<InMemoryFs, ManualClock>,
+        group: &str,
+        a: MemberId,
+        b: MemberId,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let mut for_a = None;
+        let mut for_b = None;
+        for n in 0..2000u32 {
+            let key = format!("k{n}").into_bytes();
+            // Probe via decide: a free key returns Deliver only for its owner.
+            let owns_a = matches!(
+                e.route_decision_in(group, a, &key, Offset::ZERO),
+                Some(RouteDecision::Deliver)
+            );
+            let owns_b = matches!(
+                e.route_decision_in(group, b, &key, Offset::ZERO),
+                Some(RouteDecision::Deliver)
+            );
+            if owns_a && for_a.is_none() {
+                for_a = Some(key.clone());
+            } else if owns_b && for_b.is_none() {
+                for_b = Some(key);
+            }
+            if for_a.is_some() && for_b.is_some() {
+                break;
+            }
+        }
+        (
+            for_a.expect("a key for member a"),
+            for_b.expect("a key for member b"),
+        )
+    }
+
+    #[test]
+    fn key_ordering_defaults_to_none_and_is_unchanged() {
+        // The default mode is None: no router, plain competing distribution, and a plain poll is
+        // byte-for-byte the existing behavior. poll_in_member on a None group equals poll_in.
+        let mut e = open(config(10, 5));
+        assert_eq!(e.key_ordering_in("g"), KeyOrdering::None);
+        for p in [&b"a"[..], b"b", b"c"] {
+            produce(&mut e, p);
+        }
+        // A member-aware poll on a non-key_shared group delivers in plain competing order.
+        let d = message(e.poll_in_member("g", MemberId::new(0), 0).unwrap());
+        assert_eq!(d.offset, Offset::new(0));
+        assert_eq!(e.ack_in("g", &d.token), AckResult::Acked);
+        // Still None; member id is irrelevant.
+        assert_eq!(e.key_ordering_in("g"), KeyOrdering::None);
+        assert_eq!(e.busy_keys_in("g"), 0);
+    }
+
+    #[test]
+    fn setting_key_shared_attaches_a_router_and_reverting_drops_it() {
+        let mut e = open(config(10, 5));
+        e.set_key_ordering_in("g", KeyOrdering::KeyShared).unwrap();
+        assert_eq!(e.key_ordering_in("g"), KeyOrdering::KeyShared);
+        // Re-applying does not wipe membership.
+        assert!(e.join_member_in("g", MemberId::new(1)));
+        e.set_key_ordering_in("g", KeyOrdering::KeyShared).unwrap();
+        assert!(
+            !e.join_member_in("g", MemberId::new(1)),
+            "member 1 is still joined after re-applying the mode"
+        );
+        // Reverting to None drops the router.
+        e.set_key_ordering_in("g", KeyOrdering::None).unwrap();
+        assert_eq!(e.key_ordering_in("g"), KeyOrdering::None);
+        assert!(
+            !e.join_member_in("g", MemberId::new(1)),
+            "a None group has no member set to join"
+        );
+    }
+
+    #[test]
+    fn same_key_always_routes_to_the_same_live_member() {
+        // Acceptance: same-key records always route to the same live member.
+        let (a, b) = (MemberId::new(10), MemberId::new(20));
+        let mut e = open(config(20, 5));
+        e.set_key_ordering_in("g", KeyOrdering::KeyShared).unwrap();
+        e.join_member_in("g", a);
+        e.join_member_in("g", b);
+        let (key_a, _key_b) = two_keys_to_two_members(&e, "g", a, b);
+        // Produce three records all with key_a, interleaved with other keys.
+        let o0 = produce_keyed(&mut e, &key_a, b"a0");
+        let _ = produce_keyed(&mut e, b"other", b"x");
+        let o1 = produce_keyed(&mut e, &key_a, b"a1");
+        let o2 = produce_keyed(&mut e, &key_a, b"a2");
+        // The owner of key_a takes o0; the other member never gets a key_a record.
+        let owner = if matches!(
+            e.route_decision_in("g", a, &key_a, Offset::ZERO),
+            Some(RouteDecision::Deliver)
+        ) {
+            a
+        } else {
+            b
+        };
+        let other = if owner == a { b } else { a };
+        // The non-owner polling never receives a key_a record (it may get "other").
+        // Drain the owner one key_a record at a time, acking, and assert offset order is preserved.
+        for (expected_off, _payload) in [(o0, &b"a0"[..]), (o1, b"a1"), (o2, b"a2")] {
+            // The other member must NOT be able to take this key_a offset.
+            assert_eq!(
+                e.route_decision_in("g", other, &key_a, expected_off),
+                Some(RouteDecision::NotOwner),
+                "key_a never routes to the non-owner"
+            );
+            // Poll as the owner until we get this key_a record (it may first serve "other").
+            loop {
+                match e.poll_in_member("g", owner, 0).unwrap() {
+                    Poll::Message(d) if d.record.key == key_a => {
+                        assert_eq!(d.offset, expected_off, "per-key offset order preserved");
+                        assert_eq!(e.ack_in("g", &d.token), AckResult::Acked);
+                        break;
+                    }
+                    Poll::Message(d) => {
+                        // An "other"-keyed record the owner also owns: ack and keep going.
+                        assert_eq!(e.ack_in("g", &d.token), AckResult::Acked);
+                    }
+                    Poll::Idle => panic!("the owner should eventually get its key_a record"),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_busy_key_is_not_redelivered_to_a_new_owner_until_it_drains() {
+        // Acceptance: a key with an in-flight record is not delivered to a NEW owner until the
+        // prior record drains or its lease expires (the drain-or-expire guard across a rebalance).
+        let mut e = open(config(20, 5));
+        e.set_key_ordering_in("g", KeyOrdering::KeyShared).unwrap();
+        let m1 = MemberId::new(1);
+        let m2 = MemberId::new(2);
+        let m3 = MemberId::new(3);
+        let m4 = MemberId::new(4);
+        for m in [m1, m2, m3, m4] {
+            e.join_member_in("g", m);
+        }
+        // Find a key owned by m2 whose owner CHANGES when m2 leaves.
+        let key = (0..2000u32)
+            .map(|n| format!("k{n}").into_bytes())
+            .find(|k| {
+                matches!(
+                    e.route_decision_in("g", m2, k, Offset::ZERO),
+                    Some(RouteDecision::Deliver)
+                )
+            })
+            .expect("a key owned by m2");
+        // Produce two records on this key.
+        let o0 = produce_keyed(&mut e, &key, b"first");
+        let o1 = produce_keyed(&mut e, &key, b"second");
+        // m2 takes the first record; the key is now busy at o0.
+        let d0 = message(e.poll_in_member("g", m2, 0).unwrap());
+        assert_eq!(d0.offset, o0);
+        assert_eq!(e.busy_keys_in("g"), 1);
+        // m2 leaves: the key's owner changes.
+        assert!(e.leave_member_in("g", m2));
+        let new_owner = [m1, m3, m4]
+            .into_iter()
+            .find(|&m| {
+                matches!(
+                    e.route_decision_in("g", m, &key, o1),
+                    Some(RouteDecision::KeyBusy | RouteDecision::Deliver)
+                )
+            })
+            .expect("a new owner among the survivors");
+        // The NEW owner cannot take o1 while o0 is in flight: the key is busy.
+        assert_eq!(
+            e.route_decision_in("g", new_owner, &key, o1),
+            Some(RouteDecision::KeyBusy),
+            "the next record waits for the in-flight one to drain"
+        );
+        // No survivor can poll o1 yet.
+        for m in [m1, m3, m4] {
+            match e.poll_in_member("g", m, 0).unwrap() {
+                Poll::Idle => {}
+                Poll::Message(d) => {
+                    assert_ne!(d.offset, o1, "o1 must not deliver while o0 is busy");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // o0's lease expires (advance past the 30 ns visibility): it is now reclaimable, but per-key
+        // order still requires o0 to be redelivered BEFORE o1. The new owner gets o0 first.
+        let d0b = message(e.poll_in_member("g", new_owner, 40).unwrap());
+        assert_eq!(
+            d0b.offset, o0,
+            "the expired in-flight record redelivers first"
+        );
+        assert_eq!(e.ack_in("g", &d0b.token), AckResult::Acked);
+        // Now o1 is deliverable to the new owner.
+        let d1 = message(e.poll_in_member("g", new_owner, 40).unwrap());
+        assert_eq!(
+            d1.offset, o1,
+            "the next record delivers only after the prior drains"
+        );
+    }
+
+    #[test]
+    fn per_key_order_survives_a_mid_stream_join() {
+        // Acceptance: per-key order survives a mid-stream member join (the affected key may remap,
+        // but its in-flight record drains before the new owner gets the next one).
+        let mut e = open(config(20, 5));
+        e.set_key_ordering_in("g", KeyOrdering::KeyShared).unwrap();
+        let m1 = MemberId::new(1);
+        e.join_member_in("g", m1);
+        // With one member, m1 owns every key.
+        let key = b"stream-key".to_vec();
+        let o0 = produce_keyed(&mut e, &key, b"0");
+        let o1 = produce_keyed(&mut e, &key, b"1");
+        // m1 takes o0.
+        let d0 = message(e.poll_in_member("g", m1, 0).unwrap());
+        assert_eq!(d0.offset, o0);
+        // A second member joins mid-stream.
+        let m2 = MemberId::new(2);
+        e.join_member_in("g", m2);
+        // Whoever now owns the key, o1 is not deliverable while o0 is in flight.
+        for m in [m1, m2] {
+            match e.poll_in_member("g", m, 0).unwrap() {
+                Poll::Idle => {}
+                Poll::Message(d) => assert_ne!(d.offset, o1, "o1 waits for o0"),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // Ack o0: the key frees and o1 delivers to its current owner, in order.
+        assert_eq!(e.ack_in("g", &d0.token), AckResult::Acked);
+        let owner = if matches!(
+            e.route_decision_in("g", m1, &key, o1),
+            Some(RouteDecision::Deliver)
+        ) {
+            m1
+        } else {
+            m2
+        };
+        let d1 = message(e.poll_in_member("g", owner, 0).unwrap());
+        assert_eq!(
+            d1.offset, o1,
+            "o1 delivers after o0, preserving per-key order"
+        );
+    }
+
+    #[test]
+    fn an_empty_key_keeps_plain_competing_distribution() {
+        // Records with no key have no affinity: any member may take them, and two members split the
+        // batch with no double delivery (the competing property).
+        let mut e = open(config(20, 5));
+        e.set_key_ordering_in("g", KeyOrdering::KeyShared).unwrap();
+        let m1 = MemberId::new(1);
+        let m2 = MemberId::new(2);
+        e.join_member_in("g", m1);
+        e.join_member_in("g", m2);
+        for p in [&b"a"[..], b"b", b"c", b"d"] {
+            produce_keyed(&mut e, b"", p);
+        }
+        // Drain across both members; collect the (offset, member) deliveries.
+        let mut delivered = Vec::new();
+        for m in [m1, m2, m1, m2, m1, m2] {
+            if let Poll::Message(d) = e.poll_in_member("g", m, 0).unwrap() {
+                delivered.push(d.offset.get());
+                assert_eq!(e.ack_in("g", &d.token), AckResult::Acked);
+            }
+        }
+        delivered.sort_unstable();
+        assert_eq!(
+            delivered,
+            vec![0, 1, 2, 3],
+            "every empty-keyed record delivered exactly once across the members"
+        );
+    }
+
+    #[test]
+    fn a_non_owner_never_takes_a_key_even_when_polling() {
+        // A member that does not own a key gets Idle (or another key's record), never the foreign
+        // key's record, so the affinity holds at the poll level, not just the decide level.
+        let (a, b) = (MemberId::new(7), MemberId::new(8));
+        let mut e = open(config(20, 5));
+        e.set_key_ordering_in("g", KeyOrdering::KeyShared).unwrap();
+        e.join_member_in("g", a);
+        e.join_member_in("g", b);
+        let (key_a, _key_b) = two_keys_to_two_members(&e, "g", a, b);
+        let oa = produce_keyed(&mut e, &key_a, b"only-a");
+        // b polls: it must NOT receive key_a's record (only Idle, since that is the only record).
+        match e.poll_in_member("g", b, 0).unwrap() {
+            Poll::Idle => {}
+            other => panic!("the non-owner must not get key_a's record, got {other:?}"),
+        }
+        // a polls: it gets the record.
+        let d = message(e.poll_in_member("g", a, 0).unwrap());
+        assert_eq!(d.offset, oa);
+    }
+
+    #[test]
+    fn busy_keys_tracks_in_flight_and_clears_on_ack() {
+        let mut e = open(config(20, 5));
+        e.set_key_ordering_in("g", KeyOrdering::KeyShared).unwrap();
+        let m = MemberId::new(1);
+        e.join_member_in("g", m);
+        produce_keyed(&mut e, b"k1", b"a");
+        produce_keyed(&mut e, b"k2", b"b");
+        assert_eq!(e.busy_keys_in("g"), 0);
+        let d0 = message(e.poll_in_member("g", m, 0).unwrap());
+        let d1 = message(e.poll_in_member("g", m, 0).unwrap());
+        assert_eq!(e.busy_keys_in("g"), 2, "two distinct keys in flight");
+        e.ack_in("g", &d0.token);
+        assert_eq!(e.busy_keys_in("g"), 1, "acking one frees its key");
+        e.ack_in("g", &d1.token);
+        assert_eq!(e.busy_keys_in("g"), 0);
     }
 }
