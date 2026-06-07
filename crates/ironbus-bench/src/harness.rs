@@ -322,9 +322,13 @@ fn receive_loop(
 ) -> Result<u64, RunError> {
     let mut recorded: u64 = 0;
     loop {
-        let fetched = receiver
-            .fetch(fetch_batch)
-            .map_err(|e| RunError::Client(e.to_string()))?;
+        let fetched = match receiver.fetch(fetch_batch) {
+            Ok(f) => f,
+            // The broker dropped the connection (a hard stall reset it, or it closed under load):
+            // stop gracefully and report the samples already recorded rather than failing the run.
+            Err(e) if is_connection_ended(&e) => break,
+            Err(e) => return Err(RunError::Client(e.to_string())),
+        };
         let now = now_nanos();
         for m in &fetched.messages {
             if let Some(intended) = read_token_time(&m.payload) {
@@ -343,10 +347,14 @@ fn receive_loop(
                 }
                 recorded += 1;
             }
-            // Ack to advance the cursor and free credit, so delivery keeps flowing.
-            receiver
-                .ack(m.offset, m.generation)
-                .map_err(|e| RunError::Client(e.to_string()))?;
+            // Ack to advance the cursor and free credit, so delivery keeps flowing. A connection
+            // ended here (the broker dropped us) ends the run gracefully with what we recorded.
+            if let Err(e) = receiver.ack(m.offset, m.generation) {
+                if is_connection_ended(&e) {
+                    return Ok(recorded);
+                }
+                return Err(RunError::Client(e.to_string()));
+            }
         }
         // An empty fetch while the sender is still running just means we are caught up; keep
         // polling. Stop only once the sender is done and everything it produced has been drained.
@@ -415,6 +423,13 @@ fn send_loop(
                 // A non-fatal shed is part of the overload workload (the broker sheds, not OOMs):
                 // keep pacing the schedule rather than aborting.
             }
+            Err(e) if is_connection_ended(&e) => {
+                // The broker dropped the connection (e.g. a hard stall that reset an in-flight
+                // produce on thaw). End the send loop gracefully WITHOUT a fatal error: the receiver
+                // still drains and records whatever was already produced, so the run reports the
+                // measured tail instead of crashing. `error` stays None.
+                break;
+            }
             Err(e) => {
                 error = Some(RunError::Client(e.to_string()));
                 break;
@@ -453,6 +468,26 @@ fn read_token_time(payload: &[u8]) -> Option<Nanos> {
 /// overload workload tolerates, versus a real transport or protocol failure, which is fatal.
 fn is_shed(err: &ironbus_client::ClientError) -> bool {
     matches!(err, ironbus_client::ClientError::Server(m) if m.contains("at capacity"))
+}
+
+/// Whether a client error means the broker connection simply ENDED (reset, aborted, broken pipe,
+/// truncated read, or closed), as opposed to a protocol or config fault. A load generator that is
+/// dropped by the broker under load, or during the #111 injected-stall self-test (which SIGSTOPs the
+/// broker mid-run, so an in-flight op can be reset on thaw), should report the samples it ALREADY
+/// measured rather than crash: the loops treat a connection-ended error as a graceful early end of
+/// the run, keeping the recorded tail (which already holds the stall's drained backlog).
+fn is_connection_ended(err: &ironbus_client::ClientError) -> bool {
+    match err {
+        ironbus_client::ClientError::Closed => true,
+        ironbus_client::ClientError::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
 }
 
 /// Sleeps until the monotonic-raw instant `target`, given the current reading `now < target`. Uses
