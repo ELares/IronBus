@@ -1114,6 +1114,7 @@ fn cmd_serve(
         config.max_messages,
         config.max_groups,
         config.group_idle_evict_ms,
+        config.enable_admin,
         config.disk_full_policy,
         config.visibility_ms,
         key_shared_groups,
