@@ -8,9 +8,12 @@
 //! across a restart); step-9 offline inspection (`peek`/`dump` over a stopped broker agrees with
 //! recovery up to the durable head); and steps 6 and 7, power-cut recovery (a torn tail is
 //! truncated, the durable prefix survives, and the loss is reported consistently offline and
-//! online); and step-5 overload (the durable log spills to disk and absorbs the accepted prefix,
+//! online); step-5 overload (the durable log spills to disk and absorbs the accepted prefix,
 //! then sheds drop-new once it is at or over its byte cap, with the client shed count agreeing
-//! exactly with the server's reject counter). Only the installer (step 1) remains.
+//! exactly with the server's reject counter); and step-8 disk-full drop-oldest (a stuck
+//! consumer's records are force-reaped under the byte cap, so its next fetch gets exactly one
+//! truncation, resumes at the oldest record still retained, and makes progress without
+//! re-truncating). Only the installer and in-place upgrade steps, which need a release, remain.
 //!
 //! `serve` is Unix only in v1 (on-disk storage uses positioned IO the Windows path lacks), so
 //! this whole acceptance test is gated to Unix.
@@ -174,6 +177,50 @@ fn payloads(out: &str) -> Vec<String> {
         .filter_map(|rest| rest.split_whitespace().next())
         .map(str::to_string)
         .collect()
+}
+
+/// Extracts the delivered record offsets from a `sub` run's stdout. Each delivered message prints
+/// a line `#<n> gen=<g> key=<k> payload=<value>`, so the offset is the token right after the `#`
+/// at the start of the line. The `  ack ...`, `truncated: ...`, and `fetched ...` lines carry no
+/// leading `#`, so they are skipped: only real delivered offsets are returned, in delivery order.
+fn delivered_offsets(out: &str) -> Vec<u64> {
+    out.lines()
+        .filter_map(|l| l.strip_prefix('#'))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .filter_map(|tok| tok.parse::<u64>().ok())
+        .collect()
+}
+
+/// Extracts the resume offsets from a `sub` run's truncation advisories. `ironbus sub` prints a
+/// line `truncated: resumed at offset <n>, skipped <k> record(s)` once per cursor reset below the
+/// oldest retained record (#82, #84). Returns one `<n>` per such line, so a test can assert both
+/// the COUNT of truncations (exactly one per gap, never re-truncated) and the resume offset.
+fn truncation_resume_offsets(out: &str) -> Vec<u64> {
+    out.lines()
+        .filter_map(|l| l.trim().strip_prefix("truncated: resumed at offset "))
+        .filter_map(|rest| rest.split(',').next())
+        .filter_map(|tok| tok.trim().parse::<u64>().ok())
+        .collect()
+}
+
+/// Produces `n` records of `payload` to `addr` via the real `pub` binary, asserting each one is
+/// ACCEPTED (exit 0) and lands at the next contiguous offset starting from `base`. Under the
+/// drop-oldest policy every produce succeeds (force-reap makes room) rather than shedding, so a
+/// non-zero exit here would mean the drop-oldest path did not engage; the contiguous offsets prove
+/// none was lost. Kept out of the test body so the scenario reads as steps, not a produce loop.
+fn produce_contiguous(addr: &str, payload: &str, base: usize, n: usize) {
+    for i in 0..n {
+        let (out, code) = run(&["pub", "--addr", addr, payload]);
+        assert_eq!(
+            code, 0,
+            "drop-oldest accepts every produce (no shed): {out}"
+        );
+        assert_eq!(
+            out.trim(),
+            (base + i).to_string(),
+            "the durable log marched on under drop-oldest, no gaps: {out}"
+        );
+    }
 }
 
 /// Extracts the offsets from an offline `peek` / `dump` run's stdout. Each record prints a line
@@ -827,6 +874,161 @@ fn golden_path_overload_spills_then_sheds_at_the_byte_cap() {
     assert!(
         out.contains(&format!("fetched {} message(s)", accepted.len())),
         "exactly the accepted records were delivered, none extra: {out}"
+    );
+
+    drop(broker);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn golden_path_drop_oldest_truncates_a_stuck_consumer() {
+    // #133 step 8: under the disk-full DROP-OLDEST policy (#82), producing past the byte cap
+    // FORCE-reaps the oldest sealed segments to make room, even ones a slow consumer has not
+    // consumed. A consumer whose committed cursor falls below the oldest record still retained
+    // then gets EXACTLY ONE truncation on its next fetch (#84): its cursor resets up to the
+    // earliest retained offset, delivery resumes there, and the gap is closed so it never
+    // re-truncates. Drive the real binary end to end and assert the relationships, not a brittle
+    // exact offset (the resume offset depends on roll and reap timing): the truncation appears
+    // exactly once, its resume offset is above where the consumer was stuck (it skipped a reaped
+    // span), the consumer resumes AT that offset and makes progress, the server's force-reap
+    // counter advanced, and a later fetch sees no second truncation.
+    //
+    // Sizing the roll and the reap deterministically. The CLI floors `--max-segment-bytes` at
+    // 4096, so each record carries a ~956-byte payload (empty key and headers) for ~1000 record
+    // bytes on disk (36-byte header + 956 payload + 8-byte trailer = 1000), which seals a 4096-byte
+    // segment after ~4 records. A 7000-byte total cap (above one sealed segment, so at least one
+    // segment seals before the cap engages and a sealed segment is always available to force-reap)
+    // makes a steady producer trip the cap repeatedly; under drop-oldest every produce is ACCEPTED
+    // (force-reap makes room) rather than shed, and force-reaping marches the earliest retained
+    // offset well past the stuck consumer's cursor. Producing many more records makes the reaped
+    // span (and so the resume offset) comfortably exceed the stuck cursor on any timing.
+    const PAYLOAD_BYTES: usize = 956;
+    const EXTRA: usize = 60;
+    let payload = "a".repeat(PAYLOAD_BYTES);
+
+    let dir =
+        std::env::temp_dir().join(format!("ironbus-golden-dropoldest-{}", std::process::id()));
+    let data_dir = dir.to_str().expect("utf8 temp path").to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // 1. Boot the broker with drop-oldest, a small segment cap (records roll and seal), a small
+    //    total cap (producing more trips it), and the health endpoints (for /metrics). The base
+    //    helper already supplies the ephemeral wire and health ports and `--checkpoint-interval 1`.
+    let (broker, addr, health) = start_broker_with_health_args(
+        &data_dir,
+        &[
+            "--disk-full-policy",
+            "drop-oldest",
+            "--max-segment-bytes",
+            "4096",
+            "--max-total-bytes",
+            "7000",
+        ],
+    );
+
+    // 2. Produce the first record and consume ONLY it on group `stuck`, acking it so the group's
+    //    committed cursor advances to offset 1 and then STAYS there: we never fetch this group
+    //    again until after the reap, so it is stuck below the records about to be reaped.
+    let (out, code) = run(&["pub", "--addr", &addr, &payload]);
+    assert_eq!(code, 0, "first pub exit code: {out}");
+    assert_eq!(out.trim(), "0", "the first record lands at offset 0");
+    let (out, code) = run(&[
+        "sub", "--addr", &addr, "--group", "stuck", "--max", "1", "--ack",
+    ]);
+    assert_eq!(code, 0, "stuck consumer's first fetch exit code: {out}");
+    assert_eq!(
+        delivered_offsets(&out),
+        vec![0],
+        "the stuck consumer consumed exactly the first record: {out}"
+    );
+    assert!(
+        out.contains("ack committed"),
+        "the stuck consumer acked offset 0, so its committed cursor is now 1: {out}"
+    );
+    // It is stuck at the low cursor: it must NOT have truncated on this first, caught-up fetch.
+    assert_eq!(
+        truncation_resume_offsets(&out),
+        Vec::<u64>::new(),
+        "a caught-up consumer is not truncated: {out}"
+    );
+
+    // 3. Produce many more records (offsets 1.. under drop-oldest). Every produce is ACCEPTED (the
+    //    cap is made room for by force-reaping the oldest sealed segments) rather than shed, and the
+    //    offsets march contiguously: the helper asserts both, so none was lost.
+    produce_contiguous(&addr, &payload, 1, EXTRA);
+
+    // 4. Confirm the FORCE happened: the server's force-reap counter is above zero, proving
+    //    drop-oldest force-reaped sealed segments (including records the stuck group had not
+    //    consumed) rather than merely shedding. This is the non-vacuity anchor for the truncation.
+    let metrics = http_get(&health, "/metrics");
+    let force_reaped = metric_value(&metrics, "ironbus_segments_force_reaped_total")
+        .expect("/metrics exposes ironbus_segments_force_reaped_total");
+    assert!(
+        force_reaped > 0,
+        "drop-oldest force-reaped at least one sealed segment: {metrics}"
+    );
+
+    // 5. The stuck consumer fetches again on its group. Its committed cursor (1) is now below the
+    //    oldest retained record, so it gets EXACTLY ONE truncation: the cursor resets up to the
+    //    earliest retained offset, delivery resumes there, and the consumer makes progress.
+    let (out, code) = run(&[
+        "sub", "--addr", &addr, "--group", "stuck", "--max", "100", "--ack",
+    ]);
+    assert_eq!(
+        code, 0,
+        "the stuck consumer's resume fetch exit code: {out}"
+    );
+    let resumes = truncation_resume_offsets(&out);
+    assert_eq!(
+        resumes.len(),
+        1,
+        "exactly one truncation line on the resume fetch, never zero or repeated: {out}"
+    );
+    let resume = resumes[0];
+    // The resume offset is above where the consumer was stuck (committed 1): it skipped the reaped
+    // span [1, resume). This proves records the stuck group had not consumed were force-reaped.
+    assert!(
+        resume > 1,
+        "the resume offset is past the stuck cursor (1), so a span was skipped: {resume} in {out}"
+    );
+    // The consumer resumes AT the earliest retained offset: the first record it now delivers is
+    // exactly the truncation's resume offset (it did not silently skip past the oldest record).
+    let delivered = delivered_offsets(&out);
+    assert!(
+        !delivered.is_empty(),
+        "the consumer made progress after the truncation, delivering from the resume point: {out}"
+    );
+    assert_eq!(
+        delivered[0], resume,
+        "the consumer resumed exactly at the earliest retained offset it was told: {out}"
+    );
+    // The delivered offsets are contiguous from the resume point (it streams the retained tail in
+    // order, none dropped or doubled within the batch).
+    let expected_tail: Vec<u64> = (resume..resume + delivered.len() as u64).collect();
+    assert_eq!(
+        delivered, expected_tail,
+        "the resumed delivery is contiguous from the earliest retained offset: {out}"
+    );
+    assert!(
+        out.contains(&format!("fetched {} message(s)", delivered.len())),
+        "the fetched count matches the delivered records exactly: {out}"
+    );
+
+    // 6. It does NOT re-truncate: the reset closed the gap (committed == earliest retained), so a
+    //    further fetch on the same group delivers normally with NO second truncation line. The
+    //    stuck consumer acked the resumed batch above, so this fetch sees only whatever the live
+    //    log holds beyond it (possibly nothing, but never another truncation for the closed gap).
+    let (out, code) = run(&[
+        "sub", "--addr", &addr, "--group", "stuck", "--max", "100", "--ack",
+    ]);
+    assert_eq!(
+        code, 0,
+        "the stuck consumer's follow-up fetch exit code: {out}"
+    );
+    assert_eq!(
+        truncation_resume_offsets(&out),
+        Vec::<u64>::new(),
+        "no second truncation: the gap is closed after the one-time reset: {out}"
     );
 
     drop(broker);
