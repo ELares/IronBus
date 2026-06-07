@@ -397,6 +397,14 @@ could silently commit past. A consumer's slot frees on `Unsub`, a subscription s
 disconnect, so the next subscriber may take over. The single-consumer cumulative ack past the
 consumer's own in-flight leases stays valid.
 
+A broadcast group MUST be a NAMED group: the DEFAULT/empty group (`""`) can never be marked
+broadcast (#288). `serve --broadcast-group ""` is REFUSED at startup with the typed
+`EngineError::BroadcastGroupNotNamed`. The subscriber cap binds only a named group, but the
+default group's consumers reach it on the implicit default subscription and never SUB a name,
+so the cap could never bind them; an uncapped broadcast default group would let two pollers
+hold competing in-flight leases that a cumulative ack (with an empty group name) commits past,
+the same silent drop. So `--broadcast-group` marks a named group only.
+
 ---
 
 ## Config models

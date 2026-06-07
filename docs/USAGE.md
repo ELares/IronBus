@@ -81,7 +81,7 @@ resume" below), so it is NOT fsynced on every ack.
 | `--max-groups <n>` | `1024` | Cap on the number of live work-groups; a new named group past the cap is rejected (the default group is exempt and never counted). `0` means unlimited. |
 | `--disk-full-policy <drop-new\|drop-oldest>` | `drop-new` | What an over-cap produce does once `--max-total-bytes` is hit: `drop-new` sheds it (preserving older data); `drop-oldest` force-reaps the oldest sealed segment to make room, then accepts it. |
 | `--key-shared-group <name>` | none | Repeatable: declares a named competing group that runs in `key_shared` ordering, so a record's key routes to one live member and same-key records keep their order while the group drains in parallel across keys. Pass once per group. |
-| `--broadcast-group <name>` | none | Repeatable: marks a named group BROADCAST (a group-of-one that sees every record in order), so it accepts the `cumulative-ack` verb. Mutually exclusive with `key_shared`. Pass once per group. |
+| `--broadcast-group <name>` | none | Repeatable: marks a NAMED group BROADCAST (a group-of-one that sees every record in order), so it accepts the `cumulative-ack` verb. The group must be named: the default/empty group cannot be broadcast (`--broadcast-group ""` is a startup usage error). Mutually exclusive with `key_shared`. Pass once per group. |
 | `--visibility-timeout-ms <n>` | `30000` | How long a delivered message stays in flight before it may redeliver. Must be at least 1. The lease hard cap is the larger of 5 minutes and this. |
 | `--health-addr <host:port>` | off | If set, also serve the health and metrics HTTP endpoints on this loopback port. |
 
@@ -274,6 +274,12 @@ subscriber at a time, so a cumulative ack only ever commits past that single con
 in-flight leases. A second concurrent SUB to a broadcast group is rejected, and marking a
 group broadcast is refused if it already carries competing in-flight state. The slot frees on
 UNSUB or disconnect, so a replacement consumer can take over.
+
+`--broadcast-group` marks a NAMED group only: the default/empty group cannot be a broadcast
+group (`--broadcast-group ""` is a startup usage error). The group-of-one subscriber cap binds
+a named group's subscribers, but the default group's consumers reach it on the implicit default
+subscription and never SUB a name, so the cap could never bind them; an uncapped broadcast group
+would reopen the silent-drop path, so it is refused outright.
 
 ## Offline inspection
 

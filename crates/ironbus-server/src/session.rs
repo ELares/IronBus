@@ -1656,6 +1656,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_disconnect_frees_a_broadcast_groups_group_of_one_slot_over_the_wire() {
+        // LIVENESS over the wire (#288): the disconnect-deregister must FREE a broadcast group's
+        // group-of-one slot, not just an explicit UNSUB. A SUBs the broadcast group (taking the lone
+        // slot), A's connection DROPS, then B SUBs the SAME group and SUCCEEDS. Without the disconnect
+        // cleanup the slot would stay taken and B's SUB would be rejected `BroadcastGroupBusy`
+        // forever, bricking the group; this pins that a future refactor dropping the cleanup fails
+        // here. It exercises the real SUB frame path and the real per-connection disconnect cleanup
+        // (`leave_current_key_shared` + `leave_current_subscription`), the exact pair the connection
+        // handler runs on EVERY exit (clean close, timeout, or malformed frame) in `server.rs`.
+        let e = DirectEngine::new(engine());
+        for p in [&b"a"[..], b"b", b"c"] {
+            produce(&e, p);
+        }
+        e.with(|eng| eng.set_broadcast_in("g", true))
+            .unwrap()
+            .unwrap();
+        // Consumer A (member 1) subscribes: accepted, it is the lone subscriber.
+        let mut a = connect_and_sub(&e, MemberId::new(1), b"g");
+        assert_eq!(
+            e.with(|eng| eng.subscriber_count_in("g")).unwrap(),
+            1,
+            "A holds the group-of-one slot"
+        );
+        // A's connection DROPS. The server runs this exact cleanup pair on every connection exit
+        // (see `handle_connection`), so calling it here replays an abrupt disconnect, not a graceful
+        // UNSUB. Both are best-effort and idempotent.
+        a.leave_current_key_shared(&e).unwrap();
+        a.leave_current_subscription(&e).unwrap();
+        drop(a);
+        assert_eq!(
+            e.with(|eng| eng.subscriber_count_in("g")).unwrap(),
+            0,
+            "the disconnect freed the slot"
+        );
+        // Consumer B (member 2) subscribes to the SAME broadcast group: it now SUCCEEDS because the
+        // slot was freed on A's disconnect. (If the disconnect cleanup were removed, the slot would
+        // still be held by A and this SUB would answer a typed `BroadcastGroupBusy` Err instead.)
+        let mut b = Session::with_member_id(MemberId::new(2));
+        let mut out = Vec::new();
+        b.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        b.process(&e, &frame(FrameType::Sub, b"g"), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "B's SUB to the freed broadcast group succeeds"
+        );
+        assert_eq!(
+            e.with(|eng| eng.subscriber_count_in("g")).unwrap(),
+            1,
+            "B now holds the group-of-one slot"
+        );
+        // B (the new lone consumer) can drain every record in order: the group is live, not bricked.
+        let mut out = Vec::new();
+        b.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_payloads(&out),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "the freed group still delivers every record to its new lone consumer"
+        );
+    }
+
     /// Produces a keyed record through the engine, for the `key_shared` session tests.
     fn produce_keyed<C: Clock + Clone>(
         e: &DirectEngine<InMemoryFs, C>,

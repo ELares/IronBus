@@ -232,6 +232,20 @@ pub enum EngineError {
         /// The broadcast group that already has an active subscriber or unsafe competing state.
         group: String,
     },
+    /// A flip to broadcast ([`Engine::set_broadcast_in`] with `true`) named the DEFAULT/empty group
+    /// (`""`), which can never be a broadcast group (#288). The group-of-one safety the broadcast
+    /// cumulative ack rests on is enforced by the active-subscriber cap, but that cap binds only a
+    /// NAMED group: the default group's consumers reach it on the implicit default subscription and
+    /// never SUB a non-empty name, so they are never registered and never capped. Two connections
+    /// could then both poll the default subscription, hold competing in-flight leases, and a wire
+    /// `cumulative_ack` with an empty group name would commit past a peer's still-in-flight offset,
+    /// the same silent drop the cap exists to prevent. A broadcast group MUST therefore be a NAMED
+    /// group whose subscribers are capped; the flip is refused here so the uncapped default group can
+    /// never enter broadcast mode. The group's mode is left exactly as it was on rejection.
+    BroadcastGroupNotNamed {
+        /// The group name that was refused (the default/empty group, `""`).
+        group: String,
+    },
     /// A BROADCAST cumulative ack named an `up_to` offset OUTSIDE the durable, retained window
     /// (#288): either PAST the durable head (`up_to > flushed`, committing past records that do
     /// not exist yet, which a later truncation could never reconcile) or BELOW the earliest
@@ -278,6 +292,11 @@ impl core::fmt::Display for EngineError {
                 "broadcast group `{group}` is a group-of-one: it already has an active subscriber \
                  or competing in-flight state, so a second subscriber or a flip to broadcast is \
                  refused"
+            ),
+            EngineError::BroadcastGroupNotNamed { group } => write!(
+                f,
+                "the default/empty group `{group}` cannot be a broadcast group: only a NAMED group \
+                 has a capped subscriber set, so --broadcast-group marks a named group only"
             ),
             EngineError::CumulativeAckOutOfRange {
                 up_to,
@@ -2255,6 +2274,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// `CumulativeAck` frame, #288); negotiating broadcast on `Sub`/`Connect` is the #11 follow-up.
     ///
     /// # Errors
+    /// - [`EngineError::BroadcastGroupNotNamed`] when marking the DEFAULT/empty group (`""`)
+    ///   broadcast (`broadcast == true`). The default group's consumers never SUB a non-empty name,
+    ///   so the active-subscriber cap that makes a broadcast group a true group-of-one can never bind
+    ///   it; two connections could both poll the default subscription and a cumulative ack would
+    ///   commit past a peer's in-flight offset. A broadcast group must be a NAMED group whose
+    ///   subscribers are capped, so the flip is refused and the default group keeps its plain
+    ///   competing mode.
     /// - [`EngineError::InvalidGroupName`] or [`EngineError::TooManyGroups`] if a new group would
     ///   have to be created and fails the name or cap check.
     /// - [`EngineError::BroadcastGroupBusy`] when flipping an EXISTING group to broadcast
@@ -2266,6 +2292,20 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     ///   prior mode. Marking a FRESH or already-quiescent group broadcast (the configure-time
     ///   `--broadcast-group` path, before any consumer leases anything) is always allowed.
     pub fn set_broadcast_in(&mut self, group: &str, broadcast: bool) -> Result<(), EngineError> {
+        // Close the default-group bypass (#288): the DEFAULT/empty group (`""`) is pre-created at
+        // open, so `validate_group_name` (which the contains-key branch below would run) never runs
+        // for it, AND its consumers reach it on the implicit default subscription rather than a SUB,
+        // so the active-subscriber cap never registers (and never caps) them. A broadcast flip of the
+        // default group would therefore pass the flip guard while empty yet leave two competing
+        // pollers free to accrue in-flight leases that a later cumulative ack commits past: the same
+        // silent drop, uncapped. A group whose subscribers cannot be capped must never be broadcast,
+        // so the default/empty group is refused outright; `--broadcast-group` marks a NAMED group
+        // only. A flip to NON-broadcast (clearing the flag) is always safe, so it is not gated here.
+        if broadcast && group == DEFAULT_GROUP {
+            return Err(EngineError::BroadcastGroupNotNamed {
+                group: group.to_string(),
+            });
+        }
         if !self.groups.contains_key(group) {
             validate_group_name(group)?;
             if self.max_groups != 0 && self.groups.len() >= self.max_groups {
@@ -4222,6 +4262,59 @@ mod tests {
         .to_string();
         assert!(msg.contains("broadcast group"), "{msg}");
         assert!(msg.contains("group-of-one"), "{msg}");
+    }
+
+    #[test]
+    fn the_default_group_can_never_be_marked_broadcast() {
+        // The residual silent-loss bypass (#288): the DEFAULT/empty group (`""`) is pre-created at
+        // open and its consumers never SUB, so the active-subscriber cap never binds it. Marking it
+        // broadcast would leave two competing default-subscription pollers free to accrue in-flight
+        // leases that a cumulative ack (with an empty group name) commits past, the same silent drop,
+        // uncapped. So `set_broadcast_in("", true)` is REJECTED with a distinct typed error and the
+        // default group stays a plain competing work-group that still HARD-REJECTS a cumulative ack.
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b", b"c"] {
+            produce(&mut e, p);
+        }
+        // Even on a fresh, empty default group (the flip guard would otherwise pass), the flip is
+        // refused outright with the typed `BroadcastGroupNotNamed`, not `BroadcastGroupBusy`.
+        assert!(
+            matches!(
+                e.set_broadcast_in(DEFAULT_GROUP, true),
+                Err(EngineError::BroadcastGroupNotNamed { ref group }) if group.is_empty()
+            ),
+            "marking the default/empty group broadcast must be refused"
+        );
+        // The default group is NOT broadcast: a cumulative ack on it is still the #63 work-group
+        // HARD-REJECT, and nothing is committed past a (would-be) peer's in-flight offset.
+        assert!(!e.is_broadcast_in(DEFAULT_GROUP));
+        // Two competing pollers on the default subscription each hold an in-flight lease.
+        let d0 = message(e.poll(0).unwrap());
+        let _d1 = message(e.poll(0).unwrap());
+        assert_eq!(d0.offset, Offset::new(0));
+        assert!(matches!(
+            e.cumulative_ack(Offset::new(2)),
+            Err(EngineError::CumulativeAckOnWorkGroup)
+        ));
+        assert_eq!(
+            e.committed_offset(),
+            Offset::new(0),
+            "the default-group cumulative ack commits nothing: no silent drop"
+        );
+        // Clearing the (never-set) broadcast flag on the default group is always a safe no-op.
+        e.set_broadcast_in(DEFAULT_GROUP, false).unwrap();
+        assert!(!e.is_broadcast_in(DEFAULT_GROUP));
+    }
+
+    #[test]
+    fn the_broadcast_not_named_rejection_renders_a_distinct_message() {
+        // The default-group reject has a self-describing Display, distinct from the busy reject.
+        let msg = EngineError::BroadcastGroupNotNamed {
+            group: String::new(),
+        }
+        .to_string();
+        assert!(msg.contains("default/empty group"), "{msg}");
+        assert!(msg.contains("named group only"), "{msg}");
     }
 
     // A config with an explicit work-group cap (#240), so a test exercises the bound without

@@ -82,7 +82,7 @@ broker opens.
 | `--max-groups <n>` | usize | `1024` (`DEFAULT_MAX_GROUPS`, aliased to `ironbus_server::engine::DEFAULT_MAX_GROUPS`); `0` = unlimited | count | Cap on live work-groups. A new NAMED group past the cap is rejected; the default group is exempt and never counted. |
 | `--disk-full-policy <drop-new\|drop-oldest>` | enum | `drop-new` (`DEFAULT_DISK_FULL_POLICY`) | n/a | What an over-cap produce does once `--max-total-bytes` is hit. `drop-new` sheds it (preserving older data); `drop-oldest` force-reaps the oldest sealed segment to make room then accepts it. Any other value is a usage error. |
 | `--key-shared-group <name>` | string, REPEATABLE | none (empty) | n/a | Run the named competing group in `key_shared` ordering: a record's key routes to one live member, so same-key records keep order while the group drains in parallel across keys. Pass once per group; a group not named stays plain competing. |
-| `--broadcast-group <name>` | string, REPEATABLE | none (empty) | n/a | Mark the named group BROADCAST (#288): a group-of-one that sees every record in order, so it accepts the `cumulative-ack` verb. Mutually exclusive with `key_shared`. A broadcast group is enforced as a true group-of-one: it accepts AT MOST ONE active subscriber (a second concurrent SUB is rejected). Pass once per group; a group not named stays plain competing and rejects cumulative ack. A bad name or the group cap is a startup usage error. |
+| `--broadcast-group <name>` | string, REPEATABLE | none (empty) | n/a | Mark a NAMED group BROADCAST (#288): a group-of-one that sees every record in order, so it accepts the `cumulative-ack` verb. The group MUST be named: the DEFAULT/empty group (`--broadcast-group ""`) cannot be a broadcast group (its consumers never SUB a name, so the group-of-one subscriber cap could not bind it) and is rejected as a startup usage error. Mutually exclusive with `key_shared`. A broadcast group is enforced as a true group-of-one: it accepts AT MOST ONE active subscriber (a second concurrent SUB is rejected). Pass once per group; a group not named stays plain competing and rejects cumulative ack. An empty/bad name or the group cap is a startup usage error. |
 | `--visibility-timeout-ms <n>` | u64 | `30000` (`DEFAULT_VISIBILITY_MS`) | milliseconds | How long a delivered message stays in flight before it may redeliver. Must be at least 1. The lease hard cap is the larger of 5 minutes (`DEFAULT_HARD_CAP_MS = 300000`) and this. |
 | `--health-addr <host:port>` | string | off (not set) | host:port | If set, also serve `GET /healthz`, `/readyz`, and `/metrics` on this loopback HTTP port. |
 
@@ -258,7 +258,10 @@ HARD-REJECTS the verb for a competing or `key_shared` work-group (the cumulative
 trap), and rejects an `--up-to` past the durable head or below the earliest-retained offset;
 a re-ack at or below the current commit is an idempotent no-op success.
 
-A group is marked broadcast server-side with `serve --broadcast-group <name>`.
+A group is marked broadcast server-side with `serve --broadcast-group <name>`. The group must
+be NAMED: the default/empty group cannot be a broadcast group (`--broadcast-group ""` is a
+startup usage error), because its consumers never SUB a name and so the group-of-one
+subscriber cap could never bind them.
 
 | Flag | Type | Default | Notes |
 |------|------|---------|-------|

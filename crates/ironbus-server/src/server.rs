@@ -127,6 +127,12 @@ where
     // Deregister this connection's active subscription (#288) so a broadcast group's group-of-one
     // slot frees for the next subscriber on disconnect, not just on an explicit UNSUB. Best-effort,
     // like the key_shared leave: a no-op for an unsubscribed connection or a gone actor.
+    //
+    // This is a best-effort PLAIN call (not run from a Drop guard): a panic unwinding out of
+    // `connection_loop` would skip it and leak the registration, leaving the broadcast slot stuck
+    // `BroadcastGroupBusy`. That is the same panic-unwind exposure as the `leave_current_key_shared`
+    // cleanup directly above; there is no panic source in those lib paths today, so it is not a
+    // live bug, but a future panic-prone refactor of the loop must keep this on every exit path.
     let _ = session.leave_current_subscription(engine);
     let group = session.subscription().to_string();
     let _ = engine.with(move |e| {

@@ -2034,6 +2034,39 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn serve_with_an_empty_broadcast_group_is_a_clean_usage_error() {
+        // `serve --broadcast-group ""` names the DEFAULT/empty group, which can never be a broadcast
+        // group (#288): the active-subscriber cap that makes a broadcast group a group-of-one binds
+        // only a NAMED group, so the default group would be an uncapped broadcast group, the residual
+        // silent-loss bypass. The configure-time path must surface this as a clean startup USAGE
+        // error, NOT a panic. `open_disk_engine` maps the engine's typed reject to `CliError::Usage`.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ironbus-cli-bcast-empty-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let broadcast_groups = vec![String::new()];
+        let err = open_disk_engine(&dir, &test_serve_config(64, 1), &[], &broadcast_groups)
+            .err()
+            .expect("an empty --broadcast-group must be refused, not opened");
+        match err {
+            CliError::Usage(msg) => {
+                assert!(
+                    msg.contains("--broadcast-group") && msg.contains("named group only"),
+                    "the usage error names the cause: {msg}"
+                );
+            }
+            other => panic!("expected a clean Usage error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn peek_shows_a_window_of_records() {
         let dir = make_data_dir("peek", 5);
         let mut buf = Vec::new();
