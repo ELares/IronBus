@@ -72,6 +72,26 @@ pub struct EngineConfig {
     /// The max-ack-pending window: at most this many offsets above the committed cursor
     /// may be in flight at once. Bounds in-flight work and the poll scan.
     pub max_in_flight: u32,
+    /// The per-CONSUMER (per-connection) standing in-flight credit (refs #65, #9, #10): the most
+    /// un-acked messages a single connection may hold at once, independent of the per-GROUP
+    /// `max_in_flight` window. It is the consumer-side half of credit-based flow control (MQTT
+    /// Receive Maximum / `JetStream` `MaxAckPending`): a Flow fetch delivers at most
+    /// `min(requested_credit, ceiling - already_held, whatever the group makes available)`, so the
+    /// EFFECTIVE bound is the min of the producer-side group window and this consumer ceiling.
+    ///
+    /// Enforced per session (one connection), not per group, so in a competing group one slow
+    /// consumer that fills its own ceiling and stops acking pins ONLY its own credit and cannot
+    /// reduce a peer's available deliveries (the per-consumer isolation from #10). A consumer at
+    /// zero remaining credit gets zero deliveries from a Flow until it acks, nacks, terms, or one
+    /// of its leases expires and is redelivered elsewhere, freeing the slot.
+    ///
+    /// The default is a small, memory-justified number ([`DEFAULT_CONSUMER_CREDIT`] = 64), NOT the
+    /// MQTT absent-value 65535: at the #19 working point (10k msg/s x 5 ms service = 50 in-flight by
+    /// Little's Law) 64 gives ~28% headroom. A value of `0` is treated as 1 (a hard floor of one, so
+    /// a consumer always makes progress) by [`Engine::open`]. Per-consumer BYTE budgets and the
+    /// `max_deliver`-to-DLQ poison cap are tracked separately (the byte budget is a #65 follow-up;
+    /// the poison cap already lives in [`DeliveryConfig`]).
+    pub consumer_credit: u32,
     /// Checkpoint the committed cursor after it advances at least this many offsets since the
     /// last checkpoint, bounding how many messages a crash redelivers. A value of 0 is treated
     /// as 1 (checkpoint on every advance). A clean disconnect also flushes the cursor.
@@ -325,6 +345,13 @@ pub struct GroupConsumerStat {
 /// persisted in `cursor.ckpt`. Named groups (#9) are independent in-memory cursors.
 const DEFAULT_GROUP: &str = "";
 
+/// The default per-consumer in-flight credit (refs #65, #10): the most un-acked messages one
+/// connection may hold at once before a Flow stops delivering to it. A small, memory-justified
+/// number (NOT the MQTT absent-value 65535): by Little's Law at the #19 working point (10k msg/s
+/// x 5 ms service = 50 concurrent) 64 leaves ~28% headroom for variance. See
+/// [`EngineConfig::consumer_credit`].
+pub const DEFAULT_CONSUMER_CREDIT: u32 = 64;
+
 /// The most work-groups one engine holds at once, including the durable default (#240):
 /// bounds total consumer-state memory once the wire can name groups, so an unauthenticated
 /// client cannot exhaust memory by naming endless groups.
@@ -497,6 +524,12 @@ pub struct Engine<F: Filesystem, C: Clock> {
     lease_config: LeaseConfig,
     delivery: DeliveryConfig,
     max_in_flight: u32,
+    /// The per-CONSUMER (per-connection) standing in-flight credit ceiling (refs #65, #9, #10),
+    /// floored to 1 at open. The engine itself does NOT decrement it (the engine is shared by
+    /// every connection and has no per-connection identity); it advertises this ceiling to each
+    /// [`crate::session::Session`], which tracks its own remaining credit against its
+    /// connection-scoped `leased` set (#175). See [`EngineConfig::consumer_credit`].
+    consumer_credit: u32,
     checkpoint: Checkpoint<F::File>,
     checkpoint_interval: u64,
     /// The consumer-safe retention bounds (size, age, count) the produce path enforces against the
@@ -635,6 +668,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             lease_config: config.lease,
             delivery: config.delivery,
             max_in_flight: config.max_in_flight,
+            // Floor the per-consumer credit to 1 (#65): a zero ceiling would deliver nothing to any
+            // connection, wedging every consumer. The hard floor of one guarantees forward progress.
+            consumer_credit: config.consumer_credit.max(1),
             checkpoint,
             checkpoint_interval: config.checkpoint_interval,
             retention: RetentionBounds {
@@ -1384,6 +1420,42 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.groups.values().map(|g| g.leases.in_flight()).sum()
     }
 
+    /// The per-CONSUMER (per-connection) standing in-flight credit ceiling (refs #65, #9, #10):
+    /// the most un-acked messages one connection may hold at once. Already floored to at least 1.
+    /// A [`crate::session::Session`] reads this once and enforces it against its own
+    /// connection-scoped `leased` set (#175); the engine is shared by every connection and so does
+    /// not itself decrement per-connection credit. The effective delivery bound on a Flow is the
+    /// MIN of this ceiling and the per-group `max_in_flight` window. See
+    /// [`EngineConfig::consumer_credit`].
+    #[must_use]
+    pub fn consumer_credit(&self) -> u32 {
+        self.consumer_credit
+    }
+
+    /// Whether `token` still names an ACTIVE (live and NOT yet expired) lease in `group` owned by
+    /// exactly this `(offset, generation)` at the engine's current monotonic time (refs #65, #175):
+    /// `true` only if the offset is currently leased, its generation matches the token, AND its
+    /// visibility window has not elapsed. It is `false` once the lease was acked, nacked, termed, or
+    /// redelivered under a new generation (a generation mismatch), AND also once the lease has merely
+    /// EXPIRED (the deadline has passed) even though its generation still matches, because an expired
+    /// lease is reclaimable and no longer actively held by its current holder. It is `false` for an
+    /// unknown group.
+    ///
+    /// A [`crate::session::Session`] uses this to keep its per-consumer credit consistent with true,
+    /// ACTIVE ownership: a `leased` entry the engine no longer holds actively is a slot the session
+    /// must free, because the message it once held has been committed, redelivered elsewhere, or has
+    /// expired (so it is about to be redelivered to whoever next polls, possibly the same consumer).
+    /// This is the redelivery-accounting seam that frees the original consumer's slot the moment one
+    /// of its leases expires, so the redelivery is recounted against whoever next claims it. It reads
+    /// the engine clock seam and never mutates engine state.
+    #[must_use]
+    pub fn holds_active_lease_in(&self, group: &str, token: &LeaseToken) -> bool {
+        let now = self.log.now_monotonic();
+        self.groups
+            .get(group)
+            .is_some_and(|g| g.leases.holds_active(token, now))
+    }
+
     /// Per-work-group consumer stats for the metrics endpoint (#16): committed offset and
     /// in-flight depth for each group, so an operator sees lag broken down by cursor (#15).
     /// The lag itself is derived against the durable head ([`Engine::flushed_offset`]).
@@ -1432,6 +1504,7 @@ mod tests {
             },
             delivery: DeliveryConfig::new(max_deliver, false, vec![]).unwrap(),
             max_in_flight,
+            consumer_credit: DEFAULT_CONSUMER_CREDIT,
             checkpoint_interval: 1024,
             max_retained_bytes: 0,
             max_age_ms: 0,

@@ -166,6 +166,7 @@ mod tests {
             lease: LeaseConfig::default(),
             delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
             max_in_flight: 16,
+            consumer_credit: 64,
             checkpoint_interval: 1024,
             max_retained_bytes: 0,
             max_age_ms: 0,

@@ -599,6 +599,19 @@ mod tests {
         Arc<AtomicBool>,
         std::thread::JoinHandle<()>,
     ) {
+        start_server_with_credit(64)
+    }
+
+    /// Starts an in-process broker with an explicit per-consumer `consumer_credit`, for the #65
+    /// credit tests; the roomy `max_in_flight` of 16 keeps the per-group window from being the
+    /// binding bound for the small credits these tests use.
+    fn start_server_with_credit(
+        consumer_credit: u32,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
         let engine = Engine::open(
             InMemoryFs::new(),
             SystemClock::new(),
@@ -607,6 +620,7 @@ mod tests {
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
                 max_in_flight: 16,
+                consumer_credit,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
@@ -1046,6 +1060,106 @@ mod tests {
             ProgressOutcome::Fenced
         );
         assert!(!c.term(msgs[1].offset, msgs[1].generation).unwrap());
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_fetch_is_capped_at_the_per_consumer_credit_over_a_real_server() {
+        // End to end (#65): with a broker per-consumer credit of 3, a single client fetching with a
+        // huge requested credit gets at most 3 un-acked at once, then nothing until it acks. Acking
+        // frees the slots so the next fetch delivers again. The default 30s visibility means nothing
+        // redelivers within the test, so a non-empty second fetch can only come from freed credit.
+        let (addr, shutdown, handle) = start_server_with_credit(3);
+        let mut producer = Client::connect(addr).unwrap();
+        for _ in 0..10 {
+            producer
+                .produce(&PubBody {
+                    flags: 0,
+                    timestamp_ms: 0,
+                    key: b"",
+                    headers: b"",
+                    payload: b"m",
+                })
+                .unwrap();
+        }
+        let mut c = Client::connect(addr).unwrap();
+        let first = c.fetch(1000).unwrap().messages;
+        assert_eq!(
+            first.len(),
+            3,
+            "the per-consumer credit of 3 caps the fetch, not the requested 1000"
+        );
+        // Saturated: a second fetch gets nothing while the 3 stay un-acked.
+        assert!(
+            c.fetch(1000).unwrap().messages.is_empty(),
+            "a saturated consumer gets nothing until it acks"
+        );
+        // Ack all three: the slots free.
+        for m in &first {
+            assert!(c.ack(m.offset, m.generation).unwrap());
+        }
+        let second = c.fetch(1000).unwrap().messages;
+        assert_eq!(
+            second.len(),
+            3,
+            "acking the three freed the credit for three more"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn one_stuck_consumer_does_not_starve_a_peer_over_a_real_server() {
+        // THE core property end to end (#65, isolation from #10): two clients in the SAME default
+        // competing group, each with a per-consumer credit of 2. Client A fetches its full credit
+        // and never acks (stuck). Client B still receives its full credit of 2; A's held leases do
+        // not consume B's budget. The roomy group window (16) is not the binding bound, so the only
+        // bound is each consumer's own credit.
+        let (addr, shutdown, handle) = start_server_with_credit(2);
+        let mut producer = Client::connect(addr).unwrap();
+        for _ in 0..8 {
+            producer
+                .produce(&PubBody {
+                    flags: 0,
+                    timestamp_ms: 0,
+                    key: b"",
+                    headers: b"",
+                    payload: b"m",
+                })
+                .unwrap();
+        }
+        let mut a = Client::connect(addr).unwrap();
+        let mut b = Client::connect(addr).unwrap();
+        // A fills its credit and goes stuck (never acks).
+        let a_msgs = a.fetch(1000).unwrap().messages;
+        assert_eq!(a_msgs.len(), 2, "A holds its full credit of 2");
+        assert!(a.fetch(1000).unwrap().messages.is_empty(), "A is saturated");
+        // B still gets its full credit of 2: A's stuck leases did not starve it.
+        let b_msgs = b.fetch(1000).unwrap().messages;
+        assert_eq!(
+            b_msgs.len(),
+            2,
+            "B receives its full credit; the stuck consumer A did not reduce it"
+        );
+        // The competing group hands each message to one member, so A and B hold disjoint offsets.
+        let a_offsets: std::collections::BTreeSet<u64> = a_msgs.iter().map(|m| m.offset).collect();
+        let b_offsets: std::collections::BTreeSet<u64> = b_msgs.iter().map(|m| m.offset).collect();
+        assert!(
+            a_offsets.is_disjoint(&b_offsets),
+            "A and B hold disjoint offsets: {a_offsets:?} vs {b_offsets:?}"
+        );
+        // B keeps draining at its full credit while A stays stuck forever.
+        for m in &b_msgs {
+            assert!(b.ack(m.offset, m.generation).unwrap());
+        }
+        assert_eq!(
+            b.fetch(1000).unwrap().messages.len(),
+            2,
+            "B keeps making progress while A holds its slots"
+        );
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();

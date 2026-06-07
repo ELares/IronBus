@@ -63,6 +63,13 @@ const DEFAULT_MAX_CONNECTIONS: usize = 256;
 /// The default max-ack-pending window for `serve`.
 const DEFAULT_MAX_IN_FLIGHT: u32 = 1024;
 
+/// The default per-CONSUMER (per-connection) in-flight credit for `serve` (#65): the most un-acked
+/// messages one connection may hold at once, the consumer-side half of credit-based flow control.
+/// The effective Flow bound is min(this, the per-group `--max-in-flight` window). A small,
+/// memory-justified number (64, NOT 65535), matching the engine's `DEFAULT_CONSUMER_CREDIT`, so
+/// the CLI default and the engine default agree. Floored to 1 by the engine.
+const DEFAULT_CONSUMER_CREDIT: u32 = 64;
+
 /// The default segment size cap for `serve` (64 MiB, matching the storage default).
 const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -158,6 +165,7 @@ ironbus: a durable edge message queue.
 USAGE:
     ironbus serve --data-dir <dir> [--addr <host:port>] [--max-connections <n>]
                   [--checkpoint-interval <n>] [--max-deliver <n>] [--max-in-flight <n>]
+                  [--consumer-credit <n>]
                   [--max-segment-bytes <n>] [--max-total-bytes <bytes>]
                   [--max-retained-bytes <bytes>] [--max-age-ms <ms>] [--max-messages <n>]
                   [--disk-full-policy <drop-new|drop-oldest>]
@@ -171,6 +179,10 @@ USAGE:
 
 Notes:
     The default address is 127.0.0.1:7777 (loopback only).
+    --max-in-flight bounds the per-GROUP in-flight (max-ack-pending) window; --consumer-credit
+    (default 64) bounds the per-CONNECTION un-acked set, so in a competing group one stuck
+    consumer cannot consume a peer's budget. A fetch delivers min(requested, consumer credit,
+    group window).
     Retention reaps whole old, fully-consumed sealed segments under three composable, consumer-safe
     bounds, each 0 = off (the default): --max-retained-bytes (durable record bytes),
     --max-age-ms (a segment whose newest record is older than this many milliseconds), and
@@ -558,6 +570,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut checkpoint_interval = DEFAULT_CHECKPOINT_INTERVAL;
     let mut max_deliver = DEFAULT_MAX_DELIVER;
     let mut max_in_flight = DEFAULT_MAX_IN_FLIGHT;
+    let mut consumer_credit = DEFAULT_CONSUMER_CREDIT;
     let mut max_segment_bytes = DEFAULT_MAX_SEGMENT_BYTES;
     let mut max_total_bytes = DEFAULT_MAX_TOTAL_BYTES;
     let mut max_retained_bytes = DEFAULT_MAX_RETAINED_BYTES;
@@ -579,6 +592,9 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             }
             "--max-deliver" => max_deliver = take_number("--max-deliver", args, &mut i)?,
             "--max-in-flight" => max_in_flight = take_number("--max-in-flight", args, &mut i)?,
+            "--consumer-credit" => {
+                consumer_credit = take_number("--consumer-credit", args, &mut i)?;
+            }
             "--max-segment-bytes" => {
                 max_segment_bytes = take_number("--max-segment-bytes", args, &mut i)?;
             }
@@ -623,6 +639,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         checkpoint_interval,
         max_deliver,
         max_in_flight,
+        consumer_credit,
         max_segment_bytes,
         max_total_bytes,
         max_retained_bytes,
@@ -665,6 +682,14 @@ fn validate_serve_config(config: &ServeConfig) -> Result<(), CliError> {
             "`--max-in-flight` must be at least 1".to_string(),
         ));
     }
+    if config.consumer_credit == 0 {
+        // A zero per-consumer credit would deliver nothing to any connection (#65). The engine
+        // floors it to 1, but reject it loudly here so a typo is caught before the broker opens
+        // rather than silently behaving as a credit of 1.
+        return Err(CliError::Usage(
+            "`--consumer-credit` must be at least 1".to_string(),
+        ));
+    }
     if config.max_segment_bytes < MIN_MAX_SEGMENT_BYTES {
         return Err(CliError::Usage(format!(
             "`--max-segment-bytes` must be at least {MIN_MAX_SEGMENT_BYTES} (smaller caps make \
@@ -688,6 +713,11 @@ struct ServeConfig {
     checkpoint_interval: u64,
     max_deliver: u32,
     max_in_flight: u32,
+    /// Per-CONSUMER (per-connection) standing in-flight credit (#65): the most un-acked messages one
+    /// connection may hold at once, the consumer-side half of credit-based flow control. The
+    /// effective Flow bound is min(this, the per-group `max_in_flight` window). Default 64 (NOT
+    /// 65535), floored to 1 by the engine.
+    consumer_credit: u32,
     max_segment_bytes: u64,
     /// Hard durable-log total byte cap, the drop-new shed backstop (#10). `0` means unlimited
     /// (the cap is off), which is the default and preserves the spill-by-default behavior.
@@ -781,6 +811,7 @@ fn cmd_serve(
         config.checkpoint_interval,
         config.max_deliver,
         config.max_in_flight,
+        config.consumer_credit,
         config.max_segment_bytes,
         config.max_total_bytes,
         config.max_retained_bytes,
@@ -824,6 +855,11 @@ fn open_disk_engine(
             lease: LeaseConfig::from_millis(visibility_ms, visibility_ms.max(DEFAULT_HARD_CAP_MS)),
             delivery,
             max_in_flight: config.max_in_flight,
+            // The per-CONSUMER (per-connection) standing in-flight credit (#65): the most un-acked
+            // messages one connection may hold, the consumer-side half of credit-based flow control.
+            // The effective Flow bound is min(this, the per-group max_in_flight window). Floored to
+            // 1 by the engine. Default 64 (NOT 65535), memory-justified by Little's Law (#19).
+            consumer_credit: config.consumer_credit,
             checkpoint_interval: config.checkpoint_interval,
             // Consumer-safe retention (#13, #80), each `0` = disabled (off), the default. Size in
             // record bytes, age in milliseconds (against the engine clock), count in messages; the
@@ -1220,6 +1256,7 @@ mod tests {
             checkpoint_interval,
             max_deliver: DEFAULT_MAX_DELIVER,
             max_in_flight,
+            consumer_credit: DEFAULT_CONSUMER_CREDIT,
             max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
             max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
             max_retained_bytes: DEFAULT_MAX_RETAINED_BYTES,
@@ -1413,6 +1450,7 @@ mod tests {
                 },
                 delivery: DeliveryConfig::new(1, false, Vec::new()).unwrap(), // max_deliver = 1
                 max_in_flight: 16,
+                consumer_credit: 64,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
@@ -1569,6 +1607,7 @@ mod tests {
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, Vec::new()).unwrap(),
                 max_in_flight: 16,
+                consumer_credit: 64,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
@@ -1821,6 +1860,30 @@ mod tests {
         assert_eq!(e.exit_code(), EXIT_USAGE);
         match e {
             CliError::Usage(m) => assert!(m.contains("at least 1"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_rejects_a_zero_consumer_credit() {
+        // #65: a zero per-consumer credit would deliver nothing to any connection; reject it as a
+        // usage error before the broker opens (the engine also floors it to 1, but a typo is caught
+        // here loudly rather than silently behaving as 1).
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-cli-cc0-never-created".to_string(),
+                "--consumer-credit".to_string(),
+                "0".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--consumer-credit"), "{m}"),
             other => panic!("expected Usage, got {other:?}"),
         }
     }
@@ -2203,6 +2266,7 @@ mod tests {
                 lease: LeaseConfig::from_millis(50, 300_000),
                 delivery: DeliveryConfig::new(1, false, Vec::new()).unwrap(),
                 max_in_flight: 16,
+                consumer_credit: 64,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
@@ -2271,6 +2335,7 @@ mod tests {
                 lease: LeaseConfig::from_millis(30_000, 300_000),
                 delivery: DeliveryConfig::new(5, false, Vec::new()).unwrap(),
                 max_in_flight: 2,
+                consumer_credit: 64,
                 checkpoint_interval: 1024,
                 max_retained_bytes: 0,
                 max_age_ms: 0,
