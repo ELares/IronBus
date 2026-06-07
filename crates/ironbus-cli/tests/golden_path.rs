@@ -19,10 +19,12 @@
 //! this whole acceptance test is gated to Unix.
 #![cfg(unix)]
 
+use ironbus_client::Client;
+use ironbus_proto::message::PubBody;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The built `ironbus` binary (Cargo sets this for the crate's integration tests).
 const BIN: &str = env!("CARGO_BIN_EXE_ironbus");
@@ -1032,5 +1034,186 @@ fn golden_path_drop_oldest_truncates_a_stuck_consumer() {
     );
 
     drop(broker);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Boots `ironbus serve` like [`start_broker`] but with a LARGE `--checkpoint-interval`, so the
+/// per-ack `maybe_checkpoint` never fires within the test. Returns the raw `Child` (NOT a
+/// `ChildGuard`, so the caller can SIGTERM it and read its exit status without the guard's
+/// drop-time SIGKILL) and the bound wire address. With a large interval the committed cursor can
+/// become durable ONLY via a connection's clean-disconnect close-path flush or the new
+/// graceful-shutdown flush, which is exactly what the shutdown test isolates.
+fn start_broker_large_interval(data_dir: &str) -> (Child, String) {
+    let mut child = Command::new(BIN)
+        .args([
+            "serve",
+            "--data-dir",
+            data_dir,
+            "--addr",
+            "127.0.0.1:0",
+            // Far above the three acks below, so no interval checkpoint ever runs in this test.
+            "--checkpoint-interval",
+            "1000000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ironbus serve");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let n = BufReader::new(stdout).read_line(&mut line).unwrap_or(0);
+        let _ = tx.send((n, line));
+    });
+    let (n, line) = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("ironbus serve did not print a listening line within 10s: {e}");
+        }
+    };
+    if n == 0 {
+        let mut err = String::new();
+        if let Some(mut se) = child.stderr.take() {
+            let _ = se.read_to_string(&mut err);
+        }
+        let _ = child.wait();
+        panic!("ironbus serve exited before it listened: {err}");
+    }
+    let Some(addr) = line
+        .split("listening on ")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .map(str::trim)
+    else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("could not parse the listening line: {line:?}");
+    };
+    (child, addr.to_string())
+}
+
+/// Sends SIGTERM to `pid` via the `kill` binary (std-only; the test crate pulls no signal crate),
+/// modeling an operator's `systemctl stop` / `kill <pid>`. The broker's `ctrlc` handler flips the
+/// serve loop's shutdown flag, which its non-blocking accept observes within ~50 ms.
+fn send_sigterm(pid: u32) {
+    let status = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("run kill -TERM");
+    assert!(status.success(), "kill -TERM {pid} succeeded");
+}
+
+/// Waits up to `deadline` for `child` to exit, returning its exit code. SIGKILLs and fails the test
+/// if it does not exit in time, so a broker that ignores SIGTERM cannot hang the suite.
+fn wait_for_exit(child: &mut Child, deadline: Duration) -> i32 {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("poll the broker's exit status") {
+            return status.code().unwrap_or(-1);
+        }
+        if start.elapsed() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("broker did not exit within {deadline:?} of SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn graceful_shutdown_on_sigterm_checkpoints_the_cursor_and_does_not_redeliver() {
+    // #195: a clean operator stop (SIGTERM) must flush the committed cursor so a restart does NOT
+    // redeliver acked messages. This isolates the GRACEFUL-SHUTDOWN flush specifically: the broker
+    // runs with a huge --checkpoint-interval (so the per-ack interval checkpoint never fires), and
+    // the consumer is STILL CONNECTED when the signal arrives (so the clean-disconnect close-path
+    // checkpoint never fires either). The ONLY path that can persist the cursor here is the new
+    // signal handler's checkpoint-all-groups on the way out. Without it the restart would redeliver
+    // the three acked messages; with it the restart resumes past them. Drives the real binary end to
+    // end over the real #11 client.
+    let dir = std::env::temp_dir().join(format!("ironbus-graceful-{}", std::process::id()));
+    let data_dir = dir.to_str().expect("utf8 temp path").to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // 1. Boot the broker with a large checkpoint interval (no interval checkpoint will run).
+    let (mut broker, addr) = start_broker_large_interval(&data_dir);
+
+    // 2. Open ONE long-lived connection. Produce three messages, fetch all three, ack all three.
+    //    The client stays connected past the acks, so no clean-disconnect flush fires.
+    let mut client = Client::connect(&addr).expect("connect to the broker");
+    for payload in [b"m0".as_slice(), b"m1", b"m2"] {
+        client
+            .produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                payload,
+            })
+            .expect("produce");
+    }
+    let fetched = client.fetch(10).expect("fetch the batch");
+    assert_eq!(
+        fetched.messages.len(),
+        3,
+        "all three messages were delivered before the shutdown"
+    );
+    for m in &fetched.messages {
+        assert!(
+            client.ack(m.offset, m.generation).expect("ack"),
+            "the ack committed (offset {})",
+            m.offset
+        );
+    }
+
+    // 3. SIGTERM the broker while the consumer is STILL CONNECTED (the client is not dropped). The
+    //    handler flips the shutdown flag; the serve loop stops accepting and flushes every cursor.
+    send_sigterm(broker.id());
+
+    // 4. The broker exits cleanly: a graceful, signalled shutdown is exit code 0.
+    let code = wait_for_exit(&mut broker, Duration::from_secs(10));
+    assert_eq!(code, 0, "a SIGTERM graceful shutdown exits 0");
+
+    // Now the connection is moot (the broker is gone); release it.
+    drop(client);
+
+    // 5. Restart on the SAME data dir. If the shutdown flush persisted the cursor at 3, a fresh
+    //    fetch sees NOTHING; if the cursor was lost, the three acked messages redeliver here.
+    let (mut broker2, addr2) = start_broker_large_interval(&data_dir);
+    let mut client2 = Client::connect(&addr2).expect("reconnect after restart");
+    let resumed = client2.fetch(10).expect("fetch after restart");
+    assert!(
+        resumed.messages.is_empty(),
+        "the graceful shutdown flushed the cursor, so the acked messages did NOT redeliver; \
+         got {} message(s) back: {:?}",
+        resumed.messages.len(),
+        resumed
+            .messages
+            .iter()
+            .map(|m| m.offset)
+            .collect::<Vec<_>>(),
+    );
+
+    // 6. The durable log still continues from offset 3 (the records were fsynced before their
+    //    offsets were returned), proving the data dir is intact, not wiped.
+    let next = client2
+        .produce(&PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            payload: b"m3",
+        })
+        .expect("produce after restart");
+    assert_eq!(
+        next, 3,
+        "the durable log continued across the graceful restart"
+    );
+
+    drop(client2);
+    let _ = broker2.kill();
+    let _ = broker2.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }

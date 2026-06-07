@@ -864,6 +864,28 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         }
     }
 
+    /// Forces a durable checkpoint of EVERY live work-group's committed cursor (the default group
+    /// and every named group), so a clean operator shutdown persists all cursors before exit and a
+    /// restart does not redeliver acked messages (refs #195). Each group is checkpointed via
+    /// [`Engine::checkpoint_group`], which is a no-op for a group whose watermark has not advanced
+    /// since its last checkpoint (and skips the in-memory-only named groups whose durable per-group
+    /// state is #60). Unlike [`Engine::maybe_checkpoint_group`] this is not interval-gated: it is the
+    /// final flush a SIGTERM/SIGINT handler triggers, where a few extra checkpoint writes are cheap
+    /// against the cost of redelivering already-acked messages. On the first per-group write error it
+    /// stops and propagates, so a disk failure is surfaced rather than swallowed.
+    ///
+    /// # Errors
+    /// Propagates the first storage error from writing a group's checkpoint.
+    pub fn checkpoint_all_groups(&mut self) -> Result<(), EngineError> {
+        // Snapshot the names first so the checkpoint calls (which take `&mut self`) do not borrow
+        // the live `groups` map across the loop.
+        let names: Vec<String> = self.groups.keys().cloned().collect();
+        for name in names {
+            self.checkpoint_group(&name)?;
+        }
+        Ok(())
+    }
+
     /// Writes a named work-group's cursor snapshot to its `cursor-<hex>.ckpt`, creating the file
     /// (and syncing the directory) on first use. The checkpoint file is reopened per write so
     /// the crash-safe two-slot sequence continues correctly.
@@ -2111,6 +2133,46 @@ mod tests {
             delivered,
             vec![(2, b"c".to_vec())],
             "only the uncommitted tail redelivers"
+        );
+    }
+
+    #[test]
+    fn checkpoint_all_groups_flushes_every_live_group_for_a_graceful_shutdown() {
+        // #195: the graceful-shutdown flush must persist EVERY live work-group's committed cursor
+        // (the default group and every named group), so a restart after a clean stop redelivers
+        // nothing. The checkpoint interval is the default 1024, so a single ack per group does NOT
+        // trigger any interval checkpoint; only checkpoint_all_groups makes the cursors durable.
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b", b"c"] {
+            produce(&mut e, p);
+        }
+        // Default group: consume and ack offset 0 (committed = 1), no interval checkpoint fires.
+        let d_default = message(e.poll(0).unwrap());
+        assert_eq!(e.ack(&d_default.token), AckResult::Acked);
+        // Named group "work": consume and ack offsets 0 and 1 (its committed = 2), independently.
+        for _ in 0..2 {
+            let d = message(e.poll_in("work", 0).unwrap());
+            assert_eq!(e.ack_in("work", &d.token), AckResult::Acked);
+        }
+        assert_eq!(e.committed_offset(), Offset::new(1));
+        assert_eq!(e.committed_offset_in("work"), Offset::new(2));
+
+        // The single graceful-shutdown flush persists both groups' cursors at once.
+        e.checkpoint_all_groups().unwrap();
+        let fs = e.into_filesystem();
+
+        // Reopen: BOTH cursors resumed from where they were acked, so neither group redelivers an
+        // acked message. The default group resumes at 1, the named group at 2.
+        let e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(
+            e.committed_offset(),
+            Offset::new(1),
+            "checkpoint_all_groups flushed the default group's cursor"
+        );
+        assert_eq!(
+            e.committed_offset_in("work"),
+            Offset::new(2),
+            "checkpoint_all_groups flushed the named group's cursor too"
         );
     }
 
