@@ -408,6 +408,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-free-check"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "syn",
+]
+
+[[package]]
 name = "ironbus-bench"
 version = "0.0.0"
 dependencies = [

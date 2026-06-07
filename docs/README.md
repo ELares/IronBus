@@ -2,6 +2,8 @@
 
 This directory holds the architecture and design diagrams for IronBus, rendered as PDFs. They are a visual companion to the design issues; the GitHub issues remain the canonical, authoritative design record. Each diagram is committed both as a Graphviz source (`.dot`) and a rendered `.pdf`, so anyone can regenerate them.
 
+For the byte-level data-model reference (the on-disk, wire, config, runtime, and report contracts derived from and cross-checked against the source), see [CONTRACTS.md](CONTRACTS.md).
+
 Regenerate all PDFs:
 
 ```sh
@@ -21,6 +23,10 @@ for f in *.dot; do dot -Tpdf "$f" -o "${f%.dot}.pdf"; done
 | 06 | [WAL and segment lifecycle](diagrams/06-wal-segment-lifecycle.pdf) | How the log-is-WAL files are sealed, retained, and retired, and which background actor owns each step | #135, #4, #7, #13, #10 |
 | 07 | [CLI command tree](diagrams/07-cli-command-tree.pdf) | The full command surface of the single binary, color-coded by online versus offline | #136, #15 |
 | 08 | [Contract models](diagrams/08-contract-models-er.pdf) | The on-disk, wire, config, runtime, and report schemas and their relationships | #137, #5, #11 |
+
+## Reference docs
+
+- [Invariants and glossary](INVARIANTS.md): the shared invariants every subsystem must hold (I1 to I8), the resilience invariant checkers, and the canonical glossary of load-bearing terms, each cross-checked against the code (#131).
 
 ## Notes
 

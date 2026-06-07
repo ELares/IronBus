@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+# `crates/*` are the shipped crates. `tools/*` are dev-only check binaries that no
+# shipped crate depends on (e.g. tools/io-free-check, the structural ironbus-core
+# IO-free AST check), so their dependencies never enter a published crate's graph.
+members = ["crates/*", "tools/*"]
 
 [workspace.package]
 version = "0.0.0"
