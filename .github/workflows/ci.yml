@@ -70,20 +70,20 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: forbid filesystem, network, process, and async-runtime usage in sources
-        run: |
-          set -euo pipefail
-          src=crates/ironbus-core
-          bad=0
-          grep -rnE --include='*.rs' '(tokio|async_std|smol|mio)::' "$src" && bad=1 || true
-          grep -rnE --include='*.rs' 'use[[:space:]]+(tokio|async_std|smol|mio)([[:space:]]|;|::|$)' "$src" && bad=1 || true
-          grep -rnE --include='*.rs' 'std::(fs|net|process)' "$src" && bad=1 || true
-          grep -rnE --include='*.rs' 'use[[:space:]]+std::\{[^}]*(fs|net|process)' "$src" && bad=1 || true
-          if [ "$bad" = "1" ]; then
-            echo "::error::ironbus-core must stay IO-free (no filesystem, network, process, or async runtime)"
-            exit 1
-          fi
-          echo "ironbus-core sources are IO-free"
+      # Structural source check (#143): replaces the former source-text grep. tools/io-free-check
+      # parses every crates/ironbus-core/src/*.rs with `syn` (a real Rust parser) and walks the AST
+      # for forbidden references (std::{fs,net,process,os,io}, tokio/async_std/smol/mio, and extern
+      # FFI blocks), expanding grouped/aliased/glob `use` trees to their real paths. Being AST-level
+      # it is immune to import grouping, aliasing, odd whitespace, and comments, which a line regex
+      # is not. io-free-check is a dev-only workspace member (tools/*) that no shipped crate depends
+      # on, so `syn` never enters ironbus-core's own dependency graph.
+      - name: structural AST check that ironbus-core sources are IO-free
+        run: cargo run --locked -p io-free-check -- crates/ironbus-core/src
+      # The necessary SECOND half of the structural guarantee (#143): the AST source walk only sees
+      # ironbus-core's OWN source, so IO that arrives by re-export from a dependency is invisible to
+      # it. The dep-tree check below catches that. Together (AST source walk + dep-tree) they are the
+      # structural invariant. A compiler-level dylint that resolves every path against the real name
+      # resolver would be strictly stronger and is a possible future hardening.
       - name: forbid async-runtime crates in the ironbus-core dependency tree
         run: |
           set -euo pipefail
@@ -246,11 +246,6 @@ jobs:
       # a broken release workflow is caught here rather than at a tag where it cannot be retried
       # cheaply. actionlint runs shellcheck on each `run:` block.
       - name: install and run actionlint
-        env:
-          # SC2015 (A && B || C is not if-then-else) is an info note on the intentional
-          # `grep ... && bad=1 || true` assertion pattern in the IO-free lint, where the
-          # assignment cannot fail; exclude it so the gate flags real shell bugs, not it.
-          SHELLCHECK_OPTS: --exclude=SC2015
         run: |
           set -euo pipefail
           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
