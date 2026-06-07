@@ -143,6 +143,7 @@ impl<F: RandomAccessFile> Checkpoint<F> {
 mod tests {
     use super::*;
     use crate::io::InMemoryFile;
+    use proptest::prelude::*;
     use std::sync::Arc;
 
     fn fresh() -> Arc<InMemoryFile> {
@@ -295,5 +296,48 @@ mod tests {
         file.write_all_at(&bytes, 0).unwrap();
         file.sync_data().unwrap();
         assert_eq!(reopen(&file), None);
+    }
+
+    proptest! {
+        /// Arbitrary single-byte corruption anywhere in the checkpoint file can only LOSE
+        /// the cursor or return a genuinely-written value, never fabricate one. For any short
+        /// run of writes followed by one flipped byte at an arbitrary offset (which lands in
+        /// the payload region for some inputs and the seq/len/crc region for others, so the
+        /// corruption-tolerance logic is reached across the input space), `Checkpoint::open`
+        /// must not panic and must return either `None` or a payload byte-equal to one that
+        /// was actually written. A torn, partial, or invented payload is a failure.
+        #[test]
+        fn single_byte_corruption_never_fabricates_a_payload(
+            payloads in prop::collection::vec(
+                prop::collection::vec(any::<u8>(), 0..=MAX_PAYLOAD),
+                1..6,
+            ),
+            idx in any::<prop::sample::Index>(),
+            xor in 1u8..=255,
+        ) {
+            let file = fresh();
+            let (mut cp, _) = Checkpoint::open(Arc::clone(&file)).unwrap();
+            for p in &payloads {
+                cp.write(p).unwrap();
+            }
+
+            // Flip one byte at an arbitrary offset anywhere in the fixed-size file.
+            let mut bytes = file.snapshot();
+            prop_assert_eq!(bytes.len() as u64, CHECKPOINT_LEN);
+            let pos = idx.index(bytes.len());
+            bytes[pos] ^= xor;
+            file.set_len(0).unwrap();
+            file.write_all_at(&bytes, 0).unwrap();
+            file.sync_data().unwrap();
+
+            // open must not panic; whatever it returns must be a value we actually wrote.
+            let recovered = Checkpoint::open(Arc::clone(&file)).unwrap().1;
+            if let Some(payload) = recovered {
+                prop_assert!(
+                    payloads.iter().any(|p| p == &payload),
+                    "fabricated a payload never written: {payload:?}",
+                );
+            }
+        }
     }
 }
