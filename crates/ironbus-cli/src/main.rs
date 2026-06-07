@@ -63,12 +63,12 @@ const DEFAULT_MAX_CONNECTIONS: usize = 256;
 /// The default max-ack-pending window for `serve`.
 const DEFAULT_MAX_IN_FLIGHT: u32 = 1024;
 
-/// The default per-CONSUMER (per-connection) in-flight credit for `serve` (#65): the most un-acked
-/// messages one connection may hold at once, the consumer-side half of credit-based flow control.
-/// The effective Flow bound is min(this, the per-group `--max-in-flight` window). A small,
-/// memory-justified number (64, NOT 65535), matching the engine's `DEFAULT_CONSUMER_CREDIT`, so
-/// the CLI default and the engine default agree. Floored to 1 by the engine.
-const DEFAULT_CONSUMER_CREDIT: u32 = 64;
+/// The default per-CONSUMER (per-connection) in-flight credit for `serve` (#65), aliased to the
+/// engine's [`ironbus_server::engine::DEFAULT_CONSUMER_CREDIT`] so the CLI default and the engine
+/// default are a single source of truth and cannot drift. It is the most un-acked messages one
+/// connection may hold at once, the consumer-side half of credit-based flow control; the effective
+/// Flow bound is min(this, the per-group `--max-in-flight` window). Floored to 1 by the engine.
+const DEFAULT_CONSUMER_CREDIT: u32 = ironbus_server::engine::DEFAULT_CONSUMER_CREDIT;
 
 /// The default segment size cap for `serve` (64 MiB, matching the storage default).
 const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
@@ -504,62 +504,81 @@ fn cmd_sub(
             .subscribe(group)
             .map_err(|e| classify(addr, "subscribing to", &e))?;
     }
-    let fetched = client
-        .fetch(max)
-        .map_err(|e| classify(addr, "fetching from", &e))?;
-    for m in &fetched.messages {
-        writeln!(
-            out,
-            "#{} gen={} key={} payload={}",
-            m.offset,
-            m.generation,
-            String::from_utf8_lossy(&m.key),
-            String::from_utf8_lossy(&m.payload),
-        )?;
-        match disposition {
-            Disposition::Peek => {}
-            Disposition::Ack => {
-                let ok = client
-                    .ack(m.offset, m.generation)
-                    .map_err(|e| classify(addr, "acking to", &e))?;
-                writeln!(out, "  ack {}", if ok { "committed" } else { "fenced" })?;
-            }
-            Disposition::Nack { delay_ms } => {
-                let ok = client
-                    .nack(m.offset, m.generation, delay_ms)
-                    .map_err(|e| classify(addr, "nacking to", &e))?;
-                writeln!(out, "  nack {}", if ok { "requeued" } else { "fenced" })?;
-            }
-            Disposition::Term => {
-                let ok = client
-                    .term(m.offset, m.generation)
-                    .map_err(|e| classify(addr, "terminating on", &e))?;
-                writeln!(out, "  term {}", if ok { "dropped" } else { "fenced" })?;
+    // Re-fetch until `max` is reached or a batch comes back empty. The per-consumer credit (#65)
+    // caps a single Flow at the in-flight window, so a larger `--max` can only drain when each
+    // batch is committed past: Ack and Term advance the cursor, freeing credit so the next fetch
+    // serves new records. Peek and Nack do not advance (Peek keeps the records leased, Nack
+    // requeues them), so re-fetching would only re-serve the same batch (under Nack, an immediate
+    // redelivery storm); for those we take a single window-bounded batch and stop.
+    let drains = matches!(disposition, Disposition::Ack | Disposition::Term);
+    let mut total: u32 = 0;
+    loop {
+        let want = max - total;
+        if want == 0 {
+            break;
+        }
+        let fetched = client
+            .fetch(want)
+            .map_err(|e| classify(addr, "fetching from", &e))?;
+        let got = u32::try_from(fetched.messages.len()).unwrap_or(u32::MAX);
+        for m in &fetched.messages {
+            writeln!(
+                out,
+                "#{} gen={} key={} payload={}",
+                m.offset,
+                m.generation,
+                String::from_utf8_lossy(&m.key),
+                String::from_utf8_lossy(&m.payload),
+            )?;
+            match disposition {
+                Disposition::Peek => {}
+                Disposition::Ack => {
+                    let ok = client
+                        .ack(m.offset, m.generation)
+                        .map_err(|e| classify(addr, "acking to", &e))?;
+                    writeln!(out, "  ack {}", if ok { "committed" } else { "fenced" })?;
+                }
+                Disposition::Nack { delay_ms } => {
+                    let ok = client
+                        .nack(m.offset, m.generation, delay_ms)
+                        .map_err(|e| classify(addr, "nacking to", &e))?;
+                    writeln!(out, "  nack {}", if ok { "requeued" } else { "fenced" })?;
+                }
+                Disposition::Term => {
+                    let ok = client
+                        .term(m.offset, m.generation)
+                        .map_err(|e| classify(addr, "terminating on", &e))?;
+                    writeln!(out, "  term {}", if ok { "dropped" } else { "fenced" })?;
+                }
             }
         }
+        // Surface any in-band dead-letter advisories: offsets the broker dropped as poison
+        // (over MaxDeliver) and skipped from delivery (#63), so a consumer is not left silently
+        // never seeing them.
+        for dl in &fetched.dead_letters {
+            let reason = if dl.reason == 0 {
+                "max-deliver"
+            } else {
+                "reserved"
+            };
+            writeln!(out, "dead-letter offset={} reason={reason}", dl.offset)?;
+        }
+        // Surface any truncation advisories: the broker reset this cursor below the oldest retained
+        // record because the disk-full drop-oldest policy reaped its records (#82, #84), so the
+        // consumer learns it lost a span and where delivery resumed rather than silently skipping.
+        for t in &fetched.truncations {
+            writeln!(
+                out,
+                "truncated: resumed at offset {}, skipped {} record(s)",
+                t.earliest_retained, t.skipped
+            )?;
+        }
+        total = total.saturating_add(got);
+        if got == 0 || !drains {
+            break;
+        }
     }
-    // Surface any in-band dead-letter advisories: offsets the broker dropped as poison
-    // (over MaxDeliver) and skipped from delivery (#63), so a consumer is not left silently
-    // never seeing them.
-    for dl in &fetched.dead_letters {
-        let reason = if dl.reason == 0 {
-            "max-deliver"
-        } else {
-            "reserved"
-        };
-        writeln!(out, "dead-letter offset={} reason={reason}", dl.offset)?;
-    }
-    // Surface any truncation advisories: the broker reset this cursor below the oldest retained
-    // record because the disk-full drop-oldest policy reaped its records (#82, #84), so the
-    // consumer learns it lost a span and where delivery resumed rather than silently skipping.
-    for t in &fetched.truncations {
-        writeln!(
-            out,
-            "truncated: resumed at offset {}, skipped {} record(s)",
-            t.earliest_retained, t.skipped
-        )?;
-    }
-    writeln!(out, "fetched {} message(s)", fetched.messages.len())?;
+    writeln!(out, "fetched {total} message(s)")?;
     Ok(())
 }
 
@@ -2361,40 +2380,41 @@ mod tests {
             assert_eq!(String::from_utf8(out).unwrap(), format!("{i}\n"));
         }
 
+        // Observe the per-batch window at the Flow layer: `cmd_sub --ack` deliberately drains
+        // across batches up to `--max` (#65 SHOULD-FIX), so a single CLI call no longer exposes one
+        // window-bounded batch. Drive the protocol directly to assert each fetch is capped at the
+        // in-flight window of 2, not the credit of 10.
+        let mut client = Client::connect(&a).unwrap();
+
         // First fetch: capped at the window of 2 despite a credit of 10 and 4 available.
-        let mut batch1 = Vec::new();
-        cmd_sub(&a, "", 10, Disposition::Ack, &mut batch1).unwrap();
-        let batch1 = String::from_utf8(batch1).unwrap();
-        assert!(
-            batch1.contains("fetched 2 message(s)"),
-            "the in-flight window caps the batch at 2, not the credit of 10: {batch1}"
+        let batch1 = client.fetch(10).unwrap();
+        assert_eq!(
+            batch1.messages.len(),
+            2,
+            "the in-flight window caps the batch at 2, not the credit of 10"
         );
-        assert!(
-            batch1.contains("payload=a") && batch1.contains("payload=b"),
-            "the first two: {batch1}"
-        );
+        assert_eq!(batch1.messages[0].payload.as_slice(), b"a");
+        assert_eq!(batch1.messages[1].payload.as_slice(), b"b");
+        for m in &batch1.messages {
+            assert!(client.ack(m.offset, m.generation).unwrap(), "ack committed");
+        }
 
         // The acks freed the window; the next fetch delivers the next two.
-        let mut batch2 = Vec::new();
-        cmd_sub(&a, "", 10, Disposition::Ack, &mut batch2).unwrap();
-        let batch2 = String::from_utf8(batch2).unwrap();
-        assert!(
-            batch2.contains("fetched 2 message(s)"),
-            "the next batch is also capped at 2: {batch2}"
+        let batch2 = client.fetch(10).unwrap();
+        assert_eq!(
+            batch2.messages.len(),
+            2,
+            "the next batch is also capped at 2"
         );
-        assert!(
-            batch2.contains("payload=c") && batch2.contains("payload=d"),
-            "the next two: {batch2}"
-        );
+        assert_eq!(batch2.messages[0].payload.as_slice(), b"c");
+        assert_eq!(batch2.messages[1].payload.as_slice(), b"d");
+        for m in &batch2.messages {
+            assert!(client.ack(m.offset, m.generation).unwrap(), "ack committed");
+        }
 
         // All four committed: the stream is drained.
-        let mut batch3 = Vec::new();
-        cmd_sub(&a, "", 10, Disposition::Peek, &mut batch3).unwrap();
-        assert_eq!(
-            String::from_utf8(batch3).unwrap(),
-            "fetched 0 message(s)\n",
-            "the stream is drained"
-        );
+        let batch3 = client.fetch(10).unwrap();
+        assert!(batch3.messages.is_empty(), "the stream is drained");
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
