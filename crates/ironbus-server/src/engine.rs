@@ -168,6 +168,12 @@ pub enum EngineError {
     },
     /// A work-group name was empty, too long, or held a non-graphic-ASCII byte (#240).
     InvalidGroupName,
+    /// A cumulative ack (ack-all-up-to-offset) was requested on a competing work-group (#63).
+    /// Cumulative ack is the `JetStream` `AckAll` trap on a shared, out-of-order-draining cursor:
+    /// acking up to an offset would commit past peers' still-in-flight messages and silently drop
+    /// them. It is therefore offered only to broadcast consumers (a group of one that sees every
+    /// message in order) and hard-rejected for any competing or `key_shared` work-group.
+    CumulativeAckOnWorkGroup,
 }
 
 impl core::fmt::Display for EngineError {
@@ -188,6 +194,10 @@ impl core::fmt::Display for EngineError {
                     "invalid work-group name (1 to {MAX_GROUP_NAME_LEN} graphic ASCII bytes)"
                 )
             }
+            EngineError::CumulativeAckOnWorkGroup => write!(
+                f,
+                "cumulative ack is not allowed on a competing work-group (broadcast consumers only)"
+            ),
         }
     }
 }
@@ -1603,6 +1613,34 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         }
     }
 
+    /// Cumulative ack (ack-all-up-to-`offset`) in a named work-group: the `JetStream` `AckAll`
+    /// trap, HARD-REJECTED here (#63). A competing or `key_shared` work-group shares one commit
+    /// cursor while its members drain out of order, so acking up to an offset would commit past
+    /// (and silently drop) messages still in flight to peers. Cumulative ack is therefore offered
+    /// only to BROADCAST consumers (a group of one that sees every message in order), and IronBus
+    /// has no broadcast-consumer cursor yet, so this guard rejects EVERY cumulative ack with the
+    /// typed [`EngineError::CumulativeAckOnWorkGroup`]. It exists so a caller (the wire layer, a
+    /// client, a future broadcast path) has a single, typed, non-panicking rejection point rather
+    /// than a bare TODO. The broadcast cumulative-ack feature is tracked as a follow-up (#288).
+    ///
+    /// # Errors
+    /// Always returns [`EngineError::CumulativeAckOnWorkGroup`]: no group is a broadcast consumer
+    /// today, so a cumulative ack is never valid.
+    pub fn cumulative_ack_in(&mut self, _group: &str, _up_to: Offset) -> Result<(), EngineError> {
+        // Every live group is a competing/key_shared work-group; none is a broadcast consumer, so
+        // cumulative ack is unconditionally rejected. When the broadcast consumer cursor lands, the
+        // broadcast branch commits its own single-member cursor up to `up_to` here.
+        Err(EngineError::CumulativeAckOnWorkGroup)
+    }
+
+    /// Cumulative ack in the default work-group, rejected as [`Engine::cumulative_ack_in`].
+    ///
+    /// # Errors
+    /// Always returns [`EngineError::CumulativeAckOnWorkGroup`] (the default group is a work-group).
+    pub fn cumulative_ack(&mut self, up_to: Offset) -> Result<(), EngineError> {
+        self.cumulative_ack_in(DEFAULT_GROUP, up_to)
+    }
+
     /// Nacks the message named by `token`, requeueing it for redelivery and fencing the
     /// nacking holder. `delay_ms` follows the wire convention: `u64::MAX` means no explicit
     /// delay, so the server applies its configured backoff schedule for this attempt; any
@@ -2538,6 +2576,46 @@ mod tests {
         assert_eq!(e.ack_in("y", &dy.token), AckResult::Acked);
         assert_eq!(e.committed_offset_in("y"), Offset::new(1));
         assert_eq!(e.in_flight(), 0);
+    }
+
+    #[test]
+    fn cumulative_ack_is_rejected_on_a_work_group() {
+        // Cumulative ack (ack-all-up-to-offset) is the JetStream AckAll trap on a shared,
+        // out-of-order-draining cursor: it is hard-rejected for competing work-groups (#63).
+        // Every live group today is a work-group, so the guard rejects every cumulative ack
+        // with the typed error and never panics.
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"a");
+        produce(&mut e, b"b");
+        // The default group is a work-group: rejected.
+        assert!(matches!(
+            e.cumulative_ack(Offset::new(2)),
+            Err(EngineError::CumulativeAckOnWorkGroup)
+        ));
+        // A named competing group: rejected.
+        assert!(matches!(
+            e.cumulative_ack_in("x", Offset::new(1)),
+            Err(EngineError::CumulativeAckOnWorkGroup)
+        ));
+        // A key_shared group is still a work-group: rejected.
+        e.set_key_ordering_in("k", KeyOrdering::KeyShared).unwrap();
+        assert!(matches!(
+            e.cumulative_ack_in("k", Offset::new(1)),
+            Err(EngineError::CumulativeAckOnWorkGroup)
+        ));
+        // The rejection commits nothing: per-message acks still drive the cursor as before.
+        let d = message(e.poll(0).unwrap());
+        assert_eq!(e.ack(&d.token), AckResult::Acked);
+        assert_eq!(e.committed_offset(), Offset::new(1));
+    }
+
+    #[test]
+    fn the_cumulative_ack_rejection_renders_a_distinct_message() {
+        // The typed error has a self-describing Display, distinct from the other engine errors,
+        // so the wire layer can surface a stable reason.
+        let msg = EngineError::CumulativeAckOnWorkGroup.to_string();
+        assert!(msg.contains("cumulative ack"), "{msg}");
+        assert!(msg.contains("broadcast"), "{msg}");
     }
 
     // A config with an explicit work-group cap (#240), so a test exercises the bound without
