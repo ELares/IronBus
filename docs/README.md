@@ -24,6 +24,10 @@ for f in *.dot; do dot -Tpdf "$f" -o "${f%.dot}.pdf"; done
 | 07 | [CLI command tree](diagrams/07-cli-command-tree.pdf) | The full command surface of the single binary, color-coded by online versus offline | #136, #15 |
 | 08 | [Contract models](diagrams/08-contract-models-er.pdf) | The on-disk, wire, config, runtime, and report schemas and their relationships | #137, #5, #11 |
 
+## Reference docs
+
+- [Invariants and glossary](INVARIANTS.md): the shared invariants every subsystem must hold (I1 to I8), the resilience invariant checkers, and the canonical glossary of load-bearing terms, each cross-checked against the code (#131).
+
 ## Notes
 
 - The diagrams reflect the frozen v1 model: log-is-WAL (the active segment is the write-ahead log), single durable queue, at-least-once delivery with visibility-timeout leases, and bounded, reported loss on corruption.
