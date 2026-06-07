@@ -23,6 +23,14 @@ wildcards = "deny"
 # compression codec is lz4_flex (pure Rust); zstd (zstd-sys, vendored C) is opt-in only, behind an
 # explicit feature, never on the default path. A C-FFI allowlist is enforced here once any such
 # opt-in dependency is introduced (tracked in #102).
+#
+# The macro-bench harness `ironbus-bench` (#111) is an internal, build-on-demand measurement tool,
+# not part of the shipped broker. It pulls a small, permissive (MIT or Apache-2.0), pure-Rust
+# dependency surface that the license allow-list above already covers, so no extra allowance is
+# needed: `hdrhistogram` (the latency tail, with its `serialization` feature => `base64`, `flate2`,
+# `miniz_oxide`, `nom`, `byteorder`), `rand` + `rand_distr` (the Poisson inter-arrival jitter), and
+# `serde` + `serde_json` (the provenance JSON). All are pure Rust (no vendored C), so the #139
+# pure-Rust policy holds for the harness too.
 
 [advisories]
 yanked = "deny"

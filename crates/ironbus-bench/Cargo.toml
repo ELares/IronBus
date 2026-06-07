@@ -1,0 +1,40 @@
+[package]
+name = "ironbus-bench"
+description = "Open-loop macro-bench harness for IronBus: the honest, coordinated-omission-free SLO instrument."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Off the default `cargo publish` path: this is an internal measurement tool, not a shipped crate.
+publish = false
+
+[[bin]]
+name = "ironbus-bench"
+path = "src/main.rs"
+
+[dependencies]
+# The harness drives the broker through the REAL #11 client over a real socket, never a privileged
+# test path; it launches the shipping `ironbus` binary built by `ironbus-cli`.
+ironbus-client = { path = "../ironbus-client", version = "0.0.0" }
+ironbus-proto = { path = "../ironbus-proto", version = "0.0.0" }
+# HdrHistogram for the latency tail (1 us to 60 s, 3 significant figures). The `serialization`
+# feature gives the standard V2+DEFLATE encoder so a run's RAW histogram is archived base64 and is
+# recomputable/mergeable across windows. MIT OR Apache-2.0.
+hdrhistogram = { version = "7.5", features = ["serialization"] }
+# Poisson-distributed (exponential) inter-arrival jitter for the open-loop arrival schedule.
+# MIT OR Apache-2.0; `rand` is already in the workspace lock (a dev-dep of proptest).
+rand = "0.9"
+rand_distr = "0.5"
+# Versioned provenance JSON (git SHA, build flags, host, config, raw histogram, reproduce command).
+# Already in the workspace lock. MIT OR Apache-2.0.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SIGSTOP/SIGCONT for the injected-stall self-test, and the macOS monotonic-raw clock. Unix only,
+# `cfg`-gated. A foreign call, not `unsafe`-free; the few `libc` calls are isolated and documented.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true
