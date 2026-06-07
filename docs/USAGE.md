@@ -6,7 +6,28 @@ queue, a producer and consumer over a small length-framed TCP protocol, and loop
 health and metrics endpoints. It documents the implemented subset; the design backlog
 lives in the GitHub issues, and the README holds the broader vision.
 
-## Build
+## Install (a released binary)
+
+The quickest path on an edge device is the fail-closed installer, which downloads the static musl
+binary that matches the host's architecture from a GitHub Release and verifies its SHA256 against
+the release `SHA256SUMS` BEFORE installing it. It refuses to install on any download error, a
+missing or mismatched checksum, or an unsupported platform, and it never `eval`s downloaded
+content. It has no skip-verification override.
+
+```sh
+# Latest release, auto-detected arch:
+curl -fsSL https://raw.githubusercontent.com/ELares/IronBus/main/scripts/install.sh | sh
+
+# Pin a version, pick an install dir, and also verify the Sigstore provenance:
+curl -fsSL https://raw.githubusercontent.com/ELares/IronBus/main/scripts/install.sh \
+  | sh -s -- --version v0.1.0 --bin-dir "$HOME/.local/bin" --verify-provenance
+```
+
+See [RELEASING.md](../RELEASING.md) for the full installer flags, the release assets
+(`ironbus-<triple>`, `SHA256SUMS`, the SBOM, and the build-provenance attestation), and the manual
+`sha256sum -c` / `gh attestation verify` verification commands.
+
+## Build (from source)
 
 IronBus is a Rust workspace. Build the `ironbus` binary from source:
 
