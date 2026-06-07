@@ -444,8 +444,9 @@ fn fixed_histogram_lines(s: &mut String, name: &str, help: &str, h: &FixedHistog
 /// Renders the capped per-consumer lag series `ironbus_consumer_lag_records{consumer=...}` (#97):
 /// one gauge sample per distinct consumer, the `{consumer="__overflow__"}` fold for over-cap
 /// consumers (only when a label has actually been dropped, so the line is absent on a healthy
-/// broker), and the `ironbus_consumer_labels_dropped_total` counter. Lag is maintained
-/// incrementally (`head - committed`) and never scanned on scrape.
+/// broker), the `ironbus_consumer_overflow_saturated` gauge (1 once the overflow fold became a
+/// monotonic lower bound, #321), and the `ironbus_consumer_labels_dropped_total` counter. Lag is
+/// maintained incrementally (`head - committed`) and never scanned on scrape.
 fn consumer_lag_lines(s: &mut String, registry: &crate::registry::MetricRegistry) {
     let lag = registry.consumer_lag();
     s.push_str(
@@ -469,6 +470,21 @@ fn consumer_lag_lines(s: &mut String, registry: &crate::registry::MetricRegistry
             lag.overflow_lag()
         );
     }
+    // The defense-in-depth safety valve beyond the 1024-series cap (#321): 1 once more than the
+    // overflow-ledger capacity of distinct over-cap consumers have been seen over the broker's
+    // lifetime, so the `__overflow__` fold above is a monotonic LOWER BOUND rather than exact. A
+    // GAUGE (no `_total` suffix), so it stays out of the frozen resilience-counter taxonomy by
+    // construction.
+    let _ = writeln!(
+        s,
+        "# HELP ironbus_consumer_overflow_saturated 1 when the __overflow__ consumer-lag series became a monotonic lower bound (more than the overflow-ledger capacity of distinct over-cap consumers seen)."
+    );
+    let _ = writeln!(s, "# TYPE ironbus_consumer_overflow_saturated gauge");
+    let _ = writeln!(
+        s,
+        "ironbus_consumer_overflow_saturated {}",
+        u8::from(lag.overflow_saturated() > 0)
+    );
     let _ = writeln!(
         s,
         "# HELP ironbus_consumer_labels_dropped_total Consumer lag labels refused a distinct series at the cardinality cap (folded into __overflow__)."
@@ -1230,6 +1246,66 @@ mod tests {
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
+    }
+
+    /// `/metrics` renders the `ironbus_consumer_overflow_saturated` gauge (#321): 0 (with a `gauge`
+    /// TYPE line) on a fresh registry, and 1 once the bounded overflow fold-ledger saturates (more
+    /// than the cap of distinct over-cap consumers seen), signalling the `__overflow__` lag series
+    /// has become a monotonic lower bound. Driven straight through the private `registry_body`
+    /// renderer, in the style of the registry-metrics rendering tests above.
+    #[test]
+    fn metrics_renders_the_overflow_saturated_gauge() {
+        use crate::registry::{MetricRegistry, MAX_CONSUMER_SERIES, MAX_OVERFLOW_LEDGER};
+
+        let mut registry = MetricRegistry::new(env!("CARGO_PKG_VERSION"), 0, 0);
+        registry.seed_head(1);
+
+        // A fresh registry has not saturated: the gauge renders 0 with a `gauge` TYPE line and no
+        // stray `_total` suffix that would pull it into the frozen taxonomy.
+        let before = registry_body(&registry, 0);
+        assert!(
+            before.contains("# TYPE ironbus_consumer_overflow_saturated gauge"),
+            "{before}"
+        );
+        assert!(
+            before.contains("\nironbus_consumer_overflow_saturated 0\n"),
+            "{before}"
+        );
+        assert!(
+            !before.contains("ironbus_consumer_overflow_saturated_total"),
+            "{before}"
+        );
+
+        // Fill the distinct-series cap, then the entire overflow ledger, then one MORE distinct
+        // over-cap consumer to saturate the ledger (the defense-in-depth safety valve).
+        for i in 0..MAX_CONSUMER_SERIES {
+            registry.set_consumer_committed(format!("c{i}").as_bytes(), 0);
+        }
+        for i in 0..MAX_OVERFLOW_LEDGER {
+            registry.set_consumer_committed(format!("o{i}").as_bytes(), 0);
+        }
+        assert_eq!(
+            registry.consumer_lag().overflow_saturated(),
+            0,
+            "ledger full but not yet saturated"
+        );
+        registry.set_consumer_committed(b"past-the-ledger", 0);
+        assert!(
+            registry.consumer_lag().overflow_saturated() > 0,
+            "the past-capacity consumer saturated the ledger"
+        );
+
+        // Now the gauge renders 1: the operator's scrape-visible signal that the `__overflow__` lag
+        // series is a monotonic lower bound.
+        let after = registry_body(&registry, 0);
+        assert!(
+            after.contains("# TYPE ironbus_consumer_overflow_saturated gauge"),
+            "{after}"
+        );
+        assert!(
+            after.contains("\nironbus_consumer_overflow_saturated 1\n"),
+            "{after}"
+        );
     }
 
     /// Like [`start`] but with a hard durable-log byte cap, so the rejection path is exercised.

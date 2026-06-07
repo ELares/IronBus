@@ -210,6 +210,7 @@ fixed-bucket one.
 ```
 ironbus_consumer_lag_records{consumer=...}     per-consumer durable records produced but not yet committed
 ironbus_consumer_lag_records{consumer="__overflow__"}   the folded lag of all over-cap consumers (only present once a label is dropped)
+ironbus_consumer_overflow_saturated            gauge, 1 once the __overflow__ fold became a monotonic lower bound (see below)
 ```
 
 `ironbus_consumer_lag_records` is maintained **incrementally**: the durable head
@@ -253,6 +254,16 @@ lag is **not** folded into the `__overflow__` total, so that total becomes a
 never wrong-high and never grows as folded consumers make progress. Saturation is
 the rare past-1024-distinct-over-cap-consumer case; in the common case the
 overflow total is exact.
+
+`ironbus_consumer_overflow_saturated` (#321) surfaces exactly that saturation as a
+scrape-visible **gauge** (`0` or `1`), so a Prometheus scraper can alert on it
+directly rather than only via a Rust accessor. It is **1** once more than the
+overflow-ledger capacity of **distinct** over-cap consumers have been seen over
+the broker's lifetime, i.e. once `ironbus_consumer_lag_records{consumer="__overflow__"}`
+has become a monotonic **lower bound** rather than the exact folded lag; **0** in
+the common case (over-cap cardinality within the ledger capacity). It is a gauge
+with **no `_total` suffix**, so it is excluded from the frozen resilience-counter
+taxonomy by construction.
 
 ### Self-monitoring series
 
