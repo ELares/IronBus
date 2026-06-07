@@ -27,7 +27,8 @@ jobs:
       - name: run the workspace tests with a deep proptest sweep
         env:
           # ~195x the proptest default (256), so the crash gates, recovery prefix checks,
-          # determinism meta-test, and codec round-trips each explore far more inputs.
+          # determinism meta-test, the corruption corpus's single-bit-flip sweep (#123), and the
+          # codec round-trips each explore far more inputs.
           PROPTEST_CASES: "50000"
         run: cargo test --workspace --all-features --locked
 
