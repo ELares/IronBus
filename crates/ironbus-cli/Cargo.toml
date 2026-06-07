@@ -19,5 +19,18 @@ ironbus-client = { path = "../ironbus-client", version = "0.0.0" }
 ironbus-server = { path = "../ironbus-server", version = "0.0.0" }
 ironbus-storage = { path = "../ironbus-storage", version = "0.0.0" }
 
+# Signal handling for `serve`'s graceful shutdown (#195): catches SIGINT/SIGTERM/SIGHUP and flips
+# the serve loop's shutdown flag so the broker stops accepting, flushes the committed cursor, and
+# exits 0. The maintainer chose `ctrlc` over a hand-rolled `unsafe` sigaction (Miri cannot exercise
+# OS signal delivery, so the unsafe-justification ceremony is impractical here). It pulls `nix` +
+# `libc` transitively; both are permissive (MIT) and on the deny.toml allow-list. CLI-only: the
+# IO-free `ironbus-core` and the `ironbus-server` lib never see it. Unix-only because `serve` itself
+# is Unix-only in v1 (on-disk storage uses positioned IO the Windows path lacks), so the non-Unix
+# build neither installs a handler nor pulls the dependency.
+[target.'cfg(unix)'.dependencies]
+# The `termination` feature makes the handler also catch SIGTERM and SIGHUP (not just SIGINT), which
+# the graceful-shutdown story needs for an operator's `systemctl stop` / `kill <pid>`.
+ctrlc = { version = "^3.4", features = ["termination"] }
+
 [lints]
 workspace = true

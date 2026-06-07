@@ -34,6 +34,14 @@ wildcards = "deny"
 # `miniz_oxide`, `nom`, `byteorder`), `rand` + `rand_distr` (the Poisson inter-arrival jitter), and
 # `serde` + `serde_json` (the provenance JSON). All are pure Rust (no vendored C), so the #139
 # pure-Rust policy holds for the harness too.
+#
+# Graceful shutdown (#195) adds `ctrlc` to `ironbus-cli` (the broker binary), the first non-trivial
+# runtime dependency of a shipped crate beyond `crc32c`. It catches SIGINT/SIGTERM/SIGHUP so `serve`
+# can flush the cursor and exit 0 on a clean stop. On Linux/musl (the CI target) it pulls `nix`,
+# `libc`, `bitflags`, `cfg-if`, and `cfg_aliases` transitively; all are permissive (MIT, or MIT OR
+# Apache-2.0) and the license allow-list above already covers them, so no extra allowance is needed.
+# `libc` is the only FFI binding (libc bindings, not vendored C), so the #139 pure-Rust policy for
+# the DEFAULT DATA path is unchanged: this is a signal-handling shim on the CLI, off the record path.
 
 [advisories]
 yanked = "deny"
