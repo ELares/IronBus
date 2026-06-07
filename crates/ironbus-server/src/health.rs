@@ -247,7 +247,10 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
          ironbus_dead_lettered_total {dead_lettered}\n\
          # HELP ironbus_acks_total Commits via ack (a term commits through the same path).\n\
          # TYPE ironbus_acks_total counter\n\
-         ironbus_acks_total {acks}\n",
+         ironbus_acks_total {acks}\n\
+         # HELP ironbus_segments_reaped_total Old sealed segments reclaimed by consumer-safe size retention.\n\
+         # TYPE ironbus_segments_reaped_total counter\n\
+         ironbus_segments_reaped_total {segments_reaped}\n",
         healthy_value = u8::from(healthy),
         produced = counters.produced,
         produced_bytes = counters.produced_bytes,
@@ -256,6 +259,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         redelivered = counters.redelivered,
         dead_lettered = counters.dead_lettered,
         acks = counters.acks,
+        segments_reaped = counters.segments_reaped,
     );
     body.push_str(&recovery_loss_lines(&recovery_loss));
     body.push_str(&recovery_loss_records_lines(&recovery_loss_records));
@@ -427,6 +431,7 @@ mod tests {
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
                 max_in_flight: 16,
                 checkpoint_interval: 1024,
+                max_retained_bytes: 0,
             },
         )
         .unwrap();
@@ -618,6 +623,7 @@ mod tests {
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
                 max_in_flight: 16,
                 checkpoint_interval: 1024,
+                max_retained_bytes: 0,
             },
         )
         .unwrap();
@@ -694,6 +700,123 @@ mod tests {
         assert!(m1.contains("\nironbus_produce_rejected_total 2\n"), "{m1}");
         // The successful produce was counted once and nothing more (the sheds did not inflate it).
         assert!(m1.contains("\nironbus_produced_total 1\n"), "{m1}");
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    /// Like [`start`] but with a small segment cap (so produces roll) plus a consumer-safe
+    /// size-retention bound, so the reaper path is exercised end to end.
+    fn start_with_retention(
+        max_retained_bytes: u64,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        SharedEngine<InMemoryFs, SystemClock>,
+    ) {
+        let engine = Engine::open(
+            InMemoryFs::new(),
+            SystemClock::new(),
+            EngineConfig {
+                log: LogConfig {
+                    max_segment_bytes: 160,
+                    max_total_bytes: 0,
+                },
+                lease: LeaseConfig::default(),
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight: 64,
+                checkpoint_interval: 1024,
+                max_retained_bytes,
+            },
+        )
+        .unwrap();
+        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let engine = Arc::clone(&shared);
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            move || serve_health(&listener, &shared, &shutdown).unwrap()
+        });
+        (addr, shutdown, handle, engine)
+    }
+
+    #[test]
+    fn metrics_renders_and_increments_segments_reaped() {
+        // The retention reaped counter renders on /metrics and increments once retention reclaims
+        // old, fully-consumed segments as the durable log grows past the bound (#13, #80).
+        let payload = &[0xab_u8; 16][..];
+        // Measure one record's framed durable bytes, then bound retention at a few records.
+        let one = {
+            let (_a, sd, h, eng) = start_with_retention(0);
+            let bytes = {
+                let mut g = eng.lock().unwrap();
+                g.produce(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                })
+                .unwrap();
+                g.durable_record_bytes()
+            };
+            sd.store(true, Ordering::Release);
+            h.join().unwrap();
+            bytes
+        };
+
+        let (addr, shutdown, handle, engine) = start_with_retention(4 * one);
+        // The counter is present and zero before anything is reaped.
+        let m0 = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            m0.contains("# TYPE ironbus_segments_reaped_total counter"),
+            "{m0}"
+        );
+        assert!(m0.contains("\nironbus_segments_reaped_total 0\n"), "{m0}");
+
+        // Produce well past the bound, interleaving a full drain-and-ack after each produce so the
+        // committed cursor tracks the head (a streaming workload). Retention runs on produce
+        // against the committed floor, so old, now-consumed segments become reapable.
+        {
+            let mut g = engine.lock().unwrap();
+            for _ in 0..30 {
+                g.produce(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                })
+                .unwrap();
+                loop {
+                    match g.poll_now().unwrap() {
+                        Poll::Message(d) => {
+                            assert_eq!(g.ack(&d.token), AckResult::Acked);
+                        }
+                        Poll::Parked { .. } => {}
+                        Poll::Idle => break,
+                    }
+                }
+            }
+            assert!(
+                g.counters().segments_reaped >= 1,
+                "retention reaped at least one segment"
+            );
+        }
+        let m1 = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        // The counter incremented past zero (the exact value depends on the framing, so assert
+        // it is non-zero by ruling out the zero line and confirming the family is present).
+        assert!(
+            m1.contains("# TYPE ironbus_segments_reaped_total counter"),
+            "{m1}"
+        );
+        assert!(
+            !m1.contains("\nironbus_segments_reaped_total 0\n"),
+            "the reaped counter must have incremented past zero: {m1}"
+        );
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();

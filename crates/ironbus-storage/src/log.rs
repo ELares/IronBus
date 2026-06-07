@@ -155,6 +155,21 @@ pub struct Append<'a> {
     pub payload: &'a [u8],
 }
 
+/// What a [`Log::reap_to_size`] pass reclaimed: how many whole sealed segments it unlinked
+/// and the total durable RECORD bytes those segments held (the same quantity
+/// [`Log::durable_record_bytes`] dropped by). Both are zero when nothing was reaped (the
+/// bound is off, the log is already under it, or the oldest sealed segment is still needed by
+/// a consumer).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReapOutcome {
+    /// The number of whole sealed segments unlinked this pass.
+    pub segments_reaped: u64,
+    /// The total durable RECORD bytes those reaped segments held (each segment's
+    /// `valid_end - SEGMENT_HEADER_LEN`, the same per-segment term the sealed-bytes total
+    /// accumulates), so the caller can confirm `durable_record_bytes()` dropped by exactly this.
+    pub bytes_reaped: u64,
+}
+
 /// An in-memory directory entry: a segment id and the log offset of its first record.
 /// Held sorted by `base_offset` (which is monotonic with the id) so a read can binary
 /// search for the segment that holds a given offset.
@@ -646,6 +661,100 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             }
         }
         Ok(out)
+    }
+
+    /// Reclaims disk by deleting whole OLD SEALED segments while the durable log exceeds
+    /// `max_retained_bytes`, but NEVER deletes a segment any consumer still needs (the
+    /// consumer-safe size-retention reaper, refs #13, #80). This is the drain side of the
+    /// overflow policy that complements the byte-cap shed ([`LogConfig::max_total_bytes`], #259):
+    /// the cap sheds new produces when the log is full, this frees space as consumers drain.
+    ///
+    /// `protect_below_offset` is the floor below which records are safe to drop: every consumer
+    /// has committed at least this far, so no consumer still needs any record with an offset
+    /// strictly below it. The caller passes the MINIMUM committed offset across every consumer
+    /// group, so the slowest group's unconsumed records are never reaped.
+    ///
+    /// Looping from the OLDEST sealed segment, a segment `segments[0]` is unlinked only while ALL
+    /// of these hold:
+    /// - `max_retained_bytes != 0` (a zero bound is UNLIMITED: nothing is reaped, the default);
+    /// - the log is still over the bound (`durable_record_bytes() > max_retained_bytes`);
+    /// - more than one segment exists, so the ACTIVE segment (the last slot) is never reaped;
+    /// - the oldest sealed segment is ENTIRELY consumed: since segments are contiguous,
+    ///   `segments[0]` ends exactly where `segments[1]` begins, so every record in `segments[0]`
+    ///   has offset `< segments[1].base_offset`. The segment is fully consumed iff
+    ///   `segments[1].base_offset <= protect_below_offset`, which guarantees every record in it
+    ///   is below the protect floor and so needed by no consumer.
+    ///
+    /// The loop stops as soon as the bound is satisfied, the next oldest segment is not fully
+    /// consumed (`segments[1].base_offset > protect_below_offset`), or only the active segment
+    /// remains. A whole segment is unlinked or left untouched; a record inside a segment is never
+    /// rewritten or partially removed.
+    ///
+    /// Each unlink is crash-safe and ordered so disk and memory never disagree: the segment file
+    /// is removed and the directory fsynced (so the removal is durable) BEFORE the slot leaves
+    /// `segments` and `sealed_record_bytes` is decremented. A crash after some unlinks leaves a
+    /// shorter contiguous chain with a non-zero start, which recovery already accepts; a crash
+    /// mid-unlink is fine because the unlink is atomic and the in-memory state was not yet
+    /// changed, so the next open simply recomputes the running total from what survived.
+    ///
+    /// The byte accounting decrements `sealed_record_bytes` by each reaped segment's record
+    /// region, read as `valid_end - SEGMENT_HEADER_LEN` from a streaming recovery scan: this is
+    /// EXACTLY the per-segment term the sealed-bytes total accumulated on each roll (a sealed
+    /// segment's `valid_end` is the start of its footer, so it excludes both the 64-byte header
+    /// and the 32-byte footer), so after a reap the running total still equals a fresh reopen's
+    /// recomputed value.
+    ///
+    /// Returns a [`ReapOutcome`] reporting the segments and bytes reclaimed (zero for a no-op).
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] from reading a segment's length, unlinking it, or the directory
+    /// sync. On such an error the in-memory state is left consistent with disk: any segment
+    /// removed-and-synced before the failure has already been dropped from `segments` and
+    /// `sealed_record_bytes`; the failing segment is NOT removed from memory, so it is never
+    /// orphaned. This is best-effort space reclamation, so a caller may log and continue, but a
+    /// real IO error is surfaced (never swallowed into silent state corruption).
+    pub fn reap_to_size(
+        &mut self,
+        max_retained_bytes: u64,
+        protect_below_offset: u64,
+    ) -> Result<ReapOutcome, StorageError> {
+        let mut outcome = ReapOutcome::default();
+        // A zero bound is unlimited: retention is off, so reap nothing (the default).
+        if max_retained_bytes == 0 {
+            return Ok(outcome);
+        }
+        while self.durable_record_bytes() > max_retained_bytes {
+            // Never reap the active segment: keep at least the last slot. With only one slot the
+            // single segment IS the active one, so stop.
+            let Some(next_base) = self.segments.get(1).map(|slot| slot.base_offset) else {
+                break;
+            };
+            // The oldest segment is fully consumed only if it ends at or below the protect floor.
+            // Its end is exactly the next segment's base (contiguous), so every record in it is
+            // strictly below `next_base <= protect_below_offset`, hence needed by no consumer.
+            if next_base > protect_below_offset {
+                break;
+            }
+            let oldest = self.segments[0];
+            let name = segment_file_name(oldest.id);
+            // The reaped segment's durable RECORD bytes, read the SAME way the sealed total was
+            // accumulated (`valid_end - SEGMENT_HEADER_LEN`), so the decrement is exact. A
+            // streaming recovery scan avoids materializing record payloads.
+            let scan = SegmentReader::open(self.fs.open(&name)?)?.scan_recovery()?;
+            let segment_record_bytes = scan.valid_end.saturating_sub(SEGMENT_HEADER_LEN as u64);
+            // Unlink, then dir-sync so the removal is durable, BEFORE touching in-memory state:
+            // if either fails the slot stays and the running total is untouched, so memory never
+            // claims a segment is gone while it survives on disk.
+            self.fs.remove(&name)?;
+            self.fs.sync_dir()?;
+            self.segments.remove(0);
+            self.sealed_record_bytes = self
+                .sealed_record_bytes
+                .saturating_sub(segment_record_bytes);
+            outcome.segments_reaped = outcome.segments_reaped.saturating_add(1);
+            outcome.bytes_reaped = outcome.bytes_reaped.saturating_add(segment_record_bytes);
+        }
+        Ok(outcome)
     }
 
     /// The index in `segments` of the segment whose range holds `offset` (the slot with
@@ -1795,5 +1904,267 @@ mod tests {
             .map(|id| read_back(&fs, *id).len())
             .sum();
         assert_eq!(total, 9);
+    }
+
+    // Fills a small-segment log with `n` single-byte records (each `payload` byte `i`), synced,
+    // and returns it rolled across several segments so the reaper has sealed predecessors.
+    fn rolled_log(n: u8) -> Log<InMemoryFs, ManualClock> {
+        let mut log = open_mem(small_config());
+        for i in 0..n {
+            log.append(&rec(&[i; 20])).unwrap();
+        }
+        log.sync().unwrap();
+        assert!(log.active_segment_id() >= 2, "should span 3+ segments");
+        log
+    }
+
+    #[test]
+    fn reap_with_a_zero_bound_is_unlimited_and_reaps_nothing() {
+        // max_retained_bytes == 0 means UNLIMITED: the reaper is off (the default), so even a
+        // fully-consumed multi-segment log keeps every segment.
+        let mut log = rolled_log(16);
+        let before = log.durable_record_bytes();
+        let segs_before = segment_ids(log.filesystem()).unwrap();
+        let outcome = log.reap_to_size(0, u64::MAX).unwrap();
+        assert_eq!(
+            outcome,
+            ReapOutcome::default(),
+            "a zero bound reaps nothing"
+        );
+        assert_eq!(log.durable_record_bytes(), before);
+        assert_eq!(segment_ids(log.filesystem()).unwrap(), segs_before);
+    }
+
+    #[test]
+    fn reap_with_a_bound_larger_than_the_log_reaps_nothing() {
+        // A bound above the whole log's durable bytes never trips, even with everything consumed.
+        let mut log = rolled_log(16);
+        let total = log.durable_record_bytes();
+        let segs_before = segment_ids(log.filesystem()).unwrap();
+        let outcome = log.reap_to_size(total + 1_000_000, u64::MAX).unwrap();
+        assert_eq!(outcome, ReapOutcome::default());
+        assert_eq!(log.durable_record_bytes(), total);
+        assert_eq!(segment_ids(log.filesystem()).unwrap(), segs_before);
+    }
+
+    #[test]
+    fn reap_deletes_oldest_consumed_segments_until_under_the_bound() {
+        // Everything consumed (protect at the head), a bound far below the log: the reaper deletes
+        // the oldest sealed segments one at a time until the durable total is at or below the
+        // bound, never touching the active segment.
+        let mut log = rolled_log(20);
+        let head = log.next_offset().get();
+        let active_id = log.active_segment_id();
+        let bytes_before = log.durable_record_bytes();
+        let one_record = bytes_before / 20; // 20 equal records
+                                            // Aim for roughly two records' worth of headroom; the reaper overshoots downward by
+                                            // whole sealed segments, so the result is at or under the bound.
+        let bound = 2 * one_record;
+
+        let outcome = log.reap_to_size(bound, head).unwrap();
+        assert!(outcome.segments_reaped >= 1, "should have reaped a segment");
+        assert!(
+            log.durable_record_bytes() <= bound,
+            "the log is brought to or under the bound ({} <= {bound})",
+            log.durable_record_bytes()
+        );
+        // The active segment is never reaped: it still exists and is still the active id.
+        assert_eq!(log.active_segment_id(), active_id);
+        assert!(log
+            .filesystem()
+            .exists(&segment_file_name(active_id))
+            .unwrap());
+        // bytes_reaped equals exactly how much durable_record_bytes dropped.
+        assert_eq!(
+            outcome.bytes_reaped,
+            bytes_before - log.durable_record_bytes()
+        );
+        // The reaped oldest segments are gone from disk; the surviving prefix starts above 0.
+        let surviving = segment_ids(log.filesystem()).unwrap();
+        assert!(
+            !surviving.contains(&0),
+            "segment 0 was reaped, so the surviving prefix starts above 0: {surviving:?}"
+        );
+        // The number of segments dropped from the directory matches the reported count.
+        assert_eq!(
+            (active_id + 1) - surviving.len() as u64,
+            outcome.segments_reaped
+        );
+    }
+
+    #[test]
+    fn reap_never_deletes_a_segment_above_the_protect_floor() {
+        // A protect floor of 0 means no consumer has committed anything, so NOTHING may be
+        // reaped even though the log is far over a tiny bound. This is the consumer-safety rule.
+        let mut log = rolled_log(20);
+        let before = log.durable_record_bytes();
+        let segs_before = segment_ids(log.filesystem()).unwrap();
+        let outcome = log.reap_to_size(1, 0).unwrap();
+        assert_eq!(
+            outcome,
+            ReapOutcome::default(),
+            "a zero protect floor protects every record"
+        );
+        assert_eq!(log.durable_record_bytes(), before);
+        assert_eq!(segment_ids(log.filesystem()).unwrap(), segs_before);
+    }
+
+    #[test]
+    fn reap_stops_at_the_first_segment_not_fully_consumed() {
+        // The protect floor sits inside the SECOND segment: only the first segment is fully
+        // consumed (ends at segments[1].base <= protect), so exactly one segment is reaped even
+        // though the bound is tiny, because the next segment is not fully consumed.
+        let mut log = rolled_log(20);
+        let ids = segment_ids(log.filesystem()).unwrap();
+        // segments[1].base_offset is the count of records in segment 0.
+        let seg0_records = read_back(log.filesystem(), ids[0]).len() as u64;
+        // Protect exactly at segments[1].base: segment 0 (records < that) is reapable, segment 1
+        // (it begins at the floor, so it holds a record AT the floor) is not.
+        let protect = seg0_records;
+        let bytes_before = log.durable_record_bytes();
+        let outcome = log.reap_to_size(1, protect).unwrap();
+        assert_eq!(
+            outcome.segments_reaped, 1,
+            "only segment 0 is fully consumed"
+        );
+        // Segment 0 is gone; segment 1 and the rest survive.
+        assert!(!log.filesystem().exists(&segment_file_name(ids[0])).unwrap());
+        assert!(log.filesystem().exists(&segment_file_name(ids[1])).unwrap());
+        assert_eq!(
+            log.durable_record_bytes(),
+            bytes_before - outcome.bytes_reaped
+        );
+    }
+
+    #[test]
+    fn reap_never_deletes_the_active_segment_even_fully_consumed_and_over_bound() {
+        // A single-segment log (only the active segment) over a tiny bound, everything consumed:
+        // the active segment is never reaped, so nothing happens.
+        let mut log = open_mem(LogConfig::default());
+        for i in 0..4u8 {
+            log.append(&rec(&[i; 8])).unwrap();
+        }
+        log.sync().unwrap();
+        assert_eq!(log.active_segment_id(), 0, "still a single segment");
+        let before = log.durable_record_bytes();
+        let outcome = log.reap_to_size(1, log.next_offset().get()).unwrap();
+        assert_eq!(outcome, ReapOutcome::default());
+        assert_eq!(log.durable_record_bytes(), before);
+        assert!(log.filesystem().exists(&segment_file_name(0)).unwrap());
+    }
+
+    #[test]
+    fn after_a_reap_a_reopen_recovers_the_remaining_contiguous_chain() {
+        // The durability-critical assertion: after a reap deletes a prefix of sealed segments,
+        // reopening the data dir recovers the remaining contiguous chain from a NON-ZERO start,
+        // the head/offsets are correct, the reaped records are gone, and the survivors read back.
+        let mut log = rolled_log(20);
+        let head = log.next_offset().get();
+        let one_record = log.durable_record_bytes() / 20;
+        let outcome = log.reap_to_size(3 * one_record, head).unwrap();
+        assert!(outcome.segments_reaped >= 1);
+        let oldest_surviving_base = {
+            // The first surviving segment's base is the lowest offset still present.
+            let ids = segment_ids(log.filesystem()).unwrap();
+            SegmentReader::open(log.filesystem().open(&segment_file_name(ids[0])).unwrap())
+                .unwrap()
+                .header()
+                .base_offset
+        };
+        let live_bytes = log.durable_record_bytes();
+        let fs = log.into_filesystem();
+
+        // Reopen: recovery accepts the non-zero start and rebuilds the chain.
+        let reopened = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        assert_eq!(reopened.next_offset().get(), head, "head is unchanged");
+        assert_eq!(reopened.flushed_offset().get(), head);
+        // The recomputed durable total equals the live total after the reap (byte accounting
+        // survives a round trip).
+        assert_eq!(reopened.durable_record_bytes(), live_bytes);
+        // The reaped records are gone: a read below the oldest surviving base is out of range.
+        let err = reopened.read_from(Offset::ZERO, 10).unwrap_err();
+        assert!(
+            matches!(err, StorageError::OffsetOutOfRange { requested: 0, oldest } if oldest == oldest_surviving_base.get())
+        );
+        // The un-reaped records still read correctly, contiguous from the surviving base to head.
+        let survivors = reopened.read_from(oldest_surviving_base, 1000).unwrap();
+        assert_eq!(survivors.len() as u64, head - oldest_surviving_base.get());
+        for (i, r) in survivors.iter().enumerate() {
+            assert_eq!(
+                r.offset,
+                Offset::new(oldest_surviving_base.get() + i as u64)
+            );
+        }
+    }
+
+    #[test]
+    fn sealed_record_bytes_after_a_reap_matches_a_fresh_reopen() {
+        // Cross-check the in-place running total against a fresh reopen's recomputed value, so the
+        // decrement is provably exact (not merely self-consistent).
+        let mut log = rolled_log(24);
+        let one_record = log.durable_record_bytes() / 24;
+        log.reap_to_size(4 * one_record, log.next_offset().get())
+            .unwrap();
+        let live = log.durable_record_bytes();
+        let fs = log.into_filesystem();
+        let reopened = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        assert_eq!(
+            reopened.durable_record_bytes(),
+            live,
+            "the running total equals the recomputed total after a reap"
+        );
+    }
+
+    #[test]
+    fn a_reap_followed_by_a_power_loss_yields_a_valid_log() {
+        // Crash-safety: the reap dir-synced each removal, so a power loss after it does NOT
+        // resurrect a reaped segment and does NOT break the chain. A simulated power loss then a
+        // reopen must yield a valid log with the same surviving chain.
+        let mut log = rolled_log(20);
+        let head = log.next_offset().get();
+        let one_record = log.durable_record_bytes() / 20;
+        let outcome = log.reap_to_size(3 * one_record, head).unwrap();
+        assert!(outcome.segments_reaped >= 1);
+        let surviving = segment_ids(log.filesystem()).unwrap();
+        let live_bytes = log.durable_record_bytes();
+
+        // A power loss now: the durably-removed segments stay removed (the reap dir-synced).
+        log.filesystem().simulate_power_loss();
+        assert_eq!(
+            segment_ids(log.filesystem()).unwrap(),
+            surviving,
+            "no reaped segment is resurrected by a power loss"
+        );
+        let fs = log.into_filesystem();
+        let reopened = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        assert_eq!(reopened.next_offset().get(), head);
+        assert_eq!(reopened.durable_record_bytes(), live_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reap_and_recovery_on_a_real_directory() {
+        use crate::fs::StdFs;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut log =
+            Log::open(StdFs::new(root.clone()), ManualClock::new(), small_config()).unwrap();
+        for i in 0..20u8 {
+            log.append(&rec(&[i; 20])).unwrap();
+        }
+        log.sync().unwrap();
+        assert!(log.active_segment_id() >= 2);
+        let head = log.next_offset().get();
+        let one_record = log.durable_record_bytes() / 20;
+        let outcome = log.reap_to_size(3 * one_record, head).unwrap();
+        assert!(outcome.segments_reaped >= 1, "should reap on a real dir");
+        let live_bytes = log.durable_record_bytes();
+        drop(log);
+
+        // Reopen the real directory: recovery rebuilds the survivors from a non-zero start.
+        let reopened =
+            Log::open(StdFs::new(root.clone()), ManualClock::new(), small_config()).unwrap();
+        assert_eq!(reopened.next_offset().get(), head);
+        assert_eq!(reopened.durable_record_bytes(), live_bytes);
     }
 }

@@ -47,6 +47,15 @@ pub struct EngineConfig {
     /// last checkpoint, bounding how many messages a crash redelivers. A value of 0 is treated
     /// as 1 (checkpoint on every advance). A clean disconnect also flushes the cursor.
     pub checkpoint_interval: u64,
+    /// The consumer-safe size-retention bound (refs #13, #80): after a successful produce, the
+    /// engine reclaims disk by deleting whole old SEALED segments while the durable log exceeds
+    /// this many RECORD bytes, but NEVER a segment any consumer still needs (it protects below
+    /// the minimum committed offset across every group). `0` means UNLIMITED (retention is OFF),
+    /// which is the default, so existing behavior is unchanged. This is the drain side of the
+    /// overflow policy that complements the byte-cap shed (`LogConfig::max_total_bytes`): the cap
+    /// sheds new produces when full, retention frees space as consumers drain. See
+    /// [`Log::reap_to_size`].
+    pub max_retained_bytes: u64,
 }
 
 /// An error from the engine.
@@ -221,6 +230,11 @@ pub struct Counters {
     pub dead_lettered: u64,
     /// Commits via `ack` (a `term` commits through the same path and is counted here).
     pub acks: u64,
+    /// Whole old SEALED segments reclaimed by consumer-safe size retention (refs #13, #80):
+    /// each reap unlinks a fully-consumed oldest segment to free disk once the durable log is
+    /// over its retention bound. Zero unless `max_retained_bytes` is set; the operator's
+    /// space-reclamation signal. Saturating.
+    pub segments_reaped: u64,
 }
 
 /// A snapshot of one work-group's consumer position, for the metrics endpoint (#16): an
@@ -413,6 +427,10 @@ pub struct Engine<F: Filesystem, C: Clock> {
     max_in_flight: u32,
     checkpoint: Checkpoint<F::File>,
     checkpoint_interval: u64,
+    /// The consumer-safe size-retention bound in durable RECORD bytes (refs #13, #80): `0`
+    /// (the default) means retention is off, so the produce path never reaps. See
+    /// [`EngineConfig::max_retained_bytes`].
+    max_retained_bytes: u64,
     last_checkpointed: u64,
     /// The last durably-checkpointed committed offset per NAMED work-group (#60), for the
     /// interval gate. The default group uses `last_checkpointed`; named groups checkpoint to
@@ -509,6 +527,7 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
             max_in_flight: config.max_in_flight,
             checkpoint,
             checkpoint_interval: config.checkpoint_interval,
+            max_retained_bytes: config.max_retained_bytes,
             last_checkpointed: default_committed,
             counters: Counters::default(),
             fsync: LatencyHistogram::default(),
@@ -693,7 +712,52 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
             .counters
             .produced_bytes
             .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        // Consumer-safe size retention (refs #13, #80): after the record is durable, reclaim disk
+        // by deleting whole old SEALED segments while the log is over the retention bound, but
+        // never one any consumer still needs. Run on the produce path so space is freed exactly as
+        // the log grows; it is a no-op unless the bound is set. The protect floor is the MINIMUM
+        // committed offset across every group, so the slowest group's records are never reaped.
+        self.reap_for_retention()?;
         Ok(offset)
+    }
+
+    /// Reclaims disk by reaping fully-consumed old sealed segments when the durable log is over
+    /// the retention bound (refs #13, #80). A no-op when `max_retained_bytes == 0` (the default,
+    /// retention off). The protect floor is the minimum committed offset across ALL consumer
+    /// groups (the default group `""` always exists, so the min is well-defined), so a record any
+    /// group has not yet consumed is never reaped. Counts the reaped segments (saturating).
+    ///
+    /// A reap is best-effort space reclamation, but a real IO error from a sync or unlink is a
+    /// storage error: it propagates rather than being swallowed, since [`Log::reap_to_size`]
+    /// keeps `segments`/`sealed_record_bytes` consistent with disk on a partial failure (the
+    /// in-memory removal happens only after the durable unlink), so propagating never corrupts
+    /// state. It is called only after the produce already succeeded and was counted, so a reap
+    /// error does not undo a durable record.
+    fn reap_for_retention(&mut self) -> Result<(), EngineError> {
+        if self.max_retained_bytes == 0 {
+            return Ok(());
+        }
+        let protect_below = self.min_committed_offset();
+        let outcome = self
+            .log
+            .reap_to_size(self.max_retained_bytes, protect_below)?;
+        self.counters.segments_reaped = self
+            .counters
+            .segments_reaped
+            .saturating_add(outcome.segments_reaped);
+        Ok(())
+    }
+
+    /// The minimum committed offset across every work-group: the protect floor for retention, so
+    /// the slowest group's unconsumed records are never reaped. The default group (`""`) always
+    /// exists, so the iterator is never empty; a fresh group sits at offset 0, which keeps the
+    /// floor at 0 (reaping nothing) until it has consumed something, exactly the safe behavior.
+    fn min_committed_offset(&self) -> u64 {
+        self.groups
+            .values()
+            .map(|g| g.cursor.committed().get())
+            .min()
+            .unwrap_or(0)
     }
 
     /// Claims and returns the next deliverable message, or [`Poll::Idle`] if none is
@@ -1032,6 +1096,7 @@ mod tests {
             delivery: DeliveryConfig::new(max_deliver, false, vec![]).unwrap(),
             max_in_flight,
             checkpoint_interval: 1024,
+            max_retained_bytes: 0,
         }
     }
 
@@ -2334,5 +2399,152 @@ mod tests {
         assert_eq!(c.produced, 5);
         assert_eq!(c.produce_rejected, 0);
         assert_eq!(e.flushed_offset(), Offset::new(5));
+    }
+
+    /// An engine config with a small segment cap (so produces roll across many segments) plus a
+    /// consumer-safe size-retention bound. Every other knob is the default test config.
+    fn config_with_retention(max_retained_bytes: u64) -> EngineConfig {
+        let mut cfg = config(64, 5);
+        // A small segment cap so a handful of records roll: retention reaps whole sealed segments.
+        cfg.log = LogConfig {
+            max_segment_bytes: 160,
+            max_total_bytes: 0,
+        };
+        cfg.max_retained_bytes = max_retained_bytes;
+        cfg
+    }
+
+    // Produces `n` 16-byte records, interleaving a full drain-and-ack after each produce so the
+    // default group's committed cursor tracks the head as the log grows. Retention runs on the
+    // produce path against the MIN committed offset across groups, so the cursor must advance
+    // alongside the produces (a streaming workload) for old segments to become reapable; this
+    // models exactly that.
+    fn produce_and_consume_all(e: &mut Engine<InMemoryFs, ManualClock>, n: usize) {
+        let mut now = 0u64;
+        for _ in 0..n {
+            produce(e, &[0xab; 16]);
+            loop {
+                match e.poll(now).unwrap() {
+                    Poll::Message(d) => {
+                        assert_eq!(e.ack(&d.token), AckResult::Acked);
+                    }
+                    Poll::Parked { .. } => {}
+                    Poll::Idle => break,
+                }
+                now += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn default_unlimited_retention_reaps_nothing() {
+        // The default config (max_retained_bytes == 0) never reaps: a fully consumed multi-segment
+        // log keeps every segment, exactly the historical behavior.
+        let mut e = open(config_with_retention(0));
+        produce_and_consume_all(&mut e, 24);
+        assert_eq!(e.committed_offset(), Offset::new(24));
+        let bytes = e.durable_record_bytes();
+        // Produce more (all consumed): still nothing reaped.
+        produce_and_consume_all(&mut e, 8);
+        assert_eq!(
+            e.counters().segments_reaped,
+            0,
+            "retention off reaps nothing"
+        );
+        assert!(e.durable_record_bytes() > bytes, "the log only grows");
+    }
+
+    #[test]
+    fn retention_reclaims_old_consumed_segments_as_the_log_grows() {
+        // With a retention bound set and every group caught up, producing past the bound reaps old
+        // fully-consumed segments: the durable record bytes drop and segments_reaped increments.
+        let mut e = open(config_with_retention(0)); // measure one record's bytes first
+        produce(&mut e, &[0xab; 16]);
+        let one = e.durable_record_bytes();
+
+        // A bound of ~4 records: once the consumed log exceeds it, the reaper trims it back.
+        let mut e = open(config_with_retention(4 * one));
+        produce_and_consume_all(&mut e, 30);
+        assert_eq!(e.committed_offset(), Offset::new(30), "all consumed");
+        assert!(
+            e.counters().segments_reaped >= 1,
+            "producing past the bound reclaimed at least one segment"
+        );
+        assert!(
+            e.durable_record_bytes() <= 4 * one,
+            "the live durable bytes dropped to or under the bound: {} <= {}",
+            e.durable_record_bytes(),
+            4 * one
+        );
+        // The head is unchanged (reaping deletes old records, never the head) and the surviving
+        // tail is still consumable from the committed offset (here, the head: all acked).
+        assert_eq!(e.flushed_offset(), Offset::new(30));
+    }
+
+    #[test]
+    fn a_slow_group_prevents_reaping_the_segments_it_still_needs() {
+        // The protect floor is the MINIMUM committed offset across groups. A slow group stuck near
+        // offset 0 pins the floor low, so no segment below its cursor is reaped even far over the
+        // bound. This is the consumer-safety guarantee.
+        let mut e = open(config_with_retention(0));
+        produce(&mut e, &[0xab; 16]);
+        let one = e.durable_record_bytes();
+        let mut e = open(config_with_retention(2 * one));
+
+        // The slow group "slow" leases offset 0 but never acks: its committed stays 0.
+        produce(&mut e, &[0xab; 16]);
+        assert!(matches!(e.poll_in("slow", 0).unwrap(), Poll::Message(_)));
+        assert_eq!(e.committed_offset_in("slow"), Offset::new(0));
+
+        // Now produce and fully consume many more in the DEFAULT group, far over the bound.
+        produce_and_consume_all(&mut e, 30);
+        assert_eq!(e.committed_offset(), Offset::new(31), "default caught up");
+        // The slow group is still at 0, so the min committed across groups is 0: nothing below it
+        // may be reaped, so NO segment is deleted even though the log is well over the bound.
+        assert_eq!(e.committed_offset_in("slow"), Offset::new(0));
+        assert_eq!(
+            e.counters().segments_reaped,
+            0,
+            "a slow group pins the protect floor at 0, so nothing is reaped"
+        );
+        // Offset 0 (the slow group still needs it) is still readable: the record was not reaped.
+        assert!(matches!(
+            e.poll_now_in("slow"),
+            Ok(Poll::Idle | Poll::Message(_))
+        ));
+    }
+
+    #[test]
+    fn retention_advances_once_the_slow_group_catches_up() {
+        // Once the slowest group catches up, the protect floor rises and the next produce reaps
+        // the now-fully-consumed old segments. This pins that the protection is dynamic, not a
+        // permanent block.
+        let mut e = open(config_with_retention(0));
+        produce(&mut e, &[0xab; 16]);
+        let one = e.durable_record_bytes();
+        let mut e = open(config_with_retention(2 * one));
+
+        // Build a slow group pinned at 0, produce/consume many in the default group: nothing reaps.
+        produce(&mut e, &[0xab; 16]);
+        let slow_d = match e.poll_in("slow", 0).unwrap() {
+            Poll::Message(d) => d,
+            other => panic!("expected a message, got {other:?}"),
+        };
+        produce_and_consume_all(&mut e, 24);
+        assert_eq!(e.counters().segments_reaped, 0, "blocked by the slow group");
+
+        // The slow group acks offset 0 and drains to the head: the floor rises to the head.
+        assert_eq!(e.ack_in("slow", &slow_d.token), AckResult::Acked);
+        let mut now = 100u64;
+        while let Poll::Message(d) = e.poll_in("slow", now).unwrap() {
+            assert_eq!(e.ack_in("slow", &d.token), AckResult::Acked);
+            now += 1;
+        }
+        // One more produce now that every group is caught up: the reaper runs and frees space.
+        produce_and_consume_all(&mut e, 1);
+        assert!(
+            e.counters().segments_reaped >= 1,
+            "once the slow group caught up the old segments are reaped"
+        );
     }
 }

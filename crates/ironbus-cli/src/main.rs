@@ -68,6 +68,11 @@ const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 /// default): the spill-by-default behavior is unchanged until an operator opts in to the shed.
 const DEFAULT_MAX_TOTAL_BYTES: u64 = 0;
 
+/// The default consumer-safe size-retention bound for `serve` (0 = unlimited, retention OFF,
+/// matching the engine default): the broker never reaps old sealed segments until an operator
+/// opts in, so existing behavior is unchanged.
+const DEFAULT_MAX_RETAINED_BYTES: u64 = 0;
+
 /// The smallest segment size cap `serve` accepts: below this, segments proliferate
 /// pathologically (one record each), so reject it as a misconfiguration.
 const MIN_MAX_SEGMENT_BYTES: u64 = 4096;
@@ -115,6 +120,7 @@ USAGE:
     ironbus serve --data-dir <dir> [--addr <host:port>] [--max-connections <n>]
                   [--checkpoint-interval <n>] [--max-deliver <n>] [--max-in-flight <n>]
                   [--max-segment-bytes <n>] [--max-total-bytes <bytes>]
+                  [--max-retained-bytes <bytes>]
                   [--visibility-timeout-ms <n>] [--health-addr <host:port>]
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
     ironbus sub   [--addr <host:port>] [--group <name>] [--max <n>]
@@ -231,6 +237,18 @@ fn take_value(flag: &str, args: &[String], i: &mut usize) -> Result<String, CliE
         .clone();
     *i += 2;
     Ok(value)
+}
+
+/// Like [`take_value`] but parses the value as a number, mapping a non-numeric value to the same
+/// `` `{flag}` needs a number, got `{raw}` `` usage error every numeric `serve` flag returns. This
+/// collapses the per-flag parse boilerplate to one call so the flag parser stays compact.
+fn take_number<T>(flag: &str, args: &[String], i: &mut usize) -> Result<T, CliError>
+where
+    T: std::str::FromStr,
+{
+    let raw = take_value(flag, args, i)?;
+    raw.parse::<T>()
+        .map_err(|_| CliError::Usage(format!("`{flag}` needs a number, got `{raw}`")))
 }
 
 /// Classifies a client error against the frozen exit-code scheme. A connection-level failure
@@ -479,6 +497,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut max_in_flight = DEFAULT_MAX_IN_FLIGHT;
     let mut max_segment_bytes = DEFAULT_MAX_SEGMENT_BYTES;
     let mut max_total_bytes = DEFAULT_MAX_TOTAL_BYTES;
+    let mut max_retained_bytes = DEFAULT_MAX_RETAINED_BYTES;
     let mut visibility_ms = DEFAULT_VISIBILITY_MS;
     let mut health_addr: Option<String> = None;
     let mut i = 0;
@@ -487,50 +506,24 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             "--addr" => addr = take_value("--addr", args, &mut i)?,
             "--data-dir" => data_dir = Some(take_value("--data-dir", args, &mut i)?),
             "--max-connections" => {
-                let raw = take_value("--max-connections", args, &mut i)?;
-                max_connections = raw.parse::<usize>().map_err(|_| {
-                    CliError::Usage(format!("`--max-connections` needs a number, got `{raw}`"))
-                })?;
+                max_connections = take_number("--max-connections", args, &mut i)?;
             }
             "--checkpoint-interval" => {
-                let raw = take_value("--checkpoint-interval", args, &mut i)?;
-                checkpoint_interval = raw.parse::<u64>().map_err(|_| {
-                    CliError::Usage(format!(
-                        "`--checkpoint-interval` needs a number, got `{raw}`"
-                    ))
-                })?;
+                checkpoint_interval = take_number("--checkpoint-interval", args, &mut i)?;
             }
-            "--max-deliver" => {
-                let raw = take_value("--max-deliver", args, &mut i)?;
-                max_deliver = raw.parse::<u32>().map_err(|_| {
-                    CliError::Usage(format!("`--max-deliver` needs a number, got `{raw}`"))
-                })?;
-            }
-            "--max-in-flight" => {
-                let raw = take_value("--max-in-flight", args, &mut i)?;
-                max_in_flight = raw.parse::<u32>().map_err(|_| {
-                    CliError::Usage(format!("`--max-in-flight` needs a number, got `{raw}`"))
-                })?;
-            }
+            "--max-deliver" => max_deliver = take_number("--max-deliver", args, &mut i)?,
+            "--max-in-flight" => max_in_flight = take_number("--max-in-flight", args, &mut i)?,
             "--max-segment-bytes" => {
-                let raw = take_value("--max-segment-bytes", args, &mut i)?;
-                max_segment_bytes = raw.parse::<u64>().map_err(|_| {
-                    CliError::Usage(format!("`--max-segment-bytes` needs a number, got `{raw}`"))
-                })?;
+                max_segment_bytes = take_number("--max-segment-bytes", args, &mut i)?;
             }
             "--max-total-bytes" => {
-                let raw = take_value("--max-total-bytes", args, &mut i)?;
-                max_total_bytes = raw.parse::<u64>().map_err(|_| {
-                    CliError::Usage(format!("`--max-total-bytes` needs a number, got `{raw}`"))
-                })?;
+                max_total_bytes = take_number("--max-total-bytes", args, &mut i)?;
+            }
+            "--max-retained-bytes" => {
+                max_retained_bytes = take_number("--max-retained-bytes", args, &mut i)?;
             }
             "--visibility-timeout-ms" => {
-                let raw = take_value("--visibility-timeout-ms", args, &mut i)?;
-                visibility_ms = raw.parse::<u64>().map_err(|_| {
-                    CliError::Usage(format!(
-                        "`--visibility-timeout-ms` needs a number, got `{raw}`"
-                    ))
-                })?;
+                visibility_ms = take_number("--visibility-timeout-ms", args, &mut i)?;
             }
             "--health-addr" => health_addr = Some(take_value("--health-addr", args, &mut i)?),
             flag if flag.starts_with("--") => {
@@ -552,6 +545,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         max_in_flight,
         max_segment_bytes,
         max_total_bytes,
+        max_retained_bytes,
         visibility_ms,
     };
     validate_serve_config(&config)?;
@@ -615,6 +609,10 @@ struct ServeConfig {
     /// Hard durable-log total byte cap, the drop-new shed backstop (#10). `0` means unlimited
     /// (the cap is off), which is the default and preserves the spill-by-default behavior.
     max_total_bytes: u64,
+    /// Consumer-safe size-retention bound (#13, #80): the broker reaps old fully-consumed sealed
+    /// segments while the durable log is over this many RECORD bytes. `0` means unlimited
+    /// (retention off), the default, so existing behavior is unchanged.
+    max_retained_bytes: u64,
     visibility_ms: u64,
 }
 
@@ -626,15 +624,7 @@ fn cmd_serve(
     health_addr: Option<&str>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
-    let shared = open_disk_engine(
-        data_dir,
-        config.max_in_flight,
-        config.checkpoint_interval,
-        config.max_deliver,
-        config.max_segment_bytes,
-        config.max_total_bytes,
-        config.visibility_ms,
-    )?;
+    let shared = open_disk_engine(data_dir, &config)?;
     let listener = TcpListener::bind(addr)
         .map_err(|e| CliError::Internal(format!("cannot bind {addr}: {e}")))?;
     let local = listener
@@ -698,6 +688,7 @@ fn cmd_serve(
         config.max_in_flight,
         config.max_segment_bytes,
         config.max_total_bytes,
+        config.max_retained_bytes,
         config.visibility_ms,
         health_addr,
         out,
@@ -711,31 +702,33 @@ fn cmd_serve(
 #[cfg(unix)]
 fn open_disk_engine(
     data_dir: &Path,
-    max_in_flight: u32,
-    checkpoint_interval: u64,
-    max_deliver: u32,
-    max_segment_bytes: u64,
-    max_total_bytes: u64,
-    visibility_ms: u64,
+    config: &ServeConfig,
 ) -> Result<SharedEngine<StdFs, SystemClock>, CliError> {
     std::fs::create_dir_all(data_dir)
         .map_err(|e| CliError::Internal(format!("cannot create {}: {e}", data_dir.display())))?;
     let fs = StdFs::new(data_dir.to_path_buf());
-    let delivery = DeliveryConfig::new(max_deliver, false, DEFAULT_NACK_BACKOFF_NANOS.to_vec())
-        .map_err(|e| CliError::Internal(format!("delivery config: {e:?}")))?;
+    let delivery = DeliveryConfig::new(
+        config.max_deliver,
+        false,
+        DEFAULT_NACK_BACKOFF_NANOS.to_vec(),
+    )
+    .map_err(|e| CliError::Internal(format!("delivery config: {e:?}")))?;
+    let visibility_ms = config.visibility_ms;
     let engine = Engine::open(
         fs,
         SystemClock::new(),
         EngineConfig {
             // Both caps are honored: `new` validates and sets the segment cap, the builder
             // layers on the durable-log total byte cap (the drop-new shed; `0` = unlimited).
-            log: LogConfig::new(max_segment_bytes)
+            log: LogConfig::new(config.max_segment_bytes)
                 .map_err(|e| CliError::Internal(format!("log config: {e}")))?
-                .with_max_total_bytes(max_total_bytes),
+                .with_max_total_bytes(config.max_total_bytes),
             lease: LeaseConfig::from_millis(visibility_ms, visibility_ms.max(DEFAULT_HARD_CAP_MS)),
             delivery,
-            max_in_flight,
-            checkpoint_interval,
+            max_in_flight: config.max_in_flight,
+            checkpoint_interval: config.checkpoint_interval,
+            // Consumer-safe size retention (#13, #80): `0` = unlimited (off), the default.
+            max_retained_bytes: config.max_retained_bytes,
         },
     )
     .map_err(|e| CliError::Internal(format!("opening broker at {}: {e}", data_dir.display())))?;
@@ -999,22 +992,29 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
+    /// A [`ServeConfig`] for a disk-engine test: the given in-flight window and checkpoint
+    /// interval, every other knob the production default (retention and the total cap both off).
+    #[cfg(unix)]
+    fn test_serve_config(max_in_flight: u32, checkpoint_interval: u64) -> ServeConfig {
+        ServeConfig {
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            checkpoint_interval,
+            max_deliver: DEFAULT_MAX_DELIVER,
+            max_in_flight,
+            max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
+            max_retained_bytes: DEFAULT_MAX_RETAINED_BYTES,
+            visibility_ms: DEFAULT_VISIBILITY_MS,
+        }
+    }
+
     /// Builds a real on-disk data directory with `n` durable records via the engine, for
     /// the offline `peek` / `dump` verbs to read back.
     #[cfg(unix)]
     fn make_data_dir(tag: &str, n: usize) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("ironbus-cli-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let shared = open_disk_engine(
-            &dir,
-            64,
-            1,
-            DEFAULT_MAX_DELIVER,
-            DEFAULT_MAX_SEGMENT_BYTES,
-            DEFAULT_MAX_TOTAL_BYTES,
-            DEFAULT_VISIBILITY_MS,
-        )
-        .unwrap();
+        let shared = open_disk_engine(&dir, &test_serve_config(64, 1)).unwrap();
         {
             let mut g = shared.lock().unwrap();
             for i in 0..n {
@@ -1186,6 +1186,7 @@ mod tests {
                 delivery: DeliveryConfig::new(5, false, Vec::new()).unwrap(),
                 max_in_flight: 16,
                 checkpoint_interval: 1024,
+                max_retained_bytes: 0,
             },
         )
         .unwrap();
@@ -1504,6 +1505,60 @@ mod tests {
     }
 
     #[test]
+    fn serve_rejects_a_non_numeric_max_retained_bytes() {
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--max-retained-bytes".to_string(),
+                "lots".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--max-retained-bytes"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_accepts_a_max_retained_bytes_value() {
+        // A valid --max-retained-bytes parses and validates (no usage error); the only failure is
+        // the unrelated bind on an unreachable addr, proving the flag was accepted, not rejected.
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-cli-mrb-never-served".to_string(),
+                "--max-retained-bytes".to_string(),
+                "4096".to_string(),
+                "--addr".to_string(),
+                "127.0.0.1:1".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_ne!(
+            e.exit_code(),
+            EXIT_USAGE,
+            "a valid --max-retained-bytes parses and validates: {e}"
+        );
+        let _ = std::fs::remove_dir_all("/tmp/ironbus-cli-mrb-never-served");
+    }
+
+    #[test]
+    fn usage_lists_the_max_retained_bytes_flag() {
+        // The new retention flag is documented in the USAGE string, so `ironbus help` surfaces it.
+        assert!(
+            USAGE.contains("--max-retained-bytes"),
+            "USAGE must document the retention flag"
+        );
+    }
+
+    #[test]
     fn serve_rejects_a_tiny_max_segment_bytes() {
         let mut buf = Vec::new();
         let e = run(
@@ -1682,6 +1737,7 @@ mod tests {
                 delivery: DeliveryConfig::new(1, false, Vec::new()).unwrap(),
                 max_in_flight: 16,
                 checkpoint_interval: 1024,
+                max_retained_bytes: 0,
             },
         )
         .unwrap();
@@ -1746,6 +1802,7 @@ mod tests {
                 delivery: DeliveryConfig::new(5, false, Vec::new()).unwrap(),
                 max_in_flight: 2,
                 checkpoint_interval: 1024,
+                max_retained_bytes: 0,
             },
         )
         .unwrap();
@@ -1813,16 +1870,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ironbus-cli-it-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let shared = open_disk_engine(
-            &dir,
-            64,
-            1,
-            DEFAULT_MAX_DELIVER,
-            DEFAULT_MAX_SEGMENT_BYTES,
-            DEFAULT_MAX_TOTAL_BYTES,
-            DEFAULT_VISIBILITY_MS,
-        )
-        .unwrap();
+        let shared = open_disk_engine(&dir, &test_serve_config(64, 1)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1849,16 +1897,7 @@ mod tests {
         // persisted the committed cursor synchronously when it acked offset 0, so a clean
         // restart RESUMES past the acked message (it does not redeliver), and the durable log
         // continues at offset 1 rather than overwriting offset 0.
-        let reopened = open_disk_engine(
-            &dir,
-            64,
-            1,
-            DEFAULT_MAX_DELIVER,
-            DEFAULT_MAX_SEGMENT_BYTES,
-            DEFAULT_MAX_TOTAL_BYTES,
-            DEFAULT_VISIBILITY_MS,
-        )
-        .unwrap();
+        let reopened = open_disk_engine(&dir, &test_serve_config(64, 1)).unwrap();
         let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr2 = listener2.local_addr().unwrap();
         let shutdown2 = Arc::new(AtomicBool::new(false));
@@ -1899,16 +1938,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ironbus-cli-restart-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let shared = open_disk_engine(
-            &dir,
-            64,
-            1,
-            DEFAULT_MAX_DELIVER,
-            DEFAULT_MAX_SEGMENT_BYTES,
-            DEFAULT_MAX_TOTAL_BYTES,
-            DEFAULT_VISIBILITY_MS,
-        )
-        .unwrap();
+        let shared = open_disk_engine(&dir, &test_serve_config(64, 1)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1936,16 +1966,7 @@ mod tests {
         handle.join().unwrap();
 
         // Restart on the same dir: only the uncommitted tail (offsets 1 and 2) redelivers.
-        let reopened = open_disk_engine(
-            &dir,
-            64,
-            1,
-            DEFAULT_MAX_DELIVER,
-            DEFAULT_MAX_SEGMENT_BYTES,
-            DEFAULT_MAX_TOTAL_BYTES,
-            DEFAULT_VISIBILITY_MS,
-        )
-        .unwrap();
+        let reopened = open_disk_engine(&dir, &test_serve_config(64, 1)).unwrap();
         let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr2 = listener2.local_addr().unwrap();
         let shutdown2 = Arc::new(AtomicBool::new(false));
