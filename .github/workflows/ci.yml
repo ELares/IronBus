@@ -172,6 +172,61 @@ jobs:
             exit 1
           fi
           echo "ok: $bin is a static executable (no interpreter, no NEEDED libs)"
+      # The static-link assertion above proves the binary depends only on the kernel; it does NOT
+      # prove the binary can actually START on its target ISA. A musl/qemu startup fault (a relocation
+      # the loader cannot apply, a bad TLS or stack-guard setup, host-sysroot leakage) links clean but
+      # crashes on first instruction, and only EXECUTING the artifact catches it (#100, parent #17).
+      # The aarch64 and armv7 emulators come from apt's qemu-user-static (invoked explicitly, no
+      # binfmt registration needed), so this job adds no new pinned `uses:` action.
+      - name: install qemu-user-static for the cross-arch smoke
+        if: matrix.target != 'x86_64-unknown-linux-musl'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user-static
+      # The per-target SMOKE: run the freshly-built static binary and assert it EXECUTES, not merely
+      # that it links static. x86_64-musl runs natively on the x86_64 runner; aarch64 and armv7 run
+      # under qemu-user (explicit qemu-<arch>-static, no Docker, no binfmt). Each check is
+      # deterministic and offline (no server, no socket, no thread), so it is fast and non-flaky under
+      # qemu-user: `--version` and `--help` are pure stdout-and-exit, and `dump` on an EMPTY data dir
+      # exercises the storage open + offline-reader scan path then exits 0 with no record to decode. A
+      # networked produce/consume smoke is deliberately NOT run here (sockets/threads under qemu-user
+      # are flaky); the native test job already covers the wire path on x86_64.
+      - name: smoke-test the static binary on its target architecture
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/ironbus"
+          test -x "$bin"
+          # The qemu-user emulator for the cross targets; empty for the native x86_64 host. Used
+          # unquoted as a command prefix so an empty value expands to nothing (a native run) and a
+          # non-empty value to the single emulator binary (no spaces, so no word-split hazard); this
+          # avoids the empty-array-under-`set -u` pitfall of `"${arr[@]}"`.
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)      qemu=""                  ;;
+            aarch64-unknown-linux-musl)     qemu="qemu-aarch64-static" ;;
+            armv7-unknown-linux-musleabihf) qemu="qemu-arm-static"   ;;
+            *) echo "::error::no smoke runner for ${{ matrix.target }}"; exit 1 ;;
+          esac
+          # `ironbus --version` is a single deterministic line `ironbus <semver>`, exit 0.
+          ver="$($qemu "$bin" --version)"
+          echo "version: $ver"
+          case "$ver" in
+            "ironbus "*) : ;;
+            *) echo "::error::--version did not print the expected 'ironbus <version>' line"; exit 1 ;;
+          esac
+          # `ironbus --help` prints the usage banner, exit 0; assert a known usage substring.
+          help="$($qemu "$bin" --help)"
+          case "$help" in
+            *"USAGE:"*"ironbus serve"*) : ;;
+            *) echo "::error::--help did not print the expected usage banner"; exit 1 ;;
+          esac
+          # A tiny OFFLINE end-to-end check: `dump` on an empty (but existing) data dir runs the
+          # storage-open and offline-reader scan path with no server, no socket, and no record to
+          # decode, and must exit 0 cleanly. This catches a startup crash that only the IO/storage
+          # init path triggers, which neither --version nor --help reach.
+          empty_dir="$(mktemp -d)"
+          $qemu "$bin" dump --data-dir "$empty_dir"
+          echo "ok: $bin runs on ${{ matrix.target }} (--version, --help, offline dump all exit 0)"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ironbus-${{ matrix.target }}

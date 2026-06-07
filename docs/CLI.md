@@ -17,7 +17,7 @@ flag and code does.
 > Scope: this map covers the command surface that the binary SHIPS today. The frozen
 > design in issue #136 specifies a larger verb tree (`tap`, `wire`, `bench`, `info`,
 > `consumer`, `segments`, `scrub`, `repair`, `dlq`, `retention`, `top`, `config`,
-> `recovery report`, `version`, `completions`) and a versioned `--json` schema contract;
+> `recovery report`, `completions`) and a versioned `--json` schema contract;
 > those are NOT implemented in the current binary and are deliberately absent here. This
 > reference enumerates only what `main.rs` actually parses and runs.
 
@@ -31,6 +31,7 @@ flag and code does.
 | `peek` | offline (reads `--data-dir`) | Unix only in v1 | Show a bounded window of durable records from a stopped broker's data directory. |
 | `dump` | offline (reads `--data-dir`) | Unix only in v1 | Stream every durable record (or, with `--dlq`, the dead-letter sink). |
 | `help` / `--help` / `-h` | neither | any | Print the usage banner. |
+| `version` / `--version` / `-V` | neither | any | Print a single `ironbus <version>` line. |
 
 A subcommand is required; an unknown subcommand or a missing one is a usage error
 (exit 1). `serve`, `peek`, and `dump` are Unix only in v1 because the on-disk storage

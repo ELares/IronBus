@@ -206,6 +206,7 @@ USAGE:
     ironbus peek  --data-dir <dir> [--from-offset <n>] [--limit <n>] [--json]
     ironbus dump  --data-dir <dir> [--limit <n>] [--json] [--dlq]
     ironbus help
+    ironbus version
 
 Notes:
     The default address is 127.0.0.1:7777 (loopback only).
@@ -358,6 +359,15 @@ fn run(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         "dump" => run_dump(rest, out),
         "help" | "--help" | "-h" => {
             writeln!(out, "{USAGE}")?;
+            Ok(())
+        }
+        // A single deterministic version line. `--version`/`-V`/`version` all print the same
+        // `ironbus <semver>` and exit 0, so an operator (and the CI cross-build smoke, #100) can
+        // identify the build with no broker, no data dir, and no socket. The version is the
+        // workspace package version compiled in via Cargo's `CARGO_PKG_VERSION`, so it tracks the
+        // crate version automatically and cannot drift from the manifest.
+        "version" | "--version" | "-V" => {
+            writeln!(out, "ironbus {}", env!("CARGO_PKG_VERSION"))?;
             Ok(())
         }
         other => Err(CliError::Usage(format!("unknown subcommand `{other}`"))),
@@ -2294,6 +2304,19 @@ mod tests {
         let mut buf = Vec::new();
         run(&["help".to_string()], &mut buf).unwrap();
         assert!(String::from_utf8(buf).unwrap().contains("USAGE:"));
+    }
+
+    #[test]
+    fn run_dispatches_version_without_a_server() {
+        // `version`, `--version`, and `-V` are the same deterministic, broker-free, socket-free
+        // line `ironbus <crate-version>`, exit 0. This is exactly what the #100 cross-build smoke
+        // executes on each target, so assert the program name and the compiled crate version.
+        for form in ["version", "--version", "-V"] {
+            let mut buf = Vec::new();
+            run(&[form.to_string()], &mut buf).unwrap();
+            let out = String::from_utf8(buf).unwrap();
+            assert_eq!(out, format!("ironbus {}\n", env!("CARGO_PKG_VERSION")));
+        }
     }
 
     #[test]
