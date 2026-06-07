@@ -168,30 +168,34 @@ impl KeyRouter {
     }
 
     /// The routing decision for delivering `offset` (carrying `key`) to `member` right now
-    /// (#64). An EMPTY key keeps plain competing distribution: any member may take it, subject
-    /// only to the per-key (here, the empty-key) serialization gate, so empty-keyed records
-    /// still never reorder among themselves. A non-empty key is deliverable to `member` only if
-    /// `member` is its rendezvous owner AND the key is not already busy with an EARLIER offset.
+    /// (#64). An EMPTY key keeps plain competing distribution: it has no affinity and no per-key
+    /// order, so any live member may take any free empty-keyed offset, and empty-keyed records
+    /// drain IN PARALLEL across members (the lease layer alone guarantees a single member claims a
+    /// given offset). A non-empty key is deliverable to `member` only if `member` is its rendezvous
+    /// owner AND the key is not already busy with an EARLIER offset.
     ///
     /// A key that is busy with THIS SAME offset returns [`RouteDecision::Deliver`]: that is a
     /// redelivery of the outstanding record itself (its lease expired), which the lease layer
     /// gates, and it must precede the key's next record, so it is allowed through here.
     #[must_use]
     pub fn decide(&self, member: MemberId, key: &[u8], offset: Offset) -> RouteDecision {
+        // An empty key has no affinity and no per-key order: it competes plainly, so it bypasses
+        // the per-key serialization gate entirely and any live member may take any free empty-keyed
+        // offset in parallel. The lease layer (the is_claimable peek the caller already applied)
+        // bounds it to one member per offset; serializing the empty key here would falsely throttle
+        // empty-keyed traffic to a single in-flight record across the whole group.
+        if key.is_empty() {
+            return RouteDecision::Deliver;
+        }
         // Per-key serialization / drain guard: if the key holds an EARLIER in-flight offset, no
         // member may take this (higher) one yet. The same offset is the outstanding record's own
-        // redelivery and is allowed. Applies to the empty key too (it serializes empty-keyed
-        // records against each other, preserving their order under plain competing distribution).
+        // redelivery and is allowed.
         if let Some(&busy) = self.in_flight.get(key) {
             if busy != offset.get() {
                 return RouteDecision::KeyBusy;
             }
             // Same offset: fall through. Ownership is re-checked below so a rebalance that moved
             // the key cannot deliver even its own redelivery to a non-owner.
-        }
-        // An empty key has no affinity: any member competes for it.
-        if key.is_empty() {
-            return RouteDecision::Deliver;
         }
         match self.owner(key) {
             Some(owner) if owner == member => RouteDecision::Deliver,
@@ -206,6 +210,12 @@ impl KeyRouter {
     /// only ever has one outstanding offset at a time (the serialization gate guarantees the
     /// next is not routed until this clears), so this overwrites at most a stale equal entry.
     pub fn mark_in_flight(&mut self, key: &[u8], offset: Offset) {
+        // An empty key is plain competing with no per-key order, so it is never tracked here: the
+        // lease layer alone bounds empty-keyed records. Tracking b"" would falsely serialize them
+        // (and `decide` already bypasses the gate for the empty key), so this is a no-op for it.
+        if key.is_empty() {
+            return;
+        }
         self.in_flight.insert(key.to_vec(), offset.get());
     }
 
@@ -391,6 +401,33 @@ mod tests {
         );
         assert_eq!(
             router.decide(member(2), b"", Offset::new(0)),
+            RouteDecision::Deliver
+        );
+    }
+
+    #[test]
+    fn empty_keys_drain_in_parallel_and_are_not_serialized() {
+        // Plain competing distribution for the empty key (#64 review S1): unlike a real key, an
+        // empty key is NOT throttled to one in-flight record at a time. Even with one empty-keyed
+        // offset outstanding, a HIGHER empty-keyed offset is still deliverable (to either member),
+        // so empty-keyed traffic drains in parallel; the lease layer alone bounds each offset.
+        let mut router = KeyRouter::new();
+        router.join(member(1));
+        router.join(member(2));
+        // mark_in_flight is a no-op for the empty key, so it never goes "busy".
+        router.mark_in_flight(b"", Offset::new(0));
+        assert_eq!(
+            router.busy_keys(),
+            0,
+            "an empty key is never tracked as busy"
+        );
+        // A higher empty-keyed offset is still deliverable to a DIFFERENT member in parallel.
+        assert_eq!(
+            router.decide(member(2), b"", Offset::new(1)),
+            RouteDecision::Deliver
+        );
+        assert_eq!(
+            router.decide(member(1), b"", Offset::new(1)),
             RouteDecision::Deliver
         );
     }

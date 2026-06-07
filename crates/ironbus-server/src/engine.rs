@@ -4290,24 +4290,36 @@ mod tests {
     }
 
     #[test]
-    fn per_key_order_survives_a_mid_stream_join() {
-        // Acceptance: per-key order survives a mid-stream member join (the affected key may remap,
-        // but its in-flight record drains before the new owner gets the next one).
+    fn per_key_order_survives_a_mid_stream_join_that_moves_the_owner() {
+        // Acceptance: per-key order survives a mid-stream member join, INCLUDING the case where the
+        // join actually MOVES the key's owner. The in-flight record must drain before the NEW owner
+        // gets the next one, so an old in-flight record and a newly routed one never interleave.
         let mut e = open(config(20, 5));
         e.set_key_ordering_in("g", KeyOrdering::KeyShared).unwrap();
         let m1 = MemberId::new(1);
+        let m2 = MemberId::new(2);
+        // Find a key that, in the {m1, m2} member set, is owned by m2, so the join below provably
+        // moves it from m1 (sole owner when alone) to m2. MemberId is stable across leave/rejoin,
+        // so the rendezvous owner is the same m2 after it rejoins.
         e.join_member_in("g", m1);
-        // With one member, m1 owns every key.
-        let key = b"stream-key".to_vec();
+        e.join_member_in("g", m2);
+        let (_for_m1, key) = two_keys_to_two_members(&e, "g", m1, m2);
+        e.leave_member_in("g", m2);
+        assert!(
+            matches!(
+                e.route_decision_in("g", m1, &key, Offset::ZERO),
+                Some(RouteDecision::Deliver)
+            ),
+            "with m1 alone it owns every key, including this one"
+        );
         let o0 = produce_keyed(&mut e, &key, b"0");
         let o1 = produce_keyed(&mut e, &key, b"1");
-        // m1 takes o0.
+        // m1 takes o0 while it is the sole owner.
         let d0 = message(e.poll_in_member("g", m1, 0).unwrap());
         assert_eq!(d0.offset, o0);
-        // A second member joins mid-stream.
-        let m2 = MemberId::new(2);
+        // m2 joins mid-stream: the key's owner MOVES to m2.
         e.join_member_in("g", m2);
-        // Whoever now owns the key, o1 is not deliverable while o0 is in flight.
+        // o1 is not deliverable to ANYONE while o0 is in flight (the drain guard across the remap).
         for m in [m1, m2] {
             match e.poll_in_member("g", m, 0).unwrap() {
                 Poll::Idle => {}
@@ -4315,27 +4327,33 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             }
         }
-        // Ack o0: the key frees and o1 delivers to its current owner, in order.
+        // Ack o0: the key frees and o1 delivers to the NEW owner m2 (not the old owner m1), in order.
         assert_eq!(e.ack_in("g", &d0.token), AckResult::Acked);
-        let owner = if matches!(
+        assert_eq!(
+            e.route_decision_in("g", m2, &key, o1),
+            Some(RouteDecision::Deliver),
+            "the key moved to m2, so m2 is now its owner"
+        );
+        assert_eq!(
             e.route_decision_in("g", m1, &key, o1),
-            Some(RouteDecision::Deliver)
-        ) {
-            m1
-        } else {
-            m2
-        };
-        let d1 = message(e.poll_in_member("g", owner, 0).unwrap());
+            Some(RouteDecision::NotOwner),
+            "m1 no longer owns the moved key"
+        );
+        let d1 = message(e.poll_in_member("g", m2, 0).unwrap());
         assert_eq!(
             d1.offset, o1,
-            "o1 delivers after o0, preserving per-key order"
+            "o1 delivers after o0 to the new owner, preserving per-key order across the remap"
         );
     }
 
     #[test]
     fn an_empty_key_keeps_plain_competing_distribution() {
-        // Records with no key have no affinity: any member may take them, and two members split the
-        // batch with no double delivery (the competing property).
+        // Records with no key have no affinity and no per-key order (#64): any member may take them
+        // and they drain IN PARALLEL, not one record at a time. The load-bearing property (#64
+        // review S1) is that two empty-keyed records can be in flight at two DIFFERENT members
+        // SIMULTANEOUSLY; under a (wrong) empty-key serialization gate the second poll below would
+        // be Idle. Then the whole batch drains exactly once across the members (the competing
+        // property, no double delivery).
         let mut e = open(config(20, 5));
         e.set_key_ordering_in("g", KeyOrdering::KeyShared).unwrap();
         let m1 = MemberId::new(1);
@@ -4345,9 +4363,20 @@ mod tests {
         for p in [&b"a"[..], b"b", b"c", b"d"] {
             produce_keyed(&mut e, b"", p);
         }
-        // Drain across both members; collect the (offset, member) deliveries.
-        let mut delivered = Vec::new();
-        for m in [m1, m2, m1, m2, m1, m2] {
+        // Two empty-keyed records in flight at the same time across two members, with NO ack in
+        // between: plain competing must allow this (the serialization fix). Both must deliver and
+        // they must be DISTINCT offsets (no double delivery of the same record).
+        let first = message(e.poll_in_member("g", m1, 0).unwrap());
+        let second = message(e.poll_in_member("g", m2, 0).unwrap());
+        assert_ne!(
+            first.offset, second.offset,
+            "two empty-keyed records drain in parallel to two members, not serialized"
+        );
+        let mut delivered = vec![first.offset.get(), second.offset.get()];
+        assert_eq!(e.ack_in("g", &first.token), AckResult::Acked);
+        assert_eq!(e.ack_in("g", &second.token), AckResult::Acked);
+        // Drain the remaining two across both members.
+        for m in [m1, m2, m1, m2] {
             if let Poll::Message(d) = e.poll_in_member("g", m, 0).unwrap() {
                 delivered.push(d.offset.get());
                 assert_eq!(e.ack_in("g", &d.token), AckResult::Acked);
