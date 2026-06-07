@@ -57,7 +57,7 @@ pub fn serve<F, C>(
 ) -> std::io::Result<()>
 where
     F: Filesystem + 'static,
-    C: Clock + 'static,
+    C: Clock + Clone + 'static,
 {
     listener.set_nonblocking(true)?;
     let active = Arc::new(AtomicUsize::new(0));
@@ -98,7 +98,7 @@ fn handle_connection<F, C>(
 ) -> std::io::Result<()>
 where
     F: Filesystem,
-    C: Clock,
+    C: Clock + Clone,
 {
     stream.set_nonblocking(false)?; // the handler reads blocking
                                     // Bound how long a stalled client can hold this slot (slowloris defense): a read or

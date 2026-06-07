@@ -25,6 +25,7 @@ use ironbus_core::lease::{
 };
 use ironbus_core::types::Offset;
 use ironbus_storage::checkpoint::{Checkpoint, MAX_PAYLOAD};
+use ironbus_storage::dlq::{DlqSink, DLQ_SUBDIR};
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::{Append, Log, LogConfig, RetentionBounds};
 use ironbus_storage::loss::LossReport;
@@ -519,12 +520,25 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// or `None` if none has been dead-lettered. A gauge-style companion to the
     /// `dead_lettered` counter.
     last_dead_lettered: Option<Offset>,
+    /// The durable dead-letter SINK (#63): a second segmented log under the `dlq/` subdirectory
+    /// holding every poison record for later inspection. Opened LAZILY on the first dead-letter
+    /// (so a broker that never dead-letters never creates the subdirectory), or eagerly by
+    /// [`Engine::open`] when the subdirectory already exists, so the per-group dead-lettered
+    /// high-water mark (the idempotency key) is rebuilt before the first poison redelivers.
+    dlq: Option<DlqSink<F, C>>,
+    /// The [`LogConfig`] the DLQ sink's log is opened with: the same segment sizing as the main
+    /// log, but with NO total-byte cap (a poison record must never be shed, it is the durable
+    /// evidence of a dropped message).
+    dlq_config: LogConfig,
 }
 
 /// The file name of the work-group's durable committed-cursor checkpoint.
 const CURSOR_CHECKPOINT: &str = "cursor.ckpt";
 
-impl<F: Filesystem, C: Clock> Engine<F, C> {
+// The engine requires `C: Clone` so it can hand the secondary durable DLQ sink (#63) its own clock
+// (see `Log::clock_clone`). Every shipped clock (`ManualClock`, `Arc<ManualClock>`, `SystemClock`)
+// is `Clone`, so this is not a usability regression.
+impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// Opens the engine, recovering the durable log and the durable consumer cursor (its
     /// committed watermark plus the acked-ahead set), so a restart resumes from the last
     /// checkpoint and redelivers only genuinely unacked offsets, not the acked-ahead ones.
@@ -594,6 +608,26 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
             }
         }
 
+        // The DLQ sink's log shares the main log's segment sizing but is NEVER byte-capped: a
+        // poison record is the durable evidence of a dropped message and must not itself be shed.
+        let dlq_config = LogConfig {
+            max_segment_bytes: config.log.max_segment_bytes,
+            max_total_bytes: 0,
+        };
+        // Eagerly open (recovering its high-water mark) the DLQ sink IF its subdirectory already
+        // exists from a prior run, so the idempotency key is present before the first poison
+        // redelivers after a crash. A fresh data directory has no `dlq/` yet, so the sink stays
+        // unopened (lazy) and the no-poison path never creates it.
+        let dlq = if Self::dlq_dir_exists(&log) {
+            Some(DlqSink::open(
+                log.filesystem(),
+                log.clock_clone(),
+                dlq_config,
+            )?)
+        } else {
+            None
+        };
+
         Ok(Engine {
             log,
             groups,
@@ -613,7 +647,18 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
             counters: Counters::default(),
             fsync: LatencyHistogram::default(),
             last_dead_lettered: None,
+            dlq,
+            dlq_config,
         })
+    }
+
+    /// Whether the `dlq/` subdirectory already exists, so a prior run dead-lettered at least one
+    /// message. Used by [`Engine::open`] to decide whether to eagerly open the sink (rebuilding the
+    /// idempotency high-water mark) versus deferring to the lazy open on the first dead-letter.
+    /// This is a non-creating probe ([`Filesystem::subdir_exists`]), so `Engine::open` on a fresh
+    /// data directory never materializes the DLQ subdirectory.
+    fn dlq_dir_exists(log: &Log<F, C>) -> bool {
+        log.filesystem().subdir_exists(DLQ_SUBDIR).unwrap_or(false)
     }
 
     /// Durably records the current committed offset, so a later [`Engine::open`] resumes
@@ -993,6 +1038,10 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
             .min(flushed);
 
         let mut offset = committed;
+        // The poison message (claimed but over max-deliver) to dead-letter, captured so the
+        // crash-atomic DLQ move runs OUTSIDE the borrow of `g` (the DLQ append needs `&mut self`
+        // for the sink, which cannot coexist with the live `&mut self.groups` borrow).
+        let mut dead_letter: Option<(Offset, LeaseToken, u32, OwnedRecord)> = None;
         while offset < window_end {
             let off = Offset::new(offset);
             if g.cursor.is_acked(off) {
@@ -1010,36 +1059,106 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
                         // Surface it loudly rather than silently stalling if an invariant breaks.
                         return Err(EngineError::MissingRecord { offset });
                     };
-                    let poll = match self.delivery.disposition(deliveries) {
+                    match self.delivery.disposition(deliveries) {
                         Disposition::Deliver => {
                             self.counters.delivered += 1;
                             if deliveries > 1 {
                                 self.counters.redelivered += 1;
                             }
-                            Poll::Message(Delivery {
+                            return Ok(Poll::Message(Delivery {
                                 offset: off,
                                 token,
                                 deliveries,
                                 record,
-                            })
+                            }));
                         }
                         Disposition::DeadLetter => {
-                            // Park: drop the lease and commit past it so it never redelivers.
+                            // Capture and break: the durable DLQ move and the cursor commit happen
+                            // below, after the `g` borrow is released. The lease is dropped here so
+                            // the in-flight bookkeeping is correct regardless of the move's result.
                             g.leases.ack(&token);
-                            g.cursor.ack(off);
-                            self.counters.dead_lettered += 1;
-                            self.last_dead_lettered = Some(off);
-                            Poll::Parked {
-                                offset: off,
-                                record,
-                            }
+                            dead_letter = Some((off, token, deliveries, record));
+                            break;
                         }
-                    };
-                    return Ok(poll);
+                    }
                 }
             }
         }
-        Ok(Poll::Idle)
+        match dead_letter {
+            Some((off, _token, deliveries, record)) => {
+                self.dead_letter_in(group, off, deliveries, record)
+            }
+            None => Ok(Poll::Idle),
+        }
+    }
+
+    /// Performs the crash-atomic, EXACTLY-ONCE dead-letter move for a poison message in `group` at
+    /// source offset `off` after `attempt` deliveries (#63), then commits the source group's cursor
+    /// past it and returns [`Poll::Parked`].
+    ///
+    /// The ordering is the crash-safety contract: APPEND the poison record to the durable DLQ sink
+    /// and FSYNC it, THEN commit the source cursor. A crash between the two leaves the source
+    /// uncommitted (it redelivers and is re-poisoned on the next run) and the DLQ record already
+    /// durable; on reopen the per-group dead-lettered high-water mark, rebuilt from the DLQ itself,
+    /// makes the re-poison a no-op append so the message is committed-past WITHOUT a duplicate DLQ
+    /// write. The reconciliation key is `(group, source_offset, attempt)`: an offset at or below
+    /// the group's high-water mark is already in the sink, so it is committed-past without a second
+    /// append.
+    ///
+    /// The lease has already been dropped by the caller, so on success the message holds no lease
+    /// and never redelivers.
+    fn dead_letter_in(
+        &mut self,
+        group: &str,
+        off: Offset,
+        attempt: u32,
+        record: OwnedRecord,
+    ) -> Result<Poll, EngineError> {
+        // Idempotency: if this (group, source offset) is already durably in the DLQ (at or below
+        // the group's recorded high-water mark), do NOT append a second copy. This is the path a
+        // redelivered-then-re-poisoned message takes after a crash that landed between the DLQ
+        // append and the cursor commit: the sink already has it, so we only commit past it.
+        let already = self.dlq_sink()?.already_dead_lettered(group, off.get());
+        if !already {
+            // APPEND to the DLQ and FSYNC, BEFORE committing the source cursor. A storage error
+            // (including a frozen DLQ writer) propagates WITHOUT committing the source, so the move
+            // simply did not happen and the message redelivers, never lost and never half-moved.
+            self.dlq_sink()?.append_poison(group, &record, attempt)?;
+        }
+        // The DLQ record is now durable (or was already), so commit the source cursor past the
+        // poison message: drop nothing, never redeliver. This is the second, ordered durability
+        // step; only after the append's fsync does the source advance.
+        let Some(g) = self.groups.get_mut(group) else {
+            // Unreachable: poll_in created/looked up the group before reaching here.
+            return Err(EngineError::MissingRecord { offset: off.get() });
+        };
+        g.cursor.ack(off);
+        self.counters.dead_lettered += 1;
+        self.last_dead_lettered = Some(off);
+        Ok(Poll::Parked {
+            offset: off,
+            record,
+        })
+    }
+
+    /// Lazily opens (recovering its per-group high-water mark) the durable DLQ sink on first use,
+    /// returning a mutable borrow. The sink is created on the first dead-letter, so a broker that
+    /// never dead-letters never creates the `dlq/` subdirectory (the no-poison path never touches
+    /// it). After a restart that already has a `dlq/` directory, [`Engine::open`] eagerly opens it
+    /// so the high-water mark is present before the first poison redelivers.
+    fn dlq_sink(&mut self) -> Result<&mut DlqSink<F, C>, EngineError> {
+        if self.dlq.is_none() {
+            let sink = DlqSink::open(
+                self.log.filesystem(),
+                self.log.clock_clone(),
+                self.dlq_config,
+            )?;
+            self.dlq = Some(sink);
+        }
+        // Just-assigned above when None, so this is always Some.
+        self.dlq
+            .as_mut()
+            .ok_or(EngineError::MissingRecord { offset: 0 })
     }
 
     /// Like [`Engine::poll`] but reads the current monotonic time from the engine's own
@@ -1247,6 +1366,16 @@ impl<F: Filesystem, C: Clock> Engine<F, C> {
     #[must_use]
     pub fn last_dead_lettered_offset(&self) -> Option<Offset> {
         self.last_dead_lettered
+    }
+
+    /// The number of records durably written to the DLQ sink (the dead-letter depth, #63): the
+    /// records present when the sink was opened plus every poison record appended since. Zero when
+    /// nothing has been dead-lettered (the sink is then never even opened). Exposed on `/metrics`
+    /// as `ironbus_dlq_records_total`. Unlike `dead_lettered` (an in-memory counter reset on
+    /// restart), this is reconstructed from the durable sink, so it survives a restart.
+    #[must_use]
+    pub fn dlq_records(&self) -> u64 {
+        self.dlq.as_ref().map_or(0, DlqSink::records)
     }
 
     /// The number of messages currently in flight (leased, not yet acked).
@@ -3206,6 +3335,234 @@ mod tests {
         assert!(
             e.is_healthy(),
             "the writer stays live (the shed is non-fatal)"
+        );
+    }
+
+    // ----- The durable dead-letter (DLQ) sink and the crash-atomic, exactly-once move (#63) -----
+
+    use ironbus_storage::dlq::{read_dlq_entries, DlqEntry, DLQ_SUBDIR};
+
+    /// Produces one poison message, drives it past `max_deliver` (1) so the next poll dead-letters
+    /// it, and returns the engine (the poison is now parked). Uses an `Arc<ManualClock>` the caller
+    /// drives so a redelivery's visibility window can expire deterministically.
+    fn poison_once<F: Filesystem>(
+        e: &mut Engine<F, std::sync::Arc<ManualClock>>,
+        clock: &std::sync::Arc<ManualClock>,
+        payload: &[u8],
+    ) -> Offset {
+        let off = e
+            .produce(&Append {
+                timestamp_ms: 42,
+                flags: RecordFlags::EMPTY,
+                key: b"poison-key",
+                headers: b"poison-hdr",
+                payload,
+            })
+            .unwrap();
+        // First delivery (attempt 1, within max_deliver = 1).
+        let _ = message(e.poll_now().unwrap());
+        // Expire the lease, then re-poll: attempt 2 exceeds max_deliver and is dead-lettered.
+        clock.advance_monotonic_nanos(40);
+        match e.poll_now().unwrap() {
+            Poll::Parked { offset, .. } => assert_eq!(offset, off),
+            other => panic!("expected Parked, got {other:?}"),
+        }
+        off
+    }
+
+    #[test]
+    fn a_poisoned_message_is_durably_written_to_the_dlq_and_committed_past() {
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 1)).unwrap();
+        let off = poison_once(&mut e, &clock, b"the-poison-payload");
+
+        // The source group committed PAST the poison (it never redelivers).
+        assert_eq!(e.committed_offset(), Offset::new(off.get() + 1));
+        assert!(matches!(e.poll_now().unwrap(), Poll::Idle));
+        assert_eq!(e.counters().dead_lettered, 1);
+        assert_eq!(e.dlq_records(), 1, "one record in the DLQ depth");
+        drop(e);
+
+        // Reopen the data directory: the DLQ sink holds the poison record with the ORIGINAL
+        // timestamp, the source group, the source offset, and the attempt it was poisoned at.
+        let entries = read_dlq_entries(&probe).unwrap();
+        assert_eq!(entries.len(), 1);
+        let DlqEntry {
+            group,
+            source_offset,
+            attempt,
+            timestamp_ms,
+            key,
+            headers,
+            payload,
+            ..
+        } = &entries[0];
+        assert_eq!(group, "", "the default group");
+        assert_eq!(*source_offset, off.get());
+        assert_eq!(
+            *attempt, 2,
+            "poisoned on the 2nd attempt (over max_deliver 1)"
+        );
+        assert_eq!(
+            *timestamp_ms, 42,
+            "the original enqueue timestamp is preserved"
+        );
+        assert_eq!(key, b"poison-key");
+        assert_eq!(headers, b"poison-hdr");
+        assert_eq!(payload, b"the-poison-payload");
+    }
+
+    #[test]
+    fn the_no_poison_path_never_creates_or_touches_the_dlq() {
+        // A normal produce / poll / ack lifecycle must never materialize the dlq/ subdirectory.
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b", b"c"] {
+            produce(&mut e, p);
+        }
+        for _ in 0..3 {
+            let d = message(e.poll(0).unwrap());
+            e.ack(&d.token);
+        }
+        assert_eq!(e.dlq_records(), 0, "no DLQ records without poison");
+        let fs = e.into_filesystem();
+        // The subdir was never created, and an offline DLQ read shows nothing.
+        assert!(
+            !fs.subdir_exists(DLQ_SUBDIR).unwrap(),
+            "the dlq/ subdir must not exist on the no-poison path"
+        );
+        assert!(read_dlq_entries(&fs).unwrap().is_empty());
+    }
+
+    #[test]
+    fn re_poisoning_the_same_offset_does_not_double_write() {
+        // Idempotency at the API level: dead-lettering the SAME (group, offset) twice (e.g. a
+        // forced re-evaluation) writes exactly one DLQ record. We drive a second dead-letter of an
+        // offset already at the group's high-water mark by re-invoking the internal move directly.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 1)).unwrap();
+        let off = poison_once(&mut e, &clock, b"p");
+        assert_eq!(e.dlq_records(), 1);
+
+        // Read the source record back and re-run the dead-letter move for the SAME (group, offset,
+        // attempt). The high-water mark already covers `off`, so no second DLQ write happens.
+        let record = e.log.read_from(off, 1).unwrap().into_iter().next().unwrap();
+        let poll = e.dead_letter_in("", off, 2, record).unwrap();
+        assert!(matches!(poll, Poll::Parked { .. }));
+        assert_eq!(
+            e.dlq_records(),
+            1,
+            "re-poison is idempotent: still one record"
+        );
+        drop(e);
+        assert_eq!(read_dlq_entries(&probe).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_crash_between_the_dlq_append_and_the_source_commit_yields_exactly_one_dlq_entry() {
+        use ironbus_storage::fault::FaultFs;
+        // The crash window: the DLQ append+fsync is durable, but the source-cursor commit's
+        // durability has NOT yet landed (it is only in memory, the checkpoint interval is high).
+        // A power loss reverts the un-checkpointed source cursor (the poison redelivers) while the
+        // fsynced DLQ record survives. On reopen the per-group high-water mark, rebuilt from the
+        // durable DLQ, suppresses the duplicate append: EXACTLY ONE DLQ entry, and no loss.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let (faultfs, _control) = FaultFs::new(InMemoryFs::new());
+        // Keep a probe to the underlying in-memory disk to drive the power loss and read the DLQ.
+        let probe = faultfs.inner().clone();
+        // checkpoint_interval high so the dead-letter park's cursor advance is NOT checkpointed,
+        // modeling the crash landing before the source commit becomes durable.
+        let mut cfg = config(10, 1);
+        cfg.checkpoint_interval = 1_000_000;
+        let mut e = Engine::open(faultfs, std::sync::Arc::clone(&clock), cfg.clone()).unwrap();
+        let off = poison_once(&mut e, &clock, b"poison");
+        assert_eq!(
+            e.dlq_records(),
+            1,
+            "the poison is in the DLQ before the crash"
+        );
+        // In memory the source committed past, but that advance was never checkpointed.
+        assert_eq!(e.committed_offset(), Offset::new(off.get() + 1));
+        drop(e);
+
+        // CRASH: power loss reverts everything not yet durable. The DLQ record was fsynced (durable);
+        // the source cursor checkpoint still reflects the pre-poison committed offset.
+        probe.simulate_power_loss();
+
+        // RECOVER: reopen over the surviving disk. The source poison redelivers (its commit was
+        // lost), is re-poisoned, and is committed-past WITHOUT a duplicate DLQ write.
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(probe.clone(), std::sync::Arc::clone(&clock2), cfg).unwrap();
+        // The DLQ depth recovered from the durable sink is one (it survived the crash).
+        assert_eq!(e.dlq_records(), 1, "the DLQ entry survived the crash");
+        // The source cursor lost its un-checkpointed advance, so the poison is uncommitted again.
+        assert_eq!(
+            e.committed_offset(),
+            Offset::ZERO,
+            "the source commit was lost"
+        );
+        // Re-poison it: first delivery, expire, then dead-letter again. This time the move must be
+        // a no-op append (already in the DLQ) and only commit past.
+        let _ = message(e.poll_now().unwrap());
+        clock2.advance_monotonic_nanos(40);
+        assert!(matches!(e.poll_now().unwrap(), Poll::Parked { .. }));
+        // EXACTLY ONCE: still one DLQ record (no duplicate), and the source is now committed-past.
+        assert_eq!(
+            e.dlq_records(),
+            1,
+            "no duplicate DLQ write after the crash-redelivery"
+        );
+        assert_eq!(e.committed_offset(), Offset::new(off.get() + 1));
+        assert!(
+            matches!(e.poll_now().unwrap(), Poll::Idle),
+            "no loss, no re-loop"
+        );
+        drop(e);
+
+        // The durable sink, read offline, has EXACTLY ONE entry for (group "", offset, attempt).
+        let entries = read_dlq_entries(&probe).unwrap();
+        assert_eq!(entries.len(), 1, "exactly one DLQ entry across the crash");
+        assert_eq!(entries[0].source_offset, off.get());
+        assert_eq!(entries[0].group, "");
+    }
+
+    #[test]
+    fn a_second_crash_redelivery_still_adds_no_duplicate() {
+        use ironbus_storage::fault::FaultFs;
+        // Two successive crash-then-redeliver cycles must still leave exactly one DLQ entry: the
+        // idempotency key holds across repeated re-poisoning, not just the first.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let (faultfs, _control) = FaultFs::new(InMemoryFs::new());
+        let probe = faultfs.inner().clone();
+        let mut cfg = config(10, 1);
+        cfg.checkpoint_interval = 1_000_000;
+        let mut e = Engine::open(faultfs, std::sync::Arc::clone(&clock), cfg.clone()).unwrap();
+        let _off = poison_once(&mut e, &clock, b"poison");
+        drop(e);
+
+        for round in 0..2 {
+            probe.simulate_power_loss();
+            let clk = std::sync::Arc::new(ManualClock::new());
+            let mut e =
+                Engine::open(probe.clone(), std::sync::Arc::clone(&clk), cfg.clone()).unwrap();
+            assert_eq!(
+                e.committed_offset(),
+                Offset::ZERO,
+                "round {round}: poison uncommitted"
+            );
+            let _ = message(e.poll_now().unwrap());
+            clk.advance_monotonic_nanos(40);
+            assert!(matches!(e.poll_now().unwrap(), Poll::Parked { .. }));
+            assert_eq!(e.dlq_records(), 1, "round {round}: still one DLQ record");
+            drop(e);
+        }
+        assert_eq!(
+            read_dlq_entries(&probe).unwrap().len(),
+            1,
+            "exactly one across two crashes"
         );
     }
 }
