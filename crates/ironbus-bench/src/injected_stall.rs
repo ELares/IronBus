@@ -8,11 +8,13 @@
 //! harness records from the INTENDED send time, the backlog that drains after the thaw carries its
 //! original, now-old intended times, so the freeze duration lands squarely in the tail.
 //!
-//! The self-test ASSERTS the tail rose by roughly the stall: a healthy loopback run's p99.9 is in
-//! the low milliseconds, so a recorded tail at or above a generous fraction of the stall can only
-//! come from the injected freeze being measured. It FAILS if the tail does not move, which is
-//! exactly the regression (a reintroduced coordinated omission) it exists to catch. It is kept
-//! short and uses a generous lower-bound margin so it is fast and non-flaky on a loaded CI runner.
+//! The self-test ASSERTS the recorded tail clears a separation floor (a fraction of the freeze) that
+//! the un-stalled baseline stays below, so a recorded tail over the floor can only come from the
+//! injected freeze being measured. It FAILS if the tail does not move, which is exactly the
+//! regression (a reintroduced coordinated omission) it exists to catch. Because the broker fsyncs
+//! every produce, its baseline tail is the host disk's fsync floor (sub-ms on a fast SSD, tens of ms
+//! on a slow CI disk); the test (see the integration test) CALIBRATES the arrival rate and the
+//! freeze to that floor via [`probe_op_latency_us`], so it is non-flaky across disks.
 //!
 //! Unix only: it needs `SIGSTOP`/`SIGCONT`. The shipped broker is Unix-only, so this is no loss.
 
@@ -119,4 +121,51 @@ pub fn fresh_data_dir(tag: &str) -> PathBuf {
 /// Removes a data dir best-effort (a test cleanup helper).
 pub fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Measures the broker's UNLOADED single produce round-trip latency, in microseconds: the median of
+/// a handful of sequential, well-spaced produces over the real #11 client.
+///
+/// This is the per-op floor the host disk's fsync imposes (sub-millisecond on a fast SSD, tens to
+/// low-hundreds of milliseconds on a slow CI disk). The injected-stall self-test uses it to pick an
+/// arrival rate well below saturation and a stall that clearly exceeds the floor, so the test is
+/// self-tuning to any disk rather than assuming a fixed baseline. Returns `None` if the probe could
+/// not connect or produce at all.
+#[must_use]
+pub fn probe_op_latency_us(addr: &str) -> Option<f64> {
+    use ironbus_client::{Client, ClientConfig};
+    use ironbus_proto::message::PubBody;
+
+    let mut client = Client::connect_with(addr, &ClientConfig::default()).ok()?;
+    let mut samples: Vec<u64> = Vec::new();
+    // A short warmup followed by timed produces; spaced so each fsync completes before the next, so
+    // we measure the UNLOADED per-op latency, not a queued one.
+    for i in 0..12u64 {
+        let payload = i.to_le_bytes();
+        let start = crate::clock::now_nanos();
+        let ok = client
+            .produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                payload: &payload,
+            })
+            .is_ok();
+        let elapsed = crate::clock::now_nanos().saturating_sub(start);
+        if ok && i >= 2 {
+            // Drop the first two as warmup (segment/file creation, page-cache cold start).
+            samples.push(elapsed);
+        }
+        // Space the next produce so the disk is idle again.
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable();
+    let median_ns = samples[samples.len() / 2];
+    // The precision loss above 2^52 ns (~52 days) is irrelevant for a per-op latency probe.
+    #[allow(clippy::cast_precision_loss)]
+    Some(median_ns as f64 / 1e3)
 }
