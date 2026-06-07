@@ -979,6 +979,7 @@ fn seal_highest_segment_with_no_successor(disk: &InMemoryFs, id: u64) {
         scan.valid_end,
         u32::try_from(scan.record_count).unwrap(),
         scan.last_seq,
+        scan.max_timestamp_ms,
     );
     writer.seal().unwrap();
     disk.sync_dir().unwrap();

@@ -25,6 +25,8 @@ fn config() -> EngineConfig {
         checkpoint_interval: 1,
         // Retention off (the default), so the determinism image is unchanged.
         max_retained_bytes: 0,
+        max_age_ms: 0,
+        max_messages: 0,
     }
 }
 
