@@ -35,15 +35,48 @@ For each of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, and
 
 Plus, once per release:
 
+- `SHA256SUMS`: one consolidated checksum file over all three binaries, the file the installer
+  verifies against. The job self-checks it (`sha256sum -c SHA256SUMS`) before it ships.
 - `ironbus.sbom.json`: the `cargo-auditable` dependency manifest (the graph is target
   independent for this pure-Rust workspace), extracted with `rust-audit-info`.
-- A keyless Sigstore build-provenance attestation for every binary and the SBOM, stored in the
-  repository's attestations.
+- A keyless Sigstore build-provenance attestation for every binary, the `SHA256SUMS`, and the
+  SBOM, stored in the repository's attestations.
+
+A `v0.x` (or `v0.0.0`) tag is published as a GitHub **prerelease**, since the project is pre-1.0
+and not yet a stability promise (see SECURITY.md); a `v1+` tag publishes a full release.
+
+## Install (the fail-closed installer)
+
+`scripts/install.sh` is a `curl | sh`-style installer that detects the host architecture, maps it
+to a musl triple, downloads the matching `ironbus-<triple>` binary AND the release `SHA256SUMS`,
+and verifies the binary's SHA256 against `SHA256SUMS` BEFORE installing. It is **fail-closed**: any
+download error, a missing or mismatched checksum, a malformed `SHA256SUMS`, or an unsupported
+platform aborts with a non-zero exit and installs nothing. It never `eval`s or `sh`-pipes any
+downloaded content. There is no insecure / skip-verification override.
+
+```sh
+# Latest release, auto-detected arch, default install dir:
+curl -fsSL https://raw.githubusercontent.com/ELares/IronBus/main/scripts/install.sh | sh
+
+# Pin a version, choose an install dir, and additionally verify the Sigstore provenance:
+curl -fsSL https://raw.githubusercontent.com/ELares/IronBus/main/scripts/install.sh \
+  | sh -s -- --version v0.1.0 --bin-dir "$HOME/.local/bin" --verify-provenance
+```
+
+`--verify-provenance` additionally runs `gh attestation verify` (it needs the `gh` CLI and Rekor
+reachability) and is itself fail-closed: if requested and verification fails, nothing is installed.
+The checksum verification (`verify_checksum`) is factored into a shell function and gated by a
+tamper-rejection test (`crates/ironbus-cli/tests/installer_verify.rs`) that proves a tampered
+binary, an unlisted asset, an empty or malformed `SHA256SUMS`, and a missing binary are all
+rejected, while a matching binary is accepted.
+
+`.deb` and distroless-container packaging are tracked separately in #104.
 
 ## Verify a downloaded binary
 
 ```sh
-# Integrity:
+# Integrity (one file for all three binaries, or the per-binary .sha256):
+sha256sum -c SHA256SUMS                              # checks every listed asset present locally
 sha256sum -c ironbus-x86_64-unknown-linux-musl.sha256
 
 # Provenance (it was built by this repo's Release workflow, signed via Sigstore, no key needed):

@@ -1,0 +1,14 @@
+# `cross` configuration. The only thing pinned here is the environment passthrough the
+# reproducible release build (#101 / #103) needs to reach the cross build container.
+#
+# `cross` forwards `RUSTFLAGS` from the host by default, but NOT `SOURCE_DATE_EPOCH`. The release
+# workflow sets `SOURCE_DATE_EPOCH` to the tag commit's date and a `--remap-path-prefix` RUSTFLAGS
+# pair (see RELEASING.md); both must reach the in-container `cargo` for the shipped musl binary to
+# be byte-reproducible. Listing them here is a no-op for every other `cross` caller (CI's
+# cross-build and the 32-bit parser job do not set `SOURCE_DATE_EPOCH`, so an unset var is simply
+# not forwarded), so this only affects the release path.
+[build.env]
+passthrough = [
+    "SOURCE_DATE_EPOCH",
+    "RUSTFLAGS",
+]
