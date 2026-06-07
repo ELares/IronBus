@@ -211,20 +211,31 @@ fn a_malformed_checksum_line_is_rejected() {
 /// so the test brings its own RAII temp dir under the system temp root).
 mod tempdir {
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // The six tests in this file run in parallel under one test process, so `process::id()` is
+    // identical for every fixture and `SystemTime::now()` is too coarse on the CI macOS runner to
+    // separate two dirs created in the same tick. A collision used to share one directory (because
+    // `create_dir_all` is idempotent), and whichever `TempDir` dropped first would `remove_dir_all`
+    // the sibling's dir mid-run, surfacing as a spurious `verify_checksum` failure. This
+    // process-wide counter makes every name unique, and `create_dir` (below) fails loudly instead
+    // of silently sharing a directory if a name ever collides anyway.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     pub struct TempDir(PathBuf);
     impl TempDir {
         pub fn new(prefix: &str) -> Self {
             let base = std::env::temp_dir();
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
             let p = base.join(format!(
-                "{prefix}-{}-{}",
+                "{prefix}-{}-{}-{seq}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_nanos()
             ));
-            std::fs::create_dir_all(&p).expect("create temp dir");
+            std::fs::create_dir(&p).expect("create unique temp dir");
             TempDir(p)
         }
         pub fn path(&self) -> &Path {
