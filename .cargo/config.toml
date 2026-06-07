@@ -1,0 +1,36 @@
+# Deterministic-build configuration for a reproducible release artifact (#101).
+#
+# The size-optimized `[profile.release]` (in the workspace `Cargo.toml`) makes the shipped
+# `ironbus` musl binary small and `strip = true` removes its symbol table, but strip does NOT
+# remove the absolute build paths the compiler bakes into rodata: `panic!`/`assert!` location
+# strings, `#[track_caller]` callsites, and `file!()`/`module_path!()` expansions all embed the
+# crate's source path. With those present, two operators who rebuild the SAME commit from
+# different directories (or under a different `$HOME`) get byte-different binaries, which breaks
+# the load-bearing claim behind #101: that an operator can independently rebuild a tag and
+# confirm, byte for byte, exactly what is on a device.
+#
+# The path remaps (`--remap-path-prefix`) that strip those embedded paths are NOT pinned here:
+# their source values are the WORKSPACE path (`$PWD`) and the cargo cache root (`$CARGO_HOME`),
+# both of which are only known at build time and vary per machine, so cargo (which does not
+# expand environment variables inside this file) cannot encode them portably. They are pinned
+# instead in the documented release invocation in RELEASING.md, which the release workflow (#103)
+# runs:
+#
+#   RUSTFLAGS="--remap-path-prefix=$PWD=/ironbus --remap-path-prefix=$CARGO_HOME=/cargo"
+#
+# (verified: it drops the 11 embedded absolute paths to 0 with no size change). The
+# byte-identical two-runner gate that enforces reproducibility in CI is also #103; the static
+# cross-build matrix is #100.
+#
+# What IS pinned here is the one determinism input that is location-independent:
+# `CARGO_INCREMENTAL = 0` forces non-incremental codegen. Release builds are already
+# non-incremental by default, but pinning it makes a reproducible build robust against an
+# environment that flipped the default on, since incremental compilation reorders codegen and is
+# not bit-reproducible. It pairs with `codegen-units = 1` in `[profile.release]` (parallel
+# codegen units are scheduled nondeterministically). It is behavior-neutral and changes no test.
+
+[env]
+# Pin non-incremental codegen for a reproducible build (see the comment above). This is the only
+# determinism input whose value does not depend on the build location, so it is the only one that
+# belongs in committed config; the path remaps are invocation-time (RELEASING.md / #103).
+CARGO_INCREMENTAL = "0"
