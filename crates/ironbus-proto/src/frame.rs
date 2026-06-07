@@ -66,6 +66,11 @@ pub enum FrameType {
     /// End of a Flow delivery batch. Body: the number of messages delivered in the batch
     /// as a little-endian `u32` (4 bytes).
     FlowEnd,
+    /// Server advisory that a message was dead-lettered (poison: it exceeded `MaxDeliver`)
+    /// and skipped from delivery, so the consumer learns the offset was dropped rather than
+    /// silently never seeing it (#63). Body: the dead-lettered `offset` as a little-endian
+    /// `u64` (8 bytes) followed by a one-byte reason (0 = max-deliver exhausted).
+    DeadLetter,
 }
 
 impl FrameType {
@@ -89,6 +94,7 @@ impl FrameType {
             FrameType::PubAck => 14,
             FrameType::AckStatus => 15,
             FrameType::FlowEnd => 16,
+            FrameType::DeadLetter => 17,
         }
     }
 
@@ -113,6 +119,7 @@ impl FrameType {
             14 => FrameType::PubAck,
             15 => FrameType::AckStatus,
             16 => FrameType::FlowEnd,
+            17 => FrameType::DeadLetter,
             _ => return None,
         })
     }
@@ -245,7 +252,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 16] = [
+    const ALL_TYPES: [FrameType; 17] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -262,6 +269,7 @@ mod tests {
         FrameType::PubAck,
         FrameType::AckStatus,
         FrameType::FlowEnd,
+        FrameType::DeadLetter,
     ];
 
     #[test]
@@ -296,6 +304,7 @@ mod tests {
         assert_eq!(FrameType::PubAck.as_u8(), 14);
         assert_eq!(FrameType::AckStatus.as_u8(), 15);
         assert_eq!(FrameType::FlowEnd.as_u8(), 16);
+        assert_eq!(FrameType::DeadLetter.as_u8(), 17);
     }
 
     #[test]
@@ -481,7 +490,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 17u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 18u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);

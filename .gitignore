@@ -2,3 +2,7 @@
 **/*.rs.bk
 *.pdb
 .DS_Store
+
+# proptest saves a regression seed file on a failing case; this repo runs proptests fresh
+# (with a deep nightly sweep) and does not track these transient, machine-generated seeds.
+proptest-regressions/
