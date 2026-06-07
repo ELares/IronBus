@@ -250,7 +250,10 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
          ironbus_acks_total {acks}\n\
          # HELP ironbus_segments_reaped_total Old sealed segments reclaimed by consumer-safe retention (size, age, or count).\n\
          # TYPE ironbus_segments_reaped_total counter\n\
-         ironbus_segments_reaped_total {segments_reaped}\n",
+         ironbus_segments_reaped_total {segments_reaped}\n\
+         # HELP ironbus_segments_force_reaped_total Old sealed segments force-reaped by the disk-full drop-oldest policy (may drop a slow consumer's unconsumed records).\n\
+         # TYPE ironbus_segments_force_reaped_total counter\n\
+         ironbus_segments_force_reaped_total {segments_force_reaped}\n",
         healthy_value = u8::from(healthy),
         produced = counters.produced,
         produced_bytes = counters.produced_bytes,
@@ -260,6 +263,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         dead_lettered = counters.dead_lettered,
         acks = counters.acks,
         segments_reaped = counters.segments_reaped,
+        segments_force_reaped = counters.segments_force_reaped,
     );
     body.push_str(&recovery_loss_lines(&recovery_loss));
     body.push_str(&recovery_loss_records_lines(&recovery_loss_records));
@@ -408,7 +412,7 @@ fn respond(stream: &mut TcpStream, code: u16, reason: &str, body: &str) -> std::
 mod tests {
     use super::*;
     use crate::clock::SystemClock;
-    use crate::engine::{AckResult, Engine, EngineConfig, Poll};
+    use crate::engine::{AckResult, DiskFullPolicy, Engine, EngineConfig, Poll};
     use ironbus_core::delivery::DeliveryConfig;
     use ironbus_core::lease::LeaseConfig;
     use ironbus_core::types::RecordFlags;
@@ -434,6 +438,7 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
         .unwrap();
@@ -628,6 +633,7 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
         .unwrap();
@@ -761,6 +767,7 @@ mod tests {
                 max_retained_bytes,
                 max_age_ms: 0,
                 max_messages,
+                disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
         .unwrap();
@@ -830,6 +837,7 @@ mod tests {
                             assert_eq!(g.ack(&d.token), AckResult::Acked);
                         }
                         Poll::Parked { .. } => {}
+                        Poll::Truncated { .. } => panic!("unexpected truncation"),
                         Poll::Idle => break,
                     }
                 }
@@ -882,6 +890,7 @@ mod tests {
                     match g.poll_now().unwrap() {
                         Poll::Message(d) => assert_eq!(g.ack(&d.token), AckResult::Acked),
                         Poll::Parked { .. } => {}
+                        Poll::Truncated { .. } => panic!("unexpected truncation"),
                         Poll::Idle => break,
                     }
                 }
@@ -899,6 +908,127 @@ mod tests {
         assert!(
             !m1.contains("\nironbus_segments_reaped_total 0\n"),
             "the reaped counter must have incremented under the count bound: {m1}"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    /// A small-segment broker with a durable-log byte cap and the disk-full DROP-OLDEST policy,
+    /// wired to a health endpoint, so the forced-reap counter path is exercised end to end (#82).
+    fn start_with_drop_oldest(
+        max_total_bytes: u64,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        SharedEngine<InMemoryFs, SystemClock>,
+    ) {
+        let engine = Engine::open(
+            InMemoryFs::new(),
+            SystemClock::new(),
+            EngineConfig {
+                log: LogConfig {
+                    max_segment_bytes: 160,
+                    max_total_bytes,
+                },
+                lease: LeaseConfig::default(),
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight: 64,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                disk_full_policy: DiskFullPolicy::DropOldest,
+            },
+        )
+        .unwrap();
+        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let engine = Arc::clone(&shared);
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            move || serve_health(&listener, &shared, &shutdown).unwrap()
+        });
+        (addr, shutdown, handle, engine)
+    }
+
+    #[test]
+    fn metrics_renders_and_increments_segments_force_reaped() {
+        // The force-reaped counter renders on /metrics and increments once the disk-full
+        // drop-oldest policy force-reaps an oldest segment to make room for an over-cap produce
+        // (#82). A stuck consumer (leases offset 0, never acks) pins the protect floor so the
+        // consumer-safe reaper cannot reclaim; only the forced reap can.
+        let payload = &[0xab_u8; 16][..];
+        let one = {
+            let (_a, sd, h, eng) = start_with_drop_oldest(0);
+            let bytes = {
+                let mut g = eng.lock().unwrap();
+                g.produce(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                })
+                .unwrap();
+                g.durable_record_bytes()
+            };
+            sd.store(true, Ordering::Release);
+            h.join().unwrap();
+            bytes
+        };
+
+        let (addr, shutdown, handle, engine) = start_with_drop_oldest(4 * one);
+        // The counter is present and zero before anything is force-reaped.
+        let m0 = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            m0.contains("# TYPE ironbus_segments_force_reaped_total counter"),
+            "{m0}"
+        );
+        assert!(
+            m0.contains("\nironbus_segments_force_reaped_total 0\n"),
+            "{m0}"
+        );
+
+        {
+            let mut g = engine.lock().unwrap();
+            // A stuck consumer leases offset 0 and never acks: the protect floor stays at 0.
+            g.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload,
+            })
+            .unwrap();
+            assert!(matches!(g.poll_now_in("stuck").unwrap(), Poll::Message(_)));
+            // Produce well past the cap: every produce succeeds (drop-oldest force-reaps).
+            for _ in 0..20 {
+                g.produce(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                })
+                .expect("drop-oldest accepts the produce");
+            }
+            assert!(
+                g.counters().segments_force_reaped >= 1,
+                "the drop-oldest policy force-reaped at least one segment"
+            );
+        }
+        let m1 = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            m1.contains("# TYPE ironbus_segments_force_reaped_total counter"),
+            "{m1}"
+        );
+        assert!(
+            !m1.contains("\nironbus_segments_force_reaped_total 0\n"),
+            "the force-reaped counter must have incremented past zero: {m1}"
         );
 
         shutdown.store(true, Ordering::Release);

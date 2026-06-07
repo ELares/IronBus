@@ -13,8 +13,8 @@
 
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
-    decode_dead_letter, decode_deliver, encode_ack, encode_pub, encode_sub, AckBody, AckOp,
-    BodyError, PubBody, SubBody,
+    decode_dead_letter, decode_deliver, decode_truncated, encode_ack, encode_pub, encode_sub,
+    AckBody, AckOp, BodyError, PubBody, SubBody,
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -121,14 +121,31 @@ pub struct DeadLetter {
     pub reason: u8,
 }
 
-/// The result of a [`Client::fetch`]: the messages delivered in the batch, and any in-band
-/// dead-letter advisories for offsets the broker skipped as poison during the same batch.
+/// A truncation advisory: the broker reset this consumer's cursor UP to `earliest_retained`
+/// because the disk-full drop-oldest policy force-reaped its old segments out from under it
+/// (#82, #84). The consumer lost the span `[old_cursor, earliest_retained)` and delivery resumes
+/// at `earliest_retained`; it is surfaced exactly once per gap, never repeated for the same gap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Truncation {
+    /// The new earliest-retained log offset the cursor was reset to (delivery resumes here).
+    pub earliest_retained: u64,
+    /// How many records were skipped (`earliest_retained - old_cursor`).
+    pub skipped: u64,
+}
+
+/// The result of a [`Client::fetch`]: the messages delivered in the batch, any in-band dead-letter
+/// advisories for offsets the broker skipped as poison, and any truncation advisories for a cursor
+/// the broker reset because the disk-full drop-oldest policy reaped its records, all during the
+/// same batch.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Fetch {
     /// The messages delivered, in log order.
     pub messages: Vec<Message>,
     /// Dead-letter advisories for offsets dropped as poison during this fetch (usually empty).
     pub dead_letters: Vec<DeadLetter>,
+    /// Truncation advisories for a cursor reset below the oldest retained record during this fetch
+    /// (usually empty; only under the disk-full drop-oldest policy, #82, #84).
+    pub truncations: Vec<Truncation>,
 }
 
 /// The outcome of a [`Client::progress`] call.
@@ -242,16 +259,21 @@ impl Client {
     /// more messages than the requested credit.
     pub fn fetch(&mut self, max: u32) -> Result<Fetch, ClientError> {
         self.send(FrameType::Flow, &max.to_le_bytes())?;
-        // The credit caps the TOTAL frames the server may stream back before FlowEnd: each
-        // granted slot yields at most one delivery OR one dead-letter advisory, so a buggy or
-        // hostile server cannot stream either without bound.
+        // The credit caps the TOTAL frames the server may stream back before FlowEnd: each granted
+        // slot yields at most one delivery OR one dead-letter advisory OR one truncation advisory,
+        // so a buggy or hostile server cannot stream any of them without bound.
         let limit = usize::try_from(max).unwrap_or(usize::MAX);
         let mut messages = Vec::new();
         let mut dead_letters = Vec::new();
+        let mut truncations = Vec::new();
+        // The total advisory + delivery frames seen so far, the quantity the credit bounds.
+        let over_credit = |m: &[Message], d: &[DeadLetter], t: &[Truncation]| {
+            m.len() + d.len() + t.len() >= limit
+        };
         loop {
             match self.read_frame()? {
                 (FrameType::Deliver, body) => {
-                    if messages.len() + dead_letters.len() >= limit {
+                    if over_credit(&messages, &dead_letters, &truncations) {
                         return Err(ClientError::BadResponse(
                             "server streamed more frames than the requested credit",
                         ));
@@ -270,7 +292,7 @@ impl Client {
                 // An in-band dead-letter advisory for an offset skipped as poison (#63). It is
                 // not a delivery, so it carries its own offset and does not ack.
                 (FrameType::DeadLetter, body) => {
-                    if messages.len() + dead_letters.len() >= limit {
+                    if over_credit(&messages, &dead_letters, &truncations) {
                         return Err(ClientError::BadResponse(
                             "server streamed more frames than the requested credit",
                         ));
@@ -281,11 +303,28 @@ impl Client {
                         reason: dl.reason,
                     });
                 }
+                // An in-band truncation advisory: the broker reset this cursor below the oldest
+                // retained record because the disk-full drop-oldest policy reaped its records
+                // (#82, #84). It is not a delivery and does not ack; it names where delivery
+                // resumed and how many records were skipped.
+                (FrameType::Truncated, body) => {
+                    if over_credit(&messages, &dead_letters, &truncations) {
+                        return Err(ClientError::BadResponse(
+                            "server streamed more frames than the requested credit",
+                        ));
+                    }
+                    let t = decode_truncated(&body).map_err(ClientError::Body)?;
+                    truncations.push(Truncation {
+                        earliest_retained: t.earliest_retained,
+                        skipped: t.skipped,
+                    });
+                }
                 // The FlowEnd frame terminates the batch (its body is the delivered count).
                 (FrameType::FlowEnd, _) => {
                     return Ok(Fetch {
                         messages,
                         dead_letters,
+                        truncations,
                     })
                 }
                 (FrameType::Err, body) => {
@@ -548,7 +587,7 @@ mod tests {
         encode_dead_letter, encode_deliver, DeadLetterBody, DeliverBody, DEAD_LETTER_MAX_DELIVER,
     };
     use ironbus_server::clock::SystemClock;
-    use ironbus_server::engine::{Engine, EngineConfig};
+    use ironbus_server::engine::{DiskFullPolicy, Engine, EngineConfig};
     use ironbus_server::server::{serve, SharedEngine};
     use ironbus_storage::fs::InMemoryFs;
     use ironbus_storage::log::LogConfig;
@@ -572,6 +611,7 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
         .unwrap();
@@ -847,6 +887,71 @@ mod tests {
             }],
             "the dead-letter advisory is surfaced with its offset and reason"
         );
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_surfaces_a_truncation_advisory() {
+        // A cursor the broker reset below the oldest retained record (the disk-full drop-oldest
+        // policy reaped its records, #82, #84) arrives as an in-band Truncated frame inside the
+        // Flow batch: fetch returns it in `truncations`, separate from `messages` and
+        // `dead_letters`, and the FlowEnd still terminates the batch normally.
+        let mut t_body = Vec::new();
+        ironbus_proto::message::encode_truncated(
+            &ironbus_proto::message::TruncatedBody {
+                earliest_retained: 12,
+                skipped: 5,
+            },
+            &mut t_body,
+        );
+        let mut script = frame(FrameType::Info, b"");
+        script.extend(frame(FrameType::Truncated, &t_body));
+        script.extend(frame(FrameType::FlowEnd, &0u32.to_le_bytes()));
+        let (addr, handle) = raw_server(script);
+        let mut c = Client::connect(addr).unwrap();
+        let fetched = c.fetch(10).unwrap();
+        assert!(fetched.messages.is_empty(), "no messages in this batch");
+        assert!(
+            fetched.dead_letters.is_empty(),
+            "no dead-letters in this batch"
+        );
+        assert_eq!(
+            fetched.truncations,
+            vec![Truncation {
+                earliest_retained: 12,
+                skipped: 5
+            }],
+            "the truncation advisory is surfaced with its resume offset and skipped count"
+        );
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_truncation_counts_against_the_credit() {
+        // A Truncated advisory counts as one frame toward the credit bound, so a server that
+        // streams more total frames (deliveries + advisories) than the credit is rejected.
+        fn truncated(off: u64) -> Vec<u8> {
+            let mut body = Vec::new();
+            ironbus_proto::message::encode_truncated(
+                &ironbus_proto::message::TruncatedBody {
+                    earliest_retained: off,
+                    skipped: 1,
+                },
+                &mut body,
+            );
+            frame(FrameType::Truncated, &body)
+        }
+        let mut script = frame(FrameType::Info, b"");
+        script.extend(truncated(1));
+        script.extend(truncated(2)); // one past the credit of 1
+        let (addr, handle) = raw_server(script);
+        let mut c = Client::connect(addr).unwrap();
+        match c.fetch(1).unwrap_err() {
+            ClientError::BadResponse(_) => {}
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
         drop(c);
         handle.join().unwrap();
     }

@@ -21,8 +21,8 @@ use ironbus_core::clock::Clock;
 use ironbus_core::types::RecordFlags;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
-    decode_ack, decode_pub, decode_sub, encode_dead_letter, encode_deliver, AckOp, DeadLetterBody,
-    DeliverBody, DEAD_LETTER_MAX_DELIVER,
+    decode_ack, decode_pub, decode_sub, encode_dead_letter, encode_deliver, encode_truncated,
+    AckOp, DeadLetterBody, DeliverBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER,
 };
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
@@ -362,6 +362,31 @@ impl Session {
                     );
                     reply(out, FrameType::DeadLetter, &frame_body);
                 }
+                // The group's cursor fell below the oldest retained record because the disk-full
+                // drop-oldest policy force-reaped its old segments (#82, #84). The engine has just
+                // reset the cursor to `earliest_retained` and returned this ONCE. Emit the in-band
+                // truncation advisory so the consumer learns it lost a span and where delivery
+                // resumes, then keep draining: the next poll delivers normally from the reset
+                // cursor. This consumes one credit slot (like a delivery or a dead-letter), so the
+                // credit still bounds the total frames a batch streams. Any in-flight leases this
+                // session held below the reset are now meaningless; drop them so a later ack is a
+                // no-op fence rather than acting on a reaped offset.
+                Ok(Poll::Truncated {
+                    earliest_retained,
+                    skipped,
+                }) => {
+                    self.leased
+                        .retain(|&offset, _| offset >= earliest_retained.get());
+                    let mut frame_body = Vec::new();
+                    encode_truncated(
+                        &TruncatedBody {
+                            earliest_retained: earliest_retained.get(),
+                            skipped,
+                        },
+                        &mut frame_body,
+                    );
+                    reply(out, FrameType::Truncated, &frame_body);
+                }
                 // Nothing more deliverable right now: end the batch early.
                 Ok(Poll::Idle) => break,
                 Err(e) if e.is_fatal() => {
@@ -430,7 +455,7 @@ fn reply_err(out: &mut Vec<u8>, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{Engine, EngineConfig, Poll};
+    use crate::engine::{DiskFullPolicy, Engine, EngineConfig, Poll};
     use ironbus_core::clock::ManualClock;
     use ironbus_core::delivery::DeliveryConfig;
     use ironbus_core::lease::LeaseConfig;
@@ -455,6 +480,7 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
         .unwrap()
@@ -526,9 +552,127 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
         .unwrap()
+    }
+
+    /// An engine over a shared clock with a small segment cap, a durable-log byte cap, and the
+    /// disk-full DROP-OLDEST policy, for the below-earliest truncation wire test (#82, #84).
+    fn engine_drop_oldest(
+        clock: Arc<ManualClock>,
+        max_total_bytes: u64,
+    ) -> Engine<InMemoryFs, Arc<ManualClock>> {
+        Engine::open(
+            InMemoryFs::new(),
+            clock,
+            EngineConfig {
+                log: LogConfig {
+                    max_segment_bytes: 160,
+                    max_total_bytes,
+                },
+                lease: LeaseConfig {
+                    visibility_nanos: 30,
+                    hard_cap_nanos: 100,
+                },
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight: 64,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                disk_full_policy: DiskFullPolicy::DropOldest,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_truncated_consumer_gets_exactly_one_truncated_frame_and_stays_connected() {
+        // Under DropOldest, a stuck consumer whose records were force-reaped gets EXACTLY ONE
+        // Truncated frame on its next fetch, the connection stays open, and a later fetch delivers
+        // normally without re-truncating the same gap.
+        let clock = Arc::new(ManualClock::new());
+        // Measure one record's framed bytes, then size the cap to ~4 records.
+        let one = {
+            let mut probe = engine_drop_oldest(Arc::clone(&clock), 0);
+            produce(&mut probe, &[0xab; 16]);
+            probe.durable_record_bytes()
+        };
+        let mut e = engine_drop_oldest(Arc::clone(&clock), 4 * one);
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&mut e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+
+        // Produce offset 0, then the session leases it (a stuck consumer: it never acks).
+        produce(&mut e, &[0xab; 16]);
+        out.clear();
+        s.process(
+            &mut e,
+            &frame(FrameType::Flow, &1u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(delivered_tokens(&out).len(), 1, "leased offset 0");
+        // The producer races past the cap so DropOldest force-reaps the leased records.
+        for _ in 0..20 {
+            produce(&mut e, &[0xab; 16]);
+        }
+        assert!(
+            e.earliest_retained_offset().get() > 0,
+            "the leased records were force-reaped"
+        );
+
+        // The next fetch returns EXACTLY ONE Truncated frame (then a FlowEnd terminator), and the
+        // session stays open (process returns Ok). The first Truncated consumes a credit slot, so
+        // with a credit of 1 the batch is just the advisory.
+        out.clear();
+        s.process(
+            &mut e,
+            &frame(FrameType::Flow, &1u32.to_le_bytes()),
+            &mut out,
+        )
+        .expect("the session stays open after a truncation");
+        let frames = decode_all(&out);
+        let truncated: Vec<_> = frames
+            .iter()
+            .filter(|(ty, _)| *ty == FrameType::Truncated)
+            .collect();
+        assert_eq!(
+            truncated.len(),
+            1,
+            "exactly one Truncated frame: {frames:?}"
+        );
+        // The advisory body decodes to the new earliest-retained offset and the skipped count.
+        let body = ironbus_proto::message::decode_truncated(&truncated[0].1)
+            .expect("valid Truncated body");
+        assert_eq!(body.earliest_retained, e.earliest_retained_offset().get());
+        assert!(body.skipped > 0, "the consumer skipped a non-empty span");
+        assert_eq!(
+            frames.last().map(|(ty, _)| *ty),
+            Some(FrameType::FlowEnd),
+            "the batch still terminates with FlowEnd"
+        );
+
+        // A later fetch delivers normally and does NOT emit another Truncated frame for the gap.
+        out.clear();
+        s.process(
+            &mut e,
+            &frame(FrameType::Flow, &5u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let frames2 = decode_all(&out);
+        assert!(
+            !frames2.iter().any(|(ty, _)| *ty == FrameType::Truncated),
+            "no re-truncation of the same gap: {frames2:?}"
+        );
+        assert!(
+            frames2.iter().any(|(ty, _)| *ty == FrameType::Deliver),
+            "delivery resumes from the oldest retained record: {frames2:?}"
+        );
     }
 
     /// Sends one acknowledgement op and returns the status body, asserting the reply is a
@@ -1125,6 +1269,7 @@ mod tests {
                 max_retained_bytes: 0,
                 max_age_ms: 0,
                 max_messages: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
         .unwrap();

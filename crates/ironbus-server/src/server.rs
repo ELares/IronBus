@@ -152,7 +152,7 @@ where
 mod tests {
     use super::*;
     use crate::clock::SystemClock;
-    use crate::engine::{Engine, EngineConfig, Poll};
+    use crate::engine::{DiskFullPolicy, Engine, EngineConfig, Poll};
     use ironbus_core::delivery::DeliveryConfig;
     use ironbus_core::lease::LeaseConfig;
     use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameType};
@@ -170,6 +170,7 @@ mod tests {
             max_retained_bytes: 0,
             max_age_ms: 0,
             max_messages: 0,
+            disk_full_policy: DiskFullPolicy::DropNew,
         }
     }
 
