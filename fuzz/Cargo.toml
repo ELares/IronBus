@@ -42,6 +42,34 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "pub_body"
+path = "fuzz_targets/pub_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ack_body"
+path = "fuzz_targets/ack_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "deliver_body"
+path = "fuzz_targets/deliver_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dead_letter_body"
+path = "fuzz_targets/dead_letter_body.rs"
+test = false
+doc = false
+bench = false
+
 # Detach from the parent workspace (which is `crates/*`): a cargo-fuzz crate must build with the
 # nightly sanitizer toolchain, separately from the merge-blocking stable workspace.
 [workspace]
