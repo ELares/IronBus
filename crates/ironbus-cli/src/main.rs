@@ -176,6 +176,7 @@ USAGE:
                   [--max-segment-bytes <n>] [--max-total-bytes <bytes>]
                   [--max-retained-bytes <bytes>] [--max-age-ms <ms>] [--max-messages <n>]
                   [--max-groups <n>] [--disk-full-policy <drop-new|drop-oldest>]
+                  [--key-shared-group <name>]...
                   [--visibility-timeout-ms <n>] [--health-addr <host:port>]
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
     ironbus sub   [--addr <host:port>] [--group <name>] [--max <n>]
@@ -202,6 +203,10 @@ Notes:
     is hit: drop-new sheds it (preserving older data); drop-oldest force-reaps the oldest sealed
     segment to make room then accepts it, so a slow consumer whose records are reaped gets a
     one-time truncation notice and resumes at the oldest record still present.
+    --key-shared-group <name> (repeatable, default none) runs the named competing group in
+    key_shared ordering: a record's key routes to one live member, so same-key records keep their
+    order while the group drains in parallel across keys. A group not named here stays plain
+    competing distribution (the default), unaffected.
     pub reads the payload from the argument, or from stdin if omitted (an empty input
     publishes an empty message, which is a valid record).
     sub prints one line per message; at most one disposition applies to the batch:
@@ -609,6 +614,8 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut disk_full_policy_arg = DEFAULT_DISK_FULL_POLICY.to_string();
     let mut visibility_ms = DEFAULT_VISIBILITY_MS;
     let mut health_addr: Option<String> = None;
+    // The groups to run in key_shared ordering (#64), via the repeatable --key-shared-group flag.
+    let mut key_shared_groups: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -646,6 +653,9 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             "--disk-full-policy" => {
                 disk_full_policy_arg = take_value("--disk-full-policy", args, &mut i)?;
             }
+            "--key-shared-group" => {
+                key_shared_groups.push(take_value("--key-shared-group", args, &mut i)?);
+            }
             "--visibility-timeout-ms" => {
                 visibility_ms = take_number("--visibility-timeout-ms", args, &mut i)?;
             }
@@ -660,8 +670,6 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             }
         }
     }
-    let data_dir =
-        data_dir.ok_or_else(|| CliError::Usage("serve requires `--data-dir <dir>`".to_string()))?;
     let disk_full_policy = DiskFullPolicyArg::parse(&disk_full_policy_arg).ok_or_else(|| {
         CliError::Usage(format!(
             "`--disk-full-policy` must be `drop-new` or `drop-oldest`, got `{disk_full_policy_arg}`"
@@ -682,12 +690,35 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         disk_full_policy,
         visibility_ms,
     };
+    finish_serve(
+        &addr,
+        data_dir.as_deref(),
+        config,
+        &key_shared_groups,
+        health_addr.as_deref(),
+        out,
+    )
+}
+
+/// Resolves the required `--data-dir`, validates the assembled config, and dispatches to the
+/// platform `cmd_serve`. Split out of `run_serve` so the flag-parsing loop stays a single concern.
+fn finish_serve(
+    addr: &str,
+    data_dir: Option<&str>,
+    config: ServeConfig,
+    key_shared_groups: &[String],
+    health_addr: Option<&str>,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let data_dir =
+        data_dir.ok_or_else(|| CliError::Usage("serve requires `--data-dir <dir>`".to_string()))?;
     validate_serve_config(&config)?;
     cmd_serve(
-        &addr,
-        Path::new(&data_dir),
+        addr,
+        Path::new(data_dir),
         config,
-        health_addr.as_deref(),
+        key_shared_groups,
+        health_addr,
         out,
     )
 }
@@ -785,10 +816,11 @@ fn cmd_serve(
     addr: &str,
     data_dir: &Path,
     config: ServeConfig,
+    key_shared_groups: &[String],
     health_addr: Option<&str>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
-    let shared = open_disk_engine(data_dir, &config)?;
+    let shared = open_disk_engine(data_dir, &config, key_shared_groups)?;
     let listener = TcpListener::bind(addr)
         .map_err(|e| CliError::Internal(format!("cannot bind {addr}: {e}")))?;
     let local = listener
@@ -840,6 +872,7 @@ fn cmd_serve(
     addr: &str,
     data_dir: &Path,
     config: ServeConfig,
+    key_shared_groups: &[String],
     health_addr: Option<&str>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -859,6 +892,7 @@ fn cmd_serve(
         config.max_groups,
         config.disk_full_policy,
         config.visibility_ms,
+        key_shared_groups,
         health_addr,
         out,
     );
@@ -868,10 +902,13 @@ fn cmd_serve(
 }
 
 /// Opens (creating the directory if absent) the on-disk broker engine rooted at `data_dir`.
+/// `key_shared_groups` (#64) are declared server-side: each is put into `key_shared` ordering when
+/// a consumer first subscribes; an empty slice leaves every group plain competing (the default).
 #[cfg(unix)]
 fn open_disk_engine(
     data_dir: &Path,
     config: &ServeConfig,
+    key_shared_groups: &[String],
 ) -> Result<SharedEngine<StdFs, SystemClock>, CliError> {
     std::fs::create_dir_all(data_dir)
         .map_err(|e| CliError::Internal(format!("cannot create {}: {e}", data_dir.display())))?;
@@ -920,6 +957,10 @@ fn open_disk_engine(
         },
     )
     .map_err(|e| CliError::Internal(format!("opening broker at {}: {e}", data_dir.display())))?;
+    let mut engine = engine;
+    // Declare the key_shared groups (#64) server-side: a configured group enters key_shared mode
+    // when a consumer first subscribes. An empty slice is a no-op, so every group stays competing.
+    engine.set_configured_key_shared_groups(key_shared_groups.iter().cloned());
     Ok(Arc::new(Mutex::new(engine)))
 }
 
@@ -1318,7 +1359,7 @@ mod tests {
     fn make_data_dir(tag: &str, n: usize) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("ironbus-cli-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let shared = open_disk_engine(&dir, &test_serve_config(64, 1)).unwrap();
+        let shared = open_disk_engine(&dir, &test_serve_config(64, 1), &[]).unwrap();
         {
             let mut g = shared.lock().unwrap();
             for i in 0..n {
@@ -2216,6 +2257,57 @@ mod tests {
     }
 
     #[test]
+    fn serve_accepts_repeated_key_shared_group_flags() {
+        // The repeatable --key-shared-group flag (#64) parses and validates; the only failure is
+        // the unrelated bind on an unreachable addr, proving the flag was accepted.
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-cli-ksg-never-served".to_string(),
+                "--key-shared-group".to_string(),
+                "orders".to_string(),
+                "--key-shared-group".to_string(),
+                "events".to_string(),
+                "--addr".to_string(),
+                "127.0.0.1:1".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_ne!(
+            e.exit_code(),
+            EXIT_USAGE,
+            "repeated --key-shared-group flags parse and validate: {e}"
+        );
+        let _ = std::fs::remove_dir_all("/tmp/ironbus-cli-ksg-never-served");
+    }
+
+    #[test]
+    fn serve_rejects_a_key_shared_group_without_a_value() {
+        let mut buf = Vec::new();
+        let e = run(
+            &["serve".to_string(), "--key-shared-group".to_string()],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--key-shared-group"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_lists_the_key_shared_group_flag() {
+        assert!(
+            USAGE.contains("--key-shared-group"),
+            "USAGE must document --key-shared-group"
+        );
+    }
+
+    #[test]
     fn serve_rejects_a_tiny_max_segment_bytes() {
         let mut buf = Vec::new();
         let e = run(
@@ -2538,7 +2630,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ironbus-cli-it-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let shared = open_disk_engine(&dir, &test_serve_config(64, 1)).unwrap();
+        let shared = open_disk_engine(&dir, &test_serve_config(64, 1), &[]).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2565,7 +2657,7 @@ mod tests {
         // persisted the committed cursor synchronously when it acked offset 0, so a clean
         // restart RESUMES past the acked message (it does not redeliver), and the durable log
         // continues at offset 1 rather than overwriting offset 0.
-        let reopened = open_disk_engine(&dir, &test_serve_config(64, 1)).unwrap();
+        let reopened = open_disk_engine(&dir, &test_serve_config(64, 1), &[]).unwrap();
         let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr2 = listener2.local_addr().unwrap();
         let shutdown2 = Arc::new(AtomicBool::new(false));
@@ -2606,7 +2698,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ironbus-cli-restart-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let shared = open_disk_engine(&dir, &test_serve_config(64, 1)).unwrap();
+        let shared = open_disk_engine(&dir, &test_serve_config(64, 1), &[]).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2634,7 +2726,7 @@ mod tests {
         handle.join().unwrap();
 
         // Restart on the same dir: only the uncommitted tail (offsets 1 and 2) redelivers.
-        let reopened = open_disk_engine(&dir, &test_serve_config(64, 1)).unwrap();
+        let reopened = open_disk_engine(&dir, &test_serve_config(64, 1), &[]).unwrap();
         let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr2 = listener2.local_addr().unwrap();
         let shutdown2 = Arc::new(AtomicBool::new(false));

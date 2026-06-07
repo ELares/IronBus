@@ -14,10 +14,11 @@
 use crate::engine::Engine;
 use crate::session::Session;
 use ironbus_core::clock::Clock;
+use ironbus_core::keyshared::MemberId;
 use ironbus_storage::fs::Filesystem;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -61,6 +62,11 @@ where
 {
     listener.set_nonblocking(true)?;
     let active = Arc::new(AtomicUsize::new(0));
+    // A monotonic per-connection counter that mints a distinct key_shared member id (#64) for each
+    // accepted connection, so two concurrently-live members never collide in the rendezvous hash.
+    // It only needs to be unique among the live connections; wraparound after 2^64 connections is
+    // unreachable in any real deployment.
+    let next_member = Arc::new(AtomicU64::new(0));
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _addr)) => {
@@ -72,11 +78,12 @@ where
                 active.fetch_add(1, Ordering::AcqRel);
                 let engine = Arc::clone(engine);
                 let active = Arc::clone(&active);
+                let member_id = MemberId::new(next_member.fetch_add(1, Ordering::Relaxed));
                 std::thread::spawn(move || {
                     // The guard decrements the slot on return AND on a panic unwind, so a
                     // panicking handler can never permanently leak a connection-cap slot.
                     let _slot = ConnectionSlot(&active);
-                    let _ = handle_connection(stream, &engine);
+                    let _ = handle_connection(stream, &engine, member_id);
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -95,6 +102,7 @@ where
 fn handle_connection<F, C>(
     mut stream: TcpStream,
     engine: &SharedEngine<F, C>,
+    member_id: MemberId,
 ) -> std::io::Result<()>
 where
     F: Filesystem,
@@ -105,17 +113,41 @@ where
                                     // write that makes no progress within the window errors out and closes the connection.
     stream.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
     stream.set_write_timeout(Some(CONNECTION_TIMEOUT))?;
-    let mut session = Session::new();
+    let mut session = Session::with_member_id(member_id);
+    // The read/dispatch loop, run to completion so the cleanup below ALWAYS executes on exit:
+    // whether the client closed cleanly, a read/write timed out, or a malformed frame ended the
+    // session, this connection must leave any key_shared group it joined (#64) and flush its cursor.
+    let outcome = connection_loop(&mut stream, engine, &mut session);
+    {
+        // Leave any key_shared group (#64) so this member's keys re-route to their new owners
+        // (its in-flight records drain or expire, the drain-or-expire guard), then flush its
+        // work-group's committed cursor so a clean reconnect resumes past acked messages.
+        // Best-effort: the checkpoint is a lagging optimization. Routed to the session's group
+        // (#60), default-group if unsubscribed.
+        let mut guard = engine.lock().unwrap_or_else(PoisonError::into_inner);
+        session.leave_current_key_shared(&mut guard);
+        let _ = guard.checkpoint_group(session.subscription());
+    }
+    outcome
+}
+
+/// The per-connection read/dispatch loop, factored out so [`handle_connection`] can run its
+/// cleanup (`key_shared` leave, cursor flush) on EVERY exit path: a clean close, a read/write
+/// error, or a session-ending malformed frame. Returns when the client closes or the session ends.
+fn connection_loop<F, C>(
+    stream: &mut TcpStream,
+    engine: &SharedEngine<F, C>,
+    session: &mut Session,
+) -> std::io::Result<()>
+where
+    F: Filesystem,
+    C: Clock + Clone,
+{
     let mut inbuf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
         let n = stream.read(&mut chunk)?;
         if n == 0 {
-            // The client closed: flush its work-group's committed cursor so a clean reconnect
-            // resumes past acked messages. Best-effort: the checkpoint is a lagging
-            // optimization. Routed to the session's group (#60), default-group if unsubscribed.
-            let mut guard = engine.lock().unwrap_or_else(PoisonError::into_inner);
-            let _ = guard.checkpoint_group(session.subscription());
             return Ok(()); // the client closed the connection
         }
         inbuf.extend_from_slice(&chunk[..n]);
@@ -362,7 +394,7 @@ mod tests {
             let shared = Arc::clone(&shared);
             move || {
                 let (stream, _) = listener.accept().unwrap();
-                handle_connection(stream, &shared)
+                handle_connection(stream, &shared, MemberId::new(0))
             }
         });
 
