@@ -70,6 +70,39 @@ pub trait Filesystem: Send + Sync {
     /// # Errors
     /// Propagates the underlying IO error.
     fn sync_dir(&self) -> io::Result<()>;
+
+    /// Returns a [`Filesystem`] of the SAME type rooted at the `name` subdirectory of this
+    /// one, creating the subdirectory if it does not yet exist. This is how a secondary
+    /// durable store (the dead-letter sink, #63) gets its own isolated, recoverable segment
+    /// set under the data directory without escaping it: the returned filesystem's `list`,
+    /// `open`, `create_new`, `remove`, and `sync_dir` operate only within the subdirectory.
+    ///
+    /// `name` must be a single, safe path component (no `/`, `.`, `..`, or NUL), exactly as
+    /// the other methods require of a file name; an unsafe name is rejected with
+    /// [`io::ErrorKind::InvalidInput`] so a subdirectory can never escape the root.
+    ///
+    /// # Errors
+    /// Returns [`io::ErrorKind::InvalidInput`] for an unsafe `name`, or an IO error creating
+    /// the subdirectory.
+    fn subdir(&self, name: &str) -> io::Result<Self>
+    where
+        Self: Sized;
+
+    /// Whether the `name` subdirectory already exists, WITHOUT creating it. The complement to
+    /// [`Filesystem::subdir`] (which creates on demand): a caller probes here first to avoid
+    /// materializing a subdirectory as a side effect (the DLQ sink is opened only when a prior run
+    /// created it, #63).
+    ///
+    /// # Errors
+    /// Returns [`io::ErrorKind::InvalidInput`] for an unsafe `name`, or an IO error.
+    fn subdir_exists(&self, name: &str) -> io::Result<bool>;
+}
+
+/// Validates that `name` is a single, safe path component (no separator, no `.`/`..`, no NUL),
+/// so a subdirectory or file name can never escape the data directory. Shared by the `StdFs`
+/// path resolution and the subdirectory check.
+fn is_plain_component(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
 }
 
 #[derive(Debug, Default)]
@@ -96,6 +129,11 @@ pub struct InMemoryFs {
     /// probe handle to drive [`InMemoryFs::simulate_power_loss`] or inspect the durable image
     /// after the fs has been moved into an engine or wrapped in a fault layer.
     state: Arc<Mutex<DirState>>,
+    /// The key prefix this handle operates under, so a [`InMemoryFs::subdir`] view shares the
+    /// SAME backing store (hence the same power-loss and durability model) while seeing only the
+    /// keys under its prefix. The root handle has an empty prefix. The flat in-memory store has
+    /// no real directories, so a subdirectory is modeled as a `"<name>/"` key prefix.
+    prefix: String,
 }
 
 impl InMemoryFs {
@@ -113,13 +151,20 @@ impl InMemoryFs {
     }
 
     /// Discards every directory change since the last `sync_dir` and reverts each
-    /// surviving file to its last-synced content, modelling a power loss.
+    /// surviving file to its last-synced content, modelling a power loss. This is a
+    /// disk-wide event: it reverts EVERY key in the store, including those under a
+    /// [`InMemoryFs::subdir`] prefix, since they share one backing image.
     pub fn simulate_power_loss(&self) {
         let mut g = self.lock();
         g.live = g.durable.clone();
         for f in g.live.values() {
             f.simulate_power_loss();
         }
+    }
+
+    /// Maps a caller-visible name to its backing-store key by prepending this handle's prefix.
+    fn key(&self, name: &str) -> String {
+        format!("{}{}", self.prefix, name)
     }
 }
 
@@ -129,26 +174,27 @@ impl Filesystem for InMemoryFs {
     fn open(&self, name: &str) -> io::Result<Self::File> {
         self.lock()
             .live
-            .get(name)
+            .get(&self.key(name))
             .map(Arc::clone)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))
     }
 
     fn create_new(&self, name: &str) -> io::Result<Self::File> {
+        let key = self.key(name);
         let mut g = self.lock();
-        if g.live.contains_key(name) {
+        if g.live.contains_key(&key) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "file already exists",
             ));
         }
         let file = Arc::new(InMemoryFile::new());
-        g.live.insert(name.to_owned(), Arc::clone(&file));
+        g.live.insert(key, Arc::clone(&file));
         Ok(file)
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
-        if self.lock().live.remove(name).is_some() {
+        if self.lock().live.remove(&self.key(name)).is_some() {
             Ok(())
         } else {
             Err(io::Error::new(io::ErrorKind::NotFound, "no such file"))
@@ -156,17 +202,58 @@ impl Filesystem for InMemoryFs {
     }
 
     fn list(&self) -> io::Result<Vec<String>> {
-        Ok(self.lock().live.keys().cloned().collect())
+        // Only the entries under this handle's prefix, with the prefix stripped, and never an
+        // entry that lies in a deeper subdirectory (one whose remainder still contains a `/`),
+        // so a subdir view never reports its own children's children as flat files.
+        Ok(self
+            .lock()
+            .live
+            .keys()
+            .filter_map(|k| k.strip_prefix(&self.prefix))
+            .filter(|rest| !rest.is_empty() && !rest.contains('/'))
+            .map(ToOwned::to_owned)
+            .collect())
     }
 
     fn exists(&self, name: &str) -> io::Result<bool> {
-        Ok(self.lock().live.contains_key(name))
+        Ok(self.lock().live.contains_key(&self.key(name)))
     }
 
     fn sync_dir(&self) -> io::Result<()> {
         let mut g = self.lock();
         g.durable = g.live.clone();
         Ok(())
+    }
+
+    fn subdir(&self, name: &str) -> io::Result<InMemoryFs> {
+        if !is_plain_component(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "subdirectory name must be a single path component",
+            ));
+        }
+        // A subdirectory is a deeper key prefix over the SAME shared store, so the subdir's
+        // segment files share the parent's power-loss and durability image. No backing entry
+        // needs creating: the flat store materializes a directory lazily as its files appear.
+        Ok(InMemoryFs {
+            state: Arc::clone(&self.state),
+            prefix: format!("{}{name}/", self.prefix),
+        })
+    }
+
+    fn subdir_exists(&self, name: &str) -> io::Result<bool> {
+        if !is_plain_component(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "subdirectory name must be a single path component",
+            ));
+        }
+        // The flat store has no standalone directory entries: a subdirectory "exists" iff at least
+        // one key under its `<prefix><name>/` namespace is present (a power loss that reverted every
+        // such key leaves the directory effectively gone, which is the correct, conservative answer
+        // for the DLQ probe).
+        let dir_prefix = format!("{}{name}/", self.prefix);
+        Ok(self.lock().live.keys().any(|k| k.starts_with(&dir_prefix)))
     }
 }
 
@@ -193,12 +280,7 @@ impl StdFs {
         // rejecting it would make `list` (which does not filter it) return names this
         // `resolve` then refuses, an asymmetry the recovery walk would trip over. The
         // checks below are exactly what keeps a name from escaping the data directory.
-        let is_plain = !name.is_empty()
-            && name != "."
-            && name != ".."
-            && !name.contains('/')
-            && !name.contains('\0');
-        if !is_plain {
+        if !is_plain_component(name) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "file name must be a single path component",
@@ -256,6 +338,27 @@ impl Filesystem for StdFs {
 
     fn sync_dir(&self) -> io::Result<()> {
         sync_dir(&self.root)
+    }
+
+    fn subdir(&self, name: &str) -> io::Result<StdFs> {
+        let path = self.resolve(name)?;
+        // Create the subdirectory if it does not exist; an existing one is fine (the DLQ sink
+        // is opened on demand, and a reopen must reuse it). The parent directory entry for the
+        // new subdir is made durable so a power loss right after creation does not lose it.
+        match std::fs::create_dir(&path) {
+            Ok(()) => sync_dir(&self.root)?,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        Ok(StdFs { root: path })
+    }
+
+    fn subdir_exists(&self, name: &str) -> io::Result<bool> {
+        match std::fs::symlink_metadata(self.resolve(name)?) {
+            Ok(meta) => Ok(meta.is_dir()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -389,6 +492,68 @@ mod tests {
     }
 
     #[test]
+    fn a_subdir_is_isolated_from_the_parent_keyspace() {
+        let fs = InMemoryFs::new();
+        fs.create_new("seg-0.log").unwrap();
+        let dlq = fs.subdir("dlq").unwrap();
+        dlq.create_new("seg-0.log").unwrap();
+        dlq.create_new("seg-1.log").unwrap();
+        // The subdir sees only its own files (not the parent's), and the parent's flat list does
+        // not surface the subdir's deeper keys (they still contain a `/` after the prefix strip).
+        let mut sub = dlq.list().unwrap();
+        sub.sort();
+        assert_eq!(sub, vec!["seg-0.log".to_owned(), "seg-1.log".to_owned()]);
+        assert_eq!(fs.list().unwrap(), vec!["seg-0.log".to_owned()]);
+        // Same-named files in the parent and the subdir are distinct objects.
+        dlq.open("seg-0.log")
+            .unwrap()
+            .write_all_at(b"sub", 0)
+            .unwrap();
+        fs.open("seg-0.log")
+            .unwrap()
+            .write_all_at(b"PARENT", 0)
+            .unwrap();
+        let mut buf = [0u8; 3];
+        dlq.open("seg-0.log")
+            .unwrap()
+            .read_exact_at(&mut buf, 0)
+            .unwrap();
+        assert_eq!(&buf, b"sub");
+    }
+
+    #[test]
+    fn a_subdir_shares_the_power_loss_image_with_the_parent() {
+        let fs = InMemoryFs::new();
+        let dlq = fs.subdir("dlq").unwrap();
+        let f = dlq.create_new("seg-0.log").unwrap();
+        f.write_all_at(b"durable", 0).unwrap();
+        f.sync_all().unwrap();
+        fs.sync_dir().unwrap(); // the subdir's directory entry is durable through the shared store
+                                // An unsynced overwrite is reverted by a power loss driven through the PARENT handle, since
+                                // the subdir shares the one backing image.
+        f.write_all_at(b"X", 0).unwrap();
+        fs.simulate_power_loss();
+        let mut buf = [0u8; 7];
+        dlq.open("seg-0.log")
+            .unwrap()
+            .read_exact_at(&mut buf, 0)
+            .unwrap();
+        assert_eq!(&buf, b"durable");
+    }
+
+    #[test]
+    fn subdir_rejects_an_unsafe_name() {
+        let fs = InMemoryFs::new();
+        for bad in ["", ".", "..", "a/b", "with\0nul"] {
+            assert_eq!(
+                fs.subdir(bad).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "subdir name {bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn power_loss_after_remove_and_recreate_same_name_restores_original_inode() {
         // The durable directory keeps the ORIGINAL file object when a name is removed
         // and recreated before a dir-sync, so power loss restores the original inode's
@@ -479,6 +644,35 @@ mod std_tests {
         // A subdirectory is never reported as an existing file.
         assert!(!fs.exists("subdir").unwrap());
         assert!(fs.exists("a.log").unwrap());
+    }
+
+    #[test]
+    fn subdir_creates_an_isolated_child_directory_reopenable() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = StdFs::new(dir.path().to_path_buf());
+        fs.create_new("a.log").unwrap();
+        let dlq = fs.subdir("dlq").unwrap();
+        dlq.create_new("seg.log").unwrap();
+        // The child sees only its own files; the parent's flat list never surfaces the subdir.
+        assert_eq!(dlq.list().unwrap(), vec!["seg.log".to_owned()]);
+        assert_eq!(fs.list().unwrap(), vec!["a.log".to_owned()]);
+        // Reopening the same subdir name reuses the existing directory (no AlreadyExists error)
+        // and sees the file written before.
+        let dlq_again = fs.subdir("dlq").unwrap();
+        assert_eq!(dlq_again.list().unwrap(), vec!["seg.log".to_owned()]);
+    }
+
+    #[test]
+    fn subdir_rejects_an_unsafe_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = StdFs::new(dir.path().to_path_buf());
+        for bad in ["../escape", "a/b", "", ".", "..", "with\0nul"] {
+            assert_eq!(
+                fs.subdir(bad).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "subdir name {bad:?} should be rejected"
+            );
+        }
     }
 
     #[test]

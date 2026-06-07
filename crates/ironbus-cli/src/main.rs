@@ -34,6 +34,8 @@ use ironbus_server::health::serve_health;
 #[cfg(unix)]
 use ironbus_server::server::{serve, SharedEngine};
 #[cfg(unix)]
+use ironbus_storage::dlq::{read_dlq_entries, DlqEntry};
+#[cfg(unix)]
 use ironbus_storage::fs::StdFs;
 #[cfg(unix)]
 use ironbus_storage::log::LogConfig;
@@ -164,7 +166,7 @@ USAGE:
     ironbus sub   [--addr <host:port>] [--group <name>] [--max <n>]
                   [--ack | --nack [--delay-ms <n>] | --term]
     ironbus peek  --data-dir <dir> [--from-offset <n>] [--limit <n>] [--json]
-    ironbus dump  --data-dir <dir> [--limit <n>] [--json]
+    ironbus dump  --data-dir <dir> [--limit <n>] [--json] [--dlq]
     ironbus help
 
 Notes:
@@ -186,6 +188,10 @@ Notes:
     read only up to the durable high-water mark and mark, never hide, any torn or corrupt
     tail. peek shows a window (default 10 records); dump streams every record, one per line
     (NDJSON with --json). Both bound memory to one segment at a time.
+    dump --dlq instead streams the durable dead-letter SINK (the dlq/ subdirectory): one line
+    per poison record showing dlq_offset, source_offset, group, attempt, ts_ms, and the
+    key/payload sizes (NDJSON with --json). It is read-only and never mutates the directory;
+    an empty or never-poisoned broker shows nothing.
     Exit codes: 0 clean, 1 usage, 2 not found, 4 corrupt data, 5 broker unreachable, 70 internal.";
 
 /// A command-line failure, mapped to a frozen exit code by [`main`].
@@ -895,6 +901,7 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut data_dir: Option<String> = None;
     let mut limit: Option<u64> = None;
     let mut json = false;
+    let mut dlq = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -909,6 +916,10 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
                 json = true;
                 i += 1;
             }
+            "--dlq" => {
+                dlq = true;
+                i += 1;
+            }
             flag if flag.starts_with("--") => {
                 return Err(CliError::Usage(format!("unknown flag `{flag}` for dump")));
             }
@@ -921,6 +932,9 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     }
     let data_dir =
         data_dir.ok_or_else(|| CliError::Usage("dump requires `--data-dir <dir>`".to_string()))?;
+    if dlq {
+        return cmd_inspect_dlq(Path::new(&data_dir), limit, json, out);
+    }
     cmd_inspect(Path::new(&data_dir), 0, limit, json, out)
 }
 
@@ -1038,6 +1052,94 @@ fn write_loss(report: &LossReport, json: bool, out: &mut impl Write) -> Result<(
     Ok(())
 }
 
+/// Decodes a stopped broker's DURABLE DEAD-LETTER SINK (the `dlq/` subdirectory) offline and writes
+/// its dead-letter records (at most `limit` of them) to `out`, READ-ONLY, never mutating the
+/// directory (#63). Each line shows the DLQ position, the source offset, the original timestamp, the
+/// group, the attempt, and the key/payload lengths. An ABSENT or empty DLQ shows nothing (a clean,
+/// never-poisoned broker), which is not an error. Reuses the same offline reader as `dump`, so the
+/// frozen offline exit codes apply (a missing DATA directory is still not-found).
+#[cfg(unix)]
+fn cmd_inspect_dlq(
+    data_dir: &Path,
+    limit: Option<u64>,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    // A missing DATA directory is not-found (exit 2), matching plain `dump`; an absent `dlq/`
+    // subdirectory inside an existing data directory is simply an empty DLQ (shown as nothing).
+    if !data_dir.is_dir() {
+        return Err(CliError::NotFound(format!(
+            "no data directory at {}",
+            data_dir.display()
+        )));
+    }
+    let entries = read_dlq_entries(&StdFs::new(data_dir.to_path_buf()))
+        .map_err(|e| map_offline_err(data_dir, &e))?;
+    // `--limit` caps how many records are shown; `usize::MAX` (no limit) shows them all.
+    let cap = limit.map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
+    for entry in entries.iter().take(cap) {
+        write_dlq_entry(entry, json, out)?;
+    }
+    Ok(())
+}
+
+/// Writes one DLQ entry as a human line or a single NDJSON object. Like `write_record`, this
+/// reports only sizes (not the raw key/payload bytes), so a binary payload never corrupts the
+/// terminal or the NDJSON stream.
+#[cfg(unix)]
+fn write_dlq_entry(entry: &DlqEntry, json: bool, out: &mut impl Write) -> Result<(), CliError> {
+    if json {
+        writeln!(
+            out,
+            "{{\"dlq_offset\":{},\"source_offset\":{},\"group\":\"{}\",\"attempt\":{},\"ts_ms\":{},\"bytes\":{},\"key_bytes\":{}}}",
+            entry.dlq_offset.get(),
+            entry.source_offset,
+            escape_json(&entry.group),
+            entry.attempt,
+            entry.timestamp_ms,
+            entry.payload.len(),
+            entry.key.len(),
+        )?;
+    } else {
+        writeln!(
+            out,
+            "dlq_offset={} source_offset={} group={:?} attempt={} ts_ms={} bytes={} key_bytes={}",
+            entry.dlq_offset.get(),
+            entry.source_offset,
+            entry.group,
+            entry.attempt,
+            entry.timestamp_ms,
+            entry.payload.len(),
+            entry.key.len(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Escapes a string for embedding in a JSON string literal (backslash, double-quote, and the
+/// control characters the format requires). Group names are graphic ASCII today, but the escape is
+/// unconditional so a future relaxation cannot produce invalid NDJSON.
+#[cfg(unix)]
+fn escape_json(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // A writeln/write into a String never fails, so the result is discarded.
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Maps an offline-reader storage error to the frozen offline exit-code scheme: a missing data
 /// directory is not-found (2), a broken segment chain or an undecodable header is corruption
 /// (4), and anything else is an internal failure (70).
@@ -1074,6 +1176,21 @@ fn cmd_inspect(
     let _ = (data_dir, from_offset, limit, json, out);
     Err(CliError::Internal(
         "ironbus peek/dump require a Unix host in v1: on-disk storage is Unix-only".to_string(),
+    ))
+}
+
+/// `dump --dlq` requires Unix in v1 for the same reason as `dump` (the on-disk storage uses
+/// positioned IO the Windows path does not yet implement).
+#[cfg(not(unix))]
+fn cmd_inspect_dlq(
+    data_dir: &Path,
+    limit: Option<u64>,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let _ = (data_dir, limit, json, out);
+    Err(CliError::Internal(
+        "ironbus dump --dlq requires a Unix host in v1: on-disk storage is Unix-only".to_string(),
     ))
 }
 
@@ -1273,6 +1390,168 @@ mod tests {
         let mut buf = Vec::new();
         let e = run_dump(&[], &mut buf).unwrap_err();
         assert_eq!(e.exit_code(), EXIT_USAGE);
+    }
+
+    /// Builds a real on-disk data directory that has dead-lettered exactly one poison message into
+    /// its durable DLQ sink, by driving an engine over a manual clock so a redelivery expires
+    /// deterministically. Returns the data directory path.
+    #[cfg(unix)]
+    fn make_dlq_data_dir(tag: &str) -> std::path::PathBuf {
+        use ironbus_core::clock::ManualClock;
+        let dir = std::env::temp_dir().join(format!("ironbus-cli-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let clock = Arc::new(ManualClock::new());
+        let mut e = Engine::open(
+            StdFs::new(dir.clone()),
+            Arc::clone(&clock),
+            EngineConfig {
+                log: LogConfig::default(),
+                lease: LeaseConfig {
+                    visibility_nanos: 30,
+                    hard_cap_nanos: 100,
+                },
+                delivery: DeliveryConfig::new(1, false, Vec::new()).unwrap(), // max_deliver = 1
+                max_in_flight: 16,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
+            },
+        )
+        .unwrap();
+        e.produce(&Append {
+            timestamp_ms: 777,
+            flags: RecordFlags::EMPTY,
+            key: b"kk",
+            headers: b"",
+            payload: b"poison-payload",
+        })
+        .unwrap();
+        let _ = e.poll_now().unwrap(); // delivery 1
+        clock.advance_monotonic_nanos(40);
+        match e.poll_now().unwrap() {
+            ironbus_server::engine::Poll::Parked { .. } => {}
+            other => panic!("expected the poison to be parked, got {other:?}"),
+        }
+        drop(e);
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_dlq_shows_the_dead_letter_records_read_only() {
+        let dir = make_dlq_data_dir("dumpdlq");
+        // Snapshot the directory tree before the read, to prove the inspector never mutates it.
+        let before = dir_snapshot(&dir);
+        let mut buf = Vec::new();
+        run_dump(
+            &[
+                "--data-dir".to_string(),
+                dir.display().to_string(),
+                "--dlq".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "exactly one dead-letter record: {text}");
+        assert!(lines[0].contains("source_offset=0"), "{text}");
+        assert!(lines[0].contains("attempt=2"), "{text}");
+        assert!(lines[0].contains("ts_ms=777"), "{text}");
+        assert!(lines[0].contains("bytes=14"), "the payload length: {text}");
+        assert!(lines[0].contains("key_bytes=2"), "{text}");
+
+        // The --json form is one NDJSON object with the same fields.
+        let mut jbuf = Vec::new();
+        run_dump(
+            &[
+                "--data-dir".to_string(),
+                dir.display().to_string(),
+                "--dlq".to_string(),
+                "--json".to_string(),
+            ],
+            &mut jbuf,
+        )
+        .unwrap();
+        let jtext = String::from_utf8(jbuf).unwrap();
+        assert!(jtext.contains("\"source_offset\":0"), "{jtext}");
+        assert!(jtext.contains("\"attempt\":2"), "{jtext}");
+        assert!(jtext.contains("\"ts_ms\":777"), "{jtext}");
+
+        // Read-only: the directory tree is byte-for-byte unchanged after both reads.
+        let after = dir_snapshot(&dir);
+        assert_eq!(
+            before, after,
+            "dump --dlq must not mutate the data directory"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_dlq_on_a_never_poisoned_dir_shows_nothing_and_does_not_create_the_subdir() {
+        let dir = make_data_dir("dumpdlqempty", 3);
+        let mut buf = Vec::new();
+        run_dump(
+            &[
+                "--data-dir".to_string(),
+                dir.display().to_string(),
+                "--dlq".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap();
+        assert!(buf.is_empty(), "an empty DLQ shows nothing");
+        // The read-only inspector must not have created the dlq/ subdirectory.
+        assert!(
+            !dir.join("dlq").exists(),
+            "dump --dlq must not create the dlq/ subdirectory on a poison-free directory"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_dlq_on_a_missing_dir_is_not_found() {
+        let missing =
+            std::env::temp_dir().join(format!("ironbus-cli-nodir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let mut buf = Vec::new();
+        let e = run_dump(
+            &[
+                "--data-dir".to_string(),
+                missing.display().to_string(),
+                "--dlq".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_NOT_FOUND);
+    }
+
+    /// A sorted snapshot of `(relative path, bytes)` for every regular file under `dir`, used to
+    /// prove a read-only inspector never mutates the directory.
+    #[cfg(unix)]
+    fn dir_snapshot(dir: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        fn walk(base: &Path, dir: &Path, out: &mut Vec<(std::path::PathBuf, Vec<u8>)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    walk(base, &path, out);
+                } else {
+                    let rel = path.strip_prefix(base).unwrap().to_path_buf();
+                    out.push((rel, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
     }
 
     /// Starts an in-process broker over an in-memory filesystem (cross-platform), returning
