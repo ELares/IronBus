@@ -322,10 +322,69 @@ pub fn decode_sub(body: &[u8]) -> SubBody<'_> {
     SubBody { group: body }
 }
 
+/// The dead-letter reason for a message that exceeded `MaxDeliver` (poison). Only this reason
+/// is emitted today; the one-byte reason field leaves room for future causes (#63).
+pub const DEAD_LETTER_MAX_DELIVER: u8 = 0;
+
+/// A dead-letter advisory (the `DEAD_LETTER` frame body): the broker tells a fetching consumer
+/// that a message was dropped from delivery because it exceeded `MaxDeliver` (poison), so the
+/// consumer learns the offset was skipped rather than silently never seeing it (#63). The DLQ
+/// topic write is separate; this is only the in-band notification.
+///
+/// Layout: `offset: u64`, then a one-byte `reason` ([`DEAD_LETTER_MAX_DELIVER`] today).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeadLetterBody {
+    /// The log offset of the dead-lettered message.
+    pub offset: u64,
+    /// Why the message was dead-lettered (0 = exceeded `MaxDeliver`; other values reserved).
+    pub reason: u8,
+}
+
+/// Encodes a `DEAD_LETTER` body onto the end of `out` (a fixed 9-byte layout).
+pub fn encode_dead_letter(advisory: &DeadLetterBody, out: &mut Vec<u8>) {
+    out.extend_from_slice(&advisory.offset.to_le_bytes());
+    out.push(advisory.reason);
+}
+
+/// Decodes a `DEAD_LETTER` body (a fixed 9-byte layout; trailing bytes are rejected).
+///
+/// # Errors
+/// Returns a [`BodyError`] on a short body or trailing bytes.
+pub fn decode_dead_letter(body: &[u8]) -> Result<DeadLetterBody, BodyError> {
+    let mut r = Reader::new(body);
+    let offset = r.u64()?;
+    let reason = r.u8()?;
+    if !r.at_end() {
+        return Err(BodyError::TrailingBytes);
+    }
+    Ok(DeadLetterBody { offset, reason })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn dead_letter_round_trips() {
+        let advisory = DeadLetterBody {
+            offset: 0x0102_0304_0506_0708,
+            reason: DEAD_LETTER_MAX_DELIVER,
+        };
+        let mut buf = Vec::new();
+        encode_dead_letter(&advisory, &mut buf);
+        assert_eq!(buf.len(), 9, "fixed 9-byte body: u64 offset + u8 reason");
+        assert_eq!(decode_dead_letter(&buf).unwrap(), advisory);
+    }
+
+    #[test]
+    fn dead_letter_rejects_a_short_or_overlong_body() {
+        assert_eq!(decode_dead_letter(&[0u8; 8]), Err(BodyError::Truncated));
+        assert_eq!(
+            decode_dead_letter(&[0u8; 10]),
+            Err(BodyError::TrailingBytes)
+        );
+    }
 
     #[test]
     fn pub_round_trips() {

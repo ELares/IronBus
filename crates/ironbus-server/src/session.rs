@@ -21,7 +21,8 @@ use ironbus_core::clock::Clock;
 use ironbus_core::types::RecordFlags;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
-    decode_ack, decode_pub, decode_sub, encode_deliver, AckOp, DeliverBody,
+    decode_ack, decode_pub, decode_sub, encode_dead_letter, encode_deliver, AckOp, DeadLetterBody,
+    DeliverBody, DEAD_LETTER_MAX_DELIVER,
 };
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
@@ -337,10 +338,22 @@ impl Session {
                     self.leased.insert(d.offset.get(), d.token.generation);
                     delivered += 1;
                 }
-                // A parked (poison, over max-deliver) message is committed past by the
-                // engine and skipped from delivery. The dead-letter advisory + DLQ write
-                // (#63) is not yet wired, so the consumer is not told here; keep draining.
-                Ok(Poll::Parked { .. }) => {}
+                // A parked (poison, over max-deliver) message is committed past by the engine
+                // and skipped from delivery. Emit an in-band dead-letter advisory so the
+                // consumer learns the offset was dropped rather than silently never seeing it
+                // (#63); the durable DLQ topic write is still separate. The advisory does not
+                // count toward the delivered total. Keep draining the batch.
+                Ok(Poll::Parked { offset, .. }) => {
+                    let mut frame_body = Vec::new();
+                    encode_dead_letter(
+                        &DeadLetterBody {
+                            offset: offset.get(),
+                            reason: DEAD_LETTER_MAX_DELIVER,
+                        },
+                        &mut frame_body,
+                    );
+                    reply(out, FrameType::DeadLetter, &frame_body);
+                }
                 // Nothing more deliverable right now: end the batch early.
                 Ok(Poll::Idle) => break,
                 Err(e) if e.is_fatal() => {
