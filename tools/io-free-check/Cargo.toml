@@ -1,0 +1,25 @@
+[package]
+name = "io-free-check"
+description = "Dev-only structural checker that ironbus-core stays IO-free (AST walk, not regex)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "io-free-check"
+path = "src/main.rs"
+
+# `full` parses whole files (items, blocks, exprs), `visit` provides the read-only
+# AST walker, and `extra-traits`/proc-macro2's span access let a violation name its
+# source location. This crate is dev-only: nothing in the shipped graph depends on it,
+# so syn never enters ironbus-core's own dependency tree (the dep-tree CI step proves it).
+[dependencies]
+syn = { version = "2", features = ["full", "visit", "extra-traits"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+
+[lints]
+workspace = true
