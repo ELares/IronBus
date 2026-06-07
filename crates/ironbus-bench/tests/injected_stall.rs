@@ -46,7 +46,7 @@ const MIN_STALL: Duration = Duration::from_millis(200);
 const STALL_OVER_INTERARRIVAL: f64 = 8.0;
 /// Cap the freeze so a pathologically slow disk does not blow the test runtime. The run length and
 /// the receiver read timeout (30 s) bound it well above this.
-const MAX_STALL: Duration = Duration::from_millis(2_000);
+const MAX_STALL: Duration = Duration::from_secs(2);
 /// Target utilization for the arrival rate: rate = `UTILIZATION / op_latency`. At 0.1 the broker is
 /// far from saturated, so the healthy tail stays near the op-latency floor with little queueing,
 /// which keeps a wide gap below the freeze on any disk.
