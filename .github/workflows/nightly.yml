@@ -92,6 +92,12 @@ jobs:
     #     because we run only `--lib`.
     name: miri (IO-free and in-memory paths)
     runs-on: ubuntu-latest
+    env:
+      # proptest's default failure-persistence calls getcwd to locate the source file, which Miri
+      # rejects under its default isolation, aborting the test binary. Disable isolation so the
+      # in-memory proptests run. Safe here: the job runs only `--lib` over the IO-free core and the
+      # in-memory storage simulation (the real-IO tests are skipped), so no test does real host IO.
+      MIRIFLAGS: -Zmiri-disable-isolation
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
