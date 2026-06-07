@@ -107,6 +107,13 @@ const DEFAULT_MAX_MESSAGES: u64 = 0;
 /// endless groups. `0` = unlimited (the cap is off); the default is non-zero (1024).
 const DEFAULT_MAX_GROUPS: usize = ironbus_server::engine::DEFAULT_MAX_GROUPS;
 
+/// The default idle window after which an idle, fully-caught-up, lease-free NAMED work-group is
+/// evicted for `serve` (refs #277, #240), in MILLISECONDS, aliased to the engine's
+/// [`ironbus_server::engine::DEFAULT_GROUP_IDLE_EVICT_MS`] so the CLI and engine default are a single
+/// source of truth. `0` = DISABLED (never evict), the default: an operator opts in to reclaiming
+/// idle named groups. Eviction never deletes a durable checkpoint, so a re-subscribe still resumes.
+const DEFAULT_GROUP_IDLE_EVICT_MS: u64 = ironbus_server::engine::DEFAULT_GROUP_IDLE_EVICT_MS;
+
 /// The default disk-full overflow policy for `serve` (`drop-new`, matching the engine default):
 /// an over-cap produce is shed, the older accepted data preserved, so existing behavior is
 /// unchanged. `drop-oldest` opts in to force-reaping the oldest sealed segment to make room.
@@ -184,7 +191,8 @@ USAGE:
                   [--consumer-credit <n>] [--consumer-credit-bytes <n>]
                   [--max-segment-bytes <n>] [--max-total-bytes <bytes>]
                   [--max-retained-bytes <bytes>] [--max-age-ms <ms>] [--max-messages <n>]
-                  [--max-groups <n>] [--disk-full-policy <drop-new|drop-oldest>]
+                  [--max-groups <n>] [--group-idle-evict-ms <ms>]
+                  [--disk-full-policy <drop-new|drop-oldest>]
                   [--key-shared-group <name>]...
                   [--visibility-timeout-ms <n>] [--health-addr <host:port>]
     ironbus pub   [--addr <host:port>] [--key <key>] [<payload>]
@@ -220,6 +228,13 @@ Notes:
     --max-groups (default 1024, 0 = unlimited) caps the number of live work-groups, including the
     default group, so once the wire can name groups a client cannot exhaust memory by naming
     endless groups. A new named group past the cap is rejected; the default group is never counted.
+    --group-idle-evict-ms (default 0 = disabled) evicts an idle NAMED work-group from memory after
+    it has been idle this many milliseconds, reclaiming its slot against --max-groups. Only a
+    fully-caught-up (committed at the head, no acked-ahead set), lease-free, non-key-shared named
+    group is evicted; the default group is never evicted and a group that is behind is never evicted,
+    so a consumer's committed position is never lost. The durable per-group checkpoint is kept, so a
+    re-subscribe resumes where it left off. The sweep is clock-driven (run on produce and poll, no
+    background thread). An explicit unsub of a now-idle named group reclaims it immediately.
     --disk-full-policy (default drop-new) sets what an over-cap produce does once --max-total-bytes
     is hit: drop-new sheds it (preserving older data); drop-oldest force-reaps the oldest sealed
     segment to make room then accepts it, so a slow consumer whose records are reaped gets a
@@ -691,6 +706,7 @@ fn parse_serve_flags(args: &[String]) -> Result<ParsedServe, CliError> {
     let mut max_age_ms = DEFAULT_MAX_AGE_MS;
     let mut max_messages = DEFAULT_MAX_MESSAGES;
     let mut max_groups = DEFAULT_MAX_GROUPS;
+    let mut group_idle_evict_ms = DEFAULT_GROUP_IDLE_EVICT_MS;
     let mut disk_full_policy_arg = DEFAULT_DISK_FULL_POLICY.to_string();
     let mut visibility_ms = DEFAULT_VISIBILITY_MS;
     let mut health_addr: Option<String> = None;
@@ -733,6 +749,9 @@ fn parse_serve_flags(args: &[String]) -> Result<ParsedServe, CliError> {
             "--max-age-ms" => max_age_ms = take_number("--max-age-ms", args, &mut i)?,
             "--max-messages" => max_messages = take_number("--max-messages", args, &mut i)?,
             "--max-groups" => max_groups = take_number("--max-groups", args, &mut i)?,
+            "--group-idle-evict-ms" => {
+                group_idle_evict_ms = take_number("--group-idle-evict-ms", args, &mut i)?;
+            }
             "--disk-full-policy" => {
                 disk_full_policy_arg = take_value("--disk-full-policy", args, &mut i)?;
             }
@@ -776,6 +795,7 @@ fn parse_serve_flags(args: &[String]) -> Result<ParsedServe, CliError> {
             max_age_ms,
             max_messages,
             max_groups,
+            group_idle_evict_ms,
             disk_full_policy,
             visibility_ms,
         },
@@ -909,6 +929,12 @@ struct ServeConfig {
     /// cannot exhaust memory by naming endless groups. `0` = unlimited (the cap is off); the
     /// default is non-zero (1024). A new named group past the cap is rejected by the engine.
     max_groups: usize,
+    /// The idle window after which an idle, fully-caught-up, lease-free NAMED work-group is evicted
+    /// from memory (refs #277, #240), in MILLISECONDS: the lifecycle reclaim that complements the
+    /// `max_groups` cap. `0` = DISABLED (never evict), the default; a non-zero value opts in. The
+    /// durable per-group checkpoint is never deleted, so a re-subscribe resumes; only fully-caught-up
+    /// groups are evicted, so a consumer's committed position is never lost.
+    group_idle_evict_ms: u64,
     /// The disk-full overflow policy (#82): `DropNew` (the default) sheds an over-cap produce,
     /// `DropOldest` force-reaps the oldest sealed segment to make room then accepts it. Honored only
     /// when `max_total_bytes` is set; with no cap, no produce is ever over-cap.
@@ -1121,6 +1147,12 @@ fn open_disk_engine(
             // can name groups. `0` = unlimited (off); the default is non-zero (1024). A new named
             // group past the cap is rejected by the engine before it allocates.
             max_groups: config.max_groups,
+            // Idle named-group eviction (refs #277, #240): the lifecycle reclaim that completes the
+            // #240 cap. `0` = disabled (off, the default), a non-zero value is the idle window in ms
+            // after which a fully-caught-up, lease-free named group is reclaimed. Never deletes a
+            // durable checkpoint, so a re-subscribe resumes; only caught-up groups are evicted, so a
+            // consumer's committed position is never lost.
+            group_idle_evict_ms: config.group_idle_evict_ms,
             // The disk-full overflow policy (#82): drop-new (default) sheds, drop-oldest force-reaps
             // the oldest sealed segment then accepts. Honored only when `max_total_bytes` is set.
             disk_full_policy: match config.disk_full_policy {
@@ -1524,6 +1556,7 @@ mod tests {
             max_age_ms: DEFAULT_MAX_AGE_MS,
             max_messages: DEFAULT_MAX_MESSAGES,
             max_groups: DEFAULT_MAX_GROUPS,
+            group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
             disk_full_policy: DiskFullPolicyArg::DropNew,
             visibility_ms: DEFAULT_VISIBILITY_MS,
         }
@@ -1719,6 +1752,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -1878,6 +1912,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -2108,6 +2143,7 @@ mod tests {
             max_age_ms: DEFAULT_MAX_AGE_MS,
             max_messages: DEFAULT_MAX_MESSAGES,
             max_groups: DEFAULT_MAX_GROUPS,
+            group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
             disk_full_policy: DiskFullPolicyArg::DropNew,
             visibility_ms: DEFAULT_VISIBILITY_MS,
         }
@@ -2579,6 +2615,91 @@ mod tests {
         );
     }
 
+    // ----- Idle named-group eviction flag (#277) -----
+
+    #[test]
+    fn serve_parses_the_group_idle_evict_ms_flag() {
+        // The --group-idle-evict-ms flag (#277) parses its value into the ServeConfig, so the engine
+        // receives the configured idle window.
+        let parsed = parse_serve_flags(&[
+            "--data-dir".to_string(),
+            "/tmp/ironbus-cli-gie-never-served".to_string(),
+            "--group-idle-evict-ms".to_string(),
+            "60000".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.config.group_idle_evict_ms, 60000);
+    }
+
+    #[test]
+    fn the_group_idle_evict_ms_default_is_disabled() {
+        // The default is 0 (disabled / never evict), matching the engine default and the `0` = off
+        // convention of the other bounds, so an unconfigured broker never reclaims named groups.
+        let parsed = parse_serve_flags(&[
+            "--data-dir".to_string(),
+            "/tmp/ironbus-cli-gie-default-never-served".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed.config.group_idle_evict_ms,
+            DEFAULT_GROUP_IDLE_EVICT_MS
+        );
+        assert_eq!(DEFAULT_GROUP_IDLE_EVICT_MS, 0);
+    }
+
+    #[test]
+    fn serve_accepts_a_zero_group_idle_evict_ms_meaning_disabled() {
+        // An explicit 0 (disabled) parses the same as the default, so the only failure is the
+        // unrelated bind path, never EXIT_USAGE.
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-cli-gie0-never-served".to_string(),
+                "--group-idle-evict-ms".to_string(),
+                "0".to_string(),
+                "--addr".to_string(),
+                "127.0.0.1:1".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_ne!(
+            e.exit_code(),
+            EXIT_USAGE,
+            "an explicit --group-idle-evict-ms 0 (disabled) parses and validates: {e}"
+        );
+        let _ = std::fs::remove_dir_all("/tmp/ironbus-cli-gie0-never-served");
+    }
+
+    #[test]
+    fn serve_rejects_a_non_numeric_group_idle_evict_ms() {
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--group-idle-evict-ms".to_string(),
+                "soon".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--group-idle-evict-ms"), "{m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_lists_the_group_idle_evict_ms_flag() {
+        assert!(
+            USAGE.contains("--group-idle-evict-ms"),
+            "USAGE must document --group-idle-evict-ms"
+        );
+    }
+
     // ----- Per-consumer BYTE budget flag (#275) -----
 
     #[test]
@@ -2896,6 +3017,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -2967,6 +3089,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )

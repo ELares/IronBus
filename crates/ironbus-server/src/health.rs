@@ -448,6 +448,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -652,6 +653,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -760,6 +762,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -860,6 +863,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -1035,6 +1039,7 @@ mod tests {
                 max_age_ms: 0,
                 max_messages: 0,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 disk_full_policy: DiskFullPolicy::DropOldest,
             },
         )
