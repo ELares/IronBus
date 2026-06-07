@@ -22,8 +22,9 @@ so a reader of the repository can find the rationale without leaving the tree.
 If an ADR and its owning issue ever disagree, the issue (and the README) win,
 and the ADR is corrected or superseded.
 
-The full immutable index of decisions is tracked in the ADR index issue (#130),
-under the governance process (#22).
+The flat catalog of every resolved decision (the numbered ADRs plus the frozen
+decisions that do not yet have a numbered file) lives in [`INDEX.md`](INDEX.md). The
+ADR index issue (#130) owns it, under the governance process (#22).
 
 ## Numbering
 

@@ -30,6 +30,7 @@ for f in *.dot; do dot -Tpdf "$f" -o "${f%.dot}.pdf"; done
 - [Contract models](CONTRACTS.md): the on-disk, wire, config, runtime, and report byte-level schemas, derived from and cross-checked against the source (#137).
 - [The WAL under load and the on-disk file lifecycle](WAL.md): how the active-segment-is-the-WAL model absorbs a high write rate (segment roll, the O(1) running totals, the shed/drop-oldest overflow policy), the on-disk file classes and their lifecycle (active and sealed `.log`, the cursor checkpoints, the `dlq/` sink), recovery under a crash mid-write, the knobs, and what #135 specifies but the code does not yet implement (#135).
 - [Threat model and security posture](THREAT_MODEL.md): the enumerated edge threat model, the implemented DoS and resource-exhaustion mitigations cited to the code, and an honest statement of the current no-auth / no-TLS / no-at-rest-encryption posture versus the specified controls (#106 to #109), each cross-checked against the source (#105).
+- [Architecture decision records](adr/README.md) and the [ADR index](adr/INDEX.md): the numbered in-tree decision records (log-is-WAL, segments never recycled, lz4_flex default) plus a flat catalog of every resolved design decision with its status and owning issue, marking which decisions still lack a numbered ADR file (#130, #125).
 
 ## Notes
 
