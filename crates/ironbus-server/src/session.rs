@@ -18,6 +18,7 @@
 
 use crate::engine::{AckResult, Engine, EngineError, NackResult, Poll, ProgressResult};
 use ironbus_core::clock::Clock;
+use ironbus_core::keyshared::{KeyOrdering, MemberId};
 use ironbus_core::types::RecordFlags;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
@@ -111,13 +112,35 @@ pub struct Session {
     /// created before it has an engine handle. Once set it never changes for the life of the
     /// connection. The remaining credit at any moment is `ceiling - leased.len()`.
     credit_ceiling: Option<u32>,
+    /// This connection's stable `key_shared` member identity (#64): the rendezvous-hash seed the
+    /// engine routes a key's records to. Minted once per connection by the server from an atomic
+    /// counter, so two concurrently-live connections never collide. Only consulted for a group
+    /// configured `key_shared`; a plain competing group ignores it.
+    member_id: MemberId,
+    /// Whether this connection is currently JOINED as a member of its subscribed `key_shared`
+    /// group (#64), so leave-on-switch / leave-on-disconnect is exact: it only leaves a group it
+    /// actually joined, and only joins once per subscription. `false` for a plain competing group.
+    joined_key_shared: bool,
 }
 
 impl Session {
-    /// A new, not-yet-handshaked session.
+    /// A new, not-yet-handshaked session with the default member identity (member 0). The server
+    /// uses [`Session::with_member_id`] to give each connection a distinct `key_shared` identity;
+    /// `new` is for callers (and tests) that do not exercise `key_shared` routing.
     #[must_use]
     pub fn new() -> Session {
         Session::default()
+    }
+
+    /// A new session with an explicit `key_shared` member identity (#64). The server mints a
+    /// distinct id per connection so two concurrently-live members never collide in the rendezvous
+    /// hash; a plain competing group ignores the id.
+    #[must_use]
+    pub fn with_member_id(member_id: MemberId) -> Session {
+        Session {
+            member_id,
+            ..Session::default()
+        }
     }
 
     /// The work-group this connection is subscribed to (`""` is the default group). Used to
@@ -182,11 +205,11 @@ impl Session {
             Some(FrameType::Ack) => self.handle_ack(engine, body, out),
             Some(FrameType::Flow) => self.handle_flow(engine, body, out),
             Some(FrameType::Sub) => {
-                self.handle_sub(body, out);
+                self.handle_sub(engine, body, out);
                 Ok(())
             }
             Some(FrameType::Unsub) => {
-                self.handle_unsub(out);
+                self.handle_unsub(engine, out);
                 Ok(())
             }
             // The standalone Nack frame type (a client sends a nack as an Ack frame with the
@@ -427,7 +450,10 @@ impl Session {
         let credits = requested.min(remaining);
         let mut delivered = 0u32;
         for _ in 0..credits {
-            match engine.poll_now_in(&self.subscription) {
+            // Member-aware poll (#64): for a key_shared group this routes by the connection's
+            // member id; for a plain competing group it is identical to poll_now_in, so the
+            // KeyOrdering::None path is unchanged.
+            match engine.poll_now_in_member(&self.subscription, self.member_id) {
                 Ok(Poll::Message(d)) => {
                     let msg = DeliverBody {
                         offset: d.offset.get(),
@@ -512,7 +538,12 @@ impl Session {
         Ok(())
     }
 
-    fn handle_sub(&mut self, body: &[u8], out: &mut Vec<u8>) {
+    fn handle_sub<F: Filesystem, C: Clock + Clone>(
+        &mut self,
+        engine: &mut Engine<F, C>,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) {
         if !self.connected {
             reply_err(out, "not connected");
             return;
@@ -521,25 +552,60 @@ impl Session {
             reply_err(out, "subscription name must be valid UTF-8");
             return;
         };
+        // Leave the previous key_shared group (if any) before switching: its keys re-route to
+        // their new owners, and the in-flight leases this connection held there drain or expire.
+        self.leave_current_key_shared(engine);
         // Switching subscriptions abandons this connection's in-flight leases in the
         // previous group (they redeliver there after the visibility timeout), so the new
         // subscription starts with no outstanding leases. The name's shape and the group
         // cap are validated by the engine on the first FLOW (#240), surfaced as an Err.
         group.clone_into(&mut self.subscription);
         self.leased.clear();
+        // If the new group is configured key_shared (#64), put it into that mode and join as a
+        // member so this connection's keys route to it. A failure to enable the mode (an invalid
+        // name or the group cap) is surfaced on the first FLOW as today, so SUB stays infallible
+        // here: only join when the mode is actually active.
+        if engine.is_configured_key_shared(&self.subscription)
+            && engine
+                .set_key_ordering_in(&self.subscription, KeyOrdering::KeyShared)
+                .is_ok()
+        {
+            engine.join_member_in(&self.subscription, self.member_id);
+            self.joined_key_shared = true;
+        }
         reply(out, FrameType::Ok, &[]);
     }
 
-    fn handle_unsub(&mut self, out: &mut Vec<u8>) {
+    fn handle_unsub<F: Filesystem, C: Clock + Clone>(
+        &mut self,
+        engine: &mut Engine<F, C>,
+        out: &mut Vec<u8>,
+    ) {
         if !self.connected {
             reply_err(out, "not connected");
             return;
         }
-        // Revert to the default group and drop any outstanding named-group leases (they
-        // redeliver in that group after the visibility timeout).
+        // Leave the key_shared group (if any) so its keys re-route, then revert to the default
+        // group and drop any outstanding named-group leases (they redeliver after the timeout).
+        self.leave_current_key_shared(engine);
         self.subscription.clear();
         self.leased.clear();
         reply(out, FrameType::Ok, &[]);
+    }
+
+    /// Leaves the currently-subscribed `key_shared` group's live-member set (#64), if this
+    /// connection had joined one. Idempotent and a no-op for a plain competing subscription, so it
+    /// is safe to call on every subscription switch, UNSUB, and connection close. The engine keeps
+    /// the departed member's in-flight records leased until they drain or expire (the drain-or-expire
+    /// guard), so its keys do not jump to a new owner mid-record.
+    pub fn leave_current_key_shared<F: Filesystem, C: Clock + Clone>(
+        &mut self,
+        engine: &mut Engine<F, C>,
+    ) {
+        if self.joined_key_shared {
+            engine.leave_member_in(&self.subscription, self.member_id);
+            self.joined_key_shared = false;
+        }
     }
 }
 
@@ -1085,6 +1151,165 @@ mod tests {
                 "group {group:?} independently sees the whole log"
             );
         }
+    }
+
+    /// Produces a keyed record through the engine, for the `key_shared` session tests.
+    fn produce_keyed<C: Clock + Clone>(e: &mut Engine<InMemoryFs, C>, key: &[u8], payload: &[u8]) {
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key,
+            headers: b"",
+            payload,
+        })
+        .unwrap();
+    }
+
+    /// Connects and subscribes a fresh session (with the given member id) to `group`, returning it.
+    fn connect_and_sub(
+        e: &mut Engine<InMemoryFs, ManualClock>,
+        member: MemberId,
+        group: &[u8],
+    ) -> Session {
+        let mut s = Session::with_member_id(member);
+        let mut out = Vec::new();
+        s.process(e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        s.process(e, &frame(FrameType::Sub, group), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "SUB is acked");
+        s
+    }
+
+    #[test]
+    fn key_shared_over_the_wire_routes_a_key_to_one_member_in_order() {
+        // End-to-end over the session layer (#64): a configured key_shared group, two member
+        // connections, keyed records. A key's records all go to its one owner, in offset order, and
+        // the non-owner never sees them. The default (unconfigured) behavior is untouched.
+        let mut e = engine();
+        e.set_configured_key_shared_groups(["shared".to_string()]);
+        let m1 = MemberId::new(101);
+        let m2 = MemberId::new(202);
+        let mut s1 = connect_and_sub(&mut e, m1, b"shared");
+        let mut s2 = connect_and_sub(&mut e, m2, b"shared");
+        // The SUB put the group into key_shared mode and joined both members.
+        assert_eq!(e.key_ordering_in("shared"), KeyOrdering::KeyShared);
+        // Find a key owned by m1.
+        let key = (0..2000u32)
+            .map(|n| format!("k{n}").into_bytes())
+            .find(|k| {
+                matches!(
+                    e.route_decision_in("shared", m1, k, ironbus_core::types::Offset::ZERO),
+                    Some(ironbus_core::keyshared::RouteDecision::Deliver)
+                )
+            })
+            .expect("a key owned by m1");
+        produce_keyed(&mut e, &key, b"first");
+        produce_keyed(&mut e, &key, b"second");
+        // m2 (the non-owner) fetches: it gets nothing for this key.
+        let mut out = Vec::new();
+        s2.process(
+            &mut e,
+            &frame(FrameType::Flow, &5u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        assert!(
+            delivered_payloads(&out).is_empty(),
+            "the non-owner sees no record for the owner's key"
+        );
+        // m1 (the owner) fetches: it gets the first record (only one, since the key is then busy).
+        out.clear();
+        s1.process(
+            &mut e,
+            &frame(FrameType::Flow, &5u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let got = delivered_payloads(&out);
+        assert_eq!(
+            got,
+            vec![b"first".to_vec()],
+            "owner gets the first record only"
+        );
+        // Ack it, then the second delivers (per-key order over the wire).
+        let frames = decode_all(&out);
+        let d = decode_deliver(&frames[0].1).unwrap();
+        let mut ack_body = Vec::new();
+        encode_ack(
+            &AckBody {
+                offset: d.offset,
+                generation: d.generation,
+                op: AckOp::Ack,
+                delay_ms: 0,
+            },
+            &mut ack_body,
+        );
+        out.clear();
+        s1.process(&mut e, &frame(FrameType::Ack, &ack_body), &mut out)
+            .unwrap();
+        out.clear();
+        s1.process(
+            &mut e,
+            &frame(FrameType::Flow, &5u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            delivered_payloads(&out),
+            vec![b"second".to_vec()],
+            "the second record delivers only after the first is acked"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_group_stays_plain_competing_over_the_wire() {
+        // A group NOT in the configured key_shared set keeps plain competing distribution even
+        // though another group is key_shared: the default path is unaffected (#64).
+        let mut e = engine();
+        e.set_configured_key_shared_groups(["shared".to_string()]);
+        produce_keyed(&mut e, b"some-key", b"a");
+        produce_keyed(&mut e, b"some-key", b"b");
+        let mut s = connect_and_sub(&mut e, MemberId::new(1), b"plain");
+        assert_eq!(
+            e.key_ordering_in("plain"),
+            KeyOrdering::None,
+            "an unconfigured group is not key_shared"
+        );
+        let mut out = Vec::new();
+        s.process(
+            &mut e,
+            &frame(FrameType::Flow, &5u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        // Plain competing: both same-key records deliver to the single member with no affinity gate.
+        assert_eq!(
+            delivered_payloads(&out),
+            vec![b"a".to_vec(), b"b".to_vec()],
+            "a plain group delivers same-key records normally"
+        );
+    }
+
+    #[test]
+    fn leaving_a_key_shared_group_drops_membership() {
+        // UNSUB (and switching subscriptions) leaves the key_shared group's member set (#64).
+        let mut e = engine();
+        e.set_configured_key_shared_groups(["shared".to_string()]);
+        let m = MemberId::new(5);
+        let mut s = connect_and_sub(&mut e, m, b"shared");
+        assert!(
+            !e.join_member_in("shared", m),
+            "the member is already joined via SUB"
+        );
+        let mut out = Vec::new();
+        s.process(&mut e, &frame(FrameType::Unsub, b""), &mut out)
+            .unwrap();
+        assert!(
+            e.join_member_in("shared", m),
+            "after UNSUB the member is no longer in the set (re-join changes it)"
+        );
     }
 
     #[test]

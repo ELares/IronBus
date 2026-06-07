@@ -218,6 +218,22 @@ impl LeaseTable {
         }
     }
 
+    /// Whether `offset` could be claimed at monotonic time `now`: it is free (no lease) or its
+    /// current lease has expired (`now` is at or past the deadline), so the next [`claim`] would
+    /// grant it rather than return [`Claim::InFlight`]. A non-mutating peek, unlike [`claim`]: the
+    /// `key_shared` router (#64) consults the record's key to decide routing BEFORE committing a
+    /// claim, so it needs to know an offset is claimable without consuming a generation on an
+    /// offset it then declines to deliver.
+    ///
+    /// [`claim`]: LeaseTable::claim
+    #[must_use]
+    pub fn is_claimable(&self, offset: Offset, now: u64) -> bool {
+        // Claimable unless a lease exists whose visibility window has NOT yet elapsed. Written as a
+        // negated `matches!` (rather than `map_or(true, ..)` / the 1.82-only `is_none_or`) to stay
+        // MSRV-1.78 clean without tripping a newer clippy's map-or-to-is-none-or suggestion.
+        !matches!(self.leases.get(&offset.get()), Some(lease) if now < lease.deadline)
+    }
+
     /// Acks the lease named by `token`, removing the message from the in-flight set. A
     /// token whose generation no longer matches (already acked, or redelivered) is
     /// fenced.
@@ -476,6 +492,32 @@ mod tests {
     /// A bare token for an offset/generation, for `holds_active` negative cases (no claim needed).
     fn token_at(offset: Offset, generation: u64) -> LeaseToken {
         LeaseToken { offset, generation }
+    }
+
+    #[test]
+    fn is_claimable_is_a_non_mutating_peek_of_claim() {
+        // The key_shared router (#64) peeks claimability before reading a record's key, so
+        // is_claimable must agree with what claim WOULD do, and must not consume a generation.
+        let mut t = LeaseTable::new(cfg()); // visibility 30 -> deadline 30
+        assert!(t.is_claimable(off(7), 0), "a free offset is claimable");
+        let _ = t.claim(off(7), 0);
+        assert!(
+            !t.is_claimable(off(7), 10),
+            "an active lease is not claimable"
+        );
+        assert!(!t.is_claimable(off(7), 29), "still within the window");
+        assert!(
+            t.is_claimable(off(7), 30),
+            "claimable exactly at the deadline (claim would redeliver)"
+        );
+        // The peek did not mutate: the generation a real claim now gets is still 1, not bumped.
+        match t.claim(off(7), 30) {
+            Claim::Granted { token, deliveries } => {
+                assert_eq!(token.generation, 1, "peeking never consumed a generation");
+                assert_eq!(deliveries, 2);
+            }
+            other => panic!("expected a redelivery, got {other:?}"),
+        }
     }
 
     #[test]

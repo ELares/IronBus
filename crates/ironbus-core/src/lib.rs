@@ -14,6 +14,7 @@ pub mod codec;
 pub mod cursor;
 pub mod delivery;
 pub mod format;
+pub mod keyshared;
 pub mod lease;
 pub mod segment;
 pub mod types;
