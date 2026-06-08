@@ -236,6 +236,19 @@ is pure observability: the engine never enforces the ceiling; the RAM bounds tha
 actually hold are `consumer_credit_bytes`, `max_in_flight`, `max_groups`, and the
 bounded registry. See `crates/ironbus-server/src/rss.rs`.
 
+**The tiny-profile edge-budget CI gate (#118).** These edge series are gated under
+the `edge-tiny` profile by `crates/ironbus-cli/tests/edge_tiny_budget.rs`, which boots
+the real `ironbus serve --profile edge-tiny`, runs a bounded workload, and scrapes
+`/metrics`, asserting: the edge-tiny knobs are in effect (the #87 materialized-config
+line), `ironbus_write_amp_ratio` is finite, non-zero, and strictly under the
+documented `>= 4x fails` flash-endurance gate (see `docs/EDGE_CONSTRAINTS.md`), the
+byte counters advanced with `physical >= logical`, `ironbus_ram_headroom_bytes`
+reports the honest `-1` sentinel (the serve path wires no runtime RAM ceiling yet),
+and `ironbus_produce_saturated` / `ironbus_daily_write_budget_over` read `0`. It
+deliberately does NOT assert a tight RSS number: a precise RSS-under-the-64-MiB-ceiling
+measurement is device-only (the `--ram-ceiling-bytes` follow-up), so a shared CI
+runner's RSS can never flake the gate.
+
 **Throughput-collapse signal.** `ironbus_produce_saturated` is the portable
 saturation/throughput-collapse signal #118 asks for: `1` once the broker has shed at
 least one produce (admission exhaustion via the daily-write-budget governor). It is
