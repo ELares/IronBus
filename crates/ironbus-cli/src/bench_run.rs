@@ -50,6 +50,12 @@ fn execute_isolated(cfg: &BenchConfig) -> Result<BenchReport, CliError> {
     // Start from a clean directory so a stale leftover from a crashed prior run cannot skew bytes.
     let _ = std::fs::remove_dir_all(&data_dir);
 
+    // PRODUCTION-SAFETY: arm an RAII guard that removes the synthetic directory on ANY early exit,
+    // so a broker spawn failure after the directory is created, or a panic inside the load loop,
+    // cannot leak it. The normal path runs the explicit, failure-reporting cleanup below and then
+    // disarms this guard, so the explicit cleanup stays authoritative for the exit code.
+    let mut dir_guard = DataDirGuard::arm(data_dir.clone());
+
     let broker = IsolatedBroker::spawn(&data_dir, cfg.no_fsync)?;
     let run_result = drive_load(cfg, broker.addr());
     // Tear the broker down BEFORE deleting the directory, so no writer races the cleanup.
@@ -57,9 +63,23 @@ fn execute_isolated(cfg: &BenchConfig) -> Result<BenchReport, CliError> {
 
     // Auto-delete the synthetic directory unconditionally, capturing any failure.
     let cleanup = std::fs::remove_dir_all(&data_dir);
+    // The explicit cleanup above is now authoritative; the RAII net must not also fire.
+    dir_guard.disarm();
 
-    // The run result takes precedence: a run failure is reported even if cleanup also failed.
-    let report = run_result?;
+    // The run result takes precedence: a run failure is reported even if cleanup also failed, but a
+    // cleanup failure in that combined case is still surfaced on stderr so a leak is never silent.
+    let report = match run_result {
+        Ok(report) => report,
+        Err(run_err) => {
+            if let Err(e) = &cleanup {
+                eprintln!(
+                    "warning: failed to delete the synthetic bench directory {}: {e}",
+                    data_dir.display()
+                );
+            }
+            return Err(run_err);
+        }
+    };
 
     if let Err(e) = cleanup {
         // PRODUCTION-SAFETY: a leftover synthetic directory wastes space and must be seen. Report
@@ -71,6 +91,35 @@ fn execute_isolated(cfg: &BenchConfig) -> Result<BenchReport, CliError> {
     }
 
     Ok(report)
+}
+
+/// RAII safety net that removes the synthetic bench data directory when it drops, unless it was
+/// explicitly [`disarmed`](Self::disarm). It exists so an early return (a broker spawn failure after
+/// the directory was created) or a panic in the load loop cannot leak the directory; the normal path
+/// performs an explicit, failure-reporting cleanup and then disarms this guard.
+struct DataDirGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl DataDirGuard {
+    fn arm(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DataDirGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best effort: this only fires on an error or panic path whose exit code is already set
+            // by the propagating error or the unwind, so there is nowhere better to route a failure.
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 /// The synthetic data-directory path: the temp dir plus the bench group name (already a random
@@ -590,5 +639,48 @@ fn stamp_send_time(payload: &mut [u8], started: Instant) {
     if payload.len() >= ROUND_TRIP_TOKEN_LEN {
         let offset_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         payload[0..8].copy_from_slice(&offset_ns.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DataDirGuard;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("ironbus-bench-{tag}-{}-{n}", std::process::id()))
+    }
+
+    #[test]
+    fn an_armed_guard_removes_the_dir_on_drop() {
+        let dir = unique_dir("guard-armed");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        assert!(dir.exists());
+        {
+            let _guard = DataDirGuard::arm(dir.clone());
+        }
+        assert!(
+            !dir.exists(),
+            "an armed guard must remove the synthetic dir on drop (the spawn-failure / panic leak path)"
+        );
+    }
+
+    #[test]
+    fn a_disarmed_guard_leaves_the_dir() {
+        let dir = unique_dir("guard-disarmed");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        {
+            let mut guard = DataDirGuard::arm(dir.clone());
+            guard.disarm();
+        }
+        assert!(
+            dir.exists(),
+            "a disarmed guard must NOT remove the dir; the explicit failure-reporting cleanup owns deletion"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
