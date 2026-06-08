@@ -324,6 +324,14 @@ pub enum ReportError {
         /// The offending cluster-class system string.
         system: &'static str,
     },
+    /// A row placed in the informational appendix is not tagged `Placement::Appendix`, so it would
+    /// not carry the mandated "not an edge-class comparison" label. The appendix-labeling lint.
+    AppendixRowNotAppendix {
+        /// The offending row's system string.
+        system: &'static str,
+        /// The placement string the row actually had.
+        placement: &'static str,
+    },
 }
 
 impl core::fmt::Display for ReportError {
@@ -355,6 +363,12 @@ impl core::fmt::Display for ReportError {
                 "cluster-class system `{system}` appears as an edge SLO gate row: Kafka/Redpanda are \
                  JVM/Seastar multi-node systems, excluded from edge gates and allowed ONLY in the \
                  x86-ref informational appendix (labeled `not an edge-class comparison`)."
+            ),
+            ReportError::AppendixRowNotAppendix { system, placement } => write!(
+                f,
+                "appendix row for `{system}` is tagged `{placement}`, not `appendix`: every \
+                 informational-appendix row must be placed in the appendix so it carries the fixed \
+                 `not an edge-class comparison` label."
             ),
         }
     }
@@ -394,6 +408,17 @@ impl ComparisonReport {
     ) -> Result<ComparisonReport, ReportError> {
         for pair in &pairs {
             lint_pair(pair)?;
+        }
+        // Every appendix row must actually be tagged Placement::Appendix, so the mandated
+        // "not an edge-class comparison" label is always present; a mis-tagged appendix row is a
+        // labeling-lint violation rather than something silently stored with a None label.
+        for row in &appendix {
+            if row.placement != Placement::Appendix {
+                return Err(ReportError::AppendixRowNotAppendix {
+                    system: row.system.as_str(),
+                    placement: row.placement.as_str(),
+                });
+            }
         }
         Ok(ComparisonReport {
             schema_version: SCHEMA_VERSION,
@@ -652,6 +677,21 @@ mod tests {
             report.appendix[0].placement.appendix_label(),
             Some("not an edge-class comparison")
         );
+    }
+
+    #[test]
+    fn an_appendix_row_tagged_edge_gate_fails_the_build() {
+        // An appendix row mistagged as an edge-gate row would render no "not an edge-class
+        // comparison" label, so build() rejects it rather than storing it unchecked.
+        let mistagged = row(
+            System::Kafka,
+            DurabilityLabel::PageCacheAsync,
+            256,
+            "x86-ref-n100",
+            Placement::EdgeGate,
+        );
+        let err = ComparisonReport::build(vec![], vec![mistagged]).unwrap_err();
+        assert!(matches!(err, ReportError::AppendixRowNotAppendix { .. }));
     }
 
     #[test]
