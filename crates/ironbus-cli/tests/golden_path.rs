@@ -482,7 +482,7 @@ fn start_broker_with_health_args(data_dir: &str, extra: &[&str]) -> (ChildGuard,
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
-        // Forward the startup lines: "listening on", the #87 materialized-config line, and "health
+        // Forward the startup lines: "listening on" and "health
         // endpoints on" (a few extra to absorb any future startup line), so the consumer can find
         // both addresses regardless of their relative order.
         for _ in 0..8 {

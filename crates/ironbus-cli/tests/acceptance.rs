@@ -224,7 +224,7 @@ fn start_broker(bin: &Path, data_dir: &str, extra: &[&str]) -> (ChildGuard, Stri
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
-        // Forward the startup lines: the "listening on" line, the #87 materialized-config line, and
+        // Forward the startup lines: the "listening on" line and
         // the "health endpoints on" line (a few extra to absorb any future startup line) so the
         // consumer below can find both addresses regardless of their relative order.
         for _ in 0..8 {
@@ -239,7 +239,7 @@ fn start_broker(bin: &Path, data_dir: &str, extra: &[&str]) -> (ChildGuard, Stri
     });
     let mut wire = None;
     let mut health = None;
-    // Read startup lines until BOTH addresses are seen (or the stream ends). The materialized-config
+    // Read startup lines until BOTH addresses are seen (or the stream ends). The startup
     // line (#87) sits between the listen and health lines, so a fixed two-line read would miss the
     // health address; loop until both are bound.
     while wire.is_none() || health.is_none() {

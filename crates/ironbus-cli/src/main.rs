@@ -1906,12 +1906,17 @@ fn cmd_serve(
     )?;
     // The materialized-config dump (#87): ONE structured line with the active profile, the profile
     // schema version, and every resolved knob, so an operator sees exactly the effective config the
-    // broker is running. Logged once at startup, after the listen line.
-    writeln!(
-        out,
+    // broker is running. This is diagnostic startup LOGGING, so it goes to STDERR (the log stream),
+    // never the stdout startup-protocol stream: a consumer that reads the "listening on" line and
+    // then stops reading stdout (a common supervisor pattern, and exactly what the migrate seed test
+    // does) would otherwise make serve take a SIGPIPE on this write and die on Linux. Writing to
+    // stderr and ignoring a write error keeps the broker alive and puts config logging where it
+    // belongs.
+    let _ = writeln!(
+        std::io::stderr(),
         "{}",
         materialized_config_line(config, &local.to_string(), data_dir)
-    )?;
+    );
     if config.allow_unlimited_deliver && (config.max_deliver == 0 || config.max_deliver == u32::MAX)
     {
         // Unlimited delivery is opt-in but LOUD (#63): a single poison payload can redeliver
