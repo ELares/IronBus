@@ -36,6 +36,13 @@ pub enum ReasonCode {
     /// A checksum-valid record carried an out-of-order sequence (a recycled or mixed-up
     /// frame), so the segment was abandoned at that record.
     SequenceGap,
+    /// The at-rest scrubber (#92) flagged a span as suspect during a background integrity pass
+    /// (a checksum that no longer verifies on a previously-durable record, i.e. silent bit rot),
+    /// distinct from the recovery-time reasons above. Reserved for the scrubber: recovery itself
+    /// never emits it today, but it is appended here so the report vocabulary the scrubber will
+    /// emit into is frozen up front. A new reason is append-only (a new number, name, and label)
+    /// and does NOT bump `schema_version`.
+    ScrubberSuspect,
 }
 
 impl ReasonCode {
@@ -50,17 +57,19 @@ impl ReasonCode {
             ReasonCode::CorruptRecordBody => 3,
             ReasonCode::CorruptSegmentHeader => 4,
             ReasonCode::SequenceGap => 5,
+            ReasonCode::ScrubberSuspect => 6,
         }
     }
 
     /// Every reason, in code order, so a consumer can enumerate them (for example to emit a
     /// metric series per reason). Appended to, never reordered.
-    pub const ALL: [ReasonCode; 5] = [
+    pub const ALL: [ReasonCode; 6] = [
         ReasonCode::TornTail,
         ReasonCode::CorruptRecordHeader,
         ReasonCode::CorruptRecordBody,
         ReasonCode::CorruptSegmentHeader,
         ReasonCode::SequenceGap,
+        ReasonCode::ScrubberSuspect,
     ];
 
     /// A stable, lower-snake-case label for this reason, for a metric series or a log field.
@@ -73,7 +82,23 @@ impl ReasonCode {
             ReasonCode::CorruptRecordBody => "corrupt_record_body",
             ReasonCode::CorruptSegmentHeader => "corrupt_segment_header",
             ReasonCode::SequenceGap => "sequence_gap",
+            ReasonCode::ScrubberSuspect => "scrubber_suspect",
         }
+    }
+
+    /// `true` if a span with this reason counts as real DATA loss for the loss-bytes total.
+    ///
+    /// A [`ReasonCode::TornTail`] is the expected power-loss / brownout case: the bytes after the
+    /// last durable record were simply never fully written, so they were never acked data. Counting
+    /// it as data loss would inflate fleet loss metrics on every clean restart, so it is EXCLUDED
+    /// from the data-loss total (it is still a reported skip/truncation, just not lost data). Every
+    /// other reason is a genuine corruption of previously-durable bytes and DOES count. This is the
+    /// same boundary [`is_corruption_skip`](crate::quarantine::is_corruption_skip) uses to decide
+    /// what is worth quarantining, kept in lockstep so the loss total and the forensic store agree
+    /// on what "data loss" means.
+    #[must_use]
+    pub fn is_data_loss(self) -> bool {
+        !matches!(self, ReasonCode::TornTail)
     }
 }
 
@@ -179,11 +204,28 @@ impl LossReport {
     }
 
     /// The total bytes dropped across all events (saturating, so a crafted report can never
-    /// overflow this sum).
+    /// overflow this sum). This is the full SKIP/TRUNCATION span: it INCLUDES torn tails, which
+    /// are reported skips but not real data loss. For the data-loss-only total (the metric that
+    /// must not inflate on a brownout), see [`LossReport::data_loss_bytes`].
     #[must_use]
     pub fn total_bytes_skipped(&self) -> u64 {
         self.events
             .iter()
+            .fold(0u64, |acc, e| acc.saturating_add(e.bytes_skipped))
+    }
+
+    /// The total bytes of real DATA loss across all events (saturating): the same sum as
+    /// [`LossReport::total_bytes_skipped`] but with [`ReasonCode::TornTail`] EXCLUDED, because a
+    /// torn or unsynced tail is bytes that were never fully written, not previously-durable data
+    /// that was lost (#59, criterion 2). Counting torn tails here would inflate fleet data-loss
+    /// metrics on every clean power-loss restart. The exclusion follows
+    /// [`ReasonCode::is_data_loss`], the same boundary the quarantine store uses, so the data-loss
+    /// total and the forensic store agree on what counts.
+    #[must_use]
+    pub fn data_loss_bytes(&self) -> u64 {
+        self.events
+            .iter()
+            .filter(|e| e.reason_code.is_data_loss())
             .fold(0u64, |acc, e| acc.saturating_add(e.bytes_skipped))
     }
 
@@ -364,6 +406,7 @@ mod tests {
             ReasonCode::CorruptRecordBody,
             ReasonCode::CorruptSegmentHeader,
             ReasonCode::SequenceGap,
+            ReasonCode::ScrubberSuspect,
         ];
         // Frozen numeric codes (a renumber would break a deployed metrics consumer).
         assert_eq!(ReasonCode::TornTail.code(), 1);
@@ -371,6 +414,8 @@ mod tests {
         assert_eq!(ReasonCode::CorruptRecordBody.code(), 3);
         assert_eq!(ReasonCode::CorruptSegmentHeader.code(), 4);
         assert_eq!(ReasonCode::SequenceGap.code(), 5);
+        // Appended for the at-rest scrubber (#92, #59); append-only, no schema bump.
+        assert_eq!(ReasonCode::ScrubberSuspect.code(), 6);
         // No two reasons share a code.
         let mut seen = std::collections::BTreeSet::new();
         for r in all {
@@ -481,12 +526,13 @@ mod tests {
     fn golden_reason_code_vocabulary_is_frozen() {
         // (numeric code, metric label, serde JSON name), in code order. Append-only: a new reason
         // adds a row; an existing row never changes.
-        let frozen: [(u16, &str, &str); 5] = [
+        let frozen: [(u16, &str, &str); 6] = [
             (1, "torn_tail", "\"TornTail\""),
             (2, "corrupt_record_header", "\"CorruptRecordHeader\""),
             (3, "corrupt_record_body", "\"CorruptRecordBody\""),
             (4, "corrupt_segment_header", "\"CorruptSegmentHeader\""),
             (5, "sequence_gap", "\"SequenceGap\""),
+            (6, "scrubber_suspect", "\"ScrubberSuspect\""),
         ];
         assert_eq!(
             ReasonCode::ALL.len(),
@@ -550,15 +596,19 @@ mod tests {
             .sum();
         assert_eq!(by_reason, r.total_bytes_skipped());
         // Labels are frozen and distinct, in code order.
-        assert_eq!(ReasonCode::ALL.len(), 5);
+        assert_eq!(ReasonCode::ALL.len(), 6);
         assert_eq!(ReasonCode::TornTail.metric_label(), "torn_tail");
         assert_eq!(
             ReasonCode::CorruptRecordHeader.metric_label(),
             "corrupt_record_header"
         );
+        assert_eq!(
+            ReasonCode::ScrubberSuspect.metric_label(),
+            "scrubber_suspect"
+        );
         let labels: std::collections::BTreeSet<_> =
             ReasonCode::ALL.iter().map(|rc| rc.metric_label()).collect();
-        assert_eq!(labels.len(), 5, "labels are distinct");
+        assert_eq!(labels.len(), 6, "labels are distinct");
     }
 
     #[test]
@@ -577,6 +627,43 @@ mod tests {
             .map(|&rc| r.records_lost_for(rc))
             .sum();
         assert_eq!(by_reason, r.total_records_lost_estimate());
+    }
+
+    #[test]
+    fn data_loss_bytes_excludes_torn_tail() {
+        // A torn tail is a reported skip but NOT data loss (the bytes were never fully written),
+        // so it counts toward total_bytes_skipped but is excluded from data_loss_bytes (#59).
+        let mut r = LossReport::new();
+        r.push(LossEvent::span(0, 0, 100, 1, ReasonCode::TornTail));
+        r.push(LossEvent::span(1, 0, 30, 1, ReasonCode::CorruptRecordBody));
+        r.push(LossEvent::span(
+            2,
+            0,
+            20,
+            1,
+            ReasonCode::CorruptRecordHeader,
+        ));
+        // The skip total includes the torn tail; the data-loss total does not.
+        assert_eq!(r.total_bytes_skipped(), 150);
+        assert_eq!(r.data_loss_bytes(), 50, "torn tail excluded from data loss");
+        // is_data_loss is the per-reason predicate the total filters on: only TornTail is excluded.
+        assert!(!ReasonCode::TornTail.is_data_loss());
+        for rc in ReasonCode::ALL {
+            assert_eq!(
+                rc.is_data_loss(),
+                rc != ReasonCode::TornTail,
+                "only TornTail is excluded from data loss for {rc:?}"
+            );
+        }
+        // A report whose only event is a torn tail reports zero data loss but non-zero skip.
+        let mut torn_only = LossReport::new();
+        torn_only.push(LossEvent::span(0, 0, 64, 1, ReasonCode::TornTail));
+        assert_eq!(torn_only.total_bytes_skipped(), 64);
+        assert_eq!(torn_only.data_loss_bytes(), 0);
+        // ScrubberSuspect (the appended at-rest-scrubber reason) DOES count as data loss.
+        let mut scrub = LossReport::new();
+        scrub.push(LossEvent::span(0, 0, 40, 1, ReasonCode::ScrubberSuspect));
+        assert_eq!(scrub.data_loss_bytes(), 40);
     }
 
     #[test]
