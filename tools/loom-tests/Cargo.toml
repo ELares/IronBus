@@ -1,30 +1,42 @@
+# A STANDALONE, SEPARATE workspace (its own Cargo.lock), deliberately EXCLUDED from the root IronBus
+# workspace (#122). Keeping loom out of the root workspace's lockfile is what guarantees loom and its
+# non-optional `tracing-subscriber`/`env-filter` transitive tree can never unify their features into
+# the shipped binary's dependency graph or its cargo-auditable SBOM. A root workspace member would
+# unify them onto the single shared `tracing-subscriber` build node even when cfg-gated out of the
+# compiled units, because Cargo resolves features per-lockfile, not per-built-unit. This crate
+# depends on no ironbus crate; the loom models are faithful standalone replicas of the real
+# structures' atomic ordering, cross-referenced to the real symbols in the test's comments.
+[workspace]
+members = ["."]
+resolver = "2"
+
 [package]
 name = "loom-tests"
 description = "Dev-only scoped loom concurrency models for the IronBus cross-thread hot paths (#122)."
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-authors.workspace = true
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ELares/IronBus"
+authors = ["The IronBus Authors"]
 publish = false
 
-# A STANDALONE dev-only crate (like tools/io-free-check): no shipped crate depends on it, and it
-# depends on no ironbus crate, so its dev-dependency `loom` (and loom's own transitive deps, e.g.
-# `tracing-subscriber` with `env-filter`) can NEVER unify into or otherwise reach a shipped crate's
-# dependency graph. The loom models are faithful standalone replicas of the real structures' atomic
-# ordering (the real symbols are named in the test's cross-reference comments), so they need no
-# ironbus dependency. This isolation is what keeps the `cargo-auditable` SBOM of the shipped binary
-# loom-free.
 [lib]
 path = "src/lib.rs"
 
 # loom (#122): the permutation tester for `tests/loom_concurrency.rs`. cfg-gated so it resolves ONLY
-# under `RUSTFLAGS="--cfg loom"`; a normal build never pulls it. loom is MIT (already on the
-# deny.toml license allow-list). Because this crate is dev-only and on no shipped path, loom stays
-# out of the shipped graph regardless.
+# under `RUSTFLAGS="--cfg loom"`; a normal build never pulls it. loom is MIT (already on the root
+# deny.toml license allow-list). Because this is a separate, excluded workspace, loom never touches
+# the shipped graph or the root lockfile.
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
 
-[lints]
-workspace = true
+# Mirror the root workspace lints so the standalone crate stays clippy-pedantic and unsafe-denied
+# clean under the same bar (it cannot inherit them across the workspace boundary).
+[lints.rust]
+unsafe_code = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

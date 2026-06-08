@@ -127,9 +127,11 @@ jobs:
     # Scoped loom concurrency models (#122): exhaustively permute the interleavings of the three
     # genuinely cross-thread hot paths (the commit-index publish/observe, the bounded WAL handoff,
     # and the segment/connection refcount) under `RUSTFLAGS="--cfg loom"`. The tests live in the
-    # STANDALONE dev-only `loom-tests` crate (`tools/loom-tests/tests/loom_concurrency.rs`), gated
-    # `#![cfg(loom)]`, with `loom` as a `cfg(loom)` dev-dependency of that isolated crate, so it
-    # never enters (or unifies features into) the shipped graph. Each model caps at <= 3 threads and
+    # STANDALONE, SEPARATE-WORKSPACE dev-only `loom-tests` crate
+    # (`tools/loom-tests/tests/loom_concurrency.rs`), gated `#![cfg(loom)]`, with `loom` as a
+    # `cfg(loom)` dev-dependency. That crate has its OWN Cargo.lock and is EXCLUDED from the root
+    # workspace, so loom (and loom's `tracing-subscriber`/`env-filter` tree) never enters the root
+    # lockfile, the shipped graph, or the cargo-auditable SBOM. Each model caps at <= 3 threads and
     # <= 4 ops, and `LOOM_MAX_PREEMPTIONS=3` bounds the exploration so the lane always finishes well
     # inside the budget. Non-blocking by virtue of living in the nightly lane.
     name: loom scoped concurrency models
@@ -145,10 +147,13 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: loom
+          # The loom models are a separate workspace under tools/loom-tests with their own lockfile.
+          workspaces: tools/loom-tests
       - name: run the scoped loom concurrency models
+        # The separate workspace is addressed by its manifest path (no root-workspace coupling).
         # Single-threaded so each model's interleaving count prints in order; --nocapture surfaces
         # the per-model "[loom] <name>: explored N interleavings" proof line in the job log.
-        run: cargo test -p loom-tests --test loom_concurrency -- --nocapture --test-threads=1
+        run: cargo test --manifest-path tools/loom-tests/Cargo.toml --locked --test loom_concurrency -- --nocapture --test-threads=1
 
   coverage:
     # Produce an informational LCOV coverage report for the workspace with cargo-llvm-cov and
