@@ -31,10 +31,18 @@ rand_distr = "0.5"
 # Already in the workspace lock. MIT OR Apache-2.0.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# SIGSTOP/SIGCONT for the injected-stall self-test, and the macOS monotonic-raw clock. Unix only,
-# `cfg`-gated. A foreign call, not `unsafe`-free; the few `libc` calls are isolated and documented.
+# SIGSTOP/SIGCONT for the (now `--ignored`-only) live OS-freeze path, and the macOS monotonic-raw
+# clock. Unix only, `cfg`-gated. A foreign call, not `unsafe`-free; the few `libc` calls are isolated
+# and documented. The in-process broker for the DETERMINISTIC injected-stall self-test (#284) is also
+# Unix-only (the shipped broker is Unix-only), so the server/storage/core deps are cfg(unix) too: they
+# run the SAME `ironbus-server` engine + append actor + `serve` the binary ships, over a
+# `FaultFs<InMemoryFs>` whose sync gate (#177) freezes the broker's group-commit fsync deterministically
+# (a condvar gate, no OS scheduling), so the freeze ALWAYS lands in the recorded tail.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+ironbus-server = { path = "../ironbus-server", version = "0.0.0" }
+ironbus-storage = { path = "../ironbus-storage", version = "0.0.0" }
+ironbus-core = { path = "../ironbus-core", version = "0.0.0" }
 
 [lints]
 workspace = true
