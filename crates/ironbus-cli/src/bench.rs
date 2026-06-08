@@ -413,14 +413,69 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
     })
 }
 
+/// Runs a parsed `bench` invocation: executes the load (the platform seam) and renders the report
+/// in the chosen output mode. This top-level entry is CROSS-PLATFORM so the renderers and the report
+/// type always have a live caller on every target (the actual load run is the Unix-only seam below),
+/// which keeps the non-Unix bin build warning-clean under `-D warnings` without a dead-code dance.
+///
+/// # Errors
+/// Returns [`CliError::Unreachable`] if a live broker is down, [`CliError::Internal`] for a run or
+/// synthetic-directory cleanup failure (cleanup maps to exit 70) or an unsupported platform, or a
+/// write error.
+pub fn run<W: Write>(cfg: &BenchConfig, out: &mut W) -> Result<(), CliError> {
+    let report = execute(cfg)?;
+    emit(cfg, &report, out)
+}
+
+/// Renders a finished run in the chosen output mode (JSON object or human summary).
+fn emit<W: Write>(cfg: &BenchConfig, report: &BenchReport, out: &mut W) -> Result<(), CliError> {
+    if cfg.json {
+        write_json(cfg, report, out)
+    } else {
+        write_human(cfg, report, out)
+    }
+}
+
+/// Executes the bench load and returns the measured report. The Unix implementation
+/// ([`crate::bench_run::execute`]) spins up the isolated (or live) broker, drives the real client,
+/// and auto-deletes the synthetic data dir. On a non-Unix host the on-disk broker is unavailable
+/// (positioned IO the Windows path lacks), so it is an unsupported-platform internal error.
+#[cfg(unix)]
+fn execute(cfg: &BenchConfig) -> Result<BenchReport, CliError> {
+    crate::bench_run::execute(cfg)
+}
+
+/// The non-Unix stub for [`execute`]: `bench` cannot run without the Unix-only on-disk broker. It
+/// references [`BenchReport`] (the type the Unix path returns) and [`percentiles_us`]/[`fill_payload`]
+/// so the shared, otherwise Unix-only-consumed surface is not flagged dead in the non-Unix bin build
+/// under `-D warnings` (the cfg(not(unix)) field-read footgun, generalized).
+#[cfg(not(unix))]
+fn execute(cfg: &BenchConfig) -> Result<BenchReport, CliError> {
+    let _ = cfg;
+    // Construct a report and touch the cross-platform measurement helpers and the cleanup-error
+    // builder so none is dead code on a non-Unix target. Nothing is rendered and no error but the
+    // unsupported-platform one is returned: this path always fails closed.
+    let _report = BenchReport::default();
+    let _ = percentiles_us(&[]);
+    let mut probe = [0u8; ROUND_TRIP_TOKEN_LEN + 1];
+    fill_payload(&mut probe, cfg.payload_shape, 0, ROUND_TRIP_TOKEN_LEN);
+    let _ = nanos_to_us(0);
+    let _ = cleanup_failed_error("", "");
+    Err(CliError::Internal(
+        "ironbus bench requires a Unix host in v1: the isolated broker uses the Unix-only on-disk \
+         storage path"
+            .to_string(),
+    ))
+}
+
 /// Renders a finished run as the human-readable summary. Written to `out`.
 ///
 /// # Errors
 /// Returns [`CliError`] if writing to `out` fails.
-pub fn write_human(
+pub fn write_human<W: Write + ?Sized>(
     cfg: &BenchConfig,
     report: &BenchReport,
-    out: &mut impl Write,
+    out: &mut W,
 ) -> Result<(), CliError> {
     writeln!(
         out,
@@ -467,8 +522,8 @@ pub fn write_human(
 }
 
 /// Writes one optional-microsecond latency line, or `n/a` when the value is absent.
-fn write_latency_line(
-    out: &mut impl Write,
+fn write_latency_line<W: Write + ?Sized>(
+    out: &mut W,
     label: &str,
     value: Option<f64>,
 ) -> Result<(), CliError> {
@@ -485,10 +540,10 @@ fn write_latency_line(
 ///
 /// # Errors
 /// Returns [`CliError`] if writing to `out` fails.
-pub fn write_json(
+pub fn write_json<W: Write + ?Sized>(
     cfg: &BenchConfig,
     report: &BenchReport,
-    out: &mut impl Write,
+    out: &mut W,
 ) -> Result<(), CliError> {
     writeln!(out, "{}", bench_json(cfg, report))?;
     Ok(())

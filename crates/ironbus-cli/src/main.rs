@@ -1778,28 +1778,13 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
 /// down; or [`CliError::Internal`] for a run failure or a synthetic-directory cleanup failure.
 fn run_bench(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     // A fresh random suffix names the isolated synthetic data dir and consumer group, so two
-    // concurrent bench runs never collide and the name is recognizable as bench-owned.
+    // concurrent bench runs never collide and the name is recognizable as bench-owned. Parsing and
+    // rendering are cross-platform; the load run inside `bench::run` is the Unix-only seam (it errors
+    // on a non-Unix host), so the renderers always have a live caller and the Windows build stays
+    // warning-clean under `-D warnings` (the #99/#288 cfg(not(unix)) field-read footgun, avoided by
+    // keeping the renderers' caller cross-platform rather than gating the whole module out).
     let config = bench::parse_bench(args, &random_suffix())?;
-    cmd_bench(&config, out)
-}
-
-/// Runs a parsed `bench` invocation on Unix: dispatches to the [`bench_run`] execution path.
-#[cfg(unix)]
-fn cmd_bench(config: &bench::BenchConfig, out: &mut impl Write) -> Result<(), CliError> {
-    bench_run::run_bench(config, out)
-}
-
-/// `bench` requires Unix in v1: the isolated in-process broker it spawns is the on-disk `serve`
-/// engine, which uses positioned IO the Windows path does not implement yet. The guards and JSON
-/// schema still compile and unit-test on every platform; only the run is gated.
-#[cfg(not(unix))]
-fn cmd_bench(config: &bench::BenchConfig, out: &mut impl Write) -> Result<(), CliError> {
-    let _ = (config, out);
-    Err(CliError::Internal(
-        "ironbus bench requires a Unix host in v1: the isolated broker uses the Unix-only on-disk \
-         storage path"
-            .to_string(),
-    ))
+    bench::run(&config, out)
 }
 
 /// A short random-ish hex suffix for the synthetic bench namespace. Combines the process id, a

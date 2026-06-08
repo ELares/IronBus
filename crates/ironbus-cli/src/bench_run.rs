@@ -10,22 +10,22 @@
 //! [`crate::bench`] and are unit-tested on every target.
 
 use crate::bench::{
-    fill_payload, percentiles_us, write_human, write_json, BenchConfig, BenchReport, Bound, Mode,
-    BENCH_NAMESPACE_PREFIX, ROUND_TRIP_TOKEN_LEN,
+    fill_payload, percentiles_us, BenchConfig, BenchReport, Bound, Mode, BENCH_NAMESPACE_PREFIX,
+    ROUND_TRIP_TOKEN_LEN,
 };
 use crate::{open_disk_engine, CliError, ServeConfig};
 use ironbus_client::{Client, ClientConfig, ClientError};
 use ironbus_proto::message::PubBody;
 use ironbus_server::actor::{spawn_actor, DEFAULT_CHANNEL_BOUND};
 use ironbus_server::server::serve;
-use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Runs the parsed `bench` invocation, writing the human or JSON report to `out`.
+/// Executes the parsed `bench` invocation and returns the measured [`BenchReport`]. The rendering
+/// is done by the cross-platform [`crate::bench::run`] caller, so this is pure measurement.
 ///
 /// In ISOLATED mode (the default) it spawns its own broker over a fresh `ironbus-bench-<random>`
 /// data directory under the temp dir, runs the load, then ALWAYS auto-deletes the directory: a
@@ -34,21 +34,18 @@ use std::time::{Duration, Instant};
 ///
 /// # Errors
 /// Returns [`CliError::Unreachable`] if the broker cannot be reached, [`CliError::Internal`] for a
-/// run failure or a cleanup failure (the cleanup failure maps to exit 70), or a write error.
-pub fn run_bench(cfg: &BenchConfig, out: &mut impl Write) -> Result<(), CliError> {
+/// run failure or a cleanup failure (the cleanup failure maps to exit 70).
+pub fn execute(cfg: &BenchConfig) -> Result<BenchReport, CliError> {
     match &cfg.live_addr {
-        Some(addr) => {
-            // LIVE mode: the operator acknowledged it; we never spawn or delete anything.
-            let report = drive_load(cfg, addr)?;
-            emit(cfg, &report, out)
-        }
-        None => run_isolated(cfg, out),
+        // LIVE mode: the operator acknowledged it; we never spawn or delete anything.
+        Some(addr) => drive_load(cfg, addr),
+        None => execute_isolated(cfg),
     }
 }
 
 /// The isolated path: create a synthetic data dir, spawn an in-process broker over it, run the
 /// load, tear the broker down, then auto-delete the directory (reporting a cleanup failure).
-fn run_isolated(cfg: &BenchConfig, out: &mut impl Write) -> Result<(), CliError> {
+fn execute_isolated(cfg: &BenchConfig) -> Result<BenchReport, CliError> {
     let data_dir = synthetic_data_dir(&cfg.group);
     // Start from a clean directory so a stale leftover from a crashed prior run cannot skew bytes.
     let _ = std::fs::remove_dir_all(&data_dir);
@@ -73,16 +70,7 @@ fn run_isolated(cfg: &BenchConfig, out: &mut impl Write) -> Result<(), CliError>
         ));
     }
 
-    emit(cfg, &report, out)
-}
-
-/// Writes the report in the chosen output mode.
-fn emit(cfg: &BenchConfig, report: &BenchReport, out: &mut impl Write) -> Result<(), CliError> {
-    if cfg.json {
-        write_json(cfg, report, out)
-    } else {
-        write_human(cfg, report, out)
-    }
+    Ok(report)
 }
 
 /// The synthetic data-directory path: the temp dir plus the bench group name (already a random
