@@ -68,7 +68,7 @@ use ironbus_core::lease::LeaseConfig;
 #[cfg(unix)]
 use ironbus_server::actor::{spawn_actor, DEFAULT_CHANNEL_BOUND};
 #[cfg(unix)]
-use ironbus_server::engine::{DiskFullPolicy, Engine, EngineConfig};
+use ironbus_server::engine::{DiskFullPolicy, DurabilityLevel, Engine, EngineConfig};
 #[cfg(unix)]
 use ironbus_server::health::serve_health;
 #[cfg(unix)]
@@ -173,6 +173,26 @@ const DEFAULT_GROUP_IDLE_EVICT_MS: u64 = ironbus_server::engine::DEFAULT_GROUP_I
 /// unchanged. `drop-oldest` opts in to force-reaping the oldest sealed segment to make room.
 const DEFAULT_DISK_FULL_POLICY: &str = "drop-new";
 
+/// The default durability LEVEL for `serve` (`sync`, matching the engine default, #341, #379): an ack
+/// is emitted only after the covering `fdatasync`, so I2 holds and an acknowledged record is never
+/// lost on a power cut (ZERO acked loss). A zero-config broker stays power-loss safe; the relaxed
+/// levels (`interval`/`async`/`none`) are strictly opt-in and weaken I2 by a documented loss window.
+const DEFAULT_DURABILITY_LEVEL: &str = "sync";
+
+/// The default `--flush-interval-ms` for the `interval` durability level (#341), in MILLISECONDS: the
+/// most time an acked-but-unsynced record may sit before the background flush forces an `fdatasync`,
+/// so the worst-case loss window is bounded. Only consulted under `--durability-level interval`. 1000
+/// ms (one second) is a conservative default window; an operator tunes it down for less exposure or up
+/// for fewer syncs. The byte trigger ([`DEFAULT_FLUSH_MAX_BYTES`]) bounds it independently.
+const DEFAULT_FLUSH_INTERVAL_MS: u64 = 1_000;
+
+/// The default `--flush-max-bytes` for the `interval` durability level (#341): the most UNSYNCED
+/// record bytes that may accumulate before the background flush forces an `fdatasync`. Only consulted
+/// under `--durability-level interval`. 1 MiB caps the bytes-at-risk independently of the time window,
+/// so a burst that fills the budget before the timer fires still bounds the loss. The EFFECTIVE bound
+/// is the smaller of the time and byte triggers.
+const DEFAULT_FLUSH_MAX_BYTES: u64 = 1024 * 1024;
+
 /// The default COUNT bound on each per-producer dedup window for `serve` (#3, #33), aliased to the
 /// engine's [`ironbus_core::dedup::DEFAULT_MAX_IDS`] so the CLI and engine default are one source of
 /// truth. Dedup is OFF by default and activates per-producer only when a publish carries a `msg_id`;
@@ -221,6 +241,66 @@ impl DiskFullPolicyArg {
             DiskFullPolicyArg::DropNew => DEFAULT_DISK_FULL_POLICY,
             DiskFullPolicyArg::DropOldest => "drop-oldest",
         }
+    }
+}
+
+/// The durability LEVEL parsed from `serve --durability-level` (#341, #379). A platform-neutral,
+/// `Copy` mirror of the engine's [`ironbus_server::engine::DurabilityLevel`], so it lives in the
+/// (non-Unix-gated) [`ServeConfig`] and is parsed/validated on EVERY platform; the Unix on-disk path
+/// maps it to the engine enum. The default is [`DurabilityLevelArg::Sync`], the only power-loss-safe
+/// level (ack-implies-durable, I2, zero acked loss): an operator who passes no `--durability-level`
+/// keeps the historical durable broker. The relaxed levels are strictly opt-in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DurabilityLevelArg {
+    /// The DEFAULT, power-loss-safe level: ack only after the covering `fdatasync` (I2).
+    Sync,
+    /// OPT-IN, bounded-loss: ack on page-cache write, forced `fdatasync` on the flush window.
+    Interval,
+    /// OPT-IN, unbounded-until-next-sync loss: ack on page-cache write, opportunistic fsync only.
+    /// Gated behind `--async-loss-ack`.
+    Async,
+    /// OPT-IN, the largest loss window: like `async` with no periodic fsync. Gated behind
+    /// `--async-loss-ack`.
+    None,
+}
+
+impl DurabilityLevelArg {
+    /// Parses the `--durability-level` flag value, accepting `sync`, `interval`, `async`, or `none`.
+    fn parse(value: &str) -> Option<DurabilityLevelArg> {
+        match value {
+            "sync" => Some(DurabilityLevelArg::Sync),
+            "interval" => Some(DurabilityLevelArg::Interval),
+            "async" => Some(DurabilityLevelArg::Async),
+            "none" => Some(DurabilityLevelArg::None),
+            _ => None,
+        }
+    }
+
+    /// The flag/log spelling of this level, the inverse of [`DurabilityLevelArg::parse`]. `Sync`
+    /// returns the [`DEFAULT_DURABILITY_LEVEL`] string so the default constant stays the single
+    /// source of truth for that name; used as a resolvable default and in the materialized-config log.
+    fn as_str(self) -> &'static str {
+        match self {
+            DurabilityLevelArg::Sync => DEFAULT_DURABILITY_LEVEL,
+            DurabilityLevelArg::Interval => "interval",
+            DurabilityLevelArg::Async => "async",
+            DurabilityLevelArg::None => "none",
+        }
+    }
+
+    /// Whether this level WAIVES I2 (ack no longer implies durable): true for every relaxed level,
+    /// false for `sync`. Drives the loud startup warning and the materialized-config power-loss-safe
+    /// flag.
+    fn waives_i2(self) -> bool {
+        !matches!(self, DurabilityLevelArg::Sync)
+    }
+
+    /// Whether selecting this level REQUIRES the explicit `--async-loss-ack` data-loss acknowledgement
+    /// to boot (the none/async safety gate, #49/#379): the UNBOUNDED-loss levels `async` and `none`.
+    /// `sync` needs no ack; `interval`'s loss is bounded by the operator-chosen window, so it is opt-in
+    /// but not gated behind the data-loss flag.
+    fn requires_loss_ack(self) -> bool {
+        matches!(self, DurabilityLevelArg::Async | DurabilityLevelArg::None)
     }
 }
 
@@ -1260,6 +1340,10 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
 /// can fill the unset slots with flag > env > default precedence (#89). The repeatable
 /// `--key-shared-group` is a plain `Vec` (CLI-only, no env mapping); the booleans are `true` only if
 /// their bare flag appeared.
+// Each bool mirrors a distinct bare CLI flag (--allow-unlimited-deliver, --enable-admin,
+// --health-allow-public, --async-loss-ack); they are independent knobs, not a state enum, so a
+// struct of flag mirrors is the right shape (the same reasoning as ServeConfig below).
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 struct ServeFlags {
     addr: Option<String>,
@@ -1295,6 +1379,17 @@ struct ServeFlags {
     /// The cap on the NUMBER of distinct per-producer dedup windows (#33); `None` falls back to the
     /// default. Bounds the TOTAL dedup memory under a flood of distinct `producer_id`s.
     dedup_max_producers: Option<usize>,
+    /// The durability LEVEL (#341, #379) selected by `--durability-level` / `IRONBUS_DURABILITY_LEVEL`.
+    /// `None` resolves to the default `sync` (ack-implies-durable, I2, zero acked loss). An unknown
+    /// name is a usage error.
+    durability_level: Option<String>,
+    /// The `interval` level's TIME window in ms (#341); `None` falls back to the default.
+    flush_interval_ms: Option<u64>,
+    /// The `interval` level's unsynced-byte budget (#341); `None` falls back to the default.
+    flush_max_bytes: Option<u64>,
+    /// The explicit data-loss acknowledgement for `async`/`none` (#49, #379): the `--async-loss-ack`
+    /// bare flag. `true` only if it appeared; without it, an `async`/`none` level refuses to boot.
+    async_loss_ack: bool,
     disk_full_policy: Option<String>,
     visibility_ms: Option<u64>,
     enable_admin: bool,
@@ -1379,6 +1474,21 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             }
             "--disk-full-policy" => {
                 f.disk_full_policy = Some(take_value("--disk-full-policy", args, &mut i)?);
+            }
+            "--durability-level" => {
+                f.durability_level = Some(take_value("--durability-level", args, &mut i)?);
+            }
+            "--flush-interval-ms" => {
+                f.flush_interval_ms = Some(take_number("--flush-interval-ms", args, &mut i)?);
+            }
+            "--flush-max-bytes" => {
+                f.flush_max_bytes = Some(take_number("--flush-max-bytes", args, &mut i)?);
+            }
+            // A bare boolean flag (no value): advance ONE token, not two, or the loop spins. The
+            // explicit data-loss acknowledgement that gates the unbounded-loss durability levels.
+            "--async-loss-ack" => {
+                f.async_loss_ack = true;
+                i += 1;
             }
             "--key-shared-group" => {
                 f.key_shared_groups
@@ -1478,6 +1588,27 @@ fn parse_serve_flags_with_env(args: &[String], env: &EnvFn<'_>) -> Result<Parsed
         };
         CliError::Usage(format!(
             "`{source}` must be `drop-new` or `drop-oldest`, got `{disk_full_policy_arg}`"
+        ))
+    })?;
+    // The durability LEVEL (#341, #379) resolves like the disk-full policy: an enum string with
+    // flag > env > default (`sync`) precedence, parsed after resolution so a bad value names its
+    // source (the flag if explicit, else the env var). The default `sync` keeps the historical
+    // power-loss-safe broker; the relaxed levels are strictly opt-in.
+    let level_from_flag = f.durability_level.is_some();
+    let durability_level_arg = resolve_string(
+        "--durability-level",
+        f.durability_level,
+        env,
+        DEFAULT_DURABILITY_LEVEL,
+    );
+    let durability_level = DurabilityLevelArg::parse(&durability_level_arg).ok_or_else(|| {
+        let source = if level_from_flag {
+            "--durability-level".to_string()
+        } else {
+            env_var_name("--durability-level")
+        };
+        CliError::Usage(format!(
+            "`{source}` must be `sync`, `interval`, `async`, or `none`, got `{durability_level_arg}`"
         ))
     })?;
     Ok(ParsedServe {
@@ -1600,6 +1731,24 @@ fn parse_serve_flags_with_env(args: &[String], env: &EnvFn<'_>) -> Result<Parsed
                 env,
                 DEFAULT_DEDUP_MAX_PRODUCERS,
             )?,
+            // The durability level and its interval triggers (#341, #379). The level is resolved
+            // above (flag > env > default `sync`); the interval triggers take their defaults when not
+            // set, overridable by env/flag. `async`/`none` are gated behind `--async-loss-ack` in
+            // `validate_serve_config`, never reachable by accident.
+            durability_level,
+            flush_interval_ms: resolve_number(
+                "--flush-interval-ms",
+                f.flush_interval_ms,
+                env,
+                DEFAULT_FLUSH_INTERVAL_MS,
+            )?,
+            flush_max_bytes: resolve_number(
+                "--flush-max-bytes",
+                f.flush_max_bytes,
+                env,
+                DEFAULT_FLUSH_MAX_BYTES,
+            )?,
+            async_loss_ack: resolve_bool("--async-loss-ack", f.async_loss_ack, env)?,
         },
         key_shared_groups: f.key_shared_groups,
         broadcast_groups: f.broadcast_groups,
@@ -1680,7 +1829,59 @@ fn validate_serve_config(config: &ServeConfig) -> Result<(), CliError> {
             "`--visibility-timeout-ms` must be at least 1".to_string(),
         ));
     }
+    validate_durability(config)?;
     validate_ram_ceiling(config)?;
+    Ok(())
+}
+
+/// The FAIL-CLOSED durability safety gate (#49, #341, #379): the none/async data-loss acknowledgement
+/// and the `interval`-window sanity check, both BEFORE the broker opens.
+///
+/// - The unbounded-loss levels (`async`, `none`) WAIVE I2 with no loss ceiling, so they REFUSE TO
+///   BOOT unless `--async-loss-ack` (the explicit `i-accept-acknowledged-data-loss` acknowledgement)
+///   is set. This is the #49/#379 none-safety gate: a relaxed durability that loses acked data is
+///   never reachable by a bare flag, only by an operator who explicitly accepted the loss. `sync` (the
+///   default) and `interval` (bounded loss) need no acknowledgement.
+/// - The `interval` level must have at least ONE positive trigger (`--flush-interval-ms` or
+///   `--flush-max-bytes`): with both at `0` the window would never force a sync, silently degrading
+///   `interval` to the unbounded `async` behavior WITHOUT the data-loss acknowledgement, which would
+///   defeat the bound the operator chose. Rejected here so a misconfigured `interval` cannot become an
+///   unannounced unbounded-loss broker.
+///
+/// # Errors
+/// [`CliError::Usage`] (exit 1, before any listener opens) for a gated level without the
+/// acknowledgement, or an `interval` level with no positive trigger.
+fn validate_durability(config: &ServeConfig) -> Result<(), CliError> {
+    if config.durability_level.requires_loss_ack() && !config.async_loss_ack {
+        // Fail closed: an unbounded-loss level needs the explicit acknowledgement. The error names
+        // the level, the waived invariant, the worst-case loss, and the flag to set, so the operator
+        // knows exactly what they are turning off and how to confirm it.
+        return Err(CliError::Usage(format!(
+            "refusing to start with `--durability-level {level}`: it WAIVES I2 (ack-implies-durable) \
+             with an UNBOUNDED loss window (every record acked since the last segment roll or clean \
+             shutdown can be lost on a power cut). This is contrary to IronBus's power-loss-safe \
+             default (`sync`). To enable it deliberately, pass `--async-loss-ack` to acknowledge that \
+             acknowledged data can be lost (a loud startup warning is then logged on every boot). The \
+             safe default needs no acknowledgement; `interval` carries a BOUNDED, operator-chosen loss \
+             window and is not gated by this flag.",
+            level = config.durability_level.as_str()
+        )));
+    }
+    if config.durability_level == DurabilityLevelArg::Interval
+        && config.flush_interval_ms == 0
+        && config.flush_max_bytes == 0
+    {
+        // Both triggers off would make the window never fire, silently turning `interval` into the
+        // unbounded `async` behavior without the data-loss acknowledgement. Require at least one.
+        return Err(CliError::Usage(
+            "`--durability-level interval` needs at least one positive flush trigger: set \
+             `--flush-interval-ms` (a time window) and/or `--flush-max-bytes` (an unsynced-byte \
+             budget) above 0, so the worst-case loss stays bounded. With both at 0 the window would \
+             never force an fdatasync, silently degrading `interval` to the unbounded `async` \
+             behavior."
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -1733,6 +1934,10 @@ fn validate_ram_ceiling(config: &ServeConfig) -> Result<(), CliError> {
 /// The broker tuning knobs parsed from the `serve` flags.
 // Not `Copy`: `backoff_ms` is a `Vec`. The config is moved (never re-used after the move) through
 // `finish_serve`/`cmd_serve`, so `Clone` suffices. `Debug` lets a test assert on a `ParsedServe`.
+// The four bools mirror four independent operator opt-ins (--allow-unlimited-deliver, --enable-admin,
+// --health-allow-public, --async-loss-ack); each is a distinct safety/feature toggle, not a packed
+// state, so a flat config of toggles is the right shape rather than an enum.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug)]
 struct ServeConfig {
     /// The compiled-in named profile (#87) the knobs below were resolved against, applied first and
@@ -1845,6 +2050,31 @@ struct ServeConfig {
     /// flood of distinct ids cannot grow RAM without bound. Default 4096
     /// (`DEFAULT_DEDUP_MAX_PRODUCERS`); floored to 1 by the engine.
     dedup_max_producers: usize,
+    /// The DURABILITY LEVEL (#341, #379): how an ack relates to the covering `fdatasync`. Default
+    /// [`DurabilityLevelArg::Sync`] (ack only after the covering fdatasync, I2, ZERO acked loss on a
+    /// power cut), so a zero-config broker is power-loss safe. The relaxed levels weaken I2 by a
+    /// documented loss window and are strictly opt-in; the unbounded-loss ones (`async`/`none`) refuse
+    /// to boot without `async_loss_ack` (the none/async safety gate). Platform-neutral so it is
+    /// validated on every platform; the Unix on-disk path maps it to the engine enum.
+    durability_level: DurabilityLevelArg,
+    /// The `interval` level's TIME window in MILLISECONDS (#341): the most time an acked-but-unsynced
+    /// record may sit before a forced `fdatasync`, bounding the worst-case loss. Only consulted under
+    /// `durability_level == interval`. Default 1 s (`DEFAULT_FLUSH_INTERVAL_MS`); `0` disables the time
+    /// trigger (the byte budget alone forces the sync), but the validation requires at least one
+    /// positive trigger so an `interval` broker always has a bound.
+    flush_interval_ms: u64,
+    /// The `interval` level's BYTE budget (#341): the most UNSYNCED record bytes that may accumulate
+    /// before a forced `fdatasync`. Only consulted under `durability_level == interval`. Default 1 MiB
+    /// (`DEFAULT_FLUSH_MAX_BYTES`); `0` disables the byte trigger (the time window alone forces the
+    /// sync). The EFFECTIVE worst-case loss bound is the smaller of the time and byte triggers.
+    flush_max_bytes: u64,
+    /// The explicit DATA-LOSS ACKNOWLEDGEMENT for the unbounded-loss levels (#49, #379): the
+    /// `--async-loss-ack` (a.k.a. `i-accept-acknowledged-data-loss`) bare flag. `async` and `none`
+    /// WAIVE I2 with an unbounded loss window, so they REFUSE TO BOOT unless this is set (the
+    /// fail-closed none/async safety gate). `sync` and `interval` ignore it. When a gated level boots
+    /// with the ack, the broker logs a LOUD startup warning that I2 is waived and the worst-case loss
+    /// for the active level.
+    async_loss_ack: bool,
 }
 
 // Only the Unix `bench` execution path constructs a default `ServeConfig` (the isolated broker); on
@@ -1885,6 +2115,12 @@ impl ServeConfig {
             dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
             dedup_window_ms: DEFAULT_DEDUP_WINDOW_MS,
             dedup_max_producers: DEFAULT_DEDUP_MAX_PRODUCERS,
+            // The bench broker runs the default durable level (#341): ack-implies-durable, the same
+            // power-loss-safe guarantee the shipped `serve` default carries.
+            durability_level: DurabilityLevelArg::Sync,
+            flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
+            flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
+            async_loss_ack: false,
         }
     }
 }
@@ -2015,6 +2251,11 @@ fn health_bind_decision(haddr: &str, allow_public: bool) -> Result<HealthBindDec
 /// secret material (the broker carries none today; the redacting newtype is the #89/#109 residual).
 fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: &Path) -> String {
     let policy = config.disk_full_policy.as_str();
+    // The durability level (#341, #379) and its loss exposure: an operator reads the active level,
+    // whether it is power-loss safe (I2 holds only under `sync`), and the interval triggers straight
+    // off the startup log, the same surface the `ironbus_durability_*` gauges expose on `/metrics`.
+    let durability_level = config.durability_level.as_str();
+    let power_loss_safe = !config.durability_level.waives_i2();
     format!(
         "materialized-config profile={} profile_schema_version={} addr={addr} \
          data_dir={data_dir} max_connections={} max_segment_bytes={} max_total_bytes={} \
@@ -2022,7 +2263,9 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: &Path) -
          group_idle_evict_ms={} checkpoint_interval={} max_deliver={} \
          allow_unlimited_deliver={} disk_full_policy={policy} visibility_timeout_ms={} \
          max_retained_bytes={} max_age_ms={} max_messages={} health_liveness_window_ms={} \
-         enable_admin={} ram_ceiling_bytes={}",
+         enable_admin={} ram_ceiling_bytes={} durability_level={durability_level} \
+         power_loss_safe={power_loss_safe} flush_interval_ms={} flush_max_bytes={} \
+         async_loss_ack={}",
         config.profile.name(),
         config.profile_schema_version,
         config.max_connections,
@@ -2043,8 +2286,38 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: &Path) -
         config.health_liveness_window_ms,
         config.enable_admin,
         config.ram_ceiling_bytes,
+        config.flush_interval_ms,
+        config.flush_max_bytes,
+        config.async_loss_ack,
         data_dir = data_dir.display(),
     )
+}
+
+/// A one-line, human-readable description of the WORST-CASE acknowledged loss the active durability
+/// level can take on a power cut (#341, #379), for the loud I2-waived startup warning. `sync` returns
+/// the zero-loss statement; each relaxed level returns its documented bound (with the `interval`
+/// window's configured triggers spelled out). Pure and platform-neutral (it reads only the config),
+/// so it is testable on every platform and shared by the warning. The single source of truth for the
+/// per-level loss wording, kept in step with `docs/DURABILITY.md` and the engine's
+/// `DurabilityLevel::worst_case_loss_description`.
+fn durability_loss_description(config: &ServeConfig) -> String {
+    match config.durability_level {
+        DurabilityLevelArg::Sync => {
+            "zero (an ack is emitted only after the covering fdatasync; I2 holds)".to_string()
+        }
+        DurabilityLevelArg::Interval => format!(
+            "bounded by the flush window: at most the records acked since the last fdatasync, forced \
+             every {} ms or {} unsynced bytes, whichever comes first",
+            config.flush_interval_ms, config.flush_max_bytes
+        ),
+        DurabilityLevelArg::Async => "every record acked since the last fdatasync, with no time or \
+             byte ceiling (bounded only by the OS dirty-writeback window); a segment roll or a clean \
+             shutdown is the only barrier"
+            .to_string(),
+        DurabilityLevelArg::None => "every record acked since the last segment roll or clean \
+             shutdown (no periodic fsync at all): the largest loss window"
+            .to_string(),
+    }
 }
 
 #[cfg(unix)]
@@ -2111,6 +2384,23 @@ fn cmd_serve(
         "{}",
         materialized_config_line(config, &local.to_string(), data_dir)
     );
+    if config.durability_level.waives_i2() {
+        // The LOUD I2-WAIVED warning (#341, #379): a relaxed durability level is active, so an ack no
+        // longer implies the record is durable. State exactly which invariant is waived and the
+        // worst-case acknowledged loss for the active level, on EVERY startup, so an operator who
+        // opted into a power-loss-unsafe broker always sees it. The unbounded-loss levels reached this
+        // point only because `--async-loss-ack` was set (the gate in `validate_serve_config`), so this
+        // is the deliberate, acknowledged warning, never a silent downgrade.
+        writeln!(
+            out,
+            "WARN: --durability-level {level}: I2 (ack-implies-durable) is WAIVED; this broker is NOT \
+             power-loss safe. An ack no longer implies the record is durable. Worst-case acknowledged \
+             loss on a power cut: {loss}. Only `--durability-level sync` (the default) loses zero \
+             acknowledged data on a power loss.",
+            level = config.durability_level.as_str(),
+            loss = durability_loss_description(config),
+        )?;
+    }
     if config.allow_unlimited_deliver && (config.max_deliver == 0 || config.max_deliver == u32::MAX)
     {
         // Unlimited delivery is opt-in but LOUD (#63): a single poison payload can redeliver
@@ -2354,6 +2644,14 @@ fn cmd_serve(
         config.dedup_max_ids,
         config.dedup_window_ms,
         config.dedup_max_producers,
+        // The #341/#379 durability knobs are read only on the Unix serve path (they wire the engine's
+        // durability_level / interval triggers and drive the none/async safety gate + the loud
+        // I2-waived warning), so the non-Unix stub must consume them too or the Windows `-D warnings`
+        // build trips field-never-read, invisible to a macOS reviewer (the recurring #288/#99 footgun).
+        config.durability_level,
+        config.flush_interval_ms,
+        config.flush_max_bytes,
+        config.async_loss_ack,
         key_shared_groups,
         // Read the broadcast groups under cfg(not(unix)) too: a field/param read only on cfg(unix)
         // breaks the Windows `-D warnings` build invisibly to a macOS reviewer (#288 note).
@@ -2463,6 +2761,21 @@ fn open_disk_engine(
                 window_nanos: config.dedup_window_ms.saturating_mul(1_000_000),
                 max_producers: config.dedup_max_producers,
             },
+            // The DURABILITY LEVEL (#341, #379), wired from `--durability-level`. Default `sync`
+            // (ack only after the covering fdatasync, I2, zero acked loss): a zero-config broker is
+            // byte-for-byte the historical durable broker. The relaxed levels are strictly opt-in and
+            // weaken I2 by a documented loss window; `async`/`none` are already gated behind the
+            // explicit `--async-loss-ack` acknowledgement by `validate_serve_config`, so an engine can
+            // only reach a loss-bearing level once the operator accepted the loss. The `interval`
+            // triggers (time/bytes) only matter under `interval`.
+            durability_level: match config.durability_level {
+                DurabilityLevelArg::Sync => DurabilityLevel::Sync,
+                DurabilityLevelArg::Interval => DurabilityLevel::Interval,
+                DurabilityLevelArg::Async => DurabilityLevel::Async,
+                DurabilityLevelArg::None => DurabilityLevel::None,
+            },
+            flush_interval_ms: config.flush_interval_ms,
+            flush_max_bytes: config.flush_max_bytes,
         },
     )
     .map_err(|e| CliError::Internal(format!("opening broker at {}: {e}", data_dir.display())))?;
@@ -3991,6 +4304,12 @@ mod tests {
             dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
             dedup_window_ms: DEFAULT_DEDUP_WINDOW_MS,
             dedup_max_producers: DEFAULT_DEDUP_MAX_PRODUCERS,
+            // The default durable level (#341): a test config that does not opt in stays power-loss
+            // safe (ack-implies-durable), so an unrelated test never accidentally relaxes durability.
+            durability_level: DurabilityLevelArg::Sync,
+            flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
+            flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
+            async_loss_ack: false,
         }
     }
 
@@ -4490,6 +4809,9 @@ mod tests {
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
                 dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: ironbus_server::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
             },
         )
         .unwrap();
@@ -4982,6 +5304,9 @@ mod tests {
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
                 dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: ironbus_server::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
             },
         )
         .unwrap();
@@ -5047,6 +5372,9 @@ mod tests {
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
                 dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: ironbus_server::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
             },
         )
         .unwrap();
@@ -5320,6 +5648,12 @@ mod tests {
             dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
             dedup_window_ms: DEFAULT_DEDUP_WINDOW_MS,
             dedup_max_producers: DEFAULT_DEDUP_MAX_PRODUCERS,
+            // The default durable level (#341): a test config that does not opt in stays power-loss
+            // safe (ack-implies-durable), so an unrelated test never accidentally relaxes durability.
+            durability_level: DurabilityLevelArg::Sync,
+            flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
+            flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
+            async_loss_ack: false,
         }
     }
 
@@ -5435,6 +5769,198 @@ mod tests {
                 "an unlimited byte budget under a tiny ceiling must be refused, got {other:?}"
             ),
         }
+    }
+
+    // ---- #341 / #379 relaxed durability levels: CLI gate, parsing, observability ----
+
+    #[test]
+    fn the_default_durability_level_is_sync_and_power_loss_safe() {
+        // THE TEETH for the safe default at the CLI: a zero-config `serve` resolves to `sync`, which
+        // is power-loss safe and needs no acknowledgement. An operator who changes nothing keeps I2.
+        let cfg = parse_serve_flags(&serve_args(&[])).unwrap().config;
+        assert_eq!(cfg.durability_level, DurabilityLevelArg::Sync);
+        assert!(
+            !cfg.durability_level.waives_i2(),
+            "the default sync level is power-loss safe"
+        );
+        assert!(
+            validate_serve_config(&cfg).is_ok(),
+            "the default needs no data-loss acknowledgement"
+        );
+    }
+
+    #[test]
+    fn serve_parses_every_durability_level() {
+        // Each level spelling round-trips through the flag, and `sync`/`interval` need no ack while
+        // `async`/`none` are gated (asserted separately).
+        for (flag, level) in [
+            ("sync", DurabilityLevelArg::Sync),
+            ("interval", DurabilityLevelArg::Interval),
+            ("async", DurabilityLevelArg::Async),
+            ("none", DurabilityLevelArg::None),
+        ] {
+            let cfg = parse_serve_flags(&serve_args(&["--durability-level", flag]))
+                .unwrap()
+                .config;
+            assert_eq!(cfg.durability_level, level, "{flag} parses to {level:?}");
+        }
+        // An unknown level is a usage error naming the accepted values.
+        match parse_serve_flags(&serve_args(&["--durability-level", "bogus"])) {
+            Err(CliError::Usage(m)) => {
+                assert!(m.contains("sync"), "names the accepted values: {m}");
+                assert!(m.contains("`bogus`"), "echoes the bad value: {m}");
+            }
+            other => panic!("a bad durability level must be a usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn async_and_none_refuse_to_boot_without_the_data_loss_acknowledgement() {
+        // THE none/async SAFETY GATE (#49, #379): the unbounded-loss levels refuse to start without
+        // `--async-loss-ack`, fail-closed (exit 1), with a message that names the level, the waived
+        // invariant, and the flag to set. A loss-bearing durability is never reachable by accident.
+        for level in ["async", "none"] {
+            let cfg = parse_serve_flags(&serve_args(&["--durability-level", level]))
+                .unwrap()
+                .config;
+            match validate_serve_config(&cfg) {
+                Err(CliError::Usage(m)) => {
+                    assert!(m.contains(level), "names the level: {m}");
+                    assert!(m.contains("I2"), "names the waived invariant: {m}");
+                    assert!(
+                        m.contains("--async-loss-ack"),
+                        "names the acknowledgement flag: {m}"
+                    );
+                    assert_eq!(CliError::Usage(m).exit_code(), EXIT_USAGE);
+                }
+                other => panic!("{level} without the ack must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn async_and_none_boot_with_the_data_loss_acknowledgement() {
+        // With the explicit `--async-loss-ack`, the gated levels are accepted (the loud I2-waived
+        // warning is emitted by cmd_serve at startup; validation only stops rejecting once the
+        // operator has acknowledged the loss).
+        for level in ["async", "none"] {
+            let cfg = parse_serve_flags(&serve_args(&[
+                "--durability-level",
+                level,
+                "--async-loss-ack",
+            ]))
+            .unwrap()
+            .config;
+            assert!(cfg.async_loss_ack, "the ack flag parsed");
+            assert!(
+                validate_serve_config(&cfg).is_ok(),
+                "{level} with --async-loss-ack must be accepted"
+            );
+            assert!(
+                cfg.durability_level.waives_i2(),
+                "{level} still waives I2 (the warning fires), it is just acknowledged"
+            );
+        }
+    }
+
+    #[test]
+    fn interval_needs_at_least_one_positive_flush_trigger() {
+        // `interval` with BOTH triggers at 0 would silently become the unbounded `async` behavior
+        // without the data-loss acknowledgement: rejected as a usage error so the bound the operator
+        // chose is never silently lost. `interval` needs no `--async-loss-ack` (its loss is bounded).
+        let cfg = parse_serve_flags(&serve_args(&[
+            "--durability-level",
+            "interval",
+            "--flush-interval-ms",
+            "0",
+            "--flush-max-bytes",
+            "0",
+        ]))
+        .unwrap()
+        .config;
+        match validate_serve_config(&cfg) {
+            Err(CliError::Usage(m)) => {
+                assert!(m.contains("interval"), "names the level: {m}");
+                assert!(
+                    m.contains("--flush-interval-ms") && m.contains("--flush-max-bytes"),
+                    "names both triggers: {m}"
+                );
+            }
+            other => panic!("interval with no trigger must be refused, got {other:?}"),
+        }
+        // With a positive trigger it boots (and needs no acknowledgement: its loss is bounded).
+        let ok = parse_serve_flags(&serve_args(&[
+            "--durability-level",
+            "interval",
+            "--flush-interval-ms",
+            "500",
+        ]))
+        .unwrap()
+        .config;
+        assert!(
+            validate_serve_config(&ok).is_ok(),
+            "interval with a positive trigger and no ack must boot"
+        );
+    }
+
+    #[test]
+    fn the_materialized_config_line_carries_the_durability_level_and_loss_exposure() {
+        // The OBSERVABILITY surface at startup (#341, #379): the materialized-config line carries the
+        // active level, whether it is power-loss safe, and the interval triggers, so an operator reads
+        // the durability posture straight off the startup log.
+        let safe = parse_serve_flags(&serve_args(&[])).unwrap().config;
+        let line = materialized_config_line(&safe, "127.0.0.1:7777", Path::new("/var/lib/ironbus"));
+        assert!(line.contains("durability_level=sync"), "{line}");
+        assert!(line.contains("power_loss_safe=true"), "{line}");
+
+        let relaxed = parse_serve_flags(&serve_args(&[
+            "--durability-level",
+            "async",
+            "--async-loss-ack",
+        ]))
+        .unwrap()
+        .config;
+        let line2 =
+            materialized_config_line(&relaxed, "127.0.0.1:7777", Path::new("/var/lib/ironbus"));
+        assert!(line2.contains("durability_level=async"), "{line2}");
+        assert!(line2.contains("power_loss_safe=false"), "{line2}");
+        assert!(line2.contains("async_loss_ack=true"), "{line2}");
+    }
+
+    #[test]
+    fn the_per_level_worst_case_loss_description_matches_the_level() {
+        // The loud-warning loss wording (#341): `sync` states zero loss; each relaxed level states its
+        // documented bound, with the `interval` window's triggers spelled out. Pins the operator-facing
+        // wording so a doc/code drift is caught.
+        let sync = parse_serve_flags(&serve_args(&[])).unwrap().config;
+        assert!(durability_loss_description(&sync).contains("zero"));
+        let interval = parse_serve_flags(&serve_args(&[
+            "--durability-level",
+            "interval",
+            "--flush-interval-ms",
+            "750",
+            "--flush-max-bytes",
+            "2048",
+        ]))
+        .unwrap()
+        .config;
+        let d = durability_loss_description(&interval);
+        assert!(d.contains("750 ms"), "spells out the time window: {d}");
+        assert!(
+            d.contains("2048 unsynced bytes"),
+            "spells out the budget: {d}"
+        );
+        let none = parse_serve_flags(&serve_args(&[
+            "--durability-level",
+            "none",
+            "--async-loss-ack",
+        ]))
+        .unwrap()
+        .config;
+        assert!(
+            durability_loss_description(&none).contains("largest loss window"),
+            "none states the largest window"
+        );
     }
 
     #[test]
@@ -6733,6 +7259,9 @@ mod tests {
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
                 dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: ironbus_server::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
             },
         )
         .unwrap();
@@ -6797,6 +7326,9 @@ mod tests {
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
                 dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: ironbus_server::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
             },
         )
         .unwrap();

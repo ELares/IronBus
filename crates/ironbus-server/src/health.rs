@@ -394,6 +394,14 @@ where
             daily_budget_sheds: g.daily_budget_sheds(),
             produce_rejected: g.counters().produce_rejected,
         },
+        // The durability observability inputs (#341, #379), read under the same lock: the active
+        // level, whether it waives I2 (the sticky power-loss-unsafe signal), and the live unsynced
+        // bytes-at-risk. All three are derived from the engine's level + storage state.
+        durability: DurabilityMetrics {
+            level: g.durability_level().as_str(),
+            power_loss_unsafe: g.power_loss_unsafe(),
+            unsynced_bytes: g.unsynced_bytes(),
+        },
         // Filled in below, outside the engine lock; `None` is the not-yet-read placeholder.
         rss: None,
         groups: g.group_consumer_stats(),
@@ -470,6 +478,25 @@ struct EdgeMetrics {
     produce_rejected: u64,
 }
 
+/// The durability observability inputs (#341, #379), read under the same engine lock as the rest of
+/// the snapshot. The active level surfaces both as a `level` label on `ironbus_durability_level_info`
+/// and, derived from it, as the `ironbus_durability_power_loss_unsafe` gauge (1 when the level waives
+/// I2); the live unsynced exposure is `ironbus_durability_unsynced_bytes`. Every name is a GAUGE (no
+/// `_total` suffix), so the additions extend `FROZEN_METRIC_TYPES` without touching the
+/// resilience-counter taxonomy.
+#[derive(Clone, Copy)]
+struct DurabilityMetrics {
+    /// The active durability level's stable flag spelling (`sync`/`interval`/`async`/`none`), the
+    /// `level` label of `ironbus_durability_level_info`.
+    level: &'static str,
+    /// Whether the active level WAIVES I2 (ack-implies-durable): `true` under any relaxed level,
+    /// `false` under the default `sync`. The `ironbus_durability_power_loss_unsafe` gauge (1/0).
+    power_loss_unsafe: bool,
+    /// The live UNSYNCED record-byte exposure: the acked-but-not-yet-durable bytes a power cut would
+    /// lose. Always `0` under `sync`. The `ironbus_durability_unsynced_bytes` gauge.
+    unsynced_bytes: u64,
+}
+
 /// A consistent snapshot of the metric inputs, read under one engine lock.
 #[derive(Clone)]
 struct MetricsSnapshot {
@@ -497,6 +524,11 @@ struct MetricsSnapshot {
     /// The edge write-amplification + RAM-headroom + daily-write-budget inputs (#118), read under the
     /// same engine lock as the rest so every metric is from one instant.
     edge: EdgeMetrics,
+    /// The DURABILITY observability inputs (#341, #379), read under the same lock: the active level's
+    /// flag spelling, whether it waives I2 (the sticky power-loss-unsafe signal), and the live
+    /// unsynced bytes-at-risk. Under the default `sync` the level is `"sync"`, unsafe is `false`, and
+    /// the unsynced exposure is always `0`.
+    durability: DurabilityMetrics,
     /// This process's resident-set size in bytes (#118), or `None` when it cannot be read on this
     /// platform. Read OUTSIDE the engine lock (it is a process-level read, not engine state) and
     /// injected after the actor job returns; the RAM-headroom gauge degrades to the unavailable
@@ -630,6 +662,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         counters,
         fsync,
         edge,
+        durability,
         rss,
         groups,
         registry,
@@ -651,9 +684,39 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
     body.push_str(&recovery_loss_records_lines(&recovery_loss_records));
     body.push_str(&fsync_histogram_lines(&fsync));
     body.push_str(&edge_metric_lines(&edge, rss));
+    body.push_str(&durability_metric_lines(&durability));
     body.push_str(&group_consumer_lines(&groups, flushed));
     body.push_str(&registry);
     body
+}
+
+/// Renders the DURABILITY observability series (#341, #379), all additive GAUGES (no `_total`
+/// suffix, so they extend the frozen `(name, type)` contract without touching the resilience-counter
+/// taxonomy). Three series surface the active durability level and its loss exposure:
+///
+/// - `ironbus_durability_level_info{level="..."} 1`: a labeled info gauge naming the ACTIVE level
+///   (`sync`/`interval`/`async`/`none`), always `1`, the canonical "which level is running" series a
+///   dashboard joins on. The label set is a fixed four-value enum, so the cardinality is bounded.
+/// - `ironbus_durability_power_loss_unsafe`: the STICKY power-loss-unsafe signal (#379), `1` when the
+///   active level WAIVES I2 (any relaxed level), `0` under the default `sync`. An operator alerts on
+///   it crossing to `1` (the broker can lose acknowledged data on a power cut).
+/// - `ironbus_durability_unsynced_bytes`: the live UNSYNCED bytes-at-risk a power cut would lose,
+///   always `0` under `sync` (no unsynced tail), the real-time loss exposure under a relaxed level.
+fn durability_metric_lines(durability: &DurabilityMetrics) -> String {
+    let level = escape_label(durability.level);
+    let unsafe_value = u8::from(durability.power_loss_unsafe);
+    format!(
+        "# HELP ironbus_durability_level_info The active durability level (#341); the `level` label is one of sync|interval|async|none, the value is always 1.\n\
+         # TYPE ironbus_durability_level_info gauge\n\
+         ironbus_durability_level_info{{level=\"{level}\"}} 1\n\
+         # HELP ironbus_durability_power_loss_unsafe 1 if the active durability level WAIVES I2 (ack-implies-durable) and can lose acknowledged data on a power cut (any relaxed level); 0 under the power-loss-safe default sync.\n\
+         # TYPE ironbus_durability_power_loss_unsafe gauge\n\
+         ironbus_durability_power_loss_unsafe {unsafe_value}\n\
+         # HELP ironbus_durability_unsynced_bytes Acknowledged-but-not-yet-fdatasync'd record bytes currently at risk on a power cut; always 0 under the sync level, the live loss exposure under a relaxed level.\n\
+         # TYPE ironbus_durability_unsynced_bytes gauge\n\
+         ironbus_durability_unsynced_bytes {}\n",
+        durability.unsynced_bytes,
+    )
 }
 
 /// Renders the EDGE-resource series (#118), all additive to the frozen taxonomy: the flash
@@ -1421,6 +1484,9 @@ mod tests {
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
                 dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: crate::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
             },
         )
         .unwrap();
@@ -1515,6 +1581,9 @@ mod tests {
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
                 dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: crate::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
             },
         )
         .unwrap();
@@ -2018,6 +2087,9 @@ mod tests {
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
                 dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: crate::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
             },
         )
         .unwrap();
@@ -2142,6 +2214,9 @@ mod tests {
                 ram_ceiling_bytes,
                 disk_full_policy: DiskFullPolicy::DropNew,
                 dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: crate::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
             },
         )
         .unwrap();
@@ -2166,6 +2241,130 @@ mod tests {
             }
         });
         (addr, shutdown, handle, engine)
+    }
+
+    /// Starts a health server over an engine at the given durability level + interval triggers
+    /// (#341, #379), so a test can scrape the `ironbus_durability_*` series for a relaxed level.
+    fn start_with_durability(
+        level: crate::engine::DurabilityLevel,
+        flush_interval_ms: u64,
+        flush_max_bytes: u64,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        SharedEngine<InMemoryFs, SystemClock>,
+    ) {
+        let engine = Engine::open(
+            InMemoryFs::new(),
+            SystemClock::new(),
+            EngineConfig {
+                log: LogConfig::default(),
+                lease: LeaseConfig::default(),
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight: 16,
+                consumer_credit: 64,
+                consumer_credit_bytes: 0,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                ram_ceiling_bytes: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: level,
+                flush_interval_ms,
+                flush_max_bytes,
+            },
+        )
+        .unwrap();
+        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let engine = Arc::clone(&shared);
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            move || {
+                serve_health(
+                    &listener,
+                    &shared,
+                    &shutdown,
+                    false,
+                    &LivenessBeacon::new(0),
+                    0,
+                    &SystemClock::new(),
+                )
+                .unwrap();
+            }
+        });
+        (addr, shutdown, handle, engine)
+    }
+
+    #[test]
+    fn metrics_render_the_durability_level_as_safe_under_the_default() {
+        // The default level is observable AND power-loss safe (#341, #379): /metrics carries the
+        // level info gauge labeled `sync`, the power-loss-unsafe gauge at 0, and a zero unsynced
+        // exposure. A zero-config broker advertises itself as the safe durable level.
+        let (addr, shutdown, handle, _engine) = start();
+        let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(m.starts_with("HTTP/1.1 200 OK"), "{m}");
+        assert!(
+            m.contains("ironbus_durability_level_info{level=\"sync\"} 1"),
+            "the default level is reported as sync: {m}"
+        );
+        assert_eq!(
+            metric_value(&m, "ironbus_durability_power_loss_unsafe"),
+            0,
+            "sync is power-loss safe (I2 holds): {m}"
+        );
+        assert_eq!(
+            metric_value(&m, "ironbus_durability_unsynced_bytes"),
+            0,
+            "sync has no unsynced exposure: {m}"
+        );
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn metrics_render_a_relaxed_level_as_power_loss_unsafe_with_a_live_exposure() {
+        // A relaxed level is observable as power-loss UNSAFE with a live unsynced exposure (#379):
+        // under `async`, after a produce that is acked-but-not-synced, /metrics labels the level
+        // `async`, sets the power-loss-unsafe gauge to 1, and reports a NON-ZERO unsynced byte
+        // exposure (the bytes-at-risk a power cut would lose). The operator's loss-exposure surface.
+        let (addr, shutdown, handle, engine) =
+            start_with_durability(crate::engine::DurabilityLevel::Async, 0, 0);
+        {
+            let mut g = engine.lock().unwrap();
+            g.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"at-risk-under-async",
+            })
+            .unwrap();
+        }
+        let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(m.starts_with("HTTP/1.1 200 OK"), "{m}");
+        assert!(
+            m.contains("ironbus_durability_level_info{level=\"async\"} 1"),
+            "the active level is reported as async: {m}"
+        );
+        assert_eq!(
+            metric_value(&m, "ironbus_durability_power_loss_unsafe"),
+            1,
+            "async waives I2: the power-loss-unsafe gauge is 1: {m}"
+        );
+        assert!(
+            metric_value(&m, "ironbus_durability_unsynced_bytes") > 0,
+            "async has a live unsynced exposure after an unsynced produce: {m}"
+        );
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
     }
 
     /// Extracts the value of a single un-labeled gauge/counter sample line `name <value>` from a
@@ -2333,6 +2532,9 @@ mod tests {
                     ram_ceiling_bytes: 0,
                     disk_full_policy: DiskFullPolicy::DropNew,
                     dedup: ironbus_core::dedup::DedupConfig::default(),
+                    durability_level: crate::engine::DurabilityLevel::Sync,
+                    flush_interval_ms: 0,
+                    flush_max_bytes: 0,
                 },
             )
             .unwrap();
@@ -2368,6 +2570,9 @@ mod tests {
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
                 dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: crate::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
             },
         )
         .unwrap();
@@ -2506,6 +2711,9 @@ mod tests {
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
                 dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: crate::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
             },
         )
         .unwrap();
@@ -2624,6 +2832,9 @@ mod tests {
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
                 dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: crate::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
             },
         )
         .unwrap();
@@ -2817,6 +3028,9 @@ mod tests {
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropOldest,
                 dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: crate::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
             },
         )
         .unwrap();
@@ -3228,6 +3442,14 @@ mod tests {
         ("ironbus_daily_physical_write_budget_bytes", "gauge"),
         ("ironbus_physical_bytes_written_today", "gauge"),
         ("ironbus_daily_write_budget_over", "gauge"),
+        // Durability-level observability gauges (#341, #379): the active level (a `level`-labeled info
+        // gauge), the sticky power-loss-unsafe signal (1 when the active level waives I2), and the live
+        // unsynced bytes-at-risk. All GAUGES (no `_total`), so they extend this contract without
+        // touching FROZEN_RESILIENCE_COUNTERS. A relaxed level is an opt-in, not a resilience SHED, so
+        // these are observability gauges, not loss/shed counters.
+        ("ironbus_durability_level_info", "gauge"),
+        ("ironbus_durability_power_loss_unsafe", "gauge"),
+        ("ironbus_durability_unsynced_bytes", "gauge"),
         // Per-group consumer gauges.
         ("ironbus_group_committed_offset", "gauge"),
         ("ironbus_group_consumer_lag", "gauge"),
@@ -3442,6 +3664,9 @@ mod tests {
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropOldest,
                 dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: crate::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
             },
         )
         .unwrap();
@@ -3627,6 +3852,9 @@ mod tests {
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
                 dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: crate::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
             },
         )
         .unwrap();
@@ -3823,6 +4051,9 @@ mod tests {
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
                 dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: crate::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
             },
         )
         .unwrap();

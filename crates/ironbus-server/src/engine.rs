@@ -67,6 +67,137 @@ pub enum DiskFullPolicy {
     DropOldest,
 }
 
+/// The durability LEVEL: how an ack relates to the covering `fdatasync` (#341, #379, durability #6).
+///
+/// The default, [`DurabilityLevel::Sync`], is the ONLY power-loss-safe level: an ack is emitted only
+/// AFTER the covering `fdatasync` returns, so an acknowledged record is never lost on a power cut
+/// (invariant I2). An operator who changes nothing keeps that ZERO-acked-loss guarantee. The other
+/// three levels are STRICTLY OPT-IN relaxations that trade durability for throughput by acking
+/// BEFORE the covering fsync; each weakens I2 by a precisely-bounded (or, for `None`, declared but
+/// unbounded) loss window. The two loss-bearing levels ([`DurabilityLevel::Async`],
+/// [`DurabilityLevel::None`]) additionally require an explicit data-loss acknowledgement to enable
+/// (the none/async safety gate, enforced in the CLI), because their loss is unbounded.
+///
+/// The enum is `#[non_exhaustive]` so a future level is not a breaking change. See
+/// [`docs/DURABILITY.md`](../../../docs/DURABILITY.md) for the per-level ack condition and
+/// worst-case-loss bound, and [`docs/INVARIANTS.md`](../../../docs/INVARIANTS.md) for how I2 is
+/// conditioned on `Sync`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DurabilityLevel {
+    /// The DEFAULT and only power-loss-safe level: ack ONLY after the covering `fdatasync` returns.
+    /// I2 holds (ack-implies-durable); worst-case acknowledged loss on a power cut is ZERO. The
+    /// group-commit batcher amortizes the fsync but never acks before it, so batching changes the
+    /// cost of durability, never the guarantee.
+    #[default]
+    Sync,
+    /// OPT-IN, bounded-loss: ack as soon as the record is in the OS page cache (the visible head
+    /// advances WITHOUT the covering fsync), and a background window issues an `fdatasync` every
+    /// `flush_interval_ms` of monotonic time OR after `flush_max_bytes` of unsynced record bytes,
+    /// whichever comes first. WORST-CASE acknowledged loss on a power cut is the records acked since
+    /// the last completed `fdatasync`, BOUNDED by the smaller of the time window and the byte budget.
+    /// NOT power-loss safe (the open window's acked-but-unsynced records are lost), but the bound is
+    /// a number the operator chose.
+    Interval,
+    /// OPT-IN, unbounded-until-next-sync loss: ack as soon as the record is in the page cache; an
+    /// `fdatasync` happens only OPPORTUNISTICALLY (on a segment roll's seal, or a clean shutdown
+    /// flush), with NO time or byte ceiling forcing one. WORST-CASE acknowledged loss is every record
+    /// acked since the last sync, bounded only by the OS dirty-writeback window, not by IronBus.
+    /// Gated behind an explicit data-loss acknowledgement (the CLI `--async-loss-ack`).
+    Async,
+    /// OPT-IN, the LARGEST loss window: like [`DurabilityLevel::Async`] but with NO periodic fsync at
+    /// all and no opportunistic mid-run sync beyond a segment roll's seal; the only barriers are a
+    /// segment roll and a clean shutdown. WORST-CASE acknowledged loss is every record acked since
+    /// the last roll or shutdown. Gated behind the same explicit data-loss acknowledgement.
+    None,
+}
+
+impl DurabilityLevel {
+    /// Parses the `--durability-level` flag value, accepting `sync`, `interval`, `async`, or `none`.
+    /// Returns `None` for any other spelling (the caller turns that into a usage error naming the
+    /// accepted values).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<DurabilityLevel> {
+        match value {
+            "sync" => Some(DurabilityLevel::Sync),
+            "interval" => Some(DurabilityLevel::Interval),
+            "async" => Some(DurabilityLevel::Async),
+            "none" => Some(DurabilityLevel::None),
+            _ => None,
+        }
+    }
+
+    /// The stable flag/log spelling of this level, the inverse of [`DurabilityLevel::parse`]. Used in
+    /// the materialized-config startup line and the loud I2-waived warning so an operator reads back
+    /// exactly the selectable name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DurabilityLevel::Sync => "sync",
+            DurabilityLevel::Interval => "interval",
+            DurabilityLevel::Async => "async",
+            DurabilityLevel::None => "none",
+        }
+    }
+
+    /// Whether an ack at this level implies the record is DURABLE (I2 holds). True ONLY for
+    /// [`DurabilityLevel::Sync`]; every relaxed level acks before the covering fsync, so the ack is a
+    /// weaker promise. The inverse, [`DurabilityLevel::waives_i2`], is the power-loss-unsafe signal an
+    /// operator alerts on.
+    #[must_use]
+    pub fn ack_implies_durable(self) -> bool {
+        matches!(self, DurabilityLevel::Sync)
+    }
+
+    /// Whether this level WAIVES I2 (ack no longer implies durable): true for every relaxed level,
+    /// false for [`DurabilityLevel::Sync`]. The source of the sticky `power_loss_unsafe` gauge and the
+    /// loud startup warning, and the predicate the CLI none/async safety gate keys on.
+    #[must_use]
+    pub fn waives_i2(self) -> bool {
+        !self.ack_implies_durable()
+    }
+
+    /// Whether selecting this level REQUIRES an explicit data-loss acknowledgement to boot (the
+    /// none/async safety gate, #49/#379): true for the UNBOUNDED-loss levels
+    /// [`DurabilityLevel::Async`] and [`DurabilityLevel::None`], false for `sync` (no ack needed) and
+    /// `interval` (its loss is bounded by the operator-chosen window, so it is opt-in but not gated
+    /// behind the data-loss flag). The CLI refuses to start a gated level unless the acknowledgement
+    /// flag is set.
+    #[must_use]
+    pub fn requires_loss_ack(self) -> bool {
+        matches!(self, DurabilityLevel::Async | DurabilityLevel::None)
+    }
+
+    /// A one-line, human-readable description of the WORST-CASE acknowledged loss this level can take
+    /// on a power cut, for the loud I2-waived startup warning. `sync` returns the zero-loss statement;
+    /// each relaxed level returns its documented bound. Pure (it reads the configured window only for
+    /// `interval`), so it is the single source of truth shared by the warning and the docs.
+    #[must_use]
+    pub fn worst_case_loss_description(
+        self,
+        flush_interval_ms: u64,
+        flush_max_bytes: u64,
+    ) -> String {
+        match self {
+            DurabilityLevel::Sync => {
+                "zero (an ack is emitted only after the covering fdatasync; I2 holds)".to_string()
+            }
+            DurabilityLevel::Interval => format!(
+                "bounded by the flush window: at most the records acked since the last fdatasync, \
+                 forced every {flush_interval_ms} ms or {flush_max_bytes} unsynced bytes, whichever \
+                 comes first"
+            ),
+            DurabilityLevel::Async => "every record acked since the last fdatasync, with no time or \
+                 byte ceiling (bounded only by the OS dirty-writeback window); a segment roll or a \
+                 clean shutdown is the only barrier"
+                .to_string(),
+            DurabilityLevel::None => "every record acked since the last segment roll or clean \
+                 shutdown (no periodic fsync at all): the largest loss window"
+                .to_string(),
+        }
+    }
+}
+
 /// A produce's opt-in dedup identity (#3, #33), passed to [`Engine::append_no_sync_dedup`]. The
 /// caller builds this only when the wire publish carried a `msg_id` (the dedup opt-in); a produce
 /// with no `msg_id` passes `None` and behaves exactly as before. Borrows the wire bytes.
@@ -248,6 +379,27 @@ pub struct EngineConfig {
     /// (2 minutes of monotonic time), whichever is hit first. The structure costs nothing until a
     /// producer opts in; see [`ironbus_core::dedup`] and `docs/RAM_BUDGET.md`.
     pub dedup: ironbus_core::dedup::DedupConfig,
+    /// The DURABILITY LEVEL (#341, #379): how an ack relates to the covering `fdatasync`. The DEFAULT
+    /// is [`DurabilityLevel::Sync`] (ack only after the covering fsync, I2 holds, ZERO acked loss on
+    /// a power cut), so an engine opened with the field at its default is byte-for-byte the historical
+    /// durable broker. The three relaxed levels are STRICTLY OPT-IN and weaken I2 by a precisely
+    /// documented loss window; see [`DurabilityLevel`] and `docs/DURABILITY.md`. The loss-bearing
+    /// levels (`async`/`none`) are additionally gated behind an explicit data-loss acknowledgement in
+    /// the CLI, never reachable by accident.
+    pub durability_level: DurabilityLevel,
+    /// The `interval` level's TIME window in MILLISECONDS: the most time an acked-but-unsynced record
+    /// may sit before the background flush forces an `fdatasync` (#341). Only consulted when
+    /// `durability_level == Interval`. Measured on the engine clock seam (monotonic), so an NTP step
+    /// never mis-fires the window (I6). A value of `0` disables the TIME trigger (only the byte budget
+    /// forces a sync); it is floored to a sane minimum window by the CLI's validation, never here.
+    pub flush_interval_ms: u64,
+    /// The `interval` level's BYTE budget: the most UNSYNCED record bytes that may accumulate before
+    /// the background flush forces an `fdatasync` (#341). Only consulted when
+    /// `durability_level == Interval`. A value of `0` disables the BYTE trigger (only the time window
+    /// forces a sync). Together with `flush_interval_ms`, the EFFECTIVE bound on acked-but-unsynced
+    /// records is the SMALLER of the time and byte triggers, which is the worst-case loss the operator
+    /// is choosing.
+    pub flush_max_bytes: u64,
 }
 
 /// An error from the engine.
@@ -1301,6 +1453,33 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// serially) and pure (the monotonic clock comes through the seam). Lost on restart by default
     /// (session-scoped); see [`ironbus_core::dedup`].
     dedup: ironbus_core::dedup::DedupRegistry,
+    /// The DURABILITY LEVEL (#341, #379): the default [`DurabilityLevel::Sync`] acks only after the
+    /// covering fsync (I2 holds, zero acked loss). The relaxed levels ack before the covering fsync
+    /// for a documented loss window. Read on every `commit_batch` to decide whether to issue the
+    /// covering `fdatasync` or only advance the visible head via `Log::flush_no_sync`. See
+    /// [`EngineConfig::durability_level`].
+    durability_level: DurabilityLevel,
+    /// The `interval` level's TIME window in NANOSECONDS (the configured `flush_interval_ms` converted
+    /// at open, on the monotonic clock seam): the most time an acked-but-unsynced record may sit
+    /// before the next `commit_batch` forces an `fdatasync`. `0` disables the time trigger. Only
+    /// consulted under [`DurabilityLevel::Interval`]. See [`EngineConfig::flush_interval_ms`].
+    flush_interval_nanos: u64,
+    /// The `interval` level's BYTE budget: the most UNSYNCED record bytes that may accumulate before a
+    /// `commit_batch` forces an `fdatasync`. `0` disables the byte trigger. Only consulted under
+    /// [`DurabilityLevel::Interval`]. See [`EngineConfig::flush_max_bytes`].
+    flush_max_bytes: u64,
+    /// The monotonic-clock instant (nanoseconds, via the clock seam, never a raw `Instant::now`) of
+    /// the LAST completed `fdatasync` under a relaxed level, the time-window anchor for `interval`
+    /// (#341). Seeded to the engine's open instant (a fresh broker's first record is at most one
+    /// window old). Reset to the current monotonic instant every time a covering fsync completes, so
+    /// the next window measures from the last real durability barrier. Unused under `sync` (which
+    /// always fsyncs).
+    last_sync_monotonic_nanos: u64,
+    /// The measured nanoseconds the LAST real `fdatasync` took (via the clock seam), carried out of
+    /// [`Engine::commit_durability_barrier`] so `commit_batch` records it into the latency histograms
+    /// only when a genuine barrier ran. Meaningless when the last commit deferred its sync; the caller
+    /// only reads it when the barrier reported a real fsync.
+    last_fsync_nanos: u64,
 }
 
 /// The file name of the work-group's durable committed-cursor checkpoint.
@@ -1484,6 +1663,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // The opt-in dedup registry (#33), sized by the configured window. Empty until a
             // producer opts in by sending a `msg_id`, so it costs nothing for a no-dedup workload.
             dedup: ironbus_core::dedup::DedupRegistry::new(config.dedup),
+            // The durability level (#341, #379): default `sync` is the historical durable broker
+            // (ack only after the covering fsync, I2). The interval window is held in nanoseconds on
+            // the monotonic clock seam; the time-window anchor is seeded to the open instant so a
+            // fresh broker's first record is at most one window old.
+            durability_level: config.durability_level,
+            flush_interval_nanos: config.flush_interval_ms.saturating_mul(1_000_000),
+            flush_max_bytes: config.flush_max_bytes,
+            last_sync_monotonic_nanos: opened_at,
+            last_fsync_nanos: 0,
         };
         engine.seed_registry_from_recovered_state(flushed);
         Ok(engine)
@@ -1886,6 +2074,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// Propagates the first storage error from writing a group's checkpoint, or from the final
     /// counters snapshot.
     pub fn checkpoint_all_groups(&mut self) -> Result<(), EngineError> {
+        // The CLEAN-SHUTDOWN durability barrier (#341, #379): force a real covering `fdatasync`
+        // FIRST, so a relaxed level (`interval`/`async`/`none`) makes every acked-but-unsynced record
+        // durable before the graceful stop completes. This is what bounds the relaxed levels' loss to
+        // "since the last roll OR clean shutdown": a graceful stop loses nothing, only an ABRUPT power
+        // cut exposes the open window. Under the default `sync` level there is never an unsynced tail,
+        // so this is a cheap no-op fsync. It runs before the cursor checkpoints so the durable log
+        // head the checkpoints clamp against is already advanced.
+        self.force_sync()?;
         // Snapshot the names first so the checkpoint calls (which take `&mut self`) do not borrow
         // the live `groups` map across the loop.
         let names: Vec<String> = self.groups.keys().cloned().collect();
@@ -2120,32 +2316,46 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.counters.dedup_out_of_window
     }
 
-    /// Issues the SINGLE durability barrier (`fdatasync`) that makes every record appended since the
-    /// last commit durable, advances the flushed head so those records become visible to readers, and
-    /// runs the once-per-batch post-sync bookkeeping (the fsync histogram, retention reap, idle-group
-    /// sweep). This is the sync half of group commit (#177): one `commit_batch` amortizes the fsync
-    /// over a whole drained batch of [`Engine::append_no_sync`] calls, which is what removes the
-    /// per-produce fsync and the head-of-line block. It is a cheap no-op fsync when nothing is pending.
+    /// Issues the durability barrier for a group-committed batch, advances the visible head so those
+    /// records become visible to readers, and runs the once-per-batch post-commit bookkeeping (the
+    /// fsync histogram, retention reap, idle-group sweep). This is the sync half of group commit
+    /// (#177): one `commit_batch` amortizes the work over a whole drained batch of
+    /// [`Engine::append_no_sync`] calls, which is what removes the per-produce barrier and the
+    /// head-of-line block.
     ///
-    /// After this returns `Ok`, every record appended since the previous commit is durable, so the
-    /// append actor may ack the whole batch (the covering fsync has completed): I2 is preserved.
+    /// The BARRIER is durability-level aware (#341, #379):
+    /// - Under the default [`DurabilityLevel::Sync`] this issues the covering `fdatasync` BEFORE it
+    ///   returns, so after `Ok` every record appended since the previous commit is DURABLE and the
+    ///   append actor may ack the whole batch: I2 is preserved (ack-implies-durable, zero acked loss
+    ///   on a power cut). This is the historical behavior, byte-for-byte, for the default broker.
+    /// - Under a relaxed level the records are made VISIBLE (page-cache, readable) WITHOUT the covering
+    ///   fsync, so the ack the actor then sends is a weaker promise: I2 is WAIVED, by design and
+    ///   opt-in. `interval` still forces an `fdatasync` here when the time window or the byte budget is
+    ///   due (bounding the loss); `async`/`none` issue no barrier here at all (a segment roll's seal or
+    ///   a clean shutdown is their only barrier). The fsync histogram records only REAL fsyncs, so a
+    ///   relaxed level's deferred-sync batch contributes no spurious zero-latency sample.
     ///
     /// # Errors
-    /// Propagates a storage error from the sync (a failed durability barrier freezes the writer, the
-    /// fatal `WriterFrozen`), the retention reap, or the idle-group sweep.
+    /// Propagates a storage error from the durability barrier (a failed `fdatasync` freezes the
+    /// writer, the fatal `WriterFrozen`), the retention reap, or the idle-group sweep. A frozen writer
+    /// surfaces the fatal error under every level (the relaxed `flush_no_sync` still refuses a frozen
+    /// writer), so a relaxed level never silently swallows a fatal storage fault.
     pub fn commit_batch(&mut self) -> Result<(), EngineError> {
-        // Time the durability barrier itself (the fsync), via the clock seam so the deterministic
-        // sim stays reproducible (logical time does not advance in-memory).
-        let started = self.log.now_monotonic();
-        self.log.sync()?;
-        let fsync_nanos = self.log.now_monotonic().saturating_sub(started);
-        self.fsync.observe(fsync_nanos);
-        // Mirror the one fsync into the registry's fixed-bucket `ironbus_fsync_duration_seconds`, then
-        // record the same barrier as the append latency for the batch (the whole-append latency the
-        // pre-group-commit code measured per message; with group commit one fsync covers the batch,
-        // so the barrier is the shared durable-append cost). Both are O(1) and allocation-free.
-        self.registry.observe_fsync_nanos(fsync_nanos);
-        self.registry.observe_append_nanos(fsync_nanos);
+        // The durability barrier, chosen by the active level. Returns whether a REAL `fdatasync` ran
+        // this batch, so the fsync/append-latency histograms record only genuine barriers (a relaxed
+        // level's deferred-sync batch must not log a fake 0-ns fsync sample).
+        if self.commit_durability_barrier()? {
+            // A real fsync covered this batch: it is the shared durable-append cost (group commit
+            // amortizes ONE fsync over the whole drained batch), so record it once into the
+            // fixed-bucket `ironbus_fsync_duration_seconds` and as the batch's append latency. Both
+            // are O(1) and allocation-free. The relaxed-level batches that DEFERRED their sync record
+            // nothing here; the eventual covering fsync (a window flush, a roll, or shutdown) is the
+            // one that logs the latency, so the histogram still reflects real barriers, not acks.
+            let fsync_nanos = self.last_fsync_nanos;
+            self.fsync.observe(fsync_nanos);
+            self.registry.observe_fsync_nanos(fsync_nanos);
+            self.registry.observe_append_nanos(fsync_nanos);
+        }
         // Consumer-safe retention (refs #13, #80): after the records are durable, reclaim disk by the
         // size, age, or count bound, by deleting whole old SEALED segments while the log is over the
         // retention bound, but never one any consumer still needs. Run once per group commit so space
@@ -2161,6 +2371,132 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let now = self.log.now_monotonic();
         self.sweep_idle_groups(now)?;
         Ok(())
+    }
+
+    /// Decides and issues the durability barrier for the current `commit_batch`, by the active level
+    /// (#341, #379), and reports whether a REAL `fdatasync` ran (so the caller records the latency
+    /// histograms only for genuine barriers).
+    ///
+    /// - [`DurabilityLevel::Sync`] (default): always `log.sync()` (the covering `fdatasync`). After it
+    ///   returns the batch is durable, so the ack is ack-implies-durable (I2). Returns `true`.
+    /// - [`DurabilityLevel::Interval`]: forces `log.sync()` only when the time window
+    ///   (`flush_interval_nanos`, measured on the monotonic clock seam, never the wall clock, so an
+    ///   NTP step never mis-fires it, I6) OR the unsynced-byte budget (`flush_max_bytes`) is due;
+    ///   otherwise `log.flush_no_sync()` (advance the visible head, no fsync). A forced sync resets the
+    ///   window anchor and returns `true`; a deferred batch returns `false`. The window thus bounds the
+    ///   acked-but-unsynced records to the smaller of the time and byte triggers.
+    /// - [`DurabilityLevel::Async`] / [`DurabilityLevel::None`]: never force a sync here;
+    ///   `log.flush_no_sync()` only. A segment roll's seal (every level) and a clean shutdown
+    ///   ([`Engine::checkpoint_all_groups`]) are their only barriers. Returns `false`.
+    ///
+    /// A frozen writer surfaces the fatal error under every level (`flush_no_sync` refuses a frozen
+    /// writer too), so a relaxed level never swallows a fatal storage fault.
+    ///
+    /// # Errors
+    /// Propagates a storage error from the `fdatasync` (a failed barrier freezes the writer, the fatal
+    /// `WriterFrozen`) or from `flush_no_sync` on an already-frozen writer.
+    fn commit_durability_barrier(&mut self) -> Result<bool, EngineError> {
+        // `sync` and a DUE `interval` window both issue the covering fsync; `async`/`none` and a
+        // not-yet-due `interval` window only advance the visible head (page cache), deferring the
+        // fsync. The decision is taken BEFORE the barrier so a relaxed level never issues an fsync the
+        // level did not ask for.
+        let force_sync = match self.durability_level {
+            DurabilityLevel::Sync => true,
+            DurabilityLevel::Interval => self.interval_flush_is_due(),
+            // `async`/`none` never force a periodic fsync; the seal-on-roll and shutdown flush are the
+            // only barriers. `none` differs from `async` only in that there is no opportunistic
+            // mid-run sync to add later, which is a documentation distinction, not a branch here (both
+            // defer every commit's fsync identically; the difference is the absence of a window).
+            DurabilityLevel::Async | DurabilityLevel::None => false,
+        };
+        if force_sync {
+            // Time the real durability barrier via the clock seam (so the deterministic sim stays
+            // reproducible: logical time does not advance in-memory).
+            let started = self.log.now_monotonic();
+            self.log.sync()?;
+            let done = self.log.now_monotonic();
+            self.last_fsync_nanos = done.saturating_sub(started);
+            // Reset the interval window anchor to this real barrier, so the next window measures from
+            // the last completed fsync, not from the broker's open instant.
+            self.last_sync_monotonic_nanos = done;
+            Ok(true)
+        } else {
+            // A relaxed, deferred batch: make the records VISIBLE (readable, page-cache) without the
+            // covering fsync. I2 is WAIVED for the acked-but-unsynced tail until the next real barrier.
+            self.log.flush_no_sync().map_err(EngineError::Storage)?;
+            Ok(false)
+        }
+    }
+
+    /// Whether the `interval` level's flush window is DUE this commit (#341): true when the time
+    /// window has elapsed since the last completed `fdatasync` OR the accumulated unsynced record
+    /// bytes have reached the byte budget. A trigger of `0` is DISABLED (that dimension never fires),
+    /// so with both at `0` the window never forces a sync (it degrades to `async`-like deferral, which
+    /// the CLI validation prevents by requiring at least one positive trigger). Pure read of engine
+    /// state plus the monotonic clock seam; no wall-clock read (I6).
+    fn interval_flush_is_due(&self) -> bool {
+        // The BYTE trigger: the log tracks the exact unsynced record-byte exposure (the logical bytes
+        // appended since the last real barrier, reset on a `sync` or a roll's seal), so compare it
+        // directly against the budget. A `0` budget disables the byte trigger.
+        let byte_due =
+            self.flush_max_bytes != 0 && self.log.unsynced_bytes() >= self.flush_max_bytes;
+        let time_due = self.flush_interval_nanos != 0 && {
+            let elapsed = self
+                .log
+                .now_monotonic()
+                .saturating_sub(self.last_sync_monotonic_nanos);
+            elapsed >= self.flush_interval_nanos
+        };
+        byte_due || time_due
+    }
+
+    /// Forces a real covering `fdatasync` regardless of the active level, making every visible record
+    /// DURABLE (#341, #379). This is the clean-shutdown / explicit-flush barrier the relaxed levels
+    /// rely on: [`Engine::checkpoint_all_groups`] calls it so a graceful stop loses NOTHING even under
+    /// `async`/`none` (their loss window is bounded by "since the last roll OR clean shutdown"). Under
+    /// `sync` it is the same fsync `commit_batch` already issued, so it is a cheap no-op when nothing
+    /// is unsynced. After it returns `Ok` the visible and durable heads are equal.
+    ///
+    /// # Errors
+    /// Propagates the fatal `WriterFrozen` if the barrier fails (the writer freezes read-only) or the
+    /// writer was already frozen.
+    pub fn force_sync(&mut self) -> Result<(), EngineError> {
+        let started = self.log.now_monotonic();
+        self.log.sync()?;
+        let done = self.log.now_monotonic();
+        // A real barrier ran: reset the interval window anchor and record the latency, so a shutdown
+        // flush under a relaxed level is reflected in the fsync histogram like any other real fsync.
+        self.last_sync_monotonic_nanos = done;
+        let fsync_nanos = done.saturating_sub(started);
+        self.fsync.observe(fsync_nanos);
+        self.registry.observe_fsync_nanos(fsync_nanos);
+        self.registry.observe_append_nanos(fsync_nanos);
+        Ok(())
+    }
+
+    /// The active durability level (#341, #379), for the observability surface and the materialized
+    /// config line. Default [`DurabilityLevel::Sync`].
+    #[must_use]
+    pub fn durability_level(&self) -> DurabilityLevel {
+        self.durability_level
+    }
+
+    /// Whether the active durability level WAIVES I2 (ack no longer implies durable): the sticky
+    /// power-loss-unsafe signal exposed as the `ironbus_durability_power_loss_unsafe` gauge (#379).
+    /// `false` under the default `sync`, `true` under any relaxed level.
+    #[must_use]
+    pub fn power_loss_unsafe(&self) -> bool {
+        self.durability_level.waives_i2()
+    }
+
+    /// The current UNSYNCED exposure in RECORD BYTES: the durable-record bytes that are VISIBLE
+    /// (acked) but NOT yet covered by a returned `fdatasync` (#341, #379). Always `0` under `sync`
+    /// (the visible and durable heads are equal); under a relaxed level it is the live bytes-at-risk a
+    /// power cut would lose, the operator's real-time loss-exposure read. Exposed as the
+    /// `ironbus_durability_unsynced_bytes` gauge.
+    #[must_use]
+    pub fn unsynced_bytes(&self) -> u64 {
+        self.log.unsynced_bytes()
     }
 
     /// Appends `message` honoring the disk-full overflow policy (#82), returning the storage-level
@@ -3394,9 +3730,24 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
 
     /// The durable log head: the offset of the next record to be written. Consumer lag is
     /// this minus the committed offset.
+    ///
+    /// Under the default `sync` level this is also the SYNCED head ([`Engine::synced_offset_for_test`]): every
+    /// visible record is durable (I2). Under a relaxed level this VISIBLE head can run ahead of the
+    /// synced head by the unsynced window (the records in `[synced, flushed)` are acked but not yet
+    /// fsync'd, the bytes-at-risk a power cut would lose).
     #[must_use]
     pub fn flushed_offset(&self) -> Offset {
         self.log.flushed_offset()
+    }
+
+    /// The DURABLE head (#341, #379): the first offset NOT yet covered by a returned `fdatasync`.
+    /// Equals [`Engine::flushed_offset`] under the default `sync` level (every visible record is
+    /// durable, I2); under a relaxed level the visible head may lead this by the unsynced window. A
+    /// power loss reverts the records in `[synced_offset, flushed_offset)`, so this is the head a
+    /// crash would recover to. Used by the durability tests to bound a relaxed level's loss.
+    #[must_use]
+    pub fn synced_offset_for_test(&self) -> u64 {
+        self.log.synced_offset().get()
     }
 
     /// The OLDEST retained log offset: the oldest segment's base offset, the first offset still
@@ -3716,6 +4067,9 @@ mod tests {
             // The dedup window (#33) is at its spec default in the shared test config; the dedup
             // tests below build a config with a tight count/time bound explicitly.
             dedup: ironbus_core::dedup::DedupConfig::default(),
+            durability_level: crate::engine::DurabilityLevel::Sync,
+            flush_interval_ms: 0,
+            flush_max_bytes: 0,
         }
     }
 
@@ -8401,5 +8755,376 @@ mod tests {
             "a newer epoch resets the window, so a prior epoch's id is fresh"
         );
         assert_eq!(e.flushed_offset(), Offset::new(2));
+    }
+
+    // ---- #341 / #379 relaxed durability levels ----
+
+    /// A `config(10, 5)` with the durability level overridden, sharing the default test knobs so a
+    /// durability test differs from the default ONLY in the level (and the interval triggers). Used
+    /// with `open_durability` below so a `sync` and a relaxed engine run the SAME workload over the
+    /// SAME power-loss harness, the only difference being the level.
+    fn config_durability(
+        level: DurabilityLevel,
+        flush_interval_ms: u64,
+        flush_max_bytes: u64,
+    ) -> EngineConfig {
+        EngineConfig {
+            durability_level: level,
+            flush_interval_ms,
+            flush_max_bytes,
+            ..config(10, 5)
+        }
+    }
+
+    /// Opens an engine over the given shared `InMemoryFs` and `ManualClock` with `config`. The caller
+    /// keeps its own clone of BOTH handles so it can drive `simulate_power_loss` (the fs) and advance
+    /// the monotonic clock (the interval window) while the engine owns its own clones.
+    fn open_durability(
+        fs: InMemoryFs,
+        clock: std::sync::Arc<ManualClock>,
+        config: EngineConfig,
+    ) -> Engine<InMemoryFs, std::sync::Arc<ManualClock>> {
+        Engine::open(fs, clock, config).unwrap()
+    }
+
+    /// Produces `payload` on a clock-driven engine (the durability harness uses an `Arc<ManualClock>`,
+    /// so the plain `produce` helper, which is typed to a bare `ManualClock`, does not apply).
+    fn produce_d(
+        e: &mut Engine<InMemoryFs, std::sync::Arc<ManualClock>>,
+        payload: &[u8],
+    ) -> Offset {
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn the_default_level_is_sync_and_acks_only_post_fsync_zero_acked_loss() {
+        // THE TEETH for the safe default (#341): a broker that changes NOTHING runs `sync`, every ack
+        // is post-fsync (I2), the unsynced exposure is always zero, and a power cut after the acks
+        // loses NOTHING. This is the zero-acked-loss guarantee an operator keeps for free.
+        let cfg = config(10, 5);
+        assert_eq!(
+            cfg.durability_level,
+            DurabilityLevel::Sync,
+            "the compiled default level is sync"
+        );
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_durability(fs, std::sync::Arc::clone(&clock), cfg);
+        assert!(!e.power_loss_unsafe(), "sync never waives I2");
+        for i in 0..8u8 {
+            produce_d(&mut e, &[i]);
+            // After each `sync` commit the unsynced exposure is back to zero: there is never an
+            // acked-but-unsynced tail under the default level.
+            assert_eq!(
+                e.unsynced_bytes(),
+                0,
+                "sync leaves no unsynced exposure after a commit"
+            );
+        }
+        assert_eq!(e.flushed_offset(), Offset::new(8));
+        // The crash: revert every unsynced page-cache byte. Under sync there is NONE, so nothing is
+        // lost.
+        probe.simulate_power_loss();
+        let reopened = open_durability(probe, clock, config(10, 5));
+        assert_eq!(
+            reopened.flushed_offset(),
+            Offset::new(8),
+            "sync loses ZERO acked records across a power cut (I2): every ack was post-fsync"
+        );
+    }
+
+    #[test]
+    fn async_loses_the_unsynced_tail_on_a_power_cut_but_sync_loses_nothing_same_harness() {
+        // THE TEETH contrast (#341, #379): the SAME 8-record workload over the SAME power-loss harness
+        // under `async` vs `sync`. `async` acks on the page-cache write and defers the fsync (no roll,
+        // no shutdown here), so the power cut reverts the WHOLE unsynced tail: the recovered head is
+        // the durable prefix (0, since nothing was synced). `sync` over the identical harness loses
+        // NOTHING. The difference is entirely the level.
+        let run = |level: DurabilityLevel| -> u64 {
+            let fs = InMemoryFs::new();
+            let probe = fs.clone();
+            let clock = std::sync::Arc::new(ManualClock::new());
+            let mut e = open_durability(fs, clock.clone(), config_durability(level, 0, 0));
+            for i in 0..8u8 {
+                produce_d(&mut e, &[i]);
+            }
+            assert_eq!(
+                e.flushed_offset(),
+                Offset::new(8),
+                "all 8 are acked (visible)"
+            );
+            // An ABRUPT power cut (no graceful shutdown, so no force_sync): unsynced bytes revert.
+            probe.simulate_power_loss();
+            // Reopen with the SAFE default level so recovery itself is unconditionally durable.
+            let reopened = open_durability(probe, clock, config(10, 5));
+            reopened.flushed_offset().get()
+        };
+        let sync_recovered = run(DurabilityLevel::Sync);
+        let async_recovered = run(DurabilityLevel::Async);
+        assert_eq!(
+            sync_recovered, 8,
+            "sync loses nothing on the power cut (every ack post-fsync, I2)"
+        );
+        assert_eq!(
+            async_recovered, 0,
+            "async loses its whole unsynced tail on an abrupt power cut (I2 waived by design): the \
+             durable prefix is 0 because no fsync, roll, or shutdown covered the batch"
+        );
+        assert!(
+            async_recovered < sync_recovered,
+            "the relaxed level traded durability for throughput, exactly the documented contract"
+        );
+    }
+
+    #[test]
+    fn interval_acks_within_the_window_and_a_crash_loses_at_most_the_window() {
+        // THE TEETH for the BOUNDED level (#341): under `interval` with a BYTE budget, a crash loses
+        // AT MOST the records acked since the last completed fdatasync (the open window), never more.
+        // We size the byte budget so a forced fsync fires partway through, then assert the recovered
+        // head is at least the synced prefix and at most the visible head, i.e. the loss is bounded by
+        // the window, not unbounded. The same workload under `sync` (asserted at the end) loses
+        // nothing in the identical harness.
+        let payload = [7u8; 100]; // 100 logical bytes per record.
+        let budget = 250u64; // forces a sync after ~3 records of unsynced bytes.
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let clock = std::sync::Arc::new(ManualClock::new());
+        // Time trigger off (0), byte trigger on: a sync is forced once >= `budget` unsynced bytes
+        // accumulate, so the window is purely byte-bounded and deterministic (no clock advance).
+        let mut e = open_durability(
+            fs,
+            clock.clone(),
+            config_durability(DurabilityLevel::Interval, 0, budget),
+        );
+        assert!(
+            e.power_loss_unsafe(),
+            "interval waives I2 (opt-in, bounded)"
+        );
+        for _ in 0..8u32 {
+            produce_d(&mut e, &payload);
+            // The live unsynced exposure NEVER exceeds the byte budget plus one record: the window
+            // forces a sync as soon as the budget is reached, so the bytes-at-risk are bounded.
+            assert!(
+                e.unsynced_bytes() <= budget.saturating_add(payload.len() as u64),
+                "interval bounds the unsynced exposure to the byte window (at risk {} > bound)",
+                e.unsynced_bytes()
+            );
+        }
+        let visible = e.flushed_offset().get();
+        let synced = e.synced_offset_for_test();
+        assert_eq!(visible, 8, "all 8 are acked (visible) under interval");
+        assert!(
+            synced >= 1,
+            "the byte window forced at least one real fdatasync, so a non-trivial prefix is durable \
+             ({synced} synced of {visible})"
+        );
+        // The crash: the unsynced tail reverts. Recovery yields a prefix that is AT LEAST the synced
+        // head (those records were fsync'd) and AT MOST the visible head: the loss is bounded by the
+        // open window, exactly the documented `interval` guarantee.
+        probe.simulate_power_loss();
+        let reopened = open_durability(probe, clock, config(10, 5));
+        let recovered = reopened.flushed_offset().get();
+        assert!(
+            recovered >= synced,
+            "interval recovers at least the fsync'd prefix ({recovered} >= {synced})"
+        );
+        assert!(
+            recovered <= visible,
+            "interval never recovers more than was acked ({recovered} <= {visible})"
+        );
+        let lost = visible - recovered;
+        let window_records = budget.div_ceil(payload.len() as u64) + 1;
+        assert!(
+            lost <= window_records,
+            "interval loses AT MOST the flush window ({lost} lost, window <= {window_records} records)"
+        );
+
+        // The SAME harness under `sync`: a crash loses NOTHING (the teeth contrast).
+        let fs2 = InMemoryFs::new();
+        let probe2 = fs2.clone();
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut e2 = open_durability(fs2, clock2.clone(), config(10, 5));
+        for _ in 0..8u32 {
+            produce_d(&mut e2, &payload);
+        }
+        probe2.simulate_power_loss();
+        let reopened2 = open_durability(probe2, clock2, config(10, 5));
+        assert_eq!(
+            reopened2.flushed_offset().get(),
+            8,
+            "sync loses nothing in the SAME harness (zero acked loss)"
+        );
+    }
+
+    #[test]
+    fn interval_time_window_forces_a_sync_so_a_crash_after_it_loses_nothing() {
+        // The TIME trigger (#341): with the byte trigger off and a time window set, advancing the
+        // monotonic clock past the window forces a covering fdatasync on the next commit, after which
+        // a crash loses nothing up to that barrier. Proves the time dimension of the bound (not just
+        // the byte dimension) and that it reads the MONOTONIC clock seam (I6), never the wall clock.
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let clock = std::sync::Arc::new(ManualClock::new());
+        // 1 s time window, byte trigger off.
+        let mut e = open_durability(
+            fs,
+            clock.clone(),
+            config_durability(DurabilityLevel::Interval, 1_000, 0),
+        );
+        // First record: acked on page-cache write, not yet synced (the window has not elapsed).
+        produce_d(&mut e, b"a");
+        assert!(
+            e.unsynced_bytes() > 0,
+            "the first interval record is acked but not yet synced (window not elapsed)"
+        );
+        // Advance the MONOTONIC clock past the window, then produce again: this commit's window is due,
+        // so it forces the covering fsync, making BOTH records durable.
+        clock.advance_monotonic_nanos(1_000 * 1_000_000 + 1);
+        produce_d(&mut e, b"b");
+        assert_eq!(
+            e.unsynced_bytes(),
+            0,
+            "the elapsed time window forced an fdatasync, clearing the unsynced exposure"
+        );
+        probe.simulate_power_loss();
+        let reopened = open_durability(probe, clock, config(10, 5));
+        assert_eq!(
+            reopened.flushed_offset().get(),
+            2,
+            "after the time window forced a sync, the crash loses nothing up to that barrier"
+        );
+    }
+
+    #[test]
+    fn a_clean_shutdown_makes_a_relaxed_level_lose_nothing() {
+        // The clean-shutdown barrier (#341, #379): `none` (the largest loss window) defers every
+        // commit's fsync, but a GRACEFUL stop (`checkpoint_all_groups`) forces a covering fdatasync
+        // FIRST, so a clean shutdown loses NOTHING even under `none`. This is what bounds the relaxed
+        // levels' loss to "since the last roll OR clean shutdown": only an ABRUPT cut exposes the
+        // window.
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_durability(
+            fs,
+            clock.clone(),
+            config_durability(DurabilityLevel::None, 0, 0),
+        );
+        for i in 0..5u8 {
+            produce_d(&mut e, &[i]);
+        }
+        assert!(
+            e.unsynced_bytes() > 0,
+            "none defers the fsync, so there is a real unsynced exposure before shutdown"
+        );
+        // A graceful shutdown forces the covering fsync (and checkpoints the cursors).
+        e.checkpoint_all_groups().unwrap();
+        assert_eq!(
+            e.unsynced_bytes(),
+            0,
+            "the clean-shutdown force_sync cleared the unsynced exposure (nothing at risk now)"
+        );
+        // Even an abrupt power cut AFTER the clean shutdown flush loses nothing: it was all synced.
+        probe.simulate_power_loss();
+        let reopened = open_durability(probe, clock, config(10, 5));
+        assert_eq!(
+            reopened.flushed_offset().get(),
+            5,
+            "a clean shutdown under `none` loses nothing (the shutdown flush is a real barrier)"
+        );
+    }
+
+    #[test]
+    fn a_segment_roll_bounds_the_relaxed_loss_to_one_open_segment() {
+        // The roll barrier (#341): a segment roll SEALS the old segment (fsyncing every record in it),
+        // so under a relaxed level the loss is bounded to AT MOST the records in the one OPEN segment,
+        // never the whole log. We use a tiny 160-byte segment (the same small-segment knob the roll
+        // tests use) so several small records force at least one roll mid-workload under `async`, then
+        // a crash recovers at least everything up to the last roll.
+        let small_segment = LogConfig {
+            max_segment_bytes: 160,
+            ..LogConfig::default()
+        };
+        let cfg = EngineConfig {
+            log: small_segment,
+            durability_level: DurabilityLevel::Async,
+            flush_interval_ms: 0,
+            flush_max_bytes: 0,
+            ..config(10, 5)
+        };
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_durability(fs, clock.clone(), cfg);
+        // Produce enough small records to force at least one roll (so a seal made a prefix durable).
+        for i in 0..32u8 {
+            produce_d(&mut e, &[i]);
+        }
+        let synced = e.synced_offset_for_test();
+        let visible = e.flushed_offset().get();
+        assert!(
+            synced >= 1,
+            "a segment roll sealed at least one segment, so a non-trivial prefix is durable even \
+             under async ({synced} synced of {visible} visible)"
+        );
+        probe.simulate_power_loss();
+        let reopened = open_durability(
+            probe,
+            clock,
+            EngineConfig {
+                log: small_segment,
+                ..config(10, 5)
+            },
+        );
+        let recovered = reopened.flushed_offset().get();
+        assert!(
+            recovered >= synced,
+            "the roll's seal bounds the async loss: recovery keeps at least the last-sealed prefix \
+             ({recovered} >= {synced})"
+        );
+    }
+
+    #[test]
+    fn the_active_durability_level_is_observable() {
+        // The OBSERVABILITY surface (#341, #379): the engine reports the active level, whether it
+        // waives I2 (the power-loss-unsafe signal), and the live unsynced exposure, for every level.
+        // sync: safe, no exposure.
+        let e_sync = open(config(10, 5));
+        assert_eq!(e_sync.durability_level(), DurabilityLevel::Sync);
+        assert!(!e_sync.power_loss_unsafe());
+        assert_eq!(e_sync.unsynced_bytes(), 0);
+        // Each relaxed level reports itself and waives I2.
+        for level in [
+            DurabilityLevel::Interval,
+            DurabilityLevel::Async,
+            DurabilityLevel::None,
+        ] {
+            let e = open(config_durability(level, 1_000, 1024));
+            assert_eq!(e.durability_level(), level, "the level is reported back");
+            assert!(
+                e.power_loss_unsafe(),
+                "{level:?} waives I2 (power-loss unsafe)"
+            );
+        }
+        // The flag spellings round-trip, so the metric label and the materialized-config line read
+        // back exactly the selectable name.
+        for (level, name) in [
+            (DurabilityLevel::Sync, "sync"),
+            (DurabilityLevel::Interval, "interval"),
+            (DurabilityLevel::Async, "async"),
+            (DurabilityLevel::None, "none"),
+        ] {
+            assert_eq!(level.as_str(), name);
+            assert_eq!(DurabilityLevel::parse(name), Some(level));
+        }
+        assert_eq!(DurabilityLevel::parse("bogus"), None);
     }
 }
