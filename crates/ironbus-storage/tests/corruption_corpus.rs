@@ -439,6 +439,66 @@ fn unsupported_record_version() {
     );
 }
 
+// === Planted false magic mid-log =============================================================
+
+#[test]
+fn planted_false_magic_mid_log_is_rejected_at_the_checksum() {
+    // #59 false-magic case: fabricate a record magic (the real RECORD_MAGIC, 0x4942) mid-stream,
+    // inside a MIDDLE record's body, so a naive resync could be tempted to treat the planted bytes
+    // as a fresh frame start. Recovery must NOT resync onto the planted magic: it validates the
+    // longest valid prefix and stops at the FIRST frame that fails its checksum (the now-corrupt
+    // middle record), dropping the exact span from that frame to EOF. The planted magic deeper in
+    // the file is never reached, so a fabricated frame boundary can never resurrect dropped bytes.
+    let n = 5u64;
+    let good = good_unsealed_segment(n);
+    // Target the middle record (index 2): two clean records precede it, two follow.
+    let mid = 2u64;
+    let mid_start = frame_start(mid);
+    let mut bytes = good.clone();
+    // Plant a fabricated record magic + a valid version byte INSIDE the middle record's body
+    // region (just past its header), the bytes a resync scanner would mistake for a new frame.
+    // This clobbers the record's payload, so its body checksum no longer verifies.
+    let plant_at = mid_start + RECORD_HEADER_LEN;
+    bytes[plant_at..plant_at + 2]
+        .copy_from_slice(&ironbus_core::format::RECORD_MAGIC.to_le_bytes());
+    bytes[plant_at + 2] = 1; // a plausible (supported) record version byte
+    let rec = recover_ok(disk_with_segment0(&bytes));
+    // Only the two clean records before the planted frame survive; everything from the planted
+    // (now corrupt-bodied) frame to EOF is dropped as ONE event, never partially resynced.
+    assert_valid_prefix(&rec, mid);
+    assert_single_loss(
+        &rec,
+        ReasonCode::CorruptRecordBody,
+        mid_start as u64,
+        good.len() as u64,
+    );
+}
+
+#[test]
+fn planted_false_magic_in_a_header_is_rejected_at_the_header_crc() {
+    // The header variant of the false-magic case: the middle record keeps its real (valid) magic
+    // and a supported version, so it LOOKS like a legitimate frame start, but a byte inside its
+    // CRC-protected header range is altered without recomputing the header CRC. decoded_len rejects
+    // it at the header checksum (a valid magic is necessary but not sufficient), so recovery skips
+    // the exact span from that frame to EOF rather than trusting the plausible-looking magic.
+    let n = 5u64;
+    let good = good_unsealed_segment(n);
+    let mid = 2u64;
+    let mid_start = frame_start(mid);
+    let mut bytes = good.clone();
+    // Leave MAGIC and VERSION valid; flip a byte in the sequence field (inside the CRC-covered
+    // [0, 32) header range) so the magic still scans but the header CRC fails.
+    bytes[mid_start + header_offsets::SEQ] ^= 0x80;
+    let rec = recover_ok(disk_with_segment0(&bytes));
+    assert_valid_prefix(&rec, mid);
+    assert_single_loss(
+        &rec,
+        ReasonCode::CorruptRecordHeader,
+        mid_start as u64,
+        good.len() as u64,
+    );
+}
+
 // === Segment-header corruption: version, checksum_algo, truncation ===========================
 
 #[test]
