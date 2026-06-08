@@ -53,6 +53,22 @@ mod admin;
 /// Unix-only in v1, like the on-disk store, via a cfg-gated snapshot builder.
 mod top;
 
+/// The TOML config-FILE layer (#85, #86, #382): the file IO half of the configuration system
+/// (whole-read, parse with the pure-Rust `toml` crate, flatten, strict-validate the key set, and
+/// expose the known keys as the FILE override layer the resolver slots between env and default).
+/// Cross-platform: the file is read and validated on every target (the same usage/config exit
+/// applies everywhere `serve` parses flags); only the on-disk broker run is Unix-only. The PURE
+/// grammar and the coupled-set validator live in `ironbus_core::config`; this module is the IO.
+mod config_file;
+
+/// The immutable effective-config + atomic RELOAD engine (#380, #382, the no-auth part): the
+/// `Arc<EffectiveConfig>` behind a single safe swap point, read via one refcount bump on the path
+/// that needs it, and the re-read RELOAD that validates the whole candidate, rejects a cold-key
+/// change atomically, and swaps ONLY on full success (a broken reload keeps the old config). The
+/// MUTATING wire `CONFIG SET` verbs need the #106 auth and are NOT here (no unauthenticated remote
+/// mutation surface); this is the safe SIGHUP/re-read reload path only.
+mod config_reload;
+
 use ironbus_client::{Client, ClientError};
 use ironbus_core::clock::Clock;
 use ironbus_proto::message::PubBody;
@@ -561,7 +577,8 @@ const USAGE: &str = "\
 ironbus: a durable edge message queue.
 
 USAGE:
-    ironbus serve --data-dir <dir> [--profile <edge-tiny|balanced|throughput>]
+    ironbus serve --data-dir <dir> [--config <path>] [--allow-unknown-config]
+                  [--profile <edge-tiny|balanced|throughput>]
                   [--addr <host:port>] [--max-connections <n>]
                   [--checkpoint-interval <n>] [--max-deliver <n>] [--allow-unlimited-deliver]
                   [--backoff-ms <ms,ms,...>] [--max-in-flight <n>]
@@ -597,6 +614,15 @@ USAGE:
 
 Notes:
     The default address is 127.0.0.1:7777 (loopback only).
+    --config <path> loads a TOML configuration FILE (#382). It slots BETWEEN env and default, so the
+    precedence is flag > env > FILE > default: a file key beats the compiled default, but an env var
+    or a flag still overrides it for one run. The file is whole-read, parsed, and STRICTLY validated
+    before the broker opens: an unknown key is a fatal error with a did-you-mean suggestion (pass
+    --allow-unknown-config to downgrade it to a warning, for a staged upgrade), a broken file fails
+    with the path and line/column, and the coupled-set rules (e.g. retention requested but every
+    limit 0) are checked as a whole. Durations use {ms,s,m,h,d} and byte sizes the binary
+    {B,KiB,MiB,GiB,TiB} (decimal-SI MB/GB is rejected); the unit is required. With no --config the
+    resolution is byte-for-byte the historical flag > env > default. See docs/CONFIG.md.
     --profile <edge-tiny|balanced|throughput> (default balanced) stamps a compiled-in, versioned
     set of coherent tuning knobs in one move, then any explicit env var or flag overrides an
     individual knob (precedence profile < env < flag). balanced is the shipped default set, so it
@@ -1344,6 +1370,20 @@ struct ParsedServe {
     /// (no env mapping), repeatable like `--key-shared-group`.
     broadcast_groups: Vec<String>,
     health_addr: Option<String>,
+    /// Non-fatal config-FILE warnings (#86, #382): unknown keys downgraded by
+    /// `--allow-unknown-config`, plus the coupled-set warnings (a no-op `drop-oldest`). Surfaced to
+    /// the log stream by `cmd_serve`; empty with no `--config`.
+    config_warnings: Vec<String>,
+    /// True when the config FILE explicitly set any retention key (#86, #382): drives the
+    /// coupled-set "retention requested but every limit is 0" check, which fires only on an explicit
+    /// request. False with no `--config`.
+    retention_requested: bool,
+    /// The `--config` path (#382), threaded to `cmd_serve` so the immutable-config + reload handle
+    /// can RE-READ the file on a reload (the safe re-read trigger). `None` with no `--config`.
+    config_path: Option<String>,
+    /// The `--allow-unknown-config` flag (#86), threaded to `cmd_serve` so a re-read reload applies
+    /// the SAME unknown-key policy as the startup load. False with no `--config`.
+    allow_unknown_config: bool,
 }
 
 fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
@@ -1358,8 +1398,25 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         &parsed.key_shared_groups,
         &parsed.broadcast_groups,
         parsed.health_addr.as_deref(),
+        &parsed.config_warnings,
+        ReloadSource {
+            config_path: parsed.config_path.as_deref(),
+            allow_unknown_config: parsed.allow_unknown_config,
+        },
         out,
     )
+}
+
+/// The inputs a re-read RELOAD needs (#382): the `--config` path to re-read and the unknown-key
+/// policy to re-apply. Bundled into one struct so `finish_serve`/`cmd_serve` carry a single reload
+/// concern rather than two more positional arguments. `config_path = None` means no `--config`, so
+/// no reload source exists and the handle is read-only at startup.
+#[derive(Clone, Copy)]
+struct ReloadSource<'a> {
+    /// The `--config` path to re-read on a reload, or `None` for no config file.
+    config_path: Option<&'a str>,
+    /// The `--allow-unknown-config` policy to re-apply on a reload.
+    allow_unknown_config: bool,
 }
 
 /// Parses the `serve` flag list into a [`ParsedServe`]. Split out of [`run_serve`] so the
@@ -1377,6 +1434,15 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
 struct ServeFlags {
     addr: Option<String>,
     data_dir: Option<String>,
+    /// The `--config <path>` TOML config FILE (#85, #382). `None` = no file, so resolution is the
+    /// historical flag > env > default; when set, the file is read/parsed/validated and slots
+    /// BETWEEN env and default (flag > env > FILE > default). CLI-only (no `IRONBUS_CONFIG` env, so
+    /// the file location is never itself a file-resolved knob).
+    config: Option<String>,
+    /// The `--allow-unknown-config` escape hatch (#86): downgrade an unknown config-FILE key from a
+    /// fatal error to a warning, for a staged upgrade. A bare boolean flag; default OFF (strict
+    /// reject-unknown). CLI-only.
+    allow_unknown_config: bool,
     /// The compiled-in named profile (#87) selected by `--profile` / `IRONBUS_PROFILE`. `None`
     /// resolves to the default profile (`balanced`). The profile is applied as the per-knob default,
     /// so an explicit env var or flag for any individual knob still overrides it (profile < env <
@@ -1462,6 +1528,12 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
         match args[i].as_str() {
             "--addr" => f.addr = Some(take_value("--addr", args, &mut i)?),
             "--data-dir" => f.data_dir = Some(take_value("--data-dir", args, &mut i)?),
+            "--config" => f.config = Some(take_value("--config", args, &mut i)?),
+            // A bare boolean flag (no value): advance ONE token, not two, or the loop spins.
+            "--allow-unknown-config" => {
+                f.allow_unknown_config = true;
+                i += 1;
+            }
             "--profile" => f.profile = Some(take_value("--profile", args, &mut i)?),
             "--max-connections" => {
                 f.max_connections = Some(take_number("--max-connections", args, &mut i)?);
@@ -1613,17 +1685,72 @@ fn parse_serve_flags(args: &[String]) -> Result<ParsedServe, CliError> {
     parse_serve_flags_with_env(args, &|_| None)
 }
 
-/// Parses the `serve` flag list into a [`ParsedServe`], resolving each knob with the flag > env >
-/// default precedence (#89): an explicit CLI flag wins, else the `IRONBUS_<flag>` env var read
-/// through the injected `env` seam, else the compiled default. A non-numeric env value is a usage
-/// error naming the env var, exactly like a bad flag. Split into a flag-collection pass
-/// ([`collect_serve_flags`]) and this resolution pass so the precedence lives in one place.
-// One `resolve_*` call per knob: a single linear concern (resolve every flag against env/default)
-// that reads better as one flat block than split across helpers, so the line count is allowed past
-// the default ceiling, like `collect_serve_flags`.
-#[allow(clippy::too_many_lines)]
+/// The whole-file reader the production `serve` path uses to load `--config`: a plain
+/// read-to-string. Mapped to a typed reader-error string so the file layer's
+/// [`config_file::ConfigFileError::Read`] names the path and the IO failure. Tests inject an
+/// in-memory reader instead, so the file-precedence and strict-validation tests are deterministic.
+fn fs_config_reader(path: &str) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|e| e.to_string())
+}
+
+/// Parses the `serve` flag list into a [`ParsedServe`], resolving each knob with the
+/// `flag > env > FILE > default` precedence (#85, #89, #382): an explicit CLI flag wins, else the
+/// `IRONBUS_<flag>` env var, else the `--config` TOML FILE value, else the compiled default. Reads
+/// the config file (when `--config` is set) through the real filesystem; the
+/// [`parse_serve_flags_with_env_and_reader`] variant takes an injected reader for deterministic
+/// tests of the file layer.
+///
+/// # Errors
+/// A [`CliError::Usage`] for a bad flag/env value, a broken/invalid config file, or a coupled-set
+/// violation.
 fn parse_serve_flags_with_env(args: &[String], env: &EnvFn<'_>) -> Result<ParsedServe, CliError> {
+    parse_serve_flags_with_env_and_reader(args, env, &fs_config_reader)
+}
+
+/// Parses the `serve` flag list with an injected config-file reader, resolving each knob with the
+/// flag > env > FILE > default precedence (#85, #89, #382): an explicit CLI flag wins, else the
+/// `IRONBUS_<flag>` env var read through the injected `env` seam, else the `--config` TOML FILE
+/// value (read through `read`), else the compiled default. A bad value at any layer is a usage
+/// error NAMING ITS SOURCE, exactly like a bad flag. Split into a flag-collection pass
+/// ([`collect_serve_flags`]) and this resolution pass so the precedence lives in one place.
+///
+/// The FILE layer is inserted by COMPOSING the env seam: a combined `env-then-file` closure returns
+/// the env value if set, else the file value, so the existing `flag > env > default` resolvers gain
+/// the file layer with NO change to their relative order (a flag still beats env, env still beats
+/// the file, the file still beats the default). With no `--config`, no file is read and the
+/// resolution is byte-for-byte the historical flag > env > default.
+///
+/// # Errors
+/// A [`CliError::Usage`] for a bad flag/env value, a broken/invalid config file (with path +
+/// line/column), an unknown config key (unless `--allow-unknown-config`), or a coupled-set violation.
+// One `resolve_*` call per knob: a single linear concern (resolve every flag against env/file/
+// default) that reads better as one flat block than split across helpers, so the line count is
+// allowed past the default ceiling, like `collect_serve_flags`.
+#[allow(clippy::too_many_lines)]
+fn parse_serve_flags_with_env_and_reader(
+    args: &[String],
+    env: &EnvFn<'_>,
+    read: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<ParsedServe, CliError> {
     let f = collect_serve_flags(args)?;
+    // Load the `--config` FILE layer (#85, #382), if any. It is read, parsed, and strictly
+    // validated BEFORE any knob resolves; a broken/invalid file is a fatal usage error here, so the
+    // broker never half-applies a config. With no `--config`, `file_layer` is `None` and the
+    // resolution below is the historical flag > env > default, byte-for-byte.
+    let file_layer = match &f.config {
+        Some(path) => Some(
+            config_file::load_config_file(path, f.allow_unknown_config, read)
+                .map_err(|e| CliError::Usage(e.to_string()))?,
+        ),
+        None => None,
+    };
+    // The combined env-then-file seam: env BEATS the file (env is the higher layer), so look env up
+    // first and fall back to the file value. The existing `resolve_*` helpers consult THIS, so the
+    // precedence becomes flag > env > FILE > default with no change to their internal logic.
+    let combined = |name: &str| -> Option<String> {
+        env(name).or_else(|| file_layer.as_ref().and_then(|fl| fl.lookup_env_name(name)))
+    };
+    let env: &EnvFn<'_> = &combined;
     // The named profile (#87) is resolved FIRST (flag > env), then its preset supplies the per-knob
     // DEFAULT for every knob below, so an explicit env var or flag for any knob still wins: the
     // effective precedence is profile < env < flag. No `--profile` (and no `IRONBUS_PROFILE`)
@@ -1687,7 +1814,7 @@ fn parse_serve_flags_with_env(args: &[String], env: &EnvFn<'_>) -> Result<Parsed
             "`{source}` must be `sync`, `interval`, `async`, or `none`, got `{durability_level_arg}`"
         ))
     })?;
-    Ok(ParsedServe {
+    let mut parsed = ParsedServe {
         addr: resolve_string("--addr", f.addr, env, DEFAULT_ADDR),
         data_dir: resolve_opt_string("--data-dir", f.data_dir, env),
         config: ServeConfig {
@@ -1881,11 +2008,191 @@ fn parse_serve_flags_with_env(args: &[String], env: &EnvFn<'_>) -> Result<Parsed
         key_shared_groups: f.key_shared_groups,
         broadcast_groups: f.broadcast_groups,
         health_addr: resolve_opt_string("--health-addr", f.health_addr, env),
-    })
+        // Seeded below from the file layer (warnings + the explicit-retention-request flag);
+        // empty/false with no `--config`, so the zero-config path carries nothing new.
+        config_warnings: Vec::new(),
+        retention_requested: false,
+        config_path: f.config.clone(),
+        allow_unknown_config: f.allow_unknown_config,
+    };
+    // Fold in the FILE layer's non-fatal warnings and its explicit-retention-request flag, then run
+    // the WHOLE-config coupled-set validation as a UNIT (#86, #382, docs/CONFIG.md section 4): every
+    // cross-key rule, collected at once. A fatal violation is a usage error here (the broker never
+    // half-applies a config); the warnings are surfaced by `cmd_serve`. The per-flag range checks
+    // (validate_serve_config) still run later in finish_serve; this adds the cross-key set.
+    if let Some(fl) = &file_layer {
+        parsed.config_warnings.extend(fl.warnings().iter().cloned());
+        parsed.retention_requested = fl.retention_requested();
+    }
+    let verdict = coupled_set_verdict(&parsed.config, parsed.retention_requested);
+    if let Some(first) = verdict.errors.first() {
+        return Err(CliError::Usage(format!("config error: {first}")));
+    }
+    parsed
+        .config_warnings
+        .extend(verdict.warnings.iter().cloned());
+    Ok(parsed)
+}
+
+/// Builds the IO-free [`ironbus_core::config::ResolvedConfig`] view from the assembled
+/// [`ServeConfig`] and runs the whole-config coupled-set validation (#86, #382). The max-record /
+/// frame-overhead floor uses the compiled record-format constants (the largest record the broker
+/// accepts and the per-record header), so the segment-fit rule is checked against the real format.
+/// `retention_requested` is true only when the operator EXPLICITLY asked for retention (set a
+/// retention key in the config FILE), so the "retention requested but all off" rule fires only then.
+fn coupled_set_verdict(
+    config: &ServeConfig,
+    retention_requested: bool,
+) -> ironbus_core::config::ConfigVerdict {
+    ironbus_core::config::validate_coupled_sets(&resolved_view(config, retention_requested))
+}
+
+/// Builds the IO-free [`ironbus_core::config::ResolvedConfig`] cross-key view from the assembled
+/// [`ServeConfig`], the neutral struct both the coupled-set validator and the reload engine read.
+/// The max-record / frame-overhead floor uses the compiled record-format constants, so the
+/// segment-fit rule is checked against the real on-disk format.
+fn resolved_view(
+    config: &ServeConfig,
+    retention_requested: bool,
+) -> ironbus_core::config::ResolvedConfig {
+    ironbus_core::config::ResolvedConfig {
+        segment_bytes: config.max_segment_bytes,
+        // `max_record_bytes = 0`: there is no configurable per-record CAP knob today (the shipped
+        // storage writes an oversized record to its OWN segment, so a segment is NOT required to
+        // exceed the 16 MiB record-format ceiling, which would wrongly reject the valid 8 MiB
+        // `edge-tiny` segment). The segment-fit coupled-set rule is wired in the core validator and
+        // fires the moment a `storage.max_record_bytes` knob lands; until then `0` skips it and the
+        // shipped `>= MIN_MAX_SEGMENT_BYTES` floor (checked in `validate_serve_config`) is the bound.
+        max_record_bytes: 0,
+        frame_overhead: ironbus_core::format::RECORD_HEADER_LEN as u64,
+        durability_level: map_durability_level(config.durability_level),
+        flush_interval_ms: config.flush_interval_ms,
+        flush_max_bytes: config.flush_max_bytes,
+        async_loss_ack: config.async_loss_ack,
+        max_retained_bytes: config.max_retained_bytes,
+        max_age_ms: config.max_age_ms,
+        max_messages: config.max_messages,
+        retention_requested,
+        max_total_bytes: config.max_total_bytes,
+        disk_full_policy_drop_oldest: matches!(
+            config.disk_full_policy,
+            DiskFullPolicyArg::DropOldest
+        ),
+        // The durability none/async gate and the interval-trigger check are the shipped
+        // `validate_durability`'s job (it runs first in `validate_serve_config` with the canonical
+        // operator messages), so the coupled-set validator does NOT re-run them here.
+        enforce_durability_gate: false,
+    }
+}
+
+/// Builds the immutable [`config_reload::EffectiveConfig`] snapshot the [`config_reload::ConfigHandle`]
+/// holds: the resolved cross-key view plus the COLD keys (`docs/CONFIG.md` section 3) whose change a
+/// live reload must reject atomically. The COLD keys are the layout-affecting / open-time-immutable
+/// ones: the segment size and the data dir (both COLD, changing them live could strand segments).
+fn build_effective_config(
+    config: &ServeConfig,
+    data_dir: &Path,
+    retention_requested: bool,
+) -> config_reload::EffectiveConfig {
+    // The COLD-key values, keyed off the classified `config_reload::COLD_KEYS` set so the two
+    // never drift: each cold key's current value, for the reload's cold-key-change comparison.
+    let cold_keys = config_reload::COLD_KEYS
+        .iter()
+        .map(|(key, _class)| {
+            let value = match *key {
+                "storage.segment_size" => config.max_segment_bytes.to_string(),
+                "storage.data_dir" => data_dir.display().to_string(),
+                // Unreachable: COLD_KEYS lists only the two above; a new cold key must add its arm.
+                other => {
+                    debug_assert!(false, "unhandled cold key `{other}`");
+                    String::new()
+                }
+            };
+            (*key, value)
+        })
+        .collect();
+    config_reload::EffectiveConfig {
+        cold_keys,
+        resolved: resolved_view(config, retention_requested),
+    }
+}
+
+/// Re-reads the `--config` file and attempts an atomic RELOAD (#380, #382): it builds a candidate
+/// immutable config from the freshly re-read file (the COLD keys and the cross-key view), then asks
+/// the handle to validate it fully, reject a cold-key change atomically, and swap ONLY on success.
+/// A broken or unreadable re-read, or a cold-key change, leaves the running config UNCHANGED; the
+/// outcome is logged to the broker's startup output. Auth-free: it re-reads a LOCAL file and swaps
+/// only the in-process pointer (never an unauthenticated remote mutation).
+///
+/// The candidate's reloadable fields take the re-read FILE value where the file sets them, else the
+/// currently-running value, so re-reading an UNEDITED file is a no-op `Applied` (the candidate
+/// equals current), while an edited COLD key (e.g. `storage.segment_size`) is caught and rejected.
+#[cfg(unix)]
+fn reload_effective_config(
+    handle: &config_reload::ConfigHandle,
+    path: &str,
+    allow_unknown: bool,
+    current: &ServeConfig,
+    data_dir: &Path,
+    out: &mut impl Write,
+) {
+    let layer = match config_file::load_config_file(path, allow_unknown, &fs_config_reader) {
+        Ok(layer) => layer,
+        Err(e) => {
+            // A broken/unreadable re-read keeps the running config; log and return (no swap).
+            let _ = writeln!(out, "WARN: config reload rejected (re-read failed): {e}");
+            return;
+        }
+    };
+    // The candidate segment size: the re-read file value (parsed by the env-name layer back to a
+    // plain integer) if the file set it, else the currently-running value. The same single source
+    // the startup resolver used, so an unedited file yields the identical value (a no-op reload).
+    let candidate_segment = layer
+        .lookup_env_name("IRONBUS_MAX_SEGMENT_BYTES")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(current.max_segment_bytes);
+    let mut candidate = build_effective_config(current, data_dir, layer.retention_requested());
+    candidate.resolved.segment_bytes = candidate_segment;
+    candidate.cold_keys = vec![
+        ("storage.segment_size", candidate_segment.to_string()),
+        ("storage.data_dir", data_dir.display().to_string()),
+    ];
+    let outcome = handle.reload_from(candidate);
+    debug_assert!(
+        outcome.applied(),
+        "re-reading the unedited startup config must be a no-op Applied reload",
+    );
+    match outcome {
+        config_reload::ReloadOutcome::Applied { warnings } => {
+            let _ = writeln!(out, "config reload applied (re-read {path})");
+            for w in warnings {
+                let _ = writeln!(out, "WARN: config reload: {w}");
+            }
+        }
+        config_reload::ReloadOutcome::Rejected { reasons } => {
+            for r in reasons {
+                let _ = writeln!(out, "WARN: config reload rejected (config unchanged): {r}");
+            }
+        }
+    }
+}
+
+/// Maps the CLI's durability-arg enum onto the IO-free core's [`ironbus_core::config::DurabilityLevel`]
+/// the coupled-set validator reasons about, so the cross-key durability checks live in the pure core.
+fn map_durability_level(level: DurabilityLevelArg) -> ironbus_core::config::DurabilityLevel {
+    match level {
+        DurabilityLevelArg::Sync => ironbus_core::config::DurabilityLevel::Sync,
+        DurabilityLevelArg::Interval => ironbus_core::config::DurabilityLevel::Interval,
+        DurabilityLevelArg::Async => ironbus_core::config::DurabilityLevel::Async,
+        DurabilityLevelArg::None => ironbus_core::config::DurabilityLevel::None,
+    }
 }
 
 /// Resolves the required `--data-dir`, validates the assembled config, and dispatches to the
 /// platform `cmd_serve`. Split out of `run_serve` so the flag-parsing loop stays a single concern.
+#[allow(clippy::too_many_arguments)] // each input (addr, data dir, config, groups, health, the
+                                     // config-file warnings, out) is a distinct concern; bundling
+                                     // them into a struct would only move the noise, not remove it.
 fn finish_serve(
     addr: &str,
     data_dir: Option<&str>,
@@ -1893,6 +2200,8 @@ fn finish_serve(
     key_shared_groups: &[String],
     broadcast_groups: &[String],
     health_addr: Option<&str>,
+    config_warnings: &[String],
+    reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     let data_dir =
@@ -1905,6 +2214,8 @@ fn finish_serve(
         key_shared_groups,
         broadcast_groups,
         health_addr,
+        config_warnings,
+        reload,
         out,
     )
 }
@@ -2494,6 +2805,15 @@ fn durability_loss_description(config: &ServeConfig) -> String {
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+// each input (addr, data dir, config, the declared groups,
+// health addr, the config-file warnings, the reload source,
+// out) is a distinct concern; a bundling struct would only
+// move the noise.
+#[allow(clippy::too_many_lines)] // the serve setup is one linear startup sequence (bind, lock, open
+                                 // the engine, install the immutable-config handle + reload, the
+                                 // health server, the accept loop, the graceful drain); splitting it
+                                 // further would scatter a single concern across helpers.
 fn cmd_serve(
     addr: &str,
     data_dir: &Path,
@@ -2501,6 +2821,8 @@ fn cmd_serve(
     key_shared_groups: &[String],
     broadcast_groups: &[String],
     health_addr: Option<&str>,
+    config_warnings: &[String],
+    reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     // Install the structured-tracing subscriber with the JSON log layer (#16, #99) before any broker
@@ -2557,6 +2879,51 @@ fn cmd_serve(
         "{}",
         materialized_config_line(config, &local.to_string(), data_dir)
     );
+    // The config-FILE non-fatal warnings (#86, #382): a downgraded unknown key
+    // (`--allow-unknown-config`) and the coupled-set warnings (a no-op `drop-oldest` with no byte
+    // cap). On stderr (the log stream), same as the materialized-config line, so an operator sees a
+    // setting that has no effect or a typo that was tolerated. Empty with no `--config`.
+    for warning in config_warnings {
+        let _ = writeln!(std::io::stderr(), "WARN: config: {warning}");
+    }
+    // The immutable effective-config + atomic reload handle (#380, #382): the resolved config is
+    // installed into ONE immutable `Arc<EffectiveConfig>` behind a single safe swap point, read here
+    // via one refcount bump (the single atomic pointer load on the path that needs it, never a
+    // per-message re-parse). `_config_handle` is held for the serve lifetime; a re-read RELOAD
+    // (`reload_from`) validates a whole candidate, rejects a cold-key change atomically, and swaps
+    // ONLY on full success (a broken reload keeps this config). The SIGHUP wire is the #195
+    // disentanglement residual (SIGHUP is currently bound to graceful-stop via ctrlc's `termination`
+    // feature, so re-binding it to reload would silently change `kill -HUP` semantics); the engine
+    // and the safe re-read trigger ship here, the authed mutating wire CONFIG verbs are the #106
+    // residual (no unauthenticated remote mutation surface).
+    // `retention_requested` is `false` here: the coupled-set "retention requested but all off" check
+    // already ran (and passed) at parse time, so the installed snapshot needs no re-detection of the
+    // request; a reload re-derives it from the re-read file.
+    let config_handle =
+        config_reload::ConfigHandle::new(build_effective_config(config, data_dir, false));
+    debug_assert_eq!(
+        config_handle.current().resolved.segment_bytes,
+        config.max_segment_bytes,
+        "the installed immutable config reads back the resolved segment size",
+    );
+    // The safe, auth-free RELOAD trigger (#380, #382): re-read the `--config` file, re-resolve and
+    // fully validate the candidate, reject a cold-key change ATOMICALLY, and swap the immutable
+    // `Arc<EffectiveConfig>` in ONE store ONLY on success (a broken reload keeps the running config).
+    // Run once at startup right after the engine opens, as a re-read self-check: it proves the
+    // file still parses identically just after the broker took the data-dir lock (catching a
+    // mid-start operator edit, a TOCTOU window), and it is the exact path a future SIGHUP wire calls.
+    // The reload mutates only the in-process config pointer on a LOCALLY-read file, never on an
+    // unauthenticated remote request (the mutating wire CONFIG verbs are the #106 auth residual).
+    if let Some(path) = reload.config_path {
+        reload_effective_config(
+            &config_handle,
+            path,
+            reload.allow_unknown_config,
+            config,
+            data_dir,
+            out,
+        );
+    }
     if config.durability_level.waives_i2() {
         // The LOUD I2-WAIVED warning (#341, #379): a relaxed durability level is active, so an ack no
         // longer implies the record is durable. State exactly which invariant is waived and the
@@ -2766,6 +3133,8 @@ fn install_signal_handler(shutdown: &Arc<AtomicBool>) -> Result<(), CliError> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)] // mirrors the Unix cmd_serve signature exactly; bundling the
+                                     // distinct inputs into a struct would only move the noise.
 fn cmd_serve(
     addr: &str,
     data_dir: &Path,
@@ -2773,6 +3142,8 @@ fn cmd_serve(
     key_shared_groups: &[String],
     broadcast_groups: &[String],
     health_addr: Option<&str>,
+    config_warnings: &[String],
+    reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     // The #87 materialized-config line, `Profile::name`, and `DiskFullPolicyArg::as_str` are reached
@@ -2781,6 +3152,24 @@ fn cmd_serve(
     // reviewer (the recurring #288/#99 footgun). This also consumes `profile`, `disk_full_policy`,
     // and the other knobs the line reads.
     let _ = materialized_config_line(config, addr, data_dir);
+    // The immutable effective-config + reload ENGINE (#380, #382) is exercised only on the Unix serve
+    // path (read at startup, then a re-read RELOAD), so the non-Unix stub must reference its WHOLE
+    // surface too or the Windows `-D warnings` build trips dead-code on `reload_from` / `ReloadOutcome`
+    // / `is_cold` / `class_of` / `cold_keys`, invisible to a macOS reviewer (the recurring #288/#99
+    // footgun). Build the handle, read it, and drive one no-op reload (the candidate equals current,
+    // so it is a no-op `Applied`); the stub errors out below before any real serving.
+    let config_handle =
+        config_reload::ConfigHandle::new(build_effective_config(config, data_dir, false));
+    let _ = config_handle.current().resolved.segment_bytes;
+    let candidate = build_effective_config(config, data_dir, false);
+    let outcome = config_handle.reload_from(candidate);
+    debug_assert!(
+        outcome.applied(),
+        "a no-op reload (candidate == current) is Applied",
+    );
+    if let config_reload::ReloadOutcome::Applied { warnings } = outcome {
+        let _ = warnings.len();
+    }
     let _ = (
         addr,
         data_dir,
@@ -2841,6 +3230,14 @@ fn cmd_serve(
         // Read the broadcast groups under cfg(not(unix)) too: a field/param read only on cfg(unix)
         // breaks the Windows `-D warnings` build invisibly to a macOS reviewer (#288 note).
         broadcast_groups,
+        // The config-FILE warnings (#382) are emitted only on the Unix serve path, so the non-Unix
+        // stub must consume the param too or the Windows `-D warnings` build trips unused-variable,
+        // invisible to a macOS reviewer (the recurring #288/#99 footgun).
+        config_warnings,
+        // The reload source (#382, the `--config` path + unknown-key policy) is read only on the
+        // Unix serve path's re-read reload, so consume it here too for the same #288 reason.
+        reload.config_path,
+        reload.allow_unknown_config,
         health_addr,
         out,
     );
@@ -4523,6 +4920,195 @@ mod tests {
     /// use to drive the hand-rolled parser.
     fn serve_args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    // ---- #382 TOML config-FILE layer + flag > env > FILE > default precedence ----
+
+    /// Parses `serve` flags with an injected env map AND an injected config-file reader, so the
+    /// file-precedence and strict-validation tests are deterministic (no real filesystem).
+    fn parse_with_env_and_file(
+        args: &[String],
+        env: &std::collections::HashMap<String, String>,
+        file: &'static str,
+    ) -> Result<ParsedServe, CliError> {
+        let env_fn = |name: &str| env.get(name).cloned();
+        let read = move |_path: &str| Ok(file.to_string());
+        parse_serve_flags_with_env_and_reader(args, &env_fn, &read)
+    }
+
+    #[test]
+    fn a_config_file_sets_a_knob_below_the_default() {
+        // THE FILE > default teeth: with no flag and no env, the FILE value wins over the compiled
+        // default. The file sets a 32 MiB segment; the default is 64 MiB.
+        let env = std::collections::HashMap::new();
+        let doc = "[storage]\nsegment_size = \"32MiB\"\n";
+        let parsed =
+            parse_with_env_and_file(&serve_args(&["--config", "/x.toml"]), &env, doc).unwrap();
+        assert_eq!(
+            parsed.config.max_segment_bytes,
+            32 * 1024 * 1024,
+            "FILE beats default"
+        );
+    }
+
+    #[test]
+    fn env_overrides_the_config_file() {
+        // THE env > FILE teeth: an env var beats the FILE value for the same knob.
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "IRONBUS_MAX_SEGMENT_BYTES".to_string(),
+            (16 * 1024 * 1024).to_string(),
+        );
+        let doc = "[storage]\nsegment_size = \"32MiB\"\n";
+        let parsed =
+            parse_with_env_and_file(&serve_args(&["--config", "/x.toml"]), &env, doc).unwrap();
+        assert_eq!(
+            parsed.config.max_segment_bytes,
+            16 * 1024 * 1024,
+            "env beats FILE"
+        );
+    }
+
+    #[test]
+    fn a_flag_overrides_both_env_and_the_config_file() {
+        // THE flag > env > FILE teeth: the flag wins over BOTH the env var and the FILE value.
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "IRONBUS_MAX_SEGMENT_BYTES".to_string(),
+            (16 * 1024 * 1024).to_string(),
+        );
+        let doc = "[storage]\nsegment_size = \"32MiB\"\n";
+        let parsed = parse_with_env_and_file(
+            &serve_args(&[
+                "--config",
+                "/x.toml",
+                "--max-segment-bytes",
+                &(8 * 1024 * 1024).to_string(),
+            ]),
+            &env,
+            doc,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.config.max_segment_bytes,
+            8 * 1024 * 1024,
+            "flag beats env and FILE"
+        );
+    }
+
+    #[test]
+    fn the_no_config_default_path_is_unchanged() {
+        // THE critical invariant: with NO `--config`, resolution is byte-for-byte the historical
+        // flag > env > default. A zero-config broker is exactly the `balanced` default set.
+        let parsed = parse_serve_flags(&serve_args(&[])).unwrap();
+        assert_eq!(parsed.config.max_segment_bytes, DEFAULT_MAX_SEGMENT_BYTES);
+        assert_eq!(parsed.config.consumer_credit, DEFAULT_CONSUMER_CREDIT);
+        assert!(parsed.config_warnings.is_empty(), "no file, no warnings");
+        assert!(parsed.config_path.is_none());
+    }
+
+    #[test]
+    fn a_broken_config_file_is_a_usage_error_with_the_path_and_location() {
+        let env = std::collections::HashMap::new();
+        let doc = "[storage\nsegment_size = \"32MiB\"\n"; // missing ]
+        let err =
+            parse_with_env_and_file(&serve_args(&["--config", "/etc/ironbus.toml"]), &env, doc)
+                .unwrap_err();
+        match err {
+            CliError::Usage(m) => {
+                assert!(m.contains("/etc/ironbus.toml"), "names the path: {m}");
+                assert!(m.contains("line"), "names a location: {m}");
+            }
+            other => panic!("a broken file is a usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_config_key_is_a_usage_error_with_a_suggestion() {
+        let env = std::collections::HashMap::new();
+        let doc = "[storage]\nsegmnet_size = \"32MiB\"\n";
+        let err =
+            parse_with_env_and_file(&serve_args(&["--config", "/x.toml"]), &env, doc).unwrap_err();
+        match err {
+            CliError::Usage(m) => {
+                assert!(m.contains("segmnet_size"), "echoes the bad key: {m}");
+                assert!(
+                    m.contains("storage.segment_size"),
+                    "suggests the right key: {m}"
+                );
+            }
+            other => panic!("an unknown key is a usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_config_key_is_a_warning_under_allow_unknown_config() {
+        let env = std::collections::HashMap::new();
+        let doc = "[storage]\nsegmnet_size = \"32MiB\"\n";
+        let parsed = parse_with_env_and_file(
+            &serve_args(&["--config", "/x.toml", "--allow-unknown-config"]),
+            &env,
+            doc,
+        )
+        .unwrap();
+        assert!(
+            parsed
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("segmnet_size")),
+            "the downgraded key is a warning: {:?}",
+            parsed.config_warnings
+        );
+        // The unknown key did NOT change the segment size (it stays the default).
+        assert_eq!(parsed.config.max_segment_bytes, DEFAULT_MAX_SEGMENT_BYTES);
+    }
+
+    #[test]
+    fn a_coupled_set_violation_in_the_file_is_a_usage_error() {
+        // retention requested (a retention key is set) but every limit resolves to 0 is rejected.
+        let env = std::collections::HashMap::new();
+        let doc = "[retention]\nmax_retained_bytes = 0\n";
+        let err =
+            parse_with_env_and_file(&serve_args(&["--config", "/x.toml"]), &env, doc).unwrap_err();
+        match err {
+            CliError::Usage(m) => assert!(
+                m.contains("retention requested but every limit is 0"),
+                "names the coupled-set violation: {m}"
+            ),
+            other => panic!("a coupled-set violation is a usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_drop_oldest_with_no_cap_is_a_config_warning_not_a_failure() {
+        // A no-op `drop-oldest` (no byte cap) is a WARNING, not a fatal error: the broker still
+        // resolves, and the warning is surfaced.
+        let env = std::collections::HashMap::new();
+        let doc = "[backpressure]\ndisk_full_policy = \"drop-oldest\"\n";
+        let parsed =
+            parse_with_env_and_file(&serve_args(&["--config", "/x.toml"]), &env, doc).unwrap();
+        assert!(
+            parsed
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("has no effect")),
+            "the no-op policy is a warning: {:?}",
+            parsed.config_warnings
+        );
+    }
+
+    #[test]
+    fn a_unitless_duration_in_the_file_is_a_usage_error() {
+        let env = std::collections::HashMap::new();
+        let doc = "[delivery]\nvisibility_timeout_ms = \"45\"\n";
+        let err =
+            parse_with_env_and_file(&serve_args(&["--config", "/x.toml"]), &env, doc).unwrap_err();
+        assert!(matches!(err, CliError::Usage(_)), "{err:?}");
+        assert_eq!(
+            err.exit_code(),
+            EXIT_USAGE,
+            "a bad config is a clean usage exit, never a panic"
+        );
     }
 
     // ---- #87 compiled-in profiles + materialized-config logging ----

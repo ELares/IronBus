@@ -466,11 +466,19 @@ Source: `crates/ironbus-server/src/engine.rs` (`EngineConfig`),
 `crates/ironbus-core/src/lease.rs` (`LeaseConfig`),
 `crates/ironbus-core/src/delivery.rs` (`DeliveryConfig`) (issue #14).
 
-There is NO TOML config document in the implementation today: configuration is the
-`EngineConfig` struct (and its nested configs), populated from `serve` CLI flags. The
-draft's `[durability]`/`[storage]`/... TOML schema, the `profile` key, the
-hot/cold/coupled tags, and `--allow-unknown-config` are NOT implemented. See the
-discrepancies section.
+Configuration is the `EngineConfig` struct (and its nested configs), populated from a
+layered `flag > env > FILE > default` precedence (`docs/CONFIG.md`). The TOML config FILE
+is now IMPLEMENTED (#382): `serve --config <path>` whole-reads, parses (the pure-Rust `toml`
+crate), and strictly validates a `[durability]`/`[storage]`/`[retention]`/`[backpressure]`/
+`[delivery]`/`[network]` document with the bare `profile` key, then slots it between env and
+default. The shared literal grammar (durations `{ms,s,m,h,d}`, binary byte sizes
+`{B,KiB,MiB,GiB,TiB}`, unit-required, decimal-SI rejected, overflow-checked), the
+reject-unknown-key-with-a-did-you-mean rule, `--allow-unknown-config`, and the coupled-set
+validators live in `ironbus-core::config`; the immutable `Arc<EffectiveConfig>` plus the
+atomic re-read RELOAD (validate the whole config, reject a cold-key change atomically, swap
+only on success) are in `ironbus-cli`. The hot/cold/coupled reload classes are wired for the
+SIGHUP/re-read path; the MUTATING wire `CONFIG SET` admin verbs need the #106 auth and are
+deferred (no unauthenticated remote config mutation). See the discrepancies section.
 
 ### EngineConfig (runtime config struct)
 
@@ -742,11 +750,15 @@ code; the code is canonical.
 
 ### Config
 
-- **No TOML config document.** The draft's `Config` TOML (locked tables `[durability]`,
-  `[storage]`, `[retention]`, `[compression]`, `[backpressure]`, `[network]`/`[network.tls]`,
-  the bare `profile` key, duration/size unit grammar, hot/cold/coupled tags, and
-  `--allow-unknown-config`) is NOT implemented. Configuration today is the `EngineConfig`
-  struct populated from `serve` CLI flags. The repository has no `toml` dependency.
+- **TOML config FILE: IMPLEMENTED (#382).** The `Config` TOML (the frozen tables
+  `[durability]`, `[storage]`, `[retention]`, `[backpressure]`, `[delivery]`, `[network]`, the
+  reserved-but-unwired `[observability]`/`[auth]`/`[compression]` sections, the bare `profile`
+  key, the duration/size unit grammar, the hot/cold/coupled tags, and `--allow-unknown-config`)
+  is now wired: `serve --config <path>` slots the file between env and default (precedence
+  `flag > env > FILE > default`). The repository carries the pure-Rust `toml` dependency. The
+  DEFERRED residual is the MUTATING wire `CONFIG SET`/`SAVE` admin verbs (they change runtime
+  state and need the #106 connection-scoped auth, so there is no unauthenticated remote config
+  mutation surface); the read of the materialized config and the safe SIGHUP/re-read reload ship.
 
 ---
 
@@ -843,7 +855,10 @@ code today. They are aspirational and MUST NOT be treated as a current byte cont
   per-message attempt-count checkpoint snapshot (#358), not an append-only event log.
 - **RecoveryReport and SkipEvent.** Not implemented as drafted; `LossReport`/`LossEvent`
   is the shipped artifact (see the discrepancies).
-- **TOML Config document.** Not implemented (see the discrepancies).
+- **TOML Config document.** IMPLEMENTED (#382): the `--config` file, the literal grammar, the
+  strict typed-key validation, the coupled-set validators, and the immutable-config atomic reload
+  ship. The only deferred half is the authed mutating wire `CONFIG SET`/`SAVE` verbs (#106). See
+  the discrepancies section.
 - **Wire verbs from the draft with no implementation:** the auth handshake fields in
   `Connect` (`auth_method`, `auth_blob`, `stream_id`, `max_frame_size`), the `Info`
   capabilities list, the `Sub` start-mode/start-offset selector, and the producer-flow

@@ -8,14 +8,17 @@ default, units, valid range and reload class, specifies the coupled-set
 validation rules, justifies the TOML file format, and defines the three named
 profiles with their exact values.
 
-It is a SPECIFICATION, not a feature claim. IronBus today resolves its
-configuration from `serve` command-line flags and `IRONBUS_*` environment
-variables ONLY: the precedence between those two layers and the `data_dir`
-lifecycle are SHIPPED and specified in [CLI.md](CLI.md); the TOML config FILE,
-the named PROFILES, and HOT RELOAD are SPECIFIED here but NOT YET IMPLEMENTED.
-Each unimplemented layer is tagged with the issue that owns its implementation
-residual, and the boundary between what ships and what is specified is drawn
-explicitly throughout, so this document never claims an unwired layer exists.
+IronBus resolves its configuration from `serve` command-line flags, `IRONBUS_*`
+environment variables, and a `--config <path>` TOML FILE, on the precedence
+`flag > env > FILE > default` (the `data_dir` lifecycle and the env mapping are
+specified in [CLI.md](CLI.md)). The TOML config FILE, the named PROFILES, the
+strict typed-key + literal-grammar + coupled-set validation, and the
+immutable-config atomic re-read RELOAD are all now IMPLEMENTED (#87, #382). The
+ONE remaining residual is the MUTATING wire `CONFIG SET`/`SAVE` admin verbs, which
+need the #106 connection-scoped auth (there is no unauthenticated remote config
+mutation surface). Each layer is tagged with the issue that owns it, and the
+boundary between what ships and what is still specified is drawn explicitly
+throughout, so this document never claims an unwired layer exists.
 
 Every knob name, default, and validation rule below is cross-checked against the
 real code: the `serve` flags and `DEFAULT_*`/`MIN_*` constants in
@@ -60,17 +63,20 @@ Read this first, because it frames every table below.
 | Command-line flags (`serve --...`) | SHIPPED | [CLI.md](CLI.md), `main.rs` |
 | `flag > env > default` precedence between the shipped layers | SHIPPED (#89) | [CLI.md](CLI.md) |
 | `data_dir` create-if-absent + probe-write + fatal-if-unwritable, single-broker lock | SHIPPED (#89) | [CLI.md](CLI.md) |
-| The TOML config FILE and its parser | **SPECIFIED here, NOT implemented** | [#85](https://github.com/ELares/IronBus/issues/85) |
+| The TOML config FILE and its parser (`serve --config <path>`) | SHIPPED (#382) | [#85](https://github.com/ELares/IronBus/issues/85), `config_file.rs` |
 | The named PROFILES (`edge-tiny` / `balanced` / `throughput`), the `--profile` flag, and the materialized-config log | SHIPPED (#87) | [#87](https://github.com/ELares/IronBus/issues/87), `main.rs` |
-| HOT RELOAD and the runtime admin `CONFIG` verbs | **SPECIFIED here, NOT implemented** | [#88](https://github.com/ELares/IronBus/issues/88) |
+| The immutable `Arc<EffectiveConfig>` + the atomic SIGHUP/re-read RELOAD | SHIPPED (#382, the auth-free part) | [#88](https://github.com/ELares/IronBus/issues/88), `config_reload.rs` |
+| The MUTATING wire admin `CONFIG SET`/`SAVE` verbs (need auth) | **SPECIFIED here, NOT implemented** | [#106](https://github.com/ELares/IronBus/issues/106) |
 | Secret redaction in config dumps | **SPECIFIED, NOT implemented** (env mapping IS shipped) | [#89](https://github.com/ELares/IronBus/issues/89) |
-| The typed key table, the literal grammar parser, and coupled-set validation | **SPECIFIED here; partial validation SHIPPED as per-flag range checks** | [#86](https://github.com/ELares/IronBus/issues/86) |
+| The typed key table, the literal grammar parser, and coupled-set validation | SHIPPED (#382) | [#86](https://github.com/ELares/IronBus/issues/86), `ironbus-core::config` |
 
-The honest one-line summary: the same knob surface is reachable TODAY via flags
-and env vars on the SHIPPED two-layer precedence; the FILE, PROFILE, and RELOAD
-layers in this document are the design IronBus is built toward, owned by #85,
-#87, and #88. Nothing below should be read as claiming the file, profile, or
-reload layers are wired. [CONTRACTS.md](CONTRACTS.md) states the same boundary
+The honest one-line summary: the same knob surface is reachable via flags, env
+vars, AND a `--config` TOML FILE on the SHIPPED `flag > env > FILE > default`
+precedence; the strict typed-key validation, the shared literal grammar, the
+coupled-set validators, and the immutable-config + atomic re-read RELOAD are wired
+(#382). The remaining residual is the MUTATING wire `CONFIG SET`/`SAVE` admin verbs,
+which need the #106 connection-scoped auth (no unauthenticated remote config
+mutation). [CONTRACTS.md](CONTRACTS.md) states the same boundary
 from the byte-model side ("There is NO TOML config document in the
 implementation today").
 
@@ -183,10 +189,11 @@ Reload-class legend (the live-reload semantics owned by
   reload that touches one member re-validates the whole set before any member is
   applied (see [section 4](#4-coupled-set-validation-rules)).
 
-Because no reload engine ships yet, the reload class is a SPECIFICATION of the
-intended #88 behavior, not a property the binary enforces today; today every knob
-is effectively COLD (set once at `serve` start). The class column is what #88
-must implement.
+The reload engine ships (#382): the immutable `Arc<EffectiveConfig>` and the atomic
+re-read RELOAD enforce the COLD/HOT distinction in the class column below (a COLD-key
+change across a reload is rejected atomically, leaving the running config unchanged).
+What is still deferred is the MUTATING wire `CONFIG SET`/`SAVE` admin verbs, which need
+the #106 auth; the SIGHUP/re-read reload path is wired and auth-free.
 
 ### Storage (`[storage]`)
 
@@ -383,9 +390,11 @@ The top-level TOML sections are FROZEN as a stability contract: `[durability]`,
 WITH the old name as a deprecated alias, never a silent break. Unknown top-level
 sections and unknown keys are REJECTED fatally by default (with an edit-distance
 did-you-mean), because warn-and-ignore is how a typo silently disables durability
-or retention; an opt-in `--allow-unknown-config` escape hatch is reserved for
-staged upgrades. This reject-by-default + frozen-sections rule is the #14
-resolved decision; it is SPECIFIED here and owned by the #85/#86 parser.
+or retention; an opt-in `--allow-unknown-config` escape hatch downgrades it to a
+warning for staged upgrades. This reject-by-default + frozen-sections rule is the #14
+resolved decision; it is IMPLEMENTED (#382) by the #85/#86 parser in
+`crates/ironbus-core/src/config.rs` (the did-you-mean uses edit distance) and
+`crates/ironbus-cli/src/config_file.rs`.
 
 ---
 
@@ -404,13 +413,16 @@ governing rule, stated once and applied everywhere:
 > config is left exactly unchanged. The hot path therefore never sees a
 > half-applied or partially-validated config.
 
-Today, the SHIPPED slice of this is the per-flag range validation `serve` already
-performs (each a usage error, exit 1, naming the flag, per CLI.md): `--max-deliver`
-in `[1, u32::MAX)` unless opted in, `--max-in-flight >= 1`, `--max-connections >= 1`,
-`--consumer-credit >= 1`, `--max-segment-bytes >= 4096`, `--visibility-timeout-ms >= 1`,
-`--disk-full-policy` in `{drop-new, drop-oldest}`. The COUPLED-SET checks below
-are the #86 residual: they are SPECIFIED here with their error messages and are
-not all wired yet.
+The per-flag range validation `serve` performs (each a usage error, exit 1, naming
+the flag, per CLI.md) still ships: `--max-deliver` in `[1, u32::MAX)` unless opted in,
+`--max-in-flight >= 1`, `--max-connections >= 1`, `--consumer-credit >= 1`,
+`--max-segment-bytes >= 4096`, `--visibility-timeout-ms >= 1`, `--disk-full-policy` in
+`{drop-new, drop-oldest}`. The COUPLED-SET checks below are now IMPLEMENTED (#382) in
+the IO-free `crates/ironbus-core/src/config.rs` (`validate_coupled_sets`), run as a UNIT
+over the whole resolved config before the broker opens (the durability none/async gate
+keeps its shipped CLI-side home in `validate_durability`). The not-yet-a-field rows
+(`max_record_bytes`, the compression set) are wired in the validator and fire the moment
+their knob lands.
 
 ### Coupled set 1: segment size vs the record-size ceiling vs the RAM ceiling
 
@@ -534,56 +546,66 @@ device validates its own config offline.
 ### The frozen section structure (incorporating the #139 resolutions)
 
 The illustrative file below shows the FROZEN section structure, the reconciled
-key names, and the durability-literal reconciliation. It is illustrative of the
-SPECIFIED format; there is no TOML parser in the tree yet.
+key names, and the durability-literal reconciliation. The parser is now in the tree
+(#382): `serve --config <path>` accepts exactly this format (the durability `level`
+token is `sync | interval | async | none`, the implemented enum, not the old
+`fdatasync` draft name shown in the older comment below).
+
+The keys below are the ACCEPTED set (the implemented #382 typed-key table); a key not
+in it is rejected with a did-you-mean unless `--allow-unknown-config` is passed.
+SPECIFIED-NOT-YET-A-FIELD keys (`storage.segment_roll`, `durability.group_commit_*`,
+`network.tls.*`, the compression set) are NOT yet accepted and are omitted from the
+accepted example so a copied file validates; they land with their owning issues. The
+reserved `[observability]`/`[auth]`/`[compression]` sections are TOLERATED (any key
+under them is ignored, never rejected), so a broker carrying that config still starts.
 
 ```toml
-# illustrative: the SPECIFIED file format. There is no TOML parser yet (#85);
-# configuration today is serve flags + IRONBUS_* env vars only.
+# the ACCEPTED file format (#382): serve --config <path> reads this with the precedence
+# flag > env > FILE > default. Durations use {ms,s,m,h,d}; byte sizes the binary
+# {B,KiB,MiB,GiB,TiB}; the unit is required (decimal-SI MB/GB is rejected).
 
 profile = "balanced"               # applies a coherent preset, then keys below override it
 
 [durability]
-level = "fdatasync"                # the ONE shipped level (ack-after-fdatasync, I2);
-                                   # interval | none are SPECIFIED, not wired, and gated
-group_commit_max_delay_ms = 0      # #6-frozen linger window (0 = no linger)
-group_commit_max_bytes = 1048576   # #6-frozen 1 MiB group-commit byte cap
+level = "sync"                     # sync (default, ack-after-fdatasync, I2) | interval | async | none;
+                                   # async/none require async_loss_ack = true (the loss gate)
+flush_interval_ms = "1s"           # the interval-level time trigger (a duration literal)
+flush_max_bytes = "1MiB"           # the interval-level unsynced-byte trigger
+async_loss_ack = false             # the explicit data-loss acknowledgement for async/none
 
 [storage]
-segment_size = "64MiB"             # --max-segment-bytes; COLD
-segment_roll = "1h"                # co-equal time roll (SPECIFIED-NOT-YET-A-FIELD, #4/#87)
-data_dir = "/var/lib/ironbus"      # --data-dir; created 0700 if absent (#89)
-max_total_bytes = 0                # 0 = unlimited
+segment_size = "64MiB"             # --max-segment-bytes; COLD (a reload may not change it)
+data_dir = "/var/lib/ironbus"      # --data-dir; created 0700 if absent (#89); COLD
+max_total_bytes = "0B"             # 0 = unlimited (a plain integer 0 is also accepted)
 
-[retention]
-max_retained_bytes = 0             # 0 = off; any one enabled bound reaps
-max_age_ms = 0
-max_messages = 0
+# [retention] is OFF by default (every bound 0); enable AT LEAST ONE bound when you add the
+# section, else the coupled-set validator rejects "retention requested but every limit is 0".
+# Example of an enabled retention policy (uncomment and size for the device):
+# [retention]
+# max_retained_bytes = "1GiB"        # any one enabled bound reaps; reaping never crosses a consumer
 
 [backpressure]
 disk_full_policy = "drop-new"      # drop-new | drop-oldest (block is opt-in-only, not shipped)
 consumer_credit = 64               # per-connection message credit
-consumer_credit_bytes = 8388608    # 8 MiB per-connection byte budget (0 = unlimited)
+consumer_credit_bytes = "8MiB"     # 8 MiB per-connection byte budget (0 = unlimited)
 max_in_flight = 1024               # per-group window
 max_connections = 256
 max_groups = 1024                  # 0 = unlimited
-ram_ceiling_bytes = 0              # 0 = off (edge-tiny sets 64 MiB); refuse-to-boot RAM guard (#115)
+ram_ceiling_bytes = "0B"           # 0 = off (edge-tiny sets 64 MiB); refuse-to-boot RAM guard (#115)
 
 [delivery]
 max_deliver = 5                    # 0/u32::MAX (unlimited) only with allow_unlimited_deliver
+allow_unlimited_deliver = false
 backoff_ms = [100, 500, 2000, 10000, 30000]
-visibility_timeout_ms = 30000
+visibility_timeout_ms = "30s"      # a duration literal
 checkpoint_interval = 1024
 
 [network]
 listen = "127.0.0.1:7777"          # loopback only by default
 enable_admin = false
 
-[network.tls]
-enabled = false                    # SPECIFIED, not wired (#107); cert_path/key_path when true
-
-[observability]                    # reserved section (#139); keys owned by #16
-[auth]                             # reserved section (#139); keys owned by #18 (+ at-rest)
+[observability]                    # reserved section (#139): any key here is tolerated (owned by #16)
+[auth]                             # reserved section (#139): any key here is tolerated (owned by #18)
 ```
 
 The #139 reconciliations encoded above:
@@ -684,36 +706,40 @@ reachable by passing the individual flags or `IRONBUS_*` env vars.
 
 ## 7. Implementation residuals and their owning issues
 
-This document is SPECIFICATION. The IMPLEMENTATION residuals it specifies, and
-the issues that own them:
+This document is the schema SPECIFICATION; most of its layers are now IMPLEMENTED.
+The implementation status and the issues that own each layer:
 
-- **[#85](https://github.com/ELares/IronBus/issues/85): the precedence resolver,
-  the TOML config-file parser, and atomic load/reload.** There is no `toml`
-  dependency and no config-file layer in the tree today; configuration is
-  populated from `serve` flags and `IRONBUS_*` env vars only. Adding the parser
-  (whole-read, then validate, then atomic `Arc<Config>` swap; crash-safe SAVE via
-  temp + fsync + rename + dir-fsync) is the #85 residual. The two SHIPPED layers
-  (env, flag) and their `flag > env > default` precedence are already wired (#89,
-  [CLI.md](CLI.md)).
+- **[#85](https://github.com/ELares/IronBus/issues/85): the precedence resolver
+  and the TOML config-file parser. SHIPPED (#382).** `serve --config <path>`
+  whole-reads, parses (the pure-Rust `toml` crate), flattens, strictly validates,
+  and slots the file between env and default (`flag > env > FILE > default`), in
+  `crates/ironbus-cli/src/config_file.rs`. The atomic `Arc<EffectiveConfig>` load
+  and the re-read RELOAD swap ship in `config_reload.rs`. The crash-safe SAVE
+  (temp + fsync + rename + dir-fsync, comment-preserving) ties to the mutating
+  admin surface and is the remaining #380/#106 residual.
 - **[#86](https://github.com/ELares/IronBus/issues/86): the typed key table, the
-  literal-grammar parser, and strict validation with coupled-set checks.** The
-  per-flag range checks ship; the shared duration/size literal grammar, the
-  reject-unknown-key-with-did-you-mean rule, and the coupled-set validators in
-  [section 4](#4-coupled-set-validation-rules) are the #86 residual.
+  literal-grammar parser, and strict validation with coupled-set checks. SHIPPED
+  (#382).** The shared duration/size literal grammar (unit-required, decimal-SI
+  rejected, overflow-checked), the reject-unknown-key-with-did-you-mean rule (and
+  `--allow-unknown-config`), and the coupled-set validators in
+  [section 4](#4-coupled-set-validation-rules) live in the IO-free
+  `crates/ironbus-core/src/config.rs`; the per-flag range checks still ship too.
 - **[#87](https://github.com/ELares/IronBus/issues/87): the compiled-in versioned
   profiles and materialized-config logging. SHIPPED.** The `--profile` /
   `IRONBUS_PROFILE` selector, the `edge-tiny` / `balanced` / `throughput` named
   presets, the `PROFILE_SCHEMA_VERSION` versioning, and the materialized-config
   startup log line are implemented in `main.rs`. A profile content change is a
   documented breaking change (a `PROFILE_SCHEMA_VERSION` bump and a CHANGELOG entry).
-- **[#88](https://github.com/ELares/IronBus/issues/88): the hot/cold/coupled
-  reload engine and the runtime admin `CONFIG` verbs.** The reload classes in
-  [section 3](#3-the-full-typed-knob-table) are SPECIFICATION; no reload engine
-  ships, so every knob is effectively COLD (set once at `serve` start). The
-  `CONFIG GET/SET/LIST/DIFF/RELOAD/SAVE` admin surface (SET volatile and
-  highest-precedence, SAVE explicit and atomic) is the #88 residual. The
-  read-only `/admin` introspection endpoint (`--enable-admin`) ships; the
-  mutating verbs do not.
+- **[#88](https://github.com/ELares/IronBus/issues/88)/[#380](https://github.com/ELares/IronBus/issues/380):
+  the hot/cold/coupled reload engine and the runtime admin `CONFIG` verbs. PARTLY
+  SHIPPED (#382).** The immutable `Arc<EffectiveConfig>` (read via one atomic
+  pointer load), the cold/hot key classification, and the atomic re-read RELOAD
+  (validate the whole config, reject a cold-key change atomically, swap only on
+  success) ship in `config_reload.rs` (the safe SIGHUP/re-read path). The read-only
+  `/admin` introspection endpoint (`--enable-admin`) ships. The MUTATING
+  `CONFIG SET/SAVE` verbs change runtime state and need the
+  [#106](https://github.com/ELares/IronBus/issues/106) connection-scoped auth, so
+  they are DEFERRED (no unauthenticated remote config mutation surface).
 - **[#89](https://github.com/ELares/IronBus/issues/89): the env mapping,
   `data_dir` lifecycle, and secret redaction.** The env mapping and the
   `data_dir` create-if-absent / probe-write / single-broker-lock lifecycle are
