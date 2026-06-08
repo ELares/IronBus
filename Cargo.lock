@@ -517,6 +517,8 @@ dependencies = [
  "ironbus-core",
  "ironbus-proto",
  "ironbus-storage",
+ "serde",
+ "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",

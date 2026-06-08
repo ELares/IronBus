@@ -703,6 +703,78 @@ code; the code is canonical.
 
 ---
 
+## Semantics error codes (the conformance taxonomy)
+
+Source: `crates/ironbus-server/src/codes.rs` (issue #35).
+
+The engine names a small set of OBSERVABLE outcomes the behavioral contract pins: a verb the
+engine refuses, or a non-error signal a consumer must react to. `ErrorCode` formalizes them as
+STABLE, NORMATIVE string tokens. The spelling is FROZEN: the conformance vectors (below) and any
+external client assert against exactly these strings. The mapping from the engine's typed outcomes
+to a code is the single source of truth (`ErrorCode::of_engine_error` plus `EngineError::code`), and
+it is ADDITIVE: it does not change the existing `EngineError` Display text, the wire `Err` bodies, or
+the `AckStatus` byte, so the frozen wire is byte-for-byte unchanged. A later wire error-code scheme
+(a numeric tag on the `Err` frame) can adopt the same constants without a second taxonomy.
+
+| code                              | observable outcome | source |
+|-----------------------------------|--------------------|--------|
+| `OK`                              | a verb succeeded (ack committed, cumulative ack advanced or a no-op, fresh produce appended) | generic success |
+| `DUPLICATE`                       | a benign dedup hit: the `msg_id` was in the window, so the ORIGINAL offset is returned with no second append (`duplicate = true`, `rc = 0`, never an error) | `AppendOutcome::Duplicate` |
+| `OFFSET_TRIMMED`                  | a read fell below the trim/retention horizon; the cursor reset up to `earliest_retained` and the skip is surfaced ONCE | `Poll::Truncated` |
+| `ERR_CUMULATIVE_ACK_NOT_ALLOWED`  | a cumulative ack on a competing / `key_shared` / unknown / not-marked-broadcast group | `EngineError::CumulativeAckOnWorkGroup` |
+| `ERR_ACK_NOT_OWNED`               | an ack/nack/term/progress on a lease this consumer does not own (never delivered, or a stale generation) | `AckResult::Fenced` / `NackResult::Fenced` (wire status `0`) |
+| `ERR_CUMULATIVE_ACK_OUT_OF_RANGE` | a broadcast cumulative ack whose `up_to` is past the durable head or below earliest-retained | `EngineError::CumulativeAckOutOfRange` |
+| `ERR_BROADCAST_GROUP_BUSY`        | a second subscriber, or an unsafe flip to broadcast on a group with competing in-flight state | `EngineError::BroadcastGroupBusy` |
+| `ERR_BROADCAST_GROUP_NOT_NAMED`   | a flip to broadcast named the default/empty group, which can never be broadcast | `EngineError::BroadcastGroupNotNamed` |
+| `ERR_TOO_MANY_GROUPS`             | a new named group exceeded the per-engine group cap | `EngineError::TooManyGroups` |
+| `ERR_INVALID_GROUP_NAME`          | a group name was empty, too long, or non-graphic ASCII | `EngineError::InvalidGroupName` |
+| `ERR_PRODUCER_FENCED`             | a produce presented a STALE producer epoch (a zombie session) | `AppendOutcome::Fenced` |
+| `ERR_AT_CAPACITY`                 | a produce was shed at the durable-log byte cap (drop-new) | at-capacity `EngineError::Storage` |
+| `ERR_GENERATION_EXHAUSTED`        | the lease generation space is exhausted (unreachable in practice) | `EngineError::GenerationExhausted` |
+| `ERR_MISSING_RECORD`              | an internal invariant broke (a deliverable offset had no record) | `EngineError::MissingRecord` |
+| `ERR_ZERO_MAX_IN_FLIGHT`          | `max_in_flight` was zero, rejected at open | `EngineError::ZeroMaxInFlight` |
+| `ERR_STORAGE`                     | a residual storage error (not the byte-cap shed) | `EngineError::Storage` |
+
+## Semantics conformance vectors (the executable spec)
+
+Source: `crates/ironbus-server/tests/vectors/semantics.json` plus the harness
+`crates/ironbus-server/tests/conformance_vectors.rs` (issue #35).
+
+The vectors are a LANGUAGE-AGNOSTIC, checked-in data file of input-sequence to observable-output
+cases that pin every observable behavior the parent #3 contract promises, so any IronBus
+implementation or client can be checked against the same suite. They are the NORMATIVE executable
+spec for the queue semantics; the prose contract above is the human-readable companion.
+
+This is the BEHAVIORAL semantics suite, DISTINCT from the on-disk FORMAT corpus
+(`ironbus-core/tests/conformance_corpus.rs`, #45): the corpus pins record/segment BYTES, these
+vectors pin observable QUEUE BEHAVIOR.
+
+Each vector is a `name`, a `category`, a `setup` (engine config), and an ordered list of `steps`.
+Each step is one input operation (`produce`, `produce_dedup`, `poll`, `ack`, `nack`,
+`cumulative_ack`, `set_broadcast`, `set_key_ordering`, `join_member`, `subscribe`,
+`expect_committed`, ...) plus its EXPECTED observable output (an assigned offset, a delivery count,
+a stable error/signal code from the table above, a committed cursor position, a dedup `duplicate`
+flag, or a trim signal). The categories cover: ORDERING (monotonic offsets, no gaps; out-of-order
+ack advances only the contiguous prefix); REDELIVERY (an expired lease redelivers, an acked message
+does not, a nack requeues); DEDUP (a duplicate `msg_id` returns the original offset, an evicted id
+is fresh, a stale epoch is fenced); ACK REJECTION (`ERR_CUMULATIVE_ACK_NOT_ALLOWED`,
+`ERR_ACK_NOT_OWNED`, `ERR_CUMULATIVE_ACK_OUT_OF_RANGE` with the named codes); KEY ROUTING (per-key
+head-of-line order, distinct keys do not block each other); BROADCAST (independent per-group
+cursors, the cumulative-ack verb, the group-of-one cap); and TRIM (`OFFSET_TRIMMED` after retention
+reaps).
+
+The harness DRIVES THE REAL ENGINE: it loads each vector, runs the operation sequence against an
+`Engine` over an `InMemoryFs`, and asserts the observed outputs match EXACTLY (a mismatch fails the
+test, so the vectors gate the semantics). It is DETERMINISTIC: all time flows through an injected
+logical clock (the clock seam, `ManualClock`); every poll carries an explicit monotonic `now`, so
+lease expiry, dedup-window age-out, and trim are driven by ADVANCING LOGICAL TIME with NO real
+sleeps, and the suite is reproducible bit-for-bit on a slow edge CI box. The harness has teeth: a
+deliberately-wrong vector fails it, so it cannot silently degrade into a rubber stamp. An external
+client harness can drive the same vector file over the wire to check a second implementation against
+this one suite.
+
+---
+
 ## Specified but not yet implemented
 
 These models appear in the #137 draft (or the README/diagram) but are not present in the
