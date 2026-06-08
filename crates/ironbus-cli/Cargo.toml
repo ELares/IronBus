@@ -31,6 +31,13 @@ ironbus-client = { path = "../ironbus-client", version = "0.0.0" }
 ironbus-server = { path = "../ironbus-server", version = "0.0.0" }
 ironbus-storage = { path = "../ironbus-storage", version = "0.0.0" }
 
+# A content fingerprint for the upgrade rollback's known-bad guard (#348): the failed-start counter
+# records the fingerprint of the binary that failed N starts, so a rollback re-entered after a power
+# cut in the two-rename window can never PROMOTE the known-bad bytes. crc32c is already in the tree
+# (ironbus-core's record/segment checksums) and on the deny.toml allow-list (MIT OR Apache-2.0); it
+# is a non-cryptographic content identity (paired with the byte length), never a security boundary.
+crc32c = "0.6"
+
 # Signal handling for `serve`'s graceful shutdown (#195): catches SIGINT/SIGTERM/SIGHUP and flips
 # the serve loop's shutdown flag so the broker stops accepting, flushes the committed cursor, and
 # exits 0. The maintainer chose `ctrlc` over a hand-rolled `unsafe` sigaction (Miri cannot exercise

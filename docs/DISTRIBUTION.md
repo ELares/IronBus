@@ -157,6 +157,19 @@ properties:
   (default N = 3). The systemd unit records each failed start and, at the threshold, runs
   `ironbus rollback` to restore the prior known-good bytes. See the
   [unit wiring](#fall-back-after-n-wiring-the-systemd-unit).
+- **The rollback is re-entrant under a power cut (#348).** A two-rename swap has a sub-microsecond
+  window between the renames where `ironbus.prev` momentarily holds the bytes that were at the
+  destination (the just-failed binary). A power cut there, or after the swap but before the
+  failed-start counter is cleared, could otherwise let a re-entered `--check` promote those known-bad
+  bytes. Two protections close it: (1) `rollback` restores `ironbus.prev` over the destination
+  WITHOUT first moving the destination onto `.prev`, so the last known-good bytes in `.prev` are
+  preserved for the whole rollback and a re-entry converges to the good binary; (2) when the counter
+  reaches the cap, the failing binary's content fingerprint is recorded (durably, alongside the
+  counter) as a known-bad guard, and `rollback` REFUSES to promote `ironbus.prev` if its fingerprint
+  matches the recorded known-bad one. The guard is cleared only after a rollback restores the bytes
+  and resets the counter (so a crash before that keeps the re-entry deterministic), and a genuine
+  healthy start (`record-start --ok`) clears it too. These live entirely in the verbs; no unit change
+  is needed.
 
 The download-and-verify step is NOT re-implemented in `upgrade`: it stays in the fail-closed
 `scripts/install.sh` (the single source of verify-before-install). `ironbus upgrade` is the

@@ -24,6 +24,12 @@
 # The live binary is NEVER overwritten in place; `ironbus upgrade` (or the installer) does the atomic
 # write-temp + fsync + rename, so a power cut mid-upgrade leaves either the old or the new binary
 # intact, and this unit recovers an unreachable node automatically after N failed starts.
+#
+# The rollback itself is hardened against the two-rename re-entry window (#348): the `--check` ->
+# `rollback` step records the known-bad binary's content fingerprint at the cap and restores
+# `ironbus.prev` WITHOUT first moving the live binary onto `.prev`, so a power cut between the renames
+# (or before the counter clear) re-enters deterministically and converges to the good binary rather
+# than promoting the just-failed bytes. No unit change is needed for this; it is internal to the verbs.
 
 [Unit]
 Description=IronBus durable edge message queue

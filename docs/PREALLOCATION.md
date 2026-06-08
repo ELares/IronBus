@@ -2,11 +2,14 @@
 
 This document specifies how IronBus preallocates the active segment to its full roll
 size in a portable way, and resolves the open question of whether sealed-then-deleted
-segments are recycled. It is a DESIGN spec: the preallocation primitives are SPECIFIED
-here and are NOT yet implemented in the storage layer (the shipped code grows segments as
-records are appended, with no preallocation). The recycling question is RESOLVED, not
-deferred: in v1 a segment is never recycled, for the at-rest-encryption nonce reason
-recorded in [ADR 0002](adr/0002-segments-never-recycled-in-v1.md).
+segments are recycled. The preallocation primitive is now IMPLEMENTED (#330): the IO seam
+carries a `RandomAccessFile::preallocate(len)` method, `start_segment` preallocates each
+new active segment to the roll size best-effort, and the production `StdFile` reserves
+real blocks per OS (Linux `fallocate` with `FALLOC_FL_KEEP_SIZE`, macOS
+`fcntl(F_PREALLOCATE)`), falling back to today's grow-on-append on a filesystem that
+supports neither. The recycling question is RESOLVED, not deferred: in v1 a segment is
+never recycled, for the at-rest-encryption nonce reason recorded in
+[ADR 0002](adr/0002-segments-never-recycled-in-v1.md).
 
 It complements [WAL.md](WAL.md) (the file lifecycle and the fsync model) and
 [CONTRACTS.md](CONTRACTS.md) (the frozen 64-byte segment header). The IO seam it builds
@@ -31,7 +34,7 @@ four already exist in the seam; preallocation is the one this spec adds.
 
 | # | Primitive | Seam method (today) | Status |
 |---|---|---|---|
-| a | **preallocate** | (new) a `RandomAccessFile::preallocate(len)` | SPECIFIED here, not implemented |
+| a | **preallocate** | `RandomAccessFile::preallocate(len)` | IMPLEMENTED (`io.rs`, #330) |
 | b | **file-datasync** (fdatasync) | `RandomAccessFile::sync_data` | IMPLEMENTED (`io.rs`) |
 | c | **directory-sync** | `Filesystem::sync_dir` (free `io::sync_dir` on Unix) | IMPLEMENTED (`fs.rs`, `io.rs`) |
 | d | **sealed-read-map** (positioned reads of an immutable sealed segment) | `RandomAccessFile::read_at` / `read_exact_at` | IMPLEMENTED (`io.rs`) |
@@ -66,10 +69,14 @@ appends as today (the write position is the append cursor, not the preallocated 
 preallocation changes is that the *physical blocks* backing those bytes are reserved up
 front, in one call, rather than block by block as each append extends the file.
 
-A knob disables it for filesystems or operators that prefer not to (`preallocate`,
-default `true`); with it off, the shipped grow-on-append behavior is exactly what runs
-today. The knob is a forward config key (there is no TOML config in code yet; see
-CONTRACTS.md), coordinated with #14 like the other storage knobs.
+A knob to disable it for filesystems or operators that prefer not to (`preallocate`,
+default `true`) is a forward config key (there is no TOML config in code yet; see
+CONTRACTS.md), coordinated with #14 like the other storage knobs. The IMPLEMENTED v1
+wiring is unconditional-but-best-effort: `start_segment` always attempts the reservation
+and SWALLOWS any failure, falling back to grow-on-append, so disabling the optimization is
+already the natural behavior on any filesystem that cannot reserve. Exposing the explicit
+`preallocate = false` knob (to skip the attempt entirely) rides the same #14 config plumbing
+as the other storage knobs and is deferred to it.
 
 ### The wear and latency rationale (Edge First)
 
@@ -140,19 +147,33 @@ rather than a raw `fallocate`. Each maps to the same logical contract: reserve `
 backing blocks for the file without changing the bytes a reader sees, then make that
 reservation effective for the steady-state appends that follow.
 
+The implemented form uses the KEEP-SIZE variant on every OS: it reserves blocks WITHOUT
+advancing the file's logical length. This is load-bearing, and is a refinement of the
+earlier draft (which paired the reservation with an `ftruncate`/`posix_fallocate`
+size-grow): the append cursor is the logical end of data, and both recovery's torn-tail
+scan and the offline `dump`/`scrub` tools find the end of data from `file.len()`. If
+preallocation grew the logical length to the full roll size, every reader would see a
+multi-MiB zero tail and (correctly, but needlessly, and breaking the offline-tool output)
+report it as a zero window. Keeping the size means the logical length still grows only
+with appends, which land in the already-reserved blocks. So the macOS `ftruncate` pairing
+is dropped, and Linux uses `FALLOC_FL_KEEP_SIZE`.
+
 | OS | Primitive | Reserves real blocks? | Durability note |
 |---|---|---|---|
-| **Linux** (production, musl) | `fallocate(fd, 0, 0, len)`, or `posix_fallocate` as the portable fallback | Yes | `fallocate` reserves real extents; the steady-state append then writes into allocated space, so the commit `fdatasync` need not also persist a length-grow. On a filesystem that does not support `fallocate` (rare on ext4/f2fs/xfs, the edge targets), fall back to `posix_fallocate`, then to a zero-fill write, then to no-prealloc (grow-on-append), in that order. The block reservation itself is not the durability barrier: the I2 commit `fdatasync` still is. |
-| **macOS** (developer, CI) | `fcntl(fd, F_PREALLOCATE)` with `F_ALLOCATECONTIG` then `F_ALLOCATEALL`, FOLLOWED by `ftruncate(fd, len)` | Yes (contiguous if possible) | `F_PREALLOCATE` reserves blocks but does NOT advance the file's logical size, so it is paired with `ftruncate` to set the length. Crucially, on macOS the durability barrier is `F_FULLFSYNC`, which `std` already issues for both `sync_data` and `sync_all` (see `io.rs`); preallocation does not change that, it only removes the per-commit length-grow. If `F_PREALLOCATE` returns `ENOTSUP`, fall back to `ftruncate` alone (a sparse length set), then to zero-fill, then to no-prealloc. |
+| **Linux** (production, musl) | `fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, len)` | Yes | `fallocate` reserves real extents and `FALLOC_FL_KEEP_SIZE` leaves the logical size unchanged; the steady-state append then writes into allocated blocks, so the commit `fdatasync` need not also persist a length-grow. On a filesystem that does not support allocation (`EOPNOTSUPP`/`ENOSYS`, rare on ext4/f2fs/xfs, the edge targets) it falls back to no-prealloc (grow-on-append). A genuine `ENOSPC` is surfaced (not swallowed) at the seam. The block reservation itself is not the durability barrier: the I2 commit `fdatasync` still is. |
+| **macOS** (developer, CI) | `fcntl(fd, F_PREALLOCATE)` with `F_ALLOCATECONTIG` then `F_ALLOCATEALL` (NO `ftruncate`) | Yes (contiguous if possible) | `F_PREALLOCATE` reserves blocks and does NOT advance the file's logical size, which is exactly the keep-size reservation wanted, so no `ftruncate` pairing is used. On macOS the durability barrier is `F_FULLFSYNC`, which `std` already issues for both `sync_data` and `sync_all` (see `io.rs`); preallocation does not change that, it only removes the per-commit length-grow. If `F_PREALLOCATE` returns `ENOTSUP`, it falls back to no-prealloc (grow-on-append); any other error is surfaced. |
 | **Windows** (v1 non-goal; flagged for #17) | `SetFilePointerEx(fd, len)` then `SetEndOfFile(fd)` to set the size; optionally `SetFileValidData` to mark the range valid without zeroing | Size set; blocks valid only with `SetFileValidData` | `SetFilePointerEx` + `SetEndOfFile` set the file size but leave the range as a zeroing-on-first-write valid-data region, so the wear/latency benefit is partial unless `SetFileValidData` is used. **`SetFileValidData` requires the `SE_MANAGE_VOLUME_NAME` privilege** and exposes previously-deleted disk contents in the unwritten range, so it is a deliberate, privileged opt-in, never the default. Without it, Windows preallocation sets the size (avoiding repeated grows) but the OS still zeroes-on-write; the durability barrier on Windows is `FlushFileBuffers`. Windows is a v1 NON-GOAL (the production targets are Linux musl and macOS; `io.rs` ships only the trait and `InMemoryFile` off Unix), so this row is the SPECIFIED Windows mapping for when the build matrix (#17) adds it, not shipped code. |
 
-The common fallback ladder on every OS is: **preallocate-with-block-reservation, then
-set-size only, then explicit zero-fill, then no-prealloc (grow-on-append)**. Every rung is correct for
-durability; the lower rungs only give up the wear/latency benefit, never the
-ack-implies-durable guarantee (which is always the commit `fdatasync`, independent of
-preallocation). Falling all the way back to grow-on-append is exactly the shipped v1
-behavior, so a platform that supports no preallocation primitive degrades to today's
-code, not to an unsafe one.
+The common fallback ladder on every OS is: **keep-size block reservation, then no-prealloc
+(grow-on-append)** when the filesystem reports it cannot allocate. The implementation drops
+the intermediate set-size / zero-fill rungs the draft listed precisely because they would
+advance the logical length (the very thing the keep-size form avoids), so they are not
+correct keep-size rungs. Both surviving rungs are correct for durability; the lower rung
+only gives up the wear/latency benefit, never the ack-implies-durable guarantee (which is
+always the commit `fdatasync`, independent of preallocation). Falling back to
+grow-on-append is exactly the shipped v1 behavior, so a platform that supports no
+keep-size reservation primitive (any non-Linux, non-Apple Unix, or an unsupported
+filesystem) degrades to today's code, not to an unsafe one.
 
 ---
 
@@ -162,14 +183,17 @@ The preallocate primitive slots onto `RandomAccessFile` (`io.rs`), the same seam
 `sync_data` / `read_at` / `set_len` already use, so an implementation drops in without new
 plumbing:
 
-- Add one trait method, `fn preallocate(&self, len: u64) -> io::Result<()>`, with a
-  DEFAULT no-op-or-fallback body so adding it is non-breaking and IO-free-safe for the
-  simulation. The default can be `set_len(len)` followed by `sync_all` (a portable
-  size-set that the existing `InMemoryFile` already models faithfully: `set_len` extends
-  with zeros, `sync_all` makes the length durable), or a literal no-op for backends that
-  do not benefit. Either keeps every existing test green: the in-memory simulation already
-  treats a `set_len`-extend as zero-fill, so a preallocate-to-`len` is just a longer
-  durable file the append then writes into.
+- The trait method is `fn preallocate(&self, len: u64) -> io::Result<()>` with a DEFAULT
+  no-op body, so adding it is non-breaking and IO-free-safe for the simulation. The default
+  is a literal no-op (`Ok(())`): a backend with no reservation primitive degrades to
+  grow-on-append, which is correct. The in-memory `InMemoryFile` overrides it to TRACK the
+  requested reservation (a high-water `preallocated_to`) WITHOUT changing its bytes or its
+  logical length, mirroring the real keep-size reservation. This is deliberate over a
+  `set_len`-extend: a set-len would zero-fill the in-memory image to `len` and diverge the
+  deterministic disk image (the determinism and crash-recovery sweeps assert byte-identical
+  images and exact truncated-tail counts), whereas a tracked reservation keeps a
+  preallocated active segment byte-identical to a grow-on-append one while still letting a
+  test assert the roll-size reservation was requested.
 - The production `StdFile` (Unix) overrides it with the per-OS syscall above. `StdFile`
   already exposes `from_file` for "a preallocated or handed-off descriptor" (`io.rs`), so
   the preallocation can also be done at create time and handed in; the trait method is the
@@ -180,16 +204,24 @@ plumbing:
   segment also uses. Preallocate runs after `create_new` and before the first append, on
   the file handle `create_new` returns.
 
-Because the in-memory `InMemoryFile` already distinguishes `fdatasync` from `fsync` and
-models a `set_len`-extend as a durable zero-fill, the deterministic simulation can exercise
-the preallocate path (a preallocated active segment, appends into it, a power loss, a
-recovery scan that truncates the unwritten zero tail) with no new fault model. The
-implementing PR adds that simulation case.
+The deterministic simulation exercises the preallocate path (a preallocated active segment,
+appends into it, a power loss, a recovery scan that recovers the longest valid prefix and
+drops the unwritten tail) with no new fault model: because the in-memory backend tracks the
+reservation without changing bytes, a preallocated segment IS a grow-on-append one to the
+simulation, so the existing determinism, crash-recovery, and invariant sweeps cover it, and
+the implementing PR adds the explicit `start_segment`-preallocates-the-roll-size,
+empty-segment-recovers-as-empty, partial-segment-recovers-longest-prefix, and
+preallocate-failure-is-non-fatal tests.
 
-> Implementation note: adding the trait method with a default body is OPTIONAL for this
-> M2 design milestone and is not part of this doc-only change. If a later PR adds it, it
-> must keep `ironbus-core` IO-free, add no panic on a library path, and not regress any
-> `ironbus-storage` test, per the project IO and MSRV rules.
+> Implementation note (#330): the trait method ships with a no-op default body, so adding it
+> is non-breaking and keeps `ironbus-core` IO-free (the primitive lives in `ironbus-storage`,
+> not core). The one place `unsafe` appears is the thin per-OS libc FFI wrapper for
+> `fallocate`/`fcntl(F_PREALLOCATE)` in `StdFile`, each call carrying a `// SAFETY:` argument
+> (a plain syscall over a valid owned fd and a fully-owned struct, no memory aliasing), under
+> the workspace `unsafe_code = "warn"` + `#[allow(unsafe_code)]` convention the existing
+> `clock.rs`/`broker.rs` libc calls already use. `libc` (a pure-Rust binding, no vendored C)
+> is reused, not added: it is already in the workspace tree and on the `deny.toml`
+> pure-Rust-syscall allow-list. No panic on a library path; no `ironbus-storage` test regresses.
 
 ---
 
@@ -311,10 +343,10 @@ matrix (#17), which must be flagged so the portability promise is tested, not as
 
 | Item | Status |
 |---|---|
-| The four-primitive shim (preallocate, file-datasync, directory-sync, sealed-read-map) | SPECIFIED; (b)(c)(d) IMPLEMENTED in the seam, (a) specified here |
-| Preallocation default ON, active segment, full roll size, wear/latency rationale | SPECIFIED, not implemented |
-| ENOSPC at roll routed to #10 / #13 overflow handling | SPECIFIED, reuses the shipped `AtCapacity` path |
-| Per-OS preallocate (Linux `fallocate`/`posix_fallocate`, macOS `F_PREALLOCATE`+`ftruncate`, Windows `SetEndOfFile`/`SetFileValidData`) with durability notes | SPECIFIED |
+| The four-primitive shim (preallocate, file-datasync, directory-sync, sealed-read-map) | (a)(b)(c)(d) all IMPLEMENTED in the seam (a = `RandomAccessFile::preallocate`, #330) |
+| Preallocation always-on best-effort, active segment, full roll size, wear/latency rationale | IMPLEMENTED (`start_segment`, #330); an explicit disable knob is deferred to #14 config |
+| ENOSPC at roll | A keep-size `ENOSPC` is surfaced at the seam; v1 wiring SWALLOWS it in `start_segment` and falls back to grow-on-append (the doc's route-to-`AtCapacity` refinement is a forward improvement, not required for correctness) |
+| Per-OS preallocate (Linux `fallocate` + `FALLOC_FL_KEEP_SIZE`, macOS `fcntl(F_PREALLOCATE)`; Windows `SetEndOfFile`/`SetFileValidData` still SPECIFIED for #17) | IMPLEMENTED for Linux + macOS; other Unix and Windows degrade to the no-op default |
 | Segment recycling | RESOLVED: v1 NEVER recycles (ADR 0002); no generation stamp; recycling is a v2 nonce-safety decision |
 | Build-matrix implications | FLAGGED to #17 |
 
