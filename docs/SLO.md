@@ -144,9 +144,16 @@ baseline" and, per #110, an unmeasured cell is informational and cannot gate CI.
 1. **Run the instrument on the reference device.** Run the #111 macro-bench
    harness (`crates/ironbus-bench/`) on the reference edge device for the row's
    exact conditions (device, message size, fan-out, durability mode), under the
-   warm-up and steady-state discipline #19 mandates (discard a warm-up window;
-   declare steady state only when throughput and p99 are stable across
-   consecutive windows; at least one multi-hour sustained run per release).
+   [edge run discipline](EDGE_RUN_DISCIPLINE.md) #19 mandates: the named
+   reference active cooling with per-window junction-temperature and CPU-frequency
+   logging (a throttle in the steady-state window fails the run), a fixed
+   card/eMMC model secure-erased to a known state at a fixed 50% fill, the broker
+   and harness pinned to disjoint CPU sets with harness CPU/RSS reported
+   separately, the warm-up = `max(60 s, page-cache-fill + 2 segment rolls)`
+   discarded, steady state declared only when 5 consecutive 30 s windows show
+   throughput `CoV <= 3%` and `p99 drift <= 10%`, and at least one `>= 4h`
+   sustained run per release that passes only if hour-1-to-hour-4 `p99 drift
+   < 25%`.
 2. **Archive the provenance.** Keep the run's versioned provenance JSON,
    including the RAW `HdrHistogram` (`histogram_v2_deflate_base64`), the `git_sha`
    / `git_dirty`, the `host` (device), the `config`, and the `reproduce`
@@ -201,6 +208,11 @@ no run on the reference edge device has been recorded and archived. Therefore:
   table from measured floors.
 - [#284](https://github.com/ELares/IronBus/issues/284): make the injected-stall
   coordinated-omission self-test a reliable CI gate (currently `#[ignore]`d).
+- [EDGE_RUN_DISCIPLINE.md](EDGE_RUN_DISCIPLINE.md) (#113): the run-discipline
+  protocol every canonical run must follow (thermal control, storage state,
+  harness isolation, the CoV / p99-drift steady-state criterion, the `>= 4h`
+  sustained run, and the `>= 4x` write-amplification gate) before its number can
+  ratify a row.
 - [#115](https://github.com/ELares/IronBus/issues/115): the `tiny` profile RAM
   budget (the 64 MiB ceiling).
 - [#116](https://github.com/ELares/IronBus/issues/116): edge durability defaults
