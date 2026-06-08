@@ -76,6 +76,26 @@ so explicitly. The TARGET column quotes the README or the issue where a number
 is stated, and reads "target TBD" where no number is stated yet and the value is
 to be set during ratification from the first measured run on the device.
 
+### Machine-readable form
+
+This human-readable table has a versioned, machine-readable companion that CI
+and the #111 macro-bench read targets from as DATA, not Markdown:
+[`docs/schemas/slo.v1.json`](schemas/slo.v1.json) (schema
+`ironbus.slo-table.v1`, `schema_version` `1`), frozen by its schema doc
+[`schemas/slo-table.v1.md`](schemas/slo-table.v1.md). This document is the
+single source of truth for the NUMBERS; the JSON quotes them and must AGREE with
+it. The drift gate
+[`scripts/ci/slo-table-check.sh`](../scripts/ci/slo-table-check.sh) fails a PR
+if the JSON stops parsing, drops a required field, ratifies a row too early, or
+states a target number that does not match this document, so the two cannot
+diverge. The load-bearing numbers, stated here once contiguously as the gate's
+anchor: the marquee throughput target is `60,000 msg/s` and its p99 target is
+`6 ms`; the `tiny` edge profile RAM ceiling is `64 MiB`; the edge write-
+amplification gate fails at `4x`; and a ratified gate is the measured floor, the
+on-device value minus a `20 percent margin` (equivalently the `20% margin` the
+README states). Every JSON cell is `measured: null, ratified: false` today, the
+same not-yet-measured state this document declares.
+
 ### Marquee figure
 
 The README defines one marquee figure; the rest of the table is calibrated
@@ -203,6 +223,11 @@ no run on the reference edge device has been recorded and archived. Therefore:
 
 ## References
 
+- [schemas/slo-table.v1.md](schemas/slo-table.v1.md) and
+  [schemas/slo.v1.json](schemas/slo.v1.json) (#359): the versioned,
+  machine-readable form of this table (`ironbus.slo-table.v1`) that CI and the
+  #111 macro-bench read targets from, kept in agreement with this document by the
+  drift gate [scripts/ci/slo-table-check.sh](../scripts/ci/slo-table-check.sh).
 - [README, Performance targets](../README.md#performance-targets): the marquee
   figure and the measured-floor-minus-20%-margin rule.
 - [`crates/ironbus-bench/`](../crates/ironbus-bench): the macro-bench harness

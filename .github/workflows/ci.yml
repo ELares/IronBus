@@ -232,6 +232,24 @@ jobs:
       - name: assert every required per-issue failure mode appears in the consolidated FMEA
         run: sh scripts/ci/fmea-coverage.sh
 
+  slo-table-drift:
+    name: SLO-table drift gate (#359)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # The SLO-table drift gate (#359, the #110 residual): the SLO target table has a
+      # human-readable form (docs/SLO.md) and a versioned machine-readable form
+      # (docs/schemas/slo.v1.json, schema ironbus.slo-table.v1) that CI and the #111 macro-bench
+      # read targets from. This gate keeps the two from diverging: it asserts the JSON parses,
+      # carries schema_version 1, has every required field on every row, encodes the
+      # not-yet-measured invariant (no row ratified, every measured cell null), and that the stated
+      # target numbers match docs/SLO.md. A number changed in one file but not the other fails
+      # here. Deterministic, offline, history-free: no network, no gh, no git diff base; needs only
+      # jq (pre-installed on ubuntu-latest).
+      - name: assert the SLO JSON parses, is unratified, and agrees with docs/SLO.md
+        run: sh scripts/ci/slo-table-check.sh
+
   cross-build:
     name: musl build (${{ matrix.target }})
     runs-on: ubuntu-latest
