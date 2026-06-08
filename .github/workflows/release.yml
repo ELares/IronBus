@@ -10,8 +10,9 @@ name: Release
 # static-link setup, and it builds with the reproducible invocation pinned in RELEASING.md (#101):
 # `SOURCE_DATE_EPOCH` from the tag commit, the `--remap-path-prefix` RUSTFLAGS, and `--locked`.
 # Each release ships the three binaries, a per-binary SHA256, one consolidated `SHA256SUMS`, a
-# cargo-auditable SBOM, and a keyless Sigstore build-provenance attestation over every artifact
-# (verifiable with `gh attestation verify`, per SECURITY.md). The fail-closed installer (#103)
+# cargo-auditable SBOM, a syft CycloneDX SBOM (scannable with syft/grype, #367), and a keyless
+# Sigstore build-provenance attestation over every artifact (verifiable with `gh attestation
+# verify`, per SECURITY.md). The fail-closed installer (#103)
 # consumes these assets. The `.deb` package (one per triple, `package-deb` job) and the distroless
 # container image (`container` job) are built FROM the verified binaries (no recompile), so all four
 # distribution channels (#104) ride the same reproducible bytes; see docs/DISTRIBUTION.md.
@@ -265,6 +266,30 @@ jobs:
           rust-audit-info target/release/ironbus > dist/ironbus.sbom.json
           test -s dist/ironbus.sbom.json
           grep -q 'ironbus-core' dist/ironbus.sbom.json
+      - name: generate the syft CycloneDX SBOM (#367)
+        # Anchore's syft action, SHA-pinned per #142 (v0.24.0 bundles syft v1.42.3). It scans the
+        # SAME native binary the cargo-auditable step just built, so the CycloneDX manifest covers
+        # the identical pure-Rust dependency set as ironbus.sbom.json (the graph is target
+        # independent for this workspace). Auto-upload is turned OFF (upload-artifact /
+        # upload-release-assets = false) so the publish job stays the single place that checksums,
+        # attests, and attaches the asset, exactly like the other artifacts. Unlike the in-binary
+        # cargo-auditable SBOM, this is the standalone, scannable release artifact (syft / grype),
+        # see RELEASING.md.
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          file: target/release/ironbus
+          format: cyclonedx-json
+          output-file: dist/ironbus.cyclonedx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: assert the CycloneDX SBOM was produced
+        run: |
+          set -euo pipefail
+          # Fail the release here, not at attach time, if syft emitted nothing usable: a non-empty
+          # file that declares the CycloneDX bomFormat and names this workspace's crate.
+          test -s dist/ironbus.cyclonedx.json
+          grep -q '"bomFormat": *"CycloneDX"' dist/ironbus.cyclonedx.json
+          grep -q 'ironbus-core' dist/ironbus.cyclonedx.json
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
@@ -281,6 +306,9 @@ jobs:
             cp "artifacts/ironbus-${t}/ironbus-${t}.sha256" "dist/ironbus-${t}.sha256"
             cp "artifacts/ironbus-deb-${t}/ironbus-${t}.deb" "dist/ironbus-${t}.deb"
           done
+          # The syft CycloneDX SBOM (dist/ironbus.cyclonedx.json) was written in this same job; fold
+          # it into SHA256SUMS so the scannable manifest is checksummed alongside the binaries and
+          # .deb packages (#367).
           ( cd dist && sha256sum \
               ironbus-x86_64-unknown-linux-musl \
               ironbus-aarch64-unknown-linux-musl \
@@ -288,6 +316,7 @@ jobs:
               ironbus-x86_64-unknown-linux-musl.deb \
               ironbus-aarch64-unknown-linux-musl.deb \
               ironbus-armv7-unknown-linux-musleabihf.deb \
+              ironbus.cyclonedx.json \
               > SHA256SUMS )
           # Self-check: the consolidated file must verify before it ships, so a bad upload can
           # never produce a release whose SHA256SUMS does not match its own binaries.
@@ -306,6 +335,7 @@ jobs:
             dist/ironbus-armv7-unknown-linux-musleabihf.deb
             dist/SHA256SUMS
             dist/ironbus.sbom.json
+            dist/ironbus.cyclonedx.json
       - name: determine prerelease (0.x is a prerelease)
         id: prerelease
         env:
@@ -336,7 +366,7 @@ jobs:
             --title "$TAG" \
             --verify-tag \
             $prerelease_flag \
-            --notes "Static musl binaries for the three edge triples (x86_64, aarch64, armv7) and a .deb package per triple, each with a SHA256 checksum, a consolidated SHA256SUMS (over the binaries and the .deb packages), a cargo-auditable SBOM (ironbus.sbom.json), and a keyless Sigstore build-provenance attestation over every artifact. Verify integrity with: sha256sum -c SHA256SUMS, and provenance with: gh attestation verify <artifact> --repo $REPO. The fail-closed installer (scripts/install.sh) verifies the checksum before installing; the distroless container image is built and (opt-in) published by the release workflow. See docs/DISTRIBUTION.md for all four channels and CHANGELOG.md for changes." \
+            --notes "Static musl binaries for the three edge triples (x86_64, aarch64, armv7) and a .deb package per triple, each with a SHA256 checksum, a consolidated SHA256SUMS (over the binaries, the .deb packages, and the CycloneDX SBOM), a cargo-auditable SBOM (ironbus.sbom.json), a syft CycloneDX SBOM (ironbus.cyclonedx.json, scannable with syft/grype), and a keyless Sigstore build-provenance attestation over every artifact. Verify integrity with: sha256sum -c SHA256SUMS, and provenance with: gh attestation verify <artifact> --repo $REPO. The fail-closed installer (scripts/install.sh) verifies the checksum before installing; the distroless container image is built and (opt-in) published by the release workflow. See docs/DISTRIBUTION.md for all four channels and CHANGELOG.md for changes." \
             dist/ironbus-x86_64-unknown-linux-musl \
             dist/ironbus-x86_64-unknown-linux-musl.sha256 \
             dist/ironbus-aarch64-unknown-linux-musl \
@@ -347,4 +377,5 @@ jobs:
             dist/ironbus-aarch64-unknown-linux-musl.deb \
             dist/ironbus-armv7-unknown-linux-musleabihf.deb \
             dist/SHA256SUMS \
-            dist/ironbus.sbom.json
+            dist/ironbus.sbom.json \
+            dist/ironbus.cyclonedx.json
