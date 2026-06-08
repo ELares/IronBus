@@ -28,7 +28,14 @@ secret material and no mutating action.
 
 Every name below is an `ironbus_*_total` counter. The set is frozen: the test
 asserts `/metrics` renders **exactly** this set (plus the gauges and the fsync
-histogram below). Counters are monotonic statistics (they only increase). They
+histogram below). A second, broader golden test
+(`the_metric_name_and_type_contract_is_frozen`, #99) pins the **complete**
+`(metric name, Prometheus type)` set across counters, gauges, and histograms, so
+any rename, type change, or unit change (a unit lives in the name suffix, so a
+unit change is a name change) fails CI until this contract and this doc are
+bumped deliberately (#22). The metric and label names are a stability contract: a
+dashboard or the `ironbus admin` CLI must never be broken by an unannounced
+rename. Counters are monotonic statistics (they only increase). They
 are **durable across a restart** (#98): the broker snapshots them to a CRC'd
 `counters.ckpt` on the cursor-checkpoint cadence and on the graceful-shutdown
 flush, and seeds them from that snapshot at startup, so a restart no longer
@@ -337,6 +344,53 @@ resilience-loss events:
 
 If any of these later needs a counter, it is added to the frozen taxonomy here
 and in `FROZEN_RESILIENCE_COUNTERS`, never as a silent change.
+
+## The `/admin` read-only introspection endpoint (#99)
+
+`GET /admin` is an opt-in (`serve --enable-admin`), read-only JSON view of
+operational state on the same health server as `/metrics`, with the same trust
+model: loopback by default, and any non-loopback bind carries the
+widen-requires-auth precondition `/metrics` does (#107). It is strictly
+read-only: no route mutates state, and every value is a projection of an existing
+read-only engine accessor (mutating admin actions are deferred to #18/#14). The
+schema version is pinned in the `Accept` header: a consumer that needs the exact
+shape sends `Accept: application/vnd.ironbus.admin.v1+json`; an explicit non-v1
+IronBus-admin media type gets `406 Not Acceptable`, while an absent or wildcard
+Accept takes the current `v1`.
+
+The v1 body is `{schema_version, broker, segments, consumers[], groups[],
+resilience, dlq, config}` with four named sub-resources:
+
+- `segments`: the durable-log span (`count`, `earliest_retained_offset`,
+  `head_offset`, `durable_record_count`, `durable_record_bytes`).
+- `consumers`: one row per work-group (`name`, `committed_offset`, the
+  incremental `consumer_lag` = head minus committed, `in_flight`). `groups` is a
+  byte-identical back-compat alias.
+- `config`: an echo of the effective bounds (no secret material).
+- `resilience`: `frozen` (the integrity-freeze flag, the inverse of healthy),
+  `last_skip_offset`, `records_skipped`, `bytes_skipped`,
+  `recovery_truncated_bytes`, `counter_checkpoint_repairs`.
+
+The `ironbus admin --health-addr <host:port>` CLI renders segments, consumers,
+lag, and the last-skip-offset from this body alone, never parsing a metric name,
+so the diagnostics survive a metric rename and a dashboard break.
+
+## Tracing and the OTLP export feature gate (#99)
+
+The broker instruments with the `tracing` crate and installs a JSON log layer by
+default at `serve` startup. ERROR and WARN events (the corruption-skip, freeze,
+and drop signals this contract forbids being silent) are always recorded
+regardless of the head-based sampling ratio, which defaults to `0.0` so the
+leanest edge build exports no sampled spans.
+
+OTLP span export is behind the **non-default** `otlp` Cargo feature on
+`ironbus-server` and is off at runtime by default; the default-shipped binary and
+the size-optimized `edge-min` build link **zero** opentelemetry crates. Export
+goes through a bounded, lossy queue that **drops and counts** spans rather than
+blocking the thread-per-core core, so a slow or unreachable collector can never
+stall a produce. The concrete opentelemetry-otlp socket exporter is a tracked
+follow-up; the queue, the drop counter, the sampling decision, and the
+feature-gated compile-out are real and tested today.
 
 ## See also
 

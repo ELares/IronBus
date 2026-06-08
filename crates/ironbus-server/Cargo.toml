@@ -8,10 +8,37 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# The DEFAULT shipped feature set carries ZERO opentelemetry dependencies: the `tracing` crate and
+# the JSON log layer are always compiled, but OTLP span export is behind the non-default `otlp`
+# feature below, so neither the default binary nor the `edge-min` build links opentelemetry (#99).
+default = []
+# OTLP span export (#99): the feature-gated, non-default export seam. Compiling this in enables the
+# bounded-lossy-queue drain into the (separately tracked) opentelemetry-otlp socket exporter. Kept
+# OFF by default and out of `edge-min` so the default/edge-min dependency graph is opentelemetry-free
+# and the binary stays small. The concrete exporter crate wiring is a deliberate follow-up; this
+# feature today gates the dep-free export-seam scaffold.
+otlp = []
+# The size-optimized edge build profile marker (#99, build-dist): a deliberately EMPTY feature that
+# selects the leanest tracing surface. It MUST NOT enable `otlp`, so an `edge-min` build compiles the
+# OTLP export out entirely and the binary shrinks measurably versus an `otlp` build. It is a marker
+# feature (no extra deps); the compile-out is enforced by it never pulling `otlp`.
+edge-min = []
+
 [dependencies]
 ironbus-core = { path = "../ironbus-core", version = "0.0.0" }
 ironbus-proto = { path = "../ironbus-proto", version = "0.0.0" }
 ironbus-storage = { path = "../ironbus-storage", version = "0.0.0" }
+
+# Structured tracing (#16, #99). `tracing` is the instrumentation facade; `tracing-subscriber` (the
+# `fmt` + `json` features only, no `env-filter`/`ansi`, to keep the transitive surface minimal)
+# provides the JSON log layer compiled in BY DEFAULT. Both, and their whole transitive tree
+# (tracing-core/-attributes/-serde, serde/serde_json, sharded-slab, thread_local, once_cell, ...),
+# are permissive (MIT or MIT OR Apache-2.0) and pure Rust, already covered by the deny.toml license
+# allow-list; none is opentelemetry, so the default/edge-min graph stays OTLP-free. All have an MSRV
+# at or below the workspace 1.78 floor.
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "std"] }
 
 [dev-dependencies]
 tempfile = "3"

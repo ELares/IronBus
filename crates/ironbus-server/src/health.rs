@@ -14,15 +14,27 @@
 //! in Prometheus text format, including the `ironbus_fsync_seconds` produce-fsync latency
 //! histogram, and the per-reason recovery-loss series `ironbus_recovery_loss_bytes` (#16).
 //!
-//! `GET /admin` (#99) is an OPT-IN, READ-ONLY introspection endpoint: a structured JSON snapshot
-//! of operational state (broker-level durable head and counters, per-work-group committed offset,
-//! lag, and in-flight depth, the DLQ state, and an echo of the effective config bounds), derived
-//! entirely from the engine's existing read-only accessors. It is OFF by default and enabled only
-//! when the operator passes `serve --enable-admin`; when disabled it is `404`, exactly like an
-//! unknown path. It is UNAUTHENTICATED, sharing `/metrics`'s trust model (loopback or a trusted
-//! network, the #105/#107 threat model), so it must NEVER expose a mutating action or secret
-//! material. Mutating admin actions (consumer reset, DLQ redrive, force-reap) are out of scope and
-//! deferred to a separate mutating-admin surface; this endpoint is strictly GET-only and read-only.
+//! `GET /admin` (#99) is an OPT-IN, READ-ONLY introspection endpoint: a structured JSON snapshot of
+//! operational state with four named sub-resources, `segments` (the durable-log span), `consumers`
+//! (per-work-group committed offset and INCREMENTAL lag; `groups` is a back-compat alias), `config`
+//! (an echo of the effective bounds), and `resilience` (the last-skip-offset, the integrity-freeze
+//! flag, and the skip totals), plus a broker summary and the DLQ state. Every value comes from an
+//! existing read-only engine accessor, so #15 can render segments, consumers, lag, and
+//! last-skip-offset from THIS JSON ALONE without ever parsing a metric name. The schema version is
+//! PINNED in the `Accept` header: a consumer that requires the exact shape sends `Accept:
+//! application/vnd.ironbus.admin.v1+json`; an `Accept` that explicitly names a DIFFERENT IronBus-
+//! admin version is `406 Not Acceptable`, while an absent or wildcard `Accept` (a plain `curl`)
+//! takes the current `v1`.
+//!
+//! It is OFF by default and enabled only when the operator passes `serve --enable-admin`; when
+//! disabled it is `404`, exactly like an unknown path. It shares `/metrics`'s trust model and bind
+//! rule: bound to LOOPBACK by default, and the same WIDEN-REQUIRES-AUTH invariant applies (a
+//! non-loopback bind of the health/admin surface requires the transport security and an auth
+//! identity the #107 bind invariant mandates, the same precondition that gates the data port). On
+//! loopback it is UNAUTHENTICATED like `/metrics`, so it must NEVER expose a mutating action or
+//! secret material. Mutating admin actions (consumer reset, DLQ redrive, force-reap) are out of
+//! scope and deferred to a separate mutating-admin surface (#18/#14); this endpoint is strictly
+//! GET-only and read-only, with NO route that mutates engine state.
 
 use crate::actor::EngineAccess;
 use crate::engine::{Counters, EngineConfigSnapshot, GroupConsumerStat};
@@ -96,36 +108,17 @@ where
     stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
     stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
 
-    // Bound the TOTAL time to read the request line, not only each read: a client dribbling one
-    // byte just inside each per-read window would otherwise hold this connection (and, since
-    // the accept loop is inline, every other probe) for hours.
-    let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
-    let mut buf = vec![0u8; MAX_REQUEST_LINE];
-    let mut len = 0;
-    let newline = loop {
-        if len == buf.len() {
-            return respond(&mut stream, 414, "URI Too Long", "request line too long");
-        }
-        if std::time::Instant::now() >= deadline {
-            return respond(
-                &mut stream,
-                408,
-                "Request Timeout",
-                "request line not received in time",
-            );
-        }
-        let n = stream.read(&mut buf[len..])?;
-        if n == 0 {
-            return Ok(()); // the client closed before sending a request line
-        }
-        len += n;
-        if let Some(pos) = buf[..len].iter().position(|&b| b == b'\n') {
-            break pos;
-        }
+    // Read the request HEAD (request line + headers) under a bounded byte and total-time budget; the
+    // outcome is either a parsed head or an already-sent error response (414/408) or a clean close.
+    let (head, request_line_end) = match read_request_head(&mut stream)? {
+        RequestHead::Parsed { head, line_end } => (head, line_end),
+        // Either an error response was already sent (414/408) or the client closed before a full
+        // request line; in both cases there is nothing more to answer.
+        RequestHead::Responded | RequestHead::Closed => return Ok(()),
     };
 
     // Parse "METHOD PATH VERSION" (a leading CR is trimmed by split_whitespace).
-    let line = String::from_utf8_lossy(&buf[..newline]);
+    let line = head[..request_line_end].trim_end_matches('\r');
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let raw_path = parts.next().unwrap_or("");
@@ -137,6 +130,9 @@ where
             "only GET is supported",
         );
     }
+    // The `Accept` header value (lower-cased, all values joined), for the `/admin` version pin (#99).
+    // Absent on a plain `curl`, which is fine: an absent or wildcard Accept takes the current version.
+    let accept = parse_accept_header(&head[request_line_end..]);
     // Drop any query string.
     let path = raw_path.split('?').next().unwrap_or(raw_path);
 
@@ -193,11 +189,153 @@ where
         // The opt-in read-only introspection endpoint (#99). When disabled it is indistinguishable
         // from an unknown path (a 404), so the surface is invisible unless the operator turned it
         // on. The non-GET case was already rejected with 405 above, so this is GET-only.
-        "/admin" if admin_enabled => match admin_snapshot(engine) {
-            Ok(snapshot) => respond_json(&mut stream, 200, "OK", &admin_body(&snapshot)),
-            Err(_) => respond(&mut stream, 503, "Service Unavailable", "shutting down"),
-        },
+        "/admin" if admin_enabled => {
+            // The schema version is PINNED in the `Accept` header (#99): an absent or wildcard
+            // Accept (a plain `curl`) takes the current `v1`; an Accept that explicitly names a
+            // DIFFERENT IronBus-admin version is `406 Not Acceptable`, so a future `v2` consumer
+            // cannot silently misread a `v1` body. A non-admin media type (e.g. `text/html`) is
+            // tolerated and served `v1`, matching how `/metrics` ignores Accept.
+            match admin_accept_decision(&accept) {
+                AcceptDecision::ServeV1 => match admin_snapshot(engine) {
+                    Ok(snapshot) => respond_json(&mut stream, 200, "OK", &admin_body(&snapshot)),
+                    Err(_) => respond(&mut stream, 503, "Service Unavailable", "shutting down"),
+                },
+                AcceptDecision::UnsupportedVersion => respond_json(
+                    &mut stream,
+                    406,
+                    "Not Acceptable",
+                    "{\"error\":\"unsupported admin schema version\",\
+                     \"supported\":\"application/vnd.ironbus.admin.v1+json\"}",
+                ),
+            }
+        }
         _ => respond(&mut stream, 404, "Not Found", "unknown endpoint"),
+    }
+}
+
+/// The outcome of reading the request head ([`read_request_head`]).
+enum RequestHead {
+    /// The request head was read; `head` is the decoded bytes and `line_end` the byte index of the
+    /// request line's terminating `\n` within it.
+    Parsed { head: String, line_end: usize },
+    /// An error response (414/408) was already sent to the client; the caller should return.
+    Responded,
+    /// The client closed before sending a complete request line; there is nothing to answer.
+    Closed,
+}
+
+/// Reads the request HEAD under a bounded byte budget ([`MAX_REQUEST_LINE`]) and a total-time
+/// deadline ([`REQUEST_TIMEOUT`]). It reads until the REQUEST LINE is complete (its terminating `\n`),
+/// then returns everything buffered so far, INCLUDING whatever header bytes arrived in the same
+/// read(s). It does NOT block for a separate header round-trip: every well-behaved client (curl, the
+/// `ironbus admin` client, an orchestrator probe) sends the full head in one segment, so the `Accept`
+/// header for the `/admin` version negotiation (#99) is present without a second read that a minimal
+/// request-line-only client (which never sends `\r\n\r\n`) would hang waiting on. This keeps the exact
+/// slowloris/split-segment behavior the prior request-line reader had. A request line that overruns
+/// the byte bound gets a `414`, one that misses the deadline a `408`, each sent here; a clean close
+/// before a full request line yields [`RequestHead::Closed`].
+fn read_request_head(stream: &mut TcpStream) -> std::io::Result<RequestHead> {
+    // Bound the TOTAL time to read the request line, not only each read: a client dribbling one byte
+    // just inside each per-read window would otherwise hold this connection (and, since the accept
+    // loop is inline, every other probe) for hours.
+    let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
+    let mut buf = vec![0u8; MAX_REQUEST_LINE];
+    let mut len = 0;
+    let line_end = loop {
+        if len == buf.len() {
+            respond(stream, 414, "URI Too Long", "request line too long")?;
+            return Ok(RequestHead::Responded);
+        }
+        if std::time::Instant::now() >= deadline {
+            respond(
+                stream,
+                408,
+                "Request Timeout",
+                "request line not received in time",
+            )?;
+            return Ok(RequestHead::Responded);
+        }
+        let n = stream.read(&mut buf[len..])?;
+        if n == 0 {
+            return Ok(RequestHead::Closed); // the client closed before a complete request line
+        }
+        len += n;
+        // Break as soon as the request LINE is complete (its terminating newline). Any header bytes
+        // that came along in the same read are already in `buf[..len]` and are parsed by the caller;
+        // we do not issue another blocking read for headers, so a request-line-only client never hangs.
+        if let Some(pos) = buf[..len].iter().position(|&b| b == b'\n') {
+            break pos;
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..len]).into_owned();
+    Ok(RequestHead::Parsed { head, line_end })
+}
+
+/// Extracts and lower-cases the `Accept` header value(s) from the header section (everything after
+/// the request line). Returns the joined value, or an empty string if no `Accept` header was sent.
+/// Header-name matching is ASCII-case-insensitive per RFC 7230; the value is lower-cased so the
+/// `/admin` version match is case-insensitive too.
+fn parse_accept_header(header_section: &str) -> String {
+    let mut accepts: Vec<String> = Vec::new();
+    for raw in header_section.split('\n') {
+        let line = raw.trim_end_matches('\r');
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("accept") {
+                accepts.push(value.trim().to_ascii_lowercase());
+            }
+        }
+    }
+    accepts.join(",")
+}
+
+/// The outcome of negotiating the `/admin` schema version against the `Accept` header (#99).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptDecision {
+    /// Serve the current `v1` body (the Accept was absent, a wildcard, a non-admin type, or
+    /// explicitly named `v1`).
+    ServeV1,
+    /// The Accept explicitly named an IronBus-admin version other than `v1`: `406 Not Acceptable`.
+    UnsupportedVersion,
+}
+
+/// The media type that pins the current `/admin` schema version (#99). A consumer that requires the
+/// exact schema sends `Accept: application/vnd.ironbus.admin.v1+json`; a future incompatible shape
+/// bumps the `v1` and this constant together with [`ADMIN_SCHEMA_VERSION`].
+const ADMIN_MEDIA_TYPE_V1: &str = "application/vnd.ironbus.admin.v1+json";
+
+/// The vendor-prefix that identifies ANY IronBus-admin media type, used to detect an Accept that
+/// names a DIFFERENT admin version (which we must reject rather than silently serve `v1`).
+const ADMIN_MEDIA_TYPE_PREFIX: &str = "application/vnd.ironbus.admin.";
+
+/// Decides whether to serve `v1` or reject as an unsupported version, given the (lower-cased)
+/// `Accept` value. The rule (#99): serve `v1` when the client did not pin a specific admin version
+/// (absent Accept, `*/*`, `application/json`, or an explicit `v1`); reject only when the client
+/// explicitly asked for an IronBus-admin media type whose version is NOT `v1`, so a `v2`-only
+/// consumer never misreads a `v1` body.
+fn admin_accept_decision(accept: &str) -> AcceptDecision {
+    if accept.is_empty() {
+        return AcceptDecision::ServeV1;
+    }
+    // The client named at least one IronBus-admin media type. If ANY of them is exactly the v1 type,
+    // serve v1. If it named admin types but NONE is v1, it pinned a different version: reject.
+    let mut named_admin_type = false;
+    for media in accept.split(',') {
+        // A media-range may carry parameters (`;q=...`); the type is the part before the first `;`.
+        let media = media.split(';').next().unwrap_or(media).trim();
+        if media == ADMIN_MEDIA_TYPE_V1 {
+            return AcceptDecision::ServeV1;
+        }
+        if media.starts_with(ADMIN_MEDIA_TYPE_PREFIX) {
+            named_admin_type = true;
+        }
+    }
+    if named_admin_type {
+        AcceptDecision::UnsupportedVersion
+    } else {
+        // No admin media type was named (e.g. `*/*`, `application/json`, `text/html`): serve v1,
+        // exactly as `/metrics` ignores Accept. The version is still pinnable by a consumer that
+        // wants it via the explicit v1 type above.
+        AcceptDecision::ServeV1
     }
 }
 
@@ -709,18 +847,80 @@ const ADMIN_SCHEMA_VERSION: u32 = 1;
 
 /// Renders the `/admin` JSON snapshot (#99): a structured, read-only view of operational state.
 /// Hand-rendered (no serde dependency, matching the hand-rendered Prometheus text) and strictly a
-/// projection of [`AdminSnapshot`], so it can never mutate engine state. The top-level shape is
-/// `{schema_version, broker, groups[], dlq, config}`. Lag is the durable head minus the group's
-/// committed offset, the same derivation `/metrics` uses.
+/// projection of [`AdminSnapshot`], so it can never mutate engine state.
+///
+/// The top-level shape is `{schema_version, broker, segments, consumers[], groups[], resilience,
+/// dlq, config}`. The four #99 sub-resources are present by name: `segments` (the durable-log span),
+/// `consumers` (the per-work-group committed offset and INCREMENTAL lag; `groups` is kept as a
+/// back-compat alias of the same array so an existing consumer is not broken), `config` (the
+/// effective-bounds echo), and `resilience` (last-skip-offset, the frozen flag, and the skip
+/// totals). Lag is the durable head minus the committed offset, the same derivation `/metrics` uses,
+/// so #15 can render segments, consumers, lag, and last-skip-offset from THIS JSON ALONE without
+/// parsing a single metric name.
 fn admin_body(snapshot: &AdminSnapshot) -> String {
     let mut s = String::new();
     let _ = write!(s, "{{\"schema_version\":{ADMIN_SCHEMA_VERSION},");
     admin_broker_section(&mut s, snapshot);
-    admin_groups_section(&mut s, snapshot);
+    admin_segments_section(&mut s, snapshot);
+    admin_consumers_section(&mut s, snapshot);
+    admin_resilience_section(&mut s, snapshot);
     admin_dlq_section(&mut s, snapshot);
     admin_config_section(&mut s, &snapshot.config);
     s.push('}');
     s
+}
+
+/// Appends the `"segments":{...}` sub-resource (#99): the durable-log SPAN #15 renders, derived from
+/// the broker's read-only accessors. `count` is the live segment count; `earliest_retained_offset`
+/// and `head_offset` (the durable head) bound the retained record range; `durable_record_count` and
+/// `durable_record_bytes` size it. Together these are everything #15 needs to draw the segment span
+/// without parsing any metric name.
+fn admin_segments_section(s: &mut String, snapshot: &AdminSnapshot) {
+    let _ = write!(
+        s,
+        "\"segments\":{{\
+            \"count\":{count},\
+            \"earliest_retained_offset\":{earliest},\
+            \"head_offset\":{head},\
+            \"durable_record_count\":{records},\
+            \"durable_record_bytes\":{bytes}\
+        }},",
+        count = snapshot.segment_count,
+        earliest = snapshot.earliest_retained,
+        head = snapshot.flushed,
+        records = snapshot.durable_record_count,
+        bytes = snapshot.durable_record_bytes,
+    );
+}
+
+/// Appends the `"resilience":{...}` sub-resource (#99): the resilience state #15 surfaces, so a
+/// bounded loss is never silent in the introspection view either. `frozen` is the RocksDB-style
+/// integrity freeze (the inverse of `healthy`); `last_skip_offset` is the highest offset any
+/// skip/loss event reached; `records_skipped`/`bytes_skipped` are the durable recovery-loss totals;
+/// `counter_checkpoint_repairs` is the reconcile-raised-the-lower-bound signal. All are read from the
+/// same accessors `/metrics` exposes, so the two surfaces agree by construction.
+fn admin_resilience_section(s: &mut String, snapshot: &AdminSnapshot) {
+    let counters = &snapshot.counters;
+    let _ = write!(
+        s,
+        "\"resilience\":{{\
+            \"frozen\":{frozen},\
+            \"last_skip_offset\":{last_skip_offset},\
+            \"records_skipped\":{records_skipped},\
+            \"bytes_skipped\":{bytes_skipped},\
+            \"recovery_truncated_bytes\":{recovery_truncated_bytes},\
+            \"counter_checkpoint_repairs\":{repairs}\
+        }},",
+        // `frozen` is the integrity freeze: a writer frozen by a fatal fsync answers `/readyz` 503.
+        // It is the logical inverse of `healthy`, surfaced by name so an operator reads the alarming
+        // state directly rather than inverting a health flag.
+        frozen = !snapshot.healthy,
+        last_skip_offset = counters.last_skip_offset,
+        records_skipped = counters.records_skipped,
+        bytes_skipped = counters.bytes_skipped,
+        recovery_truncated_bytes = snapshot.recovered_truncated_bytes,
+        repairs = counters.counter_checkpoint_repairs,
+    );
 }
 
 /// Appends the broker-level `"broker":{...}` object: durable head, committed cursor, retained span,
@@ -774,16 +974,22 @@ fn admin_broker_section(s: &mut String, snapshot: &AdminSnapshot) {
     );
 }
 
-/// Appends the per-work-group `"groups":[...]` array (the default group `""` included): committed
-/// offset, lag, and in-flight depth per group. Lag is the durable head minus the group's committed.
-fn admin_groups_section(s: &mut String, snapshot: &AdminSnapshot) {
-    s.push_str("\"groups\":[");
+/// Appends the per-work-group consumer view (#99) under BOTH `"consumers":[...]` (the #99 sub-
+/// resource name #15 reads) and `"groups":[...]` (a back-compat alias of the identical array, so an
+/// existing consumer of the prior scaffold keeps working). Each entry, the default group `""`
+/// included, carries the group `name`, its `committed_offset`, the INCREMENTAL `consumer_lag`
+/// (durable head minus the group's committed offset, the same derivation `/metrics` uses), and the
+/// `in_flight` depth. Rendering both names once each keeps the two arrays byte-identical.
+fn admin_consumers_section(s: &mut String, snapshot: &AdminSnapshot) {
+    // Render the entries once into a reusable fragment, then emit it under both keys so `consumers`
+    // and the `groups` alias can never diverge.
+    let mut entries = String::new();
     for (i, stat) in snapshot.groups.iter().enumerate() {
         if i > 0 {
-            s.push(',');
+            entries.push(',');
         }
         let _ = write!(
-            s,
+            entries,
             "{{\"name\":\"{}\",\"committed_offset\":{},\"consumer_lag\":{},\"in_flight\":{}}}",
             escape_json(&stat.group),
             stat.committed,
@@ -791,7 +997,7 @@ fn admin_groups_section(s: &mut String, snapshot: &AdminSnapshot) {
             stat.in_flight,
         );
     }
-    s.push_str("],");
+    let _ = write!(s, "\"consumers\":[{entries}],\"groups\":[{entries}],");
 }
 
 /// Appends the `"dlq":{...}` object: the durable dead-letter depth and the last dead-lettered
@@ -2077,6 +2283,112 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// The COMPLETE frozen `(metric name -> type)` contract for `/metrics` (#22, #99). Every metric
+    /// the endpoint declares, counters AND gauges AND histograms, with its exact Prometheus type. The
+    /// golden test below asserts the rendered `# TYPE` set equals this map EXACTLY, so ANY metric
+    /// rename, type change, or unit change (a unit lives in the name suffix `_seconds`/`_bytes`/
+    /// `_total`/`_offset`, so a unit change is a name change) fails CI until this map and
+    /// docs/METRICS.md are bumped deliberately. This is the #99 "golden test fails on any metric
+    /// name/type/unit change without a contract bump" criterion, widened past the `_total`-only
+    /// taxonomy test to the whole surface.
+    const FROZEN_METRIC_TYPES: &[(&str, &str)] = &[
+        // Operational counters (the `_total` family; a superset check against the taxonomy test).
+        ("ironbus_produced_total", "counter"),
+        ("ironbus_produced_bytes_total", "counter"),
+        ("ironbus_produce_rejected_total", "counter"),
+        ("ironbus_delivered_total", "counter"),
+        ("ironbus_redelivered_total", "counter"),
+        ("ironbus_dead_lettered_total", "counter"),
+        ("ironbus_dlq_records_total", "counter"),
+        ("ironbus_acks_total", "counter"),
+        ("ironbus_segments_reaped_total", "counter"),
+        ("ironbus_segments_force_reaped_total", "counter"),
+        ("ironbus_truncations_total", "counter"),
+        ("ironbus_truncated_records_total", "counter"),
+        ("ironbus_counter_checkpoint_repair_total", "counter"),
+        ("ironbus_consumer_labels_dropped_total", "counter"),
+        // Broker gauges.
+        ("ironbus_committed_offset", "gauge"),
+        ("ironbus_flushed_offset", "gauge"),
+        ("ironbus_consumer_lag", "gauge"),
+        ("ironbus_in_flight", "gauge"),
+        ("ironbus_writer_healthy", "gauge"),
+        ("ironbus_last_dead_lettered_offset", "gauge"),
+        ("ironbus_recovery_truncated_bytes", "gauge"),
+        ("ironbus_quarantine_bytes", "gauge"),
+        ("ironbus_consumer_overflow_saturated", "gauge"),
+        // Per-group consumer gauges.
+        ("ironbus_group_committed_offset", "gauge"),
+        ("ironbus_group_consumer_lag", "gauge"),
+        ("ironbus_group_in_flight", "gauge"),
+        // Recovery-loss gauges.
+        ("ironbus_recovery_loss_bytes", "gauge"),
+        ("ironbus_recovery_loss_records", "gauge"),
+        ("ironbus_recovery_data_loss_bytes", "gauge"),
+        // Reconciled skip/loss gauges (the resilience watermarks; NOT `_total`).
+        ("ironbus_records_skipped", "gauge"),
+        ("ironbus_bytes_skipped", "gauge"),
+        ("ironbus_last_skip_offset", "gauge"),
+        // The registry (#97) series.
+        ("ironbus_consumer_lag_records", "gauge"),
+        ("ironbus_build_info", "gauge"),
+        ("ironbus_start_time_seconds", "gauge"),
+        ("ironbus_uptime_seconds", "gauge"),
+        // Histograms (the fixed-bucket latency families).
+        ("ironbus_fsync_seconds", "histogram"),
+        ("ironbus_fsync_duration_seconds", "histogram"),
+        ("ironbus_append_duration_seconds", "histogram"),
+    ];
+
+    #[test]
+    fn the_metric_name_and_type_contract_is_frozen() {
+        // Render /metrics and extract the COMPLETE `(name, type)` set from its `# TYPE` lines, then
+        // assert it equals FROZEN_METRIC_TYPES exactly. A metric added, removed, renamed, or
+        // type-changed without updating the frozen map (and docs/METRICS.md) fails here, so the
+        // metric/label stability contract (#22) cannot silently drift and a dashboard or the #15 CLI
+        // can never be broken by an unannounced rename (#99).
+        let (addr, shutdown, handle, _engine) = start();
+        let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(m.starts_with("HTTP/1.1 200 OK"), "{m}");
+
+        // Collect every `# TYPE ironbus_<name> <type>` declaration as a (name, type) pair.
+        let mut rendered: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        for line in m.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("# TYPE ") {
+                let mut it = rest.split_whitespace();
+                if let (Some(name), Some(ty)) = (it.next(), it.next()) {
+                    if name.starts_with("ironbus_") {
+                        rendered.insert((name.to_string(), ty.to_string()));
+                    }
+                }
+            }
+        }
+        let expected: std::collections::BTreeSet<(String, String)> = FROZEN_METRIC_TYPES
+            .iter()
+            .map(|(n, t)| ((*n).to_string(), (*t).to_string()))
+            .collect();
+        assert_eq!(
+            rendered, expected,
+            "the rendered metric (name, type) set drifted from the frozen contract; update \
+             FROZEN_METRIC_TYPES and docs/METRICS.md deliberately (a metric/label rename is a #22 \
+             contract change). rendered={rendered:?} expected={expected:?}"
+        );
+
+        // The frozen map has no duplicate names (a copy-paste guard on the contract itself).
+        let names: std::collections::BTreeSet<&str> =
+            FROZEN_METRIC_TYPES.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names.len(),
+            FROZEN_METRIC_TYPES.len(),
+            "FROZEN_METRIC_TYPES has a duplicate metric name"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
     #[test]
     fn group_label_escapes_special_chars() {
         // A group name may contain a quote or backslash (both graphic ASCII); the label
@@ -2436,5 +2748,341 @@ mod tests {
         assert_eq!(escape_json("a\"b"), "a\\\"b");
         assert_eq!(escape_json("a\\b"), "a\\\\b");
         assert_eq!(escape_json("a\tb"), "a\\tb");
+    }
+
+    #[test]
+    fn admin_v1_carries_the_four_named_sub_resources() {
+        // The #99 contract: `/admin` v1 exposes the four sub-resources BY NAME (segments, consumers,
+        // config, resilience), so #15 can render each from the JSON alone without parsing a metric
+        // name. This is the test that fails if a sub-resource is dropped from the body.
+        let (addr, shutdown, handle, engine) = start_with_admin();
+        {
+            let mut g = engine.lock().unwrap();
+            for payload in [&b"a"[..], &b"b"[..], &b"c"[..]] {
+                g.produce(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                })
+                .unwrap();
+            }
+            match g.poll_in("orders", 0).unwrap() {
+                Poll::Message(d) => assert_eq!(g.ack_in("orders", &d.token), AckResult::Acked),
+                other => panic!("expected a message, got {other:?}"),
+            }
+        }
+
+        let r = request(addr, "GET /admin HTTP/1.1\r\n\r\n");
+        let (status, body) = split_body(&r);
+        assert!(status.starts_with("HTTP/1.1 200 OK"), "{r}");
+
+        // Each of the four sub-resources is present by name.
+        for key in [
+            "\"segments\":{",
+            "\"consumers\":[",
+            "\"config\":{",
+            "\"resilience\":{",
+        ] {
+            assert!(body.contains(key), "missing sub-resource {key}: {body}");
+        }
+        // `groups` is kept as a back-compat alias of `consumers`.
+        assert!(
+            body.contains("\"groups\":["),
+            "groups alias present: {body}"
+        );
+
+        // segments: one segment, head 3, earliest retained 0, 3 records.
+        assert!(body.contains("\"segments\":{\"count\":1,"), "{body}");
+        assert!(body.contains("\"head_offset\":3"), "{body}");
+        assert!(body.contains("\"earliest_retained_offset\":0"), "{body}");
+        assert!(body.contains("\"durable_record_count\":3"), "{body}");
+
+        // consumers: the orders group committed 1, incremental lag 2, in-flight 0.
+        assert!(
+            body.contains(
+                "{\"name\":\"orders\",\"committed_offset\":1,\"consumer_lag\":2,\"in_flight\":0}"
+            ),
+            "orders consumer with incremental lag: {body}"
+        );
+
+        // resilience: a clean broker is not frozen, with zero skip totals and the -? sentinel-free
+        // last-skip-offset at 0.
+        assert!(body.contains("\"resilience\":{\"frozen\":false,"), "{body}");
+        assert!(body.contains("\"last_skip_offset\":0"), "{body}");
+        assert!(body.contains("\"records_skipped\":0"), "{body}");
+        assert!(body.contains("\"bytes_skipped\":0"), "{body}");
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn admin_consumers_and_groups_arrays_are_identical() {
+        // The `consumers` sub-resource and the `groups` back-compat alias render from the same data,
+        // so the two arrays must be byte-identical; a future divergence (two render paths) fails here.
+        let (addr, shutdown, handle, engine) = start_with_admin();
+        {
+            let mut g = engine.lock().unwrap();
+            g.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"x",
+            })
+            .unwrap();
+            assert!(matches!(g.poll_in("billing", 0).unwrap(), Poll::Message(_)));
+        }
+        let r = request(addr, "GET /admin HTTP/1.1\r\n\r\n");
+        let (_status, body) = split_body(&r);
+
+        let extract = |key: &str| -> String {
+            let start = body.find(key).expect("array key present") + key.len();
+            let rest = &body[start..];
+            let end = rest.find(']').expect("array closes");
+            rest[..end].to_string()
+        };
+        assert_eq!(
+            extract("\"consumers\":["),
+            extract("\"groups\":["),
+            "consumers and groups arrays must be identical: {body}"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn admin_resilience_reports_frozen_after_an_integrity_freeze() {
+        // The resilience sub-resource surfaces the integrity freeze (#16: never silent). Drive a real
+        // writer freeze (an armed fatal fsync on the fault filesystem) and assert `/admin` reports
+        // `frozen:true`, matching the `/readyz` 503 a frozen writer answers.
+        use ironbus_core::clock::ManualClock;
+        use ironbus_storage::fault::FaultFs;
+        use ironbus_storage::segment::StorageError;
+
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let mut engine = Engine::open(
+            fs,
+            ManualClock::new(),
+            EngineConfig {
+                log: LogConfig::default(),
+                lease: LeaseConfig::default(),
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight: 16,
+                consumer_credit: 64,
+                consumer_credit_bytes: 0,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                disk_full_policy: DiskFullPolicy::DropNew,
+            },
+        )
+        .unwrap();
+        let msg = |payload: &'static [u8]| Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload,
+        };
+        // A clean first produce, then arm a fatal fsync so the next produce freezes the writer.
+        engine.produce(&msg(b"a")).unwrap();
+        assert!(engine.is_healthy());
+        control.set_fail_sync(true);
+        let err = engine.produce(&msg(b"b")).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::engine::EngineError::Storage(StorageError::WriterFrozen)
+        ));
+        assert!(!engine.is_healthy(), "the writer is frozen");
+
+        let shared: SharedEngine<FaultFs<InMemoryFs>, ManualClock> = Arc::new(Mutex::new(engine));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            let shared = Arc::clone(&shared);
+            move || serve_health(&listener, &shared, &shutdown, true).unwrap()
+        });
+
+        let r = request(addr, "GET /admin HTTP/1.1\r\n\r\n");
+        let (status, body) = split_body(&r);
+        assert!(status.starts_with("HTTP/1.1 200 OK"), "{r}");
+        assert!(
+            body.contains("\"resilience\":{\"frozen\":true,"),
+            "frozen surfaced: {body}"
+        );
+        assert!(
+            body.contains("\"healthy\":false"),
+            "broker reports unhealthy: {body}"
+        );
+        // And `/readyz` agrees: a frozen writer is 503.
+        let ready = request(addr, "GET /readyz HTTP/1.1\r\n\r\n");
+        assert!(
+            ready.starts_with("HTTP/1.1 503"),
+            "frozen writer is not ready: {ready}"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn admin_serves_v1_for_the_pinned_accept_header() {
+        // The schema version is pinned in the Accept header (#99): a consumer that sends the exact
+        // v1 media type gets the v1 body (200).
+        let (addr, shutdown, handle, _engine) = start_with_admin();
+        let r = request(
+            addr,
+            "GET /admin HTTP/1.1\r\nAccept: application/vnd.ironbus.admin.v1+json\r\n\r\n",
+        );
+        let (status, body) = split_body(&r);
+        assert!(status.starts_with("HTTP/1.1 200 OK"), "{r}");
+        assert!(body.contains("\"schema_version\":1"), "{body}");
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn admin_serves_v1_for_an_absent_or_wildcard_accept() {
+        // A plain `curl` (no Accept, or `*/*`, or `application/json`) takes the current v1, exactly as
+        // `/metrics` ignores Accept, so the endpoint stays curl-friendly while still being pinnable.
+        let (addr, shutdown, handle, _engine) = start_with_admin();
+        for accept_line in [
+            "",                             // no Accept header at all
+            "Accept: */*\r\n",              // the curl default
+            "Accept: application/json\r\n", // a generic JSON request
+        ] {
+            let r = request(addr, &format!("GET /admin HTTP/1.1\r\n{accept_line}\r\n"));
+            let (status, body) = split_body(&r);
+            assert!(
+                status.starts_with("HTTP/1.1 200 OK"),
+                "accept `{accept_line}` should serve v1: {r}"
+            );
+            assert!(body.contains("\"schema_version\":1"), "{body}");
+        }
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn admin_rejects_an_explicit_non_v1_admin_accept_with_406() {
+        // An Accept that explicitly names a DIFFERENT IronBus-admin version is 406 Not Acceptable, so
+        // a future v2-only consumer can never silently misread a v1 body. This is the version-pin
+        // teeth: it fails if the negotiation is dropped (every Accept would 200).
+        let (addr, shutdown, handle, _engine) = start_with_admin();
+        for bad in [
+            "application/vnd.ironbus.admin.v2+json",
+            "application/vnd.ironbus.admin.v99+json",
+        ] {
+            let r = request(
+                addr,
+                &format!("GET /admin HTTP/1.1\r\nAccept: {bad}\r\n\r\n"),
+            );
+            let (status, body) = split_body(&r);
+            assert!(
+                status.starts_with("HTTP/1.1 406 Not Acceptable"),
+                "accept `{bad}` should be 406: {r}"
+            );
+            assert!(
+                body.contains("application/vnd.ironbus.admin.v1+json"),
+                "the 406 names the supported version: {body}"
+            );
+        }
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn admin_serves_v1_when_a_non_v1_admin_type_is_offered_alongside_v1() {
+        // A consumer may offer several media types; if ANY is the v1 type, it is served (the client
+        // accepts v1), even if it also lists a future version. Content negotiation picks the
+        // supported representation rather than rejecting.
+        let (addr, shutdown, handle, _engine) = start_with_admin();
+        let r = request(
+            addr,
+            "GET /admin HTTP/1.1\r\nAccept: application/vnd.ironbus.admin.v2+json, \
+             application/vnd.ironbus.admin.v1+json\r\n\r\n",
+        );
+        let (status, _body) = split_body(&r);
+        assert!(status.starts_with("HTTP/1.1 200 OK"), "{r}");
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn admin_has_no_mutating_route_every_non_get_is_405() {
+        // STRICTLY READ-ONLY (#99): there is NO route that mutates state. Every mutating method on
+        // `/admin` (and on the would-be action paths a mutating surface might add) is 405, since the
+        // method gate precedes the path match, so no verb can carry a mutation through this endpoint.
+        let (addr, shutdown, handle, _engine) = start_with_admin();
+        let paths = ["/admin", "/admin/reset", "/admin/redrive", "/admin/dlq"];
+        for path in paths {
+            for verb in ["POST", "PUT", "DELETE", "PATCH"] {
+                let r = request(addr, &format!("{verb} {path} HTTP/1.1\r\n\r\n"));
+                assert!(
+                    r.starts_with("HTTP/1.1 405 Method Not Allowed"),
+                    "{verb} {path} must be 405 (no mutation): {r}"
+                );
+            }
+        }
+        // And a GET to a non-existent admin SUB-path is a 404 (only the read-only `/admin` exists),
+        // so there is no hidden mutating sub-route reachable even by GET.
+        let r = request(addr, "GET /admin/reset HTTP/1.1\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 404 Not Found"), "{r}");
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn admin_accept_decision_classifies_each_case() {
+        // The negotiation logic, unit-tested directly (lower-cased input, as the parser produces).
+        assert_eq!(admin_accept_decision(""), AcceptDecision::ServeV1);
+        assert_eq!(admin_accept_decision("*/*"), AcceptDecision::ServeV1);
+        assert_eq!(
+            admin_accept_decision("application/json"),
+            AcceptDecision::ServeV1
+        );
+        assert_eq!(
+            admin_accept_decision("application/vnd.ironbus.admin.v1+json"),
+            AcceptDecision::ServeV1
+        );
+        assert_eq!(
+            admin_accept_decision("application/vnd.ironbus.admin.v1+json;q=0.9"),
+            AcceptDecision::ServeV1
+        );
+        assert_eq!(
+            admin_accept_decision("application/vnd.ironbus.admin.v2+json"),
+            AcceptDecision::UnsupportedVersion
+        );
+        // v2 offered alongside v1 -> serve v1 (the client accepts v1).
+        assert_eq!(
+            admin_accept_decision(
+                "application/vnd.ironbus.admin.v2+json,application/vnd.ironbus.admin.v1+json"
+            ),
+            AcceptDecision::ServeV1
+        );
+    }
+
+    #[test]
+    fn parse_accept_header_extracts_the_value_case_insensitively() {
+        // The header-name match is case-insensitive and the value is lower-cased, so a mixed-case
+        // `AcCePt` with a mixed-case value still drives the version match.
+        assert_eq!(
+            parse_accept_header("\r\nAcCePt: Application/JSON\r\n"),
+            "application/json"
+        );
+        assert_eq!(parse_accept_header("\r\nHost: x\r\n"), "");
+        assert_eq!(
+            parse_accept_header("\r\nAccept: a/b\r\nAccept: c/d\r\n"),
+            "a/b,c/d"
+        );
     }
 }
