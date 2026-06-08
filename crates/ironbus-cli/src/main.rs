@@ -39,6 +39,12 @@ mod bench_run;
 #[cfg(unix)]
 mod upgrade;
 
+/// The read-only `/admin` introspection client (#15, #99): fetch the broker's `/admin` v1 JSON over
+/// HTTP and render the segments / consumers+lag / last-skip-offset views FROM THAT JSON ALONE. Plain
+/// HTTP over a TcpStream, so it is cross-platform (no Unix gate); it consumes a remote broker's
+/// health server, it does not open the on-disk store.
+mod admin;
+
 use ironbus_client::{Client, ClientError};
 use ironbus_core::clock::Clock;
 use ironbus_proto::message::PubBody;
@@ -225,6 +231,7 @@ USAGE:
     ironbus sub   [--addr <host:port>] [--group <name>] [--max <n>]
                   [--ack | --nack [--delay-ms <n>] | --term]
     ironbus cumulative-ack [--addr <host:port>] [--group <name>] --up-to <offset>
+    ironbus admin --health-addr <host:port>
     ironbus peek  --data-dir <dir> [--from-offset <n>] [--limit <n>] [--json]
     ironbus dump  --data-dir <dir> [--limit <n>] [--json] [--dlq]
     ironbus bench (--duration <secs> | --count <n>) [--mode <publish|subscribe|round-trip>]
@@ -292,6 +299,11 @@ Notes:
     DLQ state, and the effective config bounds, for debugging. It is READ-ONLY (GET only, no path
     mutates state) and UNAUTHENTICATED, sharing /metrics's trust model, so run it only on loopback or
     a trusted network. Off, /admin is a 404 like any unknown path.
+    admin --health-addr <host:port> fetches that read-only /admin v1 JSON from a RUNNING broker and
+    prints the segments span, per-consumer committed offset and lag, and the resilience
+    last-skip-offset, all from the /admin document alone (it never parses a metric name). It sends
+    the version-pinning Accept header, so a schema mismatch is a clear error, not a misrender. The
+    broker must have been started with --enable-admin; otherwise /admin is a 404 and admin says so.
     pub reads the payload from the argument, or from stdin if omitted (an empty input
     publishes an empty message, which is a valid record).
     sub prints one line per message; at most one disposition applies to the batch:
@@ -427,6 +439,7 @@ fn run(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         "sub" => run_sub(rest, out),
         "cumulative-ack" => run_cumulative_ack(rest, out),
         "serve" => run_serve(rest, out),
+        "admin" => run_admin(rest, out),
         "peek" => run_peek(rest, out),
         "dump" => run_dump(rest, out),
         "bench" => run_bench(rest, out),
@@ -1400,6 +1413,14 @@ fn cmd_serve(
     health_addr: Option<&str>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
+    // Install the structured-tracing subscriber with the JSON log layer (#16, #99) before any broker
+    // work, so startup events are structured too. OTLP span export stays OFF by runtime default and,
+    // on this default build, is COMPILED OUT entirely (the `otlp` feature is off), so the only
+    // steady-state cost is the JSON log formatting. The returned bounded span queue is the
+    // drop-and-count export buffer; with export off it simply stays empty.
+    let _span_queue =
+        ironbus_server::obs::init_tracing(ironbus_server::obs::TracingConfig::default());
+
     // Data-dir lifecycle then the single-broker lock (#89), BEFORE the engine opens. `prepare`
     // creates the dir (0700) if absent, rejects a non-directory path, and proves it writable; the
     // lock makes a SECOND `serve` on the same data dir fail fast rather than corrupt the log with
@@ -1674,6 +1695,56 @@ fn open_disk_engine(
 
 /// The default number of records `peek` shows when `--limit` is not given.
 const DEFAULT_PEEK_LIMIT: u64 = 10;
+
+/// Parses and runs `admin`: fetch a RUNNING broker's read-only `/admin` v1 JSON over HTTP and render
+/// the segments, consumers (with incremental lag), and last-skip-offset views FROM THAT JSON ALONE
+/// (#15, #99). This is the consumer that demonstrates the `/admin` contract is self-sufficient: the
+/// human diagnostics never parse a metric name. `--health-addr <host:port>` is required (the health
+/// server is off by default, so there is no implicit default to dial); the endpoint must have been
+/// started with `--enable-admin`.
+///
+/// # Errors
+/// [`CliError::Usage`] for a missing/extra flag; [`CliError::Unreachable`] if the health server
+/// cannot be reached; [`CliError::Internal`] if the response is not a usable admin v1 body (e.g.
+/// `/admin` is not enabled, or the broker serves a different schema version).
+fn run_admin(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let mut health_addr: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--health-addr" | "--addr" => {
+                health_addr = Some(take_value("--health-addr", args, &mut i)?);
+            }
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!("unknown flag `{flag}` for admin")));
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "admin takes no positional arguments, got `{other}`"
+                )));
+            }
+        }
+    }
+    let health_addr = health_addr.ok_or_else(|| {
+        CliError::Usage(
+            "admin needs --health-addr <host:port> (the broker's --health-addr, with --enable-admin)"
+                .to_string(),
+        )
+    })?;
+    cmd_admin(&health_addr, out)
+}
+
+/// Fetches and renders the `/admin` v1 view (#15, #99). Kept apart from [`run_admin`] (the flag
+/// parser) so the fetch-parse-render pipeline is callable directly.
+fn cmd_admin(health_addr: &str, out: &mut impl Write) -> Result<(), CliError> {
+    let body = admin::fetch_admin(health_addr).map_err(|e| match e {
+        admin::AdminError::Unreachable(m) => CliError::Unreachable(m),
+        admin::AdminError::Protocol(m) => CliError::Internal(m),
+    })?;
+    let view = admin::parse_admin_v1(&body).map_err(|e| CliError::Internal(e.to_string()))?;
+    write!(out, "{}", admin::render_admin_view(&view))?;
+    Ok(())
+}
 
 /// Parses and runs `peek`: show a bounded window of durable records from a data directory, with
 /// no server running.

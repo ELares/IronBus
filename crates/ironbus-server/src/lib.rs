@@ -6,6 +6,7 @@ pub mod clock;
 pub mod engine;
 pub mod health;
 pub mod metrics;
+pub mod obs;
 pub mod registry;
 pub mod server;
 pub mod session;
