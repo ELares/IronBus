@@ -15,11 +15,13 @@ USAGE.md tells you how to use the binary, this file is the complete table of wha
 flag and code does.
 
 > Scope: this map covers the command surface that the binary SHIPS today. The frozen
-> design in issue #136 specifies a larger verb tree (`tap`, `wire`, `bench`, `info`,
-> `consumer`, `segments`, `scrub`, `repair`, `dlq`, `retention`, `top`, `config`,
-> `recovery report`, `completions`) and a versioned `--json` schema contract;
-> those are NOT implemented in the current binary and are deliberately absent here. This
-> reference enumerates only what `main.rs` actually parses and runs.
+> design in issue #136 specifies a larger verb tree (`tap`, `wire`, `info`, `consumer`,
+> `segments`, `dlq`, `retention`, `top`, `config`, `recovery report`, `completions`) and a
+> versioned `--json` schema contract; those verbs are NOT implemented in the current binary
+> and are deliberately absent here. The `scrub` and `repair` verbs (#92) and their
+> versioned `--json` schemas (`ironbus.cli.scrub.v1` / `ironbus.cli.repair.v1`) ARE
+> implemented and documented below. This reference enumerates only what `main.rs` actually
+> parses and runs.
 
 ## Command summary
 
@@ -31,13 +33,16 @@ flag and code does.
 | `cumulative-ack` | online (connects) | any | Commit a BROADCAST group's cursor up to (exclusive) `--up-to` in one move (ack-all-up-to-offset, #288). |
 | `peek` | offline (reads `--data-dir`) | Unix only in v1 | Show a bounded window of durable records from a stopped broker's data directory. |
 | `dump` | offline (reads `--data-dir`) | Unix only in v1 | Stream every durable record (or, with `--dlq`, the dead-letter sink). |
+| `scrub` | offline (reads `--data-dir`) | Unix only in v1 | Strictly read-only full integrity scan: report every corruption / torn-tail / checksum issue (the plan). Never writes. |
+| `repair` | offline (reads `--data-dir`) | Unix only in v1 | Default the same read-only plan as `scrub`; `--apply` quarantines and truncates under the exclusive lock (recovery made explicit). |
 | `help` / `--help` / `-h` | neither | any | Print the usage banner. |
 | `version` / `--version` / `-V` | neither | any | Print a single `ironbus <version>` line. |
 
 A subcommand is required; an unknown subcommand or a missing one is a usage error
-(exit 1). `serve`, `peek`, and `dump` are Unix only in v1 because the on-disk storage
-uses positioned IO the Windows path does not yet implement; on a non-Unix host they fail
-with exit 70. `pub` and `sub` are thin wrappers over `ironbus-client` and run anywhere.
+(exit 1). `serve`, `peek`, `dump`, `scrub`, and `repair` are Unix only in v1 because the
+on-disk storage uses positioned IO the Windows path does not yet implement; on a non-Unix
+host they fail with exit 70. `pub` and `sub` are thin wrappers over `ironbus-client` and run
+anywhere.
 
 ## Online versus offline
 
@@ -45,11 +50,14 @@ with exit 70. `pub` and `sub` are thin wrappers over `ironbus-client` and run an
   `--addr` (default `127.0.0.1:7777`, loopback only). `pub` and `sub` connect to a
   running broker; `serve` IS the broker. If the broker cannot be reached, an online verb
   exits 5 (unreachable).
-- **Offline** verbs (`peek`, `dump`) decode the on-disk data directory directly with NO
-  server running, via the storage crate's `OfflineReader`. They read only up to the
-  durable high-water mark and stop at the first torn or bad-CRC record (the same boundary
-  recovery uses), marking, never hiding, any tail they skipped. They never mutate the
-  directory. There is no online fallback for `peek`/`dump`: they are pure offline readers.
+- **Offline** verbs (`peek`, `dump`, `scrub`, `repair`) decode the on-disk data directory
+  directly with NO server running, via the storage crate's `OfflineReader` (and, for
+  `repair --apply`, `Log::open`). They read only up to the durable high-water mark and stop
+  at the first torn or bad-CRC record (the same boundary recovery uses), marking, never
+  hiding, any tail they skipped. `peek`/`dump`/`scrub` never mutate the directory; only
+  `repair --apply` writes, and only under the exclusive data-dir lock. There is no online
+  fallback for the offline verbs: they are pure offline readers (or, for `repair --apply`,
+  an offline recovery).
 
 ## `serve` (online; Unix only in v1)
 
@@ -333,9 +341,120 @@ read-only. `--data-dir` is REQUIRED. Takes no positional arguments.
 | `--limit <n>` | u64 | none (all records) | records | The maximum number of records to show. Omitted, every record is streamed. |
 | `--json` | flag (no value) | off (human text) | n/a | Emit NDJSON instead of the human line. |
 | `--dlq` | flag (no value) | off | n/a | Stream the dead-letter sink (`dlq/`) instead of the main log. An absent or empty `dlq/` shows nothing. |
+| `--raw` | flag (no value) | off | n/a | Show the on-disk frame rather than the decoded logical message. GATED on on-disk compression (#12): the codec is always `none` today, so it renders the same field set as the decoded form. Accepted now to pin the frozen surface. Rejected with `--dlq`. |
+| `--require-dict` | flag (no value) | off | n/a | Fail strictly (exit 3) on a record whose compression dictionary is missing, instead of degrading to `decoded:false`. GATED on #12: no record carries a dictionary today, so it never trips. Rejected with `--dlq`. |
 
 Note: `dump` has NO `--from-offset`; it always starts at offset 0. Only `peek` accepts
 `--from-offset`/`--offset`.
+
+`--raw` and `--require-dict` are the committed surface for the missing-dictionary degrade /
+strict path the #136 design specifies; that behavior is only MEANINGFUL once on-disk
+compression (#12) lands (the codec is always `none` today). They are accepted now so a
+script written against the frozen surface keeps working, but they are inert until #12: the
+output is unchanged and `--require-dict` never trips. This is documented as a residual gated
+on #12, not faked compression.
+
+## `scrub` (offline; Unix only in v1)
+
+Strictly READ-ONLY full integrity scan of the data directory with no server running, sharing
+the recovery decode path (the storage crate's `OfflineReader`). It reports every corruption,
+torn-tail, or checksum issue it finds (the plan), marking, never hiding, what recovery would
+quarantine, and NEVER writes. `--data-dir` is REQUIRED. Takes no positional arguments.
+
+| Flag | Value type | Default | Unit | Meaning |
+|------|-----------|---------|------|---------|
+| `--data-dir <dir>` | path | required | path | The data directory to scan. |
+| `--json` | flag (no value) | off (human text) | n/a | Emit the versioned `ironbus.cli.scrub.v1` result object instead of the human report. |
+
+Exit codes (the exit-code-3 gate, see [`CLI_CONTRACT.md`](CLI_CONTRACT.md)):
+
+- `0`: the directory is clean, OR its only skip is an expected torn-tail brownout truncation
+  (a reported skip that is NOT data loss, per `ReasonCode::is_data_loss`).
+- `3`: the scan FINISHED and found one or more real data-loss spans (a corruption skip,
+  reason other than `torn_tail`). The plan is on stdout; the code is the degraded finding.
+- `2`: the data directory does not exist.
+- `4`: the directory is structurally corrupt and could not be read (a broken segment chain or
+  an undecodable header). This is the BLOCKED case, distinct from `3` (FINISHED-and-reported).
+
+### `scrub` output shapes
+
+Human form, a clean directory:
+
+```
+scrub: <dir> is clean (<n> segment(s) scanned, no corruption or torn tail)
+```
+
+Human form, a damaged directory (one indented line per skip span):
+
+```
+scrub: <n> segment(s) scanned, <k> skip span(s): <d> byte(s) of data loss, <t> torn-tail byte(s) (not data loss)
+  segment <id> bytes [<start>, <end>) reason=<reason> data-loss
+  segment <id> bytes [<start>, <end>) reason=torn_tail torn-tail (no data loss)
+```
+
+`--json` form (the single versioned result object, `ironbus.cli.scrub.v1`):
+
+```json
+{"schema":"ironbus.cli.scrub.v1","data_dir":"<dir>","segments":<n>,"skipped_spans":<k>,"data_loss_spans":<d>,"data_loss_bytes":<db>,"torn_tail_bytes":<tb>,"events":[{"segment":<id>,"start":<s>,"end":<e>,"reason":"<reason>","data_loss":<bool>}],"ok":<bool>,"exit_code":<code>}
+```
+
+The result object is emitted on EVERY exit path (a clean `exit_code:0` AND the `exit_code:3`
+data-loss path), carrying `ok` (true only on a clean run) and the `exit_code` it returns. The
+`events[]` field names (`segment`/`start`/`end`/`reason`) match the `ironbus.loss-report.v1`
+events, so the CLI plan and the broker's recovery loss report agree on every span.
+
+## `repair` (offline; Unix only in v1)
+
+Defaults to the SAME read-only plan as `scrub` (print what it WOULD do, change nothing).
+`--apply` performs the repair, which is recovery made explicit and offline. `--data-dir` is
+REQUIRED. Takes no positional arguments.
+
+| Flag | Value type | Default | Unit | Meaning |
+|------|-----------|---------|------|---------|
+| `--data-dir <dir>` | path | required | path | The data directory to repair. |
+| `--apply` | flag (no value) | off (read-only plan) | n/a | Perform the repair: take the exclusive lock, quarantine the corrupt span(s), truncate to the longest valid prefix. Omitted, nothing is written. |
+| `--json` | flag (no value) | off (human text) | n/a | Emit the versioned `ironbus.cli.repair.v1` result object instead of the human report. |
+
+Without `--apply`, `repair` is `scrub` re-labeled: it opens the directory read-only, computes
+the same plan, prints what `--apply` WOULD do, and changes nothing.
+
+With `--apply`, `repair`:
+
+1. Takes the EXCLUSIVE data-dir lock (`flock(LOCK_EX|LOCK_NB)` on the `LOCK` file, the same
+   lock `serve` holds) FIRST. If a broker holds it, `repair --apply` FAILS FAST with exit `5`
+   and changes nothing, so it can never race a live writer and corrupt the data.
+2. Runs recovery (`Log::open`): it QUARANTINES (copies to `quarantine/`, never deletes) any
+   corrupt span BEFORE truncating it, truncates the active segment to the longest valid
+   prefix, and uses the atomic write-then-fsync-then-rename + directory-fsync discipline for
+   any file it rewrites. It NEVER edits a sealed segment in place and NEVER makes the data
+   less recoverable than recovery already would (it IS recovery). The data directory's
+   uid/gid/mode are preserved because recovery only truncates existing files in place; it
+   never recreates the directory.
+
+Exit codes match `scrub` (`0` clean / torn-tail-only, `3` handled data loss, `2` not found,
+`4` structurally corrupt/blocked), plus: `--apply` against a broker that holds the lock is
+exit `5`, and an IO fault during apply is exit `70`.
+
+### `repair` output shapes
+
+Human form mirrors `scrub`, with a trailing line stating whether `--apply` acted:
+
+```
+  read-only plan: --apply would quarantine the corrupt span(s) to quarantine/ and truncate to the longest valid prefix (nothing changed)
+```
+
+or, with `--apply`:
+
+```
+  applied: quarantined the corrupt span(s) to quarantine/ and truncated to the longest valid prefix
+```
+
+`--json` form (the single versioned result object, `ironbus.cli.repair.v1`) is the `scrub`
+object plus an `applied` boolean:
+
+```json
+{"schema":"ironbus.cli.repair.v1","data_dir":"<dir>","segments":<n>,"skipped_spans":<k>,"data_loss_spans":<d>,"data_loss_bytes":<db>,"torn_tail_bytes":<tb>,"applied":<bool>,"events":[...],"ok":<bool>,"exit_code":<code>}
+```
 
 ### Offline output shapes (`peek` and `dump`)
 
@@ -390,15 +509,16 @@ output. The values come from the `EXIT_*` constants in `main.rs`, and `main` map
 
 | Code | Constant / source | Meaning |
 |------|-------------------|---------|
-| `0` | `ExitCode::SUCCESS` | Clean: the command completed (a `peek`/`dump` that marked a torn tail still exits 0; the loss is reported, not an error). |
+| `0` | `ExitCode::SUCCESS` | Clean: the command completed (a `peek`/`dump`/`scrub`/`repair` that marked a torn tail still exits 0; the loss is reported, not an error). |
 | `1` | `EXIT_USAGE` (`CliError::Usage`) | Usage or argument error: an unknown subcommand or flag, a missing required value, a bad numeric value, a missing `--data-dir`, an out-of-range `serve` knob, a second disposition or payload. The usage banner is also printed to stderr. |
-| `2` | `EXIT_NOT_FOUND` (`CliError::NotFound`) | Operational not-found: an offline verb's `--data-dir` does not exist (`peek` / `dump`, including `dump --dlq`). |
-| `4` | `EXIT_CORRUPT` (`CliError::Corrupt`) | Corrupt data: an offline verb found the data directory structurally corrupt (a broken segment chain, an undecodable header, a footer/segment-id mismatch), distinct from a clean torn TAIL it can read past (which is exit 0 with a loss note). |
-| `5` | `EXIT_UNREACHABLE` (`CliError::Unreachable`) | Broker unreachable: an online verb could not reach the broker, or the broker dropped the connection mid-request (a connection-level IO error or a closed socket). |
-| `70` | `EXIT_INTERNAL` (`CliError::Internal`) | Internal or runtime failure: an IO error, a broker that answered with a wrong-shape or error frame, or an unsupported platform (`serve`/`peek`/`dump` on non-Unix). |
+| `2` | `EXIT_NOT_FOUND` (`CliError::NotFound`) | Operational not-found: an offline verb's `--data-dir` does not exist (`peek` / `dump`, including `dump --dlq`; `scrub` / `repair`). |
+| `3` | `EXIT_HANDLED_CORRUPTION` (`CliError::HandledCorruption`) | Handled corruption / structured-but-degraded: an inspection verb (`scrub`, or `repair` reporting its plan or what it applied) RAN TO COMPLETION and reported one or more real data-loss spans (a corruption skip, reason other than `torn_tail`). The command succeeded at its job; the code is the degraded finding, not a failure. A clean run, AND a run whose only skip is an expected `torn_tail` brownout truncation, stays `0` (the loss-report data-loss boundary, `ReasonCode::is_data_loss`). |
+| `4` | `EXIT_CORRUPT` (`CliError::Corrupt`) | Corrupt data, BLOCKED: an offline verb found the data directory structurally corrupt (a broken segment chain, an undecodable header, a footer/segment-id mismatch) and could not finish, distinct from a clean torn TAIL it can read past (exit 0) and from a handled corruption skip it finished reporting (exit 3). The load-bearing distinction: `4` is "I gave up", `3` is "I finished and here is the damage". |
+| `5` | `EXIT_UNREACHABLE` (`CliError::Unreachable`) | Broker unreachable: an online verb could not reach the broker, or the broker dropped the connection mid-request (a connection-level IO error or a closed socket); also `repair --apply` when a broker holds the exclusive data-dir lock (it refuses to touch a live broker's data dir). |
+| `70` | `EXIT_INTERNAL` (`CliError::Internal`) | Internal or runtime failure: an IO error, a broker that answered with a wrong-shape or error frame, or an unsupported platform (`serve`/`peek`/`dump`/`scrub`/`repair` on non-Unix). |
 
-Codes `3` (handled corruption) and other codes the issue #136 design reserves are NOT
-emitted by the current binary; only the six above are mapped in `main.rs`.
+All seven codes above are mapped in `main.rs`. Other codes the issue #136 design reserves
+are NOT emitted by the current binary.
 
 ## Notes and cross-references
 
