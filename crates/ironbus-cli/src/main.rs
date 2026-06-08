@@ -155,6 +155,24 @@ const DEFAULT_GROUP_IDLE_EVICT_MS: u64 = ironbus_server::engine::DEFAULT_GROUP_I
 /// unchanged. `drop-oldest` opts in to force-reaping the oldest sealed segment to make room.
 const DEFAULT_DISK_FULL_POLICY: &str = "drop-new";
 
+/// The default COUNT bound on each per-producer dedup window for `serve` (#3, #33), aliased to the
+/// engine's [`ironbus_core::dedup::DEFAULT_MAX_IDS`] so the CLI and engine default are one source of
+/// truth. Dedup is OFF by default and activates per-producer only when a publish carries a `msg_id`;
+/// this only SIZES the window when it does (the most `(msg_id, offset)` entries one producer keeps).
+const DEFAULT_DEDUP_MAX_IDS: usize = ironbus_core::dedup::DEFAULT_MAX_IDS;
+
+/// The default TIME bound on each per-producer dedup window for `serve` (#3, #33), in MILLISECONDS:
+/// the engine's [`ironbus_core::dedup::DEFAULT_WINDOW_NANOS`] (2 minutes) converted to ms, so the CLI
+/// and engine default stay one source of truth. `0` disables the time bound (only the count bound
+/// applies). Monotonic time, so an NTP step never mis-expires the window.
+const DEFAULT_DEDUP_WINDOW_MS: u64 = ironbus_core::dedup::DEFAULT_WINDOW_NANOS / 1_000_000;
+
+/// The default cap on the NUMBER of distinct per-producer dedup windows for `serve` (#33), aliased to
+/// the engine's [`ironbus_core::dedup::DEFAULT_MAX_PRODUCERS`] so the CLI and engine default stay one
+/// source of truth. The `producer_id` is wire-supplied, so this caps the TOTAL dedup memory: a fresh
+/// `producer_id` over the cap evicts the least-recently-active window. Floored to 1 by the engine.
+const DEFAULT_DEDUP_MAX_PRODUCERS: usize = ironbus_core::dedup::DEFAULT_MAX_PRODUCERS;
+
 /// The disk-full overflow policy parsed from `serve --disk-full-policy` (#82). A platform-neutral,
 /// `Copy` mirror of the engine's policy enum, so it lives in the (non-Unix-gated) `ServeConfig` and
 /// is validated on every platform; the Unix on-disk path maps it to the engine's `DiskFullPolicy`.
@@ -796,6 +814,7 @@ fn cmd_pub(addr: &str, key: &[u8], payload: &[u8], out: &mut impl Write) -> Resu
             timestamp_ms,
             key,
             headers: b"",
+            dedup: None,
             payload,
         })
         .map_err(|e| classify(addr, "publishing to", &e))?;
@@ -1216,6 +1235,13 @@ struct ServeFlags {
     max_messages: Option<u64>,
     max_groups: Option<usize>,
     group_idle_evict_ms: Option<u64>,
+    /// The COUNT bound on each per-producer dedup window (#33); `None` falls back to the default.
+    dedup_max_ids: Option<usize>,
+    /// The TIME bound on each per-producer dedup window in ms (#33); `None` falls back to the default.
+    dedup_window_ms: Option<u64>,
+    /// The cap on the NUMBER of distinct per-producer dedup windows (#33); `None` falls back to the
+    /// default. Bounds the TOTAL dedup memory under a flood of distinct `producer_id`s.
+    dedup_max_producers: Option<usize>,
     disk_full_policy: Option<String>,
     visibility_ms: Option<u64>,
     enable_admin: bool,
@@ -1285,6 +1311,15 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             "--max-groups" => f.max_groups = Some(take_number("--max-groups", args, &mut i)?),
             "--group-idle-evict-ms" => {
                 f.group_idle_evict_ms = Some(take_number("--group-idle-evict-ms", args, &mut i)?);
+            }
+            "--dedup-max-ids" => {
+                f.dedup_max_ids = Some(take_number("--dedup-max-ids", args, &mut i)?);
+            }
+            "--dedup-window-ms" => {
+                f.dedup_window_ms = Some(take_number("--dedup-window-ms", args, &mut i)?);
+            }
+            "--dedup-max-producers" => {
+                f.dedup_max_producers = Some(take_number("--dedup-max-producers", args, &mut i)?);
             }
             "--disk-full-policy" => {
                 f.disk_full_policy = Some(take_value("--disk-full-policy", args, &mut i)?);
@@ -1482,6 +1517,24 @@ fn parse_serve_flags_with_env(args: &[String], env: &EnvFn<'_>) -> Result<Parsed
                 DEFAULT_HEALTH_LIVENESS_WINDOW_MS,
             )?,
             health_allow_public: resolve_bool("--health-allow-public", f.health_allow_public, env)?,
+            dedup_max_ids: resolve_number(
+                "--dedup-max-ids",
+                f.dedup_max_ids,
+                env,
+                DEFAULT_DEDUP_MAX_IDS,
+            )?,
+            dedup_window_ms: resolve_number(
+                "--dedup-window-ms",
+                f.dedup_window_ms,
+                env,
+                DEFAULT_DEDUP_WINDOW_MS,
+            )?,
+            dedup_max_producers: resolve_number(
+                "--dedup-max-producers",
+                f.dedup_max_producers,
+                env,
+                DEFAULT_DEDUP_MAX_PRODUCERS,
+            )?,
         },
         key_shared_groups: f.key_shared_groups,
         broadcast_groups: f.broadcast_groups,
@@ -1656,6 +1709,21 @@ struct ServeConfig {
     /// here, at which point the broker logs a loud warning. Loopback binds ignore this flag and never
     /// warn. There is NO override for the wire-protocol `--addr` bind; this is the health surface only.
     health_allow_public: bool,
+    /// The COUNT bound on each per-producer effectively-once dedup window (#3, #33): the most
+    /// `(msg_id, offset)` entries one producer's window keeps before evicting the oldest. Dedup is OFF
+    /// by default and activates per-producer ONLY when a publish carries a `msg_id`; this only sizes
+    /// the window when it does. Default 100k (`DEFAULT_DEDUP_MAX_IDS`); floored to 1 by the engine.
+    dedup_max_ids: usize,
+    /// The TIME bound on each per-producer dedup window (#3, #33), in MILLISECONDS of monotonic time:
+    /// an entry older than this is evicted regardless of the count bound. Default 2 min
+    /// (`DEFAULT_DEDUP_WINDOW_MS`); `0` disables the time bound (only the count bound applies).
+    dedup_window_ms: u64,
+    /// The cap on the NUMBER of distinct per-producer dedup windows (#33): the `producer_id` is
+    /// wire-supplied and attacker-chosen, so this bounds the TOTAL dedup memory. A fresh
+    /// `producer_id` over the cap evicts the least-recently-active window (an approximate LRU), so a
+    /// flood of distinct ids cannot grow RAM without bound. Default 4096
+    /// (`DEFAULT_DEDUP_MAX_PRODUCERS`); floored to 1 by the engine.
+    dedup_max_producers: usize,
 }
 
 // Only the Unix `bench` execution path constructs a default `ServeConfig` (the isolated broker); on
@@ -1692,6 +1760,9 @@ impl ServeConfig {
             enable_admin: false,
             health_liveness_window_ms: DEFAULT_HEALTH_LIVENESS_WINDOW_MS,
             health_allow_public: false,
+            dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
+            dedup_window_ms: DEFAULT_DEDUP_WINDOW_MS,
+            dedup_max_producers: DEFAULT_DEDUP_MAX_PRODUCERS,
         }
     }
 }
@@ -2149,6 +2220,12 @@ fn cmd_serve(
         config.health_liveness_window_ms,
         config.health_allow_public,
         config.visibility_ms,
+        // The #33 dedup knobs are read only on the Unix serve path (they size the engine's dedup
+        // window), so the non-Unix stub must consume them too or the Windows `-D warnings` build trips
+        // field-never-read, invisible to a macOS reviewer (the recurring #288/#99 footgun).
+        config.dedup_max_ids,
+        config.dedup_window_ms,
+        config.dedup_max_producers,
         key_shared_groups,
         // Read the broadcast groups under cfg(not(unix)) too: a field/param read only on cfg(unix)
         // breaks the Windows `-D warnings` build invisibly to a macOS reviewer (#288 note).
@@ -2243,6 +2320,18 @@ fn open_disk_engine(
             disk_full_policy: match config.disk_full_policy {
                 DiskFullPolicyArg::DropNew => DiskFullPolicy::DropNew,
                 DiskFullPolicyArg::DropOldest => DiskFullPolicy::DropOldest,
+            },
+            // The OPT-IN effectively-once dedup window (#3, #33): the dual count + time bound on each
+            // per-producer dedup ring, plus the cap on the NUMBER of distinct producer windows.
+            // Dedup is OFF by default and activates per-producer only when a publish carries a
+            // `msg_id`; these flags only SIZE the window when it does. `--dedup-max-ids` is the count
+            // bound (default 100k), `--dedup-window-ms` the time bound in ms (default 2 min), and
+            // `--dedup-max-producers` (default 4096) caps the producer windows so a flood of
+            // attacker-chosen `producer_id`s cannot grow RAM without bound (LRU eviction).
+            dedup: ironbus_core::dedup::DedupConfig {
+                max_ids: config.dedup_max_ids,
+                window_nanos: config.dedup_window_ms.saturating_mul(1_000_000),
+                max_producers: config.dedup_max_producers,
             },
         },
     )
@@ -3764,6 +3853,9 @@ mod tests {
             enable_admin: false,
             health_liveness_window_ms: DEFAULT_HEALTH_LIVENESS_WINDOW_MS,
             health_allow_public: false,
+            dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
+            dedup_window_ms: DEFAULT_DEDUP_WINDOW_MS,
+            dedup_max_producers: DEFAULT_DEDUP_MAX_PRODUCERS,
         }
     }
 
@@ -4251,6 +4343,7 @@ mod tests {
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap();
@@ -4742,6 +4835,7 @@ mod tests {
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap();
@@ -4806,6 +4900,7 @@ mod tests {
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap();
@@ -5075,6 +5170,9 @@ mod tests {
             enable_admin: false,
             health_liveness_window_ms: DEFAULT_HEALTH_LIVENESS_WINDOW_MS,
             health_allow_public: false,
+            dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
+            dedup_window_ms: DEFAULT_DEDUP_WINDOW_MS,
+            dedup_max_producers: DEFAULT_DEDUP_MAX_PRODUCERS,
         }
     }
 
@@ -6383,6 +6481,7 @@ mod tests {
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap();
@@ -6446,6 +6545,7 @@ mod tests {
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap();

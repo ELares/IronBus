@@ -247,6 +247,7 @@ mod tests {
             group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
             ram_ceiling_bytes: 0,
             disk_full_policy: DiskFullPolicy::DropNew,
+            dedup: ironbus_core::dedup::DedupConfig::default(),
         }
     }
 
@@ -354,6 +355,7 @@ mod tests {
                 timestamp_ms: 0,
                 key: b"k",
                 headers: b"",
+                dedup: None,
                 payload: b"net",
             },
             &mut pub_body,
@@ -410,6 +412,7 @@ mod tests {
                 timestamp_ms: 0,
                 key: b"",
                 headers: b"",
+                dedup: None,
                 payload: b"e2e",
             },
             &mut pub_body,
@@ -482,6 +485,7 @@ mod tests {
                 timestamp_ms: 0,
                 key: b"",
                 headers: b"",
+                dedup: None,
                 payload: b"persist-me",
             },
             &mut pub_body,
@@ -608,6 +612,7 @@ mod tests {
                 timestamp_ms: 0,
                 key: b"",
                 headers: b"",
+                dedup: None,
                 payload: b"stalled",
             },
             &mut pub_body,

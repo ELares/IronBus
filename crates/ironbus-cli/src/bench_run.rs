@@ -591,6 +591,7 @@ fn produce_one(
         timestamp_ms: 0,
         key: b"",
         headers: b"",
+        dedup: None,
         payload,
     });
     let latency_ns = u64::try_from(call_start.elapsed().as_nanos()).unwrap_or(u64::MAX);

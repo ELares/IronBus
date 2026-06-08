@@ -634,6 +634,7 @@ mod tests {
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap();

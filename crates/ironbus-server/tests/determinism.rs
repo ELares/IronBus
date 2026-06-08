@@ -40,6 +40,7 @@ fn config() -> EngineConfig {
         ram_ceiling_bytes: 0,
         // Drop-new (the default): the determinism image is unchanged by the new policy field.
         disk_full_policy: DiskFullPolicy::DropNew,
+        dedup: ironbus_core::dedup::DedupConfig::default(),
     }
 }
 

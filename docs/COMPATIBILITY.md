@@ -73,9 +73,10 @@ The tags are FROZEN by this discipline, each clause backed by a test in `frame.r
   round-trips through `as_u8`/`from_u8` with no duplicates, and that tags 0 and 255 are
   unknown.
 - **A new frame takes a new tag.** The set is `#[non_exhaustive]` and append-only by
-  convention; the next frame type takes tag 19, leaving every existing tag's meaning intact.
-  This is how `PubAck`/`AckStatus`/`FlowEnd` (14 to 16) and `DeadLetter`/`Truncated` (17, 18)
-  were added without disturbing earlier verbs.
+  convention; the next frame type takes tag 21, leaving every existing tag's meaning intact.
+  This is how `PubAck`/`AckStatus`/`FlowEnd` (14 to 16), `DeadLetter`/`Truncated` (17, 18),
+  `CumulativeAck` (19), and `PubAckDuplicate` (20, the #33 dedup-hit response that keeps the
+  frozen `PubAck` body intact) were added without disturbing earlier verbs.
 
 ### Unknown tags are forward-compatible at the envelope level
 
@@ -114,6 +115,14 @@ implemented."
 preservation guarantee for unknown flag bits is enforced on the storage side (next section)
 and the wire codec does not strip bits, so a flag a newer producer sets is not silently
 dropped at the framing layer.
+
+One exception is now DEFINED: `PubBody.flags` bit 7 (`PUB_FLAG_HAS_DEDUP`, `0b1000_0000`) is the
+#33 wire-only signal that an opt-in dedup block follows the headers. It is STRIPPED before the
+byte becomes a stored `RecordFlags` (`Session::handle_pub` masks it off), so a pre-#33 client
+that happened to set bit 7 on a no-dedup produce will have that bit CLEARED in the stored record
+(and no dedup block is parsed, since the server reads bit 7 to decide whether the block is
+present). Bit 7 sits well above `RecordFlags::KNOWN` (`0b111`), so this does not collide with any
+storage flag; it is the single producer-flag bit the wire now reserves.
 
 ## On-disk compatibility
 

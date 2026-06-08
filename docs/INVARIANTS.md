@@ -231,8 +231,15 @@ order-from-offset assignment: `Log::append` in
 `crates/ironbus-storage/src/log.rs` and the `Offset` doc in
 `crates/ironbus-core/src/types.rs`. Recovery's MAX-timestamp reconstruction (not
 last, not an ordering use): `scan_body_streaming` in
-`crates/ironbus-storage/src/segment.rs`. Opt-in dedup keyed by producer id is a
-non-goal-for-now feature and is not yet implemented (see pending).
+`crates/ironbus-storage/src/segment.rs`. The opt-in per-producer dedup window
+(#33) is keyed by `msg_id` only, never the body, and its TIME bound reads the
+MONOTONIC clock (not the wall clock), so an NTP step can never mis-expire the
+window: `DedupRegistry` in `crates/ironbus-core/src/dedup.rs` (pure, IO-free, the
+caller supplies monotonic `now`), wired on the produce path via
+`Engine::append_no_sync_dedup` in `crates/ironbus-server/src/engine.rs`. The
+optional PERSISTENT `producer_id` high-water that survives a restart is the one
+residual (see pending); the in-memory window is session-scoped and lost on
+restart by default.
 
 ### I8: single writer
 
@@ -368,9 +375,15 @@ Listed so a contributor does not mistake a spec for a guarantee.
   explicitly-labeled opt-in exception to I2) are not implemented. Tracking:
   durability #6.
 
-- **Opt-in producer dedup (part of I6).** Ordering-from-offset is enforced;
-  the opt-in per-producer dedup window (and the persisted producer-id high-water
-  mark) named by the issue is not implemented. Tracking: queue semantics #3.
+- **Persistent producer-id high-water (part of I6, #33).** The opt-in per-producer
+  dedup window IS implemented (`ironbus_core::dedup::DedupRegistry`, wired on the
+  produce path, keyed by `msg_id`, dual count + time bound on the monotonic clock,
+  epoch fencing, the `PubAckDuplicate` tag-20 dedup-hit response, and the
+  `ironbus_dedup_hits_total` / `ironbus_dedup_out_of_window_total` counters). It is
+  SESSION-scoped: the in-memory window is lost on broker restart by default. The one
+  residual is the OPTIONAL durable `producer_id` + epoch high-water in the WAL that
+  would let dedup survive a restart; the in-memory window and its epoch fencing are
+  shipped, the WAL persistence is the deferred follow-up. Tracking: queue semantics #3.
 
 - **The full invariant-checker harness and corpus wiring.** The pure checkers
   exist (`invariants.rs`), but the harness that runs I1 to I8 against the corpus

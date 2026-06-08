@@ -13,8 +13,9 @@
 
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
-    decode_dead_letter, decode_deliver, decode_truncated, encode_ack, encode_cumulative_ack,
-    encode_pub, encode_sub, AckBody, AckOp, BodyError, CumulativeAckBody, PubBody, SubBody,
+    decode_dead_letter, decode_deliver, decode_pub_ack, decode_truncated, encode_ack,
+    encode_cumulative_ack, encode_pub, encode_sub, AckBody, AckOp, BodyError, CumulativeAckBody,
+    PubBody, SubBody,
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -148,6 +149,21 @@ pub struct Fetch {
     pub truncations: Vec<Truncation>,
 }
 
+/// The outcome of a [`Client::produce`] / [`Client::produce_dedup`] call: the assigned (or, on a
+/// dedup hit, the ORIGINAL) durable offset, plus whether the broker treated this publish as a
+/// duplicate (#33). For a plain produce that sends no `msg_id`, `duplicate` is always `false`; for
+/// an opt-in dedup produce, `duplicate` is `true` when the `msg_id` was already seen within the
+/// producer's dedup window, in which case `offset` is the original offset and the broker appended
+/// no second copy. A dedup hit is a BENIGN success (`rc = 0`), never an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProduceAck {
+    /// The assigned offset for a fresh produce, or the ORIGINAL offset for a dedup hit.
+    pub offset: u64,
+    /// Whether the broker deduplicated this publish (returned the original offset without appending
+    /// a second copy). `true` only on a dedup hit; `false` for a fresh produce.
+    pub duplicate: bool,
+}
+
 /// The outcome of a [`Client::progress`] call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProgressOutcome {
@@ -231,18 +247,51 @@ impl Client {
 
     /// Produces a message and returns its assigned log offset.
     ///
+    /// A plain produce sends no `msg_id`, so it never opts into dedup and the reply is always a
+    /// fresh `PubAck`; for the dedup-aware variant that may surface `duplicate = true`, use
+    /// [`Client::produce_dedup`]. (A `PubAckDuplicate` reply is still parsed here defensively and
+    /// its offset returned, so an old caller never errors on a dedup-capable broker.)
+    ///
     /// # Errors
     /// Returns a [`ClientError`] on an IO error, an over-large field, or a server error.
     pub fn produce(&mut self, message: &PubBody<'_>) -> Result<u64, ClientError> {
+        self.produce_dedup(message).map(|ack| ack.offset)
+    }
+
+    /// Produces a message and returns the full [`ProduceAck`]: the assigned (or, on a dedup hit, the
+    /// ORIGINAL) offset plus the `duplicate` indication (#33). When `message.dedup` is `Some`, the
+    /// publish opts into the broker's effectively-once dedup window; if the `msg_id` was already seen
+    /// within the window, the broker replies with a `PubAckDuplicate` carrying the original offset and
+    /// this returns `duplicate = true` (a BENIGN success, never an error). When `message.dedup` is
+    /// `None`, this behaves exactly like [`Client::produce`] (`duplicate` is always `false`).
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, an over-large field, or a server error.
+    pub fn produce_dedup(&mut self, message: &PubBody<'_>) -> Result<ProduceAck, ClientError> {
         let mut body = Vec::new();
         encode_pub(message, &mut body).map_err(ClientError::Body)?;
         self.send(FrameType::Pub, &body)?;
         match self.read_frame()? {
+            // A fresh produce: a PubAck whose body is the 8-byte assigned offset.
             (FrameType::PubAck, body) => {
-                let bytes = <[u8; 8]>::try_from(body.as_slice()).map_err(|_| {
+                let ack = decode_pub_ack(&body).map_err(|_| {
                     ClientError::BadResponse("produce reply was not an eight-byte offset")
                 })?;
-                Ok(u64::from_le_bytes(bytes))
+                Ok(ProduceAck {
+                    offset: ack.offset,
+                    duplicate: false,
+                })
+            }
+            // A dedup hit (#33): a PubAckDuplicate whose body is the 8-byte ORIGINAL offset. The
+            // frame type ALONE signals duplicate = true; the frozen PubAck body is untouched.
+            (FrameType::PubAckDuplicate, body) => {
+                let ack = decode_pub_ack(&body).map_err(|_| {
+                    ClientError::BadResponse("dedup-hit reply was not an eight-byte offset")
+                })?;
+                Ok(ProduceAck {
+                    offset: ack.offset,
+                    duplicate: true,
+                })
             }
             (FrameType::Err, body) => {
                 Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
@@ -614,7 +663,8 @@ mod tests {
     use ironbus_core::delivery::DeliveryConfig;
     use ironbus_core::lease::LeaseConfig;
     use ironbus_proto::message::{
-        encode_dead_letter, encode_deliver, DeadLetterBody, DeliverBody, DEAD_LETTER_MAX_DELIVER,
+        encode_dead_letter, encode_deliver, DeadLetterBody, DeliverBody, PubDedup,
+        DEAD_LETTER_MAX_DELIVER,
     };
     use ironbus_server::actor::{spawn_actor, DEFAULT_CHANNEL_BOUND};
     use ironbus_server::clock::SystemClock;
@@ -678,6 +728,7 @@ mod tests {
                 group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap();
@@ -752,6 +803,7 @@ mod tests {
                 timestamp_ms: 0,
                 key: b"k",
                 headers: b"",
+                dedup: None,
                 payload: b"client-msg",
             })
             .unwrap();
@@ -771,6 +823,63 @@ mod tests {
     }
 
     #[test]
+    fn produce_dedup_surfaces_duplicate_true_on_a_retry_end_to_end() {
+        // The #33 end-to-end client property: an opt-in dedup produce is a fresh PubAck (duplicate =
+        // false) the first time; the SAME (producer, msg_id) retried is a PubAckDuplicate the client
+        // surfaces as duplicate = true with the ORIGINAL offset, and the broker stored only ONE copy.
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+        let dedup = PubDedup {
+            producer_id: b"producer-1",
+            epoch: 1,
+            msg_id: b"order-42",
+        };
+        let body = PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: Some(dedup),
+            payload: b"v1",
+        };
+        let first = c.produce_dedup(&body).unwrap();
+        assert_eq!(
+            first,
+            ProduceAck {
+                offset: 0,
+                duplicate: false
+            },
+            "fresh produce"
+        );
+        // The idempotent retry (same producer + msg_id; payload differs but dedup keys on msg_id).
+        let retry = c
+            .produce_dedup(&PubBody {
+                payload: b"v2-ignored",
+                ..body
+            })
+            .unwrap();
+        assert_eq!(
+            retry,
+            ProduceAck {
+                offset: 0,
+                duplicate: true
+            },
+            "the retry is a benign dedup hit with the ORIGINAL offset"
+        );
+        // Only ONE record is in the log: a single fetch yields exactly the first copy.
+        let messages = c.fetch(10).unwrap().messages;
+        assert_eq!(messages.len(), 1, "the dedup hit stored no second copy");
+        assert_eq!(
+            messages[0].payload, b"v1",
+            "the ORIGINAL payload, not the retry's"
+        );
+        assert_eq!(messages[0].offset, 0);
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn subscribed_groups_each_see_every_message() {
         // Broadcast fan-out end to end (#9): two connections subscribed to different
         // groups each independently receive every message; neither acks.
@@ -783,6 +892,7 @@ mod tests {
                     timestamp_ms: 0,
                     key: b"",
                     headers: b"",
+                    dedup: None,
                     payload: p,
                 })
                 .unwrap();
@@ -839,6 +949,7 @@ mod tests {
                 timestamp_ms: 0,
                 key: b"k",
                 headers: b"",
+                dedup: None,
                 payload: &[i],
             })
             .unwrap();
@@ -864,6 +975,7 @@ mod tests {
                 timestamp_ms: 0,
                 key: b"",
                 headers: b"",
+                dedup: None,
                 payload: b"x",
             })
             .unwrap_err()
@@ -1088,6 +1200,7 @@ mod tests {
                 timestamp_ms: 0,
                 key: b"",
                 headers: b"",
+                dedup: None,
                 payload: b"retry-me",
             })
             .unwrap();
@@ -1129,6 +1242,7 @@ mod tests {
                 timestamp_ms: 0,
                 key: b"",
                 headers: b"",
+                dedup: None,
                 payload: p,
             })
             .unwrap();
@@ -1174,6 +1288,7 @@ mod tests {
                     timestamp_ms: 0,
                     key: b"",
                     headers: b"",
+                    dedup: None,
                     payload: b"m",
                 })
                 .unwrap();
@@ -1221,6 +1336,7 @@ mod tests {
                     timestamp_ms: 0,
                     key: b"",
                     headers: b"",
+                    dedup: None,
                     payload: b"m",
                 })
                 .unwrap();
@@ -1276,6 +1392,7 @@ mod tests {
                     timestamp_ms: 0,
                     key: b"",
                     headers: b"",
+                    dedup: None,
                     payload: &payload,
                 })
                 .unwrap();
@@ -1322,6 +1439,7 @@ mod tests {
                     timestamp_ms: 0,
                     key: b"",
                     headers: b"",
+                    dedup: None,
                     payload: &big,
                 })
                 .unwrap();
