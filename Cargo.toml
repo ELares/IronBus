@@ -4,6 +4,13 @@ resolver = "2"
 # shipped crate depends on (e.g. tools/io-free-check, the structural ironbus-core
 # IO-free AST check), so their dependencies never enter a published crate's graph.
 members = ["crates/*", "tools/*"]
+# `tools/loom-tests` (#122) is its OWN, separate workspace with its OWN Cargo.lock, EXCLUDED here so
+# its `cfg(loom)` `loom` dev-dependency (and loom's non-optional `tracing-subscriber`/`env-filter`
+# tree) never enters THIS workspace's lockfile. That is what keeps the env-filter crates out of the
+# shipped binary's cargo-auditable SBOM: a workspace member would unify `tracing-subscriber`'s
+# features into the single shared build node even when cfg-gated out of the compiled units, because
+# feature resolution is per-lockfile. The nightly loom job builds it from its own directory.
+exclude = ["tools/loom-tests"]
 
 [workspace.package]
 version = "0.0.0"
@@ -18,6 +25,10 @@ authors = ["The IronBus Authors"]
 # must be opted in explicitly with `#[allow(unsafe_code)]` plus a safety comment.
 [workspace.lints.rust]
 unsafe_code = "warn"
+# `cfg(loom)` is a known, deliberate cfg: the scoped loom concurrency tests (#122) build only under
+# `RUSTFLAGS="--cfg loom"`. Declare it so `unexpected_cfgs` stays quiet (and the loom job stays
+# `-D warnings`-clean) without disabling the lint for genuinely unknown cfgs.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

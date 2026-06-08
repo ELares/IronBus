@@ -1,4 +1,7 @@
 /target
+# `tools/loom-tests` is a separate workspace (#122) with its own build dir; the root `/target` rule
+# is anchored to the repo root and does not cover it.
+/tools/loom-tests/target
 **/*.rs.bk
 *.pdb
 .DS_Store
