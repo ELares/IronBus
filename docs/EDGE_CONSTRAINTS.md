@@ -221,7 +221,9 @@ Record ordering is the broker-assigned monotonic SEQUENCE (`seq` in the 36-byte
 record header, `crates/ironbus-core/src/format.rs`), which is the log offset's
 companion: offsets are "monotonic and never reused"
 (`crates/ironbus-storage/src/segment.rs`). The `seq` is assigned by the LOG at
-append time from the running offset, not derived from any clock, so:
+append time as its own monotonic counter (a companion to, but distinct from, the
+offset counter; both are broker-assigned and never reused), not derived from any
+clock, so:
 
 - **Record IDs never consult the wall clock.** A backward wall-clock jump cannot
   reorder, duplicate, or invert a `seq`, because `seq` does not read the wall
@@ -237,8 +239,8 @@ append time from the running offset, not derived from any clock, so:
 ### Wall-clock timestamps: advisory, and never-decreasing if the broker stamps
 
 The record header also carries an 8-byte `timestamp` (milliseconds since the
-Unix epoch). Today it is PRODUCER-SUPPLIED (`Append.timestamp_ms` is the
-producer's timestamp), so it is advisory end-to-end metadata for display and
+Unix epoch). Today it is PRODUCER-SUPPLIED (`PubBody.timestamp_ms` in
+`crates/ironbus-proto/src/message.rs` is the producer's timestamp), so it is advisory end-to-end metadata for display and
 best-effort time queries, never the ordering key. The code already encodes this
 honesty: the segment tracks the MAX record timestamp, not the last, with the
 comment "producer timestamps are not monotonic"
