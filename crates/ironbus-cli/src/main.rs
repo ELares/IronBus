@@ -175,7 +175,173 @@ impl DiskFullPolicyArg {
             _ => None,
         }
     }
+
+    /// The flag/log spelling of this policy, the inverse of [`DiskFullPolicyArg::parse`]. `DropNew`
+    /// returns the [`DEFAULT_DISK_FULL_POLICY`] string so the default constant stays the single
+    /// source of truth for that name; used to supply a profile's policy as a resolvable default and
+    /// to render it in the materialized-config log.
+    fn as_str(self) -> &'static str {
+        match self {
+            DiskFullPolicyArg::DropNew => DEFAULT_DISK_FULL_POLICY,
+            DiskFullPolicyArg::DropOldest => "drop-oldest",
+        }
+    }
 }
+
+/// The schema version of the compiled-in named profiles (#87). It is BUMPED whenever any
+/// profile's knob VALUES change, so that a profile content change is a visible, versioned event
+/// rather than a silent fleet-wide behavior drift across an upgrade. It is recorded in the
+/// materialized-config startup log next to the active profile, so an operator can read exactly
+/// which profile schema a running broker was compiled against. A bump is a documented
+/// breaking-change CHANGELOG entry (the `balanced` row is also the shipped default set, so a
+/// change to it is a default change too). Starts at 1: the values frozen in `docs/CONFIG.md`
+/// section 6.
+const PROFILE_SCHEMA_VERSION: u32 = 1;
+
+/// A compiled-in named tuning profile (#87): a coherent group of knob values applied FIRST, then
+/// overridden by any explicit env var or flag (so the effective precedence is profile < env <
+/// flag, [`docs/CONFIG.md`](../../../docs/CONFIG.md) section 2). Profiles are baked into the static
+/// binary so an offline edge device selects one with no external fetch, and are VERSIONED by
+/// [`PROFILE_SCHEMA_VERSION`] so a content change is never silent.
+///
+/// A profile NEVER sets `data_dir` or any network/TLS key (those are environment-specific): it sets
+/// only the storage / backpressure / delivery tuning knobs in [`ProfilePreset`]. `balanced` is the
+/// DEFAULT and is exactly the compiled-in `DEFAULT_*` constant set, so `serve` with no `--profile`
+/// (and no env/flag override) behaves byte-identically to a broker that predates this flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Profile {
+    /// Small RAM ceiling and flash gentleness for an unattended, battery-less ARM box (the
+    /// `EDGE_SEGMENT_BYTES` 8 MiB segment, tight per-connection credits, few connections/groups,
+    /// `drop-new`). Cross-referenced byte-for-byte against the `tiny` table in
+    /// `docs/EDGE_CONSTRAINTS.md`; its steady-state RAM sums well under the 64 MiB edge ceiling.
+    EdgeTiny,
+    /// THE default: exactly the shipped compiled-in `DEFAULT_*` constants, so a zero-config broker
+    /// starts on `balanced`. NOT edge-safe (256 conns * 8 MiB is ~2 GiB worst case), which is
+    /// precisely why `edge-tiny` exists.
+    Balanced,
+    /// Wide buffers for a multi-core hub: large 256 MiB segments, wide credits and in-flight window,
+    /// more connections/groups, a deeper checkpoint interval, and `drop-oldest` so a burst prefers
+    /// spill-then-reclaim over rejecting the producer.
+    Throughput,
+}
+
+impl Profile {
+    /// The DEFAULT profile when no `--profile` (and no `IRONBUS_PROFILE`) is given: `balanced`, the
+    /// shipped compiled-in default set, so existing zero-config behavior is unchanged.
+    const DEFAULT: Profile = Profile::Balanced;
+
+    /// Parses the `--profile` / `IRONBUS_PROFILE` value into a [`Profile`]. An unknown name returns
+    /// `None`; the caller turns that into a usage error (exit 1) naming the accepted values.
+    fn parse(value: &str) -> Option<Profile> {
+        match value {
+            "edge-tiny" => Some(Profile::EdgeTiny),
+            "balanced" => Some(Profile::Balanced),
+            "throughput" => Some(Profile::Throughput),
+            _ => None,
+        }
+    }
+
+    /// The stable wire/log name of this profile, the inverse of [`Profile::parse`], used in the
+    /// materialized-config log so an operator reads back exactly the selectable name.
+    fn name(self) -> &'static str {
+        match self {
+            Profile::EdgeTiny => "edge-tiny",
+            Profile::Balanced => "balanced",
+            Profile::Throughput => "throughput",
+        }
+    }
+
+    /// The compiled-in preset (the coherent knob values) for this profile. The values are the
+    /// `docs/CONFIG.md` section 6 table, cross-checked against `docs/EDGE_CONSTRAINTS.md` for
+    /// `edge-tiny`; a test asserts each field, so a drift between this code and the doc fails CI.
+    fn preset(self) -> ProfilePreset {
+        match self {
+            Profile::EdgeTiny => EDGE_TINY_PRESET,
+            Profile::Balanced => BALANCED_PRESET,
+            Profile::Throughput => THROUGHPUT_PRESET,
+        }
+    }
+}
+
+/// The coherent group of tuning-knob values a named [`Profile`] sets (#87). Each field is the
+/// per-knob DEFAULT that profile contributes; an explicit env var or flag for the same knob still
+/// overrides it (profile < env < flag), because the resolver passes the preset value where it would
+/// otherwise pass the compiled `DEFAULT_*` constant. A preset NEVER carries `data_dir` or any
+/// network/TLS material: those are environment-specific and stay outside the profile surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProfilePreset {
+    /// `storage.segment_size` (`--max-segment-bytes`).
+    max_segment_bytes: u64,
+    /// `backpressure.consumer_credit` (`--consumer-credit`).
+    consumer_credit: u32,
+    /// `backpressure.consumer_credit_bytes` (`--consumer-credit-bytes`).
+    consumer_credit_bytes: u64,
+    /// `backpressure.max_connections` (`--max-connections`).
+    max_connections: usize,
+    /// `backpressure.max_groups` (`--max-groups`).
+    max_groups: usize,
+    /// `backpressure.max_in_flight` (`--max-in-flight`).
+    max_in_flight: u32,
+    /// `backpressure.disk_full_policy` (`--disk-full-policy`).
+    disk_full_policy: DiskFullPolicyArg,
+    /// `delivery.checkpoint_interval` (`--checkpoint-interval`).
+    checkpoint_interval: u64,
+    /// `delivery.visibility_timeout_ms` (`--visibility-timeout-ms`).
+    visibility_ms: u64,
+    /// `delivery.max_deliver` (`--max-deliver`).
+    max_deliver: u32,
+}
+
+/// The `edge-tiny` preset: `docs/CONFIG.md` section 6, identical to the `tiny` table in
+/// `docs/EDGE_CONSTRAINTS.md`. 8 MiB segments, 8 / 256 KiB consumer credits, 32 connections, 64
+/// groups, 256 in-flight, `drop-new`, 1024 checkpoint, 30 s visibility, 5 max-deliver.
+const EDGE_TINY_PRESET: ProfilePreset = ProfilePreset {
+    max_segment_bytes: 8 * 1024 * 1024,
+    consumer_credit: 8,
+    consumer_credit_bytes: 256 * 1024,
+    max_connections: 32,
+    max_groups: 64,
+    max_in_flight: 256,
+    disk_full_policy: DiskFullPolicyArg::DropNew,
+    checkpoint_interval: 1024,
+    visibility_ms: 30_000,
+    max_deliver: 5,
+};
+
+/// The `balanced` preset: THE default, and EXACTLY the compiled-in `DEFAULT_*` constant set, so a
+/// zero-config broker (no profile, env, or flag) is byte-identical to one that predates `--profile`.
+/// Each field is written as the `DEFAULT_*` constant so the two cannot drift; a test asserts they
+/// are equal. `docs/CONFIG.md` section 6: 64 MiB segments, 64 / 8 MiB credits, 256 connections,
+/// 1024 groups, 1024 in-flight, `drop-new`, 1024 checkpoint, 30 s visibility, 5 max-deliver.
+const BALANCED_PRESET: ProfilePreset = ProfilePreset {
+    max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
+    consumer_credit: DEFAULT_CONSUMER_CREDIT,
+    consumer_credit_bytes: DEFAULT_CONSUMER_CREDIT_BYTES,
+    max_connections: DEFAULT_MAX_CONNECTIONS,
+    max_groups: DEFAULT_MAX_GROUPS,
+    max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+    disk_full_policy: DiskFullPolicyArg::DropNew,
+    checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
+    visibility_ms: DEFAULT_VISIBILITY_MS,
+    max_deliver: DEFAULT_MAX_DELIVER,
+};
+
+/// The `throughput` preset: `docs/CONFIG.md` section 6, wide buffers for a multi-core hub. 256 MiB
+/// segments, 512 / 64 MiB credits, 1024 connections, 4096 groups, 8192 in-flight, `drop-oldest`,
+/// 4096 checkpoint, 30 s visibility, 5 max-deliver. CONFIG.md fixes every value here, so no
+/// throughput knob had to be chosen freely.
+const THROUGHPUT_PRESET: ProfilePreset = ProfilePreset {
+    max_segment_bytes: 256 * 1024 * 1024,
+    consumer_credit: 512,
+    consumer_credit_bytes: 64 * 1024 * 1024,
+    max_connections: 1024,
+    max_groups: 4096,
+    max_in_flight: 8192,
+    disk_full_policy: DiskFullPolicyArg::DropOldest,
+    checkpoint_interval: 4096,
+    visibility_ms: 30_000,
+    max_deliver: 5,
+};
 
 /// The smallest segment size cap `serve` accepts: below this, segments proliferate
 /// pathologically (one record each), so reject it as a misconfiguration.
@@ -237,7 +403,8 @@ const USAGE: &str = "\
 ironbus: a durable edge message queue.
 
 USAGE:
-    ironbus serve --data-dir <dir> [--addr <host:port>] [--max-connections <n>]
+    ironbus serve --data-dir <dir> [--profile <edge-tiny|balanced|throughput>]
+                  [--addr <host:port>] [--max-connections <n>]
                   [--checkpoint-interval <n>] [--max-deliver <n>] [--allow-unlimited-deliver]
                   [--backoff-ms <ms,ms,...>] [--max-in-flight <n>]
                   [--consumer-credit <n>] [--consumer-credit-bytes <n>]
@@ -270,6 +437,12 @@ USAGE:
 
 Notes:
     The default address is 127.0.0.1:7777 (loopback only).
+    --profile <edge-tiny|balanced|throughput> (default balanced) stamps a compiled-in, versioned
+    set of coherent tuning knobs in one move, then any explicit env var or flag overrides an
+    individual knob (precedence profile < env < flag). balanced is the shipped default set, so it
+    is byte-identical to passing no profile; edge-tiny is the small-RAM, flash-gentle edge preset;
+    throughput widens every buffer for a multi-core hub. An unknown profile name is a usage error.
+    The active profile and its schema version are logged in the startup materialized-config line.
     --max-in-flight bounds the per-GROUP in-flight (max-ack-pending) window; --consumer-credit
     (default 64) bounds the per-CONNECTION un-acked set, so in a competing group one stuck
     consumer cannot consume a peer's budget. A fetch delivers min(requested, consumer credit,
@@ -1023,6 +1196,11 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
 struct ServeFlags {
     addr: Option<String>,
     data_dir: Option<String>,
+    /// The compiled-in named profile (#87) selected by `--profile` / `IRONBUS_PROFILE`. `None`
+    /// resolves to the default profile (`balanced`). The profile is applied as the per-knob default,
+    /// so an explicit env var or flag for any individual knob still overrides it (profile < env <
+    /// flag). An unknown name is a usage error.
+    profile: Option<String>,
     max_connections: Option<usize>,
     checkpoint_interval: Option<u64>,
     max_deliver: Option<u32>,
@@ -1065,6 +1243,7 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
         match args[i].as_str() {
             "--addr" => f.addr = Some(take_value("--addr", args, &mut i)?),
             "--data-dir" => f.data_dir = Some(take_value("--data-dir", args, &mut i)?),
+            "--profile" => f.profile = Some(take_value("--profile", args, &mut i)?),
             "--max-connections" => {
                 f.max_connections = Some(take_number("--max-connections", args, &mut i)?);
             }
@@ -1168,15 +1347,37 @@ fn parse_serve_flags(args: &[String]) -> Result<ParsedServe, CliError> {
 #[allow(clippy::too_many_lines)]
 fn parse_serve_flags_with_env(args: &[String], env: &EnvFn<'_>) -> Result<ParsedServe, CliError> {
     let f = collect_serve_flags(args)?;
+    // The named profile (#87) is resolved FIRST (flag > env), then its preset supplies the per-knob
+    // DEFAULT for every knob below, so an explicit env var or flag for any knob still wins: the
+    // effective precedence is profile < env < flag. No `--profile` (and no `IRONBUS_PROFILE`)
+    // resolves to `balanced`, whose preset IS the compiled `DEFAULT_*` set, so zero-config behavior
+    // is byte-identical to a broker that predates this flag. An unknown name is a usage error naming
+    // its source and the accepted values.
+    let profile_from_flag = f.profile.is_some();
+    let profile = match resolve_opt_string("--profile", f.profile, env) {
+        Some(raw) => Profile::parse(&raw).ok_or_else(|| {
+            let source = if profile_from_flag {
+                "--profile".to_string()
+            } else {
+                env_var_name("--profile")
+            };
+            CliError::Usage(format!(
+                "`{source}` must be `edge-tiny`, `balanced`, or `throughput`, got `{raw}`"
+            ))
+        })?,
+        None => Profile::DEFAULT,
+    };
+    let preset = profile.preset();
     // The disk-full policy is an enum string, so it resolves like a string but is then parsed: name
     // the source (the flag if it was explicit, else the env var) in a bad-value error so the
-    // operator knows where it came from.
+    // operator knows where it came from. The profile preset supplies the DEFAULT when neither flag
+    // nor env set it, so e.g. `throughput` defaults to `drop-oldest` (still overridable).
     let policy_from_flag = f.disk_full_policy.is_some();
     let disk_full_policy_arg = resolve_string(
         "--disk-full-policy",
         f.disk_full_policy,
         env,
-        DEFAULT_DISK_FULL_POLICY,
+        preset.disk_full_policy.as_str(),
     );
     let disk_full_policy = DiskFullPolicyArg::parse(&disk_full_policy_arg).ok_or_else(|| {
         let source = if policy_from_flag {
@@ -1192,19 +1393,24 @@ fn parse_serve_flags_with_env(args: &[String], env: &EnvFn<'_>) -> Result<Parsed
         addr: resolve_string("--addr", f.addr, env, DEFAULT_ADDR),
         data_dir: resolve_opt_string("--data-dir", f.data_dir, env),
         config: ServeConfig {
+            // The active profile and its schema version are carried into the materialized config so
+            // `cmd_serve` can log them; the per-knob values below take the PRESET as their default,
+            // overridable by env/flag (profile < env < flag).
+            profile,
+            profile_schema_version: PROFILE_SCHEMA_VERSION,
             max_connections: resolve_number(
                 "--max-connections",
                 f.max_connections,
                 env,
-                DEFAULT_MAX_CONNECTIONS,
+                preset.max_connections,
             )?,
             checkpoint_interval: resolve_number(
                 "--checkpoint-interval",
                 f.checkpoint_interval,
                 env,
-                DEFAULT_CHECKPOINT_INTERVAL,
+                preset.checkpoint_interval,
             )?,
-            max_deliver: resolve_number("--max-deliver", f.max_deliver, env, DEFAULT_MAX_DELIVER)?,
+            max_deliver: resolve_number("--max-deliver", f.max_deliver, env, preset.max_deliver)?,
             allow_unlimited_deliver: resolve_bool(
                 "--allow-unlimited-deliver",
                 f.allow_unlimited_deliver,
@@ -1215,25 +1421,25 @@ fn parse_serve_flags_with_env(args: &[String], env: &EnvFn<'_>) -> Result<Parsed
                 "--max-in-flight",
                 f.max_in_flight,
                 env,
-                DEFAULT_MAX_IN_FLIGHT,
+                preset.max_in_flight,
             )?,
             consumer_credit: resolve_number(
                 "--consumer-credit",
                 f.consumer_credit,
                 env,
-                DEFAULT_CONSUMER_CREDIT,
+                preset.consumer_credit,
             )?,
             consumer_credit_bytes: resolve_number(
                 "--consumer-credit-bytes",
                 f.consumer_credit_bytes,
                 env,
-                DEFAULT_CONSUMER_CREDIT_BYTES,
+                preset.consumer_credit_bytes,
             )?,
             max_segment_bytes: resolve_number(
                 "--max-segment-bytes",
                 f.max_segment_bytes,
                 env,
-                DEFAULT_MAX_SEGMENT_BYTES,
+                preset.max_segment_bytes,
             )?,
             max_total_bytes: resolve_number(
                 "--max-total-bytes",
@@ -1254,7 +1460,7 @@ fn parse_serve_flags_with_env(args: &[String], env: &EnvFn<'_>) -> Result<Parsed
                 env,
                 DEFAULT_MAX_MESSAGES,
             )?,
-            max_groups: resolve_number("--max-groups", f.max_groups, env, DEFAULT_MAX_GROUPS)?,
+            max_groups: resolve_number("--max-groups", f.max_groups, env, preset.max_groups)?,
             group_idle_evict_ms: resolve_number(
                 "--group-idle-evict-ms",
                 f.group_idle_evict_ms,
@@ -1266,7 +1472,7 @@ fn parse_serve_flags_with_env(args: &[String], env: &EnvFn<'_>) -> Result<Parsed
                 "--visibility-timeout-ms",
                 f.visibility_ms,
                 env,
-                DEFAULT_VISIBILITY_MS,
+                preset.visibility_ms,
             )?,
             enable_admin: resolve_bool("--enable-admin", f.enable_admin, env)?,
             health_liveness_window_ms: resolve_number(
@@ -1364,6 +1570,15 @@ fn validate_serve_config(config: &ServeConfig) -> Result<(), CliError> {
 // `finish_serve`/`cmd_serve`, so `Clone` suffices. `Debug` lets a test assert on a `ParsedServe`.
 #[derive(Clone, Debug)]
 struct ServeConfig {
+    /// The compiled-in named profile (#87) the knobs below were resolved against, applied first and
+    /// then overridden by any explicit env var or flag (profile < env < flag). Default `balanced`
+    /// (the shipped `DEFAULT_*` set). Carried here only so the materialized-config startup log can
+    /// report which profile is active; it does not re-influence the already-resolved knobs.
+    profile: Profile,
+    /// The [`PROFILE_SCHEMA_VERSION`] the broker was compiled against (#87), recorded in the
+    /// materialized-config log so a profile content change across an upgrade is a visible, versioned
+    /// event rather than a silent fleet-wide drift.
+    profile_schema_version: u32,
     max_connections: usize,
     checkpoint_interval: u64,
     max_deliver: u32,
@@ -1454,6 +1669,9 @@ impl ServeConfig {
     /// here so it cannot drift from the per-flag default constants.
     fn bench_default() -> ServeConfig {
         ServeConfig {
+            // The bench broker is the shipped default set, i.e. the `balanced` profile.
+            profile: Profile::Balanced,
+            profile_schema_version: PROFILE_SCHEMA_VERSION,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
             max_deliver: DEFAULT_MAX_DELIVER,
@@ -1595,6 +1813,46 @@ fn health_bind_decision(haddr: &str, allow_public: bool) -> Result<HealthBindDec
     })
 }
 
+/// Builds the MATERIALIZED-CONFIG line (#87): one structured `key=value` line carrying the active
+/// profile, the [`PROFILE_SCHEMA_VERSION`], and EVERY resolved tuning knob, so an operator can see
+/// exactly what a broker is running and a profile content change is auditable across an upgrade. It
+/// is the EFFECTIVE config after the full profile < env < flag resolution, not the raw flags. Pure
+/// and platform-independent (it touches no IO) so a unit test asserts its contents directly and on
+/// every platform; `cmd_serve` writes it once at startup. `data_dir` is included but NEVER any
+/// secret material (the broker carries none today; the redacting newtype is the #89/#109 residual).
+fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: &Path) -> String {
+    let policy = config.disk_full_policy.as_str();
+    format!(
+        "materialized-config profile={} profile_schema_version={} addr={addr} \
+         data_dir={data_dir} max_connections={} max_segment_bytes={} max_total_bytes={} \
+         consumer_credit={} consumer_credit_bytes={} max_in_flight={} max_groups={} \
+         group_idle_evict_ms={} checkpoint_interval={} max_deliver={} \
+         allow_unlimited_deliver={} disk_full_policy={policy} visibility_timeout_ms={} \
+         max_retained_bytes={} max_age_ms={} max_messages={} health_liveness_window_ms={} \
+         enable_admin={}",
+        config.profile.name(),
+        config.profile_schema_version,
+        config.max_connections,
+        config.max_segment_bytes,
+        config.max_total_bytes,
+        config.consumer_credit,
+        config.consumer_credit_bytes,
+        config.max_in_flight,
+        config.max_groups,
+        config.group_idle_evict_ms,
+        config.checkpoint_interval,
+        config.max_deliver,
+        config.allow_unlimited_deliver,
+        config.visibility_ms,
+        config.max_retained_bytes,
+        config.max_age_ms,
+        config.max_messages,
+        config.health_liveness_window_ms,
+        config.enable_admin,
+        data_dir = data_dir.display(),
+    )
+}
+
 #[cfg(unix)]
 fn cmd_serve(
     addr: &str,
@@ -1646,6 +1904,19 @@ fn cmd_serve(
         "ironbus listening on {local}, data dir {}",
         data_dir.display()
     )?;
+    // The materialized-config dump (#87): ONE structured line with the active profile, the profile
+    // schema version, and every resolved knob, so an operator sees exactly the effective config the
+    // broker is running. This is diagnostic startup LOGGING, so it goes to STDERR (the log stream),
+    // never the stdout startup-protocol stream: a consumer that reads the "listening on" line and
+    // then stops reading stdout (a common supervisor pattern, and exactly what the migrate seed test
+    // does) would otherwise make serve take a SIGPIPE on this write and die on Linux. Writing to
+    // stderr and ignoring a write error keeps the broker alive and puts config logging where it
+    // belongs.
+    let _ = writeln!(
+        std::io::stderr(),
+        "{}",
+        materialized_config_line(config, &local.to_string(), data_dir)
+    );
     if config.allow_unlimited_deliver && (config.max_deliver == 0 || config.max_deliver == u32::MAX)
     {
         // Unlimited delivery is opt-in but LOUD (#63): a single poison payload can redeliver
@@ -1847,6 +2118,12 @@ fn cmd_serve(
     health_addr: Option<&str>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
+    // The #87 materialized-config line, `Profile::name`, and `DiskFullPolicyArg::as_str` are reached
+    // only from the Unix serve path, so build (and discard) the line here too: a function/method read
+    // only on cfg(unix) trips the Windows `-D warnings` `never used` lint, invisible to a macOS
+    // reviewer (the recurring #288/#99 footgun). This also consumes `profile`, `disk_full_policy`,
+    // and the other knobs the line reads.
+    let _ = materialized_config_line(config, addr, data_dir);
     let _ = (
         addr,
         data_dir,
@@ -1871,7 +2148,6 @@ fn cmd_serve(
         // macOS reviewer (the recurring #288/#99 footgun).
         config.health_liveness_window_ms,
         config.health_allow_public,
-        config.disk_full_policy,
         config.visibility_ms,
         key_shared_groups,
         // Read the broadcast groups under cfg(not(unix)) too: a field/param read only on cfg(unix)
@@ -3466,6 +3742,8 @@ mod tests {
     #[cfg(unix)]
     fn test_serve_config(max_in_flight: u32, checkpoint_interval: u64) -> ServeConfig {
         ServeConfig {
+            profile: Profile::Balanced,
+            profile_schema_version: PROFILE_SCHEMA_VERSION,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             checkpoint_interval,
             max_deliver: DEFAULT_MAX_DELIVER,
@@ -3487,6 +3765,267 @@ mod tests {
             health_liveness_window_ms: DEFAULT_HEALTH_LIVENESS_WINDOW_MS,
             health_allow_public: false,
         }
+    }
+
+    /// Builds a `serve` arg vector from string slices, the convenience the profile/precedence tests
+    /// use to drive the hand-rolled parser.
+    fn serve_args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    // ---- #87 compiled-in profiles + materialized-config logging ----
+
+    #[test]
+    fn edge_tiny_profile_resolves_to_its_exact_values() {
+        // Every `edge-tiny` knob is the `docs/CONFIG.md` section 6 / `docs/EDGE_CONSTRAINTS.md`
+        // value, asserted exactly so a drift between the code and the doc fails this test.
+        let parsed = parse_serve_flags(&serve_args(&["--profile", "edge-tiny"])).unwrap();
+        let c = &parsed.config;
+        assert_eq!(c.profile, Profile::EdgeTiny);
+        assert_eq!(c.profile_schema_version, PROFILE_SCHEMA_VERSION);
+        assert_eq!(c.max_segment_bytes, 8 * 1024 * 1024, "8 MiB segments");
+        assert_eq!(c.consumer_credit, 8);
+        assert_eq!(c.consumer_credit_bytes, 256 * 1024, "256 KiB");
+        assert_eq!(c.max_connections, 32);
+        assert_eq!(c.max_groups, 64);
+        assert_eq!(c.max_in_flight, 256);
+        assert_eq!(c.disk_full_policy, DiskFullPolicyArg::DropNew);
+        assert_eq!(c.checkpoint_interval, 1024);
+        assert_eq!(c.visibility_ms, 30_000);
+        assert_eq!(c.max_deliver, 5);
+    }
+
+    #[test]
+    fn balanced_profile_resolves_to_its_exact_values() {
+        // `balanced` is the default set; assert it is exactly the compiled `DEFAULT_*` constants
+        // (the source of truth the `BALANCED_PRESET` is written against).
+        let parsed = parse_serve_flags(&serve_args(&["--profile", "balanced"])).unwrap();
+        let c = &parsed.config;
+        assert_eq!(c.profile, Profile::Balanced);
+        assert_eq!(c.max_segment_bytes, DEFAULT_MAX_SEGMENT_BYTES);
+        assert_eq!(c.consumer_credit, DEFAULT_CONSUMER_CREDIT);
+        assert_eq!(c.consumer_credit_bytes, DEFAULT_CONSUMER_CREDIT_BYTES);
+        assert_eq!(c.max_connections, DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(c.max_groups, DEFAULT_MAX_GROUPS);
+        assert_eq!(c.max_in_flight, DEFAULT_MAX_IN_FLIGHT);
+        assert_eq!(c.disk_full_policy, DiskFullPolicyArg::DropNew);
+        assert_eq!(c.checkpoint_interval, DEFAULT_CHECKPOINT_INTERVAL);
+        assert_eq!(c.visibility_ms, DEFAULT_VISIBILITY_MS);
+        assert_eq!(c.max_deliver, DEFAULT_MAX_DELIVER);
+    }
+
+    #[test]
+    fn throughput_profile_resolves_to_its_exact_values() {
+        // Every `throughput` knob is the `docs/CONFIG.md` section 6 value, asserted exactly.
+        let parsed = parse_serve_flags(&serve_args(&["--profile", "throughput"])).unwrap();
+        let c = &parsed.config;
+        assert_eq!(c.profile, Profile::Throughput);
+        assert_eq!(c.max_segment_bytes, 256 * 1024 * 1024, "256 MiB segments");
+        assert_eq!(c.consumer_credit, 512);
+        assert_eq!(c.consumer_credit_bytes, 64 * 1024 * 1024, "64 MiB");
+        assert_eq!(c.max_connections, 1024);
+        assert_eq!(c.max_groups, 4096);
+        assert_eq!(c.max_in_flight, 8192);
+        assert_eq!(c.disk_full_policy, DiskFullPolicyArg::DropOldest);
+        assert_eq!(c.checkpoint_interval, 4096);
+        assert_eq!(c.visibility_ms, 30_000);
+        assert_eq!(c.max_deliver, 5);
+    }
+
+    #[test]
+    fn default_profile_is_byte_identical_to_the_compiled_defaults() {
+        // No `--profile` MUST resolve to exactly the same config as `--profile balanced`, which is
+        // the shipped default set: existing zero-config behavior is unchanged. Compare every knob.
+        let none = parse_serve_flags(&serve_args(&[])).unwrap().config;
+        let balanced = parse_serve_flags(&serve_args(&["--profile", "balanced"]))
+            .unwrap()
+            .config;
+        assert_eq!(
+            none.profile,
+            Profile::Balanced,
+            "default profile is balanced"
+        );
+        assert_eq!(none.max_segment_bytes, balanced.max_segment_bytes);
+        assert_eq!(none.consumer_credit, balanced.consumer_credit);
+        assert_eq!(none.consumer_credit_bytes, balanced.consumer_credit_bytes);
+        assert_eq!(none.max_connections, balanced.max_connections);
+        assert_eq!(none.max_groups, balanced.max_groups);
+        assert_eq!(none.max_in_flight, balanced.max_in_flight);
+        assert_eq!(none.disk_full_policy, balanced.disk_full_policy);
+        assert_eq!(none.checkpoint_interval, balanced.checkpoint_interval);
+        assert_eq!(none.visibility_ms, balanced.visibility_ms);
+        assert_eq!(none.max_deliver, balanced.max_deliver);
+        // And each is the raw compiled default, the other anchor of the zero-config guarantee.
+        assert_eq!(none.max_connections, DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(none.max_segment_bytes, DEFAULT_MAX_SEGMENT_BYTES);
+        assert_eq!(none.consumer_credit, DEFAULT_CONSUMER_CREDIT);
+    }
+
+    #[test]
+    fn an_explicit_flag_overrides_the_profile() {
+        // Precedence proof, the override half: `--profile edge-tiny` sets max_connections to 32,
+        // then an explicit `--max-connections 64` MUST win (profile < flag).
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--profile",
+            "edge-tiny",
+            "--max-connections",
+            "64",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.config.profile, Profile::EdgeTiny);
+        assert_eq!(
+            parsed.config.max_connections, 64,
+            "the flag wins over the profile"
+        );
+        // The non-overridden edge-tiny knobs are untouched, so the override is surgical.
+        assert_eq!(parsed.config.consumer_credit, 8);
+        assert_eq!(parsed.config.max_segment_bytes, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn an_env_var_overrides_the_profile_and_a_flag_overrides_the_env_var() {
+        // Full precedence proof: profile < env < flag, on one knob set at all three layers.
+        // edge-tiny -> max_connections 32; env -> 50; flag -> 64. The flag must win, and with the
+        // flag removed the env (50) must win over the profile (32).
+        let env_map = |name: &str| -> Option<String> {
+            if name == "IRONBUS_MAX_CONNECTIONS" {
+                Some("50".to_string())
+            } else {
+                None
+            }
+        };
+        let with_flag = parse_serve_flags_with_env(
+            &serve_args(&["--profile", "edge-tiny", "--max-connections", "64"]),
+            &env_map,
+        )
+        .unwrap();
+        assert_eq!(
+            with_flag.config.max_connections, 64,
+            "flag beats env beats profile"
+        );
+        let env_over_profile =
+            parse_serve_flags_with_env(&serve_args(&["--profile", "edge-tiny"]), &env_map).unwrap();
+        assert_eq!(
+            env_over_profile.config.max_connections, 50,
+            "env beats profile when no flag is given"
+        );
+    }
+
+    #[test]
+    fn the_profile_itself_is_selectable_via_env() {
+        // `IRONBUS_PROFILE` selects the profile (env layer), and an explicit `--profile` flag still
+        // wins over it. With only the env var, edge-tiny is selected.
+        let env_map = |name: &str| -> Option<String> {
+            if name == "IRONBUS_PROFILE" {
+                Some("edge-tiny".to_string())
+            } else {
+                None
+            }
+        };
+        let from_env = parse_serve_flags_with_env(&serve_args(&[]), &env_map).unwrap();
+        assert_eq!(from_env.config.profile, Profile::EdgeTiny);
+        assert_eq!(from_env.config.max_connections, 32);
+        let flag_wins =
+            parse_serve_flags_with_env(&serve_args(&["--profile", "throughput"]), &env_map)
+                .unwrap();
+        assert_eq!(
+            flag_wins.config.profile,
+            Profile::Throughput,
+            "the flag beats the env profile"
+        );
+    }
+
+    #[test]
+    fn an_unknown_profile_is_a_usage_error() {
+        let e = parse_serve_flags(&serve_args(&["--profile", "tiny"])).unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        // The error names the accepted values so the operator can fix it.
+        let msg = format!("{e:?}");
+        assert!(
+            msg.contains("edge-tiny"),
+            "names the accepted profiles: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_profile_never_overrides_a_knob_it_does_not_set() {
+        // A profile sets only its tuning knobs; retention and the total-byte cap are NOT in the
+        // preset, so even `throughput` leaves them at their compiled defaults (off).
+        let c = parse_serve_flags(&serve_args(&["--profile", "throughput"]))
+            .unwrap()
+            .config;
+        assert_eq!(c.max_total_bytes, DEFAULT_MAX_TOTAL_BYTES);
+        assert_eq!(c.max_retained_bytes, DEFAULT_MAX_RETAINED_BYTES);
+        assert_eq!(c.max_age_ms, DEFAULT_MAX_AGE_MS);
+        assert_eq!(c.max_messages, DEFAULT_MAX_MESSAGES);
+        assert_eq!(c.group_idle_evict_ms, DEFAULT_GROUP_IDLE_EVICT_MS);
+    }
+
+    #[test]
+    fn the_materialized_config_line_carries_the_profile_version_and_resolved_knobs() {
+        // The materialized-config dump must contain the active profile, the profile schema version,
+        // and the resolved knob values, so an operator can read exactly what is running. Resolve an
+        // edge-tiny profile with one flag override and assert the line reflects the EFFECTIVE config.
+        let config = parse_serve_flags(&serve_args(&[
+            "--profile",
+            "edge-tiny",
+            "--max-connections",
+            "64",
+        ]))
+        .unwrap()
+        .config;
+        let line =
+            materialized_config_line(&config, "127.0.0.1:7777", Path::new("/var/lib/ironbus"));
+        assert!(
+            line.contains("materialized-config"),
+            "is the dump line: {line}"
+        );
+        assert!(
+            line.contains("profile=edge-tiny"),
+            "the active profile: {line}"
+        );
+        assert!(
+            line.contains(&format!("profile_schema_version={PROFILE_SCHEMA_VERSION}")),
+            "the schema version: {line}"
+        );
+        // The resolved (overridden) value, not the profile's 32.
+        assert!(
+            line.contains("max_connections=64"),
+            "the resolved override: {line}"
+        );
+        // A profile-supplied value carried through.
+        assert!(
+            line.contains("consumer_credit=8"),
+            "the profile value: {line}"
+        );
+        assert!(
+            line.contains("consumer_credit_bytes=262144"),
+            "256 KiB: {line}"
+        );
+        assert!(
+            line.contains("disk_full_policy=drop-new"),
+            "the policy: {line}"
+        );
+        assert!(line.contains("addr=127.0.0.1:7777"), "the addr: {line}");
+        assert!(
+            line.contains("data_dir=/var/lib/ironbus"),
+            "the data dir: {line}"
+        );
+        // One single line (no embedded newline), so it is one structured log record.
+        assert!(!line.contains('\n'), "a single line: {line}");
+    }
+
+    #[test]
+    fn the_three_presets_are_distinct_and_balanced_equals_the_default_set() {
+        // Guard the table: the three presets differ from each other, and `balanced` IS the default
+        // set. A copy-paste that made two profiles identical, or that drifted balanced from the
+        // defaults, fails here.
+        assert_ne!(EDGE_TINY_PRESET, BALANCED_PRESET);
+        assert_ne!(BALANCED_PRESET, THROUGHPUT_PRESET);
+        assert_ne!(EDGE_TINY_PRESET, THROUGHPUT_PRESET);
+        assert_eq!(Profile::Balanced.preset(), BALANCED_PRESET);
+        assert_eq!(BALANCED_PRESET.max_connections, DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(BALANCED_PRESET.max_segment_bytes, DEFAULT_MAX_SEGMENT_BYTES);
     }
 
     /// Builds a real on-disk data directory with `n` durable records via the engine, for
@@ -4514,6 +5053,8 @@ mod tests {
     // socket are never opened, so it needs no Unix gate). Defaults mirror the production defaults.
     fn validation_config() -> ServeConfig {
         ServeConfig {
+            profile: Profile::Balanced,
+            profile_schema_version: PROFILE_SCHEMA_VERSION,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
             max_deliver: DEFAULT_MAX_DELIVER,

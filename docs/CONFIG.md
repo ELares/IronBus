@@ -61,7 +61,7 @@ Read this first, because it frames every table below.
 | `flag > env > default` precedence between the shipped layers | SHIPPED (#89) | [CLI.md](CLI.md) |
 | `data_dir` create-if-absent + probe-write + fatal-if-unwritable, single-broker lock | SHIPPED (#89) | [CLI.md](CLI.md) |
 | The TOML config FILE and its parser | **SPECIFIED here, NOT implemented** | [#85](https://github.com/ELares/IronBus/issues/85) |
-| The named PROFILES (`edge-tiny` / `balanced` / `throughput`) and a `--profile` flag | **SPECIFIED here, NOT implemented** | [#87](https://github.com/ELares/IronBus/issues/87) |
+| The named PROFILES (`edge-tiny` / `balanced` / `throughput`), the `--profile` flag, and the materialized-config log | SHIPPED (#87) | [#87](https://github.com/ELares/IronBus/issues/87), `main.rs` |
 | HOT RELOAD and the runtime admin `CONFIG` verbs | **SPECIFIED here, NOT implemented** | [#88](https://github.com/ELares/IronBus/issues/88) |
 | Secret redaction in config dumps | **SPECIFIED, NOT implemented** (env mapping IS shipped) | [#89](https://github.com/ELares/IronBus/issues/89) |
 | The typed key table, the literal grammar parser, and coupled-set validation | **SPECIFIED here; partial validation SHIPPED as per-flag range checks** | [#86](https://github.com/ELares/IronBus/issues/86) |
@@ -551,10 +551,13 @@ A profile sets a coherent group of knobs in ONE move, then any explicit key
 overrides it (applied-first-then-overridden, [section 2](#2-the-precedence-model-with-a-worked-multi-layer-example)).
 A profile NEVER sets `data_dir` or TLS material. Profiles are compiled-in and
 versioned (a profile's content change is a breaking change, logged via the
-materialized-config dump). Profile SELECTION (a `--profile` flag) is the
-[#87](https://github.com/ELares/IronBus/issues/87) implementation residual; this
-section SPECIFIES the values. Today these are the individual flag/env values an
-operator passes by hand.
+materialized-config dump). Profile SELECTION (the `--profile` flag and the
+`IRONBUS_PROFILE` env var) is SHIPPED ([#87](https://github.com/ELares/IronBus/issues/87)):
+the values below are the compiled-in presets the flag selects, applied first and then
+overridden by any explicit env var or flag (precedence profile < env < flag), and the
+active profile plus the `profile_schema_version` are emitted in the startup
+materialized-config log line. The individual flag/env values are still reachable by hand;
+`--profile` stamps a coherent set in one move.
 
 The values below are real, currently-accepted flag values. The `edge-tiny`
 column is cross-referenced byte-for-byte against the `tiny` profile table in
@@ -602,10 +605,11 @@ One-line rationale each:
   the producer.
 
 The `balanced` row IS the shipped default set (each value is the real `DEFAULT_*`
-constant), so `balanced` is implemented today as the compiled-in defaults; only
-the SELECTION of `edge-tiny` / `throughput` by name (the `--profile` flag) is the
-#87 residual. The `edge-tiny` and `throughput` VALUES are reachable today by
-passing the individual flags or `IRONBUS_*` env vars.
+constant), so `balanced` is the compiled-in default; selecting `edge-tiny` /
+`throughput` by name (the `--profile` flag) is now SHIPPED (#87, the
+`EDGE_TINY_PRESET` / `BALANCED_PRESET` / `THROUGHPUT_PRESET` constants in `main.rs`,
+carrying `PROFILE_SCHEMA_VERSION`). The `edge-tiny` and `throughput` VALUES are also
+reachable by passing the individual flags or `IRONBUS_*` env vars.
 
 ---
 
@@ -628,11 +632,11 @@ the issues that own them:
   reject-unknown-key-with-did-you-mean rule, and the coupled-set validators in
   [section 4](#4-coupled-set-validation-rules) are the #86 residual.
 - **[#87](https://github.com/ELares/IronBus/issues/87): the compiled-in versioned
-  profiles and materialized-config logging.** The `--profile` selection flag, the
-  `edge-tiny` / `throughput` named presets, profile versioning, and the
-  materialized-config dump are the #87 residual. The `balanced` profile is the
-  shipped default set; the other two profiles' VALUES are reachable via
-  individual flags today.
+  profiles and materialized-config logging. SHIPPED.** The `--profile` /
+  `IRONBUS_PROFILE` selector, the `edge-tiny` / `balanced` / `throughput` named
+  presets, the `PROFILE_SCHEMA_VERSION` versioning, and the materialized-config
+  startup log line are implemented in `main.rs`. A profile content change is a
+  documented breaking change (a `PROFILE_SCHEMA_VERSION` bump and a CHANGELOG entry).
 - **[#88](https://github.com/ELares/IronBus/issues/88): the hot/cold/coupled
   reload engine and the runtime admin `CONFIG` verbs.** The reload classes in
   [section 3](#3-the-full-typed-knob-table) are SPECIFICATION; no reload engine
