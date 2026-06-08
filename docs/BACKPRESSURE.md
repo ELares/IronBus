@@ -40,7 +40,7 @@ the resilience-observability contract (#16, see [METRICS.md](METRICS.md)).
   - [The depth-and-byte backstop](#the-depth-and-byte-backstop)
   - [Why the backstop bounds memory under a fully stalled drain](#why-the-backstop-bounds-memory-under-a-fully-stalled-drain)
 - [Part B: retry budget, shedding, and do-not-retry signaling (#69)](#part-b-retry-budget-shedding-and-do-not-retry-signaling-69)
-  - [The per-client retry budget (10% / 60 s)](#the-per-client-retry-budget-10-60-s)
+  - [The per-client retry budget (10% / 60 s)](#the-per-client-retry-budget-10--60-s)
   - [The `retry_after_ms` and `shed` wire signal](#the-retry_after_ms-and-shed-wire-signal)
   - [The fire-and-forget token bucket](#the-fire-and-forget-token-bucket)
   - [The egress AIMD concurrency limiter](#the-egress-aimd-concurrency-limiter)
@@ -273,7 +273,7 @@ a client whose requests are all being accepted retries freely; as the accept rat
 falls, the client's own retry rate is throttled toward the budget, so the
 **aggregate retry rate stays bounded to roughly 10% of the request rate**. The 10%
 figure is the budget the 60 s window enforces: sustained retries above 10% of the
-request rate are throttled at the source.
+request rate are throttled at the source. These are two composed mechanisms, not one derivation: the accept-based formula is the throttling vehicle (it gates each retry probabilistically as the accept rate falls), and the 10 percent over 60 s figure is the IronBus design budget that the broker also re-checks; the formula does not by itself derive the 10 percent number, it is the mechanism by which the budget is held.
 
 The budget is enforced **on both sides**:
 
