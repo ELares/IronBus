@@ -1926,10 +1926,6 @@ fn open_disk_engine(
                 DiskFullPolicyArg::DropNew => DiskFullPolicy::DropNew,
                 DiskFullPolicyArg::DropOldest => DiskFullPolicy::DropOldest,
             },
-            // The OPT-IN RAM-headroom ceiling for the `ironbus_ram_headroom_bytes` edge gauge (#118),
-            // OFF (`0`) by default. A dedicated `serve` flag to set it (and the daily-write-budget
-            // knob on the log) is a small follow-up; both are reachable today via the library config
-            // and echoed on `/admin`.
         },
     )
     .map_err(|e| CliError::Internal(format!("opening broker at {}: {e}", data_dir.display())))?;

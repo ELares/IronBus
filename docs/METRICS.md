@@ -246,14 +246,20 @@ shipped here.
 **Daily physical write budget (opt-in flash-wear governor).** Off by default
 (`daily_physical_write_budget_bytes = 0`). When set, once today's physical write
 volume (`ironbus_physical_bytes_written_today`, reset at the UTC day boundary on the
-clock seam) reaches the budget, the next produce is **shed via the existing #10
-drop-new path**: the append returns the non-fatal `AtCapacity`, the engine counts it
-in `ironbus_produce_rejected_total`, `ironbus_daily_write_budget_sheds_total` ticks,
+clock seam) reaches the budget, the next produce is **shed as a clean pre-write
+drop-new reject**: the append returns the non-fatal, distinct
+`StorageError::DailyWriteBudgetExceeded`, the engine counts it in
+`ironbus_produce_rejected_total`, `ironbus_daily_write_budget_sheds_total` ticks,
 `ironbus_daily_write_budget_over` reads `1`, and `ironbus_produce_saturated` flips to
-`1`. It **never weakens durability** (the record is dropped, not written unsynced),
-and the writer is not frozen (a budget shed is non-fatal). The first write of each
-day is always admitted, so the broker always makes daily progress. The dead-letter
-sink carries no budget (a poison record is durable evidence and must never be shed).
+`1`. The budget shed is a **separate error from the disk-full byte-cap shed**
+(`StorageError::AtCapacity`) on purpose: no reap ever lowers today's physical-write
+meter, so the budget shed is **FINAL under every `disk_full_policy`** and **never
+triggers the `DropOldest` force-reap loop** (only the genuine byte-cap shed may
+force-reap). It **never weakens durability** (the record is dropped, not written
+unsynced), and the writer is not frozen (a budget shed is non-fatal). The first write
+of each day is always admitted, so the broker always makes daily progress. The
+dead-letter sink carries no budget (a poison record is durable evidence and must
+never be shed).
 
 ## The bounded metric registry (#97)
 

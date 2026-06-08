@@ -392,6 +392,7 @@ where
             daily_physical_write_budget_bytes: g.daily_physical_write_budget_bytes(),
             physical_bytes_written_today: g.physical_bytes_written_today(),
             daily_budget_sheds: g.daily_budget_sheds(),
+            produce_rejected: g.counters().produce_rejected,
         },
         // Filled in below, outside the engine lock; `None` is the not-yet-read placeholder.
         rss: None,
@@ -462,6 +463,11 @@ struct EdgeMetrics {
     physical_bytes_written_today: u64,
     /// The count of appends shed because the daily physical write budget was reached.
     daily_budget_sheds: u64,
+    /// The count of produces REJECTED by the drop-new shed (the disk-full byte cap AND the
+    /// daily-write-budget governor; the same value surfaced as `ironbus_produce_rejected_total`).
+    /// Folded into the `ironbus_produce_saturated` signal so the gauge fires on EITHER shed, matching
+    /// its HELP text.
+    produce_rejected: u64,
 }
 
 /// A consistent snapshot of the metric inputs, read under one engine lock.
@@ -726,12 +732,15 @@ fn edge_metric_lines(edge: &EdgeMetrics, rss: Option<u64>) -> String {
 }
 
 /// Whether the broker has SHED at least one produce, for the portable `ironbus_produce_saturated`
-/// throughput-collapse signal (#118): 1 once any daily-write-budget shed has fired. The byte-cap
-/// drop-new shed is already surfaced by `ironbus_produce_rejected_total`; this gauge is the
-/// alert-friendly boolean an operator watches, derived purely from in-process counters (no thermal
-/// sensor, so it is portable across every target).
+/// throughput-collapse signal (#118): 1 once ANY drop-new admission exhaustion has fired, the
+/// disk-full byte-cap shed (`produce_rejected`, which also covers the daily-write-budget shed since
+/// both increment it) OR the daily-write-budget governor (`daily_budget_sheds`). Both are folded in
+/// so the gauge matches its HELP ("a drop-new byte-cap OR daily-write-budget shed") exactly: a pure
+/// byte-cap shed flips it too, not only a budget shed. It is the alert-friendly boolean an operator
+/// watches, derived purely from in-process counters (no thermal sensor, so it is portable across
+/// every target).
 fn counters_indicate_saturation(edge: &EdgeMetrics) -> bool {
-    edge.daily_budget_sheds > 0
+    edge.produce_rejected > 0 || edge.daily_budget_sheds > 0
 }
 
 /// Computes `physical / logical` as an integer part plus a three-digit milli-fraction, WITHOUT
@@ -2279,8 +2288,8 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn metrics_surfaces_the_daily_write_budget_over_signal_when_exceeded() {
         // The opt-in daily physical write budget (#118): once today's physical writes reach the
-        // budget, a produce is shed via the #10 drop-new path, the over-budget gauge flips to 1, and
-        // the shed counter ticks. Off (0) by default, so this configures a tiny budget explicitly.
+        // budget, a produce is shed as a distinct, final drop-new reject, the over-budget gauge flips
+        // to 1, and the shed counter ticks. Off (0) by default, so this configures a tiny budget.
         // Probe one record's physical footprint, then cap the day at exactly the first segment header
         // plus one record so the SECOND produce is over budget.
         let probe = {
@@ -3057,8 +3066,9 @@ mod tests {
         // are excluded from this set by construction (the taxonomy test filters on `_total`).
         "ironbus_consumer_labels_dropped_total",
         // The daily-physical-write-budget shed counter (#118): a produce shed because the opt-in
-        // flash-wear governor's daily budget was reached (the #10 drop-new path, distinct from the
-        // disk-full byte-cap shed). A shed is a resilience event the taxonomy guarantees is never
+        // flash-wear governor's daily budget was reached (a distinct, FINAL drop-new reject, a
+        // separate error from the disk-full byte-cap shed). A shed is a resilience event the taxonomy
+        // guarantees is never
         // silent, so it belongs here. The edge GAUGES the same #118 work adds
         // (`ironbus_logical_bytes_written`/`ironbus_physical_bytes_written` are counters but are
         // write-AMPLIFICATION accounting, not resilience sheds; `ironbus_write_amp_ratio`,

@@ -73,12 +73,14 @@ pub struct LogConfig {
     /// physical bytes actually written to segments SO FAR TODAY (the encoded record frames plus the
     /// segment headers and footers, the same volume [`Log::physical_bytes_written`] charges, measured
     /// against the clock seam's UTC day) reach this budget, [`Log::append`] sheds the next produce
-    /// with the same non-fatal [`StorageError::AtCapacity`] the byte cap uses, so the shed flows
-    /// through the existing #10 drop-new path (the engine counts it as `produce_rejected`) and the
-    /// over-budget event is surfaced by [`Log::daily_budget_sheds`]. It NEVER weakens durability: an
-    /// over-budget produce is DROPPED, never written unsynced. The today-counter resets at the UTC
-    /// day boundary (`now_unix_millis / 86_400_000`), so the budget refreshes each day with no
-    /// background timer.
+    /// with the DISTINCT, FINAL [`StorageError::DailyWriteBudgetExceeded`] error. The shed is a clean
+    /// PRE-WRITE drop-new reject (the engine counts it as `produce_rejected`, like the byte-cap drop)
+    /// AND it is FINAL: it is a SEPARATE variant from the byte-cap [`StorageError::AtCapacity`] so a
+    /// `DropOldest` reap can never relieve it (no reap lowers today's physical-write meter), so it
+    /// NEVER triggers the force-reap loop under any overflow policy. The over-budget event is surfaced
+    /// by [`Log::daily_budget_sheds`]. It NEVER weakens durability: an over-budget produce is DROPPED,
+    /// never written unsynced. The today-counter resets at the UTC day boundary
+    /// (`now_unix_millis / 86_400_000`), so the budget refreshes each day with no background timer.
     ///
     /// `0` means UNSET (the governor is OFF), the default, so existing behavior is byte-for-byte
     /// unchanged: an operator opts in. A budget smaller than a single record still admits the FIRST
@@ -152,8 +154,9 @@ impl LogConfig {
     /// Sets the OPT-IN daily physical write budget ([`LogConfig::daily_physical_write_budget_bytes`])
     /// and returns the updated config. `0` (the default) disables the governor; any non-zero value
     /// opts in: once today's physical write volume reaches the budget, an append is shed with the
-    /// non-fatal [`StorageError::AtCapacity`] (the #10 drop-new path) rather than weakening
-    /// durability, and the over-budget shed is counted by [`Log::daily_budget_sheds`].
+    /// distinct, FINAL [`StorageError::DailyWriteBudgetExceeded`] (a clean pre-write drop-new reject
+    /// that no reap can relieve) rather than weakening durability, and the over-budget shed is counted
+    /// by [`Log::daily_budget_sheds`].
     #[must_use]
     pub fn with_daily_physical_write_budget_bytes(mut self, budget: u64) -> LogConfig {
         self.daily_physical_write_budget_bytes = budget;
@@ -879,10 +882,13 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// # Errors
     /// Returns [`StorageError::AtCapacity`] (non-fatal) if the durable-log byte cap
     /// ([`LogConfig::max_total_bytes`]) is set and the log is at or over it, in which case
-    /// nothing is written and no offset or sequence advances. Returns
-    /// [`StorageError::SegmentFull`] if the offset or sequence space is exhausted or the
-    /// record is too large to frame, [`StorageError::WriterFrozen`] if a prior fatal error
-    /// froze the writer, or an IO error from the write.
+    /// nothing is written and no offset or sequence advances. Returns the distinct, FINAL
+    /// [`StorageError::DailyWriteBudgetExceeded`] (non-fatal) if the opt-in daily physical write
+    /// budget ([`LogConfig::daily_physical_write_budget_bytes`]) is set and today's physical write
+    /// volume is at or over it, again writing nothing and advancing nothing (a reap can never
+    /// relieve it, so it is final). Returns [`StorageError::SegmentFull`] if the offset or sequence
+    /// space is exhausted or the record is too large to frame, [`StorageError::WriterFrozen`] if a
+    /// prior fatal error froze the writer, or an IO error from the write.
     pub fn append(&mut self, record: &Append<'_>) -> Result<Offset, StorageError> {
         // Hard durable-log byte cap (the drop-new shed): when the log is at or over the cap,
         // reject the produce and write nothing, advancing no offset or sequence. The check is
@@ -902,22 +908,26 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         }
 
         // OPT-IN daily PHYSICAL write budget (#118), the flash-wear governor: when today's physical
-        // write volume is at or over the budget, shed this produce with the SAME non-fatal
-        // `AtCapacity` the byte cap uses, so it flows through the existing #10 drop-new path (the
-        // engine counts it as `produce_rejected`) and durability is never weakened (the record is
-        // dropped, never written unsynced). The day meter is rolled first so the decision is never
-        // stale across a UTC day boundary. Like the byte cap, the at-or-over check requires the
-        // meter to be NON-ZERO, so the FIRST write of each day always goes through even if the
-        // budget is smaller than one record (the broker always makes daily progress).
+        // write volume is at or over the budget, shed this produce with the DISTINCT, FINAL
+        // `DailyWriteBudgetExceeded` error (NOT `AtCapacity`). This is a clean PRE-WRITE drop-new
+        // reject (it runs at the top of append, before any write, roll, or id reservation, so
+        // nothing is written and no offset or sequence advances) AND it is FINAL: no reap ever
+        // lowers today's physical-write meter, so the engine must never enter the `DropOldest`
+        // reap-retry loop on it (which is why it is a separate variant from the byte-cap shed).
+        // Durability is never weakened (the record is dropped, never written unsynced). The day
+        // meter is rolled first so the decision is never stale across a UTC day boundary. Like the
+        // byte cap, the at-or-over check requires the meter to be NON-ZERO, so the FIRST write of
+        // each day always goes through even if the budget is smaller than one record (the broker
+        // always makes daily progress).
         let budget = self.config.daily_physical_write_budget_bytes;
         if budget != 0 {
             self.roll_physical_day_if_needed();
             let today = self.physical_bytes_written_today;
             if today >= budget && today > 0 {
                 self.daily_budget_sheds = self.daily_budget_sheds.saturating_add(1);
-                return Err(StorageError::AtCapacity {
-                    durable_bytes: today,
-                    cap: budget,
+                return Err(StorageError::DailyWriteBudgetExceeded {
+                    bytes_today: today,
+                    budget,
                 });
             }
         }
@@ -1762,11 +1772,11 @@ mod tests {
     #[test]
     fn the_daily_write_budget_sheds_when_today_exceeds_it() {
         // The opt-in daily physical write budget (#118): once today's physical writes reach the
-        // budget, the next produce is shed with the non-fatal AtCapacity (the #10 drop-new path) and
-        // the shed counter ticks; durability is never weakened (nothing is written). The first write
-        // of the day always goes through (the at-or-over check requires a non-zero meter), so the
-        // broker always makes daily progress. A budget just above one record's physical cost lets one
-        // record through, then sheds.
+        // budget, the next produce is shed with the distinct, FINAL DailyWriteBudgetExceeded (a clean
+        // pre-write drop-new reject, NOT the byte-cap AtCapacity) and the shed counter ticks;
+        // durability is never weakened (nothing is written). The first write of the day always goes
+        // through (the at-or-over check requires a non-zero meter), so the broker always makes daily
+        // progress. A budget just above one record's physical cost lets one record through, then sheds.
         let frame = record_bytes(b"abc");
         // Budget = the first segment header + one frame: after the first record the meter equals the
         // budget exactly, so the at-or-over check sheds the SECOND record. The first record is still
@@ -1788,8 +1798,12 @@ mod tests {
         let before_bytes = log.physical_bytes_written();
         let err = log.append(&rec(b"def")).unwrap_err();
         assert!(
-            err.is_at_capacity(),
-            "an over-budget produce sheds with the non-fatal AtCapacity, got {err:?}"
+            err.is_daily_write_budget_exceeded(),
+            "an over-budget produce sheds with the distinct, final DailyWriteBudgetExceeded, got {err:?}"
+        );
+        assert!(
+            !err.is_at_capacity(),
+            "the budget shed is NOT the byte-cap AtCapacity (a reap can never relieve it), got {err:?}"
         );
         assert_eq!(
             log.daily_budget_sheds(),

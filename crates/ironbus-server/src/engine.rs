@@ -358,13 +358,27 @@ impl EngineError {
         )
     }
 
-    /// Whether this is the durable-log byte-cap shed (the non-fatal drop-new rejection): a
-    /// produce was refused because the log is at its byte cap, distinct from a transient
-    /// failure or a fatal freeze. The session uses it to reply a stable, distinct message so a
-    /// producer can tell a shed from a transient failure. It is never fatal.
+    /// Whether this is a non-fatal drop-new produce REJECTION the producer should see as a stable
+    /// "at capacity / shed" reply (the wire `ProduceOutcome::AtCapacity`): EITHER the durable-log
+    /// byte-cap shed ([`StorageError::AtCapacity`]) OR the daily-write-budget shed
+    /// ([`StorageError::DailyWriteBudgetExceeded`]). Both refuse the produce without writing and
+    /// without freezing; the producer reply is identical, so they share this predicate. It is never
+    /// fatal. To distinguish the two (only the byte cap may drive the `DropOldest` reap), match the
+    /// storage error directly or use [`EngineError::is_daily_write_budget_exceeded`].
     #[must_use]
     pub fn is_at_capacity(&self) -> bool {
-        matches!(self, EngineError::Storage(e) if e.is_at_capacity())
+        matches!(self, EngineError::Storage(e)
+            if e.is_at_capacity() || e.is_daily_write_budget_exceeded())
+    }
+
+    /// Whether this is the OPT-IN daily-write-budget shed ([`StorageError::DailyWriteBudgetExceeded`]),
+    /// the flash-wear governor firing. It is a clean pre-write drop-new reject that is FINAL: a reap
+    /// can never relieve it, so the `DropOldest` overflow policy must treat it as a final rejection and
+    /// never force-reap. Kept distinct from [`EngineError::is_at_capacity`] for exactly that routing
+    /// decision; both still map to the same producer-facing rejected-produce reply.
+    #[must_use]
+    pub fn is_daily_write_budget_exceeded(&self) -> bool {
+        matches!(self, EngineError::Storage(e) if e.is_daily_write_budget_exceeded())
     }
 }
 
@@ -1610,17 +1624,22 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// then issues ONE `commit_batch` covering them all.
     ///
     /// # Errors
-    /// As [`Engine::produce`]: a drop-new shed surfaces the non-fatal [`StorageError::AtCapacity`]
-    /// (and increments `produce_rejected`); any other storage error propagates. Nothing is written
-    /// and no statistic moves on an error.
+    /// As [`Engine::produce`]: a drop-new shed (either the byte-cap [`StorageError::AtCapacity`] or
+    /// the daily-write-budget [`StorageError::DailyWriteBudgetExceeded`]) surfaces the non-fatal
+    /// rejection and increments `produce_rejected`; any other storage error propagates. Nothing is
+    /// written and no statistic moves on an error.
     pub fn append_no_sync(&mut self, message: &Append<'_>) -> Result<Offset, EngineError> {
         let offset = match self.append_with_policy(message) {
             Ok(offset) => offset,
             Err(e) => {
-                // The drop-new shed: count the rejection (a shed-rate signal) but advance no
-                // produce statistics, since nothing was written. Other storage errors fall
-                // through unchanged; only the at-capacity shed is a counted rejection.
-                if e.is_at_capacity() {
+                // A drop-new shed: count the rejection (a shed-rate signal) but advance no produce
+                // statistics, since nothing was written. Both the byte-cap shed AND the distinct
+                // daily-write-budget shed are counted rejections (each increments `produce_rejected`
+                // exactly once; the budget shed's own `daily_budget_sheds` counter is bumped once
+                // inside `Log::append`). `e` is the STORAGE error here, so check both predicates;
+                // only the byte cap could ever have force-reaped (the budget shed propagated straight
+                // back from `append_with_policy`). Other storage errors fall through unchanged.
+                if e.is_at_capacity() || e.is_daily_write_budget_exceeded() {
                     self.counters.produce_rejected =
                         self.counters.produce_rejected.saturating_add(1);
                 }
@@ -1697,11 +1716,20 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// segment remains), it returns the original `AtCapacity`, so `produce` falls back to the
     /// drop-new rejection and a single oversized in-flight set cannot wedge the log empty. Each
     /// forced reap increments `segments_force_reaped`.
+    ///
+    /// The opt-in daily-write-budget shed ([`StorageError::DailyWriteBudgetExceeded`], #118) is
+    /// EXCLUDED from the `DropOldest` reap path on purpose: no reap ever lowers today's
+    /// physical-write meter, so force-reaping to relieve a budget shed would erase the durable log
+    /// segment-by-segment without ever admitting the produce. It is therefore a FINAL drop-new
+    /// rejection under EVERY policy (it propagates straight back, the same as under `DropNew`), so
+    /// the producer is told to back off and the flash-wear governor protects the disk it is meant to.
     fn append_with_policy(&mut self, message: &Append<'_>) -> Result<Offset, StorageError> {
         match self.log.append(message) {
             Ok(offset) => Ok(offset),
-            // Only the at-capacity shed is reclaimable; any other storage error (a frozen writer,
-            // an oversized record) propagates unchanged, and under DropNew the rejection is final.
+            // Only the genuine disk-full byte-cap shed is reclaimable by a reap, so only it may drive
+            // the `DropOldest` reclaim-then-retry loop. The daily-write-budget shed and any other
+            // storage error (a frozen writer, an oversized record) propagate unchanged; under DropNew
+            // every rejection is final too.
             Err(e) if e.is_at_capacity() && self.disk_full_policy == DiskFullPolicy::DropOldest => {
                 self.make_room_then_append(message, e)
             }
@@ -6405,6 +6433,132 @@ mod tests {
         assert!(
             e.is_healthy(),
             "the writer stays live (the shed is non-fatal)"
+        );
+    }
+
+    #[test]
+    fn drop_oldest_treats_a_daily_budget_shed_as_final_and_never_force_reaps() {
+        // Regression for the #118 BLOCKER: under DropOldest the daily-write-budget shed must be a
+        // FINAL drop-new reject, NOT routed into the force-reap loop. The pre-fix code returned the
+        // SAME `AtCapacity` for the byte cap and the budget, so a budget shed under DropOldest drove
+        // `make_room_then_append`, which force-reaped EVERY sealed segment (a reap never lowers
+        // today's physical-write meter, so the retry shed again) and inflated `daily_budget_sheds`
+        // by one PER reap-loop retry: catastrophic, unintended data loss.
+        //
+        // Build several SEALED segments (a tiny segment cap so each rolls), with a daily budget the
+        // build-up crosses, then assert an over-budget produce is REJECTED, force-reaps ZERO segments
+        // (segment_count and segments_force_reaped unchanged), and bumps `daily_budget_sheds` by
+        // exactly one per rejected produce.
+        let one = one_record_bytes();
+        // A small segment cap so records roll into many sealed segments; a budget sized to admit
+        // roughly a dozen records before it bites, so a healthy spread of sealed segments exists when
+        // the governor first fires (the force-reap loop, if entered, would have many targets to erase).
+        let budget = 12 * one;
+        let mut cfg = config(64, 5);
+        cfg.log = LogConfig {
+            max_segment_bytes: 160,
+            daily_physical_write_budget_bytes: budget,
+            ..LogConfig::default()
+        };
+        cfg.disk_full_policy = DiskFullPolicy::DropOldest;
+        let mut e = open(cfg);
+
+        // Produce until the governor first sheds. Every admitted produce lands; the first rejection is
+        // the budget shed. Bounded loop so a logic error cannot spin forever.
+        let mut admitted = 0u64;
+        let mut first_shed = None;
+        for _ in 0..200 {
+            match e.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: &[0xab; 16],
+            }) {
+                Ok(_) => admitted += 1,
+                Err(err) => {
+                    first_shed = Some(err);
+                    break;
+                }
+            }
+        }
+        let shed = first_shed.expect("the daily budget eventually sheds a produce");
+        // The shed is the distinct, final daily-budget reject (it still reads as "at capacity" to the
+        // producer, mapping to the same rejected-produce reply, but it is NOT the byte-cap shed).
+        assert!(
+            shed.is_daily_write_budget_exceeded(),
+            "the over-budget produce is the distinct daily-budget shed, got {shed:?}"
+        );
+        assert!(
+            shed.is_at_capacity(),
+            "the budget shed still maps to the producer-facing rejected-produce reply, got {shed:?}"
+        );
+        assert!(
+            admitted >= 2,
+            "the build-up created multiple records before the budget bit (admitted {admitted})"
+        );
+        // Several SEALED segments exist at the moment the governor fires (the build-up rolled them);
+        // this is exactly the state in which the pre-fix reap loop would erase the log.
+        let segments_before = e.segment_count();
+        assert!(
+            segments_before >= 2,
+            "multiple segments exist when the governor fires (have {segments_before})"
+        );
+        // The KEY assertions: the budget shed force-reaped NOTHING.
+        assert_eq!(
+            e.counters().segments_force_reaped,
+            0,
+            "a daily-budget shed must NEVER force-reap (this is the BLOCKER)"
+        );
+        assert_eq!(
+            e.daily_budget_sheds(),
+            1,
+            "exactly one shed counted for the one rejected produce (not inflated by reap retries)"
+        );
+        assert_eq!(
+            e.counters().produce_rejected,
+            1,
+            "the budget shed is counted once as a rejected produce"
+        );
+        assert!(
+            e.is_healthy(),
+            "a budget shed is non-fatal: the writer stays live"
+        );
+
+        // A second over-budget produce sheds again: still final, still no force-reap, and the
+        // segment count is unchanged across BOTH sheds (the log was never erased segment-by-segment).
+        let shed2 = e
+            .produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: &[0xab; 16],
+            })
+            .unwrap_err();
+        assert!(
+            shed2.is_daily_write_budget_exceeded(),
+            "the second over-budget produce is also the daily-budget shed, got {shed2:?}"
+        );
+        assert_eq!(
+            e.counters().segments_force_reaped,
+            0,
+            "the second budget shed force-reaps nothing either"
+        );
+        assert_eq!(
+            e.segment_count(),
+            segments_before,
+            "no segment was reaped across the budget sheds (the durable log is intact)"
+        );
+        assert_eq!(
+            e.daily_budget_sheds(),
+            2,
+            "exactly one shed counted per rejected produce (two produces, two sheds)"
+        );
+        assert_eq!(
+            e.counters().produce_rejected,
+            2,
+            "two rejected produces counted"
         );
     }
 
