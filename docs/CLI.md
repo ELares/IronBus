@@ -73,6 +73,7 @@ broker opens.
 | Flag | Value type | Default | Unit | Meaning |
 |------|-----------|---------|------|---------|
 | `--data-dir <dir>` | path | required (no default) | path | The directory holding the segmented log, the cursor checkpoints, and the `dlq/` sink. |
+| `--profile <edge-tiny\|balanced\|throughput>` | enum | `balanced` (the compiled `DEFAULT_*` set, `PROFILE_SCHEMA_VERSION`) | n/a | Select a compiled-in, versioned tuning PROFILE (#87): a coherent group of knobs (`--max-segment-bytes`, `--consumer-credit`, `--consumer-credit-bytes`, `--max-connections`, `--max-groups`, `--max-in-flight`, `--disk-full-policy`, `--checkpoint-interval`, `--visibility-timeout-ms`, `--max-deliver`) set in one move. Applied FIRST, then any explicit env var or flag overrides an individual knob, so the precedence is **profile < env < flag**. `balanced` IS the shipped default set (so it is byte-identical to passing no profile); `edge-tiny` is the small-RAM, flash-gentle edge preset (8 MiB segments, 8 / 256 KiB credits, 32 connections, `drop-new`); `throughput` widens every buffer for a multi-core hub (256 MiB segments, 512 / 64 MiB credits, 1024 connections, `drop-oldest`). A profile NEVER sets `--data-dir` or any network/TLS key. An unknown name is a usage error. The exact per-profile values are frozen in `docs/CONFIG.md` section 6. |
 | `--addr <host:port>` | string | `127.0.0.1:7777` (`DEFAULT_ADDR`) | host:port | The wire-protocol listen address (loopback only by default). |
 | `--max-connections <n>` | usize | `256` (`DEFAULT_MAX_CONNECTIONS`) | count | Connection cap, so a flood cannot spawn unbounded threads. Must be at least 1. |
 | `--checkpoint-interval <n>` | u64 | `1024` (`DEFAULT_CHECKPOINT_INTERVAL`) | messages | At most this many messages may be redelivered after an abrupt crash; the cursor also flushes on a clean disconnect. |
@@ -98,6 +99,8 @@ broker opens.
 
 ### `serve` validation (each a usage error, exit 1)
 
+- `--profile` must be `edge-tiny`, `balanced`, or `throughput`; any other value is a usage error
+  naming the accepted profiles.
 - `--max-connections` must be at least 1.
 - `--max-deliver` must be at least 1 and below 4294967295 (both `0` and the u32 max mean
   unlimited; pass `--allow-unlimited-deliver` to enable it deliberately).
@@ -119,12 +122,19 @@ Every `serve` setting can also be supplied via an environment variable, so the s
 surface works as a foreground binary, a systemd unit, or a container with no config file.
 The variable name is `IRONBUS_<FLAG>`: the flag name minus its leading `--`, uppercased,
 with each `-` replaced by `_`. The **precedence is flag > env > default**: an explicit
-command-line flag overrides the env var, which overrides the compiled default.
+command-line flag overrides the env var, which overrides the compiled default. The
+compiled default for each knob is supplied by the active `--profile` (#87), which is
+itself applied below the env and flag layers, so the full chain is
+**profile < env < flag** (the profile sets a knob's starting value, then an env var or
+flag for that same knob overrides it). With no `--profile`, the default profile is
+`balanced`, whose values ARE the compiled `DEFAULT_*` constants, so the two-layer
+`flag > env > default` behavior above is unchanged.
 
 | Flag | Environment variable |
 |------|----------------------|
 | `--addr` | `IRONBUS_ADDR` |
 | `--data-dir` | `IRONBUS_DATA_DIR` |
+| `--profile` | `IRONBUS_PROFILE` (`edge-tiny`/`balanced`/`throughput`) |
 | `--max-connections` | `IRONBUS_MAX_CONNECTIONS` |
 | `--checkpoint-interval` | `IRONBUS_CHECKPOINT_INTERVAL` |
 | `--max-deliver` | `IRONBUS_MAX_DELIVER` |
@@ -151,8 +161,9 @@ A bad env value (e.g. non-numeric where a number is expected, or an unknown
 `IRONBUS_DISK_FULL_POLICY`) is a usage error (exit 1) that **names the env var**, exactly
 as a bad flag value names the flag. The repeatable `--key-shared-group` is command-line
 only (no single-var mapping, since a list with a per-group meaning does not flatten to one
-scalar). The broader TOML config file, profiles, and hot reload are SEPARATE follow-ups
-(#85/#87/#88) and not yet implemented.
+scalar). The compiled-in named PROFILES and the `--profile` selector are implemented
+(#87, see `--profile` above); the broader TOML config file and hot reload are SEPARATE
+follow-ups (#85/#88) and not yet implemented.
 
 ### `serve` data_dir lifecycle and the single-broker lock (#89)
 
@@ -176,6 +187,15 @@ On a successful bind it prints (to stdout):
 
 ```
 ironbus listening on <addr>, data dir <dir>
+```
+
+It then prints the MATERIALIZED-CONFIG line (#87): one structured `key=value` line carrying
+the active profile, the profile schema version, and every resolved tuning knob, so an
+operator can see exactly what the broker is running (and a profile content change is
+auditable across an upgrade):
+
+```
+materialized-config profile=<name> profile_schema_version=<n> addr=<addr> data_dir=<dir> max_connections=<n> max_segment_bytes=<n> ... enable_admin=<bool>
 ```
 
 If `--health-addr` is set, it also prints:
