@@ -190,6 +190,61 @@ impl InMemoryFile {
         let s = &mut *guard;
         s.live.clone_from(&s.durable);
     }
+
+    /// Models a power loss with page-cache reorder/drop of the UNSYNCED tail (#164, #55).
+    ///
+    /// A real power cut guarantees only that fsync'd bytes survive: the not-yet-synced page-cache
+    /// writes beyond the durable image may persist out of order, or partially, or not at all. The
+    /// all-or-nothing [`simulate_power_loss`](InMemoryFile::simulate_power_loss) reverts the whole
+    /// unsynced tail; this weaker, adversarial model keeps a seeded, arbitrary STRICT-PREFIX
+    /// length of the unsynced region durable and drops (reverts to the durable image) the rest,
+    /// so the surviving tail can end at any byte boundary, never past the last fsync'd byte. That
+    /// is the worst case recovery must still survive: a torn-at-an-arbitrary-point unsynced tail.
+    ///
+    /// It is deterministic in `seed` (a xorshift step, no ambient randomness), so a failing case
+    /// replays exactly. The durable prefix (every fsync'd byte) is ALWAYS retained, so this can
+    /// never lose an acknowledged record; only the unsynced surplus is reordered/dropped. Returns
+    /// the number of unsynced tail bytes that were KEPT durable by this power cut, so a caller can
+    /// assert the on-disk byte state actually crossed the modelled boundary.
+    ///
+    /// [`simulate_power_loss`]: InMemoryFile::simulate_power_loss
+    pub fn simulate_power_loss_reorder(&self, seed: u64) -> u64 {
+        let mut guard = self.lock();
+        let s = &mut *guard;
+        let durable_len = s.durable.len();
+        if s.live.len() <= durable_len {
+            // No unsynced surplus (the live image is within the durable one): a power cut here is
+            // the plain all-or-nothing revert, with nothing extra to keep.
+            s.live.clone_from(&s.durable);
+            return 0;
+        }
+        // The unsynced surplus is `live[durable_len..]`. A power cut may persist any strict prefix
+        // of it; choose a seeded length in `[0, surplus)` (strictly fewer than all the unsynced
+        // bytes, so the cut always drops at least one, modelling a real truncation of the tail).
+        let surplus = (s.live.len() - durable_len) as u64;
+        // xorshift64* so the choice is deterministic in `seed` with no external RNG.
+        let mut x = seed ^ 0x9E37_79B9_7F4A_7C15;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        let mixed = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        // `mixed % surplus < surplus <= live.len()`, so it always fits a usize (the surplus is a
+        // usize length to begin with). 0..surplus, so the cut never keeps the whole surplus.
+        let kept = usize::try_from(mixed % surplus).unwrap_or(0);
+        // Capture the unsynced prefix that survives BEFORE restoring the durable image, then rebuild
+        // the post-cut file as the durable image (every fsync'd byte) plus exactly that kept prefix
+        // of the unsynced surplus. Restoring the durable prefix first is load-bearing: only fsync'd
+        // bytes are guaranteed durable, so an unsynced in-place edit inside the durable range must
+        // NOT survive either, even though the appended surplus partly does.
+        let surviving_tail = s.live[durable_len..durable_len + kept].to_vec();
+        s.live.clone_from(&s.durable);
+        s.live.extend_from_slice(&surviving_tail);
+        // After a power cut the on-disk state IS what survived, so the durable image equals the
+        // post-cut live image: a later `simulate_power_loss` then resurrects nothing, and the kept
+        // unsynced prefix is now itself durable (the cut is the new ground truth).
+        s.durable.clone_from(&s.live);
+        kept as u64
+    }
 }
 
 impl RandomAccessFile for InMemoryFile {
@@ -388,6 +443,75 @@ mod tests {
             f.snapshot(),
             b"XBCDEF",
             "the edit survives via fdatasync, the truncated tail returns (length not synced)"
+        );
+    }
+
+    #[test]
+    fn power_loss_reorder_keeps_the_durable_prefix_and_a_strict_unsynced_prefix() {
+        // The page-cache reorder/drop model (#164, #55): only fsync'd bytes are guaranteed
+        // durable, so a power cut keeps the whole synced prefix and at most a STRICT prefix of the
+        // unsynced surplus, dropping the rest. The durable bytes always survive; the kept count is
+        // strictly fewer than the unsynced surplus (the cut always truncates at least one byte).
+        let f = InMemoryFile::new();
+        f.write_all_at(b"DURABLE", 0).unwrap();
+        f.sync_data().unwrap(); // 7 synced bytes
+        f.write_all_at(b"0123456789", 7).unwrap(); // 10 unsynced surplus bytes
+        let kept = f.simulate_power_loss_reorder(0xDEAD_BEEF);
+        assert!(
+            kept < 10,
+            "the cut keeps a STRICT prefix of the unsynced surplus"
+        );
+        let after = f.snapshot();
+        assert_eq!(
+            &after[..7],
+            b"DURABLE",
+            "every synced byte survived the power cut"
+        );
+        assert_eq!(
+            after.len() as u64,
+            7 + kept,
+            "the file ends at the durable bytes plus the kept unsynced prefix"
+        );
+        // The surviving unsynced bytes are an in-order prefix of what was written (no invention).
+        let kept = usize::try_from(kept).unwrap();
+        assert_eq!(&after[7..], &b"0123456789"[..kept]);
+    }
+
+    #[test]
+    fn power_loss_reorder_is_deterministic_in_the_seed() {
+        // Same seed, same write history => byte-identical post-cut image, so a failing case
+        // replays exactly. Two different seeds may keep different lengths (the model is varied).
+        let build = || {
+            let f = InMemoryFile::new();
+            f.write_all_at(b"abcd", 0).unwrap();
+            f.sync_all().unwrap();
+            f.write_all_at(b"EFGHIJKLMN", 4).unwrap();
+            f
+        };
+        let a = build();
+        let b = build();
+        let ka = a.simulate_power_loss_reorder(42);
+        let kb = b.simulate_power_loss_reorder(42);
+        assert_eq!(ka, kb);
+        assert_eq!(
+            a.snapshot(),
+            b.snapshot(),
+            "the reorder cut is deterministic in the seed"
+        );
+    }
+
+    #[test]
+    fn power_loss_reorder_with_no_unsynced_surplus_is_the_plain_revert() {
+        // When the live image is within the durable one (no appended surplus), the reorder cut is
+        // the all-or-nothing revert and keeps nothing extra.
+        let f = InMemoryFile::from_bytes(b"synced".to_vec());
+        f.write_all_at(b"X", 0).unwrap(); // an unsynced in-place edit, no length growth
+        let kept = f.simulate_power_loss_reorder(1);
+        assert_eq!(kept, 0);
+        assert_eq!(
+            f.snapshot(),
+            b"synced",
+            "the unsynced in-place edit did not survive"
         );
     }
 
