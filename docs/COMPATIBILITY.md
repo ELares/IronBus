@@ -317,9 +317,12 @@ Where the implementation diverges from the #132 / #126 specification:
   "centrally allocated here" with a per-id-space refuse / poison / negotiate classification. That
   single table now lives in [`docs/compat/versions.md`](compat/versions.md). The runtime
   enforcement is still a local pinned enum per id-space with the correct unknown-value behavior
-  (hard refuse for checksum_algo/version, typed error for an unknown ack op); the codec/dict id
-  spaces remain reserved-not-implemented (on-disk compression is not yet implemented; the stored
-  codec is always "none"), and the registry marks them POISON-on-unknown as the SPECIFIED action.
+  (hard refuse for checksum_algo/version, typed error for an unknown ack op). The codec/dict id
+  spaces are now IMPLEMENTED for the default `lz4` path (#387): `ironbus_core::compress` carries the
+  self-describing descriptor (codec id, `dict_id`, `uncompressed_len`), an unknown codec id or an
+  unresolved `dict_id` is the POISON-on-unknown action the registry specified (routed to #8 via
+  `ReasonCode::for_decompress_error`, never a crash), and the opt-in `zstd` codec plus ZDICT training
+  stay deferred per ADR-0003.
 - **`migrate` gates but does not yet convert.** #132 (via #17) requires that any format bump ship a
   `migrate` subcommand and a downgrade-safety statement. The subcommand now EXISTS and gates the bump
   (a differing on-disk version is refused unless explicitly allowed, never applied silently), and the

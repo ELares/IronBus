@@ -59,13 +59,47 @@ Source: `types.rs`. Unknown bits are preserved on read so a future writer can ad
 
 | bit       | name         | meaning |
 |-----------|--------------|---------|
-| `0b0000_0001` | `COMPRESSED` | the payload is compressed |
+| `0b0000_0001` | `COMPRESSED` | the payload is a compressed object: a self-describing codec descriptor then the codec stream (see [Compressed payload descriptor](#compressed-payload-descriptor-when-compressed-is-set)). CLEAR means the payload is raw |
 | `0b0000_0010` | `HAS_KEY`    | the record carries a key; DERIVED from `key_len != 0`, never taken from the caller |
 | `0b0000_0100` | `HAS_XXH3`   | the record carries the xxh3-64 field; DERIVED from the stored body reaching the threshold |
 
 `KNOWN` is `0b0000_0111`. `decode` rejects a frame whose `HAS_KEY` disagrees with
 `key_len != 0`, or whose `HAS_XXH3` disagrees with `body_len >= XXH3_PAYLOAD_THRESHOLD`,
 as `BadLength`.
+
+### Compressed payload descriptor (when `COMPRESSED` is set)
+
+Source: `crates/ironbus-core/src/compress.rs` (issues #12, #75, #76, #387). When the
+`COMPRESSED` bit is set, the record's `payload` field IS a compressed object: a fixed
+9-byte descriptor followed by the codec stream. The descriptor lives INSIDE the payload,
+inside the CRC-covered body, so it consumes NO new header bytes and shifts NO existing
+field; `FORMAT_VERSION` stays 1 and the format-registry digest (the `pub const` layout in
+`format.rs`) is unchanged. This is the reservation `docs/DICTIONARY_LIFECYCLE.md` §8 and the
+codec/dict id rows of [compat/versions.md](compat/versions.md) describe, now IMPLEMENTED for
+the `lz4` codec.
+
+| offset (within the payload) | field             | type | notes |
+|-----------------------------|-------------------|------|-------|
+| `[0, 1)`   | `codec_id`         | u8   | frozen: `0` = none, `1` = lz4 (the ADR-0003 pure-Rust default). An UNKNOWN id (a future `zstd` = 2, or garbage) is POISON on decode, never a crash |
+| `[1, 5)`   | `dict_id`          | u32  | the compression dictionary id; `0` = no dictionary (the v1 case). A non-zero id the reader cannot resolve is POISON (`UnresolvedDictId`, see DICTIONARY_LIFECYCLE.md §5) |
+| `[5, 9)`   | `uncompressed_len` | u32  | the original payload length, checked against the per-unit decompressed cap BEFORE allocation (the decompression-bomb guard, #76) |
+| `[9, ...)` | `stream`           | bytes| the codec stream (for `lz4`, an lz4 block; for `none`, the raw bytes) |
+
+Two write guards keep compression always safe and never lossy on size:
+
+- **Raw-store threshold.** A payload below `~64` bytes (`DEFAULT_RAW_STORE_THRESHOLD`), or
+  any payload when the codec is `none`, is stored RAW with the `COMPRESSED` bit CLEAR and no
+  descriptor, so the record is BYTE-FOR-BYTE the uncompressed layout.
+- **Never-expand guard.** If the descriptor + stream is not STRICTLY smaller than the raw
+  payload, the payload is stored RAW instead, so a compressed record can never be larger
+  than the same record stored raw.
+
+A `COMPRESSED`-clear record is therefore indistinguishable on disk from one written by a
+build with no compression at all, which is what keeps EVERY existing record and conformance
+vector byte-identical (backward compatibility). `body_crc` (and the optional xxh3-64) cover
+the STORED, post-compression bytes, so the verify-CRC-before-decompress ordering is the
+existing decode path unchanged: `decode` verifies the CRC over the stored bytes FIRST, and
+only those verified bytes are ever handed to the decompressor.
 
 ### Optional xxh3-64 field (on-disk, 8 bytes, conditional)
 

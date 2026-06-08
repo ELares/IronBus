@@ -195,6 +195,15 @@ const DEFAULT_DISK_FULL_POLICY: &str = "drop-new";
 /// levels (`interval`/`async`/`none`) are strictly opt-in and weaken I2 by a documented loss window.
 const DEFAULT_DURABILITY_LEVEL: &str = "sync";
 
+/// The default compression codec for `serve` (#12, #387): `lz4`, the pure-Rust default codec per
+/// [ADR-0003](../../../docs/adr/0003-default-compression-lz4-zstd-opt-in.md). The codec runtime,
+/// its raw-store / never-expand guards, and its decoder resilience live in
+/// `ironbus_core::compress`; an operator selects `none` to store every record raw (the historical
+/// byte layout) or `lz4` to compress compressible records. The opt-in `zstd` codec (behind a
+/// feature, with its level knob and trained dictionaries) is deferred per ADR-0003 and is not a
+/// valid value on the default build.
+const DEFAULT_COMPRESSION: &str = "lz4";
+
 /// The default `--flush-interval-ms` for the `interval` durability level (#341), in MILLISECONDS: the
 /// most time an acked-but-unsynced record may sit before the background flush forces an `fdatasync`,
 /// so the worst-case loss window is bounded. Only consulted under `--durability-level interval`. 1000
@@ -346,6 +355,43 @@ impl DurabilityLevelArg {
     /// but not gated behind the data-loss flag.
     fn requires_loss_ack(self) -> bool {
         matches!(self, DurabilityLevelArg::Async | DurabilityLevelArg::None)
+    }
+}
+
+/// The compression CODEC parsed from `serve --compression` (#12, #387). A platform-neutral, `Copy`
+/// mirror of [`ironbus_core::compress::Codec`], so it lives in the (non-Unix-gated) [`ServeConfig`]
+/// and is parsed/validated on EVERY platform; the Unix on-disk write path maps it to the codec
+/// runtime's config. The default is [`CompressionArg::Lz4`] (the ADR-0003 pure-Rust default codec);
+/// `none` stores every record raw (the historical byte layout, byte-for-byte). The opt-in `zstd`
+/// codec is deferred per ADR-0003 and is not accepted on the default build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompressionArg {
+    /// No compression: every record is stored raw, byte-for-byte the historical layout.
+    None,
+    /// LZ4 block compression via the pure-Rust `lz4_flex` codec (the ADR-0003 default).
+    Lz4,
+}
+
+impl CompressionArg {
+    /// Parses the `--compression` flag value, accepting `none` or `lz4`. `zstd` is intentionally
+    /// REJECTED on the default build (it is the opt-in feature, deferred per ADR-0003), so an
+    /// operator who asks for it gets a clear usage error rather than a silent fallback.
+    fn parse(value: &str) -> Option<CompressionArg> {
+        match value {
+            "none" => Some(CompressionArg::None),
+            "lz4" => Some(CompressionArg::Lz4),
+            _ => None,
+        }
+    }
+
+    /// The flag/log spelling of this codec, the inverse of [`CompressionArg::parse`]. `Lz4` returns
+    /// the [`DEFAULT_COMPRESSION`] string so the default constant stays the single source of truth
+    /// for that name; used to render it in the materialized-config log.
+    fn as_str(self) -> &'static str {
+        match self {
+            CompressionArg::None => "none",
+            CompressionArg::Lz4 => DEFAULT_COMPRESSION,
+        }
     }
 }
 
@@ -1478,6 +1524,10 @@ struct ServeFlags {
     /// `None` resolves to the default `sync` (ack-implies-durable, I2, zero acked loss). An unknown
     /// name is a usage error.
     durability_level: Option<String>,
+    /// The compression CODEC (#12, #387) selected by `--compression` / `IRONBUS_COMPRESSION`. `None`
+    /// resolves to the default `lz4` (the ADR-0003 pure-Rust default codec). `none` stores every
+    /// record raw; `zstd` is rejected on the default build. An unknown name is a usage error.
+    compression: Option<String>,
     /// The `interval` level's TIME window in ms (#341); `None` falls back to the default.
     flush_interval_ms: Option<u64>,
     /// The `interval` level's unsynced-byte budget (#341); `None` falls back to the default.
@@ -1594,6 +1644,9 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             }
             "--durability-level" => {
                 f.durability_level = Some(take_value("--durability-level", args, &mut i)?);
+            }
+            "--compression" => {
+                f.compression = Some(take_value("--compression", args, &mut i)?);
             }
             "--flush-interval-ms" => {
                 f.flush_interval_ms = Some(take_number("--flush-interval-ms", args, &mut i)?);
@@ -1814,6 +1867,23 @@ fn parse_serve_flags_with_env_and_reader(
             "`{source}` must be `sync`, `interval`, `async`, or `none`, got `{durability_level_arg}`"
         ))
     })?;
+    // The compression CODEC (#12, #387) resolves like the disk-full policy: an enum string with
+    // flag > env > default (`lz4`) precedence, parsed after resolution so a bad value names its
+    // source (the flag if explicit, else the env var). `zstd` is rejected here on the default build
+    // (it is the deferred opt-in feature), so an operator asking for it gets a clear usage error.
+    let compression_from_flag = f.compression.is_some();
+    let compression_arg = resolve_string("--compression", f.compression, env, DEFAULT_COMPRESSION);
+    let compression = CompressionArg::parse(&compression_arg).ok_or_else(|| {
+        let source = if compression_from_flag {
+            "--compression".to_string()
+        } else {
+            env_var_name("--compression")
+        };
+        CliError::Usage(format!(
+            "`{source}` must be `none` or `lz4` (zstd is a deferred opt-in feature, not available \
+             on this build), got `{compression_arg}`"
+        ))
+    })?;
     let mut parsed = ParsedServe {
         addr: resolve_string("--addr", f.addr, env, DEFAULT_ADDR),
         data_dir: resolve_opt_string("--data-dir", f.data_dir, env),
@@ -1939,6 +2009,8 @@ fn parse_serve_flags_with_env_and_reader(
             // set, overridable by env/flag. `async`/`none` are gated behind `--async-loss-ack` in
             // `validate_serve_config`, never reachable by accident.
             durability_level,
+            // The compression codec (#12, #387); default `lz4` per ADR-0003, `none` stores raw.
+            compression,
             flush_interval_ms: resolve_number(
                 "--flush-interval-ms",
                 f.flush_interval_ms,
@@ -2496,6 +2568,15 @@ struct ServeConfig {
     /// to boot without `async_loss_ack` (the none/async safety gate). Platform-neutral so it is
     /// validated on every platform; the Unix on-disk path maps it to the engine enum.
     durability_level: DurabilityLevelArg,
+    /// The COMPRESSION CODEC (#12, #387): which codec the on-disk compression runtime
+    /// (`ironbus_core::compress`) compresses NEW writes with. Default [`CompressionArg::Lz4`] (the
+    /// ADR-0003 pure-Rust default codec); [`CompressionArg::None`] stores every record raw,
+    /// byte-for-byte the historical layout. The runtime's raw-store / never-expand guards and its
+    /// decoder resilience (the decompressed-size cap, unknown-codec POISON) are codec-independent.
+    /// Platform-neutral so it is parsed/validated on every platform; the Unix on-disk path maps it to
+    /// the codec runtime's config. The opt-in `zstd` codec (and its level knob) is deferred per
+    /// ADR-0003 and not accepted on the default build.
+    compression: CompressionArg,
     /// The `interval` level's TIME window in MILLISECONDS (#341): the most time an acked-but-unsynced
     /// record may sit before a forced `fdatasync`, bounding the worst-case loss. Only consulted under
     /// `durability_level == interval`. Default 1 s (`DEFAULT_FLUSH_INTERVAL_MS`); `0` disables the time
@@ -2588,6 +2669,8 @@ impl ServeConfig {
             // The bench broker runs the default durable level (#341): ack-implies-durable, the same
             // power-loss-safe guarantee the shipped `serve` default carries.
             durability_level: DurabilityLevelArg::Sync,
+            // The bench broker runs the default compression codec (#387): lz4 per ADR-0003.
+            compression: CompressionArg::Lz4,
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
             async_loss_ack: false,
@@ -2735,6 +2818,10 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: &Path) -
     // off the startup log, the same surface the `ironbus_durability_*` gauges expose on `/metrics`.
     let durability_level = config.durability_level.as_str();
     let power_loss_safe = !config.durability_level.waives_i2();
+    // The compression codec (#12, #387) the on-disk codec runtime compresses new writes with; an
+    // operator reads the active codec straight off the startup log. `none` is the historical
+    // raw-store behavior.
+    let compression = config.compression.as_str();
     format!(
         "materialized-config profile={} profile_schema_version={} addr={addr} \
          data_dir={data_dir} max_connections={} max_segment_bytes={} max_total_bytes={} \
@@ -2743,8 +2830,8 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: &Path) -
          allow_unlimited_deliver={} disk_full_policy={policy} visibility_timeout_ms={} \
          max_retained_bytes={} max_age_ms={} max_messages={} health_liveness_window_ms={} \
          enable_admin={} ram_ceiling_bytes={} durability_level={durability_level} \
-         power_loss_safe={power_loss_safe} flush_interval_ms={} flush_max_bytes={} \
-         async_loss_ack={}",
+         power_loss_safe={power_loss_safe} compression={compression} flush_interval_ms={} \
+         flush_max_bytes={} async_loss_ack={}",
         config.profile.name(),
         config.profile_schema_version,
         config.max_connections,
@@ -3211,6 +3298,11 @@ fn cmd_serve(
         // I2-waived warning), so the non-Unix stub must consume them too or the Windows `-D warnings`
         // build trips field-never-read, invisible to a macOS reviewer (the recurring #288/#99 footgun).
         config.durability_level,
+        // The #12/#387 compression codec is read only on the Unix serve path (it wires the codec
+        // runtime's config and the materialized-config line), so the non-Unix stub must consume it
+        // too or the Windows `-D warnings` build trips field-never-read, invisible to a macOS
+        // reviewer (the recurring #288/#99 footgun).
+        config.compression,
         config.flush_interval_ms,
         config.flush_max_bytes,
         config.async_loss_ack,
@@ -4901,6 +4993,8 @@ mod tests {
             // The default durable level (#341): a test config that does not opt in stays power-loss
             // safe (ack-implies-durable), so an unrelated test never accidentally relaxes durability.
             durability_level: DurabilityLevelArg::Sync,
+            // The default compression codec (#387): lz4 per ADR-0003.
+            compression: CompressionArg::Lz4,
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
             async_loss_ack: false,
@@ -6470,6 +6564,8 @@ mod tests {
             // The default durable level (#341): a test config that does not opt in stays power-loss
             // safe (ack-implies-durable), so an unrelated test never accidentally relaxes durability.
             durability_level: DurabilityLevelArg::Sync,
+            // The default compression codec (#387): lz4 per ADR-0003.
+            compression: CompressionArg::Lz4,
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
             async_loss_ack: false,
@@ -6640,6 +6736,49 @@ mod tests {
             }
             other => panic!("a bad durability level must be a usage error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn serve_compression_default_is_lz4_and_parses_each_codec() {
+        // The compression codec (#12, #387): the default is `lz4` (ADR-0003), and both accepted
+        // spellings round-trip through the flag.
+        let cfg = parse_serve_flags(&serve_args(&[])).unwrap().config;
+        assert_eq!(cfg.compression, CompressionArg::Lz4, "default codec is lz4");
+        for (flag, codec) in [("none", CompressionArg::None), ("lz4", CompressionArg::Lz4)] {
+            let cfg = parse_serve_flags(&serve_args(&["--compression", flag]))
+                .unwrap()
+                .config;
+            assert_eq!(cfg.compression, codec, "{flag} parses to {codec:?}");
+        }
+        // `zstd` is REJECTED on the default build (it is the deferred opt-in feature): a usage error
+        // naming the accepted values and the deferral, not a silent fallback.
+        match parse_serve_flags(&serve_args(&["--compression", "zstd"])) {
+            Err(CliError::Usage(m)) => {
+                assert!(
+                    m.contains("`none`") && m.contains("`lz4`"),
+                    "names accepted values: {m}"
+                );
+                assert!(m.contains("zstd"), "explains the zstd deferral: {m}");
+            }
+            other => panic!("zstd must be a usage error on the default build, got {other:?}"),
+        }
+        // Any other unknown codec is a usage error too.
+        match parse_serve_flags(&serve_args(&["--compression", "bogus"])) {
+            Err(CliError::Usage(m)) => assert!(m.contains("`bogus`"), "echoes the bad value: {m}"),
+            other => panic!("a bad compression codec must be a usage error, got {other:?}"),
+        }
+        // The materialized-config line carries the active codec.
+        let line = materialized_config_line(
+            &parse_serve_flags(&serve_args(&["--compression", "none"]))
+                .unwrap()
+                .config,
+            "127.0.0.1:7700",
+            Path::new("/tmp/d"),
+        );
+        assert!(
+            line.contains("compression=none"),
+            "config line carries the codec: {line}"
+        );
     }
 
     #[test]

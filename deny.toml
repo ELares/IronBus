@@ -24,7 +24,11 @@ multiple-versions = "warn"
 wildcards = "deny"
 # Per #139, the default path is pure Rust: no vendored-C crate is allowed on it. The default
 # compression codec is lz4_flex (pure Rust); zstd (zstd-sys, vendored C) is opt-in only, behind an
-# explicit feature, never on the default path.
+# explicit feature, never on the default path. lz4_flex IS NOW on the record path (#387, the
+# compression codec runtime in ironbus-core): it is MIT (already on the license allow-list above),
+# pure Rust (built with the `safe-encode`/`safe-decode` features so it links no C and runs no
+# C-building build script), and declares no `links` key, so it satisfies the C-FFI ban below and the
+# cffi-ban.sh structural guard with no allowlist entry needed (only `links`/C-builder crates need one).
 #
 # C-FFI BAN (#102). The best-known vendored-C / native crates are name-banned below as a
 # belt-and-suspenders layer; the STRUCTURAL forward guard is `scripts/ci/cffi-ban.sh` (run by the
@@ -108,6 +112,31 @@ name = "mimalloc" # vendored mimalloc C.
 [advisories]
 yanked = "deny"
 unmaintained = "all"
+# Scoped, justified advisory acknowledgements. An entry here is a DELIBERATE decision that the
+# named advisory does not apply to IronBus's usage AND cannot be resolved by upgrading yet; it is
+# never a blanket mute. Re-review each on every dependency or MSRV change.
+ignore = [
+  # RUSTSEC-2026-0041 (lz4_flex < 0.11.6 / < 0.12.1): the LZ4 BLOCK decompressor under-validates a
+  # match-copy OFFSET, so a crafted/invalid stream can copy from outside the initialized output and
+  # leak (a) uninitialized memory when the `unsafe` decode path is used, or (b) the previous
+  # contents of a REUSED output buffer. IronBus is NOT exposed on either path and CANNOT upgrade to
+  # the fix yet:
+  #   * `lz4_flex` is pinned to 0.10 because the fixed releases (0.11.6 / 0.12.1) declare a 1.81
+  #     MSRV and IronBus's MSRV is 1.78 (the `msrv (1.78)` CI gate). Bumping the codec would break
+  #     that gate; the MSRV rise is a separate, deliberate decision.
+  #   * We enable the `safe-decode` feature (see ironbus-core/Cargo.toml), so the uninitialized-
+  #     memory path (a) does not apply: decode never runs the `unsafe` implementation.
+  #   * `ironbus_core::compress::decompress_payload` allocates a FRESH, ZEROED buffer
+  #     (`vec![0u8; uncompressed_len]`) sized to the descriptor's claimed length on EVERY call and
+  #     never reuses a user-supplied output buffer, so the reused-buffer leak path (b) does not
+  #     apply either: the worst case is bytes from this record's own fresh, zeroed buffer.
+  #   * The result is independently bounded: the claimed length is checked against an 8 MiB cap
+  #     before allocation, the decoded length must equal it exactly (else a typed `CorruptStream`
+  #     error), and the record body CRC is verified BEFORE any decompress. So no cross-record
+  #     information leak and no panic are reachable.
+  # Drop this ignore when the MSRV reaches 1.81 and `lz4_flex` is bumped to >= 0.11.6 (#387).
+  "RUSTSEC-2026-0041",
+]
 
 [sources]
 unknown-registry = "deny"

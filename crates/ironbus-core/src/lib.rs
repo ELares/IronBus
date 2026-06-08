@@ -13,6 +13,7 @@ pub mod attempt;
 pub mod backpressure;
 pub mod clock;
 pub mod codec;
+pub mod compress;
 pub mod config;
 pub mod cursor;
 pub mod dedup;
