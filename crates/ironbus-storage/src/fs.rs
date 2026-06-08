@@ -162,6 +162,36 @@ impl InMemoryFs {
         }
     }
 
+    /// Models a power loss with page-cache reorder/drop of the unsynced tail (#164, #55).
+    ///
+    /// Like [`simulate_power_loss`](InMemoryFs::simulate_power_loss), the directory reverts to its
+    /// last `sync_dir` image and every surviving file reverts its unsynced bytes. The difference is
+    /// the ACTIVE segment named `active_name`: instead of the all-or-nothing revert, its unsynced
+    /// tail is reordered/dropped to a seeded strict prefix (only fsync'd bytes are guaranteed
+    /// durable), via [`InMemoryFile::simulate_power_loss_reorder`]. Every other surviving file does
+    /// the plain revert (the sealed predecessors carry only fsync'd bytes anyway). Deterministic in
+    /// `seed`. Returns the number of unsynced tail bytes the cut KEPT on the active segment (0 if it
+    /// did not survive the directory revert), so a caller can assert the byte state crossed the
+    /// modelled boundary.
+    ///
+    /// [`simulate_power_loss`]: InMemoryFs::simulate_power_loss
+    /// [`InMemoryFile::simulate_power_loss_reorder`]: crate::io::InMemoryFile::simulate_power_loss_reorder
+    #[must_use]
+    pub fn simulate_power_loss_reorder(&self, active_name: &str, seed: u64) -> u64 {
+        let mut g = self.lock();
+        g.live = g.durable.clone();
+        let active_key = format!("{}{}", self.prefix, active_name);
+        let mut kept = 0u64;
+        for (key, f) in &g.live {
+            if *key == active_key {
+                kept = f.simulate_power_loss_reorder(seed);
+            } else {
+                f.simulate_power_loss();
+            }
+        }
+        kept
+    }
+
     /// Maps a caller-visible name to its backing-store key by prepending this handle's prefix.
     fn key(&self, name: &str) -> String {
         format!("{}{}", self.prefix, name)

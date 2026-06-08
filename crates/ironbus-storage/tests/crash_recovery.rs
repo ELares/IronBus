@@ -12,11 +12,22 @@
 //! - tail corruption (the last record's bytes damaged);
 //! - mid-log rot and arbitrary single-byte corruption anywhere in the segment;
 //! - a reordered / partial unsynced tail (a hole punched into the unsynced region), where
-//!   recovery must truncate at the first gap and never lose a durable record below it.
+//!   recovery must truncate at the first gap and never lose a durable record below it;
+//! - a power cut with page-cache reorder/drop of the unsynced tail (#164): only fsync'd bytes
+//!   are guaranteed durable, so a seeded strict prefix of the unsynced surplus survives and the
+//!   rest is dropped, and recovery must still yield a consistent monotonic prefix;
+//! - the rename-boundary analogue (#55): IronBus uses no `rename`, so its atomic-publish point is
+//!   the `sync_dir` that makes a new segment's directory entry durable (the seal / roll publish);
+//!   a crash injected immediately BEFORE and AFTER that publish must recover a consistent prefix.
 //!
-//! Block-layer fault injection (an fsync that returns EIO, page-cache reordering, a
-//! both-slots-torn checkpoint) needs a fault-injecting file layer and is tracked
-//! separately.
+//! After EVERY injected crash that truncates a torn tail, the loss-bound assertion
+//! ([`assert_loss_bound_equals_discarded_suffix`]) checks the structured `LossReport`'s claimed
+//! byte loss equals the ACTUAL discarded suffix (the durable byte length at recovery minus the
+//! bytes recovery kept), so a report that under- or over-claims its loss is caught.
+//!
+//! Block-layer fault injection (an fsync that returns EIO, the rename/`sync_dir` boundary, and
+//! page-cache reorder/drop) is driven through the [`FaultFs`] fault layer and the
+//! `simulate_power_loss_reorder` disk model.
 
 use ironbus_core::clock::ManualClock;
 use ironbus_core::format::{RECORD_HEADER_LEN, SEGMENT_HEADER_LEN};
@@ -28,6 +39,7 @@ use ironbus_storage::invariants::{
 };
 use ironbus_storage::io::RandomAccessFile;
 use ironbus_storage::log::{Append, Log, LogConfig};
+use ironbus_storage::loss::ReasonCode;
 use ironbus_storage::naming::segment_file_name;
 use proptest::prelude::*;
 
@@ -118,6 +130,74 @@ fn assert_prefix<F: Filesystem>(log: &Log<F, ManualClock>, expected: u64) {
         assert_eq!(record.seq, Seq::new(i));
         assert_eq!(record.payload, payload(i));
     }
+}
+
+/// Asserts the recovered records of `log` are exactly the durable prefix of a `simulate_power_loss`
+/// (no roll), then returns nothing: shared by the reorder/drop gate below.
+fn assert_consistent_prefix<F: Filesystem>(log: &Log<F, ManualClock>) {
+    let recovered = log.flushed_offset().get();
+    let records = log.read_from(Offset::ZERO, usize::MAX).unwrap();
+    assert_eq!(
+        records.len() as u64,
+        recovered,
+        "the readable run equals the flush mark"
+    );
+    check_longest_valid_prefix(&records).unwrap();
+    for (i, record) in records.iter().enumerate() {
+        let i = u64::try_from(i).unwrap();
+        assert_eq!(record.offset, Offset::new(i));
+        assert_eq!(record.seq, Seq::new(i));
+        assert_eq!(record.payload, payload(i));
+    }
+}
+
+/// The single-segment loss-bound assertion (#55 acceptance: `loss_bound` == actual discarded suffix).
+///
+/// `durable_active_len` is the active segment's DURABLE byte length captured just before recovery
+/// (the on-disk image a power cut would have left). After `Log::open` recovers and truncates any
+/// torn tail, the active segment file's length IS the kept `valid_end`, so the actual discarded
+/// suffix is `durable_active_len - kept_len`. This asserts the structured `LossReport`'s claimed
+/// byte loss (`total_bytes_skipped`) and the raw `recovered_truncated_bytes` both equal that actual
+/// discarded suffix, so a report that under- or over-claims its loss is mechanically falsified. It
+/// also asserts every claimed loss event names the active segment and the span matches.
+fn assert_loss_bound_equals_discarded_suffix(
+    fs: &InMemoryFs,
+    active_id: u64,
+    durable_active_len: u64,
+    log: &Log<InMemoryFs, ManualClock>,
+) {
+    let active_name = segment_file_name(active_id);
+    let kept_len = fs.open(&active_name).unwrap().len().unwrap();
+    let actual_discarded = durable_active_len.saturating_sub(kept_len);
+    assert_eq!(
+        log.loss_report().total_bytes_skipped(),
+        actual_discarded,
+        "the LossReport's claimed byte loss must equal the actual discarded suffix \
+         (durable {durable_active_len} - kept {kept_len})"
+    );
+    assert_eq!(
+        log.recovered_truncated_bytes(),
+        actual_discarded,
+        "the raw recovered_truncated_bytes must equal the actual discarded suffix"
+    );
+    // Every claimed loss event names the active segment and its span equals the discarded bytes.
+    let claimed: u64 = log
+        .loss_report()
+        .events
+        .iter()
+        .map(|e| {
+            assert_eq!(
+                e.segment_id, active_id,
+                "a loss event names the wrong segment"
+            );
+            assert_eq!(e.byte_offset_end - e.byte_offset_start, e.bytes_skipped);
+            e.bytes_skipped
+        })
+        .sum();
+    assert_eq!(
+        claimed, actual_discarded,
+        "the loss events sum to the discarded suffix"
+    );
 }
 
 /// The fixed workload replayed prefix-by-prefix in the every-boundary tests.
@@ -1035,5 +1115,336 @@ fn recovery_fails_closed_when_a_fault_strikes_the_roll_forward() {
             matches!(err, StorageError::Io(_)),
             "fault {fault:?} during roll-forward must fail closed cleanly, got {err:?}"
         );
+    }
+}
+
+// --- Gap 3: the loss_bound assertion on the existing torn-tail / corruption boundaries ---------
+
+#[test]
+fn loss_bound_equals_the_discarded_suffix_after_a_torn_tail() {
+    // The loss-bound contract (#55): after a torn tail is truncated, the LossReport's claimed
+    // byte loss must equal the ACTUAL discarded suffix (durable length at recovery minus the bytes
+    // recovery kept), not merely "some loss". Sweep the chop size so the claimed bound is checked
+    // against several true discarded-suffix lengths, never a coincidental match.
+    let n = 6u64;
+    for chop in 1u64..=5 {
+        let ops: Vec<Op> = (0..n).map(|_| Op::Append).chain([Op::Sync]).collect();
+        let log = apply(InMemoryFs::new(), big_config(), &ops);
+        let fs = log.into_filesystem();
+
+        // Tear `chop` bytes off the last record and make the torn image DURABLE (a set_len shrink
+        // is metadata that only sync_all persists), so the durable length at recovery is the torn
+        // length and the discarded suffix is well defined.
+        let file = fs.open(&segment_file_name(0)).unwrap();
+        let full_len = file.len().unwrap();
+        let torn_len = full_len - chop;
+        file.set_len(torn_len).unwrap();
+        file.sync_all().unwrap();
+        let durable_active_len = fs.open(&segment_file_name(0)).unwrap().len().unwrap();
+        assert_eq!(
+            durable_active_len, torn_len,
+            "the torn image is the durable image"
+        );
+
+        let log = Log::open(fs.clone(), ManualClock::new(), big_config()).unwrap();
+        // The whole last record is dropped (its frame is no longer parseable), so the prefix is n-1.
+        assert_eq!(log.flushed_offset(), Offset::new(n - 1));
+        assert_prefix(&log, n - 1);
+        // The claimed loss bound equals the actual discarded suffix.
+        assert_loss_bound_equals_discarded_suffix(&fs, 0, durable_active_len, &log);
+        assert!(
+            log.loss_report().total_bytes_skipped() >= chop,
+            "the discarded suffix is at least the bytes we chopped"
+        );
+    }
+}
+
+#[test]
+fn loss_bound_equals_the_discarded_suffix_after_body_corruption() {
+    // The same loss-bound equality after a CORRUPT (not torn) tail: the last record's body byte is
+    // flipped, so recovery drops that record and everything after it, and the claimed loss bound
+    // must equal the actual discarded suffix (here the whole last record's frame).
+    let n = 6u64;
+    let ops: Vec<Op> = (0..n).map(|_| Op::Append).chain([Op::Sync]).collect();
+    let log = apply(InMemoryFs::new(), big_config(), &ops);
+    let fs = log.into_filesystem();
+
+    let file = fs.open(&segment_file_name(0)).unwrap();
+    let mut bytes = file.snapshot();
+    let frame = (bytes.len() - SEGMENT_HEADER_LEN) / usize::try_from(n).unwrap();
+    // A byte in the LAST record's body (after its header), so the body CRC, not the header CRC,
+    // rejects it: the corruption is durably written so the discarded suffix is well defined.
+    let target =
+        SEGMENT_HEADER_LEN + usize::try_from(n - 1).unwrap() * frame + RECORD_HEADER_LEN + 1;
+    bytes[target] ^= 0xff;
+    file.set_len(0).unwrap();
+    file.write_all_at(&bytes, 0).unwrap();
+    file.sync_all().unwrap();
+    let durable_active_len = fs.open(&segment_file_name(0)).unwrap().len().unwrap();
+
+    let log = Log::open(fs.clone(), ManualClock::new(), big_config()).unwrap();
+    assert_eq!(log.flushed_offset(), Offset::new(n - 1));
+    assert_prefix(&log, n - 1);
+    assert_loss_bound_equals_discarded_suffix(&fs, 0, durable_active_len, &log);
+    // The corruption fell in the record body, so the body-CRC reason is reported (not torn-tail).
+    assert!(
+        log.loss_report()
+            .events
+            .iter()
+            .any(|e| e.reason_code == ReasonCode::CorruptRecordBody),
+        "a body-corruption loss is reported with the body-CRC reason"
+    );
+}
+
+// --- Gap 2: page-cache reorder/drop of the unsynced tail (only fsync'd bytes are durable) -------
+
+#[test]
+fn power_cut_with_reordered_unsynced_tail_recovers_a_consistent_prefix() {
+    // The page-cache reorder/drop power-loss model (#164, #55): a real power cut guarantees only
+    // that fsync'd bytes survive, so the unsynced tail may persist only as a STRICT prefix (the
+    // rest dropped/reordered away). Across many seeds, recovery must still yield a consistent
+    // monotonic prefix that loses no acked record, and the claimed loss bound must equal the actual
+    // discarded suffix. The seed makes each case replay exactly.
+    for seed in 0u64..64 {
+        let durable = 5u64;
+        let unsynced = 4u64;
+        // A durable, acked prefix...
+        let durable_ops: Vec<Op> = (0..durable).map(|_| Op::Append).chain([Op::Sync]).collect();
+        let mut log = apply(InMemoryFs::new(), big_config(), &durable_ops);
+        assert_eq!(log.flushed_offset().get(), durable);
+        let durable_active_len = log
+            .filesystem()
+            .open(&segment_file_name(0))
+            .unwrap()
+            .len()
+            .unwrap();
+        // ...then an UNSYNCED tail (more appends, no sync): these page-cache bytes are not durable.
+        for i in durable..(durable + unsynced) {
+            append_at(&mut log, i);
+        }
+        let appended = log.next_offset().get();
+        let fs = log.into_filesystem();
+
+        // The power cut keeps a seeded strict prefix of the unsynced surplus and drops the rest.
+        let kept = fs.simulate_power_loss_reorder(&segment_file_name(0), seed);
+        // Byte-state assertion (no false pass): the cut genuinely truncated the unsynced surplus,
+        // never resurrected a durable byte and never kept the whole surplus.
+        let after_len = fs.open(&segment_file_name(0)).unwrap().len().unwrap();
+        assert_eq!(
+            after_len,
+            durable_active_len + kept,
+            "the cut kept exactly the durable prefix + a strict unsynced prefix"
+        );
+        assert!(
+            after_len >= durable_active_len,
+            "the durable (acked) bytes always survive the cut"
+        );
+
+        // Recovery: the acked prefix survives, the reordered/dropped tail truncates at the first
+        // incomplete record, and no acked record is lost.
+        let log = Log::open(fs.clone(), ManualClock::new(), big_config()).unwrap();
+        let recovered = log.flushed_offset().get();
+        assert!(
+            recovered >= durable,
+            "seed {seed}: a reordered unsynced tail lost an acked record: recovered {recovered} < durable {durable}"
+        );
+        assert!(recovered <= appended, "seed {seed}: invented a record");
+        assert_consistent_prefix(&log);
+        // The acked prefix is intact through the shared invariant checker.
+        let records = log.read_from(Offset::ZERO, usize::MAX).unwrap();
+        let acked: Vec<u64> = (0..durable).collect();
+        check_no_acked_loss(&records, &acked).unwrap();
+        // The loss bound equals the actual discarded suffix of the active segment after the cut.
+        assert_loss_bound_equals_discarded_suffix(&fs, 0, after_len, &log);
+    }
+}
+
+#[test]
+fn power_cut_reorder_is_deterministic_across_two_independent_disks() {
+    // Determinism is paramount (#55): the same seed and the same write history must produce a
+    // byte-identical post-cut image and therefore byte-identical recovery on two independent disks.
+    let build = || {
+        let durable = 4u64;
+        let durable_ops: Vec<Op> = (0..durable).map(|_| Op::Append).chain([Op::Sync]).collect();
+        let mut log = apply(InMemoryFs::new(), big_config(), &durable_ops);
+        for i in durable..(durable + 5) {
+            append_at(&mut log, i);
+        }
+        log.into_filesystem()
+    };
+    let seed = 0x1234_5678_9abc_def0u64;
+    let fs_a = build();
+    let fs_b = build();
+    let kept_a = fs_a.simulate_power_loss_reorder(&segment_file_name(0), seed);
+    let kept_b = fs_b.simulate_power_loss_reorder(&segment_file_name(0), seed);
+    assert_eq!(
+        kept_a, kept_b,
+        "the reorder cut keeps the same length for the same seed"
+    );
+    assert_eq!(
+        fs_a.open(&segment_file_name(0)).unwrap().snapshot(),
+        fs_b.open(&segment_file_name(0)).unwrap().snapshot(),
+        "the post-cut byte image is identical for the same seed"
+    );
+    let recs_a = Log::open(fs_a, ManualClock::new(), big_config())
+        .unwrap()
+        .read_from(Offset::ZERO, usize::MAX)
+        .unwrap();
+    let recs_b = Log::open(fs_b, ManualClock::new(), big_config())
+        .unwrap()
+        .read_from(Offset::ZERO, usize::MAX)
+        .unwrap();
+    check_pure_recovery(&recs_a, &recs_b).unwrap();
+}
+
+// --- Gap 1: the rename-boundary analogue (the sync_dir directory-publish of a seal / roll) ------
+
+#[test]
+fn crash_before_the_directory_publish_of_a_fresh_segment_recovers_an_empty_log() {
+    // The first segment's directory entry is published by the `sync_dir` at the end of the fresh
+    // `Log::open`. A crash injected BEFORE that publish (the create's `sync_dir` faults) leaves the
+    // segment file un-published, so a power loss drops it and recovery starts a clean empty log
+    // (no acked record existed yet). This is the create-side rename-boundary, BEFORE the publish.
+    let disk = InMemoryFs::new();
+    let (faultfs, control) = FaultFs::new(disk.clone());
+    control.set_fail_sync_dir(true);
+    // The fresh open creates segment 0, syncs its header, then `sync_dir`s its entry: the publish
+    // faults, so open fails closed (a clean error, no panic).
+    let err = Log::open(faultfs, ManualClock::new(), big_config());
+    assert!(
+        err.is_err(),
+        "a faulted directory publish fails the open closed"
+    );
+    assert_eq!(
+        control.sync_dir_count(),
+        1,
+        "the directory-publish boundary was actually reached"
+    );
+    // Byte-state assertion (no false pass): segment 0's file was created in the live image but its
+    // directory entry was never published, so it is NOT durable.
+    assert!(
+        disk.exists(&segment_file_name(0)).unwrap(),
+        "the create reached the live image"
+    );
+
+    // Model the crash that accompanies the failed publish: the un-published entry vanishes.
+    disk.simulate_power_loss();
+    assert!(
+        !disk.exists(&segment_file_name(0)).unwrap(),
+        "the un-published segment was dropped by the power loss"
+    );
+
+    // A clean reopen on the post-crash disk yields a fresh empty log (offset 0, no records), and it
+    // republishes segment 0 cleanly.
+    let log = Log::open(disk, ManualClock::new(), big_config()).unwrap();
+    assert_eq!(log.flushed_offset(), Offset::new(0));
+    assert_prefix(&log, 0);
+}
+
+#[test]
+fn crash_before_and_after_the_roll_directory_publish_recovers_a_consistent_prefix() {
+    // A roll's publish boundary (#55 rename analogue): `roll` seals the old segment (durable
+    // footer) and then creates + header-syncs + `sync_dir`-publishes the NEW segment. We stop the
+    // process immediately BEFORE that publish (the `sync_dir` faults, freezing the writer) and,
+    // separately, immediately AFTER it (a clean roll, then a power loss), and assert recovery
+    // yields the same consistent acked prefix at BOTH points.
+    let durable = 4u64;
+
+    // --- BEFORE the publish: the roll's sync_dir faults. ---
+    {
+        let (faultfs, control) = FaultFs::new(InMemoryFs::new());
+        let mut log = Log::open(faultfs, ManualClock::new(), small_config()).unwrap();
+        for i in 0..durable {
+            append_at(&mut log, i);
+            log.sync().unwrap();
+        }
+        let acked = log.flushed_offset().get();
+        assert_eq!(acked, durable);
+        let publishes_before = control.sync_dir_count();
+
+        // Arm the directory-publish fault, then append until a roll fires: the roll seals the old
+        // segment, creates the new one, and its `sync_dir` publish faults, freezing the writer.
+        control.set_fail_sync_dir(true);
+        let mut froze = false;
+        for i in durable..durable + 80 {
+            match log.append(&Append {
+                timestamp_ms: i,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: &payload(i),
+            }) {
+                Ok(_) => {}
+                Err(ironbus_storage::segment::StorageError::WriterFrozen) => {
+                    froze = true;
+                    break;
+                }
+                Err(other) => panic!("a roll whose publish faults must be fatal, got {other:?}"),
+            }
+        }
+        assert!(
+            froze,
+            "the roll's directory publish should have frozen the writer"
+        );
+        assert!(
+            control.sync_dir_count() > publishes_before,
+            "the directory-publish boundary was genuinely reached during the roll"
+        );
+        assert_eq!(
+            log.flushed_offset().get(),
+            acked,
+            "the durable mark never advanced past the acked prefix when the publish faulted"
+        );
+
+        // Crash: the new segment's directory entry was never published, so it vanishes; the sealed
+        // old segment survives and recovery rolls forward from it. The acked prefix is intact.
+        control.set_fail_sync_dir(false);
+        let faultfs = log.into_filesystem();
+        faultfs.inner().simulate_power_loss();
+        let log = Log::open(faultfs, ManualClock::new(), small_config()).unwrap();
+        assert!(
+            log.flushed_offset().get() >= acked,
+            "the before-publish crash lost an acked record"
+        );
+        assert_consistent_prefix(&log);
+    }
+
+    // --- AFTER the publish: a clean roll, then a power loss. ---
+    {
+        let mut log = apply(
+            InMemoryFs::new(),
+            small_config(),
+            &(0..durable)
+                .flat_map(|_| [Op::Append, Op::Sync])
+                .collect::<Vec<_>>(),
+        );
+        let acked = log.flushed_offset().get();
+        assert_eq!(acked, durable);
+        // Drive enough appends to roll at least once (the publish of the new segment succeeds), then
+        // sync so the rolled state is fully durable.
+        let before_segments = log.segment_count();
+        for i in durable..durable + 80 {
+            append_at(&mut log, i);
+            if log.segment_count() > before_segments {
+                break;
+            }
+        }
+        assert!(
+            log.segment_count() > before_segments,
+            "a roll actually happened"
+        );
+        log.sync().unwrap();
+        let acked_after_roll = log.flushed_offset().get();
+        // A power loss AFTER the publish: every durable byte (including the published new segment
+        // entry) survives, so recovery recovers the full synced prefix, monotone and intact.
+        log.filesystem().simulate_power_loss();
+        let fs = log.into_filesystem();
+        let log = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        assert_eq!(
+            log.flushed_offset().get(),
+            acked_after_roll,
+            "the after-publish crash recovers exactly the synced prefix"
+        );
+        assert_consistent_prefix(&log);
     }
 }
