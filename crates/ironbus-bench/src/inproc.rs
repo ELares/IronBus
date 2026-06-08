@@ -28,7 +28,7 @@
 
 #![cfg(unix)]
 
-use ironbus_core::clock::ManualClock;
+use ironbus_core::clock::{Clock as _, ManualClock};
 use ironbus_core::delivery::DeliveryConfig;
 use ironbus_core::lease::LeaseConfig;
 use ironbus_server::actor::{spawn_actor, EngineHandle, DEFAULT_CHANNEL_BOUND};
@@ -112,7 +112,12 @@ impl InProcBroker {
             // `max_connections` matches the binary's default headroom; the self-test opens only a
             // sender + a receiver + a probe, far below this.
             move || {
-                let _ = serve(&listener, &engine, &shutdown, 256);
+                // The self-test does not read the liveness beacon (#95); the serve loop still ticks
+                // it, so hand it a throwaway beacon on a ManualClock matching the engine's clock type.
+                let clock = ManualClock::new();
+                let beacon =
+                    ironbus_server::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                let _ = serve(&listener, &engine, &shutdown, 256, &clock, &beacon);
             }
         });
 

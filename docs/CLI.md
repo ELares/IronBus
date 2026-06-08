@@ -84,7 +84,9 @@ broker opens.
 | `--key-shared-group <name>` | string, REPEATABLE | none (empty) | n/a | Run the named competing group in `key_shared` ordering: a record's key routes to one live member, so same-key records keep order while the group drains in parallel across keys. Pass once per group; a group not named stays plain competing. |
 | `--broadcast-group <name>` | string, REPEATABLE | none (empty) | n/a | Mark a NAMED group BROADCAST (#288): a group-of-one that sees every record in order, so it accepts the `cumulative-ack` verb. The group MUST be named: the DEFAULT/empty group (`--broadcast-group ""`) cannot be a broadcast group (its consumers never SUB a name, so the group-of-one subscriber cap could not bind it) and is rejected as a startup usage error. Mutually exclusive with `key_shared`. A broadcast group is enforced as a true group-of-one: it accepts AT MOST ONE active subscriber (a second concurrent SUB is rejected). Pass once per group; a group not named stays plain competing and rejects cumulative ack. An empty/bad name or the group cap is a startup usage error. |
 | `--visibility-timeout-ms <n>` | u64 | `30000` (`DEFAULT_VISIBILITY_MS`) | milliseconds | How long a delivered message stays in flight before it may redeliver. Must be at least 1. The lease hard cap is the larger of 5 minutes (`DEFAULT_HARD_CAP_MS = 300000`) and this. |
-| `--health-addr <host:port>` | string | off (not set) | host:port | If set, also serve `GET /healthz`, `/readyz`, and `/metrics` on this loopback HTTP port. |
+| `--health-addr <host:port>` | string | off (not set) | host:port | If set, also serve `GET /healthz`, `/readyz`, and `/metrics` (and `/admin` with `--enable-admin`) on this HTTP port. Loopback by default; a non-loopback bind requires `--health-allow-public` (see below). |
+| `--health-allow-public` | flag (no value) | off (false) | n/a | Acknowledge a NON-LOOPBACK `--health-addr` bind (#95). The health surface is UNAUTHENTICATED and UNENCRYPTED (TLS #107 and auth #106 are not yet implemented), so by default a non-loopback bind refuses to start; this flag binds it anyway with a loud startup WARN. Loopback binds ignore this flag. Covers the health surface only; the wire `--addr` bind has no such override. |
+| `--health-liveness-window-ms <n>` | u64 | `10000` (10 s, `DEFAULT_HEALTH_LIVENESS_WINDOW_MS`); `0` = disabled | milliseconds | The `/healthz` liveness HYSTERESIS WINDOW (#95): `/healthz` returns 503 only after the broker's accept loop has gone this long with no monotonic-clock progress tick, so a slow-but-progressing fsync never fails liveness and a healthy idle node stays 200. `0` disables the watchdog (static-200 `/healthz` while up). |
 
 ### `serve` validation (each a usage error, exit 1)
 
@@ -96,6 +98,12 @@ broker opens.
 - `--max-segment-bytes` must be at least 4096.
 - `--visibility-timeout-ms` must be at least 1.
 - `--disk-full-policy` must be `drop-new` or `drop-oldest`.
+- `--health-addr` that resolves to a NON-LOOPBACK address (including the wildcards `0.0.0.0` /
+  `::`, or a hostname that resolves to a routable IP) is REFUSED unless `--health-allow-public` is
+  also set: the health surface is unauthenticated and unencrypted, so a fail-closed startup error
+  (naming the address) is the default rather than an accidental public metrics endpoint (#95). The
+  classification is on the resolved address. A `--health-addr` that resolves to nothing is also a
+  usage error.
 
 ### Environment-variable mapping and precedence (#89)
 
@@ -127,6 +135,8 @@ command-line flag overrides the env var, which overrides the compiled default.
 | `--disk-full-policy` | `IRONBUS_DISK_FULL_POLICY` |
 | `--visibility-timeout-ms` | `IRONBUS_VISIBILITY_TIMEOUT_MS` |
 | `--health-addr` | `IRONBUS_HEALTH_ADDR` |
+| `--health-allow-public` | `IRONBUS_HEALTH_ALLOW_PUBLIC` (`true`/`1` or `false`/`0`) |
+| `--health-liveness-window-ms` | `IRONBUS_HEALTH_LIVENESS_WINDOW_MS` |
 | `--enable-admin` | `IRONBUS_ENABLE_ADMIN` (`true`/`1` or `false`/`0`) |
 
 A bad env value (e.g. non-numeric where a number is expected, or an unknown
@@ -171,6 +181,25 @@ If unlimited delivery is enabled, it prints the startup warning:
 ```
 WARN: --max-deliver is unlimited (--allow-unlimited-deliver): a poison message can redeliver forever and is never dead-lettered
 ```
+
+If a NON-LOOPBACK health bind was acknowledged with `--health-allow-public`, it prints a loud
+startup warning on every start (the surface is unauthenticated and unencrypted):
+
+```
+WARN: --health-allow-public: binding the UNAUTHENTICATED, UNENCRYPTED health surface to non-loopback <addr> ...
+```
+
+A non-loopback `--health-addr` WITHOUT `--health-allow-public` does not start: it prints a
+fail-closed usage error naming the address and exits 1.
+
+### `/healthz` liveness vs `/readyz` readiness (#95)
+
+`/healthz` is LIVENESS: it answers 200 while the broker's accept loop is making progress and flips
+to 503 only after `--health-liveness-window-ms` (default 10 s) of no progress, on a monotonic clock
+so a wall-clock step never drives it. A slow-but-progressing fsync keeps `/healthz` 200, an idle node
+stays 200 (idle is progress), and a writer frozen by a fatal fsync still returns `/healthz` 200
+(liveness is not readiness). `/readyz` is READINESS: it answers 503 while the durable-log writer is
+frozen or the broker is shutting down, and 200 once it accepts writes.
 
 ## `pub` (online; any platform)
 

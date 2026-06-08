@@ -44,6 +44,12 @@ impl Drop for ConnectionSlot<'_> {
 /// connection (up to `max_connections` concurrently; further connections are refused). Each
 /// connection drives a [`Session`] against the shared engine.
 ///
+/// `clock` is the monotonic clock seam this loop reads to tick the `progress` liveness beacon
+/// (#95): the accept loop calls [`LivenessBeacon::mark_progress`](crate::liveness::LivenessBeacon::mark_progress)
+/// on EVERY iteration, including the idle would-block poll, so `/healthz` can tell a stuck loop from
+/// an idle one (idle still ticks). The clock is read directly, NOT through the append actor, so the
+/// accept loop's own liveness signal never depends on the actor being alive.
+///
 /// # Errors
 /// Propagates a fatal listener error. A transient (would-block) accept is retried; a
 /// per-connection IO error closes only that connection.
@@ -52,6 +58,8 @@ pub fn serve<F, C>(
     engine: &EngineHandle<F, C>,
     shutdown: &AtomicBool,
     max_connections: usize,
+    clock: &C,
+    progress: &crate::liveness::LivenessBeacon,
 ) -> std::io::Result<()>
 where
     F: Filesystem + 'static,
@@ -65,6 +73,12 @@ where
     // unreachable in any real deployment.
     let next_member = Arc::new(AtomicU64::new(0));
     while !shutdown.load(Ordering::Acquire) {
+        // Tick the liveness beacon at the TOP of every iteration, before the (possibly blocking)
+        // accept. A connection accepted, a connection refused at the cap, AND the idle would-block
+        // poll all reach this point, so the beacon advances whether or not there is work: a running
+        // accept loop is liveness. Only a loop that has truly wedged (or crashed) stops ticking, and
+        // only then does `/healthz` shed after the hysteresis window (#95).
+        progress.mark_progress(clock.now_monotonic_nanos());
         match listener.accept() {
             Ok((stream, _addr)) => {
                 if active.load(Ordering::Acquire) >= max_connections {
@@ -316,7 +330,11 @@ mod tests {
         let server = std::thread::spawn({
             let engine = handle.clone();
             let shutdown = Arc::clone(&shutdown);
-            move || serve(&listener, &engine, &shutdown, 16).unwrap()
+            move || {
+                let clock = SystemClock::new();
+                let beacon = crate::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                serve(&listener, &engine, &shutdown, 16, &clock, &beacon).unwrap();
+            }
         });
 
         // Client: connect, handshake, publish, read the responses.
@@ -370,7 +388,11 @@ mod tests {
         let server = std::thread::spawn({
             let engine = handle.clone();
             let shutdown = Arc::clone(&shutdown);
-            move || serve(&listener, &engine, &shutdown, 16).unwrap()
+            move || {
+                let clock = SystemClock::new();
+                let beacon = crate::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                serve(&listener, &engine, &shutdown, 16, &clock, &beacon).unwrap();
+            }
         });
 
         let mut c = TcpStream::connect(addr).unwrap();
@@ -513,7 +535,11 @@ mod tests {
         let server = std::thread::spawn({
             let engine = handle.clone();
             let shutdown = Arc::clone(&shutdown);
-            move || serve(&listener, &engine, &shutdown, 16).unwrap()
+            move || {
+                let clock = SystemClock::new();
+                let beacon = crate::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                serve(&listener, &engine, &shutdown, 16, &clock, &beacon).unwrap();
+            }
         });
 
         let mut client = TcpStream::connect(addr).unwrap();
@@ -557,7 +583,13 @@ mod tests {
         let server = std::thread::spawn({
             let engine = handle.clone();
             let shutdown = Arc::clone(&shutdown);
-            move || serve(&listener, &engine, &shutdown, 16).unwrap()
+            move || {
+                // This engine runs on a ManualClock, so the serve loop's liveness beacon ticks on the
+                // same clock type (`C`). The beacon/window are not exercised by this #177 test.
+                let clock = ManualClock::new();
+                let beacon = crate::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                serve(&listener, &engine, &shutdown, 16, &clock, &beacon).unwrap();
+            }
         });
 
         // Connection A: connect, then publish. Close the sync gate FIRST so A's produce parks inside

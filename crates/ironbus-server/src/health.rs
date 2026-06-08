@@ -38,6 +38,7 @@
 
 use crate::actor::EngineAccess;
 use crate::engine::{Counters, EngineConfigSnapshot, GroupConsumerStat};
+use crate::liveness::LivenessBeacon;
 use crate::metrics::{LatencyHistogram, FSYNC_BUCKET_LE_SECONDS};
 use crate::registry::{FixedHistogram, REGISTRY_BUCKET_LE_SECONDS};
 use ironbus_core::clock::Clock;
@@ -64,6 +65,14 @@ const MAX_REQUEST_LINE: usize = 8 * 1024;
 /// (the default an operator gets unless they pass `--enable-admin`) makes `/admin` answer `404`
 /// exactly like any unknown path, so the surface is OFF unless deliberately turned on.
 ///
+/// `progress` and `liveness_window_nanos` drive the `/healthz` hysteresis watchdog (#95): the
+/// handler reads `clock.now_monotonic_nanos()` (the SAME monotonic seam the wire accept loop ticks
+/// the `progress` beacon on) and answers 503 only after the broker's main loop has gone a whole
+/// `liveness_window_nanos` with no tick, so a slow-but-progressing broker stays 200 and a stuck loop
+/// trips. A `liveness_window_nanos` of `0` DISABLES the watchdog (`/healthz` is then always 200 while
+/// up). `clock` is read directly here, NOT through the append actor, so liveness measures the accept
+/// loop's progress and never blocks on (nor is faulted by) a wedged writer.
+///
 /// # Errors
 /// Returns an IO error only from configuring the listener; per-connection IO errors are
 /// contained so one bad client never ends the loop.
@@ -72,6 +81,9 @@ pub fn serve_health<F, C, E>(
     engine: &E,
     shutdown: &AtomicBool,
     admin_enabled: bool,
+    progress: &LivenessBeacon,
+    liveness_window_nanos: u64,
+    clock: &C,
 ) -> std::io::Result<()>
 where
     F: Filesystem + 'static,
@@ -83,7 +95,14 @@ where
         match listener.accept() {
             Ok((stream, _addr)) => {
                 // One bad client must not end the loop; contain its IO error.
-                let _ = handle(stream, engine, admin_enabled);
+                let _ = handle(
+                    stream,
+                    engine,
+                    admin_enabled,
+                    progress,
+                    liveness_window_nanos,
+                    clock,
+                );
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(ACCEPT_POLL);
@@ -95,7 +114,14 @@ where
     Ok(())
 }
 
-fn handle<F, C, E>(mut stream: TcpStream, engine: &E, admin_enabled: bool) -> std::io::Result<()>
+fn handle<F, C, E>(
+    mut stream: TcpStream,
+    engine: &E,
+    admin_enabled: bool,
+    progress: &LivenessBeacon,
+    liveness_window_nanos: u64,
+    clock: &C,
+) -> std::io::Result<()>
 where
     F: Filesystem + 'static,
     C: Clock + Clone + 'static,
@@ -137,7 +163,24 @@ where
     let path = raw_path.split('?').next().unwrap_or(raw_path);
 
     match path {
-        "/healthz" => respond(&mut stream, 200, "OK", "ok"),
+        // Liveness with a hysteresis watchdog (#95). Read the monotonic seam DIRECTLY (not through
+        // the actor): liveness measures the accept loop's progress, so it must not block on, nor be
+        // faulted by, a wedged writer. The beacon is ticked every accept-loop iteration (idle too),
+        // so this sheds 503 only after a full window with no tick, which only a STUCK loop produces.
+        // A slow-but-progressing broker keeps ticking and stays 200; a frozen writer (a readyz 503)
+        // is still live here. A zero window disables the watchdog (always 200 while up).
+        "/healthz" => {
+            if progress.stuck_for_window(clock.now_monotonic_nanos(), liveness_window_nanos) {
+                respond(
+                    &mut stream,
+                    503,
+                    "Service Unavailable",
+                    "no event-loop progress",
+                )
+            } else {
+                respond(&mut stream, 200, "OK", "ok")
+            }
+        }
         "/readyz" => {
             // Read the writer-health flag through the actor (the single owner). If the actor is gone
             // (a shutdown drain), the broker is not ready: surface 503 rather than hang.
@@ -1167,7 +1210,21 @@ mod tests {
         let engine = Arc::clone(&shared);
         let handle = std::thread::spawn({
             let shutdown = Arc::clone(&shutdown);
-            move || serve_health(&listener, &shared, &shutdown, false).unwrap()
+            move || {
+                // Watchdog disabled (window 0): these helpers exercise /metrics, /readyz, etc., so
+                // /healthz keeps its static-200 contract. The dedicated #95 liveness tests below pass
+                // a non-zero window and drive a ManualClock.
+                serve_health(
+                    &listener,
+                    &shared,
+                    &shutdown,
+                    false,
+                    &LivenessBeacon::new(0),
+                    0,
+                    &SystemClock::new(),
+                )
+                .unwrap();
+            }
         });
         (addr, shutdown, handle, engine)
     }
@@ -1198,6 +1255,160 @@ mod tests {
         let q = request(addr, "GET /healthz?probe=1 HTTP/1.1\r\n\r\n");
         assert!(q.starts_with("HTTP/1.1 200 OK"), "{q}");
 
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    /// Runs `serve_health` over a `ManualClock` with the given liveness `window_nanos` and a beacon
+    /// the caller drives, so the #95 hysteresis watchdog can be exercised deterministically: the test
+    /// advances the clock and ticks (or withholds) the beacon, then probes `/healthz`. Returns the
+    /// bound address, the shutdown flag, the join handle, the shared clock, and the shared beacon.
+    #[allow(clippy::type_complexity)]
+    fn start_watchdog(
+        window_nanos: u64,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        Arc<ironbus_core::clock::ManualClock>,
+        Arc<LivenessBeacon>,
+    ) {
+        use ironbus_core::clock::ManualClock;
+        let clock = Arc::new(ManualClock::new());
+        let engine = Engine::open(
+            InMemoryFs::new(),
+            Arc::clone(&clock),
+            EngineConfig {
+                log: LogConfig::default(),
+                lease: LeaseConfig::default(),
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight: 16,
+                consumer_credit: 64,
+                consumer_credit_bytes: 0,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                disk_full_policy: DiskFullPolicy::DropNew,
+            },
+        )
+        .unwrap();
+        let shared: SharedEngine<InMemoryFs, Arc<ManualClock>> = Arc::new(Mutex::new(engine));
+        // The beacon starts at the clock's origin (0), exactly as the broker seeds it from its start
+        // instant, so it is fresh at t=0 and only goes stale once the clock advances past the window
+        // with no tick.
+        let beacon = Arc::new(LivenessBeacon::new(clock.now_monotonic_nanos()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            let beacon = Arc::clone(&beacon);
+            let clock = Arc::clone(&clock);
+            move || {
+                serve_health(
+                    &listener,
+                    &shared,
+                    &shutdown,
+                    false,
+                    &beacon,
+                    window_nanos,
+                    &clock,
+                )
+                .unwrap();
+            }
+        });
+        (addr, shutdown, handle, clock, beacon)
+    }
+
+    #[test]
+    fn healthz_is_200_while_progress_is_fresh() {
+        // With a 30 ms window: a beacon tick at the current instant keeps /healthz 200 even after the
+        // clock advances a little (under the window), so a slow-but-progressing loop never sheds.
+        let window = 30_000_000; // 30 ms in nanos
+        let (addr, shutdown, handle, clock, beacon) = start_watchdog(window);
+
+        // Fresh at t=0.
+        let h = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");
+        assert!(h.starts_with("HTTP/1.1 200 OK"), "{h}");
+
+        // Advance 10 ms (well under the window) and tick: still healthy.
+        clock.advance_monotonic_nanos(10_000_000);
+        beacon.mark_progress(clock.now_monotonic_nanos());
+        let h = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");
+        assert!(h.starts_with("HTTP/1.1 200 OK"), "{h}");
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn healthz_flips_to_503_after_the_window_with_no_progress() {
+        // The teeth of the watchdog (#95): with the loop STUCK (no further beacon tick), once the
+        // clock has advanced past the window /healthz sheds 503. This is the only thing that makes
+        // the guard real: remove the watchdog (revert to a static 200) and this fails.
+        let window = 30_000_000; // 30 ms
+        let (addr, shutdown, handle, clock, beacon) = start_watchdog(window);
+
+        // Tick once at t=0, then let the loop wedge: no more ticks.
+        beacon.mark_progress(clock.now_monotonic_nanos());
+        // At exactly the window: still healthy (strict >).
+        clock.advance_monotonic_nanos(window);
+        let at = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");
+        assert!(
+            at.starts_with("HTTP/1.1 200 OK"),
+            "at the window is healthy: {at}"
+        );
+
+        // One nanosecond past the window with no progress: stuck, so 503.
+        clock.advance_monotonic_nanos(1);
+        let past = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");
+        assert!(
+            past.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "past the window with no progress is 503: {past}"
+        );
+        assert!(past.ends_with("no event-loop progress"), "{past}");
+
+        // A resumed loop (a fresh tick) clears it: liveness is not a one-way latch.
+        beacon.mark_progress(clock.now_monotonic_nanos());
+        let resumed = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");
+        assert!(resumed.starts_with("HTTP/1.1 200 OK"), "{resumed}");
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn healthz_does_not_flip_on_normal_idle() {
+        // A healthy-but-idle broker must stay 200: the accept loop ticks the beacon every ~poll even
+        // with no client work, so even across MANY window-lengths of pure idle /healthz never sheds.
+        // This pins "idle is progress" so the watchdog cannot crash-loop an idle edge node.
+        let window = 30_000_000; // 30 ms
+        let (addr, shutdown, handle, clock, beacon) = start_watchdog(window);
+
+        // Model a long idle run: a 5 ms idle poll tick repeated past several windows.
+        for _ in 0..50 {
+            clock.advance_monotonic_nanos(5_000_000);
+            beacon.mark_progress(clock.now_monotonic_nanos());
+            let h = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");
+            assert!(h.starts_with("HTTP/1.1 200 OK"), "idle stays healthy: {h}");
+        }
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_zero_window_disables_the_healthz_watchdog() {
+        // window 0 = the watchdog is off: /healthz is the legacy static 200 no matter how stale the
+        // beacon, the opt-out path (and the contract the existing metrics/admin helpers rely on).
+        let (addr, shutdown, handle, clock, _beacon) = start_watchdog(0);
+        // Advance far past any window with NO beacon tick: still 200, because the watchdog is off.
+        clock.advance_monotonic_nanos(10_000_000_000);
+        let h = request(addr, "GET /healthz HTTP/1.1\r\n\r\n");
+        assert!(h.starts_with("HTTP/1.1 200 OK"), "{h}");
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
@@ -1583,7 +1794,21 @@ mod tests {
         let engine = Arc::clone(&shared);
         let handle = std::thread::spawn({
             let shutdown = Arc::clone(&shutdown);
-            move || serve_health(&listener, &shared, &shutdown, false).unwrap()
+            move || {
+                // Watchdog disabled (window 0): these helpers exercise /metrics, /readyz, etc., so
+                // /healthz keeps its static-200 contract. The dedicated #95 liveness tests below pass
+                // a non-zero window and drive a ManualClock.
+                serve_health(
+                    &listener,
+                    &shared,
+                    &shutdown,
+                    false,
+                    &LivenessBeacon::new(0),
+                    0,
+                    &SystemClock::new(),
+                )
+                .unwrap();
+            }
         });
         (addr, shutdown, handle, engine)
     }
@@ -1707,7 +1932,21 @@ mod tests {
         let handle = std::thread::spawn({
             let shutdown = Arc::clone(&shutdown);
             let shared = Arc::clone(&shared);
-            move || serve_health(&listener, &shared, &shutdown, false).unwrap()
+            // The watchdog is disabled (window 0) for this metric-rendering test, so it keeps the
+            // legacy static-200 /healthz contract while exercising /metrics.
+            let clock = Arc::clone(&clock);
+            move || {
+                serve_health(
+                    &listener,
+                    &shared,
+                    &shutdown,
+                    false,
+                    &LivenessBeacon::new(0),
+                    0,
+                    &clock,
+                )
+                .unwrap();
+            }
         });
 
         let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
@@ -1794,7 +2033,21 @@ mod tests {
         let engine = Arc::clone(&shared);
         let handle = std::thread::spawn({
             let shutdown = Arc::clone(&shutdown);
-            move || serve_health(&listener, &shared, &shutdown, false).unwrap()
+            move || {
+                // Watchdog disabled (window 0): these helpers exercise /metrics, /readyz, etc., so
+                // /healthz keeps its static-200 contract. The dedicated #95 liveness tests below pass
+                // a non-zero window and drive a ManualClock.
+                serve_health(
+                    &listener,
+                    &shared,
+                    &shutdown,
+                    false,
+                    &LivenessBeacon::new(0),
+                    0,
+                    &SystemClock::new(),
+                )
+                .unwrap();
+            }
         });
         (addr, shutdown, handle, engine)
     }
@@ -1971,7 +2224,21 @@ mod tests {
         let engine = Arc::clone(&shared);
         let handle = std::thread::spawn({
             let shutdown = Arc::clone(&shutdown);
-            move || serve_health(&listener, &shared, &shutdown, false).unwrap()
+            move || {
+                // Watchdog disabled (window 0): these helpers exercise /metrics, /readyz, etc., so
+                // /healthz keeps its static-200 contract. The dedicated #95 liveness tests below pass
+                // a non-zero window and drive a ManualClock.
+                serve_health(
+                    &listener,
+                    &shared,
+                    &shutdown,
+                    false,
+                    &LivenessBeacon::new(0),
+                    0,
+                    &SystemClock::new(),
+                )
+                .unwrap();
+            }
         });
         (addr, shutdown, handle, engine)
     }
@@ -2539,8 +2806,20 @@ mod tests {
         let engine = Arc::clone(&shared);
         let handle = std::thread::spawn({
             let shutdown = Arc::clone(&shutdown);
-            // admin_enabled = true: this harness exercises the opt-in introspection endpoint.
-            move || serve_health(&listener, &shared, &shutdown, true).unwrap()
+            // admin_enabled = true: this harness exercises the opt-in introspection endpoint. The
+            // liveness watchdog is disabled (window 0), so /healthz keeps its static-200 contract.
+            move || {
+                serve_health(
+                    &listener,
+                    &shared,
+                    &shutdown,
+                    true,
+                    &LivenessBeacon::new(0),
+                    0,
+                    &SystemClock::new(),
+                )
+                .unwrap();
+            }
         });
         (addr, shutdown, handle, engine)
     }
@@ -2724,7 +3003,20 @@ mod tests {
         let handle = std::thread::spawn({
             let shutdown = Arc::clone(&shutdown);
             let shared = Arc::clone(&shared);
-            move || serve_health(&listener, &shared, &shutdown, true).unwrap()
+            // Watchdog disabled (window 0): this DLQ-state admin test does not exercise liveness.
+            let clock = Arc::clone(&clock);
+            move || {
+                serve_health(
+                    &listener,
+                    &shared,
+                    &shutdown,
+                    true,
+                    &LivenessBeacon::new(0),
+                    0,
+                    &clock,
+                )
+                .unwrap();
+            }
         });
 
         let r = request(addr, "GET /admin HTTP/1.1\r\n\r\n");
@@ -2909,7 +3201,21 @@ mod tests {
         let handle = std::thread::spawn({
             let shutdown = Arc::clone(&shutdown);
             let shared = Arc::clone(&shared);
-            move || serve_health(&listener, &shared, &shutdown, true).unwrap()
+            // Watchdog disabled (window 0): this frozen-resilience admin test does not exercise
+            // liveness. A frozen writer must still answer /healthz 200 (liveness != readiness), which
+            // the watchdog respects by reading the accept-loop beacon, not the writer health.
+            move || {
+                serve_health(
+                    &listener,
+                    &shared,
+                    &shutdown,
+                    true,
+                    &LivenessBeacon::new(0),
+                    0,
+                    &ManualClock::new(),
+                )
+                .unwrap();
+            }
         });
 
         let r = request(addr, "GET /admin HTTP/1.1\r\n\r\n");

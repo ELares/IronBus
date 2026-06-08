@@ -79,6 +79,10 @@ use ironbus_storage::offline::OfflineReader;
 use ironbus_storage::segment::{OwnedRecord, StorageError};
 #[cfg(unix)]
 use std::net::TcpListener;
+// The secure-bind guard (#95) resolves and classifies `--health-addr`; it runs on the Unix serve path
+// and in the platform-independent unit tests, so its imports follow the same gate as the helpers.
+#[cfg(any(unix, test))]
+use std::net::{SocketAddr, ToSocketAddrs};
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
@@ -179,6 +183,12 @@ const MIN_MAX_SEGMENT_BYTES: u64 = 4096;
 
 /// The default visibility timeout for `serve` (30 s, matching the lease default).
 const DEFAULT_VISIBILITY_MS: u64 = 30_000;
+
+/// The default `/healthz` liveness HYSTERESIS WINDOW for `serve` (#95), in milliseconds: `/healthz`
+/// flips to 503 only after the broker's accept loop has gone this long with no progress tick, so a
+/// slow-but-progressing fsync never fails liveness and an idle (but ticking) loop stays healthy. `0`
+/// DISABLES the watchdog (`/healthz` is then a static 200 while up). 10 s matches the #95 spec.
+const DEFAULT_HEALTH_LIVENESS_WINDOW_MS: u64 = 10_000;
 
 /// The default lease hard cap for `serve` (5 minutes). The effective cap is the larger of
 /// this and the visibility timeout, so it is never below one redelivery window. Used only by
@@ -990,6 +1000,12 @@ struct ServeFlags {
     visibility_ms: Option<u64>,
     enable_admin: bool,
     health_addr: Option<String>,
+    /// The `/healthz` liveness hysteresis window in ms (#95); `None` falls back to the default.
+    health_liveness_window_ms: Option<u64>,
+    /// The fail-closed acknowledgement for a NON-LOOPBACK `--health-addr` (#95): the metrics/health
+    /// surface is unauthenticated and unencrypted (TLS/#107 and auth/#106 are not wired), so a
+    /// non-loopback bind refuses to start unless the operator sets this. A bare boolean flag.
+    health_allow_public: bool,
     key_shared_groups: Vec<String>,
     broadcast_groups: Vec<String>,
 }
@@ -1064,6 +1080,15 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
                 f.visibility_ms = Some(take_number("--visibility-timeout-ms", args, &mut i)?);
             }
             "--health-addr" => f.health_addr = Some(take_value("--health-addr", args, &mut i)?),
+            "--health-liveness-window-ms" => {
+                f.health_liveness_window_ms =
+                    Some(take_number("--health-liveness-window-ms", args, &mut i)?);
+            }
+            // A bare boolean flag (no value): advance ONE token, not two, or the loop spins.
+            "--health-allow-public" => {
+                f.health_allow_public = true;
+                i += 1;
+            }
             // A bare boolean flag (no value): advance ONE token, not two, or the loop spins.
             "--enable-admin" => {
                 f.enable_admin = true;
@@ -1202,6 +1227,13 @@ fn parse_serve_flags_with_env(args: &[String], env: &EnvFn<'_>) -> Result<Parsed
                 DEFAULT_VISIBILITY_MS,
             )?,
             enable_admin: resolve_bool("--enable-admin", f.enable_admin, env)?,
+            health_liveness_window_ms: resolve_number(
+                "--health-liveness-window-ms",
+                f.health_liveness_window_ms,
+                env,
+                DEFAULT_HEALTH_LIVENESS_WINDOW_MS,
+            )?,
+            health_allow_public: resolve_bool("--health-allow-public", f.health_allow_public, env)?,
         },
         key_shared_groups: f.key_shared_groups,
         broadcast_groups: f.broadcast_groups,
@@ -1354,6 +1386,19 @@ struct ServeConfig {
     /// network, the #105/#107 threat model), so it must run only where `/metrics` is already
     /// trusted. It exposes no mutating action and no secret material.
     enable_admin: bool,
+    /// The `/healthz` liveness hysteresis window in MILLISECONDS (#95): the broker's accept loop ticks
+    /// a monotonic-clock progress beacon every iteration (idle too), and `/healthz` answers 503 only
+    /// after this long with no tick, so a slow-but-progressing fsync never fails liveness and a
+    /// healthy idle loop stays 200. `0` = the watchdog is DISABLED (a static-200 `/healthz` while up).
+    /// Default 10 s (`DEFAULT_HEALTH_LIVENESS_WINDOW_MS`).
+    health_liveness_window_ms: u64,
+    /// Acknowledge a NON-LOOPBACK `--health-addr` bind (#95), fail-closed default. The health surface
+    /// (`/metrics`, `/healthz`, `/readyz`, optional `/admin`) is UNAUTHENTICATED and UNENCRYPTED: TLS
+    /// (#107) and an auth identity (#106) are specified but NOT yet wired, so per the #107 bind
+    /// invariant a non-loopback health bind refuses to start unless the operator deliberately opts in
+    /// here, at which point the broker logs a loud warning. Loopback binds ignore this flag and never
+    /// warn. There is NO override for the wire-protocol `--addr` bind; this is the health surface only.
+    health_allow_public: bool,
 }
 
 // Only the Unix `bench` execution path constructs a default `ServeConfig` (the isolated broker); on
@@ -1385,6 +1430,8 @@ impl ServeConfig {
             disk_full_policy: DiskFullPolicyArg::DropNew,
             visibility_ms: DEFAULT_VISIBILITY_MS,
             enable_admin: false,
+            health_liveness_window_ms: DEFAULT_HEALTH_LIVENESS_WINDOW_MS,
+            health_allow_public: false,
         }
     }
 }
@@ -1401,6 +1448,109 @@ fn map_dir_error(e: &dirlock::DirError) -> CliError {
         | dirlock::DirError::AlreadyLocked(_)
         | dirlock::DirError::LockIo(..) => CliError::Internal(e.to_string()),
     }
+}
+
+/// Resolves a `--health-addr` to its socket addresses and classifies the bind as loopback or not, the
+/// fail-closed SECURE-BIND guard for the health surface (#95, the #107 bind invariant).
+///
+/// Resolution is on the RESOLVED address, never the literal string: a hostname that resolves to a
+/// routable IP is non-loopback, and the wildcards `0.0.0.0` / `::` are non-loopback (they expose every
+/// interface). A bind is loopback only when EVERY resolved address is loopback (`127.0.0.0/8` or
+/// `::1`), so a name that maps to both `127.0.0.1` and a routable IP is treated as non-loopback.
+///
+/// Returns the resolved addresses to bind, plus whether the bind is loopback. An address that resolves
+/// to nothing is a usage error. The CALLER applies the policy: a non-loopback bind without
+/// `--health-allow-public` is refused (the health surface is unauthenticated and unencrypted today),
+/// and with the ack it binds after a loud warning.
+///
+/// # Errors
+/// [`CliError::Usage`] if the address cannot be resolved (an unresolvable host or a malformed
+/// `host:port`), so a typo fails closed rather than silently binding nothing.
+// Used on the Unix serve path and exercised by the (platform-independent) unit tests; gated so a
+// non-Unix non-test build, where `serve` is stubbed out, does not carry it as dead code under
+// `-D warnings`.
+#[cfg(any(unix, test))]
+fn resolve_and_classify_health_bind(haddr: &str) -> Result<(Vec<SocketAddr>, bool), CliError> {
+    let resolved: Vec<SocketAddr> = haddr
+        .to_socket_addrs()
+        .map_err(|e| {
+            CliError::Usage(format!(
+                "`--health-addr` value `{haddr}` could not be resolved to an address: {e}"
+            ))
+        })?
+        .collect();
+    if resolved.is_empty() {
+        return Err(CliError::Usage(format!(
+            "`--health-addr` value `{haddr}` resolved to no address"
+        )));
+    }
+    // Loopback ONLY if every resolved address is loopback; the wildcard `0.0.0.0`/`::` is unspecified
+    // (not loopback), so it is correctly classified non-loopback by `is_loopback()`.
+    let loopback = resolved.iter().all(|a| a.ip().is_loopback());
+    Ok((resolved, loopback))
+}
+
+/// The fatal usage error for a non-loopback `--health-addr` bind without the `--health-allow-public`
+/// acknowledgement (#95): the health surface is UNAUTHENTICATED and UNENCRYPTED (TLS #107 and auth
+/// #106 are specified but not wired), so per the #107 bind invariant the broker refuses to start and
+/// names the address, says which protections are missing, and points at the safe options. Fail-closed
+/// (exit 1, before any listener opens): there is no window where an unprotected non-loopback health
+/// socket accepts a connection.
+#[cfg(any(unix, test))]
+fn health_non_loopback_refusal(haddr: &str) -> CliError {
+    CliError::Usage(format!(
+        "refusing to bind non-loopback health address `{haddr}`: the health surface (/metrics, \
+         /healthz, /readyz, /admin) is UNAUTHENTICATED and UNENCRYPTED (TLS #107 and an auth \
+         identity #106 are not yet implemented), so exposing it off loopback would leak topology \
+         and offsets and invite a scrape-amplification DoS. Bind a loopback address (the default is \
+         a 127.0.0.1 health port) and scrape it over a localhost tunnel, OR pass \
+         --health-allow-public to acknowledge that the metrics endpoint is unauthenticated and bind \
+         it anyway (a loud startup warning is logged). This acknowledgement covers the health \
+         surface only; the wire-protocol --addr bind has no such override."
+    ))
+}
+
+/// The outcome of the secure-bind guard for a `--health-addr` that WAS set (#95): the resolved
+/// addresses to bind, and whether to emit the loud unauthenticated-surface warning (true only for an
+/// acknowledged non-loopback bind). A non-loopback bind without the acknowledgement does not produce
+/// this; it is a fatal [`CliError::Usage`] from [`health_bind_decision`].
+#[cfg(any(unix, test))]
+#[derive(Debug)]
+struct HealthBindDecision {
+    /// The resolved socket addresses to bind, exactly what the guard classified.
+    addrs: Vec<SocketAddr>,
+    /// Whether to log the loud "unauthenticated network health surface" warning at startup (an
+    /// acknowledged non-loopback bind), so the operator who opted in always sees it.
+    warn_public: bool,
+}
+
+/// Applies the fail-closed SECURE-BIND policy (#95) to a set `--health-addr`: resolve and classify it,
+/// then REFUSE a non-loopback bind unless `allow_public` was set. The single decision seam `cmd_serve`
+/// uses, so the policy (loopback binds silently, non-loopback needs the ack and then warns) is in one
+/// testable place: a unit test drives every branch, so removing the guard fails a test.
+///
+/// # Errors
+/// [`CliError::Usage`] if the address does not resolve, or if it is non-loopback and `allow_public`
+/// is `false` (the fail-closed refusal naming the address and the missing protections).
+#[cfg(any(unix, test))]
+fn health_bind_decision(haddr: &str, allow_public: bool) -> Result<HealthBindDecision, CliError> {
+    let (addrs, loopback) = resolve_and_classify_health_bind(haddr)?;
+    if loopback {
+        // Loopback MAY run unauthenticated, silently: the trust boundary is the host itself.
+        return Ok(HealthBindDecision {
+            addrs,
+            warn_public: false,
+        });
+    }
+    if !allow_public {
+        // Non-loopback with no acknowledgement: fail closed, before any side effect.
+        return Err(health_non_loopback_refusal(haddr));
+    }
+    // Acknowledged non-loopback: bind it, but warn loudly on every startup.
+    Ok(HealthBindDecision {
+        addrs,
+        warn_public: true,
+    })
 }
 
 #[cfg(unix)]
@@ -1420,6 +1570,16 @@ fn cmd_serve(
     // drop-and-count export buffer; with export off it simply stays empty.
     let _span_queue =
         ironbus_server::obs::init_tracing(ironbus_server::obs::TracingConfig::default());
+
+    // SECURE-BIND guard (#95, the #107 bind invariant), FAIL-CLOSED and FIRST: resolve and classify
+    // `--health-addr` before ANY broker side effect (no data dir touched, no lock taken, no listener
+    // opened), so a non-loopback health bind without the --health-allow-public acknowledgement
+    // refuses to start cleanly with no partial state. Loopback binds (and the no-health-addr case)
+    // pass through. The resolved addresses are reused below so what binds is exactly what was checked.
+    let health_bind: Option<HealthBindDecision> = match health_addr {
+        Some(haddr) => Some(health_bind_decision(haddr, config.health_allow_public)?),
+        None => None,
+    };
 
     // Data-dir lifecycle then the single-broker lock (#89), BEFORE the engine opens. `prepare`
     // creates the dir (0700) if absent, rejects a non-directory path, and proves it writable; the
@@ -1464,49 +1624,42 @@ fn cmd_serve(
     let shutdown = Arc::new(AtomicBool::new(false));
     install_signal_handler(&shutdown)?;
 
-    // The opt-in read-only `/admin` introspection endpoint (#99) needs the health server, which
-    // only runs when `--health-addr` is set. A `--enable-admin` with no health address can never
-    // take effect, so warn loudly rather than silently no-op.
-    if config.enable_admin && health_addr.is_none() {
-        writeln!(
-            out,
-            "WARN: --enable-admin has no effect without --health-addr (the /admin endpoint is \
-             served by the health server)"
-        )?;
-    }
-    // Optionally start the health endpoints on their own loopback HTTP port.
-    let health_handle = if let Some(haddr) = health_addr {
-        let health_listener = TcpListener::bind(haddr)
-            .map_err(|e| CliError::Internal(format!("cannot bind health {haddr}: {e}")))?;
-        let health_local = health_listener
-            .local_addr()
-            .map_err(|e| CliError::Internal(format!("cannot read health address: {e}")))?;
-        // The admin route is only advertised when opted in, so the default startup line is
-        // unchanged for an operator who has not enabled it.
-        if config.enable_admin {
-            writeln!(
-                out,
-                "ironbus health endpoints on {health_local} (/healthz, /readyz, /metrics, \
-                 /admin [read-only, unauthenticated])"
-            )?;
-        } else {
-            writeln!(
-                out,
-                "ironbus health endpoints on {health_local} (/healthz, /readyz, /metrics)"
-            )?;
-        }
-        let engine = shared.clone();
-        let shutdown = Arc::clone(&shutdown);
-        let admin_enabled = config.enable_admin;
-        Some(std::thread::spawn(move || {
-            let _ = serve_health(&health_listener, &engine, &shutdown, admin_enabled);
-        }))
-    } else {
-        None
-    };
+    // The monotonic clock the liveness watchdog (#95) measures against. ONE clock instance is shared
+    // (cloned, so every clone reports from the SAME monotonic origin) between the wire accept loop
+    // that ticks the beacon and the health server that reads it, so their difference is a real
+    // elapsed-nanos measure. The beacon is seeded at the broker's start instant, so a fresh broker is
+    // live until a whole window elapses with no tick.
+    let health_clock = SystemClock::new();
+    let progress = Arc::new(ironbus_server::liveness::LivenessBeacon::new(
+        health_clock.now_monotonic_nanos(),
+    ));
 
-    let result = serve(&listener, &shared, &shutdown, config.max_connections)
-        .map_err(|e| CliError::Internal(format!("serve loop failed: {e}")));
+    // Start the health endpoints (if `--health-addr` was set), warning about an enabled-but-unreachable
+    // admin endpoint and an acknowledged public bind. The secure-bind guard already classified and
+    // (where required) refused the bind at the top of this function, so `health_bind` here is safe.
+    let health_handle = start_health_server(
+        config,
+        health_addr,
+        health_bind,
+        &shared,
+        &shutdown,
+        &progress,
+        &health_clock,
+        out,
+    )?;
+
+    // The wire accept loop ticks the liveness beacon (#95) on its OWN clock clone (same origin), so
+    // `/healthz` measures the accept loop's progress. The clone keeps the original `health_clock`
+    // available above for the health server's own reads.
+    let result = serve(
+        &listener,
+        &shared,
+        &shutdown,
+        config.max_connections,
+        &health_clock.clone(),
+        &progress,
+    )
+    .map_err(|e| CliError::Internal(format!("serve loop failed: {e}")));
     // The wire serve returns only when shutdown is set (a signal, or a fatal listener error that
     // ends the loop), so flip it for the health thread too.
     shutdown.store(true, Ordering::Release);
@@ -1531,6 +1684,95 @@ fn cmd_serve(
     drop(shared);
     let _ = actor.join();
     Ok(())
+}
+
+/// Starts the health-endpoint server thread when `--health-addr` was set, returning its join handle
+/// (or `None` if no health address). Split out of [`cmd_serve`] so the bind, the startup warnings, and
+/// the liveness-watchdog wiring (#95) live in one place and `cmd_serve` stays under the line bound.
+///
+/// `health_bind` is the secure-bind guard's already-classified decision: the bind was resolved and an
+/// unacknowledged non-loopback bind was refused at the top of `cmd_serve`, so this only emits the loud
+/// acknowledged-public warning (when `warn_public`) and binds the resolved addresses. It also warns
+/// when `--enable-admin` was set without a health address (the admin endpoint then has nowhere to run).
+///
+/// # Errors
+/// [`CliError::Internal`] if the health listener cannot bind or its local address cannot be read.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)] // the wiring inputs (config, bind, engine, shutdown, beacon,
+                                     // clock, out) are each a distinct concern; bundling them into a
+                                     // struct would only move the noise, not remove it.
+fn start_health_server(
+    config: &ServeConfig,
+    health_addr: Option<&str>,
+    health_bind: Option<HealthBindDecision>,
+    shared: &ironbus_server::actor::EngineHandle<StdFs, SystemClock>,
+    shutdown: &Arc<AtomicBool>,
+    progress: &Arc<ironbus_server::liveness::LivenessBeacon>,
+    health_clock: &SystemClock,
+    out: &mut impl Write,
+) -> Result<Option<std::thread::JoinHandle<()>>, CliError> {
+    // The opt-in read-only `/admin` introspection endpoint (#99) needs the health server, which only
+    // runs when `--health-addr` is set. A `--enable-admin` with no health address can never take
+    // effect, so warn loudly rather than silently no-op.
+    if config.enable_admin && health_addr.is_none() {
+        writeln!(
+            out,
+            "WARN: --enable-admin has no effect without --health-addr (the /admin endpoint is \
+             served by the health server)"
+        )?;
+    }
+    let (Some(haddr), Some(decision)) = (health_addr, health_bind) else {
+        return Ok(None);
+    };
+    if decision.warn_public {
+        // Acknowledged non-loopback: bind it, but loudly, on every startup, so the operator who opted
+        // into an unauthenticated network metrics surface always sees it.
+        writeln!(
+            out,
+            "WARN: --health-allow-public: binding the UNAUTHENTICATED, UNENCRYPTED health surface to \
+             non-loopback {haddr} (/metrics, /healthz, /readyz exposed to the network; TLS #107 and \
+             auth #106 are not yet implemented). Restrict it at the network layer."
+        )?;
+    }
+    // Bind the RESOLVED addresses (what the guard classified), not re-resolve the literal string, so
+    // what is bound is exactly what was checked.
+    let health_listener = TcpListener::bind(decision.addrs.as_slice())
+        .map_err(|e| CliError::Internal(format!("cannot bind health {haddr}: {e}")))?;
+    let health_local = health_listener
+        .local_addr()
+        .map_err(|e| CliError::Internal(format!("cannot read health address: {e}")))?;
+    // The admin route is only advertised when opted in, so the default startup line is unchanged for
+    // an operator who has not enabled it.
+    if config.enable_admin {
+        writeln!(
+            out,
+            "ironbus health endpoints on {health_local} (/healthz, /readyz, /metrics, \
+             /admin [read-only, unauthenticated])"
+        )?;
+    } else {
+        writeln!(
+            out,
+            "ironbus health endpoints on {health_local} (/healthz, /readyz, /metrics)"
+        )?;
+    }
+    let engine = shared.clone();
+    let shutdown = Arc::clone(shutdown);
+    let admin_enabled = config.enable_admin;
+    // The liveness watchdog window in nanos (#95); the config knob is in ms, `0` = disabled.
+    let liveness_window_nanos = config.health_liveness_window_ms.saturating_mul(1_000_000);
+    let progress = Arc::clone(progress);
+    let health_clock = health_clock.clone();
+    Ok(Some(std::thread::spawn(move || {
+        let _ = serve_health(
+            &health_listener,
+            &engine,
+            &shutdown,
+            admin_enabled,
+            &progress,
+            liveness_window_nanos,
+            &health_clock,
+        );
+    })))
 }
 
 /// Installs the process-wide signal handler that flips `shutdown` on SIGINT, SIGTERM, or SIGHUP, so
@@ -1582,6 +1824,11 @@ fn cmd_serve(
         config.max_groups,
         config.group_idle_evict_ms,
         config.enable_admin,
+        // The #95 health knobs are read only on the Unix serve path, so the non-Unix stub must
+        // consume them too or the Windows `-D warnings` build trips field-never-read, invisible to a
+        // macOS reviewer (the recurring #288/#99 footgun).
+        config.health_liveness_window_ms,
+        config.health_allow_public,
         config.disk_full_policy,
         config.visibility_ms,
         key_shared_groups,
@@ -2627,7 +2874,7 @@ mod tests {
     )
     where
         F: ironbus_storage::fs::Filesystem + 'static,
-        C: ironbus_core::clock::Clock + Clone + 'static,
+        C: ironbus_core::clock::Clock + Clone + Default + 'static,
     {
         let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2635,7 +2882,23 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let server = std::thread::spawn({
             let shutdown = Arc::clone(&shutdown);
-            move || serve(&listener, &handle, &shutdown, max_connections).unwrap()
+            move || {
+                // These wire-only helpers do not start a health server, so the liveness beacon (#95)
+                // is unread; the serve loop still ticks it, so give it a fresh beacon on a default
+                // clock of the matching type.
+                let clock = C::default();
+                let beacon =
+                    ironbus_server::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                serve(
+                    &listener,
+                    &handle,
+                    &shutdown,
+                    max_connections,
+                    &clock,
+                    &beacon,
+                )
+                .unwrap();
+            }
         });
         (addr, shutdown, server, actor)
     }
@@ -2674,6 +2937,8 @@ mod tests {
             disk_full_policy: DiskFullPolicyArg::DropNew,
             visibility_ms: DEFAULT_VISIBILITY_MS,
             enable_admin: false,
+            health_liveness_window_ms: DEFAULT_HEALTH_LIVENESS_WINDOW_MS,
+            health_allow_public: false,
         }
     }
 
@@ -3387,6 +3652,8 @@ mod tests {
             disk_full_policy: DiskFullPolicyArg::DropNew,
             visibility_ms: DEFAULT_VISIBILITY_MS,
             enable_admin: false,
+            health_liveness_window_ms: DEFAULT_HEALTH_LIVENESS_WINDOW_MS,
+            health_allow_public: false,
         }
     }
 
@@ -4230,6 +4497,176 @@ mod tests {
         .unwrap();
         assert!(on.config.enable_admin, "admin is on with --enable-admin");
         assert_eq!(on.config.max_in_flight, 8, "the trailing flag still parses");
+    }
+
+    #[test]
+    fn health_bind_classifies_loopback_and_non_loopback() {
+        // The #95 secure-bind classification is on the RESOLVED address. Loopback literals classify
+        // loopback; the wildcard and a routable literal classify non-loopback.
+        let (_a, loopback) = resolve_and_classify_health_bind("127.0.0.1:9095").unwrap();
+        assert!(loopback, "127.0.0.1 is loopback");
+        let (_a, loopback) = resolve_and_classify_health_bind("127.0.0.5:9095").unwrap();
+        assert!(loopback, "all of 127.0.0.0/8 is loopback");
+        let (_a, loopback) = resolve_and_classify_health_bind("[::1]:9095").unwrap();
+        assert!(loopback, "::1 is loopback");
+        // The unspecified wildcard exposes every interface, so it is NOT loopback.
+        let (_a, loopback) = resolve_and_classify_health_bind("0.0.0.0:9095").unwrap();
+        assert!(!loopback, "0.0.0.0 (every interface) is non-loopback");
+        let (_a, loopback) = resolve_and_classify_health_bind("[::]:9095").unwrap();
+        assert!(!loopback, ":: (every interface) is non-loopback");
+        // A routable literal IP is non-loopback (a documentation-range address, never dialed).
+        let (_a, loopback) = resolve_and_classify_health_bind("192.0.2.1:9095").unwrap();
+        assert!(!loopback, "a routable IP is non-loopback");
+    }
+
+    #[test]
+    fn health_bind_rejects_an_unresolvable_address() {
+        // A malformed or unresolvable --health-addr fails closed with a usage error naming the value,
+        // never silently binds nothing. `.invalid` is the reserved never-resolves TLD (RFC 6761).
+        let e = resolve_and_classify_health_bind("no-such-host.invalid:9095").unwrap_err();
+        assert!(matches!(e, CliError::Usage(_)), "got {e:?}");
+        let e = resolve_and_classify_health_bind("not-a-host-port").unwrap_err();
+        assert!(matches!(e, CliError::Usage(_)), "got {e:?}");
+    }
+
+    #[test]
+    fn health_bind_decision_is_fail_closed_for_a_non_loopback_bind() {
+        // The teeth of the secure-bind guard (#95): a NON-LOOPBACK bind WITHOUT the acknowledgement
+        // is refused (the broker would never start). Remove the guard and this fails.
+        let e = health_bind_decision("0.0.0.0:9095", false).unwrap_err();
+        match e {
+            CliError::Usage(m) => {
+                assert!(m.contains("0.0.0.0:9095"), "names the address: {m}");
+                assert!(
+                    m.contains("UNAUTHENTICATED"),
+                    "explains the missing auth: {m}"
+                );
+                assert!(
+                    m.contains("--health-allow-public"),
+                    "names the ack flag: {m}"
+                );
+            }
+            other => panic!("expected a usage refusal, got {other:?}"),
+        }
+        // A hostname that resolves to a non-loopback IP is caught the same way (classification is on
+        // the resolved address, not the literal string).
+        assert!(
+            matches!(
+                health_bind_decision("192.0.2.7:9095", false),
+                Err(CliError::Usage(_))
+            ),
+            "a routable address with no ack is refused"
+        );
+    }
+
+    #[test]
+    fn health_bind_decision_loopback_binds_silently_and_ack_binds_with_a_warning() {
+        // Loopback MAY run unauthenticated with NO warning (the trust boundary is the host).
+        let d = health_bind_decision("127.0.0.1:0", false).unwrap();
+        assert!(!d.warn_public, "loopback never warns");
+        assert!(
+            !d.addrs.is_empty(),
+            "loopback resolves to an address to bind"
+        );
+        // The ack flag has no effect on a loopback bind (still silent).
+        let d = health_bind_decision("127.0.0.1:0", true).unwrap();
+        assert!(!d.warn_public, "loopback stays silent even with the ack");
+        // A NON-LOOPBACK bind WITH the acknowledgement starts, and flags the loud warning.
+        let d = health_bind_decision("0.0.0.0:0", true).unwrap();
+        assert!(
+            d.warn_public,
+            "an acknowledged non-loopback bind warns loudly"
+        );
+        assert!(!d.addrs.is_empty(), "it resolves an address to bind");
+    }
+
+    #[test]
+    fn serve_parses_the_health_liveness_window_and_allow_public_flags() {
+        // The #95 knobs: the liveness window (ms) and the bare allow-public ack flag parse into the
+        // ServeConfig with the documented defaults absent the flags.
+        let def = parse_serve_flags(&["--data-dir".to_string(), "/tmp/x".to_string()]).unwrap();
+        assert_eq!(
+            def.config.health_liveness_window_ms, DEFAULT_HEALTH_LIVENESS_WINDOW_MS,
+            "the liveness window defaults to 10 s"
+        );
+        assert!(
+            !def.config.health_allow_public,
+            "the public-bind ack is off by default (fail-closed)"
+        );
+        let set = parse_serve_flags(&[
+            "--data-dir".to_string(),
+            "/tmp/x".to_string(),
+            "--health-liveness-window-ms".to_string(),
+            "0".to_string(),
+            "--health-allow-public".to_string(),
+            "--max-in-flight".to_string(),
+            "8".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            set.config.health_liveness_window_ms, 0,
+            "0 disables the watchdog"
+        );
+        assert!(
+            set.config.health_allow_public,
+            "the bare ack flag sets true"
+        );
+        assert_eq!(
+            set.config.max_in_flight, 8,
+            "the trailing flag still parses"
+        );
+    }
+
+    #[test]
+    fn serve_rejects_a_non_numeric_health_liveness_window() {
+        // A bad --health-liveness-window-ms value is a usage error naming the flag, like every other
+        // numeric serve flag (it never silently falls back to a default).
+        let e = parse_serve_flags(&[
+            "--data-dir".to_string(),
+            "/tmp/x".to_string(),
+            "--health-liveness-window-ms".to_string(),
+            "soon".to_string(),
+        ])
+        .unwrap_err();
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--health-liveness-window-ms"), "{m}"),
+            other => panic!("expected a usage error, got {other:?}"),
+        }
+    }
+
+    // The guard runs inside the Unix `cmd_serve` (the non-Unix `cmd_serve` is a stub that errors
+    // before it), so this end-to-end refusal test is Unix-only, like the other `serve` runtime tests.
+    #[cfg(unix)]
+    #[test]
+    fn serve_refuses_a_non_loopback_health_addr_without_the_ack() {
+        // END TO END through `run`: a non-loopback --health-addr with no acknowledgement fails to
+        // start with a usage error (exit 1) and binds nothing. The data dir is never served.
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-cli-health-public-never-served".to_string(),
+                "--health-addr".to_string(),
+                "0.0.0.0:9099".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE, "the refusal is exit 1");
+        match e {
+            CliError::Usage(m) => {
+                assert!(
+                    m.contains("0.0.0.0:9099"),
+                    "names the offending address: {m}"
+                );
+                assert!(
+                    m.contains("--health-allow-public"),
+                    "names the ack flag: {m}"
+                );
+            }
+            other => panic!("expected a fail-closed usage error, got {other:?}"),
+        }
     }
 
     #[test]

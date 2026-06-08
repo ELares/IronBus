@@ -345,6 +345,43 @@ resilience-loss events:
 If any of these later needs a counter, it is added to the frozen taxonomy here
 and in `FROZEN_RESILIENCE_COUNTERS`, never as a silent change.
 
+## Health probes: `/healthz` liveness and `/readyz` readiness (#95)
+
+The health server exposes two probes alongside `/metrics`:
+
+- `GET /healthz` is **liveness** with a monotonic-clock HYSTERESIS WATCHDOG. The
+  broker's accept loop ticks a monotonic "last progress" beacon on every iteration
+  (a connection accepted, refused at the cap, OR the idle would-block poll), so the
+  beacon advances even on a totally idle broker: a running loop is liveness whether
+  or not it has work. `/healthz` compares `now_monotonic - last_progress` against the
+  configurable window (`--health-liveness-window-ms`, default 10 s, `0` = disabled)
+  and answers 503 ONLY after a whole window with no tick, which only a stuck (or
+  crashed) accept loop produces. A slow-but-progressing fsync keeps it 200, a healthy
+  idle node stays 200, and a writer frozen by a fatal fsync still returns `/healthz`
+  200 (liveness is not readiness). All timing is on the monotonic clock seam
+  (`Clock::now_monotonic_nanos`), never the wall clock, so an NTP step never drives
+  liveness. The watchdog is read DIRECTLY off the clock, not through the append actor,
+  so liveness measures the accept loop and never blocks on (nor is faulted by) a
+  wedged writer.
+- `GET /readyz` is **readiness** (the writer-frozen / shutdown gate): 503 while the
+  durable-log writer is frozen by a fatal fsync or the broker is shutting down, 200
+  once it accepts writes. Replay-in-progress readiness gating is a follow-up
+  (recovery completes before the listener opens today, so a started broker has
+  already replayed).
+
+### Secure-bind default for the health surface
+
+The whole health surface (`/metrics`, `/healthz`, `/readyz`, opt-in `/admin`) is
+UNAUTHENTICATED and UNENCRYPTED today (TLS #107 and an auth identity #106 are
+specified but not yet wired). Per the #107 bind invariant, `serve` therefore
+REFUSES to start when `--health-addr` resolves to a non-loopback address, failing
+closed before any listener opens, with an error that names the address and the
+missing protections. The classification is on the RESOLVED address, so a hostname or
+the wildcards `0.0.0.0` / `::` that map to a routable IP are caught; loopback binds
+freely. `--health-allow-public` is the explicit operator acknowledgement that binds
+a non-loopback surface anyway, with a loud startup warning on every start. There is
+no such override for the wire `--addr` bind.
+
 ## The `/admin` read-only introspection endpoint (#99)
 
 `GET /admin` is an opt-in (`serve --enable-admin`), read-only JSON view of

@@ -15,6 +15,7 @@ use crate::bench::{
 };
 use crate::{open_disk_engine, CliError, ServeConfig};
 use ironbus_client::{Client, ClientConfig, ClientError};
+use ironbus_core::clock::Clock; // the monotonic seam the serve loop's liveness beacon (#95) reads
 use ironbus_proto::message::PubBody;
 use ironbus_server::actor::{spawn_actor, DEFAULT_CHANNEL_BOUND};
 use ironbus_server::server::serve;
@@ -180,7 +181,20 @@ impl IsolatedBroker {
             std::thread::Builder::new()
                 .name("ironbus-bench-serve".to_string())
                 .spawn(move || {
-                    let _ = serve(&listener, &serve_handle, &serve_shutdown, max_connections);
+                    // The bench broker has no health server, so the liveness beacon (#95) is unread;
+                    // the serve loop still ticks it, so we hand it a throwaway beacon on a matching
+                    // SystemClock.
+                    let clock = ironbus_server::clock::SystemClock::new();
+                    let beacon =
+                        ironbus_server::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                    let _ = serve(
+                        &listener,
+                        &serve_handle,
+                        &serve_shutdown,
+                        max_connections,
+                        &clock,
+                        &beacon,
+                    );
                 })
                 .map_err(|e| CliError::Internal(format!("bench: cannot spawn serve thread: {e}")))?
         };
