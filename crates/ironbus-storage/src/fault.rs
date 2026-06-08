@@ -481,6 +481,14 @@ impl<F: RandomAccessFile> RandomAccessFile for FaultFile<F> {
     fn set_len(&self, len: u64) -> io::Result<()> {
         self.inner.set_len(len)
     }
+
+    fn preallocate(&self, len: u64) -> io::Result<()> {
+        // Preallocation is a best-effort optimization with no fault arm of its own: it delegates to
+        // the inner file (the in-memory backend tracks the reservation without changing bytes). A
+        // test that needs a preallocate FAILURE arms `set_fail_write`, exercising start_segment's
+        // best-effort fall-back-on-error path without a dedicated injector.
+        self.inner.preallocate(len)
+    }
 }
 
 #[cfg(test)]

@@ -667,6 +667,18 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             flags: 0,
         };
         let file = self.fs.create_new(&segment_file_name(id))?;
+        // Preallocate the new active segment to the full roll size BEFORE the first append, so the
+        // steady-state appends write into already-reserved space (`docs/PREALLOCATION.md`). This is
+        // a BEST-EFFORT optimization: a filesystem with no reservation primitive (or any preallocate
+        // error) degrades to today's grow-on-append, so the failure is SWALLOWED and never fails the
+        // create. The reserved tail is zeros that recovery's torn-tail scan truncates exactly as a
+        // torn tail (the frozen #45 zero-window fixture), so preallocation cannot break recovery: a
+        // freshly preallocated empty segment (header then zeros) recovers as no records, and a
+        // partially-written one recovers to its longest valid prefix. A genuine create-time
+        // out-of-space is therefore not surfaced here as a distinct fail-fast event; it falls back to
+        // grow-on-append and surfaces at the append/sync as it does today (the doc's ENOSPC-to-
+        // `AtCapacity` routing is a forward refinement, not required for correctness).
+        let _ = file.preallocate(self.config.max_segment_bytes);
         let writer = SegmentWriter::create(file, header)?;
         writer.sync()?; // the header is durable...
         self.fs.sync_dir()?; // ...and so is its directory entry.
@@ -1646,6 +1658,236 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].payload, b"durable");
         assert_eq!(records[1].payload, b"after");
+    }
+
+    #[test]
+    fn start_segment_preallocates_the_active_segment_to_the_roll_size() {
+        // `start_segment` preallocates each new active segment to the full roll size up front
+        // (#330, `docs/PREALLOCATION.md`). The in-memory backend records the reservation request,
+        // so we can assert the first segment AND a rolled-to segment were each preallocated to
+        // `max_segment_bytes`, without changing the deterministic on-disk image.
+        let cfg = LogConfig {
+            max_segment_bytes: 256,
+            ..LogConfig::default()
+        };
+        let mut log = open_mem(cfg);
+        // The first active segment (created on open) was preallocated to the roll size.
+        let seg0 = log.filesystem().open(&segment_file_name(0)).unwrap();
+        assert_eq!(
+            seg0.preallocated_to(),
+            256,
+            "segment 0 is preallocated to the roll size on open"
+        );
+        // Append past the cap so a roll creates segment 1, then assert it too was preallocated.
+        for _ in 0..16 {
+            log.append(&rec(b"payload-payload")).unwrap();
+            log.sync().unwrap();
+        }
+        assert!(
+            log.active_segment_id() >= 1,
+            "the workload rolled at least once"
+        );
+        let seg1 = log.filesystem().open(&segment_file_name(1)).unwrap();
+        assert_eq!(
+            seg1.preallocated_to(),
+            256,
+            "a rolled-to active segment is also preallocated to the roll size"
+        );
+    }
+
+    #[test]
+    fn a_preallocated_then_crashed_empty_segment_recovers_as_no_records() {
+        // A freshly preallocated active segment is header + zeros. The active segment is created
+        // and dir-synced on open, but no record was ever appended. A power loss (the zero tail is
+        // not durable in the in-memory model, but even a durable header + zeros must recover empty)
+        // then a reopen must recover ZERO records with no spurious record minted from the zero
+        // region (the preallocated tail is the torn/zero tail recovery truncates). This is the
+        // recovery-correctness-over-a-zero-region tooth.
+        let cfg = LogConfig {
+            max_segment_bytes: 4096,
+            ..LogConfig::default()
+        };
+        let log = open_mem(cfg);
+        // Confirm the segment was preallocated, then crash before any append.
+        assert_eq!(
+            log.filesystem()
+                .open(&segment_file_name(0))
+                .unwrap()
+                .preallocated_to(),
+            4096
+        );
+        log.filesystem().simulate_power_loss();
+        let fs = log.into_filesystem();
+        let mut log = Log::open(fs, ManualClock::new(), cfg).unwrap();
+        assert_eq!(log.next_offset(), Offset::ZERO, "no record recovered");
+        assert_eq!(log.next_seq(), Seq::new(0));
+        assert_eq!(
+            log.durable_record_count(),
+            0,
+            "zero region minted no record"
+        );
+        // The recovered log is fully appendable: the first record lands at offset 0.
+        assert_eq!(log.append(&rec(b"first")).unwrap(), Offset::ZERO);
+        log.sync().unwrap();
+        assert_eq!(read_back(log.filesystem(), 0)[0].payload, b"first");
+    }
+
+    #[test]
+    fn a_partially_written_preallocated_segment_recovers_its_longest_valid_prefix() {
+        // With preallocation ON, a crash after some records but before the segment filled leaves a
+        // header + records + a preallocated zero tail. Recovery must recover the longest valid
+        // prefix (exactly the synced records) and truncate the zero tail, never inventing a record
+        // from the zeros. This is the longest-valid-prefix tooth over a preallocated region.
+        let cfg = LogConfig {
+            max_segment_bytes: 64 * 1024, // big enough that several records never roll
+            ..LogConfig::default()
+        };
+        let mut log = open_mem(cfg);
+        for i in 0..5u8 {
+            log.append(&rec(&[i; 8])).unwrap();
+        }
+        log.sync().unwrap(); // the five records are acked-durable
+        log.append(&rec(b"unsynced-tail")).unwrap(); // never synced
+        log.filesystem().simulate_power_loss();
+        let fs = log.into_filesystem();
+
+        let mut log = Log::open(fs, ManualClock::new(), cfg).unwrap();
+        // Exactly the five synced records survive; the unsynced record and the zero tail are gone.
+        assert_eq!(
+            log.next_offset(),
+            Offset::new(5),
+            "longest valid prefix = 5"
+        );
+        assert_eq!(log.durable_record_count(), 5);
+        let records = read_back(log.filesystem(), 0);
+        assert_eq!(records.len(), 5, "no spurious record from the zero region");
+        for (i, r) in (0u8..5).zip(&records) {
+            assert_eq!(r.payload, vec![i; 8]);
+        }
+        // The recovered writer resumes cleanly at offset 5.
+        assert_eq!(log.append(&rec(b"after")).unwrap(), Offset::new(5));
+    }
+
+    /// A file whose `preallocate` always errors (an unsupported FS or an out-of-space reservation),
+    /// counting each failure so a test can prove the failing path was genuinely taken; every other
+    /// op delegates to the inner file. Used to exercise `start_segment`'s best-effort swallow.
+    struct FailPreallocFile<G> {
+        inner: G,
+        fails: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl<G: RandomAccessFile> RandomAccessFile for FailPreallocFile<G> {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+            self.inner.read_at(buf, offset)
+        }
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+            self.inner.write_all_at(buf, offset)
+        }
+        fn sync_data(&self) -> std::io::Result<()> {
+            self.inner.sync_data()
+        }
+        fn sync_all(&self) -> std::io::Result<()> {
+            self.inner.sync_all()
+        }
+        fn len(&self) -> std::io::Result<u64> {
+            self.inner.len()
+        }
+        fn set_len(&self, len: u64) -> std::io::Result<()> {
+            self.inner.set_len(len)
+        }
+        fn preallocate(&self, _len: u64) -> std::io::Result<()> {
+            self.fails.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(std::io::Error::other("preallocate unsupported on this fs"))
+        }
+    }
+
+    /// A filesystem that hands out [`FailPreallocFile`]s, so every segment's preallocate fails.
+    struct FailPreallocFs {
+        inner: InMemoryFs,
+        fails: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl Filesystem for FailPreallocFs {
+        type File = FailPreallocFile<<InMemoryFs as Filesystem>::File>;
+        fn open(&self, name: &str) -> std::io::Result<Self::File> {
+            Ok(FailPreallocFile {
+                inner: self.inner.open(name)?,
+                fails: std::sync::Arc::clone(&self.fails),
+            })
+        }
+        fn create_new(&self, name: &str) -> std::io::Result<Self::File> {
+            Ok(FailPreallocFile {
+                inner: self.inner.create_new(name)?,
+                fails: std::sync::Arc::clone(&self.fails),
+            })
+        }
+        fn remove(&self, name: &str) -> std::io::Result<()> {
+            self.inner.remove(name)
+        }
+        fn list(&self) -> std::io::Result<Vec<String>> {
+            self.inner.list()
+        }
+        fn exists(&self, name: &str) -> std::io::Result<bool> {
+            self.inner.exists(name)
+        }
+        fn sync_dir(&self) -> std::io::Result<()> {
+            self.inner.sync_dir()
+        }
+        fn subdir(&self, name: &str) -> std::io::Result<Self> {
+            Ok(FailPreallocFs {
+                inner: self.inner.subdir(name)?,
+                fails: std::sync::Arc::clone(&self.fails),
+            })
+        }
+        fn subdir_exists(&self, name: &str) -> std::io::Result<bool> {
+            self.inner.subdir_exists(name)
+        }
+    }
+
+    #[test]
+    fn a_preallocate_failure_is_non_fatal_and_the_broker_still_starts_and_appends() {
+        // Preallocation is a best-effort optimization: a filesystem whose `preallocate` ALWAYS
+        // errors must NOT prevent the broker from opening or appending. `start_segment` swallows the
+        // error and falls back to grow-on-append. `FailPreallocFs` fails (and counts) every
+        // segment's preallocate, so the test proves the failing path was genuinely taken (no false
+        // pass) AND the broker still opens, rolls, and appends.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let fails = Arc::new(AtomicU64::new(0));
+        let fs = FailPreallocFs {
+            inner: InMemoryFs::new(),
+            fails: Arc::clone(&fails),
+        };
+        // A small cap so the workload rolls (each roll re-attempts the failing preallocate).
+        let cfg = LogConfig {
+            max_segment_bytes: 256,
+            ..LogConfig::default()
+        };
+        // The broker OPENS despite the first segment's preallocate failing (best-effort, swallowed).
+        let mut log = Log::open(fs, ManualClock::new(), cfg)
+            .expect("the broker opens even though every preallocate fails");
+        assert!(
+            fails.load(Ordering::SeqCst) >= 1,
+            "the failing preallocate was taken on open"
+        );
+        // It appends, rolls, and the records are durable: grow-on-append fallback works end to end.
+        for _ in 0..16 {
+            log.append(&rec(b"payload-payload")).unwrap();
+            log.sync().unwrap();
+        }
+        assert!(
+            log.active_segment_id() >= 1,
+            "the workload rolled despite failing preallocate"
+        );
+        assert!(
+            fails.load(Ordering::SeqCst) >= 2,
+            "a rolled-to segment re-attempted (and swallowed) the failing preallocate"
+        );
+        assert_eq!(
+            read_back(log.filesystem(), 0)[0].payload,
+            b"payload-payload"
+        );
     }
 
     #[test]
