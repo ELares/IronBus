@@ -54,7 +54,13 @@ sha256_of_stdin() {
 extract_layout() {
   awk '
     /^#\[cfg\(test\)\]/ { exit }
-    /pub const/ { sub(/^[ \t]+/, ""); sub(/[ \t]+$/, ""); print }
+    /pub const/ { incon = 1 }
+    incon {
+      line = $0
+      sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
+      print line
+      if ($0 ~ /;/) { incon = 0 }
+    }
   ' "$FORMAT_FILE"
 }
 
