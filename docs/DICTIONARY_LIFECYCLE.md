@@ -23,8 +23,9 @@ and the frozen `ironbus.loss-report.v1` reason-code vocabulary.
 - **Deferred from v1 on purpose, and ADDITIVE.** #78 is deliberately deferred: a
   referenced-but-absent dictionary is permanently undecodable data, so dictionaries land
   ONLY once the distribution story below is real. The v1 frame already RESERVES the dict_id
-  space (Section 8), so this is additive with NO wire-format break and NO on-disk format
-  break. A v1 reader and a future dictionary-aware reader interpret a v1 frame identically.
+  INTERPRETATION behind the COMPRESSED flag (Section 8): the dict_id is not a physical reserved
+  header field, it is a value carried only inside a compressed payload's descriptor, which v1
+  never writes. So this is additive with NO wire-format break and NO on-disk format break. A v1 reader and a future dictionary-aware reader interpret a v1 frame identically.
 - **This spec is NOT the `ZDICT` implementation.** IronBus runs a deliberately minimal
   dependency graph: per [ADR 0003](adr/0003-default-compression-lz4-zstd-opt-in.md) the
   default codec is pure-Rust `lz4_flex` and zstd (`zstd-sys`, vendored C) is opt-in only,
@@ -123,7 +124,10 @@ Rationale for the choice:
   even on the default build (the hash runs at TRAIN time and at the dict_id-derivation step,
   not in the hot compress path). Using a cryptographic hash (not a CRC) means a same-prefix
   collision cannot be engineered cheaply, which matters because the id is the immutability
-  guarantee.
+  guarantee. BLAKE3 is NOT in the dependency graph today (the only hashes present are the
+  CRC32C/xxhash used on the data path), so the implementation adds it as a new crate with its own
+  `deny.toml` justification entry; its `CC0-1.0 OR Apache-2.0` license is accepted via the
+  Apache-2.0 arm of the permissive allowlist.
 - The truncation to u32 matches the dict_id WIDTH the v1 frame reserves (Section 8) and the
   `u32 dict_id` field #12 sketched. The truncation is what makes a collision POSSIBLE (a 32-bit
   space over a 256-bit hash), which is exactly why the train-time collision check below is
@@ -135,6 +139,10 @@ The trainer holds the dict_id space honest. Before writing `dicts/<dict_id>.zstd
 the candidate dict_id and checks the output directory (and any operator-supplied active set
 passed with `--known-dicts`):
 
+- If the candidate derives dict_id 0, the trainer REFUSES it (0 is permanently the
+  no-dictionary sentinel, Section 8) and the operator re-trains with a trivially different
+  corpus, exactly as for a collision below. This is a ~1 in 2^32 event, but it is a HARD rule so
+  a trained dictionary can never claim the no-dictionary id.
 - If NO file `dicts/<dict_id>.zstd` exists, the id is free: write it.
 - If a file `dicts/<dict_id>.zstd` exists AND its bytes are BYTE-IDENTICAL to the candidate,
   the trainer produced the same dictionary again (a deterministic re-train of the same corpus):
@@ -272,8 +280,8 @@ dictionary later.
 
 ### The distinguishing property: framing is intact, decode is impossible
 
-This is a DIFFERENT failure class from the corruption ReasonCodes 1 through 5. Those are all
-checksum or framing failures: a bad record header CRC, a bad body CRC, a bad segment header, an
+This is a DIFFERENT failure class from the existing ReasonCodes 1 through 6. Those are corruption
+or ordering failures: a bad record header CRC, a bad body CRC, a bad segment header, an
 out-of-order sequence. An unresolved-dict_id frame is the opposite: the record header CRC, the
 body CRC, and the xxh3 (if present) ALL PASS, because the dict_id and the compressed payload are
 inside the checksum-covered body and are byte-perfect on disk. The bytes are not corrupt; they
@@ -296,8 +304,9 @@ Why a NEW reason rather than reusing an existing one:
 - Reusing `CorruptRecordBody` (3) would misreport an absent-dictionary event as bit-rot,
   defeating the whole "reported loss names exactly what was lost" contract (#8) and sending the
   operator after the wrong root cause.
-- The existing reasons 1 through 6 are all either checksum/framing failures (1 through 5) or
-  scrubber-detected bit-rot (6); none describes "intact frame, absent decode input". An honest
+- The existing reasons 1 through 6 are checksum/framing failures (1 through 4), an ordering break
+  (5, SequenceGap, whose own CRCs pass), or scrubber-detected bit-rot (6); none describes "intact
+  frame, valid CRCs, absent decode input". An honest
   report needs its own reason, so an operator (and a dashboard) can tell "ship the missing
   dictionary" apart from "this disk is rotting".
 
