@@ -219,8 +219,18 @@ const EXIT_UNREACHABLE: u8 = 5;
 const EXIT_INTERNAL: u8 = 70;
 /// The data directory (or path) an offline verb was pointed at does not exist.
 const EXIT_NOT_FOUND: u8 = 2;
+/// Handled corruption / a structured-but-degraded result: an inspection verb (`scrub`, or
+/// `repair` reporting what it did) RAN TO COMPLETION and reported one or more real
+/// data-loss spans (a corruption skip, reason other than the expected torn tail). The
+/// command succeeded at its job; the non-zero code communicates the degraded finding, not a
+/// failure. A clean run, AND a run whose only skip is an expected `TornTail` brownout
+/// truncation, stays `0`. This is the exit-code-3 gate frozen in `docs/CLI_CONTRACT.md`,
+/// reusing the loss report's data-loss-vs-torn-tail boundary (`ReasonCode::is_data_loss`).
+const EXIT_HANDLED_CORRUPTION: u8 = 3;
 /// An offline verb found the data directory structurally corrupt (a broken segment chain
-/// or an undecodable header), distinct from a clean torn tail it can still read past.
+/// or an undecodable header), distinct from a clean torn tail it can still read past. This
+/// is the BLOCKED case (the command could not finish), distinct from exit 3 (the command
+/// FINISHED and reported the damage).
 const EXIT_CORRUPT: u8 = 4;
 
 const USAGE: &str = "\
@@ -244,6 +254,9 @@ USAGE:
     ironbus admin --health-addr <host:port>
     ironbus peek  --data-dir <dir> [--from-offset <n>] [--limit <n>] [--json]
     ironbus dump  --data-dir <dir> [--limit <n>] [--json] [--dlq]
+                  [--raw] [--require-dict]
+    ironbus scrub --data-dir <dir> [--json]
+    ironbus repair --data-dir <dir> [--apply] [--json]
     ironbus bench (--duration <secs> | --count <n>) [--mode <publish|subscribe|round-trip>]
                   [--rate <msg/s>] [--payload-bytes <n>] [--payload-shape <realistic|random>]
                   [--fetch-batch <n>] [--group <name>] [--no-fsync] [--json]
@@ -326,6 +339,21 @@ Notes:
     per poison record showing dlq_offset, source_offset, group, attempt, ts_ms, and the
     key/payload sizes (NDJSON with --json). It is read-only and never mutates the directory;
     an empty or never-poisoned broker shows nothing.
+    dump --raw shows the on-disk frame and --require-dict fails strictly (exit 3) on a record
+    whose dictionary is missing. On-disk compression (#12) is not yet implemented (the codec is
+    always none), so today every record decodes plainly: --raw renders the same field set and
+    --require-dict never trips. The flags are the committed surface for when #12 lands.
+    scrub is an offline, strictly READ-ONLY full integrity scan of the data dir (no broker): it
+    reports every corruption, torn-tail, or checksum issue it finds (the plan) and marks, never
+    hides, what recovery would quarantine. It exits 0 if clean (a torn-tail-only result stays 0,
+    matching recovery's data-loss boundary), 3 if it found and reported real data-loss corruption,
+    2 if the data dir is missing, 4 if the chain is structurally corrupt and could not be read.
+    repair defaults to the SAME read-only plan as scrub (print what it WOULD do, change nothing).
+    --apply performs the repair: it takes the EXCLUSIVE data-dir lock first (exit 5 if a broker
+    holds it), QUARANTINES (copies to quarantine/, never deletes) any corrupt span, truncates to
+    the longest valid prefix exactly as recovery does, and preserves the data dir's uid/gid/mode.
+    It is recovery made explicit and offline; it never makes the data less recoverable than
+    recovery already would.
     bench is a load generator that reports throughput, p50/p99/p999 latency, fsync cost, and
     bytes/op over the real wire and produce path. By DEFAULT it is PRODUCTION-SAFE: it spawns its
     own ISOLATED broker over a fresh ironbus-bench-<random> data directory and reads through a fresh
@@ -368,7 +396,9 @@ Notes:
     opens with no migration (migrate reports 'no migration needed' and exits 0); a future format
     bump requires an explicit --allow <to-version> and is refused without it, exit 1. ironbus
     --version emits the build version (and the release embeds commit/provenance, see RELEASING.md).
-    Exit codes: 0 clean, 1 usage, 2 not found, 4 corrupt data, 5 broker unreachable, 70 internal.";
+    Exit codes: 0 clean, 1 usage, 2 not found, 3 handled corruption (scrub/repair finished and
+    reported real data loss), 4 corrupt data (blocked: the chain could not be read), 5 broker
+    unreachable, 70 internal.";
 
 /// A command-line failure, mapped to a frozen exit code by [`main`].
 #[derive(Debug)]
@@ -387,6 +417,14 @@ enum CliError {
     /// on Unix, where the offline verbs run; documented on every platform.
     #[cfg_attr(not(unix), allow(dead_code))]
     Corrupt(String),
+    /// Handled corruption (exit 3): an inspection verb (`scrub`/`repair`) ran to completion
+    /// and reported one or more real data-loss spans. The command SUCCEEDED at its job; the
+    /// non-zero code is the degraded finding, not a failure. The structured result has already
+    /// been written to stdout (human or `--json`) before this is returned; the message is the
+    /// informational summary, not an alarm. Constructed only on Unix, where the verbs run;
+    /// documented on every platform.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    HandledCorruption(String),
 }
 
 impl CliError {
@@ -396,6 +434,7 @@ impl CliError {
             CliError::Unreachable(_) => EXIT_UNREACHABLE,
             CliError::Internal(_) => EXIT_INTERNAL,
             CliError::NotFound(_) => EXIT_NOT_FOUND,
+            CliError::HandledCorruption(_) => EXIT_HANDLED_CORRUPTION,
             CliError::Corrupt(_) => EXIT_CORRUPT,
         }
     }
@@ -408,6 +447,7 @@ impl core::fmt::Display for CliError {
             | CliError::Unreachable(m)
             | CliError::Internal(m)
             | CliError::NotFound(m)
+            | CliError::HandledCorruption(m)
             | CliError::Corrupt(m) => write!(f, "{m}"),
         }
     }
@@ -452,6 +492,8 @@ fn run(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         "admin" => run_admin(rest, out),
         "peek" => run_peek(rest, out),
         "dump" => run_dump(rest, out),
+        "scrub" => run_scrub(rest, out),
+        "repair" => run_repair(rest, out),
         "bench" => run_bench(rest, out),
         "upgrade" => run_upgrade(rest, out),
         "rollback" => run_rollback(rest, out),
@@ -2049,6 +2091,8 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut limit: Option<u64> = None;
     let mut json = false;
     let mut dlq = false;
+    let mut raw = false;
+    let mut require_dict = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2067,6 +2111,20 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
                 dlq = true;
                 i += 1;
             }
+            // The committed compression-inspection surface (#92), gated on on-disk compression
+            // (#12). Today the codec is always `none`, so `--raw` (show the on-disk frame) renders
+            // the same field set as the decoded form, and `--require-dict` (fail strictly on a
+            // missing dictionary) never trips because no record carries a dictionary id. The flags
+            // are accepted now so a script written against the frozen surface keeps working once
+            // #12 lands; they are documented as gated, not faked.
+            "--raw" => {
+                raw = true;
+                i += 1;
+            }
+            "--require-dict" => {
+                require_dict = true;
+                i += 1;
+            }
             flag if flag.starts_with("--") => {
                 return Err(CliError::Usage(format!("unknown flag `{flag}` for dump")));
             }
@@ -2079,10 +2137,97 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     }
     let data_dir =
         data_dir.ok_or_else(|| CliError::Usage("dump requires `--data-dir <dir>`".to_string()))?;
+    // `--raw` and `--require-dict` are meaningless against the DLQ sink (it has no compressed
+    // frames either), so reject the combination as a usage error rather than silently ignore it.
+    if dlq && (raw || require_dict) {
+        return Err(CliError::Usage(
+            "`--raw`/`--require-dict` are not valid with `--dlq`".to_string(),
+        ));
+    }
     if dlq {
         return cmd_inspect_dlq(Path::new(&data_dir), limit, json, out);
     }
+    // `raw`/`require_dict` are inert until #12 (codec is always `none`); they are threaded through
+    // so the dispatch records the frozen surface without faking compression.
+    let _ = (raw, require_dict);
     cmd_inspect(Path::new(&data_dir), 0, limit, json, out)
+}
+
+/// Parses and runs `scrub` (#92): a strictly READ-ONLY offline full integrity scan of the data dir,
+/// sharing the recovery decode path. It reports every corruption/torn-tail/checksum issue it finds
+/// (the plan) and marks, never hides, what recovery would quarantine; it NEVER writes.
+///
+/// # Errors
+/// [`CliError::Usage`] for a bad flag or a missing `--data-dir`; [`CliError::NotFound`] (exit 2) if
+/// the data dir is absent; [`CliError::Corrupt`] (exit 4) if the chain is structurally unreadable;
+/// [`CliError::HandledCorruption`] (exit 3) if it found and reported real data-loss corruption (a
+/// torn-tail-only result stays exit 0).
+fn run_scrub(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let mut data_dir: Option<String> = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data-dir" => data_dir = Some(take_value("--data-dir", args, &mut i)?),
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!("unknown flag `{flag}` for scrub")));
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "scrub takes no positional arguments, got `{other}`"
+                )));
+            }
+        }
+    }
+    let data_dir =
+        data_dir.ok_or_else(|| CliError::Usage("scrub requires `--data-dir <dir>`".to_string()))?;
+    cmd_scrub(Path::new(&data_dir), json, out)
+}
+
+/// Parses and runs `repair` (#92): defaults to the SAME read-only plan as `scrub` (print what it
+/// WOULD do, change nothing). `--apply` performs the repair under the exclusive data-dir lock:
+/// quarantine-not-delete any corrupt span, truncate to the longest valid prefix exactly as recovery
+/// does, preserving the data dir's uid/gid/mode. Unix-only (the on-disk storage is Unix-only in v1).
+///
+/// # Errors
+/// [`CliError::Usage`] for a bad flag or a missing `--data-dir`; [`CliError::NotFound`] (exit 2) if
+/// the data dir is absent; [`CliError::Unreachable`] (exit 5) if a broker holds the data-dir lock;
+/// [`CliError::Corrupt`] (exit 4) if the chain is structurally unreadable; [`CliError::Internal`]
+/// (exit 70) on an IO fault; [`CliError::HandledCorruption`] (exit 3) if it found and reported (plan)
+/// or quarantined (`--apply`) real data-loss corruption (a torn-tail-only result stays exit 0).
+fn run_repair(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let mut data_dir: Option<String> = None;
+    let mut json = false;
+    let mut apply = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data-dir" => data_dir = Some(take_value("--data-dir", args, &mut i)?),
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            "--apply" => {
+                apply = true;
+                i += 1;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!("unknown flag `{flag}` for repair")));
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "repair takes no positional arguments, got `{other}`"
+                )));
+            }
+        }
+    }
+    let data_dir = data_dir
+        .ok_or_else(|| CliError::Usage("repair requires `--data-dir <dir>`".to_string()))?;
+    cmd_repair(Path::new(&data_dir), apply, json, out)
 }
 
 /// Parses and runs `bench` (#94): the publish / subscribe / round-trip load generator with the
@@ -2535,6 +2680,403 @@ fn map_offline_err(data_dir: &Path, e: &StorageError) -> CliError {
         }
         other => CliError::Internal(format!("reading {at}: {other}")),
     }
+}
+
+/// The current schema version of the `scrub` `--json` result object (`ironbus.cli.scrub.vN`),
+/// per [`docs/CLI_CONTRACT.md`]. A new OPTIONAL field is additive (no bump); a field
+/// rename/removal/type-change bumps this. Registered in `docs/compat/versions.md`.
+#[cfg(unix)]
+const SCRUB_SCHEMA_VERSION: u32 = 1;
+/// The current schema version of the `repair` `--json` result object (`ironbus.cli.repair.vN`),
+/// per [`docs/CLI_CONTRACT.md`]. Same bump rule as [`SCRUB_SCHEMA_VERSION`].
+#[cfg(unix)]
+const REPAIR_SCHEMA_VERSION: u32 = 1;
+
+/// Runs `scrub` (#92): a strictly READ-ONLY offline full integrity scan of the data dir, sharing the
+/// recovery decode path ([`OfflineReader`]). It opens the directory read-only (which NEVER mutates
+/// it: no truncation, no roll, no segment creation), computes the loss report exactly as recovery
+/// would, renders the plan (human or `--json` `ironbus.cli.scrub.v1`), and maps the outcome to the
+/// frozen exit scheme.
+///
+/// Exit mapping (the exit-code-3 gate, `docs/CLI_CONTRACT.md`):
+/// - `0`: the directory is clean, OR its only skip is an expected `TornTail` brownout truncation (a
+///   reported skip that is NOT data loss, per [`ReasonCode::is_data_loss`]).
+/// - `3` ([`CliError::HandledCorruption`]): the scan FINISHED and found one or more real data-loss
+///   spans (a corruption skip). The plan is on stdout; the code communicates the degraded finding.
+/// - `2` ([`CliError::NotFound`]): the data dir is missing.
+/// - `4` ([`CliError::Corrupt`]): the chain is structurally unreadable (BLOCKED, distinct from 3).
+///
+/// It is strictly read-only: the only storage call is [`OfflineReader::open`], which the storage
+/// crate documents (and a test here proves) never writes.
+#[cfg(unix)]
+fn cmd_scrub(data_dir: &Path, json: bool, out: &mut impl Write) -> Result<(), CliError> {
+    let reader = OfflineReader::open(StdFs::new(data_dir.to_path_buf()))
+        .map_err(|e| map_offline_err(data_dir, &e))?;
+    let report = reader.loss_report();
+    let plan = ScrubPlan::from_report(report, reader.segment_ids().len());
+    write_scrub_result(data_dir, &plan, json, out)?;
+    // Exit 3 ONLY for real data loss; a torn-tail-only result stays exit 0 (the loss-report
+    // data-loss boundary, the same one recovery and the quarantine store use). The structured
+    // result has already been written above, so the non-zero return only carries the exit code.
+    if plan.data_loss_bytes > 0 {
+        return Err(CliError::HandledCorruption(plan.summary("scrub", false)));
+    }
+    Ok(())
+}
+
+/// Runs `repair` (#92). Without `--apply` it is `scrub` re-labeled: the SAME read-only plan (open
+/// read-only, compute the loss report, print what it WOULD do, change nothing). With `--apply` it
+/// performs the repair, which is recovery made explicit and offline:
+///
+/// 1. Acquire the EXCLUSIVE data-dir lock ([`dirlock::DirLock`], the same lock `serve` holds). If a
+///    broker holds it, fail fast with exit 5 ([`CliError::Unreachable`]) and change nothing, so
+///    `--apply` can never race a live writer and corrupt the MANIFEST.
+/// 2. Run recovery via [`Log::open`], which QUARANTINES (copies to `quarantine/`, never deletes) any
+///    corrupt span BEFORE truncating it, truncates the active segment to the longest valid prefix,
+///    and uses the atomic write-temp+fsync+rename + dir-fsync discipline for every file it rewrites.
+///    It NEVER edits a sealed segment in place and NEVER makes the data less recoverable than
+///    recovery already would (it IS recovery). The data dir's uid/gid/mode are preserved because
+///    recovery only truncates EXISTING files in place; it never recreates the directory.
+///
+/// The exit mapping matches [`cmd_scrub`]; additionally an apply that races a broker is exit 5, and
+/// an IO fault during apply is exit 70.
+#[cfg(unix)]
+fn cmd_repair(
+    data_dir: &Path,
+    apply: bool,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    if !apply {
+        // Read-only by default: the plan, computed exactly as scrub computes it, changing nothing.
+        let reader = OfflineReader::open(StdFs::new(data_dir.to_path_buf()))
+            .map_err(|e| map_offline_err(data_dir, &e))?;
+        let plan = ScrubPlan::from_report(reader.loss_report(), reader.segment_ids().len());
+        write_repair_result(data_dir, &plan, false, json, out)?;
+        if plan.data_loss_bytes > 0 {
+            return Err(CliError::HandledCorruption(plan.summary("repair", false)));
+        }
+        return Ok(());
+    }
+
+    // `--apply`: take the EXCLUSIVE lock FIRST, so a running broker (which holds it) blocks us with a
+    // fail-fast exit 5 rather than letting two writers touch one log. `prepare_data_dir` rejects a
+    // non-directory path and a missing dir maps to not-found (exit 2), matching scrub. The lock is
+    // released by close(2) when `_lock` drops at the end of this function (or on any early return).
+    if !data_dir.exists() {
+        return Err(CliError::NotFound(format!(
+            "no data directory at {}",
+            data_dir.display()
+        )));
+    }
+    dirlock::prepare_data_dir(data_dir).map_err(|e| map_dir_error(&e))?;
+    let _lock = dirlock::DirLock::acquire(data_dir).map_err(|e| match e {
+        // A broker holding the lock is the fail-fast contention case the issue maps to exit 5
+        // (unreachable): repair refuses to touch a live broker's data dir. This is the ONE place
+        // `AlreadyLocked` is exit 5 rather than `serve`'s exit-70 double-open guard.
+        dirlock::DirError::AlreadyLocked(_) => CliError::Unreachable(format!(
+            "cannot repair {}: a broker holds its exclusive lock (stop the broker first)",
+            data_dir.display()
+        )),
+        other => map_dir_error(&other),
+    })?;
+
+    // Recovery made explicit: `Log::open` quarantines each corrupt span (copy, not move), truncates
+    // to the longest valid prefix with the atomic fsync discipline, and preserves the directory in
+    // place. The default config is the documented recovery baseline (64 MiB segment cap, the default
+    // quarantine budget); repair never makes the data LESS recoverable than this. A structural fault
+    // maps to exit 4 (blocked), an I3 cap breach the same (recovery itself would refuse), an IO
+    // fault to exit 70.
+    let recovered = ironbus_storage::log::Log::open(
+        StdFs::new(data_dir.to_path_buf()),
+        SystemClock::new(),
+        LogConfig::default(),
+    )
+    .map_err(|e| map_offline_err(data_dir, &e))?;
+    let plan = ScrubPlan::from_report(recovered.loss_report(), recovered.segment_count());
+    // Drop the recovered log (releasing its file handles) BEFORE reporting, so nothing dangles.
+    drop(recovered);
+    write_repair_result(data_dir, &plan, true, json, out)?;
+    if plan.data_loss_bytes > 0 {
+        return Err(CliError::HandledCorruption(plan.summary("repair", true)));
+    }
+    Ok(())
+}
+
+/// The structured plan a `scrub`/`repair` run produces: the segment count it scanned, and the loss
+/// the durable prefix dropped, split into the data-loss total (corruption, the exit-3 trigger) and
+/// the torn-tail total (a reported skip that is NOT data loss). Built from the recovery
+/// [`LossReport`] so the offline plan and the broker's next-start recovery agree on every span.
+#[cfg(unix)]
+struct ScrubPlan {
+    /// How many segments the scan walked.
+    segments: usize,
+    /// The number of skip spans the report carries (corruption + torn tail).
+    skipped_spans: usize,
+    /// The total bytes of real DATA loss (the exit-3 trigger): the sum over events whose reason
+    /// [`ReasonCode::is_data_loss`], i.e. every reason EXCEPT `TornTail`.
+    data_loss_bytes: u64,
+    /// The total bytes of torn/unsynced tail skipped (a reported skip, NOT data loss).
+    torn_tail_bytes: u64,
+    /// The number of spans that are real data loss (corruption skips).
+    data_loss_spans: usize,
+    /// The per-event spans, copied so the renderer does not borrow the report.
+    events: Vec<ScrubEvent>,
+}
+
+/// One loss span in a [`ScrubPlan`], flattened from a [`ironbus_storage::loss::LossEvent`] for
+/// rendering (the segment, the byte span, the reason label, and whether it counts as data loss).
+#[cfg(unix)]
+struct ScrubEvent {
+    segment_id: u64,
+    start: u64,
+    end: u64,
+    reason: &'static str,
+    is_data_loss: bool,
+}
+
+#[cfg(unix)]
+impl ScrubPlan {
+    /// Builds the plan from a recovery [`LossReport`] and the scanned segment count, classifying
+    /// each span by [`ReasonCode::is_data_loss`] so a torn-tail-only report yields
+    /// `data_loss_bytes == 0` (exit 0) while any corruption span trips the exit-3 total.
+    fn from_report(report: &LossReport, segments: usize) -> ScrubPlan {
+        let events: Vec<ScrubEvent> = report
+            .events
+            .iter()
+            .map(|e| ScrubEvent {
+                segment_id: e.segment_id,
+                start: e.byte_offset_start,
+                end: e.byte_offset_end,
+                reason: e.reason_code.metric_label(),
+                is_data_loss: e.reason_code.is_data_loss(),
+            })
+            .collect();
+        let data_loss_spans = events.iter().filter(|e| e.is_data_loss).count();
+        ScrubPlan {
+            segments,
+            skipped_spans: report.events.len(),
+            data_loss_bytes: report.data_loss_bytes(),
+            torn_tail_bytes: report
+                .total_bytes_skipped()
+                .saturating_sub(report.data_loss_bytes()),
+            data_loss_spans,
+            events,
+        }
+    }
+
+    /// `true` if the scan found nothing to report (a clean directory).
+    fn is_clean(&self) -> bool {
+        self.skipped_spans == 0
+    }
+
+    /// A one-line informational summary for the [`CliError::HandledCorruption`] message (exit 3) and
+    /// the human stdout line. `applied` distinguishes a repair that quarantined-and-truncated from a
+    /// scrub/plan that only reported.
+    fn summary(&self, command: &str, applied: bool) -> String {
+        let verb = if applied {
+            "quarantined"
+        } else {
+            "would quarantine"
+        };
+        format!(
+            "{command} {verb} {} corrupt span(s), {} byte(s) of data loss ({} torn-tail byte(s) excluded)",
+            self.data_loss_spans, self.data_loss_bytes, self.torn_tail_bytes,
+        )
+    }
+}
+
+/// Writes the `scrub` result: the human plan (or the `ironbus.cli.scrub.v1` `--json` object). The
+/// JSON object is emitted on EVERY exit path (clean exit 0 AND the exit-3 data-loss path), per the
+/// `--json` contract, carrying the `exit_code` it is about to return.
+#[cfg(unix)]
+fn write_scrub_result(
+    data_dir: &Path,
+    plan: &ScrubPlan,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let exit_code = if plan.data_loss_bytes > 0 {
+        EXIT_HANDLED_CORRUPTION
+    } else {
+        0
+    };
+    if json {
+        write_plan_json(
+            out,
+            "ironbus.cli.scrub",
+            SCRUB_SCHEMA_VERSION,
+            data_dir,
+            plan,
+            None,
+            exit_code,
+        )
+    } else {
+        write_plan_human(out, "scrub", data_dir, plan, None)
+    }
+}
+
+/// Writes the `repair` result: the human plan (or the `ironbus.cli.repair.v1` `--json` object),
+/// labeling whether `--apply` mutated the directory. `applied=false` is the read-only plan (what it
+/// WOULD do); `applied=true` reports what it DID (quarantined and truncated under the lock).
+#[cfg(unix)]
+fn write_repair_result(
+    data_dir: &Path,
+    plan: &ScrubPlan,
+    applied: bool,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let exit_code = if plan.data_loss_bytes > 0 {
+        EXIT_HANDLED_CORRUPTION
+    } else {
+        0
+    };
+    if json {
+        write_plan_json(
+            out,
+            "ironbus.cli.repair",
+            REPAIR_SCHEMA_VERSION,
+            data_dir,
+            plan,
+            Some(applied),
+            exit_code,
+        )
+    } else {
+        write_plan_human(out, "repair", data_dir, plan, Some(applied))
+    }
+}
+
+/// Renders a scrub/repair plan as a human report: a header line (clean or a damage count), then one
+/// indented line per span, then for `repair` an applied/plan line. Wording is NOT a stability
+/// contract (only `--json` is); a script should pass `--json` and key off `schema`.
+#[cfg(unix)]
+fn write_plan_human(
+    out: &mut impl Write,
+    command: &str,
+    data_dir: &Path,
+    plan: &ScrubPlan,
+    applied: Option<bool>,
+) -> Result<(), CliError> {
+    if plan.is_clean() {
+        writeln!(
+            out,
+            "{command}: {} is clean ({} segment(s) scanned, no corruption or torn tail)",
+            data_dir.display(),
+            plan.segments,
+        )?;
+        if let Some(false) = applied {
+            writeln!(
+                out,
+                "  nothing to repair (read-only plan; pass --apply to act)"
+            )?;
+        }
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "{command}: {} segment(s) scanned, {} skip span(s): {} byte(s) of data loss, {} torn-tail byte(s) (not data loss)",
+        plan.segments, plan.skipped_spans, plan.data_loss_bytes, plan.torn_tail_bytes,
+    )?;
+    for e in &plan.events {
+        let kind = if e.is_data_loss {
+            "data-loss"
+        } else {
+            "torn-tail (no data loss)"
+        };
+        writeln!(
+            out,
+            "  segment {} bytes [{}, {}) reason={} {kind}",
+            e.segment_id, e.start, e.end, e.reason,
+        )?;
+    }
+    match applied {
+        None => {}
+        Some(true) => {
+            writeln!(
+                out,
+                "  applied: quarantined the corrupt span(s) to quarantine/ and truncated to the longest valid prefix",
+            )?;
+        }
+        Some(false) => {
+            writeln!(
+                out,
+                "  read-only plan: --apply would quarantine the corrupt span(s) to quarantine/ and truncate to the longest valid prefix (nothing changed)",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Renders a scrub/repair plan as the single versioned `--json` result object
+/// (`ironbus.cli.<command>.vN`). It carries the `schema`, the source `data_dir`, the segment count,
+/// the skip/data-loss/torn-tail tallies, the per-span `events` array (the same field names as the
+/// `ironbus.loss-report.v1` events so the CLI and recovery agree), the `exit_code` it is about to
+/// return, and `ok` (true only on a clean exit-0 run). `repair` additionally carries `applied`.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn write_plan_json(
+    out: &mut impl Write,
+    schema_command: &str,
+    schema_version: u32,
+    data_dir: &Path,
+    plan: &ScrubPlan,
+    applied: Option<bool>,
+    exit_code: u8,
+) -> Result<(), CliError> {
+    write!(
+        out,
+        "{{\"schema\":\"{schema_command}.v{schema_version}\",\"data_dir\":\"{}\",\"segments\":{},\"skipped_spans\":{},\"data_loss_spans\":{},\"data_loss_bytes\":{},\"torn_tail_bytes\":{},",
+        escape_json(&data_dir.display().to_string()),
+        plan.segments,
+        plan.skipped_spans,
+        plan.data_loss_spans,
+        plan.data_loss_bytes,
+        plan.torn_tail_bytes,
+    )?;
+    if let Some(applied) = applied {
+        write!(out, "\"applied\":{applied},")?;
+    }
+    write!(out, "\"events\":[")?;
+    for (n, e) in plan.events.iter().enumerate() {
+        if n > 0 {
+            write!(out, ",")?;
+        }
+        write!(
+            out,
+            "{{\"segment\":{},\"start\":{},\"end\":{},\"reason\":\"{}\",\"data_loss\":{}}}",
+            e.segment_id, e.start, e.end, e.reason, e.is_data_loss,
+        )?;
+    }
+    let ok = exit_code == 0;
+    writeln!(out, "],\"ok\":{ok},\"exit_code\":{exit_code}}}")?;
+    Ok(())
+}
+
+/// `scrub`/`repair` require Unix in v1 (the on-disk storage uses positioned IO the Windows path does
+/// not yet implement), matching `serve`/`peek`/`dump`. The non-Unix stub consumes every parameter so
+/// the Windows `-D warnings` build stays clean (the #99/#288 cfg(not(unix)) field-read footgun).
+#[cfg(not(unix))]
+fn cmd_scrub(data_dir: &Path, json: bool, out: &mut impl Write) -> Result<(), CliError> {
+    let _ = (data_dir, json, out);
+    Err(CliError::Internal(
+        "ironbus scrub requires a Unix host in v1: on-disk storage is Unix-only".to_string(),
+    ))
+}
+
+/// `repair` requires Unix in v1, for the same reason as `scrub` (and the exclusive `flock(2)` lock
+/// and atomic `rename(2)` recovery discipline are POSIX). The stub consumes every parameter.
+#[cfg(not(unix))]
+fn cmd_repair(
+    data_dir: &Path,
+    apply: bool,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let _ = (data_dir, apply, json, out);
+    Err(CliError::Internal(
+        "ironbus repair requires a Unix host in v1: on-disk storage is Unix-only".to_string(),
+    ))
 }
 
 /// Maps an upgrade/rollback error to the frozen exit-code scheme: a missing rollback copy is a
@@ -3298,6 +3840,336 @@ mod tests {
         walk(dir, dir, &mut out);
         out.sort();
         out
+    }
+
+    // ---- scrub / repair (#92) -------------------------------------------------------------
+
+    /// Plants a real `CorruptRecordBody` (data-loss) span in `dir`'s active segment by flipping the
+    /// LAST byte of the file (inside the last record's frame). The file length is unchanged, so the
+    /// last frame parses structurally but fails its body CRC: recovery stops at it and drops
+    /// `[lastframe, EOF)` as one `corrupt_record_body` event (data loss), exactly as the storage
+    /// recovery test does. The first `n-1` records stay intact.
+    #[cfg(unix)]
+    fn plant_corrupt_body(dir: &Path) {
+        let seg = dir.join("seg-0000000000000000.log");
+        let mut bytes = std::fs::read(&seg).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&seg, &bytes).unwrap();
+    }
+
+    /// Reads the `mode & 0o777` of a path (Unix), so a test can prove repair preserved it.
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scrub_on_a_clean_dir_exits_0_and_reports_clean() {
+        let dir = make_data_dir("scrubclean", 5);
+        let mut buf = Vec::new();
+        // A clean directory: scrub returns Ok (exit 0) and the human report says "clean".
+        cmd_scrub(&dir, false, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("is clean"), "clean report: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scrub_on_a_planted_corruption_exits_3_and_reports_the_exact_span() {
+        let dir = make_data_dir("scrubcorrupt", 5);
+        // Record the span the body corruption will drop, by reading the file length before AND after
+        // (the corrupt body drops `[lastframe, EOF)`; EOF is the physical length, unchanged).
+        let seg = dir.join("seg-0000000000000000.log");
+        let physical_len = std::fs::metadata(&seg).unwrap().len();
+        plant_corrupt_body(&dir);
+        let mut buf = Vec::new();
+        let e = cmd_scrub(&dir, false, &mut buf).unwrap_err();
+        // Exit 3: handled corruption (the scan finished and found real data loss).
+        assert_eq!(e.exit_code(), EXIT_HANDLED_CORRUPTION, "{e}");
+        let text = String::from_utf8(buf).unwrap();
+        // The exact span is reported: segment 0, a corrupt_record_body reason ending at EOF, marked
+        // as data-loss.
+        assert!(
+            text.contains("segment 0 bytes ["),
+            "names the segment+span: {text}"
+        );
+        assert!(
+            text.contains(&format!(", {physical_len})")),
+            "the span ends at the physical EOF {physical_len}: {text}"
+        );
+        assert!(text.contains("reason=corrupt_record_body"), "{text}");
+        assert!(text.contains("data-loss"), "{text}");
+        assert!(
+            !text.contains("torn-tail (no data loss)"),
+            "a body-CRC failure is data loss, not a torn tail: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scrub_on_a_torn_tail_only_dir_exits_0() {
+        let dir = make_data_dir("scrubtorn", 4);
+        // Tear three bytes off the active segment: a TORN TAIL (the last frame's declared length now
+        // runs past EOF), which is a reported skip but NOT data loss, so scrub stays exit 0.
+        let seg = dir.join("seg-0000000000000000.log");
+        let f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
+        let len = f.metadata().unwrap().len();
+        f.set_len(len - 3).unwrap();
+        f.sync_all().unwrap();
+        let mut buf = Vec::new();
+        // Ok (exit 0): a torn-tail-only result is clean per the data-loss boundary.
+        cmd_scrub(&dir, false, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("torn_tail"),
+            "the torn tail is still REPORTED: {text}"
+        );
+        assert!(
+            text.contains("torn-tail (no data loss)"),
+            "marked as not-data-loss: {text}"
+        );
+        assert!(
+            text.contains("0 byte(s) of data loss"),
+            "zero data-loss bytes: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scrub_is_strictly_read_only() {
+        let dir = make_data_dir("scrubro", 5);
+        plant_corrupt_body(&dir);
+        // Snapshot the whole directory tree, run scrub (which finds data loss), and prove every byte
+        // is unchanged: scrub never writes, not even to quarantine.
+        let before = dir_snapshot(&dir);
+        let mut buf = Vec::new();
+        let _ = cmd_scrub(&dir, false, &mut buf); // exit 3; the result is irrelevant here
+        let after = dir_snapshot(&dir);
+        assert_eq!(before, after, "scrub must not mutate the data directory");
+        assert!(
+            !dir.join("quarantine").exists(),
+            "scrub never creates the quarantine/ subdir (it is read-only)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scrub_json_carries_the_versioned_schema_and_exit_code() {
+        let dir = make_data_dir("scrubjson", 5);
+        plant_corrupt_body(&dir);
+        let mut buf = Vec::new();
+        let _ = cmd_scrub(&dir, true, &mut buf);
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("\"schema\":\"ironbus.cli.scrub.v1\""),
+            "versioned schema: {text}"
+        );
+        assert!(
+            text.contains("\"exit_code\":3"),
+            "carries exit_code 3: {text}"
+        );
+        assert!(
+            text.contains("\"ok\":false"),
+            "ok=false on data loss: {text}"
+        );
+        assert!(text.contains("\"data_loss_bytes\":"), "{text}");
+        assert!(
+            text.contains("\"reason\":\"corrupt_record_body\""),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scrub_on_a_missing_dir_is_not_found() {
+        let dir =
+            std::env::temp_dir().join(format!("ironbus-cli-scrubabsent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut buf = Vec::new();
+        let e = cmd_scrub(&dir, false, &mut buf).unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_NOT_FOUND, "{e}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_without_apply_changes_nothing() {
+        let dir = make_data_dir("repairplan", 5);
+        plant_corrupt_body(&dir);
+        let before = dir_snapshot(&dir);
+        let mut buf = Vec::new();
+        // The read-only plan reports the same data loss as scrub and returns exit 3, but mutates
+        // NOTHING: no quarantine, no truncation.
+        let e = cmd_repair(&dir, false, false, &mut buf).unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_HANDLED_CORRUPTION, "{e}");
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("read-only plan"), "labels the plan: {text}");
+        assert!(text.contains("nothing changed"), "{text}");
+        let after = dir_snapshot(&dir);
+        assert_eq!(
+            before, after,
+            "repair without --apply must not mutate the dir"
+        );
+        assert!(
+            !dir.join("quarantine").exists(),
+            "no quarantine without --apply"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_apply_quarantines_truncates_and_preserves_mode() {
+        let dir = make_data_dir("repairapply", 6);
+        let seg = dir.join("seg-0000000000000000.log");
+        // Set a deliberate, non-default mode on the data dir so the preservation check has teeth.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+        }
+        let dir_mode_before = mode_of(&dir);
+        let len_before = std::fs::metadata(&seg).unwrap().len();
+        plant_corrupt_body(&dir);
+        let mut buf = Vec::new();
+        let e = cmd_repair(&dir, true, false, &mut buf).unwrap_err();
+        // Exit 3: it quarantined real data loss.
+        assert_eq!(e.exit_code(), EXIT_HANDLED_CORRUPTION, "{e}");
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("applied: quarantined"),
+            "reports what it did: {text}"
+        );
+
+        // QUARANTINE-not-delete: the corrupt span was COPIED to quarantine/, a forensic blob exists.
+        let qdir = dir.join("quarantine");
+        assert!(qdir.is_dir(), "quarantine/ was created: {text}");
+        let blobs: Vec<_> = std::fs::read_dir(&qdir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("q-") && n.ends_with(".bin")
+            })
+            .collect();
+        assert_eq!(blobs.len(), 1, "exactly one forensic blob");
+        assert!(
+            blobs[0]
+                .file_name()
+                .to_string_lossy()
+                .contains("corrupt_record_body"),
+            "the blob names the reason: {:?}",
+            blobs[0].file_name()
+        );
+
+        // TRUNCATED to the longest valid prefix: the active segment is now SHORTER than before
+        // (the corrupt last frame is gone).
+        let len_after = std::fs::metadata(&seg).unwrap().len();
+        assert!(
+            len_after < len_before,
+            "the segment was truncated to the valid prefix: {len_after} < {len_before}"
+        );
+
+        // PRESERVED mode: recovery only truncates files in place, never recreates the dir.
+        assert_eq!(
+            mode_of(&dir),
+            dir_mode_before,
+            "the data dir mode is preserved"
+        );
+        assert_eq!(mode_of(&dir), 0o750, "the explicit 0750 survives");
+
+        // RECOVERY AGREEMENT: re-running scrub on the repaired dir is now CLEAN (exit 0), proving the
+        // repair left a consistent prefix the broker's next start would accept unchanged.
+        let mut buf2 = Vec::new();
+        cmd_scrub(&dir, false, &mut buf2).unwrap();
+        assert!(
+            String::from_utf8(buf2).unwrap().contains("is clean"),
+            "the repaired dir scrubs clean"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_apply_exits_5_when_the_lock_is_held() {
+        let dir = make_data_dir("repairlocked", 4);
+        plant_corrupt_body(&dir);
+        // Simulate a running broker by holding the exclusive data-dir lock ourselves.
+        dirlock::prepare_data_dir(&dir).unwrap();
+        let held = dirlock::DirLock::acquire(&dir).unwrap();
+        let before = dir_snapshot(&dir);
+        let mut buf = Vec::new();
+        let e = cmd_repair(&dir, true, false, &mut buf).unwrap_err();
+        // Exit 5 (unreachable): repair refuses to touch a live broker's data dir, and changes
+        // nothing (the lock blocked it before recovery ran).
+        assert_eq!(e.exit_code(), EXIT_UNREACHABLE, "{e}");
+        let after = dir_snapshot(&dir);
+        assert_eq!(
+            before, after,
+            "a lock-blocked repair --apply mutates nothing"
+        );
+        assert!(
+            !dir.join("quarantine").exists(),
+            "no quarantine when lock-blocked"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_apply_on_a_clean_dir_exits_0() {
+        let dir = make_data_dir("repaircleanapply", 5);
+        // A clean dir: --apply takes the lock, runs recovery (which truncates nothing), and exits 0.
+        let mut buf = Vec::new();
+        cmd_repair(&dir, true, false, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("is clean"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_accepts_raw_and_require_dict_flags_inertly_today() {
+        // The #12-gated flags are accepted now: with the codec always `none` they do not change the
+        // output (no record carries a dictionary, so --require-dict never trips) and --raw renders
+        // the same field set. This pins the frozen flag surface without faking compression.
+        let dir = make_data_dir("dumpraw", 3);
+        let mut buf = Vec::new();
+        run_dump(
+            &[
+                "--data-dir".to_string(),
+                dir.display().to_string(),
+                "--raw".to_string(),
+                "--require-dict".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.lines().count(), 3, "all three records dump: {text}");
+        assert!(text.contains("codec=none"), "{text}");
+        // --raw/--require-dict are rejected against the DLQ sink (no compressed frames there either).
+        let mut bad = Vec::new();
+        let e = run_dump(
+            &[
+                "--data-dir".to_string(),
+                dir.display().to_string(),
+                "--dlq".to_string(),
+                "--raw".to_string(),
+            ],
+            &mut bad,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Starts an in-process broker over an in-memory filesystem (cross-platform), returning
