@@ -66,7 +66,7 @@ Read this first, because it frames every table below.
 | The TOML config FILE and its parser (`serve --config <path>`) | SHIPPED (#382) | [#85](https://github.com/ELares/IronBus/issues/85), `config_file.rs` |
 | The named PROFILES (`edge-tiny` / `balanced` / `throughput`), the `--profile` flag, and the materialized-config log | SHIPPED (#87) | [#87](https://github.com/ELares/IronBus/issues/87), `main.rs` |
 | The immutable `Arc<EffectiveConfig>` + the atomic SIGHUP/re-read RELOAD | SHIPPED (#382, the auth-free part) | [#88](https://github.com/ELares/IronBus/issues/88), `config_reload.rs` |
-| The MUTATING wire admin `CONFIG SET`/`SAVE` verbs (need auth) | **SPECIFIED here, NOT implemented** | [#106](https://github.com/ELares/IronBus/issues/106) |
+| The MUTATING wire admin `CONFIG SET`/`SAVE` verbs (need auth) | **SPECIFIED here, NOT implemented** | [#380](https://github.com/ELares/IronBus/issues/380) (needs auth) |
 | Secret redaction in config dumps | **SPECIFIED, NOT implemented** (env mapping IS shipped) | [#89](https://github.com/ELares/IronBus/issues/89) |
 | The typed key table, the literal grammar parser, and coupled-set validation | SHIPPED (#382) | [#86](https://github.com/ELares/IronBus/issues/86), `ironbus-core::config` |
 
