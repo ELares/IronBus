@@ -5,9 +5,13 @@
 //! fault through the shared [`FaultControl`]; the next matching operation fails deterministically
 //! (no ambient randomness). It injects fsync failures (the fsyncgate / EIO mode), clean write
 //! failures, one-shot torn (partial) writes, short reads (a `read_at` returning fewer bytes than
-//! asked while data remains), and read errors (an injected `read_at` IO error). A seeded fault
-//! scheduler that drives these primitives from one PRNG is a follow-up (#151); page-cache
-//! reordering and both-slots-torn are follow-ups under #164.
+//! asked while data remains), read errors (an injected `read_at` IO error), and a `sync_dir`
+//! (directory-publish) failure: the rename-boundary analogue for IronBus, which uses no `rename`,
+//! whose atomic-publish point is the `sync_dir` that makes a new segment's directory entry durable
+//! (the seal / roll publish). A seeded fault scheduler that drives these primitives from one PRNG
+//! is a follow-up (#151). Page-cache reorder/drop of the unsynced tail (the power-loss model where
+//! only fsync'd bytes are guaranteed durable, #164) is modeled on the disk itself by
+//! [`InMemoryFs::simulate_power_loss_reorder`](crate::fs::InMemoryFs::simulate_power_loss_reorder).
 
 use crate::fs::Filesystem;
 use crate::io::RandomAccessFile;
@@ -40,6 +44,15 @@ pub struct FaultControl {
     /// failed), so a test can assert a batch of concurrent produces issued exactly ONE `fdatasync`
     /// (group commit), not N.
     sync_count: Arc<AtomicU64>,
+    /// While armed, every `sync_dir` returns an injected IO error WITHOUT publishing the directory
+    /// change. IronBus uses NO `rename`; its atomic-publish boundary is the `sync_dir` that makes a
+    /// freshly created segment's directory entry durable (the seal / roll publish), the analogue of
+    /// an atomic-swap rename. Failing it deterministically stops the process at that boundary so a
+    /// test can assert recovery yields a consistent prefix BEFORE the publish is durable (#55).
+    fail_sync_dir: Arc<AtomicBool>,
+    /// A monotonic count of every `sync_dir` that ran (whether or not it failed), so a test can
+    /// assert the directory-publish boundary was actually reached (no false pass).
+    sync_dir_count: Arc<AtomicU64>,
 }
 
 /// A condvar-backed gate the sync path waits on while closed (#177): `open` starts open (syncs pass),
@@ -80,6 +93,32 @@ impl FaultControl {
     /// instead of reading, modelling a read that hits a bad block.
     pub fn set_fail_read(&self, fail: bool) {
         self.fail_read.store(fail, Ordering::SeqCst);
+    }
+
+    /// Arms (or disarms) directory-publish failure: while armed, every `sync_dir` returns an
+    /// injected IO error WITHOUT making the directory change durable. This is the rename-boundary
+    /// analogue for IronBus, which uses no `rename`: the `sync_dir` that publishes a new segment's
+    /// directory entry (the seal / atomic-swap publish point) is the boundary, and failing it stops
+    /// the process there so a test can prove recovery yields a consistent prefix before the publish
+    /// committed (#55).
+    pub fn set_fail_sync_dir(&self, fail: bool) {
+        self.fail_sync_dir.store(fail, Ordering::SeqCst);
+    }
+
+    /// The number of `sync_dir` calls that have run, so a test can assert the directory-publish
+    /// (rename-analogue) boundary was actually reached and a crash injected there is not a false
+    /// pass (the boundary was genuinely crossed).
+    #[must_use]
+    pub fn sync_dir_count(&self) -> u64 {
+        self.sync_dir_count.load(Ordering::SeqCst)
+    }
+
+    fn sync_dir_should_fail(&self) -> bool {
+        self.fail_sync_dir.load(Ordering::SeqCst)
+    }
+
+    fn record_sync_dir(&self) {
+        self.sync_dir_count.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Arms (or disarms) short reads: while `limit` is non-zero, every `read_at` returns at most
@@ -263,6 +302,17 @@ impl<F: Filesystem> Filesystem for FaultFs<F> {
     }
 
     fn sync_dir(&self) -> io::Result<()> {
+        // Count the directory-publish boundary so a test can assert it was reached, then, if armed,
+        // fail it WITHOUT publishing: the rename-analogue crash point (#55). IronBus uses no
+        // `rename`; the `sync_dir` that makes a new segment's directory entry durable is its
+        // atomic-publish boundary, so a fault here stops the process exactly before the publish
+        // commits, and recovery must still yield a consistent prefix.
+        self.control.record_sync_dir();
+        if self.control.sync_dir_should_fail() {
+            return Err(io::Error::other(
+                "injected fault: sync_dir (directory publish) failed",
+            ));
+        }
         self.inner.sync_dir()
     }
 
@@ -586,6 +636,41 @@ mod tests {
             inner: file,
             control: control.clone(),
         }
+    }
+
+    #[test]
+    fn arming_sync_dir_failure_fails_the_directory_publish_only() {
+        // The rename-boundary analogue (#55): a `sync_dir` fault stops the directory publish without
+        // committing it, and is counted so a test can prove the boundary was reached. File-level
+        // syncs and IO are untouched (only the directory publish faults).
+        let (fs, control) = faulted();
+        let f = fs.create_new("seg").unwrap();
+        f.write_all_at(b"durable", 0).unwrap();
+        f.sync_all().unwrap();
+        // Unarmed: the publish passes and is counted.
+        fs.sync_dir().unwrap();
+        assert_eq!(control.sync_dir_count(), 1);
+        // Armed: the publish faults (the directory entry is not made durable), and the boundary is
+        // still counted (it was genuinely reached, not skipped).
+        control.set_fail_sync_dir(true);
+        assert!(
+            fs.sync_dir().is_err(),
+            "the directory publish faults while armed"
+        );
+        assert_eq!(
+            control.sync_dir_count(),
+            2,
+            "the faulted publish was still counted"
+        );
+        // Only the directory publish faulted: a file sync and a read still go through.
+        f.sync_all().unwrap();
+        let mut buf = [0u8; 7];
+        f.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"durable");
+        // Disarmed, the publish flows to the inner filesystem again.
+        control.set_fail_sync_dir(false);
+        fs.sync_dir().unwrap();
+        assert_eq!(control.sync_dir_count(), 3);
     }
 
     #[test]
