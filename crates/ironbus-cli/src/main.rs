@@ -1915,12 +1915,21 @@ fn open_disk_engine(
             // durable checkpoint, so a re-subscribe resumes; only caught-up groups are evicted, so a
             // consumer's committed position is never lost.
             group_idle_evict_ms: config.group_idle_evict_ms,
+            // The OPT-IN RAM-headroom ceiling for the `ironbus_ram_headroom_bytes` edge gauge (#118),
+            // OFF (`0`) by default. A dedicated `serve` flag to set it (and the daily-write-budget
+            // knob on the log) is a small follow-up; both are reachable today via the library config
+            // and echoed on `/admin`.
+            ram_ceiling_bytes: 0,
             // The disk-full overflow policy (#82): drop-new (default) sheds, drop-oldest force-reaps
             // the oldest sealed segment then accepts. Honored only when `max_total_bytes` is set.
             disk_full_policy: match config.disk_full_policy {
                 DiskFullPolicyArg::DropNew => DiskFullPolicy::DropNew,
                 DiskFullPolicyArg::DropOldest => DiskFullPolicy::DropOldest,
             },
+            // The OPT-IN RAM-headroom ceiling for the `ironbus_ram_headroom_bytes` edge gauge (#118),
+            // OFF (`0`) by default. A dedicated `serve` flag to set it (and the daily-write-budget
+            // knob on the log) is a small follow-up; both are reachable today via the library config
+            // and echoed on `/admin`.
         },
     )
     .map_err(|e| CliError::Internal(format!("opening broker at {}: {e}", data_dir.display())))?;
@@ -3163,6 +3172,7 @@ mod tests {
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
                 group_idle_evict_ms: 0,
+                ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -3323,6 +3333,7 @@ mod tests {
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
                 group_idle_evict_ms: 0,
+                ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -3386,6 +3397,7 @@ mod tests {
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
                 group_idle_evict_ms: 0,
+                ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -4960,6 +4972,7 @@ mod tests {
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
                 group_idle_evict_ms: 0,
+                ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -5022,6 +5035,7 @@ mod tests {
                 max_messages: 0,
                 max_groups: DEFAULT_MAX_GROUPS,
                 group_idle_evict_ms: 0,
+                ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )

@@ -185,6 +185,76 @@ plus `_sum` and `_count`): the produce-time durability-barrier latency. A latenc
 distribution, not a resilience event, so it is also outside the frozen counter
 set.
 
+## Edge-resource series (#118)
+
+These surface the edge-specific resource pressures #118 names: flash write
+amplification, RAM headroom against a configured ceiling, a portable
+throughput-collapse signal, and an opt-in daily physical write budget (the
+flash-wear governor). They are additive to the frozen taxonomy: the two
+write-amplification byte counters and the over-budget shed counter are TYPE
+`counter`; everything else is a gauge. The new GAUGES carry no `_total` suffix, so
+the resilience-counter taxonomy test excludes them by construction; the one new
+`_total` (`ironbus_daily_write_budget_sheds_total`) IS in the frozen taxonomy (a
+shed is a resilience event that is never silent). Every name below is pinned by the
+`(name, type)` golden test `the_metric_name_and_type_contract_is_frozen` (#22), so a
+rename or type change fails CI until this doc and the contract are bumped together.
+
+```
+ironbus_logical_bytes_written          counter, bytes   user payload appended this run (key + headers + payload, no framing); the write-amplification denominator
+ironbus_physical_bytes_written         counter, bytes   bytes actually written to segments this run (record frames + segment headers/footers); the real flash-wear write volume and the write-amplification numerator
+ironbus_write_amp_ratio                gauge, ratio     physical / logical, rendered with 3 decimals (0.000 until the first byte is produced)
+ironbus_ram_headroom_bytes             gauge, bytes     ram_ceiling_bytes minus the process RSS, or -1 when no ceiling is set or RSS is unavailable on this platform
+ironbus_produce_saturated              gauge, 0|1       1 once the broker has shed at least one produce (admission exhaustion); a portable throughput-collapse signal, NOT a thermal sensor
+ironbus_daily_physical_write_budget_bytes  gauge, bytes the opt-in daily physical write budget (0 = the flash-wear governor is off)
+ironbus_physical_bytes_written_today   gauge, bytes     physical bytes written so far on the current UTC day (the daily-budget meter, reset at the UTC day boundary)
+ironbus_daily_write_budget_over        gauge, 0|1       1 when the daily budget is set and today's physical writes have reached it (the broker is shedding produces to protect flash)
+ironbus_daily_write_budget_sheds_total counter          produces shed because the daily physical write budget was reached (the governor firing); in the frozen resilience taxonomy
+```
+
+**Write amplification.** `ironbus_physical_bytes_written / ironbus_logical_bytes_written`
+is the per-run flash write amplification: how many bytes of flash an SSD/eMMC wear
+model is charged for each byte of user payload, counting record framing (header +
+trailer + length fields) plus segment headers and footers. Both counters are
+process-lifetime monotonic (a retention reap frees disk but does not un-write the
+bytes a wear counter already charged), and reset to zero on each broker open (a run
+starts a fresh amplification window). The derived `ironbus_write_amp_ratio` gauge is
+rendered exactly, without floating point (integer milli-units), and is greater than
+1 in practice (the framing always adds bytes).
+
+**RAM headroom.** `ironbus_ram_headroom_bytes = ram_ceiling_bytes - RSS`, the bytes
+of resident headroom before the kernel OOM-kills the process. The RAM ceiling is an
+opt-in config knob (`ram_ceiling_bytes`, `0` = unset, the default); set it to the
+cgroup/container memory limit or the device RAM budget (e.g. the 64 MiB `tiny`
+profile). RSS is read best-effort, with NO `unsafe`: `VmRSS` from
+`/proc/self/status` on Linux (the edge target), `ps -o rss=` on macOS (developers),
+and unavailable elsewhere. When no ceiling is set OR RSS cannot be read, the gauge
+reports the **`-1` unavailable sentinel** rather than a misleading maximal headroom
+(the same `-1`-means-none convention `ironbus_last_dead_lettered_offset` uses). This
+is pure observability: the engine never enforces the ceiling; the RAM bounds that
+actually hold are `consumer_credit_bytes`, `max_in_flight`, `max_groups`, and the
+bounded registry. See `crates/ironbus-server/src/rss.rs`.
+
+**Throughput-collapse signal.** `ironbus_produce_saturated` is the portable
+saturation/throughput-collapse signal #118 asks for: `1` once the broker has shed at
+least one produce (admission exhaustion via the daily-write-budget governor). It is
+derived purely from in-process counters, so it is portable across every target. Per
+#118 it is **throughput-derived, not a thermal sensor**: a chip-temperature gauge is
+left as an optional, device-only add-on where a platform sysfs source exists (binding
+the trigger to a Linux-only sensor would break the cross-platform binary), and is not
+shipped here.
+
+**Daily physical write budget (opt-in flash-wear governor).** Off by default
+(`daily_physical_write_budget_bytes = 0`). When set, once today's physical write
+volume (`ironbus_physical_bytes_written_today`, reset at the UTC day boundary on the
+clock seam) reaches the budget, the next produce is **shed via the existing #10
+drop-new path**: the append returns the non-fatal `AtCapacity`, the engine counts it
+in `ironbus_produce_rejected_total`, `ironbus_daily_write_budget_sheds_total` ticks,
+`ironbus_daily_write_budget_over` reads `1`, and `ironbus_produce_saturated` flips to
+`1`. It **never weakens durability** (the record is dropped, not written unsynced),
+and the writer is not frozen (a budget shed is non-fatal). The first write of each
+day is always admitted, so the broker always makes daily progress. The dead-letter
+sink carries no budget (a poison record is durable evidence and must never be shed).
+
 ## The bounded metric registry (#97)
 
 The registry (`crates/ironbus-server/src/registry.rs`) makes leaving metrics on

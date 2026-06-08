@@ -69,6 +69,9 @@ fn engine_config() -> EngineConfig {
         max_groups: DEFAULT_MAX_GROUPS,
         group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
         disk_full_policy: DiskFullPolicy::DropNew,
+        // The RAM-headroom ceiling is off in the bench broker (#118): the bench samples real RSS
+        // out-of-band, it does not need the in-broker headroom gauge.
+        ram_ceiling_bytes: 0,
     }
 }
 

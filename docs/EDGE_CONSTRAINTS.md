@@ -396,8 +396,14 @@ The implementation residuals (design done, code follow-up) are:
   `clock_step` event ([#117](https://github.com/ELares/IronBus/issues/117) /
   [#118](https://github.com/ELares/IronBus/issues/118));
 - the edge metrics (write amplification, RAM headroom, throughput-collapse
-  thermal signal, loss counters) and the power-loss fault-injection test
-  contract ([#118](https://github.com/ELares/IronBus/issues/118));
+  signal, loss counters) and the power-loss fault-injection test contract
+  ([#118](https://github.com/ELares/IronBus/issues/118)) are now IMPLEMENTED on
+  `/metrics` (`ironbus_logical_bytes_written` / `ironbus_physical_bytes_written` /
+  `ironbus_write_amp_ratio`, `ironbus_ram_headroom_bytes`,
+  `ironbus_produce_saturated`, the opt-in daily-write-budget series, plus the
+  arming checksum-flip injector); see [METRICS.md](METRICS.md). The chip-temperature
+  gauge stays a device-only add-on and the `tiny`-profile CI gate is a residual on
+  [#87](https://github.com/ELares/IronBus/issues/87);
 - the on-device edge runs under the run discipline, a device residual that feeds
   [#19](https://github.com/ELares/IronBus/issues/19) and must not be faked
   ([EDGE_RUN_DISCIPLINE.md](EDGE_RUN_DISCIPLINE.md)).

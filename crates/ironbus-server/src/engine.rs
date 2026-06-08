@@ -188,6 +188,19 @@ pub struct EngineConfig {
     /// matching the `0` = off convention of the other bounds; an operator opts in by setting a
     /// non-zero window. See [`Engine::sweep_idle_groups`] and [`EngineConfig::max_groups`].
     pub group_idle_evict_ms: u64,
+    /// The OPT-IN RAM ceiling in BYTES for the `ironbus_ram_headroom_bytes` edge gauge (#118, #19,
+    /// #115): the resident-set budget an operator sizes the broker against on a constrained edge node
+    /// (e.g. the 64 MiB `tiny` profile). The gauge reports `ram_ceiling_bytes - current_rss`, the
+    /// headroom remaining before the kernel OOM-kills the process, so an operator can alert before
+    /// the broker is reaped. It is purely OBSERVABILITY: the engine never enforces it (the RAM bounds
+    /// that actually hold are `consumer_credit_bytes`, `max_in_flight`, `max_groups`, and the bounded
+    /// registry), this only surfaces the configured budget against the measured footprint.
+    ///
+    /// `0` means UNSET (the default): with no ceiling the headroom gauge reports the unavailable
+    /// sentinel (`-1`), since "headroom below the ceiling" is undefined. An operator opts in by
+    /// setting it (typically to the cgroup/container memory limit or the device RAM budget). See
+    /// [`crate::rss`].
+    pub ram_ceiling_bytes: u64,
 }
 
 /// An error from the engine.
@@ -672,6 +685,11 @@ pub struct EngineConfigSnapshot {
     pub hard_cap_nanos: u64,
     /// The disk-full overflow policy (`DropNew` or `DropOldest`).
     pub disk_full_policy: DiskFullPolicy,
+    /// The OPT-IN RAM ceiling in bytes for the `ironbus_ram_headroom_bytes` edge gauge (`0` = unset,
+    /// the gauge reports the unavailable sentinel) (#118).
+    pub ram_ceiling_bytes: u64,
+    /// The OPT-IN daily physical write budget in bytes (`0` = the flash-wear governor is off) (#118).
+    pub daily_physical_write_budget_bytes: u64,
 }
 
 /// The durable, unnamed default work-group: the one the wire protocol uses today, the one
@@ -969,6 +987,11 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// ([`Engine::sweep_idle_groups`]) runs from the produce and poll seams. See
     /// [`EngineConfig::group_idle_evict_ms`].
     group_idle_evict_nanos: u64,
+    /// The OPT-IN RAM ceiling in bytes for the `ironbus_ram_headroom_bytes` edge gauge (#118): the
+    /// resident-set budget the headroom gauge subtracts the measured RSS from. `0` means UNSET (the
+    /// gauge reports the unavailable sentinel). Pure observability; never enforced. See
+    /// [`EngineConfig::ram_ceiling_bytes`] and [`crate::rss`].
+    ram_ceiling_bytes: u64,
     last_checkpointed: u64,
     /// The last durably-checkpointed committed offset per NAMED work-group (#60), for the
     /// interval gate. The default group uses `last_checkpointed`; named groups checkpoint to
@@ -1103,6 +1126,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // The DLQ is already the durable forensic sink for dropped messages; it needs no second
             // forensic quarantine of its own.
             max_quarantine_bytes: 0,
+            // The DLQ must NEVER shed: a poison record is durable evidence, so it carries no daily
+            // physical write budget (the flash-wear governor is for the main produce path only, #118).
+            daily_physical_write_budget_bytes: 0,
         };
         // Eagerly open (recovering its high-water mark) the DLQ sink IF its subdirectory already
         // exists from a prior run, so the idempotency key is present before the first poison
@@ -1147,6 +1173,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // nanoseconds and saturated rather than overflowed. `0` (disabled) stays 0, so the
             // sweep is a no-op unless an operator opts in.
             group_idle_evict_nanos: config.group_idle_evict_ms.saturating_mul(1_000_000),
+            ram_ceiling_bytes: config.ram_ceiling_bytes,
             last_checkpointed: default_committed,
             // Seeded from the durable counters snapshot (#98), all-zeros if it was missing or torn.
             counters,
@@ -2908,6 +2935,51 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.log.durable_record_count()
     }
 
+    /// The total LOGICAL bytes appended this run (#118): user payload (key + headers + payload), no
+    /// framing. The denominator of the flash write-amplification ratio. Exposed as the
+    /// `ironbus_logical_bytes_written` counter on `/metrics`.
+    #[must_use]
+    pub fn logical_bytes_written(&self) -> u64 {
+        self.log.logical_bytes_written()
+    }
+
+    /// The total PHYSICAL bytes appended to segments this run (#118): record frames plus segment
+    /// headers and footers, the real flash-wear write volume. The numerator of the write-amplification
+    /// ratio. Exposed as the `ironbus_physical_bytes_written` counter on `/metrics`.
+    #[must_use]
+    pub fn physical_bytes_written(&self) -> u64 {
+        self.log.physical_bytes_written()
+    }
+
+    /// The physical bytes written so far on the current UTC day (#118): the daily-write-budget meter.
+    /// Exposed as the `ironbus_physical_bytes_written_today` gauge on `/metrics`.
+    #[must_use]
+    pub fn physical_bytes_written_today(&self) -> u64 {
+        self.log.physical_bytes_written_today()
+    }
+
+    /// The OPT-IN daily physical write budget in bytes (`0` = the flash-wear governor is off), echoed
+    /// for the `ironbus_daily_physical_write_budget_bytes` gauge (#118).
+    #[must_use]
+    pub fn daily_physical_write_budget_bytes(&self) -> u64 {
+        self.log.daily_physical_write_budget_bytes()
+    }
+
+    /// The count of appends shed because the daily physical write budget was reached (#118): the
+    /// over-budget signal. Exposed as the `ironbus_daily_write_budget_sheds_total` counter on
+    /// `/metrics`.
+    #[must_use]
+    pub fn daily_budget_sheds(&self) -> u64 {
+        self.log.daily_budget_sheds()
+    }
+
+    /// The OPT-IN RAM ceiling in bytes for the `ironbus_ram_headroom_bytes` gauge (`0` = unset)
+    /// (#118). Pure observability; never enforced. See [`EngineConfig::ram_ceiling_bytes`].
+    #[must_use]
+    pub fn ram_ceiling_bytes(&self) -> u64 {
+        self.ram_ceiling_bytes
+    }
+
     /// Bytes dropped from a torn or unsynced tail at recovery (startup): the raw
     /// recovery-loss signal an operator can surface, zero on a clean start.
     #[must_use]
@@ -3107,6 +3179,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             visibility_nanos: self.lease_config.visibility_nanos,
             hard_cap_nanos: self.lease_config.hard_cap_nanos,
             disk_full_policy: self.disk_full_policy,
+            ram_ceiling_bytes: self.ram_ceiling_bytes,
+            daily_physical_write_budget_bytes: self.log.daily_physical_write_budget_bytes(),
         }
     }
 
@@ -3146,6 +3220,9 @@ mod tests {
             // Eviction OFF by default in the shared test config (#277); the eviction tests build a
             // config with a non-zero window explicitly so the golden-path tests stay unaffected.
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
+            // The RAM-headroom ceiling is OFF by default in the shared test config (#118); the
+            // headroom test sets a non-zero ceiling explicitly.
+            ram_ceiling_bytes: 0,
         }
     }
 

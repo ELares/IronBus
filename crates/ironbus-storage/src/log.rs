@@ -68,6 +68,23 @@ pub struct LogConfig {
     /// describes (`min(256 MiB, 5% of the data-directory filesystem)`) is computed by the server at
     /// config time, since the IO-free storage core cannot stat the host filesystem (refs #134).
     pub max_quarantine_bytes: u64,
+
+    /// OPT-IN daily PHYSICAL write budget in bytes (#118): a flash-wear governor. When set and the
+    /// physical bytes actually written to segments SO FAR TODAY (the encoded record frames plus the
+    /// segment headers and footers, the same volume [`Log::physical_bytes_written`] charges, measured
+    /// against the clock seam's UTC day) reach this budget, [`Log::append`] sheds the next produce
+    /// with the same non-fatal [`StorageError::AtCapacity`] the byte cap uses, so the shed flows
+    /// through the existing #10 drop-new path (the engine counts it as `produce_rejected`) and the
+    /// over-budget event is surfaced by [`Log::daily_budget_sheds`]. It NEVER weakens durability: an
+    /// over-budget produce is DROPPED, never written unsynced. The today-counter resets at the UTC
+    /// day boundary (`now_unix_millis / 86_400_000`), so the budget refreshes each day with no
+    /// background timer.
+    ///
+    /// `0` means UNSET (the governor is OFF), the default, so existing behavior is byte-for-byte
+    /// unchanged: an operator opts in. A budget smaller than a single record still admits the FIRST
+    /// write of the day (the append-on-empty rule that keeps an oversized first record from wedging
+    /// the log applies here too), so the broker always makes some daily progress.
+    pub daily_physical_write_budget_bytes: u64,
 }
 
 impl LogConfig {
@@ -108,6 +125,8 @@ impl LogConfig {
             max_segment_bytes,
             max_total_bytes: 0,
             max_quarantine_bytes: LogConfig::DEFAULT_MAX_QUARANTINE_BYTES,
+            // The daily physical write budget is OFF by default; an operator opts in (#118).
+            daily_physical_write_budget_bytes: 0,
         })
     }
 
@@ -127,6 +146,17 @@ impl LogConfig {
     #[must_use]
     pub fn with_max_total_bytes(mut self, max_total_bytes: u64) -> LogConfig {
         self.max_total_bytes = max_total_bytes;
+        self
+    }
+
+    /// Sets the OPT-IN daily physical write budget ([`LogConfig::daily_physical_write_budget_bytes`])
+    /// and returns the updated config. `0` (the default) disables the governor; any non-zero value
+    /// opts in: once today's physical write volume reaches the budget, an append is shed with the
+    /// non-fatal [`StorageError::AtCapacity`] (the #10 drop-new path) rather than weakening
+    /// durability, and the over-budget shed is counted by [`Log::daily_budget_sheds`].
+    #[must_use]
+    pub fn with_daily_physical_write_budget_bytes(mut self, budget: u64) -> LogConfig {
+        self.daily_physical_write_budget_bytes = budget;
         self
     }
 }
@@ -168,6 +198,9 @@ impl Default for LogConfig {
             // A finite forensic quarantine budget by default, so a corrupt-byte copy is bounded
             // out of the box (#134).
             max_quarantine_bytes: LogConfig::DEFAULT_MAX_QUARANTINE_BYTES,
+            // The daily physical write budget is OFF by default (#118): existing behavior is
+            // unchanged unless an operator opts in to the flash-wear governor.
+            daily_physical_write_budget_bytes: 0,
         }
     }
 }
@@ -313,6 +346,41 @@ pub struct Log<F: Filesystem, C: Clock> {
     /// quarantine error leaves this at most stale, never blocking recovery. Exposed for the
     /// `ironbus_quarantine_bytes` gauge.
     quarantined_bytes: u64,
+    /// The total LOGICAL bytes this log instance has appended since it was opened (#118): the sum of
+    /// each appended record's user payload (key + headers + payload), EXCLUDING all framing. The
+    /// numerator-free denominator of the flash write-amplification ratio: "the bytes the application
+    /// asked us to store". Process-lifetime monotonic (it counts every append this run, never
+    /// decremented by a reap), so it pairs with [`Log::physical_bytes_written`] to give a stable
+    /// write-amp ratio. Seeded to `0` on open (a fresh run starts the amplification window fresh);
+    /// it is an observability rate signal, not a durable total. Saturating. Exposed for the
+    /// `ironbus_logical_bytes_written` counter.
+    logical_bytes_written: u64,
+    /// The total PHYSICAL bytes this log instance has actually appended to segment files since it
+    /// was opened (#118): every record FRAME (header + body + trailer, the encoded length the
+    /// segment writer advanced its write position by), PLUS every segment HEADER stamped on a
+    /// `start_segment` and every segment FOOTER written on a `seal`. This is the real on-disk write
+    /// volume an SSD/eMMC wear model cares about, so `physical / logical` is the flash
+    /// write-amplification ratio. Process-lifetime monotonic (a reap frees disk but does not un-write
+    /// the bytes a wear counter already charged), so it never decreases even as retention reclaims
+    /// segments. Seeded to `0` on open. Saturating. Exposed for the `ironbus_physical_bytes_written`
+    /// counter and the derived `ironbus_write_amp_ratio` gauge.
+    physical_bytes_written: u64,
+    /// The physical bytes written SO FAR on the current UTC day (#118): the daily-write-budget
+    /// accumulator. Charged the same encoded-frame / segment-header / segment-footer volume as
+    /// `physical_bytes_written`, but RESET to zero at each UTC day boundary so the budget refreshes
+    /// daily. Exposed for the `ironbus_physical_bytes_written_today` gauge. Always tracked (cheap),
+    /// even when no budget is configured, so the accounting is visible without enabling the shed.
+    physical_bytes_written_today: u64,
+    /// The UTC day index (`now_unix_millis / 86_400_000`) the `physical_bytes_written_today` total
+    /// belongs to (#118). When an append observes a different day on the clock seam, the today-total
+    /// is rolled over to zero before the new write is charged, so the daily budget is measured per
+    /// UTC day against the deterministic clock seam (no background timer).
+    physical_write_today_day: u64,
+    /// The count of appends SHED because the daily physical write budget was reached (#118): the
+    /// over-budget signal an operator alerts on, distinct from the byte-cap `produce_rejected` (this
+    /// is the flash-wear governor firing, not a disk-full shed). Process-lifetime monotonic, never
+    /// reset on a day rollover. Exposed for the `ironbus_daily_write_budget_sheds_total` counter.
+    daily_budget_sheds: u64,
 }
 
 impl<F: Filesystem, C: Clock> Log<F, C> {
@@ -350,6 +418,13 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     recovered_truncated_bytes: 0,
                     loss_report: LossReport::new(),
                     quarantined_bytes: persisted_quarantine_bytes,
+                    // The write-amplification counters (#118) measure THIS run's append volume, so
+                    // both start at zero; `start_segment` below charges the first segment header.
+                    logical_bytes_written: 0,
+                    physical_bytes_written: 0,
+                    physical_bytes_written_today: 0,
+                    physical_write_today_day: 0,
+                    daily_budget_sheds: 0,
                 };
                 log.start_segment(FIRST_SEGMENT_ID, Seq::new(0), Offset::ZERO)?;
                 Ok(log)
@@ -481,6 +556,14 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             // blocks-recovery and copy-not-move properties. A new corruption skip below ADDS its
             // capture on top, so the total stays the true persisted on-disk footprint.
             quarantined_bytes: persisted_quarantine_bytes,
+            // The write-amplification counters (#118) measure THIS run's append volume: a recovered
+            // log starts the amplification window fresh (recovery itself writes nothing here; a
+            // roll-forward below charges the new segment's header).
+            logical_bytes_written: 0,
+            physical_bytes_written: 0,
+            physical_bytes_written_today: 0,
+            physical_write_today_day: 0,
+            daily_budget_sheds: 0,
         };
 
         if scan.footer.is_some() {
@@ -584,6 +667,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         let writer = SegmentWriter::create(file, header)?;
         writer.sync()?; // the header is durable...
         self.fs.sync_dir()?; // ...and so is its directory entry.
+                             // The segment header is physical write volume an SSD/eMMC wear model charges (#118): the
+                             // 64-byte header is on disk now (the `sync` above made it durable). Counted here, after the
+                             // create succeeded, so a failed create never inflates the physical-bytes total.
+        self.charge_physical(SEGMENT_HEADER_LEN as u64);
         self.active = Some(writer);
         self.active_id = id;
         // A fresh active segment starts empty; its per-segment retention metadata is filled in
@@ -623,6 +710,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             slot.max_timestamp_ms = old_max_timestamp_ms;
         }
         old.seal().map_err(|_| StorageError::WriterFrozen)?;
+        // The segment footer is durable physical write volume (#118): `seal` wrote and fsynced the
+        // 32-byte footer, so charge it to the wear total here (the per-record frames and this
+        // segment's header were charged on append and `start_segment`).
+        self.charge_physical(SEGMENT_FOOTER_LEN as u64);
         self.sealed_record_bytes = self.sealed_record_bytes.saturating_add(old_record_bytes);
         self.start_segment(next_id, self.next_seq, self.next_offset)
             .map_err(|_| StorageError::WriterFrozen)?;
@@ -634,6 +725,35 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
 
     fn active(&self) -> Result<&SegmentWriter<F::File>, StorageError> {
         self.active.as_ref().ok_or(StorageError::WriterFrozen)
+    }
+
+    /// Charges `bytes` of real physical write volume to BOTH the process-lifetime
+    /// `physical_bytes_written` total and the per-UTC-day `physical_bytes_written_today` accumulator
+    /// (the daily-write-budget meter), rolling the today-meter over to zero first if the clock seam
+    /// has crossed into a new UTC day (#118). The day index is `now_unix_millis / 86_400_000`,
+    /// measured on the injected clock seam so the deterministic simulation stays reproducible (no
+    /// wall-clock read). Saturating; never panics.
+    fn charge_physical(&mut self, bytes: u64) {
+        self.roll_physical_day_if_needed();
+        self.physical_bytes_written = self.physical_bytes_written.saturating_add(bytes);
+        self.physical_bytes_written_today = self.physical_bytes_written_today.saturating_add(bytes);
+    }
+
+    /// The current UTC day index on the clock seam: `now_unix_millis / 86_400_000`.
+    fn current_utc_day(&self) -> u64 {
+        const MILLIS_PER_DAY: u64 = 24 * 60 * 60 * 1000;
+        self.clock.now_unix_millis() / MILLIS_PER_DAY
+    }
+
+    /// Resets the per-day physical-write meter to zero when the clock seam has advanced to a new UTC
+    /// day, so the daily write budget (#118) refreshes each day with no background timer. A no-op
+    /// within the same day. Idempotent.
+    fn roll_physical_day_if_needed(&mut self) {
+        let day = self.current_utc_day();
+        if day != self.physical_write_today_day {
+            self.physical_write_today_day = day;
+            self.physical_bytes_written_today = 0;
+        }
     }
 
     /// The log's current total durable RECORD bytes: the sealed predecessors' record bytes
@@ -656,6 +776,54 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     #[must_use]
     pub fn durable_record_count(&self) -> u64 {
         self.total_record_count
+    }
+
+    /// The total LOGICAL bytes appended since this log was opened (#118): the sum of each record's
+    /// user payload (key + headers + payload), EXCLUDING all framing. The denominator of the flash
+    /// write-amplification ratio. Process-lifetime monotonic (a reap never lowers it). Exposed as
+    /// the `ironbus_logical_bytes_written` counter on `/metrics`.
+    #[must_use]
+    pub fn logical_bytes_written(&self) -> u64 {
+        self.logical_bytes_written
+    }
+
+    /// The total PHYSICAL bytes appended to segment files since this log was opened (#118): every
+    /// record FRAME (header + body + trailer) plus every segment HEADER and FOOTER. The real on-disk
+    /// write volume a flash-wear model charges, and the numerator of the write-amplification ratio.
+    /// Process-lifetime monotonic (a reap frees disk but does not un-write the charged bytes).
+    /// Exposed as the `ironbus_physical_bytes_written` counter on `/metrics`.
+    #[must_use]
+    pub fn physical_bytes_written(&self) -> u64 {
+        self.physical_bytes_written
+    }
+
+    /// The physical bytes written so far on the current UTC day (#118): the daily-write-budget meter,
+    /// reset to zero at each UTC day boundary on the clock seam. Always tracked (even with no budget
+    /// configured), so the accounting is visible without enabling the shed. Exposed as the
+    /// `ironbus_physical_bytes_written_today` gauge on `/metrics`.
+    ///
+    /// This is the value as of the last write; a scrape between writes does not roll the day forward
+    /// (the meter rolls lazily on the next charged write), so a long-idle broker may briefly report
+    /// yesterday's total until its next append. The budget shed itself always rolls the day first, so
+    /// the governor decision is never stale.
+    #[must_use]
+    pub fn physical_bytes_written_today(&self) -> u64 {
+        self.physical_bytes_written_today
+    }
+
+    /// The OPT-IN daily physical write budget in bytes (`0` = the governor is off), echoed from the
+    /// effective [`LogConfig`] for the `ironbus_daily_physical_write_budget_bytes` gauge (#118).
+    #[must_use]
+    pub fn daily_physical_write_budget_bytes(&self) -> u64 {
+        self.config.daily_physical_write_budget_bytes
+    }
+
+    /// The count of appends SHED because the daily physical write budget was reached (#118): the
+    /// flash-wear governor's over-budget signal, distinct from the disk-full byte-cap shed.
+    /// Process-lifetime monotonic. Exposed as the `ironbus_daily_write_budget_sheds_total` counter.
+    #[must_use]
+    pub fn daily_budget_sheds(&self) -> u64 {
+        self.daily_budget_sheds
     }
 
     /// The number of segments the log currently holds: every sealed predecessor plus the one
@@ -733,6 +901,27 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             }
         }
 
+        // OPT-IN daily PHYSICAL write budget (#118), the flash-wear governor: when today's physical
+        // write volume is at or over the budget, shed this produce with the SAME non-fatal
+        // `AtCapacity` the byte cap uses, so it flows through the existing #10 drop-new path (the
+        // engine counts it as `produce_rejected`) and durability is never weakened (the record is
+        // dropped, never written unsynced). The day meter is rolled first so the decision is never
+        // stale across a UTC day boundary. Like the byte cap, the at-or-over check requires the
+        // meter to be NON-ZERO, so the FIRST write of each day always goes through even if the
+        // budget is smaller than one record (the broker always makes daily progress).
+        let budget = self.config.daily_physical_write_budget_bytes;
+        if budget != 0 {
+            self.roll_physical_day_if_needed();
+            let today = self.physical_bytes_written_today;
+            if today >= budget && today > 0 {
+                self.daily_budget_sheds = self.daily_budget_sheds.saturating_add(1);
+                return Err(StorageError::AtCapacity {
+                    durable_bytes: today,
+                    cap: budget,
+                });
+            }
+        }
+
         // Soft size cap: roll before appending if the active segment has reached the cap,
         // but never roll an empty one (so an oversized record still gets written).
         let active = self.active()?;
@@ -756,14 +945,32 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             headers: record.headers,
             payload: record.payload,
         };
-        let offset = self
+        let writer = self.active.as_mut().ok_or(StorageError::WriterFrozen)?;
+        // The encoded FRAME length is the writer's write-position delta across the append (the
+        // segment writer advances `write_pos` by exactly the encoded record's byte length: header +
+        // body + trailer). Measuring the delta avoids re-encoding the record just to size it.
+        let pos_before = writer.write_pos();
+        let offset = writer.append(&view)?;
+        let frame_len = self
             .active
-            .as_mut()
-            .ok_or(StorageError::WriterFrozen)?
-            .append(&view)?;
+            .as_ref()
+            .map_or(0, |w| w.write_pos().saturating_sub(pos_before));
         // The ids advance only after the write returns Ok.
         self.next_seq = next_seq;
         self.next_offset = next_offset;
+        // Write-amplification accounting (#118), charged only after the append returned Ok (a failed
+        // append wrote nothing). Logical = the user payload the application asked us to store (key +
+        // headers + payload, no framing); physical = the encoded frame actually written to the
+        // segment. `physical / logical` over the run is the flash write-amplification ratio.
+        let logical = record
+            .key
+            .len()
+            .saturating_add(record.headers.len())
+            .saturating_add(record.payload.len());
+        self.logical_bytes_written = self
+            .logical_bytes_written
+            .saturating_add(u64::try_from(logical).unwrap_or(u64::MAX));
+        self.charge_physical(frame_len);
         // Maintain the running total record count the same way the byte total is maintained, so
         // the count-retention bound stays O(1). The active segment's records live in the writer's
         // running count; the slot's count is filled in only when the segment is sealed.
@@ -1499,6 +1706,143 @@ mod tests {
         let fs = log.into_filesystem();
         let reopened = Log::open(fs, ManualClock::new(), small_config()).unwrap();
         assert_eq!(reopened.durable_record_bytes(), 12 * one);
+    }
+
+    #[test]
+    fn write_amp_counters_track_logical_physical_and_imply_the_ratio() {
+        // The write-amplification counters (#118): a known produce yields a known logical (the user
+        // payload) and a known physical (the framed record plus the segment header). The frame is
+        // larger than the payload (header + trailer + length fields), so physical > logical, i.e. the
+        // amplification ratio is greater than 1. A test that pins the EXACT relationship fails if the
+        // accounting regresses.
+        let payload = b"payload-xyz"; // 11 bytes
+        let frame = record_bytes(payload); // the exact framed length (header + body + trailer)
+        let mut log = open_mem(LogConfig::default());
+        // A fresh log has already charged its FIRST segment header to physical, nothing to logical.
+        assert_eq!(
+            log.logical_bytes_written(),
+            0,
+            "no logical bytes before any append"
+        );
+        assert_eq!(
+            log.physical_bytes_written(),
+            SEGMENT_HEADER_LEN as u64,
+            "the first segment header is the only physical write before any append"
+        );
+        // Append three known records (no roll: the default segment cap is far larger).
+        for _ in 0..3 {
+            log.append(&rec(payload)).unwrap();
+        }
+        assert_eq!(
+            log.logical_bytes_written(),
+            3 * payload.len() as u64,
+            "logical is exactly the sum of the user payloads"
+        );
+        assert_eq!(
+            log.physical_bytes_written(),
+            SEGMENT_HEADER_LEN as u64 + 3 * frame,
+            "physical is the segment header plus the three framed records"
+        );
+        // The physical-minus-the-header equals the durable record bytes (the framed records), the
+        // independent quantity the byte cap is measured against: a cross-check on the accounting.
+        assert_eq!(
+            log.physical_bytes_written() - SEGMENT_HEADER_LEN as u64,
+            log.durable_record_bytes(),
+            "physical minus the header equals the framed record bytes"
+        );
+        // Each frame is strictly larger than its payload, so the amplification ratio exceeds 1.
+        assert!(
+            log.physical_bytes_written() > log.logical_bytes_written(),
+            "physical {} should exceed logical {} (amplification > 1)",
+            log.physical_bytes_written(),
+            log.logical_bytes_written()
+        );
+    }
+
+    #[test]
+    fn the_daily_write_budget_sheds_when_today_exceeds_it() {
+        // The opt-in daily physical write budget (#118): once today's physical writes reach the
+        // budget, the next produce is shed with the non-fatal AtCapacity (the #10 drop-new path) and
+        // the shed counter ticks; durability is never weakened (nothing is written). The first write
+        // of the day always goes through (the at-or-over check requires a non-zero meter), so the
+        // broker always makes daily progress. A budget just above one record's physical cost lets one
+        // record through, then sheds.
+        let frame = record_bytes(b"abc");
+        // Budget = the first segment header + one frame: after the first record the meter equals the
+        // budget exactly, so the at-or-over check sheds the SECOND record. The first record is still
+        // admitted (when it is checked the meter is only the header, below the budget).
+        let budget = SEGMENT_HEADER_LEN as u64 + frame;
+        let config = LogConfig {
+            daily_physical_write_budget_bytes: budget,
+            ..LogConfig::default()
+        };
+        let mut log = open_mem(config);
+        // The first produce is admitted (the meter was below the budget when checked).
+        log.append(&rec(b"abc")).unwrap();
+        assert_eq!(log.daily_budget_sheds(), 0, "the first record is admitted");
+        assert!(
+            log.physical_bytes_written_today() >= budget,
+            "after the first record today's physical writes reach the budget"
+        );
+        // The second produce is shed: at-or-over the budget, non-fatal, nothing written.
+        let before_bytes = log.physical_bytes_written();
+        let err = log.append(&rec(b"def")).unwrap_err();
+        assert!(
+            err.is_at_capacity(),
+            "an over-budget produce sheds with the non-fatal AtCapacity, got {err:?}"
+        );
+        assert_eq!(
+            log.daily_budget_sheds(),
+            1,
+            "the over-budget shed is counted"
+        );
+        assert_eq!(
+            log.physical_bytes_written(),
+            before_bytes,
+            "the shed produce wrote nothing (durability is never weakened)"
+        );
+        // The writer is NOT frozen: a budget shed is non-fatal, so the log stays usable.
+        assert!(
+            log.flushed_offset().get() <= 1,
+            "only the first record is durable after sync"
+        );
+    }
+
+    #[test]
+    fn the_daily_write_budget_resets_at_the_utc_day_boundary() {
+        // The daily meter resets at the UTC day boundary on the clock seam (#118), so the budget
+        // refreshes each day with no background timer. Drive the clock past midnight and the next
+        // produce is admitted again even though yesterday hit the budget.
+        let frame = record_bytes(b"abc");
+        let budget = SEGMENT_HEADER_LEN as u64 + frame;
+        let config = LogConfig {
+            daily_physical_write_budget_bytes: budget,
+            ..LogConfig::default()
+        };
+        // A shared ManualClock so the test can advance wall time across a UTC day boundary.
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let mut log = Log::open(InMemoryFs::new(), std::sync::Arc::clone(&clock), config).unwrap();
+        // Day 0: first record admitted, second shed.
+        log.append(&rec(b"abc")).unwrap();
+        assert!(
+            log.append(&rec(b"def")).is_err(),
+            "day 0 is over budget after one record"
+        );
+        assert_eq!(log.daily_budget_sheds(), 1);
+        // Advance the wall clock to the next UTC day (86_400_000 ms): the meter rolls over, so the
+        // first produce of the new day is admitted again.
+        clock.set_unix_millis(24 * 60 * 60 * 1000);
+        log.append(&rec(b"ghi")).unwrap();
+        assert_eq!(
+            log.physical_bytes_written_today(),
+            frame,
+            "the new day's meter starts fresh at one frame (the header was charged on day 0)"
+        );
+        assert_eq!(
+            log.daily_budget_sheds(),
+            1,
+            "no new shed on the fresh day's first record"
+        );
     }
 
     #[test]

@@ -245,6 +245,7 @@ mod tests {
             max_messages: 0,
             max_groups: crate::engine::DEFAULT_MAX_GROUPS,
             group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+            ram_ceiling_bytes: 0,
             disk_full_policy: DiskFullPolicy::DropNew,
         }
     }
