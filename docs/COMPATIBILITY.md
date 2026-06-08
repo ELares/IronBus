@@ -237,7 +237,7 @@ compatibility policy) specify a single registry and a set of CI gates. The state
 | `docs/compat/versions.md` registry with a row per version | #126, #132 | NOT PRESENT. No registry file exists. |
 | CI gate: an encoding change must touch the registry | #126, #132 | NOT PRESENT. No header-diff or registry-row CI check exists. |
 | CI gate: no duplicate version integer across branches | #132 | NOT PRESENT. |
-| `migrate` subcommand for a format bump | #132 (#17) | NOT IMPLEMENTED. The CLI has no `migrate` verb. |
+| `migrate` subcommand for a format bump | #132 (#17) | IMPLEMENTED as a GATE. `ironbus migrate --data-dir <dir>` reads the data dir's stamped on-disk format version: within the current major it reports "no migration needed" (the dir opens with no migration); a stamped version that differs from this build's is REFUSED unless `--allow <to-version>` is passed, so a format bump is never silent. No in-place migrator across majors exists yet (refusing is honest, not faked). See `crates/ironbus-cli/src/main.rs` `cmd_migrate` and `crates/ironbus-cli/tests/upgrade_migrate.rs`. |
 
 The append-only id sub-registries that #132 wants centrally allocated (checksum_algo, codec
 id, dict_id, header key_id, NACK disposition, reason codes) are, in the shipped code, each a
@@ -269,10 +269,11 @@ verifiably ABSENT from the code today. They MUST NOT be assumed present.
   frozen tag set and fixed body layouts; there is no version byte to negotiate down or reject.
 - **The `docs/compat/versions.md` registry and its CI gates.** No registry file, no
   header-diff-requires-a-row check, no duplicate-integer check.
-- **A multi-version on-disk migration path / `migrate` subcommand.** There is no upgrade path
-  between format versions: a v1 reader refuses any other version outright (above), and there
-  is no `migrate` CLI verb or downgrade-safety statement. A format bump today would require a
-  new reader, not an in-place migration.
+- **A multi-version on-disk MIGRATION path (the migrator itself).** The `ironbus migrate` verb now
+  exists as a GATE (it detects a differing on-disk format version and refuses a silent bump, see the
+  registry table above), but there is still no code that REWRITES v1 bytes into a future layout: a v1
+  reader refuses any other version outright, and a real cross-major migrator is future work. `migrate`
+  makes the bump explicit and fail-closed; it does not yet perform an in-place conversion.
 - **At-rest encryption (the consumer of the never-recycle id rule).** ADR 0002 exists because
   of the at-rest AEAD nonce (#18), but at-rest encryption itself is not implemented (see
   [THREAT_MODEL.md](THREAT_MODEL.md)); the never-recycle rule is enforced today regardless, as
@@ -302,9 +303,12 @@ Where the implementation diverges from the #132 / #126 specification:
   typed error for an unknown ack op), but there is no single table that classifies them, and
   the codec/dict id spaces are not present at all (on-disk compression is not yet implemented;
   the stored codec is always "none").
-- **No `migrate` subcommand.** #132 (via #17) requires that any format bump within a major
-  version ship a `migrate` subcommand and a downgrade-safety statement. Neither exists; the
-  only cross-version behavior is refuse-on-unknown.
+- **`migrate` gates but does not yet convert.** #132 (via #17) requires that any format bump ship a
+  `migrate` subcommand and a downgrade-safety statement. The subcommand now EXISTS and gates the bump
+  (a differing on-disk version is refused unless explicitly allowed, never applied silently), and the
+  policy is documented in `docs/DISTRIBUTION.md`. What is still missing is the actual byte-rewriting
+  migrator across majors and a formal downgrade-safety statement; today the cross-major behavior is
+  refuse-on-unknown plus the explicit `migrate` gate.
 
 Accuracy note: every "implemented" claim above is tied to a named constant, function, or test
 in the cited file. The negotiation and migration items are listed as absent because no wire

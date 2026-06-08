@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# IronBus distroless image built from an ALREADY-VERIFIED release binary (#104), with no compile
+# step. The release workflow downloads the static musl `ironbus-<triple>` artifact, verifies it
+# against the signed SHA256SUMS (the same fail-closed check scripts/install.sh enforces), and only
+# then passes it here as IRONBUS_BIN. This keeps the container on the exact reproducible bytes the
+# release ships, and the verify-before-package property holds: the image is never built over an
+# unverified binary.
+#
+# Build (from the repo root, with a verified binary staged under dist/):
+#   docker build -f Dockerfile.release \
+#     --build-arg IRONBUS_BIN=dist/ironbus-x86_64-unknown-linux-musl \
+#     -t ghcr.io/elares/ironbus:latest .
+#
+# The runtime stage and its non-root user, CA certs, tzdata, required writable volume, and reserved
+# `FROM scratch` note are identical to Dockerfile; see that file and docs/DISTRIBUTION.md.
+
+ARG IRONBUS_BIN
+
+FROM gcr.io/distroless/static:nonroot AS runtime
+ARG IRONBUS_BIN
+LABEL org.opencontainers.image.source="https://github.com/ELares/IronBus" \
+      org.opencontainers.image.description="IronBus durable edge message queue (distroless static)" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0"
+
+# The verified static musl binary, copied in directly (no recompile). `--chmod=0755` is REQUIRED:
+# `actions/upload-artifact`/`download-artifact` do not preserve the Unix executable bit, so the
+# staged `IRONBUS_BIN` arrives mode 0644. A plain `COPY` would carry that 0644 into the image and the
+# release smoke (`docker run ... --version`) would fail permission-denied; distroless/static has no
+# shell, so a `RUN chmod` is not an option. `COPY --chmod` (BuildKit, default on the runner) sets the
+# mode at copy time so the entrypoint is executable.
+COPY --chmod=0755 ${IRONBUS_BIN} /usr/local/bin/ironbus
+
+ENV IRONBUS_DATA_DIR=/var/lib/ironbus \
+    IRONBUS_ADDR=0.0.0.0:7777
+VOLUME ["/var/lib/ironbus"]
+EXPOSE 7777
+
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/ironbus"]
+CMD ["serve"]

@@ -11,8 +11,10 @@ name: Release
 # `SOURCE_DATE_EPOCH` from the tag commit, the `--remap-path-prefix` RUSTFLAGS, and `--locked`.
 # Each release ships the three binaries, a per-binary SHA256, one consolidated `SHA256SUMS`, a
 # cargo-auditable SBOM, and a keyless Sigstore build-provenance attestation over every artifact
-# (verifiable with `gh attestation verify`, per SECURITY.md). The fail-closed installer (#103) and
-# the `.deb`/distroless packaging (#104) consume these assets.
+# (verifiable with `gh attestation verify`, per SECURITY.md). The fail-closed installer (#103)
+# consumes these assets. The `.deb` package (one per triple, `package-deb` job) and the distroless
+# container image (`container` job) are built FROM the verified binaries (no recompile), so all four
+# distribution channels (#104) ride the same reproducible bytes; see docs/DISTRIBUTION.md.
 on:
   push:
     tags:
@@ -103,9 +105,121 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  package-deb:
+    name: package .deb (${{ matrix.target }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            deb_arch: amd64
+          - target: aarch64-unknown-linux-musl
+            deb_arch: arm64
+          - target: armv7-unknown-linux-musleabihf
+            deb_arch: armhf
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2
+        with:
+          tool: cargo-deb
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ironbus-${{ matrix.target }}
+          path: dist
+      - name: build the .deb from the verified static binary (no recompile)
+        env:
+          TARGET: ${{ matrix.target }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+        run: |
+          set -euo pipefail
+          # Stage the ALREADY-BUILT static musl binary where the [package.metadata.deb] assets map
+          # expects it WITH `--target`: cargo-deb reads the `target/release/ironbus` asset relative to
+          # `target/<triple>/`, i.e. `target/<triple>/release/ironbus`, and it infers the Debian
+          # `Architecture` from the `--target` triple (amd64/arm64/armhf), NOT from the host. Without
+          # `--target` every leg would label `amd64` (the ubuntu-latest host), so the aarch64/armv7
+          # .debs would declare amd64 and `dpkg -i` would refuse them on an arm node. We pass the
+          # per-triple binary and `--target`, matching docs/DISTRIBUTION.md. --no-build skips the
+          # compile (ships the exact reproducible release bytes, not a fresh glibc rebuild);
+          # --no-strip preserves the embedded SBOM and the reproducible bytes.
+          mkdir -p "target/${TARGET}/release"
+          install -m 0755 "dist/ironbus-${TARGET}" "target/${TARGET}/release/ironbus"
+          cargo deb -p ironbus-cli --target "${TARGET}" --no-build --no-strip \
+            --output "dist/ironbus-${TARGET}.deb"
+          ls -l dist/*.deb
+          # A self-check: dpkg-deb can parse the package and it lists the binary, the unit, and the
+          # conffile, so a broken metadata change is caught at the tag, not on a device.
+          dpkg-deb -I "dist/ironbus-${TARGET}.deb"
+          dpkg-deb -c "dist/ironbus-${TARGET}.deb" | grep -E 'usr/bin/ironbus|ironbus.service|etc/ironbus/ironbus.env'
+          # ASSERT the Debian Architecture matches this leg's triple. A mislabeled .deb (the amd64-for-
+          # everything bug) now FAILS the job instead of shipping a package an arm `dpkg -i` rejects.
+          actual_arch="$(dpkg-deb -f "dist/ironbus-${TARGET}.deb" Architecture)"
+          if [ "${actual_arch}" != "${DEB_ARCH}" ]; then
+            echo "::error::ironbus-${TARGET}.deb declares Architecture '${actual_arch}', expected '${DEB_ARCH}'"
+            exit 1
+          fi
+          echo "ironbus-${TARGET}.deb Architecture = ${actual_arch} (matches ${DEB_ARCH})"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ironbus-deb-${{ matrix.target }}
+          path: dist/ironbus-${{ matrix.target }}.deb
+          if-no-files-found: error
+
+  container:
+    name: distroless container image
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io when publishing is enabled
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ironbus-x86_64-unknown-linux-musl
+          path: dist
+      - name: build the distroless image from the verified static binary
+        run: |
+          set -euo pipefail
+          # Build FROM the verified release artifact (Dockerfile.release copies it in, no recompile),
+          # so the image carries the exact reproducible bytes the `build` job produced. This always
+          # runs, proving the Dockerfile is valid and the binary runs as the non-root user.
+          # The downloaded artifact lost its Unix +x bit (upload/download-artifact do not preserve
+          # it), so restore it before the build. Dockerfile.release also does `COPY --chmod=0755`, so
+          # the image entrypoint is executable even if a future build path drops this; together the
+          # `docker run ... --version` smoke below can never fail permission-denied on the binary.
+          chmod 0755 "dist/ironbus-x86_64-unknown-linux-musl"
+          docker build -f Dockerfile.release \
+            --build-arg IRONBUS_BIN=dist/ironbus-x86_64-unknown-linux-musl \
+            -t "ironbus:${{ github.event.inputs.tag || github.ref_name }}" .
+          # Smoke: the non-root entrypoint runs (--version is a pure stdout-and-exit, no data dir).
+          docker run --rm "ironbus:${{ github.event.inputs.tag || github.ref_name }}" --version
+      # Registry publishing is OPT-IN (#334): it needs an org-level registry login and is a no-op
+      # unless the `IRONBUS_PUBLISH_IMAGE` repository variable is set to `true`, so the build above
+      # always gates the Dockerfile while the credentialed push stays a deliberate, separately-enabled
+      # step.
+      - name: log in to ghcr.io and push (opt-in)
+        if: vars.IRONBUS_PUBLISH_IMAGE == 'true'
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          repo="ghcr.io/$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
+          docker tag "ironbus:${TAG}" "${repo}:${TAG}"
+          docker push "${repo}:${TAG}"
+
   publish:
     name: publish release
-    needs: build
+    needs: [build, package-deb]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -139,15 +253,21 @@ jobs:
           set -euo pipefail
           # The per-target upload-artifact entries each carry the binary plus its own .sha256; copy
           # only the binaries into dist (the consolidated SHA256SUMS replaces the per-binary files
-          # as the installer's source of truth), then build one SHA256SUMS over all three binaries.
+          # as the installer's source of truth), and the per-target .deb (built by package-deb from
+          # the same verified binary), then build one SHA256SUMS over all three binaries AND the
+          # three .deb packages so the checksummed-release channel covers the .deb too.
           for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf; do
             cp "artifacts/ironbus-${t}/ironbus-${t}" "dist/ironbus-${t}"
             cp "artifacts/ironbus-${t}/ironbus-${t}.sha256" "dist/ironbus-${t}.sha256"
+            cp "artifacts/ironbus-deb-${t}/ironbus-${t}.deb" "dist/ironbus-${t}.deb"
           done
           ( cd dist && sha256sum \
               ironbus-x86_64-unknown-linux-musl \
               ironbus-aarch64-unknown-linux-musl \
               ironbus-armv7-unknown-linux-musleabihf \
+              ironbus-x86_64-unknown-linux-musl.deb \
+              ironbus-aarch64-unknown-linux-musl.deb \
+              ironbus-armv7-unknown-linux-musleabihf.deb \
               > SHA256SUMS )
           # Self-check: the consolidated file must verify before it ships, so a bad upload can
           # never produce a release whose SHA256SUMS does not match its own binaries.
@@ -161,6 +281,9 @@ jobs:
             dist/ironbus-x86_64-unknown-linux-musl
             dist/ironbus-aarch64-unknown-linux-musl
             dist/ironbus-armv7-unknown-linux-musleabihf
+            dist/ironbus-x86_64-unknown-linux-musl.deb
+            dist/ironbus-aarch64-unknown-linux-musl.deb
+            dist/ironbus-armv7-unknown-linux-musleabihf.deb
             dist/SHA256SUMS
             dist/ironbus.sbom.json
       - name: determine prerelease (0.x is a prerelease)
@@ -193,12 +316,15 @@ jobs:
             --title "$TAG" \
             --verify-tag \
             $prerelease_flag \
-            --notes "Static musl binaries for the three edge triples (x86_64, aarch64, armv7), each with a SHA256 checksum, a consolidated SHA256SUMS, a cargo-auditable SBOM (ironbus.sbom.json), and a keyless Sigstore build-provenance attestation over every artifact. Verify integrity with: sha256sum -c SHA256SUMS, and provenance with: gh attestation verify <binary> --repo $REPO. The fail-closed installer (scripts/install.sh) verifies the checksum before installing. See CHANGELOG.md for changes." \
+            --notes "Static musl binaries for the three edge triples (x86_64, aarch64, armv7) and a .deb package per triple, each with a SHA256 checksum, a consolidated SHA256SUMS (over the binaries and the .deb packages), a cargo-auditable SBOM (ironbus.sbom.json), and a keyless Sigstore build-provenance attestation over every artifact. Verify integrity with: sha256sum -c SHA256SUMS, and provenance with: gh attestation verify <artifact> --repo $REPO. The fail-closed installer (scripts/install.sh) verifies the checksum before installing; the distroless container image is built and (opt-in) published by the release workflow. See docs/DISTRIBUTION.md for all four channels and CHANGELOG.md for changes." \
             dist/ironbus-x86_64-unknown-linux-musl \
             dist/ironbus-x86_64-unknown-linux-musl.sha256 \
             dist/ironbus-aarch64-unknown-linux-musl \
             dist/ironbus-aarch64-unknown-linux-musl.sha256 \
             dist/ironbus-armv7-unknown-linux-musleabihf \
             dist/ironbus-armv7-unknown-linux-musleabihf.sha256 \
+            dist/ironbus-x86_64-unknown-linux-musl.deb \
+            dist/ironbus-aarch64-unknown-linux-musl.deb \
+            dist/ironbus-armv7-unknown-linux-musleabihf.deb \
             dist/SHA256SUMS \
             dist/ironbus.sbom.json

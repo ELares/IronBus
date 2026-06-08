@@ -1,0 +1,203 @@
+# Distribution channels and lifecycle
+
+How IronBus ships and how a deployed broker is upgraded and rolled back safely (#104, parent #17).
+
+IronBus is one static `musl` binary that is both the broker and the client tooling. Every channel
+below ships the SAME reproducible binary (see [RELEASING.md](../RELEASING.md)); the difference is
+only the packaging. There are four channels, each fail-closed verified before it places a binary:
+
+1. The fail-closed `curl | sh` installer (`scripts/install.sh`).
+2. A Debian `.deb` package (cargo-deb).
+3. A distroless container image (`gcr.io/distroless/static`).
+4. The checksummed GitHub Releases (the raw binaries + `SHA256SUMS` + SBOM + provenance).
+
+Plus the lifecycle on an unattended edge node: an atomic in-place [upgrade](#in-place-upgrade-and-rollback)
+that never overwrites the live binary, one-command rollback, fall-back after N failed starts, and an
+explicit [`migrate` gate](#on-disk-format-compatibility-and-the-migrate-gate) so an on-disk format
+bump is never silent.
+
+## 1. The fail-closed installer
+
+`scripts/install.sh` detects the host architecture, maps it to a musl triple, downloads the matching
+`ironbus-<triple>` binary AND the release `SHA256SUMS`, and verifies the SHA256 BEFORE installing. It
+is fail-closed: any download error, a missing or mismatched checksum, a malformed `SHA256SUMS`, or an
+unsupported platform aborts with a non-zero exit and installs nothing. It never `eval`s or `sh`-pipes
+downloaded content, and there is no skip-verification override. On an upgrade it retains the prior
+binary as `ironbus.prev` (an atomic same-directory move) before the atomic swap, so a rollback copy
+always exists. Full usage is in [RELEASING.md](../RELEASING.md#install-the-fail-closed-installer).
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ELares/IronBus/main/scripts/install.sh | sh
+```
+
+## 2. The Debian `.deb` package
+
+Built with [`cargo deb`](https://github.com/kornelski/cargo-deb) from the verified static binary; the
+metadata lives in `[package.metadata.deb]` in `crates/ironbus-cli/Cargo.toml`. cargo-deb is a
+build-time tool only: it is NOT a runtime or compile dependency of any shipped crate, so it adds
+nothing to the binary's dependency graph and leaves the `cargo-deny` supply-chain gate untouched.
+
+The package installs:
+
+- `/usr/bin/ironbus`, the static binary (mode 0755).
+- `/lib/systemd/system/ironbus.service`, a systemd unit running the broker as the unprivileged
+  `ironbus` system user (created by the postinst) against `/var/lib/ironbus`.
+- `/etc/ironbus/ironbus.env`, the default config (a dpkg conffile, so local edits survive upgrades).
+
+The unit is installed but NOT enabled or started automatically; enable it deliberately:
+
+```sh
+sudo dpkg -i ironbus_<version>_<arch>.deb
+sudo systemctl enable --now ironbus
+```
+
+The CI/release path builds the verified static musl binary first, then packages it WITHOUT a rebuild
+so the `.deb` ships the exact reproducible release bytes:
+
+```sh
+# (after the static musl binary is built and verified into target/<triple>/release/ironbus)
+cargo deb -p ironbus-cli --no-build --no-strip --target <triple>
+```
+
+`.rpm` is deferred behind the same spec: the `assets` map that drives the `.deb` also drives an
+[nfpm](https://nfpm.goreleaser.com/) config, and an `.rpm` job is added once a dnf/yum fleet exists.
+
+### Fall-back-after-N wiring (the systemd unit)
+
+The packaged unit (`packaging/systemd/ironbus.service`) wires the atomic-upgrade fall-back with a
+consecutive-failed-start counter (a file next to the binary). Each lifecycle hook has ONE job, so the
+count means "consecutive genuinely-failed starts" and a HEALTHY broker is never spuriously rolled back
+(e.g. by repeated unclean power losses):
+
+- `ExecStartPre` runs `ironbus record-start --dest <bin> --check`: it only CONSULTS the counter (never
+  bumps it) and, once it has reached N (default 3) AND an `ironbus.prev` exists, runs
+  `ironbus rollback --dest <bin>` to restore the last known-good binary before this start.
+- `ExecStartPost` runs `ironbus record-start --dest <bin> --ok` AFTER a short readiness grace window
+  (`IRONBUS_STARTUP_GRACE_SEC`, default 10s), CLEARING the budget. For a `Type=simple` service, a
+  binary that crashes during the window has its `ExecStartPost` killed before the `--ok`, so a genuine
+  failed start never clears the counter; a binary that stays up past the window is a real successful
+  start and resets it to 0.
+- `ExecStopPost` runs `ironbus record-start --dest <bin> --failed` ONLY on a non-clean exit. This is
+  the SINGLE place the counter is incremented, so one crash cycle bumps it by exactly 1 (no
+  double-count) and a deliberate `systemctl stop` (a clean exit) leaves it untouched.
+
+So a node that cannot start a freshly-upgraded binary heals itself to the prior bytes after N genuine
+consecutive failed starts, while an unclean power loss of a working broker never accumulates toward a
+rollback (the consult-only `ExecStartPre` does not bump, and `ExecStartPost --ok` cleared the budget
+on the last healthy start). `StartLimitIntervalSec=0` disables systemd's start-rate limiter so the
+fall-back-after-N logic, not the rate limiter, governs restarts. N is `--max-failed-starts`
+(default 3).
+
+## 3. The distroless container image
+
+`Dockerfile` builds a multi-stage image whose runtime stage is `gcr.io/distroless/static:nonroot`.
+distroless static provides exactly what a static musl binary needs and nothing else: CA certificates
+(for the future TLS uplink, #107), tzdata, an `/etc/passwd` `nonroot` user, and NO shell, package
+manager, or libc. The image runs as the non-root `nonroot` user (uid 65532), never root.
+
+A `FROM scratch` variant is RESERVED, not used: scratch carries no CA certs, no tzdata, and no passwd
+entry, so a binary that does TLS or non-root execution would silently break on it. We default to
+distroless to avoid that footgun; scratch is only viable once there is provably no TLS or tz
+dependency.
+
+### Required writable volume
+
+The broker's WAL/segment directory (`IRONBUS_DATA_DIR`, default `/var/lib/ironbus`) MUST be a
+writable volume mount owned by the nonroot uid (65532). The image itself is read-only; without the
+mount the broker cannot open its data dir.
+
+```sh
+docker build -t ironbus:dev .
+docker run --rm \
+  -v ironbus-data:/var/lib/ironbus \
+  -e IRONBUS_ADDR=0.0.0.0:7777 -p 7777:7777 \
+  ironbus:dev
+```
+
+### Publishing
+
+The release workflow builds the image FROM the already-verified release artifact (no recompile)
+using `Dockerfile.release`, which copies the binary that passed the `SHA256SUMS` check, preserving
+verify-before-package. Publishing to a registry (e.g. `ghcr.io/elares/ironbus`) requires registry
+credentials provisioned at the org level; the build step is in `.github/workflows/release.yml`
+behind an explicit opt-in, and the documented push command is:
+
+```sh
+docker build -f Dockerfile.release \
+  --build-arg IRONBUS_BIN=dist/ironbus-x86_64-unknown-linux-musl \
+  -t ghcr.io/elares/ironbus:<tag> .
+docker push ghcr.io/elares/ironbus:<tag>
+```
+
+Registry publishing (the credentialed push to ghcr.io) is tracked as a focused follow-up (#334) so
+the build and the verified-artifact wiring land now without blocking on org-level registry secrets.
+
+## 4. Checksummed GitHub Releases
+
+Each tagged release publishes, for `x86_64`, `aarch64`, and `armv7` musl triples: the static binary,
+a per-binary `.sha256`, one consolidated `SHA256SUMS`, a cargo-auditable SBOM, and a keyless Sigstore
+build-provenance attestation over every artifact. This is the source of truth the installer, the
+`.deb`, and the container all consume. Verify integrity with `sha256sum -c SHA256SUMS` and provenance
+with `gh attestation verify <binary> --repo ELares/IronBus`. Details in
+[RELEASING.md](../RELEASING.md#what-the-release-produces).
+
+## In-place upgrade and rollback
+
+A running broker is a binary with an open WAL, so an upgrade is a lifecycle operation, not a one-shot
+install. The `ironbus upgrade` verb (and the installer's `install_binary`/shell twin) enforce two
+properties:
+
+- **The live binary is never overwritten in place.** The new bytes are written to a sibling temp file
+  ON THE SAME FILESYSTEM, fsynced, the current binary is retained as `<dest>.prev` via an atomic
+  same-directory rename, then the new file is `rename(2)`d over the destination. `rename` is atomic
+  on POSIX, so **a power cut mid-upgrade leaves either the old binary (rename not yet applied) or the
+  new binary fully on disk, never a truncated one.** The fsync before the rename guarantees the new
+  bytes are durable before the rename publishes them.
+- **A node that cannot start the new binary falls back to `ironbus.prev` after N failed starts**
+  (default N = 3). The systemd unit records each failed start and, at the threshold, runs
+  `ironbus rollback` to restore the prior known-good bytes. See the
+  [unit wiring](#fall-back-after-n-wiring-the-systemd-unit).
+
+The download-and-verify step is NOT re-implemented in `upgrade`: it stays in the fail-closed
+`scripts/install.sh` (the single source of verify-before-install). `ironbus upgrade` is the
+post-verify atomic swap, so it never weakens the fail-closed posture: any download/verify happens
+BEFORE the swap.
+
+```sh
+# Verify and download the new binary with the fail-closed installer to a staging path, then swap it
+# in atomically (retaining the prior binary as /usr/bin/ironbus.prev):
+ironbus upgrade --new-binary /tmp/ironbus.new --dest /usr/bin/ironbus
+
+# One-command rollback to the retained previous binary:
+ironbus rollback --dest /usr/bin/ironbus
+```
+
+## On-disk format compatibility and the `migrate` gate
+
+On-disk WAL/segment formats are forward/backward compatible WITHIN a major version (#4, #5): the
+record header, segment header, and segment footer each carry a single `FORMAT_VERSION` byte (= 1
+today), unknown record-flag bits are preserved, and the reserved header bytes give a future version
+room to add fields without disturbing older readers. A v1 reader reads only v1 and refuses any other
+version loudly rather than guessing a layout it does not know (see
+[COMPATIBILITY.md](COMPATIBILITY.md)).
+
+A format bump across a major version is gated behind the explicit `ironbus migrate` subcommand and is
+NEVER silent:
+
+- Within a major version (the data dir's stamped format equals this build's), `migrate` reports
+  "no migration needed" and the data dir opens with no migration.
+- A data dir whose stamped on-disk format version differs from this build's is REFUSED with a usage
+  error unless the operator passes `--allow <to-version>` to acknowledge the bump explicitly. Even
+  with `--allow`, this v1 build has no in-place migrator, so it reports the honest state rather than
+  reinterpreting bytes under a layout it does not know.
+
+```sh
+ironbus migrate --data-dir /var/lib/ironbus
+```
+
+## Build provenance
+
+`ironbus --version` emits the build version. The reproducible release embeds the exact commit and
+build provenance (a keyless Sigstore build-provenance attestation over every artifact, verifiable
+with `gh attestation verify`, plus a cargo-auditable SBOM embedded in the binary); see
+[RELEASING.md](../RELEASING.md#reproducibility) and [SECURITY.md](../SECURITY.md).

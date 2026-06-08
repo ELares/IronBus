@@ -1,0 +1,20 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# IronBus .deb post-removal (#104). cargo-deb appends the systemd unit deregistration here via the
+# `systemd-units` integration. We deliberately do NOT delete /var/lib/ironbus or remove the
+# `ironbus` user on a plain remove, so a reinstall keeps the durable WAL; a `purge` is the operator's
+# explicit choice to discard data.
+set -e
+
+case "$1" in
+    purge)
+        # On an explicit purge only: drop the config dir (the data dir is left for the operator to
+        # remove deliberately, since it holds durable messages).
+        rm -rf /etc/ironbus
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

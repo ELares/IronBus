@@ -1,0 +1,34 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# IronBus .deb post-install (#104): create the unprivileged `ironbus` system user and the data dir
+# the systemd unit runs against. cargo-deb appends the systemd unit registration to this script via
+# the `systemd-units` integration, so this body runs first.
+set -e
+
+IRONBUS_USER=ironbus
+IRONBUS_DATA_DIR=/var/lib/ironbus
+
+case "$1" in
+    configure)
+        # A system user with no login shell and no home: it only owns the data dir and runs serve.
+        if ! getent passwd "$IRONBUS_USER" >/dev/null 2>&1; then
+            adduser --system --group --no-create-home \
+                --home "$IRONBUS_DATA_DIR" \
+                --shell /usr/sbin/nologin \
+                "$IRONBUS_USER" >/dev/null 2>&1 || \
+            useradd --system --user-group --no-create-home \
+                --home-dir "$IRONBUS_DATA_DIR" \
+                --shell /usr/sbin/nologin \
+                "$IRONBUS_USER" >/dev/null 2>&1 || true
+        fi
+        # The durable WAL/segment dir, owner-only (0700), owned by the broker user.
+        mkdir -p "$IRONBUS_DATA_DIR"
+        chown "$IRONBUS_USER":"$IRONBUS_USER" "$IRONBUS_DATA_DIR"
+        chmod 0700 "$IRONBUS_DATA_DIR"
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
