@@ -13,6 +13,10 @@ to follow Semantic Versioning once it reaches a tagged release.
   - New power-cut-between-renames and crash-during-rollback tests (library + the real-binary `upgrade_migrate` harness); the existing no-double-count / healthy-never-rolls-back / N-failed-starts contract is unchanged.
 
 ### Added
+- Versioned machine-readable SLO target table and a drift gate (Closes #359, the #110 residual).
+  - New `docs/schemas/slo.v1.json` (schema `ironbus.slo-table.v1`, `schema_version` 1) encodes every SLO row keyed by `{device, message_size_bytes, fan_out, durability_mode}` with its harness field, gate direction, stated target, and a `measured`/`ratified` cell that stays `null`/`false` until a reference-device run ratifies it; frozen by `docs/schemas/slo-table.v1.md`.
+  - New `scripts/ci/slo-table-check.sh` drift gate (wired into `ci.yml`) asserts the JSON parses, carries the schema version, has every required field per row, is unratified, and that the load-bearing target numbers match `docs/SLO.md`, so the human-readable and machine-readable tables cannot diverge. Deterministic, offline, jq-only.
+  - `docs/SLO.md` documents the JSON companion and how a measured floor (the on-device value minus the 20 percent margin) ratifies a cell. The measured numbers are the device residual (every cell stays null pending a run on the reference device and a tagged baseline).
 - Fuzz corpus persistence and a per-PR regression replay (Closes #385).
   - Committed, content-addressed regression corpus `fuzz/corpus-regression/<target>/<sha256>`, seeded by `fuzz/seed-regression-corpus.sh` from the #45 conformance vectors plus crafted hostile inputs; `fuzz/.gitignore` now tracks it while still ignoring the volatile working `corpus/`.
   - Per-PR teeth: `crates/ironbus-server/tests/fuzz_regression_replay.rs` replays every seed through the exact decoder each libFuzzer target drives (deterministic, no sanitizer, all three OSes) and re-verifies the content-address invariant. New `ci.yml` jobs assert the corpus is current and run a bounded ASan smoke (`--target x86_64-unknown-linux-gnu`).
