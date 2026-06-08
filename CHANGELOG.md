@@ -6,6 +6,12 @@ to follow Semantic Versioning once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Fixed
+- Hardened the upgrade rollback against the two-rename re-entry window (Closes #348).
+  - `ironbus rollback` now restores `ironbus.prev` over the destination WITHOUT first moving the destination onto `.prev`, so a power cut between the renames preserves the last known-good bytes and a re-entry converges to the good binary.
+  - At the fall-back cap, `record-start --failed` records the failing binary's content fingerprint (crc32c + length, fsynced); `rollback` refuses to promote `ironbus.prev` if it matches, so a re-entry can never promote the known-bad bytes. The guard clears after a completed rollback or a healthy `--ok`.
+  - New power-cut-between-renames and crash-during-rollback tests (library + the real-binary `upgrade_migrate` harness); the existing no-double-count / healthy-never-rolls-back / N-failed-starts contract is unchanged.
+
 ### Added
 - Docs link-check CI and a slug-token issue index (Closes #30, #25).
   - Per-PR `docs-links` job runs `scripts/ci/relative-link-check.sh` (in-repo relative links + section anchors, zero network, never flaky) and the offline `scripts/ci/issue-index-audit.sh` structural pass.
