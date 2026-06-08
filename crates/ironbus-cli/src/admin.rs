@@ -657,7 +657,20 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let server = std::thread::spawn({
             let shutdown = Arc::clone(&shutdown);
-            move || serve_health(&listener, &handle_engine, &shutdown, admin_enabled).unwrap()
+            move || {
+                // Watchdog disabled (window 0): this admin round-trip test does not exercise the #95
+                // liveness watchdog, so /healthz keeps its static-200 contract.
+                serve_health(
+                    &listener,
+                    &handle_engine,
+                    &shutdown,
+                    admin_enabled,
+                    &ironbus_server::liveness::LivenessBeacon::new(0),
+                    0,
+                    &SystemClock::new(),
+                )
+                .unwrap();
+            }
         });
         (addr, shutdown, server)
     }
