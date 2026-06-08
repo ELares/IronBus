@@ -9,3 +9,6 @@
 # proptest saves a regression seed file on a failing case; this repo runs proptests fresh
 # (with a deep nightly sweep) and does not track these transient, machine-generated seeds.
 proptest-regressions/
+
+# Claude Code agent worktrees and session state (never commit; they leaked as gitlinks before).
+.claude/
