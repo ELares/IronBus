@@ -42,6 +42,11 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 
 [dev-dependencies]
 tempfile = "3"
+# The semantics conformance vector suite (#35) is a checked-in JSON data file driven by a Rust
+# harness test. `serde`/`serde_json` parse the vectors; they are DEV-ONLY (the JSON format crate is
+# never linked into the shipped broker binary), matching the storage crate's loss-report fixtures.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [lints]
 workspace = true

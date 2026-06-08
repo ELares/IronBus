@@ -404,6 +404,26 @@ ironbus sub --addr 127.0.0.1:7777 --max 10 --ack
 curl -s http://127.0.0.1:9090/metrics | grep ironbus_consumer_lag
 ```
 
+## Semantics contract and conformance vectors
+
+IronBus pins its observable queue behavior as a STABLE contract so a client can rely on it and a
+second implementation can be checked against it. Two pieces make it concrete.
+
+STABLE error/signal codes. Every observable rejection or signal has a frozen, normative code (e.g.
+`ERR_CUMULATIVE_ACK_NOT_ALLOWED` for a cumulative ack on a competing group, `ERR_ACK_NOT_OWNED` for
+an ack on a lease you do not own, `OFFSET_TRIMMED` for a read below the retention horizon,
+`ERR_PRODUCER_FENCED` for a stale producer epoch, `DUPLICATE` for a benign dedup hit). The full
+table is in [CONTRACTS.md](CONTRACTS.md). The codes never change spelling, so you can branch on them.
+
+The conformance vector suite (`crates/ironbus-server/tests/vectors/semantics.json`). This is a
+language-agnostic, checked-in data file of input-sequence to observable-output cases covering
+ordering, at-least-once redelivery, dedup hit and eviction, ack rejection with the named codes, key
+routing, broadcast cursors, and trim. It is the executable spec: a Rust harness runs every vector
+against the real engine and asserts the outputs match exactly, driven by an injected logical clock
+(no real sleeps), so the suite is deterministic. The same vectors can drive an external client
+harness over the wire to certify another implementation. See [CONTRACTS.md](CONTRACTS.md) for the
+vector schema and the harness contract.
+
 ## Exit codes
 
 Every verb follows one fixed scheme, so a script can branch on the code without parsing

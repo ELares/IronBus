@@ -1,0 +1,931 @@
+{
+  "description": "IronBus SEMANTICS conformance vectors (#35). Language-agnostic input-sequence -> observable-output vectors that pin every observable behavior the parent #3 contract promises. Each vector is a name, a category, an engine setup, and an ordered list of input operations with their expected observable outputs (offsets, redeliveries, stable error codes, cursor positions, dedup flags, trim signals). Time flows ONLY through an injected logical clock (each poll carries an explicit monotonic `now` in nanoseconds), so leases, dedup windows, and trims are driven by advancing logical time with NO real sleeps; the suite is deterministic. The stable error codes (ERR_CUMULATIVE_ACK_NOT_ALLOWED, ERR_ACK_NOT_OWNED, OFFSET_TRIMMED, ERR_PRODUCER_FENCED, ...) are the frozen taxonomy in ironbus_server::codes::ErrorCode and are asserted against here. The Rust harness in conformance_vectors.rs runs these against the REAL engine; an external client harness can drive the same vectors over the wire.",
+  "vectors": [
+    {
+      "name": "ordering_monotonic_offsets_no_gaps",
+      "category": "ordering",
+      "description": "A producer sends N records; the assigned offsets are 0..N-1 in exact order with no gaps, and a broadcast (group-of-one) consumer reads them back in that exact order.",
+      "setup": {},
+      "steps": [
+        {
+          "op": "produce",
+          "payload": "a",
+          "expect_offset": 0
+        },
+        {
+          "op": "produce",
+          "payload": "b",
+          "expect_offset": 1
+        },
+        {
+          "op": "produce",
+          "payload": "c",
+          "expect_offset": 2
+        },
+        {
+          "op": "produce",
+          "payload": "d",
+          "expect_offset": 3
+        },
+        {
+          "op": "poll",
+          "now": 0,
+          "outcome": "message",
+          "expect_offset": 0,
+          "expect_deliveries": 1,
+          "bind": "t0"
+        },
+        {
+          "op": "ack",
+          "token": "t0",
+          "outcome": "acked"
+        },
+        {
+          "op": "poll",
+          "now": 0,
+          "outcome": "message",
+          "expect_offset": 1,
+          "expect_deliveries": 1,
+          "bind": "t1"
+        },
+        {
+          "op": "ack",
+          "token": "t1",
+          "outcome": "acked"
+        },
+        {
+          "op": "poll",
+          "now": 0,
+          "outcome": "message",
+          "expect_offset": 2,
+          "expect_deliveries": 1,
+          "bind": "t2"
+        },
+        {
+          "op": "ack",
+          "token": "t2",
+          "outcome": "acked"
+        },
+        {
+          "op": "poll",
+          "now": 0,
+          "outcome": "message",
+          "expect_offset": 3,
+          "expect_deliveries": 1,
+          "bind": "t3"
+        },
+        {
+          "op": "ack",
+          "token": "t3",
+          "outcome": "acked"
+        },
+        {
+          "op": "poll",
+          "now": 0,
+          "outcome": "idle"
+        },
+        {
+          "op": "expect_committed",
+          "offset": 4
+        }
+      ]
+    },
+    {
+      "name": "ordering_out_of_order_ack_only_advances_contiguous_prefix",
+      "category": "ordering",
+      "description": "The committed cursor advances only over the contiguous acked prefix: acking offset 1 and 2 before 0 leaves the cursor at 0; acking 0 then jumps it to 3.",
+      "setup": {},
+      "steps": [
+        {
+          "op": "produce",
+          "payload": "a",
+          "expect_offset": 0
+        },
+        {
+          "op": "produce",
+          "payload": "b",
+          "expect_offset": 1
+        },
+        {
+          "op": "produce",
+          "payload": "c",
+          "expect_offset": 2
+        },
+        {
+          "op": "poll",
+          "now": 0,
+          "outcome": "message",
+          "expect_offset": 0,
+          "bind": "t0"
+        },
+        {
+          "op": "poll",
+          "now": 0,
+          "outcome": "message",
+          "expect_offset": 1,
+          "bind": "t1"
+        },
+        {
+          "op": "poll",
+          "now": 0,
+          "outcome": "message",
+          "expect_offset": 2,
+          "bind": "t2"
+        },
+        {
+          "op": "ack",
+          "token": "t1",
+          "outcome": "acked"
+        },
+        {
+          "op": "expect_committed",
+          "offset": 0
+        },
+        {
+          "op": "ack",
+          "token": "t2",
+          "outcome": "acked"
+        },
+        {
+          "op": "expect_committed",
+          "offset": 0
+        },
+        {
+          "op": "ack",
+          "token": "t0",
+          "outcome": "acked"
+        },
+        {
+          "op": "expect_committed",
+          "offset": 3
+        }
+      ]
+    },
+    {
+      "name": "redelivery_unacked_lease_redelivers_after_expiry",
+      "category": "redelivery",
+      "description": "At-least-once: an un-acked offset whose lease has expired is redelivered on a later poll with an escalated delivery count and a fresh fencing token; the stale token can no longer ack.",
+      "setup": {
+        "visibility_nanos": 30
+      },
+      "steps": [
+        {
+          "op": "produce",
+          "payload": "a",
+          "expect_offset": 0
+        },
+        {
+          "op": "poll",
+          "now": 0,
+          "outcome": "message",
+          "expect_offset": 0,
+          "expect_deliveries": 1,
+          "bind": "first"
+        },
+        {
+          "op": "poll",
+          "now": 10,
+          "outcome": "idle"
+        },
+        {
+          "op": "poll",
+          "now": 40,
+          "outcome": "message",
+          "expect_offset": 0,
+          "expect_deliveries": 2,
+          "bind": "second"
+        },
+        {
+          "op": "ack",
+          "token": "first",
+          "outcome": "not_owned"
+        },
+        {
+          "op": "ack",
+          "token": "second",
+          "outcome": "acked"
+        },
+        {
+          "op": "expect_committed",
+          "offset": 1
+        }
+      ]
+    },
+    {
+      "name": "redelivery_acked_message_is_not_redelivered",
+      "category": "redelivery",
+      "description": "At-least-once does not become at-least-twice once acked: an acked offset is never redelivered even after the visibility window elapses.",
+      "setup": {
+        "visibility_nanos": 30
+      },
+      "steps": [
+        {
+          "op": "produce",
+          "payload": "a",
+          "expect_offset": 0
+        },
+        {
+          "op": "poll",
+          "now": 0,
+          "outcome": "message",
+          "expect_offset": 0,
+          "bind": "t0"
+        },
+        {
+          "op": "ack",
+          "token": "t0",
+          "outcome": "acked"
+        },
+        {
+          "op": "poll",
+          "now": 100,
+          "outcome": "idle"
+        },
+        {
+          "op": "expect_committed",
+          "offset": 1
+        }
+      ]
+    },
+    {
+      "name": "redelivery_nack_requeues_with_escalated_delivery_count",
+      "category": "redelivery",
+      "description": "A nack requeues the message for an immediate redelivery, which arrives with an escalated delivery count.",
+      "setup": {},
+      "steps": [
+        {
+          "op": "produce",
+          "payload": "a",
+          "expect_offset": 0
+        },
+        {
+          "op": "poll",
+          "now": 0,
+          "outcome": "message",
+          "expect_offset": 0,
+          "expect_deliveries": 1,
+          "bind": "t0"
+        },
+        {
+          "op": "nack",
+          "token": "t0",
+          "outcome": "requeued"
+        },
+        {
+          "op": "poll",
+          "now": 1,
+          "outcome": "message",
+          "expect_offset": 0,
+          "expect_deliveries": 2,
+          "bind": "t0b"
+        },
+        {
+          "op": "ack",
+          "token": "t0b",
+          "outcome": "acked"
+        },
+        {
+          "op": "expect_committed",
+          "offset": 1
+        }
+      ]
+    },
+    {
+      "name": "dedup_duplicate_msg_id_returns_original_offset",
+      "category": "dedup",
+      "description": "A duplicate msg_id within the window is a benign dedup hit: it returns the ORIGINAL offset with duplicate=true (the DUPLICATE signal code) and appends NO second copy, so the next fresh produce still gets the next sequential offset.",
+      "setup": {
+        "dedup_max_ids": 8,
+        "dedup_window_nanos": 1000
+      },
+      "steps": [
+        {
+          "op": "produce_dedup",
+          "producer_id": "p1",
+          "epoch": 0,
+          "msg_id": "m1",
+          "payload": "first",
+          "outcome": "appended",
+          "offset": 0
+        },
+        {
+          "op": "produce_dedup",
+          "producer_id": "p1",
+          "epoch": 0,
+          "msg_id": "m1",
+          "payload": "retry",
+          "outcome": "duplicate",
+          "offset": 0
+        },
+        {
+          "op": "produce_dedup",
+          "producer_id": "p1",
+          "epoch": 0,
+          "msg_id": "m2",
+          "payload": "second",
+          "outcome": "appended",
+          "offset": 1
+        }
+      ]
+    },
+    {
+      "name": "dedup_evicted_msg_id_is_fresh_again",
+      "category": "dedup",
+      "description": "An evicted id is fresh: once the count bound evicts the oldest msg_id, a republish of it is treated as a genuinely new produce and gets a NEW offset (at-least-once fallback), never a stale false dedup hit.",
+      "setup": {
+        "dedup_max_ids": 2,
+        "dedup_window_nanos": 0
+      },
+      "steps": [
+        {
+          "op": "produce_dedup",
+          "producer_id": "p1",
+          "epoch": 0,
+          "msg_id": "m1",
+          "payload": "x",
+          "outcome": "appended",
+          "offset": 0
+        },
+        {
+          "op": "produce_dedup",
+          "producer_id": "p1",
+          "epoch": 0,
+          "msg_id": "m2",
+          "payload": "x",
+          "outcome": "appended",
+          "offset": 1
+        },
+        {
+          "op": "produce_dedup",
+          "producer_id": "p1",
+          "epoch": 0,
+          "msg_id": "m1",
+          "payload": "x",
+          "outcome": "duplicate",
+          "offset": 0
+        },
+        {
+          "op": "produce_dedup",
+          "producer_id": "p1",
+          "epoch": 0,
+          "msg_id": "m3",
+          "payload": "x",
+          "outcome": "appended",
+          "offset": 2
+        },
+        {
+          "op": "produce_dedup",
+          "producer_id": "p1",
+          "epoch": 0,
+          "msg_id": "m1",
+          "payload": "x",
+          "outcome": "appended",
+          "offset": 3
+        }
+      ]
+    },
+    {
+      "name": "dedup_stale_producer_epoch_is_fenced",
+      "category": "dedup",
+      "description": "Epoch fencing: a higher epoch supersedes the old session, and a produce presenting a STALE epoch (below the known high-water) is fenced and rejected with ERR_PRODUCER_FENCED, appending nothing.",
+      "setup": {
+        "dedup_max_ids": 8,
+        "dedup_window_nanos": 0
+      },
+      "steps": [
+        {
+          "op": "produce_dedup",
+          "producer_id": "p1",
+          "epoch": 5,
+          "msg_id": "m1",
+          "payload": "x",
+          "outcome": "appended",
+          "offset": 0
+        },
+        {
+          "op": "produce_dedup",
+          "producer_id": "p1",
+          "epoch": 4,
+          "msg_id": "m2",
+          "payload": "x",
+          "outcome": "fenced"
+        }
+      ]
+    },
+    {
+      "name": "ack_rejection_cumulative_ack_on_competing_group",
+      "category": "ack_rejection",
+      "description": "A cumulative ack on a competing (non-broadcast) work-group is hard-rejected with the stable code ERR_CUMULATIVE_ACK_NOT_ALLOWED, and the group's cursor is left untouched.",
+      "setup": {},
+      "steps": [
+        {
+          "op": "produce",
+          "payload": "a",
+          "expect_offset": 0
+        },
+        {
+          "op": "produce",
+          "payload": "b",
+          "expect_offset": 1
+        },
+        {
+          "op": "poll",
+          "group": "workers",
+          "now": 0,
+          "outcome": "message",
+          "expect_offset": 0,
+          "bind": "t0"
+        },
+        {
+          "op": "cumulative_ack",
+          "group": "workers",
+          "up_to": 2,
+          "outcome": "error",
+          "expect_code": "ERR_CUMULATIVE_ACK_NOT_ALLOWED"
+        },
+        {
+          "op": "expect_committed",
+          "group": "workers",
+          "offset": 0
+        }
+      ]
+    },
+    {
+      "name": "ack_rejection_foreign_lease_ack_not_owned",
+      "category": "ack_rejection",
+      "description": "An ack naming a lease the consumer does not own (here a stale token whose message already redelivered under a fresh generation) is fenced and maps to ERR_ACK_NOT_OWNED; the live token still acks.",
+      "setup": {
+        "visibility_nanos": 30
+      },
+      "steps": [
+        {
+          "op": "produce",
+          "payload": "a",
+          "expect_offset": 0
+        },
+        {
+          "op": "poll",
+          "now": 0,
+          "outcome": "message",
+          "expect_offset": 0,
+          "bind": "stale"
+        },
+        {
+          "op": "poll",
+          "now": 40,
+          "outcome": "message",
+          "expect_offset": 0,
+          "expect_deliveries": 2,
+          "bind": "live"
+        },
+        {
+          "op": "ack",
+          "token": "stale",
+          "outcome": "not_owned"
+        },
+        {
+          "op": "ack",
+          "token": "live",
+          "outcome": "acked"
+        },
+        {
+          "op": "expect_committed",
+          "offset": 1
+        }
+      ]
+    },
+    {
+      "name": "ack_rejection_cumulative_ack_out_of_range_on_broadcast",
+      "category": "ack_rejection",
+      "description": "A broadcast cumulative ack whose up_to is past the durable head is rejected with ERR_CUMULATIVE_ACK_OUT_OF_RANGE; the broadcast cursor is unchanged.",
+      "setup": {},
+      "steps": [
+        {
+          "op": "set_broadcast",
+          "group": "bcast",
+          "broadcast": true
+        },
+        {
+          "op": "produce",
+          "payload": "a",
+          "expect_offset": 0
+        },
+        {
+          "op": "produce",
+          "payload": "b",
+          "expect_offset": 1
+        },
+        {
+          "op": "cumulative_ack",
+          "group": "bcast",
+          "up_to": 99,
+          "outcome": "error",
+          "expect_code": "ERR_CUMULATIVE_ACK_OUT_OF_RANGE"
+        },
+        {
+          "op": "expect_committed",
+          "group": "bcast",
+          "offset": 0
+        }
+      ]
+    },
+    {
+      "name": "key_routing_per_key_head_of_line_one_member",
+      "category": "key_routing",
+      "description": "Per-key head-of-line order: with a single key-shared member, two records sharing a key are delivered strictly in order; the second is withheld (the key is busy) until the first drains, then delivers. Hash-independent because one member owns every key.",
+      "setup": {
+        "max_in_flight": 16
+      },
+      "steps": [
+        {
+          "op": "set_key_ordering",
+          "group": "ks",
+          "ordering": "key_shared"
+        },
+        {
+          "op": "join_member",
+          "group": "ks",
+          "member": 1
+        },
+        {
+          "op": "produce",
+          "key": "alpha",
+          "payload": "a0",
+          "expect_offset": 0
+        },
+        {
+          "op": "produce",
+          "key": "alpha",
+          "payload": "a1",
+          "expect_offset": 1
+        },
+        {
+          "op": "poll",
+          "group": "ks",
+          "now": 0,
+          "member": 1,
+          "outcome": "message",
+          "expect_offset": 0,
+          "expect_key": "alpha",
+          "bind": "a0"
+        },
+        {
+          "op": "poll",
+          "group": "ks",
+          "now": 0,
+          "member": 1,
+          "outcome": "idle"
+        },
+        {
+          "op": "ack",
+          "group": "ks",
+          "token": "a0",
+          "outcome": "acked"
+        },
+        {
+          "op": "poll",
+          "group": "ks",
+          "now": 0,
+          "member": 1,
+          "outcome": "message",
+          "expect_offset": 1,
+          "expect_key": "alpha",
+          "bind": "a1"
+        },
+        {
+          "op": "ack",
+          "group": "ks",
+          "token": "a1",
+          "outcome": "acked"
+        },
+        {
+          "op": "expect_committed",
+          "group": "ks",
+          "offset": 2
+        }
+      ]
+    },
+    {
+      "name": "key_routing_distinct_keys_do_not_block_each_other",
+      "category": "key_routing",
+      "description": "Head-of-line is PER KEY, not global: two records on DIFFERENT keys are both deliverable to the member at once (one busy key does not stall an unrelated key).",
+      "setup": {
+        "max_in_flight": 16
+      },
+      "steps": [
+        {
+          "op": "set_key_ordering",
+          "group": "ks",
+          "ordering": "key_shared"
+        },
+        {
+          "op": "join_member",
+          "group": "ks",
+          "member": 1
+        },
+        {
+          "op": "produce",
+          "key": "alpha",
+          "payload": "a0",
+          "expect_offset": 0
+        },
+        {
+          "op": "produce",
+          "key": "beta",
+          "payload": "b0",
+          "expect_offset": 1
+        },
+        {
+          "op": "poll",
+          "group": "ks",
+          "now": 0,
+          "member": 1,
+          "outcome": "message",
+          "expect_offset": 0,
+          "expect_key": "alpha",
+          "bind": "a0"
+        },
+        {
+          "op": "poll",
+          "group": "ks",
+          "now": 0,
+          "member": 1,
+          "outcome": "message",
+          "expect_offset": 1,
+          "expect_key": "beta",
+          "bind": "b0"
+        },
+        {
+          "op": "ack",
+          "group": "ks",
+          "token": "a0",
+          "outcome": "acked"
+        },
+        {
+          "op": "ack",
+          "group": "ks",
+          "token": "b0",
+          "outcome": "acked"
+        },
+        {
+          "op": "expect_committed",
+          "group": "ks",
+          "offset": 2
+        }
+      ]
+    },
+    {
+      "name": "broadcast_cursors_are_independent_per_group",
+      "category": "broadcast",
+      "description": "Each consumer group has its own committed cursor over the shared log: two broadcast groups read the same records and advance independently; committing one's cursor does not move the other's.",
+      "setup": {},
+      "steps": [
+        {
+          "op": "set_broadcast",
+          "group": "g1",
+          "broadcast": true
+        },
+        {
+          "op": "set_broadcast",
+          "group": "g2",
+          "broadcast": true
+        },
+        {
+          "op": "produce",
+          "payload": "a",
+          "expect_offset": 0
+        },
+        {
+          "op": "produce",
+          "payload": "b",
+          "expect_offset": 1
+        },
+        {
+          "op": "produce",
+          "payload": "c",
+          "expect_offset": 2
+        },
+        {
+          "op": "poll",
+          "group": "g1",
+          "now": 0,
+          "outcome": "message",
+          "expect_offset": 0,
+          "bind": "g1_0"
+        },
+        {
+          "op": "ack",
+          "group": "g1",
+          "token": "g1_0",
+          "outcome": "acked"
+        },
+        {
+          "op": "poll",
+          "group": "g1",
+          "now": 0,
+          "outcome": "message",
+          "expect_offset": 1,
+          "bind": "g1_1"
+        },
+        {
+          "op": "ack",
+          "group": "g1",
+          "token": "g1_1",
+          "outcome": "acked"
+        },
+        {
+          "op": "expect_committed",
+          "group": "g1",
+          "offset": 2
+        },
+        {
+          "op": "expect_committed",
+          "group": "g2",
+          "offset": 0
+        },
+        {
+          "op": "poll",
+          "group": "g2",
+          "now": 0,
+          "outcome": "message",
+          "expect_offset": 0,
+          "bind": "g2_0"
+        },
+        {
+          "op": "ack",
+          "group": "g2",
+          "token": "g2_0",
+          "outcome": "acked"
+        },
+        {
+          "op": "expect_committed",
+          "group": "g2",
+          "offset": 1
+        },
+        {
+          "op": "expect_committed",
+          "group": "g1",
+          "offset": 2
+        }
+      ]
+    },
+    {
+      "name": "broadcast_cumulative_ack_advances_single_cursor",
+      "category": "broadcast",
+      "description": "A broadcast group accepts the cumulative-ack verb: committing up_to (exclusive) jumps its single cursor to that offset in one move, and an idempotent re-ack at or below the commit is a no-op success that never regresses the watermark.",
+      "setup": {},
+      "steps": [
+        {
+          "op": "set_broadcast",
+          "group": "bcast",
+          "broadcast": true
+        },
+        {
+          "op": "produce",
+          "payload": "a",
+          "expect_offset": 0
+        },
+        {
+          "op": "produce",
+          "payload": "b",
+          "expect_offset": 1
+        },
+        {
+          "op": "produce",
+          "payload": "c",
+          "expect_offset": 2
+        },
+        {
+          "op": "cumulative_ack",
+          "group": "bcast",
+          "up_to": 2,
+          "outcome": "ok"
+        },
+        {
+          "op": "expect_committed",
+          "group": "bcast",
+          "offset": 2
+        },
+        {
+          "op": "cumulative_ack",
+          "group": "bcast",
+          "up_to": 1,
+          "outcome": "ok"
+        },
+        {
+          "op": "expect_committed",
+          "group": "bcast",
+          "offset": 2
+        }
+      ]
+    },
+    {
+      "name": "broadcast_group_of_one_rejects_a_second_subscriber",
+      "category": "broadcast",
+      "description": "The broadcast group-of-one invariant: a first subscriber attaches, but a SECOND distinct subscriber is rejected with ERR_BROADCAST_GROUP_BUSY (so a cumulative ack can only ever commit past the lone consumer's own work).",
+      "setup": {},
+      "steps": [
+        {
+          "op": "set_broadcast",
+          "group": "bcast",
+          "broadcast": true
+        },
+        {
+          "op": "subscribe",
+          "group": "bcast",
+          "member": 1
+        },
+        {
+          "op": "subscribe",
+          "group": "bcast",
+          "member": 2,
+          "expect_code": "ERR_BROADCAST_GROUP_BUSY"
+        }
+      ]
+    },
+    {
+      "name": "trim_below_horizon_read_returns_offset_trimmed",
+      "category": "trim",
+      "description": "A read of a trimmed offset returns OFFSET_TRIMMED: under the drop-oldest disk-full policy a stuck consumer's records are force-reaped, so its next poll is a one-time truncation that resets its cursor up to the earliest retained offset and reports the skipped span; the SAME gap never re-truncates.",
+      "setup": {
+        "max_total_bytes": 256,
+        "max_segment_bytes": 160,
+        "disk_full_policy": "drop_oldest",
+        "visibility_nanos": 30
+      },
+      "steps": [
+        {
+          "op": "produce",
+          "payload": "0123456789abcdef",
+          "expect_offset": 0
+        },
+        {
+          "op": "poll",
+          "group": "stuck",
+          "now": 0,
+          "outcome": "message",
+          "expect_offset": 0,
+          "bind": "s0"
+        },
+        {
+          "op": "produce",
+          "payload": "0123456789abcdef",
+          "expect_offset": 1
+        },
+        {
+          "op": "produce",
+          "payload": "0123456789abcdef",
+          "expect_offset": 2
+        },
+        {
+          "op": "produce",
+          "payload": "0123456789abcdef",
+          "expect_offset": 3
+        },
+        {
+          "op": "produce",
+          "payload": "0123456789abcdef",
+          "expect_offset": 4
+        },
+        {
+          "op": "produce",
+          "payload": "0123456789abcdef",
+          "expect_offset": 5
+        },
+        {
+          "op": "produce",
+          "payload": "0123456789abcdef",
+          "expect_offset": 6
+        },
+        {
+          "op": "produce",
+          "payload": "0123456789abcdef",
+          "expect_offset": 7
+        },
+        {
+          "op": "produce",
+          "payload": "0123456789abcdef",
+          "expect_offset": 8
+        },
+        {
+          "op": "produce",
+          "payload": "0123456789abcdef",
+          "expect_offset": 9
+        },
+        {
+          "op": "poll",
+          "group": "stuck",
+          "now": 100,
+          "outcome": "truncated",
+          "expect_code": "OFFSET_TRIMMED"
+        },
+        {
+          "op": "poll",
+          "group": "stuck",
+          "now": 100,
+          "outcome": "message"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,250 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! The STABLE semantics error/outcome codes (#35): the pinned, language-agnostic vocabulary the
+//! conformance vectors assert against.
+//!
+//! The engine's behavioral contract (the parent #3 design) names a handful of OBSERVABLE rejection
+//! and signal outcomes: a cumulative ack on a competing group is refused, a foreign-lease ack is
+//! not owned, a read below the trim horizon is trimmed, a zombie producer is fenced, and so on.
+//! Before #35 those outcomes were carried as ad-hoc prose [`crate::engine::EngineError`] Display
+//! strings (surfaced to a client via `Err` replies) or as untyped status bytes (a fenced ack is a
+//! `0` on the wire). Prose drifts and a status byte is anonymous, so neither is a stable contract a
+//! second implementation or an external client can assert against.
+//!
+//! This module FORMALIZES those outcomes as stable string constants ([`ErrorCode`]). The codes are
+//! NORMATIVE: once shipped they never change spelling, so the conformance vectors
+//! (`tests/vectors/semantics.json`) and any external client may pin them. The mapping from the
+//! engine's typed outcomes to a code is the single source of truth:
+//!
+//! - [`ErrorCode::of_engine_error`] maps every [`crate::engine::EngineError`] variant to its code.
+//! - The non-error observable outcomes that are NOT an `EngineError` (a fenced/foreign ack, a
+//!   producer-epoch fence, a benign dedup hit, a below-trim-horizon read) each have a named
+//!   constant the harness asserts the engine's behavior maps to.
+//!
+//! The change is ADDITIVE: it introduces codes and a mapping but does NOT alter the existing
+//! `EngineError` Display text, the wire `Err` bodies, or the status bytes, so every existing test
+//! and the frozen wire stay byte-for-byte unchanged. A later wire error-code scheme (a numeric tag
+//! on the `Err` frame) can adopt these same constants without a second taxonomy.
+
+use crate::engine::EngineError;
+
+/// A stable, NORMATIVE semantics outcome code (#35): a short `SCREAMING_SNAKE_CASE` token that names
+/// an observable engine behavior the conformance contract pins. The string spelling is frozen, so
+/// the conformance vectors and any external client may assert against it.
+///
+/// The `ERR_*` codes name a REJECTION (a verb the engine refused); the bare codes ([`Self::OK`],
+/// [`Self::DUPLICATE`], [`Self::OFFSET_TRIMMED`]) name a non-error observable SIGNAL (a success, a
+/// benign dedup hit, a below-trim-horizon read).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ErrorCode(&'static str);
+
+impl ErrorCode {
+    /// The stable string spelling of this code (e.g. `"ERR_CUMULATIVE_ACK_NOT_ALLOWED"`). Frozen:
+    /// the conformance vectors assert against exactly this text.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+
+    // ----- non-error observable signals -----
+
+    /// A verb succeeded (an ack committed, a cumulative ack advanced or was an idempotent no-op, a
+    /// fresh produce was appended). The generic body-less success.
+    pub const OK: ErrorCode = ErrorCode("OK");
+
+    /// A BENIGN dedup hit (#33): a produce whose `msg_id` was already in the producer's window, so
+    /// the broker returned the ORIGINAL offset WITHOUT appending a second copy (`duplicate = true`,
+    /// a success, never an error). Not an `EngineError`: it is an `AppendOutcome::Duplicate`.
+    pub const DUPLICATE: ErrorCode = ErrorCode("DUPLICATE");
+
+    /// A read fell BELOW the trim/retention horizon (#82, #84): the consumer's cursor was reaped out
+    /// from under it, so the engine reset the cursor up to the earliest retained offset and surfaced
+    /// the skip ONCE (the `Poll::Truncated` advisory). Not an `EngineError`: it is an observable
+    /// poll outcome the consumer learns its lost span from. The contract's `OFFSET_TRIMMED`.
+    #[allow(non_upper_case_globals)]
+    pub const OFFSET_TRIMMED: ErrorCode = ErrorCode("OFFSET_TRIMMED");
+
+    // ----- rejection codes (one per EngineError, plus the fenced-ack / producer-fence outcomes) -----
+
+    /// A cumulative ack was refused because the group is a COMPETING (or `key_shared`, or unknown,
+    /// or not-marked-broadcast) work-group (#63). Maps [`EngineError::CumulativeAckOnWorkGroup`].
+    pub const ERR_CUMULATIVE_ACK_NOT_ALLOWED: ErrorCode =
+        ErrorCode("ERR_CUMULATIVE_ACK_NOT_ALLOWED");
+
+    /// An ack/nack/term/progress named a lease this consumer does NOT own: a token never delivered
+    /// to it, or a stale generation whose message already redelivered or was acked (the engine
+    /// returns `AckResult::Fenced` / `NackResult::Fenced`, the wire status `0`). The contract's
+    /// `ERR_ACK_NOT_OWNED`.
+    pub const ERR_ACK_NOT_OWNED: ErrorCode = ErrorCode("ERR_ACK_NOT_OWNED");
+
+    /// A broadcast cumulative ack named an `up_to` outside the retained window (#288). Maps
+    /// [`EngineError::CumulativeAckOutOfRange`].
+    pub const ERR_CUMULATIVE_ACK_OUT_OF_RANGE: ErrorCode =
+        ErrorCode("ERR_CUMULATIVE_ACK_OUT_OF_RANGE");
+
+    /// A second subscriber or an unsafe flip to broadcast violated the group-of-one invariant
+    /// (#288). Maps [`EngineError::BroadcastGroupBusy`].
+    pub const ERR_BROADCAST_GROUP_BUSY: ErrorCode = ErrorCode("ERR_BROADCAST_GROUP_BUSY");
+
+    /// A flip to broadcast named the default/empty group, which can never be broadcast (#288). Maps
+    /// [`EngineError::BroadcastGroupNotNamed`].
+    pub const ERR_BROADCAST_GROUP_NOT_NAMED: ErrorCode = ErrorCode("ERR_BROADCAST_GROUP_NOT_NAMED");
+
+    /// A new named work-group exceeded the per-engine group cap (#240). Maps
+    /// [`EngineError::TooManyGroups`].
+    pub const ERR_TOO_MANY_GROUPS: ErrorCode = ErrorCode("ERR_TOO_MANY_GROUPS");
+
+    /// A work-group name was empty, too long, or non-graphic ASCII (#240). Maps
+    /// [`EngineError::InvalidGroupName`].
+    pub const ERR_INVALID_GROUP_NAME: ErrorCode = ErrorCode("ERR_INVALID_GROUP_NAME");
+
+    /// A produce presented a STALE producer epoch (a zombie session reusing an old `producer_id`,
+    /// #33): the broker rejects it (`AppendOutcome::Fenced`, the wire `fenced: stale producer
+    /// epoch`). Not an `EngineError`: it is an `AppendOutcome`. The contract's `ERR_PRODUCER_FENCED`.
+    pub const ERR_PRODUCER_FENCED: ErrorCode = ErrorCode("ERR_PRODUCER_FENCED");
+
+    /// A produce was shed because the durable log is at its byte cap (the drop-new shed). Maps an
+    /// at-capacity [`EngineError::Storage`].
+    pub const ERR_AT_CAPACITY: ErrorCode = ErrorCode("ERR_AT_CAPACITY");
+
+    /// The lease generation space is exhausted (unreachable in practice). Maps
+    /// [`EngineError::GenerationExhausted`].
+    pub const ERR_GENERATION_EXHAUSTED: ErrorCode = ErrorCode("ERR_GENERATION_EXHAUSTED");
+
+    /// An internal invariant broke (a deliverable offset had no record). Maps
+    /// [`EngineError::MissingRecord`].
+    pub const ERR_MISSING_RECORD: ErrorCode = ErrorCode("ERR_MISSING_RECORD");
+
+    /// `max_in_flight` was zero, rejected at open. Maps [`EngineError::ZeroMaxInFlight`].
+    pub const ERR_ZERO_MAX_IN_FLIGHT: ErrorCode = ErrorCode("ERR_ZERO_MAX_IN_FLIGHT");
+
+    /// A generic storage error (not one of the named-above storage outcomes). Maps the residual
+    /// [`EngineError::Storage`].
+    pub const ERR_STORAGE: ErrorCode = ErrorCode("ERR_STORAGE");
+
+    /// Maps an [`EngineError`] to its stable code. The single source of truth the conformance
+    /// vectors and any wire error-code scheme share. A storage error is split into the two named
+    /// outcomes ([`Self::ERR_AT_CAPACITY`] for the byte-cap shed) plus the residual
+    /// [`Self::ERR_STORAGE`], so a shed is a stable, distinct code rather than an anonymous storage
+    /// fault.
+    #[must_use]
+    pub fn of_engine_error(error: &EngineError) -> ErrorCode {
+        match error {
+            EngineError::CumulativeAckOnWorkGroup => Self::ERR_CUMULATIVE_ACK_NOT_ALLOWED,
+            EngineError::CumulativeAckOutOfRange { .. } => Self::ERR_CUMULATIVE_ACK_OUT_OF_RANGE,
+            EngineError::BroadcastGroupBusy { .. } => Self::ERR_BROADCAST_GROUP_BUSY,
+            EngineError::BroadcastGroupNotNamed { .. } => Self::ERR_BROADCAST_GROUP_NOT_NAMED,
+            EngineError::TooManyGroups { .. } => Self::ERR_TOO_MANY_GROUPS,
+            EngineError::InvalidGroupName => Self::ERR_INVALID_GROUP_NAME,
+            EngineError::GenerationExhausted => Self::ERR_GENERATION_EXHAUSTED,
+            EngineError::MissingRecord { .. } => Self::ERR_MISSING_RECORD,
+            EngineError::ZeroMaxInFlight => Self::ERR_ZERO_MAX_IN_FLIGHT,
+            EngineError::Storage(_) if error.is_at_capacity() => Self::ERR_AT_CAPACITY,
+            EngineError::Storage(_) => Self::ERR_STORAGE,
+        }
+    }
+}
+
+impl core::fmt::Display for ErrorCode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl EngineError {
+    /// The STABLE semantics code for this error (#35): the normative, frozen token the conformance
+    /// vectors assert against, distinct from the human-readable [`core::fmt::Display`] text (which is
+    /// not pinned and may be reworded). Delegates to [`ErrorCode::of_engine_error`].
+    #[must_use]
+    pub fn code(&self) -> ErrorCode {
+        ErrorCode::of_engine_error(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ironbus_storage::segment::StorageError;
+
+    #[test]
+    fn the_named_codes_have_their_frozen_spelling() {
+        // The vectors and external clients pin these exact strings: a rename must fail here.
+        assert_eq!(
+            ErrorCode::ERR_CUMULATIVE_ACK_NOT_ALLOWED.as_str(),
+            "ERR_CUMULATIVE_ACK_NOT_ALLOWED"
+        );
+        assert_eq!(ErrorCode::ERR_ACK_NOT_OWNED.as_str(), "ERR_ACK_NOT_OWNED");
+        assert_eq!(ErrorCode::OFFSET_TRIMMED.as_str(), "OFFSET_TRIMMED");
+        assert_eq!(
+            ErrorCode::ERR_PRODUCER_FENCED.as_str(),
+            "ERR_PRODUCER_FENCED"
+        );
+        assert_eq!(ErrorCode::DUPLICATE.as_str(), "DUPLICATE");
+        assert_eq!(ErrorCode::OK.as_str(), "OK");
+    }
+
+    #[test]
+    fn every_engine_error_maps_to_a_code() {
+        // One representative per variant, so a NEW EngineError variant that forgets its code makes
+        // `of_engine_error` non-exhaustive and fails to compile (the match has no wildcard).
+        let cases: &[(EngineError, ErrorCode)] = &[
+            (
+                EngineError::CumulativeAckOnWorkGroup,
+                ErrorCode::ERR_CUMULATIVE_ACK_NOT_ALLOWED,
+            ),
+            (
+                EngineError::CumulativeAckOutOfRange {
+                    up_to: 9,
+                    earliest_retained: 0,
+                    durable_head: 3,
+                },
+                ErrorCode::ERR_CUMULATIVE_ACK_OUT_OF_RANGE,
+            ),
+            (
+                EngineError::BroadcastGroupBusy {
+                    group: "g".to_string(),
+                },
+                ErrorCode::ERR_BROADCAST_GROUP_BUSY,
+            ),
+            (
+                EngineError::BroadcastGroupNotNamed {
+                    group: String::new(),
+                },
+                ErrorCode::ERR_BROADCAST_GROUP_NOT_NAMED,
+            ),
+            (
+                EngineError::TooManyGroups { max: 8 },
+                ErrorCode::ERR_TOO_MANY_GROUPS,
+            ),
+            (
+                EngineError::InvalidGroupName,
+                ErrorCode::ERR_INVALID_GROUP_NAME,
+            ),
+            (
+                EngineError::GenerationExhausted,
+                ErrorCode::ERR_GENERATION_EXHAUSTED,
+            ),
+            (
+                EngineError::MissingRecord { offset: 4 },
+                ErrorCode::ERR_MISSING_RECORD,
+            ),
+            (
+                EngineError::ZeroMaxInFlight,
+                ErrorCode::ERR_ZERO_MAX_IN_FLIGHT,
+            ),
+            (
+                EngineError::Storage(StorageError::AtCapacity {
+                    durable_bytes: 64,
+                    cap: 32,
+                }),
+                ErrorCode::ERR_AT_CAPACITY,
+            ),
+            (
+                EngineError::Storage(StorageError::WriterFrozen),
+                ErrorCode::ERR_STORAGE,
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.code(), *expected, "wrong code for {err:?}");
+        }
+    }
+}
