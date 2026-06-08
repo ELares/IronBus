@@ -288,15 +288,21 @@ per-group meaning does not flatten to one scalar env var), as CLI.md states.
 | Knob (file key) | Flag / env | Type | Default | Units | Valid range | Reload |
 | --- | --- | --- | --- | --- | --- | --- |
 | `listen` | `--addr` / `IRONBUS_ADDR` | host:port | `127.0.0.1:7777` (`DEFAULT_ADDR`) | -- | a bindable `host:port` | COLD |
-| `health_addr` | `--health-addr` / `IRONBUS_HEALTH_ADDR` | host:port | off (not set) | -- | a loopback `host:port` | COLD |
+| `health_addr` | `--health-addr` / `IRONBUS_HEALTH_ADDR` | host:port | off (not set) | -- | a `host:port`; non-loopback requires `health_allow_public` (#95) | COLD |
+| `health_allow_public` | `--health-allow-public` / `IRONBUS_HEALTH_ALLOW_PUBLIC` | bool | `false` (off) | -- | `true`/`1` or `false`/`0` | COLD |
+| `health_liveness_window_ms` | `--health-liveness-window-ms` / `IRONBUS_HEALTH_LIVENESS_WINDOW_MS` | u64 | `10000` (10 s) | ms | `0` = disabled, else any positive window | COLD |
 | `enable_admin` | `--enable-admin` / `IRONBUS_ENABLE_ADMIN` | bool | `false` (off) | -- | `true`/`1` or `false`/`0` | COLD |
 | `tls.enabled` | SPECIFIED-NOT-YET-A-FIELD | bool | `false` | -- | bool; `cert_path`/`key_path` required when true | COLD |
 | `tls.cert_path` / `tls.key_path` | SPECIFIED-NOT-YET-A-FIELD | path | none | path | a readable file, mode `& 0o077 == 0` | COLD |
 
-TLS, the bind invariant, and the pre-auth DoS keys are SPECIFIED in
-[TRANSPORT.md](TRANSPORT.md) (the #107 residual), not wired; the broker today is
-loopback plaintext by default. `enable_admin` ships (it gates the read-only
-`/admin` introspection endpoint) but the mutating `CONFIG` verbs do not (#88).
+TLS and the pre-auth DoS keys are SPECIFIED in [TRANSPORT.md](TRANSPORT.md) (the
+#107 residual), not wired; the broker's WIRE bind today is loopback plaintext by
+default. The fail-closed bind invariant IS enforced for the HEALTH surface (#95):
+a non-loopback `health_addr` refuses to start unless `health_allow_public`
+acknowledges the unauthenticated/unencrypted surface (then it binds with a loud
+warning), since TLS/auth are not yet wired there either. `enable_admin` ships (it
+gates the read-only `/admin` introspection endpoint) but the mutating `CONFIG`
+verbs do not (#88).
 
 ### Observability (`[observability]`) and auth (`[auth]`)
 

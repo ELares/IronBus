@@ -610,6 +610,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironbus_core::clock::Clock as _; // the monotonic seam for the serve loop's #95 beacon
     use ironbus_core::delivery::DeliveryConfig;
     use ironbus_core::lease::LeaseConfig;
     use ironbus_proto::message::{
@@ -689,7 +690,14 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = std::thread::spawn({
             let shutdown = Arc::clone(&shutdown);
-            move || serve(&listener, &handle_engine, &shutdown, 16).unwrap()
+            move || {
+                // These client tests drive the broker over the wire only; the serve loop's liveness
+                // beacon (#95) is unread, so a throwaway beacon on a fresh SystemClock suffices.
+                let clock = SystemClock::new();
+                let beacon =
+                    ironbus_server::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                serve(&listener, &handle_engine, &shutdown, 16, &clock, &beacon).unwrap();
+            }
         });
         (addr, shutdown, handle)
     }
