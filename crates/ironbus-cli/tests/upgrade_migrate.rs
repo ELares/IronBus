@@ -369,15 +369,22 @@ fn seed_data_dir_with_one_record(data_dir: &Path) {
     }
     assert!(!addr.is_empty(), "broker did not report its bound address");
 
-    // Retry the produce briefly in case the listen line raced ahead of the accept loop.
+    // Retry the produce until it succeeds, in case the listen line raced ahead of the accept loop or
+    // the broker is starved on a heavily-loaded shared CI runner (the acceptance gate runs a 40s
+    // job in parallel on macOS). A generous window (~30s: 300 attempts x 100ms) tolerates a badly
+    // contended runner without flaking, and bails early if the broker process has already exited so a
+    // crashed broker fails fast with its reason instead of burning the whole window.
     let mut produced = false;
-    for _ in 0..50 {
+    for _ in 0..300 {
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("broker exited before a record was produced (status: {status})");
+        }
         let (code, _o, _e) = run_ironbus(&["pub", "--addr", &addr, "a durable record"]);
         if code == 0 {
             produced = true;
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let _ = child.kill();
     let _ = child.wait();
