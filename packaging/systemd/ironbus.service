@@ -2,18 +2,40 @@
 #
 # IronBus broker systemd unit (#104, #14). Ships in the `.deb` and is referenced by the container
 # docs. It runs the broker as the unprivileged `ironbus` user against a writable data dir, and wires
-# the atomic-upgrade FALL-BACK-AFTER-N mechanism: a start that fails to come up bumps a counter
-# (`ironbus record-start --failed`), and once the counter reaches N (default 3) the unit rolls back
-# to the retained `ironbus.prev` via `ironbus rollback` before the next start. A healthy start clears
-# the counter (`record-start --ok`). The live binary is NEVER overwritten in place; `ironbus upgrade`
-# (or the installer) does the atomic write-temp + fsync + rename, so a power cut mid-upgrade leaves
-# either the old or the new binary intact, and this unit recovers an unreachable node automatically.
+# the atomic-upgrade FALL-BACK-AFTER-N mechanism so a bad upgrade self-heals while a HEALTHY broker is
+# never spuriously rolled back (e.g. by repeated unclean power losses).
+#
+# The failed-start counter (`ironbus record-start`, a file next to the binary) is driven at exactly
+# three lifecycle points, each with ONE job, so the count means "consecutive genuinely-failed starts"
+# and nothing else:
+#
+#   - ExecStartPre  `record-start --check`: CONSULT ONLY. It reads the counter (never bumps it) and,
+#     if N (default 3) consecutive failures have accrued AND an `ironbus.prev` exists, rolls back to
+#     the last known-good bytes BEFORE this start. Because it never writes the counter, consulting on
+#     every boot (including after an unclean power loss of a perfectly healthy binary) cannot itself
+#     push the count toward a rollback.
+#   - ExecStartPost `record-start --ok`: CLEAR. It runs only AFTER the broker has stayed up for a
+#     short readiness grace window (see below), so a genuine failed start (which crashes inside the
+#     window) never reaches it and never clears the budget; a real successful start resets it to 0.
+#   - ExecStopPost  `record-start --failed`: the SINGLE place the counter is INCREMENTED, and only on
+#     a non-clean exit ($SERVICE_RESULT != success). So one crash cycle bumps the count by exactly 1
+#     (no ExecStartPre double-count), and N=3 genuine consecutive failed starts trigger the fall-back.
+#
+# The live binary is NEVER overwritten in place; `ironbus upgrade` (or the installer) does the atomic
+# write-temp + fsync + rename, so a power cut mid-upgrade leaves either the old or the new binary
+# intact, and this unit recovers an unreachable node automatically after N failed starts.
 
 [Unit]
 Description=IronBus durable edge message queue
 Documentation=https://github.com/ELares/IronBus
 After=network-online.target
 Wants=network-online.target
+
+# Disable systemd's start-rate limiter so the fall-back-after-N logic (not the rate limiter) governs
+# restarts: with it enabled a crash-looping new binary could hit the burst cap and stop being
+# restarted BEFORE the counter reaches N, leaving the node down on a bad binary instead of rolling
+# back to ironbus.prev. The fall-back rolls back after N failures, so unbounded retry is intended.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -28,17 +50,27 @@ Environment=IRONBUS_DATA_DIR=/var/lib/ironbus
 # Path of the installed binary, so the fall-back helpers and the swap target agree on one location.
 Environment=IRONBUS_BIN=/usr/bin/ironbus
 
-# BEFORE start: if a prior boot left the failed-start counter at or past the threshold AND a
-# rollback copy exists, restore ironbus.prev first, so a node that cannot start the new binary
-# heals to the last known-good bytes. `record-start --failed` (run as ExecStopPost on a crash)
-# prints the fall-back instruction; this pre-step performs it. A no-op when below the threshold.
-ExecStartPre=/bin/sh -c '/usr/bin/ironbus record-start --dest "${IRONBUS_BIN}" --failed | grep -q "fall-back threshold reached" && /usr/bin/ironbus rollback --dest "${IRONBUS_BIN}" || true'
+# BEFORE start: CONSULT the failed-start counter (never bump it). If a prior boot left the counter at
+# or past the threshold AND a rollback copy exists, restore ironbus.prev first, so a node that cannot
+# start the new binary heals to the last known-good bytes. `--check` only reads the counter, so this
+# pre-step cannot itself accumulate failures; the increment is owned solely by ExecStopPost below.
+ExecStartPre=/bin/sh -c '/usr/bin/ironbus record-start --dest "${IRONBUS_BIN}" --check | grep -q "fall-back threshold reached" && /usr/bin/ironbus rollback --dest "${IRONBUS_BIN}" || true'
 
 ExecStart=/usr/bin/ironbus serve
 
-# A clean, healthy run that systemd later stops clears the failure budget so a deliberate restart
-# does not look like a failure. (A crash takes the ExecStopPost --failed path via $SERVICE_RESULT.)
-ExecStopPost=/bin/sh -c 'if [ "${SERVICE_RESULT}" = "success" ]; then /usr/bin/ironbus record-start --dest "${IRONBUS_BIN}" --ok; else /usr/bin/ironbus record-start --dest "${IRONBUS_BIN}" --failed; fi'
+# AFTER the broker is confirmed up: clear the failure budget. The leading `sleep` is a readiness grace
+# window: for a Type=simple service, if the main process dies during ExecStartPost, systemd kills the
+# remaining ExecStartPost command and runs ExecStopPost instead, so a binary that crashes on startup
+# never reaches the `--ok` and never clears the counter. A binary that stays up past the window is a
+# genuine successful start and resets the budget to 0. IRONBUS_STARTUP_GRACE_SEC is overridable in
+# /etc/ironbus/ironbus.env (default 10s); keep it shorter than a real first-boot mount/init time.
+ExecStartPost=/bin/sh -c 'sleep "${IRONBUS_STARTUP_GRACE_SEC:-10}"; /usr/bin/ironbus record-start --dest "${IRONBUS_BIN}" --ok'
+
+# ON STOP: this is the SINGLE place the counter is incremented, and only on a non-clean exit. A clean
+# stop (a deliberate `systemctl stop`, $SERVICE_RESULT == success) is NOT a failed start, so it leaves
+# the counter untouched (the ExecStartPost --ok already cleared a healthy run). A crash/non-zero exit
+# bumps the counter by exactly one, so N consecutive genuine failures (and only those) fall back.
+ExecStopPost=/bin/sh -c '[ "${SERVICE_RESULT}" = "success" ] || /usr/bin/ironbus record-start --dest "${IRONBUS_BIN}" --failed'
 
 Restart=on-failure
 RestartSec=5

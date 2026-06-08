@@ -64,15 +64,29 @@ cargo deb -p ironbus-cli --no-build --no-strip --target <triple>
 
 ### Fall-back-after-N wiring (the systemd unit)
 
-The packaged unit (`packaging/systemd/ironbus.service`) wires the atomic-upgrade fall-back:
+The packaged unit (`packaging/systemd/ironbus.service`) wires the atomic-upgrade fall-back with a
+consecutive-failed-start counter (a file next to the binary). Each lifecycle hook has ONE job, so the
+count means "consecutive genuinely-failed starts" and a HEALTHY broker is never spuriously rolled back
+(e.g. by repeated unclean power losses):
 
-- `ExecStopPost` runs `ironbus record-start --dest <bin> --ok` on a clean stop (clearing the failure
-  budget) or `--failed` on a crash (bumping a consecutive-failed-start counter).
-- `ExecStartPre` consults the counter: once it reaches N (default 3) AND an `ironbus.prev` exists, it
-  runs `ironbus rollback --dest <bin>` to restore the last known-good binary before the next start.
+- `ExecStartPre` runs `ironbus record-start --dest <bin> --check`: it only CONSULTS the counter (never
+  bumps it) and, once it has reached N (default 3) AND an `ironbus.prev` exists, runs
+  `ironbus rollback --dest <bin>` to restore the last known-good binary before this start.
+- `ExecStartPost` runs `ironbus record-start --dest <bin> --ok` AFTER a short readiness grace window
+  (`IRONBUS_STARTUP_GRACE_SEC`, default 10s), CLEARING the budget. For a `Type=simple` service, a
+  binary that crashes during the window has its `ExecStartPost` killed before the `--ok`, so a genuine
+  failed start never clears the counter; a binary that stays up past the window is a real successful
+  start and resets it to 0.
+- `ExecStopPost` runs `ironbus record-start --dest <bin> --failed` ONLY on a non-clean exit. This is
+  the SINGLE place the counter is incremented, so one crash cycle bumps it by exactly 1 (no
+  double-count) and a deliberate `systemctl stop` (a clean exit) leaves it untouched.
 
-So a node that cannot start a freshly-upgraded binary heals itself to the prior bytes automatically.
-N is `--max-failed-starts` (default 3).
+So a node that cannot start a freshly-upgraded binary heals itself to the prior bytes after N genuine
+consecutive failed starts, while an unclean power loss of a working broker never accumulates toward a
+rollback (the consult-only `ExecStartPre` does not bump, and `ExecStartPost --ok` cleared the budget
+on the last healthy start). `StartLimitIntervalSec=0` disables systemd's start-rate limiter so the
+fall-back-after-N logic, not the rate limiter, governs restarts. N is `--max-failed-starts`
+(default 3).
 
 ## 3. The distroless container image
 

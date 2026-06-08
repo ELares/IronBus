@@ -176,6 +176,129 @@ fn the_fall_back_counter_reaches_the_threshold_after_n_failed_starts() {
     );
 }
 
+/// Drives the EXACT `record-start` sequence the packaged systemd unit performs at its three
+/// lifecycle hooks, so the unit wiring (not just the pure functions) is proved. The hooks map to:
+///
+/// - `ExecStartPre`  -> `record-start --check`  (CONSULT only; rolls back iff it reports the
+///   threshold reached). Returns whether the unit would roll back at this boot.
+/// - `ExecStartPost` -> `record-start --ok`     (CLEAR; runs only once the broker survived the
+///   readiness grace window, i.e. a genuine successful start).
+/// - `ExecStopPost`  -> `record-start --failed` (the SINGLE increment, only on a non-clean exit).
+fn unit_check_says_roll_back(dest: &Path) -> bool {
+    // ExecStartPre: consult only, never bump. The unit greps this line to decide on a rollback.
+    let (code, out, _e) =
+        run_ironbus(&["record-start", "--dest", dest.to_str().unwrap(), "--check"]);
+    assert_eq!(code, 0, "record-start --check must succeed");
+    out.contains("fall-back threshold reached")
+}
+fn unit_exec_stop_post_failed(dest: &Path) {
+    // ExecStopPost on a non-clean exit: the SINGLE increment.
+    let (code, _o, _e) =
+        run_ironbus(&["record-start", "--dest", dest.to_str().unwrap(), "--failed"]);
+    assert_eq!(code, 0, "record-start --failed must succeed");
+}
+fn unit_exec_start_post_ok(dest: &Path) {
+    // ExecStartPost after the readiness grace window: a genuine successful start clears the budget.
+    let (code, _o, _e) = run_ironbus(&["record-start", "--dest", dest.to_str().unwrap(), "--ok"]);
+    assert_eq!(code, 0, "record-start --ok must succeed");
+}
+
+#[test]
+fn unit_wiring_three_genuine_failed_starts_roll_back() {
+    // The fixed unit wiring (#104): a genuine failed start at boot consults (ExecStartPre --check,
+    // no bump) then bumps once (ExecStopPost --failed) because the crash happens before the
+    // ExecStartPost --ok grace window. Exactly N=3 such consecutive cycles trigger the rollback, and
+    // ExecStartPre never double-counts.
+    let scr = Scratch::new("unit-3fail");
+    let dest = scr.path().join("ironbus");
+    std::fs::write(&dest, b"new (failing) binary").unwrap();
+    std::fs::write(scr.path().join("ironbus.prev"), b"old known-good binary").unwrap();
+
+    // Boots 1 and 2: consult says no rollback yet; the crash bumps once each (no --ok, no double).
+    for boot in 1..=2 {
+        assert!(
+            !unit_check_says_roll_back(&dest),
+            "boot {boot}: below the threshold, ExecStartPre must not roll back"
+        );
+        unit_exec_stop_post_failed(&dest); // the binary crashed in the grace window
+    }
+    // Boot 3: the consult now sees the count at N=3 (each crash bumped by exactly 1, never +2), so
+    // ExecStartPre would roll back. The count reaching 3 after exactly 3 crashes proves no
+    // double-count from ExecStartPre.
+    assert!(
+        !unit_check_says_roll_back(&dest),
+        "the consult before the 3rd crash is still below the threshold"
+    );
+    unit_exec_stop_post_failed(&dest);
+    assert!(
+        unit_check_says_roll_back(&dest),
+        "after exactly 3 genuine failed starts the unit rolls back (no ExecStartPre double-count)"
+    );
+}
+
+#[test]
+fn unit_wiring_an_ok_in_between_resets_the_budget() {
+    // A genuine successful start (ExecStartPost --ok after the grace window) in the middle of a
+    // failure streak resets the budget, so the streak must restart from scratch and a later pair of
+    // failures does NOT cross the threshold a single contiguous run of 3 would.
+    let scr = Scratch::new("unit-reset");
+    let dest = scr.path().join("ironbus");
+    std::fs::write(&dest, b"binary").unwrap();
+    std::fs::write(scr.path().join("ironbus.prev"), b"prev").unwrap();
+
+    // Two failed starts...
+    unit_exec_stop_post_failed(&dest);
+    unit_exec_stop_post_failed(&dest);
+    // ...then a healthy start (survived the grace window) clears the budget.
+    unit_exec_start_post_ok(&dest);
+    // Two more failed starts: the count is 2 (NOT 4), so still below the N=3 threshold.
+    unit_exec_stop_post_failed(&dest);
+    assert!(
+        !unit_check_says_roll_back(&dest),
+        "after a reset, one failed start is below the threshold"
+    );
+    unit_exec_stop_post_failed(&dest);
+    assert!(
+        !unit_check_says_roll_back(&dest),
+        "after a reset, two failed starts are still below the threshold (an --ok reset the streak)"
+    );
+}
+
+#[test]
+fn unit_wiring_a_healthy_binary_does_not_roll_back_on_unclean_power_loss() {
+    // THE power-loss hazard #104 centers on: a HEALTHY broker that loses power uncleanly must NOT
+    // accumulate toward a rollback. After a genuine successful start (ExecStartPost --ok cleared the
+    // budget), an unclean power loss runs NO ExecStopPost (power was cut), and the next boot's
+    // ExecStartPre is a CONSULT ONLY (no bump). So repeated unclean power losses of a perfectly good
+    // binary never roll it back.
+    let scr = Scratch::new("unit-powerloss");
+    let dest = scr.path().join("ironbus");
+    std::fs::write(&dest, b"healthy binary").unwrap();
+    std::fs::write(scr.path().join("ironbus.prev"), b"prev binary").unwrap();
+
+    // A genuine successful start: ExecStartPost --ok clears the budget.
+    unit_exec_start_post_ok(&dest);
+
+    // Now simulate many unclean power losses of the HEALTHY binary. Each boot:
+    //   - ExecStartPre --check (consult only, no bump),
+    //   - the broker comes up and stays up (no ExecStopPost --failed runs),
+    //   - power is cut uncleanly (so NO ExecStopPost runs at all on this boot).
+    // The only counter call per boot is the consult, which never bumps.
+    for boot in 1..=10 {
+        assert!(
+            !unit_check_says_roll_back(&dest),
+            "boot {boot}: a healthy binary must never roll back on an unclean power loss"
+        );
+        // A power cut leaves no ExecStopPost; nothing increments the counter.
+    }
+    // The healthy binary is still in place; nothing was ever rolled back.
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        b"healthy binary",
+        "the healthy binary survived repeated unclean power losses untouched"
+    );
+}
+
 #[test]
 fn upgrade_rejects_a_missing_new_binary() {
     // Fail-closed: upgrade refuses to run if the (would-be verified) new binary is absent, rather
@@ -306,7 +429,9 @@ fn migrate_refuses_a_silent_format_bump() {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("seg-"));
-            let is_log = p.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("log"));
+            let is_log = p
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("log"));
             is_seg_name && is_log
         })
         .expect("a segment file must exist after seeding");

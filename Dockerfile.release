@@ -23,8 +23,13 @@ LABEL org.opencontainers.image.source="https://github.com/ELares/IronBus" \
       org.opencontainers.image.description="IronBus durable edge message queue (distroless static)" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
-# The verified static musl binary, copied in directly (no recompile).
-COPY ${IRONBUS_BIN} /usr/local/bin/ironbus
+# The verified static musl binary, copied in directly (no recompile). `--chmod=0755` is REQUIRED:
+# `actions/upload-artifact`/`download-artifact` do not preserve the Unix executable bit, so the
+# staged `IRONBUS_BIN` arrives mode 0644. A plain `COPY` would carry that 0644 into the image and the
+# release smoke (`docker run ... --version`) would fail permission-denied; distroless/static has no
+# shell, so a `RUN chmod` is not an option. `COPY --chmod` (BuildKit, default on the runner) sets the
+# mode at copy time so the entrypoint is executable.
+COPY --chmod=0755 ${IRONBUS_BIN} /usr/local/bin/ironbus
 
 ENV IRONBUS_DATA_DIR=/var/lib/ironbus \
     IRONBUS_ADDR=0.0.0.0:7777

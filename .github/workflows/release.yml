@@ -113,10 +113,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-          - armv7-unknown-linux-musleabihf
+        include:
+          - target: x86_64-unknown-linux-musl
+            deb_arch: amd64
+          - target: aarch64-unknown-linux-musl
+            deb_arch: arm64
+          - target: armv7-unknown-linux-musleabihf
+            deb_arch: armhf
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -130,20 +133,37 @@ jobs:
           name: ironbus-${{ matrix.target }}
           path: dist
       - name: build the .deb from the verified static binary (no recompile)
+        env:
+          TARGET: ${{ matrix.target }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
         run: |
           set -euo pipefail
           # Stage the ALREADY-BUILT static musl binary where the [package.metadata.deb] assets map
-          # expects it (target/release/ironbus), so the .deb ships the exact reproducible release
-          # bytes the `build` job produced rather than a fresh glibc rebuild. --no-build skips the
-          # compile, --no-strip preserves the embedded SBOM and the reproducible bytes.
-          mkdir -p target/release
-          install -m 0755 "dist/ironbus-${{ matrix.target }}" target/release/ironbus
-          cargo deb -p ironbus-cli --no-build --no-strip --output "dist/ironbus-${{ matrix.target }}.deb"
+          # expects it WITH `--target`: cargo-deb reads the `target/release/ironbus` asset relative to
+          # `target/<triple>/`, i.e. `target/<triple>/release/ironbus`, and it infers the Debian
+          # `Architecture` from the `--target` triple (amd64/arm64/armhf), NOT from the host. Without
+          # `--target` every leg would label `amd64` (the ubuntu-latest host), so the aarch64/armv7
+          # .debs would declare amd64 and `dpkg -i` would refuse them on an arm node. We pass the
+          # per-triple binary and `--target`, matching docs/DISTRIBUTION.md. --no-build skips the
+          # compile (ships the exact reproducible release bytes, not a fresh glibc rebuild);
+          # --no-strip preserves the embedded SBOM and the reproducible bytes.
+          mkdir -p "target/${TARGET}/release"
+          install -m 0755 "dist/ironbus-${TARGET}" "target/${TARGET}/release/ironbus"
+          cargo deb -p ironbus-cli --target "${TARGET}" --no-build --no-strip \
+            --output "dist/ironbus-${TARGET}.deb"
           ls -l dist/*.deb
           # A self-check: dpkg-deb can parse the package and it lists the binary, the unit, and the
           # conffile, so a broken metadata change is caught at the tag, not on a device.
-          dpkg-deb -I "dist/ironbus-${{ matrix.target }}.deb"
-          dpkg-deb -c "dist/ironbus-${{ matrix.target }}.deb" | grep -E 'usr/bin/ironbus|ironbus.service|etc/ironbus/ironbus.env'
+          dpkg-deb -I "dist/ironbus-${TARGET}.deb"
+          dpkg-deb -c "dist/ironbus-${TARGET}.deb" | grep -E 'usr/bin/ironbus|ironbus.service|etc/ironbus/ironbus.env'
+          # ASSERT the Debian Architecture matches this leg's triple. A mislabeled .deb (the amd64-for-
+          # everything bug) now FAILS the job instead of shipping a package an arm `dpkg -i` rejects.
+          actual_arch="$(dpkg-deb -f "dist/ironbus-${TARGET}.deb" Architecture)"
+          if [ "${actual_arch}" != "${DEB_ARCH}" ]; then
+            echo "::error::ironbus-${TARGET}.deb declares Architecture '${actual_arch}', expected '${DEB_ARCH}'"
+            exit 1
+          fi
+          echo "ironbus-${TARGET}.deb Architecture = ${actual_arch} (matches ${DEB_ARCH})"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ironbus-deb-${{ matrix.target }}
@@ -172,6 +192,11 @@ jobs:
           # Build FROM the verified release artifact (Dockerfile.release copies it in, no recompile),
           # so the image carries the exact reproducible bytes the `build` job produced. This always
           # runs, proving the Dockerfile is valid and the binary runs as the non-root user.
+          # The downloaded artifact lost its Unix +x bit (upload/download-artifact do not preserve
+          # it), so restore it before the build. Dockerfile.release also does `COPY --chmod=0755`, so
+          # the image entrypoint is executable even if a future build path drops this; together the
+          # `docker run ... --version` smoke below can never fail permission-denied on the binary.
+          chmod 0755 "dist/ironbus-x86_64-unknown-linux-musl"
           docker build -f Dockerfile.release \
             --build-arg IRONBUS_BIN=dist/ironbus-x86_64-unknown-linux-musl \
             -t "ironbus:${{ github.event.inputs.tag || github.ref_name }}" .

@@ -217,7 +217,7 @@ USAGE:
     ironbus dump  --data-dir <dir> [--limit <n>] [--json] [--dlq]
     ironbus upgrade --new-binary <path> --dest <path> [--max-failed-starts <n>]
     ironbus rollback --dest <path>
-    ironbus record-start --dest <path> (--failed | --ok)
+    ironbus record-start --dest <path> (--failed | --ok | --check)
     ironbus migrate --data-dir <dir> [--allow <to-version>]
     ironbus help
     ironbus version
@@ -304,9 +304,14 @@ Notes:
     one. The fail-closed download/verify is scripts/install.sh; upgrade is the post-verify swap.
     --max-failed-starts (default 3) is the N the systemd unit consults for fall-back.
     rollback restores <dest>.prev over --dest (the same atomic swap) and clears the start counter.
-    record-start --failed/--ok updates the consecutive-failed-start counter the systemd unit uses to
-    fall back after N failures: --failed bumps it (and reports whether N is reached and a .prev
-    exists), --ok clears it on a healthy start. See docs/DISTRIBUTION.md for the unit wiring.
+    record-start --failed/--ok/--check drives the consecutive-failed-start counter the systemd unit
+    uses to fall back after N failures. --failed bumps it by one (the SINGLE increment source: the
+    unit runs it as ExecStopPost on a non-clean exit); --ok clears it (the unit runs it once the
+    broker is confirmed up, so a genuine failed start never clears it); --check only CONSULTS the
+    counter without changing it (the unit runs it as ExecStartPre and rolls back if it reports the
+    threshold is reached and a .prev exists), so a consult never itself bumps the counter and a
+    healthy node that loses power uncleanly cannot accumulate toward a spurious rollback. See
+    docs/DISTRIBUTION.md for the exact unit wiring.
     migrate gates an on-disk format bump so it is NEVER silent: within a major version the data dir
     opens with no migration (migrate reports 'no migration needed' and exits 0); a future format
     bump requires an explicit --allow <to-version> and is refused without it, exit 1. ironbus
@@ -1771,17 +1776,31 @@ fn run_rollback(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     cmd_rollback(Path::new(&dest), out)
 }
 
-/// Parses and runs `record-start`: update the consecutive-failed-start counter the systemd unit
-/// uses to fall back after N failures (#104). `--failed` bumps it (and reports whether the fall-back
-/// threshold is reached and a `.prev` exists); `--ok` clears it on a healthy start. Unix-only.
+/// The action `record-start` performs on the consecutive-failed-start counter (#104). Exactly one is
+/// chosen per invocation; the systemd unit drives all three at the three lifecycle points.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RecordStartMode {
+    /// Bump the counter by one (`ExecStopPost` on a non-clean exit: the SINGLE increment source).
+    Failed,
+    /// Clear the counter (`ExecStartPost` once the broker is confirmed up: a healthy start).
+    Ok,
+    /// Consult the counter WITHOUT changing it (`ExecStartPre`: report whether to roll back). A
+    /// consult never bumps, so a healthy node losing power uncleanly cannot accumulate a rollback.
+    Check,
+}
+
+/// Parses and runs `record-start`: drive the consecutive-failed-start counter the systemd unit uses
+/// to fall back after N failures (#104). `--failed` bumps it, `--ok` clears it, `--check` only
+/// consults it (no mutation). Exactly one mode is required. Unix-only.
 ///
 /// # Errors
-/// [`CliError::Usage`] for a missing `--dest` or a missing/duplicate `--failed`/`--ok`;
-/// [`CliError::Internal`] on an IO fault updating the counter.
+/// [`CliError::Usage`] for a missing `--dest` or anything other than exactly one of
+/// `--failed`/`--ok`/`--check`; [`CliError::Internal`] on an IO fault updating the counter.
 fn run_record_start(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut dest: Option<String> = None;
     let mut failed = false;
     let mut ok = false;
+    let mut check = false;
     let mut max_failed_starts: Option<u32> = None;
     let mut i = 0;
     while i < args.len() {
@@ -1793,6 +1812,10 @@ fn run_record_start(args: &[String], out: &mut impl Write) -> Result<(), CliErro
             }
             "--ok" => {
                 ok = true;
+                i += 1;
+            }
+            "--check" => {
+                check = true;
                 i += 1;
             }
             "--max-failed-starts" => {
@@ -1812,12 +1835,17 @@ fn run_record_start(args: &[String], out: &mut impl Write) -> Result<(), CliErro
     }
     let dest =
         dest.ok_or_else(|| CliError::Usage("record-start requires `--dest <path>`".to_string()))?;
-    if failed == ok {
-        return Err(CliError::Usage(
-            "record-start requires exactly one of `--failed` or `--ok`".to_string(),
-        ));
-    }
-    cmd_record_start(Path::new(&dest), failed, max_failed_starts, out)
+    let mode = match (failed, ok, check) {
+        (true, false, false) => RecordStartMode::Failed,
+        (false, true, false) => RecordStartMode::Ok,
+        (false, false, true) => RecordStartMode::Check,
+        _ => {
+            return Err(CliError::Usage(
+                "record-start requires exactly one of `--failed`, `--ok`, or `--check`".to_string(),
+            ));
+        }
+    };
+    cmd_record_start(Path::new(&dest), mode, max_failed_starts, out)
 }
 
 /// Parses and runs `migrate`: gate an on-disk format bump so it is NEVER silent (#104, #132). Within
@@ -2146,35 +2174,63 @@ fn cmd_rollback(dest: &Path, out: &mut impl Write) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Updates the consecutive-failed-start counter the systemd unit uses to fall back after N failures
-/// (#104). `failed` bumps the counter and reports whether the fall-back threshold is reached AND a
-/// `<dest>.prev` exists (the unit then runs `ironbus rollback`); otherwise it clears it (a healthy
-/// start). The decision (`should_fall_back`) is pure and unit-tested in the `upgrade` module.
+/// Drives the consecutive-failed-start counter the systemd unit uses to fall back after N failures
+/// (#104). The three modes are the three lifecycle points the unit wires, and they keep the count
+/// honest so a HEALTHY node never rolls back on power loss:
+///
+/// - [`RecordStartMode::Failed`] (`ExecStopPost` on a non-clean exit) is the SINGLE place the counter
+///   is bumped, so one crash cycle increments by exactly one.
+/// - [`RecordStartMode::Ok`] (`ExecStartPost`, run only once the broker is confirmed up) clears it,
+///   so a genuine successful start resets the budget.
+/// - [`RecordStartMode::Check`] (`ExecStartPre`) only CONSULTS the count and reports whether to roll
+///   back; it never mutates the counter, so consulting on every boot (including after an unclean
+///   power loss of a healthy binary) cannot itself accumulate toward a spurious rollback.
+///
+/// `Check`/`Failed` report whether [`upgrade::should_fall_back`] holds (the count has reached N AND a
+/// `<dest>.prev` exists); the unit greps the "fall-back threshold reached" line and runs `rollback`.
+/// The decision (`should_fall_back`) is pure and unit-tested in the `upgrade` module.
 #[cfg(unix)]
 fn cmd_record_start(
     dest: &Path,
-    failed: bool,
+    mode: RecordStartMode,
     max_failed_starts: Option<u32>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     let n = max_failed_starts.unwrap_or(upgrade::DEFAULT_MAX_FAILED_STARTS);
-    if failed {
-        let count = upgrade::record_failed_start(dest)
-            .map_err(|e| CliError::Internal(format!("recording a failed start: {e}")))?;
-        if upgrade::should_fall_back(dest, count, n) {
-            writeln!(
-                out,
-                "failed start {count}/{n}: fall-back threshold reached and a rollback copy exists; \
-                 run `ironbus rollback --dest {}`",
-                dest.display()
-            )?;
-        } else {
-            writeln!(out, "failed start {count}/{n}: no fall-back yet")?;
+    match mode {
+        RecordStartMode::Failed => {
+            let count = upgrade::record_failed_start(dest)
+                .map_err(|e| CliError::Internal(format!("recording a failed start: {e}")))?;
+            report_fall_back(dest, count, n, out)?;
         }
+        RecordStartMode::Check => {
+            // Consult only: read the current count, never write it.
+            let count = upgrade::read_failed_starts(dest);
+            report_fall_back(dest, count, n, out)?;
+        }
+        RecordStartMode::Ok => {
+            upgrade::record_successful_start(dest)
+                .map_err(|e| CliError::Internal(format!("clearing the start counter: {e}")))?;
+            writeln!(out, "healthy start: start counter cleared")?;
+        }
+    }
+    Ok(())
+}
+
+/// Reports whether the node should fall back at the given `count` (the shared `--failed`/`--check`
+/// output): the "fall-back threshold reached" line the systemd unit greps when `should_fall_back`
+/// holds, otherwise a no-op line. Writes only; never touches the counter.
+#[cfg(unix)]
+fn report_fall_back(dest: &Path, count: u32, n: u32, out: &mut impl Write) -> Result<(), CliError> {
+    if upgrade::should_fall_back(dest, count, n) {
+        writeln!(
+            out,
+            "failed start {count}/{n}: fall-back threshold reached and a rollback copy exists; \
+             run `ironbus rollback --dest {}`",
+            dest.display()
+        )?;
     } else {
-        upgrade::record_successful_start(dest)
-            .map_err(|e| CliError::Internal(format!("clearing the start counter: {e}")))?;
-        writeln!(out, "healthy start: start counter cleared")?;
+        writeln!(out, "failed start {count}/{n}: no fall-back yet")?;
     }
     Ok(())
 }
@@ -2333,11 +2389,11 @@ fn cmd_rollback(dest: &Path, out: &mut impl Write) -> Result<(), CliError> {
 #[cfg(not(unix))]
 fn cmd_record_start(
     dest: &Path,
-    failed: bool,
+    mode: RecordStartMode,
     max_failed_starts: Option<u32>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
-    let _ = (dest, failed, max_failed_starts, out);
+    let _ = (dest, mode, max_failed_starts, out);
     Err(CliError::Internal(
         "ironbus record-start requires a Unix host in v1 (the systemd fall-back helper)"
             .to_string(),
