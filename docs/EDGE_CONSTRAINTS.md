@@ -42,11 +42,13 @@ Read this before the tables, because it frames how to read them.
   that), and the shipped DEFAULT knob values are server-sized, not edge-safe.
   The runtime ENFORCEMENT and the selection flag are the implementation
   residuals named per row.
-- **The safe path is already the default where it is wired.** Durability
-  (ack-after-`fdatasync`, fatal-fsync, torn-tail truncation) is the only level
-  the binary exposes and cannot be weakened from the command line today
-  ([DURABILITY.md](DURABILITY.md)). The edge gap is in PROFILE DEFAULTS and
-  PROFILE SELECTION, not in the durability mechanism.
+- **The safe path is the DEFAULT.** Durability (ack-after-`fdatasync`,
+  fatal-fsync, torn-tail truncation) is the DEFAULT level `sync` and cannot be
+  weakened without an explicit `--durability-level` opt-in; the unbounded-loss
+  levels (`async`/`none`) additionally refuse to boot without `--async-loss-ack`
+  (#341, #379, [DURABILITY.md](DURABILITY.md)). An edge box that changes nothing
+  keeps zero acked loss on a power cut. The relaxed levels exist for a throughput
+  trade an operator explicitly accepts; the edge default never reaches them.
 - **Numbers here are concrete and testable.** The `tiny` values are real,
   currently-accepted flag values; the RAM arithmetic reuses
   [RAM_BUDGET.md](RAM_BUDGET.md)'s worked budget; the clock model maps onto the
@@ -83,7 +85,7 @@ implies a field exists when it does not.
 | **CPU** (slow ARM core shared with the radio) | Per-record fsync and an expensive codec starve the core and the radio | Codec choice: lz4_flex (cheap, pure Rust) is the default codec; zstd (and its higher levels) is opt-in only, never on the default path | lz4_flex (on-disk compression NOT yet landed; codec reads `none` today) | [ADR-0003](adr/0003-default-compression-lz4-zstd-opt-in.md), [#12](https://github.com/ELares/IronBus/issues/12) |
 | | | CRC32C checksum (hardware-accelerated on aarch64), always on, every record | always on | [DURABILITY.md](DURABILITY.md), [#5](https://github.com/ELares/IronBus/issues/5) |
 | | | Group-commit batching: one `fdatasync` per drained batch, not per record (single-writer append actor, no thread-count knob) | always on (#177) | [DURABILITY.md](DURABILITY.md), [#6](https://github.com/ELares/IronBus/issues/6) |
-| **Power loss / brownout** (no UPS, mid-write cut) | Page-cache writeback loses acknowledged data; a torn tail or a falsely-retried fsync looks durable but is not | `fdatasync`-before-ack: a `PubAck` is emitted only after the covering `fdatasync` returns (invariant I2). The only level exposed; cannot be weakened from the command line | always on, `sync` level | [DURABILITY.md](DURABILITY.md), [#6](https://github.com/ELares/IronBus/issues/6) / [#116](https://github.com/ELares/IronBus/issues/116) |
+| **Power loss / brownout** (no UPS, mid-write cut) | Page-cache writeback loses acknowledged data; a torn tail or a falsely-retried fsync looks durable but is not | `fdatasync`-before-ack: under the DEFAULT `sync` level a `PubAck` is emitted only after the covering `fdatasync` returns (invariant I2), so a power cut loses zero acked data. The relaxed levels (`--durability-level interval/async/none`) are strictly opt-in and weaken I2 by a documented loss window; `async`/`none` refuse to boot without `--async-loss-ack` (#341, #379) | default `sync`; relaxed levels opt-in only | [DURABILITY.md](DURABILITY.md), [#6](https://github.com/ELares/IronBus/issues/6) / [#341](https://github.com/ELares/IronBus/issues/341) / [#379](https://github.com/ELares/IronBus/issues/379) |
 | | | Torn-tail truncation + CRC32C stop-at-first-bad-frame: recovery yields the longest valid prefix; an unsynced, never-acked tail is dropped | always on | [DURABILITY.md](DURABILITY.md), [#7](https://github.com/ELares/IronBus/issues/7) / [#8](https://github.com/ELares/IronBus/issues/8) |
 | | | Fatal-fsync: a failed `fdatasync` freezes the writer read-only (`WriterFrozen`) and is NEVER retried as a transient success (fsyncgate) | always on | [DURABILITY.md](DURABILITY.md), [#6](https://github.com/ELares/IronBus/issues/6) |
 | | | `disk_full_policy` (`--disk-full-policy`): drop-new on a brown-out-prone device avoids the extra force-reap writes of drop-oldest | `drop-new` (default) | [EDGE_TUNING.md](EDGE_TUNING.md), [#82](https://github.com/ELares/IronBus/issues/82) |
@@ -138,7 +140,7 @@ codec defaults the rest of #20 fixes.
 | RAM ceiling | `--ram-ceiling-bytes` | `67108864` (64 MiB) | the refuse-to-boot RAM guard (#115): the broker refuses to start if the worst-case bounded-buffer footprint provably exceeds this; arms `ironbus_ram_headroom_bytes` to a real value |
 | Disk-full policy | `--disk-full-policy` | `drop-new` | brownout-friendly shed; avoids drop-oldest force-reap writes |
 | Checkpoint interval | `--checkpoint-interval` | `1024` | cursor checkpoint cadence far below one write per ack; bounds post-crash redelivery |
-| Durability level | (always on, not a flag) | `sync` (ack-after-`fdatasync`) | power-loss-safe default; cannot be weakened from the CLI |
+| Durability level | `--durability-level` | `sync` (ack-after-`fdatasync`) | power-loss-safe default; the relaxed `interval`/`async`/`none` levels are opt-in only, and `async`/`none` need `--async-loss-ack` (#341, #379) |
 | Codec | (design default, no flag) | lz4_flex (zstd opt-in) | cheap on ARM, pure Rust; on-disk compression not yet landed |
 | Retention | `--max-retained-bytes` / `--max-age-ms` / `--max-messages` | enable at least one, device-sized | bounds on-disk footprint and the erase/rewrite volume the flash sees |
 
@@ -360,10 +362,12 @@ document does not restate or re-derive them.
   and realized by the knobs in
   [section 2](#2-the-tiny-profile-fully-specified).
 - **Power-loss-safe default, no silent relaxed mode (criterion 5).**
-  Ack-implies-durable (I2): a `PubAck` is emitted only after the covering
-  `fdatasync` returns; the relaxed `interval` / `async` levels are SPECIFIED but
-  NOT wired and cannot be reached from the command line, so nothing silently
-  weakens the safe default. Owned by [DURABILITY.md](DURABILITY.md)
+  Ack-implies-durable (I2) under the DEFAULT `sync`: a `PubAck` is emitted only
+  after the covering `fdatasync` returns. The relaxed `interval` / `async` /
+  `none` levels are IMPLEMENTED but strictly opt-in (#341, #379): reaching one
+  requires an explicit `--durability-level`, the unbounded-loss levels refuse to
+  boot without `--async-loss-ack`, and the broker loudly logs a waived I2, so
+  nothing SILENTLY weakens the safe default. Owned by [DURABILITY.md](DURABILITY.md)
   ([#50](https://github.com/ELares/IronBus/issues/50) /
   [#6](https://github.com/ELares/IronBus/issues/6)) and the edge durability
   defaults in [#116](https://github.com/ELares/IronBus/issues/116).

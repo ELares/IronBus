@@ -660,6 +660,10 @@ fn build_config(setup: &Setup) -> EngineConfig {
             window_nanos: setup.dedup_window_nanos,
             max_producers: 4096,
         },
+        // The conformance vectors exercise the default durable level (#341): ack-implies-durable.
+        durability_level: ironbus_server::engine::DurabilityLevel::Sync,
+        flush_interval_ms: 0,
+        flush_max_bytes: 0,
     }
 }
 

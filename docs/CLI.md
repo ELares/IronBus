@@ -96,6 +96,10 @@ broker opens.
 | `--max-groups <n>` | usize | `1024` (`DEFAULT_MAX_GROUPS`, aliased to `ironbus_server::engine::DEFAULT_MAX_GROUPS`); `0` = unlimited | count | Cap on live work-groups. A new NAMED group past the cap is rejected; the default group is exempt and never counted. |
 | `--ram-ceiling-bytes <n>` | u64 | `0` = unset (`DEFAULT_RAM_CEILING_BYTES`; the `edge-tiny` profile sets `67108864` = 64 MiB) | bytes | The refuse-to-boot RAM ceiling (#115, #19). `0` leaves the guard OFF and `ironbus_ram_headroom_bytes` reports the `-1` sentinel. When set, the broker REFUSES to start (usage error, exit 1, naming the overage) if the WORST-CASE bounded-buffer footprint the configured caps imply provably exceeds it, and the `ironbus_ram_headroom_bytes` gauge reports a real `ceiling - RSS` headroom. The worst case is provable from the CONFIG (`max_connections * consumer_credit_bytes` in-flight payloads, plus the per-group cursor/lease state and a fixed overhead), NOT a boot-time RSS reading (RSS at boot is near-zero and meaningless). See `docs/RAM_BUDGET.md` for the formula. |
 | `--disk-full-policy <drop-new\|drop-oldest>` | enum | `drop-new` (`DEFAULT_DISK_FULL_POLICY`) | n/a | What an over-cap produce does once `--max-total-bytes` is hit. `drop-new` sheds it (preserving older data); `drop-oldest` force-reaps the oldest sealed segment to make room then accepts it. Any other value is a usage error. |
+| `--durability-level <sync\|interval\|async\|none>` | enum | `sync` (`DEFAULT_DURABILITY_LEVEL`) | n/a | The DURABILITY LEVEL (#341, #379): how an ack relates to the covering `fdatasync`. `sync` (the default) acks ONLY after the covering `fdatasync` returns, so I2 holds and a power cut loses ZERO acknowledged records. The relaxed levels are STRICTLY OPT-IN and weaken I2: `interval` acks on the page-cache write and forces a sync on the flush window (bounded loss = the smaller of `--flush-interval-ms` and `--flush-max-bytes`); `async` acks on the page-cache write and syncs only opportunistically (a segment roll or clean shutdown), unbounded loss until then; `none` adds no periodic fsync at all (the largest loss window). `async` and `none` REFUSE to boot without `--async-loss-ack`. Any relaxed level logs a loud startup WARN that I2 is waived and the worst-case loss. Any other value is a usage error. |
+| `--flush-interval-ms <n>` | u64 | `1000` (`DEFAULT_FLUSH_INTERVAL_MS`) | milliseconds | The `interval` level's TIME window: the most MONOTONIC-clock time an acked-but-unsynced record may sit before a forced `fdatasync`. `0` disables the time trigger (the byte budget alone forces the sync). Only consulted under `--durability-level interval`. |
+| `--flush-max-bytes <n>` | u64 | `1048576` (1 MiB, `DEFAULT_FLUSH_MAX_BYTES`) | bytes | The `interval` level's BYTE budget: the most UNSYNCED record bytes that may accumulate before a forced `fdatasync`. `0` disables the byte trigger (the time window alone forces the sync). The EFFECTIVE worst-case loss bound is the smaller of the time and byte triggers. Only consulted under `--durability-level interval`. |
+| `--async-loss-ack` | flag (no value) | off (false) | n/a | The explicit DATA-LOSS ACKNOWLEDGEMENT (#49, #379) that the unbounded-loss levels (`async`, `none`) require to boot: an `i-accept-acknowledged-data-loss`-style confirmation. Without it, `--durability-level async`/`none` is a fail-closed usage error (exit 1). `sync` and `interval` ignore it (`sync` is safe; `interval`'s loss is bounded by the operator-chosen window). |
 | `--key-shared-group <name>` | string, REPEATABLE | none (empty) | n/a | Run the named competing group in `key_shared` ordering: a record's key routes to one live member, so same-key records keep order while the group drains in parallel across keys. Pass once per group; a group not named stays plain competing. |
 | `--broadcast-group <name>` | string, REPEATABLE | none (empty) | n/a | Mark a NAMED group BROADCAST (#288): a group-of-one that sees every record in order, so it accepts the `cumulative-ack` verb. The group MUST be named: the DEFAULT/empty group (`--broadcast-group ""`) cannot be a broadcast group (its consumers never SUB a name, so the group-of-one subscriber cap could not bind it) and is rejected as a startup usage error. Mutually exclusive with `key_shared`. A broadcast group is enforced as a true group-of-one: it accepts AT MOST ONE active subscriber (a second concurrent SUB is rejected). Pass once per group; a group not named stays plain competing and rejects cumulative ack. An empty/bad name or the group cap is a startup usage error. |
 | `--visibility-timeout-ms <n>` | u64 | `30000` (`DEFAULT_VISIBILITY_MS`) | milliseconds | How long a delivered message stays in flight before it may redeliver. Must be at least 1. The lease hard cap is the larger of 5 minutes (`DEFAULT_HARD_CAP_MS = 300000`) and this. |
@@ -115,6 +119,12 @@ broker opens.
 - `--max-segment-bytes` must be at least 4096.
 - `--visibility-timeout-ms` must be at least 1.
 - `--disk-full-policy` must be `drop-new` or `drop-oldest`.
+- `--durability-level` must be `sync`, `interval`, `async`, or `none`. `async` and `none` REFUSE to
+  boot without `--async-loss-ack` (the unbounded-loss safety gate, #49/#379): a fail-closed usage
+  error naming the level, the waived I2 invariant, the worst-case loss, and the flag to set.
+  `--durability-level interval` with BOTH `--flush-interval-ms` and `--flush-max-bytes` at `0` is a
+  usage error (it would silently degrade to the unbounded `async` behavior without the
+  acknowledgement); set at least one positive trigger.
 - `--ram-ceiling-bytes`, when set (non-zero), must be at or above the WORST-CASE bounded-buffer
   footprint the configured caps imply, or the broker REFUSES to boot with a usage error that names
   the worst case, the ceiling, the overage, and the knobs to lower (`--max-connections`,
@@ -165,6 +175,10 @@ flag for that same knob overrides it). With no `--profile`, the default profile 
 | `--group-idle-evict-ms` | `IRONBUS_GROUP_IDLE_EVICT_MS` |
 | `--ram-ceiling-bytes` | `IRONBUS_RAM_CEILING_BYTES` |
 | `--disk-full-policy` | `IRONBUS_DISK_FULL_POLICY` |
+| `--durability-level` | `IRONBUS_DURABILITY_LEVEL` |
+| `--flush-interval-ms` | `IRONBUS_FLUSH_INTERVAL_MS` |
+| `--flush-max-bytes` | `IRONBUS_FLUSH_MAX_BYTES` |
+| `--async-loss-ack` | `IRONBUS_ASYNC_LOSS_ACK` |
 | `--visibility-timeout-ms` | `IRONBUS_VISIBILITY_TIMEOUT_MS` |
 | `--health-addr` | `IRONBUS_HEALTH_ADDR` |
 | `--health-allow-public` | `IRONBUS_HEALTH_ALLOW_PUBLIC` (`true`/`1` or `false`/`0`) |
