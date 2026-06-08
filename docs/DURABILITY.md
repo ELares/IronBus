@@ -149,8 +149,9 @@ rather than vanishing a segment or recovering a silent partial.
 
 `a_batch_of_concurrent_produces_issues_one_fdatasync_not_n` already proves the
 syncs-per-record ratio drops below 1 under a concurrent burst: N produces, one
-sync. The engine-level observation that the per-message fsync histogram is
-recorded once per batch (not once per message) is in
+sync. The engine-level observation that the fsync-duration histogram records one
+observation per `commit_batch` (so the N-produces-one-sync amortization above
+contributes a single fsync sample, not one sample per message) is in
 `produce_records_one_fsync_observation_each` and the `commit_batch` accounting in
 `crates/ironbus-server/src/engine.rs`.
 
