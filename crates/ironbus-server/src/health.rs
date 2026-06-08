@@ -588,7 +588,13 @@ fn broker_core_lines(
          ironbus_truncations_total {truncations}\n\
          # HELP ironbus_truncated_records_total Records skipped by below-earliest truncations (the record-count span of ironbus_truncations_total).\n\
          # TYPE ironbus_truncated_records_total counter\n\
-         ironbus_truncated_records_total {truncated_records}\n",
+         ironbus_truncated_records_total {truncated_records}\n\
+         # HELP ironbus_dedup_hits_total Benign producer dedup hits: a msg_id already seen within the producer's window, so the original offset was returned (duplicate=true) and no second copy appended.\n\
+         # TYPE ironbus_dedup_hits_total counter\n\
+         ironbus_dedup_hits_total {dedup_hits}\n\
+         # HELP ironbus_dedup_out_of_window_total Dedup ids evicted by the time bound (their dedup protection lapsed, so a later republish would not be deduped).\n\
+         # TYPE ironbus_dedup_out_of_window_total counter\n\
+         ironbus_dedup_out_of_window_total {dedup_out_of_window}\n",
         healthy_value = u8::from(healthy),
         produced = counters.produced,
         produced_bytes = counters.produced_bytes,
@@ -601,6 +607,8 @@ fn broker_core_lines(
         segments_force_reaped = counters.segments_force_reaped,
         truncations = counters.truncations,
         truncated_records = counters.truncated_records,
+        dedup_hits = counters.dedup_hits,
+        dedup_out_of_window = counters.dedup_out_of_window,
     )
 }
 
@@ -1412,6 +1420,7 @@ mod tests {
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap();
@@ -1505,6 +1514,7 @@ mod tests {
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap();
@@ -1726,6 +1736,15 @@ mod tests {
         assert!(m.contains("\nironbus_produce_rejected_total 0\n"), "{m}");
         assert!(m.contains("\nironbus_delivered_total 0\n"), "{m}");
         assert!(m.contains("\nironbus_dead_lettered_total 0\n"), "{m}");
+        // The opt-in dedup counters (#33) are present and zero on a broker no producer dedups
+        // against (the two produces above sent no msg_id, so neither counter moved).
+        assert!(m.contains("# TYPE ironbus_dedup_hits_total counter"), "{m}");
+        assert!(m.contains("\nironbus_dedup_hits_total 0\n"), "{m}");
+        assert!(
+            m.contains("# TYPE ironbus_dedup_out_of_window_total counter"),
+            "{m}"
+        );
+        assert!(m.contains("\nironbus_dedup_out_of_window_total 0\n"), "{m}");
         // The DLQ depth counter is present and zero on a broker that has never dead-lettered.
         assert!(
             m.contains("# TYPE ironbus_dlq_records_total counter"),
@@ -1998,6 +2017,7 @@ mod tests {
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap();
@@ -2121,6 +2141,7 @@ mod tests {
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap();
@@ -2311,6 +2332,7 @@ mod tests {
                     group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                     ram_ceiling_bytes: 0,
                     disk_full_policy: DiskFullPolicy::DropNew,
+                    dedup: ironbus_core::dedup::DedupConfig::default(),
                 },
             )
             .unwrap();
@@ -2345,6 +2367,7 @@ mod tests {
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap();
@@ -2482,6 +2505,7 @@ mod tests {
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap();
@@ -2599,6 +2623,7 @@ mod tests {
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap();
@@ -2791,6 +2816,7 @@ mod tests {
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropOldest,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap();
@@ -3078,6 +3104,16 @@ mod tests {
         // write-amp counters are byte-accounting, not loss/shed/skip events, and the gauges carry no
         // `_total` suffix, so the taxonomy test excludes them by construction.
         "ironbus_daily_write_budget_sheds_total",
+        // The opt-in effectively-once dedup counters (#3, #33): a benign dedup HIT (a msg_id already
+        // in the producer's window, so the original offset was returned and no second copy stored) and
+        // an OUT-OF-WINDOW eviction (an id aged out by the time bound, so a later republish would not
+        // be deduped). Both are resilience/observability events the taxonomy guarantees are never
+        // silent (a dedup hit AVOIDED a double-store; an out-of-window event WARNS the window is too
+        // small for the retry interval), so they are `_total` counters in the frozen set. The dedup
+        // ITSELF carries no new gauge; the original/duplicate offset rides the existing PubAck/
+        // PubAckDuplicate frames, not a metric.
+        "ironbus_dedup_hits_total",
+        "ironbus_dedup_out_of_window_total",
     ];
 
     #[test]
@@ -3164,6 +3200,9 @@ mod tests {
         ("ironbus_truncated_records_total", "counter"),
         ("ironbus_counter_checkpoint_repair_total", "counter"),
         ("ironbus_consumer_labels_dropped_total", "counter"),
+        // Opt-in effectively-once dedup counters (#3, #33): the benign-hit and out-of-window counts.
+        ("ironbus_dedup_hits_total", "counter"),
+        ("ironbus_dedup_out_of_window_total", "counter"),
         // Edge write-amplification (#118): two byte counters (TYPE counter, but NOT `_total`-named,
         // matching the issue's contract, so the resilience-taxonomy `_total` filter excludes them)
         // plus the daily-write-budget shed counter (a resilience shed, so it IS `_total` and in the
@@ -3402,6 +3441,7 @@ mod tests {
                 group_idle_evict_ms: 0,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropOldest,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap();
@@ -3586,6 +3626,7 @@ mod tests {
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap();
@@ -3781,6 +3822,7 @@ mod tests {
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap();

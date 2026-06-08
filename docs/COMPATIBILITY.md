@@ -73,9 +73,10 @@ The tags are FROZEN by this discipline, each clause backed by a test in `frame.r
   round-trips through `as_u8`/`from_u8` with no duplicates, and that tags 0 and 255 are
   unknown.
 - **A new frame takes a new tag.** The set is `#[non_exhaustive]` and append-only by
-  convention; the next frame type takes tag 19, leaving every existing tag's meaning intact.
-  This is how `PubAck`/`AckStatus`/`FlowEnd` (14 to 16) and `DeadLetter`/`Truncated` (17, 18)
-  were added without disturbing earlier verbs.
+  convention; the next frame type takes tag 21, leaving every existing tag's meaning intact.
+  This is how `PubAck`/`AckStatus`/`FlowEnd` (14 to 16), `DeadLetter`/`Truncated` (17, 18),
+  `CumulativeAck` (19), and `PubAckDuplicate` (20, the #33 dedup-hit response that keeps the
+  frozen `PubAck` body intact) were added without disturbing earlier verbs.
 
 ### Unknown tags are forward-compatible at the envelope level
 

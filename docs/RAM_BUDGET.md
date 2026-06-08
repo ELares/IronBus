@@ -48,7 +48,7 @@ Throughout, MiB = 1024 * 1024 bytes and KiB = 1024 bytes.
 
 ## The RAM sources and their bounding knobs
 
-There are five process-RSS sources plus a fixed overhead. Each is bounded by a
+There are six process-RSS sources plus a fixed overhead. Each is bounded by a
 specific knob, cited to the code.
 
 ### 1. Per-connection in-flight messages (the dominant term)
@@ -211,6 +211,41 @@ A floor independent of load:
 Call the fixed overhead ~4 MiB as a conservative working figure for the edge
 profile (binary resident pages + runtime + a small allocator slack). This is an
 estimate, not a measured or code-asserted bound.
+
+### 6. Per-producer dedup window (opt-in, #33)
+
+The opt-in effectively-once dedup registry
+(`crates/ironbus-core/src/dedup.rs`) costs NOTHING until a producer opts in by
+sending a `msg_id`; a no-dedup workload allocates zero here. When a producer
+does opt in, it gets one bounded window: a `(msg_id -> offset)` ring indexed
+twice (a FIFO order `VecDeque` and an O(1) lookup `HashMap`), bounded by BOTH a
+count (`--dedup-max-ids`, default **100,000**, `DedupConfig::max_ids`, floored
+to 1) AND a monotonic time bound (`--dedup-window-ms`, default **2 min**,
+`DedupConfig::window_nanos`), evicting on whichever is hit first. So the
+per-producer worst case is:
+
+```
+per_producer_dedup <= dedup_max_ids * (msg_id_len + ~2 * (Vec/HashMap entry overhead))
+```
+
+Each entry stores a `msg_id` (`Vec<u8>`, bounded by `MAX_MSG_ID_LEN` = **256
+bytes**), a `u64` offset, and a `u64` insertion instant, held in both the order
+queue and the lookup map. For a generous estimate at the default cap with
+modest 32-byte ids, that is `100_000 * (32 + ~64) ~= 9-10 MiB` PER opted-in
+producer; with the worst-case 256-byte id it is on the order of `100_000 * ~320
+~= 30 MiB`. This term is therefore SIZED BY the count bound, so an edge profile
+that opts into dedup must either lower `--dedup-max-ids` or rely on the time
+bound to keep the live window small. The number of distinct live producer
+windows is bounded by the connection count and the natural churn of the
+windows (an idle producer's entries age out under the time bound). The structure
+is pure and IO-free (the monotonic `now` comes through the clock seam), and it
+is SESSION-scoped: lost on broker restart by default, so it never grows across
+restarts.
+
+A defensive default for a 64 MiB edge box is to LOWER `--dedup-max-ids` (e.g. to
+a few thousand) when enabling dedup, sizing the count bound to the realistic
+in-flight retry depth rather than the 100k default; the 2-minute time bound then
+caps how long any id lingers regardless.
 
 ## A worked tiny-profile configuration that fits under 64 MiB
 

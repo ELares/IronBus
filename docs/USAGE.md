@@ -83,6 +83,8 @@ resume" below), so it is NOT fsynced on every ack.
 | `--key-shared-group <name>` | none | Repeatable: declares a named competing group that runs in `key_shared` ordering, so a record's key routes to one live member and same-key records keep their order while the group drains in parallel across keys. Pass once per group. |
 | `--broadcast-group <name>` | none | Repeatable: marks a NAMED group BROADCAST (a group-of-one that sees every record in order), so it accepts the `cumulative-ack` verb. The group must be named: the default/empty group cannot be broadcast (`--broadcast-group ""` is a startup usage error). Mutually exclusive with `key_shared`. Pass once per group. |
 | `--visibility-timeout-ms <n>` | `30000` | How long a delivered message stays in flight before it may redeliver. Must be at least 1. The lease hard cap is the larger of 5 minutes and this. |
+| `--dedup-max-ids <n>` | `100000` | The count bound on each per-producer effectively-once dedup window: the most `(msg_id, offset)` entries one producer keeps before the oldest is evicted. Dedup is OFF until a producer opts in by sending a `msg_id`; this only sizes the window when it does. Floored to 1. See "Effectively-once dedup" below. |
+| `--dedup-window-ms <ms>` | `120000` (2 min) | The time bound on each per-producer dedup window, in milliseconds of monotonic time: an entry older than this is evicted regardless of the count bound. `0` disables the time bound (only the count bound applies). |
 | `--health-addr <host:port>` | off | If set, also serve the health and metrics HTTP endpoints on this loopback port. |
 
 For the exhaustive flag map (value types, every default cited to its `main.rs` constant, and
@@ -149,6 +151,29 @@ echo "from stdin" | ironbus pub
 payload comes from the argument, or from stdin if the argument is omitted (an empty
 input publishes an empty message, which is a valid record). The offset is returned only
 after the record is fsynced, so a printed offset means the message is durable.
+
+### Effectively-once dedup (opt-in, #33)
+
+A producer can request effectively-once delivery by attaching a `msg_id` to a publish
+(via the client library's `produce_dedup`; the `pub` CLI sends no `msg_id`, so it never
+dedups, and behavior is unchanged). When a `msg_id` is present the broker keeps a bounded
+per-producer window of `(msg_id -> offset)` and:
+
+- A `msg_id` it has NOT seen within the window is a fresh produce: it is appended and
+  acked with the assigned offset (`duplicate = false`).
+- A `msg_id` it HAS seen within the window is a BENIGN dedup hit: the broker returns the
+  ORIGINAL offset with `duplicate = true` and `rc = 0` (NEVER an error) and appends no
+  second copy, so an idempotent retry over a lossy link does not loop or double-store.
+
+The window is bounded by BOTH a count (`--dedup-max-ids`, default 100k) AND a time bound
+(`--dedup-window-ms`, default 2 min, on the MONOTONIC clock, so an NTP step never
+mis-expires it), whichever is hit first. A republish OUTSIDE the window creates a new
+offset and is delivered again, so consumers must stay idempotent regardless. Dedup keys on
+`msg_id` ONLY, never the body. A producer may also carry a stable `producer_id` and a
+monotonic `epoch`: a HIGHER epoch fences an older zombie session reusing the same
+`producer_id`. Dedup is SESSION-scoped (in-memory) and lost on broker restart by default.
+The `ironbus_dedup_hits_total` and `ironbus_dedup_out_of_window_total` metrics expose the
+hit and out-of-window rates.
 
 ## Consume
 
@@ -348,6 +373,8 @@ ironbus_segments_reaped_total segments reclaimed by consumer-safe retention
 ironbus_segments_force_reaped_total segments force-reaped by the disk-full drop-oldest policy
 ironbus_truncations_total      below-earliest truncations served to a consumer (the skip signal)
 ironbus_truncated_records_total records skipped by those truncations
+ironbus_dedup_hits_total       benign opt-in dedup hits (a msg_id retry returned the original offset, no second copy)
+ironbus_dedup_out_of_window_total dedup ids that aged out of the window (size the window if non-zero)
 ```
 
 Every resilience event the broker sheds, drops, skips, dead-letters, truncates,

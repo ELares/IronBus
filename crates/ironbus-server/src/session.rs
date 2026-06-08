@@ -16,7 +16,7 @@
 //! malformed frame envelope is unrecoverable for a length-prefixed stream, so it ends the
 //! session.
 
-use crate::actor::{ActorGone, EngineAccess, OwnedAppend, ProduceOutcome};
+use crate::actor::{ActorGone, EngineAccess, OwnedAppend, OwnedDedup, ProduceOutcome};
 use crate::engine::{AckResult, EngineError, NackResult, Poll, ProgressResult};
 use ironbus_core::clock::Clock;
 use ironbus_core::keyshared::{KeyOrdering, MemberId};
@@ -26,6 +26,7 @@ use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, 
 use ironbus_proto::message::{
     decode_ack, decode_cumulative_ack, decode_pub, decode_sub, encode_dead_letter, encode_deliver,
     encode_truncated, AckOp, DeadLetterBody, DeliverBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER,
+    PUB_FLAG_HAS_DEDUP,
 };
 use ironbus_storage::fs::Filesystem;
 use std::collections::HashMap;
@@ -353,16 +354,41 @@ impl Session {
         // (I2): the actor never replies Appended before the fdatasync that made the record durable.
         // The codec already normalized the HAS_KEY bit and preserved unknown bits for forward
         // compatibility; the storage layer never acts on unknown bits.
+        //
+        // The opt-in dedup block (#33): if the publish carried a `msg_id`, carry the producer id /
+        // epoch / msg_id to the engine's dedup window. Mask the WIRE-only dedup bit OUT of the stored
+        // record flags so it never becomes a record flag (it is a wire signal, not stored state).
+        let dedup = msg.dedup.map(|d| OwnedDedup {
+            producer_id: d.producer_id.to_vec(),
+            epoch: d.epoch,
+            msg_id: d.msg_id.to_vec(),
+        });
         let append = OwnedAppend {
             timestamp_ms: msg.timestamp_ms,
-            flags: msg.flags,
+            flags: msg.flags & !PUB_FLAG_HAS_DEDUP,
             key: msg.key.to_vec(),
             headers: msg.headers.to_vec(),
             payload: msg.payload.to_vec(),
+            dedup,
         };
         match engine.produce(append)? {
             ProduceOutcome::Appended(offset) => {
                 reply(out, FrameType::PubAck, &offset.get().to_le_bytes());
+                Ok(())
+            }
+            // A BENIGN dedup hit (#33): the `msg_id` was already in the producer's window, so the
+            // broker returns the ORIGINAL offset via the NEW PubAckDuplicate frame (the frozen PubAck
+            // body is untouched). It is a SUCCESS (`rc = 0`, `duplicate = true`), never an error, so an
+            // idempotent retry over a lossy edge link does not loop.
+            ProduceOutcome::AppendedDuplicate(offset) => {
+                reply(out, FrameType::PubAckDuplicate, &offset.get().to_le_bytes());
+                Ok(())
+            }
+            // A stale-epoch fence (#33): a zombie session reused an old `producer_id` with an epoch
+            // below the broker's known high-water. Reject it with a distinct, stable message; the
+            // connection stays open so the producer can re-handshake with a fresh epoch.
+            ProduceOutcome::Fenced => {
+                reply_err(out, "fenced: stale producer epoch");
                 Ok(())
             }
             // A fatal error (frozen writer) would fail every future produce, so end the
@@ -1021,7 +1047,9 @@ mod tests {
     use ironbus_core::delivery::DeliveryConfig;
     use ironbus_core::lease::LeaseConfig;
     use ironbus_core::types::RecordFlags;
-    use ironbus_proto::message::{decode_deliver, encode_ack, encode_pub, AckBody, PubBody};
+    use ironbus_proto::message::{
+        decode_deliver, encode_ack, encode_pub, AckBody, PubBody, PubDedup,
+    };
     use ironbus_storage::fs::InMemoryFs;
     use ironbus_storage::log::{Append, LogConfig};
     use std::sync::Arc;
@@ -1048,6 +1076,7 @@ mod tests {
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap()
@@ -1126,6 +1155,7 @@ mod tests {
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap()
@@ -1162,6 +1192,7 @@ mod tests {
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropOldest,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap()
@@ -2005,6 +2036,7 @@ mod tests {
                 timestamp_ms: 0,
                 key: b"",
                 headers: b"",
+                dedup: None,
                 payload: b"round-trip",
             },
             &mut pub_body,
@@ -2034,6 +2066,159 @@ mod tests {
         s.process(&e, &frame(FrameType::Ack, &ack_body), &mut out)
             .unwrap();
         assert_eq!(e.engine_mut().committed_offset().get(), 1);
+    }
+
+    /// Encodes a PUB body carrying an opt-in dedup block (#33), for the wire dedup tests.
+    fn dedup_pub_body(producer_id: &[u8], epoch: u64, msg_id: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: Some(PubDedup {
+                    producer_id,
+                    epoch,
+                    msg_id,
+                }),
+                payload,
+            },
+            &mut body,
+        )
+        .unwrap();
+        body
+    }
+
+    #[test]
+    fn a_duplicate_msg_id_over_the_wire_replies_pub_ack_duplicate_with_the_original_offset() {
+        // The headline #33 wire property: a fresh dedup produce replies PubAck(0); the same
+        // (producer, msg_id) replies the NEW PubAckDuplicate frame (tag 20) carrying the ORIGINAL
+        // offset, and the durable log gains NO second record.
+        let e = DirectEngine::new(engine());
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        // Fresh produce: PubAck with offset 0.
+        s.process(
+            &e,
+            &frame(FrameType::Pub, &dedup_pub_body(b"p1", 1, b"idem", b"v1")),
+            &mut out,
+        )
+        .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::PubAck);
+        assert_eq!(body, 0u64.to_le_bytes());
+        assert_eq!(
+            e.engine_mut().flushed_offset().get(),
+            1,
+            "one record durable"
+        );
+        out.clear();
+        // The SAME msg_id again (different payload): a PubAckDuplicate (tag 20) with the ORIGINAL
+        // offset 0, and NO second record appended.
+        s.process(
+            &e,
+            &frame(
+                FrameType::Pub,
+                &dedup_pub_body(b"p1", 1, b"idem", b"v2-ignored"),
+            ),
+            &mut out,
+        )
+        .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::PubAckDuplicate,
+            "a dedup hit uses the new tag 20 frame"
+        );
+        assert_eq!(
+            body,
+            0u64.to_le_bytes(),
+            "the duplicate carries the ORIGINAL offset"
+        );
+        assert_eq!(
+            e.engine_mut().flushed_offset().get(),
+            1,
+            "the durable head did NOT advance on the dedup hit"
+        );
+        assert_eq!(e.engine_mut().dedup_hits(), 1);
+    }
+
+    #[test]
+    fn a_no_msg_id_produce_over_the_wire_is_unchanged_and_never_dedups() {
+        // Two identical no-msg-id produces both PubAck with DISTINCT offsets (today's behavior); the
+        // dedup hit counter never moves.
+        let e = DirectEngine::new(engine());
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        for expected in [0u64, 1] {
+            out.clear();
+            let mut body = Vec::new();
+            encode_pub(
+                &PubBody {
+                    flags: 0,
+                    timestamp_ms: 0,
+                    key: b"",
+                    headers: b"",
+                    dedup: None,
+                    payload: b"same",
+                },
+                &mut body,
+            )
+            .unwrap();
+            s.process(&e, &frame(FrameType::Pub, &body), &mut out)
+                .unwrap();
+            let (ty, ack) = one_response(&out);
+            assert_eq!(ty, FrameType::PubAck);
+            assert_eq!(
+                ack,
+                expected.to_le_bytes(),
+                "each no-dedup produce gets a fresh offset"
+            );
+        }
+        assert_eq!(e.engine_mut().flushed_offset().get(), 2, "both appended");
+        assert_eq!(e.engine_mut().dedup_hits(), 0, "no msg_id, no dedup");
+    }
+
+    #[test]
+    fn a_stale_epoch_produce_over_the_wire_is_fenced_with_an_err() {
+        // Epoch fencing over the wire: epoch 5 establishes the producer; a produce at the older epoch
+        // 4 replies Err (fenced) and appends nothing.
+        let e = DirectEngine::new(engine());
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        s.process(
+            &e,
+            &frame(FrameType::Pub, &dedup_pub_body(b"p1", 5, b"m1", b"a")),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::PubAck);
+        out.clear();
+        s.process(
+            &e,
+            &frame(FrameType::Pub, &dedup_pub_body(b"p1", 4, b"m2", b"b")),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Err,
+            "a stale epoch is fenced with an Err"
+        );
+        assert_eq!(
+            e.engine_mut().flushed_offset().get(),
+            1,
+            "the fenced produce appended nothing"
+        );
     }
 
     #[test]
@@ -2070,6 +2255,7 @@ mod tests {
                 timestamp_ms: 5,
                 key: b"k",
                 headers: b"",
+                dedup: None,
                 payload: b"hello",
             },
             &mut pub_body,
@@ -2110,6 +2296,7 @@ mod tests {
                 timestamp_ms: 0,
                 key: b"",
                 headers: b"",
+                dedup: None,
                 payload,
             },
             &mut body,
@@ -2160,6 +2347,7 @@ mod tests {
                     group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                     ram_ceiling_bytes: 0,
                     disk_full_policy: DiskFullPolicy::DropNew,
+                    dedup: ironbus_core::dedup::DedupConfig::default(),
                 },
             )
             .unwrap(),
@@ -2210,6 +2398,7 @@ mod tests {
                 timestamp_ms: 0,
                 key: b"",
                 headers: b"",
+                dedup: None,
                 payload: b"x",
             },
             &mut pub_body,
@@ -2277,6 +2466,7 @@ mod tests {
                 timestamp_ms: 0,
                 key: b"",
                 headers: b"",
+                dedup: None,
                 payload: b"trickled-payload",
             },
             &mut pub_body,
@@ -2521,6 +2711,7 @@ mod tests {
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap()
@@ -2556,6 +2747,7 @@ mod tests {
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap()
@@ -3125,6 +3317,7 @@ mod tests {
                 group_idle_evict_ms: 10, // eviction ON; the explicit-Unsub path ignores the window
                 disk_full_policy: DiskFullPolicy::DropNew,
                 ram_ceiling_bytes: 0,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
             },
         )
         .unwrap()

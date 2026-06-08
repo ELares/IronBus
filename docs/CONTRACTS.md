@@ -286,9 +286,16 @@ test in `frame.rs`. They start at 1 and are contiguous.
 | 17  | `DeadLetter`| server to client | `DeadLetterBody` (9 bytes, below) |
 | 18  | `Truncated` | server to client | `TruncatedBody` (16 bytes, below) |
 | 19  | `CumulativeAck` | client to server | `CumulativeAckBody` (below): the exclusive `up_to` offset then the group name |
+| 20  | `PubAckDuplicate` | server to client | the ORIGINAL durable `offset` as an 8-byte LE u64 (a benign dedup hit, #33): same body shape as `PubAck`, `duplicate = true` by the frame type alone, `rc = 0` |
 
-`from_u8` returns `None` for tag 0 and for tags 20 and above (unknown, still framed by the
+`from_u8` returns `None` for tag 0 and for tags 21 and above (unknown, still framed by the
 envelope).
+
+The dedup-hit response (#33) deliberately uses the NEW append-only tag 20 rather than mutating the
+frozen `PubAck` (tag 14) body: a fresh produce answers `PubAck` (tag 14) and a dedup hit answers
+`PubAckDuplicate` (tag 20), both carrying the 8-byte offset. The frozen `PubAck` body is therefore
+untouched, and an old client that never sends a `msg_id` (see the opt-in dedup block below) never
+receives tag 20.
 
 ### PubBody (wire body of `Pub`)
 
@@ -296,16 +303,30 @@ Source: `message.rs`. Variable parts use explicit u16 length prefixes.
 
 | field         | type   | width | notes |
 |---------------|--------|-------|-------|
-| `flags`       | u8     | 1     | producer record flags (the server derives storage flags like `HAS_KEY`) |
+| `flags`       | u8     | 1     | producer record flags (the server derives storage flags like `HAS_KEY`); bit 7 (`PUB_FLAG_HAS_DEDUP`, `0b1000_0000`) is a WIRE-only signal that the opt-in dedup block follows, masked OFF before the byte becomes a stored record flag |
 | `timestamp_ms`| u64    | 8     | producer time, milliseconds |
 | `key_len`     | u16    | 2     | length of the key |
 | `key`         | bytes  | `key_len` | routing/ordering key (empty if none) |
 | `hdr_len`     | u16    | 2     | length of the headers |
 | `headers`     | bytes  | `hdr_len` | headers blob |
+| `pid_len`     | u16    | 2     | ONLY if bit 7 set: length of the dedup `producer_id` |
+| `producer_id` | bytes  | `pid_len` | ONLY if bit 7 set: the dedup identity (empty = anonymous, session-scoped) |
+| `epoch`       | u64    | 8     | ONLY if bit 7 set: the producer's monotonic epoch (the fencing token) |
+| `mid_len`     | u16    | 2     | ONLY if bit 7 set: length of the dedup `msg_id` |
+| `msg_id`      | bytes  | `mid_len` | ONLY if bit 7 set: the idempotency key the broker deduplicates on (NEVER the body) |
 | `payload`     | bytes  | rest  | the remainder of the body is the payload |
 
-There is NO topic field and NO message-id/trace-id header list. `key` and `headers` are
-each bounded by `u16::MAX`.
+The OPT-IN dedup block (`producer_id`, `epoch`, `msg_id`) is the effectively-once mechanism (#33):
+it is present on the wire ONLY when bit 7 of `flags` is set, so a dedup-DISABLED produce omits it and
+the body is byte-for-byte the historical layout (additive, opt-in). Dedup keys on `msg_id` ONLY,
+never the body. A `msg_id` already seen within the producer's bounded window (the dual count + time
+bound, default ~100k ids OR ~2 min on the monotonic clock) is a benign dedup hit: the broker answers
+`PubAckDuplicate` (tag 20) with the ORIGINAL offset and appends no second copy. A produce whose
+`epoch` is below the broker's known high-water for `producer_id` is FENCED (answered an `Err`), so a
+zombie session reusing an old `producer_id` cannot replay stale ids.
+
+There is NO topic field and NO trace-id header list. `key`, `headers`, `producer_id`, and `msg_id`
+are each bounded by `u16::MAX`.
 
 ### AckBody (wire body of `Ack`, fixed 25 bytes)
 
@@ -578,8 +599,8 @@ code; the code is canonical.
   `CONNECT 0x08`, `PING 0x09`, `PONG 0x0A`, `ERR 0x0B`. The frozen implementation tags are
   `Connect 1`, `Info 2`, `Ping 3`, `Pong 4`, `Pub 5`, `Sub 6`, `Unsub 7`, `Ack 8`,
   `Nack 9`, `Flow 10`, `Ok 11`, `Err 12`, `Deliver 13`, `PubAck 14`, `AckStatus 15`,
-  `FlowEnd 16`, `DeadLetter 17`, `Truncated 18`, `CumulativeAck 19`. None of the draft's
-  numbers match.
+  `FlowEnd 16`, `DeadLetter 17`, `Truncated 18`, `CumulativeAck 19`, `PubAckDuplicate 20`. None
+  of the draft's numbers match.
 - **Deliver/MSG.** The draft's `MSG` carried `offset, attempt, header list, key, payload`.
   The real `DeliverBody` carries `offset, generation, flags, timestamp_ms, key, headers,
   payload` and has NO `attempt` field on the wire.

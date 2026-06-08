@@ -86,6 +86,16 @@ pub enum FrameType {
     /// `u64` (8 bytes) followed by the work-group name as the remainder of the body (empty selects
     /// the default group).
     CumulativeAck,
+    /// Producer dedup-hit acknowledgement (#33): the broker's BENIGN response to a publish whose
+    /// `msg_id` was already seen within the producer's dedup window. It carries the ORIGINAL durable
+    /// offset the first copy was assigned (so the producer learns where its message landed) and a
+    /// `duplicate = true` indication by its frame type ALONE; the broker appends NO second copy and
+    /// this is NEVER an error (`rc = 0`). It is the dedup-aware twin of [`FrameType::PubAck`]: the
+    /// frozen `PubAck` (tag 14) body is left untouched (exactly the 8-byte offset), and a dedup hit
+    /// is signaled by this NEW append-only frame type instead, so an old client that never sends a
+    /// `msg_id` never receives it. Body: the original durable `offset` as a little-endian `u64`
+    /// (8 bytes), identical in shape to `PubAck`.
+    PubAckDuplicate,
 }
 
 impl FrameType {
@@ -112,6 +122,7 @@ impl FrameType {
             FrameType::DeadLetter => 17,
             FrameType::Truncated => 18,
             FrameType::CumulativeAck => 19,
+            FrameType::PubAckDuplicate => 20,
         }
     }
 
@@ -139,6 +150,7 @@ impl FrameType {
             17 => FrameType::DeadLetter,
             18 => FrameType::Truncated,
             19 => FrameType::CumulativeAck,
+            20 => FrameType::PubAckDuplicate,
             _ => return None,
         })
     }
@@ -271,7 +283,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 19] = [
+    const ALL_TYPES: [FrameType; 20] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -291,6 +303,7 @@ mod tests {
         FrameType::DeadLetter,
         FrameType::Truncated,
         FrameType::CumulativeAck,
+        FrameType::PubAckDuplicate,
     ];
 
     #[test]
@@ -328,6 +341,7 @@ mod tests {
         assert_eq!(FrameType::DeadLetter.as_u8(), 17);
         assert_eq!(FrameType::Truncated.as_u8(), 18);
         assert_eq!(FrameType::CumulativeAck.as_u8(), 19);
+        assert_eq!(FrameType::PubAckDuplicate.as_u8(), 20);
     }
 
     #[test]
@@ -513,7 +527,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 20u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 21u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);

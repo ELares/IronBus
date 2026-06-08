@@ -72,6 +72,7 @@ fn engine_config() -> EngineConfig {
         // The RAM-headroom ceiling is off in the bench broker (#118): the bench samples real RSS
         // out-of-band, it does not need the in-broker headroom gauge.
         ram_ceiling_bytes: 0,
+        dedup: ironbus_core::dedup::DedupConfig::default(),
     }
 }
 

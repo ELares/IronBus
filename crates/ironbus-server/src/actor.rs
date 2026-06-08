@@ -47,12 +47,13 @@ pub const DEFAULT_CHANNEL_BOUND: usize = 1024;
 
 /// A produce request's payload, OWNED so it can cross the channel to the actor (the wire [`Append`]
 /// borrows the connection's input buffer, which the actor cannot hold). The actor borrows it back as
-/// an [`Append`] to append it. Fields mirror [`Append`].
+/// an [`Append`] to append it. Fields mirror [`Append`], plus the opt-in dedup identity (#33).
 #[derive(Clone, Debug)]
 pub struct OwnedAppend {
     /// Producer timestamp, milliseconds since the Unix epoch.
     pub timestamp_ms: u64,
-    /// Record flags as raw bits (the codec normalizes `HAS_KEY`; unknown bits are preserved).
+    /// Record flags as raw bits (the codec normalizes `HAS_KEY`; unknown bits are preserved). The
+    /// wire-only dedup bit is masked OFF by the session before this crosses the channel.
     pub flags: u8,
     /// The routing or ordering key (empty if none).
     pub key: Vec<u8>,
@@ -60,15 +61,41 @@ pub struct OwnedAppend {
     pub headers: Vec<u8>,
     /// The record payload.
     pub payload: Vec<u8>,
+    /// The OPT-IN dedup identity (#3, #33): `Some` iff the publish carried a `msg_id` (the dedup
+    /// opt-in), owned so it can cross the channel. `None` is the default no-dedup produce.
+    pub dedup: Option<OwnedDedup>,
+}
+
+/// An owned copy of a produce's dedup identity (#33), so it can cross the actor channel (the wire
+/// [`ironbus_proto::message::PubDedup`] borrows the connection buffer). Mirrors
+/// [`crate::engine::DedupRequest`].
+#[derive(Clone, Debug)]
+pub struct OwnedDedup {
+    /// The stable producer identity for dedup keying and epoch fencing (empty = anonymous).
+    pub producer_id: Vec<u8>,
+    /// The producer's monotonic epoch (the fencing token).
+    pub epoch: u64,
+    /// The idempotency key the broker deduplicates on (never the body).
+    pub msg_id: Vec<u8>,
 }
 
 /// The outcome of a produce, mapped to the wire reply by the session. It carries enough to
 /// reproduce the pre-actor `handle_pub` behavior exactly: a success with the assigned offset, the
-/// non-fatal drop-new shed, a fatal storage error (which ends the session), or a transient failure.
+/// non-fatal drop-new shed, a fatal storage error (which ends the session), or a transient failure,
+/// plus the two opt-in dedup outcomes (#33).
 #[derive(Debug)]
 pub enum ProduceOutcome {
     /// The record is durable (the covering `commit_batch` completed); reply `PubAck` with this offset.
     Appended(Offset),
+    /// A BENIGN dedup hit (#33): the `msg_id` was already in the producer's window, so nothing was
+    /// appended and this is the ORIGINAL offset. Reply `PubAckDuplicate` (`duplicate = true`,
+    /// `rc = 0`), keep the session. Released only after the covering `commit_batch` (I2), so a hit on
+    /// an id recorded earlier in the SAME uncommitted batch never replies before that id is durable.
+    AppendedDuplicate(Offset),
+    /// A stale-epoch FENCE (#33): a zombie session reusing an old `producer_id` presented an epoch
+    /// below the broker's known high-water. Reply an error, keep the session (the producer can
+    /// re-handshake with a fresh epoch).
+    Fenced,
     /// The durable-log byte cap shed (drop-new): reply a stable "at capacity" error, keep the session.
     AtCapacity,
     /// A fatal storage error (a frozen writer): reply an error AND end the session.
@@ -325,9 +352,21 @@ impl<F: Filesystem, C: Clock + Clone> EngineAccess<F, C> for SharedEngine<F, C> 
     }
 }
 
-/// Performs ONE one-message group commit (`append_no_sync` + `commit_batch`) on `engine`, mapping the
-/// result to a [`ProduceOutcome`] exactly as the actor does, so the test-only direct access paths
-/// preserve I2 (the outcome reflects the covering fsync) and the shed/freeze taxonomy.
+/// Borrows an [`OwnedAppend`]'s dedup identity (#33) as an engine [`DedupRequest`], or `None` for a
+/// no-dedup produce. The borrow is valid for the duration of the engine call (the owned bytes outlive
+/// it), so the engine sees the `producer_id` / `epoch` / `msg_id` without copying again.
+fn dedup_request(append: &OwnedAppend) -> Option<crate::engine::DedupRequest<'_>> {
+    append.dedup.as_ref().map(|d| crate::engine::DedupRequest {
+        producer_id: &d.producer_id,
+        epoch: d.epoch,
+        msg_id: &d.msg_id,
+    })
+}
+
+/// Performs ONE one-message group commit (`append_no_sync_dedup` + `commit_batch`) on `engine`,
+/// mapping the result to a [`ProduceOutcome`] exactly as the actor does, so the test-only direct
+/// access paths preserve I2 (the outcome reflects the covering fsync), the shed/freeze taxonomy, and
+/// the opt-in dedup outcomes (#33).
 #[cfg(test)]
 fn produce_once<F: Filesystem, C: Clock + Clone>(
     engine: &mut Engine<F, C>,
@@ -340,11 +379,20 @@ fn produce_once<F: Filesystem, C: Clock + Clone>(
         headers: &append.headers,
         payload: &append.payload,
     };
-    match engine.append_no_sync(&view) {
-        Ok(offset) => match engine.commit_batch() {
+    match engine.append_no_sync_dedup(&view, dedup_request(append)) {
+        // A fresh append: the covering fsync decides durability (I2).
+        Ok(crate::engine::AppendOutcome::Appended(offset)) => match engine.commit_batch() {
             Ok(()) => ProduceOutcome::Appended(offset),
             Err(e) => ProduceOutcome::Fatal(e),
         },
+        // A dedup hit: nothing appended, but still commit (a no-op fsync) so a hit on an id recorded
+        // earlier in this same one-message batch is durable before the reply (I2 uniformity).
+        Ok(crate::engine::AppendOutcome::Duplicate(offset)) => match engine.commit_batch() {
+            Ok(()) => ProduceOutcome::AppendedDuplicate(offset),
+            Err(e) => ProduceOutcome::Fatal(e),
+        },
+        // A stale-epoch fence: nothing appended, reject (no fsync needed; nothing changed).
+        Ok(crate::engine::AppendOutcome::Fenced { .. }) => ProduceOutcome::Fenced,
         Err(e) if e.is_at_capacity() => ProduceOutcome::AtCapacity,
         Err(e) if e.is_fatal() => ProduceOutcome::Fatal(e),
         Err(e) => ProduceOutcome::Failed(e),
@@ -422,11 +470,28 @@ where
                         headers: &append.headers,
                         payload: &append.payload,
                     };
-                    match engine.append_no_sync(&view) {
-                        Ok(offset) => pending.push(PendingProduce {
-                            outcome: PendingOutcome::Appended(offset),
-                            reply,
-                        }),
+                    match engine.append_no_sync_dedup(&view, dedup_request(&append)) {
+                        Ok(crate::engine::AppendOutcome::Appended(offset)) => {
+                            pending.push(PendingProduce {
+                                outcome: PendingOutcome::Appended(offset),
+                                reply,
+                            });
+                        }
+                        // A BENIGN dedup hit (#33): nothing was appended, but its original offset may
+                        // be an id recorded earlier in THIS uncommitted batch, so PARK the reply behind
+                        // the covering fsync too (I2). On a sync failure the batch is non-durable and
+                        // every parked reply, hit or fresh, becomes Fatal, exactly as for a fresh append.
+                        Ok(crate::engine::AppendOutcome::Duplicate(offset)) => {
+                            pending.push(PendingProduce {
+                                outcome: PendingOutcome::Duplicate(offset),
+                                reply,
+                            });
+                        }
+                        // A stale-epoch fence (#33): nothing was written, so reply immediately; it does
+                        // not join the durable batch.
+                        Ok(crate::engine::AppendOutcome::Fenced { .. }) => {
+                            let _ = reply.send(ProduceOutcome::Fenced);
+                        }
                         // A shed or a hard error is known WITHOUT the sync (nothing was written), so
                         // reply immediately; it does not join the durable batch.
                         Err(e) if e.is_at_capacity() => {
@@ -470,11 +535,16 @@ struct PendingProduce {
     reply: SyncSender<ProduceOutcome>,
 }
 
-/// The pre-sync outcome of a parked produce. Only `Appended` records reach here (a shed or hard error
-/// replies immediately and never parks), so the post-sync mapping is a success-or-freeze decision.
+/// The pre-sync outcome of a parked produce. A fresh append OR a dedup hit reaches here (a shed,
+/// fence, or hard error replies immediately and never parks), so the post-sync mapping is a
+/// success-or-freeze decision for either.
 enum PendingOutcome {
-    /// Appended at this offset, pending the covering fsync.
+    /// A fresh append at this offset, pending the covering fsync: replies `PubAck` once durable.
     Appended(Offset),
+    /// A dedup hit returning this ORIGINAL offset (#33), pending the covering fsync: replies
+    /// `PubAckDuplicate` once the batch is durable, so a hit on an id recorded earlier in THIS batch
+    /// never replies before that id's offset is durable (I2).
+    Duplicate(Offset),
 }
 
 /// Issues the SINGLE `commit_batch` fsync that covers every parked produce, then releases each parked
@@ -496,8 +566,12 @@ where
     match engine.commit_batch() {
         Ok(()) => {
             for p in pending.drain(..) {
-                let PendingOutcome::Appended(offset) = p.outcome;
-                let _ = p.reply.send(ProduceOutcome::Appended(offset));
+                let outcome = match p.outcome {
+                    PendingOutcome::Appended(offset) => ProduceOutcome::Appended(offset),
+                    // A dedup hit replies PubAckDuplicate now that the covering batch is durable (#33).
+                    PendingOutcome::Duplicate(offset) => ProduceOutcome::AppendedDuplicate(offset),
+                };
+                let _ = p.reply.send(outcome);
             }
         }
         Err(e) => {
@@ -545,6 +619,7 @@ mod tests {
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
             ram_ceiling_bytes: 0,
             disk_full_policy: DiskFullPolicy::DropNew,
+            dedup: ironbus_core::dedup::DedupConfig::default(),
         }
     }
 
@@ -570,6 +645,24 @@ mod tests {
             key: Vec::new(),
             headers: Vec::new(),
             payload: payload.to_vec(),
+            dedup: None,
+        }
+    }
+
+    /// An owned produce that opts into dedup with `(producer_id, epoch, msg_id)` (#33), for the
+    /// actor-level dedup tests.
+    fn append_dedup(payload: &[u8], producer_id: &[u8], epoch: u64, msg_id: &[u8]) -> OwnedAppend {
+        OwnedAppend {
+            timestamp_ms: 0,
+            flags: 0,
+            key: Vec::new(),
+            headers: Vec::new(),
+            payload: payload.to_vec(),
+            dedup: Some(OwnedDedup {
+                producer_id: producer_id.to_vec(),
+                epoch,
+                msg_id: msg_id.to_vec(),
+            }),
         }
     }
 
@@ -759,6 +852,61 @@ mod tests {
         let before = control.sync_count();
         handle.produce(append(b"solo")).unwrap();
         assert_eq!(control.sync_count() - before, 1, "one produce, one fsync");
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn a_duplicate_msg_id_returns_the_original_offset_and_appends_no_second_record() {
+        // The headline #33 property over the REAL actor: a fresh dedup produce appends and acks
+        // PubAck(0); the SAME (producer, msg_id) again returns the ORIGINAL offset via
+        // AppendedDuplicate and appends NO second record (the durable head does not move).
+        let (handle, actor, _control) = rig();
+        let first = handle
+            .produce(append_dedup(b"v1", b"p1", 1, b"idem"))
+            .unwrap();
+        assert!(
+            matches!(first, ProduceOutcome::Appended(o) if o.get() == 0),
+            "fresh produce appends at offset 0: {first:?}"
+        );
+        let head_after_first = handle.with(|e| e.flushed_offset().get()).unwrap();
+        assert_eq!(head_after_first, 1, "one record durable");
+        // A duplicate (same producer + msg_id, payload irrelevant): the original offset, no append.
+        let dup = handle
+            .produce(append_dedup(b"v2-ignored", b"p1", 1, b"idem"))
+            .unwrap();
+        assert!(
+            matches!(dup, ProduceOutcome::AppendedDuplicate(o) if o.get() == 0),
+            "duplicate returns the ORIGINAL offset 0: {dup:?}"
+        );
+        let head_after_dup = handle.with(|e| e.flushed_offset().get()).unwrap();
+        assert_eq!(
+            head_after_dup, 1,
+            "the durable head did NOT advance on a dedup hit"
+        );
+        assert_eq!(
+            handle.with(|e| e.dedup_hits()).unwrap(),
+            1,
+            "one dedup hit counted"
+        );
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn a_stale_epoch_produce_is_fenced_over_the_actor() {
+        // Epoch fencing over the real actor: establish epoch 5, then a produce at the older epoch 4 is
+        // fenced (nothing appended) while a produce at epoch 5 still works.
+        let (handle, actor, _control) = rig();
+        handle.produce(append_dedup(b"a", b"p1", 5, b"m1")).unwrap();
+        let fenced = handle.produce(append_dedup(b"b", b"p1", 4, b"m2")).unwrap();
+        assert!(
+            matches!(fenced, ProduceOutcome::Fenced),
+            "stale epoch is fenced: {fenced:?}"
+        );
+        assert_eq!(
+            handle.with(|e| e.flushed_offset().get()).unwrap(),
+            1,
+            "the fenced produce appended nothing (head stays at the one accepted record)"
+        );
         let _ = recover(handle, actor);
     }
 }

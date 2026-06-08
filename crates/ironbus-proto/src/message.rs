@@ -98,13 +98,46 @@ fn push_var(out: &mut Vec<u8>, field: &[u8]) -> Result<(), BodyError> {
     Ok(())
 }
 
+/// The PUB-body WIRE flag bit that signals an OPT-IN dedup block (`producer_id` + `epoch` +
+/// `msg_id`) follows the headers, before the payload (#33). It is a WIRE-ONLY flag on the PUB
+/// body's `flags` byte, NOT a stored record flag: the server masks it OUT before the byte
+/// becomes [`ironbus_core::types::RecordFlags`], so it never pollutes the stored record flags
+/// and never collides with a future record-flag bit. It sits at bit 7 (`0b1000_0000`), well
+/// above `RecordFlags::KNOWN` (`0b111`). A dedup-disabled produce OMITS the block and leaves
+/// this bit clear, so the body is byte-for-byte the historical layout (additive, opt-in).
+pub const PUB_FLAG_HAS_DEDUP: u8 = 0b1000_0000;
+
+/// The opt-in dedup metadata a producer attaches to a PUB to request effectively-once dedup
+/// (#33): a `producer_id` (the dedup identity; empty is the anonymous/session-scoped default),
+/// a monotonic `epoch` (the fencing token; a higher epoch fences an older zombie session), and
+/// the `msg_id` (the idempotency key the broker deduplicates on, NEVER the body). Present on the
+/// wire only when [`PUB_FLAG_HAS_DEDUP`] is set; absent for the default (no-dedup) produce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PubDedup<'a> {
+    /// The stable producer identity for dedup keying and epoch fencing (empty = anonymous,
+    /// session-scoped). Each producer has its own bounded dedup window keyed by this.
+    pub producer_id: &'a [u8],
+    /// The producer's monotonic epoch (the fencing token). A produce whose epoch is below the
+    /// broker's known high-water for `producer_id` is fenced; a higher epoch supersedes the old
+    /// session's window.
+    pub epoch: u64,
+    /// The idempotency key the broker deduplicates on (keying is by `msg_id` ONLY, never the
+    /// body). Empty is permitted but pointless (it never matches a meaningful prior id).
+    pub msg_id: &'a [u8],
+}
+
 /// A producer's published message (the PUB frame body).
 ///
 /// Layout: `flags: u8`, `timestamp_ms: u64`, `key: u16-len + bytes`,
-/// `headers: u16-len + bytes`, then `payload` (the remainder of the body).
+/// `headers: u16-len + bytes`, an OPT-IN dedup block (present iff the [`PUB_FLAG_HAS_DEDUP`] bit of
+/// `flags` is set: `producer_id: u16-len + bytes`, `epoch: u64`, `msg_id: u16-len + bytes`), then
+/// `payload` (the remainder of the body). With the dedup bit clear the layout is byte-for-byte
+/// the historical one (#33, additive).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PubBody<'a> {
-    /// Producer record flags (the codec/server derives storage flags such as `HAS_KEY`).
+    /// Producer record flags (the codec/server derives storage flags such as `HAS_KEY`). The
+    /// wire-only [`PUB_FLAG_HAS_DEDUP`] bit (bit 7) signals the dedup block and is masked off by
+    /// the server before this becomes a stored record flag.
     pub flags: u8,
     /// Producer timestamp, milliseconds since the Unix epoch.
     pub timestamp_ms: u64,
@@ -112,41 +145,76 @@ pub struct PubBody<'a> {
     pub key: &'a [u8],
     /// The headers blob (empty if none).
     pub headers: &'a [u8],
+    /// The OPT-IN dedup metadata (#33): `Some` iff the producer requested effectively-once dedup
+    /// (the [`PUB_FLAG_HAS_DEDUP`] bit). `None` for the default no-dedup produce, so today's
+    /// behavior is unchanged.
+    pub dedup: Option<PubDedup<'a>>,
     /// The message payload.
     pub payload: &'a [u8],
 }
 
-/// Encodes a PUB body onto the end of `out`.
+/// Encodes a PUB body onto the end of `out`. When `msg.dedup` is `Some`, the
+/// [`PUB_FLAG_HAS_DEDUP`] bit is forced set in the written flags byte and the dedup block is
+/// emitted after the headers; when `None`, the bit is forced clear, so the encoded body cannot
+/// claim a dedup block it does not carry (or omit one it does).
 ///
 /// # Errors
-/// Returns [`BodyError::FieldTooLarge`] if the key or headers exceed `u16::MAX`.
+/// Returns [`BodyError::FieldTooLarge`] if the key, headers, `producer_id`, or `msg_id` exceed
+/// `u16::MAX`.
 pub fn encode_pub(msg: &PubBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
-    out.push(msg.flags);
+    // Derive the on-wire dedup bit from the presence of the block, not from the caller's flags, so
+    // the bit and the body can never disagree.
+    let flags = match msg.dedup {
+        Some(_) => msg.flags | PUB_FLAG_HAS_DEDUP,
+        None => msg.flags & !PUB_FLAG_HAS_DEDUP,
+    };
+    out.push(flags);
     out.extend_from_slice(&msg.timestamp_ms.to_le_bytes());
     push_var(out, msg.key)?;
     push_var(out, msg.headers)?;
+    if let Some(dedup) = msg.dedup {
+        push_var(out, dedup.producer_id)?;
+        out.extend_from_slice(&dedup.epoch.to_le_bytes());
+        push_var(out, dedup.msg_id)?;
+    }
     out.extend_from_slice(msg.payload);
     Ok(())
 }
 
-/// Decodes a PUB body. The payload is whatever remains after the framed fields, so
-/// `body` MUST be exactly one frame's body (as handed out by [`crate::frame::decode_frame`]):
-/// any trailing bytes would be folded into the payload.
+/// Decodes a PUB body. The payload is whatever remains after the framed fields (and the opt-in
+/// dedup block), so `body` MUST be exactly one frame's body (as handed out by
+/// [`crate::frame::decode_frame`]): any trailing bytes would be folded into the payload.
 ///
 /// # Errors
-/// Returns a [`BodyError`] on a short or inconsistent body.
+/// Returns a [`BodyError`] on a short or inconsistent body (including a dedup block that the
+/// [`PUB_FLAG_HAS_DEDUP`] bit claims but the body is too short to hold).
 pub fn decode_pub(body: &[u8]) -> Result<PubBody<'_>, BodyError> {
     let mut r = Reader::new(body);
     let flags = r.u8()?;
     let timestamp_ms = r.u64()?;
     let key = r.var()?;
     let headers = r.var()?;
+    // The opt-in dedup block follows the headers ONLY when the wire bit is set; otherwise the
+    // remainder is the payload exactly as before (the historical layout).
+    let dedup = if flags & PUB_FLAG_HAS_DEDUP != 0 {
+        let producer_id = r.var()?;
+        let epoch = r.u64()?;
+        let msg_id = r.var()?;
+        Some(PubDedup {
+            producer_id,
+            epoch,
+            msg_id,
+        })
+    } else {
+        None
+    };
     let payload = r.rest();
     Ok(PubBody {
         flags,
         timestamp_ms,
         key,
         headers,
+        dedup,
         payload,
     })
 }
@@ -361,6 +429,38 @@ pub fn decode_cumulative_ack(body: &[u8]) -> Result<CumulativeAckBody<'_>, BodyE
     Ok(CumulativeAckBody { up_to, group })
 }
 
+/// A producer publish acknowledgement carrying the assigned durable offset: the body of BOTH
+/// [`crate::frame::FrameType::PubAck`] (a fresh produce) and [`crate::frame::FrameType::PubAckDuplicate`]
+/// (a dedup hit returning the ORIGINAL offset, #33). The body is a fixed 8-byte little-endian
+/// `u64` offset for both; the FRAME TYPE alone distinguishes a fresh ack (tag 14) from a benign
+/// dedup hit (tag 20, `duplicate = true`), which is why the frozen `PubAck` body is left exactly
+/// as it was. Held as a shared codec so both frame types agree on the byte layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PubAckBody {
+    /// The assigned (fresh) or original (dedup hit) durable log offset.
+    pub offset: u64,
+}
+
+/// Encodes a publish-ack body (the 8-byte LE offset) onto the end of `out`. Used for both the
+/// fresh `PubAck` (tag 14) and the dedup-hit `PubAckDuplicate` (tag 20), which share this body.
+pub fn encode_pub_ack(ack: &PubAckBody, out: &mut Vec<u8>) {
+    out.extend_from_slice(&ack.offset.to_le_bytes());
+}
+
+/// Decodes a publish-ack body (a fixed 8-byte LE offset; trailing bytes are rejected). The caller
+/// reads the FRAME TYPE to know whether this is a fresh `PubAck` or a `PubAckDuplicate` dedup hit.
+///
+/// # Errors
+/// Returns a [`BodyError`] on a short or overlong body.
+pub fn decode_pub_ack(body: &[u8]) -> Result<PubAckBody, BodyError> {
+    let mut r = Reader::new(body);
+    let offset = r.u64()?;
+    if !r.at_end() {
+        return Err(BodyError::TrailingBytes);
+    }
+    Ok(PubAckBody { offset })
+}
+
 /// The dead-letter reason for a message that exceeded `MaxDeliver` (poison). Only this reason
 /// is emitted today; the one-byte reason field leaves room for future causes (#63).
 pub const DEAD_LETTER_MAX_DELIVER: u8 = 0;
@@ -531,6 +631,7 @@ mod tests {
             timestamp_ms: 1_700_000_000_000,
             key: b"order-42",
             headers: b"h",
+            dedup: None,
             payload: b"the payload bytes",
         };
         let mut buf = Vec::new();
@@ -571,6 +672,7 @@ mod tests {
             timestamp_ms: 0,
             key: b"",
             headers: b"",
+            dedup: None,
             payload: b"",
         };
         let mut buf = Vec::new();
@@ -588,6 +690,7 @@ mod tests {
             timestamp_ms: 0,
             key: &big,
             headers: b"",
+            dedup: None,
             payload: b"",
         };
         let mut buf = Vec::new();
@@ -603,6 +706,7 @@ mod tests {
                 timestamp_ms: 9,
                 key: b"abc",
                 headers: b"de",
+                dedup: None,
                 payload: b"xyz",
             },
             &mut buf,
@@ -666,11 +770,117 @@ mod tests {
             timestamp_ms: 1,
             key: &big,
             headers: &big,
+            dedup: None,
             payload: b"tail",
         };
         let mut buf = Vec::new();
         encode_pub(&msg, &mut buf).unwrap();
         assert_eq!(decode_pub(&buf).unwrap(), msg);
+    }
+
+    #[test]
+    fn pub_with_dedup_round_trips_and_sets_the_wire_bit() {
+        let dedup = PubDedup {
+            producer_id: b"producer-7",
+            epoch: 42,
+            msg_id: b"idem-key-abc",
+        };
+        let msg = PubBody {
+            flags: 0,
+            timestamp_ms: 9,
+            key: b"k",
+            headers: b"h",
+            dedup: Some(dedup),
+            payload: b"p",
+        };
+        let mut buf = Vec::new();
+        encode_pub(&msg, &mut buf).unwrap();
+        // The encoded flags byte carries the wire dedup bit even though the caller passed flags 0.
+        assert_eq!(buf[0] & PUB_FLAG_HAS_DEDUP, PUB_FLAG_HAS_DEDUP);
+        let got = decode_pub(&buf).unwrap();
+        assert_eq!(got.dedup, Some(dedup));
+        assert_eq!(got.payload, b"p");
+    }
+
+    #[test]
+    fn a_no_dedup_pub_is_byte_for_byte_the_historical_layout() {
+        // The dedup-disabled body must be EXACTLY the pre-#33 layout, so an old broker reads it
+        // unchanged. Build the historical body by hand and compare.
+        let msg = PubBody {
+            flags: 0b0000_0010,
+            timestamp_ms: 0x0102_0304_0506_0708,
+            key: b"key",
+            headers: b"hd",
+            dedup: None,
+            payload: b"payload",
+        };
+        let mut buf = Vec::new();
+        encode_pub(&msg, &mut buf).unwrap();
+        let mut expected = Vec::new();
+        expected.push(0b0000_0010); // flags, dedup bit clear
+        expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        expected.extend_from_slice(&3u16.to_le_bytes());
+        expected.extend_from_slice(b"key");
+        expected.extend_from_slice(&2u16.to_le_bytes());
+        expected.extend_from_slice(b"hd");
+        expected.extend_from_slice(b"payload");
+        assert_eq!(
+            buf, expected,
+            "no-dedup PUB must match the frozen historical layout"
+        );
+    }
+
+    #[test]
+    fn encode_clears_a_stray_dedup_bit_when_there_is_no_block() {
+        // A caller that sets bit 7 in flags but provides no dedup block must NOT produce a body that
+        // claims a block: the bit is derived from `dedup`, so it is force-cleared.
+        let msg = PubBody {
+            flags: PUB_FLAG_HAS_DEDUP | 0b0000_0001,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            payload: b"x",
+        };
+        let mut buf = Vec::new();
+        encode_pub(&msg, &mut buf).unwrap();
+        assert_eq!(
+            buf[0] & PUB_FLAG_HAS_DEDUP,
+            0,
+            "the stray dedup bit is cleared"
+        );
+        let got = decode_pub(&buf).unwrap();
+        assert_eq!(got.dedup, None);
+        assert_eq!(got.payload, b"x");
+    }
+
+    #[test]
+    fn pub_with_dedup_bit_set_but_truncated_block_errors() {
+        // The dedup bit claims a block the body is too short to hold: a typed error, never a panic.
+        let mut buf = Vec::new();
+        buf.push(PUB_FLAG_HAS_DEDUP); // flags with the dedup bit
+        buf.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+        buf.extend_from_slice(&0u16.to_le_bytes()); // empty key
+        buf.extend_from_slice(&0u16.to_le_bytes()); // empty headers
+                                                    // The producer_id length field is missing entirely.
+        assert_eq!(decode_pub(&buf), Err(BodyError::Truncated));
+    }
+
+    #[test]
+    fn pub_ack_body_round_trips_and_rejects_a_bad_length() {
+        let ack = PubAckBody {
+            offset: 0x0102_0304_0506_0708,
+        };
+        let mut buf = Vec::new();
+        encode_pub_ack(&ack, &mut buf);
+        assert_eq!(
+            buf.len(),
+            8,
+            "fixed 8-byte LE offset, like the frozen PubAck body"
+        );
+        assert_eq!(decode_pub_ack(&buf).unwrap(), ack);
+        assert_eq!(decode_pub_ack(&[0u8; 7]), Err(BodyError::Truncated));
+        assert_eq!(decode_pub_ack(&[0u8; 9]), Err(BodyError::TrailingBytes));
     }
 
     #[test]
@@ -695,10 +905,38 @@ mod tests {
             headers in prop::collection::vec(any::<u8>(), 0..300),
             payload in prop::collection::vec(any::<u8>(), 0..1024),
         ) {
-            let msg = PubBody { flags, timestamp_ms, key: &key, headers: &headers, payload: &payload };
+            // A no-dedup body never sets the wire dedup bit; `encode_pub` force-clears it, so clear
+            // it here too to keep the round-trip exact (the bit is derived from `dedup`, not `flags`).
+            let flags = flags & !PUB_FLAG_HAS_DEDUP;
+            let msg = PubBody { flags, timestamp_ms, key: &key, headers: &headers, dedup: None, payload: &payload };
             let mut buf = Vec::new();
             encode_pub(&msg, &mut buf).unwrap();
             prop_assert_eq!(decode_pub(&buf).unwrap(), msg);
+        }
+
+        /// A PUB body WITH the opt-in dedup block round-trips for any producer_id / epoch / msg_id:
+        /// the dedup bit is set, the block is emitted after the headers, and decode recovers the
+        /// exact `(producer_id, epoch, msg_id)` plus the payload tail (#33).
+        #[test]
+        fn any_pub_with_dedup_round_trips(
+            flags in any::<u8>(),
+            timestamp_ms in any::<u64>(),
+            key in prop::collection::vec(any::<u8>(), 0..200),
+            headers in prop::collection::vec(any::<u8>(), 0..200),
+            producer_id in prop::collection::vec(any::<u8>(), 0..200),
+            epoch in any::<u64>(),
+            msg_id in prop::collection::vec(any::<u8>(), 0..200),
+            payload in prop::collection::vec(any::<u8>(), 0..512),
+        ) {
+            let dedup = PubDedup { producer_id: &producer_id, epoch, msg_id: &msg_id };
+            let msg = PubBody { flags, timestamp_ms, key: &key, headers: &headers, dedup: Some(dedup), payload: &payload };
+            let mut buf = Vec::new();
+            encode_pub(&msg, &mut buf).unwrap();
+            let got = decode_pub(&buf).unwrap();
+            // The wire body carries the dedup bit regardless of the caller's flags input.
+            prop_assert_eq!(got.flags & PUB_FLAG_HAS_DEDUP, PUB_FLAG_HAS_DEDUP);
+            prop_assert_eq!(got.dedup, Some(dedup));
+            prop_assert_eq!(got.payload, payload.as_slice());
         }
 
         #[test]
@@ -721,6 +959,7 @@ mod tests {
             let _ = decode_dead_letter(&bytes);
             let _ = decode_truncated(&bytes);
             let _ = decode_cumulative_ack(&bytes);
+            let _ = decode_pub_ack(&bytes);
             // SUB is infallible: any byte string is a valid body, and decoding it recovers the
             // exact bytes as the group, so it cannot panic either.
             prop_assert_eq!(decode_sub(&bytes).group, bytes.as_slice());

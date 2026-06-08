@@ -62,6 +62,41 @@ pub enum DiskFullPolicy {
     DropOldest,
 }
 
+/// A produce's opt-in dedup identity (#3, #33), passed to [`Engine::append_no_sync_dedup`]. The
+/// caller builds this only when the wire publish carried a `msg_id` (the dedup opt-in); a produce
+/// with no `msg_id` passes `None` and behaves exactly as before. Borrows the wire bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct DedupRequest<'a> {
+    /// The stable producer identity for dedup keying and epoch fencing (empty = anonymous,
+    /// session-scoped). Each producer has its own bounded window keyed by this.
+    pub producer_id: &'a [u8],
+    /// The producer's monotonic epoch (the fencing token). A produce below the broker's known
+    /// high-water for `producer_id` is fenced; a higher epoch supersedes the old session's window.
+    pub epoch: u64,
+    /// The idempotency key the broker deduplicates on (keying is by `msg_id` ONLY, never the body).
+    pub msg_id: &'a [u8],
+}
+
+/// The outcome of an [`Engine::append_no_sync_dedup`] (#3, #33): a fresh append, a benign dedup hit,
+/// or a stale-epoch fence. The actor maps each to its wire reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppendOutcome {
+    /// A fresh produce was appended at this offset (write, NO fsync); park its reply behind the
+    /// covering [`Engine::commit_batch`], then reply `PubAck`. This is also the no-dedup path.
+    Appended(Offset),
+    /// A BENIGN dedup hit: the `msg_id` was already in the producer's window. NOTHING was appended;
+    /// reply `PubAckDuplicate` with this ORIGINAL offset (`duplicate = true`, `rc = 0`). Park it
+    /// behind the covering commit too, so a hit on an id recorded earlier in the SAME uncommitted
+    /// batch never replies before that id's offset is durable (I2).
+    Duplicate(Offset),
+    /// The produce presented a STALE epoch (a zombie session reusing an old `producer_id`): reject
+    /// it. NOTHING was appended.
+    Fenced {
+        /// The producer's current (newer) known epoch that fenced this produce.
+        current_epoch: u64,
+    },
+}
+
 /// Tunables for an [`Engine`].
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -201,6 +236,13 @@ pub struct EngineConfig {
     /// setting it (typically to the cgroup/container memory limit or the device RAM budget). See
     /// [`crate::rss`].
     pub ram_ceiling_bytes: u64,
+    /// The OPT-IN effectively-once dedup window (#3, #33): the dual count + time bound on each
+    /// per-producer dedup ring. Dedup is OFF by default and activates per-producer only when a
+    /// publish carries a `msg_id`; this only SIZES the window when it does. The defaults are
+    /// [`ironbus_core::dedup::DEFAULT_MAX_IDS`] ids OR [`ironbus_core::dedup::DEFAULT_WINDOW_NANOS`]
+    /// (2 minutes of monotonic time), whichever is hit first. The structure costs nothing until a
+    /// producer opts in; see [`ironbus_core::dedup`] and `docs/RAM_BUDGET.md`.
+    pub dedup: ironbus_core::dedup::DedupConfig,
 }
 
 /// An error from the engine.
@@ -556,6 +598,19 @@ pub struct Counters {
     /// frozen-taxonomy `_total` counter an operator watches to see the checkpoint-plus-replay lower
     /// bound actually firing after a hard crash. Saturating.
     pub counter_checkpoint_repairs: u64,
+    /// BENIGN producer dedup HITS (#3, #33): a publish whose `msg_id` was already seen within the
+    /// producer's dedup window, so the broker returned the ORIGINAL offset (`duplicate = true`,
+    /// `rc = 0`) and appended NO second copy. The effectively-once-saved-a-duplicate signal: a
+    /// non-zero rate means producers are retrying and the window is absorbing the duplicates rather
+    /// than the log double-storing them. Exposed as the `ironbus_dedup_hits_total` counter.
+    /// Saturating.
+    pub dedup_hits: u64,
+    /// OUT-OF-WINDOW dedup events (#3, #33): a `msg_id` aged out of a producer's window by the TIME
+    /// bound (its dedup protection lapsed), so a later republish of that id would NOT be deduped and
+    /// would create a genuinely new offset. The "is the window too small for the retry interval"
+    /// signal an operator watches to size [`EngineConfig::dedup`]. Exposed as the
+    /// `ironbus_dedup_out_of_window_total` counter. Saturating.
+    pub dedup_out_of_window: u64,
 }
 
 /// The durable counters-snapshot format version (#98). A future field addition bumps this only if
@@ -573,7 +628,10 @@ const COUNTERS_SNAPSHOT_VERSION: u8 = 1;
 /// `bytes_skipped`, `last_skip_offset`, `counter_checkpoint_repairs`), so a `counters.ckpt` written
 /// before #307 still decodes (the four new fields read as zero) and reconciliation re-derives the
 /// replay-reconcilable recovery-loss values from the durable loss report on the next open.
-const COUNTERS_FIELD_COUNT: usize = 15;
+/// The dedup family (#33) appended two more trailing fields (`dedup_hits`, `dedup_out_of_window`),
+/// so an older snapshot still decodes (they read as zero) and a newer snapshot still decodes on an
+/// old binary (the trailing fields are ignored).
+const COUNTERS_FIELD_COUNT: usize = 17;
 
 impl Counters {
     /// Serializes the counters into a small versioned little-endian byte string for the durable
@@ -604,6 +662,9 @@ impl Counters {
             self.bytes_skipped,
             self.last_skip_offset,
             self.counter_checkpoint_repairs,
+            // The dedup family (#33) appended after #307, same forward/backward-compatible rule.
+            self.dedup_hits,
+            self.dedup_out_of_window,
         ] {
             buf.extend_from_slice(&v.to_le_bytes());
         }
@@ -649,6 +710,11 @@ impl Counters {
             bytes_skipped: field(12),
             last_skip_offset: field(13),
             counter_checkpoint_repairs: field(14),
+            // The dedup family (#33), appended after #307: a pre-#33 snapshot is too short to hold
+            // these, so they read as zero (the tolerant decode). They are operational counters with
+            // no replay reconciliation, so the resumed value is the #306 snapshot-only lower bound.
+            dedup_hits: field(15),
+            dedup_out_of_window: field(16),
         }
     }
 }
@@ -1042,6 +1108,12 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// `key_shared` mode and joins as a member. Held separate from the live per-group router so the
     /// declared config survives a group that has no current members.
     key_shared_groups: std::collections::BTreeSet<String>,
+    /// The opt-in effectively-once dedup registry (#3, #33): the per-producer bounded windows of
+    /// `(msg_id -> offset)`. Empty until a producer opts in by sending a `msg_id`, so a broker no
+    /// producer dedups against costs nothing here. Consulted on the produce path (the actor thread,
+    /// serially) and pure (the monotonic clock comes through the seam). Lost on restart by default
+    /// (session-scoped); see [`ironbus_core::dedup`].
+    dedup: ironbus_core::dedup::DedupRegistry,
 }
 
 /// The file name of the work-group's durable committed-cursor checkpoint.
@@ -1201,6 +1273,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // Empty by default: no group is key_shared until an operator configures one (#64), so an
             // unconfigured engine is plain competing everywhere and unchanged.
             key_shared_groups: std::collections::BTreeSet::new(),
+            // The opt-in dedup registry (#33), sized by the configured window. Empty until a
+            // producer opts in by sending a `msg_id`, so it costs nothing for a no-dedup workload.
+            dedup: ironbus_core::dedup::DedupRegistry::new(config.dedup),
         };
         engine.seed_registry_from_recovered_state(flushed);
         Ok(engine)
@@ -1656,6 +1731,82 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .produced_bytes
             .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
         Ok(offset)
+    }
+
+    /// The opt-in effectively-once dedup variant of [`Engine::append_no_sync`] (#3, #33): it consults
+    /// the per-producer dedup window FIRST, then appends only on a fresh produce.
+    ///
+    /// `dedup` is the producer's dedup identity for THIS publish: `(producer_id, epoch, msg_id)`. The
+    /// `msg_id`'s presence is what activates dedup (the caller passes `Some` only when the wire carried
+    /// a `msg_id`); a `None` `dedup` is exactly today's no-dedup [`Engine::append_no_sync`].
+    ///
+    /// The three outcomes, decided on the actor thread serially so they cannot race:
+    /// - [`AppendOutcome::Duplicate`]: the `msg_id` is already in the producer's live window. NOTHING
+    ///   is appended; the ORIGINAL offset is returned for a `PubAckDuplicate` (`duplicate = true`,
+    ///   `rc = 0`). The `dedup_hits` counter increments. This is a BENIGN hit, never an error.
+    /// - [`AppendOutcome::Fenced`]: the produce presented a STALE epoch (a zombie session). NOTHING is
+    ///   appended; the caller rejects it.
+    /// - [`AppendOutcome::Appended`]: a fresh produce. The record is appended (write, no fsync) exactly
+    ///   as [`Engine::append_no_sync`], the `(msg_id -> offset)` mapping is RECORDED immediately (so a
+    ///   second copy of the same `msg_id` LATER IN THE SAME BATCH dedups against it before its fsync),
+    ///   and the offset is returned to be parked behind the covering commit (I2). If the maintenance
+    ///   evicted an id by the TIME bound, the `dedup_out_of_window` counter increments.
+    ///
+    /// The monotonic `now` comes through the clock seam (the same one the lease table reads), so an
+    /// NTP wall-clock step can never mis-expire the window (I6).
+    ///
+    /// # Errors
+    /// On a fresh produce, the same storage errors as [`Engine::append_no_sync`] (a drop-new shed or a
+    /// fatal write). A dedup hit or a fence never appends, so it never errors here.
+    pub fn append_no_sync_dedup(
+        &mut self,
+        message: &Append<'_>,
+        dedup: Option<DedupRequest<'_>>,
+    ) -> Result<AppendOutcome, EngineError> {
+        let Some(req) = dedup else {
+            // No dedup requested: identical to the historical no-dedup append.
+            return self.append_no_sync(message).map(AppendOutcome::Appended);
+        };
+        let now = self.log.now_monotonic();
+        match self
+            .dedup
+            .check(req.producer_id, req.epoch, req.msg_id, now)
+        {
+            ironbus_core::dedup::DedupDecision::Duplicate { offset } => {
+                // A benign dedup hit: return the original offset, append nothing, count the hit.
+                self.counters.dedup_hits = self.counters.dedup_hits.saturating_add(1);
+                Ok(AppendOutcome::Duplicate(offset))
+            }
+            ironbus_core::dedup::DedupDecision::Fenced { current_epoch } => {
+                Ok(AppendOutcome::Fenced { current_epoch })
+            }
+            ironbus_core::dedup::DedupDecision::Fresh { out_of_window } => {
+                if out_of_window {
+                    // An id aged out of the window by the TIME bound: a future republish of it would
+                    // not be deduped. Count it so an operator can size the window to the retry interval.
+                    self.counters.dedup_out_of_window =
+                        self.counters.dedup_out_of_window.saturating_add(1);
+                }
+                let offset = self.append_no_sync(message)?;
+                // Record the mapping at append time (offset assigned), so a same-batch duplicate is
+                // caught before the covering fsync. The reply is still parked behind that fsync, so a
+                // dedup hit never returns an offset that is not (or will not be) durable.
+                self.dedup.record(req.producer_id, req.msg_id, offset, now);
+                Ok(AppendOutcome::Appended(offset))
+            }
+        }
+    }
+
+    /// The current benign dedup-hit count (the `ironbus_dedup_hits_total` counter, #33).
+    #[must_use]
+    pub fn dedup_hits(&self) -> u64 {
+        self.counters.dedup_hits
+    }
+
+    /// The current out-of-window dedup count (the `ironbus_dedup_out_of_window_total` counter, #33).
+    #[must_use]
+    pub fn dedup_out_of_window(&self) -> u64 {
+        self.counters.dedup_out_of_window
     }
 
     /// Issues the SINGLE durability barrier (`fdatasync`) that makes every record appended since the
@@ -3251,6 +3402,9 @@ mod tests {
             // The RAM-headroom ceiling is OFF by default in the shared test config (#118); the
             // headroom test sets a non-zero ceiling explicitly.
             ram_ceiling_bytes: 0,
+            // The dedup window (#33) is at its spec default in the shared test config; the dedup
+            // tests below build a config with a tight count/time bound explicitly.
+            dedup: ironbus_core::dedup::DedupConfig::default(),
         }
     }
 
@@ -5255,6 +5409,10 @@ mod tests {
             bytes_skipped: 4096,
             last_skip_offset: 1234,
             counter_checkpoint_repairs: 2,
+            // The dedup family (#33), appended after #307; non-zero so the snapshot round-trip
+            // proves the two new trailing fields are carried.
+            dedup_hits: 314,
+            dedup_out_of_window: 42,
         };
         let encoded = counters.encode_snapshot();
         assert_eq!(Counters::decode_snapshot(&encoded), counters);
@@ -7478,5 +7636,163 @@ mod tests {
             "an acked-ahead (behind) group is never evicted on unsub either"
         );
         assert!(e.has_group("g"));
+    }
+
+    // --- Opt-in effectively-once dedup (#3, #33) ---
+
+    /// A dedup config with a TIGHT count and time bound so the engine tests can drive eviction with
+    /// small integers (4 ids OR 1000 ns), over a shared `ManualClock` the test advances.
+    fn config_with_dedup(max_ids: usize, window_nanos: u64) -> EngineConfig {
+        EngineConfig {
+            dedup: ironbus_core::dedup::DedupConfig {
+                max_ids,
+                window_nanos,
+            },
+            ..config(10, 5)
+        }
+    }
+
+    /// Produces with an opt-in dedup identity through the engine's group-commit primitives
+    /// (`append_no_sync_dedup` + `commit_batch`), exactly as the actor does, returning the outcome.
+    fn produce_dedup(
+        e: &mut Engine<InMemoryFs, std::sync::Arc<ManualClock>>,
+        payload: &[u8],
+        producer_id: &[u8],
+        epoch: u64,
+        msg_id: &[u8],
+    ) -> AppendOutcome {
+        let outcome = e
+            .append_no_sync_dedup(
+                &Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                },
+                Some(DedupRequest {
+                    producer_id,
+                    epoch,
+                    msg_id,
+                }),
+            )
+            .unwrap();
+        e.commit_batch().unwrap();
+        outcome
+    }
+
+    #[test]
+    fn no_msg_id_means_no_dedup_todays_behavior_unchanged() {
+        // The default no-dedup produce: passing `None` dedup is byte-for-byte today's append. Two
+        // identical payloads with no msg_id both append (distinct offsets), and nothing is counted.
+        let mut e = open(config_with_dedup(4, 1000));
+        assert_eq!(produce(&mut e, b"same"), Offset::new(0));
+        assert_eq!(produce(&mut e, b"same"), Offset::new(1));
+        assert_eq!(e.flushed_offset(), Offset::new(2), "both appended");
+        assert_eq!(e.dedup_hits(), 0, "no dedup hit without a msg_id");
+        assert_eq!(e.dedup_out_of_window(), 0);
+    }
+
+    #[test]
+    fn a_duplicate_within_the_window_returns_the_original_offset_and_appends_nothing() {
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config_with_dedup(4, 1000), clock);
+        // Fresh produce at offset 0.
+        assert_eq!(
+            produce_dedup(&mut e, b"v1", b"p1", 0, b"idem"),
+            AppendOutcome::Appended(Offset::new(0))
+        );
+        assert_eq!(e.flushed_offset(), Offset::new(1));
+        // The SAME msg_id again (payload differs, dedup keys on msg_id only): the ORIGINAL offset 0,
+        // no second record appended (the head does not move), the hit counter increments.
+        assert_eq!(
+            produce_dedup(&mut e, b"v2-ignored", b"p1", 0, b"idem"),
+            AppendOutcome::Duplicate(Offset::new(0))
+        );
+        assert_eq!(
+            e.flushed_offset(),
+            Offset::new(1),
+            "the durable head did NOT advance on a dedup hit (no second record)"
+        );
+        assert_eq!(e.dedup_hits(), 1);
+        assert_eq!(e.dedup_out_of_window(), 0);
+    }
+
+    #[test]
+    fn an_id_evicted_by_the_count_bound_is_treated_as_fresh() {
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config_with_dedup(2, 0), clock); // count bound 2, no time bound
+        produce_dedup(&mut e, b"a", b"p", 0, b"m0"); // offset 0
+        produce_dedup(&mut e, b"b", b"p", 0, b"m1"); // offset 1, window now full (m0, m1)
+        produce_dedup(&mut e, b"c", b"p", 0, b"m2"); // offset 2, evicts m0
+                                                     // m0 was evicted by the count bound: a republish is FRESH (appends a new offset), not a
+                                                     // false dedup.
+        assert_eq!(
+            produce_dedup(&mut e, b"a-again", b"p", 0, b"m0"),
+            AppendOutcome::Appended(Offset::new(3)),
+            "a count-evicted id is fresh, not a false dedup hit"
+        );
+        assert_eq!(e.flushed_offset(), Offset::new(4));
+        assert_eq!(e.dedup_hits(), 0, "no dedup hit: m0 had aged out by count");
+    }
+
+    #[test]
+    fn an_id_evicted_by_the_time_bound_is_fresh_and_counts_out_of_window() {
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config_with_dedup(100, 1000), std::sync::Arc::clone(&clock));
+        produce_dedup(&mut e, b"v1", b"p", 0, b"idem"); // offset 0 at t=0
+                                                        // Still within the 1000 ns window: a duplicate.
+        clock.advance_monotonic_nanos(999);
+        assert_eq!(
+            produce_dedup(&mut e, b"v1b", b"p", 0, b"idem"),
+            AppendOutcome::Duplicate(Offset::new(0))
+        );
+        assert_eq!(
+            e.flushed_offset(),
+            Offset::new(1),
+            "no append on the in-window dup"
+        );
+        // Past the window: the aged id is evicted, the republish is FRESH (a new offset), and the
+        // out-of-window counter fires.
+        clock.advance_monotonic_nanos(1);
+        assert_eq!(
+            produce_dedup(&mut e, b"v2", b"p", 0, b"idem"),
+            AppendOutcome::Appended(Offset::new(1)),
+            "a time-evicted id is fresh, not a false dedup hit"
+        );
+        assert_eq!(
+            e.flushed_offset(),
+            Offset::new(2),
+            "the republish appended a new record"
+        );
+        assert!(
+            e.dedup_out_of_window() >= 1,
+            "the time-bound eviction counted out-of-window"
+        );
+    }
+
+    #[test]
+    fn a_stale_epoch_is_fenced_and_a_fresh_epoch_supersedes() {
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config_with_dedup(100, 0), clock);
+        // Establish epoch 5 with msg m1 at offset 0.
+        produce_dedup(&mut e, b"a", b"p", 5, b"m1");
+        // A produce at the OLDER epoch 4 is fenced: nothing appended.
+        assert_eq!(
+            produce_dedup(&mut e, b"b", b"p", 4, b"m2"),
+            AppendOutcome::Fenced { current_epoch: 5 }
+        );
+        assert_eq!(
+            e.flushed_offset(),
+            Offset::new(1),
+            "the fenced produce appended nothing"
+        );
+        // A NEWER epoch 6 supersedes: the old window is reset, so m1 reads fresh again (appends).
+        assert_eq!(
+            produce_dedup(&mut e, b"c", b"p", 6, b"m1"),
+            AppendOutcome::Appended(Offset::new(1)),
+            "a newer epoch resets the window, so a prior epoch's id is fresh"
+        );
+        assert_eq!(e.flushed_offset(), Offset::new(2));
     }
 }

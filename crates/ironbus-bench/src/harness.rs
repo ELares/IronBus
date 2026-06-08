@@ -413,6 +413,7 @@ fn send_loop(
             timestamp_ms: 0,
             key: b"",
             headers: b"",
+            dedup: None,
             payload: &payload,
         }) {
             Ok(_) => {
