@@ -2300,6 +2300,11 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: &Path) -
 /// so it is testable on every platform and shared by the warning. The single source of truth for the
 /// per-level loss wording, kept in step with `docs/DURABILITY.md` and the engine's
 /// `DurabilityLevel::worst_case_loss_description`.
+// Used on the Unix serve path (the loud I2-waived warning in `cmd_serve`) and by the
+// platform-independent unit tests; gated so a non-Unix non-test build, where `serve` is stubbed out
+// and never emits the warning, does not carry it as dead code under `-D warnings` (the recurring
+// #288/#99 Windows footgun: a fn read only on cfg(unix) trips the Windows `never used` lint).
+#[cfg(any(unix, test))]
 fn durability_loss_description(config: &ServeConfig) -> String {
     match config.durability_level {
         DurabilityLevelArg::Sync => {
