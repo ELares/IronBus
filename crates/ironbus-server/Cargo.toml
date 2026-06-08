@@ -43,5 +43,14 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 [dev-dependencies]
 tempfile = "3"
 
+# loom (#122): the permutation tester for the scoped concurrency models in
+# `tests/loom_concurrency.rs`. It is gated behind `cfg(loom)` so it is pulled in ONLY when the
+# tests are built with `RUSTFLAGS="--cfg loom"`; a normal build/test never resolves it, so it
+# never enters the shipped dependency graph (confirm with `cargo tree`). loom is MIT, already on
+# the deny.toml license allow-list. The loom tests are themselves `#![cfg(loom)]`, so they compile
+# only under that flag.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
 [lints]
 workspace = true

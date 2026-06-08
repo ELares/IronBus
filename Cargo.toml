@@ -18,6 +18,10 @@ authors = ["The IronBus Authors"]
 # must be opted in explicitly with `#[allow(unsafe_code)]` plus a safety comment.
 [workspace.lints.rust]
 unsafe_code = "warn"
+# `cfg(loom)` is a known, deliberate cfg: the scoped loom concurrency tests (#122) build only under
+# `RUSTFLAGS="--cfg loom"`. Declare it so `unexpected_cfgs` stays quiet (and the loom job stays
+# `-D warnings`-clean) without disabling the lint for genuinely unknown cfgs.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
