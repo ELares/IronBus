@@ -34,6 +34,16 @@ pub const MAX_PAYLOAD: usize = 64;
 /// recovers as all-zeros and never blocks broker startup.
 pub const COUNTERS_PAYLOAD: usize = 256;
 
+/// The per-slot payload cap for the durable per-message ATTEMPT-COUNT checkpoint (#358): the
+/// in-flight `{offset -> attempt_count}` map a poison record's `MaxDeliver` count survives an
+/// unclean restart through. The snapshot is a small header plus 12 bytes per in-flight offset, and
+/// the in-flight set is bounded by `max_in_flight` per group, so the map is bounded too. At the
+/// default `max_in_flight` of 1024 the snapshot is `9 + 1024 * 12` ~= 12 KiB; this 32 KiB cap holds
+/// roughly 2700 in-flight attempt counts before the server drops the overflow tail (which only
+/// resets those few offsets to attempt 1, an at-least-once-safe loss, never a correctness break).
+/// It stays under the slot's `u16` length field (65535), so a snapshot at the cap still frames.
+pub const ATTEMPTS_PAYLOAD: usize = 32 * 1024;
+
 const SEQ_LEN: usize = 8;
 const LEN_LEN: usize = 2;
 const CRC_LEN: usize = 4;
@@ -103,6 +113,13 @@ pub type Checkpoint<F> = SlotCheckpoint<F, MAX_PAYLOAD>;
 /// [`SlotCheckpoint`]. It is an OBSERVABILITY aid only: a torn or missing snapshot recovers as
 /// all-zeros and never blocks broker startup or touches the durable log, cursors, or DLQ.
 pub type CountersCheckpoint<F> = SlotCheckpoint<F, COUNTERS_PAYLOAD>;
+
+/// The crash-safe checkpoint for the durable per-message ATTEMPT-COUNT map (#358): an
+/// [`ATTEMPTS_PAYLOAD`]-per-slot [`SlotCheckpoint`]. It reuses the identical dual-slot CRC
+/// discipline as the cursor and counters checkpoints, so a torn write reverts to the prior slot and
+/// a torn or missing snapshot recovers as "no carried counts" (every in-flight message resumes at
+/// attempt 1, the pre-#358 behavior) without ever blocking startup.
+pub type AttemptsCheckpoint<F> = SlotCheckpoint<F, ATTEMPTS_PAYLOAD>;
 
 impl<F: RandomAccessFile, const PAYLOAD_CAP: usize> SlotCheckpoint<F, PAYLOAD_CAP> {
     /// Bytes per slot for this cap: sequence, payload length, payload, CRC.
@@ -440,5 +457,50 @@ mod tests {
     fn a_fresh_counters_checkpoint_recovers_nothing() {
         let file = fresh();
         assert_eq!(CountersCheckpoint::open(Arc::clone(&file)).unwrap().1, None);
+    }
+
+    // The attempt-count checkpoint (#358) reuses the identical dual-slot crash-safe machinery with
+    // a still-larger slot, so a handful of tests confirm the big slot round-trips and stays
+    // torn-safe, exactly as the counters checkpoint above.
+
+    #[test]
+    fn an_attempts_checkpoint_round_trips_a_full_size_payload() {
+        let file = fresh();
+        let (mut cp, recovered) = AttemptsCheckpoint::open(Arc::clone(&file)).unwrap();
+        assert_eq!(recovered, None);
+        let payload = vec![0x42; ATTEMPTS_PAYLOAD];
+        cp.write(&payload).unwrap();
+        let reopened = AttemptsCheckpoint::open(Arc::clone(&file)).unwrap().1;
+        assert_eq!(reopened, Some(payload));
+    }
+
+    #[test]
+    fn an_attempts_checkpoint_over_its_cap_is_rejected() {
+        let file = fresh();
+        let (mut cp, _) = AttemptsCheckpoint::open(Arc::clone(&file)).unwrap();
+        let big = vec![0u8; ATTEMPTS_PAYLOAD + 1];
+        assert!(matches!(
+            cp.write(&big),
+            Err(StorageError::Segment(SegmentError::Truncated))
+        ));
+    }
+
+    #[test]
+    fn a_torn_attempts_slot_falls_back_to_the_previous_value() {
+        let file = fresh();
+        let (mut cp, _) = AttemptsCheckpoint::open(Arc::clone(&file)).unwrap();
+        cp.write(&[1u8; 64]).unwrap(); // seq 1 -> slot 1
+        cp.write(&[2u8; 64]).unwrap(); // seq 2 -> slot 0
+                                       // Corrupt slot 0 (the newest, seq 2): flip a CRC-covered payload byte.
+        let mut bytes = file.snapshot();
+        bytes[SEQ_LEN + LEN_LEN] ^= 0xff;
+        file.set_len(0).unwrap();
+        file.write_all_at(&bytes, 0).unwrap();
+        file.sync_data().unwrap();
+        // Recovery regresses to the previous durable value, never a torn one.
+        assert_eq!(
+            AttemptsCheckpoint::open(Arc::clone(&file)).unwrap().1,
+            Some(vec![1u8; 64])
+        );
     }
 }

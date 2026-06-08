@@ -193,6 +193,28 @@ offset). The default work-group's checkpoint file is `cursor.ckpt`; a named grou
 `cursor-<hex(name)>.ckpt`, where the group name is lowercase-hex-encoded so a path-unsafe
 name is a safe, reversible filename.
 
+### Attempt-count snapshot (the checkpoint payload, #358)
+
+Source: `crates/ironbus-core/src/attempt.rs`. This is the payload stored in a separate
+two-slot checkpoint for a work-group's durable per-message delivery-attempt counts: the
+`{offset -> attempt}` map of its in-flight (delivered but unacked) entries, so `MaxDeliver`
+survives an unclean restart. Bounded by `max_in_flight` per group.
+
+| field        | type  | width   | notes |
+|--------------|-------|---------|-------|
+| `version`    | u8    | 1       | attempt `SNAPSHOT_VERSION` = 1 (distinct from the cursor's) |
+| `count`      | u32   | 4       | number of `(offset, attempt)` pairs that follow |
+| `pairs[]`    | pairs | 12 each | `count` `(offset: u64, attempt: u32)` pairs in strictly ascending offset order |
+| `crc`        | u32   | 4       | CRC32C over every preceding byte of the snapshot |
+
+`ATTEMPT_SNAPSHOT_MIN_LEN` = `1 + 4 + 4` = 9 bytes (no pairs). The default group's file is
+`attempts.ckpt`; a named group's is `attempts-<hex(name)>.ckpt`. It is its OWN two-slot
+checkpoint with a larger per-slot payload cap (`ATTEMPTS_PAYLOAD` = 32 KiB) than the 64-byte
+cursor slot, since the map scales with `max_in_flight`. The format is ADDITIVE to the prior
+model: a data directory written before #358 simply has no attempts file, which decodes as
+"no carried counts" (every in-flight message resumes at attempt 1, the historical behavior);
+a torn snapshot degrades the same way and never blocks open.
+
 ---
 
 ## On-disk DLQ model
@@ -484,7 +506,11 @@ Per work-group consumer state over the shared log: an independent committed `Ack
 plus its own in-flight `LeaseTable`. The lease generation space is per-group, so a
 `LeaseToken` is only meaningful within the group it was delivered from. The default group
 is `""` (durable, `cursor.ckpt`); named groups are durable to their own
-`cursor-<hex>.ckpt`.
+`cursor-<hex>.ckpt`. The `LeaseTable`'s per-message delivery-attempt counts are ALSO
+durable (#358): each group's in-flight `{offset -> attempt}` map is checkpointed (default
+`attempts.ckpt`, named `attempts-<hex>.ckpt`) so `MaxDeliver` survives an unclean restart.
+On open the table seeds its carried attempt counts so a redelivered message resumes at its
+true attempt number instead of resetting to 1.
 
 ### LeaseToken (in-memory fencing token)
 
@@ -657,7 +683,16 @@ code; the code is canonical.
 - **`ConsumerStateEvent` is not implemented.** The draft's append-only per-consumer event
   log (`event_type, offset, attempt, lease_id, fence_token, timestamp, crc`) does not exist.
   Durable consumer state today is the `AckCursor` snapshot in a two-slot checkpoint
-  (committed watermark plus a run-length acked-ahead set), not an event log.
+  (committed watermark plus a run-length acked-ahead set), PLUS a separate two-slot
+  per-message attempt-count snapshot (#358), not an event log.
+- **The per-message delivery-attempt count IS durable (#358).** It was formerly in-memory
+  and reset on restart; it is now persisted as a compact `{offset -> attempt}` map of the
+  in-flight entries, in its own two-slot CRC checkpoint (`attempts.ckpt` for the default
+  group, `attempts-<hex>.ckpt` for a named group), written on the cursor-checkpoint cadence.
+  On open the lease table resumes each redelivery at its true attempt number, so `MaxDeliver`
+  routes a poison record to the DLQ after exactly `MaxDeliver` attempts TOTAL across an
+  unclean restart. The map is bounded by `max_in_flight` per group. A torn or missing
+  snapshot degrades to "resume at attempt 1" (the historical behavior) and never blocks open.
 - **`Lease` shape.** The draft's runtime `Lease` had `lease_id, consumer, offset, attempt,
   granted_unix_ms, visibility_deadline_ms, fence_token`. The implemented fencing token is
   `LeaseToken { offset, generation }`; the internal lease tracks `generation, attempt_start,
@@ -792,7 +827,8 @@ code today. They are aspirational and MUST NOT be treated as a current byte cont
   (`edit_type, segment_id, base_seq, timestamp, crc`) is not implemented; the directory
   scan plus per-segment checksums is the only source of truth.
 - **ConsumerStateEvent log under `consumers/<name>/`.** Not implemented (see the
-  discrepancies). Durable consumer state is the `AckCursor` checkpoint snapshot.
+  discrepancies). Durable consumer state is the `AckCursor` checkpoint snapshot plus the
+  per-message attempt-count checkpoint snapshot (#358), not an append-only event log.
 - **RecoveryReport and SkipEvent.** Not implemented as drafted; `LossReport`/`LossEvent`
   is the shipped artifact (see the discrepancies).
 - **TOML Config document.** Not implemented (see the discrepancies).
