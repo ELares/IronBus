@@ -234,19 +234,20 @@ compatibility policy) specify a single registry and a set of CI gates. The state
 | SemVer / 0.x promise (formats versioned independently of the API) | #126, #132 | PARTIAL. The pre-release status is stated (CHANGELOG, `0.0.0`); the on-disk format is a single versioned byte; the wire has no separate version integer yet. |
 | `storage_format_version` is a single versioned integer | #126 | IMPLEMENTED as `FORMAT_VERSION` (= 1), stamped in the record and segment headers/footer. |
 | `wire_protocol_version` negotiated in the handshake | #126, #132 | NOT IMPLEMENTED. The Connect/Info handshake bodies are empty; there is no wire-version field. |
-| `docs/compat/versions.md` registry with a row per version | #126, #132 | NOT PRESENT. No registry file exists. |
-| CI gate: an encoding change must touch the registry | #126, #132 | NOT PRESENT. No header-diff or registry-row CI check exists. |
-| CI gate: no duplicate version integer across branches | #132 | NOT PRESENT. |
+| `docs/compat/versions.md` registry with a row per version | #126, #132 | PRESENT. [`docs/compat/versions.md`](compat/versions.md) holds the version table, the refuse/poison/negotiate classification table, and the wire-negotiation spec; one row per versioned id-space, each cited to its code symbol. |
+| CI gate: an encoding change must touch the registry | #126, #132 | PRESENT. `scripts/check-format-registry.sh` (the `format-registry` CI job) hashes the layout `pub const`s in `format.rs` and fails unless the digest pinned in `docs/compat/versions.md` matches, so an encoding change cannot land without updating the registry. |
+| CI gate: no duplicate version integer across branches | #132 | MECHANICAL via the registry. The `FORMAT_VERSION` value lives on one line in `format.rs` and one row in the registry, so two branches bumping to the same next integer collide as a git MERGE CONFLICT on the second merge (the "turn a collision into a git conflict" mechanism); there is no separate cross-branch CI scanner. |
 | `migrate` subcommand for a format bump | #132 (#17) | IMPLEMENTED as a GATE. `ironbus migrate --data-dir <dir>` reads the data dir's stamped on-disk format version: within the current major it reports "no migration needed" (the dir opens with no migration); a stamped version that differs from this build's is REFUSED unless `--allow <to-version>` is passed, so a format bump is never silent. No in-place migrator across majors exists yet (refusing is honest, not faked). See `crates/ironbus-cli/src/main.rs` `cmd_migrate` and `crates/ironbus-cli/tests/upgrade_migrate.rs`. |
 
 The append-only id sub-registries that #132 wants centrally allocated (checksum_algo, codec
 id, dict_id, header key_id, NACK disposition, reason codes) are, in the shipped code, each a
-small enum with its values pinned in tests rather than a single registry document. Their
-unknown-value classes match the policy intent: an unknown `checksum_algo` or `version` is a
-hard refuse (above); an unknown ack op (`AckOp::from_u8`) is a typed `BadAckOp`; the
-`ReasonCode` numeric codes are frozen in `ironbus_storage::loss`. The single central registry
-table that #132 asks for (mapping each id space to refuse / poison / negotiate, owner issue,
-and append-only) does not exist as a file.
+small enum with its values pinned in tests. Their unknown-value classes match the policy
+intent: an unknown `checksum_algo` or `version` is a hard refuse (above); an unknown ack op
+(`AckOp::from_u8`) is a typed `BadAckOp`; the `ReasonCode` numeric codes are frozen in
+`ironbus_storage::loss`. The single central registry table that #132 asks for (mapping each id
+space to refuse / poison / negotiate, owner issue, and append-only) now lives in
+[`docs/compat/versions.md`](compat/versions.md); the per-enum tests remain the runtime
+enforcement, and the registry is the allocation document on top of them.
 
 ## Specified but not yet implemented
 
@@ -265,10 +266,11 @@ verifiably ABSENT from the code today. They MUST NOT be assumed present.
 - **A negotiated per-connection `max_frame_size`.** The decoder supports a tightening cap
   (`decode_frame_with_cap`), but no value is negotiated; every connection uses the absolute
   `MAX_FRAME_LEN`.
-- **A separate `wire_protocol_version` integer.** The wire is versioned only implicitly by the
-  frozen tag set and fixed body layouts; there is no version byte to negotiate down or reject.
-- **The `docs/compat/versions.md` registry and its CI gates.** No registry file, no
-  header-diff-requires-a-row check, no duplicate-integer check.
+- **A separate `wire_protocol_version` integer on the wire.** The wire is versioned only
+  implicitly by the frozen tag set and fixed body layouts; there is no version byte crossing the
+  handshake to negotiate down or reject. The `min(client, server)` negotiation is SPECIFIED in
+  [`docs/compat/versions.md`](compat/versions.md) (the architecture deliverable); wiring it into
+  the empty `Connect`/`Info` bodies is the implementation residual owned by #11.
 - **A multi-version on-disk MIGRATION path (the migrator itself).** The `ironbus migrate` verb now
   exists as a GATE (it detects a differing on-disk format version and refuses a silent bump, see the
   registry table above), but there is still no code that REWRITES v1 bytes into a future layout: a v1
@@ -283,26 +285,32 @@ verifiably ABSENT from the code today. They MUST NOT be assumed present.
 
 Where the implementation diverges from the #132 / #126 specification:
 
-- **No wire-version negotiation surface.** #132 mandates a handshake that "picks
-  `min(client, server)` wire_protocol_version" and a server that "never speaks a version it
-  did not advertise in INFO." The code has neither a wire-version integer nor any handshake
-  payload, so this rule is unenforceable today. Forward compatibility on the wire rests
-  entirely on the frozen append-only tag set plus typed unknown-tag handling, not on
-  negotiation.
-- **No central registry, no registry CI gates.** #126 / #132 require a single
-  `docs/compat/versions.md` with a row per version and CI that fails an encoding change
-  without a matching bump and registry row, and fails a duplicate integer. None of this
-  exists. The "turn a collision into a git conflict" mechanism the issues rely on is not in
-  place; today the protection against a silent format change is the frozen-layout tests
-  (`frozen_sizes`, `frozen_values`, the offset tests in `format.rs`, and the per-codec
-  round-trip tests), which break a CHANGE but do not enforce a registry row.
-- **Sub-registries are local enums, not one allocated table.** #132 wants checksum_algo,
-  codec/dict ids, key_id, NACK disposition, and reason codes "centrally allocated here" with a
-  per-id-space refuse / poison / negotiate classification. The code implements each as a local
-  pinned enum with the correct unknown-value behavior (hard refuse for checksum_algo/version,
-  typed error for an unknown ack op), but there is no single table that classifies them, and
-  the codec/dict id spaces are not present at all (on-disk compression is not yet implemented;
-  the stored codec is always "none").
+- **No wire-version negotiation surface (specified, not wired).** #132 mandates a handshake
+  that "picks `min(client, server)` wire_protocol_version" and a server that "never speaks a
+  version it did not advertise in INFO." That rule is now fully SPECIFIED in
+  [`docs/compat/versions.md`](compat/versions.md) (the architecture deliverable), but the code
+  still has neither a wire-version integer nor any handshake payload, so it is unenforceable
+  today and the wiring is the residual owned by #11. Forward compatibility on the wire rests
+  entirely on the frozen append-only tag set plus typed unknown-tag handling until then.
+- **The central registry and the encoding-change CI gate now exist; the duplicate-integer
+  check is conflict-based, not a scanner.** #126 / #132 require a single
+  `docs/compat/versions.md` with a row per version, CI that fails an encoding change without a
+  registry update, and a no-duplicate-integer guard. The registry and the encoding-change gate
+  are present ([`docs/compat/versions.md`](compat/versions.md) plus the `format-registry` CI
+  job hashing the `format.rs` layout consts against a pinned digest). The duplicate-integer
+  guard is the "turn a collision into a git conflict" mechanism, not a separate cross-branch
+  scanner: two branches bumping `FORMAT_VERSION` to the same integer conflict on the one line in
+  `format.rs` and the one registry row. The frozen-layout tests (`frozen_sizes`, `frozen_values`,
+  the offset tests in `format.rs`, the per-codec round-trips) remain the runtime enforcement
+  that also breaks a silent CHANGE.
+- **The classification table now exists; the sub-registries are still local enums underneath.**
+  #132 wants checksum_algo, codec/dict ids, key_id, NACK disposition, and reason codes
+  "centrally allocated here" with a per-id-space refuse / poison / negotiate classification. That
+  single table now lives in [`docs/compat/versions.md`](compat/versions.md). The runtime
+  enforcement is still a local pinned enum per id-space with the correct unknown-value behavior
+  (hard refuse for checksum_algo/version, typed error for an unknown ack op); the codec/dict id
+  spaces remain reserved-not-implemented (on-disk compression is not yet implemented; the stored
+  codec is always "none"), and the registry marks them POISON-on-unknown as the SPECIFIED action.
 - **`migrate` gates but does not yet convert.** #132 (via #17) requires that any format bump ship a
   `migrate` subcommand and a downgrade-safety statement. The subcommand now EXISTS and gates the bump
   (a differing on-disk version is refused unless explicitly allowed, never applied silently), and the
