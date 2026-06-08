@@ -20,6 +20,18 @@
 #[cfg(unix)]
 mod dirlock;
 
+/// The `bench` load generator's platform-neutral surface (#94): arg parsing, the production-safety
+/// and flash-endurance guards, the versioned `--json` schema, payload generation, and percentiles.
+/// Cross-platform (and unit-tested on every target) so the guards are exercised everywhere.
+mod bench;
+
+/// The `bench` Unix execution path (#94): spin up an isolated in-process broker (or connect to a
+/// live one), drive the real #11 client over the real #6 produce path, measure the latency tail and
+/// the honest round-trip fsync cost, then auto-delete the synthetic data dir. Unix-only, like
+/// `serve` (the on-disk broker is Unix-only in v1); the non-Unix `run_bench` stub errors out.
+#[cfg(unix)]
+mod bench_run;
+
 /// Atomic in-place upgrade + rollback for the `ironbus` binary (#104). Unix-only (the atomic
 /// `rename(2)` swap and the directory fsync are POSIX guarantees); the non-Unix `cmd_upgrade`,
 /// `cmd_rollback`, and `cmd_record_start` stubs error out before any of it runs, so the module is
@@ -215,6 +227,10 @@ USAGE:
     ironbus cumulative-ack [--addr <host:port>] [--group <name>] --up-to <offset>
     ironbus peek  --data-dir <dir> [--from-offset <n>] [--limit <n>] [--json]
     ironbus dump  --data-dir <dir> [--limit <n>] [--json] [--dlq]
+    ironbus bench (--duration <secs> | --count <n>) [--mode <publish|subscribe|round-trip>]
+                  [--rate <msg/s>] [--payload-bytes <n>] [--payload-shape <realistic|random>]
+                  [--fetch-batch <n>] [--group <name>] [--no-fsync] [--json]
+                  [--addr <host:port> --i-understand-this-is-live]
     ironbus upgrade --new-binary <path> --dest <path> [--max-failed-starts <n>]
     ironbus rollback --dest <path>
     ironbus record-start --dest <path> (--failed | --ok | --check)
@@ -288,6 +304,20 @@ Notes:
     per poison record showing dlq_offset, source_offset, group, attempt, ts_ms, and the
     key/payload sizes (NDJSON with --json). It is read-only and never mutates the directory;
     an empty or never-poisoned broker shows nothing.
+    bench is a load generator that reports throughput, p50/p99/p999 latency, fsync cost, and
+    bytes/op over the real wire and produce path. By DEFAULT it is PRODUCTION-SAFE: it spawns its
+    own ISOLATED broker over a fresh ironbus-bench-<random> data directory and reads through a fresh
+    ironbus-bench-<random> consumer group, then auto-deletes the directory (a cleanup failure is
+    reported and exits 70). It REFUSES to target an existing broker (--addr) or join a non-bench
+    consumer group (--group) unless --i-understand-this-is-live is passed, so it can never corrupt
+    real data or steal a real group's messages. To protect edge flash, exactly one of --duration
+    <secs> or --count <n> is REQUIRED (no unbounded default), and --no-fsync is a dry run that
+    batches the bench broker's cursor checkpoints (the fsync cost is then reported as not measured).
+    round-trip mode (the default) measures producer-to-consumer latency through the real durable
+    path, so the fsync-cost number is honest. Payloads are realistic (compressible, codec-friendly)
+    by default; --payload-shape random uses incompressible noise. --json emits a single versioned
+    object with explicitly-named latency-histogram fields (latency_p50_us, latency_p99_us,
+    latency_p999_us, latency_max_us).
     Every serve setting can also be supplied via an environment variable IRONBUS_<FLAG>, the flag
     name uppercased with dashes as underscores (--max-total-bytes -> IRONBUS_MAX_TOTAL_BYTES,
     --data-dir -> IRONBUS_DATA_DIR, --addr -> IRONBUS_ADDR). Precedence is flag > env > default: an
@@ -399,6 +429,7 @@ fn run(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         "serve" => run_serve(rest, out),
         "peek" => run_peek(rest, out),
         "dump" => run_dump(rest, out),
+        "bench" => run_bench(rest, out),
         "upgrade" => run_upgrade(rest, out),
         "rollback" => run_rollback(rest, out),
         "record-start" => run_record_start(rest, out),
@@ -1312,6 +1343,39 @@ struct ServeConfig {
     enable_admin: bool,
 }
 
+// Only the Unix `bench` execution path constructs a default `ServeConfig` (the isolated broker); on
+// a non-Unix target the `bench` run is stubbed out, so gate the constructor to avoid a dead-code
+// warning under `-D warnings`.
+#[cfg(unix)]
+impl ServeConfig {
+    /// The compiled-default `ServeConfig`, every knob at its built-in default. The `bench` (#94)
+    /// isolated in-process broker starts from this and then sets only its checkpoint interval, so
+    /// the bench broker matches the shipped `serve` defaults in every other respect. Defined once
+    /// here so it cannot drift from the per-flag default constants.
+    fn bench_default() -> ServeConfig {
+        ServeConfig {
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
+            max_deliver: DEFAULT_MAX_DELIVER,
+            allow_unlimited_deliver: false,
+            backoff_ms: Vec::new(),
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            consumer_credit: DEFAULT_CONSUMER_CREDIT,
+            consumer_credit_bytes: DEFAULT_CONSUMER_CREDIT_BYTES,
+            max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
+            max_retained_bytes: DEFAULT_MAX_RETAINED_BYTES,
+            max_age_ms: DEFAULT_MAX_AGE_MS,
+            max_messages: DEFAULT_MAX_MESSAGES,
+            max_groups: DEFAULT_MAX_GROUPS,
+            group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
+            disk_full_policy: DiskFullPolicyArg::DropNew,
+            visibility_ms: DEFAULT_VISIBILITY_MS,
+            enable_admin: false,
+        }
+    }
+}
+
 /// Maps a data-dir lifecycle/lock failure (#89) onto the frozen CLI exit-code scheme. A
 /// non-directory path is an operator MISCONFIGURATION (usage, exit 1); an unwritable mount, a
 /// lock-IO fault, and the "another broker already running" contention are RUNTIME faults that fail
@@ -1701,6 +1765,69 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         return cmd_inspect_dlq(Path::new(&data_dir), limit, json, out);
     }
     cmd_inspect(Path::new(&data_dir), 0, limit, json, out)
+}
+
+/// Parses and runs `bench` (#94): the publish / subscribe / round-trip load generator with the
+/// production-safety and flash-endurance guards. Parsing (and the guards) are platform-neutral; the
+/// load run is Unix-only (the on-disk broker is Unix-only in v1), so the run is dispatched through a
+/// cfg-gated `cmd_bench`.
+///
+/// # Errors
+/// Returns [`CliError::Usage`] for a bad flag, a missing required bound, an unacknowledged live
+/// target, or an unacknowledged non-bench group; [`CliError::Unreachable`] if a live broker is
+/// down; or [`CliError::Internal`] for a run failure or a synthetic-directory cleanup failure.
+fn run_bench(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    // A fresh random suffix names the isolated synthetic data dir and consumer group, so two
+    // concurrent bench runs never collide and the name is recognizable as bench-owned.
+    let config = bench::parse_bench(args, &random_suffix())?;
+    cmd_bench(&config, out)
+}
+
+/// Runs a parsed `bench` invocation on Unix: dispatches to the [`bench_run`] execution path.
+#[cfg(unix)]
+fn cmd_bench(config: &bench::BenchConfig, out: &mut impl Write) -> Result<(), CliError> {
+    bench_run::run_bench(config, out)
+}
+
+/// `bench` requires Unix in v1: the isolated in-process broker it spawns is the on-disk `serve`
+/// engine, which uses positioned IO the Windows path does not implement yet. The guards and JSON
+/// schema still compile and unit-test on every platform; only the run is gated.
+#[cfg(not(unix))]
+fn cmd_bench(config: &bench::BenchConfig, out: &mut impl Write) -> Result<(), CliError> {
+    let _ = (config, out);
+    Err(CliError::Internal(
+        "ironbus bench requires a Unix host in v1: the isolated broker uses the Unix-only on-disk \
+         storage path"
+            .to_string(),
+    ))
+}
+
+/// A short random-ish hex suffix for the synthetic bench namespace. Combines the process id, a
+/// monotonic clock reading, and a per-call atomic counter, mixed with a small hash, so two runs in
+/// the same process and two processes never collide on the temp-dir/group name. This is a
+/// uniqueness aid for an isolated namespace, not a security primitive, so no `rand` dependency is
+/// pulled onto the shipped binary's graph.
+fn random_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let pid = u64::from(std::process::id());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    let seq = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    // A cheap splitmix64-style mix so the suffix looks random and a coarse clock plus a small pid
+    // still spread out.
+    let mut x = pid
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(nanos)
+        .wrapping_add(seq.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    format!("{x:016x}")
 }
 
 /// Parses and runs `upgrade`: atomically swap an already-verified new binary over the live one,
