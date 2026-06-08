@@ -125,8 +125,8 @@ jobs:
 
   loom:
     # Scoped loom concurrency models (#122): exhaustively permute the interleavings of the three
-    # genuinely cross-thread hot paths (the commit-index publish/observe, the bounded WAL handoff,
-    # and the segment/connection refcount) under `RUSTFLAGS="--cfg loom"`. The tests live in the
+    # concurrency patterns the cross-thread paths rely on (the commit-index publish/observe, the
+    # bounded WAL handoff, and the segment/connection refcount) under `RUSTFLAGS="--cfg loom"`. The tests live in the
     # STANDALONE, SEPARATE-WORKSPACE dev-only `loom-tests` crate
     # (`tools/loom-tests/tests/loom_concurrency.rs`), gated `#![cfg(loom)]`, with `loom` as a
     # `cfg(loom)` dev-dependency. That crate has its OWN Cargo.lock and is EXCLUDED from the root
