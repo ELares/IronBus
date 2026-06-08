@@ -530,6 +530,7 @@ name = "ironbus-storage"
 version = "0.0.0"
 dependencies = [
  "crc32c",
+ "criterion",
  "ironbus-core",
  "libc",
  "proptest",
