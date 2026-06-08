@@ -215,6 +215,23 @@ jobs:
       - name: assert an on-disk format change also updates the version registry
         run: sh scripts/check-format-registry.sh
 
+  fmea-coverage:
+    name: FMEA coverage gate (#129)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # The consolidated-FMEA coverage gate (#129): docs/FMEA.md aggregates every per-issue
+      # failure mode into one operator-facing table, and this gate is its mechanized acceptance
+      # criterion. The script holds a curated list of required failure-mode IDs (F1..Fn) each
+      # with an anchor keyword, and fails if any ID is missing a table row, any anchor keyword is
+      # absent (so a row cannot be gutted while keeping its ID), or the IDs are not contiguous (so
+      # a row cannot be silently dropped from the middle). Deterministic and history-free: no
+      # network, no gh, no git diff base. To add a failure mode, append a row to docs/FMEA.md and
+      # an `Fn|<keyword>` line to the REQUIRED block in the script (see docs/FMEA.md).
+      - name: assert every required per-issue failure mode appears in the consolidated FMEA
+        run: sh scripts/ci/fmea-coverage.sh
+
   cross-build:
     name: musl build (${{ matrix.target }})
     runs-on: ubuntu-latest
