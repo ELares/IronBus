@@ -482,7 +482,10 @@ fn start_broker_with_health_args(data_dir: &str, extra: &[&str]) -> (ChildGuard,
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
-        for _ in 0..2 {
+        // Forward the startup lines: "listening on", the #87 materialized-config line, and "health
+        // endpoints on" (a few extra to absorb any future startup line), so the consumer can find
+        // both addresses regardless of their relative order.
+        for _ in 0..8 {
             let mut line = String::new();
             if reader.read_line(&mut line).unwrap_or(0) == 0 {
                 break;
@@ -494,10 +497,13 @@ fn start_broker_with_health_args(data_dir: &str, extra: &[&str]) -> (ChildGuard,
     });
     let mut wire = None;
     let mut health = None;
-    for _ in 0..2 {
-        let line = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("ironbus serve did not print its addresses within 10s");
+    // Read startup lines until BOTH addresses are seen (or the stream ends): the materialized-config
+    // line (#87) now sits between the listen and health lines, so a fixed two-line read would miss
+    // the health address.
+    while wire.is_none() || health.is_none() {
+        let Ok(line) = rx.recv_timeout(Duration::from_secs(10)) else {
+            break;
+        };
         if let Some(a) = line
             .split("listening on ")
             .nth(1)
