@@ -76,6 +76,15 @@ fn engine_config() -> EngineConfig {
         durability_level: ironbus_server::engine::DurabilityLevel::Sync,
         flush_interval_ms: 0,
         flush_max_bytes: 0,
+        // Backpressure controls (#68, #69) default to inert.
+        codel_target_ms: 0,
+        codel_interval_ms: 0,
+        retry_budget_ratio_per_million: 0,
+        retry_budget_window_ms: 0,
+        fire_and_forget_msg_rate: 0,
+        fire_and_forget_byte_rate: 0,
+        fire_and_forget_refill_ms: 0,
+        egress_limit: 0,
     }
 }
 

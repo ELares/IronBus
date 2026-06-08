@@ -193,6 +193,35 @@ const DEFAULT_FLUSH_INTERVAL_MS: u64 = 1_000;
 /// is the smaller of the time and byte triggers.
 const DEFAULT_FLUSH_MAX_BYTES: u64 = 1024 * 1024;
 
+/// The default CoDel TARGET (ms) for `serve` (#68), aliased to the engine's default so the CLI and
+/// engine stay one source of truth. `0` = DISABLED (CoDel off, the default), so a zero-config broker
+/// is unchanged; an operator opts in by setting a non-zero target.
+const DEFAULT_CODEL_TARGET_MS: u64 = ironbus_server::engine::DEFAULT_CODEL_TARGET_MS;
+/// The default CoDel INTERVAL (ms) for `serve` (#68), aliased to the engine default. Only consulted
+/// when the target is non-zero.
+const DEFAULT_CODEL_INTERVAL_MS: u64 = ironbus_server::engine::DEFAULT_CODEL_INTERVAL_MS;
+/// The default per-client retry-budget ratio (parts per million) for `serve` (#69), aliased to the
+/// engine default. `0` = DISABLED (the default).
+const DEFAULT_RETRY_BUDGET_RATIO_PER_MILLION: u64 =
+    ironbus_server::engine::DEFAULT_RETRY_BUDGET_RATIO_PER_MILLION;
+/// The default per-client retry-budget window (ms) for `serve` (#69), aliased to the engine default.
+const DEFAULT_RETRY_BUDGET_WINDOW_MS: u64 = ironbus_server::engine::DEFAULT_RETRY_BUDGET_WINDOW_MS;
+/// The default fire-and-forget token-bucket message rate (msg/s) for `serve` (#69), aliased to the
+/// engine default. `0` = DISABLED (the un-credited tier is ungoverned, as today).
+const DEFAULT_FIRE_AND_FORGET_MSG_RATE: u64 =
+    ironbus_server::engine::DEFAULT_FIRE_AND_FORGET_MSG_RATE;
+/// The default fire-and-forget token-bucket byte rate (bytes/s) for `serve` (#69), aliased to the
+/// engine default. `0` = disabled.
+const DEFAULT_FIRE_AND_FORGET_BYTE_RATE: u64 =
+    ironbus_server::engine::DEFAULT_FIRE_AND_FORGET_BYTE_RATE;
+/// The default fire-and-forget token-bucket refill granularity (ms) for `serve` (#69), aliased to the
+/// engine default (100 ms).
+const DEFAULT_FIRE_AND_FORGET_REFILL_MS: u64 =
+    ironbus_server::engine::DEFAULT_FIRE_AND_FORGET_REFILL_MS;
+/// The default starting / static-floor egress concurrency limit for `serve` (#69), aliased to the
+/// engine default (16); the AIMD bounds `[4, 128]` always apply.
+const DEFAULT_EGRESS_LIMIT: u32 = ironbus_server::engine::DEFAULT_EGRESS_LIMIT;
+
 /// The default COUNT bound on each per-producer dedup window for `serve` (#3, #33), aliased to the
 /// engine's [`ironbus_core::dedup::DEFAULT_MAX_IDS`] so the CLI and engine default are one source of
 /// truth. Dedup is OFF by default and activates per-producer only when a publish carries a `msg_id`;
@@ -1400,6 +1429,22 @@ struct ServeFlags {
     /// surface is unauthenticated and unencrypted (TLS/#107 and auth/#106 are not wired), so a
     /// non-loopback bind refuses to start unless the operator sets this. A bare boolean flag.
     health_allow_public: bool,
+    /// The CoDel TARGET in ms (#68); `None` falls back to the default (`0` = CoDel disabled).
+    codel_target_ms: Option<u64>,
+    /// The CoDel INTERVAL in ms (#68); `None` falls back to the default (100 ms).
+    codel_interval_ms: Option<u64>,
+    /// The per-client retry-budget ratio in parts-per-million (#69); `None` -> default (`0` = off).
+    retry_budget_ratio_per_million: Option<u64>,
+    /// The per-client retry-budget window in ms (#69); `None` -> default (60 s).
+    retry_budget_window_ms: Option<u64>,
+    /// The fire-and-forget token-bucket message rate in msg/s (#69); `None` -> default (`0` = off).
+    fire_and_forget_msg_rate: Option<u64>,
+    /// The fire-and-forget token-bucket byte rate in bytes/s (#69); `None` -> default (`0` = off).
+    fire_and_forget_byte_rate: Option<u64>,
+    /// The fire-and-forget token-bucket refill granularity in ms (#69); `None` -> default (100 ms).
+    fire_and_forget_refill_ms: Option<u64>,
+    /// The starting / static-floor egress concurrency limit (#69); `None` -> default (16).
+    egress_limit: Option<u32>,
     key_shared_groups: Vec<String>,
     broadcast_groups: Vec<String>,
 }
@@ -1483,6 +1528,37 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             }
             "--flush-max-bytes" => {
                 f.flush_max_bytes = Some(take_number("--flush-max-bytes", args, &mut i)?);
+            }
+            // The backpressure controls (#68, #69). Each is opt-in: the resolver supplies the
+            // disabling default when the flag is absent.
+            "--codel-target-ms" => {
+                f.codel_target_ms = Some(take_number("--codel-target-ms", args, &mut i)?);
+            }
+            "--codel-interval-ms" => {
+                f.codel_interval_ms = Some(take_number("--codel-interval-ms", args, &mut i)?);
+            }
+            "--retry-budget-ratio-ppm" => {
+                f.retry_budget_ratio_per_million =
+                    Some(take_number("--retry-budget-ratio-ppm", args, &mut i)?);
+            }
+            "--retry-budget-window-ms" => {
+                f.retry_budget_window_ms =
+                    Some(take_number("--retry-budget-window-ms", args, &mut i)?);
+            }
+            "--fire-and-forget-msg-rate" => {
+                f.fire_and_forget_msg_rate =
+                    Some(take_number("--fire-and-forget-msg-rate", args, &mut i)?);
+            }
+            "--fire-and-forget-byte-rate" => {
+                f.fire_and_forget_byte_rate =
+                    Some(take_number("--fire-and-forget-byte-rate", args, &mut i)?);
+            }
+            "--fire-and-forget-refill-ms" => {
+                f.fire_and_forget_refill_ms =
+                    Some(take_number("--fire-and-forget-refill-ms", args, &mut i)?);
+            }
+            "--egress-limit" => {
+                f.egress_limit = Some(take_number("--egress-limit", args, &mut i)?);
             }
             // A bare boolean flag (no value): advance ONE token, not two, or the loop spins. The
             // explicit data-loss acknowledgement that gates the unbounded-loss durability levels.
@@ -1749,6 +1825,58 @@ fn parse_serve_flags_with_env(args: &[String], env: &EnvFn<'_>) -> Result<Parsed
                 DEFAULT_FLUSH_MAX_BYTES,
             )?,
             async_loss_ack: resolve_bool("--async-loss-ack", f.async_loss_ack, env)?,
+            // The backpressure controls (#68, #69). Every knob DEFAULTS to its disabling value, so a
+            // zero-config broker behaves exactly as today; an operator opts in per knob. CoDel and the
+            // retry budget and the fire-and-forget bucket default OFF; the egress limiter defaults to
+            // its floor (16) and is always bounded to [4, 128].
+            codel_target_ms: resolve_number(
+                "--codel-target-ms",
+                f.codel_target_ms,
+                env,
+                DEFAULT_CODEL_TARGET_MS,
+            )?,
+            codel_interval_ms: resolve_number(
+                "--codel-interval-ms",
+                f.codel_interval_ms,
+                env,
+                DEFAULT_CODEL_INTERVAL_MS,
+            )?,
+            retry_budget_ratio_per_million: resolve_number(
+                "--retry-budget-ratio-ppm",
+                f.retry_budget_ratio_per_million,
+                env,
+                DEFAULT_RETRY_BUDGET_RATIO_PER_MILLION,
+            )?,
+            retry_budget_window_ms: resolve_number(
+                "--retry-budget-window-ms",
+                f.retry_budget_window_ms,
+                env,
+                DEFAULT_RETRY_BUDGET_WINDOW_MS,
+            )?,
+            fire_and_forget_msg_rate: resolve_number(
+                "--fire-and-forget-msg-rate",
+                f.fire_and_forget_msg_rate,
+                env,
+                DEFAULT_FIRE_AND_FORGET_MSG_RATE,
+            )?,
+            fire_and_forget_byte_rate: resolve_number(
+                "--fire-and-forget-byte-rate",
+                f.fire_and_forget_byte_rate,
+                env,
+                DEFAULT_FIRE_AND_FORGET_BYTE_RATE,
+            )?,
+            fire_and_forget_refill_ms: resolve_number(
+                "--fire-and-forget-refill-ms",
+                f.fire_and_forget_refill_ms,
+                env,
+                DEFAULT_FIRE_AND_FORGET_REFILL_MS,
+            )?,
+            egress_limit: resolve_number(
+                "--egress-limit",
+                f.egress_limit,
+                env,
+                DEFAULT_EGRESS_LIMIT,
+            )?,
         },
         key_shared_groups: f.key_shared_groups,
         broadcast_groups: f.broadcast_groups,
@@ -2075,6 +2203,37 @@ struct ServeConfig {
     /// with the ack, the broker logs a LOUD startup warning that I2 is waived and the worst-case loss
     /// for the active level.
     async_loss_ack: bool,
+    /// The CoDel time-in-queue (sojourn) shedding TARGET in MILLISECONDS (#68): the acceptable
+    /// standing produce-admission latency before the load-shed begins. `0` = DISABLED (the default),
+    /// so a zero-config broker behaves exactly as today (byte-cap shed + consumer credit only). When
+    /// set, the RFC 8289 recommended 5 ms is the doc value, and the engine CLAMPS it to `[1 ms, 1 s]`
+    /// (never rejected). A sustained admission sojourn above it for `codel_interval_ms` sheds NEW
+    /// produces with the typed "shed under load" signal, never dropping an accepted record.
+    codel_target_ms: u64,
+    /// The CoDel INTERVAL in MILLISECONDS (#68): the window the admission sojourn must stay above
+    /// `codel_target_ms` before shedding, clamped to `[20 ms, 10 s]`. Only consulted when
+    /// `codel_target_ms` is non-zero. Default 100 ms (the RFC 8289 value).
+    codel_interval_ms: u64,
+    /// The per-client retry-budget RATIO in PARTS PER MILLION (#69): the fraction of a client's
+    /// request rate its retries may occupy before the broker-side throttle sheds them. `0` = DISABLED
+    /// (the default). The doc budget is 10% (`100000`).
+    retry_budget_ratio_per_million: u64,
+    /// The per-client retry-budget sliding WINDOW in MILLISECONDS (#69), only consulted when the
+    /// ratio is non-zero. Default 60 s.
+    retry_budget_window_ms: u64,
+    /// The fire-and-forget (un-credited) token-bucket MESSAGE rate in msg/s (#69): caps the
+    /// QoS-0-equivalent tier so it cannot bypass the consumer-credit brake. `0` = DISABLED (the tier
+    /// is ungoverned, as today). The doc default is 5000.
+    fire_and_forget_msg_rate: u64,
+    /// The fire-and-forget token-bucket BYTE rate in bytes/s (#69). `0` = disabled. Doc default
+    /// 5 MiB/s.
+    fire_and_forget_byte_rate: u64,
+    /// The fire-and-forget token-bucket refill granularity in MILLISECONDS (#69): sizes the burst
+    /// ceiling. Default 100 ms.
+    fire_and_forget_refill_ms: u64,
+    /// The starting / static-floor EGRESS concurrency limit for the AIMD downstream limiter (#69),
+    /// adapted within `[4, 128]`. `0` is treated as the doc default floor (16) by the limiter.
+    egress_limit: u32,
 }
 
 // Only the Unix `bench` execution path constructs a default `ServeConfig` (the isolated broker); on
@@ -2121,6 +2280,15 @@ impl ServeConfig {
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
             async_loss_ack: false,
+            // Backpressure controls (#68, #69) default to inert in this config builder.
+            codel_target_ms: 0,
+            codel_interval_ms: DEFAULT_CODEL_INTERVAL_MS,
+            retry_budget_ratio_per_million: 0,
+            retry_budget_window_ms: DEFAULT_RETRY_BUDGET_WINDOW_MS,
+            fire_and_forget_msg_rate: 0,
+            fire_and_forget_byte_rate: 0,
+            fire_and_forget_refill_ms: DEFAULT_FIRE_AND_FORGET_REFILL_MS,
+            egress_limit: DEFAULT_EGRESS_LIMIT,
         }
     }
 }
@@ -2657,6 +2825,18 @@ fn cmd_serve(
         config.flush_interval_ms,
         config.flush_max_bytes,
         config.async_loss_ack,
+        // The #68/#69 backpressure knobs are read only on the Unix serve path (they wire the engine's
+        // CoDel / retry-budget / fire-and-forget / egress controls), so the non-Unix stub must consume
+        // them too or the Windows `-D warnings` build trips field-never-read, invisible to a macOS
+        // reviewer (the recurring #288/#99 footgun).
+        config.codel_target_ms,
+        config.codel_interval_ms,
+        config.retry_budget_ratio_per_million,
+        config.retry_budget_window_ms,
+        config.fire_and_forget_msg_rate,
+        config.fire_and_forget_byte_rate,
+        config.fire_and_forget_refill_ms,
+        config.egress_limit,
         key_shared_groups,
         // Read the broadcast groups under cfg(not(unix)) too: a field/param read only on cfg(unix)
         // breaks the Windows `-D warnings` build invisibly to a macOS reviewer (#288 note).
@@ -2781,6 +2961,18 @@ fn open_disk_engine(
             },
             flush_interval_ms: config.flush_interval_ms,
             flush_max_bytes: config.flush_max_bytes,
+            // The backpressure controls (#68, #69), wired from the serve flags. Every knob defaults
+            // to its disabling value (CoDel off, retry budget off, fire-and-forget ungoverned, egress
+            // at its floor), so a zero-config broker is byte-for-byte the historical broker. The
+            // engine CLAMPS the CoDel values and bounds the egress limiter, never rejecting a value.
+            codel_target_ms: config.codel_target_ms,
+            codel_interval_ms: config.codel_interval_ms,
+            retry_budget_ratio_per_million: config.retry_budget_ratio_per_million,
+            retry_budget_window_ms: config.retry_budget_window_ms,
+            fire_and_forget_msg_rate: config.fire_and_forget_msg_rate,
+            fire_and_forget_byte_rate: config.fire_and_forget_byte_rate,
+            fire_and_forget_refill_ms: config.fire_and_forget_refill_ms,
+            egress_limit: config.egress_limit,
         },
     )
     .map_err(|e| CliError::Internal(format!("opening broker at {}: {e}", data_dir.display())))?;
@@ -4315,6 +4507,15 @@ mod tests {
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
             async_loss_ack: false,
+            // Backpressure controls (#68, #69) default to inert in this config builder.
+            codel_target_ms: 0,
+            codel_interval_ms: DEFAULT_CODEL_INTERVAL_MS,
+            retry_budget_ratio_per_million: 0,
+            retry_budget_window_ms: DEFAULT_RETRY_BUDGET_WINDOW_MS,
+            fire_and_forget_msg_rate: 0,
+            fire_and_forget_byte_rate: 0,
+            fire_and_forget_refill_ms: DEFAULT_FIRE_AND_FORGET_REFILL_MS,
+            egress_limit: DEFAULT_EGRESS_LIMIT,
         }
     }
 
@@ -4817,6 +5018,15 @@ mod tests {
                 durability_level: ironbus_server::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert in this test EngineConfig.
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap();
@@ -5312,6 +5522,15 @@ mod tests {
                 durability_level: ironbus_server::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert in this test EngineConfig.
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap();
@@ -5380,6 +5599,15 @@ mod tests {
                 durability_level: ironbus_server::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert in this test EngineConfig.
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap();
@@ -5659,6 +5887,15 @@ mod tests {
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
             async_loss_ack: false,
+            // Backpressure controls (#68, #69) default to inert in this config builder.
+            codel_target_ms: 0,
+            codel_interval_ms: DEFAULT_CODEL_INTERVAL_MS,
+            retry_budget_ratio_per_million: 0,
+            retry_budget_window_ms: DEFAULT_RETRY_BUDGET_WINDOW_MS,
+            fire_and_forget_msg_rate: 0,
+            fire_and_forget_byte_rate: 0,
+            fire_and_forget_refill_ms: DEFAULT_FIRE_AND_FORGET_REFILL_MS,
+            egress_limit: DEFAULT_EGRESS_LIMIT,
         }
     }
 
@@ -7267,6 +7504,15 @@ mod tests {
                 durability_level: ironbus_server::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert in this test EngineConfig.
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap();
@@ -7334,6 +7580,15 @@ mod tests {
                 durability_level: ironbus_server::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert in this test EngineConfig.
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap();

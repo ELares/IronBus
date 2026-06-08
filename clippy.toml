@@ -1,1 +1,1 @@
-doc-valid-idents = ["IronBus", "IO", ".."]
+doc-valid-idents = ["IronBus", "IO", "CoDel", "AIMD", "QoS", ".."]

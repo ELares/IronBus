@@ -100,6 +100,12 @@ snapshot already dominates the replay increments nothing).
 | `ironbus_consumer_labels_dropped_total` | A new consumer is refused a distinct `ironbus_consumer_lag_records{consumer}` series because the **1024-series cardinality cap** was reached; its lag is folded into `{consumer="__overflow__"}` instead (#97). | **Cardinality shed**: the registry refuses an unbounded number of distinct consumer labels (which would OOM the very node metrics protect), but the dropped label and its lag are never silent. An operator's cardinality-pressure signal. |
 | `ironbus_dedup_hits_total` | An opt-in dedup `produce` carried a `msg_id` already seen within the producer's bounded window, so the broker returned the **original** offset (`PubAckDuplicate`, `duplicate = true`, `rc = 0`) and appended **no** second copy (#33). | **Dedup hit (benign)**: the effectively-once window absorbed a producer's retry rather than double-storing it. A non-zero rate means idempotent retries are being deduplicated, never an error. |
 | `ironbus_dedup_out_of_window_total` | A `msg_id` aged out of a producer's window by the **time** bound (its dedup protection lapsed), so a later republish of that id would create a new offset rather than dedup (#33). | **Out-of-window**: the "is the dedup window too small for the retry interval" signal an operator watches to size `--dedup-max-ids` / `--dedup-window-ms`. |
+| `ironbus_codel_shed_total` | A NEW `produce` is shed by the **CoDel** time-in-queue (sojourn) control: the standing produce-admission latency stayed above `--codel-target-ms` for a full `--codel-interval-ms` window (#68). | **Load shed** (latency backpressure): the broker refuses the *new* write to protect tail latency. Decided BEFORE the append, so it NEVER drops an already-accepted record (I2 holds). The producer is told via a typed "shed under load" reply. Zero unless CoDel is enabled. |
+| `ironbus_codel_backstop_shed_total` | A NEW `produce` is shed by the **sojourn-independent depth/byte backstop** (#68): the admission ring depth bound, OR the durable-log byte cap (`max_total_bytes`), which sheds at enqueue even when a fully stalled drain produces no sojourn samples CoDel could see. | **Backstop shed**: bounds memory under a total drain stall that CoDel cannot detect. The byte-cap shed (`ironbus_produce_rejected_total`) also counts here as the BYTE dimension of the backstop, so this is the unified sojourn-independent shed signal. |
+| `ironbus_codel_interval_resets_total` | CoDel detected a **suspend gap** (the monotonic clock jumped past a multiple of `--codel-interval-ms` with no intervening activity) and RESET its window, discarding the across-gap sojourns (#68). | **Suspend-safe**: a sleeping edge device that resumed did NOT misfire a burst of false sheds. A non-zero rate is benign (it means the suspend reset worked), not a loss. |
+| `ironbus_retry_shed_total{side="broker"}` | A retry is THROTTLED broker-side by the per-client **retry budget** (the Google SRE accept-based adaptive throttle): the client's recent accept rate fell, so its retries are bounded to the budget ratio (#69). The `side` label is `broker` (the broker-side re-check; a future client library mirrors it as `client`). | **Anti-amplification**: a buggy or hostile client that ignores its own throttle is shed broker-side, so a retry storm cannot multiply the offered load. Zero unless the retry budget is enabled. |
+| `ironbus_fire_and_forget_shed_total` | A fire-and-forget (un-credited) message is shed by the per-connection **token bucket** because either bucket (message or byte) was empty (#69). | **Uncontrolled-tier cap**: the QoS-0-equivalent path is bounded to its configured rate so it cannot bypass the consumer-credit brake or starve credited traffic. It sheds fire-and-forget messages and NOTHING ELSE (the credited path is untouched). Zero unless the bucket is enabled. |
+| `ironbus_egress_shed_total` | A downstream-egress request is shed at the **AIMD** concurrency limit (#69): the in-flight count reached the current adaptive limit. | **Egress backpressure**: a degrading downstream sink (the AIMD limit halved) sheds new egress rather than piling on, so a slow sink does not convert into upstream backlog. Zero until egress sinks are wired (the limiter and its counter exist; the egress call sites land with the sink features). |
 
 ### Recovery-loss series (startup, per reason)
 
@@ -209,6 +215,29 @@ broker can lose acknowledged data) and watches `ironbus_durability_unsynced_byte
 as the live bytes-at-risk. The level + loss exposure are also in the startup
 `materialized-config` line (`durability_level=`, `power_loss_safe=`). See
 [DURABILITY.md](DURABILITY.md) for the per-level ack/loss contract.
+
+## Backpressure series (#68, #69)
+
+The backpressure shed COUNTERS are in the resilience-counter table above (every
+shed is a `_total` the taxonomy guarantees is never silent). These GAUGES surface
+the controllers' live state; they carry no `_total` suffix, so they extend the
+frozen `(name, type)` contract (`FROZEN_METRIC_TYPES`) but are EXCLUDED from the
+resilience-counter taxonomy (`FROZEN_RESILIENCE_COUNTERS`) by construction.
+
+```
+ironbus_codel_sojourn_estimate_ms          the current minimum-sojourn estimate (ms) the CoDel control law is acting on
+ironbus_retry_ratio                        the observed retry (shed) rate as a fraction of the request rate, in parts-per-million (divide by 1e6); the 10%-budget signal
+ironbus_egress_limit                       the current AIMD egress concurrency limit (between 4 and 128); halves on a degrading sink, climbs back as it heals
+```
+
+`ironbus_retry_ratio` makes the anti-amplification claim observable: an operator
+watches it stay near or below the configured budget under overload.
+`ironbus_egress_limit` makes the AIMD backoff visible. With every backpressure knob
+at its disabling default the shed counters are `0` and the gauges report the inert
+values (a `0` sojourn, a `0` ratio, the default `16` egress limit), so a zero-config
+broker still emits the full series (the taxonomy is complete) with no shed activity.
+See [BACKPRESSURE.md](BACKPRESSURE.md) for the control laws and the wire-signal
+residual (the structured `retry_after_ms` / `shed` hint waits on #11).
 
 ## Edge-resource series (#118)
 

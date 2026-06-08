@@ -21,6 +21,7 @@ use crate::registry::MetricRegistry;
 use ironbus_core::attempt::{
     decode_attempt_snapshot, encode_attempt_snapshot, ATTEMPT_SNAPSHOT_MIN_LEN,
 };
+use ironbus_core::backpressure::{AimdLimiter, Codel, RetryBudget, TokenBucket};
 use ironbus_core::clock::Clock;
 use ironbus_core::cursor::AckCursor;
 use ironbus_core::delivery::{DeliveryConfig, Disposition};
@@ -400,6 +401,50 @@ pub struct EngineConfig {
     /// records is the SMALLER of the time and byte triggers, which is the worst-case loss the operator
     /// is choosing.
     pub flush_max_bytes: u64,
+    /// The CoDel time-in-queue (sojourn) shedding controls (#68): the TARGET and INTERVAL of the
+    /// load-based admission shed that bounds tail latency under overload. BOTH default to `0`
+    /// (DISABLED), so a broker that does not opt in behaves EXACTLY as today (the byte-cap shed and
+    /// the consumer credit are the only backpressure). When enabled, the values are CLAMPED (`target`
+    /// to `[1 ms, 1 s]`, `interval` to `[20 ms, 10 s]`) and never rejected (#14), and a sustained
+    /// produce-admission sojourn above TARGET for a full INTERVAL sheds the NEW produce into the
+    /// configured overflow disposition (the same drop-new / drop-oldest decision the byte cap uses),
+    /// counted as a CoDel shed. It NEVER drops an already-accepted record (I2 holds); see
+    /// [`ironbus_core::backpressure::Codel`] and `docs/BACKPRESSURE.md`.
+    pub codel_target_ms: u64,
+    /// The CoDel INTERVAL in MILLISECONDS (#68): the window the admission sojourn must stay above
+    /// `codel_target_ms` before shedding begins, and the base drop spacing. `0` (with the target)
+    /// disables CoDel. Clamped to `[20 ms, 10 s]` when enabled. See [`EngineConfig::codel_target_ms`].
+    pub codel_interval_ms: u64,
+    /// The per-client retry budget ratio in PARTS PER MILLION (#69): the fraction of a client's
+    /// request rate its retries may occupy before the broker-side re-check throttles them (the Google
+    /// SRE accept-based adaptive throttle). Default `0` (DISABLED), so a broker that does not opt in
+    /// behaves as today. The doc budget is 10% (`100_000`). See
+    /// [`ironbus_core::backpressure::RetryBudget`].
+    pub retry_budget_ratio_per_million: u64,
+    /// The per-client retry-budget sliding window in MILLISECONDS (#69): the window the
+    /// request/accept counts are tracked over. Default `0` is treated as the 60 s doc default by the
+    /// controller. Only consulted when the ratio is non-zero. See
+    /// [`EngineConfig::retry_budget_ratio_per_million`].
+    pub retry_budget_window_ms: u64,
+    /// The fire-and-forget (un-credited) admission token bucket's MESSAGE rate in msg/s (#69): caps
+    /// the QoS-0-equivalent tier so it cannot bypass the consumer-credit brake. Default `0` (with the
+    /// byte rate) DISABLES the bucket (the tier is ungoverned, as today). The doc default is 5000.
+    /// See [`ironbus_core::backpressure::TokenBucket`].
+    pub fire_and_forget_msg_rate: u64,
+    /// The fire-and-forget token bucket's BYTE rate in bytes/s (#69). `0` (with the message rate)
+    /// disables the bucket. The doc default is 5 MiB/s. See
+    /// [`EngineConfig::fire_and_forget_msg_rate`].
+    pub fire_and_forget_byte_rate: u64,
+    /// The fire-and-forget token bucket's refill granularity in MILLISECONDS (#69): sizes the burst
+    /// ceiling (`rate * refill_ms / 1000`). `0` is treated as the 100 ms doc default by the
+    /// controller. See [`EngineConfig::fire_and_forget_msg_rate`].
+    pub fire_and_forget_refill_ms: u64,
+    /// The starting / static-floor egress concurrency limit for the AIMD downstream limiter (#69):
+    /// the in-flight concurrency to a downstream sink, adapted up additively and down
+    /// multiplicatively (bounded to `[4, 128]`) as the sink's health changes. Default `0` is treated
+    /// as the doc default floor (16) by the limiter; the AIMD bounds always apply. See
+    /// [`ironbus_core::backpressure::AimdLimiter`].
+    pub egress_limit: u32,
 }
 
 /// An error from the engine.
@@ -876,6 +921,135 @@ impl Counters {
     }
 }
 
+/// The runtime backpressure controllers and their shed counters (#68, #69), held on the engine
+/// separate from [`Counters`] so they do NOT join the durable counters snapshot: they are RUNTIME
+/// resilience signals (a monotonic-since-start lower bound, reset on restart), exactly like the
+/// in-memory operational signals the snapshot already treats as best-effort. Keeping them out of
+/// `encode_snapshot`/`decode_snapshot` leaves the frozen counters-snapshot format byte-for-byte
+/// unchanged.
+///
+/// The controllers themselves ([`Codel`], [`RetryBudget`], [`TokenBucket`], [`AimdLimiter`]) are
+/// pure (see [`ironbus_core::backpressure`]); the engine threads the monotonic clock seam into them
+/// so they stay deterministic. All four DEFAULT to disabled / inert, so a broker that configures no
+/// backpressure knob behaves exactly as today.
+#[derive(Clone, Copy, Debug)]
+pub struct Backpressure {
+    /// The CoDel produce-admission shedding controller (#68). Disabled (never sheds) unless both the
+    /// target and interval are non-zero.
+    codel: Codel,
+    /// The broker-side per-client retry budget (#69). Disabled (never throttles) unless the ratio is
+    /// non-zero. One broker-wide instance today (per-connection identity is #106, deferred); see the
+    /// field on [`Engine`].
+    retry_budget: RetryBudget,
+    /// The fire-and-forget (un-credited) admission token bucket (#69). Disabled (always admits)
+    /// unless a rate is non-zero.
+    fire_and_forget: TokenBucket,
+    /// The egress AIMD concurrency limiter (#69). Always within `[4, 128]`; the seam a future
+    /// gradient estimator slots into.
+    egress: AimdLimiter,
+    /// CoDel sojourn sheds: a new produce rejected because the admission sojourn stayed above TARGET
+    /// for a full INTERVAL. The `ironbus_codel_shed_total` counter. Saturating.
+    codel_shed: u64,
+    /// CoDel depth/byte backstop sheds: a new produce shed by the sojourn-INDEPENDENT depth/byte
+    /// bound (a stalled drain CoDel cannot see). The `ironbus_codel_backstop_shed_total` counter.
+    /// Saturating.
+    codel_backstop_shed: u64,
+    /// Retries throttled by the budget broker-side. The `ironbus_retry_shed_total{side="broker"}`
+    /// counter. Saturating.
+    retry_shed: u64,
+    /// Fire-and-forget messages shed by the token bucket. The `ironbus_fire_and_forget_shed_total`
+    /// counter. Saturating.
+    fire_and_forget_shed: u64,
+    /// Egress requests shed at the AIMD concurrency limit. The `ironbus_egress_shed_total` counter.
+    /// Saturating.
+    egress_shed: u64,
+}
+
+impl Backpressure {
+    /// Builds the backpressure controllers from an [`EngineConfig`] (a single borrow, so it can run
+    /// before the `Engine` struct literal that moves the config's non-`Copy` fields). Every knob
+    /// defaults to a disabling value, so the controllers are inert unless an operator opts in.
+    fn from_engine_config(config: &EngineConfig) -> Backpressure {
+        Backpressure::new(
+            config.codel_target_ms,
+            config.codel_interval_ms,
+            config.retry_budget_ratio_per_million,
+            config.retry_budget_window_ms,
+            config.fire_and_forget_msg_rate,
+            config.fire_and_forget_byte_rate,
+            config.fire_and_forget_refill_ms,
+            config.egress_limit,
+        )
+    }
+
+    /// Builds the backpressure controllers from the engine config knobs (all scalar `Copy` values, so
+    /// no borrow of the whole config is needed). Every knob defaults to a disabling value, so the
+    /// controllers are inert unless an operator opts in.
+    // One parameter per backpressure knob is the clearest shape (it mirrors the config fields
+    // one-to-one); bundling them into a sub-struct would only add indirection.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        codel_target_ms: u64,
+        codel_interval_ms: u64,
+        retry_budget_ratio_per_million: u64,
+        retry_budget_window_ms: u64,
+        fire_and_forget_msg_rate: u64,
+        fire_and_forget_byte_rate: u64,
+        fire_and_forget_refill_ms: u64,
+        egress_limit: u32,
+    ) -> Backpressure {
+        Backpressure {
+            codel: Codel::from_millis(codel_target_ms, codel_interval_ms),
+            retry_budget: RetryBudget::new(retry_budget_ratio_per_million, retry_budget_window_ms),
+            fire_and_forget: TokenBucket::new(
+                fire_and_forget_msg_rate,
+                fire_and_forget_byte_rate,
+                fire_and_forget_refill_ms,
+            ),
+            egress: AimdLimiter::new(
+                if egress_limit == 0 {
+                    ironbus_core::backpressure::DEFAULT_EGRESS_LIMIT
+                } else {
+                    egress_limit
+                },
+                ironbus_core::backpressure::EGRESS_LIMIT_MIN,
+                ironbus_core::backpressure::EGRESS_LIMIT_MAX,
+            ),
+            codel_shed: 0,
+            codel_backstop_shed: 0,
+            retry_shed: 0,
+            fire_and_forget_shed: 0,
+            egress_shed: 0,
+        }
+    }
+}
+
+/// A read-only snapshot of the backpressure controllers' observable state (#68, #69), for the
+/// `/metrics` rendering and the `/admin` introspection. Counters are `_total`; estimates / ratios /
+/// limits are gauges, matching the #16 frozen-taxonomy rule (gauges carry no `_total` suffix).
+#[derive(Clone, Copy, Debug)]
+pub struct BackpressureSnapshot {
+    /// The `ironbus_codel_shed_total` counter: new produces shed by the CoDel sojourn control.
+    pub codel_shed: u64,
+    /// The `ironbus_codel_backstop_shed_total` counter: new produces shed by the depth/byte backstop.
+    pub codel_backstop_shed: u64,
+    /// The `ironbus_codel_interval_resets_total` counter: suspend-gap interval resets.
+    pub codel_interval_resets: u64,
+    /// The `ironbus_codel_sojourn_estimate_ms` gauge: the current minimum-sojourn estimate, in ms.
+    pub codel_sojourn_estimate_ms: u64,
+    /// The `ironbus_retry_shed_total{side="broker"}` counter: retries throttled by the budget.
+    pub retry_shed: u64,
+    /// The `ironbus_retry_ratio` gauge, in parts-per-million: the observed retry (shed) rate as a
+    /// fraction of the request rate.
+    pub retry_ratio_per_million: u64,
+    /// The `ironbus_fire_and_forget_shed_total` counter: messages shed by the token bucket.
+    pub fire_and_forget_shed: u64,
+    /// The `ironbus_egress_shed_total` counter: requests shed at the concurrency limit.
+    pub egress_shed: u64,
+    /// The `ironbus_egress_limit` gauge: the current AIMD egress concurrency limit (4..=128).
+    pub egress_limit: u32,
+}
+
 /// A snapshot of one work-group's consumer position, for the metrics endpoint (#16): an
 /// operator sees committed offset, lag, and in-flight depth broken down by cursor (#15).
 #[derive(Clone, Debug)]
@@ -969,6 +1143,43 @@ pub const DEFAULT_MAX_GROUPS: usize = 1024;
 /// requirement, and the SAFE default is to leave it off so an operator opts in deliberately (it
 /// matches the `0` = off convention of the other bounds). See [`EngineConfig::group_idle_evict_ms`].
 pub const DEFAULT_GROUP_IDLE_EVICT_MS: u64 = 0;
+
+/// The default CoDel TARGET sojourn in MILLISECONDS for `serve` (#68): `0` = DISABLED. CoDel is
+/// OFF by default so a zero-config broker behaves exactly as today (byte-cap shed + consumer
+/// credit only); an operator opts in by setting a non-zero target, at which point the RFC 8289
+/// recommended 5 ms applies (and is clamped to `[1 ms, 1 s]`). See [`EngineConfig::codel_target_ms`].
+pub const DEFAULT_CODEL_TARGET_MS: u64 = 0;
+
+/// The default CoDel INTERVAL in MILLISECONDS for `serve` (#68): the RFC 8289 recommended 100 ms,
+/// used only when a non-zero target enables CoDel (and clamped to `[20 ms, 10 s]`). With the
+/// default `0` target CoDel is off regardless. See [`EngineConfig::codel_interval_ms`].
+pub const DEFAULT_CODEL_INTERVAL_MS: u64 = 100;
+
+/// The default per-client retry-budget ratio in PARTS PER MILLION for `serve` (#69): `0` = DISABLED
+/// (no retry is throttled), so a zero-config broker behaves as today. The doc budget is 10%
+/// (`100_000`), opt-in. See [`EngineConfig::retry_budget_ratio_per_million`].
+pub const DEFAULT_RETRY_BUDGET_RATIO_PER_MILLION: u64 = 0;
+
+/// The default per-client retry-budget window in MILLISECONDS for `serve` (#69): 60 s, used only
+/// when the ratio is non-zero. See [`EngineConfig::retry_budget_window_ms`].
+pub const DEFAULT_RETRY_BUDGET_WINDOW_MS: u64 = 60_000;
+
+/// The default fire-and-forget token-bucket MESSAGE rate (msg/s) for `serve` (#69): `0` = DISABLED
+/// (the un-credited tier is ungoverned, as today). The doc default is 5000, opt-in. See
+/// [`EngineConfig::fire_and_forget_msg_rate`].
+pub const DEFAULT_FIRE_AND_FORGET_MSG_RATE: u64 = 0;
+
+/// The default fire-and-forget token-bucket BYTE rate (bytes/s) for `serve` (#69): `0` = DISABLED.
+/// The doc default is 5 MiB/s, opt-in. See [`EngineConfig::fire_and_forget_byte_rate`].
+pub const DEFAULT_FIRE_AND_FORGET_BYTE_RATE: u64 = 0;
+
+/// The default fire-and-forget token-bucket refill granularity (ms) for `serve` (#69): 100 ms (the
+/// doc default). See [`EngineConfig::fire_and_forget_refill_ms`].
+pub const DEFAULT_FIRE_AND_FORGET_REFILL_MS: u64 = 100;
+
+/// The default starting / static-floor egress concurrency limit for `serve` (#69): the doc default
+/// floor of 16 (the AIMD bounds `[4, 128]` always apply). See [`EngineConfig::egress_limit`].
+pub const DEFAULT_EGRESS_LIMIT: u32 = 16;
 
 /// The longest a named work-group name may be (#240): bounds per-name memory.
 const MAX_GROUP_NAME_LEN: usize = 128;
@@ -1480,6 +1691,13 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// only when a genuine barrier ran. Meaningless when the last commit deferred its sync; the caller
     /// only reads it when the barrier reported a real fsync.
     last_fsync_nanos: u64,
+    /// The runtime backpressure controllers and their shed counters (#68, #69): the CoDel
+    /// produce-admission shed, the broker-side retry budget, the fire-and-forget token bucket, and
+    /// the egress AIMD limiter. Held OUTSIDE the durable counters snapshot (a runtime resilience
+    /// signal, not a checkpointed counter). All four default to inert, so a broker that configures no
+    /// backpressure knob behaves exactly as today. See [`Backpressure`] and
+    /// [`ironbus_core::backpressure`].
+    backpressure: Backpressure,
 }
 
 /// The file name of the work-group's durable committed-cursor checkpoint.
@@ -1613,6 +1831,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             None
         };
 
+        // Build the backpressure controllers (#68, #69) from the config knobs BEFORE the struct
+        // literal, since the literal moves the non-Copy `config.delivery` and field expressions are
+        // evaluated in source order (a later read of `config` would then be a
+        // borrow-after-partial-move). All knobs default to inert.
+        let backpressure = Backpressure::from_engine_config(&config);
         let mut engine = Engine {
             log,
             groups,
@@ -1672,6 +1895,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             flush_max_bytes: config.flush_max_bytes,
             last_sync_monotonic_nanos: opened_at,
             last_fsync_nanos: 0,
+            // The runtime backpressure controllers (#68, #69), prebuilt above. Held outside the
+            // durable snapshot, so a broker that configures none of them is byte-for-byte the
+            // historical broker.
+            backpressure,
         };
         engine.seed_registry_from_recovered_state(flushed);
         Ok(engine)
@@ -2224,6 +2451,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 if e.is_at_capacity() || e.is_daily_write_budget_exceeded() {
                     self.counters.produce_rejected =
                         self.counters.produce_rejected.saturating_add(1);
+                    // The byte-cap / daily-budget shed is the BYTE dimension of the CoDel depth/byte
+                    // backstop (#68): a sojourn-INDEPENDENT bound enforced at enqueue that holds even
+                    // when a stalled drain produces no sojourn samples CoDel could see. Count it as a
+                    // backstop shed so `ironbus_codel_backstop_shed_total` is the unified
+                    // sojourn-independent backstop signal. (`produce_rejected` keeps its own historical
+                    // meaning; this is additive observability, not a behavior change.)
+                    self.record_backstop_shed();
                 }
                 return Err(EngineError::Storage(e));
             }
@@ -2314,6 +2548,169 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     #[must_use]
     pub fn dedup_out_of_window(&self) -> u64 {
         self.counters.dedup_out_of_window
+    }
+
+    /// The CoDel produce-admission decision (#68): given the monotonic instant a produce was ENQUEUED
+    /// (when the session handed it to the append actor, read from the clock seam, `0` = not stamped),
+    /// returns `true` if THIS new produce should be SHED under the controlled-delay control law,
+    /// having measured its sojourn `now_monotonic - enqueue` (clamped `>= 0`) at this dequeue.
+    ///
+    /// This is the load-based (latency) shed distinct from the byte cap: a sustained admission
+    /// sojourn above TARGET for a full INTERVAL sheds the NEW produce. It NEVER drops an
+    /// already-accepted record (it is consulted BEFORE the append), so I2 holds. A shed increments
+    /// the `ironbus_codel_shed_total` counter (a shed is never silent). When CoDel is disabled (the
+    /// default), it always returns `false` (admit), so the produce path is byte-for-byte unchanged.
+    ///
+    /// `enqueue_monotonic_nanos` of `0` (an un-stamped produce, e.g. a test or a path that does not
+    /// route through the actor channel) reads as a zero sojourn (below TARGET), so it never sheds:
+    /// the control degrades safely to admit.
+    pub fn codel_admit(&mut self, enqueue_monotonic_nanos: u64) -> bool {
+        if !self.backpressure.codel.is_enabled() {
+            return false;
+        }
+        let now = self.log.now_monotonic();
+        // Sojourn is a non-negative duration; the monotonic clock never goes backwards, but clamp to
+        // `>= 0` defensively (an un-stamped enqueue of 0 yields a 0 sojourn = below target = admit).
+        let sojourn = now.saturating_sub(enqueue_monotonic_nanos);
+        let shed = self.backpressure.codel.sojourn(sojourn, now);
+        if shed {
+            self.backpressure.codel_shed = self.backpressure.codel_shed.saturating_add(1);
+        }
+        shed
+    }
+
+    /// Signals the CoDel controller that the admission queue drained to empty at the current
+    /// monotonic instant (#68), so the above-TARGET window closes and the dropping state is left. The
+    /// append actor calls this when it has drained its whole pending batch with no further produce, so
+    /// a bursty-but-healthy queue never lingers in the dropping state. A no-op when CoDel is disabled.
+    pub fn codel_queue_empty(&mut self) {
+        if self.backpressure.codel.is_enabled() {
+            let now = self.log.now_monotonic();
+            self.backpressure.codel.on_empty(now);
+        }
+    }
+
+    /// The CoDel depth/byte BACKSTOP decision (#68): the sojourn-INDEPENDENT bound that fires when a
+    /// drain is fully stalled (no sojourn samples), checked at enqueue. Given the current admission
+    /// `pending_depth` (un-drained produce count) and the per-topic `ring_capacity` message bound
+    /// (`0` = the bound is off, the byte cap alone backstops), returns `true` if the new enqueue is
+    /// over the depth bound and must be shed regardless of sojourn. A shed increments the
+    /// `ironbus_codel_backstop_shed_total` counter. The BYTE half of the backstop is the existing
+    /// durable-log byte cap (`max_total_bytes`), which already sheds at enqueue independent of CoDel,
+    /// so this method covers the DEPTH dimension the in-memory admission queue adds.
+    pub fn codel_backstop_admit(&mut self, pending_depth: u64, ring_capacity: u64) -> bool {
+        let shed = ring_capacity != 0 && pending_depth >= ring_capacity;
+        if shed {
+            self.backpressure.codel_backstop_shed =
+                self.backpressure.codel_backstop_shed.saturating_add(1);
+        }
+        shed
+    }
+
+    /// Records that the byte-cap (or daily-budget) backstop shed a produce (#68), so the backstop
+    /// shed counter reflects the BYTE dimension too, not only the depth dimension of
+    /// [`Engine::codel_backstop_admit`]. The caller (the produce path) invokes it when an over-cap
+    /// produce was rejected, so `ironbus_codel_backstop_shed_total` is the unified
+    /// sojourn-independent backstop signal CoDel cannot see. Saturating.
+    fn record_backstop_shed(&mut self) {
+        self.backpressure.codel_backstop_shed =
+            self.backpressure.codel_backstop_shed.saturating_add(1);
+    }
+
+    /// The broker-side per-client retry-budget re-check (#69): records one ORIGINAL request the
+    /// broker ACCEPTED at the current monotonic instant, feeding the accept-based throttle so the
+    /// observed retry ratio stays meaningful. Called when a produce (or other request) is admitted.
+    /// A no-op accounting bump when the budget is disabled. See [`ironbus_core::backpressure::RetryBudget`].
+    pub fn retry_budget_record_accept(&mut self) {
+        let now = self.log.now_monotonic();
+        self.backpressure.retry_budget.record_accept(now);
+    }
+
+    /// The broker-side per-client retry-budget re-check for a SHED request (#69): records one request
+    /// the broker shed (raising the request count without the accept count), which drives the throttle
+    /// probability up. Called when a produce is shed (CoDel, byte cap, or backstop). A no-op when the
+    /// budget is disabled.
+    pub fn retry_budget_record_shed(&mut self) {
+        let now = self.log.now_monotonic();
+        self.backpressure.retry_budget.record_shed(now);
+    }
+
+    /// Whether a RETRY (a redelivery the client is re-issuing) should be THROTTLED broker-side (#69),
+    /// at the current monotonic instant. `true` means the budget is exhausted and the retry must be
+    /// shed with the do-not-retry signal (so a buggy or hostile client that ignores its own
+    /// client-side throttle still cannot mount a retry storm). A throttle increments the
+    /// `ironbus_retry_shed_total` counter. When the budget is disabled, never throttles.
+    pub fn retry_budget_should_throttle(&mut self) -> bool {
+        let now = self.log.now_monotonic();
+        let throttle = self.backpressure.retry_budget.should_throttle(now);
+        if throttle {
+            self.backpressure.retry_shed = self.backpressure.retry_shed.saturating_add(1);
+        }
+        throttle
+    }
+
+    /// The fire-and-forget (un-credited) admission decision (#69): tries to admit one fire-and-forget
+    /// message of `payload_bytes` at the current monotonic instant through the per-connection token
+    /// bucket. `true` admits; `false` SHEDS the message (the bucket is empty), incrementing
+    /// `ironbus_fire_and_forget_shed_total`. The bucket governs ONLY this path, so a depleted bucket
+    /// sheds fire-and-forget messages and NOTHING ELSE (the credited path is untouched). When the
+    /// bucket is disabled (the default), always admits. See [`ironbus_core::backpressure::TokenBucket`].
+    pub fn fire_and_forget_admit(&mut self, payload_bytes: u64) -> bool {
+        let now = self.log.now_monotonic();
+        let admit = self
+            .backpressure
+            .fire_and_forget
+            .try_admit(payload_bytes, now);
+        if !admit {
+            self.backpressure.fire_and_forget_shed =
+                self.backpressure.fire_and_forget_shed.saturating_add(1);
+        }
+        admit
+    }
+
+    /// The egress concurrency budget under the AIMD limiter (#69): the current limit on in-flight
+    /// requests to a downstream sink (within `[4, 128]`). The caller compares it against the live
+    /// in-flight count to decide whether to dispatch or shed an egress request.
+    #[must_use]
+    pub fn egress_limit(&self) -> u32 {
+        self.backpressure.egress.limit()
+    }
+
+    /// Reports a CLEAN egress window to the AIMD limiter (#69): additive increase of the egress
+    /// concurrency limit by one (capped at 128). Called after a window with no downstream failure.
+    pub fn egress_on_success(&mut self) {
+        self.backpressure.egress.on_success();
+    }
+
+    /// Reports a FAILED egress signal to the AIMD limiter (#69): multiplicative decrease (halve,
+    /// floored at 4) on a downstream timeout / 429 / 503. Called when the downstream degrades, so the
+    /// limit backs off fast while a recovery probes slowly.
+    pub fn egress_on_failure(&mut self) {
+        self.backpressure.egress.on_failure();
+    }
+
+    /// Records that an egress request was SHED at the concurrency limit (#69), incrementing
+    /// `ironbus_egress_shed_total`. Saturating.
+    pub fn egress_record_shed(&mut self) {
+        self.backpressure.egress_shed = self.backpressure.egress_shed.saturating_add(1);
+    }
+
+    /// A read-only snapshot of the backpressure controllers' observable state (#68, #69), for the
+    /// `/metrics` rendering and the `/admin` introspection. The counters are the runtime resilience
+    /// signals; the estimate / ratio / limit are gauges.
+    #[must_use]
+    pub fn backpressure_snapshot(&self) -> BackpressureSnapshot {
+        BackpressureSnapshot {
+            codel_shed: self.backpressure.codel_shed,
+            codel_backstop_shed: self.backpressure.codel_backstop_shed,
+            codel_interval_resets: self.backpressure.codel.interval_resets(),
+            codel_sojourn_estimate_ms: self.backpressure.codel.sojourn_estimate_ms(),
+            retry_shed: self.backpressure.retry_shed,
+            retry_ratio_per_million: self.backpressure.retry_budget.observed_ratio_per_million(),
+            fire_and_forget_shed: self.backpressure.fire_and_forget_shed,
+            egress_shed: self.backpressure.egress_shed,
+            egress_limit: self.backpressure.egress.limit(),
+        }
     }
 
     /// Issues the durability barrier for a group-committed batch, advances the visible head so those
@@ -3876,6 +4273,16 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.log.now_monotonic()
     }
 
+    /// A clone of the engine's clock seam (#68), for the append-actor handle so a connection handler
+    /// can stamp a produce's ENQUEUE instant without a round-trip through the actor (the CoDel sojourn
+    /// measurement). The clone reads the SAME monotonic time as the engine's clock (an
+    /// `Arc<ManualClock>` clone aliases the same atomics; a `SystemClock` clone keeps the same
+    /// monotonic origin), so an enqueue stamp and the actor's dequeue read are comparable.
+    #[must_use]
+    pub fn clock_clone(&self) -> C {
+        self.log.clock_clone()
+    }
+
     /// The log offset of the most recently dead-lettered (parked past `MaxDeliver`) message,
     /// or `None` if none has been dead-lettered. Pairs with the `dead_lettered` counter to
     /// report not just how many messages were dropped but which one most recently.
@@ -4070,6 +4477,16 @@ mod tests {
             durability_level: crate::engine::DurabilityLevel::Sync,
             flush_interval_ms: 0,
             flush_max_bytes: 0,
+            // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+            // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+            codel_target_ms: 0,
+            codel_interval_ms: 0,
+            retry_budget_ratio_per_million: 0,
+            retry_budget_window_ms: 0,
+            fire_and_forget_msg_rate: 0,
+            fire_and_forget_byte_rate: 0,
+            fire_and_forget_refill_ms: 0,
+            egress_limit: 0,
         }
     }
 
@@ -9058,6 +9475,16 @@ mod tests {
             durability_level: DurabilityLevel::Async,
             flush_interval_ms: 0,
             flush_max_bytes: 0,
+            // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+            // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+            codel_target_ms: 0,
+            codel_interval_ms: 0,
+            retry_budget_ratio_per_million: 0,
+            retry_budget_window_ms: 0,
+            fire_and_forget_msg_rate: 0,
+            fire_and_forget_byte_rate: 0,
+            fire_and_forget_refill_ms: 0,
+            egress_limit: 0,
             ..config(10, 5)
         };
         let fs = InMemoryFs::new();
@@ -9126,5 +9553,285 @@ mod tests {
             assert_eq!(DurabilityLevel::parse(name), Some(level));
         }
         assert_eq!(DurabilityLevel::parse("bogus"), None);
+    }
+
+    // ---- Backpressure controls (#68, #69): deterministic engine-level tests over a ManualClock ----
+
+    /// A config with CoDel enabled at a 5 ms target / 100 ms interval, everything else inert. The
+    /// lease/visibility nanos are roomy so CoDel (not the lease) drives the test.
+    fn codel_config() -> EngineConfig {
+        let mut c = config(64, 5);
+        c.codel_target_ms = 5;
+        c.codel_interval_ms = 100;
+        c
+    }
+
+    /// A simple append borrowing `payload`, for the backpressure tests.
+    fn append_at(payload: &[u8]) -> Append<'_> {
+        Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload,
+        }
+    }
+
+    #[test]
+    fn codel_off_by_default_never_sheds_and_admits_every_produce() {
+        // The safe-default property: with CoDel at its inert default, `codel_admit` never sheds, no
+        // matter the enqueue stamp, so the produce path is byte-for-byte unchanged.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(64, 5), std::sync::Arc::clone(&clock));
+        clock.advance_millis(10_000); // a huge "sojourn" if CoDel were on
+        for _ in 0..100 {
+            assert!(!e.codel_admit(0), "disabled CoDel must admit (never shed)");
+        }
+        let snap = e.backpressure_snapshot();
+        assert_eq!(snap.codel_shed, 0, "no CoDel sheds when disabled");
+    }
+
+    #[test]
+    fn codel_does_not_shed_under_normal_admission_latency() {
+        // Enqueue stamps that keep the sojourn UNDER the 5 ms target never shed, however long the run.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(codel_config(), std::sync::Arc::clone(&clock));
+        for _ in 0..5_000 {
+            // Advance 1 ms, and stamp the enqueue 1 ms ago: a 1 ms sojourn, under the 5 ms target.
+            clock.advance_millis(1);
+            let enqueue = e.now_monotonic().saturating_sub(1_000_000); // 1 ms in nanos
+            assert!(
+                !e.codel_admit(enqueue),
+                "a 1 ms sojourn is under target, never shed"
+            );
+        }
+        assert_eq!(e.backpressure_snapshot().codel_shed, 0);
+    }
+
+    #[test]
+    fn codel_sheds_under_sustained_overload_and_never_drops_an_accepted_record() {
+        // The headline #68 property with teeth: a sustained admission sojourn ABOVE the target for a
+        // full interval sheds NEW produces, and a shed NEVER appends a record (no data loss: the
+        // durable head only advances for ADMITTED produces). We drive a shared ManualClock so the
+        // sojourn is exact and the test is deterministic.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(codel_config(), std::sync::Arc::clone(&clock));
+        let mut admitted = 0u64;
+        let mut shed = 0u64;
+        // Feed 300 ms of produces whose sojourn is 20 ms (well above the 5 ms target): after one full
+        // 100 ms interval CoDel enters the dropping state and begins shedding.
+        for _ in 0..300 {
+            clock.advance_millis(1);
+            let enqueue = e.now_monotonic().saturating_sub(20_000_000); // 20 ms sojourn
+            if e.codel_admit(enqueue) {
+                // A shed: do NOT append (exactly what the actor does), so nothing durable is written.
+                shed += 1;
+            } else {
+                // Admitted: append durably. This is the only path that advances the durable head.
+                e.produce(&append_at(b"ok")).unwrap();
+                admitted += 1;
+            }
+        }
+        assert!(shed > 0, "sustained overload past the target must shed");
+        // NO DATA LOSS: the durable head equals exactly the number of ADMITTED produces. A shed never
+        // appended, and an admitted produce was never dropped.
+        assert_eq!(
+            e.flushed_offset().get(),
+            admitted,
+            "the durable log holds exactly the admitted produces; no shed was ever appended, no \
+             admitted record was ever dropped"
+        );
+        // Observability: the shed counter matches the sheds we saw, and the sojourn estimate is live.
+        let snap = e.backpressure_snapshot();
+        assert_eq!(
+            snap.codel_shed, shed,
+            "the shed counter is the observable shed rate"
+        );
+        assert!(
+            snap.codel_sojourn_estimate_ms >= 5,
+            "the sojourn estimate is exposed"
+        );
+    }
+
+    #[test]
+    fn codel_recovers_and_stops_shedding_once_admission_latency_falls() {
+        // After overload, a return to low admission latency exits the dropping state and admits again.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(codel_config(), std::sync::Arc::clone(&clock));
+        // Drive into shedding.
+        for _ in 0..300 {
+            clock.advance_millis(1);
+            let enqueue = e.now_monotonic().saturating_sub(20_000_000);
+            let _ = e.codel_admit(enqueue);
+        }
+        assert!(e.backpressure_snapshot().codel_shed > 0);
+        // Recovery: low sojourn for a while. None of these shed.
+        let before = e.backpressure_snapshot().codel_shed;
+        for _ in 0..300 {
+            clock.advance_millis(1);
+            let enqueue = e.now_monotonic().saturating_sub(1_000_000); // 1 ms, under target
+            assert!(!e.codel_admit(enqueue), "a recovered sojourn never sheds");
+        }
+        assert_eq!(
+            e.backpressure_snapshot().codel_shed,
+            before,
+            "no new sheds once admission latency recovered"
+        );
+    }
+
+    #[test]
+    fn codel_depth_backstop_sheds_independent_of_sojourn() {
+        // The sojourn-INDEPENDENT depth backstop: at or above the ring capacity the new enqueue is
+        // shed regardless of CoDel, and the backstop shed counter rises. A `0` capacity disables it.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(64, 5), std::sync::Arc::clone(&clock));
+        // capacity 4: depths 0..3 admit, 4 and up shed.
+        assert!(!e.codel_backstop_admit(0, 4));
+        assert!(!e.codel_backstop_admit(3, 4));
+        assert!(
+            e.codel_backstop_admit(4, 4),
+            "at capacity the backstop sheds"
+        );
+        assert!(
+            e.codel_backstop_admit(99, 4),
+            "over capacity the backstop sheds"
+        );
+        // A 0 capacity disables the depth backstop (the byte cap alone backstops).
+        assert!(!e.codel_backstop_admit(u64::MAX, 0));
+        assert!(e.backpressure_snapshot().codel_backstop_shed >= 2);
+    }
+
+    #[test]
+    fn the_byte_cap_shed_counts_as_a_backstop_shed() {
+        // A drop-new byte-cap shed (the BYTE dimension of the backstop) increments the unified
+        // backstop counter, so `ironbus_codel_backstop_shed_total` reflects a stalled-drain byte
+        // bound CoDel cannot see.
+        let one = LogConfig::default().max_segment_bytes;
+        let mut cfg = config(64, 5);
+        cfg.log = LogConfig::new(one).unwrap().with_max_total_bytes(4 * one);
+        cfg.disk_full_policy = DiskFullPolicy::DropNew;
+        let mut e = open(cfg);
+        // Fill the log over its cap; once over, produces are shed (drop-new), and each shed bumps the
+        // backstop counter.
+        let big = vec![0u8; usize::try_from(one).unwrap_or(usize::MAX) / 2];
+        let mut sheds = 0u64;
+        for _ in 0..40 {
+            if e.produce(&append_at(&big)).is_err() {
+                sheds += 1;
+            }
+        }
+        assert!(sheds > 0, "the byte cap eventually sheds");
+        assert!(
+            e.backpressure_snapshot().codel_backstop_shed >= sheds,
+            "every byte-cap shed counts as a backstop shed"
+        );
+    }
+
+    #[test]
+    fn the_retry_budget_throttles_a_storm_broker_side() {
+        // The broker-side retry budget bounds redelivery work: after the broker sheds a burst of
+        // requests, hammering retries gets most of them throttled (the anti-amplification re-check),
+        // and the throttles are counted.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut cfg = config(64, 5);
+        cfg.retry_budget_ratio_per_million = 100_000; // 10%
+        cfg.retry_budget_window_ms = 60_000;
+        let mut e = open_with_clock(cfg, std::sync::Arc::clone(&clock));
+        // The broker sheds 1000 requests (accepts collapse), so the retry numerator goes positive.
+        for _ in 0..1000 {
+            e.retry_budget_record_shed();
+        }
+        assert!(
+            e.backpressure_snapshot().retry_ratio_per_million > 0,
+            "sheds are observable"
+        );
+        let mut throttled = 0u64;
+        let mut allowed = 0u64;
+        for _ in 0..1000 {
+            if e.retry_budget_should_throttle() {
+                throttled += 1;
+            } else {
+                allowed += 1;
+            }
+        }
+        assert!(
+            throttled > allowed,
+            "most retries throttled under a storm: {throttled} vs {allowed}"
+        );
+        assert_eq!(
+            e.backpressure_snapshot().retry_shed,
+            throttled,
+            "the throttle counter matches"
+        );
+    }
+
+    #[test]
+    fn the_egress_aimd_decreases_on_failure_and_recovers_additively_within_caps() {
+        // The egress AIMD: halve on a downstream failure (floored at 4), additive recovery (capped at
+        // 128), so a slow sink is throttled smoothly within the configured caps.
+        let mut e = open(config(64, 5));
+        assert_eq!(e.egress_limit(), 16, "the default floor");
+        e.egress_on_failure();
+        assert_eq!(e.egress_limit(), 8, "halves on a downstream failure");
+        e.egress_on_failure();
+        assert_eq!(e.egress_limit(), 4, "halves toward the floor");
+        e.egress_on_failure();
+        assert_eq!(e.egress_limit(), 4, "never below the floor of 4");
+        for _ in 0..200 {
+            e.egress_on_success();
+        }
+        assert_eq!(e.egress_limit(), 128, "additive recovery, capped at 128");
+        e.egress_record_shed();
+        assert_eq!(
+            e.backpressure_snapshot().egress_shed,
+            1,
+            "an egress shed is counted"
+        );
+    }
+
+    #[test]
+    fn the_fire_and_forget_bucket_caps_the_uncredited_tier() {
+        // The fire-and-forget token bucket caps the un-credited admission tier: the burst drains, then
+        // it sheds until tokens refill, and each shed is counted. Disabled by default (always admits).
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut cfg = config(64, 5);
+        cfg.fire_and_forget_msg_rate = 5000;
+        cfg.fire_and_forget_byte_rate = 0; // message dimension only, for a crisp count
+        cfg.fire_and_forget_refill_ms = 100;
+        let mut e = open_with_clock(cfg, std::sync::Arc::clone(&clock));
+        // Drain the burst at t=0.
+        let mut admitted = 0u64;
+        for _ in 0..2000 {
+            if e.fire_and_forget_admit(0) {
+                admitted += 1;
+            }
+        }
+        assert!(
+            (400..=600).contains(&admitted),
+            "burst capped near 500, got {admitted}"
+        );
+        assert!(
+            e.backpressure_snapshot().fire_and_forget_shed > 0,
+            "the bucket sheds and counts"
+        );
+        // After a refill window, tokens are available again.
+        clock.advance_millis(100);
+        assert!(
+            e.fire_and_forget_admit(0),
+            "tokens refilled after the window"
+        );
+    }
+
+    #[test]
+    fn a_disabled_fire_and_forget_bucket_always_admits() {
+        // The safe default: with no rate configured the un-credited tier is ungoverned (admits all).
+        let mut e = open(config(64, 5));
+        for _ in 0..1000 {
+            assert!(
+                e.fire_and_forget_admit(1_000_000),
+                "disabled bucket admits everything"
+            );
+        }
+        assert_eq!(e.backpressure_snapshot().fire_and_forget_shed, 0);
     }
 }

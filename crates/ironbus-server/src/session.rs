@@ -386,6 +386,11 @@ impl Session {
             headers: msg.headers.to_vec(),
             payload: msg.payload.to_vec(),
             dedup,
+            // Stamp the ENQUEUE instant from the engine's clock seam (a LOCAL read, no actor
+            // round-trip), so the engine can measure the admission SOJOURN for the CoDel shed (#68).
+            // Read just before the produce crosses the channel, so the sojourn captures the queue
+            // wait. CoDel-off (the default) ignores this entirely.
+            enqueue_monotonic_nanos: engine.now_monotonic_nanos(),
         };
         match engine.produce(append)? {
             ProduceOutcome::Appended(offset) => {
@@ -419,6 +424,18 @@ impl Session {
             // retention frees space).
             ProduceOutcome::AtCapacity => {
                 reply_err(out, "at capacity");
+                Ok(())
+            }
+            // The CoDel load-shed (#68): the broker is overloaded past the controlled-delay target,
+            // so this NEW produce was shed to protect tail latency. A distinct, stable message so a
+            // producer can tell a latency-load shed from a disk-full shed (`at capacity`) or a
+            // transient failure. The connection stays open: a later produce succeeds once the standing
+            // delay clears. It NEVER dropped an already-accepted record (the shed is decided before the
+            // append), so I2 holds. The structured machine-actionable retry hint (`retry_after_ms` /
+            // `shed`) waits on the frozen-protocol extension (#11), per docs/BACKPRESSURE.md; until
+            // then the shed rides the existing bare `Err` frame, exactly like the byte-cap shed.
+            ProduceOutcome::Shed => {
+                reply_err(out, "shed under load");
                 Ok(())
             }
             ProduceOutcome::Failed(_) => {
@@ -1111,6 +1128,16 @@ mod tests {
                 durability_level: crate::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap()
@@ -1193,6 +1220,16 @@ mod tests {
                 durability_level: crate::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap()
@@ -1233,6 +1270,16 @@ mod tests {
                 durability_level: crate::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap()
@@ -2061,6 +2108,155 @@ mod tests {
         assert_eq!(one_response(&out).0, FrameType::Err);
     }
 
+    /// A CoDel-enabled engine over a shared `ManualClock` the test drives, so the controlled-delay
+    /// sojourn is deterministic (#68). Everything else is the default `engine()` shape.
+    fn codel_engine(clock: Arc<ManualClock>) -> Engine<InMemoryFs, Arc<ManualClock>> {
+        Engine::open(
+            InMemoryFs::new(),
+            clock,
+            EngineConfig {
+                log: LogConfig::default(),
+                lease: LeaseConfig {
+                    visibility_nanos: 30,
+                    hard_cap_nanos: 100,
+                },
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight: 10,
+                consumer_credit: 64,
+                consumer_credit_bytes: 0,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                ram_ceiling_bytes: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: crate::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
+                // CoDel ON (5 ms target / 100 ms interval); the rest inert.
+                codel_target_ms: 5,
+                codel_interval_ms: 100,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
+            },
+        )
+        .unwrap()
+    }
+
+    fn connect_and_pub<C: Clock + Clone + 'static, E: crate::actor::EngineAccess<InMemoryFs, C>>(
+        s: &mut Session,
+        e: &E,
+        out: &mut Vec<u8>,
+    ) {
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                payload: b"p",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        s.process(e, &frame(FrameType::Pub, &pub_body), out)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_codel_enabled_session_still_pub_acks_under_normal_load() {
+        // The safe-default-when-on property at the session layer: a CoDel-enabled broker under normal
+        // admission latency (a zero sojourn, the direct path's enqueue == dequeue) still PubAcks every
+        // produce. CoDel never false-sheds a healthy producer.
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(codel_engine(Arc::clone(&clock)));
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        for _ in 0..50 {
+            out.clear();
+            connect_and_pub(&mut s, &e, &mut out);
+            assert_eq!(
+                one_response(&out).0,
+                FrameType::PubAck,
+                "a healthy produce is acked"
+            );
+        }
+    }
+
+    /// A mock [`EngineAccess`] that ALWAYS returns a given [`ProduceOutcome`] for a produce (and
+    /// records nothing else), so the session's outcome-to-wire mapping can be tested in isolation. It
+    /// proves the `ProduceOutcome::Shed` mapping surfaces the typed "shed under load" `Err`. The
+    /// `with`/`now_monotonic_nanos` paths are unused by a produce-only test, so they return inert
+    /// values.
+    struct ShedEngine;
+    impl crate::actor::EngineAccess<InMemoryFs, ManualClock> for ShedEngine {
+        fn produce(
+            &self,
+            _append: crate::actor::OwnedAppend,
+        ) -> Result<ProduceOutcome, crate::actor::ActorGone> {
+            // The engine decided to SHED this NEW produce under load (#68): the reply is a typed,
+            // self-announcing signal, and NOTHING was appended (the mock has no log to advance), so
+            // the no-data-loss property holds by construction.
+            Ok(ProduceOutcome::Shed)
+        }
+        fn with<R, J>(&self, _job: J) -> Result<R, crate::actor::ActorGone>
+        where
+            R: Send + 'static,
+            J: FnOnce(&mut Engine<InMemoryFs, ManualClock>) -> R + Send + 'static,
+        {
+            Err(crate::actor::ActorGone)
+        }
+        fn now_monotonic_nanos(&self) -> u64 {
+            0
+        }
+    }
+
+    #[test]
+    fn a_codel_shed_surfaces_the_typed_shed_under_load_err_over_the_session() {
+        // The wire-facing #68 property: a `ProduceOutcome::Shed` (the CoDel load-shed) maps to a
+        // typed, self-announcing "shed under load" `Err` frame, NOT a silent drop and NOT a generic
+        // failure, so a producer can distinguish a latency-load shed and back off. The connection
+        // stays open (the session keeps processing).
+        let e = ShedEngine;
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        connect_and_pub(&mut s, &e, &mut out);
+        let (ty, body) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::Err,
+            "a CoDel shed is a typed Err, not a silent drop"
+        );
+        assert_eq!(
+            body, b"shed under load",
+            "the shed Err is self-announcing and distinct from `at capacity` and a generic failure"
+        );
+        // The session keeps going (the shed did not end the connection): a follow-up frame is still
+        // processed (here a Ping -> Pong).
+        out.clear();
+        s.process(&e, &frame(FrameType::Ping, b""), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Pong,
+            "the connection stays open after a shed"
+        );
+    }
+
     #[test]
     fn end_to_end_produce_fetch_ack_over_the_session() {
         let e = DirectEngine::new(engine());
@@ -2464,6 +2660,16 @@ mod tests {
                     durability_level: crate::engine::DurabilityLevel::Sync,
                     flush_interval_ms: 0,
                     flush_max_bytes: 0,
+                    // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                    // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                    codel_target_ms: 0,
+                    codel_interval_ms: 0,
+                    retry_budget_ratio_per_million: 0,
+                    retry_budget_window_ms: 0,
+                    fire_and_forget_msg_rate: 0,
+                    fire_and_forget_byte_rate: 0,
+                    fire_and_forget_refill_ms: 0,
+                    egress_limit: 0,
                 },
             )
             .unwrap(),
@@ -2831,6 +3037,16 @@ mod tests {
                 durability_level: crate::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap()
@@ -2870,6 +3086,16 @@ mod tests {
                 durability_level: crate::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap()
@@ -3443,6 +3669,16 @@ mod tests {
                 durability_level: crate::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap()

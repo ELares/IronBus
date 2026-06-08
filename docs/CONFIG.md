@@ -247,6 +247,45 @@ so these knobs tune the COST of durability, never the GUARANTEE. They are
 SPECIFIED-NOT-YET-A-FIELD: the append actor's batching is hardwired today, not a
 configurable bound.
 
+### Backpressure controls (`[backpressure]`, #68 / #69)
+
+These knobs are now IMPLEMENTED (#336). Every one DEFAULTS to its disabling value,
+so a broker that changes nothing behaves EXACTLY as today (the byte-cap drop-new /
+drop-oldest overflow policy and the per-consumer credit window are the only
+backpressure). They are the load-based complement to the byte cap; see
+[BACKPRESSURE.md](BACKPRESSURE.md) for the control laws and the proofs-of-intent.
+
+| Knob (file key) | Flag / env | Type | Default | Units | Valid range | Reload |
+| --- | --- | --- | --- | --- | --- | --- |
+| `codel_target_ms` | `--codel-target-ms` / `IRONBUS_CODEL_TARGET_MS` | u64 | `0` = off (`DEFAULT_CODEL_TARGET_MS`) | ms | `0` (off) or CLAMPED to `[1, 1000]` | COLD |
+| `codel_interval_ms` | `--codel-interval-ms` / `IRONBUS_CODEL_INTERVAL_MS` | u64 | `100` (`DEFAULT_CODEL_INTERVAL_MS`) | ms | CLAMPED to `[20, 10000]` | COLD |
+| `retry_budget_ratio_per_million` | `--retry-budget-ratio-ppm` / `IRONBUS_RETRY_BUDGET_RATIO_PPM` | u64 | `0` = off | ppm | `0` (off) or `<= 1000000` | COLD |
+| `retry_budget_window_ms` | `--retry-budget-window-ms` / `IRONBUS_RETRY_BUDGET_WINDOW_MS` | u64 | `60000` (60 s) | ms | `> 0` | COLD |
+| `fire_and_forget_msg_rate` | `--fire-and-forget-msg-rate` / `IRONBUS_FIRE_AND_FORGET_MSG_RATE` | u64 | `0` = off | msg/s | `0` (off) or any u64 | COLD |
+| `fire_and_forget_byte_rate` | `--fire-and-forget-byte-rate` / `IRONBUS_FIRE_AND_FORGET_BYTE_RATE` | u64 | `0` = off | bytes/s | `0` (off) or any u64 | COLD |
+| `fire_and_forget_refill_ms` | `--fire-and-forget-refill-ms` / `IRONBUS_FIRE_AND_FORGET_REFILL_MS` | u64 | `100` | ms | `> 0` | COLD |
+| `egress_limit` | `--egress-limit` / `IRONBUS_EGRESS_LIMIT` | u32 | `16` (`DEFAULT_EGRESS_LIMIT`) | count | AIMD-bounded to `[4, 128]` | COLD |
+
+A CoDel value outside its clamp is SILENTLY CLAMPED to the nearest bound (never a
+startup error), per the "no per-device tuning" and "cannot refuse to start over a
+CoDel value" criteria (#14). The CoDel TARGET and INTERVAL ship at the RFC 8289
+recommended 5 ms / 100 ms when enabled, but CoDel is OFF by default (`target = 0`),
+so an operator opts in. A CoDel shed rejects a NEW produce with a typed "shed under
+load" signal and NEVER drops an already-accepted record (I2 holds). The retry
+budget and the fire-and-forget bucket are accounting / admission controls that are
+off by default; the egress AIMD limiter is always bounded to `[4, 128]` and starts
+at its floor (16). Each control is observable on `/metrics`
+(`ironbus_codel_shed_total`, `ironbus_codel_backstop_shed_total`,
+`ironbus_codel_interval_resets_total`, `ironbus_retry_shed_total`,
+`ironbus_fire_and_forget_shed_total`, `ironbus_egress_shed_total`, and the gauges
+`ironbus_codel_sojourn_estimate_ms`, `ironbus_retry_ratio`, `ironbus_egress_limit`).
+
+> Wire-signal residual (#11): the machine-actionable `retry_after_ms` / `shed`
+> fields on the rejection frame are owned by the frozen-protocol extension (#11) and
+> are NOT in the protocol yet. Until #11 lands, a CoDel / retry shed rides the
+> existing bare `Err` frame (a distinct, self-announcing message), exactly as
+> BACKPRESSURE.md specifies; the structured hint is the part that waits on #11.
+
 ### Retention (`[retention]`)
 
 | Knob (file key) | Flag / env | Type | Default | Units | Valid range | Reload |

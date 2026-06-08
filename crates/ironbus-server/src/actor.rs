@@ -64,6 +64,12 @@ pub struct OwnedAppend {
     /// The OPT-IN dedup identity (#3, #33): `Some` iff the publish carried a `msg_id` (the dedup
     /// opt-in), owned so it can cross the channel. `None` is the default no-dedup produce.
     pub dedup: Option<OwnedDedup>,
+    /// The monotonic instant (nanoseconds, from the clock seam) the session ENQUEUED this produce to
+    /// the actor (#68), so the engine can measure the admission SOJOURN (`now - enqueue`) at dequeue
+    /// for the CoDel controlled-delay shed. `0` means UN-STAMPED (a test or a path that does not
+    /// route through the actor channel), which reads as a zero sojourn (below TARGET, never sheds), so
+    /// the field is backward-compatible and CoDel-off behavior is unchanged.
+    pub enqueue_monotonic_nanos: u64,
 }
 
 /// An owned copy of a produce's dedup identity (#33), so it can cross the actor channel (the wire
@@ -98,6 +104,13 @@ pub enum ProduceOutcome {
     Fenced,
     /// The durable-log byte cap shed (drop-new): reply a stable "at capacity" error, keep the session.
     AtCapacity,
+    /// A CoDel load-shed (#68): the broker is overloaded past the controlled-delay target, so this
+    /// NEW produce was shed (rejected) to protect tail latency. Distinct from `AtCapacity` (a byte-cap
+    /// shed) so a producer can tell a latency-load shed from a disk-full shed. It NEVER drops an
+    /// already-accepted record (the shed is decided BEFORE the append, so I2 holds). Reply a stable
+    /// "shed under load" error, keep the session (a later produce succeeds once the standing delay
+    /// clears).
+    Shed,
     /// A fatal storage error (a frozen writer): reply an error AND end the session.
     Fatal(EngineError),
     /// A transient produce failure: reply a generic error, keep the session.
@@ -150,14 +163,22 @@ enum Command<F: Filesystem, C: Clock> {
 /// [`EngineHandle::shutdown`]).
 pub struct EngineHandle<F: Filesystem, C: Clock> {
     tx: SyncSender<Command<F, C>>,
+    /// A clone of the engine's clock seam (#68), so a connection handler can read the monotonic
+    /// instant it ENQUEUES a produce at WITHOUT a round-trip through the actor. The session stamps
+    /// this onto the produce so the engine can measure the admission SOJOURN (`dequeue - enqueue`)
+    /// for the CoDel controlled-delay shed. It is the SAME clock the actor's engine reads at dequeue
+    /// (a `ManualClock` clone aliases via `Arc`, a `SystemClock` clone keeps the same monotonic
+    /// origin), so the two readings are comparable.
+    clock: C,
 }
 
-// Derived `Clone` would demand `F: Clone, C: Clone`; the handle only clones the `SyncSender`, so it
-// is cloneable for any `F`/`C`.
-impl<F: Filesystem, C: Clock> Clone for EngineHandle<F, C> {
+// Derived `Clone` would demand `F: Clone`; the handle clones the `SyncSender` and the clock (`C` is
+// already `Clock + Clone` everywhere a handle is built), so spell it out for any `F`.
+impl<F: Filesystem, C: Clock + Clone> Clone for EngineHandle<F, C> {
     fn clone(&self) -> Self {
         EngineHandle {
             tx: self.tx.clone(),
+            clock: self.clock.clone(),
         }
     }
 }
@@ -268,9 +289,17 @@ pub trait EngineAccess<F: Filesystem, C: Clock> {
     where
         R: Send + 'static,
         J: FnOnce(&mut Engine<F, C>) -> R + Send + 'static;
+
+    /// The current MONOTONIC time (nanoseconds) from the engine's clock seam, read LOCALLY (no actor
+    /// round-trip), so a connection handler can stamp a produce's ENQUEUE instant for the CoDel
+    /// admission sojourn (#68). It is the same clock the engine reads at dequeue, so the two readings
+    /// are comparable.
+    fn now_monotonic_nanos(&self) -> u64;
 }
 
-impl<F: Filesystem + 'static, C: Clock + 'static> EngineAccess<F, C> for EngineHandle<F, C> {
+impl<F: Filesystem + 'static, C: Clock + Clone + 'static> EngineAccess<F, C>
+    for EngineHandle<F, C>
+{
     fn produce(&self, append: OwnedAppend) -> Result<ProduceOutcome, ActorGone> {
         EngineHandle::produce(self, append)
     }
@@ -281,6 +310,11 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineAccess<F, C> for EngineH
         J: FnOnce(&mut Engine<F, C>) -> R + Send + 'static,
     {
         EngineHandle::with(self, job)
+    }
+
+    fn now_monotonic_nanos(&self) -> u64 {
+        // A LOCAL clock read, no actor round-trip: the handle holds a clone of the engine's clock.
+        self.clock.now_monotonic_nanos()
     }
 }
 
@@ -322,6 +356,10 @@ impl<F: Filesystem, C: Clock + Clone> EngineAccess<F, C> for DirectEngine<F, C> 
     {
         Ok(job(&mut self.engine.borrow_mut()))
     }
+
+    fn now_monotonic_nanos(&self) -> u64 {
+        self.engine.borrow().now_monotonic()
+    }
 }
 
 /// A test-only [`EngineAccess`] over a `Mutex`-guarded engine, so a test that drives the health
@@ -350,6 +388,12 @@ impl<F: Filesystem, C: Clock + Clone> EngineAccess<F, C> for SharedEngine<F, C> 
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(job(&mut engine))
     }
+
+    fn now_monotonic_nanos(&self) -> u64 {
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .now_monotonic()
+    }
 }
 
 /// Borrows an [`OwnedAppend`]'s dedup identity (#33) as an engine [`DedupRequest`], or `None` for a
@@ -372,6 +416,13 @@ fn produce_once<F: Filesystem, C: Clock + Clone>(
     engine: &mut Engine<F, C>,
     append: &OwnedAppend,
 ) -> ProduceOutcome {
+    // The CoDel admission shed (#68), decided before the append exactly as the real actor does, so
+    // the direct path preserves the load-shed taxonomy and the no-data-loss property (it never
+    // appends a record it shed). A no-op when CoDel is disabled.
+    if engine.codel_admit(append.enqueue_monotonic_nanos) {
+        engine.retry_budget_record_shed();
+        return ProduceOutcome::Shed;
+    }
     let view = Append {
         timestamp_ms: append.timestamp_ms,
         flags: ironbus_core::types::RecordFlags::from_bits(append.flags),
@@ -423,6 +474,10 @@ where
     C: Clock + Clone + 'static,
 {
     let (tx, rx) = sync_channel::<Command<F, C>>(channel_bound.max(1));
+    // Clone the engine's clock seam BEFORE the engine moves into the actor thread, so the handle can
+    // stamp a produce's enqueue instant (the CoDel sojourn measurement, #68) with the SAME clock the
+    // actor reads at dequeue.
+    let clock = engine.clock_clone();
     let join = std::thread::Builder::new()
         .name("ironbus-append-actor".to_string())
         .spawn(move || run_actor(engine, &rx))
@@ -430,7 +485,7 @@ where
         // for the LIBRARY hot paths; spawning the single actor at boot is a startup step. Surface it
         // by propagating the panic only here (boot), never on a request path.
         .expect("spawning the append actor thread");
-    (EngineHandle { tx }, join)
+    (EngineHandle { tx, clock }, join)
 }
 
 /// The actor's run loop. It blocks for one command, then DRAINS every command already queued
@@ -461,6 +516,18 @@ where
         for cmd in commands {
             match cmd {
                 Command::Produce { append, reply } => {
+                    // CoDel controlled-delay shed (#68), decided BEFORE the append so it rejects only
+                    // NEW work and never drops an already-accepted record (I2 holds). The sojourn is
+                    // `now - enqueue` on the monotonic clock seam; a sustained admission delay above
+                    // TARGET sheds this produce. When CoDel is disabled (the default) this is always
+                    // false, so the append path is byte-for-byte unchanged.
+                    if engine.codel_admit(append.enqueue_monotonic_nanos) {
+                        // The shed counts as a request the broker shed (the retry-budget signal), then
+                        // replies a stable "shed under load" outcome; the connection stays open.
+                        engine.retry_budget_record_shed();
+                        let _ = reply.send(ProduceOutcome::Shed);
+                        continue;
+                    }
                     // Append (write, NO fsync) and park the reply; the covering fsync is issued once
                     // for the whole batch by `flush_pending` below.
                     let view = Append {
@@ -472,6 +539,9 @@ where
                     };
                     match engine.append_no_sync_dedup(&view, dedup_request(&append)) {
                         Ok(crate::engine::AppendOutcome::Appended(offset)) => {
+                            // An accepted produce feeds the broker-side retry-budget accept count
+                            // (#69), so the observed retry ratio stays meaningful under load.
+                            engine.retry_budget_record_accept();
                             pending.push(PendingProduce {
                                 outcome: PendingOutcome::Appended(offset),
                                 reply,
@@ -495,6 +565,8 @@ where
                         // A shed or a hard error is known WITHOUT the sync (nothing was written), so
                         // reply immediately; it does not join the durable batch.
                         Err(e) if e.is_at_capacity() => {
+                            // A byte-cap shed is a request the broker shed (the retry-budget signal).
+                            engine.retry_budget_record_shed();
                             let _ = reply.send(ProduceOutcome::AtCapacity);
                         }
                         Err(e) if e.is_fatal() => {
@@ -525,6 +597,11 @@ where
         // The drain is exhausted: commit the parked produces with the ONE covering fsync, then release
         // their replies. This is the steady-state group commit boundary.
         flush_pending(&mut engine, &mut pending);
+        // The admission queue drained to empty: tell CoDel so the controlled-delay window closes and
+        // a bursty-but-healthy queue never lingers in the dropping state (#68). A no-op when CoDel is
+        // disabled (the default), so the steady-state loop is unchanged for a broker that has not
+        // opted in.
+        engine.codel_queue_empty();
     }
 }
 
@@ -623,6 +700,16 @@ mod tests {
             durability_level: crate::engine::DurabilityLevel::Sync,
             flush_interval_ms: 0,
             flush_max_bytes: 0,
+            // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+            // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+            codel_target_ms: 0,
+            codel_interval_ms: 0,
+            retry_budget_ratio_per_million: 0,
+            retry_budget_window_ms: 0,
+            fire_and_forget_msg_rate: 0,
+            fire_and_forget_byte_rate: 0,
+            fire_and_forget_refill_ms: 0,
+            egress_limit: 0,
         }
     }
 
@@ -649,6 +736,7 @@ mod tests {
             headers: Vec::new(),
             payload: payload.to_vec(),
             dedup: None,
+            enqueue_monotonic_nanos: 0,
         }
     }
 
@@ -666,6 +754,7 @@ mod tests {
                 epoch,
                 msg_id: msg_id.to_vec(),
             }),
+            enqueue_monotonic_nanos: 0,
         }
     }
 
