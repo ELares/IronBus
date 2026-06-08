@@ -90,7 +90,10 @@ The append-then-sync-then-ack ordering is in `Engine::produce` in
 `crates/ironbus-storage/src/io.rs`; the `InMemoryFile` model reverts a
 data-only-synced truncation on a simulated power loss
 (`fix/inmem-fdatasync-metadata`), and the crash classes are exercised by the
-seeded fault-recovery sweeps in `crates/ironbus-storage/tests/`. The README
+seeded fault-recovery sweeps in `crates/ironbus-storage/tests/` (including the
+seeded fault scheduler and the same-seed determinism gate in
+`tests/seeded_faults.rs`, where one `u64` seed drives the whole crash workload and a
+failing case replays from the printed seed, #384). The README
 states it directly: "durable on one node by calling `fdatasync` before it
 acknowledges a write". The opt-in ack-on-buffer mode named in the issue (the
 `none` / `interval` durability modes) is a config knob, not yet implemented;

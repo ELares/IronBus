@@ -184,6 +184,39 @@ total-skip cap but is excluded from the DATA-loss accounting. See the I3 block o
 `check_caps_rejects_a_single_oversized_event`,
 `check_caps_rejects_a_cascade_over_the_global_cap`.
 
+### 1.5 The fault schedule is SEEDED and replayable (#384)
+
+The crash classes above are exercised two complementary ways, both fully
+deterministic:
+
+- **The ARMING model** (`crates/ironbus-storage/src/fault.rs`): a test arms ONE
+  specific fault (a failed fsync, a torn write, a checksum flip, a short read, a
+  `sync_dir` publish failure) at a chosen boundary. The point gates in
+  `crash_recovery.rs` use this to pin a named crash situation to a named outcome.
+- **The SEEDED model** (`crates/ironbus-storage/src/sim.rs`): a single seeded
+  in-tree PRNG (`SplitMix64`, ~15 lines, no external RNG crate) drives EVERY fault
+  decision (which op class faults, and which fault), so a whole crash workload is a
+  pure function of one `u64` seed. A `FaultSchedule` records the fault/op EVENT
+  TRACE, so a run is fully replayable: re-running with the printed seed reproduces
+  the identical trace and the identical recovery.
+
+Two gates in `crates/ironbus-storage/tests/seeded_faults.rs` give the seeded model
+teeth: the SAME-SEED determinism gate runs one workload under one seed twice and
+asserts an identical event trace AND an identical recovered-log hash (stronger than
+the disk-image equality the `determinism.rs` gate already checks), while asserting a
+DIFFERENT seed varies the schedule (so the gate is not vacuous); and a per-PR
+fixed-256-seed recovery sweep drives faults through the crash + recovery path and
+asserts I1 to I4 hold under a few-second budget, PRINTING the seed of any failing
+case so it replays exactly (`cargo test`, deterministic, no flaky cron). A
+recovery-side arm injects a fault DURING recovery and requires the invariants hold
+on success or a clean typed error (never a panic).
+
+Out of scope for #384, still open: the broader ASYNC-SCHEDULER seam (#119, #151)
+that would also seed the ORDERING/interleaving of concurrent operations, and the
+cfg-guarded sim-mode lint deny-list (reject `now()` / real-thread-spawn /
+unordered-map iteration in sim mode). This PR scopes to the highest-value parts: the
+seeded FAULT schedule, the same-seed gate, and the seed sweep.
+
 ---
 
 ## 2. The exhaustive decision table (#43 core deliverable)

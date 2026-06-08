@@ -28,3 +28,16 @@ harness = false
 [[bench]]
 name = "cursor"
 harness = false
+
+# CRC32C realized (hardware-when-available) vs a portable table-driven reference (#386 / #112
+# residual). The crc32c crate auto-selects SSE4.2 / ARMv8-CRC at runtime and exposes no portable-only
+# entry point, so the bench compares the realized path against an in-bench portable reference.
+[[bench]]
+name = "crc32c_hw_vs_portable"
+harness = false
+
+# Zero-copy slice handoff (#386 / #112 residual). `bytes` is NOT a dependency, so this benches the
+# equivalent Arc<[u8]> freeze + refcounted slice handoff IronBus actually uses, vs a copy.
+[[bench]]
+name = "zero_copy_handoff"
+harness = false

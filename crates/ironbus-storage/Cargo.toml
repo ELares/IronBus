@@ -27,9 +27,22 @@ serde = { version = "1", features = ["derive"] }
 libc = "0.2"
 
 [dev-dependencies]
+# Informational micro-benches only (the WAL-append framing hot path, #386 / #112 residual). Criterion
+# is a DEV-dependency: it never enters the shipped binary's dependency graph (the static edge binary
+# stays small), it is run on demand via `cargo bench -p ironbus-storage`, and it is not wired into
+# per-PR CI; the regression gate is #114.
+criterion = "0.5"
 proptest = "1"
 serde_json = "1"
 tempfile = "3"
 
 [lints]
 workspace = true
+
+# Informational micro-bench for the WAL append framing hot path (#386 / #112 residual). Run on demand
+# via `cargo bench -p ironbus-storage`; not wired into per-PR CI. Measures the IO-light framing + CRC +
+# buffer cost over the in-memory filesystem, NOT device-dependent fsync latency. The regression gate is
+# #114.
+[[bench]]
+name = "wal_append"
+harness = false
