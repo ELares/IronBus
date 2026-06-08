@@ -102,11 +102,20 @@ same "no silent loss" contract: a torn or corrupt tail dropped at recovery is
 always reported, never silently accepted.
 
 ```
-ironbus_recovery_truncated_bytes              total bytes dropped at the last recovery (the grand total)
+ironbus_recovery_truncated_bytes              total bytes dropped at the last recovery (the grand total, includes torn tails)
+ironbus_recovery_data_loss_bytes              bytes of REAL data loss at the last recovery (the total with torn_tail excluded)
 ironbus_recovery_loss_bytes{reason=...}       bytes dropped at the last recovery, by reason
 ironbus_recovery_loss_records{reason=...}     records dropped at the last recovery, by reason
 ironbus_quarantine_bytes                      persisted on-disk bytes of the forensic quarantine store (surviving restart)
 ```
+
+`ironbus_recovery_data_loss_bytes` (#59) is the headline **bytes lost** figure: the loss report's
+total with `TornTail` **excluded**, because a torn or unsynced tail is bytes that were never fully
+written, not previously-durable data that was lost. Counting torn tails as data loss would inflate
+fleet loss metrics on every clean power-loss restart, so they show up as a reported skip
+(`ironbus_recovery_truncated_bytes` and the `torn_tail` per-reason series carry them) but NOT here.
+Every other reason, including the appended `scrubber_suspect` (#92), DOES count. It is a gauge
+(no `_total`), so it is outside the frozen counter set by construction.
 
 `ironbus_quarantine_bytes` (#134, #315) is the **persisted on-disk footprint** of
 the forensic **quarantine store**: the total bytes of the corrupt-byte copies
@@ -122,8 +131,8 @@ dir degrades to 0 without failing `Log::open`. Like the other recovery-loss gaug
 it is excluded from the frozen `_total` counter set by construction.
 
 The `reason` label is confined to the fixed `ReasonCode` enum (`torn_tail`,
-`corrupt_record_header`, `corrupt_record_body`, `sequence_gap`,
-`segment_chain_gap`); no offset, message-id, or subject is ever a label. The
+`corrupt_record_header`, `corrupt_record_body`, `corrupt_segment_header`,
+`sequence_gap`, `scrubber_suspect`); no offset, message-id, or subject is ever a label. The
 bounded-loss fail-closed recovery (refuse to exceed the loss cap) is the
 companion control in the threat model.
 

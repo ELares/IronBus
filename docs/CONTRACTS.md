@@ -549,6 +549,16 @@ with a new number; existing numbers never change.
 | 3    | `CorruptRecordBody`    | `corrupt_record_body`     |
 | 4    | `CorruptSegmentHeader` | `corrupt_segment_header`  |
 | 5    | `SequenceGap`          | `sequence_gap`            |
+| 6    | `ScrubberSuspect`      | `scrubber_suspect`        |
+
+Code 6 (`ScrubberSuspect`) is reserved for the at-rest scrubber (#92): silent bit rot found on a
+background integrity pass. It was APPENDED per #59 without bumping `schema_version` (the
+append-only rule: a new reason gets a new number, name, and label; existing codes never change).
+A torn tail (code 1) is a reported skip but NOT data loss, so it is excluded from the
+data-loss-bytes total (`LossReport::data_loss_bytes()`, the `ironbus_recovery_data_loss_bytes`
+gauge); every other reason, including `ScrubberSuspect`, counts as data loss. See the
+[loss-report.v1 schema doc](schemas/loss-report.v1.md) for the SkipEvent reconciliation (the
+shipped `LossEvent` IS the canonical per-skip SkipEvent) and the v1-stays decision.
 
 ---
 
@@ -654,7 +664,13 @@ code; the code is canonical.
 - **`ReasonCode` values differ.** The draft's `SkipEvent.reason_code` enumerated
   `RecordCrcMismatch, SegmentHeaderBad, InvariantViolation, TornTailTruncated,
   ScrubberSuspect`. The implemented `ReasonCode` is `TornTail (1), CorruptRecordHeader (2),
-  CorruptRecordBody (3), CorruptSegmentHeader (4), SequenceGap (5)`.
+  CorruptRecordBody (3), CorruptSegmentHeader (4), SequenceGap (5), ScrubberSuspect (6)`.
+  The draft names map onto the frozen ones: `TornTailTruncated` -> `TornTail`,
+  `RecordCrcMismatch` -> `CorruptRecordHeader`/`CorruptRecordBody` (split by where the
+  checksum failed), `SegmentHeaderBad` -> `CorruptSegmentHeader`, `InvariantViolation` ->
+  `SequenceGap` (the concrete invariant recovery enforces inline), and `ScrubberSuspect` is
+  appended as code 6 for the at-rest scrubber (#92). The full mapping is in the
+  [loss-report.v1 schema doc](schemas/loss-report.v1.md#skipevent-the-shipped-lossevent-is-the-canonical-per-skip-schema).
 
 ### Config
 
