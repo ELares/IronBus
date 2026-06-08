@@ -10,7 +10,7 @@
 #   set of permanent seeds: the frozen #45 conformance vectors plus a handful of crafted
 #   hostile inputs, one file per target. The per-PR smoke (ci.yml) and the nightly soak both
 #   feed it as seeds, and the deterministic replay test
-#   (crates/ironbus-proto/tests/fuzz_regression_replay.rs) drives every file through the same
+#   (crates/ironbus-server/tests/fuzz_regression_replay.rs) drives every file through the same
 #   decoders the fuzz targets call and asserts no panic. A nightly-found crasher is minimized
 #   (cargo fuzz tmin) and PROMOTED here by dropping its file under the right target dir; its
 #   content-addressed name makes promotion idempotent (re-adding the same bytes is a no-op).
