@@ -97,6 +97,17 @@ name = "mimalloc" # vendored mimalloc C.
 # exporter (which would add `opentelemetry`, `opentelemetry-otlp`, `tonic`/`prost`, and a larger
 # permissive tree to review) is a deliberate follow-up; until it lands behind `otlp`, the #139
 # pure-Rust DATA-path policy is unchanged (tracing is observability, off the record path).
+#
+# The TOML config-FILE layer (#85, #86, #382) adds the maintainer-APPROVED `toml` crate to
+# `ironbus-cli` for the `--config <path>` parser (the decision recorded in docs/CONFIG.md section 5).
+# `toml 0.5` is chosen deliberately for its MINIMAL dependency surface: its ONLY dependency is
+# `serde` (already in the tree via tracing-subscriber's json feature above), so it adds NO new crate
+# to the shipped `ironbus-cli` graph (no `toml_edit`/`indexmap`/`hashbrown`/`winnow`/`foldhash`). That
+# matters twice: it keeps the 1.78 MSRV gate green (indexmap 2.10+ requires the `edition2024` Cargo
+# feature, rustc >= 1.85) and the SBOM round-trip clean (no foldhash drift). It is PURE RUST with no
+# `links` key or C build script (cargo-deny `bans` + scripts/ci/cffi-ban.sh verify this over the
+# shipped musl graph), so the #102 C-FFI ban and the #139 pure-Rust DATA-path policy hold: config
+# parsing is a CLI startup concern, off the record path.
 
 [advisories]
 yanked = "deny"

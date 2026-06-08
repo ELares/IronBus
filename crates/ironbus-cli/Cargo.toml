@@ -38,6 +38,19 @@ ironbus-storage = { path = "../ironbus-storage", version = "0.0.0" }
 # is a non-cryptographic content identity (paired with the byte length), never a security boundary.
 crc32c = "0.6"
 
+# The TOML config-FILE parser (#85, #86, #382), the maintainer-approved pure-Rust dependency. It
+# parses a `--config <path>` file into a typed `toml::Value` the resolver flattens, slotting the
+# FILE layer between env and default (flag > env > FILE > default). `toml 0.5` is chosen for its
+# MINIMAL dependency surface: its ONLY dependency is `serde` (already in the tree via
+# tracing-subscriber's json feature), so it pulls NO new crates (no toml_edit / indexmap / hashbrown
+# / winnow), which keeps the 1.78 MSRV gate green (indexmap 2.10+ needs edition2024) and the
+# SBOM round-trip clean (no foldhash drift). It is PURE RUST with no `links` key or C build script,
+# so the #102 C-FFI ban and the #139 pure-Rust DATA-path policy stay clean (config parsing is a CLI
+# startup concern, off the record path). Its `Value`/`type_str` API and its line/column parse errors
+# give a broken file the exact location. The IO-free `ironbus-core` never sees it (the pure
+# grammar/validator is in `ironbus-core::config`; only the whole-read file IO lives here).
+toml = "0.5"
+
 # Signal handling for `serve`'s graceful shutdown (#195): catches SIGINT/SIGTERM/SIGHUP and flips
 # the serve loop's shutdown flag so the broker stops accepting, flushes the committed cursor, and
 # exits 0. The maintainer chose `ctrlc` over a hand-rolled `unsafe` sigaction (Miri cannot exercise

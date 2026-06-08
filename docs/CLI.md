@@ -78,6 +78,8 @@ broker opens.
 | Flag | Value type | Default | Unit | Meaning |
 |------|-----------|---------|------|---------|
 | `--data-dir <dir>` | path | required (no default) | path | The directory holding the segmented log, the cursor checkpoints, and the `dlq/` sink. |
+| `--config <path>` | path | none (no file) | path | Load a TOML configuration FILE (#382). It slots BETWEEN env and default, so the precedence is **flag > env > FILE > default**: a file key beats the compiled default, but an env var or a flag still overrides it. The file is whole-read, parsed (the pure-Rust `toml` crate), and STRICTLY validated before the broker opens: an unknown key is a fatal usage error with a did-you-mean (downgradable with `--allow-unknown-config`), a broken file fails with the path + line/column, durations use `{ms,s,m,h,d}` and byte sizes the binary `{B,KiB,MiB,GiB,TiB}` (unit required, decimal-SI rejected), and the coupled-set rules are checked as a whole. The frozen sections are `[durability]`, `[storage]`, `[retention]`, `[backpressure]`, `[delivery]`, `[network]`, the bare `profile` key, and the reserved-but-tolerated `[observability]`/`[auth]`/`[compression]`. With no `--config` the resolution is byte-for-byte the historical flag > env > default. The schema is `docs/CONFIG.md`. |
+| `--allow-unknown-config` | bool flag | off | n/a | Downgrade an UNKNOWN config-FILE key from a fatal error to a warning (for a staged upgrade). The unknown key is logged and ignored, never wired into a knob. Has no effect without `--config`. |
 | `--profile <edge-tiny\|balanced\|throughput>` | enum | `balanced` (the compiled `DEFAULT_*` set, `PROFILE_SCHEMA_VERSION`) | n/a | Select a compiled-in, versioned tuning PROFILE (#87): a coherent group of knobs (`--max-segment-bytes`, `--consumer-credit`, `--consumer-credit-bytes`, `--max-connections`, `--max-groups`, `--max-in-flight`, `--disk-full-policy`, `--checkpoint-interval`, `--visibility-timeout-ms`, `--max-deliver`) set in one move. Applied FIRST, then any explicit env var or flag overrides an individual knob, so the precedence is **profile < env < flag**. `balanced` IS the shipped default set (so it is byte-identical to passing no profile); `edge-tiny` is the small-RAM, flash-gentle edge preset (8 MiB segments, 8 / 256 KiB credits, 32 connections, `drop-new`); `throughput` widens every buffer for a multi-core hub (256 MiB segments, 512 / 64 MiB credits, 1024 connections, `drop-oldest`). A profile NEVER sets `--data-dir` or any network/TLS key. An unknown name is a usage error. The exact per-profile values are frozen in `docs/CONFIG.md` section 6. |
 | `--addr <host:port>` | string | `127.0.0.1:7777` (`DEFAULT_ADDR`) | host:port | The wire-protocol listen address (loopback only by default). |
 | `--max-connections <n>` | usize | `256` (`DEFAULT_MAX_CONNECTIONS`) | count | Connection cap, so a flood cannot spawn unbounded threads. Must be at least 1. |
@@ -152,14 +154,15 @@ broker opens.
 Every `serve` setting can also be supplied via an environment variable, so the same key
 surface works as a foreground binary, a systemd unit, or a container with no config file.
 The variable name is `IRONBUS_<FLAG>`: the flag name minus its leading `--`, uppercased,
-with each `-` replaced by `_`. The **precedence is flag > env > default**: an explicit
-command-line flag overrides the env var, which overrides the compiled default. The
-compiled default for each knob is supplied by the active `--profile` (#87), which is
-itself applied below the env and flag layers, so the full chain is
-**profile < env < flag** (the profile sets a knob's starting value, then an env var or
-flag for that same knob overrides it). With no `--profile`, the default profile is
-`balanced`, whose values ARE the compiled `DEFAULT_*` constants, so the two-layer
-`flag > env > default` behavior above is unchanged.
+with each `-` replaced by `_`. The **precedence is flag > env > FILE > default**: an
+explicit command-line flag overrides the env var, which overrides the `--config` TOML FILE
+value (#382), which overrides the compiled default. The compiled default for each knob is
+supplied by the active `--profile` (#87), which is itself applied below the file, env, and
+flag layers, so the full chain is **profile < FILE < env < flag** (the profile sets a
+knob's starting value, then the file, an env var, or a flag for that same knob overrides
+it). With no `--profile`, the default profile is `balanced`, whose values ARE the compiled
+`DEFAULT_*` constants; with no `--config`, the file layer is absent, so the historical
+`flag > env > default` behavior is byte-for-byte unchanged.
 
 | Flag | Environment variable |
 |------|----------------------|
@@ -198,8 +201,11 @@ A bad env value (e.g. non-numeric where a number is expected, or an unknown
 as a bad flag value names the flag. The repeatable `--key-shared-group` is command-line
 only (no single-var mapping, since a list with a per-group meaning does not flatten to one
 scalar). The compiled-in named PROFILES and the `--profile` selector are implemented
-(#87, see `--profile` above); the broader TOML config file and hot reload are SEPARATE
-follow-ups (#85/#88) and not yet implemented.
+(#87, see `--profile` above); the TOML config FILE (`--config`), its strict typed-key /
+literal-grammar / coupled-set validation, and the immutable-config atomic re-read RELOAD
+are implemented (#382, see `--config` above and `docs/CONFIG.md`). The remaining residual is
+the MUTATING wire `CONFIG SET`/`SAVE` admin verbs, which need the #106 connection-scoped
+auth (there is no unauthenticated remote config mutation).
 
 ### `serve` data_dir lifecycle and the single-broker lock (#89)
 
