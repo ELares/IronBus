@@ -140,7 +140,12 @@ fn generator_reproduces_the_checked_in_corpus_bytes_exactly() {
                         continue;
                     }
                 };
-                if on_disk != want {
+                // Compare the meaningful digest content (the `len=... *_crc=...` line), trimmed of
+                // the trailing newline style. The digest fields are byte-exact (a single bit of
+                // drift changes a CRC), but the trailing EOL is not part of the gate: this keeps
+                // the check immune to a platform's CRLF<->LF handling even though `.gitattributes`
+                // already pins the corpus files as binary (`-text`).
+                if on_disk.trim_end() != want.trim_end() {
                     mismatches.push(format!(
                         "{}: digest drifted\n  generated: {}  checked-in: {}\n(the v1 byte format \
                          drifted; regenerate with IRONBUS_REGENERATE_CORPUS=1 and bump \

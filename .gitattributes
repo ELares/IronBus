@@ -1,0 +1,7 @@
+# The #45 conformance corpus is a byte-exact freeze of the v1 on-disk format. The fixtures
+# must be checked out byte-for-byte identical on every platform, so git must never apply
+# end-of-line (CRLF<->LF) conversion to them. The `.digest` sidecar is text but is compared
+# byte-exactly too, so it is pinned the same way. Without this, a Windows checkout under
+# core.autocrlf=true would rewrite the `.digest` newline and break the byte gate.
+crates/ironbus-core/tests/corpus/*.bin    -text
+crates/ironbus-core/tests/corpus/*.digest -text
