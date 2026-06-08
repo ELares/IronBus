@@ -260,6 +260,47 @@ combination and the contract, and own each invention under #7, #8, and #10.
 
 ---
 
+## Source-URL durability policy (#30)
+
+The #2 acceptance criterion that "all cited URLs are verifiable" is enforced
+mechanically, and every external source this survey leans on is pinned so its
+cited content cannot silently change or vanish under it. Two rules apply to any
+prior-art source URL added to the docs:
+
+- **Pin a GitHub source citation to an immutable commit, never a branch.** When
+  a prior-art claim cites a specific file or specific lines in a GitHub repo
+  (a `filestore.go`, a `bookkeeper.conf`), link the `blob/<commit-sha>`
+  permalink, NOT a `blob/main` (or `master`/`HEAD`) link whose lines move. The
+  link-check's relative half cannot police an external host, so the immutability
+  of the cited lines is bought by the SHA in the URL itself. (No prior-art GitHub
+  SOURCE-line citation is present in this document on `main` yet; the comparative
+  survey that adds them is #2/#26, and this rule is the standing requirement for
+  when it lands. GitHub ACTIONS are already SHA-pinned under #142; this rule is
+  about prior-art SOURCE URLs.)
+- **Record an archive.org snapshot plus a dated note for a mutable vendor doc.**
+  A vendor doc tree or blog post can move or 404. Where the docs cite one, the
+  citation carries an inline dated `archived YYYY-MM-DD` link to a
+  `web.archive.org` snapshot, so the content as cited is recoverable even if the
+  live page changes. The
+  mutable vendor docs cited across the docs tree today, with their snapshots:
+
+  | Cited vendor doc | Live URL | archive.org snapshot |
+  | --- | --- | --- |
+  | NDJSON spec (`CLI_CONTRACT.md`) | `https://ndjson.org/` | [2026-05-08](https://web.archive.org/web/20260508182020/https://ndjson.org/) |
+  | `cargo deb` (`DISTRIBUTION.md`) | `https://github.com/kornelski/cargo-deb` | [2026-06-05](https://web.archive.org/web/20260605144432/https://github.com/kornelski/cargo-deb) |
+  | nfpm (`DISTRIBUTION.md`) | `https://nfpm.goreleaser.com/` | [2026-04-13](https://web.archive.org/web/20260413200705/https://nfpm.goreleaser.com/) |
+
+The integrity of these URLs is checked by two CI layers (#30): a per-PR
+relative-link check (`scripts/ci/relative-link-check.sh`, no network, never
+flaky) that proves every in-repo doc link and section anchor resolves, and a
+weekly external-URL check (`scripts/ci/external-link-check.sh`, run by the
+`docs-link-check` workflow) that confirms every cited external URL is reachable
+and opens a tracking issue on a dead one. The split is deliberate: the per-PR
+gate never reaches the open internet, so a transient third-party outage can
+never redden `main`; link ROT is still caught within a week by the cron.
+
+---
+
 ## Cross-references
 
 - [ADR-0001](adr/0001-log-is-wal.md): the active segment is the write-ahead log
