@@ -41,3 +41,41 @@ libc = "0.2"
 
 [lints]
 workspace = true
+
+# Debian package metadata for `cargo deb` (#104). cargo-deb is a BUILD-TIME tool, never a runtime or
+# compile dependency of any shipped crate, so it adds nothing to the binary's dependency graph and
+# leaves the cargo-deny supply-chain gate untouched. The package bundles the static binary, the
+# systemd unit, and the default config; `.rpm` is deferred behind the same spec until a dnf fleet
+# exists (the same `assets` map drives an nfpm config when that lands). See docs/DISTRIBUTION.md.
+#
+# The CI/release path builds the verified static musl binary FIRST, then packages it with
+# `cargo deb --no-build --no-strip` so the .deb ships the exact reproducible release bytes (not a
+# fresh glibc rebuild). `maintainer-scripts` adds the ironbus system user on install.
+[package.metadata.deb]
+name = "ironbus"
+maintainer = "The IronBus Authors <noreply@github.com>"
+copyright = "The IronBus Authors"
+license-file = ["../../LICENSE-APACHE", "0"]
+extended-description = """\
+IronBus is a durable, single-binary edge message queue: a produce/consume broker with an on-disk \
+write-ahead log, at-least-once delivery, and a fail-closed installer. This package installs the \
+broker binary, a systemd unit running it as the unprivileged `ironbus` user, and a default \
+configuration."""
+section = "net"
+priority = "optional"
+# Depend only on systemd (for the unit); the binary itself is static musl, so it has no library deps.
+depends = "systemd"
+assets = [
+    ["target/release/ironbus", "usr/bin/", "755"],
+    ["../../packaging/ironbus.env", "etc/ironbus/ironbus.env", "644"],
+    ["../../README.md", "usr/share/doc/ironbus/README.md", "644"],
+    ["../../docs/DISTRIBUTION.md", "usr/share/doc/ironbus/DISTRIBUTION.md", "644"],
+]
+# The default config is a conffile: an operator's local edits survive a package upgrade.
+conf-files = ["/etc/ironbus/ironbus.env"]
+maintainer-scripts = "../../packaging/debian/"
+# The systemd unit is installed and registered (daemon-reload) by the cargo-deb systemd integration,
+# which reads it from `unit-scripts`. It is installed but NOT enabled or started automatically, so an
+# operator enables it deliberately (`systemctl enable --now ironbus`); the postinst still creates the
+# `ironbus` system user and the data dir first.
+systemd-units = { unit-scripts = "../../packaging/systemd", unit-name = "ironbus", enable = false, start = false }

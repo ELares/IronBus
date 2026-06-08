@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# IronBus broker systemd unit (#104, #14). Ships in the `.deb` and is referenced by the container
+# docs. It runs the broker as the unprivileged `ironbus` user against a writable data dir, and wires
+# the atomic-upgrade FALL-BACK-AFTER-N mechanism: a start that fails to come up bumps a counter
+# (`ironbus record-start --failed`), and once the counter reaches N (default 3) the unit rolls back
+# to the retained `ironbus.prev` via `ironbus rollback` before the next start. A healthy start clears
+# the counter (`record-start --ok`). The live binary is NEVER overwritten in place; `ironbus upgrade`
+# (or the installer) does the atomic write-temp + fsync + rename, so a power cut mid-upgrade leaves
+# either the old or the new binary intact, and this unit recovers an unreachable node automatically.
+
+[Unit]
+Description=IronBus durable edge message queue
+Documentation=https://github.com/ELares/IronBus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ironbus
+Group=ironbus
+
+# All tuning comes from /etc/ironbus/ironbus.env (the IRONBUS_* env-var contract; see docs/CLI.md).
+# At minimum it sets IRONBUS_DATA_DIR; an unset value falls back to the unit default below.
+EnvironmentFile=/etc/ironbus/ironbus.env
+Environment=IRONBUS_DATA_DIR=/var/lib/ironbus
+
+# Path of the installed binary, so the fall-back helpers and the swap target agree on one location.
+Environment=IRONBUS_BIN=/usr/bin/ironbus
+
+# BEFORE start: if a prior boot left the failed-start counter at or past the threshold AND a
+# rollback copy exists, restore ironbus.prev first, so a node that cannot start the new binary
+# heals to the last known-good bytes. `record-start --failed` (run as ExecStopPost on a crash)
+# prints the fall-back instruction; this pre-step performs it. A no-op when below the threshold.
+ExecStartPre=/bin/sh -c '/usr/bin/ironbus record-start --dest "${IRONBUS_BIN}" --failed | grep -q "fall-back threshold reached" && /usr/bin/ironbus rollback --dest "${IRONBUS_BIN}" || true'
+
+ExecStart=/usr/bin/ironbus serve
+
+# A clean, healthy run that systemd later stops clears the failure budget so a deliberate restart
+# does not look like a failure. (A crash takes the ExecStopPost --failed path via $SERVICE_RESULT.)
+ExecStopPost=/bin/sh -c 'if [ "${SERVICE_RESULT}" = "success" ]; then /usr/bin/ironbus record-start --dest "${IRONBUS_BIN}" --ok; else /usr/bin/ironbus record-start --dest "${IRONBUS_BIN}" --failed; fi'
+
+Restart=on-failure
+RestartSec=5
+
+# The data dir is the only writable surface the broker needs; harden the rest.
+StateDirectory=ironbus
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/var/lib/ironbus
+
+[Install]
+WantedBy=multi-user.target

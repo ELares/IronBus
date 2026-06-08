@@ -32,11 +32,16 @@ For each of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, and
 
 - `ironbus-<triple>`: the static binary (no `PT_INTERP`, no `NEEDED` libs; asserted in the job).
 - `ironbus-<triple>.sha256`: its SHA256 checksum.
+- `ironbus-<triple>.deb`: the Debian package built from that verified binary (no recompile),
+  self-checked with `dpkg-deb -c` in the `package-deb` job.
 
 Plus, once per release:
 
-- `SHA256SUMS`: one consolidated checksum file over all three binaries, the file the installer
-  verifies against. The job self-checks it (`sha256sum -c SHA256SUMS`) before it ships.
+- `SHA256SUMS`: one consolidated checksum file over all three binaries AND the three `.deb` packages,
+  the file the installer verifies against. The job self-checks it (`sha256sum -c SHA256SUMS`) before
+  it ships.
+- The distroless container image (built by the `container` job from the verified binary; published to
+  ghcr.io only when registry publishing is opted in, see docs/DISTRIBUTION.md).
 - `ironbus.sbom.json`: the `cargo-auditable` dependency manifest (the graph is target
   independent for this pure-Rust workspace), extracted with `rust-audit-info`.
 - A keyless Sigstore build-provenance attestation for every binary, the `SHA256SUMS`, and the
@@ -70,7 +75,26 @@ tamper-rejection test (`crates/ironbus-cli/tests/installer_verify.rs`) that prov
 binary, an unlisted asset, an empty or malformed `SHA256SUMS`, and a missing binary are all
 rejected, while a matching binary is accepted.
 
-`.deb` and distroless-container packaging are tracked separately in #104.
+## Distribution channels
+
+IronBus ships over four channels, each fail-closed verified before it places a binary, all carrying
+the same reproducible static binary. They are documented in full in
+[docs/DISTRIBUTION.md](docs/DISTRIBUTION.md):
+
+1. The fail-closed `curl | sh` installer (`scripts/install.sh`), below.
+2. A Debian `.deb` package (`cargo deb`, metadata in `crates/ironbus-cli/Cargo.toml`), built per
+   triple by the `package-deb` release job from the verified static binary (no recompile). It bundles
+   the binary, a systemd unit (running the broker as the unprivileged `ironbus` user, wiring the
+   atomic-upgrade fall-back), and a default config conffile.
+3. A distroless container image (`gcr.io/distroless/static:nonroot`, `Dockerfile`/`Dockerfile.release`)
+   built by the `container` release job from the verified binary; running as non-root with the
+   WAL/segment dir as a required writable volume. Registry publishing is opt-in (see DISTRIBUTION.md).
+4. The checksummed GitHub Releases (the binaries, the `.deb` packages, the consolidated `SHA256SUMS`,
+   the SBOM, and the build-provenance attestation), below.
+
+The lifecycle on a deployed node (atomic in-place upgrade, one-command rollback, fall-back after N
+failed starts, and the explicit `migrate` format gate) is also in
+[docs/DISTRIBUTION.md](docs/DISTRIBUTION.md).
 
 ## Verify a downloaded binary
 

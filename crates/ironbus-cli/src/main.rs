@@ -20,6 +20,13 @@
 #[cfg(unix)]
 mod dirlock;
 
+/// Atomic in-place upgrade + rollback for the `ironbus` binary (#104). Unix-only (the atomic
+/// `rename(2)` swap and the directory fsync are POSIX guarantees); the non-Unix `cmd_upgrade`,
+/// `cmd_rollback`, and `cmd_record_start` stubs error out before any of it runs, so the module is
+/// gated. The module itself is `#![cfg(unix)]`-gated internally.
+#[cfg(unix)]
+mod upgrade;
+
 use ironbus_client::{Client, ClientError};
 use ironbus_core::clock::Clock;
 use ironbus_proto::message::PubBody;
@@ -208,6 +215,10 @@ USAGE:
     ironbus cumulative-ack [--addr <host:port>] [--group <name>] --up-to <offset>
     ironbus peek  --data-dir <dir> [--from-offset <n>] [--limit <n>] [--json]
     ironbus dump  --data-dir <dir> [--limit <n>] [--json] [--dlq]
+    ironbus upgrade --new-binary <path> --dest <path> [--max-failed-starts <n>]
+    ironbus rollback --dest <path>
+    ironbus record-start --dest <path> (--failed | --ok)
+    ironbus migrate --data-dir <dir> [--allow <to-version>]
     ironbus help
     ironbus version
 
@@ -286,6 +297,20 @@ Notes:
     path that exists but is not a directory, or a read-only mount, is a fatal error naming the path.
     serve takes an exclusive lock on the data dir, so a second broker on the same data dir fails
     fast rather than corrupting the log with concurrent writers.
+    upgrade swaps an ALREADY-VERIFIED new binary (--new-binary) over the live one (--dest) WITHOUT
+    overwriting it in place: it stages the new bytes to a sibling temp on the same filesystem,
+    fsyncs, retains the prior binary as <dest>.prev (one-command rollback), then renames atomically
+    (POSIX), so a power cut mid-upgrade leaves either the old or the new binary, never a truncated
+    one. The fail-closed download/verify is scripts/install.sh; upgrade is the post-verify swap.
+    --max-failed-starts (default 3) is the N the systemd unit consults for fall-back.
+    rollback restores <dest>.prev over --dest (the same atomic swap) and clears the start counter.
+    record-start --failed/--ok updates the consecutive-failed-start counter the systemd unit uses to
+    fall back after N failures: --failed bumps it (and reports whether N is reached and a .prev
+    exists), --ok clears it on a healthy start. See docs/DISTRIBUTION.md for the unit wiring.
+    migrate gates an on-disk format bump so it is NEVER silent: within a major version the data dir
+    opens with no migration (migrate reports 'no migration needed' and exits 0); a future format
+    bump requires an explicit --allow <to-version> and is refused without it, exit 1. ironbus
+    --version emits the build version (and the release embeds commit/provenance, see RELEASING.md).
     Exit codes: 0 clean, 1 usage, 2 not found, 4 corrupt data, 5 broker unreachable, 70 internal.";
 
 /// A command-line failure, mapped to a frozen exit code by [`main`].
@@ -369,6 +394,10 @@ fn run(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         "serve" => run_serve(rest, out),
         "peek" => run_peek(rest, out),
         "dump" => run_dump(rest, out),
+        "upgrade" => run_upgrade(rest, out),
+        "rollback" => run_rollback(rest, out),
+        "record-start" => run_record_start(rest, out),
+        "migrate" => run_migrate(rest, out),
         "help" | "--help" | "-h" => {
             writeln!(out, "{USAGE}")?;
             Ok(())
@@ -1669,6 +1698,162 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     cmd_inspect(Path::new(&data_dir), 0, limit, json, out)
 }
 
+/// Parses and runs `upgrade`: atomically swap an already-verified new binary over the live one,
+/// retaining the prior binary as `<dest>.prev` (#104). The download/verify is the fail-closed
+/// `scripts/install.sh`; this verb is the post-verify atomic swap, so it never weakens
+/// verify-before-install. Unix-only (atomic `rename(2)`); the non-Unix `cmd_upgrade` stub errors.
+///
+/// # Errors
+/// [`CliError::Usage`] for a missing `--new-binary`/`--dest` or a bad flag; [`CliError::Internal`]
+/// on an IO fault during the swap.
+fn run_upgrade(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let mut new_binary: Option<String> = None;
+    let mut dest: Option<String> = None;
+    let mut max_failed_starts: Option<u32> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--new-binary" => new_binary = Some(take_value("--new-binary", args, &mut i)?),
+            "--dest" => dest = Some(take_value("--dest", args, &mut i)?),
+            "--max-failed-starts" => {
+                max_failed_starts = Some(take_number("--max-failed-starts", args, &mut i)?);
+            }
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!(
+                    "unknown flag `{flag}` for upgrade"
+                )));
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "upgrade takes no positional arguments, got `{other}`"
+                )));
+            }
+        }
+    }
+    let new_binary = new_binary
+        .ok_or_else(|| CliError::Usage("upgrade requires `--new-binary <path>`".to_string()))?;
+    let dest =
+        dest.ok_or_else(|| CliError::Usage("upgrade requires `--dest <path>`".to_string()))?;
+    cmd_upgrade(
+        Path::new(&new_binary),
+        Path::new(&dest),
+        max_failed_starts,
+        out,
+    )
+}
+
+/// Parses and runs `rollback`: restore `<dest>.prev` over the live binary (#104), the one-command
+/// rollback to the last known-good bytes. Unix-only; the non-Unix `cmd_rollback` stub errors.
+///
+/// # Errors
+/// [`CliError::Usage`] for a missing `--dest`; [`CliError::Internal`] if there is no `.prev` to
+/// restore or on an IO fault during the swap.
+fn run_rollback(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let mut dest: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dest" => dest = Some(take_value("--dest", args, &mut i)?),
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!(
+                    "unknown flag `{flag}` for rollback"
+                )));
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "rollback takes no positional arguments, got `{other}`"
+                )));
+            }
+        }
+    }
+    let dest =
+        dest.ok_or_else(|| CliError::Usage("rollback requires `--dest <path>`".to_string()))?;
+    cmd_rollback(Path::new(&dest), out)
+}
+
+/// Parses and runs `record-start`: update the consecutive-failed-start counter the systemd unit
+/// uses to fall back after N failures (#104). `--failed` bumps it (and reports whether the fall-back
+/// threshold is reached and a `.prev` exists); `--ok` clears it on a healthy start. Unix-only.
+///
+/// # Errors
+/// [`CliError::Usage`] for a missing `--dest` or a missing/duplicate `--failed`/`--ok`;
+/// [`CliError::Internal`] on an IO fault updating the counter.
+fn run_record_start(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let mut dest: Option<String> = None;
+    let mut failed = false;
+    let mut ok = false;
+    let mut max_failed_starts: Option<u32> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dest" => dest = Some(take_value("--dest", args, &mut i)?),
+            "--failed" => {
+                failed = true;
+                i += 1;
+            }
+            "--ok" => {
+                ok = true;
+                i += 1;
+            }
+            "--max-failed-starts" => {
+                max_failed_starts = Some(take_number("--max-failed-starts", args, &mut i)?);
+            }
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!(
+                    "unknown flag `{flag}` for record-start"
+                )));
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "record-start takes no positional arguments, got `{other}`"
+                )));
+            }
+        }
+    }
+    let dest =
+        dest.ok_or_else(|| CliError::Usage("record-start requires `--dest <path>`".to_string()))?;
+    if failed == ok {
+        return Err(CliError::Usage(
+            "record-start requires exactly one of `--failed` or `--ok`".to_string(),
+        ));
+    }
+    cmd_record_start(Path::new(&dest), failed, max_failed_starts, out)
+}
+
+/// Parses and runs `migrate`: gate an on-disk format bump so it is NEVER silent (#104, #132). Within
+/// a major version the data dir opens with no migration; a future format bump is refused without an
+/// explicit `--allow <to-version>`. Unix-only (it reads the on-disk segments); the non-Unix
+/// `cmd_migrate` stub errors.
+///
+/// # Errors
+/// [`CliError::Usage`] for a missing `--data-dir`, a bad `--allow` value, or a refused silent bump;
+/// [`CliError::NotFound`] if the data dir is absent; [`CliError::Corrupt`] / [`CliError::Internal`]
+/// per the offline read.
+fn run_migrate(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let mut data_dir: Option<String> = None;
+    let mut allow: Option<u8> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data-dir" => data_dir = Some(take_value("--data-dir", args, &mut i)?),
+            "--allow" => allow = Some(take_number("--allow", args, &mut i)?),
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!(
+                    "unknown flag `{flag}` for migrate"
+                )));
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "migrate takes no positional arguments, got `{other}`"
+                )));
+            }
+        }
+    }
+    let data_dir = data_dir
+        .ok_or_else(|| CliError::Usage("migrate requires `--data-dir <dir>`".to_string()))?;
+    cmd_migrate(Path::new(&data_dir), allow, out)
+}
+
 /// Decodes a data directory offline and writes its durable records (from `from_offset`, at most
 /// `limit` of them) to `out`, then a final note for any torn or corrupt tail recovery would
 /// skip, so the holes are shown, not hidden. Shared by `peek` (a bounded window) and `dump`
@@ -1894,6 +2079,198 @@ fn map_offline_err(data_dir: &Path, e: &StorageError) -> CliError {
     }
 }
 
+/// Maps an upgrade/rollback error to the frozen exit-code scheme: a missing rollback copy is a
+/// usage error (1; the operator asked to roll back where nothing was upgraded), an IO fault is
+/// internal (70).
+#[cfg(unix)]
+fn map_upgrade_err(e: &upgrade::UpgradeError) -> CliError {
+    match e {
+        upgrade::UpgradeError::NoPrev(_) => CliError::Usage(e.to_string()),
+        upgrade::UpgradeError::Io(..) => CliError::Internal(e.to_string()),
+    }
+}
+
+/// Atomically swaps the already-verified `new_binary` over `dest`, retaining the prior binary as
+/// `<dest>.prev` (#104). Never overwrites the live binary in place: it stages to a sibling temp,
+/// fsyncs, retains the prior bytes, then renames atomically (POSIX). The caller has ALREADY verified
+/// `new_binary` (the fail-closed `scripts/install.sh`), so this never weakens verify-before-install.
+#[cfg(unix)]
+fn cmd_upgrade(
+    new_binary: &Path,
+    dest: &Path,
+    max_failed_starts: Option<u32>,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    if !new_binary.exists() {
+        return Err(CliError::Usage(format!(
+            "no new binary at {} (run the fail-closed scripts/install.sh to download and verify it \
+             first; upgrade only performs the post-verify atomic swap)",
+            new_binary.display()
+        )));
+    }
+    let had_prior = dest.exists();
+    upgrade::atomic_swap_with_prev(new_binary, dest).map_err(|e| map_upgrade_err(&e))?;
+    // A new binary is a fresh start budget: clear any stale failed-start count so a prior version's
+    // failures do not trip the fall-back for this one.
+    upgrade::record_successful_start(dest)
+        .map_err(|e| CliError::Internal(format!("resetting the start counter: {e}")))?;
+    let n = max_failed_starts.unwrap_or(upgrade::DEFAULT_MAX_FAILED_STARTS);
+    if had_prior {
+        writeln!(
+            out,
+            "upgraded {} (prior binary retained as {} for rollback; falls back after {n} failed \
+             starts)",
+            dest.display(),
+            upgrade::prev_path(dest).display()
+        )?;
+    } else {
+        writeln!(
+            out,
+            "installed {} (fresh install, no prior binary to retain)",
+            dest.display()
+        )?;
+    }
+    Ok(())
+}
+
+/// Restores `<dest>.prev` over the live binary (#104): the one-command rollback to the last
+/// known-good bytes, via the same atomic swap, also clearing the start-attempt counter.
+#[cfg(unix)]
+fn cmd_rollback(dest: &Path, out: &mut impl Write) -> Result<(), CliError> {
+    upgrade::rollback_to_prev(dest).map_err(|e| map_upgrade_err(&e))?;
+    writeln!(
+        out,
+        "rolled back {} to the retained previous binary (start counter cleared)",
+        dest.display()
+    )?;
+    Ok(())
+}
+
+/// Updates the consecutive-failed-start counter the systemd unit uses to fall back after N failures
+/// (#104). `failed` bumps the counter and reports whether the fall-back threshold is reached AND a
+/// `<dest>.prev` exists (the unit then runs `ironbus rollback`); otherwise it clears it (a healthy
+/// start). The decision (`should_fall_back`) is pure and unit-tested in the `upgrade` module.
+#[cfg(unix)]
+fn cmd_record_start(
+    dest: &Path,
+    failed: bool,
+    max_failed_starts: Option<u32>,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let n = max_failed_starts.unwrap_or(upgrade::DEFAULT_MAX_FAILED_STARTS);
+    if failed {
+        let count = upgrade::record_failed_start(dest)
+            .map_err(|e| CliError::Internal(format!("recording a failed start: {e}")))?;
+        if upgrade::should_fall_back(dest, count, n) {
+            writeln!(
+                out,
+                "failed start {count}/{n}: fall-back threshold reached and a rollback copy exists; \
+                 run `ironbus rollback --dest {}`",
+                dest.display()
+            )?;
+        } else {
+            writeln!(out, "failed start {count}/{n}: no fall-back yet")?;
+        }
+    } else {
+        upgrade::record_successful_start(dest)
+            .map_err(|e| CliError::Internal(format!("clearing the start counter: {e}")))?;
+        writeln!(out, "healthy start: start counter cleared")?;
+    }
+    Ok(())
+}
+
+/// Gates an on-disk format bump so it is NEVER silent (#104, #132). Reads the data dir's on-disk
+/// format version (the first segment header's version byte, read RAW so a future version is
+/// detectable even though this build's decoder would reject it), and:
+///
+/// - An EMPTY/absent-segments data dir (or one already at this build's [`FORMAT_VERSION`]) needs no
+///   migration: it opens as-is within the major version. Reports "no migration needed", exits 0.
+/// - A data dir at a DIFFERENT format version is a format bump. Without an explicit `--allow
+///   <to-version>` naming this build's version it is REFUSED (a usage error), so an upgrade can
+///   never silently reinterpret on-disk bytes under a layout it does not know. With a matching
+///   `--allow` it still cannot migrate (no in-place migration path exists in v1), so it reports the
+///   honest state and the operator's options rather than faking a migration.
+#[cfg(unix)]
+fn cmd_migrate(data_dir: &Path, allow: Option<u8>, out: &mut impl Write) -> Result<(), CliError> {
+    use ironbus_core::format::FORMAT_VERSION;
+    if !data_dir.exists() {
+        return Err(CliError::NotFound(format!(
+            "no data directory at {}",
+            data_dir.display()
+        )));
+    }
+    let on_disk = read_on_disk_format_version(data_dir)?;
+    let current = FORMAT_VERSION;
+    match on_disk {
+        None => {
+            writeln!(
+                out,
+                "no migration needed: {} holds no segments yet (a fresh data dir opens at format v{current})",
+                data_dir.display()
+            )?;
+            Ok(())
+        }
+        Some(v) if v == current => {
+            writeln!(
+                out,
+                "no migration needed: {} is on-disk format v{v}, the current major (opens with no migration)",
+                data_dir.display()
+            )?;
+            Ok(())
+        }
+        Some(v) => {
+            // A different on-disk format version: a bump that must NEVER be silent.
+            match allow {
+                Some(to) if to == current => Err(CliError::Usage(format!(
+                    "{} is on-disk format v{v}, but this build writes format v{current}, and no \
+                     in-place migration path from v{v} to v{current} exists yet. A format bump \
+                     within a major version is forward/backward compatible (see \
+                     docs/COMPATIBILITY.md); a major bump needs a dedicated migrator, not an \
+                     in-place reinterpretation. Refusing rather than corrupting the log.",
+                    data_dir.display()
+                ))),
+                _ => Err(CliError::Usage(format!(
+                    "REFUSING a silent format bump: {} is on-disk format v{v} but this build writes \
+                     format v{current}. Re-run with `--allow {current}` to acknowledge the bump \
+                     explicitly (it is still gated; an on-disk format change is never applied \
+                     silently, see docs/COMPATIBILITY.md).",
+                    data_dir.display()
+                ))),
+            }
+        }
+    }
+}
+
+/// Reads the on-disk format version stamped in the data dir's first segment header, RAW (the
+/// version byte at [`ironbus_core::format::segment_header_offsets::VERSION`]), so a FUTURE version
+/// is detectable even though this build's `SegmentHeader::decode` would reject it. Returns `None`
+/// for a data dir with no segments yet (a fresh dir needs no migration).
+#[cfg(unix)]
+fn read_on_disk_format_version(data_dir: &Path) -> Result<Option<u8>, CliError> {
+    use ironbus_core::format::{segment_header_offsets, SEGMENT_HEADER_LEN};
+    use ironbus_storage::fs::Filesystem;
+    use ironbus_storage::io::RandomAccessFile;
+    use ironbus_storage::naming::{segment_file_name, segment_ids};
+    let fs = StdFs::new(data_dir.to_path_buf());
+    let ids = segment_ids(&fs)
+        .map_err(|e| CliError::Internal(format!("listing {}: {e}", data_dir.display())))?;
+    let Some(&first) = ids.first() else {
+        return Ok(None);
+    };
+    let name = segment_file_name(first);
+    let file = fs
+        .open(&name)
+        .map_err(|e| CliError::Internal(format!("opening {name}: {e}")))?;
+    let mut header = [0u8; SEGMENT_HEADER_LEN];
+    file.read_exact_at(&mut header, 0).map_err(|e| {
+        CliError::Corrupt(format!(
+            "{} is too short to hold a segment header: {e}",
+            data_dir.display()
+        ))
+    })?;
+    Ok(Some(header[segment_header_offsets::VERSION]))
+}
+
 /// `peek` / `dump` require Unix in v1 (the on-disk storage uses positioned IO the Windows path
 /// does not yet implement), matching `serve`.
 #[cfg(not(unix))]
@@ -1922,6 +2299,58 @@ fn cmd_inspect_dlq(
     let _ = (data_dir, limit, json, out);
     Err(CliError::Internal(
         "ironbus dump --dlq requires a Unix host in v1: on-disk storage is Unix-only".to_string(),
+    ))
+}
+
+/// `upgrade` requires Unix in v1: the atomic `rename(2)` swap and the directory fsync are POSIX
+/// guarantees. The non-Unix stub consumes every parameter (so the Windows `-D warnings` build is
+/// clean, per the #288 footgun note) and errors before any swap.
+#[cfg(not(unix))]
+fn cmd_upgrade(
+    new_binary: &Path,
+    dest: &Path,
+    max_failed_starts: Option<u32>,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let _ = (new_binary, dest, max_failed_starts, out);
+    Err(CliError::Internal(
+        "ironbus upgrade requires a Unix host in v1: the atomic rename(2) swap is POSIX-only"
+            .to_string(),
+    ))
+}
+
+/// `rollback` requires Unix in v1, for the same reason as `upgrade` (the atomic `rename(2)` swap).
+#[cfg(not(unix))]
+fn cmd_rollback(dest: &Path, out: &mut impl Write) -> Result<(), CliError> {
+    let _ = (dest, out);
+    Err(CliError::Internal(
+        "ironbus rollback requires a Unix host in v1: the atomic rename(2) swap is POSIX-only"
+            .to_string(),
+    ))
+}
+
+/// `record-start` requires Unix in v1 (it is the systemd fall-back helper, and `serve` is Unix-only).
+#[cfg(not(unix))]
+fn cmd_record_start(
+    dest: &Path,
+    failed: bool,
+    max_failed_starts: Option<u32>,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let _ = (dest, failed, max_failed_starts, out);
+    Err(CliError::Internal(
+        "ironbus record-start requires a Unix host in v1 (the systemd fall-back helper)"
+            .to_string(),
+    ))
+}
+
+/// `migrate` requires Unix in v1 (it reads the on-disk segments, which use positioned IO the Windows
+/// path does not yet implement, matching `peek`/`dump`).
+#[cfg(not(unix))]
+fn cmd_migrate(data_dir: &Path, allow: Option<u8>, out: &mut impl Write) -> Result<(), CliError> {
+    let _ = (data_dir, allow, out);
+    Err(CliError::Internal(
+        "ironbus migrate requires a Unix host in v1: on-disk storage is Unix-only".to_string(),
     ))
 }
 
