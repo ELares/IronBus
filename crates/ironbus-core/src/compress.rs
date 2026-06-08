@@ -724,6 +724,30 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_that_decodes_past_the_claimed_length_is_a_typed_error_never_a_panic() {
+        // The claimed length and the stream are independently attacker-controlled (the body CRC
+        // proves integrity, not honesty). A descriptor that claims a SMALL length but carries a
+        // valid lz4 block decoding to a LARGER length must be a typed CorruptStream, never an
+        // out-of-bounds panic on the claim-sized buffer. This is exactly the case the lz4_flex
+        // `checked-decode` feature guards: without it, decompress_into indexes past the buffer.
+        let real = vec![0x5Au8; 4096];
+        let block = lz4_flex::block::compress(&real); // a valid lz4 block that decodes to 4096
+        let mut stored = Vec::new();
+        stored.push(CODEC_ID_LZ4);
+        stored.extend_from_slice(&0u32.to_le_bytes()); // dict_id
+        stored.extend_from_slice(&16u32.to_le_bytes()); // LIE: claim 16, well under the cap
+        stored.extend_from_slice(&block);
+        let err = decompress_payload(
+            RecordFlags::COMPRESSED,
+            &stored,
+            &NoDictionaries,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+        .unwrap_err();
+        assert_eq!(err, DecompressError::CorruptStream);
+    }
+
+    #[test]
     fn truncated_descriptor_is_a_typed_error() {
         // A compressed-flagged payload shorter than the descriptor is a typed error.
         let err = decompress_payload(

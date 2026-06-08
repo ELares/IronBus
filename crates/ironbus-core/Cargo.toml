@@ -17,7 +17,7 @@ xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
 # `links` key and runs no C-builder build script). Pinned to 0.10 to hold the workspace MSRV (1.78):
 # 0.11+ declare a 1.81 minimum and would fail the `msrv (1.78)` CI job. `default-features = false`
 # drops the `frame` format (and its xxhash dependency); IronBus uses only the block API.
-lz4_flex = { version = "0.10", default-features = false, features = ["safe-encode", "safe-decode"] }
+lz4_flex = { version = "0.10", default-features = false, features = ["safe-encode", "safe-decode", "checked-decode"] }
 
 [dev-dependencies]
 criterion = "0.5"
