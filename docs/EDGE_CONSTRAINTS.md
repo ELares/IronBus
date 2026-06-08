@@ -183,15 +183,27 @@ To be precise about what this section delivers versus what it does not:
 - **SPECIFIED here (design done):** the `tiny` profile name, its concrete
   default VALUES, the proof they sum under 64 MiB, and that they ship in the one
   static binary with no external dependency.
-- **The #115 implementation residual (NOT claimed as done):** the
-  auto-selection mechanism (a `--profile tiny` switch, [#17](https://github.com/ELares/IronBus/issues/17) /
-  [#87](https://github.com/ELares/IronBus/issues/87)) that sets these values for
-  the operator, the itemized per-buffer budget turned into a refuse-to-boot
-  RSS guard, the per-topic RAM floor, and the `mmap_max_bytes=0` assertion (a
-  no-op today since storage uses positional IO, not mmap). The 64 MiB ceiling
-  is a documented target met BY CONFIGURATION today, not an invariant the binary
-  enforces; this is stated plainly in [RAM_BUDGET.md](RAM_BUDGET.md) and is not
-  re-claimed as enforced here.
+- **Shipped since (no longer residual):** the auto-selection mechanism is the
+  `--profile edge-tiny` switch ([#87](https://github.com/ELares/IronBus/issues/87)),
+  which sets the values in this table for the operator. An `edge-tiny` edge-budget
+  CI gate (`crates/ironbus-cli/tests/edge_tiny_budget.rs`,
+  [#118](https://github.com/ELares/IronBus/issues/118)) boots the real
+  `serve --profile edge-tiny`, asserts these knobs are in effect via the #87
+  materialized-config startup line, and asserts the edge metrics are within budget:
+  `ironbus_write_amp_ratio` is under the `>= 4x fails` flash-endurance gate (the
+  flash-endurance row above), the byte counters advance with `physical >= logical`,
+  and `ironbus_ram_headroom_bytes` reports the honest `-1` sentinel.
+- **The #115 implementation residual (NOT claimed as done):** the itemized
+  per-buffer budget turned into a refuse-to-boot RSS guard (a `--ram-ceiling-bytes`
+  serve flag that would make `ironbus_ram_headroom_bytes` report a real number
+  rather than the `-1` sentinel), the per-topic RAM floor, and the `mmap_max_bytes=0`
+  assertion (a no-op today since storage uses positional IO, not mmap). The 64 MiB
+  ceiling is a documented target met BY CONFIGURATION today, not an invariant the
+  binary enforces; this is stated plainly in [RAM_BUDGET.md](RAM_BUDGET.md) and is
+  not re-claimed as enforced here. The precise RSS-under-64-MiB assertion is
+  therefore DEVICE-ONLY: the edge-budget CI gate above asserts the honest `-1`
+  sentinel and the write-amp budget that ARE meaningful on a shared runner, never a
+  flaky RSS number.
 
 ---
 
