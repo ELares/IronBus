@@ -5,3 +5,8 @@
 # core.autocrlf=true would rewrite the `.digest` newline and break the byte gate.
 crates/ironbus-core/tests/corpus/*.bin    -text
 crates/ironbus-core/tests/corpus/*.digest -text
+
+# The #385 fuzz REGRESSION corpus is content-addressed: each file's name is the SHA-256 of its
+# own raw bytes. Any CRLF<->LF rewrite would change the bytes and break the name<->content
+# invariant the replay test checks, so these raw seed files must never be EOL-converted either.
+fuzz/corpus-regression/** -text

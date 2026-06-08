@@ -57,7 +57,9 @@ jobs:
           tool: cargo-fuzz@0.13.1
       - name: soak each parser fuzz target
         env:
-          # Per-target wall-clock budget; 8 targets => ~24 min of fuzzing per nightly run.
+          # Per-target wall-clock budget; 8 targets => ~24 min of fuzzing per nightly run. The #385
+          # plan is to raise this toward 30 min/target; it is a single knob so deepening the soak is
+          # a one-line change once the nightly runner-time budget allows.
           MAX_TOTAL_TIME: "180"
         run: |
           # Select nightly explicitly via the rustup proxy: cargo-fuzz needs the nightly
@@ -73,9 +75,22 @@ jobs:
             # is incompatible with a statically linked libc (and the musl std for the sanitizer
             # build is not installed), so the build failed with "sanitizer is incompatible with
             # statically linked libc". The host gnu target is always installed by the toolchain.
-            cargo +nightly fuzz run "${target}" --target x86_64-unknown-linux-gnu -- -max_total_time="${MAX_TOTAL_TIME}"
+            #
+            # The committed regression corpus (fuzz/corpus-regression/<target>, #385) is passed as
+            # the seed corpus, so the soak always REPLAYS every #45 vector and every promoted crasher
+            # first, then explores from them rather than from an empty corpus each night.
+            cargo +nightly fuzz run "${target}" --target x86_64-unknown-linux-gnu \
+              "corpus-regression/${target}" -- -max_total_time="${MAX_TOTAL_TIME}"
             echo "::endgroup::"
           done
+        working-directory: fuzz
+      # Minimize-and-promote (#385): on a crash, cargo-fuzz drops the offending input under
+      # fuzz/artifacts/<target>/. Upload it with a 90-day retention (the external-artifact retention
+      # policy this task calls for) so a triager can fetch it. The PROMOTE flow is manual and cheap:
+      #   cd fuzz && cargo +nightly fuzz tmin <target> --target x86_64-unknown-linux-gnu <crash-file>
+      #   cp <minimized> corpus-regression/<target>/"$(sha256sum <minimized> | cut -d' ' -f1)"
+      # which makes the minimized crasher a permanent, content-addressed per-PR regression seed (the
+      # replay test then guards it on every PR). See fuzz/README.md "Minimize and promote".
       - name: upload crashing inputs for triage
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -83,6 +98,7 @@ jobs:
           name: fuzz-artifacts
           path: fuzz/artifacts/
           if-no-files-found: ignore
+          retention-days: 90
 
   miri:
     # Run Miri (the MIR interpreter) over the crates it CAN run, to catch undefined behavior the
@@ -167,6 +183,17 @@ jobs:
     # upload it as a build artifact (#21). This lane is informational only: it has no threshold
     # gate and adds no external coverage service or token. It succeeds as long as coverage is
     # collected, so a drop in coverage is visible in the artifact without ever blocking a merge.
+    #
+    # COVERAGE-REGRESSION GATE (#385, intended mechanism, documented here, NOT yet enforcing):
+    # the planned "coverage-below-last-release" gate compares this run's line coverage against the
+    # coverage archived for the last released tag and fails on an un-ratified drop. It is NOT wired
+    # as a hard gate yet for the SAME reason the #114 perf regression gate no-ops today: there is no
+    # released tag / baseline yet (v0.1.0 is the maintainer's action), so there is nothing to compare
+    # against. What IS wired cheaply now: this job emits the summary percentage to the job log and
+    # the step summary every night, and retains the lcov.info artifact for 90 days, so a release can
+    # archive a baseline lcov.info and a future revision of this job can flip the comparison on
+    # (read the baseline percentage, FAIL if `current < baseline - tolerance`), mirroring the perf
+    # gate's baseline/no-op/ratify shape. Documented in fuzz/README.md and CHANGELOG.
     name: coverage (informational)
     runs-on: ubuntu-latest
     steps:
@@ -186,9 +213,27 @@ jobs:
         env:
           RUSTFLAGS: ""
         run: cargo llvm-cov --workspace --all-features --locked --lcov --output-path lcov.info
+      - name: summarize line coverage (the number a future below-last-release gate would compare)
+        # Deterministic, dependency-free: derive the overall line-coverage percentage straight from
+        # the LCOV LF/LH counters and print it to the log and the step summary. This is the single
+        # value the documented coverage-regression gate (#385) would check against the last release's
+        # archived baseline; emitting it now makes the baseline trivially recoverable later.
+        run: |
+          set -euo pipefail
+          total_lf=$(awk -F: '/^LF:/ {s+=$2} END {print s+0}' lcov.info)
+          total_lh=$(awk -F: '/^LH:/ {s+=$2} END {print s+0}' lcov.info)
+          if [ "$total_lf" -eq 0 ]; then
+            echo "::warning::no instrumented lines found in lcov.info"
+            pct="0.00"
+          else
+            pct=$(awk -v lh="$total_lh" -v lf="$total_lf" 'BEGIN { printf "%.2f", (lh*100.0)/lf }')
+          fi
+          echo "line coverage: ${pct}% (${total_lh}/${total_lf} lines)"
+          echo "line coverage: ${pct}% (${total_lh}/${total_lf} lines)" >> "$GITHUB_STEP_SUMMARY"
       - name: upload the coverage report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-lcov
           path: lcov.info
           if-no-files-found: error
+          retention-days: 90

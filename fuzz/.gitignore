@@ -1,6 +1,17 @@
-# cargo-fuzz build output and machine-discovered data (corpora, crash artifacts, coverage).
-# Cargo.lock IS committed for reproducible nightly soaks, matching this repo's supply-chain rigor.
+# cargo-fuzz build output and machine-discovered data (working corpora, crash artifacts,
+# coverage). These are VOLATILE: cargo-fuzz rewrites the working `corpus/<target>/` on every
+# run, so they are never committed. Cargo.lock IS committed for reproducible nightly soaks,
+# matching this repo's supply-chain rigor.
 target/
 corpus/
 artifacts/
 coverage/
+
+# ...but the committed, content-addressed REGRESSION corpus (#385) IS tracked: it is the
+# permanent seed set (the frozen #45 conformance vectors + crafted hostile inputs, plus any
+# promoted minimized crasher) that the per-PR smoke and the nightly soak replay. The `corpus/`
+# rule above matches only a path component named exactly `corpus`, so `corpus-regression/` is
+# already tracked; this negation is belt-and-suspenders and documents the intent. Re-seed with
+# `sh fuzz/seed-regression-corpus.sh`.
+!corpus-regression/
+!corpus-regression/**

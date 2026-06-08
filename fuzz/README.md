@@ -30,20 +30,68 @@ cargo-fuzz needs a nightly toolchain:
 rustup toolchain install nightly
 cargo install cargo-fuzz
 
-# Soak one target (Ctrl-C to stop), or bound it with -max_total_time=<seconds>.
-cargo +nightly fuzz run record_codec -- -max_total_time=60
+# Soak one target (Ctrl-C to stop), or bound it with -max_total_time=<seconds>. Seed it from
+# the committed regression corpus so it replays every known crasher first.
+cargo +nightly fuzz run record_codec --target x86_64-unknown-linux-gnu \
+    corpus-regression/record_codec -- -max_total_time=60
 
 # Build every target without running, to check they still compile.
-cargo +nightly fuzz build
+cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
 ```
 
-A crash drops the offending input under `fuzz/artifacts/<target>/`. Minimize it
-(`cargo +nightly fuzz tmin <target> <crash-file>`) and add the minimized input as a
-permanent regression seed.
+`--target x86_64-unknown-linux-gnu` is REQUIRED. cargo-fuzz infers its default `--target`
+from its own binary triple, and CI binstalls the musl-static cargo-fuzz build, so without
+the flag the fuzz targets build for `x86_64-unknown-linux-musl`, which is incompatible with
+AddressSanitizer. Pass it on every `fuzz run` / `fuzz build` (locally too, on a musl host).
+
+## The committed regression corpus (#385)
+
+`fuzz/corpus-regression/<target>/<sha256>` is a small, committed, content-addressed set of
+permanent seeds: the frozen [#45](https://github.com/ELares/IronBus/issues/45) conformance
+vectors plus crafted hostile inputs (overlong length fields, truncated frames, all-ones
+headers), one directory per target, each file named by the SHA-256 of its own bytes. Unlike
+the volatile working `corpus/` (which cargo-fuzz rewrites every run and `.gitignore`
+excludes), this directory is TRACKED, so a once-found crash stays a permanent seed.
+
+Regenerate it deterministically (and assert it is current) with:
+
+```sh
+sh fuzz/seed-regression-corpus.sh           # (re)write the committed corpus
+sh fuzz/seed-regression-corpus.sh --check    # assert the committed corpus is up to date (CI)
+```
+
+## Minimize and promote
+
+When a soak finds a crasher (dropped under `fuzz/artifacts/<target>/`), minimize it and
+promote the minimized input into the regression corpus, where its content-addressed name
+makes the promotion idempotent:
+
+```sh
+cd fuzz
+cargo +nightly fuzz tmin <target> --target x86_64-unknown-linux-gnu <crash-file>
+# tmin writes the minimized input; copy it in under its content hash:
+cp <minimized-file> "corpus-regression/<target>/$(sha256sum <minimized-file> | cut -d' ' -f1)"
+```
+
+Commit the new seed. From then on the per-PR replay (below) guards it on every PR.
 
 ## CI
 
-The nightly workflow's `fuzz` job soaks every target for a few minutes under ASan on each
-run. A crash fails the job and uploads the crashing input as an artifact for triage. The
-build outputs, the discovered corpora, and the crash artifacts are git-ignored;
-`Cargo.lock` is committed so a soak is reproducible.
+- **Per-PR (light, deterministic):** the `test` job runs
+  `crates/ironbus-server/tests/fuzz_regression_replay.rs`, which drives every committed
+  regression seed through the same decoder its libFuzzer target calls and asserts no panic.
+  It needs no sanitizer and no nightly, so it runs on every PR on all three OSes and is
+  non-flaky. The `fuzz-corpus` job asserts the committed corpus is up to date, and the
+  `fuzz-smoke` job replays the corpus under ASan and short-fuzzes each target for a few
+  seconds (`--target x86_64-unknown-linux-gnu`), so a shallow new crasher is caught on the PR.
+- **Nightly (deep):** the `fuzz` job soaks every target under ASan (180 s/target today,
+  rising toward 30 min/target), seeded by the regression corpus. A crash fails the job and
+  uploads the input (90-day retention) for triage and promotion.
+- **Coverage regression:** the nightly `coverage` job emits the workspace line-coverage
+  percentage and retains `lcov.info`. The intended "coverage-below-last-release" gate
+  (compare to the last released tag's archived coverage, fail on an un-ratified drop) is
+  documented in `nightly.yml`; it stays informational until a release archives a baseline,
+  mirroring the #114 perf gate's baseline/no-op shape.
+
+The build outputs, the discovered working corpora, and the crash artifacts are git-ignored;
+the regression corpus and `Cargo.lock` are committed so a soak is reproducible.
