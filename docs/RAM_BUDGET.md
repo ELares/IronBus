@@ -412,7 +412,7 @@ of the steady-state budget that sums under 64 MiB; bounding it tightly needs an
 on-the-wire record-size cap (the read-buffer follow-up). Charging it would refuse
 EVERY edge config, including the worked `edge-tiny` one this doc proves fits, so the
 guard sums the firmly-bounded steady-state terms (1, 3, 5) the budget itemizes.
-For the `edge-tiny` profile the worst case is ~13 MiB (8 MiB term1 + ~1 MiB term3 +
+For the `edge-tiny` profile the worst case is ~15 MiB (8 MiB term1 + ~1 MiB term3 +
 ~6 MiB term5), well under 64 MiB, so it boots; a blown-up `--max-connections` (or a
 `0` byte budget) pushes it over and is refused.
 

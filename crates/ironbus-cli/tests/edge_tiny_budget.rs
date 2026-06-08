@@ -32,7 +32,7 @@
 //! 3. The RAM-headroom gauge reports a REAL value. The edge-tiny profile now wires a runtime RAM
 //!    ceiling: the `serve` path sets `ram_ceiling_bytes = 64 MiB` for `--profile edge-tiny` (#115),
 //!    and the refuse-to-boot RAM guard let the broker start because the worst-case bounded-buffer
-//!    footprint the edge-tiny caps imply (~13 MiB) fits under 64 MiB. So `ironbus_ram_headroom_bytes`
+//!    footprint the edge-tiny caps imply (~15 MiB) fits under 64 MiB. So `ironbus_ram_headroom_bytes`
 //!    reports a REAL `ceiling - RSS` headroom (a non-negative number BELOW the 64 MiB ceiling), NOT
 //!    the `-1` UNAVAILABLE sentinel it reported when no ceiling was configured. This test asserts the
 //!    gauge is non-negative and under the ceiling. It deliberately does NOT assert a tight RSS
@@ -426,7 +426,7 @@ fn edge_tiny_profile_is_within_the_documented_edge_budget() {
     // ====================================================================================
     // PROPERTY 3: the RAM-headroom gauge reports a REAL value (#115). The edge-tiny serve path now
     // wires a 64 MiB ram_ceiling_bytes and the refuse-to-boot guard let the broker start (the
-    // edge-tiny caps' worst-case bounded-buffer footprint, ~13 MiB, fits under 64 MiB), so
+    // edge-tiny caps' worst-case bounded-buffer footprint, ~15 MiB, fits under 64 MiB), so
     // ram_headroom is a real `ceiling - RSS`: NON-NEGATIVE (so NOT the -1 sentinel) and strictly
     // BELOW the 64 MiB ceiling (RSS is non-zero). We deliberately do NOT assert a tight RSS number:
     // a precise RSS-under-64-MiB measurement is DEVICE-ONLY (a shared CI runner's RSS would flake).

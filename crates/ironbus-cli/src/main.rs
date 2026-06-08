@@ -109,7 +109,7 @@ const DEFAULT_MAX_CONNECTIONS: usize = 256;
 const DEFAULT_RAM_CEILING_BYTES: u64 = 0;
 /// The `edge-tiny` profile RAM ceiling (#115, #19, #115-residual): the 64 MiB resident budget
 /// `docs/RAM_BUDGET.md` and `docs/EDGE_CONSTRAINTS.md` size the tiny edge node against. With the
-/// edge-tiny knobs the worst-case bounded-buffer footprint is well under this (~13 MiB), so
+/// edge-tiny knobs the worst-case bounded-buffer footprint is well under this (~15 MiB), so
 /// `--profile edge-tiny` boots; a blown-up `--max-connections` (or another over-cap) override pushes
 /// the provable worst case over 64 MiB and the refuse-to-boot guard rejects it.
 const EDGE_TINY_RAM_CEILING: u64 = 64 * 1024 * 1024;
@@ -346,7 +346,7 @@ const EDGE_TINY_PRESET: ProfilePreset = ProfilePreset {
     visibility_ms: 30_000,
     max_deliver: 5,
     // The 64 MiB tiny-edge RAM ceiling (#115): with the edge-tiny knobs above the worst-case
-    // bounded-buffer footprint is ~13 MiB, so the refuse-to-boot guard lets edge-tiny boot, and a
+    // bounded-buffer footprint is ~15 MiB, so the refuse-to-boot guard lets edge-tiny boot, and a
     // blown-up cap override (e.g. a server-sized --max-connections) is provably refused.
     ram_ceiling_bytes: EDGE_TINY_RAM_CEILING,
 };
@@ -1691,7 +1691,7 @@ fn validate_serve_config(config: &ServeConfig) -> Result<(), CliError> {
 /// `docs/RAM_BUDGET.md` itemizes, each at its CONFIGURED cap, so a refusal is a proof from the config
 /// that the caps cannot fit, not a guess. The error names the worst case, the ceiling, the overage,
 /// and the knobs that drive it, so an operator knows exactly which cap to lower. `0` (the default for
-/// `balanced`/`throughput`) disables the guard; `edge-tiny`'s 64 MiB ceiling fits (~13 MiB worst
+/// `balanced`/`throughput`) disables the guard; `edge-tiny`'s 64 MiB ceiling fits (~15 MiB worst
 /// case) but a blown-up cap override (e.g. a server-sized `--max-connections`) is refused here.
 fn validate_ram_ceiling(config: &ServeConfig) -> Result<(), CliError> {
     // `usize` -> `u64` is lossless on every supported (32/64-bit) target; the saturating fallback is
@@ -5367,7 +5367,7 @@ mod tests {
     #[test]
     fn validate_accepts_edge_tiny_caps_under_the_64_mib_ceiling() {
         // The edge-tiny knobs (32 conns, 256 KiB byte budget, 64 groups, 256 in-flight) under the
-        // 64 MiB ceiling: the worst-case bounded-buffer footprint (~13 MiB) fits, so the broker boots.
+        // 64 MiB ceiling: the worst-case bounded-buffer footprint (~15 MiB) fits, so the broker boots.
         let cfg = ServeConfig {
             max_connections: 32,
             consumer_credit: 8,

@@ -11,7 +11,7 @@ to follow Semantic Versioning once it reaches a tagged release.
   - New `serve --ram-ceiling-bytes <n>` flag (and `IRONBUS_RAM_CEILING_BYTES`) wired into `EngineConfig.ram_ceiling_bytes`; `0` = unset (default, guard off).
   - When set, the broker refuses to start (usage error, exit 1, naming the overage and the knobs to lower) if the worst-case bounded-buffer footprint the configured caps imply provably exceeds the ceiling. The footprint is `max_connections * consumer_credit_bytes` (in-flight payloads) + `max_groups * max_in_flight * ~64` (cursor/lease state) + a fixed overhead, all provable from the config, never a boot-time RSS reading.
   - With a ceiling set, `ironbus_ram_headroom_bytes` reports a real `ceiling - RSS` value instead of the `-1` sentinel.
-  - `--profile edge-tiny` now sets a 64 MiB ceiling: its caps fit (~13 MiB worst case) so it boots, while a blown-up `--max-connections` or a `0` (unlimited) byte budget is refused.
+  - `--profile edge-tiny` now sets a 64 MiB ceiling: its caps fit (~15 MiB worst case) so it boots, while a blown-up `--max-connections` or a `0` (unlimited) byte budget is refused.
   - RAM-guard unit tests; the `edge_tiny_budget` gate now asserts a real headroom. No new metric. Docs: RAM_BUDGET.md (formula + flipped enforcement table), EDGE_CONSTRAINTS.md, CLI.md, CONFIG.md. The precise on-device RSS-under-ceiling burst stays a device residual.
 - Docs link-check CI and a slug-token issue index (Closes #30, #25).
   - Per-PR `docs-links` job runs `scripts/ci/relative-link-check.sh` (in-repo relative links + section anchors, zero network, never flaky) and the offline `scripts/ci/issue-index-audit.sh` structural pass.
