@@ -95,6 +95,20 @@ pub enum StorageError {
         /// The configured cap (`max_total_bytes`) the log met or exceeded.
         cap: u64,
     },
+    /// The OPT-IN daily PHYSICAL write budget (#118), the flash-wear governor, is set and today's
+    /// physical write volume has reached it, so a produce was REJECTED: a clean PRE-WRITE drop-new
+    /// reject (nothing written, no offset or sequence advanced, durability never weakened) that is
+    /// FINAL. It is a DISTINCT variant from [`StorageError::AtCapacity`] on purpose: the byte-cap
+    /// shed can be relieved by reclaiming disk (so `DropOldest` may force-reap and retry), but no
+    /// reap ever lowers today's physical-write meter, so a budget shed must NEVER trigger the
+    /// `DropOldest` reap-retry loop. The day meter resets at the UTC day boundary, so a later
+    /// produce on the next day succeeds; the writer stays live (this is not a fatal freeze).
+    DailyWriteBudgetExceeded {
+        /// The physical bytes written so far today when the produce was rejected.
+        bytes_today: u64,
+        /// The configured daily physical write budget the meter met or exceeded.
+        budget: u64,
+    },
 }
 
 impl core::fmt::Display for StorageError {
@@ -150,6 +164,14 @@ impl core::fmt::Display for StorageError {
                 f,
                 "durable log is at capacity ({durable_bytes} of {cap} bytes); produce rejected"
             ),
+            StorageError::DailyWriteBudgetExceeded {
+                bytes_today,
+                budget,
+            } => write!(
+                f,
+                "daily physical write budget reached ({bytes_today} of {budget} bytes today); \
+                 produce rejected"
+            ),
         }
     }
 }
@@ -185,9 +207,25 @@ impl StorageError {
     /// recoverable, drop-new rejection, distinct from a transient IO failure or a fatal writer
     /// freeze. Callers use it to surface a stable, distinct signal to a producer (a shed is not
     /// a transient failure) without matching the message text.
+    ///
+    /// This is ONLY the genuine disk-full byte-cap shed: it deliberately does NOT include the
+    /// daily-write-budget shed ([`StorageError::DailyWriteBudgetExceeded`]), because reclaiming
+    /// disk can relieve the byte cap (so the `DropOldest` policy may force-reap and retry on it)
+    /// but no reap ever relieves the daily budget. Use [`StorageError::is_daily_write_budget_exceeded`]
+    /// for that distinct, final shed.
     #[must_use]
     pub fn is_at_capacity(&self) -> bool {
         matches!(self, StorageError::AtCapacity { .. })
+    }
+
+    /// Whether this is the OPT-IN daily-write-budget shed ([`StorageError::DailyWriteBudgetExceeded`]),
+    /// the flash-wear governor firing: a clean PRE-WRITE drop-new reject that is FINAL. It is kept
+    /// separate from [`StorageError::is_at_capacity`] so the engine can treat it as a final reject
+    /// under EVERY overflow policy (a reap never lowers today's physical-write meter, so the
+    /// `DropOldest` force-reap loop must never be entered for it).
+    #[must_use]
+    pub fn is_daily_write_budget_exceeded(&self) -> bool {
+        matches!(self, StorageError::DailyWriteBudgetExceeded { .. })
     }
 }
 

@@ -37,6 +37,7 @@ fn config() -> EngineConfig {
         max_groups: DEFAULT_MAX_GROUPS,
         // Idle named-group eviction OFF (#277), the default: the determinism image is unchanged.
         group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
+        ram_ceiling_bytes: 0,
         // Drop-new (the default): the determinism image is unchanged by the new policy field.
         disk_full_policy: DiskFullPolicy::DropNew,
     }

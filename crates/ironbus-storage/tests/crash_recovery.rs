@@ -1448,3 +1448,73 @@ fn crash_before_and_after_the_roll_directory_publish_recovers_a_consistent_prefi
         assert_consistent_prefix(&log);
     }
 }
+
+#[test]
+fn a_power_loss_checksum_flip_corrupts_a_record_and_recovery_reports_it() {
+    // The arming CHECKSUM-FLIP injector (#118) drives a power-loss test that the prior STATIC
+    // bit-flip corpus could only model offline: we arm a one-shot flip at a byte inside the LAST
+    // record's body, write+sync that record (so the corrupt-but-COMPLETE frame is durable on disk),
+    // then crash and reopen. Recovery must DETECT the body-checksum mismatch, stop the valid prefix
+    // BEFORE the corrupt record, and REPORT it as a `CorruptRecordBody` loss event. This proves the
+    // injector genuinely corrupts and that recovery surfaces the loss rather than silently serving a
+    // bad record.
+    let durable = 5u64;
+    let (fs, control) = FaultFs::new(InMemoryFs::new());
+    let mut log = Log::open(fs, ManualClock::new(), big_config()).unwrap();
+    // A clean, durable prefix of `durable` records.
+    for i in 0..durable {
+        append_at(&mut log, i);
+    }
+    log.sync().unwrap();
+    let clean_prefix = log.flushed_offset().get();
+    assert_eq!(clean_prefix, durable, "the clean prefix is fully durable");
+
+    // The active segment's write position is where the NEXT record's frame begins. With a single
+    // segment and no roll (big_config), the durable record bytes are exactly `write_pos minus the
+    // segment header`, so the next frame starts at `SEGMENT_HEADER_LEN + durable_record_bytes`. A
+    // byte inside its BODY is `frame_start + RECORD_HEADER_LEN` (just past the record header), so the
+    // flip corrupts the body/trailer checksum (a `CorruptRecordBody`), not the header.
+    let frame_start = SEGMENT_HEADER_LEN as u64 + log.durable_record_bytes();
+    let body_byte = frame_start + RECORD_HEADER_LEN as u64;
+    control.arm_checksum_flip(body_byte);
+
+    // Append the to-be-corrupted record: the covering write persists a bit-flipped byte and SUCCEEDS,
+    // so a complete-but-corrupt frame lands; the sync makes it durable on disk.
+    append_at(&mut log, durable);
+    log.sync().unwrap();
+    assert_eq!(
+        control.checksum_flip_count(),
+        1,
+        "the flip fired on the corrupting record's write (no false pass)"
+    );
+
+    // Crash and reopen: recovery walks the segment, decodes records, and stops at the corrupt frame.
+    let faultfs = log.into_filesystem();
+    faultfs.inner().simulate_power_loss();
+    let recovered = Log::open(faultfs, ManualClock::new(), big_config()).unwrap();
+
+    // The valid prefix is exactly the clean records; the corrupt record (and nothing after) is gone.
+    assert_eq!(
+        recovered.flushed_offset().get(),
+        clean_prefix,
+        "recovery stops the valid prefix before the corrupt record"
+    );
+    assert_prefix(&recovered, clean_prefix);
+
+    // Recovery REPORTS the corruption as a CorruptRecordBody loss event (a real data-loss reason, not
+    // a torn tail), so the loss is never silent.
+    let report = recovered.loss_report();
+    assert!(
+        report.records_lost_for(ReasonCode::CorruptRecordBody) >= 1,
+        "recovery must report at least one CorruptRecordBody record, got report {report:?}"
+    );
+    assert!(
+        report.bytes_skipped_for(ReasonCode::CorruptRecordBody) > 0,
+        "the corrupt-body loss must carry a non-zero byte span"
+    );
+    // A flipped body is REAL data loss (not an excluded torn tail), so the data-loss total is non-zero.
+    assert!(
+        report.data_loss_bytes() > 0,
+        "a checksum-flipped record is real data loss, not an excluded torn tail"
+    );
+}

@@ -190,45 +190,10 @@ where
                 Err(_) => respond(&mut stream, 503, "Service Unavailable", "shutting down"),
             }
         }
-        "/metrics" => {
-            // Build the whole metrics snapshot in ONE actor job so every field is from the same
-            // instant (the actor is the single reader/writer). A gone actor yields 503.
-            let snapshot = engine.with(|g| MetricsSnapshot {
-                committed: g.committed_offset().get(),
-                flushed: g.flushed_offset().get(),
-                in_flight: g.in_flight(),
-                healthy: g.is_healthy(),
-                recovered_truncated: g.recovered_truncated_bytes(),
-                quarantined: g.quarantined_bytes(),
-                recovery_loss: {
-                    let r = g.loss_report();
-                    ReasonCode::ALL.map(|rc| r.bytes_skipped_for(rc))
-                },
-                recovery_loss_records: {
-                    let r = g.loss_report();
-                    ReasonCode::ALL.map(|rc| r.records_lost_for(rc))
-                },
-                recovery_data_loss: g.loss_report().data_loss_bytes(),
-                // -1 is the unambiguous "none yet" sentinel (offsets are never negative).
-                last_dead_lettered: g
-                    .last_dead_lettered_offset()
-                    .map_or(-1i64, |o| i64::try_from(o.get()).unwrap_or(i64::MAX)),
-                dlq_records: g.dlq_records(),
-                counters: g.counters(),
-                fsync: g.fsync_histogram(),
-                groups: g.group_consumer_stats(),
-                // The bounded metric registry (#97) is rendered into a String inside the actor job
-                // (it walks only the bounded series set and the fixed histograms, so the work is
-                // O(number of series), independent of the record count or disk size), then the body
-                // is assembled outside with the rest. The uptime series reads the live monotonic
-                // clock seam here so it advances between scrapes.
-                registry: registry_body(g.registry(), g.now_monotonic()),
-            });
-            match snapshot {
-                Ok(snapshot) => respond(&mut stream, 200, "OK", &metrics_body(snapshot)),
-                Err(_) => respond(&mut stream, 503, "Service Unavailable", "shutting down"),
-            }
-        }
+        "/metrics" => match metrics_snapshot(engine) {
+            Ok(snapshot) => respond(&mut stream, 200, "OK", &metrics_body(snapshot)),
+            Err(_) => respond(&mut stream, 503, "Service Unavailable", "shutting down"),
+        },
         // The opt-in read-only introspection endpoint (#99). When disabled it is indistinguishable
         // from an unknown path (a 404), so the surface is invisible unless the operator turned it
         // on. The non-GET case was already rejected with 405 above, so this is GET-only.
@@ -382,6 +347,71 @@ fn admin_accept_decision(accept: &str) -> AcceptDecision {
     }
 }
 
+/// Captures the whole `/metrics` snapshot in ONE actor job, so every field is from the same instant
+/// (the actor is the single reader/writer). The RSS reading is then filled in OUTSIDE the engine
+/// lock (it is a process-level read, not engine state), so a `/proc`/`ps` read never runs inside the
+/// actor job. Every value comes from an existing read-only accessor; this cannot mutate the engine.
+///
+/// # Errors
+/// Returns [`ActorGone`](crate::actor::ActorGone) if the actor exited before the read.
+fn metrics_snapshot<F, C, E>(engine: &E) -> Result<MetricsSnapshot, crate::actor::ActorGone>
+where
+    F: Filesystem + 'static,
+    C: Clock + Clone + 'static,
+    E: EngineAccess<F, C>,
+{
+    let mut snapshot = engine.with(|g| MetricsSnapshot {
+        committed: g.committed_offset().get(),
+        flushed: g.flushed_offset().get(),
+        in_flight: g.in_flight(),
+        healthy: g.is_healthy(),
+        recovered_truncated: g.recovered_truncated_bytes(),
+        quarantined: g.quarantined_bytes(),
+        recovery_loss: {
+            let r = g.loss_report();
+            ReasonCode::ALL.map(|rc| r.bytes_skipped_for(rc))
+        },
+        recovery_loss_records: {
+            let r = g.loss_report();
+            ReasonCode::ALL.map(|rc| r.records_lost_for(rc))
+        },
+        recovery_data_loss: g.loss_report().data_loss_bytes(),
+        // -1 is the unambiguous "none yet" sentinel (offsets are never negative).
+        last_dead_lettered: g
+            .last_dead_lettered_offset()
+            .map_or(-1i64, |o| i64::try_from(o.get()).unwrap_or(i64::MAX)),
+        dlq_records: g.dlq_records(),
+        counters: g.counters(),
+        fsync: g.fsync_histogram(),
+        // The edge write-amplification + RAM-headroom + daily-write-budget inputs (#118), read here
+        // so they share the snapshot's single instant. The RSS is filled in below, off the lock.
+        edge: EdgeMetrics {
+            logical_bytes_written: g.logical_bytes_written(),
+            physical_bytes_written: g.physical_bytes_written(),
+            ram_ceiling_bytes: g.ram_ceiling_bytes(),
+            daily_physical_write_budget_bytes: g.daily_physical_write_budget_bytes(),
+            physical_bytes_written_today: g.physical_bytes_written_today(),
+            daily_budget_sheds: g.daily_budget_sheds(),
+            produce_rejected: g.counters().produce_rejected,
+        },
+        // Filled in below, outside the engine lock; `None` is the not-yet-read placeholder.
+        rss: None,
+        groups: g.group_consumer_stats(),
+        // The bounded metric registry (#97) is rendered into a String inside the actor job (it walks
+        // only the bounded series set and the fixed histograms, so the work is O(number of series),
+        // independent of the record count or disk size), then the body is assembled outside with the
+        // rest. The uptime series reads the live monotonic clock seam here so it advances between
+        // scrapes.
+        registry: registry_body(g.registry(), g.now_monotonic()),
+    })?;
+    // Read this process's RSS OUTSIDE the engine lock (#118): a best-effort, no-`unsafe`
+    // cross-platform read (`/proc/self/status` on Linux, `ps` on macOS), `None` where unavailable so
+    // the headroom gauge reports the honest sentinel rather than a misleading zero. It is not engine
+    // state, so keeping it off the lock avoids a `ps`/`/proc` read inside the actor job.
+    snapshot.rss = crate::rss::current_rss_bytes();
+    Ok(snapshot)
+}
+
 /// Captures the read-only introspection state (#99) in ONE actor job, so every field is from the
 /// same instant. Every value comes from an existing read-only accessor; this cannot mutate the
 /// engine and carries no secret material.
@@ -415,6 +445,31 @@ where
     })
 }
 
+/// The edge-resource metric inputs (#118), read from the engine under the same lock as the rest of
+/// the snapshot. The RSS reading and the derived `write_amp_ratio` / `ram_headroom` are computed in
+/// the renderer from these raw values, so the actor job stays a pure read of engine state.
+#[derive(Clone, Copy)]
+struct EdgeMetrics {
+    /// Total LOGICAL bytes appended this run (user payload, no framing): the write-amp denominator.
+    logical_bytes_written: u64,
+    /// Total PHYSICAL bytes appended this run (frames + segment headers/footers): the write-amp
+    /// numerator and the real flash-wear write volume.
+    physical_bytes_written: u64,
+    /// The configured RAM ceiling in bytes for the headroom gauge (`0` = unset).
+    ram_ceiling_bytes: u64,
+    /// The OPT-IN daily physical write budget in bytes (`0` = the governor is off).
+    daily_physical_write_budget_bytes: u64,
+    /// The physical bytes written so far on the current UTC day (the daily-budget meter).
+    physical_bytes_written_today: u64,
+    /// The count of appends shed because the daily physical write budget was reached.
+    daily_budget_sheds: u64,
+    /// The count of produces REJECTED by the drop-new shed (the disk-full byte cap AND the
+    /// daily-write-budget governor; the same value surfaced as `ironbus_produce_rejected_total`).
+    /// Folded into the `ironbus_produce_saturated` signal so the gauge fires on EITHER shed, matching
+    /// its HELP text.
+    produce_rejected: u64,
+}
+
 /// A consistent snapshot of the metric inputs, read under one engine lock.
 #[derive(Clone)]
 struct MetricsSnapshot {
@@ -439,6 +494,14 @@ struct MetricsSnapshot {
     dlq_records: u64,
     counters: Counters,
     fsync: LatencyHistogram,
+    /// The edge write-amplification + RAM-headroom + daily-write-budget inputs (#118), read under the
+    /// same engine lock as the rest so every metric is from one instant.
+    edge: EdgeMetrics,
+    /// This process's resident-set size in bytes (#118), or `None` when it cannot be read on this
+    /// platform. Read OUTSIDE the engine lock (it is a process-level read, not engine state) and
+    /// injected after the actor job returns; the RAM-headroom gauge degrades to the unavailable
+    /// sentinel when it is `None`.
+    rss: Option<u64>,
     /// Per-work-group consumer position, for the lag-by-cursor series (#15, #16).
     groups: Vec<GroupConsumerStat>,
     /// The pre-rendered bounded-metric-registry section (#97): the fixed-bucket fsync-duration and
@@ -448,28 +511,24 @@ struct MetricsSnapshot {
     registry: String,
 }
 
-/// Renders the Prometheus text exposition body from an engine snapshot. Consumer lag is the
-/// durable records produced but not yet committed (`flushed - committed`).
-fn metrics_body(snapshot: MetricsSnapshot) -> String {
-    let MetricsSnapshot {
-        committed,
-        flushed,
-        in_flight,
-        healthy,
-        recovered_truncated,
-        quarantined,
-        recovery_loss,
-        recovery_loss_records,
-        recovery_data_loss,
-        last_dead_lettered,
-        dlq_records,
-        counters,
-        fsync,
-        groups,
-        registry,
-    } = snapshot;
+/// Renders the broker-core gauge + operational-counter block (the first section of the `/metrics`
+/// body): the offsets and lag gauges, the writer-health and recovery gauges, and the `_total`
+/// operational counters. Held in its own function so [`metrics_body`] stays under the line cap and
+/// the big inline `format!` is one focused unit. Consumer lag is `flushed - committed`.
+#[allow(clippy::too_many_arguments)]
+fn broker_core_lines(
+    committed: u64,
+    flushed: u64,
+    in_flight: usize,
+    healthy: bool,
+    recovered_truncated: u64,
+    quarantined: u64,
+    last_dead_lettered: i64,
+    dlq_records: u64,
+    counters: &Counters,
+) -> String {
     let lag = flushed.saturating_sub(committed);
-    let mut body = format!(
+    format!(
         "# HELP ironbus_committed_offset The committed consumer cursor; every offset below it is acked.\n\
          # TYPE ironbus_committed_offset gauge\n\
          ironbus_committed_offset {committed}\n\
@@ -542,15 +601,161 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         segments_force_reaped = counters.segments_force_reaped,
         truncations = counters.truncations,
         truncated_records = counters.truncated_records,
+    )
+}
+
+/// Renders the Prometheus text exposition body from an engine snapshot. Consumer lag is the
+/// durable records produced but not yet committed (`flushed - committed`).
+fn metrics_body(snapshot: MetricsSnapshot) -> String {
+    let MetricsSnapshot {
+        committed,
+        flushed,
+        in_flight,
+        healthy,
+        recovered_truncated,
+        quarantined,
+        recovery_loss,
+        recovery_loss_records,
+        recovery_data_loss,
+        last_dead_lettered,
+        dlq_records,
+        counters,
+        fsync,
+        edge,
+        rss,
+        groups,
+        registry,
+    } = snapshot;
+    let mut body = broker_core_lines(
+        committed,
+        flushed,
+        in_flight,
+        healthy,
+        recovered_truncated,
+        quarantined,
+        last_dead_lettered,
+        dlq_records,
+        &counters,
     );
     body.push_str(&skip_loss_reconciliation_lines(&counters));
     body.push_str(&recovery_loss_lines(&recovery_loss));
     body.push_str(&recovery_data_loss_lines(recovery_data_loss));
     body.push_str(&recovery_loss_records_lines(&recovery_loss_records));
     body.push_str(&fsync_histogram_lines(&fsync));
+    body.push_str(&edge_metric_lines(&edge, rss));
     body.push_str(&group_consumer_lines(&groups, flushed));
     body.push_str(&registry);
     body
+}
+
+/// Renders the EDGE-resource series (#118), all additive to the frozen taxonomy: the flash
+/// write-amplification counters and derived ratio, the RAM-headroom gauge, the throughput-collapse
+/// saturation signal, and the opt-in daily-physical-write-budget accounting. Every name is pinned in
+/// `FROZEN_METRIC_TYPES` (the #22 contract); the two new `_total` counters are also pinned in
+/// `FROZEN_RESILIENCE_COUNTERS` (a write-budget shed and a produce shed are resilience events, never
+/// silent). The new GAUGES carry no `_total` suffix, so they stay out of the taxonomy by
+/// construction.
+///
+/// `write_amp_ratio` is `physical / logical` rendered with three decimal places WITHOUT floating
+/// point (integer milli-units), and is `0.000` until the first logical byte is produced (a fresh
+/// broker has no ratio yet). `ram_headroom_bytes` is `ceiling - rss`, or the `-1` unavailable
+/// sentinel when no ceiling is set or RSS could not be read (see [`crate::rss`]).
+fn edge_metric_lines(edge: &EdgeMetrics, rss: Option<u64>) -> String {
+    let mut s = String::new();
+    // The write-amplification counters and the derived ratio (#118).
+    let _ = write!(
+        s,
+        "# HELP ironbus_logical_bytes_written Logical bytes appended this run (user payload: key + headers + payload, no framing); the write-amplification denominator.\n\
+         # TYPE ironbus_logical_bytes_written counter\n\
+         ironbus_logical_bytes_written {logical}\n\
+         # HELP ironbus_physical_bytes_written Physical bytes appended to segments this run (record frames plus segment headers and footers); the real flash-wear write volume and the write-amplification numerator.\n\
+         # TYPE ironbus_physical_bytes_written counter\n\
+         ironbus_physical_bytes_written {physical}\n",
+        logical = edge.logical_bytes_written,
+        physical = edge.physical_bytes_written,
+    );
+    let (ratio_int, ratio_milli) =
+        write_amp_ratio_milli(edge.physical_bytes_written, edge.logical_bytes_written);
+    let _ = write!(
+        s,
+        "# HELP ironbus_write_amp_ratio Flash write amplification: physical bytes written divided by logical bytes written (0 until the first byte is produced).\n\
+         # TYPE ironbus_write_amp_ratio gauge\n\
+         ironbus_write_amp_ratio {ratio_int}.{ratio_milli:03}\n"
+    );
+    // The RAM-headroom gauge (#118): the configured ceiling minus the measured RSS, or -1 when
+    // either is unavailable (no ceiling set, or RSS unreadable on this platform).
+    let headroom = crate::rss::ram_headroom_bytes(edge.ram_ceiling_bytes, rss);
+    let _ = write!(
+        s,
+        "# HELP ironbus_ram_headroom_bytes Bytes of headroom below the configured RAM ceiling (ram_ceiling_bytes minus the process RSS), or -1 when no ceiling is set or RSS is unavailable on this platform.\n\
+         # TYPE ironbus_ram_headroom_bytes gauge\n\
+         ironbus_ram_headroom_bytes {headroom}\n"
+    );
+    // The portable throughput-collapse / saturation signal (#118): a GAUGE that is 1 once the broker
+    // has SHED at least one produce (a drop-new admission exhaustion: the byte cap, the daily write
+    // budget, or any over-cap rejection). It is throughput-derived, NOT a thermal sensor, so it is
+    // portable across every target (temperature is left as an optional device-only add-on). An
+    // operator alerts on it crossing to 1 (the broker is shedding load, the saturation symptom).
+    let saturated = counters_indicate_saturation(edge);
+    let _ = write!(
+        s,
+        "# HELP ironbus_produce_saturated 1 once the broker has shed at least one produce (admission exhaustion: a drop-new byte-cap or daily-write-budget shed); a portable throughput-collapse signal, not a thermal sensor.\n\
+         # TYPE ironbus_produce_saturated gauge\n\
+         ironbus_produce_saturated {saturated}\n",
+        saturated = u8::from(saturated),
+    );
+    // The OPT-IN daily-physical-write-budget accounting (#118): the configured budget, today's
+    // physical write meter, the over-budget gauge, and the shed counter. All are zero / off when no
+    // budget is configured (the default), so the surface is honest without enabling the governor.
+    let over_budget = edge.daily_physical_write_budget_bytes != 0
+        && edge.physical_bytes_written_today >= edge.daily_physical_write_budget_bytes;
+    let _ = write!(
+        s,
+        "# HELP ironbus_daily_physical_write_budget_bytes The opt-in daily physical write budget in bytes (0 = the flash-wear governor is off).\n\
+         # TYPE ironbus_daily_physical_write_budget_bytes gauge\n\
+         ironbus_daily_physical_write_budget_bytes {budget}\n\
+         # HELP ironbus_physical_bytes_written_today Physical bytes written so far on the current UTC day (the daily-write-budget meter, reset at the UTC day boundary).\n\
+         # TYPE ironbus_physical_bytes_written_today gauge\n\
+         ironbus_physical_bytes_written_today {today}\n\
+         # HELP ironbus_daily_write_budget_over 1 when the daily physical write budget is set and today's physical writes have reached it (the broker is shedding produces to protect flash), else 0.\n\
+         # TYPE ironbus_daily_write_budget_over gauge\n\
+         ironbus_daily_write_budget_over {over}\n\
+         # HELP ironbus_daily_write_budget_sheds_total Produces shed because the daily physical write budget was reached (the flash-wear governor firing).\n\
+         # TYPE ironbus_daily_write_budget_sheds_total counter\n\
+         ironbus_daily_write_budget_sheds_total {sheds}\n",
+        budget = edge.daily_physical_write_budget_bytes,
+        today = edge.physical_bytes_written_today,
+        over = u8::from(over_budget),
+        sheds = edge.daily_budget_sheds,
+    );
+    s
+}
+
+/// Whether the broker has SHED at least one produce, for the portable `ironbus_produce_saturated`
+/// throughput-collapse signal (#118): 1 once ANY drop-new admission exhaustion has fired, the
+/// disk-full byte-cap shed (`produce_rejected`, which also covers the daily-write-budget shed since
+/// both increment it) OR the daily-write-budget governor (`daily_budget_sheds`). Both are folded in
+/// so the gauge matches its HELP ("a drop-new byte-cap OR daily-write-budget shed") exactly: a pure
+/// byte-cap shed flips it too, not only a budget shed. It is the alert-friendly boolean an operator
+/// watches, derived purely from in-process counters (no thermal sensor, so it is portable across
+/// every target).
+fn counters_indicate_saturation(edge: &EdgeMetrics) -> bool {
+    edge.produce_rejected > 0 || edge.daily_budget_sheds > 0
+}
+
+/// Computes `physical / logical` as an integer part plus a three-digit milli-fraction, WITHOUT
+/// floating point (#118), so the exposition is exact and reproducible. Returns `(0, 0)` (rendered
+/// `0.000`) when `logical` is zero (a fresh broker has no ratio yet). The ratio is rounded to the
+/// nearest milli-unit. Saturates rather than overflowing on a pathologically large physical total.
+fn write_amp_ratio_milli(physical: u64, logical: u64) -> (u64, u64) {
+    if logical == 0 {
+        return (0, 0);
+    }
+    // milli = round(physical * 1000 / logical), computed in u128 to avoid overflow on the multiply.
+    let milli_total = (u128::from(physical) * 1000 + u128::from(logical) / 2) / u128::from(logical);
+    let int_part = u64::try_from(milli_total / 1000).unwrap_or(u64::MAX);
+    let milli_part = u64::try_from(milli_total % 1000).unwrap_or(0);
+    (int_part, milli_part)
 }
 
 /// Renders the recovery-loss reconciliation surface (#307): the new `_total` repair counter
@@ -1072,7 +1277,9 @@ fn admin_config_section(s: &mut String, config: &EngineConfigSnapshot) {
             \"group_idle_evict_nanos\":{group_idle_evict_nanos},\
             \"visibility_nanos\":{visibility_nanos},\
             \"hard_cap_nanos\":{hard_cap_nanos},\
-            \"disk_full_policy\":\"{disk_full_policy}\"\
+            \"disk_full_policy\":\"{disk_full_policy}\",\
+            \"ram_ceiling_bytes\":{ram_ceiling_bytes},\
+            \"daily_physical_write_budget_bytes\":{daily_physical_write_budget_bytes}\
         }}",
         max_total_bytes = config.max_total_bytes,
         max_segment_bytes = config.max_segment_bytes,
@@ -1088,6 +1295,10 @@ fn admin_config_section(s: &mut String, config: &EngineConfigSnapshot) {
         visibility_nanos = config.visibility_nanos,
         hard_cap_nanos = config.hard_cap_nanos,
         disk_full_policy = disk_full_policy_label(config.disk_full_policy),
+        // The #118 edge knobs echoed for #15 / the operator: the RAM-headroom ceiling and the
+        // opt-in daily physical write budget (both `0` = off/unset by default).
+        ram_ceiling_bytes = config.ram_ceiling_bytes,
+        daily_physical_write_budget_bytes = config.daily_physical_write_budget_bytes,
     );
 }
 
@@ -1199,6 +1410,7 @@ mod tests {
                 max_messages: 0,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -1291,6 +1503,7 @@ mod tests {
                 max_messages: 0,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -1783,6 +1996,7 @@ mod tests {
                 max_messages: 0,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -1879,6 +2093,366 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// Starts a broker with a non-zero RAM ceiling (#118), so the `ironbus_ram_headroom_bytes` gauge
+    /// reports a real headroom (`ceiling - rss`) rather than the unavailable sentinel.
+    fn start_with_ram_ceiling(
+        ram_ceiling_bytes: u64,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        SharedEngine<InMemoryFs, SystemClock>,
+    ) {
+        let engine = Engine::open(
+            InMemoryFs::new(),
+            SystemClock::new(),
+            EngineConfig {
+                log: LogConfig::default(),
+                lease: LeaseConfig::default(),
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight: 16,
+                consumer_credit: 64,
+                consumer_credit_bytes: 0,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                ram_ceiling_bytes,
+                disk_full_policy: DiskFullPolicy::DropNew,
+            },
+        )
+        .unwrap();
+        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let engine = Arc::clone(&shared);
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            move || {
+                serve_health(
+                    &listener,
+                    &shared,
+                    &shutdown,
+                    false,
+                    &LivenessBeacon::new(0),
+                    0,
+                    &SystemClock::new(),
+                )
+                .unwrap();
+            }
+        });
+        (addr, shutdown, handle, engine)
+    }
+
+    /// Extracts the value of a single un-labeled gauge/counter sample line `name <value>` from a
+    /// rendered `/metrics` body, as an `i64` (so the -1 RAM-headroom sentinel parses too).
+    fn metric_value(body: &str, name: &str) -> i64 {
+        for line in body.lines() {
+            if let Some(rest) = line.strip_prefix(name) {
+                if let Some(v) = rest.strip_prefix(' ') {
+                    return v.trim().parse().unwrap_or_else(|_| {
+                        panic!("metric {name} value `{v}` did not parse as i64; body:\n{body}")
+                    });
+                }
+            }
+        }
+        panic!("metric {name} not found in body:\n{body}");
+    }
+
+    #[test]
+    fn metrics_renders_the_edge_write_amplification_series() {
+        // The edge write-amp series (#118): after a known produce, /metrics carries the logical and
+        // physical byte counters and the derived ratio, with physical > logical (amplification > 1)
+        // and the ratio strictly above 1.000. A test that pins these fails if the accounting or the
+        // rendering regresses.
+        let (addr, shutdown, handle, engine) = start();
+        {
+            let mut g = engine.lock().unwrap();
+            for _ in 0..4 {
+                g.produce(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload: b"edge-write-amp-probe",
+                })
+                .unwrap();
+            }
+        }
+        let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(m.starts_with("HTTP/1.1 200 OK"), "{m}");
+        // The series are present with their TYPE declarations.
+        assert!(
+            m.contains("# TYPE ironbus_logical_bytes_written counter"),
+            "{m}"
+        );
+        assert!(
+            m.contains("# TYPE ironbus_physical_bytes_written counter"),
+            "{m}"
+        );
+        assert!(m.contains("# TYPE ironbus_write_amp_ratio gauge"), "{m}");
+
+        let logical = metric_value(&m, "ironbus_logical_bytes_written");
+        let physical = metric_value(&m, "ironbus_physical_bytes_written");
+        // 4 records x 20-byte payload = 80 logical bytes.
+        assert_eq!(logical, 4 * 20, "logical is the sum of the user payloads");
+        assert!(
+            physical > logical,
+            "physical {physical} should exceed logical {logical} (write amplification > 1)"
+        );
+        // The ratio renders as `<int>.<3-digit milli>` and is strictly above 1.000.
+        let ratio_line = m
+            .lines()
+            .find(|l| l.starts_with("ironbus_write_amp_ratio "))
+            .unwrap_or_else(|| panic!("no ratio line in {m}"));
+        let ratio_str = ratio_line
+            .trim_start_matches("ironbus_write_amp_ratio ")
+            .trim();
+        assert!(
+            ratio_str.contains('.'),
+            "the ratio is rendered with a decimal point, got `{ratio_str}`"
+        );
+        assert!(
+            ratio_str > "1.000",
+            "the write-amp ratio should exceed 1.000, got `{ratio_str}`"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn ram_headroom_gauge_reflects_the_ceiling_minus_rss() {
+        // With a configured RAM ceiling (#118), the headroom gauge reports `ceiling - rss`: a real,
+        // non-sentinel value strictly below the ceiling (the process always uses SOME RSS) and equal
+        // to the ceiling minus the measured RSS at scrape time. The ceiling is set far above any
+        // plausible test RSS so the headroom is positive on every platform.
+        let ceiling: u64 = 64 * 1024 * 1024 * 1024; // 64 GiB, far above any test RSS
+        let (addr, shutdown, handle, _engine) = start_with_ram_ceiling(ceiling);
+        let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(m.contains("# TYPE ironbus_ram_headroom_bytes gauge"), "{m}");
+        let headroom = metric_value(&m, "ironbus_ram_headroom_bytes");
+        // On Linux/macOS the RSS is readable, so the headroom is a real value: positive, below the
+        // ceiling, and equal to ceiling - rss for the RSS measured here.
+        if let Some(rss) = crate::rss::current_rss_bytes() {
+            assert!(
+                headroom > 0,
+                "headroom should be positive with a huge ceiling, got {headroom}"
+            );
+            let headroom_u = u64::try_from(headroom).expect("positive headroom fits u64");
+            assert!(
+                headroom_u < ceiling,
+                "headroom {headroom} must be below the ceiling {ceiling} (the process uses some RSS)"
+            );
+            let expected = crate::rss::ram_headroom_bytes(ceiling, Some(rss));
+            // The scrape's own RSS reading may differ from ours by a little; assert it is within a
+            // generous 64 MiB window of ceiling - our-rss, which proves it is ceiling-minus-an-RSS,
+            // not a constant or the sentinel.
+            let delta = (headroom - expected).unsigned_abs();
+            assert!(
+                delta < 64 * 1024 * 1024,
+                "headroom {headroom} should track ceiling - rss ({expected}); delta {delta}"
+            );
+        } else {
+            // No RSS on this platform: the gauge is the unavailable sentinel.
+            assert_eq!(
+                headroom,
+                crate::rss::RSS_UNAVAILABLE,
+                "no RSS means the sentinel"
+            );
+        }
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn ram_headroom_gauge_is_the_sentinel_without_a_ceiling() {
+        // With NO RAM ceiling configured (the default), the headroom gauge reports the -1 unavailable
+        // sentinel rather than a misleading maximal headroom (#118).
+        let (addr, shutdown, handle, _engine) = start();
+        let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert_eq!(
+            metric_value(&m, "ironbus_ram_headroom_bytes"),
+            crate::rss::RSS_UNAVAILABLE,
+            "no ceiling means the unavailable sentinel; body:\n{m}"
+        );
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn metrics_surfaces_the_daily_write_budget_over_signal_when_exceeded() {
+        // The opt-in daily physical write budget (#118): once today's physical writes reach the
+        // budget, a produce is shed as a distinct, final drop-new reject, the over-budget gauge flips
+        // to 1, and the shed counter ticks. Off (0) by default, so this configures a tiny budget.
+        // Probe one record's physical footprint, then cap the day at exactly the first segment header
+        // plus one record so the SECOND produce is over budget.
+        let probe = {
+            let e = Engine::open(
+                InMemoryFs::new(),
+                SystemClock::new(),
+                EngineConfig {
+                    log: LogConfig::default(),
+                    lease: LeaseConfig::default(),
+                    delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                    max_in_flight: 16,
+                    consumer_credit: 64,
+                    consumer_credit_bytes: 0,
+                    checkpoint_interval: 1024,
+                    max_retained_bytes: 0,
+                    max_age_ms: 0,
+                    max_messages: 0,
+                    max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                    group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                    ram_ceiling_bytes: 0,
+                    disk_full_policy: DiskFullPolicy::DropNew,
+                },
+            )
+            .unwrap();
+            let mut g = e;
+            g.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"budget-probe",
+            })
+            .unwrap();
+            g.physical_bytes_written_today()
+        };
+        // Budget = exactly one record's physical footprint today: the first produce is admitted (the
+        // meter is below the budget when checked), the second is over budget and shed.
+        let engine = Engine::open(
+            InMemoryFs::new(),
+            SystemClock::new(),
+            EngineConfig {
+                log: LogConfig::default().with_daily_physical_write_budget_bytes(probe),
+                lease: LeaseConfig::default(),
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight: 16,
+                consumer_credit: 64,
+                consumer_credit_bytes: 0,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                ram_ceiling_bytes: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
+            },
+        )
+        .unwrap();
+        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let engine = Arc::clone(&shared);
+        let handle = std::thread::spawn({
+            let shared = Arc::clone(&shared);
+            let shutdown = Arc::clone(&shutdown);
+            move || {
+                serve_health(
+                    &listener,
+                    &shared,
+                    &shutdown,
+                    false,
+                    &LivenessBeacon::new(0),
+                    0,
+                    &SystemClock::new(),
+                )
+                .unwrap();
+            }
+        });
+        // The first produce is admitted; the over-budget gauge is still 0 and nothing has shed.
+        {
+            let mut g = engine.lock().unwrap();
+            g.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"budget-probe",
+            })
+            .unwrap();
+        }
+        let m0 = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            m0.contains("# TYPE ironbus_daily_write_budget_over gauge"),
+            "{m0}"
+        );
+        assert_eq!(
+            metric_value(&m0, "ironbus_daily_write_budget_over"),
+            1,
+            "{m0}"
+        );
+        assert_eq!(
+            metric_value(&m0, "ironbus_daily_write_budget_sheds_total"),
+            0,
+            "{m0}"
+        );
+        assert_eq!(
+            metric_value(&m0, "ironbus_produce_saturated"),
+            0,
+            "no shed yet: {m0}"
+        );
+        assert_eq!(
+            metric_value(&m0, "ironbus_daily_physical_write_budget_bytes"),
+            i64::try_from(probe).expect("the budget fits i64"),
+            "the configured budget is echoed: {m0}"
+        );
+
+        // The second produce is shed by the governor (non-fatal); the shed counter ticks and the
+        // saturation signal flips to 1.
+        {
+            let mut g = engine.lock().unwrap();
+            let err = g
+                .produce(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload: b"budget-probe",
+                })
+                .unwrap_err();
+            assert!(
+                err.is_at_capacity(),
+                "the over-budget produce sheds, got {err:?}"
+            );
+            assert!(g.is_healthy(), "a budget shed never freezes the writer");
+        }
+        let m1 = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert_eq!(
+            metric_value(&m1, "ironbus_daily_write_budget_sheds_total"),
+            1,
+            "{m1}"
+        );
+        assert_eq!(
+            metric_value(&m1, "ironbus_daily_write_budget_over"),
+            1,
+            "{m1}"
+        );
+        assert_eq!(
+            metric_value(&m1, "ironbus_produce_saturated"),
+            1,
+            "the shed sets saturation: {m1}"
+        );
+        // The over-budget shed also flows through the existing drop-new rejection counter.
+        assert_eq!(
+            metric_value(&m1, "ironbus_produce_rejected_total"),
+            1,
+            "{m1}"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
     #[test]
     fn metrics_renders_and_increments_dlq_records() {
         use ironbus_core::clock::ManualClock;
@@ -1906,6 +2480,7 @@ mod tests {
                 max_messages: 0,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -2022,6 +2597,7 @@ mod tests {
                 max_messages,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -2213,6 +2789,7 @@ mod tests {
                 max_messages: 0,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropOldest,
             },
         )
@@ -2488,6 +3065,19 @@ mod tests {
         // `_start_time_seconds`, `_uptime_seconds`) the registry also adds are NOT `_total`, so they
         // are excluded from this set by construction (the taxonomy test filters on `_total`).
         "ironbus_consumer_labels_dropped_total",
+        // The daily-physical-write-budget shed counter (#118): a produce shed because the opt-in
+        // flash-wear governor's daily budget was reached (a distinct, FINAL drop-new reject, a
+        // separate error from the disk-full byte-cap shed). A shed is a resilience event the taxonomy
+        // guarantees is never
+        // silent, so it belongs here. The edge GAUGES the same #118 work adds
+        // (`ironbus_logical_bytes_written`/`ironbus_physical_bytes_written` are counters but are
+        // write-AMPLIFICATION accounting, not resilience sheds; `ironbus_write_amp_ratio`,
+        // `ironbus_ram_headroom_bytes`, `ironbus_produce_saturated`,
+        // `ironbus_daily_physical_write_budget_bytes`, `ironbus_physical_bytes_written_today`, and
+        // `ironbus_daily_write_budget_over` are gauges) are NOT in this resilience-shed set: the two
+        // write-amp counters are byte-accounting, not loss/shed/skip events, and the gauges carry no
+        // `_total` suffix, so the taxonomy test excludes them by construction.
+        "ironbus_daily_write_budget_sheds_total",
     ];
 
     #[test]
@@ -2574,6 +3164,13 @@ mod tests {
         ("ironbus_truncated_records_total", "counter"),
         ("ironbus_counter_checkpoint_repair_total", "counter"),
         ("ironbus_consumer_labels_dropped_total", "counter"),
+        // Edge write-amplification (#118): two byte counters (TYPE counter, but NOT `_total`-named,
+        // matching the issue's contract, so the resilience-taxonomy `_total` filter excludes them)
+        // plus the daily-write-budget shed counter (a resilience shed, so it IS `_total` and in the
+        // frozen taxonomy too).
+        ("ironbus_logical_bytes_written", "counter"),
+        ("ironbus_physical_bytes_written", "counter"),
+        ("ironbus_daily_write_budget_sheds_total", "counter"),
         // Broker gauges.
         ("ironbus_committed_offset", "gauge"),
         ("ironbus_flushed_offset", "gauge"),
@@ -2584,6 +3181,14 @@ mod tests {
         ("ironbus_recovery_truncated_bytes", "gauge"),
         ("ironbus_quarantine_bytes", "gauge"),
         ("ironbus_consumer_overflow_saturated", "gauge"),
+        // Edge gauges (#118): write-amp ratio, RAM headroom, the throughput-collapse saturation
+        // signal, and the opt-in daily-write-budget accounting (budget, today's meter, over-budget).
+        ("ironbus_write_amp_ratio", "gauge"),
+        ("ironbus_ram_headroom_bytes", "gauge"),
+        ("ironbus_produce_saturated", "gauge"),
+        ("ironbus_daily_physical_write_budget_bytes", "gauge"),
+        ("ironbus_physical_bytes_written_today", "gauge"),
+        ("ironbus_daily_write_budget_over", "gauge"),
         // Per-group consumer gauges.
         ("ironbus_group_committed_offset", "gauge"),
         ("ironbus_group_consumer_lag", "gauge"),
@@ -2795,6 +3400,7 @@ mod tests {
                 max_messages: 33,
                 max_groups: 100,
                 group_idle_evict_ms: 0,
+                ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropOldest,
             },
         )
@@ -2978,6 +3584,7 @@ mod tests {
                 max_messages: 0,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )
@@ -3172,6 +3779,7 @@ mod tests {
                 max_messages: 0,
                 max_groups: crate::engine::DEFAULT_MAX_GROUPS,
                 group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )

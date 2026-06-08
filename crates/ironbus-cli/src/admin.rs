@@ -632,6 +632,7 @@ mod tests {
                 max_messages: 0,
                 max_groups: 1024,
                 group_idle_evict_ms: 0,
+                ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
             },
         )

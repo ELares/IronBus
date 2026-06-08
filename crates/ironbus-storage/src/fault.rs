@@ -4,7 +4,10 @@
 //! [`InMemoryFs`](crate::fs::InMemoryFs) (or any [`Filesystem`]) in a [`FaultFs`], then arm a
 //! fault through the shared [`FaultControl`]; the next matching operation fails deterministically
 //! (no ambient randomness). It injects fsync failures (the fsyncgate / EIO mode), clean write
-//! failures, one-shot torn (partial) writes, short reads (a `read_at` returning fewer bytes than
+//! failures, one-shot torn (partial) writes, one-shot CHECKSUM FLIPS (#118: a covering write
+//! succeeds but persists a bit-flipped byte, so a complete-but-corrupt record reaches the disk and a
+//! later recovery reports the checksum mismatch, promoting the prior static bit-flip corpus to an
+//! arming injector), short reads (a `read_at` returning fewer bytes than
 //! asked while data remains), read errors (an injected `read_at` IO error), and a `sync_dir`
 //! (directory-publish) failure: the rename-boundary analogue for IronBus, which uses no `rename`,
 //! whose atomic-publish point is the `sync_dir` that makes a new segment's directory entry durable
@@ -28,6 +31,22 @@ pub struct FaultControl {
     fail_read: Arc<AtomicBool>,
     torn_write_armed: Arc<AtomicBool>,
     torn_write_prefix: Arc<AtomicU64>,
+    /// A one-shot CHECKSUM-FLIP injector (#118): while armed, the NEXT `write_all_at` whose byte
+    /// range covers `checksum_flip_offset` persists the buffer with the byte at that absolute file
+    /// offset XOR'd by one bit, then disarms. Unlike the torn write (which truncates), the write
+    /// SUCCEEDS in full, so a complete-but-corrupt record reaches the disk: its body/trailer (or
+    /// header) checksum no longer matches its bytes, so a later recovery DETECTS the corruption and
+    /// reports it (a `CorruptRecordBody`/`CorruptRecordHeader` loss event), the durability-claim test
+    /// vector the prior static bit-flip corpus could only model offline. It is the arming companion
+    /// to `arm_torn_write` and `set_fail_sync`.
+    checksum_flip_armed: Arc<AtomicBool>,
+    /// The absolute file byte offset whose byte the armed checksum flip XORs by one bit. Meaningful
+    /// only while `checksum_flip_armed` is set.
+    checksum_flip_offset: Arc<AtomicU64>,
+    /// A monotonic count of checksum flips that actually FIRED (a covering write persisted a flipped
+    /// byte), so a test can assert the corruption was genuinely injected (no false pass where the
+    /// armed offset was never written).
+    checksum_flip_count: Arc<AtomicU64>,
     /// While non-zero, every `read_at` returns at most this many bytes (a short read). Zero
     /// disables it. The model never returns zero bytes while data remains (that would be a
     /// spurious EOF, not a short read), so the limit must be at least 1 to take effect.
@@ -136,6 +155,46 @@ impl FaultControl {
     pub fn arm_torn_write(&self, prefix_len: u64) {
         self.torn_write_prefix.store(prefix_len, Ordering::SeqCst);
         self.torn_write_armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Arms a one-shot CHECKSUM FLIP at the given ABSOLUTE file byte offset (#118): the NEXT
+    /// `write_all_at` whose byte range `[offset, offset + len)` COVERS `flip_offset` persists its
+    /// buffer with the single byte at `flip_offset` XOR'd by `0x01` (one bit), then disarms. The
+    /// write SUCCEEDS (no error), so a complete-but-corrupt record lands on disk; on a later
+    /// recovery its checksum mismatch is detected and reported as a corruption loss event, the
+    /// power-loss / bit-rot test vector. If the armed offset is never written, the flip never fires
+    /// (and `checksum_flip_count` stays zero, so a test can prove it did not silently miss).
+    pub fn arm_checksum_flip(&self, flip_offset: u64) {
+        self.checksum_flip_offset
+            .store(flip_offset, Ordering::SeqCst);
+        self.checksum_flip_armed.store(true, Ordering::SeqCst);
+    }
+
+    /// The number of checksum flips that have FIRED (a covering write persisted a flipped byte), so
+    /// a test can assert the corruption was genuinely injected rather than silently missed.
+    #[must_use]
+    pub fn checksum_flip_count(&self) -> u64 {
+        self.checksum_flip_count.load(Ordering::SeqCst)
+    }
+
+    /// If a checksum flip is armed AND its offset falls within `[write_offset, write_offset + len)`,
+    /// consume it (one-shot), record that it fired, and return the IN-BUFFER index of the byte to
+    /// flip. Returns `None` when no flip is armed or the armed offset is outside this write (so the
+    /// next covering write takes it instead).
+    fn take_checksum_flip(&self, write_offset: u64, len: usize) -> Option<usize> {
+        if !self.checksum_flip_armed.load(Ordering::SeqCst) {
+            return None;
+        }
+        let flip = self.checksum_flip_offset.load(Ordering::SeqCst);
+        let end = write_offset.saturating_add(len as u64);
+        if flip < write_offset || flip >= end {
+            // The armed offset is not in this write; leave it armed for a covering write.
+            return None;
+        }
+        // Disarm (one-shot) and count the fired flip.
+        self.checksum_flip_armed.store(false, Ordering::SeqCst);
+        self.checksum_flip_count.fetch_add(1, Ordering::SeqCst);
+        usize::try_from(flip - write_offset).ok()
     }
 
     /// Closes the sync gate (#177): the NEXT `sync_data`/`sync_all` blocks until [`open_sync_gate`]
@@ -333,8 +392,9 @@ impl<F: Filesystem> Filesystem for FaultFs<F> {
 
 /// A [`RandomAccessFile`] that wraps another and injects faults while the shared
 /// [`FaultControl`] is armed: a failed fsync, a clean write failure, a one-shot torn write that
-/// persists a byte prefix then errors, a read error, or a short read that returns fewer bytes
-/// than asked. Length and truncation delegate unchanged.
+/// persists a byte prefix then errors, a one-shot checksum flip that persists a bit-flipped byte
+/// (the write succeeds, so a corrupt-but-complete record lands on disk), a read error, or a short
+/// read that returns fewer bytes than asked. Length and truncation delegate unchanged.
 #[derive(Debug)]
 pub struct FaultFile<F> {
     inner: F,
@@ -369,6 +429,20 @@ impl<F: RandomAccessFile> RandomAccessFile for FaultFile<F> {
     }
 
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        // A one-shot checksum flip (#118): if armed and this write covers the armed offset, persist
+        // the buffer with the one covered byte XOR'd by a bit. The write SUCCEEDS (no error), so a
+        // complete-but-corrupt record lands on disk and a later recovery detects the checksum
+        // mismatch (a corruption loss event). Done BEFORE the torn/fail checks so the flip models a
+        // silent on-disk corruption, not a write failure.
+        if let Some(idx) = self.control.take_checksum_flip(offset, buf.len()) {
+            let mut corrupted = buf.to_vec();
+            // `idx` is in bounds by construction (take_checksum_flip only fires when the offset is
+            // inside this write), but guard anyway so a future change can never panic here.
+            if let Some(byte) = corrupted.get_mut(idx) {
+                *byte ^= 0x01;
+            }
+            return self.inner.write_all_at(&corrupted, offset);
+        }
         // A one-shot torn write: persist a prefix of the bytes, then fail, modelling a write
         // interrupted mid-record by a crash (the partial bytes survive for recovery to find).
         if let Some(prefix) = self.control.take_torn_write() {
@@ -671,6 +745,60 @@ mod tests {
         control.set_fail_sync_dir(false);
         fs.sync_dir().unwrap();
         assert_eq!(control.sync_dir_count(), 3);
+    }
+
+    #[test]
+    fn a_checksum_flip_persists_a_flipped_byte_then_disarms() {
+        let (fs, control) = faulted();
+        let f = fs.create_new("seg").unwrap();
+        // Arm a flip at absolute offset 2: the next covering write persists the buffer with byte 2
+        // XOR'd by a bit, and the write SUCCEEDS (no error), so a complete-but-corrupt image lands.
+        control.arm_checksum_flip(2);
+        assert_eq!(control.checksum_flip_count(), 0, "not fired until written");
+        f.write_all_at(b"hello", 0).unwrap();
+        assert_eq!(
+            control.checksum_flip_count(),
+            1,
+            "the covering write fired the flip"
+        );
+        let mut buf = [0u8; 5];
+        f.read_exact_at(&mut buf, 0).unwrap();
+        // Byte 2 ('l' = 0x6c) flipped to 0x6d ('m'); every other byte is intact.
+        assert_eq!(&buf, b"hemlo", "exactly the one byte at offset 2 flipped");
+        // It is one-shot: the next write is untouched.
+        f.write_all_at(b"world", 0).unwrap();
+        f.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"world", "the flip disarmed after firing once");
+        assert_eq!(
+            control.checksum_flip_count(),
+            1,
+            "still only one flip fired"
+        );
+    }
+
+    #[test]
+    fn a_checksum_flip_outside_the_write_does_not_fire() {
+        let (fs, control) = faulted();
+        let f = fs.create_new("seg").unwrap();
+        // Arm a flip at offset 100, then write a region that does NOT cover it: the flip stays armed
+        // and unfired, so a test can prove it did not silently miss the intended record.
+        control.arm_checksum_flip(100);
+        f.write_all_at(b"abc", 0).unwrap();
+        assert_eq!(
+            control.checksum_flip_count(),
+            0,
+            "a non-covering write does not fire the flip"
+        );
+        let mut buf = [0u8; 3];
+        f.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"abc", "the non-covering write was not corrupted");
+        // A later covering write fires it.
+        f.write_all_at(&[0u8; 1], 100).unwrap();
+        assert_eq!(
+            control.checksum_flip_count(),
+            1,
+            "the covering write fired it"
+        );
     }
 
     #[test]

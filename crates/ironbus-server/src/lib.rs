@@ -9,5 +9,6 @@ pub mod liveness;
 pub mod metrics;
 pub mod obs;
 pub mod registry;
+pub mod rss;
 pub mod server;
 pub mod session;
