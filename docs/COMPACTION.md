@@ -1,0 +1,407 @@
+# Optional key-based log compaction (the no-manifest design)
+
+This document is the DESIGN spec for IronBus's optional, opt-in, Kafka-style KEY-BASED
+log compaction (#83, parent #13). It is SPECIFIED, NOT YET IMPLEMENTED: no compaction
+code exists in the source today (verified absent; the WAL doc lists it under
+[Specified but not yet implemented](WAL.md#specified-but-not-yet-implemented), and #135's
+optional compactor is unbuilt). This doc pins the contract so the future implementation
+has one honest target.
+
+It is a behavior-and-format document, not a byte-layout reference. For the exact on-disk
+record, segment, and footer byte layouts see [CONTRACTS.md](CONTRACTS.md); for the file
+lifecycle (active vs sealed segments, the reaper, recovery) see [WAL.md](WAL.md); for the
+shared invariants (I1 to I8) see [INVARIANTS.md](INVARIANTS.md). The two frozen storage
+decisions this builds on are [ADR 0001 (the active segment is the WAL)](adr/0001-log-is-wal.md)
+and [ADR 0002 (v1 never recycles a segment id)](adr/0002-segments-never-recycled-in-v1.md).
+
+Two honesty headers up front:
+
+- **This is opt-in and edge-hostile.** Compaction is OFF by default because it costs the
+  one resource an edge core cannot spare: CPU (it re-reads, key-indexes, and rewrites
+  sealed segments) and flash write endurance (it rewrites survivor bytes). It is for
+  changelog / state-snapshot topics where the latest value per key is the only thing that
+  matters, not for a general durable queue. When enabled it is rate-limited and yields to
+  the append path so it never starves a produce.
+- **The issue says "atomic MANIFEST swap"; IronBus has NO manifest.** The #83 text and
+  #135's sketch both assume a manifest the compactor edits. IronBus deliberately has none:
+  recovery discovers segments by listing the directory and parsing self-describing file
+  names (`naming.rs`: "the directory of self-describing files is the authority, no manifest
+  required"). This document ADAPTS the compaction design to that model. The single atomic
+  commit point is the durable appearance of the new compacted segment file, not a manifest
+  entry swap. The bulk of this spec is that reconciliation, below.
+
+---
+
+## What compaction does
+
+A compacted topic keeps, for each key, AT LEAST the last value, plus a bounded retention of
+tombstones (null-value deletes). The cleaner reads N adjacent dirty SEALED segments, builds
+a key-to-latest-offset map over them, and rewrites only the SURVIVORS (the latest record per
+key, plus any tombstone still inside its `tombstone_ttl`) into a fresh segment. Every survivor
+keeps its ORIGINAL log offset and original sequence; nothing is reordered, no offset is
+rewritten or reused. The result is a sparse offset range: the survivors are the same records
+they always were, just with the superseded records between them removed, leaving permanent
+gaps.
+
+This is the exact opposite of the reaper. The [reaper](WAL.md#retention-deleting-whole-sealed-segments)
+deletes WHOLE sealed segments by age / size / count, cheaply, never looking inside. The
+compactor looks inside, keeps a per-key subset, and is expensive. They compose
+(see [`compact_and_delete`](#compact_and_delete-the-reaper-runs-first)).
+
+### Survivor selection (the acceptance core)
+
+Over the N source segments, scanned in offset order:
+
+- **At least the last value per key.** For each distinct key, the record with the HIGHEST
+  offset wins; every earlier record for that key is superseded and dropped. "At least"
+  because the boundary rules below can retain more, never fewer.
+- **A keyless record is never compacted away.** A record with `key_len == 0` (the
+  `HAS_KEY` flag false, derived from `key_len`, per [CONTRACTS.md](CONTRACTS.md)) has no
+  compaction key and is ALWAYS a survivor. Compaction is meaningful only for keyed topics;
+  a keyless record on a compacted topic is carried through verbatim. (Whether to even admit
+  keyless records on a compacted topic is an operator policy, not a compaction-correctness
+  question; the compactor's job is to never silently drop one.)
+- **Tombstones (null-value deletes) honored for `tombstone_ttl`.** A tombstone is a record
+  whose value (payload) is empty for a key: it means "this key is deleted." It supersedes
+  every earlier value for its key, exactly like any newer record. It is RETAINED (kept as a
+  survivor) until it is older than `tombstone_ttl` (default 24h), measured against the engine
+  clock seam (never the host wall clock, so the deterministic simulation drives it, per I6).
+  Retaining it that long lets an OFFLINE consumer that was down come back and observe the
+  delete rather than silently never seeing the key vanish. Once a tombstone has aged past
+  `tombstone_ttl` AND it is still the latest record for its key, the cleaner may drop it on a
+  later pass, finally reclaiming the key. A tombstone is encoded as the empty payload, NOT a
+  new flag bit, so the #5 record header is untouched (the existing `payload_len == 0` carries
+  it; an explicit tombstone flag bit is a possible future refinement, called out under
+  [Open questions](#open-questions)).
+
+### What compaction must NEVER do (the hard guarantees)
+
+- **Never reorder records.** Survivors are written in ascending offset order. The single
+  total order (I7-style, by offset) is preserved.
+- **Never rewrite or reuse an offset.** A survivor keeps its original offset and original
+  per-segment sequence verbatim. This preserves I5 (offset monotonic, never reused) at the
+  record level: compaction removes offsets, it never invents or shifts one.
+- **Never compact the active segment.** Only SEALED segments are ever inputs. The active
+  segment is the WAL; it is being appended to and is never an input or output of a clean.
+  This is the same structural rule that makes the active segment provably non-deletable
+  (WAL.md), reused here.
+- **Never lose a key's last value to a crash.** The originals stay authoritative until the
+  single atomic commit point (below); a crash before it leaves the originals; a crash after
+  it leaves the compacted segment. There is no in-place mutation, so there is no window in
+  which a half-written clean is the only copy.
+
+---
+
+## The new compacted segment, without a manifest
+
+Compaction's only structural novelty over the existing model is that ONE segment file can be
+authoritative for an offset RANGE that the originals also cover, until the originals are gone.
+A manifest is the usual way to record "this file now owns offsets [a, b)". IronBus has none,
+so the new segment must DECLARE its own coverage in its self-describing header, and recovery
+must resolve an overlap deterministically from the files alone.
+
+### Header fields: the covered offset range and a compaction marker
+
+A compacted segment is a normal segment (the [SegmentHeader](CONTRACTS.md) / record-frame /
+[SegmentFooter](CONTRACTS.md) format is unchanged in shape) with three additional facts
+recorded in its header:
+
+- a **compaction marker** (this segment is the output of a clean, not a fresh roll),
+- the **covered offset range** `[covered_base_offset, covered_end_offset)`: the offset span
+  of the ORIGINAL source segments this compacted segment supersedes, and
+- the **covered segment-id range** (or the highest covered source id), so recovery can name
+  exactly which original files this one replaces.
+
+Where these live in the frozen #5 header, honestly:
+
+- The header has a `flags` u16 at `[10, 12)` ("reserved in v1 (zero); preserved on read, not
+  interpreted") and a 16-byte reserved region at `[44, 60)`, both inside the CRC-covered
+  bytes `[0, 60)`. The compaction marker is ONE bit of `flags` (e.g. `0b0000_0001` = COMPACTED).
+  The covered range needs `covered_end_offset` (`u64`) and the highest covered source segment
+  id (`u64`): the `covered_base_offset` is already `base_offset` at `[28, 36)` (a compacted
+  segment's first survivor IS the base of the covered range), so two `u64`s = 16 bytes fit
+  EXACTLY in the reserved `[44, 60)` region. No byte grows, no field moves, the CRC still
+  covers them.
+- **Honesty: this is a format change, and it is gated by the format version.** Although the
+  bytes physically fit the reserved region, a v1 reader treats `flags` as "preserved but not
+  interpreted" and the reserved bytes as zero. A v1 reader that encountered a COMPACTED
+  segment would IGNORE the marker and the covered range and try to stitch the segment into
+  the contiguous chain as if it were ordinary, which (because survivors are sparse) would
+  fail the chain check or, worse, deliver a wrong view. So a compactor-writing broker MUST
+  stamp the segment header `version` = 2 (a format-version bump) on compacted segments, and a
+  v1 reader MUST refuse a `version` it does not know (it already does: "a v1 reader rejects
+  any other value" for `checksum_algo`, and `version` is refuse-on-unknown per
+  [COMPATIBILITY.md](COMPATIBILITY.md)). This is the correct, fail-closed outcome: an old
+  reader refuses a compacted log rather than silently misreading it. The format-version bump,
+  the COMPACTED flag bit, and the two reserved-region `u64`s are coordinated with the frozen
+  #5 header and [ADR 0001](adr/0001-log-is-wal.md); they are listed in
+  [COMPATIBILITY.md](COMPATIBILITY.md) as the v2
+  on-disk delta and must be added to [CONTRACTS.md](CONTRACTS.md) when implemented.
+
+The footer is unchanged: a compacted segment is still sealed with the normal
+[SegmentFooter](CONTRACTS.md) (segment id, last seq, record count) the moment it is written,
+because it is born sealed (it is never the active segment).
+
+### Why the covered range, not a manifest, is enough
+
+Recovery already discovers every `seg-<id>.log`, parses its self-describing header, and
+stitches a chain by `base_offset`. A compacted segment's header self-describes BOTH its own
+survivor records AND the original offset span it stands in for. That is exactly the
+information a manifest entry would have carried ("offsets [a, b) now live in file X"), only it
+lives in the file that owns the range rather than in a separate mutable index. The directory
+remains the single authority; we have added one self-describing fact to one file, which is the
+existing design philosophy, not a new structure.
+
+---
+
+## The atomic swap, without a manifest
+
+The clean is a write-new-then-retire-originals sequence whose SINGLE commit point is the
+durable appearance of the new compacted segment. The originals stay authoritative until that
+instant; afterwards they are redundant and removed with the existing rename-then-unlink reaper
+discipline so an open reader drains rather than reading freed bytes.
+
+The compactor's new segment id is a FRESH id strictly greater than any id ever used (ADR 0002:
+ids are never recycled, the at-rest AEAD nonce depends on it). So a compacted segment that
+covers a LOW original offset range nonetheless carries a HIGH segment id. The id no longer
+sorts with its offset range (the one place the "id order equals offset order" assumption is
+deliberately broken), which the recovery resolution below accounts for explicitly.
+
+### The sequence
+
+1. **Select.** Pick N adjacent dirty sealed source segments whose combined dirty ratio is at
+   or over `min_dirty_ratio` (default 0.5: at least half the records are superseded, so the
+   rewrite pays for itself). Never the active segment.
+2. **Build the key map.** Scan the N segments in offset order (streaming, one record at a
+   time, peak memory one record plus the key map; the key map is the cost line that bounds how
+   many segments N can be on an edge core). Record, per key, the highest-offset survivor; track
+   tombstones and their ages.
+3. **Write the new segment.** Create `seg-<fresh-id>.log`, write its header (COMPACTED flag,
+   `base_offset` = the lowest survivor's offset, `covered_end_offset` and highest-covered
+   source id in the reserved region, `version` = 2), then the survivors in ascending offset
+   order with their ORIGINAL offsets and sequences, then the [SegmentFooter](CONTRACTS.md).
+   `fsync` the file, then `fsync` the parent directory so the new file's directory entry is
+   durable. THIS DIRECTORY FSYNC IS THE ATOMIC COMMIT POINT: before it, the new segment may
+   not survive a power loss and the originals are authoritative; after it, the compacted
+   segment is durably present and authoritative for its covered range.
+4. **Retire the originals.** For each covered source segment, `rename` it out of the way (to a
+   transient name a reader will not pick up, e.g. a `.compacting` suffix that
+   `parse_segment_file_name` rejects, so it instantly leaves the recoverable set) then
+   `unlink` it, then `fsync` the parent directory. Rename-then-unlink, not a bare unlink, so a
+   reader still holding an open handle to an original drains its bytes (the file stays on disk
+   until the handle closes) and never reads freed data. A reader that has not yet opened the
+   original simply will not find it (the rename removed it from the namespace), and falls
+   through to the compacted segment.
+
+A produce can interleave at every step: the cleaner yields to the append actor (below), and
+because the cleaner only ever touches SEALED segments and writes a NEW file, an append to the
+ACTIVE segment never races a clean for the same bytes.
+
+### Crash recovery: longest-valid-prefix, no compaction-specific repair
+
+The acceptance criterion is that a crash before OR after the swap recovers via the existing
+longest-valid-prefix recovery with NO compaction-specific repair step. It does, because the
+two crash windows each leave the directory in a state ordinary recovery already resolves, plus
+two small, generic resolution rules:
+
+- **Crash BEFORE the commit point (step 3 not durably complete).** The new compacted segment
+  is either absent or a torn/partial file. The originals are all still present and still
+  authoritative. Recovery: the originals form the normal contiguous chain and recover exactly
+  as today. The orphan new segment is DISCARDED: it is a COMPACTED segment whose covered range
+  is ALREADY fully present as original segments, so it is redundant; recovery unlinks it (the
+  generic "an authoritative-elsewhere compacted segment is dropped" rule). If it was torn
+  (header not even fully written), it never parsed as a segment at all. Either way: no special
+  repair, the originals win.
+- **Crash AFTER the commit point but during retire (step 4 partway).** The compacted segment
+  is durably present; SOME originals are gone, some remain (renamed-aside or not yet
+  unlinked). Recovery: the compacted segment is authoritative for its covered range. Any
+  original still present whose offset range is FULLY covered by a durable compacted segment is
+  UNREFERENCED and recovery unlinks it (the generic "an original superseded by a durable
+  compacted segment is removed" rule), and any leftover `.compacting`-suffixed transient is
+  removed (it parses as no segment, so it is foreign and skipped, then garbage-collected). The
+  compacted segment plus any not-yet-covered originals form the chain.
+
+Both rules are generic file-set reconciliations driven entirely by the self-describing headers
+(the COMPACTED flag and covered range), not a replay of a compaction journal. There is no
+manifest to be torn, so there is no torn-manifest recovery case. The recovery loss caps (I3,
+bounded reported loss) are unaffected: a discarded orphan compacted segment is not a loss (its
+data is fully present in the originals), and an unlinked superseded original is not a loss (its
+surviving records are present in the compacted segment); neither path emits a `LossReport`
+event, because no durable record was actually lost.
+
+### Determining overlap deterministically without a manifest
+
+When two files cover the same offset (a compacted segment and an as-yet-unretired original),
+recovery must pick ONE deterministically. The rule, in order:
+
+1. **Group the discovered segments into ordinary and compacted** (by the COMPACTED flag).
+2. **A compacted segment is authoritative over every original whose offset range it fully
+   covers.** Concretely: an ordinary segment whose `[base_offset, base_offset + record_count)`
+   is fully inside some compacted segment's `[covered_base_offset, covered_end_offset)` is
+   superseded; recovery drops it.
+3. **Two compacted segments never partially overlap.** A clean always covers a contiguous run
+   of WHOLE source segments, and the next clean's source set starts at the previous clean's
+   covered end (or a later offset), so covered ranges are disjoint and abut. If a future crash
+   somehow leaves two compacted segments with overlapping covered ranges, the one with the
+   HIGHER segment id (the later clean, by ADR 0002 monotonicity) wins and the lower is dropped
+   as superseded. This is the single tie-break, and it is total because ids are monotonic and
+   never reused.
+4. **After dropping superseded originals, the surviving set (compacted segments plus
+   uncompacted originals) must stitch into one offset-contiguous-at-the-segment-boundary
+   chain.** Note the chain is contiguous at SEGMENT boundaries (each segment's covered or
+   actual range abuts the next), even though offsets WITHIN a compacted segment are sparse.
+   This is the one place the recovery chain check must change: today
+   `scan_recover_chain` requires `base_offset == next_base_offset` exactly and every
+   non-final segment sealed; with compaction the predecessor's "end" is its
+   `covered_end_offset` (for a compacted segment) or `base_offset + record_count` (for an
+   ordinary one), and a compacted segment's record offsets are not dense. The chain continuity
+   check becomes "the next segment's covered/actual base equals the previous segment's
+   covered/actual end," which reduces to the current check for an all-ordinary log.
+
+Because each step is a pure function of the self-describing headers in the directory, recovery
+is still deterministic and still a pure function of the durable bytes (I4). The id is no
+longer a proxy for offset order (a compacted segment has a high id but a low covered range), so
+recovery sorts the resolution by COVERED/ACTUAL OFFSET RANGE, not by id, and uses the id only
+for the monotonic tie-break in rule 3.
+
+---
+
+## Sparse offsets at the reader (coordinating with #9 and #59)
+
+Compaction makes the durable log SPARSE: between two survivors there is a permanent hole where
+superseded records used to be. This is a real change to a contract the current read path
+assumes, and the spec is honest about it.
+
+- **The current read path assumes dense offsets.** `Engine::poll` walks offsets one by one
+  (`offset += 1`) and `Log::read_from(off, 1)` expects a record at every offset below the
+  flushed head (the `MissingRecord` "unreachable" arm). The offline reader asserts "offsets are
+  contiguous." A compacted log violates all three: a compacted-away offset has no record. So
+  sparse-offset tolerance is a NEW requirement compaction introduces, not an existing
+  property.
+- **The reader skips a compaction gap; it is NOT a loss.** When the reader reaches an offset
+  that was compacted away, it ADVANCES to the next present offset rather than stalling or
+  reporting `MissingRecord`. The index (the in-memory sorted `SegmentSlot` list plus the
+  per-segment record positions) must let a read FIND the next present offset at or after a
+  target, so the read path seeks forward over a gap in O(log n) rather than probing every
+  absent offset. Inside a compacted segment, the records are physically contiguous (the gaps
+  are between original offsets, not in the file), so a sequential scan of the compacted segment
+  naturally yields the survivors in order; the gap only appears when mapping file position to
+  logical offset.
+- **The gap marker is the #59 sparse-offset contract, with a DISTINCT, non-loss reason.** #59
+  already defines sparse, stable offsets with an explicit gap marker delivered to the #9
+  consumer (a skip range `[lost_offset_start, lost_offset_end)` with a reason code). Compaction
+  reuses that machinery for the consumer-visible gap, BUT the reason is a new, deliberate one:
+  a compaction gap is NOT data loss (the superseded values were intentionally removed and a
+  newer value for the key exists), unlike the #59 corruption reasons
+  (`RecordCrcMismatch`, `TornTailTruncated`, etc.) which ARE loss-or-truncation. So compaction
+  adds a `Compacted` skip reason that is EXCLUDED from the loss-bytes counters (the same way
+  `TornTailTruncated` is excluded), and a consumer that wants the latest-value-per-key view can
+  simply ignore a `Compacted` gap marker entirely. This must be agreed with #9 and #59 when
+  implemented; the honest statement is that compaction turns "every offset below the head has a
+  record" from an invariant into "every offset below the head has a record OR a recorded
+  compaction gap."
+- **A consumer cursor is unaffected by a gap.** The committed cursor is a watermark over
+  ACKED offsets; a compacted-away offset is treated as already-satisfied (there is nothing to
+  deliver), so the cursor advances past the gap exactly as if those offsets had been acked.
+  This is distinct from the below-earliest TRUNCATION signal (`Poll::Truncated`, WAL.md), which
+  fires when a reaper deletes records UNDER a cursor; a compaction gap is above-or-at the
+  cursor and is a normal forward skip, not a truncation. The two signals stay separate.
+
+---
+
+## `compact_and_delete`: the reaper runs first
+
+A compacted topic can ALSO have age / size / count retention (`compact_and_delete`, the Kafka
+`cleanup.policy=compact,delete`). The order is fixed and load-bearing: the cheap age/size/count
+REAPER runs FIRST, then the compactor. Two reasons:
+
+- **Never compact a segment we are about to delete.** If the reaper is going to drop the oldest
+  sealed segments wholesale (they aged out, or the byte/count cap is over), spending CPU and
+  flash to compact them first is pure waste. Reaping first means the compactor only ever sees
+  segments that survived retention.
+- **The reaper is whole-segment and consumer-safe; the compactor is intra-segment.** The
+  [reaper](WAL.md#retention-deleting-whole-sealed-segments) deletes whole sealed segments below
+  the slowest-consumer protect floor. Running it first keeps that simple, cheap, consumer-safe
+  path unchanged and unblocked by the expensive compactor.
+
+So `compact_and_delete` is: run `Engine::reap_for_retention` (the existing produce-path reaper)
+to completion, THEN, if compaction is enabled and a dirty run meets `min_dirty_ratio`, run one
+rate-limited compaction pass. Pure `compact` (no delete) skips the reaper step. Pure `delete`
+(no compact) is exactly today's behavior.
+
+---
+
+## The cleaner is rate-limited, yields to appends, and is OFF by default
+
+On a single edge core an unthrottled cleaner would starve the append path (it does CPU-bound
+key-mapping and flash-bound rewriting). The cleaner is therefore:
+
+- **OFF by default.** No compaction runs unless an operator opts a topic in. The default
+  durable-queue behavior (append, seal, reap whole segments) is unchanged. (IronBus has one
+  durable log per broker today, so "compacted topic" is a per-broker policy until multi-topic
+  lands; the opt-in is a `serve` flag plus the `min_dirty_ratio` / `tombstone_ttl` knobs.)
+- **Rate-limited.** A compaction pass does a BOUNDED amount of work (at most N source segments,
+  N small enough that the key map fits the edge RAM budget per
+  [RAM_BUDGET.md](RAM_BUDGET.md)), then stops and re-checks `min_dirty_ratio` before another
+  pass. There is no continuous background grind; a pass is event-driven (on a seal that pushes a
+  dirty run over the ratio) plus a coarse interval, both rate-capped.
+- **Yields to the append path.** The append actor (the single writer, WAL.md) always wins. The
+  cleaner runs OUTSIDE the append actor's critical section (it reads sealed segments, which the
+  actor never touches, and writes a new file, never the active one), and its directory fsyncs
+  are scheduled so they never sit in front of a produce's covering fdatasync. A produce is never
+  blocked behind a compaction fsync; if the cleaner and a produce contend for the disk, the
+  produce's durability barrier takes priority and the cleaner backs off. The bounded
+  `sync_channel` to the append actor (WAL.md) is the backpressure seam: the cleaner submits its
+  work without ever holding a lock the actor needs.
+
+---
+
+## Honest limits and what is deliberately deferred
+
+- **Specified, not implemented.** No code exists. The header v2 fields, the COMPACTED flag, the
+  covered-range recovery rules, the sparse-offset read path, the `Compacted` skip reason, and
+  the cleaner are all unbuilt. This doc is the target.
+- **It costs CPU and flash; it is for changelog topics only.** Stated up front; restated here.
+  A general durable queue should leave it OFF.
+- **It forces a format-version bump.** A broker that has ever written a compacted segment
+  produces a v2-header log that a v1-only reader correctly REFUSES (fail-closed) rather than
+  misreads. This is a real compatibility consequence, owned by [COMPATIBILITY.md](COMPATIBILITY.md).
+- **The id no longer tracks offset order for compacted segments.** A compacted segment has a
+  high id but a low covered range; recovery resolves by covered/actual offset range and uses the
+  id only as the monotonic tie-break. ADR 0002 (never recycle) is preserved and is in fact
+  relied on for that tie-break.
+- **The at-rest nonce stays safe.** Because the compacted segment gets a FRESH never-recycled id
+  (ADR 0002), the at-rest AEAD nonce (segment-id || record counter, per
+  [AT_REST_ENCRYPTION.md](AT_REST_ENCRYPTION.md)) is unique for the rewritten survivors; a
+  survivor is re-encrypted under the new segment's id, not its old one, so no nonce is reused.
+  This is an interaction to pin in the encryption spec when both are implemented.
+
+### Open questions
+
+- Whether to add an explicit TOMBSTONE record flag bit (vs the implicit empty-payload
+  convention), which would let the reader recognize a delete without inspecting the payload
+  length. Deferred; the empty-payload convention is enough for the compactor and keeps the #5
+  header untouched at the record level (only the segment header gains the COMPACTED flag).
+- The exact `min_dirty_ratio` accounting (dirty = superseded record count, or superseded
+  bytes). Bytes is the better flash-cost proxy; pinned at implementation.
+- Whether a single broker grows multi-topic before compaction ships (compaction is most useful
+  per-topic). Until then it is a per-broker opt-in.
+
+---
+
+## Where this will be verified (when implemented)
+
+- Survivor selection (last-value-per-key, tombstone TTL, keyless carry-through, no reorder, no
+  offset rewrite): compactor unit tests over crafted multi-segment inputs.
+- Crash-before / crash-after the commit point recovering via longest-valid-prefix with no
+  special repair: a fault-injection test in the crash-recovery sweep
+  (`crates/ironbus-storage/tests/crash_recovery.rs`), injecting a power loss at the directory
+  fsync (commit point) and mid-retire, asserting the originals win before and the compacted
+  segment wins after, with no `LossReport` event either way.
+- Open readers never read freed data during retire: a reader holding an open handle to an
+  original drains it after the rename-then-unlink (the same discipline the reaper already uses).
+- Sparse-offset read / skip-the-gap and the `Compacted` skip reason excluded from loss bytes:
+  read-path and #59 SkipEvent tests.
+- The cleaner off by default, rate-limited, and append-priority: an engine test that a produce
+  is never blocked behind a compaction fsync (the sync-gating fault fs the #177 actor test
+  already uses).
