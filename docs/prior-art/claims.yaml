@@ -1,0 +1,517 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# IronBus prior-art claims: the version-pinned source of record (#26).
+#
+# This file is the SINGLE descriptive source of truth for every NUMERIC or
+# version-specific claim that docs/PRIOR_ART.md asserts about another system.
+# It is strictly DESCRIPTIVE: it records what an upstream system does at a pinned
+# version, never what IronBus should do. The prescriptive IronBus decisions live
+# in the merged design docs (DURABILITY.md, PREALLOCATION.md, ADR-0001, etc.) and
+# never here.
+#
+# Contract with docs/PRIOR_ART.md:
+#   * Every load-bearing number in the survey carries a "[id]" tag that names an
+#     entry below. The survey table and prose may be hand-maintained, but they
+#     MUST agree with the value pinned here; this file wins on any disagreement.
+#   * scripts/ci/check-prior-art-claims.sh asserts that every [id] cited in
+#     PRIOR_ART.md exists below, and that every id below is unique. It does NOT
+#     re-fetch sources (offline, deterministic); a number drifting upstream is
+#     caught by the accessed_date going stale, not by the script.
+#
+# Per-entry schema (every key required):
+#   id            stable kebab-case key, cited from PRIOR_ART.md as "[id]"
+#   system        the upstream system the claim is about
+#   version       the pinned release / spec version the value was read against
+#   claim         a one-line human description of what the value is
+#   value         the value itself (string, so units and sentinels are explicit)
+#   source_url    a URL, with a #section anchor where the source exposes one
+#   accessed_date the date the source_url was last read (ISO-8601)
+#   confidence    high | medium | low (low = rests on a single source sentence,
+#                 a default that is easy to misread, or a value we could not
+#                 anchor to an exact upstream sentence; each low entry says why)
+#
+# Low-confidence entries are also called out in PRIOR_ART.md so a reviewer can
+# re-verify them first.
+
+claims:
+  # ---------------------------------------------------------------------------
+  # Kafka (network-broker tier)
+  # ---------------------------------------------------------------------------
+  - id: kafka-flush-interval-messages-default
+    system: Kafka
+    version: "4.1"
+    claim: "log.flush.interval.messages default (messages between forced flushes to disk)"
+    value: "9223372036854775807 (Long.MAX_VALUE; effectively never force-flush, durability comes from replication)"
+    source_url: "https://kafka.apache.org/41/documentation.html#brokerconfigs_log.flush.interval.messages"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: kafka-acks-default
+    system: Kafka
+    version: "4.1"
+    claim: "producer acks default (how many in-sync replicas must acknowledge a produce)"
+    value: "all (since 3.0; an ack still does not imply fsync, only replication to in-sync replicas)"
+    source_url: "https://kafka.apache.org/41/documentation.html#producerconfigs_acks"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: kafka-min-insync-replicas-default
+    system: Kafka
+    version: "4.1"
+    claim: "min.insync.replicas default"
+    value: "1"
+    source_url: "https://kafka.apache.org/41/documentation.html#topicconfigs_min.insync.replicas"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: kafka-batch-size-default
+    system: Kafka
+    version: "4.1"
+    claim: "producer batch.size default (bytes)"
+    value: "16384"
+    source_url: "https://kafka.apache.org/41/documentation.html#producerconfigs_batch.size"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: kafka-linger-ms-default
+    system: Kafka
+    version: "4.1"
+    claim: "producer linger.ms default (ms)"
+    value: "5 (was 0 before 4.0; changed by KIP-1030)"
+    source_url: "https://kafka.apache.org/41/documentation.html#producerconfigs_linger.ms"
+    accessed_date: "2026-06-08"
+    confidence: medium
+    # medium: the 4.x default is 5 ms but several older docs and tutorials still
+    # quote 0; verify against the 4.1 producer-configs table specifically.
+
+  - id: kafka-log-index-interval-bytes-default
+    system: Kafka
+    version: "4.1"
+    claim: "log.index.interval.bytes default (bytes between sparse .index entries)"
+    value: "4096"
+    source_url: "https://kafka.apache.org/41/documentation.html#brokerconfigs_log.index.interval.bytes"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: kafka-index-entry-format
+    system: Kafka
+    version: "KIP-33"
+    claim: "offset .index entry size and time .timeindex entry size"
+    value: ".index entry = 8 bytes (int32 relative offset + int32 physical position); .timeindex entry = 12 bytes (int64 timestamp + int32 relative offset)"
+    source_url: "https://cwiki.apache.org/confluence/display/KAFKA/KIP-33+-+Add+a+time+based+log+index"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: kafka-segment-bytes-default
+    system: Kafka
+    version: "4.1"
+    claim: "log.segment.bytes default (bytes per log segment)"
+    value: "1073741824 (1 GiB)"
+    source_url: "https://kafka.apache.org/41/documentation.html#topicconfigs_segment.bytes"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  # ---------------------------------------------------------------------------
+  # NATS JetStream (network-broker tier)
+  # ---------------------------------------------------------------------------
+  - id: nats-filestore-block-sizes
+    system: NATS JetStream
+    version: "nats-server 2.10.x"
+    claim: "FileStore on-disk block size per storage class (the <n>.blk files)"
+    value: "memory-backed default block 8 MiB, file-backed default block 4 MiB, with a 1 MiB minimum-tier; sized from blkSize() in filestore.go, not a public config knob"
+    source_url: "https://github.com/nats-io/nats-server/blob/main/server/filestore.go"
+    accessed_date: "2026-06-08"
+    confidence: low
+    # low: the exact block sizes are derived in blkSize()/defaultLargeBlockSize
+    # in filestore.go, not documented in a stable public reference; they have
+    # changed across releases and the file has no line-stable anchor. Treated as
+    # illustrative of "fixed-size append blocks", not a pinned contract.
+
+  - id: nats-ackwait-default
+    system: NATS JetStream
+    version: "nats-server 2.10.x"
+    claim: "consumer AckWait default (redelivery timer when no ack arrives)"
+    value: "30s"
+    source_url: "https://docs.nats.io/nats-concepts/jetstream/consumers#ackwait"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: nats-maxackpending-default
+    system: NATS JetStream
+    version: "nats-server 2.10.x"
+    claim: "consumer MaxAckPending default (the central pull-consumer backpressure lever)"
+    value: "1000 (-1 = unlimited; push consumers default 1000, the documented bound)"
+    source_url: "https://docs.nats.io/nats-concepts/jetstream/consumers#maxackpending"
+    accessed_date: "2026-06-08"
+    confidence: medium
+    # medium: 1000 is the widely-documented default; some client/server versions
+    # have used 20000 for push consumers. Verify against the running server's
+    # consumer info for the exact deployment before quoting as a hard number.
+
+  - id: nats-ack-vocabulary
+    system: NATS JetStream
+    version: "nats-server 2.10.x"
+    claim: "the four consumer ack-protocol replies"
+    value: "+ACK (acknowledge), -NAK (negative ack, redeliver), +WPI/+WPP (working/in-progress, reset the AckWait timer), +TERM (terminate, do not redeliver)"
+    source_url: "https://docs.nats.io/nats-concepts/jetstream/consumers#ackpolicy"
+    accessed_date: "2026-06-08"
+    confidence: medium
+    # medium: the four ack kinds are stable, but the exact in-progress token spelling
+    # (+WPI vs +WPP / AckProgress) varies by client and protocol revision.
+
+  - id: nats-dedup-window-default
+    system: NATS JetStream
+    version: "nats-server 2.10.x"
+    claim: "stream message-deduplication window default (Nats-Msg-Id based)"
+    value: "2m (120s)"
+    source_url: "https://docs.nats.io/nats-concepts/jetstream/streams#message-deduplication"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: nats-maxdeliver-poison
+    system: NATS JetStream
+    version: "nats-server 2.10.x"
+    claim: "consumer MaxDeliver sentinel that loops a poison message forever"
+    value: "-1 (unlimited redeliveries; a poison message redelivers without bound)"
+    source_url: "https://docs.nats.io/nats-concepts/jetstream/consumers#maxdeliver"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  # ---------------------------------------------------------------------------
+  # Pulsar / BookKeeper (network-broker tier)
+  # ---------------------------------------------------------------------------
+  - id: pulsar-journal-sync-data-default
+    system: Apache Pulsar (BookKeeper)
+    version: "Pulsar 3.2.x / BookKeeper"
+    claim: "journalSyncData default (fsync the bookie journal before acking a write)"
+    value: "true (the durable default; setting false acks before the journal fsync and opens a loss window)"
+    source_url: "https://github.com/apache/pulsar/blob/master/conf/bookkeeper.conf"
+    accessed_date: "2026-06-08"
+    confidence: medium
+    # medium: journalSyncData=true is the documented default, but the conf file is
+    # a moving target on master with no line-stable anchor; pin to the bookie
+    # release actually deployed before quoting.
+
+  - id: pulsar-quorum-inequality
+    system: Apache Pulsar (BookKeeper)
+    version: "BookKeeper protocol"
+    claim: "the ensemble / write-quorum / ack-quorum ordering invariant for a ledger"
+    value: "E >= Qw >= Qa (ensemble size >= write quorum >= ack quorum); a write acks after Qa bookies fsync the journal"
+    source_url: "https://bookkeeper.apache.org/docs/development/protocol/"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: pulsar-subscription-types
+    system: Apache Pulsar
+    version: "Pulsar 3.2.x"
+    claim: "the four subscription types"
+    value: "exclusive, failover, shared, key_shared"
+    source_url: "https://pulsar.apache.org/docs/3.2.x/concepts-messaging/#subscription-types"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  # ---------------------------------------------------------------------------
+  # Redpanda (network-broker tier)
+  # ---------------------------------------------------------------------------
+  - id: redpanda-raft-quorum
+    system: Redpanda
+    version: "current docs"
+    claim: "per-partition replication model"
+    value: "per-partition Raft, 2f+1 replicas to tolerate f failures, fsync-batched, no JVM and no ZooKeeper"
+    source_url: "https://docs.redpanda.com/current/get-started/architecture/"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: redpanda-write-caching
+    system: Redpanda
+    version: "current docs"
+    claim: "write caching is opt-in ack-before-fsync"
+    value: "off by default; when enabled, a write is acked after a Raft-majority replicate but BEFORE fsync, trading a correlated-majority power-loss loss window for latency"
+    source_url: "https://docs.redpanda.com/current/develop/config-topics/#configure-write-caching"
+    accessed_date: "2026-06-08"
+    confidence: medium
+    # medium: write caching is correctly opt-in; the precise ack-vs-fsync ordering
+    # and the loss-window framing come from the Redpanda write-caching blog, not a
+    # single normative reference sentence.
+
+  # ---------------------------------------------------------------------------
+  # RocksDB (network-broker tier, KV reference)
+  # ---------------------------------------------------------------------------
+  - id: rocksdb-write-sync-default
+    system: RocksDB
+    version: "current wiki"
+    claim: "WriteOptions.sync default (fsync the WAL on every write)"
+    value: "false (writes land in the OS page cache only; durable on process crash, NOT on power loss unless sync=true or WAL is fsynced)"
+    source_url: "https://github.com/facebook/rocksdb/wiki/WAL-Performance"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: rocksdb-wal-block-format
+    system: RocksDB
+    version: "current wiki"
+    claim: "WAL physical block size and per-record framing"
+    value: "32 KiB (32768-byte) blocks; each record carries CRC32c + length + type so a torn tail is detectable"
+    source_url: "https://github.com/facebook/rocksdb/wiki/Write-Ahead-Log-File-Format"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: rocksdb-pit-recovery
+    system: RocksDB
+    version: "current wiki"
+    claim: "the point-in-time WAL recovery mode (replay the longest valid prefix)"
+    value: "kPointInTimeRecovery: replay until the first corruption, stop, keep the consistent prefix (does NOT skip a bad span and resume)"
+    source_url: "https://github.com/facebook/rocksdb/wiki/WAL-Recovery-Modes#kpointintimerecovery"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: rocksdb-compaction-write-amp
+    system: RocksDB
+    version: "general LSM literature"
+    claim: "leveled-compaction write amplification on flash"
+    value: "approximately 10x to 30x (level fan-out dependent; the headline cost that burns flash endurance)"
+    source_url: "https://github.com/facebook/rocksdb/wiki/Compaction-Trivial-Move"
+    accessed_date: "2026-06-08"
+    confidence: low
+    # low: the 10x-30x range is a well-known rule of thumb for leveled LSM write
+    # amplification, not a single pinned RocksDB number; it depends on level
+    # multiplier, value size, and workload. Quoted as an order-of-magnitude.
+
+  # ---------------------------------------------------------------------------
+  # Redis Streams (network-broker tier)
+  # ---------------------------------------------------------------------------
+  - id: redis-appendfsync-default
+    system: Redis
+    version: "Redis 7.x"
+    claim: "appendfsync default AOF fsync policy"
+    value: "everysec (fsync the AOF once per second; bounds worst-case loss to about 1 second of writes). Other values: always (fsync every write), no (let the OS flush)"
+    source_url: "https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/#how-durable-is-the-append-only-file"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: redis-stream-id-format
+    system: Redis Streams
+    version: "Redis 7.x"
+    claim: "stream entry ID format"
+    value: "128-bit <millisecondsTime>-<sequenceNumber> (monotonic; the ms part can be reused with an incrementing seq, and never goes backwards even on a clock regression)"
+    source_url: "https://redis.io/docs/latest/develop/data-types/streams/#entry-ids"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: redis-pel-mechanism
+    system: Redis Streams
+    version: "Redis 7.x"
+    claim: "consumer-group pending-entries and claim primitives"
+    value: "per-group/per-consumer Pending Entries List (PEL) with a per-message delivery counter; XACK removes, XCLAIM/XAUTOCLAIM reassign entries idle longer than min-idle-time"
+    source_url: "https://redis.io/docs/latest/develop/data-types/streams/#consumer-groups"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: redis-async-replication-loss
+    system: Redis
+    version: "Redis 7.x"
+    claim: "replication acknowledgement ordering (the acked-but-lost window)"
+    value: "asynchronous by default: the primary acks a write to the client BEFORE replicas have it, so a failover can lose acknowledged writes (explicitly AP, not CP)"
+    source_url: "https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/#consistency-guarantees"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  # ---------------------------------------------------------------------------
+  # SQS (network-broker tier)
+  # ---------------------------------------------------------------------------
+  - id: sqs-visibility-timeout-default
+    system: Amazon SQS
+    version: "current API"
+    claim: "default and maximum visibility timeout (the message lease)"
+    value: "default 30s; maximum 12h (43200s) measured from the first receive of a message"
+    source_url: "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: sqs-fifo-dedup-window
+    system: Amazon SQS
+    version: "current API"
+    claim: "FIFO content-based deduplication window"
+    value: "5 minutes (a duplicate MessageDeduplicationId within 5 minutes is treated as the same message)"
+    source_url: "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-exactly-once-processing.html"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: sqs-redrive-maxreceivecount
+    system: Amazon SQS
+    version: "current API"
+    claim: "dead-letter redrive policy"
+    value: "maxReceiveCount: after a message is received maxReceiveCount times without a successful DeleteMessage, the redrive policy moves it to the configured DLQ"
+    source_url: "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  # ---------------------------------------------------------------------------
+  # MQTT (network-broker tier)
+  # ---------------------------------------------------------------------------
+  - id: mqtt-qos-levels
+    system: MQTT
+    version: "5.0 (OASIS)"
+    claim: "the three QoS levels and effective-QoS rule"
+    value: "QoS 0 at-most-once, QoS 1 at-least-once (PUBACK), QoS 2 exactly-once (4-step PUBREC/PUBREL/PUBCOMP handshake); delivered QoS = min(publisher QoS, subscription QoS)"
+    source_url: "https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901234"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: mqtt-receive-maximum
+    system: MQTT
+    version: "5.0 (OASIS)"
+    claim: "Receive Maximum credit-based flow control"
+    value: "Receive Maximum caps the number of unacknowledged QoS 1 and QoS 2 PUBLISH packets in flight; QoS 0 is exempt; exceeding it is a protocol error (DISCONNECT reason 0x93, Receive Maximum exceeded)"
+    source_url: "https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901251"
+    accessed_date: "2026-06-08"
+    confidence: medium
+    # medium: the Receive-Maximum semantics and the 0x93 reason code are correct,
+    # but the exact OASIS subsection anchor for the flow-control text is approximate;
+    # confirm the anchor resolves to the Flow Control section before quoting.
+
+  # ===========================================================================
+  # Embeddable single-node tier (#27)
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Chronicle Queue
+  # ---------------------------------------------------------------------------
+  - id: chronicle-single-writer
+    system: Chronicle Queue
+    version: "OpenHFT Chronicle Queue 5.x"
+    claim: "writer concurrency model and storage layout"
+    value: "memory-mapped append-only log split into roll-cycle files (default DAILY roll) with a per-cycle index; appends from one process are serialized through a single-writer mode, ordering enforced by a write lock on the queue"
+    source_url: "https://github.com/OpenHFT/Chronicle-Queue#what-is-chronicle-queue"
+    accessed_date: "2026-06-08"
+    confidence: medium
+    # medium: Chronicle supports concurrent writers via a lock, but the practical
+    # high-throughput model is single-writer-per-queue; "single-writer constraint"
+    # is the documented best-practice framing, not an absolute hard lock in all modes.
+
+  # ---------------------------------------------------------------------------
+  # SQLite WAL mode
+  # ---------------------------------------------------------------------------
+  - id: sqlite-wal-checkpoint-modes
+    system: SQLite
+    version: "3.x"
+    claim: "the four WAL checkpoint modes"
+    value: "PASSIVE (checkpoint as much as possible without blocking, default for automatic checkpoints), FULL (block new writers, checkpoint all frames), RESTART (FULL then restart the WAL at the start), TRUNCATE (RESTART then truncate the -wal file to zero)"
+    source_url: "https://www.sqlite.org/pragma.html#pragma_wal_checkpoint"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: sqlite-synchronous-normal-vs-full
+    system: SQLite
+    version: "3.x"
+    claim: "synchronous=NORMAL vs FULL durability in WAL mode"
+    value: "in WAL mode, synchronous=NORMAL (1) fsyncs the WAL at each checkpoint but NOT at every commit, so a power loss can lose the last transactions (but never corrupts the database); synchronous=FULL (2) fsyncs enough to be durable across power loss"
+    source_url: "https://www.sqlite.org/pragma.html#pragma_synchronous"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: sqlite-single-writer
+    system: SQLite
+    version: "3.x"
+    claim: "writer concurrency in WAL mode"
+    value: "WAL allows concurrent readers with one writer, but still only ONE writer at a time (a database-level write lock); readers never block the writer and the writer never blocks readers"
+    source_url: "https://www.sqlite.org/wal.html#concurrency"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: sqlite-checkpoint-starvation
+    system: SQLite
+    version: "3.x"
+    claim: "checkpoint starvation under continuous readers"
+    value: "a checkpoint can only reclaim WAL frames up to the oldest reader's mark; a continuous stream of overlapping readers can prevent the WAL from ever being fully checkpointed, so the -wal file grows without bound"
+    source_url: "https://www.sqlite.org/wal.html#avoiding_excessively_large_wal_files"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  # ---------------------------------------------------------------------------
+  # LMDB
+  # ---------------------------------------------------------------------------
+  - id: lmdb-cow-btree-single-fsync
+    system: LMDB
+    version: "0.9.x"
+    claim: "storage model and commit durability"
+    value: "memory-mapped copy-on-write B+tree with MVCC readers (readers never block writers); a write transaction is made durable by a single fsync (or msync) of the data plus a meta-page write at commit; single writer at a time"
+    source_url: "http://www.lmdb.tech/doc/"
+    accessed_date: "2026-06-08"
+    confidence: medium
+    # medium: the single-batched-fsync-at-commit and COW-B+tree model are accurate,
+    # but the LMDB doc landing page has no per-claim anchor; the precise sync vs
+    # writemap/mapasync behavior depends on env flags. Quoted for the default
+    # (durable, MDB_NOSYNC off) path.
+
+  - id: lmdb-freelist-growth
+    system: LMDB
+    version: "0.9.x"
+    claim: "free-list / long-lived-reader space amplification"
+    value: "COW means a committed write copies every modified B+tree page; pages freed by a write cannot be reused while a long-lived read transaction still references the old version, so the free list and the on-disk file can grow under a stalled reader"
+    source_url: "http://www.lmdb.tech/doc/group__mdb.html"
+    accessed_date: "2026-06-08"
+    confidence: low
+    # low: the reader-blocks-page-reuse behavior is real and well known, but it is
+    # described across mailing-list posts and the design paper rather than one
+    # anchored doc sentence; treated as a directional hazard, not a pinned figure.
+
+  # ---------------------------------------------------------------------------
+  # bbolt / etcd-on-bolt
+  # ---------------------------------------------------------------------------
+  - id: bbolt-cow-btree-single-fsync
+    system: bbolt (etcd-io/bbolt)
+    version: "1.3.x"
+    claim: "storage model and commit durability"
+    value: "memory-mapped copy-on-write B+tree, one writer at a time, MVCC readers; a Tx commit writes dirty pages then fsyncs, then writes and fsyncs the meta page, so a commit is two ordered fsyncs (the classic bolt single-batched-commit pattern etcd relies on)"
+    source_url: "https://github.com/etcd-io/bbolt#caveats--limitations"
+    accessed_date: "2026-06-08"
+    confidence: medium
+    # medium: bbolt commits with an ordered data-then-meta fsync pair (described as
+    # the durable commit in the project README/limitations), not literally a single
+    # syscall; "single batched fsync commit" is the take-the-pattern framing.
+
+  - id: bbolt-full-page-write-amp
+    system: bbolt (etcd-io/bbolt)
+    version: "1.3.x"
+    claim: "full-page copy-on-write write amplification and free-list growth"
+    value: "COW rewrites every page touched by a transaction in full (page-granular, not byte-granular), and the free list / file grows when a long-running read transaction prevents freed pages from being reclaimed; large value churn amplifies on-disk writes"
+    source_url: "https://github.com/etcd-io/bbolt#caveats--limitations"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  # ---------------------------------------------------------------------------
+  # mmap durability hazards (cross-cutting, embeddable tier)
+  # ---------------------------------------------------------------------------
+  - id: mmap-msync-not-write-ordering
+    system: POSIX mmap/msync
+    version: "POSIX.1-2017"
+    claim: "msync flushes pages but does not impose write ordering between unrelated dirty pages"
+    value: "msync(MS_SYNC) writes the specified dirty mapped pages back to the file, but it does not order writes of pages outside the synced range, nor does the kernel guarantee dirty pages reach the device in modification order between msync calls; ordering is the application's responsibility (an msync is not a write barrier across the whole mapping)"
+    source_url: "https://pubs.opengroup.org/onlinepubs/9699919799/functions/msync.html"
+    accessed_date: "2026-06-08"
+    confidence: medium
+    # medium: POSIX guarantees MS_SYNC writes the named range before returning;
+    # the "no ordering across unrelated pages / page-cache writeback window"
+    # property is correct in practice and is the whole hazard, but it is argued
+    # from what POSIX does NOT promise rather than a single positive sentence.
+
+  - id: mmap-sigbus-on-truncation
+    system: POSIX mmap
+    version: "POSIX.1-2017"
+    claim: "accessing a mapped page past the end of a truncated file raises SIGBUS"
+    value: "if a file is truncated (or an unwritten/ENOSPC backing block cannot be materialized) while a mapping is active, a subsequent access to the now-invalid page generates SIGBUS, crashing a process that does not handle the signal"
+    source_url: "https://pubs.opengroup.org/onlinepubs/9699919799/functions/mmap.html"
+    accessed_date: "2026-06-08"
+    confidence: high
+
+  - id: mmap-writeback-window
+    system: OS page cache (Linux)
+    version: "Linux"
+    claim: "the dirty-page writeback window between a store to a mapped page and durability"
+    value: "a store to a writable mapped page only dirties a page-cache page; it becomes durable on the device only at the next msync/fsync or when kernel writeback (dirty_expire_centisecs / dirty_writeback_centisecs, default tens of seconds) flushes it, so an un-msynced store has an unbounded-until-flush loss window on power loss"
+    source_url: "https://www.kernel.org/doc/Documentation/sysctl/vm.txt"
+    accessed_date: "2026-06-08"
+    confidence: medium
+    # medium: the writeback knobs and default-order-of-tens-of-seconds are correct,
+    # but the precise default centisecs values vary by kernel/distro; quoted as the
+    # mechanism, not an exact constant.
