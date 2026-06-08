@@ -42,6 +42,19 @@ wildcards = "deny"
 # Apache-2.0) and the license allow-list above already covers them, so no extra allowance is needed.
 # `libc` is the only FFI binding (libc bindings, not vendored C), so the #139 pure-Rust policy for
 # the DEFAULT DATA path is unchanged: this is a signal-handling shim on the CLI, off the record path.
+#
+# Structured tracing (#16, #99) adds `tracing` + `tracing-subscriber` (the `fmt` + `json` features
+# only, no `env-filter`/`ansi`) to `ironbus-server` for the JSON log layer compiled in by default.
+# Transitively this pulls `tracing-core`/`-attributes`/`-serde`, `serde`/`serde_json`/`serde_core`/
+# `serde_derive`, `sharded-slab`, `thread_local`, `once_cell`, `lazy_static`, `valuable`, `zmij`, and
+# the proc-macro trio (`proc-macro2`, `quote`, `syn`); all are permissive (MIT, or MIT OR Apache-2.0,
+# with `zmij`/`unicode-ident` adding the already-allowed Unicode-3.0) and pure Rust, so the license
+# allow-list above already covers the whole tree and no new entry is needed. NONE of these is an
+# opentelemetry crate: OTLP span export is behind the NON-DEFAULT `otlp` feature of `ironbus-server`,
+# so the default and `edge-min` builds link zero opentelemetry. The concrete opentelemetry-otlp
+# exporter (which would add `opentelemetry`, `opentelemetry-otlp`, `tonic`/`prost`, and a larger
+# permissive tree to review) is a deliberate follow-up; until it lands behind `otlp`, the #139
+# pure-Rust DATA-path policy is unchanged (tracing is observability, off the record path).
 
 [advisories]
 yanked = "deny"

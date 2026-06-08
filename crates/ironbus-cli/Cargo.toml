@@ -12,6 +12,18 @@ authors.workspace = true
 name = "ironbus"
 path = "src/main.rs"
 
+[features]
+# The DEFAULT binary carries the `tracing` JSON log layer and ZERO opentelemetry: OTLP span export is
+# behind `ironbus-server`'s non-default `otlp` feature, forwarded here so a maintainer can build the
+# OTLP-export broker explicitly (#99).
+default = []
+# Forward OTLP span export: `cargo build -p ironbus-cli --features otlp` compiles the export seam in.
+otlp = ["ironbus-server/otlp"]
+# The size-optimized edge build: `cargo build -p ironbus-cli --features edge-min` forwards the
+# server's `edge-min` marker, which MUST NOT enable `otlp`, so the binary links no opentelemetry and
+# shrinks versus an `otlp` build (#99).
+edge-min = ["ironbus-server/edge-min"]
+
 [dependencies]
 ironbus-core = { path = "../ironbus-core", version = "0.0.0" }
 ironbus-proto = { path = "../ironbus-proto", version = "0.0.0" }
