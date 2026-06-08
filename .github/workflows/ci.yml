@@ -420,6 +420,25 @@ jobs:
           grep -q 'ironbus-core' sbom.json
           grep -q 'ironbus-cli' sbom.json
           echo "ok: embedded cargo-auditable SBOM present and lists the workspace crates"
+      # SBOM round-trip diff (#102): recover the embedded SBOM and assert it equals the shipped
+      # dependency graph (both directions) AND that every crate is pinned in Cargo.lock at the same
+      # version. The grep above only proves the SBOM is non-empty; this proves it is COMPLETE and
+      # faithful, so a crate that drifts into the binary but not the lock (or vice versa) fails here.
+      # The graph is taken for the SAME musl target the binary was built for, so the comparison is
+      # target-consistent.
+      - name: SBOM round-trip diff against the shipped graph and Cargo.lock
+        run: |
+          rustup target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
+          sh scripts/ci/sbom-diff.sh \
+            target/x86_64-unknown-linux-musl/release/ironbus \
+            x86_64-unknown-linux-musl
+      # C-FFI ban (#102, #139): assert no crate in the shipped musl graph pulls a C-compiled
+      # component, a build script that compiles C, or a `links` native-library key. IronBus is pure
+      # Rust today, so this is a forward guard; it scopes to the shipped graph so a dev-only tool's
+      # C-builder never trips it, and it complements the deny.toml name bans by also catching an
+      # unknown `links`/C-builder crate deny.toml has no rule for.
+      - name: C-FFI ban on the shipped dependency graph
+        run: sh scripts/ci/cffi-ban.sh x86_64-unknown-linux-musl
 
   actionlint:
     name: actionlint
@@ -435,3 +454,93 @@ jobs:
           set -euo pipefail
           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           "$(go env GOPATH)/bin/actionlint" -color
+
+  dco:
+    name: DCO sign-off
+    # Merge-blocking DCO check (#128, #22): every commit on the PR must carry a Signed-off-by
+    # trailer, per CONTRIBUTING.md. PR-only: a push to main has no PR commit range to check (the
+    # range is the PR's own commits), and the merge queue re-runs this on the candidate.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Need the PR commit range, so fetch enough history to walk base..head.
+          fetch-depth: 0
+      - name: every PR commit is signed off
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: sh scripts/ci/dco-check.sh "$BASE_SHA" "$HEAD_SHA"
+
+  repro:
+    name: byte-identical reproducibility gate (#101)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: repro
+      - name: install musl tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+      # The byte-identical reproducibility GATE (#101, acceptance: "two builds of the same commit
+      # produce byte-identical binaries, enforced in CI"). It builds the SAME commit TWICE with the
+      # exact reproducible invocation pinned in RELEASING.md (SOURCE_DATE_EPOCH from the commit date,
+      # CARGO_INCREMENTAL=0, --locked, the --remap-path-prefix pair that strips the checkout dir and
+      # cargo cache out of the embedded panic/track_caller/file!() strings) and asserts the two
+      # binaries have an IDENTICAL SHA256.
+      #
+      # SINGLE-RUNNER, TWO-BUILD by design: the two builds run back to back on the SAME runner, with
+      # a `cargo clean` between them so build two is a genuine fresh compile, not a cache replay. The
+      # alternative (build on two DIFFERENT runners and diff) adds runner-variance risk (a differing
+      # rustc patch, libc, or sysroot would fail the gate for a reason that is NOT a determinism
+      # regression in our tree); a single runner holds the toolchain fixed, so a mismatch here is a
+      # real determinism regression. The release workflow can still rebuild on a clean runner to
+      # cross-check, but the per-PR GATE is the deterministic single-runner comparison. Verified
+      # before this gate was added: `cargo build --release --locked` with this invocation is
+      # byte-identical across an incremental rebuild AND a full `cargo clean` rebuild.
+      #
+      # diffoscope TRIAGE (documented, not run on the happy path): if this gate ever fails, rebuild
+      # the two binaries locally and run `diffoscope b1 b2` to localize the differing bytes; the
+      # usual culprits are a new embedded absolute path (extend the --remap-path-prefix set), a
+      # build timestamp that ignores SOURCE_DATE_EPOCH, or parallel codegen creeping in
+      # (codegen-units must stay 1). See RELEASING.md "The byte-identical gate".
+      - name: build the same commit twice and assert byte-identical SHA256
+        run: |
+          set -euo pipefail
+          target="x86_64-unknown-linux-musl"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          export CARGO_INCREMENTAL=0
+          export RUSTFLAGS="-D warnings --remap-path-prefix=${PWD}=/ironbus --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+          bin="target/${target}/release/ironbus"
+
+          rm -f "$bin"
+          cargo build --release --locked -p ironbus-cli --target "$target"
+          test -x "$bin"
+          sum1="$(sha256sum "$bin" | cut -d' ' -f1)"
+          cp "$bin" /tmp/ironbus-build1
+
+          # A genuine fresh rebuild of the SAME commit: drop the artifacts so build two recompiles.
+          cargo clean --release --target "$target"
+          rm -f "$bin"
+          cargo build --release --locked -p ironbus-cli --target "$target"
+          test -x "$bin"
+          sum2="$(sha256sum "$bin" | cut -d' ' -f1)"
+
+          echo "build 1 SHA256: $sum1"
+          echo "build 2 SHA256: $sum2"
+          if [ "$sum1" != "$sum2" ]; then
+            echo "::error::reproducibility gate: the two builds of this commit differ ($sum1 != $sum2)."
+            echo "::error::Triage: run 'diffoscope /tmp/ironbus-build1 ${bin}' to localize the differing bytes (see RELEASING.md)."
+            exit 1
+          fi
+          echo "ok: byte-identical across two clean builds of this commit (SHA256 $sum1)"

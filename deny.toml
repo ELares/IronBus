@@ -24,8 +24,46 @@ multiple-versions = "warn"
 wildcards = "deny"
 # Per #139, the default path is pure Rust: no vendored-C crate is allowed on it. The default
 # compression codec is lz4_flex (pure Rust); zstd (zstd-sys, vendored C) is opt-in only, behind an
-# explicit feature, never on the default path. A C-FFI allowlist is enforced here once any such
-# opt-in dependency is introduced (tracked in #102).
+# explicit feature, never on the default path.
+#
+# C-FFI BAN (#102). The best-known vendored-C / native crates are name-banned below as a
+# belt-and-suspenders layer; the STRUCTURAL forward guard is `scripts/ci/cffi-ban.sh` (run by the
+# CI `sbom` job over the shipped musl graph), which also catches an UNKNOWN `links` / C-builder
+# crate this name list has no rule for. ALLOWLIST: `libc` and `nix` are pure-Rust bindings to OS
+# SYSCALLS (no compiled C, no C-building build script), are on the license allow-list above, and
+# are off the record path, so they are permitted (they are also exempted in cffi-ban.sh). Add a
+# crate here (and to that script's allowlist) ONLY if it is proven pure Rust; if an opt-in
+# vendored-C codec (e.g. zstd-sys behind a feature) is ever introduced it must be added to BOTH the
+# allowlist and a documented #12 C-FFI allowance, never silently.
+[[bans.deny]]
+name = "openssl-sys" # vendored/system OpenSSL via a C build script; use rustls (pure Rust) instead.
+[[bans.deny]]
+name = "openssl" # the openssl-sys wrapper, same C linkage.
+[[bans.deny]]
+name = "libz-sys" # zlib C linkage; use a pure-Rust inflate/deflate (miniz_oxide) instead.
+[[bans.deny]]
+name = "zstd-sys" # vendored zstd C; zstd is opt-in only and not on the default path (#12, #139).
+[[bans.deny]]
+name = "lz4-sys" # the C lz4 binding; the default codec is lz4_flex (pure Rust) (#12, #139).
+[[bans.deny]]
+name = "bzip2-sys" # vendored bzip2 C.
+[[bans.deny]]
+name = "ring" # vendored C / assembly crypto; use a pure-Rust / *-rs primitive instead.
+[[bans.deny]]
+name = "aws-lc-sys" # vendored AWS-LC C.
+[[bans.deny]]
+name = "libsqlite3-sys" # vendored SQLite C.
+[[bans.deny]]
+name = "curl-sys" # libcurl C linkage.
+[[bans.deny]]
+name = "jemalloc-sys" # vendored jemalloc C; the system allocator is used.
+[[bans.deny]]
+name = "tikv-jemalloc-sys" # the maintained jemalloc fork, same C linkage.
+[[bans.deny]]
+name = "mimalloc" # vendored mimalloc C.
+#
+# (historical note) A C-FFI allowlist was deferred to #102 when no such opt-in dependency existed;
+# #102 now lands the ban above plus the structural cffi-ban.sh guard.
 #
 # The macro-bench harness `ironbus-bench` (#111) is an internal, build-on-demand measurement tool,
 # not part of the shipped broker. It pulls a small, permissive (MIT or Apache-2.0), pure-Rust

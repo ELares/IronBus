@@ -8,6 +8,10 @@ so a tagged release does not run unproven steps.
 
 ## Cut a release
 
+The release workflow has a `changelog Unreleased is non-empty` gate (#128) that runs first and
+FAILS the whole release if `## [Unreleased]` in `CHANGELOG.md` has no content, so a release can
+never ship without an audit-trail entry. Tag a release only after the entries are present.
+
 1. Land all changes for the release via the normal PR flow (CI green, self-reviewed, merged).
 2. Move the `## [Unreleased]` section of `CHANGELOG.md` under a new `## [vX.Y.Z]` heading and
    bump the workspace `version` in the top-level `Cargo.toml`, in a final PR.
@@ -165,9 +169,34 @@ smaller) on the original measurement; the determinism inputs are byte-rewrites o
 change the size. The musl edge targets are the shipped artifacts and are size-checked per
 architecture by the #100 cross-build matrix.
 
-### The byte-identical gate (follow-up)
+### The byte-identical gate
 
-Enforcing reproducibility in CI (build the same tag twice on two different runners, assert
-byte-identical SHA256, fail the release on a mismatch with a documented `diffoscope` triage step)
-lives with the release workflow and signing in #103. This section pins the inputs that gate has to
-hold fixed; the static cross-build matrix is #100.
+Reproducibility is mechanized as a merge-blocking CI gate (the `byte-identical reproducibility gate`
+job in `.github/workflows/ci.yml`, #101). On every PR it builds the SAME commit TWICE with the
+reproducible invocation above (`SOURCE_DATE_EPOCH` from the commit date, `CARGO_INCREMENTAL=0`,
+`--locked`, the `--remap-path-prefix` pair) for `x86_64-unknown-linux-musl`, runs a `cargo clean`
+between the two builds so the second is a genuine fresh compile, and asserts the two binaries have
+an IDENTICAL SHA256. A mismatch fails the gate.
+
+It is a SINGLE-RUNNER, TWO-BUILD comparison by design. The two builds run back to back on one
+runner, so the toolchain (`rustc`, libc, sysroot) is held fixed and a mismatch is a real determinism
+regression in this tree. Building on two DIFFERENT runners and diffing was rejected: a differing
+runner toolchain would fail the gate for a reason that is NOT a determinism regression in our
+sources. The release workflow can still rebuild on a clean runner to cross-check, but the per-PR
+gate is the deterministic single-runner comparison.
+
+Verified before the gate was added: `cargo build --release --locked` with this invocation is
+byte-identical across both an incremental rebuild and a full `cargo clean` rebuild.
+
+#### diffoscope triage
+
+If the gate ever fails, rebuild the two binaries with the invocation above and localize the
+differing bytes:
+
+```sh
+diffoscope /tmp/ironbus-build1 target/x86_64-unknown-linux-musl/release/ironbus
+```
+
+The usual culprits are a new embedded absolute path (extend the `--remap-path-prefix` set), a build
+timestamp that ignores `SOURCE_DATE_EPOCH`, or parallel codegen creeping in (`codegen-units` must
+stay `1`). The static cross-build matrix is #100; release signing is #103.
