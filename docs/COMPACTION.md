@@ -97,60 +97,118 @@ Over the N source segments, scanned in offset order:
 Compaction's only structural novelty over the existing model is that ONE segment file can be
 authoritative for an offset RANGE that the originals also cover, until the originals are gone.
 A manifest is the usual way to record "this file now owns offsets [a, b)". IronBus has none,
-so the new segment must DECLARE its own coverage in its self-describing header, and recovery
+so the new segment must DECLARE its own coverage in its self-describing metadata (a COMPACTED
+marker in the header plus a covered-range block in the footer region, below), and recovery
 must resolve an overlap deterministically from the files alone.
 
-### Header fields: the covered offset range and a compaction marker
+### A compaction marker in the header, the covered range in a v2 footer block
 
 A compacted segment is a normal segment (the [SegmentHeader](CONTRACTS.md) / record-frame /
-[SegmentFooter](CONTRACTS.md) format is unchanged in shape) with three additional facts
-recorded in its header:
+[SegmentFooter](CONTRACTS.md) format is unchanged in SHAPE) with two additional facts it
+records, in two different places chosen so each fact lives where it fits and is
+CRC-protected:
 
-- a **compaction marker** (this segment is the output of a clean, not a fresh roll),
-- the **covered offset range** `[covered_base_offset, covered_end_offset)`: the offset span
-  of the ORIGINAL source segments this compacted segment supersedes, and
-- the **covered segment-id range** (or the highest covered source id), so recovery can name
+- a **compaction marker** in the header (this segment is the output of a clean, not a fresh
+  roll), and
+- the **covered range**, in a dedicated v2 compaction-metadata block appended after the sealed
+  footer (not in the header): the covered offset span
+  `[covered_base_offset, covered_end_offset)` and the parallel covered SEQUENCE span
+  `[covered_base_seq, covered_end_seq)` of the ORIGINAL source segments this compacted segment
+  supersedes (both spans are needed because recovery checks offset AND sequence continuity, see
+  the chain check below), plus the highest covered source segment id so recovery can name
   exactly which original files this one replaces.
 
-Where these live in the frozen #5 header, honestly:
+**Why the covered range does NOT go in the header reserved bytes.** The earlier sketch put
+the covered range in the header's 16-byte reserved region `[44, 60)`. That region is NOT
+free: [AT_REST_ENCRYPTION.md](AT_REST_ENCRYPTION.md) already assigns `[44, 60)` to the at-rest
+`aead_suite` u8 plus a `key_id` (the rest reserved-zero), and a compacted segment can ALSO be
+encrypted (this spec re-encrypts every survivor under the new segment id below, so a compacted
+segment is a normal candidate for at-rest encryption). A segment that is BOTH compacted AND
+encrypted cannot put both the at-rest fields and the covered range in the same 16 bytes.
+Worse, the covered range is more than two fields: `covered_base_offset` is its OWN field (see
+the next subsection, not an alias of `base_offset`), and the parallel `base_seq` continuity
+forces a covered SEQUENCE span too, so even the offset-only covered range (3 `u64`s = 24 bytes)
+does not fit a 16-byte region at all, and the full covered range is larger still. So
+`[44, 60)` stays owned by at-rest encryption, and the covered range moves out of the header
+entirely.
 
-- The header has a `flags` u16 at `[10, 12)` ("reserved in v1 (zero); preserved on read, not
-  interpreted") and a 16-byte reserved region at `[44, 60)`, both inside the CRC-covered
-  bytes `[0, 60)`. The compaction marker is ONE bit of `flags` (e.g. `0b0000_0001` = COMPACTED).
-  The covered range needs `covered_end_offset` (`u64`) and the highest covered source segment
-  id (`u64`): the `covered_base_offset` is already `base_offset` at `[28, 36)` (a compacted
-  segment's first survivor IS the base of the covered range), so two `u64`s = 16 bytes fit
-  EXACTLY in the reserved `[44, 60)` region. No byte grows, no field moves, the CRC still
-  covers them.
-- **Honesty: this is a format change, and it is gated by the format version.** Although the
-  bytes physically fit the reserved region, a v1 reader treats `flags` as "preserved but not
-  interpreted" and the reserved bytes as zero. A v1 reader that encountered a COMPACTED
-  segment would IGNORE the marker and the covered range and try to stitch the segment into
-  the contiguous chain as if it were ordinary, which (because survivors are sparse) would
-  fail the chain check or, worse, deliver a wrong view. So a compactor-writing broker MUST
-  stamp the segment header `version` = 2 (a format-version bump) on compacted segments, and a
-  v1 reader MUST refuse a `version` it does not know (it already does: "a v1 reader rejects
-  any other value" for `checksum_algo`, and `version` is refuse-on-unknown per
-  [COMPATIBILITY.md](COMPATIBILITY.md)). This is the correct, fail-closed outcome: an old
-  reader refuses a compacted log rather than silently misreading it. The format-version bump,
-  the COMPACTED flag bit, and the two reserved-region `u64`s are coordinated with the frozen
-  #5 header and [ADR 0001](adr/0001-log-is-wal.md); they are listed in
-  [COMPATIBILITY.md](COMPATIBILITY.md) as the v2
-  on-disk delta and must be added to [CONTRACTS.md](CONTRACTS.md) when implemented.
+**Where the covered range lives: a v2 compaction-metadata block in the footer region.** A
+compacted segment is born SEALED (it is never the active segment), so it always carries a
+[SegmentFooter](CONTRACTS.md), written once at seal time. The version=2 format defines a
+compaction-metadata block that a compacted segment writes immediately AFTER the standard
+32-byte footer, as the file's final bytes, CRC-protected on its own:
 
-The footer is unchanged: a compacted segment is still sealed with the normal
-[SegmentFooter](CONTRACTS.md) (segment id, last seq, record count) the moment it is written,
-because it is born sealed (it is never the active segment).
+| offset (from block start) | field | type | notes |
+|---|---|---|---|
+| `[0, 8)`   | `covered_base_offset` | u64 | the source set's TRUE starting offset (see below) |
+| `[8, 16)`  | `covered_end_offset`  | u64 | one past the highest covered SOURCE offset |
+| `[16, 24)` | `covered_base_seq`    | u64 | the source set's TRUE starting sequence (parallel to `covered_base_offset`) |
+| `[24, 32)` | `covered_end_seq`     | u64 | one past the highest covered SOURCE sequence |
+| `[32, 40)` | `highest_covered_source_id` | u64 | the highest segment id this clean supersedes (the recovery tie-break) |
+| `[40, 44)` | `block_crc` | u32 | CRC32C over `[0, 40)` of this block |
+
+The block is 44 bytes, written and fsynced as part of the same seal that writes the footer, so
+it is durable at the same instant the footer is (the footer and this block are one contiguous
+trailing write). It is self-validating exactly like the footer: a reader of a `version` = 2
+segment reads the trailing block, checks `block_crc`, and rejects a torn or mismatched block
+the same way a torn footer is rejected, so a half-written compacted segment never parses as a
+valid compacted segment (it falls into the crash-before-commit case below). The standard
+32-byte footer is UNCHANGED in layout (segment id, last seq, record count, its own
+`footer_crc` over `[0, 28)`); v2 only appends the 44-byte block after it. Nothing in the
+header reserved region `[44, 60)` is touched, so a compacted-AND-encrypted segment has room
+for BOTH: the at-rest `aead_suite` + `key_id` in the header `[44, 60)`, and the covered range
+in the footer-region block.
+
+**The only header change is one flag bit.** The header's `flags` u16 at `[10, 12)` (inside the
+CRC-covered bytes `[0, 60)`) gains ONE bit, `COMPACTED` (a distinct bit from the at-rest
+`SEGMENT_ENCRYPTED` bit, so the two never collide and a segment may set both). The header
+reserved bytes `[44, 60)` are NOT used by compaction. The CRC at `[60, 64)` still covers the
+flag bit for free.
+
+- **Honesty: this is a format change, and it is gated by the format version.** A v1 reader
+  treats `flags` as "preserved but not interpreted" and would not even look for a trailing
+  compaction-metadata block. A v1 reader that encountered a COMPACTED segment would IGNORE the
+  marker and the covered range and try to stitch the segment into the contiguous chain as if
+  it were ordinary, which (because survivors are sparse) would fail the chain check or, worse,
+  deliver a wrong view. So a compactor-writing broker MUST stamp the segment header `version`
+  = 2 (a format-version bump) on compacted segments AND stamp the same `version` = 2 in the
+  footer (the footer carries its own `version` byte, per [CONTRACTS.md](CONTRACTS.md), so the
+  trailing block is version-gated there too), and a v1 reader MUST refuse a `version` it does
+  not know (it already does: "a v1 reader rejects any other value" for `checksum_algo`, and
+  `version` is refuse-on-unknown per [COMPATIBILITY.md](COMPATIBILITY.md)). This is the
+  correct, fail-closed outcome: an old reader refuses a compacted log rather than silently
+  misreading it. The format-version bump, the COMPACTED flag bit, and the v2
+  compaction-metadata block are coordinated with the frozen #5 header / #5 footer and
+  [ADR 0001](adr/0001-log-is-wal.md); they must be registered as the v2 on-disk delta in
+  [COMPATIBILITY.md](COMPATIBILITY.md) and the byte layouts added to
+  [CONTRACTS.md](CONTRACTS.md) when implemented.
+
+### `covered_base_offset` is the source set's TRUE start, its own field
+
+`covered_base_offset` is NOT `base_offset` (the lowest survivor's offset). They differ exactly
+when the first source segment's LEADING records are all superseded: the lowest survivor's
+offset is then strictly greater than the source set's true starting offset. If recovery used
+`base_offset` as the covered start, the span `[predecessor_end, lowest_survivor_offset)` would
+be left UNCOVERED, a gap that the chain-continuity check (below) would reject. So
+`covered_base_offset` is defined as the source set's TRUE starting offset, the lowest covered
+SOURCE offset (equivalently, the predecessor segment's end / where this compacted segment must
+abut its predecessor in the chain), independent of which survivor happens to be lowest. It is
+its own field in the compaction-metadata block, carried explicitly, never derived from
+`base_offset`. `covered_end_offset` is symmetric: one past the highest covered SOURCE offset
+(which, because the last source record is always a survivor of its own key unless tombstoned,
+typically coincides with the last survivor's offset + 1, but is recorded as the source span,
+not inferred). `highest_covered_source_id` is the highest segment id in the source set, used
+only as the deterministic tie-break in recovery rule 3 below.
 
 ### Why the covered range, not a manifest, is enough
 
 Recovery already discovers every `seg-<id>.log`, parses its self-describing header, and
-stitches a chain by `base_offset`. A compacted segment's header self-describes BOTH its own
-survivor records AND the original offset span it stands in for. That is exactly the
-information a manifest entry would have carried ("offsets [a, b) now live in file X"), only it
-lives in the file that owns the range rather than in a separate mutable index. The directory
-remains the single authority; we have added one self-describing fact to one file, which is the
-existing design philosophy, not a new structure.
+stitches a chain by `base_offset`. A compacted segment self-describes BOTH its own survivor
+records (header) AND the original offset/sequence span it stands in for (the v2 footer block).
+That is exactly the information a manifest entry would have carried ("offsets [a, b) now live
+in file X"), only it lives in the file that owns the range rather than in a separate mutable
+index. The directory remains the single authority; we have added self-describing facts to one
+file, which is the existing design philosophy, not a new structure.
 
 ---
 
@@ -176,14 +234,19 @@ deliberately broken), which the recovery resolution below accounts for explicitl
    time, peak memory one record plus the key map; the key map is the cost line that bounds how
    many segments N can be on an edge core). Record, per key, the highest-offset survivor; track
    tombstones and their ages.
-3. **Write the new segment.** Create `seg-<fresh-id>.log`, write its header (COMPACTED flag,
-   `base_offset` = the lowest survivor's offset, `covered_end_offset` and highest-covered
-   source id in the reserved region, `version` = 2), then the survivors in ascending offset
-   order with their ORIGINAL offsets and sequences, then the [SegmentFooter](CONTRACTS.md).
-   `fsync` the file, then `fsync` the parent directory so the new file's directory entry is
-   durable. THIS DIRECTORY FSYNC IS THE ATOMIC COMMIT POINT: before it, the new segment may
-   not survive a power loss and the originals are authoritative; after it, the compacted
-   segment is durably present and authoritative for its covered range.
+3. **Write the new segment.** Create `seg-<fresh-id>.log`, write its header (`version` = 2,
+   COMPACTED flag set; `base_offset` = the lowest survivor's offset, as for any segment; the
+   header reserved bytes `[44, 60)` left for at-rest encryption), then the survivors in
+   ascending offset order with their ORIGINAL offsets and sequences, then the
+   [SegmentFooter](CONTRACTS.md) (`version` = 2), then the 44-byte v2 compaction-metadata block
+   (`covered_base_offset`, `covered_end_offset`, `covered_base_seq`, `covered_end_seq`,
+   `highest_covered_source_id`, `block_crc`) as the file's final bytes. `fsync` the file, then `fsync` the parent directory so the new
+   file's directory entry is durable. THIS DIRECTORY FSYNC IS THE ATOMIC COMMIT POINT: before
+   it, the new segment may not survive a power loss and the originals are authoritative; after
+   it, the compacted segment is durably present and authoritative for its covered range. The
+   footer and the trailing block are one contiguous final write, so they become durable
+   together; a crash that leaves a torn block (failing `block_crc`) is indistinguishable from a
+   crash before the commit, and recovery treats it as such.
 4. **Retire the originals.** For each covered source segment, `rename` it out of the way (to a
    transient name a reader will not pick up, e.g. a `.compacting` suffix that
    `parse_segment_file_name` rejects, so it instantly leaves the recoverable set) then
@@ -221,8 +284,9 @@ two small, generic resolution rules:
   removed (it parses as no segment, so it is foreign and skipped, then garbage-collected). The
   compacted segment plus any not-yet-covered originals form the chain.
 
-Both rules are generic file-set reconciliations driven entirely by the self-describing headers
-(the COMPACTED flag and covered range), not a replay of a compaction journal. There is no
+Both rules are generic file-set reconciliations driven entirely by the segment's
+self-describing metadata (the COMPACTED flag in the header and the covered range in the v2
+footer block), not a replay of a compaction journal. There is no
 manifest to be torn, so there is no torn-manifest recovery case. The recovery loss caps (I3,
 bounded reported loss) are unaffected: a discarded orphan compacted segment is not a loss (its
 data is fully present in the originals), and an unlinked superseded original is not a loss (its
@@ -251,12 +315,26 @@ recovery must pick ONE deterministically. The rule, in order:
    chain.** Note the chain is contiguous at SEGMENT boundaries (each segment's covered or
    actual range abuts the next), even though offsets WITHIN a compacted segment are sparse.
    This is the one place the recovery chain check must change: today
-   `scan_recover_chain` requires `base_offset == next_base_offset` exactly and every
-   non-final segment sealed; with compaction the predecessor's "end" is its
-   `covered_end_offset` (for a compacted segment) or `base_offset + record_count` (for an
-   ordinary one), and a compacted segment's record offsets are not dense. The chain continuity
-   check becomes "the next segment's covered/actual base equals the previous segment's
-   covered/actual end," which reduces to the current check for an all-ordinary log.
+   `scan_recover_chain` requires BOTH `base_offset == next_base_offset` AND
+   `base_seq == next_base_seq` exactly (it advances `next_base_seq = base_seq + record_count`
+   in lockstep with the offset half) and every non-final segment sealed; with compaction the
+   predecessor's offset "end" is its `covered_end_offset` (for a compacted segment) or
+   `base_offset + record_count` (for an ordinary one), and a compacted segment's record
+   offsets are not dense. The offset continuity check becomes "the next segment's
+   covered/actual base equals the previous segment's covered/actual end," which reduces to the
+   current check for an all-ordinary log.
+   - **The `base_seq` half must change in parallel.** Survivors keep their ORIGINAL, now-sparse
+     sequences, exactly as they keep their original offsets, so a compacted segment's record
+     count is smaller than its covered sequence span and `next_base_seq = base_seq +
+     record_count` no longer lands on the next segment's `base_seq`. The compaction-metadata
+     block therefore also pins the covered SEQUENCE span so recovery can advance the sequence
+     expectation by the covered span (not the survivor count) across a compacted segment, the
+     same way it advances the offset expectation by `covered_end_offset`. Concretely the v2
+     block carries `covered_base_seq` and `covered_end_seq` (the source set's true starting and
+     one-past-ending sequence) alongside the offset span, and the chain-continuity check
+     compares the next segment's covered/actual base sequence to the previous segment's
+     covered/actual end sequence. For an all-ordinary log both halves reduce to today's exact
+     `base_offset`/`base_seq` checks.
 
 Because each step is a pure function of the self-describing headers in the directory, recovery
 is still deterministic and still a pure function of the durable bytes (I4). The id is no
@@ -292,14 +370,18 @@ assumes, and the spec is honest about it.
   consumer (a skip range `[lost_offset_start, lost_offset_end)` with a reason code). Compaction
   reuses that machinery for the consumer-visible gap, BUT the reason is a new, deliberate one:
   a compaction gap is NOT data loss (the superseded values were intentionally removed and a
-  newer value for the key exists), unlike the #59 corruption reasons
-  (`RecordCrcMismatch`, `TornTailTruncated`, etc.) which ARE loss-or-truncation. So compaction
-  adds a `Compacted` skip reason that is EXCLUDED from the loss-bytes counters (the same way
-  `TornTailTruncated` is excluded), and a consumer that wants the latest-value-per-key view can
-  simply ignore a `Compacted` gap marker entirely. This must be agreed with #9 and #59 when
-  implemented; the honest statement is that compaction turns "every offset below the head has a
-  record" from an invariant into "every offset below the head has a record OR a recorded
-  compaction gap."
+  newer value for the key exists), unlike the recovery loss reasons
+  (`TornTail`, `CorruptRecordHeader`, `CorruptRecordBody`, `CorruptSegmentHeader`,
+  `SequenceGap`, per `loss.rs`) which ARE loss-or-truncation and EACH emit a `LossEvent` with
+  a non-zero `bytes_skipped` that the loss-bytes counters sum (including `TornTail`, the
+  expected power-loss truncation, which is reported, not excluded). So compaction adds a
+  `Compacted` skip reason that is NOT a recovery loss reason at all: it never produces a
+  `LossEvent` or `LossReport` and so never touches the loss-bytes counters, because no durable
+  record was lost. It is purely a consumer-facing #59 SkipEvent reason, and a consumer that
+  wants the latest-value-per-key view can simply ignore a `Compacted` gap marker entirely.
+  This must be agreed with #9 and #59 when implemented; the honest statement is that compaction
+  turns "every offset below the head has a record" from an invariant into "every offset below
+  the head has a record OR a recorded compaction gap."
 - **A consumer cursor is unaffected by a gap.** The committed cursor is a watermark over
   ACKED offsets; a compacted-away offset is treated as already-satisfied (there is nothing to
   deliver), so the cursor advances past the gap exactly as if those offsets had been acked.
@@ -358,9 +440,9 @@ key-mapping and flash-bound rewriting). The cleaner is therefore:
 
 ## Honest limits and what is deliberately deferred
 
-- **Specified, not implemented.** No code exists. The header v2 fields, the COMPACTED flag, the
-  covered-range recovery rules, the sparse-offset read path, the `Compacted` skip reason, and
-  the cleaner are all unbuilt. This doc is the target.
+- **Specified, not implemented.** No code exists. The COMPACTED header flag, the v2
+  compaction-metadata footer block, the covered-range recovery rules, the sparse-offset read
+  path, the `Compacted` skip reason, and the cleaner are all unbuilt. This doc is the target.
 - **It costs CPU and flash; it is for changelog topics only.** Stated up front; restated here.
   A general durable queue should leave it OFF.
 - **It forces a format-version bump.** A broker that has ever written a compacted segment
@@ -370,11 +452,17 @@ key-mapping and flash-bound rewriting). The cleaner is therefore:
   high id but a low covered range; recovery resolves by covered/actual offset range and uses the
   id only as the monotonic tie-break. ADR 0002 (never recycle) is preserved and is in fact
   relied on for that tie-break.
-- **The at-rest nonce stays safe.** Because the compacted segment gets a FRESH never-recycled id
-  (ADR 0002), the at-rest AEAD nonce (segment-id || record counter, per
-  [AT_REST_ENCRYPTION.md](AT_REST_ENCRYPTION.md)) is unique for the rewritten survivors; a
-  survivor is re-encrypted under the new segment's id, not its old one, so no nonce is reused.
-  This is an interaction to pin in the encryption spec when both are implemented.
+- **A compacted segment can also be encrypted; the two specs partition the header cleanly.** A
+  compacted segment is a normal candidate for at-rest encryption, and the two features do not
+  collide: at-rest encryption owns the header reserved bytes `[44, 60)` (`aead_suite` + `key_id`)
+  and the `SEGMENT_ENCRYPTED` flag bit; compaction owns a DIFFERENT flag bit (`COMPACTED`) and
+  the v2 compaction-metadata block in the footer region, and touches none of `[44, 60)`. So a
+  compacted-AND-encrypted segment has room for BOTH sets of fields. And the at-rest AEAD nonce
+  (segment-id || record counter, per [AT_REST_ENCRYPTION.md](AT_REST_ENCRYPTION.md)) stays
+  unique for the rewritten survivors: because the compacted segment gets a FRESH never-recycled
+  id (ADR 0002), each survivor is re-encrypted under the new segment's id, not its old one, so
+  no nonce is reused. This header partition and the nonce interaction are pinned in the
+  encryption spec when both are implemented.
 
 ### Open questions
 
@@ -400,8 +488,9 @@ key-mapping and flash-bound rewriting). The cleaner is therefore:
   segment wins after, with no `LossReport` event either way.
 - Open readers never read freed data during retire: a reader holding an open handle to an
   original drains it after the rename-then-unlink (the same discipline the reaper already uses).
-- Sparse-offset read / skip-the-gap and the `Compacted` skip reason excluded from loss bytes:
-  read-path and #59 SkipEvent tests.
+- Sparse-offset read / skip-the-gap and the `Compacted` skip reason as a #59 SkipEvent reason
+  (never a recovery `LossEvent`, so never in the loss-bytes counters): read-path and #59
+  SkipEvent tests.
 - The cleaner off by default, rate-limited, and append-priority: an engine test that a produce
   is never blocked behind a compaction fsync (the sync-gating fault fs the #177 actor test
   already uses).
