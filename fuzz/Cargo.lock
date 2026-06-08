@@ -58,6 +58,7 @@ name = "ironbus-core"
 version = "0.0.0"
 dependencies = [
  "crc32c",
+ "lz4_flex",
  "xxhash-rust",
 ]
 
@@ -110,6 +111,12 @@ dependencies = [
  "arbitrary",
  "cc",
 ]
+
+[[package]]
+name = "lz4_flex"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b8c72594ac26bfd34f2d99dfced2edfaddfe8a476e3ff2ca0eb293d925c4f83"
 
 [[package]]
 name = "proc-macro2"

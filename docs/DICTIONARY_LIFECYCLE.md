@@ -1,12 +1,18 @@
 # Trained per-type dictionary lifecycle (the self-contained-distribution design)
 
 This document is the DESIGN spec for IronBus's trained per-message-type compression
-dictionaries (#78, parent #12). It is SPECIFIED, NOT YET IMPLEMENTED: no dictionary code,
-no `ZDICT` training call, and no on-disk compression of any kind exists in the source today.
-This is verified, not assumed: the stored codec is always "none", the `COMPRESSED` record
-flag is never set on a written frame, and the codec/dict id spaces "are not present at all"
-(see [COMPATIBILITY.md](COMPATIBILITY.md#discrepancies-with-the-132-intent)). This doc pins
-the contract so the future implementation has one honest, testable target.
+dictionaries (#78, parent #12). It is PARTLY IMPLEMENTED. The on-disk compression runtime now
+exists for the default `lz4` codec (#387, `crates/ironbus-core/src/compress.rs`): the
+self-describing descriptor carries the `dict_id` field (§8), the `DictResolver` SEAM (§3, §4)
+is in place (the default `NoDictionaries` resolver holds nothing), and an unresolved `dict_id`
+is the bounded POISON class routed to #8 as `ReasonCode::UnresolvedDictId` (§5, IMPLEMENTED in
+`crates/ironbus-storage/src/loss.rs`). What stays DEFERRED is the zstd-specific machinery: the
+`ZDICT` training call (§1), the sidecar-IO write/read and `include_bytes!` embed (§3), and the
+measured before/after ratio (§7), all behind the opt-in zstd feature per
+[ADR 0003](adr/0003-default-compression-lz4-zstd-opt-in.md). On the default `lz4` path every
+frame is written with `dict_id = 0` (no dictionary), so a dictionary-BEARING frame is still
+only ever produced by a future zstd-feature writer. This doc pins the contract for the
+remaining residual.
 
 It is a lifecycle-and-format document, not a byte-layout reference. For the exact on-disk
 record, segment, and footer byte layouts see [CONTRACTS.md](CONTRACTS.md) and the
@@ -323,10 +329,16 @@ Why this is SAFE against the frozen-schema rule:
   `ironbus_recovery_data_loss_bytes` and `quarantine::is_corruption_skip` keeps the forensic
   copy, the same boundary every other corruption skip uses.
 
-**IMPL-RESIDUAL:** appending `ReasonCode::UnresolvedDictId` (code 7, label `unresolved_dict_id`)
-to `crates/ironbus-storage/src/loss.rs`, extending the golden vocabulary test, and wiring the
-decompress path to emit it. This section specifies the code, name, label, data-loss
-classification, the append-only justification, and the no-version-bump guarantee.
+**IMPLEMENTED (#357, #387):** `ReasonCode::UnresolvedDictId` (code 7, label `unresolved_dict_id`,
+`is_data_loss() == true`) is appended to `crates/ironbus-storage/src/loss.rs`, the golden
+vocabulary test (`golden_reason_code_vocabulary_is_frozen`) and the stability test
+(`reason_codes_are_stable_and_distinct`) are extended, and `schema_version` stays `1` (codes 1
+through 6 are byte-identical). The decode path emits it: `ironbus_core::compress::decompress_payload`
+returns `PoisonUnresolvedDict` for a non-zero `dict_id` the `DictResolver` cannot resolve, and
+`ReasonCode::for_decompress_error` maps that to `UnresolvedDictId` for the #8 quarantine flow. The
+DEFERRED residual is only the actual dictionary RESOLUTION against real sidecar/embedded bytes (the
+zstd-feature side); the default build's `NoDictionaries` resolver makes every non-zero `dict_id`
+correctly unresolved.
 
 ## 6. Immutability and rotation
 
@@ -406,18 +418,20 @@ the dict_id space. The reservation is concrete:
   re-derived, the trivial probability of which is handled by the train-time collision/re-roll
   path in Section 2), so a `dict_id = 0` frame is unambiguously "no dictionary, decode without
   one".
-- **Why this is provably additive.** In v1 the `COMPRESSED` flag is NEVER set on a written frame
-  and the stored codec is always "none" (verified in
-  [COMPATIBILITY.md](COMPATIBILITY.md#discrepancies-with-the-132-intent): "the codec/dict id
-  spaces are not present at all; on-disk compression is not yet implemented; the stored codec is
-  always none"). So every v1 frame already carries the unset state (`COMPRESSED` clear, the
-  no-dictionary case). A future dictionary-aware writer SETS `COMPRESSED` and writes a non-zero
-  dict_id in the payload descriptor; a v1 reader that meets such a frame is unaffected for every
-  frame it actually sees today (all v1 frames are `dict_id = 0`), and the unknown-flag-bit
-  preservation rule (`RecordFlags::unknown_bits`, types.rs) means an older reader preserves bits
-  it does not recognize rather than corrupting them. No existing byte moves, no tag is
-  renumbered, no field width changes. The addition is purely a new INTERPRETATION of a state the
-  v1 format already reserves, which is the definition of additive.
+- **Why this is provably additive.** The compression runtime is implemented at the SAME
+  `FORMAT_VERSION = 1` because the descriptor lives INSIDE the payload, inside the CRC-covered
+  body, so no header byte moves, no field width changes, and the format-registry digest (the
+  `pub const` layout in `format.rs`) is unchanged (#387). A record stored RAW (the `lz4` codec's
+  raw-store / never-expand fallback, or `--compression none`) leaves the `COMPRESSED` bit CLEAR
+  and writes no descriptor, so it is BYTE-FOR-BYTE the pre-compression layout: every existing
+  record and conformance vector reads identically. A frame that DOES set `COMPRESSED` is a frame
+  written by this `lz4`-codec runtime (always `dict_id = 0` on the default path) or a future
+  zstd-feature writer (which may set a non-zero `dict_id`); the unknown-flag-bit preservation rule
+  (`RecordFlags::unknown_bits`, types.rs) means an older reader preserves bits it does not
+  recognize rather than corrupting them, and a reader without the codec routes an unknown codec id
+  or an unresolved `dict_id` to the bounded POISON class (§5) rather than crashing. The addition is
+  a new INTERPRETATION of a state the v1 format already reserved, which is the definition of
+  additive.
 
 ---
 
@@ -428,7 +442,7 @@ the dict_id space. The reservation is concrete:
 | CLI trains a dictionary from collected samples and emits a content-hash dict_id | SPECIFIED-HERE (Sections 1, 2); the `ZDICT` call is IMPL-RESIDUAL |
 | A frame written with a dictionary is decodable using only the on-disk sidecar (binary-independent) | SPECIFIED-HERE (Sections 3a, 4) |
 | The same frame is decodable from the embedded set when the sidecar is absent | SPECIFIED-HERE (Sections 3b, 4) |
-| An unresolved dict_id is quarantined via #8, not crashed or silently dropped | SPECIFIED-HERE (Section 5); emitting `UnresolvedDictId` is IMPL-RESIDUAL |
+| An unresolved dict_id is quarantined via #8, not crashed or silently dropped | IMPLEMENTED (Section 5, #357/#387): `PoisonUnresolvedDict` -> `ReasonCode::UnresolvedDictId` -> #8 |
 | Dictionaries are immutable; a re-train yields a new dict_id and leaves old data readable | SPECIFIED-HERE (Sections 2, 6) |
 | A documented before/after ratio on real telemetry shows the dictionary win over no-dictionary per-batch | METHOD SPECIFIED-HERE (Section 7); the measured number is IMPL-RESIDUAL |
 
@@ -445,6 +459,7 @@ the dict_id space. The reservation is concrete:
 - The codec / pure-Rust-default decision: [ADR 0003](adr/0003-default-compression-lz4-zstd-opt-in.md).
 - The never-reuse precedent: [ADR 0002](adr/0002-segments-never-recycled-in-v1.md).
 
-This document is the spec; no source is changed by it. The implementation follow-up (the zstd
-`ZDICT` training, the sidecar IO, the `include_bytes!` embed, the `UnresolvedDictId` reason
-emission, and the measured before/after ratio) is tracked separately.
+The `lz4`-codec runtime, the `dict_id` descriptor field, the `DictResolver` seam, and the
+`UnresolvedDictId` reason emission are now in source (#387/#357). The remaining implementation
+follow-up (the zstd `ZDICT` training, the sidecar IO, the `include_bytes!` embed, and the measured
+before/after ratio), all behind the opt-in zstd feature, is tracked separately.

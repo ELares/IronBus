@@ -129,8 +129,9 @@ total with `TornTail` **excluded**, because a torn or unsynced tail is bytes tha
 written, not previously-durable data that was lost. Counting torn tails as data loss would inflate
 fleet loss metrics on every clean power-loss restart, so they show up as a reported skip
 (`ironbus_recovery_truncated_bytes` and the `torn_tail` per-reason series carry them) but NOT here.
-Every other reason, including the appended `scrubber_suspect` (#92), DOES count. It is a gauge
-(no `_total`), so it is outside the frozen counter set by construction.
+Every other reason, including the appended `scrubber_suspect` (#92) and `unresolved_dict_id`
+(#357, an intact but undecodable record whose compression dictionary is absent), DOES count. It is
+a gauge (no `_total`), so it is outside the frozen counter set by construction.
 
 `ironbus_quarantine_bytes` (#134, #315) is the **persisted on-disk footprint** of
 the forensic **quarantine store**: the total bytes of the corrupt-byte copies
@@ -147,7 +148,8 @@ it is excluded from the frozen `_total` counter set by construction.
 
 The `reason` label is confined to the fixed `ReasonCode` enum (`torn_tail`,
 `corrupt_record_header`, `corrupt_record_body`, `corrupt_segment_header`,
-`sequence_gap`, `scrubber_suspect`); no offset, message-id, or subject is ever a label. The
+`sequence_gap`, `scrubber_suspect`, `unresolved_dict_id`); no offset, message-id, or subject is
+ever a label. The
 bounded-loss fail-closed recovery (refuse to exceed the loss cap) is the
 companion control in the threat model.
 

@@ -510,10 +510,13 @@ struct MetricsSnapshot {
     /// The persisted on-disk footprint of the forensic quarantine store (#134, #315): the
     /// corrupt-byte copies prior recoveries left, surviving restart.
     quarantined: u64,
-    /// Bytes dropped at the last recovery, per [`ReasonCode`] in code order.
-    recovery_loss: [u64; 6],
-    /// Records dropped at the last recovery, per [`ReasonCode`] in code order.
-    recovery_loss_records: [u64; 6],
+    /// Bytes dropped at the last recovery, per [`ReasonCode`] in code order. Sized to
+    /// [`ReasonCode::ALL`] so appending a reason (e.g. `UnresolvedDictId`, #357) ripples here
+    /// automatically instead of leaving a stale, too-short array.
+    recovery_loss: [u64; ReasonCode::ALL.len()],
+    /// Records dropped at the last recovery, per [`ReasonCode`] in code order. Sized to
+    /// [`ReasonCode::ALL`] so a new reason ripples automatically.
+    recovery_loss_records: [u64; ReasonCode::ALL.len()],
     /// Bytes of real DATA loss at the last recovery (the loss report total with `TornTail`
     /// excluded, #59): the headline "bytes lost" figure that must not inflate on a brownout.
     recovery_data_loss: u64,
@@ -1129,7 +1132,7 @@ fn group_consumer_lines(groups: &[GroupConsumerStat], flushed: u64) -> String {
 /// Renders the per-reason recovery-loss gauge `ironbus_recovery_loss_bytes{reason=...}` from the
 /// last recovery's loss report: one line per reason in code order, zero where a reason did not
 /// occur. The grand total equals `ironbus_recovery_truncated_bytes`.
-fn recovery_loss_lines(by_reason: &[u64; 6]) -> String {
+fn recovery_loss_lines(by_reason: &[u64; ReasonCode::ALL.len()]) -> String {
     let mut s = String::from(
         "# HELP ironbus_recovery_loss_bytes Bytes dropped at the last recovery, by reason.\n\
          # TYPE ironbus_recovery_loss_bytes gauge\n",
@@ -1162,7 +1165,7 @@ fn recovery_data_loss_lines(data_loss_bytes: u64) -> String {
 /// from the last recovery's loss report: the record-count complement of
 /// `ironbus_recovery_loss_bytes`, so an operator sees not just how many bytes recovery
 /// dropped but how many records, by reason. Zero where a reason did not occur.
-fn recovery_loss_records_lines(by_reason: &[u64; 6]) -> String {
+fn recovery_loss_records_lines(by_reason: &[u64; ReasonCode::ALL.len()]) -> String {
     let mut s = String::from(
         "# HELP ironbus_recovery_loss_records Records dropped at the last recovery, by reason.\n\
          # TYPE ironbus_recovery_loss_records gauge\n",
