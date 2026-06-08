@@ -330,26 +330,27 @@ fn upgrade_rejects_a_missing_new_binary() {
 /// has a real, current-format segment on disk), then stops it. Returns once a record is durable.
 fn seed_data_dir_with_one_record(data_dir: &Path) {
     use std::io::{BufRead, BufReader};
-    // A free loopback port for this broker.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    let addr = addr.to_string();
-
+    // Let the broker pick a free loopback port and REPORT it, then parse the actual bound address
+    // from its "listening on <addr>," line (the same pattern the acceptance test uses). Pre-picking
+    // a :0 port, dropping the listener, and handing that port to serve is a TOCTOU race: another
+    // parallel test can grab the freed port before the broker binds it, so serve fails to bind and
+    // every produce fails. That flaked on the shared macOS CI runner. Binding :0 in serve itself and
+    // reading back the real address removes the race.
     let mut child = Command::new(BUILT_BIN)
         .args([
             "serve",
             "--data-dir",
             data_dir.to_str().unwrap(),
             "--addr",
-            &addr,
+            "127.0.0.1:0",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("serve must spawn");
 
-    // Wait for the broker to announce it is listening, then produce one record over the wire.
+    // Read the broker's stdout until it announces the address it actually bound.
+    let mut addr = String::new();
     if let Some(stdout) = child.stdout.take() {
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
@@ -358,11 +359,16 @@ fn seed_data_dir_with_one_record(data_dir: &Path) {
             if reader.read_line(&mut line).unwrap_or(0) == 0 {
                 break;
             }
-            if line.contains("listening") || line.contains(&addr) {
-                break;
+            if let Some(rest) = line.split("listening on ").nth(1) {
+                if let Some(bound) = rest.split(',').next() {
+                    addr = bound.trim().to_string();
+                    break;
+                }
             }
         }
     }
+    assert!(!addr.is_empty(), "broker did not report its bound address");
+
     // Retry the produce briefly in case the listen line raced ahead of the accept loop.
     let mut produced = false;
     for _ in 0..50 {
