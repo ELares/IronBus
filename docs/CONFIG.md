@@ -256,6 +256,7 @@ bounded only by `max_total_bytes` and `disk_full_policy`.
 | `max_connections` | `--max-connections` / `IRONBUS_MAX_CONNECTIONS` | usize | `256` (`DEFAULT_MAX_CONNECTIONS`) | count | `>= 1` | COLD |
 | `max_groups` | `--max-groups` / `IRONBUS_MAX_GROUPS` | usize | `1024` (`DEFAULT_MAX_GROUPS`) | count | `0` = unlimited or any usize | COLD |
 | `group_idle_evict_ms` | `--group-idle-evict-ms` / `IRONBUS_GROUP_IDLE_EVICT_MS` | u64 | `0` = disabled (`DEFAULT_GROUP_IDLE_EVICT_MS`) | ms | `0` (off) or any u64 | HOT |
+| `ram_ceiling_bytes` | `--ram-ceiling-bytes` / `IRONBUS_RAM_CEILING_BYTES` | u64 | `0` = unset (`DEFAULT_RAM_CEILING_BYTES`; `edge-tiny` sets `67108864` = 64 MiB) | bytes | `0` (off) or `>=` the worst-case bounded-buffer footprint | COLD |
 | `codel_target_ms` | SPECIFIED-NOT-YET-A-FIELD | u64 | `5` (CoDel TARGET) | ms | `[1 ms, 1 s]` (clamped) | HOT |
 | `codel_interval_ms` | SPECIFIED-NOT-YET-A-FIELD | u64 | `100` (CoDel INTERVAL) | ms | `[20 ms, 10 s]` (clamped) | HOT |
 
@@ -380,17 +381,25 @@ a coupled RAM bound: the effective per-fetch delivery is
 message larger than the whole byte budget is still delivered so it never wedges,
 but nothing further is sent until bytes free). On an edge profile, the product
 `max_connections * consumer_credit_bytes` is the worst-case in-flight RAM, and is
-validated against the documented RAM ceiling.
+validated against the configured RAM ceiling (`ram_ceiling_bytes`).
+
+When `ram_ceiling_bytes` is set (the `edge-tiny` profile sets 64 MiB; an operator
+may set it on any profile), this is now ENFORCED by a refuse-to-boot guard (#115):
+the broker computes the worst-case bounded-buffer footprint from the config and
+refuses to start, with a usage error (exit 1) naming the overage, when it provably
+exceeds the ceiling.
 
 ```
-config error: backpressure.max_connections (256) * consumer_credit_bytes (8MiB)
-  = 2GiB worst-case in-flight, over the 64MiB edge RAM ceiling;
-  lower max_connections or consumer_credit_bytes, or select profile = "edge-tiny"
+config error: --ram-ceiling-bytes 67108864 is below the worst-case bounded-buffer
+  footprint the configured caps imply (over by N bytes): lower max_connections or
+  consumer_credit_bytes (0 = unlimited cannot fit a small ceiling), or raise the
+  ceiling. See docs/RAM_BUDGET.md for the worst-case formula.
 ```
 
-(The 64 MiB ceiling is a documented target met BY CONFIGURATION, not enforced by
-a boot guard today: see [RAM_BUDGET.md](RAM_BUDGET.md). The boot-guard residual is
-#115.)
+(The verdict is PROVABLE from the config, never a boot-time RSS reading: RSS at
+boot is near-zero and meaningless as a steady-state predictor. With a ceiling set
+the `ironbus_ram_headroom_bytes` gauge also reports a real `ceiling - RSS` value
+instead of the `-1` unset sentinel. See [RAM_BUDGET.md](RAM_BUDGET.md).)
 
 ### Coupled set 3: durability level vs the none-gate
 
@@ -503,6 +512,7 @@ consumer_credit_bytes = 8388608    # 8 MiB per-connection byte budget (0 = unlim
 max_in_flight = 1024               # per-group window
 max_connections = 256
 max_groups = 1024                  # 0 = unlimited
+ram_ceiling_bytes = 0              # 0 = off (edge-tiny sets 64 MiB); refuse-to-boot RAM guard (#115)
 
 [delivery]
 max_deliver = 5                    # 0/u32::MAX (unlimited) only with allow_unlimited_deliver
@@ -572,6 +582,7 @@ column is cross-referenced byte-for-byte against the `tiny` profile table in
 | `max_connections` (`--max-connections`) | `32` | `256` | `1024` |
 | `max_groups` (`--max-groups`) | `64` | `1024` | `4096` |
 | `max_in_flight` (`--max-in-flight`) | `256` | `1024` | `8192` |
+| `ram_ceiling_bytes` (`--ram-ceiling-bytes`) | `67108864` (64 MiB) | `0` (off) | `0` (off) |
 | `disk_full_policy` (`--disk-full-policy`) | `drop-new` | `drop-new` | `drop-oldest` |
 | `checkpoint_interval` (`--checkpoint-interval`) | `1024` | `1024` | `4096` |
 | `visibility_timeout_ms` (`--visibility-timeout-ms`) | `30000` | `30000` | `30000` |
@@ -589,7 +600,10 @@ One-line rationale each:
   `drop-oldest`. Its steady-state RAM sums to ~9 MiB, well under the 64 MiB edge
   ceiling (the per-term arithmetic is in [RAM_BUDGET.md](RAM_BUDGET.md) and
   [EDGE_CONSTRAINTS.md](EDGE_CONSTRAINTS.md)). The 8 MiB segment is the
-  `EDGE_SEGMENT_BYTES` value.
+  `EDGE_SEGMENT_BYTES` value. It also sets `ram_ceiling_bytes = 64 MiB`, which arms
+  the refuse-to-boot RAM guard (#115): its own caps fit (the worst-case
+  bounded-buffer footprint is well under 64 MiB), so it boots, but a blown-up cap
+  override (e.g. a server-sized `--max-connections`) is provably refused.
 - **`balanced`** is THE default, and is exactly the set of compiled-in
   `DEFAULT_*` constants in `main.rs` (64 MiB segments, 64 / 8 MiB consumer
   credits, 256 connections, 1024 groups, 1024 in-flight, `drop-new`, 1024

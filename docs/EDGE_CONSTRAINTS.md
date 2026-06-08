@@ -78,8 +78,8 @@ implies a field exists when it does not.
 | | | `consumer_credit` (`--consumer-credit`): per-connection un-acked MESSAGE count | `8` | [RAM_BUDGET.md](RAM_BUDGET.md), [#65](https://github.com/ELares/IronBus/issues/65) |
 | | | `max_connections` (`--max-connections`): bounds the in-flight set, the read buffers, and the per-connection thread stacks all at once | `32` | [RAM_BUDGET.md](RAM_BUDGET.md), [#105](https://github.com/ELares/IronBus/issues/105) |
 | | | `max_groups` (`--max-groups`) and `max_in_flight` (`--max-in-flight`): bound the per-group cursor + lease state | `64` and `256` | [RAM_BUDGET.md](RAM_BUDGET.md), [#240](https://github.com/ELares/IronBus/issues/240) / [#10](https://github.com/ELares/IronBus/issues/10) |
-| | | 64 MiB RSS ceiling itemized into a per-buffer budget with a refuse-to-boot guard | **SPECIFIED-NOT-YET-A-FIELD** (no boot guard, no RSS check) | [RAM_BUDGET.md](RAM_BUDGET.md), [#115](https://github.com/ELares/IronBus/issues/115) |
-| | | `mmap_max_bytes` (cap mapped pages) | **SPECIFIED-NOT-YET-A-FIELD**; N/A today (storage uses positional file IO, not mmap, so there are no uncounted mapped pages) | [RAM_BUDGET.md](RAM_BUDGET.md), [#115](https://github.com/ELares/IronBus/issues/115) |
+| | | 64 MiB RSS ceiling itemized into a per-buffer budget with a refuse-to-boot guard (`ram_ceiling_bytes` / `--ram-ceiling-bytes`) | `67108864` (64 MiB; SHIPPED #115: the guard refuses to boot when the worst-case bounded-buffer footprint provably exceeds it, and `ironbus_ram_headroom_bytes` reports a real value) | [RAM_BUDGET.md](RAM_BUDGET.md), [#115](https://github.com/ELares/IronBus/issues/115) |
+| | | `mmap_max_bytes` (cap mapped pages) | `0` (a no-op today: storage uses positional file IO, not mmap, so there are no uncounted mapped pages to cap) | [RAM_BUDGET.md](RAM_BUDGET.md), [#115](https://github.com/ELares/IronBus/issues/115) |
 | **CPU** (slow ARM core shared with the radio) | Per-record fsync and an expensive codec starve the core and the radio | Codec choice: lz4_flex (cheap, pure Rust) is the default codec; zstd (and its higher levels) is opt-in only, never on the default path | lz4_flex (on-disk compression NOT yet landed; codec reads `none` today) | [ADR-0003](adr/0003-default-compression-lz4-zstd-opt-in.md), [#12](https://github.com/ELares/IronBus/issues/12) |
 | | | CRC32C checksum (hardware-accelerated on aarch64), always on, every record | always on | [DURABILITY.md](DURABILITY.md), [#5](https://github.com/ELares/IronBus/issues/5) |
 | | | Group-commit batching: one `fdatasync` per drained batch, not per record (single-writer append actor, no thread-count knob) | always on (#177) | [DURABILITY.md](DURABILITY.md), [#6](https://github.com/ELares/IronBus/issues/6) |
@@ -99,10 +99,11 @@ Notes that keep the table honest:
   they are the safe path itself. They are in the table because #20 criterion 1
   asks for the knob that honors EACH limit, and for these limits the honoring
   thing is a fixed mechanism, not a configurable value.
-- Every `tiny` default in this table is a real, currently-accepted flag value
-  EXCEPT the two SPECIFIED-NOT-YET-A-FIELD rows (the RSS boot guard and
-  `mmap_max_bytes`). Those are the #115 enforcement residual, called out so the
-  table never invents a field.
+- Every `tiny` default in this table is now a real, currently-accepted flag value:
+  the RSS boot guard shipped as `--ram-ceiling-bytes` (#115, the `edge-tiny`
+  profile sets 64 MiB), and `mmap_max_bytes` is `0` (a no-op, since storage uses
+  positional IO with no mmap to cap). The table no longer carries a
+  SPECIFIED-NOT-YET-A-FIELD RAM row.
 - The thermal active response (shed before the device melts down) is SPECIFIED
   in [BACKPRESSURE.md](BACKPRESSURE.md) (CoDel sojourn shedding) and gated as a
   fail condition in [EDGE_RUN_DISCIPLINE.md](EDGE_RUN_DISCIPLINE.md); the
@@ -134,6 +135,7 @@ codec defaults the rest of #20 fixes.
 | Max connections | `--max-connections` | `32` | bounds the in-flight set, the read buffers, and the thread stacks |
 | Max groups | `--max-groups` | `64` | live work-groups (never `0` on the edge) |
 | Max in-flight | `--max-in-flight` | `256` | per-group delivery window |
+| RAM ceiling | `--ram-ceiling-bytes` | `67108864` (64 MiB) | the refuse-to-boot RAM guard (#115): the broker refuses to start if the worst-case bounded-buffer footprint provably exceeds this; arms `ironbus_ram_headroom_bytes` to a real value |
 | Disk-full policy | `--disk-full-policy` | `drop-new` | brownout-friendly shed; avoids drop-oldest force-reap writes |
 | Checkpoint interval | `--checkpoint-interval` | `1024` | cursor checkpoint cadence far below one write per ack; bounds post-crash redelivery |
 | Durability level | (always on, not a flag) | `sync` (ack-after-`fdatasync`) | power-loss-safe default; cannot be weakened from the CLI |
@@ -185,25 +187,31 @@ To be precise about what this section delivers versus what it does not:
   static binary with no external dependency.
 - **Shipped since (no longer residual):** the auto-selection mechanism is the
   `--profile edge-tiny` switch ([#87](https://github.com/ELares/IronBus/issues/87)),
-  which sets the values in this table for the operator. An `edge-tiny` edge-budget
-  CI gate (`crates/ironbus-cli/tests/edge_tiny_budget.rs`,
+  which sets the values in this table for the operator, AND the refuse-to-boot RAM
+  guard ([#115](https://github.com/ELares/IronBus/issues/115)): `--ram-ceiling-bytes`
+  (the `edge-tiny` profile sets 64 MiB) makes the broker refuse to start when the
+  worst-case bounded-buffer footprint provably exceeds the ceiling, and makes
+  `ironbus_ram_headroom_bytes` report a real `ceiling - RSS` value instead of the
+  `-1` sentinel. An `edge-tiny` edge-budget CI gate
+  (`crates/ironbus-cli/tests/edge_tiny_budget.rs`,
   [#118](https://github.com/ELares/IronBus/issues/118)) boots the real
   `serve --profile edge-tiny`, asserts these knobs are in effect via the #87
-  materialized-config startup line, and asserts the edge metrics are within budget:
-  `ironbus_write_amp_ratio` is under the `>= 4x fails` flash-endurance gate (the
-  flash-endurance row above), the byte counters advance with `physical >= logical`,
-  and `ironbus_ram_headroom_bytes` reports the honest `-1` sentinel.
-- **The #115 implementation residual (NOT claimed as done):** the itemized
-  per-buffer budget turned into a refuse-to-boot RSS guard (a `--ram-ceiling-bytes`
-  serve flag that would make `ironbus_ram_headroom_bytes` report a real number
-  rather than the `-1` sentinel), the per-topic RAM floor, and the `mmap_max_bytes=0`
-  assertion (a no-op today since storage uses positional IO, not mmap). The 64 MiB
-  ceiling is a documented target met BY CONFIGURATION today, not an invariant the
-  binary enforces; this is stated plainly in [RAM_BUDGET.md](RAM_BUDGET.md) and is
-  not re-claimed as enforced here. The precise RSS-under-64-MiB assertion is
-  therefore DEVICE-ONLY: the edge-budget CI gate above asserts the honest `-1`
-  sentinel and the write-amp budget that ARE meaningful on a shared runner, never a
-  flaky RSS number.
+  materialized-config startup line (including `ram_ceiling_bytes=67108864`), and
+  asserts the edge metrics are within budget: `ironbus_write_amp_ratio` is under the
+  `>= 4x fails` flash-endurance gate (the flash-endurance row above), the byte
+  counters advance with `physical >= logical`, and `ironbus_ram_headroom_bytes`
+  reports a REAL value (non-negative, under the 64 MiB ceiling), not the `-1`
+  sentinel.
+- **The #115 device residual (what stays device-only):** the PRECISE
+  RSS-under-64-MiB measurement under a real RAM burst. The boot guard proves the
+  CONFIGURED CAPS fit (a provable-from-config property the CI gate asserts via the
+  real headroom value), but a shared CI runner's measured RSS is not a meaningful or
+  stable edge signal, so the live RSS-under-ceiling measurement is exercised on the
+  reference device under the run discipline ([RAM_BUDGET.md](RAM_BUDGET.md),
+  [EDGE_RUN_DISCIPLINE.md](EDGE_RUN_DISCIPLINE.md)), never a flaky CI RSS number. The
+  per-topic RAM floor (a multi-queue concept) and the tighter read-buffer bound
+  remain open follow-ups; `mmap_max_bytes=0` is a no-op today (storage uses
+  positional IO, not mmap, so there are no mapped pages to cap).
 
 ---
 
@@ -400,10 +408,12 @@ design pinned with a clearly-named IMPLEMENTATION residual.
 
 The implementation residuals (design done, code follow-up) are:
 
-- the auto `--profile tiny` selection and the refuse-to-boot RSS guard /
-  per-topic floor ([#115](https://github.com/ELares/IronBus/issues/115),
-  [#17](https://github.com/ELares/IronBus/issues/17) /
-  [#87](https://github.com/ELares/IronBus/issues/87));
+- the `--profile edge-tiny` selection ([#87](https://github.com/ELares/IronBus/issues/87))
+  and the refuse-to-boot RAM guard (`--ram-ceiling-bytes`,
+  [#115](https://github.com/ELares/IronBus/issues/115)) are now SHIPPED; the
+  per-topic RAM floor (a multi-queue concept,
+  [#17](https://github.com/ELares/IronBus/issues/17)) and the tighter read-buffer
+  bound remain follow-ups;
 - the monotone-wall-clock wrapper, the persisted wall-clock anchor, and the
   `clock_step` event ([#117](https://github.com/ELares/IronBus/issues/117) /
   [#118](https://github.com/ELares/IronBus/issues/118));

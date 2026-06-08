@@ -103,6 +103,16 @@ const DEFAULT_ADDR: &str = "127.0.0.1:7777";
 const DEFAULT_FETCH: u32 = 10;
 /// The default connection cap for `serve`.
 const DEFAULT_MAX_CONNECTIONS: usize = 256;
+/// The default RAM ceiling for `serve` (#115, #19): `0` = UNSET (the refuse-to-boot RAM guard is OFF
+/// and `ironbus_ram_headroom_bytes` reports the `-1` sentinel). The `balanced` and `throughput`
+/// profiles inherit this `0`; only `edge-tiny` opts into a real ceiling ([`EDGE_TINY_RAM_CEILING`]).
+const DEFAULT_RAM_CEILING_BYTES: u64 = 0;
+/// The `edge-tiny` profile RAM ceiling (#115, #19, #115-residual): the 64 MiB resident budget
+/// `docs/RAM_BUDGET.md` and `docs/EDGE_CONSTRAINTS.md` size the tiny edge node against. With the
+/// edge-tiny knobs the worst-case bounded-buffer footprint is well under this (~13 MiB), so
+/// `--profile edge-tiny` boots; a blown-up `--max-connections` (or another over-cap) override pushes
+/// the provable worst case over 64 MiB and the refuse-to-boot guard rejects it.
+const EDGE_TINY_RAM_CEILING: u64 = 64 * 1024 * 1024;
 /// The default in-flight window for the `serve` engine.
 /// The default max-ack-pending window for `serve`.
 const DEFAULT_MAX_IN_FLIGHT: u32 = 1024;
@@ -316,6 +326,9 @@ struct ProfilePreset {
     visibility_ms: u64,
     /// `delivery.max_deliver` (`--max-deliver`).
     max_deliver: u32,
+    /// `resources.ram_ceiling_bytes` (`--ram-ceiling-bytes`): the refuse-to-boot RAM ceiling (#115).
+    /// `0` = UNSET (the guard is off) for `balanced`/`throughput`; `edge-tiny` sets the 64 MiB ceiling.
+    ram_ceiling_bytes: u64,
 }
 
 /// The `edge-tiny` preset: `docs/CONFIG.md` section 6, identical to the `tiny` table in
@@ -332,6 +345,10 @@ const EDGE_TINY_PRESET: ProfilePreset = ProfilePreset {
     checkpoint_interval: 1024,
     visibility_ms: 30_000,
     max_deliver: 5,
+    // The 64 MiB tiny-edge RAM ceiling (#115): with the edge-tiny knobs above the worst-case
+    // bounded-buffer footprint is ~13 MiB, so the refuse-to-boot guard lets edge-tiny boot, and a
+    // blown-up cap override (e.g. a server-sized --max-connections) is provably refused.
+    ram_ceiling_bytes: EDGE_TINY_RAM_CEILING,
 };
 
 /// The `balanced` preset: THE default, and EXACTLY the compiled-in `DEFAULT_*` constant set, so a
@@ -350,6 +367,9 @@ const BALANCED_PRESET: ProfilePreset = ProfilePreset {
     checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
     visibility_ms: DEFAULT_VISIBILITY_MS,
     max_deliver: DEFAULT_MAX_DELIVER,
+    // `balanced` leaves the RAM guard OFF (server-sized defaults are far over 64 MiB by design), so a
+    // zero-config broker is byte-identical to one that predates `--ram-ceiling-bytes`.
+    ram_ceiling_bytes: DEFAULT_RAM_CEILING_BYTES,
 };
 
 /// The `throughput` preset: `docs/CONFIG.md` section 6, wide buffers for a multi-core hub. 256 MiB
@@ -367,6 +387,9 @@ const THROUGHPUT_PRESET: ProfilePreset = ProfilePreset {
     checkpoint_interval: 4096,
     visibility_ms: 30_000,
     max_deliver: 5,
+    // `throughput` is a multi-core hub, not an edge node, so the RAM guard is OFF: its wide buffers
+    // are intentionally over 64 MiB and an operator on a hub sizes RAM out of band.
+    ram_ceiling_bytes: DEFAULT_RAM_CEILING_BYTES,
 };
 
 /// The smallest segment size cap `serve` accepts: below this, segments proliferate
@@ -1261,6 +1284,10 @@ struct ServeFlags {
     max_messages: Option<u64>,
     max_groups: Option<usize>,
     group_idle_evict_ms: Option<u64>,
+    /// The refuse-to-boot RAM ceiling in bytes (#115); `None` falls back to the profile preset (`0`
+    /// = off for `balanced`/`throughput`, 64 MiB for `edge-tiny`). When set, the broker refuses to
+    /// start if the worst-case bounded-buffer footprint provably exceeds it.
+    ram_ceiling_bytes: Option<u64>,
     /// The COUNT bound on each per-producer dedup window (#33); `None` falls back to the default.
     dedup_max_ids: Option<usize>,
     /// The TIME bound on each per-producer dedup window in ms (#33); `None` falls back to the default.
@@ -1337,6 +1364,9 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             "--max-groups" => f.max_groups = Some(take_number("--max-groups", args, &mut i)?),
             "--group-idle-evict-ms" => {
                 f.group_idle_evict_ms = Some(take_number("--group-idle-evict-ms", args, &mut i)?);
+            }
+            "--ram-ceiling-bytes" => {
+                f.ram_ceiling_bytes = Some(take_number("--ram-ceiling-bytes", args, &mut i)?);
             }
             "--dedup-max-ids" => {
                 f.dedup_max_ids = Some(take_number("--dedup-max-ids", args, &mut i)?);
@@ -1528,6 +1558,15 @@ fn parse_serve_flags_with_env(args: &[String], env: &EnvFn<'_>) -> Result<Parsed
                 env,
                 DEFAULT_GROUP_IDLE_EVICT_MS,
             )?,
+            // The refuse-to-boot RAM ceiling (#115): the profile preset supplies the default (0 = off
+            // for balanced/throughput, 64 MiB for edge-tiny), still overridable by env/flag, so an
+            // operator can set the ceiling to the device/cgroup limit or override the edge-tiny one.
+            ram_ceiling_bytes: resolve_number(
+                "--ram-ceiling-bytes",
+                f.ram_ceiling_bytes,
+                env,
+                preset.ram_ceiling_bytes,
+            )?,
             disk_full_policy,
             visibility_ms: resolve_number(
                 "--visibility-timeout-ms",
@@ -1641,7 +1680,54 @@ fn validate_serve_config(config: &ServeConfig) -> Result<(), CliError> {
             "`--visibility-timeout-ms` must be at least 1".to_string(),
         ));
     }
+    validate_ram_ceiling(config)?;
     Ok(())
+}
+
+/// The REFUSE-TO-BOOT RAM guard (#115, #19, #10): when `--ram-ceiling-bytes` is set (non-zero), the
+/// broker refuses to start if the WORST-CASE bounded-buffer footprint the configured caps imply
+/// PROVABLY exceeds the ceiling. The verdict is a pure function of the config (no live RSS, which at
+/// boot is near-zero and meaningless as a steady-state predictor): it sums the bounded RAM sources
+/// `docs/RAM_BUDGET.md` itemizes, each at its CONFIGURED cap, so a refusal is a proof from the config
+/// that the caps cannot fit, not a guess. The error names the worst case, the ceiling, the overage,
+/// and the knobs that drive it, so an operator knows exactly which cap to lower. `0` (the default for
+/// `balanced`/`throughput`) disables the guard; `edge-tiny`'s 64 MiB ceiling fits (~13 MiB worst
+/// case) but a blown-up cap override (e.g. a server-sized `--max-connections`) is refused here.
+fn validate_ram_ceiling(config: &ServeConfig) -> Result<(), CliError> {
+    // `usize` -> `u64` is lossless on every supported (32/64-bit) target; the saturating fallback is
+    // belt-and-braces so a hypothetical >u64 platform could only ever make the worst case LARGER (more
+    // likely to refuse), never spuriously fit.
+    let footprint = ironbus_server::rss::RamFootprintConfig {
+        ram_ceiling_bytes: config.ram_ceiling_bytes,
+        max_connections: u64::try_from(config.max_connections).unwrap_or(u64::MAX),
+        consumer_credit: u64::from(config.consumer_credit),
+        consumer_credit_bytes: config.consumer_credit_bytes,
+        max_groups: u64::try_from(config.max_groups).unwrap_or(u64::MAX),
+        max_in_flight: u64::from(config.max_in_flight),
+    };
+    match ironbus_server::rss::fits_under_ram_ceiling(&footprint) {
+        ironbus_server::rss::RamCeilingVerdict::Disabled
+        | ironbus_server::rss::RamCeilingVerdict::Fits { .. } => Ok(()),
+        ironbus_server::rss::RamCeilingVerdict::Exceeds {
+            worst_case_bytes,
+            ceiling_bytes,
+            overage_bytes,
+        } => Err(CliError::Usage(format!(
+            "`--ram-ceiling-bytes` {ceiling_bytes} is below the worst-case bounded-buffer footprint \
+             {worst_case_bytes} the configured caps imply (over by {overage_bytes} bytes): the \
+             broker cannot prove it stays under the ceiling, so it refuses to boot. Lower \
+             `--max-connections` ({max_connections}), `--consumer-credit-bytes` \
+             ({consumer_credit_bytes}; 0 = unlimited, which cannot fit a small ceiling), \
+             `--consumer-credit` ({consumer_credit}), `--max-groups` ({max_groups}), or \
+             `--max-in-flight` ({max_in_flight}), or raise the ceiling. See docs/RAM_BUDGET.md for \
+             the worst-case formula.",
+            max_connections = config.max_connections,
+            consumer_credit_bytes = config.consumer_credit_bytes,
+            consumer_credit = config.consumer_credit,
+            max_groups = config.max_groups,
+            max_in_flight = config.max_in_flight,
+        ))),
+    }
 }
 
 /// The broker tuning knobs parsed from the `serve` flags.
@@ -1710,6 +1796,15 @@ struct ServeConfig {
     /// durable per-group checkpoint is never deleted, so a re-subscribe resumes; only fully-caught-up
     /// groups are evicted, so a consumer's committed position is never lost.
     group_idle_evict_ms: u64,
+    /// The refuse-to-boot RAM ceiling in BYTES (#115, #19, #10), wired into
+    /// [`EngineConfig::ram_ceiling_bytes`]. `0` = UNSET (the default for `balanced`/`throughput`):
+    /// the guard is off and `ironbus_ram_headroom_bytes` reports the `-1` sentinel. When set
+    /// (`edge-tiny` sets 64 MiB), the broker refuses to start if the WORST-CASE bounded-buffer
+    /// footprint the configured caps imply (`max_connections` * the per-connection in-flight + read
+    /// buffers, plus the per-group state and the fixed overhead; see
+    /// `ironbus_server::rss::worst_case_buffer_bytes`) PROVABLY exceeds it, and the headroom gauge
+    /// reports a real `ceiling - RSS` value.
+    ram_ceiling_bytes: u64,
     /// The disk-full overflow policy (#82): `DropNew` (the default) sheds an over-cap produce,
     /// `DropOldest` force-reaps the oldest sealed segment to make room then accepts it. Honored only
     /// when `max_total_bytes` is set; with no cap, no produce is ever over-cap.
@@ -1781,6 +1876,7 @@ impl ServeConfig {
             max_messages: DEFAULT_MAX_MESSAGES,
             max_groups: DEFAULT_MAX_GROUPS,
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
+            ram_ceiling_bytes: DEFAULT_RAM_CEILING_BYTES,
             disk_full_policy: DiskFullPolicyArg::DropNew,
             visibility_ms: DEFAULT_VISIBILITY_MS,
             enable_admin: false,
@@ -1926,7 +2022,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: &Path) -
          group_idle_evict_ms={} checkpoint_interval={} max_deliver={} \
          allow_unlimited_deliver={} disk_full_policy={policy} visibility_timeout_ms={} \
          max_retained_bytes={} max_age_ms={} max_messages={} health_liveness_window_ms={} \
-         enable_admin={}",
+         enable_admin={} ram_ceiling_bytes={}",
         config.profile.name(),
         config.profile_schema_version,
         config.max_connections,
@@ -1946,6 +2042,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: &Path) -
         config.max_messages,
         config.health_liveness_window_ms,
         config.enable_admin,
+        config.ram_ceiling_bytes,
         data_dir = data_dir.display(),
     )
 }
@@ -2239,6 +2336,11 @@ fn cmd_serve(
         config.max_messages,
         config.max_groups,
         config.group_idle_evict_ms,
+        // The #115 refuse-to-boot RAM ceiling is read only on the Unix serve path (it wires the
+        // engine's ram_ceiling_bytes and drives the boot guard), so the non-Unix stub must consume it
+        // too or the Windows `-D warnings` build trips field-never-read, invisible to a macOS reviewer
+        // (the recurring #288/#99 footgun).
+        config.ram_ceiling_bytes,
         config.enable_admin,
         // The #95 health knobs are read only on the Unix serve path, so the non-Unix stub must
         // consume them too or the Windows `-D warnings` build trips field-never-read, invisible to a
@@ -2336,11 +2438,13 @@ fn open_disk_engine(
             // durable checkpoint, so a re-subscribe resumes; only caught-up groups are evicted, so a
             // consumer's committed position is never lost.
             group_idle_evict_ms: config.group_idle_evict_ms,
-            // The OPT-IN RAM-headroom ceiling for the `ironbus_ram_headroom_bytes` edge gauge (#118),
-            // OFF (`0`) by default. A dedicated `serve` flag to set it (and the daily-write-budget
-            // knob on the log) is a small follow-up; both are reachable today via the library config
-            // and echoed on `/admin`.
-            ram_ceiling_bytes: 0,
+            // The refuse-to-boot RAM ceiling (#115, #19), wired from `--ram-ceiling-bytes` (or the
+            // profile preset: 0 = off for balanced/throughput, 64 MiB for edge-tiny). `0` leaves the
+            // guard off and `ironbus_ram_headroom_bytes` at the `-1` sentinel; a set ceiling makes the
+            // gauge report a real `ceiling - RSS` value AND is enforced before this point by
+            // `validate_serve_config` (which refuses to boot when the worst-case bounded-buffer
+            // footprint provably exceeds it).
+            ram_ceiling_bytes: config.ram_ceiling_bytes,
             // The disk-full overflow policy (#82): drop-new (default) sheds, drop-oldest force-reaps
             // the oldest sealed segment then accepts. Honored only when `max_total_bytes` is set.
             disk_full_policy: match config.disk_full_policy {
@@ -3874,6 +3978,7 @@ mod tests {
             max_messages: DEFAULT_MAX_MESSAGES,
             max_groups: DEFAULT_MAX_GROUPS,
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
+            ram_ceiling_bytes: DEFAULT_RAM_CEILING_BYTES,
             disk_full_policy: DiskFullPolicyArg::DropNew,
             visibility_ms: DEFAULT_VISIBILITY_MS,
             enable_admin: false,
@@ -4124,6 +4229,11 @@ mod tests {
             line.contains("disk_full_policy=drop-new"),
             "the policy: {line}"
         );
+        // The edge-tiny RAM ceiling (#115) carried through: 64 MiB, the refuse-to-boot guard's bound.
+        assert!(
+            line.contains("ram_ceiling_bytes=67108864"),
+            "the edge-tiny 64 MiB RAM ceiling: {line}"
+        );
         assert!(line.contains("addr=127.0.0.1:7777"), "the addr: {line}");
         assert!(
             line.contains("data_dir=/var/lib/ironbus"),
@@ -4144,6 +4254,12 @@ mod tests {
         assert_eq!(Profile::Balanced.preset(), BALANCED_PRESET);
         assert_eq!(BALANCED_PRESET.max_connections, DEFAULT_MAX_CONNECTIONS);
         assert_eq!(BALANCED_PRESET.max_segment_bytes, DEFAULT_MAX_SEGMENT_BYTES);
+        // The RAM ceiling (#115): only edge-tiny opts into the 64 MiB refuse-to-boot guard; the
+        // server-sized balanced/throughput presets leave it OFF (0).
+        assert_eq!(EDGE_TINY_PRESET.ram_ceiling_bytes, EDGE_TINY_RAM_CEILING);
+        assert_eq!(EDGE_TINY_PRESET.ram_ceiling_bytes, 64 * 1024 * 1024);
+        assert_eq!(BALANCED_PRESET.ram_ceiling_bytes, 0);
+        assert_eq!(THROUGHPUT_PRESET.ram_ceiling_bytes, 0);
     }
 
     /// Builds a real on-disk data directory with `n` durable records via the engine, for
@@ -5191,6 +5307,7 @@ mod tests {
             max_messages: DEFAULT_MAX_MESSAGES,
             max_groups: DEFAULT_MAX_GROUPS,
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
+            ram_ceiling_bytes: DEFAULT_RAM_CEILING_BYTES,
             disk_full_policy: DiskFullPolicyArg::DropNew,
             visibility_ms: DEFAULT_VISIBILITY_MS,
             enable_admin: false,
@@ -5235,6 +5352,110 @@ mod tests {
                 validate_serve_config(&cfg).is_ok(),
                 "unlimited max_deliver={max} should be accepted with the opt-in"
             );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_config_with_no_ram_ceiling() {
+        // The default ceiling is 0 (unset): the refuse-to-boot guard is OFF, so the server-sized
+        // balanced defaults (far over 64 MiB by design) validate cleanly.
+        let cfg = validation_config();
+        assert_eq!(cfg.ram_ceiling_bytes, 0);
+        assert!(validate_serve_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_edge_tiny_caps_under_the_64_mib_ceiling() {
+        // The edge-tiny knobs (32 conns, 256 KiB byte budget, 64 groups, 256 in-flight) under the
+        // 64 MiB ceiling: the worst-case bounded-buffer footprint (~13 MiB) fits, so the broker boots.
+        let cfg = ServeConfig {
+            max_connections: 32,
+            consumer_credit: 8,
+            consumer_credit_bytes: 256 * 1024,
+            max_groups: 64,
+            max_in_flight: 256,
+            ram_ceiling_bytes: EDGE_TINY_RAM_CEILING,
+            ..validation_config()
+        };
+        assert!(
+            validate_serve_config(&cfg).is_ok(),
+            "edge-tiny caps fit under the 64 MiB ceiling, so the broker must boot"
+        );
+    }
+
+    #[test]
+    fn validate_refuses_to_boot_when_a_blown_up_cap_exceeds_the_ceiling() {
+        // The edge-tiny ceiling but a server-sized --max-connections override: 4096 * 256 KiB of
+        // in-flight bytes alone is 1 GiB, provably over 64 MiB, so the guard refuses to boot (exit 1)
+        // and the usage message names the overage and the knob to lower.
+        let cfg = ServeConfig {
+            max_connections: 4096,
+            consumer_credit: 8,
+            consumer_credit_bytes: 256 * 1024,
+            max_groups: 64,
+            max_in_flight: 256,
+            ram_ceiling_bytes: EDGE_TINY_RAM_CEILING,
+            ..validation_config()
+        };
+        match validate_serve_config(&cfg) {
+            Err(CliError::Usage(m)) => {
+                assert!(m.contains("--ram-ceiling-bytes"), "{m}");
+                assert!(m.contains("refuses to boot"), "{m}");
+                assert!(m.contains("over by"), "names the overage: {m}");
+                assert!(
+                    m.contains("--max-connections"),
+                    "names the knob to lower: {m}"
+                );
+                // A usage error maps to the frozen exit code 1.
+                assert_eq!(CliError::Usage(m).exit_code(), EXIT_USAGE);
+            }
+            other => panic!("a 4096-connection edge-tiny override must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_refuses_an_unlimited_byte_budget_under_a_tiny_ceiling() {
+        // consumer_credit_bytes = 0 (OFF) means the only term-1 bound is the message COUNT, so the
+        // worst case is consumer_credit maximal frames per connection: under a 64 MiB ceiling this
+        // cannot be PROVEN to fit and is refused (the honest, conservative reading).
+        let cfg = ServeConfig {
+            max_connections: 32,
+            consumer_credit: DEFAULT_CONSUMER_CREDIT,
+            consumer_credit_bytes: 0,
+            ram_ceiling_bytes: EDGE_TINY_RAM_CEILING,
+            ..validation_config()
+        };
+        match validate_serve_config(&cfg) {
+            Err(CliError::Usage(m)) => assert!(m.contains("--ram-ceiling-bytes"), "{m}"),
+            other => panic!(
+                "an unlimited byte budget under a tiny ceiling must be refused, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn serve_parses_the_ram_ceiling_bytes_flag() {
+        // The flag takes a value and feeds the guard: a tiny ceiling with the (huge) balanced defaults
+        // is refused to boot, proving the flag parsed and reached the guard rather than being an
+        // unknown flag or a no-op.
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-ram-ceiling-test".to_string(),
+                "--ram-ceiling-bytes".to_string(),
+                "1048576".to_string(), // 1 MiB: the balanced server defaults cannot fit.
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        match e {
+            CliError::Usage(m) => assert!(
+                m.contains("--ram-ceiling-bytes") && m.contains("refuses to boot"),
+                "the flag parsed and the guard refused the over-ceiling default config: {m}"
+            ),
+            other => panic!("expected the ram-ceiling refuse-to-boot usage error, got {other:?}"),
         }
     }
 
