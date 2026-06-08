@@ -1,0 +1,29 @@
+{
+  "now_unix_secs": 1700000000,
+  "runs": [
+    {
+      "device": "edge-min-pi4",
+      "unix_secs": 1700000000,
+      "throughput_msgs_per_sec": 61000.0,
+      "p99_us": 5200.0,
+      "p999_us": 9100.0,
+      "warmup_cov_ok": true
+    },
+    {
+      "device": "edge-min-pi4",
+      "unix_secs": 1699913600,
+      "throughput_msgs_per_sec": 60500.0,
+      "p99_us": 5100.0,
+      "p999_us": 9000.0,
+      "warmup_cov_ok": true
+    },
+    {
+      "device": "edge-mid-rk3399",
+      "unix_secs": 1700000000,
+      "throughput_msgs_per_sec": 121000.0,
+      "p99_us": 4050.0,
+      "p999_us": 8100.0,
+      "warmup_cov_ok": true
+    }
+  ]
+}

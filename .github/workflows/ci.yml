@@ -87,6 +87,44 @@ jobs:
           path: ${{ runner.temp }}/acceptance-summary.json
           if-no-files-found: warn
 
+  regression-gate:
+    name: perf regression gate (#114)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: regression-gate
+      # The rolling-median performance regression gate (#114). It compares the per-device 7-day
+      # median throughput / p99 / p99.9 of the current run history against the last released tag's
+      # baseline and FAILS only on an un-ratified regression (throughput median down > 10%, p99 median
+      # up > 15%, p99.9 median up > 25%); warm-up-CoV-failed runs are advisory-only and an edge
+      # regression needs a human --ratify to block. The gate's fire/no-op/advisory/ratify logic is
+      # unit + binary tested (the lib `regression` tests and `tests/regression_gate_cli.rs`), run by
+      # the workspace `test` job above; this job additionally EXECUTES the shipped gate binary against
+      # the checked-in history fixture to prove the END-TO-END wiring. IMPORTANT: there is NO released
+      # tag / baseline history yet (v0.1.0 is the maintainer's action), so with no `--baseline` the
+      # gate GRACEFULLY NO-OPS (exit 0, logged "no baseline history yet") rather than failing. Once a
+      # release archives a baseline JSON, pass it via `--baseline` and the gate begins enforcing. The
+      # LIVE per-device numbers come from the #111 macro-bench run on the reference edge device, which
+      # is a documented device residual, not a CI run; this job validates the GATE, not the runs.
+      - name: run the regression gate against the checked-in history (no baseline yet => no-op)
+        run: |
+          set -euo pipefail
+          cargo run --locked -p ironbus-bench --bin ironbus-regression-gate -- \
+            --history crates/ironbus-bench/tests/fixtures/regression-history.json \
+            | tee gate-output.txt
+          # Until the first release archives a baseline, assert the gate took the documented no-op
+          # path rather than silently doing something else. This line changes to a real --baseline
+          # invocation (dropping this grep) the moment a baseline JSON exists.
+          if ! grep -q 'no baseline history yet' gate-output.txt; then
+            echo "::error::the regression gate did not take the expected no-baseline no-op path"
+            exit 1
+          fi
+          echo "ok: regression gate no-ops gracefully with no baseline history (exit 0)"
+
   msrv:
     name: msrv (1.78)
     runs-on: ubuntu-latest
