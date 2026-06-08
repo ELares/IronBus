@@ -17,14 +17,25 @@ RAM SLO row, measured by the macro-bench harness).
 
 Read this before the arithmetic, because it changes how you should read it:
 
-- **The 64 MiB ceiling is NOT enforced in code.** There is no runtime RSS
-  check, no refuse-to-boot guard that compares measured RSS plus the configured
-  caps against a ceiling, and no automatic `tiny`/edge profile that sets
-  edge-safe defaults. The only RSS-aware code in the tree is the macro-bench
-  probe (`crates/ironbus-bench/src/probe.rs`, `rss_bytes`), which *measures*
-  steady-state RSS during a benchmark run; it does not gate anything. The
-  ceiling is, today, a documented target you meet by choosing knobs, not an
-  invariant the binary holds for you.
+- **A RAM ceiling is now ENFORCED by a refuse-to-boot guard (#115).** When
+  `ram_ceiling_bytes` is set (the `--ram-ceiling-bytes` serve flag; the
+  `edge-tiny` profile sets it to 64 MiB), the broker computes the WORST-CASE
+  bounded-buffer footprint the configured caps imply (the formula below) and
+  REFUSES to start, with a usage error (exit 1) naming the overage and the knobs
+  to lower, when that worst case provably exceeds the ceiling. The verdict is
+  PROVABLE from the config, NOT a live boot-time RSS reading: RSS at boot is
+  near-zero and meaningless as a steady-state predictor, so the guard asserts only
+  what the caps prove (the bounded-buffer sum either can or cannot fit), never a
+  guess. With a ceiling set, the `ironbus_ram_headroom_bytes` gauge also reports a
+  real `ceiling - RSS` headroom instead of the `-1` unset sentinel. The
+  default is `0` = UNSET (the guard is off for `balanced`/`throughput`), so a
+  zero-config broker is unchanged. The implementation is in
+  `ironbus_server::rss::worst_case_buffer_bytes` / `fits_under_ram_ceiling` and the
+  CLI `validate_ram_ceiling`. The only OTHER RSS-aware code is the macro-bench probe
+  (`crates/ironbus-bench/src/probe.rs`, `rss_bytes`), which *measures* steady-state
+  RSS during a benchmark run; the precise on-device RSS-under-ceiling measurement
+  stays a device residual (a shared CI runner's RSS is not meaningful), so the guard
+  asserts the provable-from-config fit, not the live RSS magnitude.
 - **The default knob values are NOT edge-safe.** Shipped as-is, the
   per-connection and per-connection-times-`max_connections` worst cases are far
   over 64 MiB (the arithmetic is below: the consumer byte budget alone is
@@ -33,7 +44,8 @@ Read this before the arithmetic, because it changes how you should read it:
 - **There is no mmap in storage.** Segments are read and written through
   positional file IO (`write_all_at` / `read_at`), not a memory map, so there
   are no uncounted mapped pages. The #115 design sketch's `mmap_max_bytes=0`
-  knob does not exist because there is nothing to set it on.
+  knob is therefore a no-op (there is nothing to set it on), so the guard does
+  not model an mmap term: term 4 (the active segment) is ~0 in RSS.
 
 The itemized per-buffer budget, the refuse-to-boot guard, the per-topic floor,
 and the auto edge profile that [#115](https://github.com/ELares/IronBus/issues/115)
@@ -360,6 +372,50 @@ per connection (`32 * 16 KiB = 512 KiB`). Even fully saturated, term 1 stays
 ~8.5 MiB, so the steady-state budget is robust; the read buffers (term 2) are
 the only term that can spike, and only under an adversarial maximal-frame load.
 
+## The refuse-to-boot RAM guard: the worst-case formula it enforces
+
+When `ram_ceiling_bytes` is set (`--ram-ceiling-bytes`; `edge-tiny` sets 64 MiB),
+the broker REFUSES to start if the worst-case bounded-buffer footprint the
+configured caps imply provably exceeds the ceiling. The footprint is a CLOSED
+formula in the config (no live RSS), summing the FIRMLY-BOUNDED terms above:
+
+```
+worst_case = term1 + term3 + term5
+
+term1 (per-connection in-flight payloads, the firm RAM bound)
+     = max_connections * per_conn_inflight
+  where per_conn_inflight = consumer_credit_bytes              if it is set, else
+                            consumer_credit * MAX_FRAME_LEN     if it is 0 (UNLIMITED)
+term3 (per-group cursor + lease state)
+     = max_groups * max_in_flight * PER_LEASE_BYTES (~64 bytes)
+term5 (fixed overhead + one OS-thread stack per connection)
+     = FIXED_OVERHEAD_BYTES (~4 MiB)
+     + max_connections * PER_CONNECTION_STACK_BYTES (~64 KiB resident)
+```
+
+WHY this is PROVABLE-FROM-CONFIG and not a boot RSS guess: every term is a
+CONFIGURED cap multiplied to its maximum, so the sum is the largest the bounded
+buffers can ever be under that config. RSS at boot is near-zero (no connections,
+no in-flight), so it predicts nothing about the steady-state ceiling the caps
+imply; the guard therefore asserts only what the caps prove. A
+`consumer_credit_bytes` of `0` (the byte budget OFF) has NO byte-side bound, so the
+only provable bound is the message COUNT times a maximal frame, which a small
+ceiling cannot fit, so such a config is honestly refused rather than waved through.
+
+WHAT THE GUARD DELIBERATELY DOES NOT CHARGE, and why: **term 2, the per-connection
+read buffer**, is bounded only by `max_connections * MAX_FRAME_LEN` (~514 MiB at
+`max_connections = 32`), NOT by any credit knob, because `MAX_FRAME_LEN` is a
+protocol constant, not a `serve` knob. As the worst-case-read-buffer caveat above
+explains, that ~514 MiB is the ADVERSARIAL spike, realized only if every connection
+is simultaneously mid-assembly of a near-maximal frame, and is explicitly NOT part
+of the steady-state budget that sums under 64 MiB; bounding it tightly needs an
+on-the-wire record-size cap (the read-buffer follow-up). Charging it would refuse
+EVERY edge config, including the worked `edge-tiny` one this doc proves fits, so the
+guard sums the firmly-bounded steady-state terms (1, 3, 5) the budget itemizes.
+For the `edge-tiny` profile the worst case is ~15 MiB (8 MiB term1 + ~1 MiB term3 +
+~6 MiB term5), well under 64 MiB, so it boots; a blown-up `--max-connections` (or a
+`0` byte budget) pushes it over and is refused.
+
 ## What enforces this, and what does not
 
 | Mechanism | Status in code |
@@ -372,17 +428,17 @@ the only term that can spike, and only under an adversarial maximal-frame load.
 | `MAX_FRAME_LEN` frame cap | ENFORCED before allocation (frame.rs) |
 | `dedup_max_producers` producer-window cap | ENFORCED (LRU eviction, `DedupRegistry::make_room_for`, #33) |
 | `MAX_PRODUCER_ID_LEN` / `MAX_MSG_ID_LEN` id caps | ENFORCED (typed wire-boundary rejection, `Session::handle_pub`, #33) |
-| 64 MiB RSS ceiling | NOT ENFORCED (no boot guard, no runtime RSS check) |
-| Edge-safe defaults / auto `tiny` profile | NOT PRESENT (defaults are server-sized) |
-| `mmap_max_bytes` | N/A (no mmap in storage) |
+| RAM ceiling refuse-to-boot guard | ENFORCED when `ram_ceiling_bytes` is set (`fits_under_ram_ceiling`, CLI `validate_ram_ceiling`, #115); `ram_headroom_bytes` then reports a real value |
+| Edge `tiny` profile (`--profile edge-tiny`) | SHIPPED (#87); also sets `ram_ceiling_bytes = 64 MiB` to arm the guard |
+| `mmap_max_bytes` | N/A (no mmap in storage; the `=0` tiny knob is a no-op) |
 | Per-topic RAM floor + reject-on-no-budget | NOT PRESENT (single queue today) |
 
-The itemized-and-enforced budget, the refuse-to-boot guard, and the auto edge
-profile are the open work in
-[#115](https://github.com/ELares/IronBus/issues/115) /
-[#20](https://github.com/ELares/IronBus/issues/20) /
-[#87](https://github.com/ELares/IronBus/issues/87) /
-[#117](https://github.com/ELares/IronBus/issues/117). Until then, the budget is
-met by configuration: use the worked values above (or the
-[EDGE_TUNING.md](EDGE_TUNING.md) profile) rather than the shipped defaults on a
-64 MiB node.
+The refuse-to-boot guard and the edge profile are now implemented
+([#115](https://github.com/ELares/IronBus/issues/115),
+[#87](https://github.com/ELares/IronBus/issues/87)); the per-topic RAM floor (a
+multi-queue concept) and the tighter read-buffer bound remain open
+([#20](https://github.com/ELares/IronBus/issues/20) /
+[#117](https://github.com/ELares/IronBus/issues/117)). For a 64 MiB node, run
+`--profile edge-tiny` (which sets both the edge-safe knobs and the 64 MiB ceiling)
+rather than the shipped server defaults; the guard then refuses any override that
+would not fit.

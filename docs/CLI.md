@@ -94,6 +94,7 @@ broker opens.
 | `--max-age-ms <ms>` | u64 | `0` = off (`DEFAULT_MAX_AGE_MS`) | milliseconds | Age-based retention: reap a fully-consumed sealed segment whose newest record is older than this. |
 | `--max-messages <n>` | u64 | `0` = off (`DEFAULT_MAX_MESSAGES`) | messages | Count-based retention: reap oldest fully-consumed sealed segments while the total durable record count exceeds this bound. |
 | `--max-groups <n>` | usize | `1024` (`DEFAULT_MAX_GROUPS`, aliased to `ironbus_server::engine::DEFAULT_MAX_GROUPS`); `0` = unlimited | count | Cap on live work-groups. A new NAMED group past the cap is rejected; the default group is exempt and never counted. |
+| `--ram-ceiling-bytes <n>` | u64 | `0` = unset (`DEFAULT_RAM_CEILING_BYTES`; the `edge-tiny` profile sets `67108864` = 64 MiB) | bytes | The refuse-to-boot RAM ceiling (#115, #19). `0` leaves the guard OFF and `ironbus_ram_headroom_bytes` reports the `-1` sentinel. When set, the broker REFUSES to start (usage error, exit 1, naming the overage) if the WORST-CASE bounded-buffer footprint the configured caps imply provably exceeds it, and the `ironbus_ram_headroom_bytes` gauge reports a real `ceiling - RSS` headroom. The worst case is provable from the CONFIG (`max_connections * consumer_credit_bytes` in-flight payloads, plus the per-group cursor/lease state and a fixed overhead), NOT a boot-time RSS reading (RSS at boot is near-zero and meaningless). See `docs/RAM_BUDGET.md` for the formula. |
 | `--disk-full-policy <drop-new\|drop-oldest>` | enum | `drop-new` (`DEFAULT_DISK_FULL_POLICY`) | n/a | What an over-cap produce does once `--max-total-bytes` is hit. `drop-new` sheds it (preserving older data); `drop-oldest` force-reaps the oldest sealed segment to make room then accepts it. Any other value is a usage error. |
 | `--key-shared-group <name>` | string, REPEATABLE | none (empty) | n/a | Run the named competing group in `key_shared` ordering: a record's key routes to one live member, so same-key records keep order while the group drains in parallel across keys. Pass once per group; a group not named stays plain competing. |
 | `--broadcast-group <name>` | string, REPEATABLE | none (empty) | n/a | Mark a NAMED group BROADCAST (#288): a group-of-one that sees every record in order, so it accepts the `cumulative-ack` verb. The group MUST be named: the DEFAULT/empty group (`--broadcast-group ""`) cannot be a broadcast group (its consumers never SUB a name, so the group-of-one subscriber cap could not bind it) and is rejected as a startup usage error. Mutually exclusive with `key_shared`. A broadcast group is enforced as a true group-of-one: it accepts AT MOST ONE active subscriber (a second concurrent SUB is rejected). Pass once per group; a group not named stays plain competing and rejects cumulative ack. An empty/bad name or the group cap is a startup usage error. |
@@ -114,6 +115,13 @@ broker opens.
 - `--max-segment-bytes` must be at least 4096.
 - `--visibility-timeout-ms` must be at least 1.
 - `--disk-full-policy` must be `drop-new` or `drop-oldest`.
+- `--ram-ceiling-bytes`, when set (non-zero), must be at or above the WORST-CASE bounded-buffer
+  footprint the configured caps imply, or the broker REFUSES to boot with a usage error that names
+  the worst case, the ceiling, the overage, and the knobs to lower (`--max-connections`,
+  `--consumer-credit-bytes`, `--consumer-credit`, `--max-groups`, `--max-in-flight`). `0` (the
+  default for `balanced`/`throughput`) disables the guard; `edge-tiny`'s 64 MiB ceiling fits its
+  caps (a blown-up override is what trips it). The check is provable from the config, never a live
+  RSS reading. See `docs/RAM_BUDGET.md`.
 - `--health-addr` that resolves to a NON-LOOPBACK address (including the wildcards `0.0.0.0` /
   `::`, or a hostname that resolves to a routable IP) is REFUSED unless `--health-allow-public` is
   also set: the health surface is unauthenticated and unencrypted, so a fail-closed startup error
@@ -155,6 +163,7 @@ flag for that same knob overrides it). With no `--profile`, the default profile 
 | `--max-messages` | `IRONBUS_MAX_MESSAGES` |
 | `--max-groups` | `IRONBUS_MAX_GROUPS` |
 | `--group-idle-evict-ms` | `IRONBUS_GROUP_IDLE_EVICT_MS` |
+| `--ram-ceiling-bytes` | `IRONBUS_RAM_CEILING_BYTES` |
 | `--disk-full-policy` | `IRONBUS_DISK_FULL_POLICY` |
 | `--visibility-timeout-ms` | `IRONBUS_VISIBILITY_TIMEOUT_MS` |
 | `--health-addr` | `IRONBUS_HEALTH_ADDR` |
@@ -200,7 +209,7 @@ operator can see exactly what the broker is running (and a profile content chang
 auditable across an upgrade):
 
 ```
-materialized-config profile=<name> profile_schema_version=<n> addr=<addr> data_dir=<dir> max_connections=<n> max_segment_bytes=<n> ... enable_admin=<bool>
+materialized-config profile=<name> profile_schema_version=<n> addr=<addr> data_dir=<dir> max_connections=<n> max_segment_bytes=<n> ... enable_admin=<bool> ram_ceiling_bytes=<n>
 ```
 
 If `--health-addr` is set, it also prints:
