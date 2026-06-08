@@ -85,6 +85,7 @@ resume" below), so it is NOT fsynced on every ack.
 | `--visibility-timeout-ms <n>` | `30000` | How long a delivered message stays in flight before it may redeliver. Must be at least 1. The lease hard cap is the larger of 5 minutes and this. |
 | `--dedup-max-ids <n>` | `100000` | The count bound on each per-producer effectively-once dedup window: the most `(msg_id, offset)` entries one producer keeps before the oldest is evicted. Dedup is OFF until a producer opts in by sending a `msg_id`; this only sizes the window when it does. Floored to 1. See "Effectively-once dedup" below. |
 | `--dedup-window-ms <ms>` | `120000` (2 min) | The time bound on each per-producer dedup window, in milliseconds of monotonic time: an entry older than this is evicted regardless of the count bound. `0` disables the time bound (only the count bound applies). |
+| `--dedup-max-producers <n>` | `4096` | The cap on the NUMBER of distinct per-producer dedup windows. The `producer_id` is wire-supplied, so this bounds the TOTAL dedup memory: a fresh `producer_id` over the cap evicts the least-recently-active window (an approximate LRU), so a flood of distinct ids cannot grow RAM without bound. Floored to 1. |
 | `--health-addr <host:port>` | off | If set, also serve the health and metrics HTTP endpoints on this loopback port. |
 
 For the exhaustive flag map (value types, every default cited to its `main.rs` constant, and
@@ -174,6 +175,13 @@ monotonic `epoch`: a HIGHER epoch fences an older zombie session reusing the sam
 `producer_id`. Dedup is SESSION-scoped (in-memory) and lost on broker restart by default.
 The `ironbus_dedup_hits_total` and `ironbus_dedup_out_of_window_total` metrics expose the
 hit and out-of-window rates.
+
+The TOTAL dedup memory is hard-bounded: the number of distinct producer windows is capped at
+`--dedup-max-producers` (default 4096) with least-recently-active LRU eviction (a flood of
+distinct, attacker-chosen `producer_id`s cannot grow RAM without bound), and the `producer_id`
+and `msg_id` are each capped at 256 bytes (an oversized id is rejected with a typed error, the
+connection stays open). The worst-case bound is `max_producers * max_ids * per_entry`; see
+[RAM_BUDGET.md](RAM_BUDGET.md) for the arithmetic and the edge-safe knob values.
 
 ## Consume
 

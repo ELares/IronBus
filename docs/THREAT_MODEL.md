@@ -186,6 +186,7 @@ contains controls that actually run.
 | 30s idle read/write timeout on every connection | `CONNECTION_TIMEOUT`, `server.rs` | T7 (slowloris) |
 | Frame length validated before allocation, hard 16 MiB + 64 KiB cap | `decode_frame_with_cap`, `frame.rs` | T7 (oversized-frame DoS) |
 | Named-group cap (default 1024) + name validation (1 to 128 graphic-ASCII) | `validate_group_name` / `poll_in`, `engine.rs` | T7 (group-name memory exhaustion, #240) |
+| Dedup producer-window cap (default 4096) with LRU eviction + 256-byte `producer_id`/`msg_id` caps | `DedupRegistry::make_room_for`, `dedup.rs`; `Session::handle_pub`, `session.rs` | T7 (distinct-`producer_id` dedup memory exhaustion, #33) |
 | Per-consumer credit (default 64) bounds one connection's in-flight set | `Session` credit / `leased`, `session.rs` | T7 (one consumer starving peers, #65) |
 | Durable-log byte cap + drop-new shed; consumer-safe retention reaper | `Log` byte cap / `Log::reap`, `engine.rs` | T7 (disk exhaustion, #10 / #13) |
 | Record body CRC32C (+ xxh3-64 for large records); CRC'd dual-slot checkpoint | `codec` / `checkpoint.rs` | T-file (bit-rot / torn write integrity) |

@@ -7647,6 +7647,7 @@ mod tests {
             dedup: ironbus_core::dedup::DedupConfig {
                 max_ids,
                 window_nanos,
+                ..ironbus_core::dedup::DedupConfig::default()
             },
             ..config(10, 5)
         }

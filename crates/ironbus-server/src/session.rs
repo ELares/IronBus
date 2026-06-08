@@ -19,14 +19,15 @@
 use crate::actor::{ActorGone, EngineAccess, OwnedAppend, OwnedDedup, ProduceOutcome};
 use crate::engine::{AckResult, EngineError, NackResult, Poll, ProgressResult};
 use ironbus_core::clock::Clock;
+use ironbus_core::dedup::{MAX_MSG_ID_LEN, MAX_PRODUCER_ID_LEN};
 use ironbus_core::keyshared::{KeyOrdering, MemberId};
 use ironbus_core::lease::LeaseToken;
 use ironbus_core::types::Offset;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
     decode_ack, decode_cumulative_ack, decode_pub, decode_sub, encode_dead_letter, encode_deliver,
-    encode_truncated, AckOp, DeadLetterBody, DeliverBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER,
-    PUB_FLAG_HAS_DEDUP,
+    encode_pub_ack, encode_truncated, AckOp, DeadLetterBody, DeliverBody, PubAckBody,
+    TruncatedBody, DEAD_LETTER_MAX_DELIVER, PUB_FLAG_HAS_DEDUP,
 };
 use ironbus_storage::fs::Filesystem;
 use std::collections::HashMap;
@@ -348,6 +349,21 @@ impl Session {
             reply_err(out, "malformed pub body");
             return Ok(());
         };
+        // Enforce the dedup id length caps (#33) at the wire boundary, BEFORE the bytes cross into
+        // owned storage. The `producer_id` keys the per-producer window map and the `msg_id` keys the
+        // per-window ring; both are wire-supplied and attacker-chosen (up to the 64 KiB wire field
+        // limit), so an unbounded id would bloat per-entry memory. A too-long id is a typed,
+        // connection-preserving rejection (NOT a panic, NOT a frame change), like a malformed body.
+        if let Some(d) = msg.dedup.as_ref() {
+            if d.producer_id.len() > MAX_PRODUCER_ID_LEN {
+                reply_err(out, "producer_id too long");
+                return Ok(());
+            }
+            if d.msg_id.len() > MAX_MSG_ID_LEN {
+                reply_err(out, "msg_id too long");
+                return Ok(());
+            }
+        }
         // Hand the produce to the append actor as an OWNED payload (the wire body borrows the
         // connection's input buffer, which the actor cannot hold) and AWAIT its outcome. The reply
         // arrives only after the covering group-commit fsync, so the PubAck is ack-implies-durable
@@ -373,7 +389,7 @@ impl Session {
         };
         match engine.produce(append)? {
             ProduceOutcome::Appended(offset) => {
-                reply(out, FrameType::PubAck, &offset.get().to_le_bytes());
+                reply_pub_ack(out, FrameType::PubAck, offset);
                 Ok(())
             }
             // A BENIGN dedup hit (#33): the `msg_id` was already in the producer's window, so the
@@ -381,7 +397,7 @@ impl Session {
             // body is untouched). It is a SUCCESS (`rc = 0`, `duplicate = true`), never an error, so an
             // idempotent retry over a lossy edge link does not loop.
             ProduceOutcome::AppendedDuplicate(offset) => {
-                reply(out, FrameType::PubAckDuplicate, &offset.get().to_le_bytes());
+                reply_pub_ack(out, FrameType::PubAckDuplicate, offset);
                 Ok(())
             }
             // A stale-epoch fence (#33): a zombie session reused an old `producer_id` with an epoch
@@ -1036,6 +1052,21 @@ fn reply(out: &mut Vec<u8>, frame_type: FrameType, body: &[u8]) {
 
 fn reply_err(out: &mut Vec<u8>, message: &str) {
     reply(out, FrameType::Err, message.as_bytes());
+}
+
+/// Emits a publish-ack reply (`PubAck` for a fresh produce, `PubAckDuplicate` for a #33 dedup hit)
+/// via the shared [`encode_pub_ack`] codec, so the wire body and the codec cannot drift: both frame
+/// types share the exact 8-byte LE offset body the codec produces. The frame type alone distinguishes
+/// a fresh ack from a benign dedup hit; the frozen `PubAck` body is unchanged.
+fn reply_pub_ack(out: &mut Vec<u8>, frame_type: FrameType, offset: Offset) {
+    let mut body = Vec::with_capacity(8);
+    encode_pub_ack(
+        &PubAckBody {
+            offset: offset.get(),
+        },
+        &mut body,
+    );
+    reply(out, frame_type, &body);
 }
 
 #[cfg(test)]
@@ -2218,6 +2249,79 @@ mod tests {
             e.engine_mut().flushed_offset().get(),
             1,
             "the fenced produce appended nothing"
+        );
+    }
+
+    #[test]
+    fn an_oversized_producer_id_is_rejected_at_the_wire_boundary() {
+        // The #33 memory-exhaustion length cap: a producer_id over MAX_PRODUCER_ID_LEN is rejected
+        // with a typed Err (the connection stays open) and appends nothing, so a hostile 64 KiB id
+        // never reaches the dedup map as a key. A producer_id exactly at the cap is accepted.
+        let e = DirectEngine::new(engine());
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        let too_long = vec![b'p'; MAX_PRODUCER_ID_LEN + 1];
+        s.process(
+            &e,
+            &frame(FrameType::Pub, &dedup_pub_body(&too_long, 1, b"m", b"v")),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Err,
+            "an oversized producer_id is a typed rejection"
+        );
+        assert_eq!(
+            e.engine_mut().flushed_offset().get(),
+            0,
+            "the rejected produce appended nothing"
+        );
+        out.clear();
+        // A producer_id exactly at the cap is fine (the boundary is inclusive).
+        let at_cap = vec![b'p'; MAX_PRODUCER_ID_LEN];
+        s.process(
+            &e,
+            &frame(FrameType::Pub, &dedup_pub_body(&at_cap, 1, b"m", b"v")),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::PubAck,
+            "at-cap is accepted"
+        );
+    }
+
+    #[test]
+    fn an_oversized_msg_id_is_rejected_at_the_wire_boundary() {
+        // The msg_id length cap mirror of the producer_id cap: an oversized msg_id is a typed
+        // rejection and appends nothing.
+        let e = DirectEngine::new(engine());
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        let too_long = vec![b'm'; MAX_MSG_ID_LEN + 1];
+        s.process(
+            &e,
+            &frame(FrameType::Pub, &dedup_pub_body(b"p1", 1, &too_long, b"v")),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Err,
+            "an oversized msg_id is a typed rejection"
+        );
+        assert_eq!(
+            e.engine_mut().flushed_offset().get(),
+            0,
+            "the rejected produce appended nothing"
         );
     }
 

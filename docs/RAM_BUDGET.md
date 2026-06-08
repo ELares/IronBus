@@ -229,22 +229,51 @@ per_producer_dedup <= dedup_max_ids * (msg_id_len + ~2 * (Vec/HashMap entry over
 ```
 
 Each entry stores a `msg_id` (`Vec<u8>`, bounded by `MAX_MSG_ID_LEN` = **256
-bytes**), a `u64` offset, and a `u64` insertion instant, held in both the order
-queue and the lookup map. For a generous estimate at the default cap with
-modest 32-byte ids, that is `100_000 * (32 + ~64) ~= 9-10 MiB` PER opted-in
-producer; with the worst-case 256-byte id it is on the order of `100_000 * ~320
-~= 30 MiB`. This term is therefore SIZED BY the count bound, so an edge profile
-that opts into dedup must either lower `--dedup-max-ids` or rely on the time
-bound to keep the live window small. The number of distinct live producer
-windows is bounded by the connection count and the natural churn of the
-windows (an idle producer's entries age out under the time bound). The structure
+bytes**, enforced as a typed rejection at the wire boundary in
+`Session::handle_pub`), a `u64` offset, and a `u64` insertion instant, held in
+both the order queue and the lookup map. For a generous estimate at the default
+cap with modest 32-byte ids, that is `100_000 * (32 + ~64) ~= 9-10 MiB` PER
+opted-in producer; with the worst-case 256-byte id it is on the order of
+`100_000 * ~320 ~= 30 MiB`. This term is therefore SIZED BY the count bound, so
+an edge profile that opts into dedup must either lower `--dedup-max-ids` or rely
+on the time bound to keep the live window small.
+
+**The TOTAL is hard-bounded too.** The `producer_id` is wire-supplied and
+attacker-chosen, so the NUMBER of distinct producer windows is NOT bounded by
+the connection count (one connection can present an unbounded stream of distinct
+`producer_id`s). It is bounded by `--dedup-max-producers` (default **4,096**,
+`DedupConfig::max_producers`, floored to 1): a fresh `producer_id` over the cap
+evicts the LEAST-RECENTLY-ACTIVE producer window (an approximate LRU keyed on
+each window's last-touch monotonic instant), and fully time-expired windows are
+reaped opportunistically first, so an idle producer does not pin a slot until the
+LRU forces it. Evicting a window only drops dedup state for the least-active
+producer, which then falls back to at-least-once for that producer (already the
+contract for an aged/evicted id), so eviction is safe. The `producer_id` itself
+is bounded by `MAX_PRODUCER_ID_LEN` = **256 bytes** (the same typed wire-boundary
+rejection), so a single id cannot be the 64 KiB wire field maximum. The TOTAL
+dedup memory is therefore:
+
+```
+total_dedup <= max_producers * max_ids * (msg_id_len + ~2 * entry overhead)
+             + max_producers * producer_id_len
+```
+
+At the SHIPPED defaults with the worst-case 256-byte ids, the absolute ceiling is
+`4_096 * 100_000 * ~320 bytes ~= 122 GiB` (plus `4_096 * 256 ~= 1 MiB` of keys),
+which is the honest worst case the count knobs must be lowered against for a
+64 MiB edge node, NOT a steady-state figure. With edge-sized knobs (e.g.
+`--dedup-max-ids 4096`, `--dedup-max-producers 256`, 32-byte ids) the ceiling is
+`256 * 4_096 * ~96 ~= 96 MiB`; lower `--dedup-max-ids` further (e.g. 1024) for
+`~24 MiB`. The point is that the bound is now a CLOSED formula in the three knobs,
+independent of how many distinct `producer_id`s an attacker sends. The structure
 is pure and IO-free (the monotonic `now` comes through the clock seam), and it
 is SESSION-scoped: lost on broker restart by default, so it never grows across
 restarts.
 
 A defensive default for a 64 MiB edge box is to LOWER `--dedup-max-ids` (e.g. to
-a few thousand) when enabling dedup, sizing the count bound to the realistic
-in-flight retry depth rather than the 100k default; the 2-minute time bound then
+a few thousand) AND `--dedup-max-producers` (e.g. to a few hundred) when enabling
+dedup, sizing the count bound to the realistic in-flight retry depth and the
+producer fan-in rather than the shipped defaults; the 2-minute time bound then
 caps how long any id lingers regardless.
 
 ## A worked tiny-profile configuration that fits under 64 MiB
@@ -341,6 +370,8 @@ the only term that can spike, and only under an adversarial maximal-frame load.
 | `max_groups` group cap | ENFORCED (`EngineError::TooManyGroups`, #240) |
 | `max_in_flight` per-group window | ENFORCED (`Engine::poll` window) |
 | `MAX_FRAME_LEN` frame cap | ENFORCED before allocation (frame.rs) |
+| `dedup_max_producers` producer-window cap | ENFORCED (LRU eviction, `DedupRegistry::make_room_for`, #33) |
+| `MAX_PRODUCER_ID_LEN` / `MAX_MSG_ID_LEN` id caps | ENFORCED (typed wire-boundary rejection, `Session::handle_pub`, #33) |
 | 64 MiB RSS ceiling | NOT ENFORCED (no boot guard, no runtime RSS check) |
 | Edge-safe defaults / auto `tiny` profile | NOT PRESENT (defaults are server-sized) |
 | `mmap_max_bytes` | N/A (no mmap in storage) |

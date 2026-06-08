@@ -38,7 +38,20 @@
 //! Each live producer holds at most [`DedupConfig::max_ids`] entries; each entry is a
 //! `Vec<u8>` `msg_id` plus a `u64` offset plus a `u64` insertion instant, indexed twice (a
 //! FIFO order queue and a lookup map). The per-producer worst case is bounded by `max_ids`
-//! and the `msg_id` length cap; see `docs/RAM_BUDGET.md`.
+//! and the `msg_id` length cap.
+//!
+//! The TOTAL memory is hard-bounded too (#33). The `producer_id` is wire-supplied and
+//! attacker-chosen, so the NUMBER of distinct producer windows must be capped or a peer that
+//! sends endless distinct `producer_id`s grows broker RAM without bound. The registry caps the
+//! count of tracked windows at [`DedupConfig::max_producers`] (default
+//! [`DEFAULT_MAX_PRODUCERS`]) and, when a fresh `producer_id` would exceed the cap, evicts the
+//! LEAST-RECENTLY-ACTIVE window (an approximate LRU keyed on each window's last-touch monotonic
+//! instant). Evicting a window only loses dedup state for the least-active producer, which then
+//! falls back to at-least-once for that producer (already the contract for an aged/evicted id),
+//! so eviction is safe. Fully time-expired windows are reaped opportunistically first, so an
+//! idle producer does not pin a slot until the LRU cap forces it. The TOTAL worst case is thus
+//! `max_producers * max_ids * per_entry`, with each `producer_id` itself bounded by
+//! [`MAX_PRODUCER_ID_LEN`]; see `docs/RAM_BUDGET.md`.
 
 use crate::types::Offset;
 use std::collections::HashMap;
@@ -59,6 +72,20 @@ pub const DEFAULT_WINDOW_NANOS: u64 = 120 * 1_000_000_000;
 /// oversized id before it is stored. Generous for any real idempotency key.
 pub const MAX_MSG_ID_LEN: usize = 256;
 
+/// The hard cap on a `producer_id`'s length in bytes. The `producer_id` is wire-supplied and
+/// attacker-chosen, and it is the KEY of the producer-window map; without a cap a single id could
+/// be up to the wire `u16` field limit (64 KiB), so this bounds the per-window key memory and
+/// rejects a hostile oversized id at the engine boundary before it is stored (a typed rejection,
+/// never a panic). Generous for any real producer identity (a UUID, a hostname, a session token).
+pub const MAX_PRODUCER_ID_LEN: usize = 256;
+
+/// The default cap on the NUMBER of distinct producer windows the registry tracks at once (#33).
+/// The `producer_id` is attacker-chosen, so the count of windows must be bounded or a peer sending
+/// endless distinct `producer_id`s grows broker RAM without bound. When a fresh `producer_id` would
+/// exceed this cap, the least-recently-active window is evicted (an approximate LRU). Sized so a
+/// realistic fan-in of producers all keep their windows, while a flood is hard-bounded.
+pub const DEFAULT_MAX_PRODUCERS: usize = 4096;
+
 /// The dedup window tunables: the dual count + time bound (#33). A `0` `max_ids` is NOT a
 /// way to disable the count bound (a zero count bound would remember nothing and so dedup
 /// nothing); the engine floors it to 1. A `0` `window_nanos` DOES disable the TIME bound
@@ -73,15 +100,23 @@ pub struct DedupConfig {
     /// on the next touch of the producer's window, independent of the count bound. `0`
     /// disables the time bound (only the count bound applies).
     pub window_nanos: u64,
+    /// The cap on the NUMBER of distinct producer windows tracked at once (the TOTAL-memory
+    /// bound, #33): the `producer_id` is attacker-chosen, so the count of windows must be capped
+    /// or a flood of distinct ids grows RAM without bound. A fresh `producer_id` over this cap
+    /// evicts the least-recently-active window (an approximate LRU). Floored to 1 by
+    /// [`DedupRegistry::new`] (a zero producer bound would track nothing). Default
+    /// [`DEFAULT_MAX_PRODUCERS`].
+    pub max_producers: usize,
 }
 
 impl Default for DedupConfig {
     /// The spec defaults: [`DEFAULT_MAX_IDS`] ids OR [`DEFAULT_WINDOW_NANOS`] (2 min),
-    /// whichever is hit first.
+    /// whichever is hit first, across at most [`DEFAULT_MAX_PRODUCERS`] distinct producers.
     fn default() -> DedupConfig {
         DedupConfig {
             max_ids: DEFAULT_MAX_IDS,
             window_nanos: DEFAULT_WINDOW_NANOS,
+            max_producers: DEFAULT_MAX_PRODUCERS,
         }
     }
 }
@@ -128,15 +163,28 @@ struct ProducerWindow {
     order: VecDeque<(Vec<u8>, u64)>,
     /// O(1) lookup from `msg_id` to its `(offset, insertion_instant_nanos)`.
     index: HashMap<Vec<u8>, (Offset, u64)>,
+    /// The monotonic instant this window was last touched (checked or recorded), the LRU recency
+    /// key for the [`DedupConfig::max_producers`] cap: when a fresh `producer_id` would exceed the
+    /// cap, the window with the smallest `last_touch` is evicted. Updated on every `check`/`record`
+    /// for the producer, so an actively-used window is never the eviction victim while idle ones
+    /// exist.
+    last_touch: u64,
 }
 
 impl ProducerWindow {
-    fn new(epoch: u64) -> ProducerWindow {
+    fn new(epoch: u64, now: u64) -> ProducerWindow {
         ProducerWindow {
             epoch,
             order: VecDeque::new(),
             index: HashMap::new(),
+            last_touch: now,
         }
+    }
+
+    /// Whether the window holds no live entries (fully empty or fully time-expired), so it pins no
+    /// dedup state and can be reaped without losing any protection.
+    fn is_empty(&self) -> bool {
+        self.index.is_empty()
     }
 
     /// Drops every entry older than the time bound (front of the FIFO), returning whether any
@@ -187,9 +235,10 @@ impl ProducerWindow {
 
 /// The per-producer dedup registry: the broker-side owner of every live producer window
 /// (#33). Held by the engine and consulted on the produce path; pure and IO-free (the
-/// caller supplies monotonic `now`). The number of distinct live producers is bounded by
-/// the caller's connection count and the natural churn of the windows; each window is
-/// bounded by [`DedupConfig::max_ids`].
+/// caller supplies monotonic `now`). The number of distinct live producer windows is HARD-bounded
+/// by [`DedupConfig::max_producers`] with LRU eviction (a flood of attacker-chosen `producer_id`s
+/// cannot grow it without bound); each window is bounded by [`DedupConfig::max_ids`] and the time
+/// bound, so the TOTAL memory is `max_producers * max_ids * per_entry`.
 #[derive(Debug)]
 pub struct DedupRegistry {
     config: DedupConfig,
@@ -197,14 +246,16 @@ pub struct DedupRegistry {
 }
 
 impl DedupRegistry {
-    /// Creates an empty registry with `config`. The count bound is floored to 1 (a zero count
-    /// bound would remember no id and dedup nothing).
+    /// Creates an empty registry with `config`. The count bound and the producer-count bound are
+    /// each floored to 1 (a zero count bound would remember no id and dedup nothing; a zero
+    /// producer bound would track no producer).
     #[must_use]
     pub fn new(config: DedupConfig) -> DedupRegistry {
         DedupRegistry {
             config: DedupConfig {
                 max_ids: config.max_ids.max(1),
                 window_nanos: config.window_nanos,
+                max_producers: config.max_producers.max(1),
             },
             producers: HashMap::new(),
         }
@@ -220,6 +271,56 @@ impl DedupRegistry {
     #[must_use]
     pub fn producer_count(&self) -> usize {
         self.producers.len()
+    }
+
+    /// Reaps every producer window that aged FULLY empty under the time bound, so an idle producer
+    /// does not pin a slot against the [`DedupConfig::max_producers`] cap until the LRU forces it.
+    /// A no-op when the time bound is disabled (`window_nanos == 0`, ids never age out). `now` is
+    /// monotonic, so the per-window `evict_expired` never underflows. Returns nothing; it only
+    /// shrinks the map.
+    fn reap_empty_windows(&mut self, now: u64) {
+        let window_nanos = self.config.window_nanos;
+        if window_nanos == 0 {
+            return;
+        }
+        self.producers.retain(|_, window| {
+            window.evict_expired(window_nanos, now);
+            !window.is_empty()
+        });
+    }
+
+    /// Ensures there is room for ONE MORE producer window before inserting `producer_id`, enforcing
+    /// the [`DedupConfig::max_producers`] TOTAL-memory cap (#33). If `producer_id` is already
+    /// tracked, this is a no-op (a re-touch never needs a slot). Otherwise, if the map is at the
+    /// cap, it first reaps fully time-expired windows (free room without losing any live state),
+    /// then, if still at the cap, evicts the LEAST-RECENTLY-active window (the smallest
+    /// `last_touch`) so the new producer fits. Evicting a window only drops dedup state for the
+    /// least-active producer, which falls back to at-least-once (already the contract), so this is
+    /// safe. Pure: no IO, no panic (the `min_by_key`/`remove` are guarded by the at-cap check).
+    fn make_room_for(&mut self, producer_id: &[u8], now: u64) {
+        if self.producers.contains_key(producer_id) {
+            return;
+        }
+        let cap = self.config.max_producers;
+        if self.producers.len() < cap {
+            return;
+        }
+        // First try to free a slot for nothing by reaping fully time-expired (now-empty) windows.
+        self.reap_empty_windows(now);
+        // If reaping was not enough (or the time bound is off), evict the least-recently-active
+        // window. `min_by_key` over a non-empty map yields a key; clone it so the borrow ends
+        // before the remove.
+        while self.producers.len() >= cap {
+            let Some(victim) = self
+                .producers
+                .iter()
+                .min_by_key(|(_, window)| window.last_touch)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.producers.remove(&victim);
+        }
     }
 
     /// Decides what a produce carrying `producer_id` / `epoch` / `msg_id` should do, at
@@ -247,10 +348,17 @@ impl DedupRegistry {
     ) -> DedupDecision {
         let max_ids = self.config.max_ids;
         let window_nanos = self.config.window_nanos;
+        // Enforce the producer-count cap BEFORE inserting a (possibly new) window, so the registry
+        // never holds more than `max_producers` windows: a flood of distinct attacker-chosen
+        // `producer_id`s evicts the least-recently-active window rather than growing without bound.
+        self.make_room_for(producer_id, now);
         let window = self
             .producers
             .entry(producer_id.to_vec())
-            .or_insert_with(|| ProducerWindow::new(epoch));
+            .or_insert_with(|| ProducerWindow::new(epoch, now));
+        // Touch the recency clock: this window is the most-recently-active, so it is not the LRU
+        // eviction victim while idle windows exist.
+        window.last_touch = now;
 
         // Epoch fencing: a stale epoch is rejected; a newer epoch supersedes the old session.
         if epoch < window.epoch {
@@ -286,10 +394,14 @@ impl DedupRegistry {
     pub fn record(&mut self, producer_id: &[u8], msg_id: &[u8], offset: Offset, now: u64) {
         let max_ids = self.config.max_ids;
         let window_nanos = self.config.window_nanos;
+        // Enforce the producer-count cap before a (possibly new) window is inserted: `record` for a
+        // never-checked producer would otherwise grow the map past the cap.
+        self.make_room_for(producer_id, now);
         let window = self
             .producers
             .entry(producer_id.to_vec())
-            .or_insert_with(|| ProducerWindow::new(0));
+            .or_insert_with(|| ProducerWindow::new(0, now));
+        window.last_touch = now;
         // A re-record of a live id updates the map in place; the stale order-queue entry is
         // skipped at eviction time by the instant guard, so it never double-removes a live id.
         window.index.insert(msg_id.to_vec(), (offset, now));
@@ -313,6 +425,7 @@ mod tests {
         DedupRegistry::new(DedupConfig {
             max_ids: 4,
             window_nanos: 1_000,
+            ..DedupConfig::default()
         })
     }
 
@@ -403,6 +516,7 @@ mod tests {
         let mut r = DedupRegistry::new(DedupConfig {
             max_ids: 8,
             window_nanos: 0,
+            ..DedupConfig::default()
         });
         r.record(b"", b"m1", Offset::new(1), 0);
         // Even far in the future the id is a duplicate (only the count bound applies).
@@ -419,6 +533,7 @@ mod tests {
         let r = DedupRegistry::new(DedupConfig {
             max_ids: 0,
             window_nanos: 0,
+            ..DedupConfig::default()
         });
         assert_eq!(r.config().max_ids, 1);
     }
@@ -479,6 +594,7 @@ mod tests {
         let mut r = DedupRegistry::new(DedupConfig {
             max_ids: 100,
             window_nanos: 0,
+            ..DedupConfig::default()
         });
         for t in 0..50u64 {
             r.record(b"", b"same", Offset::new(t), t);
@@ -490,6 +606,165 @@ mod tests {
             DedupDecision::Duplicate {
                 offset: Offset::new(49)
             }
+        );
+    }
+
+    #[test]
+    fn the_producer_count_is_floored_to_one() {
+        let r = DedupRegistry::new(DedupConfig {
+            max_ids: 4,
+            window_nanos: 0,
+            max_producers: 0,
+        });
+        assert_eq!(r.config().max_producers, 1);
+    }
+
+    #[test]
+    fn the_producer_count_is_hard_bounded_under_a_flood_of_distinct_producer_ids() {
+        // The #33 memory-exhaustion regression: a peer driving MANY distinct producer_ids must NOT
+        // grow the registry without bound. With the LRU producer cap the count stays <= the cap no
+        // matter how many distinct ids arrive. This test FAILS on the pre-fix (unbounded) code,
+        // where producer_count would equal the number of distinct ids driven.
+        let max_producers = 16;
+        let mut r = DedupRegistry::new(DedupConfig {
+            max_ids: 4,
+            window_nanos: 0, // time bound off, so only the LRU cap can bound the producer count
+            max_producers,
+        });
+        // Drive 10x the cap of distinct producer_ids, each recording one id.
+        for i in 0..(max_producers as u64 * 10) {
+            let pid = format!("producer-{i}");
+            assert!(matches!(
+                r.check(pid.as_bytes(), 0, b"m", i),
+                DedupDecision::Fresh { .. }
+            ));
+            r.record(pid.as_bytes(), b"m", Offset::new(i), i);
+            // The registry is HARD-bounded at every step, never past the cap.
+            assert!(
+                r.producer_count() <= max_producers,
+                "producer_count {} exceeded the cap {max_producers}",
+                r.producer_count()
+            );
+        }
+        assert_eq!(
+            r.producer_count(),
+            max_producers,
+            "the registry holds exactly the cap of windows after the flood"
+        );
+    }
+
+    #[test]
+    fn an_evicted_producers_later_duplicate_is_treated_as_fresh() {
+        // LRU-eviction safety: once a producer's window is evicted to honor the cap, a later repeat
+        // of its id is a genuinely-FRESH produce (at-least-once fallback), NEVER a false dedup hit
+        // against stale state. The earliest producer is the LRU victim under the flood.
+        let max_producers = 4;
+        let mut r = DedupRegistry::new(DedupConfig {
+            max_ids: 4,
+            window_nanos: 0,
+            max_producers,
+        });
+        // The victim records an id at t=0, making it the least-recently-active.
+        r.check(b"victim", 0, b"id", 0);
+        r.record(b"victim", b"id", Offset::new(7), 0);
+        assert_eq!(
+            r.check(b"victim", 0, b"id", 1),
+            DedupDecision::Duplicate {
+                offset: Offset::new(7)
+            },
+            "the victim's id is a duplicate while its window is still live"
+        );
+        // Fill the cap with NEWER producers, each more-recently-active than the victim, forcing the
+        // victim out by LRU.
+        for i in 0..max_producers as u64 {
+            let pid = format!("newer-{i}");
+            let t = 10 + i;
+            r.check(pid.as_bytes(), 0, b"x", t);
+            r.record(pid.as_bytes(), b"x", Offset::new(100 + i), t);
+        }
+        assert_eq!(r.producer_count(), max_producers);
+        // The victim's window was evicted, so its id now reads FRESH (no false dedup, at-least-once).
+        assert_eq!(
+            r.check(b"victim", 0, b"id", 100),
+            DedupDecision::Fresh {
+                out_of_window: false
+            },
+            "an evicted producer's id falls back to at-least-once, never a stale false dedup"
+        );
+    }
+
+    #[test]
+    fn an_active_producer_is_not_evicted_while_idle_ones_exist() {
+        // LRU correctness: a continuously-active producer must survive the cap pressure; the IDLE
+        // producers are the eviction victims, not the hot one.
+        let max_producers = 4;
+        let mut r = DedupRegistry::new(DedupConfig {
+            max_ids: 4,
+            window_nanos: 0,
+            max_producers,
+        });
+        // "hot" records an id early, then is re-touched LAST so it is the most-recently-active.
+        r.check(b"hot", 0, b"keep", 0);
+        r.record(b"hot", b"keep", Offset::new(42), 0);
+        // Fill the rest of the cap with idle producers (touched once, never again).
+        for i in 0..(max_producers as u64 - 1) {
+            let pid = format!("idle-{i}");
+            let t = 1 + i;
+            r.check(pid.as_bytes(), 0, b"x", t);
+            r.record(pid.as_bytes(), b"x", Offset::new(200 + i), t);
+        }
+        assert_eq!(r.producer_count(), max_producers);
+        // Re-touch hot so it is the most recently active, then drive a flood of NEW producers. Each
+        // new one evicts the least-recently-active, which is always an idle producer, never hot.
+        r.check(b"hot", 0, b"keep", 1_000);
+        for i in 0..(max_producers as u64 * 4) {
+            let pid = format!("flood-{i}");
+            let t = 1_001 + i;
+            r.check(pid.as_bytes(), 0, b"y", t);
+            r.record(pid.as_bytes(), b"y", Offset::new(300 + i), t);
+            // Re-touch hot each round so it stays the freshest and is never the victim.
+            r.check(b"hot", 0, b"keep", t + 1);
+        }
+        // hot survived: its id is still a live duplicate at its original offset.
+        assert_eq!(
+            r.check(b"hot", 0, b"keep", 100_000),
+            DedupDecision::Duplicate {
+                offset: Offset::new(42)
+            },
+            "the continuously-active producer is never the LRU victim"
+        );
+    }
+
+    #[test]
+    fn a_fully_time_expired_window_is_reaped_so_it_does_not_pin_a_slot() {
+        // Empty-window reaping: an idle producer whose entries all aged out under the time bound is
+        // reaped opportunistically when the cap is reached, freeing a slot WITHOUT evicting a live
+        // window. Here the cap is 2: one expired idle window and one fresh window, then a third
+        // producer reaps the expired one rather than evicting the fresh one.
+        let mut r = DedupRegistry::new(DedupConfig {
+            max_ids: 4,
+            window_nanos: 1_000,
+            max_producers: 2,
+        });
+        // p_old records at t=0; it will fully age out by t=2000.
+        r.check(b"p_old", 0, b"a", 0);
+        r.record(b"p_old", b"a", Offset::new(1), 0);
+        // p_live records recently so it must NOT be reaped or evicted.
+        r.check(b"p_live", 0, b"b", 1_900);
+        r.record(b"p_live", b"b", Offset::new(2), 1_900);
+        assert_eq!(r.producer_count(), 2);
+        // A third producer at t=2000: p_old's only entry has aged out (>= 1000 ns old), so the
+        // empty-window reap drops p_old and the new producer fits without evicting p_live.
+        r.check(b"p_new", 0, b"c", 2_000);
+        r.record(b"p_new", b"c", Offset::new(3), 2_000);
+        assert_eq!(r.producer_count(), 2, "still at the cap");
+        // p_live survived the reap (it was not expired), so its id is still a live duplicate.
+        assert_eq!(
+            r.check(b"p_live", 0, b"b", 2_001),
+            DedupDecision::Duplicate {
+                offset: Offset::new(2)
+            },
+            "the live window survived; only the fully-expired idle one was reaped"
         );
     }
 }

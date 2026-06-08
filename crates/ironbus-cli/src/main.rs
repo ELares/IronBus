@@ -167,6 +167,12 @@ const DEFAULT_DEDUP_MAX_IDS: usize = ironbus_core::dedup::DEFAULT_MAX_IDS;
 /// applies). Monotonic time, so an NTP step never mis-expires the window.
 const DEFAULT_DEDUP_WINDOW_MS: u64 = ironbus_core::dedup::DEFAULT_WINDOW_NANOS / 1_000_000;
 
+/// The default cap on the NUMBER of distinct per-producer dedup windows for `serve` (#33), aliased to
+/// the engine's [`ironbus_core::dedup::DEFAULT_MAX_PRODUCERS`] so the CLI and engine default stay one
+/// source of truth. The `producer_id` is wire-supplied, so this caps the TOTAL dedup memory: a fresh
+/// `producer_id` over the cap evicts the least-recently-active window. Floored to 1 by the engine.
+const DEFAULT_DEDUP_MAX_PRODUCERS: usize = ironbus_core::dedup::DEFAULT_MAX_PRODUCERS;
+
 /// The disk-full overflow policy parsed from `serve --disk-full-policy` (#82). A platform-neutral,
 /// `Copy` mirror of the engine's policy enum, so it lives in the (non-Unix-gated) `ServeConfig` and
 /// is validated on every platform; the Unix on-disk path maps it to the engine's `DiskFullPolicy`.
@@ -1055,6 +1061,9 @@ struct ServeFlags {
     dedup_max_ids: Option<usize>,
     /// The TIME bound on each per-producer dedup window in ms (#33); `None` falls back to the default.
     dedup_window_ms: Option<u64>,
+    /// The cap on the NUMBER of distinct per-producer dedup windows (#33); `None` falls back to the
+    /// default. Bounds the TOTAL dedup memory under a flood of distinct `producer_id`s.
+    dedup_max_producers: Option<usize>,
     disk_full_policy: Option<String>,
     visibility_ms: Option<u64>,
     enable_admin: bool,
@@ -1129,6 +1138,9 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             }
             "--dedup-window-ms" => {
                 f.dedup_window_ms = Some(take_number("--dedup-window-ms", args, &mut i)?);
+            }
+            "--dedup-max-producers" => {
+                f.dedup_max_producers = Some(take_number("--dedup-max-producers", args, &mut i)?);
             }
             "--disk-full-policy" => {
                 f.disk_full_policy = Some(take_value("--disk-full-policy", args, &mut i)?);
@@ -1311,6 +1323,12 @@ fn parse_serve_flags_with_env(args: &[String], env: &EnvFn<'_>) -> Result<Parsed
                 env,
                 DEFAULT_DEDUP_WINDOW_MS,
             )?,
+            dedup_max_producers: resolve_number(
+                "--dedup-max-producers",
+                f.dedup_max_producers,
+                env,
+                DEFAULT_DEDUP_MAX_PRODUCERS,
+            )?,
         },
         key_shared_groups: f.key_shared_groups,
         broadcast_groups: f.broadcast_groups,
@@ -1485,6 +1503,12 @@ struct ServeConfig {
     /// an entry older than this is evicted regardless of the count bound. Default 2 min
     /// (`DEFAULT_DEDUP_WINDOW_MS`); `0` disables the time bound (only the count bound applies).
     dedup_window_ms: u64,
+    /// The cap on the NUMBER of distinct per-producer dedup windows (#33): the `producer_id` is
+    /// wire-supplied and attacker-chosen, so this bounds the TOTAL dedup memory. A fresh
+    /// `producer_id` over the cap evicts the least-recently-active window (an approximate LRU), so a
+    /// flood of distinct ids cannot grow RAM without bound. Default 4096
+    /// (`DEFAULT_DEDUP_MAX_PRODUCERS`); floored to 1 by the engine.
+    dedup_max_producers: usize,
 }
 
 // Only the Unix `bench` execution path constructs a default `ServeConfig` (the isolated broker); on
@@ -1520,6 +1544,7 @@ impl ServeConfig {
             health_allow_public: false,
             dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
             dedup_window_ms: DEFAULT_DEDUP_WINDOW_MS,
+            dedup_max_producers: DEFAULT_DEDUP_MAX_PRODUCERS,
         }
     }
 }
@@ -1924,6 +1949,7 @@ fn cmd_serve(
         // field-never-read, invisible to a macOS reviewer (the recurring #288/#99 footgun).
         config.dedup_max_ids,
         config.dedup_window_ms,
+        config.dedup_max_producers,
         key_shared_groups,
         // Read the broadcast groups under cfg(not(unix)) too: a field/param read only on cfg(unix)
         // breaks the Windows `-D warnings` build invisibly to a macOS reviewer (#288 note).
@@ -2020,12 +2046,16 @@ fn open_disk_engine(
                 DiskFullPolicyArg::DropOldest => DiskFullPolicy::DropOldest,
             },
             // The OPT-IN effectively-once dedup window (#3, #33): the dual count + time bound on each
-            // per-producer dedup ring. Dedup is OFF by default and activates per-producer only when a
-            // publish carries a `msg_id`; these flags only SIZE the window when it does. `--dedup-max-ids`
-            // is the count bound (default 100k), `--dedup-window-ms` the time bound in ms (default 2 min).
+            // per-producer dedup ring, plus the cap on the NUMBER of distinct producer windows.
+            // Dedup is OFF by default and activates per-producer only when a publish carries a
+            // `msg_id`; these flags only SIZE the window when it does. `--dedup-max-ids` is the count
+            // bound (default 100k), `--dedup-window-ms` the time bound in ms (default 2 min), and
+            // `--dedup-max-producers` (default 4096) caps the producer windows so a flood of
+            // attacker-chosen `producer_id`s cannot grow RAM without bound (LRU eviction).
             dedup: ironbus_core::dedup::DedupConfig {
                 max_ids: config.dedup_max_ids,
                 window_nanos: config.dedup_window_ms.saturating_mul(1_000_000),
+                max_producers: config.dedup_max_producers,
             },
         },
     )
@@ -3547,6 +3577,7 @@ mod tests {
             health_allow_public: false,
             dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
             dedup_window_ms: DEFAULT_DEDUP_WINDOW_MS,
+            dedup_max_producers: DEFAULT_DEDUP_MAX_PRODUCERS,
         }
     }
 
@@ -4600,6 +4631,7 @@ mod tests {
             health_allow_public: false,
             dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
             dedup_window_ms: DEFAULT_DEDUP_WINDOW_MS,
+            dedup_max_producers: DEFAULT_DEDUP_MAX_PRODUCERS,
         }
     }
 

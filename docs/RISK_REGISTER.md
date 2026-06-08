@@ -479,11 +479,46 @@ Honest accounting of what is not defended yet. Each names its tracking issue.
 - **Residual risk:** low today (coarse locking is simple to reason about), rising
   the moment a lock-free path is introduced.
 
+### RR-24 Unbounded dedup producer map (distinct-`producer_id` RAM exhaustion)
+
+- **Category:** resource-exhaustion/DoS.
+- **Failure mode:** the opt-in dedup registry
+  (`crates/ironbus-core/src/dedup.rs`) keyed its per-producer window map on the
+  wire-supplied, attacker-chosen `producer_id` and NEVER reaped it: no cap, no
+  LRU, no idle eviction. A peer (when dedup is enabled) sending an unbounded
+  stream of distinct `producer_id`s grew broker RAM without bound, and a single
+  `producer_id` could be up to the 64 KiB wire field maximum. The per-window
+  bounds (count + time) bounded each window but not the NUMBER of windows, so the
+  RAM_BUDGET claim that the term was "bounded by the connection count" was false.
+- **Mitigation:** a hard cap on the number of tracked windows
+  (`DedupConfig::max_producers`, default 4096, `serve --dedup-max-producers`,
+  floored to 1) with LRU eviction: a fresh `producer_id` over the cap evicts the
+  least-recently-active window (`DedupRegistry::make_room_for`), and fully
+  time-expired windows are reaped opportunistically first, so the TOTAL dedup
+  memory is the closed formula `max_producers * max_ids * per_entry`. Evicting a
+  window only drops dedup state for the least-active producer, which falls back to
+  at-least-once (already the contract for an aged/evicted id). The `producer_id`
+  and `msg_id` are each capped at 256 bytes (`MAX_PRODUCER_ID_LEN` /
+  `MAX_MSG_ID_LEN`), enforced as a typed, connection-preserving rejection at the
+  wire boundary in `Session::handle_pub`. Tested in `dedup.rs`
+  (`the_producer_count_is_hard_bounded_under_a_flood_of_distinct_producer_ids`,
+  `an_evicted_producers_later_duplicate_is_treated_as_fresh`,
+  `an_active_producer_is_not_evicted_while_idle_ones_exist`,
+  `a_fully_time_expired_window_is_reaped_so_it_does_not_pin_a_slot`) and in
+  `session.rs` (`an_oversized_producer_id_is_rejected_at_the_wire_boundary`).
+- **Residual risk:** the cap is a per-producer-window count, not a measured RAM
+  high-water; an operator who opts into dedup on a tight node must still size
+  `--dedup-max-producers` and `--dedup-max-ids` against the documented worst case
+  (RAM_BUDGET.md), since the shipped defaults target a server, not a 64 MiB edge
+  box. The window is session-scoped (lost on restart), so it never grows across
+  restarts.
+
 ---
 
 ## Summary of counts
 
-Mitigated (Section 1): 9 risks. Fixed defects (Section 2): 6 real merged fixes.
+Mitigated (Section 1): 9 risks. Fixed defects (Section 2): 7 real merged fixes
+(RR-24 the latest, the dedup producer-map bound found in adversarial review).
 Open / unmitigated (Section 3): 8 risks.
 
 By category (mitigated vs open, defects counted under their category):
@@ -492,7 +527,7 @@ By category (mitigated vs open, defects counted under their category):
 | --- | --- | --- | --- |
 | durability | RR-03, RR-05, RR-06, RR-07 | RR-10 | |
 | concurrency | | RR-11, RR-19 | RR-23 |
-| resource-exhaustion/DoS | RR-01, RR-02, RR-03, RR-08 | | |
+| resource-exhaustion/DoS | RR-01, RR-02, RR-03, RR-08 | RR-24 | |
 | recovery | RR-05, RR-06 | RR-10 | |
 | observability | RR-09 | RR-12, RR-14 | RR-20, RR-22 |
 | security | RR-08 | | RR-16, RR-17, RR-18 |
