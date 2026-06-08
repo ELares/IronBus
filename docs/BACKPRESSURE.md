@@ -33,8 +33,10 @@ the resilience-observability contract (#16, see [METRICS.md](METRICS.md)).
 > machine-actionable `retry_after_ms` / `shed` fields on the rejection frame are
 > owned by the frozen-protocol extension (#11), which has not landed, so a CoDel /
 > retry shed today rides the existing bare `Err` frame (a distinct, self-announcing
-> "shed under load" message), NOT a structured hint. The retry budget is enforced
-> (it is an accounting control needing no wire change); only the structured hint
+> "shed under load" message), NOT a structured hint. The retry budget's accounting
+> (accept/shed counts) is wired in the append actor, but its broker-side throttle
+> enforcement call site, like the egress AIMD and the fire-and-forget tier, lands with
+> the redelivery/egress wiring (tracked in #402); only the structured wire hint
 > waits on #11. See [What this changes on the wire](#what-this-changes-on-the-wire-11).
 > The egress limiter and the fire-and-forget bucket exist and are observable; their
 > call sites at a live downstream sink / a wire fire-and-forget tier land with those
@@ -286,7 +288,8 @@ falls, the client's own retry rate is throttled toward the budget, so the
 figure is the budget the 60 s window enforces: sustained retries above 10% of the
 request rate are throttled at the source. These are two composed mechanisms, not one derivation: the accept-based formula is the throttling vehicle (it gates each retry probabilistically as the accept rate falls), and the 10 percent over 60 s figure is the IronBus design budget that the broker also re-checks; the formula does not by itself derive the 10 percent number, it is the mechanism by which the budget is held.
 
-The budget is enforced **on both sides**:
+The budget is two-sided by design (the broker-side accounting is wired today; the
+broker-side throttle ENFORCEMENT call site lands with the redelivery wiring, #402):
 
 - **Client-side** (in the client library, the first line of defense): the client
   throttles its own retries against its local window before a retry ever reaches the
