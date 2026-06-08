@@ -295,6 +295,44 @@ jobs:
       - name: cross test the byte parsers on a 32-bit target
         run: cross test --locked -p ironbus-core --target ${{ matrix.target }}
 
+  conformance-byte-identity:
+    name: conformance corpus byte-identity (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          # The two production edge ISAs. x86_64 runs natively on the runner; aarch64 runs
+          # under qemu-user (via cross). Both regenerate the frozen #45 conformance corpus and
+          # must reproduce the SAME checked-in bytes and cross-verify the SAME header_crc /
+          # body_crc, so an endianness or alignment bug that only shows on aarch64 fails here
+          # rather than on a deployed edge box. The encoders are endianness-explicit LE, so
+          # byte-identity must hold; this job makes it a gate. (The i686 32-bit arch already runs
+          # the same ironbus-core tests in the parse-32bit job, adding a little-endian 32-bit
+          # leg.)
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: conformance-${{ matrix.target }}
+      - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2
+        with:
+          tool: cross
+      # cross runs the aarch64 tests under qemu-user; x86_64-gnu runs natively but is invoked
+      # through cross too so both legs share one command shape. The conformance gate
+      # (`conformance_corpus`) regenerates every fixture and asserts it equals the checked-in
+      # bytes (or digest), then re-encodes each record and verifies its CRCs; the
+      # `conformance_recovery` storage gate drives the same fixtures through real recovery. A
+      # byte that differs across arches fails the byte-equality assertion on the differing arch.
+      - name: cross-test the conformance corpus on the target ISA
+        run: |
+          cross test --locked -p ironbus-core --target ${{ matrix.target }} --test conformance_corpus
+          cross test --locked -p ironbus-storage --target ${{ matrix.target }} --test conformance_recovery
+
   sbom:
     name: cargo-auditable SBOM
     runs-on: ubuntu-latest
