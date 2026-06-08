@@ -198,6 +198,23 @@ jobs:
           fi
           echo "all Rust sources carry the SPDX header"
 
+  format-registry:
+    name: format-registry (#126 #132)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # The on-disk-format version-registry gate (#126, #132): a change to the byte-layout
+      # consts/offsets in crates/ironbus-core/src/format.rs must also update the registry in
+      # docs/compat/versions.md. The script hashes only the layout-defining `pub const` lines
+      # (before the #[cfg(test)] block, whitespace-normalized) and compares the digest to the one
+      # pinned on the `format-layout-sha256:` line in the registry, so a silent encoding change
+      # fails here rather than mis-parsing durable data on a deployed reader. Deterministic and
+      # history-free: no git diff base is needed. Re-pin after an INTENTIONAL bump with
+      # `sh scripts/check-format-registry.sh --print`.
+      - name: assert an on-disk format change also updates the version registry
+        run: sh scripts/check-format-registry.sh
+
   cross-build:
     name: musl build (${{ matrix.target }})
     runs-on: ubuntu-latest
