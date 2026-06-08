@@ -66,7 +66,14 @@ jobs:
           # toolchain unambiguous and matches the documented local command in fuzz/README.md.
           for target in record_codec frame_decode cursor_snapshot segment_scan pub_body ack_body deliver_body dead_letter_body; do
             echo "::group::fuzz ${target}"
-            cargo +nightly fuzz run "${target}" -- -max_total_time="${MAX_TOTAL_TIME}"
+            # Pin the fuzz build to the rustc HOST target (gnu), not cargo-fuzz's self-detected
+            # default. cargo-fuzz infers its default --target from its OWN binary triple, and
+            # taiki-e/install-action now binstalls the musl-static cargo-fuzz build, so without
+            # this flag it builds the fuzz targets for x86_64-unknown-linux-musl. AddressSanitizer
+            # is incompatible with a statically linked libc (and the musl std for the sanitizer
+            # build is not installed), so the build failed with "sanitizer is incompatible with
+            # statically linked libc". The host gnu target is always installed by the toolchain.
+            cargo +nightly fuzz run "${target}" --target x86_64-unknown-linux-gnu -- -max_total_time="${MAX_TOTAL_TIME}"
             echo "::endgroup::"
           done
       - name: upload crashing inputs for triage
