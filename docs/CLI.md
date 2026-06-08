@@ -16,12 +16,12 @@ flag and code does.
 
 > Scope: this map covers the command surface that the binary SHIPS today. The frozen
 > design in issue #136 specifies a larger verb tree (`tap`, `wire`, `info`, `consumer`,
-> `segments`, `dlq`, `retention`, `top`, `config`, `recovery report`, `completions`) and a
+> `segments`, `dlq`, `retention`, `config`, `recovery report`, `completions`) and a
 > versioned `--json` schema contract; those verbs are NOT implemented in the current binary
 > and are deliberately absent here. The `scrub` and `repair` verbs (#92) and their
-> versioned `--json` schemas (`ironbus.cli.scrub.v1` / `ironbus.cli.repair.v1`) ARE
-> implemented and documented below. This reference enumerates only what `main.rs` actually
-> parses and runs.
+> versioned `--json` schemas (`ironbus.cli.scrub.v1` / `ironbus.cli.repair.v1`), and the
+> `top` verb (#93) with its `ironbus.cli.top.v1` `--json` schema, ARE implemented and
+> documented below. This reference enumerates only what `main.rs` actually parses and runs.
 
 ## Command summary
 
@@ -35,6 +35,7 @@ flag and code does.
 | `dump` | offline (reads `--data-dir`) | Unix only in v1 | Stream every durable record (or, with `--dlq`, the dead-letter sink). |
 | `scrub` | offline (reads `--data-dir`) | Unix only in v1 | Strictly read-only full integrity scan: report every corruption / torn-tail / checksum issue (the plan). Never writes. |
 | `repair` | offline (reads `--data-dir`) | Unix only in v1 | Default the same read-only plan as `scrub`; `--apply` quarantines and truncates under the exclusive lock (recovery made explicit). |
+| `top` | LIVE (polls `/admin`) any; OFFLINE (reads `--data-dir`) Unix only in v1 | Strictly read-only status view. LIVE polls the broker's `/admin` v1 JSON; OFFLINE renders only the file-derived panels behind a mandatory banner. |
 | `help` / `--help` / `-h` | neither | any | Print the usage banner. |
 | `version` / `--version` / `-V` | neither | any | Print a single `ironbus <version>` line. |
 
@@ -58,6 +59,10 @@ anywhere.
   `repair --apply` writes, and only under the exclusive data-dir lock. There is no online
   fallback for the offline verbs: they are pure offline readers (or, for `repair --apply`,
   an offline recovery).
+- **Dual-mode**: `top` is BOTH. Its LIVE mode is an `/admin` HTTP client (any platform); its
+  OFFLINE mode is a pure file-derived reader (Unix only in v1). Which mode runs is chosen by the
+  flag (`--addr`/`--health-addr` vs `--data-dir`), and a mandatory banner names the active mode so
+  the two are never confused.
 
 ## `serve` (online; Unix only in v1)
 
@@ -474,6 +479,89 @@ object plus an `applied` boolean:
 
 ```json
 {"schema":"ironbus.cli.repair.v1","data_dir":"<dir>","segments":<n>,"skipped_spans":<k>,"data_loss_spans":<d>,"data_loss_bytes":<db>,"torn_tail_bytes":<tb>,"applied":<bool>,"events":[...],"ok":<bool>,"exit_code":<code>}
+```
+
+## `top` (LIVE: any platform; OFFLINE: Unix only in v1)
+
+A strictly READ-ONLY status view with two explicit modes and graceful text degradation (#93).
+It pulls NO new dependency: the rendering is hand-rolled, the live half reuses the same
+dependency-free `/admin` v1 client and JSON extractors as `admin`, and the in-place TTY redraw is
+a couple of bare ANSI escapes gated behind a TTY-and-`NO_COLOR` check (`std::io::IsTerminal`).
+
+- **LIVE mode** (`--addr` or `--health-addr <host:port>`) polls the broker's read-only `/admin` v1
+  JSON every `--interval` seconds and renders the #16 counters: the durable head and committed
+  cursor, the per-group lag and in-flight depth, the DLQ depth and last dead-lettered offset, the
+  resilience counters (frozen, last-skip-offset, records/bytes skipped), and the cumulative
+  throughput counters (produced, delivered, redelivered, acks). Each panel names its `/admin`
+  source. The broker must have been started with `--health-addr` AND `--enable-admin`. A down
+  broker exits 5.
+- **OFFLINE mode** (`--data-dir <dir>`) renders ONLY the file-derived panels the offline reader can
+  compute with NO broker: the segment count and durable head, the loss report (events, bytes,
+  records estimate), and the quarantine span (blob count and bytes). It is shown behind a MANDATORY
+  banner that names it the offline file-derived view, and it explicitly states the volatile live
+  panels (throughput, fsync latency, in-flight) are NOT available offline, so a missing panel is
+  never misread as a real zero.
+
+Exactly one mode is required; both or neither is a usage error (exit 1). `top` NEVER mutates
+anything: live mode only issues `GET /admin`, offline mode only reads the data directory (the same
+read-only `OfflineReader` that backs `peek`/`dump`) and lists `quarantine/`. Any operator action is
+PRINTED as the exact subcommand to run, never executed.
+
+| Flag | Value type | Default | Unit | Meaning |
+|------|-----------|---------|------|---------|
+| `--addr <host:port>` / `--health-addr <host:port>` | string | none | host:port | LIVE mode: the broker's `/admin` HTTP endpoint (its `--health-addr`). Both spellings are accepted. |
+| `--data-dir <dir>` | path | none | path | OFFLINE mode: the stopped broker's data directory. |
+| `--interval <secs>` | u64 | `1` (`DEFAULT_TOP_INTERVAL_SECS`) | seconds | The refresh interval. Minimum 1; `0` would busy-spin and is a usage error. The poll SLEEPS this long between snapshots, so a slow-poll on a constrained link costs no CPU. |
+| `--once` | flag | off | n/a | Emit ONE snapshot and exit 0 (for tests and scripting). Always plain text. |
+| `--json` | flag | off | n/a | Emit a single versioned `ironbus.cli.top.v1` object instead of the human view. The `mode` field is tagged `live` or `offline`. |
+| `--no-color` | flag | off | n/a | Suppress color even on a TTY. `NO_COLOR` (any non-empty value) does the same. |
+
+### `top` degradation
+
+When stdout is a TTY AND `NO_COLOR` is unset AND `--no-color` is absent AND this is a refreshing
+(not `--once`) run, `top` does an in-place redraw: it clears the screen and homes the cursor with
+two simple ANSI escapes and colors the mode banner. In every other case (a piped or non-TTY
+stdout, `NO_COLOR`, `--no-color`, or `--once`) it prints a PLAIN snapshot with NO escape sequences,
+so `ironbus top --once | cat` and a CI run produce clean text, not escape-sequence garbage. The
+mode banner is ALWAYS present (only its styling degrades), so the live-vs-offline distinction is
+never lost.
+
+### `top` output shapes
+
+LIVE human form (each panel names its `/admin` source):
+
+```
+ironbus top -- LIVE (broker /admin v1 at 127.0.0.1:PORT)
+broker: frozen=false durable_head=3 committed=0 retained_from=0 [source: /admin broker, segments]
+log: segments=1 records=3 bytes=12 [source: /admin segments]
+throughput: produced=3 produced_bytes=6 delivered=0 redelivered=0 acks=0 [source: /admin broker counters #16]
+dlq: records=0 last_dead_lettered_offset=-1 dead_lettered=0 [source: /admin dlq, broker]
+resilience: frozen=false last_skip_offset=0 records_skipped=0 bytes_skipped=0 [source: /admin resilience]
+consumers (per-group lag + in-flight) [source: /admin consumers]:
+  (default): committed=0 lag=3 in_flight=0
+note: top is read-only. ...
+```
+
+OFFLINE human form (the mandatory banner, the file-derived panels only):
+
+```
+ironbus top -- OFFLINE file-derived view of <dir> (NO broker)
+note: OFFLINE. These panels are derived from files on disk with no running broker; the live
+      volatile panels (throughput, fsync latency, in-flight depth) are NOT available offline.
+log: segments=1 durable_head=4 [source: offline reader]
+loss: events=0 bytes=0 records_estimate=0 [source: offline loss report]
+quarantine: blobs=0 bytes=0 [source: quarantine/ subdirectory]
+note: top is read-only. ...
+```
+
+`--json` form (the single versioned object, `ironbus.cli.top.v1`); `mode` tells the two apart:
+
+```json
+{"schema":"ironbus.cli.top.v1","mode":"live","source":"<addr>","frozen":<bool>,"durable_head":<n>,"committed":<n>,"earliest_retained":<n>,"segment_count":<n>,"durable_record_count":<n>,"durable_record_bytes":<n>,"produced":<n>,"produced_bytes":<n>,"delivered":<n>,"redelivered":<n>,"acks":<n>,"dead_lettered":<n>,"dlq_records":<n>,"dlq_last_dead_lettered_offset":<i>,"last_skip_offset":<n>,"records_skipped":<n>,"bytes_skipped":<n>,"consumers":[{"name":"<g>","committed_offset":<n>,"consumer_lag":<n>,"in_flight":<n>}]}
+```
+
+```json
+{"schema":"ironbus.cli.top.v1","mode":"offline","source":"<dir>","segment_count":<n>,"durable_head":<n>,"loss_events":<n>,"loss_bytes":<n>,"loss_records_estimate":<n>,"quarantine_blobs":<n>,"quarantine_bytes":<n>}
 ```
 
 ### Offline output shapes (`peek` and `dump`)

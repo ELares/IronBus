@@ -325,12 +325,17 @@ pub fn render_admin_view(view: &AdminView) -> String {
 
 /// Returns the slice of `body` starting at the opening `{` of the object named `key` and running to
 /// its matching close brace (inclusive), so a field lookup is confined to that object.
-fn object_slice<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+///
+/// Exposed `pub(crate)` so the `top` view (#93) reuses the SAME dependency-free, shape-specific
+/// `/admin` JSON extractors as the `admin` view rather than duplicating a second hand-rolled parser.
+pub(crate) fn object_slice<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     bracketed_slice(body, key, b'{', b'}')
 }
 
 /// Returns the slice of `body` for the array named `key`, from its `[` to the matching `]`.
-fn array_slice<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+///
+/// Exposed `pub(crate)` for the `top` view (#93); see [`object_slice`].
+pub(crate) fn array_slice<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     bracketed_slice(body, key, b'[', b']')
 }
 
@@ -380,7 +385,9 @@ fn bracketed_slice<'a>(body: &'a str, key: &str, open: u8, close: u8) -> Option<
 
 /// Extracts the unsigned integer value of `"key":N` from `scope`. Returns `None` if the key is
 /// absent or the value is not a bare unsigned integer.
-fn extract_u64(scope: &str, key: &str) -> Option<u64> {
+///
+/// Exposed `pub(crate)` for the `top` view (#93); see [`object_slice`].
+pub(crate) fn extract_u64(scope: &str, key: &str) -> Option<u64> {
     let value = scalar_after_key(scope, key)?;
     let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
     if digits.is_empty() {
@@ -390,7 +397,9 @@ fn extract_u64(scope: &str, key: &str) -> Option<u64> {
 }
 
 /// Extracts the boolean value of `"key":true|false` from `scope`.
-fn extract_bool(scope: &str, key: &str) -> Option<bool> {
+///
+/// Exposed `pub(crate)` for the `top` view (#93); see [`object_slice`].
+pub(crate) fn extract_bool(scope: &str, key: &str) -> Option<bool> {
     let value = scalar_after_key(scope, key)?;
     if value.starts_with("true") {
         Some(true)
@@ -401,10 +410,40 @@ fn extract_bool(scope: &str, key: &str) -> Option<bool> {
     }
 }
 
+/// Extracts the signed integer value of `"key":N` from `scope`, including a leading `-` (so a `-1`
+/// sentinel such as `last_dead_lettered_offset` parses). Returns `None` if the key is absent or the
+/// value is not a bare signed integer.
+///
+/// Exposed `pub(crate)` for the `top` view (#93); see [`object_slice`].
+pub(crate) fn extract_i64(scope: &str, key: &str) -> Option<i64> {
+    let value = scalar_after_key(scope, key)?;
+    let mut chars = value.chars();
+    let mut text = String::new();
+    if let Some(first) = chars.clone().next() {
+        if first == '-' {
+            text.push('-');
+            chars.next();
+        }
+    }
+    for c in chars {
+        if c.is_ascii_digit() {
+            text.push(c);
+        } else {
+            break;
+        }
+    }
+    if text.is_empty() || text == "-" {
+        return None;
+    }
+    text.parse().ok()
+}
+
 /// Extracts the string value of `"key":"..."` from `scope`, undoing the two structural escapes the
 /// server emits (`\"` and `\\`); other escapes (`\n` etc.) are left as-is since the admin string
 /// fields (group names) are graphic ASCII.
-fn extract_string(scope: &str, key: &str) -> Option<String> {
+///
+/// Exposed `pub(crate)` for the `top` view (#93); see [`object_slice`].
+pub(crate) fn extract_string(scope: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\":");
     let at = scope.find(&needle)? + needle.len();
     let rest = scope[at..].trim_start();
@@ -567,6 +606,18 @@ mod tests {
             \"resilience\":{\"frozen\":false,\"last_skip_offset\":0,\"records_skipped\":0}}";
         let view = parse_admin_v1(body).unwrap();
         assert_eq!(view.consumers[0].name, "a\"b\\c");
+    }
+
+    #[test]
+    fn extract_i64_reads_a_negative_sentinel() {
+        // The DLQ `last_dead_lettered_offset` is `-1` when nothing has been dead-lettered; the
+        // signed extractor (shared with the `top` view, #93) must read it, where `extract_u64` cannot.
+        let scope = "{\"records\":0,\"last_dead_lettered_offset\":-1}";
+        assert_eq!(extract_i64(scope, "last_dead_lettered_offset"), Some(-1));
+        assert_eq!(extract_i64(scope, "records"), Some(0));
+        assert_eq!(extract_i64(scope, "absent"), None);
+        // A lone `-` with no digits is not a number.
+        assert_eq!(extract_i64("{\"x\":-}", "x"), None);
     }
 
     #[test]

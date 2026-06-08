@@ -45,6 +45,14 @@ mod upgrade;
 /// health server, it does not open the on-disk store.
 mod admin;
 
+/// The strictly READ-ONLY `top` status view (#93): a LIVE mode that polls the broker's `/admin` v1
+/// JSON (reusing the `admin` client) and an OFFLINE mode that renders only the file-derived panels
+/// from the on-disk store (with a mandatory offline banner). Hand-rolled rendering that degrades to
+/// plain text off a TTY / under `NO_COLOR` / with `--once` and sleeps between polls (no busy-spin),
+/// pulling no new dependency. The live half is cross-platform (an HTTP client); the offline half is
+/// Unix-only in v1, like the on-disk store, via a cfg-gated snapshot builder.
+mod top;
+
 use ironbus_client::{Client, ClientError};
 use ironbus_core::clock::Clock;
 use ironbus_proto::message::PubBody;
@@ -442,6 +450,8 @@ USAGE:
                   [--raw] [--require-dict]
     ironbus scrub --data-dir <dir> [--json]
     ironbus repair --data-dir <dir> [--apply] [--json]
+    ironbus top   (--addr <host:port> | --health-addr <host:port> | --data-dir <dir>)
+                  [--interval <secs>] [--once] [--json] [--no-color]
     ironbus bench (--duration <secs> | --count <n>) [--mode <publish|subscribe|round-trip>]
                   [--rate <msg/s>] [--payload-bytes <n>] [--payload-shape <realistic|random>]
                   [--fetch-batch <n>] [--group <name>] [--no-fsync] [--json]
@@ -545,6 +555,21 @@ Notes:
     the longest valid prefix exactly as recovery does, and preserves the data dir's uid/gid/mode.
     It is recovery made explicit and offline; it never makes the data less recoverable than
     recovery already would.
+    top is a strictly READ-ONLY status view with two explicit modes. LIVE
+    (--addr/--health-addr <host:port>) polls the broker's read-only /admin v1 JSON every --interval
+    seconds (default 1, minimum 1) and renders the #16 counters: durable head, per-group lag and
+    in-flight, the DLQ, the resilience counters, and the cumulative throughput counters; a down
+    broker exits 5. OFFLINE (--data-dir <dir>) renders ONLY the file-derived panels (segments,
+    durable head, the loss report, and the quarantine span) with NO broker, behind a MANDATORY
+    banner that names it the offline file-derived view, so a missing volatile panel is never misread
+    as a real zero. Exactly one mode is required (both or neither is a usage error). top never
+    mutates anything: it only reads, and any action is PRINTED, never run. --once emits one snapshot
+    and exits (for tests and scripting). Output degrades gracefully: a TTY with color (NO_COLOR
+    unset, --no-color absent) and a refreshing run redraw in place with simple ANSI escapes; a piped
+    or non-TTY stdout, NO_COLOR, --no-color, or --once print a PLAIN escape-free snapshot, so
+    `ironbus top | cat` and a CI run produce clean text. --json emits a single versioned
+    ironbus.cli.top.v1 object (the mode is tagged, so a script tells live from offline). The refresh
+    SLEEPS between polls and never busy-spins. Offline mode is Unix-only in v1 (the on-disk store).
     bench is a load generator that reports throughput, p50/p99/p999 latency, fsync cost, and
     bytes/op over the real wire and produce path. By DEFAULT it is PRODUCTION-SAFE: it spawns its
     own ISOLATED broker over a fresh ironbus-bench-<random> data directory and reads through a fresh
@@ -685,6 +710,7 @@ fn run(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         "dump" => run_dump(rest, out),
         "scrub" => run_scrub(rest, out),
         "repair" => run_repair(rest, out),
+        "top" => top::run_top(rest, out),
         "bench" => run_bench(rest, out),
         "upgrade" => run_upgrade(rest, out),
         "rollback" => run_rollback(rest, out),
