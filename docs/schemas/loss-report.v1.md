@@ -110,11 +110,12 @@ JSON name) triple is pinned by `golden_reason_code_vocabulary_is_frozen`.
 | `4`  | `"CorruptSegmentHeader"`  | `corrupt_segment_header`  | a segment header was unreadable, so the whole segment was abandoned |
 | `5`  | `"SequenceGap"`           | `sequence_gap`            | a checksum-valid record carried an out-of-order sequence (a recycled or mixed-up frame), so the segment was abandoned at that record |
 | `6`  | `"ScrubberSuspect"`       | `scrubber_suspect`        | the at-rest scrubber (#92) flagged a span as suspect during a background integrity pass (silent bit rot: a checksum that no longer verifies on a previously-durable record). Reserved for the scrubber; recovery itself never emits it today, but the reason is appended now so the scrubber emits into a frozen vocabulary. Appended per #59; APPEND-ONLY, so it does NOT bump `schema_version` |
+| `7`  | `"UnresolvedDictId"`      | `unresolved_dict_id`      | a checksum-VALID record referenced a compression `dict_id` the reader could resolve from neither the on-disk `dicts/` sidecar nor the embedded active set, so the record could not be decompressed and was skipped as bounded, reported loss (#357, #78, `../DICTIONARY_LIFECYCLE.md` §5). DISTINCT from a corrupt body (codes 2/3): the framing and CRCs all PASS; the dictionary is simply ABSENT, so reporting it as bit-rot would mislead an operator. Appended per #357; APPEND-ONLY, so it does NOT bump `schema_version` |
 
-Code `6` was appended without a `schema_version` bump, which is the whole point of the
-append-only rule: a `v1` reader that predates `ScrubberSuspect` still reads a code-6 event's numeric
-span (`bytes_skipped`, the offset range, the record estimate); it just renders the reason as an
-unknown name. Codes `1` through `5` are byte-identical to before.
+Codes `6` and `7` were appended without a `schema_version` bump, which is the whole point of the
+append-only rule: a `v1` reader that predates `ScrubberSuspect`/`UnresolvedDictId` still reads such an
+event's numeric span (`bytes_skipped`, the offset range, the record estimate); it just renders the
+reason as an unknown name. Codes `1` through `5` are byte-identical to before.
 
 ## Data loss vs. reported skip (the torn-tail exclusion)
 
@@ -134,7 +135,8 @@ as data loss would inflate fleet loss metrics on every clean restart. So:
   store agree on what "data loss" means.
 
 `ScrubberSuspect` (code `6`) is silent bit rot on previously-durable bytes, so it DOES count as data
-loss.
+loss. `UnresolvedDictId` (code `7`) is intact, checksum-valid data that is undecodable because its
+dictionary is absent, which IS a loss of decodable data, so it also counts as data loss.
 
 ## SkipEvent: the shipped `LossEvent` is the canonical per-skip schema
 
@@ -177,9 +179,9 @@ the frozen schema and do NOT justify bumping to a `v2`:
 
 Adding any of them would be an INCOMPATIBLE field change that bumps `schema_version` for no real
 gain, breaking every deployed `v1` reader. So the schema stays at `v1`; only the append-only
-`ScrubberSuspect` reason was added (which by rule does not bump the version). If a future need for a
-genuinely new field appears, it is a deliberate `v2`: bump `SCHEMA_VERSION`, freeze a new golden, and
-update this document and CONTRACTS.md.
+`ScrubberSuspect` (code 6) and `UnresolvedDictId` (code 7) reasons were added (which by rule do not
+bump the version). If a future need for a genuinely new field appears, it is a deliberate `v2`: bump
+`SCHEMA_VERSION`, freeze a new golden, and update this document and CONTRACTS.md.
 
 ## Worked examples (the three headline scenarios)
 

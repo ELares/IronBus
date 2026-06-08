@@ -43,6 +43,15 @@ pub enum ReasonCode {
     /// emit into is frozen up front. A new reason is append-only (a new number, name, and label)
     /// and does NOT bump `schema_version`.
     ScrubberSuspect,
+    /// A checksum-VALID record referenced a compression `dict_id` the reader could resolve from
+    /// neither the on-disk `dicts/` sidecar nor the embedded active set, so the record could not
+    /// be decompressed and was skipped as bounded, reported loss (#357, #78,
+    /// `docs/DICTIONARY_LIFECYCLE.md` §5). DISTINCT from a corrupt body (codes 2/3): the framing,
+    /// the header CRC, the body CRC, and the xxh3 (if present) all PASS; the bytes are not
+    /// corrupt, the dictionary is simply ABSENT. Reporting it as bit-rot would send an operator
+    /// after the wrong root cause. It IS data loss. Appended per the append-only rule (a new
+    /// number, name, and label); it does NOT bump `schema_version`, exactly as code 6 did.
+    UnresolvedDictId,
 }
 
 impl ReasonCode {
@@ -58,18 +67,20 @@ impl ReasonCode {
             ReasonCode::CorruptSegmentHeader => 4,
             ReasonCode::SequenceGap => 5,
             ReasonCode::ScrubberSuspect => 6,
+            ReasonCode::UnresolvedDictId => 7,
         }
     }
 
     /// Every reason, in code order, so a consumer can enumerate them (for example to emit a
     /// metric series per reason). Appended to, never reordered.
-    pub const ALL: [ReasonCode; 6] = [
+    pub const ALL: [ReasonCode; 7] = [
         ReasonCode::TornTail,
         ReasonCode::CorruptRecordHeader,
         ReasonCode::CorruptRecordBody,
         ReasonCode::CorruptSegmentHeader,
         ReasonCode::SequenceGap,
         ReasonCode::ScrubberSuspect,
+        ReasonCode::UnresolvedDictId,
     ];
 
     /// A stable, lower-snake-case label for this reason, for a metric series or a log field.
@@ -83,6 +94,7 @@ impl ReasonCode {
             ReasonCode::CorruptSegmentHeader => "corrupt_segment_header",
             ReasonCode::SequenceGap => "sequence_gap",
             ReasonCode::ScrubberSuspect => "scrubber_suspect",
+            ReasonCode::UnresolvedDictId => "unresolved_dict_id",
         }
     }
 
@@ -99,6 +111,35 @@ impl ReasonCode {
     #[must_use]
     pub fn is_data_loss(self) -> bool {
         !matches!(self, ReasonCode::TornTail)
+    }
+
+    /// The [`ReasonCode`] a decompression failure on the read/recovery path maps to, the seam
+    /// that routes the codec's typed decode errors (`ironbus_core::compress`) onto the frozen
+    /// loss vocabulary (#357, #76, `docs/DICTIONARY_LIFECYCLE.md` §5, `docs/compat/versions.md`).
+    ///
+    /// The split mirrors the registry's POISON-vs-corruption boundary:
+    ///
+    /// - An UNRESOLVED `dict_id` (the frame is intact and its CRC passed, but the dictionary is
+    ///   absent) is the distinct [`ReasonCode::UnresolvedDictId`]: NOT bit-rot, just an absent
+    ///   decode input.
+    /// - An UNKNOWN codec id, an over-cap decompression-bomb claim, a corrupt codec stream, or a
+    ///   malformed descriptor all map to [`ReasonCode::CorruptRecordBody`]: the body did not yield
+    ///   the data it framed, the same class as a body whose checksum could have failed.
+    ///
+    /// Either way the record is routed to the #8 quarantine as a bounded, reported loss and the
+    /// reader advances; nothing here ever crashes the process.
+    #[must_use]
+    pub fn for_decompress_error(err: ironbus_core::compress::DecompressError) -> ReasonCode {
+        use ironbus_core::compress::DecompressError;
+        // ONLY an unresolved `dict_id` gets the distinct `UnresolvedDictId` reason (intact frame,
+        // valid CRC, absent decode input). Every OTHER decode failure (an unknown codec id, an
+        // over-cap decompression-bomb claim, a corrupt stream, a malformed descriptor, and any
+        // future `#[non_exhaustive]` variant) maps to `CorruptRecordBody`: the framed body did not
+        // yield the data it promised. The catch-all keeps a future variant conservatively safe.
+        match err {
+            DecompressError::PoisonUnresolvedDict(_) => ReasonCode::UnresolvedDictId,
+            _ => ReasonCode::CorruptRecordBody,
+        }
     }
 }
 
@@ -407,6 +448,7 @@ mod tests {
             ReasonCode::CorruptSegmentHeader,
             ReasonCode::SequenceGap,
             ReasonCode::ScrubberSuspect,
+            ReasonCode::UnresolvedDictId,
         ];
         // Frozen numeric codes (a renumber would break a deployed metrics consumer).
         assert_eq!(ReasonCode::TornTail.code(), 1);
@@ -416,6 +458,9 @@ mod tests {
         assert_eq!(ReasonCode::SequenceGap.code(), 5);
         // Appended for the at-rest scrubber (#92, #59); append-only, no schema bump.
         assert_eq!(ReasonCode::ScrubberSuspect.code(), 6);
+        // Appended for the absent-dictionary decompress loss (#357, #78); append-only, no
+        // schema bump (the same move code 6 made).
+        assert_eq!(ReasonCode::UnresolvedDictId.code(), 7);
         // No two reasons share a code.
         let mut seen = std::collections::BTreeSet::new();
         for r in all {
@@ -526,13 +571,14 @@ mod tests {
     fn golden_reason_code_vocabulary_is_frozen() {
         // (numeric code, metric label, serde JSON name), in code order. Append-only: a new reason
         // adds a row; an existing row never changes.
-        let frozen: [(u16, &str, &str); 6] = [
+        let frozen: [(u16, &str, &str); 7] = [
             (1, "torn_tail", "\"TornTail\""),
             (2, "corrupt_record_header", "\"CorruptRecordHeader\""),
             (3, "corrupt_record_body", "\"CorruptRecordBody\""),
             (4, "corrupt_segment_header", "\"CorruptSegmentHeader\""),
             (5, "sequence_gap", "\"SequenceGap\""),
             (6, "scrubber_suspect", "\"ScrubberSuspect\""),
+            (7, "unresolved_dict_id", "\"UnresolvedDictId\""),
         ];
         assert_eq!(
             ReasonCode::ALL.len(),
@@ -596,7 +642,7 @@ mod tests {
             .sum();
         assert_eq!(by_reason, r.total_bytes_skipped());
         // Labels are frozen and distinct, in code order.
-        assert_eq!(ReasonCode::ALL.len(), 6);
+        assert_eq!(ReasonCode::ALL.len(), 7);
         assert_eq!(ReasonCode::TornTail.metric_label(), "torn_tail");
         assert_eq!(
             ReasonCode::CorruptRecordHeader.metric_label(),
@@ -606,9 +652,13 @@ mod tests {
             ReasonCode::ScrubberSuspect.metric_label(),
             "scrubber_suspect"
         );
+        assert_eq!(
+            ReasonCode::UnresolvedDictId.metric_label(),
+            "unresolved_dict_id"
+        );
         let labels: std::collections::BTreeSet<_> =
             ReasonCode::ALL.iter().map(|rc| rc.metric_label()).collect();
-        assert_eq!(labels.len(), 6, "labels are distinct");
+        assert_eq!(labels.len(), 7, "labels are distinct");
     }
 
     #[test]
@@ -664,6 +714,47 @@ mod tests {
         let mut scrub = LossReport::new();
         scrub.push(LossEvent::span(0, 0, 40, 1, ReasonCode::ScrubberSuspect));
         assert_eq!(scrub.data_loss_bytes(), 40);
+        // UnresolvedDictId (the appended absent-dictionary reason, #357) ALSO counts as data loss:
+        // intact but undecodable data is still lost decodable data.
+        let mut dict = LossReport::new();
+        dict.push(LossEvent::span(0, 0, 55, 1, ReasonCode::UnresolvedDictId));
+        assert_eq!(dict.data_loss_bytes(), 55);
+        assert!(ReasonCode::UnresolvedDictId.is_data_loss());
+    }
+
+    #[test]
+    fn decompress_error_maps_to_the_right_reason_code() {
+        use ironbus_core::compress::DecompressError;
+        // The #357 seam: a decode-time decompression failure routes onto the frozen vocabulary.
+        // An unresolved dict_id is the distinct UnresolvedDictId reason (absent decode input, not
+        // bit-rot).
+        assert_eq!(
+            ReasonCode::for_decompress_error(DecompressError::PoisonUnresolvedDict(7)),
+            ReasonCode::UnresolvedDictId
+        );
+        // An unknown codec, an over-cap bomb claim, a corrupt stream, and a malformed descriptor
+        // all map to CorruptRecordBody: the framed body did not yield the data it promised.
+        for err in [
+            DecompressError::PoisonUnknownCodec(2),
+            DecompressError::DecompressedTooLarge {
+                claimed: u32::MAX,
+                cap: 8 * 1024 * 1024,
+            },
+            DecompressError::CorruptStream,
+            DecompressError::TruncatedDescriptor,
+            DecompressError::BadRawLength,
+        ] {
+            assert_eq!(
+                ReasonCode::for_decompress_error(err),
+                ReasonCode::CorruptRecordBody,
+                "{err:?} maps to CorruptRecordBody"
+            );
+        }
+        // Both mapped reasons are corruption skips (quarantined) and count as data loss.
+        assert!(crate::quarantine::is_corruption_skip(
+            ReasonCode::UnresolvedDictId
+        ));
+        assert!(ReasonCode::UnresolvedDictId.is_data_loss());
     }
 
     #[test]

@@ -1,6 +1,8 @@
 # 0003. lz4_flex is the default compression codec, zstd is opt-in only
 
-- **Status**: Accepted
+- **Status**: Accepted; the `lz4_flex` default-codec runtime is IMPLEMENTED (#387,
+  `crates/ironbus-core/src/compress.rs`). The opt-in `zstd` codec (and its trained-dictionary
+  ZDICT training) remains deferred, never on the default path.
 - **Owning issue**: [#12](https://github.com/ELares/IronBus/issues/12) (compression), decided in #139
 
 ## Context
