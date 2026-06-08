@@ -41,15 +41,23 @@ For each of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, and
 
 Plus, once per release:
 
-- `SHA256SUMS`: one consolidated checksum file over all three binaries AND the three `.deb` packages,
-  the file the installer verifies against. The job self-checks it (`sha256sum -c SHA256SUMS`) before
-  it ships.
+- `SHA256SUMS`: one consolidated checksum file over all three binaries, the three `.deb` packages,
+  AND the CycloneDX SBOM, the file the installer verifies against. The job self-checks it
+  (`sha256sum -c SHA256SUMS`) before it ships.
 - The distroless container image (built by the `container` job from the verified binary; published to
   ghcr.io only when registry publishing is opted in, see docs/DISTRIBUTION.md).
 - `ironbus.sbom.json`: the `cargo-auditable` dependency manifest (the graph is target
   independent for this pure-Rust workspace), extracted with `rust-audit-info`.
-- A keyless Sigstore build-provenance attestation for every binary, the `SHA256SUMS`, and the
-  SBOM, stored in the repository's attestations.
+- `ironbus.cyclonedx.json`: a `syft`-generated CycloneDX (JSON) SBOM of the released binary, the
+  standalone, tool-recoverable manifest a scanner consumes (#367). It is emitted by the SHA-pinned
+  `anchore/sbom-action` over the SAME native binary the cargo-auditable step builds, so it covers
+  the identical pure-Rust dependency set as `ironbus.sbom.json`. The two are complementary: the
+  cargo-auditable one is the in-binary provenance embedded in the shipped artifact (recovered with
+  `rust-audit-info`, round-trip-gated against `Cargo.lock` per #102); the CycloneDX one is the
+  scannable release asset every SBOM/vuln tool reads natively (`syft`/`grype`, below). syft is a CI
+  tool only; it is NOT a crate dependency and adds nothing to the shipped graph.
+- A keyless Sigstore build-provenance attestation for every binary, the `SHA256SUMS`, the
+  cargo-auditable SBOM, and the CycloneDX SBOM, stored in the repository's attestations.
 
 A `v0.x` (or `v0.0.0`) tag is published as a GitHub **prerelease**, since the project is pre-1.0
 and not yet a stability promise (see SECURITY.md); a `v1+` tag publishes a full release.
@@ -94,7 +102,7 @@ the same reproducible static binary. They are documented in full in
    built by the `container` release job from the verified binary; running as non-root with the
    WAL/segment dir as a required writable volume. Registry publishing is opt-in (see DISTRIBUTION.md).
 4. The checksummed GitHub Releases (the binaries, the `.deb` packages, the consolidated `SHA256SUMS`,
-   the SBOM, and the build-provenance attestation), below.
+   the cargo-auditable SBOM, the syft CycloneDX SBOM, and the build-provenance attestation), below.
 
 The lifecycle on a deployed node (atomic in-place upgrade, one-command rollback, fall-back after N
 failed starts, and the explicit `migrate` format gate) is also in
@@ -113,6 +121,35 @@ gh attestation verify ironbus-x86_64-unknown-linux-musl --repo ELares/IronBus
 # Dependency manifest (the embedded or attached SBOM):
 rust-audit-info ironbus.sbom.json
 ```
+
+## Scan the CycloneDX SBOM (syft / grype)
+
+`ironbus.cyclonedx.json` is the scannable release artifact: any CycloneDX-aware tool reads it
+directly, no extraction step. After downloading it (and, optionally, verifying it against
+`SHA256SUMS` and its provenance attestation as above):
+
+```sh
+# Read the manifest back / re-emit it in another format (syft converts between SBOM formats):
+syft convert ironbus.cyclonedx.json -o cyclonedx-json    # or spdx-json, syft-table, ...
+
+# Vulnerability-scan the SBOM with grype (no rebuild, no network fetch of the binary):
+grype sbom:ironbus.cyclonedx.json
+
+# Equivalently, scan the downloaded binary directly (syft/grype generate the SBOM on the fly):
+grype ./ironbus-x86_64-unknown-linux-musl
+```
+
+The CycloneDX SBOM and the embedded `cargo-auditable` SBOM (`ironbus.sbom.json`) describe the SAME
+dependency set by construction (both derive from the one native release build): the cargo-auditable
+one is the in-binary provenance you recover from a deployed binary with `rust-audit-info` (and the
+#102 round-trip gate proves matches `Cargo.lock`), while the CycloneDX one is the standalone asset
+the `syft`/`grype` ecosystem scans without unpacking the binary.
+
+> Note (separate tuning decision, not changed here): #367 also raises whether `deny.toml`'s
+> `[advisories] unmaintained = "all"` should become a documented warn-then-deny grace window rather
+> than a hard deny on every unmaintained advisory. That is a cargo-deny policy preference, distinct
+> from attaching the SBOM, and is intentionally left unchanged in this change; revisit it on its own
+> so a policy loosening is a deliberate, reviewed decision.
 
 ## Reproducibility
 
