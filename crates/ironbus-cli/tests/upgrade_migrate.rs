@@ -299,6 +299,111 @@ fn unit_wiring_a_healthy_binary_does_not_roll_back_on_unclean_power_loss() {
     );
 }
 
+// --- #348: two-rename re-entry window, over the real binary -------------------------------------
+
+/// The fingerprint the CLI records for the known-bad guard: `"<crc32c hex>-<len>"`. Kept in lockstep
+/// with `upgrade::fingerprint_bytes`; the integration test recomputes it to assert the guard file.
+fn known_bad_fingerprint(bytes: &[u8]) -> String {
+    format!("{:08x}-{}", crc32c::crc32c(bytes), bytes.len())
+}
+
+#[test]
+fn a_power_cut_between_the_renames_never_promotes_the_bad_binary_over_the_real_binary() {
+    // #348 over the SHIPPED verbs: drive `record-start --failed` to the cap (which records the
+    // known-bad guard), then reproduce the EXACT on-disk state a power cut between the two rollback
+    // renames leaves (dest holding nothing useful, `ironbus.prev` holding the BAD bytes), then run
+    // the real `ironbus rollback` as the next boot's ExecStartPre would. It MUST refuse to promote
+    // the known-bad `.prev` rather than installing the bad binary.
+    let scr = Scratch::new("powercut-it");
+    let dest = scr.path().join("ironbus");
+    let prev = scr.path().join("ironbus.prev");
+    let good = b"ironbus v1 (known good)";
+    let bad = b"ironbus v2 (broken upgrade)";
+
+    // The failing binary is at dest with a good rollback copy; N=3 failed starts record the guard.
+    std::fs::write(&dest, bad).unwrap();
+    std::fs::write(&prev, good).unwrap();
+    for _ in 0..3 {
+        let (code, _o, _e) =
+            run_ironbus(&["record-start", "--dest", dest.to_str().unwrap(), "--failed"]);
+        assert_eq!(code, 0);
+    }
+    let guard = scr.path().join(".ironbus-failed-fingerprint");
+    assert_eq!(
+        std::fs::read_to_string(&guard).unwrap().trim(),
+        known_bad_fingerprint(bad),
+        "reaching the cap records the failing binary's fingerprint as the known-bad guard"
+    );
+
+    // Reproduce the mid-rollback crash state: the first rename (dest -> .prev) landed, so `.prev`
+    // now holds the BAD bytes and dest is gone. This is the precise hazard window.
+    std::fs::rename(&dest, &prev).unwrap();
+    assert!(!dest.exists());
+    assert_eq!(
+        std::fs::read(&prev).unwrap(),
+        bad,
+        "the crash left .prev bad"
+    );
+
+    // Re-enter the rollback as the next boot would. It must REFUSE (exit 1), never promoting the bad
+    // bytes to the destination.
+    let (code, _o, err) = run_ironbus(&["rollback", "--dest", dest.to_str().unwrap()]);
+    assert_eq!(
+        code, 1,
+        "the re-entry refuses to promote the known-bad .prev (stderr={err})"
+    );
+    assert!(
+        err.contains("known-bad"),
+        "the refusal names the known-bad guard (stderr={err})"
+    );
+    assert!(
+        !dest.exists() || std::fs::read(&dest).unwrap() != bad,
+        "the known-bad bytes were never promoted to the destination"
+    );
+}
+
+#[test]
+fn a_crash_during_rollback_then_re_entry_converges_to_the_good_binary_over_the_real_binary() {
+    // CRASH-DURING-ROLLBACK over the shipped verbs: the counter reached the cap (guard recorded) and
+    // a rollback was attempted but power was cut BEFORE the dest rename landed, so dest still holds
+    // the bad bytes and `ironbus.prev` is still good. Re-entering `ironbus rollback` must complete
+    // the rollback and converge dest to the GOOD binary (the good `.prev` is not the known-bad bytes).
+    let scr = Scratch::new("crash-during-it");
+    let dest = scr.path().join("ironbus");
+    let prev = scr.path().join("ironbus.prev");
+    let good = b"ironbus v1 (known good)";
+    let bad = b"ironbus v2 (broken upgrade)";
+
+    std::fs::write(&dest, bad).unwrap();
+    std::fs::write(&prev, good).unwrap();
+    for _ in 0..3 {
+        let (code, _o, _e) =
+            run_ironbus(&["record-start", "--dest", dest.to_str().unwrap(), "--failed"]);
+        assert_eq!(code, 0);
+    }
+
+    // Re-enter: the good `.prev` does NOT match the known-bad guard, so the rollback proceeds.
+    let (code, out, err) = run_ironbus(&["rollback", "--dest", dest.to_str().unwrap()]);
+    assert_eq!(
+        code, 0,
+        "the re-entry completes the rollback (stdout={out} stderr={err})"
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        good,
+        "the re-entry converged the destination to the good binary"
+    );
+    // The completed rollback cleared the counter and the known-bad guard.
+    assert!(
+        !scr.path().join(".ironbus-start-attempts").exists(),
+        "the completed rollback reset the failure budget"
+    );
+    assert!(
+        !scr.path().join(".ironbus-failed-fingerprint").exists(),
+        "the completed rollback cleared the known-bad guard"
+    );
+}
+
 #[test]
 fn upgrade_rejects_a_missing_new_binary() {
     // Fail-closed: upgrade refuses to run if the (would-be verified) new binary is absent, rather

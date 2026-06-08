@@ -27,6 +27,32 @@
 //! and drives that flow; the swap below only ever runs over bytes the caller has already verified,
 //! so it never weakens the fail-closed posture (any download/verify happens BEFORE the swap).
 //!
+//! ## Re-entry hardening against the two-rename window (#348, a #104 follow-up)
+//!
+//! A generic [`atomic_swap_with_prev`] does a two-rename swap (retain `dest` as `<dest>.prev`, then
+//! rename the new bytes over `dest`) and the original rollback reused it. That has a sub-microsecond
+//! window: between the two `rename(2)`s `<dest>.prev` holds the bytes that were AT `dest` (the bad,
+//! just-failed binary), and `dest` is momentarily absent. If power is lost there (or after the swap
+//! but before the counter clear), a re-entered `record-start --check` could re-fire the rollback and
+//! PROMOTE the known-bad bytes that now sit in `.prev`. Two changes close that window so a re-entry
+//! deterministically converges to the GOOD binary instead of re-applying a half-done rollback:
+//!
+//! - **A rollback swap that never destroys the good `.prev`.** [`rollback_to_prev`] no longer reuses
+//!   the generic retain-then-swap; it uses [`restore_prev_over_dest`], which stages the `.prev` bytes
+//!   to a sibling temp, fsyncs, then renames the temp OVER `dest` directly (and fsyncs the dir),
+//!   WITHOUT first moving `dest` onto `.prev`. So `.prev` (the last known-good bytes) is preserved
+//!   for the whole rollback: a crash at any single point leaves `dest` holding either the bad bytes
+//!   (rename not yet applied) or the good bytes (applied), with `.prev` ALWAYS still good, so a
+//!   re-entered rollback repeats safely and converges to the good binary.
+//! - **A durable known-bad content guard recorded with the counter.** When the failed-start count
+//!   reaches the fall-back cap, [`record_failed_start`] also records the content fingerprint of the
+//!   binary that is failing (a `crc32c` + byte-length identity, fsynced via the atomic write-temp +
+//!   rename + dir-fsync discipline). [`rollback_to_prev`] REFUSES to promote `<dest>.prev` if its
+//!   fingerprint matches that recorded known-bad fingerprint, so even a pathological state in which
+//!   `.prev` somehow holds the just-failed bytes can never promote them. The guard is cleared (also
+//!   durably) only AFTER a rollback has restored the bytes and reset the counter, so a crash between
+//!   the swap and the counter clear leaves the guard in place and the re-entry stays deterministic.
+//!
 //! Unix-only, like `serve`: `rename(2)` atomicity and the fsync-the-dir durability step are POSIX
 //! guarantees. The module is gated with `#[cfg(unix)] mod upgrade;` in `main.rs`, so it is compiled
 //! only on Unix; the non-Unix `cmd_upgrade` stub there errors out before any of this runs.
@@ -47,6 +73,13 @@ pub const DEFAULT_MAX_FAILED_STARTS: u32 = 3;
 /// and a rollback can clear it. The packaged systemd unit reads and writes it across restarts.
 pub const COUNTER_FILE: &str = ".ironbus-start-attempts";
 
+/// The file name (a sibling of the installed binary) holding the content fingerprint of the binary
+/// that reached the fall-back cap: the durable known-bad guard (#348). It is written (fsynced) when
+/// the counter reaches the cap and cleared (fsynced) only after a rollback restores the bytes and
+/// resets the counter, so a re-entered rollback after a crash in the two-rename window can never
+/// PROMOTE the known-bad bytes. Its presence is harmless if absent (no guard = nothing refused).
+pub const FAILED_FINGERPRINT_FILE: &str = ".ironbus-failed-fingerprint";
+
 /// The suffix of the retained rollback copy: `<dest>.prev`. Identical to `scripts/install.sh`, so
 /// the installer and the `upgrade` subcommand agree on where the rollback bytes live.
 const PREV_SUFFIX: &str = ".prev";
@@ -59,6 +92,12 @@ pub enum UpgradeError {
     Io(String, io::Error),
     /// The requested rollback found no `<dest>.prev` to restore (nothing was ever upgraded over).
     NoPrev(PathBuf),
+    /// The rollback target `<dest>.prev` holds the bytes recorded as known-bad (the binary that just
+    /// failed N starts), so promoting it is REFUSED (#348). This only arises from a re-entry after a
+    /// crash in the two-rename window; promoting the known-bad bytes is the exact hazard the guard
+    /// closes. The `dest` already holds the bytes the prior rollback restored, so the node is not
+    /// bricked; this refusal just prevents re-applying a half-done rollback onto the bad binary.
+    PrevIsKnownBad(PathBuf),
 }
 
 impl std::fmt::Display for UpgradeError {
@@ -69,6 +108,15 @@ impl std::fmt::Display for UpgradeError {
                 write!(
                     f,
                     "no rollback copy at {} (nothing to roll back to)",
+                    p.display()
+                )
+            }
+            UpgradeError::PrevIsKnownBad(p) => {
+                write!(
+                    f,
+                    "refusing to promote {}: it holds the bytes recorded as known-bad (the binary \
+                     that failed N starts); a rollback was already applied, so this re-entry is a \
+                     no-op rather than promoting the known-bad binary",
                     p.display()
                 )
             }
@@ -92,6 +140,14 @@ pub fn counter_path(dest: &Path) -> PathBuf {
     dest.parent()
         .unwrap_or_else(|| Path::new("."))
         .join(COUNTER_FILE)
+}
+
+/// The path of the known-bad fingerprint guard file, a sibling of the installed binary (#348).
+#[must_use]
+pub fn failed_fingerprint_path(dest: &Path) -> PathBuf {
+    dest.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(FAILED_FINGERPRINT_FILE)
 }
 
 /// Atomically installs the already-verified bytes at `src` over `dest`, retaining any prior binary
@@ -163,24 +219,59 @@ pub fn atomic_swap_with_prev(src: &Path, dest: &Path) -> Result<(), UpgradeError
     Ok(())
 }
 
-/// Rolls back to the retained `<dest>.prev`, restoring it over `dest` via the same atomic swap and
-/// clearing the start-attempt counter (the rollback target is, by definition, the last known-good).
+/// Rolls back to the retained `<dest>.prev`, restoring it over `dest` and clearing the start-attempt
+/// counter (the rollback target is, by definition, the last known-good).
+///
+/// Hardened against the two-rename re-entry window (#348):
+/// - It uses [`restore_prev_over_dest`], which NEVER moves `dest` onto `.prev`, so the good `.prev`
+///   bytes survive a crash at any point and a re-entered rollback converges to the good binary.
+/// - It REFUSES to promote `.prev` if `.prev`'s content fingerprint matches the known-bad
+///   fingerprint recorded by [`record_failed_start`] at the cap, so a re-entry can never promote the
+///   just-failed bytes.
+/// - It clears the known-bad guard (durably) only AFTER the swap AND the counter reset, so a crash
+///   in between leaves the guard in place and the next `--check` stays deterministic.
 ///
 /// # Errors
-/// [`UpgradeError::NoPrev`] if there is no `<dest>.prev` to restore; [`UpgradeError::Io`] on any IO
-/// failure during the swap.
+/// [`UpgradeError::NoPrev`] if there is no `<dest>.prev` to restore; [`UpgradeError::PrevIsKnownBad`]
+/// if `.prev` holds the recorded known-bad bytes; [`UpgradeError::Io`] on any IO failure.
 pub fn rollback_to_prev(dest: &Path) -> Result<(), UpgradeError> {
     let prev = prev_path(dest);
     if !prev.exists() {
         return Err(UpgradeError::NoPrev(prev));
     }
-    atomic_swap_with_prev(&prev, dest)?;
+    // Content guard: never promote bytes recorded as the binary that just failed N starts. This is
+    // the case a power cut in the two-rename window leaves behind (`.prev` momentarily holds the bad
+    // dest bytes). The guard is best-effort to READ: an unreadable/absent guard simply does not
+    // refuse (a missing guard is "no known-bad recorded"), so it never blocks a legitimate rollback.
+    if let Some(bad) = read_failed_fingerprint(dest) {
+        let prev_fp = fingerprint_file(&prev).map_err(|e| {
+            UpgradeError::Io(
+                format!("fingerprinting the rollback copy at {}", prev.display()),
+                e,
+            )
+        })?;
+        if prev_fp == bad {
+            return Err(UpgradeError::PrevIsKnownBad(prev));
+        }
+    }
+    restore_prev_over_dest(&prev, dest)?;
     // A successful rollback resets the failure budget: the restored binary is the known-good one.
     clear_failed_starts(dest).map_err(|e| {
         UpgradeError::Io(
             format!(
                 "clearing the start counter at {}",
                 counter_path(dest).display()
+            ),
+            e,
+        )
+    })?;
+    // Only AFTER the bytes are restored and the counter is reset do we clear the known-bad guard, so
+    // a crash before this point keeps the guard for the next deterministic re-entry.
+    clear_failed_fingerprint(dest).map_err(|e| {
+        UpgradeError::Io(
+            format!(
+                "clearing the known-bad guard at {}",
+                failed_fingerprint_path(dest).display()
             ),
             e,
         )
@@ -200,25 +291,40 @@ pub fn read_failed_starts(dest: &Path) -> u32 {
 }
 
 /// Records one more failed start for `dest`, returning the NEW count. The systemd unit calls this
-/// when the broker fails to come up; once the count reaches [`DEFAULT_MAX_FAILED_STARTS`] the unit
-/// consults [`should_fall_back`] and rolls back. The counter file is fsynced so the count survives
-/// a power loss between the failed start and the next boot.
+/// when the broker fails to come up; once the count reaches `max_failed_starts` the unit consults
+/// [`should_fall_back`] and rolls back. The counter file is fsynced so the count survives a power
+/// loss between the failed start and the next boot.
+///
+/// When the new count REACHES the cap, this also records the content fingerprint of the binary at
+/// `dest` as the known-bad guard (#348), durably (atomic write-temp + fsync + rename + dir-fsync),
+/// so a rollback re-entered after a power cut in the two-rename window can refuse to promote those
+/// exact bytes. Recording the guard is best-effort: a guard-write IO failure is swallowed (the
+/// counter itself is the authority; a missing guard only forgoes the extra refusal), so a failed
+/// guard write never turns a normal failed-start record into a hard error.
 ///
 /// # Errors
 /// Propagates an IO error writing or fsyncing the counter file.
-pub fn record_failed_start(dest: &Path) -> io::Result<u32> {
+pub fn record_failed_start(dest: &Path, max_failed_starts: u32) -> io::Result<u32> {
     let next = read_failed_starts(dest).saturating_add(1);
     write_counter(dest, next)?;
+    if next >= max_failed_starts {
+        // Best-effort: the guard is a defense-in-depth refusal, not the rollback authority.
+        if let Ok(fp) = fingerprint_file(dest) {
+            let _ = write_failed_fingerprint(dest, &fp);
+        }
+    }
     Ok(next)
 }
 
 /// Clears the failed-start counter for `dest` (a successful, healthy start). Removing the file is
-/// the clean-slate state [`read_failed_starts`] reads as 0.
+/// the clean-slate state [`read_failed_starts`] reads as 0. Also clears the known-bad guard (#348):
+/// a healthy start means the binary at `dest` is good, so any stale known-bad record is obsolete.
 ///
 /// # Errors
 /// Propagates an IO error other than "already absent" removing the counter file.
 pub fn record_successful_start(dest: &Path) -> io::Result<()> {
-    clear_failed_starts(dest)
+    clear_failed_starts(dest)?;
+    clear_failed_fingerprint(dest)
 }
 
 /// The fallback decision: should a node at `dest` having failed `failed_starts` times fall back to
@@ -281,6 +387,114 @@ fn write_counter(dest: &Path, count: u32) -> io::Result<()> {
 /// Removes the counter file, treating an already-absent file as success.
 fn clear_failed_starts(dest: &Path) -> io::Result<()> {
     match fs::remove_file(counter_path(dest)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Restores the `.prev` bytes over `dest` WITHOUT moving `dest` onto `.prev` (#348). Unlike the
+/// generic [`atomic_swap_with_prev`] (which retains `dest` as `.prev` BEFORE the swap, destroying the
+/// good rollback copy in the two-rename window), this preserves `.prev` for the whole operation:
+///
+/// 1. Copy `src` (the `.prev` bytes) to a sibling temp on the SAME filesystem, mode 0755.
+/// 2. `fsync` the temp so a power loss after the rename cannot surface a truncated binary.
+/// 3. `rename` the temp over `dest` (atomic on POSIX), then `fsync` the parent dir so it is durable.
+///
+/// `.prev` is never touched, so a crash at any point leaves `dest` holding either the prior bytes
+/// (rename not yet applied) or the restored good bytes (applied), and `.prev` ALWAYS still good. A
+/// re-entered rollback therefore repeats safely and converges to the good binary.
+fn restore_prev_over_dest(src: &Path, dest: &Path) -> Result<(), UpgradeError> {
+    let io_err = |step: &str| {
+        let step = step.to_string();
+        move |e: io::Error| UpgradeError::Io(step.clone(), e)
+    };
+
+    // 1. Stage the rollback bytes next to the destination on the same filesystem, mode 0755.
+    let pid = std::process::id();
+    let tmp = sibling_temp(dest, pid);
+    copy_mode_0755(src, &tmp).map_err(io_err(&format!(
+        "staging the rollback binary at {}",
+        tmp.display()
+    )))?;
+
+    // 2. fsync the staged file so its bytes are durable before the rename publishes it.
+    if let Err(e) = fsync_path(&tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(UpgradeError::Io(format!("fsyncing {}", tmp.display()), e));
+    }
+
+    // 3. Atomically swap the rollback bytes into place (NEVER moving dest onto .prev), then fsync the
+    //    directory so the rename persists. `.prev` is left intact for a deterministic re-entry.
+    if let Err(e) = fs::rename(&tmp, dest) {
+        let _ = fs::remove_file(&tmp);
+        return Err(UpgradeError::Io(
+            format!("restoring the rollback binary to {}", dest.display()),
+            e,
+        ));
+    }
+    if let Some(dir) = dest.parent() {
+        fsync_dir(dir).map_err(io_err(&format!(
+            "fsyncing the install dir {}",
+            dir.display()
+        )))?;
+    }
+    Ok(())
+}
+
+/// A content fingerprint of a file: `"<crc32c>-<len>"` (#348). A non-cryptographic content identity,
+/// never a security boundary; pairing the crc32c with the byte length makes an accidental collision
+/// between two real binaries effectively impossible. Used to record the known-bad binary and to
+/// compare a rollback candidate against it.
+fn fingerprint_bytes(bytes: &[u8]) -> String {
+    let crc = crc32c::crc32c(bytes);
+    format!("{crc:08x}-{}", bytes.len())
+}
+
+/// Reads a file and returns its [`fingerprint_bytes`].
+fn fingerprint_file(path: &Path) -> io::Result<String> {
+    let bytes = fs::read(path)?;
+    Ok(fingerprint_bytes(&bytes))
+}
+
+/// Writes the known-bad fingerprint `fp` for `dest`, durably (atomic write-temp + fsync + rename +
+/// dir-fsync), so the guard survives a power loss and a reader never sees a partial fingerprint.
+fn write_failed_fingerprint(dest: &Path, fp: &str) -> io::Result<()> {
+    let path = failed_fingerprint_path(dest);
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(format!(".tmp.{}", std::process::id()));
+        PathBuf::from(name)
+    };
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    f.write_all(fp.as_bytes())?;
+    f.flush()?;
+    f.sync_all()?;
+    drop(f);
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    fsync_dir(dir)
+}
+
+/// Reads the recorded known-bad fingerprint for `dest` (`None` if absent or unreadable: a missing
+/// guard means "no known-bad recorded", so it never blocks a legitimate rollback).
+fn read_failed_fingerprint(dest: &Path) -> Option<String> {
+    fs::read_to_string(failed_fingerprint_path(dest))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Removes the known-bad guard file, treating an already-absent file as success.
+fn clear_failed_fingerprint(dest: &Path) -> io::Result<()> {
+    match fs::remove_file(failed_fingerprint_path(dest)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -396,8 +610,8 @@ mod tests {
         atomic_swap_with_prev(&bad_src, &dest).unwrap();
 
         // Simulate failed starts having accrued, then roll back.
-        record_failed_start(&dest).unwrap();
-        record_failed_start(&dest).unwrap();
+        record_failed_start(&dest, DEFAULT_MAX_FAILED_STARTS).unwrap();
+        record_failed_start(&dest, DEFAULT_MAX_FAILED_STARTS).unwrap();
         assert_eq!(read_failed_starts(&dest), 2);
 
         rollback_to_prev(&dest).expect("rollback must succeed when a .prev exists");
@@ -440,9 +654,18 @@ mod tests {
             0,
             "an absent counter reads as a clean slate"
         );
-        assert_eq!(record_failed_start(&dest).unwrap(), 1);
-        assert_eq!(record_failed_start(&dest).unwrap(), 2);
-        assert_eq!(record_failed_start(&dest).unwrap(), 3);
+        assert_eq!(
+            record_failed_start(&dest, DEFAULT_MAX_FAILED_STARTS).unwrap(),
+            1
+        );
+        assert_eq!(
+            record_failed_start(&dest, DEFAULT_MAX_FAILED_STARTS).unwrap(),
+            2
+        );
+        assert_eq!(
+            record_failed_start(&dest, DEFAULT_MAX_FAILED_STARTS).unwrap(),
+            3
+        );
         assert_eq!(
             read_failed_starts(&dest),
             3,
@@ -500,6 +723,202 @@ mod tests {
         assert_eq!(
             DEFAULT_MAX_FAILED_STARTS, 3,
             "the documented default N is 3"
+        );
+    }
+
+    // --- #348: two-rename re-entry window hardening -------------------------------------------
+
+    /// Reproduces the EXACT mid-rollback state a power cut in the two-rename window of the ORIGINAL
+    /// (generic-swap) rollback would leave: `dest` is absent (it was renamed away to `.prev`), and
+    /// `.prev` holds the BAD, just-failed bytes (the bytes that were at `dest`). The good bytes
+    /// survive only in `.prev` BEFORE this step in the old shape; here they are lost, exactly the
+    /// hazard. A re-entered `--check` would then promote `.prev`'s bad bytes.
+    fn simulate_crash_between_renames(dest: &Path, good: &[u8], bad: &[u8]) {
+        // The destination currently holds the bad (failing) binary; `.prev` holds the good one.
+        fs::write(dest, bad).unwrap();
+        fs::write(prev_path(dest), good).unwrap();
+        // The original rollback's first rename: dest -> .prev. After this, `.prev` = bad bytes and
+        // dest is gone. (The good bytes existed only in a pid-named temp the next boot cannot find.)
+        fs::rename(dest, prev_path(dest)).unwrap();
+        assert!(!dest.exists(), "the crash left dest absent");
+        assert_eq!(
+            fs::read(prev_path(dest)).unwrap(),
+            bad,
+            "the crash left .prev holding the BAD bytes (the two-rename hazard)"
+        );
+    }
+
+    #[test]
+    fn a_power_cut_between_the_renames_never_promotes_the_bad_binary() {
+        // #348 TEETH: drive the failed-start counter to the cap (recording the known-bad guard),
+        // then reproduce the mid-rollback crash state (dest absent, .prev = bad bytes), then re-enter
+        // the rollback as the next boot would. The content guard MUST refuse to promote the known-bad
+        // `.prev`, so the bad binary is NEVER promoted to the destination.
+        //
+        // PROOF OF TEETH: without the guard (the pre-fix shape that reused the generic swap),
+        // `rollback_to_prev` here would happily install `.prev`'s BAD bytes at `dest` and return Ok,
+        // promoting the known-bad binary. The refusal below is exactly what closes that window.
+        let scr = Scratch::new("powercut");
+        let dest = scr.path().join("ironbus");
+        let good = b"ironbus v1 (known good)";
+        let bad = b"ironbus v2 (broken upgrade)";
+
+        // The failing binary is at dest with a good `.prev`; N failed starts record the guard.
+        fs::write(&dest, bad).unwrap();
+        fs::write(prev_path(&dest), good).unwrap();
+        for _ in 0..DEFAULT_MAX_FAILED_STARTS {
+            record_failed_start(&dest, DEFAULT_MAX_FAILED_STARTS).unwrap();
+        }
+        assert_eq!(
+            read_failed_fingerprint(&dest).as_deref(),
+            Some(fingerprint_bytes(bad).as_str()),
+            "reaching the cap records the failing binary's fingerprint as the known-bad guard"
+        );
+
+        // A power cut in the two-rename window leaves dest absent and `.prev` holding the bad bytes.
+        simulate_crash_between_renames(&dest, good, bad);
+
+        // Re-enter the rollback as the next boot's --check would. The guard REFUSES to promote the
+        // known-bad `.prev`, rather than installing the bad bytes at dest.
+        let e = rollback_to_prev(&dest).unwrap_err();
+        assert!(
+            matches!(e, UpgradeError::PrevIsKnownBad(_)),
+            "the re-entry must refuse to promote the known-bad .prev, got: {e}"
+        );
+        // The bad binary was never promoted to the destination (the whole point of the guard).
+        assert!(
+            !dest.exists() || fs::read(&dest).unwrap() != bad,
+            "the known-bad bytes were never promoted to the destination"
+        );
+        // The guard is still present (a refusing re-entry never clears it), so the refusal is stable
+        // across repeated re-entries until a genuine good binary clears it.
+        assert!(
+            read_failed_fingerprint(&dest).is_some(),
+            "a refused re-entry keeps the known-bad guard for the next deterministic re-entry"
+        );
+    }
+
+    #[test]
+    fn the_hardened_rollback_never_destroys_the_good_prev() {
+        // The structural half of the fix: a normal rollback restores `.prev` over `dest` WITHOUT
+        // moving `dest` onto `.prev`, so the good `.prev` bytes are preserved for a re-entry. This
+        // is what makes a crash mid-rollback converge to the good binary instead of losing it.
+        let scr = Scratch::new("preserve-prev");
+        let dest = scr.path().join("ironbus");
+        let good = b"ironbus v1 (known good)";
+        let bad = b"ironbus v2 (broken upgrade)";
+        fs::write(&dest, bad).unwrap();
+        fs::write(prev_path(&dest), good).unwrap();
+
+        restore_prev_over_dest(&prev_path(&dest), &dest).unwrap();
+
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            good,
+            "the rollback restored the good bytes at the destination"
+        );
+        assert_eq!(
+            fs::read(prev_path(&dest)).unwrap(),
+            good,
+            "the good .prev is PRESERVED (never overwritten with the bad dest bytes)"
+        );
+    }
+
+    #[test]
+    fn a_crash_during_rollback_then_re_entry_converges_to_the_good_binary() {
+        // CRASH-DURING-ROLLBACK: with the hardened swap, a re-entry after a crash before the counter
+        // clear still converges to the good binary. Here dest still holds the bad bytes (the rename
+        // had not landed when power was cut) and `.prev` is still good. The re-entry must restore the
+        // good bytes and clear the counter and the guard.
+        let scr = Scratch::new("crash-during");
+        let dest = scr.path().join("ironbus");
+        let good = b"ironbus v1 (known good)";
+        let bad = b"ironbus v2 (broken upgrade)";
+        fs::write(&dest, bad).unwrap();
+        fs::write(prev_path(&dest), good).unwrap();
+        // The counter reached the cap (guard recorded), and a rollback was attempted but power was
+        // cut BEFORE the dest rename landed: dest still bad, .prev still good, counter still at N.
+        for _ in 0..DEFAULT_MAX_FAILED_STARTS {
+            record_failed_start(&dest, DEFAULT_MAX_FAILED_STARTS).unwrap();
+        }
+        assert_eq!(read_failed_starts(&dest), DEFAULT_MAX_FAILED_STARTS);
+
+        // Re-enter: `.prev` (good) does NOT match the known-bad guard, so the rollback proceeds.
+        rollback_to_prev(&dest)
+            .expect("the re-entry must complete the rollback to the good binary");
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            good,
+            "the re-entry converged the destination to the good binary"
+        );
+        assert_eq!(
+            read_failed_starts(&dest),
+            0,
+            "the completed rollback reset the failure budget"
+        );
+        assert!(
+            read_failed_fingerprint(&dest).is_none(),
+            "a completed rollback clears the known-bad guard"
+        );
+    }
+
+    #[test]
+    fn a_healthy_start_clears_the_known_bad_guard() {
+        // A genuine successful start means the binary at dest is good, so any stale known-bad guard
+        // is obsolete and must be cleared (otherwise a later legitimate rollback to those bytes,
+        // were they to become good-again `.prev`, could be wrongly refused).
+        let scr = Scratch::new("ok-clears-guard");
+        let dest = scr.path().join("ironbus");
+        fs::write(&dest, b"binary").unwrap();
+        for _ in 0..DEFAULT_MAX_FAILED_STARTS {
+            record_failed_start(&dest, DEFAULT_MAX_FAILED_STARTS).unwrap();
+        }
+        assert!(
+            read_failed_fingerprint(&dest).is_some(),
+            "guard recorded at the cap"
+        );
+
+        record_successful_start(&dest).unwrap();
+        assert!(
+            read_failed_fingerprint(&dest).is_none(),
+            "a healthy start clears the known-bad guard"
+        );
+        assert_eq!(read_failed_starts(&dest), 0, "and the counter");
+    }
+
+    #[test]
+    fn the_guard_is_only_recorded_at_the_cap_not_below() {
+        // Below the cap, no known-bad guard is written: only reaching N records the failing binary,
+        // so a transient single failure of a healthy binary never arms the refusal.
+        let scr = Scratch::new("guard-at-cap");
+        let dest = scr.path().join("ironbus");
+        fs::write(&dest, b"binary").unwrap();
+        record_failed_start(&dest, DEFAULT_MAX_FAILED_STARTS).unwrap();
+        record_failed_start(&dest, DEFAULT_MAX_FAILED_STARTS).unwrap();
+        assert!(
+            read_failed_fingerprint(&dest).is_none(),
+            "below the cap there is no known-bad guard"
+        );
+        record_failed_start(&dest, DEFAULT_MAX_FAILED_STARTS).unwrap();
+        assert!(
+            read_failed_fingerprint(&dest).is_some(),
+            "the guard is recorded exactly when the count reaches the cap"
+        );
+    }
+
+    #[test]
+    fn the_content_fingerprint_distinguishes_distinct_binaries() {
+        // The guard's identity must distinguish a good binary from a bad one (same fingerprint for
+        // identical bytes, different for different bytes), so it never confuses the two.
+        assert_eq!(
+            fingerprint_bytes(b"ironbus good"),
+            fingerprint_bytes(b"ironbus good"),
+            "identical bytes have an identical fingerprint"
+        );
+        assert_ne!(
+            fingerprint_bytes(b"ironbus good"),
+            fingerprint_bytes(b"ironbus bad"),
+            "distinct bytes have distinct fingerprints"
         );
     }
 }

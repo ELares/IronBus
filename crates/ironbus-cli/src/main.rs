@@ -3481,7 +3481,11 @@ fn cmd_repair(
 #[cfg(unix)]
 fn map_upgrade_err(e: &upgrade::UpgradeError) -> CliError {
     match e {
-        upgrade::UpgradeError::NoPrev(_) => CliError::Usage(e.to_string()),
+        // Both refusals (no rollback copy, or a copy recorded as known-bad) are usage-level: the
+        // verb declined to act and left the binary in a safe state, it did not fault (exit 1).
+        upgrade::UpgradeError::NoPrev(_) | upgrade::UpgradeError::PrevIsKnownBad(_) => {
+            CliError::Usage(e.to_string())
+        }
         upgrade::UpgradeError::Io(..) => CliError::Internal(e.to_string()),
     }
 }
@@ -3567,7 +3571,7 @@ fn cmd_record_start(
     let n = max_failed_starts.unwrap_or(upgrade::DEFAULT_MAX_FAILED_STARTS);
     match mode {
         RecordStartMode::Failed => {
-            let count = upgrade::record_failed_start(dest)
+            let count = upgrade::record_failed_start(dest, n)
                 .map_err(|e| CliError::Internal(format!("recording a failed start: {e}")))?;
             report_fall_back(dest, count, n, out)?;
         }
