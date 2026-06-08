@@ -31,6 +31,10 @@
 
 pub mod broker;
 pub mod clock;
+/// The apples-to-apples baseline COMPARISON RIG (#114): the versioned comparison-report schema, the
+/// durability-label-match lint (the central anti-marketing guard), the appendix-labeling rule, and
+/// the Little's-Law queue-occupancy computation. Pure data + lints; ready to ingest peer rows.
+pub mod comparison;
 pub mod harness;
 pub mod injected_stall;
 /// The in-process broker over a fault-injecting filesystem, the DETERMINISTIC freeze seam for the
@@ -39,7 +43,16 @@ pub mod injected_stall;
 pub mod inproc;
 pub mod probe;
 pub mod provenance;
+/// The rolling-median CI REGRESSION GATE (#114): per-device 7-day median throughput/p99/p99.9 drift
+/// detection versus the last released tag, with advisory-only noisy runs, a human-ratify escape
+/// hatch, and a graceful no-op when there is no baseline history yet. Pure computation; no IO.
+pub mod regression;
 
 pub use broker::{Broker, BrokerError};
+pub use comparison::{
+    littles_law_occupancy, ComparisonReport, ComparisonRow, DurabilityLabel, Placement,
+    ReportError, System,
+};
 pub use harness::{run_open_loop, Percentiles, RunConfig, RunError, RunReport};
 pub use provenance::Provenance;
+pub use regression::{evaluate, Baseline, Breach, GateOutcome, History, Override, RunPoint};

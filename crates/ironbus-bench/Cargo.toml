@@ -14,6 +14,14 @@ publish = false
 name = "ironbus-bench"
 path = "src/main.rs"
 
+# The CI regression gate (#114): reads the per-device run history + the last-released-tag baseline
+# from JSON and exits non-zero only on an un-ratified rolling-median regression. It GRACEFULLY NO-OPS
+# (exit 0, logged "no baseline history yet") when no baseline exists, which is the state today (no
+# released tag until v0.1.0). Off the shipped binary graph, like the rest of this crate.
+[[bin]]
+name = "ironbus-regression-gate"
+path = "src/bin/regression_gate.rs"
+
 [dependencies]
 # The harness drives the broker through the REAL #11 client over a real socket, never a privileged
 # test path; it launches the shipping `ironbus` binary built by `ironbus-cli`.

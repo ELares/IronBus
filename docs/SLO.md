@@ -220,6 +220,15 @@ no run on the reference edge device has been recorded and archived. Therefore:
   harness isolation, the CoV / p99-drift steady-state criterion, the `>= 4h`
   sustained run, and the `>= 4x` write-amplification gate) before its number can
   ratify a row.
+- [BASELINE_RIG.md](BASELINE_RIG.md) (#114): the apples-to-apples peer-comparison
+  rig (the versioned comparison schema, the matched-durability-label lint that
+  fails a mismatched comparison, the appendix-only rule for cluster-class
+  Kafka/Redpanda, and the Little's-Law occupancy reporting) and the CI
+  rolling-median regression gate (per-device 7-day median; throughput down
+  `> 10%` / p99 up `> 15%` / p99.9 up `> 25%` versus the last released tag, with
+  advisory-only noisy runs, a human-ratify escape hatch, and a graceful no-op
+  when there is no baseline history yet). The live multi-broker runs are a
+  documented host residual the rig is ready to ingest.
 - [#115](https://github.com/ELares/IronBus/issues/115): the `tiny` profile RAM
   budget (the 64 MiB ceiling).
 - [#116](https://github.com/ELares/IronBus/issues/116): edge durability defaults
