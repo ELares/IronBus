@@ -11,8 +11,11 @@
 //! asked while data remains), read errors (an injected `read_at` IO error), and a `sync_dir`
 //! (directory-publish) failure: the rename-boundary analogue for IronBus, which uses no `rename`,
 //! whose atomic-publish point is the `sync_dir` that makes a new segment's directory entry durable
-//! (the seal / roll publish). A seeded fault scheduler that drives these primitives from one PRNG
-//! is a follow-up (#151). Page-cache reorder/drop of the unsynced tail (the power-loss model where
+//! (the seal / roll publish). A SEEDED fault scheduler that drives these same primitives from one
+//! PRNG (so a whole crash workload is a pure function of one `u64` seed, replayable from the printed
+//! seed) is the additive companion in [`sim`](crate::sim) (#384); this arming model stays for the
+//! explicit, boundary-pinning tests. Page-cache reorder/drop of the unsynced tail (the power-loss
+//! model where
 //! only fsync'd bytes are guaranteed durable, #164) is modeled on the disk itself by
 //! [`InMemoryFs::simulate_power_loss_reorder`](crate::fs::InMemoryFs::simulate_power_loss_reorder).
 
@@ -297,6 +300,42 @@ impl FaultControl {
             None
         }
     }
+
+    /// The seeded-schedule constructor (#384): pairs a fresh [`FaultControl`] with a
+    /// [`FaultSchedule`](crate::sim::FaultSchedule) whose single seeded PRNG drives every fault
+    /// decision (which op class faults, and which fault), so a whole crash workload is a pure
+    /// function of `seed` and replays from the printed seed alone. This is the additive,
+    /// seed-driven companion to the explicit arming methods above (which the boundary-pinning tests
+    /// keep using): nothing here injects a fault on its own. A caller drives the schedule
+    /// ([`FaultSchedule::decide`](crate::sim::FaultSchedule::decide)) per op the recovery path
+    /// performs and arms the returned [`FaultKind`](crate::sim::FaultKind) on the control via
+    /// [`FaultSchedule::apply_to`](crate::sim::FaultSchedule::apply_to). The fault MECHANICS stay
+    /// in this module; only the seeded CHOICE lives in [`sim`](crate::sim).
+    #[must_use]
+    pub fn seeded_schedule(
+        seed: u64,
+        probs: crate::sim::FaultProbabilities,
+    ) -> (FaultControl, crate::sim::FaultSchedule) {
+        (
+            FaultControl::default(),
+            crate::sim::FaultSchedule::new(seed, probs),
+        )
+    }
+
+    /// Disarms every transient fault (sync, write, read, short-read), so a test can apply one
+    /// seeded decision, exercise it, then reset before the next op or before inspecting the
+    /// recovered state under a clean filesystem. The one-shot torn write and checksum flip
+    /// self-disarm when they fire, so they need no reset here; the sync gate is left untouched (it
+    /// is not part of the seeded schedule).
+    pub fn disarm_transient_faults(&self) {
+        self.set_fail_sync(false);
+        self.set_fail_write(false);
+        self.set_fail_read(false);
+        self.set_short_read(0);
+        self.set_fail_sync_dir(false);
+        // Consume any still-armed one-shot torn write so it cannot fire on a later op.
+        let _ = self.take_torn_write();
+    }
 }
 
 /// A [`Filesystem`] that wraps another and hands out [`FaultFile`]s sharing one
@@ -319,6 +358,23 @@ impl<F: Filesystem> FaultFs<F> {
             },
             control,
         )
+    }
+
+    /// Wraps `inner` with an EXISTING [`FaultControl`], for the seeded-schedule path where the
+    /// control is created first (via [`FaultControl::seeded_schedule`]) and shared with the
+    /// schedule that drives it. The returned [`FaultFs`] arms its faults from that same control.
+    #[must_use]
+    pub fn with_control(inner: F, control: FaultControl) -> FaultFs<F> {
+        FaultFs { inner, control }
+    }
+
+    /// Consumes the fault layer and returns the wrapped filesystem, so a test can reopen the
+    /// underlying disk cleanly (with no fault layer) after a faulted run, exactly as a real reopen
+    /// would. The fault layer holds no state of its own beyond the shared [`FaultControl`], so
+    /// nothing is lost by unwrapping it.
+    #[must_use]
+    pub fn into_inner(self) -> F {
+        self.inner
     }
 
     /// Borrows the wrapped filesystem, so a test can reach through the fault layer to the
