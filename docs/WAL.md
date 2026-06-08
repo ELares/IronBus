@@ -386,7 +386,13 @@ code.
   exists: segments grow as records are appended, and ADR 0002 forbids recycling a
   segment id in v1 (nonce-reuse safety for encryption at rest), pinned by the test
   `segment_ids_increase_monotonically_and_are_never_recycled`. There are no generation
-  tags in the segment header.
+  tags in the segment header. The cross-platform preallocation design (the four-primitive
+  shim, default-ON preallocation to roll size, per-OS implementations, and the
+  ENOSPC-at-roll fail-fast path) is now SPECIFIED in
+  [PREALLOCATION.md](PREALLOCATION.md), which also resolves the recycling question
+  honestly: v1 never recycles, and no generation stamp is added to the #5 header because,
+  with ids never reused, it is unnecessary (recycling becomes a v2 nonce-safety decision,
+  #40).
 - **A dedicated append actor + commit thread, group-commit batching, admission
   credits.** The single append actor and group-commit batching are now SHIPPED (#177):
   `actor.rs` owns the `Engine`, drains a batch of queued produces, and issues one
