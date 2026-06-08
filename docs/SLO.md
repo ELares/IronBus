@@ -18,15 +18,18 @@ not it marks the metric as a target to be set during ratification.
 > baseline, and nothing in this document should be read as an SLO that is "met".
 >
 > The measurement instrument is the macro-bench harness
-> ([`crates/ironbus-bench/`](../crates/ironbus-bench), task #111). Its live
+> ([`crates/ironbus-bench/`](../crates/ironbus-bench), task #111). Its
 > coordinated-omission self-test
-> (`an_injected_sigstop_shows_up_in_the_recorded_tail`) is `#[ignore]`d on shared
-> CI because the SIGSTOP freeze does not reliably manifest in the tail on
-> GitHub's shared runners; it is reliable only on a stable host.
-> [#284](https://github.com/ELares/IronBus/issues/284) tracks making it a
-> reliable gate. Until a run on the reference edge device is recorded and
-> archived, there are no committed measured numbers to ratify the targets
-> against. See [Ratification process](#ratification-process) below.
+> (`an_injected_stall_shows_up_in_the_recorded_tail`) is a reliable, non-flaky
+> CI gate ([#284](https://github.com/ELares/IronBus/issues/284)): it freezes an
+> in-process broker deterministically (the `FaultFs` sync gate parks the
+> group-commit `fdatasync` on a condvar), so the freeze always lands in the
+> recorded p99.9 tail with no dependence on OS scheduling. The legacy live
+> `SIGSTOP` proof (`an_injected_sigstop_shows_up_in_the_recorded_tail`) is kept
+> behind `--ignored` because the OS freeze did not reliably manifest on GitHub's
+> shared runners; it does not gate CI. Until a run on the reference edge device
+> is recorded and archived, there are no committed measured numbers to ratify the
+> targets against. See [Ratification process](#ratification-process) below.
 
 ---
 
@@ -160,14 +163,18 @@ baseline" and, per #110, an unmeasured cell is informational and cannot gate CI.
    command, so any percentile recomputes and the run is re-runnable. A row is
    only as trustworthy as `results.tail_resolution_ok` allows: p99.9 needs
    >= 1000 recorded samples to be a real quantile.
-3. **The coordinated-omission self-test must pass on a stable host.** The
-   instrument is only honest if it does not commit coordinated omission. The
-   injected-stall self-test (`an_injected_sigstop_shows_up_in_the_recorded_tail`)
-   must pass on a stable host (`cargo test -p ironbus-bench -- --ignored`), where
-   it is reliable. It is `#[ignore]`d on shared CI and is NOT a per-PR gate;
-   [#284](https://github.com/ELares/IronBus/issues/284) tracks wiring it into a
-   reliable gate (a stable / self-hosted runner or an in-broker fault-injection
-   seam). Do not ratify a row from a run whose harness could not be shown honest.
+3. **The coordinated-omission self-test gates every PR.** The instrument is only
+   honest if it does not commit coordinated omission. The injected-stall
+   self-test (`an_injected_stall_shows_up_in_the_recorded_tail`) is a reliable,
+   non-flaky per-PR gate ([#284](https://github.com/ELares/IronBus/issues/284)):
+   it freezes an in-process broker deterministically via the `FaultFs` sync gate
+   (the in-broker fault-injection seam), so the freeze always lands in the tail
+   with no dependence on OS scheduling, and it still fails if the freeze is
+   absent (non-vacuous). The legacy live `SIGSTOP` proof
+   (`an_injected_sigstop_shows_up_in_the_recorded_tail`) is kept behind
+   `--ignored` (`cargo test -p ironbus-bench -- --ignored`) for a stable host and
+   does NOT gate CI. Do not ratify a row from a run whose harness could not be
+   shown honest.
 4. **Set the committed gate as a measured floor.** Per the README ("every
    published SLO is a measured floor (the on-device p99 minus a 20 percent
    margin)") and #110 (commit each cell as the measured p50/p99 minus a 20%

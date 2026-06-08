@@ -1,27 +1,44 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! The injected-stall self-test: the proof that this harness does NOT commit coordinated omission.
 //!
-//! It runs a short open-loop generation and, mid-run, freezes the broker with `SIGSTOP` for a fixed
-//! window, then thaws it with `SIGCONT`. A harness that measured latency from the ACTUAL send time
-//! (closed-loop, or "from when the sender got around to it") would record nothing unusual: the
-//! sender would simply block during the freeze and the frozen interval would vanish. Because this
-//! harness records from the INTENDED send time, the backlog that drains after the thaw carries its
-//! original, now-old intended times, so the freeze duration lands squarely in the tail.
+//! It runs a short open-loop generation and, mid-run, FREEZES the broker for a fixed window, then
+//! thaws it. A harness that measured latency from the ACTUAL send time (closed-loop, or "from when
+//! the sender got around to it") would record nothing unusual: the sender would simply block during
+//! the freeze and the frozen interval would vanish. Because this harness records from the INTENDED
+//! send time, the backlog that drains after the thaw carries its original, now-old intended times,
+//! so the freeze duration lands squarely in the tail.
 //!
 //! The self-test ASSERTS the recorded tail clears a separation floor (a fraction of the freeze) that
 //! the un-stalled baseline stays below, so a recorded tail over the floor can only come from the
 //! injected freeze being measured. It FAILS if the tail does not move, which is exactly the
-//! regression (a reintroduced coordinated omission) it exists to catch. Because the broker fsyncs
-//! every produce, its baseline tail is the host disk's fsync floor (sub-ms on a fast SSD, tens of ms
-//! on a slow CI disk); the test (see the integration test) CALIBRATES the arrival rate and the
-//! freeze to that floor via [`probe_op_latency_us`], so it is non-flaky across disks.
+//! regression (a reintroduced coordinated omission) it exists to catch.
 //!
-//! Unix only: it needs `SIGSTOP`/`SIGCONT`. The shipped broker is Unix-only, so this is no loss.
+//! # Two freeze mechanisms
+//!
+//! - The DETERMINISTIC freeze (#284), the default and the CI gate: an IN-PROCESS broker (see
+//!   [`crate::inproc`], the same `ironbus-server` engine + actor + `serve` the binary ships) over a
+//!   `FaultFs` whose SYNC GATE parks the broker's group-commit `fdatasync` on a condvar. Closing the
+//!   gate is GUARANTEED to block every produce that needs that fsync for exactly the held window, so
+//!   the freeze ALWAYS lands in the tail. No OS scheduling, no wall-clock sleep inside the broker:
+//!   [`run_with_gated_stall`] drives it. This is the reliable, non-flaky proof.
+//! - The LIVE OS freeze, kept only as an `#[ignore]`d on-demand proof: [`run_with_injected_stall`]
+//!   spawns the shipping `ironbus` binary and `SIGSTOP`s it. It is solid on a stable host but flaky
+//!   on shared CI runners, where the kernel does not reliably deschedule the broker for the whole
+//!   window, so the freeze sometimes delays no client op at all (#284). It is NOT a CI gate.
+//!
+//! Because the broker fsyncs every produce, its baseline tail is the fsync floor (sub-ms on a fast
+//! SSD; for the in-memory `FaultFs` it is effectively the in-process round trip). The test
+//! CALIBRATES the arrival rate and the freeze via [`probe_op_latency_us`], so it is non-flaky across
+//! hosts.
+//!
+//! Unix only: the in-process broker (and the `SIGSTOP` path) are Unix-only, matching the shipped
+//! broker, so this is no loss.
 
 #![cfg(unix)]
 
 use crate::broker::{resume, stop, Broker};
 use crate::harness::{run_open_loop, RunConfig, RunReport};
+use crate::inproc::InProcBroker;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -42,9 +59,79 @@ pub struct StallOutcome {
     pub stall_us: f64,
 }
 
-/// Runs one open-loop generation against `broker`, freezing it with `SIGSTOP` for `stall` partway
-/// through (after `stall_after` of wall time), then `SIGCONT`. Returns the recorded tail so a caller
-/// can assert the stall is visible.
+/// Runs one open-loop generation against the IN-PROCESS broker, freezing it DETERMINISTICALLY for
+/// `stall` partway through (after `stall_after` of wall time) via the `FaultFs` sync gate, then
+/// thawing it. Returns the recorded tail so a caller can assert the stall is visible.
+///
+/// This is the reliable, non-flaky proof (#284). The freeze is driven from a watcher thread that
+/// CLOSES the sync gate, holds it for `stall`, then OPENS it. While the gate is closed, the broker's
+/// group-commit `fdatasync` parks on a condvar, so EVERY produce that needs that fsync blocks for
+/// the whole window. There is no OS-scheduling dependence: unlike `SIGSTOP` (which only ASKS the
+/// kernel to deschedule the broker and may not, on a shared runner, actually delay any client op),
+/// the gate GUARANTEES the block, so the freeze always lands in the tail. The open-loop honesty is
+/// untouched: the main run thread keeps pacing the schedule and its produce blocks during the freeze,
+/// exactly as a real stalled disk would block a producer, and latency is still measured from the
+/// intended send time.
+///
+/// `stall_after` is wall time so the freeze starts after a warm steady state, like the live path;
+/// the determinism comes from the GATE blocking the fsync, not from any sleep timing.
+///
+/// # Errors
+/// Returns the underlying [`crate::harness::RunError`] string if the run itself fails.
+pub fn run_with_gated_stall(
+    broker: &InProcBroker,
+    config: &RunConfig,
+    stall: Duration,
+    stall_after: Duration,
+) -> Result<StallOutcome, String> {
+    let control = broker.control().clone();
+    let fired = Arc::new(AtomicBool::new(false));
+    let watcher = std::thread::spawn({
+        let fired = Arc::clone(&fired);
+        move || {
+            // Wait for a warm steady state, then close the gate so the broker's NEXT group-commit
+            // fsync (and every produce behind it) parks; hold the freeze; then open it so the backlog
+            // drains carrying its old intended times. If the run finished early the open is harmless.
+            std::thread::sleep(stall_after);
+            control.close_sync_gate();
+            std::thread::sleep(stall);
+            control.open_sync_gate();
+            fired.store(true, Ordering::Release);
+        }
+    });
+
+    // The resource probes (RSS, data-dir bytes) are not load-bearing for the coordinated-omission
+    // proof; the in-process broker has no on-disk data dir, so a throwaway dir and our own pid yield
+    // harmless resource numbers while the latency path (the only thing the proof asserts on) is
+    // unaffected.
+    let probe_dir = std::env::temp_dir();
+    let report: RunReport = run_open_loop(broker.addr(), &probe_dir, std::process::id(), config)
+        .map_err(|e| e.to_string())?;
+
+    // Make sure the watcher opened the gate even if the run outpaced it, so nothing is left frozen.
+    let _ = watcher.join();
+    if !fired.load(Ordering::Acquire) {
+        // The watcher panicked before firing; open defensively so a later run is not wedged.
+        broker.control().open_sync_gate();
+    }
+
+    let stall_us = duration_us(stall);
+    Ok(StallOutcome {
+        p99_us: report.percentiles.p99_us,
+        p999_us: report.percentiles.p999_us,
+        max_us: report.percentiles.max_us,
+        recorded: report.recorded,
+        stall_us,
+    })
+}
+
+/// Runs one open-loop generation against the spawned-binary `broker`, freezing it with `SIGSTOP` for
+/// `stall` partway through (after `stall_after` of wall time), then `SIGCONT`. Returns the recorded
+/// tail so a caller can assert the stall is visible.
+///
+/// The LIVE OS-freeze path, kept only behind `--ignored` (#284): solid on a stable host, flaky on
+/// shared CI runners where the kernel does not reliably deschedule the broker for the whole window.
+/// The DETERMINISTIC gate ([`run_with_gated_stall`]) is the CI gate; prefer it.
 ///
 /// The freeze is driven from a watcher thread so the main run thread keeps pacing the schedule (its
 /// produce blocks during the freeze, exactly as a real stalled broker would block a producer).

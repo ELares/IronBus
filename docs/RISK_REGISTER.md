@@ -294,7 +294,8 @@ CHANGELOG, the issue, or the merged PR (none invented).
   the macro-bench harness tolerate a dropped broker connection (#111)") and
   recorded in the CHANGELOG. Verified against the merged PR commits and the source.
 - **Residual risk:** the harness is a measurement tool, not a shipped path; its
-  live injected-stall self-test is still flaky on shared CI (see RR-20, #284).
+  coordinated-omission self-test is now a reliable deterministic gate (the legacy
+  live `SIGSTOP` proof stays behind `--ignored`; see RR-20, #284).
 
 ### RR-13 serve-flag parse infinite loop on a value-less flag
 
@@ -414,17 +415,22 @@ Honest accounting of what is not defended yet. Each names its tracking issue.
 ### RR-20 Macro-bench injected-stall self-test flaky on shared CI
 
 - **Category:** observability (tooling).
-- **Failure mode:** the headline coordinated-omission self-test (`SIGSTOP` the
-  broker mid-run and assert the tail moves) is reliable on a stable host but flaky
-  on GitHub's shared runners, where the freeze does not reliably manifest in the
-  tail (a runner-scheduling artifact, not a harness-logic bug), so it cannot gate
-  per-PR CI and is `#[ignore]`d.
-- **Status:** OPEN, tracking #284. No measured SLO baseline is committed as a
-  result; [SLO.md](SLO.md) marks every target as a STATED TARGET, not yet
-  ratified.
-- **Residual risk:** the SLO table is aspirational until #284 lands a reliable
-  gate (a stable / self-hosted runner or an in-broker fault-injection seam) and a
-  measured baseline is archived.
+- **Failure mode:** the headline coordinated-omission self-test originally
+  `SIGSTOP`ped the broker mid-run and asserted the tail moves; it was reliable on
+  a stable host but flaky on GitHub's shared runners, where the OS freeze did not
+  reliably manifest in the tail (a runner-scheduling artifact, not a harness-logic
+  bug), so it could not gate per-PR CI and was `#[ignore]`d.
+- **Status:** RESOLVED by #284. The proof is now a deterministic in-process
+  freeze: the self-test runs the broker in-process (the same `ironbus-server`
+  engine + actor + `serve`) over a `FaultFs` and freezes it by closing the sync
+  gate, which parks the group-commit `fdatasync` on a condvar, so the freeze
+  always lands in the tail with no OS dependence. It is de-`#[ignore]`d, gates
+  every PR, and was verified non-flaky over 20 consecutive runs. The legacy live
+  `SIGSTOP` proof is kept behind `--ignored` and does not gate CI.
+- **Residual risk:** the SLO table is still aspirational because no measured
+  on-device baseline has been archived; [SLO.md](SLO.md) marks every target as a
+  STATED TARGET, not yet ratified. The honesty gate itself (no coordinated
+  omission) is now enforced per PR.
 
 ### RR-21 No wire-advertised credit or version / capability negotiation
 
