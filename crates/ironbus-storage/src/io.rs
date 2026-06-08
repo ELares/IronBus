@@ -98,6 +98,43 @@ pub trait RandomAccessFile: Send + Sync {
     fn is_empty(&self) -> io::Result<bool> {
         Ok(self.len()? == 0)
     }
+
+    /// Reserves `len` bytes of backing storage for this file up front, so the appends that
+    /// follow write into already-allocated space instead of growing it a block at a time.
+    ///
+    /// This is the cross-platform preallocation primitive (the four-primitive shim in
+    /// `docs/PREALLOCATION.md`). It is a BEST-EFFORT optimization, never a correctness
+    /// requirement: it does not change the bytes a reader sees, it does not advance the
+    /// append cursor (the write position stays the logical length), and a backend that
+    /// cannot reserve blocks is free to do less. Two payoffs on the slow flash an edge node
+    /// runs on: the segment is placed as one contiguous extent (less fragmentation, faster
+    /// sequential scan), and the steady-state append writes into already-allocated space so
+    /// the per-commit `fdatasync` need not also persist a length-grow (less flash wear, lower
+    /// commit latency).
+    ///
+    /// The reservation is NOT the durability barrier: the ack-implies-durable guarantee is
+    /// always the commit `sync_data` (I2), independent of preallocation. A preallocated tail
+    /// reads back as ZEROS, and a zero word is never a valid record-frame magic, so recovery's
+    /// torn-tail scan stops at the first unwritten byte and truncates the unwritten tail
+    /// exactly as it truncates a torn one (the zero-window end-of-data rule, the frozen #45
+    /// fixture). A freshly preallocated, empty segment (header then zeros) therefore recovers
+    /// as no records.
+    ///
+    /// The DEFAULT body is a no-op: a backend with no preallocation primitive degrades to
+    /// today's grow-on-append, which is correct, only without the wear/latency benefit. The
+    /// production [`StdFile`] overrides it with the per-OS KEEP-SIZE reservation (Linux
+    /// `fallocate` with `FALLOC_FL_KEEP_SIZE`, macOS `fcntl(F_PREALLOCATE)`), which reserves
+    /// blocks WITHOUT advancing the logical length, falling back to grow-on-append on a
+    /// filesystem that supports none of them.
+    ///
+    /// # Errors
+    /// Propagates an underlying IO error (for example `ENOSPC`, which an implementation may
+    /// surface so a caller can route it to the disk-full overflow path at segment create
+    /// time, rather than mid-append). The default no-op never errors.
+    fn preallocate(&self, len: u64) -> io::Result<()> {
+        let _ = len;
+        Ok(())
+    }
 }
 
 fn invalid_input(msg: &'static str) -> io::Error {
@@ -135,6 +172,15 @@ struct State {
 pub struct InMemoryFile {
     state: Mutex<State>,
     syncs: AtomicU64,
+    /// The highest `len` ever passed to [`preallocate`](RandomAccessFile::preallocate), or `0` if
+    /// it was never called. The in-memory backend models preallocation as a TRACKED RESERVATION,
+    /// not a length change: a real `fallocate` reserves backing blocks without advancing the file's
+    /// logical length or its bytes, and the deterministic simulation must mirror that so a
+    /// preallocated active segment is byte-identical to a grow-on-append one (the determinism and
+    /// crash-recovery sweeps stay green, and recovery's truncated-tail accounting is unchanged).
+    /// A test reads this back via [`InMemoryFile::preallocated_to`] to assert the roll-size
+    /// reservation was requested.
+    preallocated_to: AtomicU64,
 }
 
 impl InMemoryFile {
@@ -154,6 +200,7 @@ impl InMemoryFile {
                 durable: bytes,
             }),
             syncs: AtomicU64::new(0),
+            preallocated_to: AtomicU64::new(0),
         }
     }
 
@@ -169,6 +216,16 @@ impl InMemoryFile {
     #[must_use]
     pub fn sync_count(&self) -> u64 {
         self.syncs.load(Ordering::SeqCst)
+    }
+
+    /// Returns the highest `len` ever requested through
+    /// [`preallocate`](RandomAccessFile::preallocate), or `0` if it was never called. The
+    /// in-memory backend tracks the reservation request without changing the file's bytes or
+    /// length (mirroring a real `fallocate`), so a test can assert a fresh active segment was
+    /// preallocated to the roll size while the deterministic disk image stays byte-identical.
+    #[must_use]
+    pub fn preallocated_to(&self) -> u64 {
+        self.preallocated_to.load(Ordering::SeqCst)
     }
 
     /// Returns a copy of the current (live) bytes.
@@ -309,6 +366,15 @@ impl RandomAccessFile for InMemoryFile {
     fn set_len(&self, len: u64) -> io::Result<()> {
         let len = usize::try_from(len).map_err(|_| invalid_input("length out of range"))?;
         self.lock().live.resize(len, 0);
+        Ok(())
+    }
+
+    fn preallocate(&self, len: u64) -> io::Result<()> {
+        // Model `fallocate`: RESERVE backing space without changing the file's bytes or its
+        // logical length, so a preallocated active segment is byte-identical to a grow-on-append
+        // one and the determinism / crash-recovery sweeps stay green. Only the requested reservation
+        // is recorded (a high-water mark a test can read via `preallocated_to`).
+        self.preallocated_to.fetch_max(len, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -543,6 +609,65 @@ mod tests {
         assert_eq!(f.read_at(&mut buf, 0).unwrap(), 4);
         assert_eq!(&buf, b"data");
     }
+
+    #[test]
+    fn preallocate_tracks_the_reservation_without_changing_bytes_or_length() {
+        // The in-memory backend models `fallocate`: it RESERVES space (recorded so a test can
+        // assert the roll-size request) but does NOT change the file's bytes or its logical length.
+        // This is load-bearing: a preallocated active segment must be byte-identical to a
+        // grow-on-append one, or the determinism and crash-recovery sweeps would diverge.
+        let f = InMemoryFile::new();
+        assert_eq!(f.preallocated_to(), 0, "never preallocated yet");
+        f.write_all_at(b"hdr", 0).unwrap();
+        f.preallocate(4096).unwrap();
+        assert_eq!(f.preallocated_to(), 4096, "the reservation is tracked");
+        // The bytes and the length are unchanged: only the 3 written bytes exist, no zero tail.
+        assert_eq!(
+            f.len().unwrap(),
+            3,
+            "preallocate does not advance the length"
+        );
+        assert_eq!(f.snapshot(), b"hdr", "preallocate writes no bytes");
+        // It is a high-water mark: a smaller later reservation does not lower it.
+        f.preallocate(100).unwrap();
+        assert_eq!(f.preallocated_to(), 4096, "high-water, never lowered");
+    }
+
+    #[test]
+    fn the_default_preallocate_is_a_no_op() {
+        // A backend that does not override `preallocate` gets the trait default: a no-op that
+        // never errors and changes nothing, so adding the method is non-breaking and IO-free-safe.
+        struct Minimal(InMemoryFile);
+        impl RandomAccessFile for Minimal {
+            fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+                self.0.read_at(buf, offset)
+            }
+            fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+                self.0.write_all_at(buf, offset)
+            }
+            fn sync_data(&self) -> io::Result<()> {
+                self.0.sync_data()
+            }
+            fn sync_all(&self) -> io::Result<()> {
+                self.0.sync_all()
+            }
+            fn len(&self) -> io::Result<u64> {
+                self.0.len()
+            }
+            fn set_len(&self, len: u64) -> io::Result<()> {
+                self.0.set_len(len)
+            }
+            // No `preallocate` override: the trait default (no-op) is used.
+        }
+        let f = Minimal(InMemoryFile::new());
+        f.write_all_at(b"ok", 0).unwrap();
+        // The default no-op succeeds and leaves the bytes and length untouched.
+        f.preallocate(1 << 20).unwrap();
+        assert_eq!(f.len().unwrap(), 2);
+        let mut buf = [0u8; 2];
+        f.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"ok");
+    }
 }
 
 /// A production [`RandomAccessFile`] backed by an OS file, using cursor-free
@@ -650,6 +775,141 @@ impl RandomAccessFile for StdFile {
 
     fn set_len(&self, len: u64) -> io::Result<()> {
         self.file.set_len(len)
+    }
+
+    // Preallocation (the `docs/PREALLOCATION.md` shim). Reserve `len` backing blocks for the
+    // segment up front so the steady-state appends write into already-allocated space. This is a
+    // BEST-EFFORT optimization: the fallback ladder bottoms out at today's grow-on-append, which is
+    // correct, only without the wear/latency win. It never advances the append cursor and never
+    // changes a byte a reader sees; the preallocated tail is zeros that recovery's torn-tail scan
+    // truncates exactly as it would a torn tail (the frozen #45 zero-window fixture).
+    fn preallocate(&self, len: u64) -> io::Result<()> {
+        preallocate_file(&self.file, len)
+    }
+}
+
+/// Reserves `len` backing blocks for `file`, with the per-OS reservation recipe and a fallback
+/// ladder that bottoms out at grow-on-append (the `docs/PREALLOCATION.md` shim, primitive (a)).
+///
+/// CRUCIAL invariant: the reservation reserves blocks WITHOUT advancing the file's LOGICAL length.
+/// The append cursor is the logical end of data, and recovery and the offline scan tools find the
+/// end of data from `file.len()`; if preallocation grew the logical length to `len`, every reader
+/// would see a 64 MiB zero tail and (correctly but needlessly) report it as a torn/zero window. So
+/// each OS uses the keep-size form: Linux `fallocate` with `FALLOC_FL_KEEP_SIZE`, macOS
+/// `F_PREALLOCATE` alone (which never advances the size). The appends then extend the logical
+/// length the normal way (a positioned write past the current end), landing in already-reserved
+/// blocks.
+///
+/// - **Linux**: `fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, len)` reserves real extents on ext4/f2fs/xfs
+///   (the edge targets) and keeps the apparent size. On `EOPNOTSUPP`/`ENOSYS` (a filesystem with no
+///   allocation support, e.g. some tmpfs) it falls back to grow-on-append.
+/// - **Apple**: `fcntl(fd, F_PREALLOCATE)` requesting contiguous blocks (`F_ALLOCATECONTIG`) then
+///   any blocks (`F_ALLOCATEALL`); it reserves blocks and never advances the logical size, so no
+///   `ftruncate` pairing is used. On `ENOTSUP` it falls back to grow-on-append.
+/// - **Any other Unix**: no portable keep-size reservation syscall, so it is grow-on-append (a
+///   no-op here).
+///
+/// `len == 0` is a no-op (nothing to reserve). The reservation is never the durability barrier: the
+/// commit `sync_data` (I2) is, independent of this call. A genuine `ENOSPC` is surfaced so the
+/// caller can route a create-time out-of-space to the overflow path rather than discover it
+/// mid-append.
+#[cfg(unix)]
+fn preallocate_file(file: &std::fs::File, len: u64) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        preallocate_linux(file, len)
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        preallocate_apple(file, len)
+    }
+    // Any other Unix (no portable keep-size reservation primitive): grow-on-append, the bottom rung.
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        let _ = (file, len);
+        Ok(())
+    }
+}
+
+/// Linux: `fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, len)` reserves real extents while KEEPING the
+/// apparent file size (so the logical length still grows only with appends). A filesystem that
+/// cannot allocate (`EOPNOTSUPP`/`ENOSYS`) degrades to grow-on-append; any other error (e.g.
+/// `ENOSPC`) is surfaced so a create-time out-of-space is not masked.
+#[cfg(target_os = "linux")]
+fn preallocate_linux(file: &std::fs::File, len: u64) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    let len =
+        libc::off_t::try_from(len).map_err(|_| invalid_input("preallocate length out of range"))?;
+    // SAFETY: `fallocate` is a plain libc syscall wrapper (a foreign function, not a memory-unsafe
+    // operation). `fd` is a valid, open, writable descriptor owned by `file` and outlives the call;
+    // the mode flag and the two `off_t` arguments are passed by value. It reads and writes no
+    // process memory and cannot read or write past any buffer (there is none); the only state it
+    // touches is the kernel's block map for `fd`. `FALLOC_FL_KEEP_SIZE` keeps the logical size
+    // unchanged. This is the one justified FFI call on Linux (`docs/PREALLOCATION.md`, primitive
+    // (a)).
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, len) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        // The filesystem does not support allocation: fall back to grow-on-append (still correct).
+        Some(libc::EOPNOTSUPP | libc::ENOSYS) => Ok(()),
+        // A real failure (e.g. ENOSPC): surface it so a create-time out-of-space is not masked.
+        _ => Err(err),
+    }
+}
+
+/// Apple: `fcntl(fd, F_PREALLOCATE)` reserves blocks (contiguous if possible) WITHOUT advancing the
+/// logical size, which is exactly the keep-size reservation we want (no `ftruncate` pairing, so the
+/// logical length still grows only with appends). If `F_PREALLOCATE` is unsupported (`ENOTSUP`),
+/// fall back to grow-on-append.
+#[cfg(target_vendor = "apple")]
+fn preallocate_apple(file: &std::fs::File, len: u64) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    let want =
+        libc::off_t::try_from(len).map_err(|_| invalid_input("preallocate length out of range"))?;
+    // Reserve blocks contiguously if we can, otherwise allow a fragmented reservation. `fst_length`
+    // is the number of bytes to allocate from `fst_offset` (0 = the start of the file).
+    let mut store = libc::fstore_t {
+        fst_flags: libc::F_ALLOCATECONTIG,
+        fst_posmode: libc::F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: want,
+        fst_bytesalloc: 0,
+    };
+    // SAFETY: `fcntl` is a plain libc syscall wrapper (a foreign function, not a memory-unsafe
+    // operation). `fd` is a valid, open, writable descriptor owned by `file` and outlives the call.
+    // `F_PREALLOCATE` reads and writes the single fully-owned, stack-allocated `fstore_t` whose
+    // address we pass; the kernel cannot read or write past that struct. This is the one justified
+    // FFI call on Apple (`docs/PREALLOCATION.md`, primitive (a)).
+    #[allow(unsafe_code)]
+    let contiguous = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) };
+    if contiguous != -1 {
+        return Ok(());
+    }
+    // Could not place it contiguously: retry allowing any blocks.
+    store.fst_flags = libc::F_ALLOCATEALL;
+    store.fst_bytesalloc = 0;
+    // SAFETY: identical to the call above; same valid `fd` and same fully-owned `fstore_t`.
+    #[allow(unsafe_code)]
+    let any = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) };
+    if any != -1 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    // F_PREALLOCATE unsupported on this filesystem: fall back to grow-on-append (still correct, only
+    // without the contiguity win). Any other error is surfaced.
+    if err.raw_os_error() == Some(libc::ENOTSUP) {
+        Ok(())
+    } else {
+        Err(err)
     }
 }
 
@@ -775,6 +1035,79 @@ mod std_file_tests {
         g.read_exact_at(&mut buf, 0).unwrap();
         assert_eq!(&buf, b"durable");
     }
+
+    #[test]
+    fn preallocate_reserves_real_blocks_on_a_supporting_fs() {
+        // On the Unix CI targets (Linux musl, macOS) the per-OS reservation reserves REAL backing
+        // blocks. We assert the on-disk block count (`st_blocks`, in 512-byte units) covers the
+        // requested length, the syscall path that actually reserves space. This is the
+        // "preallocate reserves the space" tooth (the in-memory backend tracks the request; this
+        // proves the production file truly reserves blocks).
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prealloc.log");
+        let f = StdFile::create(&path).unwrap();
+        let want: u64 = 256 * 1024; // 256 KiB, comfortably more than a couple of blocks.
+        f.preallocate(want).unwrap();
+        f.sync_all().unwrap();
+        let blocks = std::fs::metadata(&path).unwrap().blocks();
+        // `blocks` counts 512-byte units; a real reservation covers the requested bytes. Allow the
+        // filesystem a little slack but require it to be in the right order of magnitude (not the 0
+        // a no-op grow-on-append would leave on a still-empty file).
+        assert!(
+            blocks * 512 >= want,
+            "preallocate should reserve at least {want} bytes of blocks, got {} bytes",
+            blocks * 512
+        );
+    }
+
+    #[test]
+    fn preallocate_keeps_the_logical_length_and_appends_round_trip() {
+        // The keep-size reservation reserves blocks WITHOUT advancing the logical length: the
+        // header written at 0 is intact, the logical length stays at the written length (no zero
+        // tail a reader or the offline scan tools would see), and an append into the reserved range
+        // round-trips. This is the load-bearing property: the logical length grows only with
+        // appends, so recovery and the offline `dump`/`scrub` tools find the end of data unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg.log");
+        let f = StdFile::create(&path).unwrap();
+        f.write_all_at(b"HEADER", 0).unwrap();
+        f.preallocate(64 * 1024).unwrap();
+        f.sync_all().unwrap();
+        // The header is intact and the LOGICAL length is unchanged (the reservation grew no bytes).
+        let mut hdr = [0u8; 6];
+        f.read_exact_at(&mut hdr, 0).unwrap();
+        assert_eq!(&hdr, b"HEADER");
+        assert_eq!(
+            f.len().unwrap(),
+            6,
+            "keep-size preallocation does not advance the logical length"
+        );
+        // A read past the logical end is a real EOF, exactly as before preallocation (no zero tail).
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            f.read_at(&mut buf, 6).unwrap(),
+            0,
+            "no zero tail past the end"
+        );
+        // An append extends the logical length into the reserved range and round-trips.
+        f.write_all_at(b"record", 6).unwrap();
+        f.sync_data().unwrap();
+        assert_eq!(f.len().unwrap(), 12);
+        let mut back = [0u8; 12];
+        f.read_exact_at(&mut back, 0).unwrap();
+        assert_eq!(&back, b"HEADERrecord");
+    }
+
+    #[test]
+    fn preallocate_zero_is_a_no_op() {
+        // A zero-length reservation has nothing to reserve and must not error or touch the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("z.log");
+        let f = StdFile::create(&path).unwrap();
+        f.preallocate(0).unwrap();
+        assert_eq!(f.len().unwrap(), 0);
+    }
 }
 
 /// Sharing a file behind a reference forwards to the inner implementation, so the
@@ -798,6 +1131,9 @@ impl<F: RandomAccessFile + ?Sized> RandomAccessFile for &F {
     fn set_len(&self, len: u64) -> io::Result<()> {
         (**self).set_len(len)
     }
+    fn preallocate(&self, len: u64) -> io::Result<()> {
+        (**self).preallocate(len)
+    }
 }
 
 /// Sharing a file behind an [`std::sync::Arc`] forwards to the inner implementation.
@@ -819,5 +1155,8 @@ impl<F: RandomAccessFile + ?Sized> RandomAccessFile for std::sync::Arc<F> {
     }
     fn set_len(&self, len: u64) -> io::Result<()> {
         (**self).set_len(len)
+    }
+    fn preallocate(&self, len: u64) -> io::Result<()> {
+        (**self).preallocate(len)
     }
 }

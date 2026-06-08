@@ -531,6 +531,7 @@ version = "0.0.0"
 dependencies = [
  "crc32c",
  "ironbus-core",
+ "libc",
  "proptest",
  "serde",
  "serde_json",
