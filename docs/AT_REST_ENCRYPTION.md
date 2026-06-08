@@ -140,6 +140,13 @@ at-rest encryption uses them as follows, and changes no other offset:
 | reserved `[44, 60)` (16 bytes) | zero | `aead_suite` u8, then a `key_id` (a fixed-width identifier, never the key), the rest reserved-zero |
 | `header_crc` u32 `[60, 64)` | CRC32C over `[0, 60)` | unchanged: it already covers the `flags` and reserved bytes, so the suite and key-id are CRC-protected for free |
 
+The reserved bytes `[44, 60)` are owned by at-rest encryption alone. Optional
+key-based compaction ([COMPACTION.md](COMPACTION.md)) does NOT use `[44, 60)`: it
+puts its covered-range metadata in a CRC-protected v2 compaction-metadata block in
+the footer region and uses only a separate `COMPACTED` flag bit, so a segment that
+is both compacted and encrypted carries the `aead_suite` + `key_id` here AND the
+covered range in its footer block without collision.
+
 Because `header_crc` already covers `[0, 60)`, the suite byte and the key-id are
 integrity-protected the moment they are written, with no new checksum and no
 offset move. A future, encryption-aware reader that meets an `aead_suite` VALUE
