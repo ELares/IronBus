@@ -38,8 +38,28 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  changelog-gate:
+    name: changelog Unreleased is non-empty (#128)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      # A tagged release that ships no changelog entries erodes the audit trail (#128). FAIL the
+      # release here, before any binary is built, if the release's changelog section has no content.
+      # The build jobs `needs:` this gate, so the whole release is blocked on an empty changelog. The
+      # script checks the `## [vX.Y.Z]` section if RELEASING.md's step 2 already moved the entries
+      # under the version heading, and otherwise the `## [Unreleased]` section, so it is correct
+      # either way.
+      - name: assert the release CHANGELOG section is not empty
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: sh scripts/ci/changelog-unreleased.sh CHANGELOG.md "$TAG"
+
   build:
     name: build (${{ matrix.target }})
+    needs: changelog-gate
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:

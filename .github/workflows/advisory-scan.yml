@@ -1,0 +1,50 @@
+name: advisory-scan
+
+# Weekly security advisory scan (#128, #22).
+#
+# `cargo deny check advisories` is already a merge-blocking CI gate, so the dependency tree is
+# advisory-clean at merge time. But a RUSTSEC advisory can be published against an ALREADY-MERGED
+# dependency days later. This scheduled lane re-checks the committed Cargo.lock against the freshly
+# fetched advisory DB and opens ONE deduplicated tracking issue per new advisory, so a standing
+# vulnerability surfaces as a tracked issue within a week instead of waiting for the next unrelated
+# PR to trip the merge gate.
+#
+# INFORMATIONAL, never merge-blocking: it runs on a cron (and manual dispatch), not on a PR, and
+# exits 0 even when it files an issue; the merge-time cargo-deny gate is what fails a PR.
+on:
+  schedule:
+    - cron: "0 5 * * 1" # weekly, Monday 05:00 UTC
+  workflow_dispatch: {} # manual trigger, also used to validate the lane on demand
+
+# Default to read-only; the scan job below additionally grants issues:write so it can file a
+# tracking issue. No other job in this file needs write.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  advisories:
+    name: weekly cargo-deny advisory scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write # open a tracking issue on a new advisory (deduplicated)
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2
+        with:
+          tool: cargo-deny@0.19.8
+      # The scan fetches the advisory DB, runs `cargo deny check advisories` against the committed
+      # Cargo.lock, and for each advisory id opens a deduplicated GitHub issue (the title carries a
+      # `[advisory] RUSTSEC-...` marker; an open issue with that marker suppresses a duplicate). It
+      # is informational: a found advisory exits 0 here, the merge-time cargo-deny gate is the
+      # blocking enforcement. GH_REPO and GH_TOKEN let the script's `gh` calls target this repo.
+      - name: scan advisories and file a deduplicated issue on a new one
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: sh scripts/ci/advisory-scan.sh

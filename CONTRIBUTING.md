@@ -34,19 +34,30 @@ Every pull request needs two things before it can merge:
    - `ironbus-core is IO-free`: `ironbus-core` sources and dependency tree carry
      no filesystem, network, process, or async-runtime usage.
    - `cargo-deny`: the supply-chain policy in `deny.toml` (licenses, bans,
-     advisories, sources) holds.
+     advisories, sources) holds, including the C-FFI crate bans.
    - `SPDX headers`: every Rust source starts with
      `// SPDX-License-Identifier: MIT OR Apache-2.0`.
    - `musl build`: the static `ironbus` binary cross-builds and is statically
      linked for `x86_64`, `aarch64`, and `armv7` musl triples.
    - `parser tests (32-bit)`: `ironbus-core`'s tests pass on
      `i686-unknown-linux-gnu`.
-   - `cargo-auditable SBOM`: the musl binary embeds an SBOM that lists the
-     workspace crates.
+   - `cargo-auditable SBOM`: the musl binary embeds an SBOM, the SBOM round-trips
+     (the recovered crate set equals the shipped dependency graph and is pinned
+     in `Cargo.lock`), and the shipped graph carries no C-FFI crate
+     (`scripts/ci/sbom-diff.sh`, `scripts/ci/cffi-ban.sh`).
+   - `byte-identical reproducibility gate`: the same commit built twice with the
+     reproducible invocation produces a byte-identical binary (see RELEASING.md).
+   - `DCO sign-off`: every commit on the PR carries a `Signed-off-by:` trailer
+     (see the Developer Certificate of Origin section below).
    - `actionlint`: every workflow passes schema, expression, and shell linting.
 2. **An independent review.** Green CI is necessary but not sufficient. A
    maintainer other than the author must review and approve before merge. CI
    being green is never on its own a reason to merge.
+
+   A weekly scheduled scan (`.github/workflows/advisory-scan.yml`) additionally
+   re-runs `cargo deny check advisories` against the committed `Cargo.lock` and
+   files a deduplicated tracking issue on any new advisory; it is informational
+   and never blocks a merge (the merge-time `cargo-deny` gate is the blocker).
 
 ## The engineering bar
 
@@ -99,6 +110,11 @@ git commit -s -m "your message"
 
 The name and email in the trailer must match the commit author. Copyright is
 held collectively by "The IronBus Authors".
+
+This is enforced in CI: the merge-blocking `DCO sign-off` job
+(`scripts/ci/dco-check.sh`) checks that every commit on the PR carries a
+`Signed-off-by:` trailer and fails the build otherwise. To sign off commits you
+already made, run `git rebase --signoff <base>` and force-push the branch.
 
 ## License
 
