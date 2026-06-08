@@ -41,7 +41,10 @@ segment file (`SegmentWriter::sync` -> `RandomAccessFile::sync_data`). The engin
 `Engine::produce` (`engine.rs`) does exactly this: append, then `log.sync()`, and only
 then return the offset, so a producer's ack is post-fsync (invariant I2,
 ack-implies-durable, in INVARIANTS.md). There is one append path and one durability
-barrier, not two structures to reconcile on recovery.
+barrier, not two structures to reconcile on recovery. The full durability CONTRACT this
+grounds (the v1 single-`sync`-level guarantee, the crash and ack-ordering tests that
+prove it, and the relaxed `interval` / `async` levels that are SPECIFIED but not shipped)
+is in [DURABILITY.md](DURABILITY.md).
 
 Why one path: the only durable artifact is the log, so recovery is replay of the log
 itself, not a WAL-versus-store reconciliation. The cost (and benefit) is that the
@@ -419,7 +422,13 @@ code.
   emits the truncation signal. There is no `consumer_safe` config field.
 - **Compaction (#83) / an archival offload sink.** #135 mentions an optional compactor
   and an archival sink (`WAL_ttl_seconds` analogue, a `state=1 offloaded` enum). Neither
-  exists; there is no compaction and no offload.
+  exists; there is no compaction and no offload. The optional, opt-in, key-based compactor
+  is now DESIGNED (specified, not implemented) in [COMPACTION.md](COMPACTION.md), adapted
+  to this no-manifest directory model: a compacted segment self-describes its covered offset
+  range in the header (a v2-header field plus a COMPACTED flag bit), recovery prefers it over
+  the originals for that range, and the single atomic commit point is the durable appearance
+  of the new segment, after which the originals are rename-then-unlinked. The archival offload
+  sink remains unspecified.
 - **A `quarantined` segment side-state.** The README and the resilience story mention
   quarantining an unreadable segment. The lifecycle states in code are active / sealed
   (plus reaped); a corrupt segment surfaces a typed `StorageError` at scan time rather
