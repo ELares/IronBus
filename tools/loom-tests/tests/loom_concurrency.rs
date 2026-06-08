@@ -37,8 +37,13 @@
 //!   - loom UNDER-EXPLORES the load-buffering relaxation, a known FALSE-NEGATIVE source. These
 //!     models do not rest on any subtle load-buffering argument, and the same paths are also
 //!     cross-checked by the crate's stress/property tests, so a miss here is not the only net.
-//!   - The whole file is `#![cfg(loom)]`: it builds and runs ONLY under `RUSTFLAGS="--cfg loom"`,
-//!     so loom never enters the shipped dependency graph (it is a `cfg(loom)` dev-dependency).
+//!   - The whole file is `#![cfg(loom)]`: it builds and runs ONLY under `RUSTFLAGS="--cfg loom"`.
+//!     It lives in the STANDALONE dev-only `loom-tests` crate (like `tools/io-free-check`), which
+//!     depends on no ironbus crate, so loom and its transitive `tracing-subscriber`/`env-filter`
+//!     tree can never unify into a shipped crate's dependency graph (the models are faithful
+//!     standalone replicas, so no ironbus dependency is needed; the real symbols are named in the
+//!     cross-reference comments below). loom is a `cfg(loom)` dev-dependency, MIT, already
+//!     allowlisted in deny.toml.
 #![cfg(loom)]
 
 use loom::sync::atomic::{AtomicUsize, Ordering};

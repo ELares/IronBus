@@ -126,11 +126,12 @@ jobs:
   loom:
     # Scoped loom concurrency models (#122): exhaustively permute the interleavings of the three
     # genuinely cross-thread hot paths (the commit-index publish/observe, the bounded WAL handoff,
-    # and the segment/connection refcount) under `RUSTFLAGS="--cfg loom"`. The tests live in
-    # `crates/ironbus-server/tests/loom_concurrency.rs`, gated `#![cfg(loom)]`, and `loom` is a
-    # `cfg(loom)` dev-dependency, so it never enters the shipped graph. Each model caps at <= 3
-    # threads and <= 4 ops, and `LOOM_MAX_PREEMPTIONS=3` bounds the exploration so the lane always
-    # finishes well inside the budget. Non-blocking by virtue of living in the nightly lane.
+    # and the segment/connection refcount) under `RUSTFLAGS="--cfg loom"`. The tests live in the
+    # STANDALONE dev-only `loom-tests` crate (`tools/loom-tests/tests/loom_concurrency.rs`), gated
+    # `#![cfg(loom)]`, with `loom` as a `cfg(loom)` dev-dependency of that isolated crate, so it
+    # never enters (or unifies features into) the shipped graph. Each model caps at <= 3 threads and
+    # <= 4 ops, and `LOOM_MAX_PREEMPTIONS=3` bounds the exploration so the lane always finishes well
+    # inside the budget. Non-blocking by virtue of living in the nightly lane.
     name: loom scoped concurrency models
     runs-on: ubuntu-latest
     env:
@@ -147,7 +148,7 @@ jobs:
       - name: run the scoped loom concurrency models
         # Single-threaded so each model's interleaving count prints in order; --nocapture surfaces
         # the per-model "[loom] <name>: explored N interleavings" proof line in the job log.
-        run: cargo test -p ironbus-server --test loom_concurrency -- --nocapture --test-threads=1
+        run: cargo test -p loom-tests --test loom_concurrency -- --nocapture --test-threads=1
 
   coverage:
     # Produce an informational LCOV coverage report for the workspace with cargo-llvm-cov and

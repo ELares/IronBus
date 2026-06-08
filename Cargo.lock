@@ -548,7 +548,6 @@ dependencies = [
  "ironbus-core",
  "ironbus-proto",
  "ironbus-storage",
- "loom",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -651,6 +650,13 @@ dependencies = [
  "scoped-tls",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "loom-tests"
+version = "0.0.0"
+dependencies = [
+ "loom",
 ]
 
 [[package]]
