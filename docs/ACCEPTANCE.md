@@ -147,10 +147,15 @@ exercises the device-only steps that CI cannot:
      gate uses.
    - **Throughput SLO.** Run the #111 macro-bench
      ([`crates/ironbus-bench/`](../crates/ironbus-bench)) for the marquee
-     conditions (256 B, fan-out 1, group-commit `fdatasync`) and confirm the
-     measured `msgs_per_sec` and `p99_us` against the [SLO table](SLO.md). This
-     is the device throughput number, NOT the acceptance summary's
-     process-spawn-bound floor.
+     conditions (256 B, fan-out 1, group-commit `fdatasync`) under the
+     [edge run discipline](EDGE_RUN_DISCIPLINE.md) (#113): the named reference
+     cooling with per-window thermal/frequency logging and the
+     throttle-quarantine rule, the fixed secure-erased card at 50% fill, the
+     broker and harness pinned to disjoint CPU sets, the CoV / p99-drift
+     steady-state criterion, and the mandated `>= 4h` sustained run with the
+     hour-1-to-hour-4 p99-drift gate. Confirm the measured `msgs_per_sec` and
+     `p99_us` against the [SLO table](SLO.md). This is the device throughput
+     number, NOT the acceptance summary's process-spawn-bound floor.
 
 4. Archive the device summary and the macro-bench provenance JSON with the
    release, per the [SLO ratification process](SLO.md#ratification-process).
