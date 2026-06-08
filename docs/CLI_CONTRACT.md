@@ -94,7 +94,7 @@ object under `--json`.
 ### 1.3 Streaming verbs emit NDJSON: a header object, then record objects
 
 The streaming verbs (`sub`, `dump`, `peek`, `tap`, `top --json`) emit
-[NDJSON](https://ndjson.org/): one JSON object per line, no enclosing array. The first line
+[NDJSON](https://ndjson.org/) ([archived 2026-05-08](https://web.archive.org/web/20260508182020/https://ndjson.org/)): one JSON object per line, no enclosing array. The first line
 is a HEADER object that describes the stream; each following line is one RECORD object;
 the LAST line is the terminal result/summary object (1.2). So a streaming `--json` run is:
 

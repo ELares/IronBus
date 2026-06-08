@@ -561,3 +561,26 @@ jobs:
             exit 1
           fi
           echo "ok: byte-identical across two clean builds of this commit (SHA256 $sum1)"
+
+  docs-links:
+    name: docs relative-link + issue-index integrity (#30 #25)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # The NEVER-FLAKY per-PR half of the #30 link integrity story: validate that every
+      # IN-REPO relative doc link and every same-file / cross-file section ANCHOR resolves,
+      # with ZERO network calls, so a moved doc, a typo'd path, or a stale anchor fails on the
+      # PR deterministically. The external-URL reachability check (which can flake on a
+      # third-party outage) is deliberately NOT run here; it is the weekly docs-link-check
+      # cron (.github/workflows/docs-link-check.yml), which reports instead of blocking.
+      - name: per-PR relative-link and anchor integrity (no network)
+        run: sh scripts/ci/relative-link-check.sh
+      # The STRUCTURAL half of the #25 issue-index audit: with no GH token in a PR context the
+      # audit runs its offline checks only (the index parses, the 21 design parents are present
+      # and back-link to the EPIC, every node's parent resolves in-index with no dangling/orphan
+      # reference, and slugs are unique). The LIVE tracker cross-checks (milestone match, live
+      # back-links, untracked-issue warnings) need `gh` and run on the weekly governance cron,
+      # not here, because the tracker changes outside PRs. yq is preinstalled on the runner.
+      - name: issue-index structural audit (offline)
+        run: sh scripts/ci/issue-index-audit.sh

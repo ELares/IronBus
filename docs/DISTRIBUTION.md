@@ -32,7 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/ELares/IronBus/main/scripts/install
 
 ## 2. The Debian `.deb` package
 
-Built with [`cargo deb`](https://github.com/kornelski/cargo-deb) from the verified static binary; the
+Built with [`cargo deb`](https://github.com/kornelski/cargo-deb) ([archived 2026-06-05](https://web.archive.org/web/20260605144432/https://github.com/kornelski/cargo-deb)) from the verified static binary; the
 metadata lives in `[package.metadata.deb]` in `crates/ironbus-cli/Cargo.toml`. cargo-deb is a
 build-time tool only: it is NOT a runtime or compile dependency of any shipped crate, so it adds
 nothing to the binary's dependency graph and leaves the `cargo-deny` supply-chain gate untouched.
@@ -60,7 +60,7 @@ cargo deb -p ironbus-cli --no-build --no-strip --target <triple>
 ```
 
 `.rpm` is deferred behind the same spec: the `assets` map that drives the `.deb` also drives an
-[nfpm](https://nfpm.goreleaser.com/) config, and an `.rpm` job is added once a dnf/yum fleet exists.
+[nfpm](https://nfpm.goreleaser.com/) ([archived 2026-04-13](https://web.archive.org/web/20260413200705/https://nfpm.goreleaser.com/)) config, and an `.rpm` job is added once a dnf/yum fleet exists.
 
 ### Fall-back-after-N wiring (the systemd unit)
 

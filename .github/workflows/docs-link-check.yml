@@ -1,0 +1,46 @@
+name: docs-link-check
+
+# Weekly docs governance lane (#30, #25).
+#
+# Two integrity guards are already merge-blocking on every PR (in ci.yml, the `docs-links` job):
+# the per-PR relative-link + anchor check (no network, never flaky) and the offline issue-index
+# structural audit. Those cannot see two kinds of rot that happen OUTSIDE a PR:
+#   - an external source URL cited in the docs that 404s or moves AFTER it was last edited, and
+#   - the live issue tracker drifting away from the committed docs/issue-index.yaml snapshot.
+# This scheduled lane catches both: it runs the external-URL reachability check and the LIVE
+# issue-index audit, and opens ONE deduplicated tracking issue per finding (like the advisory-scan
+# lane), so link rot or index drift surfaces as a tracked issue within a week.
+#
+# INFORMATIONAL, never merge-blocking: it runs on a cron (and manual dispatch), not on a PR, and
+# exits 0 even when it files an issue. The per-PR ci.yml gates are the blocking enforcement. The
+# external check is deliberately kept OFF the PR path so a transient third-party outage can never
+# redden main.
+on:
+  schedule:
+    - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC (after the advisory-scan lane)
+  workflow_dispatch: {} # manual trigger, also used to validate the lane on demand
+
+# Default to read-only; the job below additionally grants issues:write so it can file a
+# deduplicated tracking issue. No other permission is needed.
+permissions:
+  contents: read
+
+jobs:
+  docs-links:
+    name: weekly external-link + live issue-index governance
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write # open/refresh a deduplicated tracking issue on a dead link or a broken index
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # Runs scripts/ci/external-link-check.sh (curl, retries, skip-list) and the LIVE
+      # scripts/ci/issue-index-audit.sh (gh + yq), then files at most one deduplicated issue per
+      # finding. curl, yq, and the gh CLI are preinstalled on the runner; GH_TOKEN and GH_REPO let
+      # the script's gh calls target this repo. Informational: a finding exits 0 here.
+      - name: scan external links and audit the issue index, filing a deduplicated issue on a problem
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: sh scripts/ci/docs-link-report.sh

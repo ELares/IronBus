@@ -1,0 +1,847 @@
+# IronBus issue index (machine-readable governance snapshot)
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# A committed, checkable snapshot of the design issue map (#25). It pins, for the
+# EPIC (#1), the 21 design PARENTS (#2 to #22), and their direct task children, a
+# stable slug token plus the parent back-link, milestone, and state, so the map
+# the planning artifacts trust is a verifiable artifact rather than raw #N
+# references that drift on renumber.
+#
+# The slug is the canonical, renumber-proof token: derived once from the issue
+# title (drop the [TYPE] prefix, lowercase, hyphenate, cap length) and stable
+# across issue reordering. Cross-references should prefer the slug over the raw
+# number where a stable handle is wanted.
+#
+# This file is a SNAPSHOT regenerated from the live tracker; it is allowed to lag
+# the tracker between regenerations. scripts/ci/issue-index-audit.sh is the guard:
+# it FAILS on a broken back-link or a dangling reference and WARNS (never fails)
+# on a new untracked issue, so the tracker can evolve without reddening a build.
+# Regenerate with: scripts/ci/issue-index-gen.sh > docs/issue-index.yaml
+#
+# Generated: 2026-06-08 (UTC) from github.com/ELares/IronBus
+schema: ironbus.issue-index.v1
+epic: 1
+generated: "2026-06-08"
+milestones:
+  M0: "M0: Vision and Scope"
+  M1: "M1: Architecture Specification"
+  M2: "M2: Prototype-Ready Design"
+  unassigned: "(no milestone)"
+
+# The 21 design parents (#2 to #22), as slug tokens. These are the spine the
+# children hang off; each is a direct child of the EPIC (#1) via the EPIC's
+# milestone map. Referenced by slug so a renumber cannot break the link.
+parents:
+  - { number: 2, slug: comparative-prior-art-what-ironbus-borrows-and-rejects-from, milestone: M0 }
+  - { number: 3, slug: single-topic-queue-semantics-and-the-delivery-model, milestone: M1 }
+  - { number: 4, slug: storage-engine-segmented-append-only-log-plus-write-ahead-lo, milestone: M1 }
+  - { number: 5, slug: on-disk-record-and-segment-binary-format, milestone: M1 }
+  - { number: 6, slug: durability-model-fsync-strategy-group-commit-and-power-loss, milestone: M1 }
+  - { number: 7, slug: crash-recovery-and-power-cut-self-healing-on-startup, milestone: M1 }
+  - { number: 8, slug: corruption-detection-self-recovery-and-poison-record-segment, milestone: M1 }
+  - { number: 9, slug: consumer-model-cursors-groups-acks-redelivery-visibility-tim, milestone: M1 }
+  - { number: 10, slug: backpressure-and-flow-control-without-head-of-line-stalls, milestone: M1 }
+  - { number: 11, slug: wire-protocol-and-client-api, milestone: M1 }
+  - { number: 12, slug: compression-and-encoding, milestone: M1 }
+  - { number: 13, slug: retention-compaction-and-segment-lifecycle, milestone: M1 }
+  - { number: 14, slug: hyper-configurable-configuration-system-with-safe-defaults, milestone: M1 }
+  - { number: 15, slug: cli-and-diagnostics-better-than-the-nats-cli-with-a-real-vie, milestone: M1 }
+  - { number: 16, slug: observability-metrics-tracing-health-and-introspection, milestone: M2 }
+  - { number: 17, slug: single-static-binary-cross-platform-build-and-distribution, milestone: M2 }
+  - { number: 18, slug: security-model-authentication-authorization-tls-and-edge-thr, milestone: M2 }
+  - { number: 19, slug: performance-targets-slos-and-benchmarking-methodology, milestone: M2 }
+  - { number: 20, slug: edge-resource-constraints-flash-wear-ram-ceilings-fsync-cost, milestone: M2 }
+  - { number: 21, slug: verification-strategy-crash-injection-fuzzing-property-tests, milestone: M2 }
+  - { number: 22, slug: project-governance-license-repo-structure-rfc-process-versio, milestone: M2 }
+
+# Every node in scope (EPIC + 21 parents + their direct children), ordered by
+# number. parent is the EPIC for the parents themselves, the design parent for a
+# task child, and null for the EPIC. milestone is the issue's own label.
+nodes:
+  - number: 1
+    slug: ironbus-vision-scope-non-goals-and-design-tenets
+    parent: null
+    milestone: M0
+    state: closed
+    title: "[EPIC] IronBus: vision, scope, non-goals, and design tenets"
+  - number: 2
+    slug: comparative-prior-art-what-ironbus-borrows-and-rejects-from
+    parent: 1
+    milestone: M0
+    state: open
+    title: "[RESEARCH] Comparative prior-art: what IronBus borrows and rejects from MQTT, NATS, Kafka, Pulsar, Redpanda, RocksDB, Redis Streams, SQS"
+  - number: 3
+    slug: single-topic-queue-semantics-and-the-delivery-model
+    parent: 1
+    milestone: M1
+    state: closed
+    title: "[DESIGN] Single-topic queue semantics and the delivery model"
+  - number: 4
+    slug: storage-engine-segmented-append-only-log-plus-write-ahead-lo
+    parent: 1
+    milestone: M1
+    state: closed
+    title: "[DESIGN] Storage engine: segmented append-only log plus write-ahead log"
+  - number: 5
+    slug: on-disk-record-and-segment-binary-format
+    parent: 1
+    milestone: M1
+    state: closed
+    title: "[DESIGN] On-disk record and segment binary format"
+  - number: 6
+    slug: durability-model-fsync-strategy-group-commit-and-power-loss
+    parent: 1
+    milestone: M1
+    state: closed
+    title: "[DESIGN] Durability model: fsync strategy, group commit, and power-loss guarantees"
+  - number: 7
+    slug: crash-recovery-and-power-cut-self-healing-on-startup
+    parent: 1
+    milestone: M1
+    state: closed
+    title: "[DESIGN] Crash recovery and power-cut self-healing on startup"
+  - number: 8
+    slug: corruption-detection-self-recovery-and-poison-record-segment
+    parent: 1
+    milestone: M1
+    state: closed
+    title: "[DESIGN] Corruption detection, self-recovery, and poison-record/segment skip with bounded loss"
+  - number: 9
+    slug: consumer-model-cursors-groups-acks-redelivery-visibility-tim
+    parent: 1
+    milestone: M1
+    state: closed
+    title: "[DESIGN] Consumer model: cursors, groups, acks, redelivery, visibility timeout, and DLQ"
+  - number: 10
+    slug: backpressure-and-flow-control-without-head-of-line-stalls
+    parent: 1
+    milestone: M1
+    state: closed
+    title: "[DESIGN] Backpressure and flow control without head-of-line stalls"
+  - number: 11
+    slug: wire-protocol-and-client-api
+    parent: 1
+    milestone: M1
+    state: closed
+    title: "[DESIGN] Wire protocol and client API"
+  - number: 12
+    slug: compression-and-encoding
+    parent: 1
+    milestone: M1
+    state: closed
+    title: "[DESIGN] Compression and encoding"
+  - number: 13
+    slug: retention-compaction-and-segment-lifecycle
+    parent: 1
+    milestone: M1
+    state: closed
+    title: "[DESIGN] Retention, compaction, and segment lifecycle"
+  - number: 14
+    slug: hyper-configurable-configuration-system-with-safe-defaults
+    parent: 1
+    milestone: M1
+    state: closed
+    title: "[DESIGN] Hyper-configurable configuration system with safe defaults"
+  - number: 15
+    slug: cli-and-diagnostics-better-than-the-nats-cli-with-a-real-vie
+    parent: 1
+    milestone: M1
+    state: closed
+    title: "[DESIGN] CLI and diagnostics: better than the NATS CLI, with a real view into the data"
+  - number: 16
+    slug: observability-metrics-tracing-health-and-introspection
+    parent: 1
+    milestone: M2
+    state: closed
+    title: "[DESIGN] Observability: metrics, tracing, health, and introspection"
+  - number: 17
+    slug: single-static-binary-cross-platform-build-and-distribution
+    parent: 1
+    milestone: M2
+    state: closed
+    title: "[DESIGN] Single static binary, cross-platform build, and distribution"
+  - number: 18
+    slug: security-model-authentication-authorization-tls-and-edge-thr
+    parent: 1
+    milestone: M2
+    state: closed
+    title: "[DESIGN] Security model: authentication, authorization, TLS, and edge threat model"
+  - number: 19
+    slug: performance-targets-slos-and-benchmarking-methodology
+    parent: 1
+    milestone: M2
+    state: closed
+    title: "[DESIGN] Performance targets, SLOs, and benchmarking methodology"
+  - number: 20
+    slug: edge-resource-constraints-flash-wear-ram-ceilings-fsync-cost
+    parent: 1
+    milestone: M2
+    state: closed
+    title: "[DESIGN] Edge resource constraints: flash wear, RAM ceilings, fsync cost, brownout behavior"
+  - number: 21
+    slug: verification-strategy-crash-injection-fuzzing-property-tests
+    parent: 1
+    milestone: M2
+    state: closed
+    title: "[DESIGN] Verification strategy: crash injection, fuzzing, property tests, and simulation"
+  - number: 22
+    slug: project-governance-license-repo-structure-rfc-process-versio
+    parent: 1
+    milestone: M2
+    state: closed
+    title: "[DESIGN] Project governance: license, repo structure, RFC process, versioning"
+  - number: 23
+    slug: write-the-canonical-is-non-goals-and-committed-defaults-docu
+    parent: 1
+    milestone: M0
+    state: closed
+    title: "[TASK] Write the canonical IS / NON-GOALS and committed Defaults document"
+  - number: 24
+    slug: define-and-commit-the-testable-success-criteria-slo-table
+    parent: 1
+    milestone: M0
+    state: closed
+    title: "[TASK] Define and commit the testable success-criteria / SLO table"
+  - number: 25
+    slug: audit-the-issue-map-and-convert-it-to-a-checkable-slug-token
+    parent: 1
+    milestone: M0
+    state: open
+    title: "[TASK] Audit the issue map and convert it to a checkable slug-token index"
+  - number: 26
+    slug: version-pin-every-prior-art-claim-into-a-dated-claims-yaml-a
+    parent: 2
+    milestone: M0
+    state: open
+    title: "[TASK] Version-pin every prior-art claim into a dated claims.yaml and render the table from it"
+  - number: 27
+    slug: survey-the-embeddable-single-node-tier-chronicle-queue-sqlit
+    parent: 2
+    milestone: M0
+    state: open
+    title: "[TASK] Survey the embeddable single-node tier: Chronicle Queue, SQLite WAL, LMDB/bbolt, mmap hazards"
+  - number: 28
+    slug: reconcile-page-cache-vs-direct-dma-and-fsync-floor-vs-async
+    parent: 2
+    milestone: M1
+    state: closed
+    title: "[TASK] Reconcile page-cache vs direct-DMA and fsync-floor vs async into one edge stance"
+  - number: 29
+    slug: document-the-open-prior-art-gaps-for-ironbus-novel-features
+    parent: 2
+    milestone: M1
+    state: closed
+    title: "[TASK] Document the open prior-art gaps for IronBus-novel features"
+  - number: 30
+    slug: add-a-ci-link-check-and-sha-pin-all-prior-art-source-urls
+    parent: 2
+    milestone: M0
+    state: open
+    title: "[TASK] Add a CI link-check and SHA-pin all prior-art source URLs"
+  - number: 31
+    slug: specify-the-offset-lifecycle-contract-monotonicity-never-reu
+    parent: 3
+    milestone: M0
+    state: closed
+    title: "[TASK] Specify the offset lifecycle contract: monotonicity, never-reuse, recovery watermark, and trim semantics"
+  - number: 32
+    slug: specify-the-at-least-once-delivery-and-ack-contract-includin
+    parent: 3
+    milestone: M0
+    state: closed
+    title: "[TASK] Specify the at-least-once delivery and ack contract, including PUB return shape and cumulative-ack scoping"
+  - number: 33
+    slug: specify-the-effectively-once-dedup-window-dual-bounds-dedup
+    parent: 3
+    milestone: M1
+    state: closed
+    title: "[TASK] Specify the effectively-once dedup window: dual bounds, dedup-hit return, and optional persistent producer identity"
+  - number: 34
+    slug: specify-message-key-routing-and-ordering-consistent-hash-sti
+    parent: 3
+    milestone: M1
+    state: closed
+    title: "[TASK] Specify message_key routing and ordering: consistent-hash sticky competing delivery and per-key head-of-line rule"
+  - number: 35
+    slug: author-the-conformance-test-vectors-for-the-semantics-contra
+    parent: 3
+    milestone: M1
+    state: closed
+    title: "[TASK] Author the conformance test vectors for the semantics contract"
+  - number: 36
+    slug: specify-the-single-topic-segment-directory-layout-file-namin
+    parent: 4
+    milestone: M0
+    state: closed
+    title: "[TASK] Specify the single-topic segment directory layout, file naming, and live-segment set"
+  - number: 37
+    slug: specify-the-advisory-manifest-plus-atomic-current-pointer-me
+    parent: 4
+    milestone: M1
+    state: closed
+    title: "[TASK] Specify the advisory manifest plus atomic current-pointer mechanism"
+  - number: 38
+    slug: specify-the-sparse-offset-index-and-time-index-layout-densit
+    parent: 4
+    milestone: M1
+    state: closed
+    title: "[TASK] Specify the sparse offset index and time index layout, density, and lookup"
+  - number: 39
+    slug: specify-the-per-access-path-i-o-model-sealed-mmap-reads-sing
+    parent: 4
+    milestone: M1
+    state: closed
+    title: "[TASK] Specify the per-access-path I/O model: sealed mmap reads, single-writer appends"
+  - number: 40
+    slug: specify-cross-platform-preallocation-and-generation-tagged-s
+    parent: 4
+    milestone: M2
+    state: closed
+    title: "[TASK] Specify cross-platform preallocation and generation-tagged segment recycling"
+  - number: 41
+    slug: freeze-the-version-1-record-header-trailer-and-dual-crc-byte
+    parent: 5
+    milestone: M0
+    state: closed
+    title: "[TASK] Freeze the version-1 record header, trailer, and dual-CRC byte layout"
+  - number: 42
+    slug: freeze-the-segment-header-and-footer-layout-alignment-and-ze
+    parent: 5
+    milestone: M0
+    state: closed
+    title: "[TASK] Freeze the segment header and footer layout, alignment, and zero-region end-of-data rule"
+  - number: 43
+    slug: specify-torn-tail-vs-mid-log-distinction-and-the-longest-val
+    parent: 5
+    milestone: M1
+    state: closed
+    title: "[TASK] Specify torn-tail vs mid-log distinction and the longest-valid-prefix recovery contract"
+  - number: 44
+    slug: specify-forward-compatibility-fail-closed-version-flag-algo
+    parent: 5
+    milestone: M1
+    state: closed
+    title: "[TASK] Specify forward-compatibility, fail-closed version/flag/algo rules, and a worked CLI record dump"
+  - number: 45
+    slug: conformance-corpus-and-cross-platform-byte-identity-test-vec
+    parent: 5
+    milestone: M2
+    state: closed
+    title: "[TASK] Conformance corpus and cross-platform byte-identity test vectors for the v1 format"
+  - number: 46
+    slug: specify-and-document-the-four-durability-levels-with-written
+    parent: 6
+    milestone: M0
+    state: closed
+    title: "[TASK] Specify and document the four durability levels with written worst-case-loss guarantees"
+  - number: 47
+    slug: implement-single-committer-group-commit-on-the-wal
+    parent: 6
+    milestone: M1
+    state: closed
+    title: "[TASK] Implement single-committer group commit on the WAL"
+  - number: 48
+    slug: fatal-on-fsync-failure-path-and-parent-directory-fsync-on-se
+    parent: 6
+    milestone: M1
+    state: closed
+    title: "[TASK] Fatal-on-fsync-failure path and parent-directory fsync on segment create"
+  - number: 49
+    slug: durability-observability-and-the-none-safety-gate
+    parent: 6
+    milestone: M1
+    state: closed
+    title: "[TASK] Durability observability and the none safety gate"
+  - number: 50
+    slug: crash-injection-and-ack-ordering-test-harness-for-the-durabi
+    parent: 6
+    milestone: M2
+    state: closed
+    title: "[TASK] Crash-injection and ack-ordering test harness for the durability contract"
+  - number: 51
+    slug: define-the-checkpoint-file-format-double-buffered-slots-and
+    parent: 7
+    milestone: M0
+    state: closed
+    title: "[TASK] Define the checkpoint file format, double-buffered slots, and lower-bound write protocol"
+  - number: 52
+    slug: implement-the-startup-recovery-state-machine-forward-validat
+    parent: 7
+    milestone: M1
+    state: closed
+    title: "[TASK] Implement the startup recovery state machine: forward validation, torn-tail truncation, idempotent commit"
+  - number: 53
+    slug: implement-torn-tail-versus-mid-log-classification-and-the-ha
+    parent: 7
+    milestone: M1
+    state: closed
+    title: "[TASK] Implement torn-tail versus mid-log classification and the handoff to corruption-skip"
+  - number: 54
+    slug: rebuild-and-validate-offset-time-indexes-and-clamp-consumer
+    parent: 7
+    milestone: M1
+    state: closed
+    title: "[TASK] Rebuild and validate offset/time indexes and clamp consumer cursors atomically during recovery"
+  - number: 55
+    slug: crash-injection-and-power-cut-harness-asserting-a-consistent
+    parent: 7
+    milestone: M2
+    state: closed
+    title: "[TASK] Crash-injection and power-cut harness asserting a consistent recovered prefix at every write boundary"
+  - number: 56
+    slug: define-record-segment-framing-checksum-coverage-and-length-v
+    parent: 8
+    milestone: M0
+    state: closed
+    title: "[TASK] Define record/segment framing checksum coverage and length-validation contract"
+  - number: 57
+    slug: implement-bounded-two-record-resync-scan-with-poison-set-mem
+    parent: 8
+    milestone: M1
+    state: closed
+    title: "[TASK] Implement bounded two-record resync scan with poison-set memoization"
+  - number: 58
+    slug: specify-recovery-modes-torn-tail-versus-mid-log-distinction
+    parent: 8
+    milestone: M1
+    state: closed
+    title: "[TASK] Specify recovery modes, torn-tail versus mid-log distinction, and active-segment handling"
+  - number: 59
+    slug: define-skipevent-schema-consumer-gap-markers-and-crash-fuzz
+    parent: 8
+    milestone: M2
+    state: closed
+    title: "[TASK] Define SkipEvent schema, consumer gap markers, and crash/fuzz test harness"
+  - number: 60
+    slug: durable-consumer-state-store-cursors-pel-attempt-counters-sn
+    parent: 9
+    milestone: M1
+    state: closed
+    title: "[TASK] Durable consumer-state store: cursors, PEL, attempt counters, snapshot and replay"
+  - number: 61
+    slug: work-group-cursor-advancement-under-out-of-order-acks-sparse
+    parent: 9
+    milestone: M1
+    state: closed
+    title: "[TASK] Work-group cursor advancement under out-of-order acks (sparse acked-ahead set)"
+  - number: 62
+    slug: lease-lifecycle-visibility-timeout-progress-extend-janitor-r
+    parent: 9
+    milestone: M1
+    state: closed
+    title: "[TASK] Lease lifecycle: visibility timeout, progress extend, janitor reclaim, generation fencing"
+  - number: 63
+    slug: ack-vocabulary-maxdeliver-backoff-and-crash-atomic-dlq-move
+    parent: 9
+    milestone: M1
+    state: closed
+    title: "[TASK] Ack vocabulary, MaxDeliver, BackOff, and crash-atomic DLQ move"
+  - number: 64
+    slug: key-shared-routing-and-rebalancing-with-per-key-order-preser
+    parent: 9
+    milestone: M2
+    state: closed
+    title: "[TASK] key_shared routing and rebalancing with per-key order preservation"
+  - number: 65
+    slug: per-consumer-credit-and-in-flight-window-with-redelivery-acc
+    parent: 10
+    milestone: M1
+    state: closed
+    title: "[TASK] Per-consumer credit and in-flight window with redelivery accounting"
+  - number: 66
+    slug: per-topic-overflow-policies-and-config-validator
+    parent: 10
+    milestone: M1
+    state: closed
+    title: "[TASK] Per-topic overflow policies and config validator"
+  - number: 67
+    slug: fsync-derived-producer-admission-window-and-wal-backpressure
+    parent: 10
+    milestone: M1
+    state: closed
+    title: "[TASK] fsync-derived producer admission window and WAL backpressure seam"
+  - number: 68
+    slug: codel-time-in-queue-shedding-with-monotonic-clock-and-depth
+    parent: 10
+    milestone: M2
+    state: closed
+    title: "[TASK] CoDel time-in-queue shedding with monotonic clock and depth backstop"
+  - number: 69
+    slug: retry-budget-load-shedding-and-do-not-retry-signaling
+    parent: 10
+    milestone: M2
+    state: closed
+    title: "[TASK] Retry budget, load shedding, and do-not-retry signaling"
+  - number: 70
+    slug: freeze-the-byte-for-byte-frame-layout-verbs-flags-and-varint
+    parent: 11
+    milestone: M0
+    state: closed
+    title: "[TASK] Freeze the byte-for-byte frame layout, verbs, flags, and varint encoding"
+  - number: 71
+    slug: connection-lifecycle-info-connect-negotiation-and-the-auth-c
+    parent: 11
+    milestone: M0
+    state: closed
+    title: "[TASK] Connection lifecycle, INFO/CONNECT negotiation, and the auth carrier"
+  - number: 72
+    slug: flow-credit-and-producer-pflow-semantics-on-the-wire
+    parent: 11
+    milestone: M1
+    state: closed
+    title: "[TASK] FLOW credit and producer PFLOW semantics on the wire"
+  - number: 73
+    slug: frame-limits-canonical-form-fragmentation-and-slow-loris-saf
+    parent: 11
+    milestone: M0
+    state: closed
+    title: "[TASK] Frame limits, canonical-form, fragmentation, and slow-loris safety rules"
+  - number: 74
+    slug: wire-decoder-fuzz-target-and-encode-decode-property-harness
+    parent: 11
+    milestone: M1
+    state: closed
+    title: "[TASK] Wire decoder fuzz target and encode/decode property harness"
+  - number: 75
+    slug: zstd-integration-frame-format-and-codec-descriptor-with-raw
+    parent: 12
+    milestone: M0
+    state: closed
+    title: "[TASK] zstd integration, frame format, and codec descriptor with raw-store threshold"
+  - number: 76
+    slug: decoder-resilience-bounded-decompression-unknown-codec-and-c
+    parent: 12
+    milestone: M0
+    state: closed
+    title: "[TASK] Decoder resilience: bounded decompression, unknown-codec and corrupt-unit quarantine"
+  - number: 77
+    slug: static-musl-cross-build-verification-for-zstd-plus-lz4-flex
+    parent: 12
+    milestone: M0
+    state: closed
+    title: "[TASK] Static-musl cross-build verification for zstd plus lz4_flex fallback codec"
+  - number: 78
+    slug: trained-per-type-dictionary-lifecycle-train-content-hash-dic
+    parent: 12
+    milestone: M2
+    state: closed
+    title: "[TASK] Trained per-type dictionary lifecycle (train, content-hash dict_id, self-contained distribution)"
+  - number: 79
+    slug: compression-config-surface-and-observability-ratio-cpu-reali
+    parent: 12
+    milestone: M1
+    state: closed
+    title: "[TASK] Compression config surface and observability (ratio, CPU, realized codec)"
+  - number: 80
+    slug: segment-reaper-time-size-and-count-bounds-over-sealed-segmen
+    parent: 13
+    milestone: M1
+    state: closed
+    title: "[TASK] Segment reaper: time, size, and count bounds over sealed segments"
+  - number: 81
+    slug: crash-safe-segment-delete-fsync-ordered-manifest-advance-the
+    parent: 13
+    milestone: M1
+    state: closed
+    title: "[TASK] Crash-safe segment delete: fsync-ordered MANIFEST advance then unlink"
+  - number: 82
+    slug: disk-full-policy-and-bounded-block-handoff-to-backpressure
+    parent: 13
+    milestone: M1
+    state: closed
+    title: "[TASK] Disk-full policy and bounded block handoff to backpressure"
+  - number: 83
+    slug: optional-key-based-log-compaction-with-atomic-manifest-swap
+    parent: 13
+    milestone: M2
+    state: closed
+    title: "[TASK] Optional key-based log compaction with atomic MANIFEST swap"
+  - number: 84
+    slug: consumer-safe-retention-knob-truncation-signal-and-clock-sou
+    parent: 13
+    milestone: M1
+    state: closed
+    title: "[TASK] Consumer-safe retention knob, truncation signal, and clock-source semantics"
+  - number: 85
+    slug: precedence-resolver-and-immutable-effective-config-with-atom
+    parent: 14
+    milestone: M0
+    state: closed
+    title: "[TASK] Precedence resolver and immutable effective-config with atomic load/reload"
+  - number: 86
+    slug: typed-key-table-literal-grammar-parser-and-strict-validation
+    parent: 14
+    milestone: M0
+    state: closed
+    title: "[TASK] Typed key table, literal grammar parser, and strict validation with coupled-set checks"
+  - number: 87
+    slug: compiled-in-versioned-profiles-and-materialized-config-loggi
+    parent: 14
+    milestone: M1
+    state: closed
+    title: "[TASK] Compiled-in versioned profiles and materialized-config logging"
+  - number: 88
+    slug: hot-cold-coupled-reload-engine-and-runtime-admin-api
+    parent: 14
+    milestone: M1
+    state: closed
+    title: "[TASK] Hot/cold/coupled reload engine and runtime admin API"
+  - number: 89
+    slug: env-var-and-flag-mapping-data-dir-lifecycle-and-secret-redac
+    parent: 14
+    milestone: M1
+    state: closed
+    title: "[TASK] Env-var and flag mapping, data_dir lifecycle, and secret redaction"
+  - number: 90
+    slug: offline-data-dir-reader-shared-decode-durable-hwm-bound-mark
+    parent: 15
+    milestone: M0
+    state: closed
+    title: "[TASK] Offline data-dir reader: shared decode, durable-HWM bound, marks-not-drops"
+  - number: 91
+    slug: cli-surface-and-contracts-subcommands-flags-exit-codes-versi
+    parent: 15
+    milestone: M0
+    state: closed
+    title: "[TASK] CLI surface and contracts: subcommands, flags, exit codes, versioned --json"
+  - number: 92
+    slug: peek-dump-repair-scrub-offline-inspection-and-read-only-by-d
+    parent: 15
+    milestone: M1
+    state: closed
+    title: "[TASK] peek/dump/repair/scrub: offline inspection and read-only-by-default repair"
+  - number: 93
+    slug: top-live-and-offline-tui-with-graceful-text-degradation
+    parent: 15
+    milestone: M1
+    state: closed
+    title: "[TASK] top: live and offline TUI with graceful text degradation"
+  - number: 94
+    slug: bench-load-generator-with-production-safety-and-flash-endura
+    parent: 15
+    milestone: M2
+    state: closed
+    title: "[TASK] bench: load generator with production-safety and flash-endurance guards"
+  - number: 95
+    slug: embedded-http-server-with-metrics-healthz-readyz-and-secure
+    parent: 16
+    milestone: M1
+    state: closed
+    title: "[TASK] Embedded HTTP server with /metrics, /healthz, /readyz and secure bind defaults"
+  - number: 96
+    slug: resilience-observability-contract-count-every-skip-freeze-dr
+    parent: 16
+    milestone: M1
+    state: closed
+    title: "[TASK] Resilience-observability contract: count every skip, freeze, drop, and overflow with its offset"
+  - number: 97
+    slug: metric-registry-fixed-histogram-buckets-consumer-lag-cardina
+    parent: 16
+    milestone: M1
+    state: closed
+    title: "[TASK] Metric registry: fixed histogram buckets, consumer-lag cardinality cap, allocation-free hot path"
+  - number: 98
+    slug: resilience-counter-durability-checkpoint-plus-replay-reconci
+    parent: 16
+    milestone: M2
+    state: closed
+    title: "[TASK] Resilience-counter durability: checkpoint plus replay reconciliation with a monotonicity contract"
+  - number: 99
+    slug: admin-read-only-introspection-contract-and-feature-gated-tra
+    parent: 16
+    milestone: M2
+    state: closed
+    title: "[TASK] /admin read-only introspection contract and feature-gated tracing/OTLP"
+  - number: 100
+    slug: static-musl-cross-build-matrix-with-per-target-static-verifi
+    parent: 17
+    milestone: M0
+    state: closed
+    title: "[TASK] Static musl cross-build matrix with per-target static verification"
+  - number: 101
+    slug: size-optimized-reproducible-release-profile-with-byte-identi
+    parent: 17
+    milestone: M1
+    state: closed
+    title: "[TASK] Size-optimized, reproducible release profile with byte-identical gate"
+  - number: 102
+    slug: supply-chain-gate-cargo-deny-policy-auditable-sbom-round-tri
+    parent: 17
+    milestone: M1
+    state: closed
+    title: "[TASK] Supply-chain gate: cargo-deny policy, auditable SBOM round-trip, C-FFI ban"
+  - number: 103
+    slug: signed-checksummed-releases-and-fail-closed-curl-to-shell-in
+    parent: 17
+    milestone: M1
+    state: closed
+    title: "[TASK] Signed checksummed releases and fail-closed curl-to-shell installer"
+  - number: 104
+    slug: distribution-artifacts-deb-package-distroless-image-and-atom
+    parent: 17
+    milestone: M2
+    state: closed
+    title: "[TASK] Distribution artifacts: .deb package, distroless image, and atomic upgrade/rollback"
+  - number: 105
+    slug: write-the-enumerated-edge-threat-model-and-the-secure-defaul
+    parent: 18
+    milestone: M0
+    state: closed
+    title: "[TASK] Write the enumerated edge threat model and the secure-defaults catalog"
+  - number: 106
+    slug: specify-connection-scoped-authentication-and-the-three-scope
+    parent: 18
+    milestone: M1
+    state: closed
+    title: "[TASK] Specify connection-scoped authentication and the three-scope authorization model"
+  - number: 107
+    slug: specify-tls-1-3-transport-the-localhost-default-bind-invaria
+    parent: 18
+    milestone: M1
+    state: closed
+    title: "[TASK] Specify TLS 1.3 transport, the localhost-default bind invariant, and pre-auth DoS defenses"
+  - number: 108
+    slug: specify-optional-at-rest-aead-encryption-and-its-interaction
+    parent: 18
+    milestone: M2
+    state: closed
+    title: "[TASK] Specify optional at-rest AEAD encryption and its interaction with checksums and recovery"
+  - number: 109
+    slug: specify-secret-handling-redaction-security-audit-events-and
+    parent: 18
+    milestone: M1
+    state: closed
+    title: "[TASK] Specify secret handling, redaction, security audit events, and crypto SBOM posture"
+  - number: 110
+    slug: ratify-and-version-the-slo-target-table-from-measured-floors
+    parent: 19
+    milestone: M1
+    state: closed
+    title: "[TASK] Ratify and version the SLO target table from measured floors"
+  - number: 111
+    slug: macro-bench-harness-open-loop-generator-hdrhistogram-coordin
+    parent: 19
+    milestone: M1
+    state: closed
+    title: "[TASK] Macro-bench harness: open-loop generator, HdrHistogram, coordinated-omission proof"
+  - number: 112
+    slug: criterion-micro-bench-suite-for-hot-path-components
+    parent: 19
+    milestone: M0
+    state: closed
+    title: "[TASK] criterion micro-bench suite for hot-path components"
+  - number: 113
+    slug: edge-run-discipline-thermal-sd-state-harness-isolation-multi
+    parent: 19
+    milestone: M2
+    state: closed
+    title: "[TASK] Edge run discipline: thermal, SD state, harness isolation, multi-hour run"
+  - number: 114
+    slug: baseline-comparison-rig-and-ci-regression-gate
+    parent: 19
+    milestone: M2
+    state: closed
+    title: "[TASK] Baseline comparison rig and CI regression gate"
+  - number: 115
+    slug: specify-and-enforce-the-tiny-profile-ram-budget
+    parent: 20
+    milestone: M0
+    state: closed
+    title: "[TASK] Specify and enforce the tiny profile RAM budget"
+  - number: 116
+    slug: define-edge-durability-defaults-ack-contract-fatal-fsync-rec
+    parent: 20
+    milestone: M0
+    state: closed
+    title: "[TASK] Define edge durability defaults: ack contract, fatal-fsync, recycled-segment generation tags"
+  - number: 117
+    slug: hardware-constraint-to-knob-mapping-table-and-rtc-less-clock
+    parent: 20
+    milestone: M1
+    state: closed
+    title: "[TASK] Hardware-constraint-to-knob mapping table and RTC-less clock model"
+  - number: 118
+    slug: edge-metrics-and-power-loss-fault-injection-test-contract
+    parent: 20
+    milestone: M1
+    state: closed
+    title: "[TASK] Edge metrics and power-loss fault-injection test contract"
+  - number: 119
+    slug: deterministic-simulation-core-io-clock-scheduler-seam-seeded
+    parent: 21
+    milestone: M0
+    state: closed
+    title: "[TASK] Deterministic simulation core: IO/Clock/Scheduler seam, seeded disk model, determinism meta-test"
+  - number: 120
+    slug: invariant-checkers-i1-to-i4-and-the-versioned-structured-los
+    parent: 21
+    milestone: M0
+    state: closed
+    title: "[TASK] Invariant checkers I1 to I4 and the versioned structured loss-report schema"
+  - number: 121
+    slug: proptest-and-cargo-fuzz-harnesses-for-the-record-and-segment
+    parent: 21
+    milestone: M0
+    state: closed
+    title: "[TASK] proptest and cargo-fuzz harnesses for the record and segment codecs with corpus persistence"
+  - number: 122
+    slug: loom-scoped-concurrency-tests-for-commit-index-ring-buffer-h
+    parent: 21
+    milestone: M1
+    state: closed
+    title: "[TASK] loom scoped concurrency tests for commit index, ring-buffer handoff, and refcounts"
+  - number: 123
+    slug: corruption-corpus-plus-block-layer-and-alice-conformance-gat
+    parent: 21
+    milestone: M1
+    state: closed
+    title: "[TASK] Corruption corpus plus block-layer and ALICE conformance gate on the reference edge device"
+  - number: 124
+    slug: license-files-spdx-headers-and-the-cargo-deny-allowlist
+    parent: 22
+    milestone: M0
+    state: closed
+    title: "[TASK] License files, SPDX headers, and the cargo-deny allowlist"
+  - number: 125
+    slug: rfc-process-scaffolding-codeowners-and-back-filled-design-re
+    parent: 22
+    milestone: M0
+    state: closed
+    title: "[TASK] RFC process scaffolding, CODEOWNERS, and back-filled design records"
+  - number: 126
+    slug: semver-msrv-and-the-format-version-registry-policy
+    parent: 22
+    milestone: M1
+    state: closed
+    title: "[TASK] SemVer, MSRV, and the format-version registry policy"
+  - number: 127
+    slug: community-and-security-docs-contributing-code-of-conduct-sec
+    parent: 22
+    milestone: M1
+    state: closed
+    title: "[TASK] Community and security docs: CONTRIBUTING, CODE_OF_CONDUCT, SECURITY, GOVERNANCE, DCO"
+  - number: 128
+    slug: ci-matrix-branch-protection-and-release-sbom-workflow-gates
+    parent: 22
+    milestone: M1
+    state: closed
+    title: "[TASK] CI matrix, branch protection, and release/SBOM workflow gates"
+  - number: 134
+    slug: build-quarantine-store-copy-not-move-capped-accounted-with-m
+    parent: 8
+    milestone: M2
+    state: closed
+    title: "[TASK] Build quarantine store: copy-not-move, capped, accounted, with metadata-only fallback"
+  - number: 297
+    slug: edge-device-alice-crash-consistency-dm-flakey-dm-dust-block
+    parent: 21
+    milestone: unassigned
+    state: open
+    title: "[TASK] Edge-device ALICE crash-consistency + dm-flakey/dm-dust block-layer conformance run"
+  - number: 357
+    slug: implement-the-trained-dictionary-lifecycle-zdict-training-si
+    parent: 12
+    milestone: unassigned
+    state: open
+    title: "[TASK] Implement the trained dictionary lifecycle (ZDICT training, sidecar IO, embed, UnresolvedDictId, measured ratio)"
