@@ -169,6 +169,7 @@ where
                     let r = g.loss_report();
                     ReasonCode::ALL.map(|rc| r.records_lost_for(rc))
                 },
+                recovery_data_loss: g.loss_report().data_loss_bytes(),
                 // -1 is the unambiguous "none yet" sentinel (offsets are never negative).
                 last_dead_lettered: g
                     .last_dead_lettered_offset()
@@ -245,9 +246,12 @@ struct MetricsSnapshot {
     /// corrupt-byte copies prior recoveries left, surviving restart.
     quarantined: u64,
     /// Bytes dropped at the last recovery, per [`ReasonCode`] in code order.
-    recovery_loss: [u64; 5],
+    recovery_loss: [u64; 6],
     /// Records dropped at the last recovery, per [`ReasonCode`] in code order.
-    recovery_loss_records: [u64; 5],
+    recovery_loss_records: [u64; 6],
+    /// Bytes of real DATA loss at the last recovery (the loss report total with `TornTail`
+    /// excluded, #59): the headline "bytes lost" figure that must not inflate on a brownout.
+    recovery_data_loss: u64,
     /// The most recent dead-letter offset, or -1 if none (the exposition sentinel).
     last_dead_lettered: i64,
     /// The number of records durably written to the DLQ sink (the dead-letter depth, #63).
@@ -275,6 +279,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         quarantined,
         recovery_loss,
         recovery_loss_records,
+        recovery_data_loss,
         last_dead_lettered,
         dlq_records,
         counters,
@@ -359,6 +364,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
     );
     body.push_str(&skip_loss_reconciliation_lines(&counters));
     body.push_str(&recovery_loss_lines(&recovery_loss));
+    body.push_str(&recovery_data_loss_lines(recovery_data_loss));
     body.push_str(&recovery_loss_records_lines(&recovery_loss_records));
     body.push_str(&fsync_histogram_lines(&fsync));
     body.push_str(&group_consumer_lines(&groups, flushed));
@@ -603,7 +609,7 @@ fn group_consumer_lines(groups: &[GroupConsumerStat], flushed: u64) -> String {
 /// Renders the per-reason recovery-loss gauge `ironbus_recovery_loss_bytes{reason=...}` from the
 /// last recovery's loss report: one line per reason in code order, zero where a reason did not
 /// occur. The grand total equals `ironbus_recovery_truncated_bytes`.
-fn recovery_loss_lines(by_reason: &[u64; 5]) -> String {
+fn recovery_loss_lines(by_reason: &[u64; 6]) -> String {
     let mut s = String::from(
         "# HELP ironbus_recovery_loss_bytes Bytes dropped at the last recovery, by reason.\n\
          # TYPE ironbus_recovery_loss_bytes gauge\n",
@@ -618,11 +624,25 @@ fn recovery_loss_lines(by_reason: &[u64; 5]) -> String {
     s
 }
 
+/// Renders the recovery DATA-LOSS gauge `ironbus_recovery_data_loss_bytes` (#59): the bytes the
+/// last recovery dropped that are REAL data loss, i.e. the loss report's total with
+/// [`ReasonCode::TornTail`] excluded. A torn or unsynced tail is a reported skip
+/// (`ironbus_recovery_truncated_bytes` and the `torn_tail` per-reason series still carry it) but
+/// not lost data, so this headline figure does not inflate on a brownout restart. It is a GAUGE
+/// (no `_total`), so it stays out of the frozen resilience-counter taxonomy by construction.
+fn recovery_data_loss_lines(data_loss_bytes: u64) -> String {
+    format!(
+        "# HELP ironbus_recovery_data_loss_bytes Bytes of real data loss at the last recovery (the loss report total with torn-tail truncation excluded, since a torn tail is bytes never fully written, not lost data).\n\
+         # TYPE ironbus_recovery_data_loss_bytes gauge\n\
+         ironbus_recovery_data_loss_bytes {data_loss_bytes}\n"
+    )
+}
+
 /// Renders the per-reason recovery-loss gauge `ironbus_recovery_loss_records{reason=...}`
 /// from the last recovery's loss report: the record-count complement of
 /// `ironbus_recovery_loss_bytes`, so an operator sees not just how many bytes recovery
 /// dropped but how many records, by reason. Zero where a reason did not occur.
-fn recovery_loss_records_lines(by_reason: &[u64; 5]) -> String {
+fn recovery_loss_records_lines(by_reason: &[u64; 6]) -> String {
     let mut s = String::from(
         "# HELP ironbus_recovery_loss_records Records dropped at the last recovery, by reason.\n\
          # TYPE ironbus_recovery_loss_records gauge\n",
@@ -991,6 +1011,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one exposition test asserting many metric lines end to end.
     fn metrics_exposes_engine_gauges() {
         let (addr, shutdown, handle, engine) = start();
         // Produce two durable records so the flushed head and the lag advance.
@@ -1031,6 +1052,17 @@ mod tests {
             m.contains("\nironbus_recovery_loss_bytes{reason=\"corrupt_record_body\"} 0\n"),
             "{m}"
         );
+        // The appended at-rest-scrubber reason (#92, #59) has its own per-reason series (zero on a
+        // clean start), and the data-loss gauge (torn-tail-excluded total, #59) is present and zero.
+        assert!(
+            m.contains("\nironbus_recovery_loss_bytes{reason=\"scrubber_suspect\"} 0\n"),
+            "{m}"
+        );
+        assert!(
+            m.contains("\n# TYPE ironbus_recovery_data_loss_bytes gauge\n"),
+            "{m}"
+        );
+        assert!(m.contains("\nironbus_recovery_data_loss_bytes 0\n"), "{m}");
         // The record-count complement of the per-reason loss-bytes series, plus a clean
         // (no leading whitespace) TYPE line so a strict Prometheus parser accepts it.
         assert!(
