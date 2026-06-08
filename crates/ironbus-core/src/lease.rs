@@ -180,8 +180,10 @@ impl LeaseTable {
     /// [`LeaseTable::claim`] of each offset resumes its delivery count instead of resetting to 1.
     /// Each `(offset, attempt)` says the message at `offset` had been delivered `attempt` times
     /// before the restart; the next claim grants it as attempt `attempt + 1` (the redelivery), so
-    /// `MaxDeliver` routes it to the dead-letter queue after exactly `MaxDeliver` attempts TOTAL
-    /// across restarts. A zero `attempt` carries no information and is ignored (a fresh delivery is
+    /// `MaxDeliver` routes it to the dead-letter queue after at least `MaxDeliver` attempts TOTAL
+    /// across restarts (the count is durable on the checkpoint cadence, so a crash replays only the
+    /// un-checkpointed tail, bounding it at `MaxDeliver` plus that tail; it never regresses below the
+    /// durable floor, so a poison can no longer redeliver unboundedly across reboots). A zero `attempt` carries no information and is ignored (a fresh delivery is
     /// attempt 1 anyway). Called once on the durable-resume path at open, on a freshly-built (empty)
     /// table; the carried set is bounded by `max_in_flight`, the same window that bounds the leases.
     pub fn resume_attempts(&mut self, attempts: impl IntoIterator<Item = (u64, u32)>) {

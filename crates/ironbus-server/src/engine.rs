@@ -1377,7 +1377,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // The default group's durable cursor, from `cursor.ckpt`, clamped to the head, plus its
         // durable attempt counts from `attempts.ckpt` (#358): a redelivered in-flight message
         // resumes its attempt number instead of resetting to 1, so `MaxDeliver` routes a poison
-        // record to the DLQ after exactly `MaxDeliver` attempts TOTAL across the restart.
+        // record to the DLQ after at least `MaxDeliver` attempts TOTAL across the restart (at most that
+        // plus the redeliveries not yet checkpointed when the crash hit; never below the durable floor).
         let cursor = resume_cursor_from_snapshot(recovered.as_deref(), flushed);
         let default_committed = cursor.committed().get();
         let default_group = resume_work_group(

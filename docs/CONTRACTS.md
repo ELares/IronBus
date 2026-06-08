@@ -689,9 +689,12 @@ code; the code is canonical.
   and reset on restart; it is now persisted as a compact `{offset -> attempt}` map of the
   in-flight entries, in its own two-slot CRC checkpoint (`attempts.ckpt` for the default
   group, `attempts-<hex>.ckpt` for a named group), written on the cursor-checkpoint cadence.
-  On open the lease table resumes each redelivery at its true attempt number, so `MaxDeliver`
-  routes a poison record to the DLQ after exactly `MaxDeliver` attempts TOTAL across an
-  unclean restart. The map is bounded by `max_in_flight` per group. A torn or missing
+  On open the lease table resumes each redelivery near its true attempt number, so `MaxDeliver`
+  routes a poison record to the DLQ after at least `MaxDeliver` attempts TOTAL across an
+  unclean restart (at most `MaxDeliver` plus the redeliveries not yet checkpointed when the
+  crash hit). The count advances on the checkpoint cadence, so a crash replays only the
+  un-checkpointed tail and never regresses below the durable floor, so a poison can no longer
+  redeliver unboundedly across reboots. The map is bounded by `max_in_flight` per group. A torn or missing
   snapshot degrades to "resume at attempt 1" (the historical behavior) and never blocks open.
 - **`Lease` shape.** The draft's runtime `Lease` had `lease_id, consumer, offset, attempt,
   granted_unix_ms, visibility_deadline_ms, fence_token`. The implemented fencing token is
