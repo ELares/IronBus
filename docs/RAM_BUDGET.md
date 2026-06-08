@@ -146,6 +146,18 @@ entries (each a small fixed struct: generation, attempt_start, deadline,
 deliveries) and the `AckCursor`'s acked-ahead `Vec` is bounded by the same
 window.
 
+The durable per-message attempt counter (#358) adds nothing unbounded. At rest
+the attempt counts live INSIDE the `LeaseTable`'s `Lease` entries (the existing
+`deliveries` field above), so they cost no extra RAM. The only added structure is
+the `carried: BTreeMap<u64, u32>` map seeded at open from the durable
+`attempts.ckpt` / `attempts-<hex>.ckpt` snapshot: it holds at most one
+`(offset, attempt)` entry per in-flight offset, so it is bounded by the SAME
+`max_in_flight` window, and each entry is consumed (dropped) by the first
+redelivery after the restart, so it is empty in steady state. The on-disk snapshot
+is likewise bounded: at most `max_in_flight` 12-byte pairs per group, capped to the
+`ATTEMPTS_PAYLOAD` = 32 KiB checkpoint slot (the leading pairs that fit are kept;
+the rare overflow tail only resets those offsets to attempt 1, never a leak).
+
 The number of live groups is bounded by `max_groups` (`--max-groups`, default
 **1024**, `DEFAULT_MAX_GROUPS` in `engine.rs`; the default group `""` is exempt
 and never counted): a new named group past the cap is rejected with

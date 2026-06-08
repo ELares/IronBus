@@ -150,6 +150,18 @@ pub struct LeaseTable {
     config: LeaseConfig,
     leases: BTreeMap<u64, Lease>,
     next_generation: u64,
+    /// The durable per-message attempt counts CARRIED across a restart (#358): `{offset ->
+    /// attempt_count}` for offsets that were in flight (delivered but unacked) at the last
+    /// checkpoint. The table is rebuilt empty on restart, so without this a redelivered message
+    /// resets to attempt 1 and a poison record could redeliver past its `MaxDeliver` cap. When the
+    /// FIRST post-restart [`LeaseTable::claim`] of such an offset grants, it resumes the lease's
+    /// delivery count at `carried + 1` (this redelivery is the next attempt), then drops the entry,
+    /// so the live lease owns the count from then on. Empty in steady state (every entry is consumed
+    /// by the first redelivery), and bounded by the same `max_in_flight` window that bounds
+    /// `leases`, so it never grows unbounded. Acked / committed-past offsets never redeliver (the
+    /// cursor gates them), so a stale carried entry is simply never consumed; the snapshot is
+    /// rebuilt from the live leases each checkpoint, so such an entry never persists.
+    carried: BTreeMap<u64, u32>,
 }
 
 impl LeaseTable {
@@ -160,7 +172,40 @@ impl LeaseTable {
             config,
             leases: BTreeMap::new(),
             next_generation: 0,
+            carried: BTreeMap::new(),
         }
+    }
+
+    /// Seeds the durable per-message attempt counts CARRIED from a prior run (#358), so the next
+    /// [`LeaseTable::claim`] of each offset resumes its delivery count instead of resetting to 1.
+    /// Each `(offset, attempt)` says the message at `offset` had been delivered `attempt` times
+    /// before the restart; the next claim grants it as attempt `attempt + 1` (the redelivery), so
+    /// `MaxDeliver` routes it to the dead-letter queue after at least `MaxDeliver` attempts TOTAL
+    /// across restarts (the count is durable on the checkpoint cadence, so a crash replays only the
+    /// un-checkpointed tail, bounding it at `MaxDeliver` plus that tail; it never regresses below the
+    /// durable floor, so a poison can no longer redeliver unboundedly across reboots). A zero `attempt` carries no information and is ignored (a fresh delivery is
+    /// attempt 1 anyway). Called once on the durable-resume path at open, on a freshly-built (empty)
+    /// table; the carried set is bounded by `max_in_flight`, the same window that bounds the leases.
+    pub fn resume_attempts(&mut self, attempts: impl IntoIterator<Item = (u64, u32)>) {
+        for (offset, attempt) in attempts {
+            if attempt > 0 {
+                self.carried.insert(offset, attempt);
+            }
+        }
+    }
+
+    /// The per-message attempt counts of the currently-in-flight leases, as `(offset, deliveries)`
+    /// pairs in ascending-offset order (#358). This is the durable snapshot the server persists
+    /// alongside the cursor checkpoint so the counts survive an unclean restart; it is bounded by
+    /// `max_in_flight` (one pair per in-flight offset). Acked offsets have no lease, so they are
+    /// absent: a clean ack clears the durable count. Pairs with `deliveries == 0` cannot occur (a
+    /// granted lease is at least attempt 1).
+    #[must_use]
+    pub fn attempt_counts(&self) -> Vec<(u64, u32)> {
+        self.leases
+            .iter()
+            .map(|(&off, lease)| (off, lease.deliveries))
+            .collect()
     }
 
     /// The number of messages currently tracked as in-flight (granted but not yet acked,
@@ -201,16 +246,26 @@ impl LeaseTable {
             lease.deliveries = lease.deliveries.saturating_add(1);
             lease.deliveries
         } else {
+            // First claim of this offset in THIS table. If a durable attempt count was carried
+            // across a restart (#358), this delivery resumes at `carried + 1` (the message had
+            // been delivered `carried` times before the crash, and this redelivery is the next
+            // attempt), so `MaxDeliver` counts across restarts. The entry is consumed here, so the
+            // live lease owns the count from now on. Saturating-add keeps a pathological carried
+            // value from wrapping; the count saturates at u32::MAX exactly as the in-memory path.
+            let resumed = self
+                .carried
+                .remove(&off)
+                .map_or(1, |prior| prior.saturating_add(1));
             self.leases.insert(
                 off,
                 Lease {
                     generation,
                     attempt_start: now,
                     deadline,
-                    deliveries: 1,
+                    deliveries: resumed,
                 },
             );
-            1
+            resumed
         };
         Claim::Granted {
             token: LeaseToken { offset, generation },
@@ -641,6 +696,71 @@ mod tests {
         match t.claim(off(7), 30) {
             Claim::Granted { deliveries, .. } => assert_eq!(deliveries, 2),
             other => panic!("at-deadline should redeliver, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_carried_attempt_count_resumes_the_delivery_count_across_a_restart() {
+        // #358: a message delivered N-1 times before a restart resumes at attempt N, not 1, so a
+        // fresh (restarted) table seeded with the carried count grants the next claim as N.
+        let mut t = LeaseTable::new(cfg());
+        // The message had been delivered 3 times before the crash.
+        t.resume_attempts([(off(7).get(), 3)]);
+        // The first claim after the restart is attempt 4 (the resumed count + 1), NOT 1.
+        match t.claim(off(7), 0) {
+            Claim::Granted { deliveries, .. } => assert_eq!(deliveries, 4, "resumes at attempt 4"),
+            other => panic!("expected Granted, got {other:?}"),
+        }
+        // A different, un-carried offset still starts at attempt 1.
+        match t.claim(off(8), 0) {
+            Claim::Granted { deliveries, .. } => assert_eq!(deliveries, 1),
+            other => panic!("expected Granted, got {other:?}"),
+        }
+        // The carried entry was consumed: a re-claim of 7 after expiry escalates from the live
+        // lease (5), not from the carried value again.
+        match t.claim(off(7), 1000) {
+            Claim::Granted { deliveries, .. } => {
+                assert_eq!(deliveries, 5, "escalates from the live lease");
+            }
+            other => panic!("expected Granted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attempt_counts_snapshots_the_live_leases_and_a_clean_ack_clears_it() {
+        let mut t = LeaseTable::new(cfg());
+        // Claim two offsets and redeliver one so its attempt count is 2.
+        let _ = t.claim(off(1), 0);
+        let tok2 = token(t.claim(off(2), 0));
+        let _ = t.claim(off(2), 1000); // redeliver 2: now attempt 2 (tok2 is stale)
+        let mut counts = t.attempt_counts();
+        counts.sort_unstable();
+        assert_eq!(counts, vec![(1, 1), (2, 2)]);
+        // A clean ack of offset 1 removes its lease, so it drops out of the snapshot (the durable
+        // count is cleared). tok2 is stale (offset 2 was redelivered), so re-fetch the live token.
+        let live1 = LeaseToken {
+            offset: off(1),
+            generation: 0,
+        };
+        assert_eq!(t.ack(&live1), AckOutcome::Acked);
+        let _ = tok2; // tok2 stays stale; we only assert offset 1 cleared.
+        let counts = t.attempt_counts();
+        assert_eq!(
+            counts,
+            vec![(2, 2)],
+            "an acked offset clears its durable count"
+        );
+    }
+
+    #[test]
+    fn resume_attempts_ignores_a_zero_carried_count() {
+        // A zero carried attempt carries no information (a fresh delivery is attempt 1 anyway), so
+        // it must not be seeded; the next claim is attempt 1, the unchanged pre-#358 behavior.
+        let mut t = LeaseTable::new(cfg());
+        t.resume_attempts([(off(7).get(), 0)]);
+        match t.claim(off(7), 0) {
+            Claim::Granted { deliveries, .. } => assert_eq!(deliveries, 1),
+            other => panic!("expected Granted, got {other:?}"),
         }
     }
 

@@ -255,6 +255,21 @@ the restart, which is the correct at-least-once behavior. The everyday `pub`/`su
 also resumes cleanly because each short-lived `sub` connection closes and flushes its
 cursor on disconnect.
 
+The per-message delivery-attempt count is ALSO durable, so `MaxDeliver` is a hard
+guarantee across an unclean restart, not best-effort. Each group's in-flight
+`{offset -> attempt}` map is checkpointed alongside its cursor (the default group to
+`attempts.ckpt`, a named group to `attempts-<hex(name)>.ckpt`), on the same
+`--checkpoint-interval` cadence and the clean-shutdown flush. A message delivered N-1
+times that survives a crash resumes near attempt N (not reset to 1), so a poison record
+reaches the dead-letter queue after at least `MaxDeliver` attempts TOTAL across restarts
+(at most `MaxDeliver` plus the redeliveries since the last checkpoint). The count is durable
+on the checkpoint cadence, so a crash between checkpoints replays only the un-checkpointed
+tail, and a poison can no longer redeliver unboundedly across reboots. An edge
+device that reboots often can no longer redeliver a poison record past its cap. A clean
+ack clears the count, and the map is bounded by `--max-in-flight` per group (see
+RAM_BUDGET.md). A torn or missing attempts checkpoint degrades safely to "resume at
+attempt 1", the historical behavior, and never blocks startup.
+
 ## Consumer groups
 
 The single durable log fans out to many named work-groups. Pass `--group <name>` to

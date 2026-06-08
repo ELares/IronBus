@@ -18,6 +18,9 @@
 
 use crate::metrics::LatencyHistogram;
 use crate::registry::MetricRegistry;
+use ironbus_core::attempt::{
+    decode_attempt_snapshot, encode_attempt_snapshot, ATTEMPT_SNAPSHOT_MIN_LEN,
+};
 use ironbus_core::clock::Clock;
 use ironbus_core::cursor::AckCursor;
 use ironbus_core::delivery::{DeliveryConfig, Disposition};
@@ -26,7 +29,9 @@ use ironbus_core::lease::{
     AckOutcome, Claim, ExtendOutcome, LeaseConfig, LeaseTable, LeaseToken, NackOutcome,
 };
 use ironbus_core::types::Offset;
-use ironbus_storage::checkpoint::{Checkpoint, CountersCheckpoint, MAX_PAYLOAD};
+use ironbus_storage::checkpoint::{
+    AttemptsCheckpoint, Checkpoint, CountersCheckpoint, ATTEMPTS_PAYLOAD, MAX_PAYLOAD,
+};
 use ironbus_storage::dlq::{DlqSink, DLQ_SUBDIR};
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::{Append, Log, LogConfig, RetentionBounds};
@@ -834,6 +839,12 @@ fn validate_group_name(name: &str) -> Result<(), EngineError> {
 const GROUP_CKPT_PREFIX: &str = "cursor-";
 const GROUP_CKPT_SUFFIX: &str = ".ckpt";
 
+/// The filename prefix of a named work-group's durable per-message ATTEMPT-COUNT checkpoint (#358),
+/// the companion to its `cursor-<hex>.ckpt`. The default group uses `attempts.ckpt` (note
+/// `attempts.`, not `attempts-`), so it never matches the named pattern. Neither prefix begins with
+/// `cursor`, so the attempt files never collide with, nor are mistaken for, a cursor checkpoint.
+const GROUP_ATTEMPTS_PREFIX: &str = "attempts-";
+
 /// Lowercase-hex-encodes bytes, for embedding a graphic-ASCII work-group name in a safe,
 /// reversible filename (a name may contain `/`, `:`, etc., which are unsafe in a path).
 fn hex_encode(bytes: &[u8]) -> String {
@@ -874,11 +885,40 @@ fn group_checkpoint_name(group: &str) -> String {
     )
 }
 
+/// The durable per-message attempt-count checkpoint filename for a work-group (#358): the default
+/// group is `attempts.ckpt`, a named group is `attempts-<hex(name)>.ckpt` (the companion to its
+/// `cursor-<hex>.ckpt`). Kept beside the cursor checkpoint so the attempt counts ride the same
+/// crash-safe dual-slot discipline.
+fn group_attempts_name(group: &str) -> String {
+    if group == DEFAULT_GROUP {
+        ATTEMPTS_CHECKPOINT.to_string()
+    } else {
+        format!(
+            "{GROUP_ATTEMPTS_PREFIX}{}{GROUP_CKPT_SUFFIX}",
+            hex_encode(group.as_bytes())
+        )
+    }
+}
+
 /// Recovers the work-group name from a checkpoint filename, or `None` if it is not a named-group
 /// checkpoint (e.g. the default `cursor.ckpt`, a segment file, or a malformed name).
 fn parse_group_checkpoint_name(name: &str) -> Option<String> {
     let mid = name
         .strip_prefix(GROUP_CKPT_PREFIX)?
+        .strip_suffix(GROUP_CKPT_SUFFIX)?;
+    if mid.is_empty() {
+        return None;
+    }
+    String::from_utf8(hex_decode(mid)?).ok()
+}
+
+/// Recovers the work-group name from a named-group ATTEMPT-COUNT checkpoint filename
+/// (`attempts-<hex>.ckpt`), or `None` for the default `attempts.ckpt`, a cursor file, or a malformed
+/// name (#358). Used so a group whose poison was in flight but never committed (so it has an
+/// attempts file but NO cursor file yet) is still rediscovered and resumed at open.
+fn parse_group_attempts_name(name: &str) -> Option<String> {
+    let mid = name
+        .strip_prefix(GROUP_ATTEMPTS_PREFIX)?
         .strip_suffix(GROUP_CKPT_SUFFIX)?;
     if mid.is_empty() {
         return None;
@@ -949,6 +989,137 @@ fn resume_cursor_from_snapshot(recovered: Option<&[u8]>, flushed: u64) -> AckCur
     // a bare resume rather than panic if a future change ever violates that.
     AckCursor::resume_with_ahead(Offset::new(committed), ahead)
         .unwrap_or_else(|_| AckCursor::resume(Offset::new(committed)))
+}
+
+/// Builds the checkpoint payload for a group's in-flight attempt counts (#358): the CRC-protected
+/// snapshot of the `(offset, attempt)` pairs, capped to a checkpoint slot. The pairs come from the
+/// live lease table (ascending by offset, one per in-flight offset, bounded by `max_in_flight`), so
+/// they already satisfy the codec's sorted-distinct contract. If the snapshot would overflow a slot
+/// (a pathologically large in-flight set), only the leading pairs that fit are kept; dropping the
+/// overflow tail only resets those few offsets to attempt 1 after a crash (at-least-once safe), it
+/// never loses an attempt count for the offsets it does keep, and the in-flight window bounds it.
+fn attempts_snapshot_payload(pairs: &[(u64, u32)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    encode_attempt_snapshot(pairs, &mut buf);
+    if buf.len() <= ATTEMPTS_PAYLOAD {
+        return buf;
+    }
+    // A slot holds ATTEMPTS_PAYLOAD bytes: the fixed header and crc, plus 12 per pair. Keep the
+    // leading pairs that fit and re-encode; the count field is rewritten, so the result is valid.
+    let max_pairs = ATTEMPTS_PAYLOAD.saturating_sub(ATTEMPT_SNAPSHOT_MIN_LEN) / 12;
+    let kept = &pairs[..max_pairs.min(pairs.len())];
+    let mut out = Vec::new();
+    encode_attempt_snapshot(kept, &mut out);
+    out
+}
+
+/// Reads the recovered snapshot bytes of a work-group's durable attempt-count checkpoint (#358),
+/// or `None` if the group has no attempts file yet (it never poisoned, or predates the feature).
+/// The dual-slot `AttemptsCheckpoint::open` discards a torn slot, so the bytes are either the last
+/// fully-durable snapshot or `None`; the caller decodes and clamps them.
+///
+/// # Errors
+/// Propagates a genuine IO error from opening or reading the attempts checkpoint file.
+fn read_group_attempts<F: Filesystem>(fs: &F, group: &str) -> Result<Option<Vec<u8>>, EngineError> {
+    let name = group_attempts_name(group);
+    if !fs.exists(&name)? {
+        return Ok(None);
+    }
+    let (_, recovered) = AttemptsCheckpoint::open(fs.open(&name)?)?;
+    Ok(recovered)
+}
+
+/// Builds a [`WorkGroup`] around a recovered `cursor` and seeds its lease table with the durable
+/// attempt counts decoded from `attempts_recovered` (#358), clamped to the cursor's watermark and
+/// the durable head `flushed`. Shared by the default-group and named-group resume paths so the
+/// clamp-and-seed step lives in one place. A `None`/torn attempt payload yields no carried counts.
+fn resume_work_group(
+    cursor: AckCursor,
+    attempts_recovered: Option<&[u8]>,
+    lease: LeaseConfig,
+    opened_at: u64,
+    flushed: u64,
+) -> WorkGroup {
+    let committed = cursor.committed().get();
+    let attempts = resume_attempts_from_snapshot(attempts_recovered, committed, flushed);
+    let mut group = WorkGroup::resume(cursor, lease, opened_at);
+    group.leases.resume_attempts(attempts);
+    group
+}
+
+/// Discovers and resumes each NAMED work-group from its own `cursor-<hex>.ckpt` plus its
+/// `attempts-<hex>.ckpt` (#60, #358), inserting each into `groups`, and returns the per-group
+/// last-checkpointed committed offsets. Recovery is deliberately NOT bounded by `max_groups`: the
+/// cap gates only NEW group creation, never the resume of groups already durable on disk (lowering
+/// `--max-groups` below the on-disk count must not silently drop committed cursors). A group already
+/// present (the default group) or with an invalid name is skipped.
+///
+/// # Errors
+/// Propagates a storage error from listing or opening a group's checkpoint files.
+fn recover_named_groups<F: Filesystem>(
+    fs: &F,
+    groups: &mut BTreeMap<String, WorkGroup>,
+    lease: LeaseConfig,
+    opened_at: u64,
+    flushed: u64,
+) -> Result<BTreeMap<String, u64>, EngineError> {
+    // Discover every durable named group from BOTH its cursor file AND its attempts file (#358): a
+    // group whose poison was in flight but never committed has an `attempts-<hex>.ckpt` yet no
+    // `cursor-<hex>.ckpt` (the cursor write is gated on the watermark advancing), so iterating only
+    // cursor files would orphan its durable attempt counts. The union of the two filename sets, with
+    // a fresh cursor for a group that has only an attempts file, recovers both.
+    let mut names = std::collections::BTreeSet::new();
+    for file in fs.list()? {
+        if let Some(gname) = parse_group_checkpoint_name(&file) {
+            names.insert(gname);
+        } else if let Some(gname) = parse_group_attempts_name(&file) {
+            names.insert(gname);
+        }
+    }
+    let mut group_last_checkpointed = BTreeMap::new();
+    for gname in names {
+        if validate_group_name(&gname).is_err() || groups.contains_key(&gname) {
+            continue;
+        }
+        // Resume the cursor from `cursor-<hex>.ckpt` if present, else start fresh at offset 0 (the
+        // attempts-only case). Then seed the durable attempt counts from `attempts-<hex>.ckpt`,
+        // clamped exactly like the default group, so MaxDeliver survives a restart in every group.
+        let cursor_name = group_checkpoint_name(&gname);
+        let gcursor = if fs.exists(&cursor_name)? {
+            let (_, recovered) = Checkpoint::open(fs.open(&cursor_name)?)?;
+            resume_cursor_from_snapshot(recovered.as_deref(), flushed)
+        } else {
+            AckCursor::new()
+        };
+        group_last_checkpointed.insert(gname.clone(), gcursor.committed().get());
+        let recovered_a = read_group_attempts(fs, &gname)?;
+        let g = resume_work_group(gcursor, recovered_a.as_deref(), lease, opened_at, flushed);
+        groups.insert(gname, g);
+    }
+    Ok(group_last_checkpointed)
+}
+
+/// Reconstructs a group's carried attempt counts from a recovered `attempts.ckpt` payload, clamped
+/// to the durable log head `flushed` and the resumed committed watermark `committed`: a carried
+/// count is only meaningful for an offset that still exists (`< flushed`) and has NOT been committed
+/// past (`>= committed`), since a committed offset never redelivers. A torn, corrupt, or absent
+/// snapshot yields no carried counts (every in-flight message resumes at attempt 1, the pre-#358
+/// behavior), so a bad attempt snapshot can never block startup or invent a count.
+fn resume_attempts_from_snapshot(
+    recovered: Option<&[u8]>,
+    committed: u64,
+    flushed: u64,
+) -> Vec<(u64, u32)> {
+    let Some(payload) = recovered else {
+        return Vec::new();
+    };
+    let Ok(pairs) = decode_attempt_snapshot(payload) else {
+        return Vec::new();
+    };
+    pairs
+        .into_iter()
+        .filter(|&(offset, _)| offset >= committed && offset < flushed)
+        .collect()
 }
 
 /// Per-work-group consumer state over the shared log: an independent committed cursor and
@@ -1048,6 +1219,17 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// DLQ. It is NOT fsynced per increment (that would kill throughput), so the resumed counters
     /// are a monotonic LOWER BOUND, losing at most the increments since the last snapshot on a crash.
     counters_checkpoint: CountersCheckpoint<F::File>,
+    /// The default group's durable per-message ATTEMPT-COUNT checkpoint (#358): a CRC'd dual-slot
+    /// `attempts.ckpt` holding the `{offset -> attempt_count}` map of the default group's in-flight
+    /// (delivered but unacked) entries, written on the same cursor-checkpoint cadence and the
+    /// graceful-shutdown flush. On [`Engine::open`] its snapshot seeds the default lease table's
+    /// carried attempt counts, so a redelivered poison message resumes its attempt number instead of
+    /// resetting to 1 and `MaxDeliver`/DLQ routing holds across an unclean restart. It is CORRECTNESS
+    /// state but tolerant: a torn or missing snapshot recovers as no carried counts (every in-flight
+    /// message resumes at attempt 1, the pre-#358 behavior), so it can never block open. Named groups
+    /// use their own `attempts-<hex>.ckpt`, reopened per write like their cursor checkpoint. The map
+    /// is bounded by `max_in_flight` per group, so it never grows unbounded.
+    attempts_checkpoint: AttemptsCheckpoint<F::File>,
     /// The consumer-safe retention bounds (size, age, count) the produce path enforces against the
     /// minimum committed offset (refs #13, #80). All `0` (the default) means retention is off, so
     /// the produce path never reaps. See [`EngineConfig::max_retained_bytes`],
@@ -1073,6 +1255,11 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// [`EngineConfig::ram_ceiling_bytes`] and [`crate::rss`].
     ram_ceiling_bytes: u64,
     last_checkpointed: u64,
+    /// The default group's committed offset at its last ATTEMPT-COUNT checkpoint write (#358), so a
+    /// fully-drained group (nothing in flight) is not re-written every flush once its empty snapshot
+    /// is already durable. Attempt writes ALSO fire whenever in-flight leases exist (a redelivery
+    /// escalates a count without moving the cursor), so this only suppresses redundant empty writes.
+    last_attempts_checkpointed: u64,
     /// The last durably-checkpointed committed offset per NAMED work-group (#60), for the
     /// interval gate. The default group uses `last_checkpointed`; named groups checkpoint to
     /// their own `cursor-<hex>.ckpt` files.
@@ -1123,6 +1310,17 @@ const CURSOR_CHECKPOINT: &str = "cursor.ckpt";
 /// cursor checkpoints (`cursor.ckpt` and `cursor-<hex>.ckpt`).
 const COUNTERS_CHECKPOINT: &str = "counters.ckpt";
 
+/// The file name of the default group's durable per-message ATTEMPT-COUNT checkpoint (#358). It
+/// never collides with the cursor or counters checkpoints (`attempts.` vs `cursor.`/`counters.`),
+/// and named groups use `attempts-<hex>.ckpt`.
+const ATTEMPTS_CHECKPOINT: &str = "attempts.ckpt";
+
+/// The result of opening the durable attempt-count checkpoint (#358): the long-lived dual-slot
+/// handle plus the recovered snapshot bytes (decoded and clamped by the caller), or `None` if the
+/// file was fresh or its slots were torn. Named so the [`Engine::open_attempts_checkpoint`]
+/// signature stays simple.
+type RecoveredAttempts<File> = (AttemptsCheckpoint<File>, Option<Vec<u8>>);
+
 // The engine requires `C: Clone` so it can hand the secondary durable DLQ sink (#63) its own clock
 // (see `Log::clock_clone`). Every shipped clock (`ManualClock`, `Arc<ManualClock>`, `SystemClock`)
 // is `Clone`, so this is not a usability regression.
@@ -1155,6 +1353,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         };
         let (checkpoint, recovered) = Checkpoint::open(checkpoint_file)?;
 
+        // Open (creating if absent) the default group's attempt-count checkpoint (#358) and recover
+        // its snapshot, so the durable per-message attempt counts seed the default lease table below
+        // and `MaxDeliver` survives an unclean restart. The handle is kept long-lived like the cursor
+        // checkpoint; the recovered bytes are clamped and applied after the cursor resumes. Factored
+        // out (like the counters checkpoint) to keep `open` readable.
+        let (attempts_checkpoint, recovered_attempts) = Self::open_attempts_checkpoint(&log)?;
+
         // Open and recover the durable resilience-counters checkpoint (#98), seeding the in-memory
         // counters from the last snapshot (or all-zeros if it is missing or torn) AND reconciling the
         // recovery-loss family with the durable log / loss report (#307). Factored out to keep `open`
@@ -1169,14 +1374,22 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // The broker start time as Unix SECONDS for `ironbus_start_time_seconds` (#97), read ONCE
         // from the clock seam (never a raw `SystemTime::now`); uptime derives from `opened_at`.
         let start_time_unix_seconds = log.now_unix_millis() / 1_000;
-        // The default group's durable cursor, from `cursor.ckpt`, clamped to the head.
+        // The default group's durable cursor, from `cursor.ckpt`, clamped to the head, plus its
+        // durable attempt counts from `attempts.ckpt` (#358): a redelivered in-flight message
+        // resumes its attempt number instead of resetting to 1, so `MaxDeliver` routes a poison
+        // record to the DLQ after at least `MaxDeliver` attempts TOTAL across the restart (at most that
+        // plus the redeliveries not yet checkpointed when the crash hit; never below the durable floor).
         let cursor = resume_cursor_from_snapshot(recovered.as_deref(), flushed);
         let default_committed = cursor.committed().get();
-        let mut groups = BTreeMap::new();
-        groups.insert(
-            DEFAULT_GROUP.to_string(),
-            WorkGroup::resume(cursor, config.lease, opened_at),
+        let default_group = resume_work_group(
+            cursor,
+            recovered_attempts.as_deref(),
+            config.lease,
+            opened_at,
+            flushed,
         );
+        let mut groups = BTreeMap::new();
+        groups.insert(DEFAULT_GROUP.to_string(), default_group);
         // Discover and resume each NAMED work-group from its own `cursor-<hex>.ckpt` (#60),
         // so a broadcast or competing group keeps its position across a restart instead of
         // redelivering the whole log. Recovery is deliberately NOT bounded by `max_groups`: the
@@ -1187,22 +1400,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // whole already-acked log. Loading every existing group unconditionally keeps a config
         // change from corrupting durable state; the cap still bounds unbounded runtime growth from
         // wire-named groups created after open.
-        let mut group_last_checkpointed = BTreeMap::new();
-        {
-            let fs = log.filesystem();
-            for name in fs.list()? {
-                let Some(gname) = parse_group_checkpoint_name(&name) else {
-                    continue;
-                };
-                if validate_group_name(&gname).is_err() || groups.contains_key(&gname) {
-                    continue;
-                }
-                let (_, recovered) = Checkpoint::open(fs.open(&name)?)?;
-                let gcursor = resume_cursor_from_snapshot(recovered.as_deref(), flushed);
-                group_last_checkpointed.insert(gname.clone(), gcursor.committed().get());
-                groups.insert(gname, WorkGroup::resume(gcursor, config.lease, opened_at));
-            }
-        }
+        let group_last_checkpointed = recover_named_groups(
+            log.filesystem(),
+            &mut groups,
+            config.lease,
+            opened_at,
+            flushed,
+        )?;
 
         // The DLQ sink's log shares the main log's segment sizing but is NEVER byte-capped: a
         // poison record is the durable evidence of a dropped message and must not itself be shed.
@@ -1248,6 +1452,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             checkpoint,
             checkpoint_interval: config.checkpoint_interval,
             counters_checkpoint,
+            attempts_checkpoint,
             retention: RetentionBounds {
                 max_bytes: config.max_retained_bytes,
                 max_age_ms: config.max_age_ms,
@@ -1261,6 +1466,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             group_idle_evict_nanos: config.group_idle_evict_ms.saturating_mul(1_000_000),
             ram_ceiling_bytes: config.ram_ceiling_bytes,
             last_checkpointed: default_committed,
+            // Seed at the resumed watermark so a freshly-opened, fully-drained group does not
+            // redundantly re-write its empty attempt snapshot before any new poll (#358).
+            last_attempts_checkpointed: default_committed,
             // Seeded from the durable counters snapshot (#98), all-zeros if it was missing or torn.
             counters,
             fsync: LatencyHistogram::default(),
@@ -1301,6 +1509,31 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// data directory never materializes the DLQ subdirectory.
     fn dlq_dir_exists(log: &Log<F, C>) -> bool {
         log.filesystem().subdir_exists(DLQ_SUBDIR).unwrap_or(false)
+    }
+
+    /// Opens (creating if absent) the default group's durable per-message ATTEMPT-COUNT checkpoint
+    /// (#358) and recovers the last snapshot bytes, returning the checkpoint handle plus the
+    /// recovered payload (decoded and clamped by the caller after the cursor resumes). The handle is
+    /// kept long-lived like the cursor and counters checkpoints. A torn or missing snapshot is
+    /// surfaced as `None`/discarded by the dual-slot fallback, so it never blocks open; the only
+    /// errors are genuine IO failures from creating or reading the file.
+    ///
+    /// # Errors
+    /// Propagates a genuine IO error from creating or opening the attempts checkpoint file.
+    fn open_attempts_checkpoint(
+        log: &Log<F, C>,
+    ) -> Result<RecoveredAttempts<F::File>, EngineError> {
+        let attempts_file = {
+            let fs = log.filesystem();
+            if fs.exists(ATTEMPTS_CHECKPOINT)? {
+                fs.open(ATTEMPTS_CHECKPOINT)?
+            } else {
+                let file = fs.create_new(ATTEMPTS_CHECKPOINT)?;
+                fs.sync_dir()?; // the new file's directory entry must be durable
+                file
+            }
+        };
+        Ok(AttemptsCheckpoint::open(attempts_file)?)
     }
 
     /// Opens (creating if absent) the durable resilience-counters checkpoint (#98) and recovers the
@@ -1436,10 +1669,19 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // redelivered after a restart. A forced checkpoint with nothing new (a connection
         // close that did no acking) stays a no-op. Only the default group is durable today.
         let has_ahead = !group.cursor.ahead_ranges().is_empty();
+        let has_in_flight = group.leases.in_flight() > 0;
         if committed > self.last_checkpointed || has_ahead {
             let payload = self.cursor_checkpoint_payload();
             self.checkpoint.write(&payload)?;
             self.last_checkpointed = committed;
+        }
+        // Persist the durable per-message attempt counts (#358) when the cursor advanced OR there
+        // are in-flight leases: a redelivery escalates an attempt count WITHOUT moving the cursor,
+        // so a poison record being retried must still record its rising count. Writing an empty
+        // snapshot when nothing is in flight clears any stale carried counts from the last crash.
+        if committed > self.last_attempts_checkpointed || has_in_flight {
+            self.checkpoint_default_attempts()?;
+            self.last_attempts_checkpointed = committed;
         }
         Ok(())
     }
@@ -1454,6 +1696,52 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.groups
             .get(DEFAULT_GROUP)
             .map_or_else(Vec::new, |g| snapshot_payload(&g.cursor))
+    }
+
+    /// Durably writes the default group's in-flight attempt-count snapshot to `attempts.ckpt`
+    /// (#358), via the same CRC'd dual-slot checkpoint the cursor uses. The payload is the live
+    /// lease table's `(offset, attempt)` pairs, capped to a slot; an empty payload (nothing in
+    /// flight) is a valid snapshot that clears any stale carried counts. The handle is long-lived,
+    /// so this continues the crash-safe two-slot sequence without reopening.
+    ///
+    /// # Errors
+    /// Propagates a storage error from writing the checkpoint.
+    fn checkpoint_default_attempts(&mut self) -> Result<(), EngineError> {
+        let pairs = self
+            .groups
+            .get(DEFAULT_GROUP)
+            .map_or_else(Vec::new, |g| g.leases.attempt_counts());
+        let payload = attempts_snapshot_payload(&pairs);
+        self.attempts_checkpoint.write(&payload)?;
+        Ok(())
+    }
+
+    /// Durably writes a NAMED group's in-flight attempt-count snapshot to its `attempts-<hex>.ckpt`
+    /// (#358), the companion to [`Engine::write_group_checkpoint`]. The file is reopened per write so
+    /// the crash-safe two-slot sequence continues correctly, exactly as the named cursor checkpoint.
+    ///
+    /// # Errors
+    /// Propagates a storage error from opening or writing the checkpoint file.
+    fn write_group_attempts(&mut self, group: &str) -> Result<(), EngineError> {
+        let pairs = match self.groups.get(group) {
+            Some(g) => g.leases.attempt_counts(),
+            None => return Ok(()),
+        };
+        let payload = attempts_snapshot_payload(&pairs);
+        let name = group_attempts_name(group);
+        let file = {
+            let fs = self.log.filesystem();
+            if fs.exists(&name)? {
+                fs.open(&name)?
+            } else {
+                let f = fs.create_new(&name)?;
+                fs.sync_dir()?; // the new file's directory entry must be durable
+                f
+            }
+        };
+        let (mut cp, _) = AttemptsCheckpoint::open(file)?;
+        cp.write(&payload)?;
+        Ok(())
     }
 
     /// Checkpoints the committed cursor if it has advanced at least `checkpoint_interval`
@@ -1472,6 +1760,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             let payload = self.cursor_checkpoint_payload();
             self.checkpoint.write(&payload)?;
             self.last_checkpointed = committed;
+            // Persist the durable per-message attempt counts on the same cadence (#358): a poison
+            // record under retry must keep its rising attempt count durable so `MaxDeliver` holds
+            // across an unclean restart. This is CORRECTNESS state (unlike the counters below), so a
+            // write failure propagates rather than being swallowed.
+            self.checkpoint_default_attempts()?;
+            self.last_attempts_checkpointed = committed;
             // Piggyback the resilience-counters snapshot on the cursor-checkpoint cadence (#98), so
             // the counters become durable on the same low-frequency rhythm without a per-increment
             // fsync. Best-effort: a counters write failure only loses some observability history on
@@ -1524,6 +1818,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         };
         let committed = g.cursor.committed().get();
         let has_ahead = !g.cursor.ahead_ranges().is_empty();
+        let has_in_flight = g.leases.in_flight() > 0;
         let last = self
             .group_last_checkpointed
             .get(group)
@@ -1531,6 +1826,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .unwrap_or(0);
         if committed > last || has_ahead {
             self.write_group_checkpoint(group, committed)?;
+        }
+        // Persist this named group's durable attempt counts (#358) when the cursor advanced or any
+        // lease is in flight (a redelivery escalates a count without moving the cursor), exactly as
+        // the default group does, so MaxDeliver survives a restart in every group.
+        if committed > last || has_in_flight {
+            self.write_group_attempts(group)?;
         }
         Ok(())
     }
@@ -1557,6 +1858,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .unwrap_or(0);
         if committed.saturating_sub(last) >= self.checkpoint_interval.max(1) {
             self.write_group_checkpoint(group, committed)?;
+            // Persist the named group's attempt counts on the same interval cadence (#358).
+            self.write_group_attempts(group)?;
             Ok(true)
         } else {
             Ok(false)
@@ -1643,22 +1946,30 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let flushed = self.log.flushed_offset().get();
         let name = group_checkpoint_name(group);
         // Resume from the durable checkpoint if present (the evicted-then-re-created path), else
-        // start fresh at offset 0 (a genuinely new group). Clamped to the head exactly as `open`.
-        let cursor = {
+        // start fresh at offset 0 (a genuinely new group). Clamped to the head exactly as `open`. The
+        // cursor and the attempt counts (#358) are read INDEPENDENTLY: a group evicted with poison in
+        // flight but uncommitted has an `attempts-<hex>.ckpt` yet no `cursor-<hex>.ckpt`, so the
+        // attempt counts must resume even when the cursor starts fresh, or MaxDeliver would reset.
+        let (cursor, recovered_a) = {
             let fs = self.log.filesystem();
-            if fs.exists(&name)? {
+            let cursor = if fs.exists(&name)? {
                 let (_, recovered) = Checkpoint::open(fs.open(&name)?)?;
                 resume_cursor_from_snapshot(recovered.as_deref(), flushed)
             } else {
                 AckCursor::new()
-            }
+            };
+            (cursor, read_group_attempts(fs, group)?)
         };
         self.group_last_checkpointed
             .insert(group.to_string(), cursor.committed().get());
-        self.groups.insert(
-            group.to_string(),
-            WorkGroup::resume(cursor, self.lease_config, now),
+        let g = resume_work_group(
+            cursor,
+            recovered_a.as_deref(),
+            self.lease_config,
+            now,
+            flushed,
         );
+        self.groups.insert(group.to_string(), g);
         Ok(())
     }
 
@@ -6945,6 +7256,301 @@ mod tests {
             read_dlq_entries(&probe).unwrap().len(),
             1,
             "exactly one across two crashes"
+        );
+    }
+
+    // ---- durable per-message attempt counter (#358) ----
+
+    /// Delivers the offset-0 message `n` times (each delivery expires before the next), nacking
+    /// nothing, so its lease delivery count reaches `n` WITHOUT yet exceeding `max_deliver`. The
+    /// caller has produced exactly one message and configured `max_deliver > n`. Returns the offset.
+    fn deliver_n_times(
+        e: &mut Engine<InMemoryFs, std::sync::Arc<ManualClock>>,
+        clock: &std::sync::Arc<ManualClock>,
+        n: u32,
+    ) {
+        for attempt in 1..=n {
+            let d = message(e.poll_now().unwrap());
+            assert_eq!(
+                d.deliveries, attempt,
+                "the {attempt}th delivery reports attempt {attempt}"
+            );
+            // Let the lease expire so the next poll redelivers it (attempt + 1).
+            clock.advance_monotonic_nanos(40);
+        }
+    }
+
+    #[test]
+    fn a_message_delivered_n_minus_1_times_resumes_at_attempt_n_after_a_crash_and_reaches_the_dlq()
+    {
+        // THE TEETH (#358): a poison message delivered MaxDeliver-1 times, then a crash+restart,
+        // must redeliver as attempt MaxDeliver (not 1) and reach the DLQ after exactly MaxDeliver
+        // TOTAL attempts across the restart, not 2*MaxDeliver. Without the durable attempt counter
+        // the count resets to 1 on restart and the poison would need MaxDeliver MORE attempts.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        // max_deliver = 5: the 6th attempt is poison. Deliver it 4 times pre-crash (still under the
+        // cap), checkpoint so the attempt count is durable, then crash before the 5th.
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 5)).unwrap();
+        e.produce(&Append {
+            timestamp_ms: 7,
+            flags: RecordFlags::EMPTY,
+            key: b"k",
+            headers: b"h",
+            payload: b"poison",
+        })
+        .unwrap();
+        deliver_n_times(&mut e, &clock, 4);
+        // Persist the durable attempt count (the cursor has NOT advanced: nothing acked).
+        e.checkpoint_cursor().unwrap();
+        assert_eq!(e.committed_offset(), Offset::ZERO, "still uncommitted");
+        drop(e);
+
+        // CRASH+RESTART: the lease table is empty, but the durable attempt count carries 4.
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut e =
+            Engine::open(probe.clone(), std::sync::Arc::clone(&clock2), config(10, 5)).unwrap();
+        // The FIRST redelivery after the restart is attempt 5 (resumed 4 + 1), NOT 1.
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(
+            d.deliveries, 5,
+            "resumes at attempt 5 across the restart, not 1"
+        );
+        // Expire it: the next poll is attempt 6, which exceeds max_deliver (5) and dead-letters.
+        clock2.advance_monotonic_nanos(40);
+        match e.poll_now().unwrap() {
+            Poll::Parked { offset, .. } => assert_eq!(offset, Offset::ZERO),
+            other => panic!("expected the poison to be dead-lettered, got {other:?}"),
+        }
+        assert_eq!(e.dlq_records(), 1, "reaches the DLQ after MaxDeliver TOTAL");
+        assert_eq!(
+            e.committed_offset(),
+            Offset::new(1),
+            "committed past poison"
+        );
+        drop(e);
+
+        // The DLQ entry records attempt 6 (the poison attempt), proving the count was TOTAL across
+        // the restart (6 = MaxDeliver + 1), not a fresh 2 after a reset.
+        let entries = read_dlq_entries(&probe).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].attempt, 6,
+            "the poison attempt is MaxDeliver + 1 = 6, counted across the restart"
+        );
+    }
+
+    #[test]
+    fn without_the_durable_counter_a_restart_would_double_the_attempts_this_proves_it_does_not() {
+        // A focused counterfactual: deliver 4 times, crash, and confirm the post-restart delivery is
+        // attempt 5 (not 1). If the durability regressed, the first post-restart delivery would be
+        // attempt 1 and this assertion would fail, so the test has teeth against a regression.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 100)).unwrap();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"p",
+        })
+        .unwrap();
+        deliver_n_times(&mut e, &clock, 4);
+        e.checkpoint_cursor().unwrap();
+        drop(e);
+
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(probe, std::sync::Arc::clone(&clock2), config(10, 100)).unwrap();
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(
+            d.deliveries, 5,
+            "the attempt count resumed; a reset-to-1 regression would fail here"
+        );
+    }
+
+    #[test]
+    fn a_clean_ack_clears_the_durable_attempt_count_across_a_restart() {
+        // A message delivered a few times then cleanly ACKED must leave NO carried attempt count: a
+        // later message at the same offset (impossible here since offsets are monotonic, but a fresh
+        // run resuming an acked offset must not inherit) resumes fresh. We assert the acked offset
+        // never redelivers and carries nothing: the cursor committed past it and the snapshot is empty.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 5)).unwrap();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"a",
+        })
+        .unwrap();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"b",
+        })
+        .unwrap();
+        // Deliver offset 0 three times, then ACK it cleanly (the durable count must be cleared).
+        for _ in 0..2 {
+            let _ = message(e.poll_now().unwrap());
+            clock.advance_monotonic_nanos(40);
+        }
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.offset, Offset::ZERO);
+        assert_eq!(d.deliveries, 3);
+        assert_eq!(e.ack(&d.token), AckResult::Acked);
+        e.checkpoint_cursor().unwrap();
+        assert_eq!(e.committed_offset(), Offset::new(1), "offset 0 committed");
+        drop(e);
+
+        // Reopen: offset 0 is committed past (never redelivers); only offset 1 (b) is deliverable,
+        // and it starts at attempt 1 (no stale count leaked from offset 0's three deliveries).
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(probe, std::sync::Arc::clone(&clock2), config(10, 5)).unwrap();
+        assert_eq!(e.committed_offset(), Offset::new(1));
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.offset, Offset::new(1), "only the unacked tail redelivers");
+        assert_eq!(
+            d.deliveries, 1,
+            "a clean ack cleared the durable count; the next message is attempt 1"
+        );
+    }
+
+    #[test]
+    fn an_old_snapshot_without_attempt_counts_decodes_as_attempts_zero() {
+        // ADDITIVE-FORMAT proof (#358): a data directory from BEFORE this feature has a cursor
+        // checkpoint but NO attempts.ckpt. Opening it must resume with no carried counts (every
+        // in-flight message at attempt 1, the pre-#358 behavior), never a panic or a wrong count.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 5)).unwrap();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"p",
+        })
+        .unwrap();
+        deliver_n_times(&mut e, &clock, 3);
+        e.checkpoint_cursor().unwrap();
+        drop(e);
+
+        // Simulate an OLD data directory: delete the attempts checkpoint so only the cursor remains.
+        assert!(probe.exists(ATTEMPTS_CHECKPOINT).unwrap());
+        probe.remove(ATTEMPTS_CHECKPOINT).unwrap();
+        assert!(!probe.exists(ATTEMPTS_CHECKPOINT).unwrap());
+
+        // Reopen with no attempts file: the in-flight message resumes at attempt 1 (counts = 0),
+        // exactly the pre-#358 behavior. Open must not panic and the recovery must succeed.
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(probe, std::sync::Arc::clone(&clock2), config(10, 5)).unwrap();
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(
+            d.deliveries, 1,
+            "an old snapshot (no attempt counts) decodes as attempts = 0"
+        );
+    }
+
+    #[test]
+    fn a_torn_attempts_snapshot_falls_back_to_no_carried_counts() {
+        // A corrupt attempts.ckpt must never block startup or invent a count: it degrades to "no
+        // carried counts" (attempt 1), the at-least-once-safe fallback, exactly like a torn cursor.
+        use ironbus_storage::io::RandomAccessFile;
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 5)).unwrap();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"p",
+        })
+        .unwrap();
+        deliver_n_times(&mut e, &clock, 3);
+        e.checkpoint_cursor().unwrap();
+        drop(e);
+
+        // Corrupt EVERY byte region of attempts.ckpt so neither slot's CRC can validate.
+        let ckpt = probe.open(ATTEMPTS_CHECKPOINT).unwrap();
+        let mut bytes = ckpt.snapshot();
+        assert!(!bytes.is_empty(), "the attempts checkpoint was written");
+        for b in &mut bytes {
+            *b ^= 0xff;
+        }
+        ckpt.set_len(0).unwrap();
+        ckpt.write_all_at(&bytes, 0).unwrap();
+        ckpt.sync_all().unwrap();
+
+        // Reopen: the torn snapshot is rejected, so no carried counts; the in-flight message resumes
+        // at attempt 1 and open succeeds without panic.
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut e = Engine::open(probe, std::sync::Arc::clone(&clock2), config(10, 5)).unwrap();
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(
+            d.deliveries, 1,
+            "a torn attempts snapshot degrades to no carried counts (attempt 1)"
+        );
+    }
+
+    #[test]
+    fn a_named_groups_attempt_count_survives_a_restart_and_reaches_its_dlq() {
+        // The durable attempt counter holds in a NAMED group too (#358), not only the default group:
+        // a poison record retried in group "work", crashed, and restarted, reaches the DLQ after
+        // MaxDeliver TOTAL attempts and is recorded under the group "work".
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 3)).unwrap();
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload: b"poison",
+        })
+        .unwrap();
+        // Deliver twice in group "work" (max_deliver = 3, so still under the cap).
+        for attempt in 1..=2u32 {
+            let d = message(e.poll_in("work", e.log.now_monotonic()).unwrap());
+            assert_eq!(d.deliveries, attempt);
+            clock.advance_monotonic_nanos(40);
+        }
+        // Flush the named group's cursor AND attempt counts.
+        e.checkpoint_group("work").unwrap();
+        drop(e);
+
+        // Reopen: the named group resumes its attempt count, so the next delivery is attempt 3.
+        let clock2 = std::sync::Arc::new(ManualClock::new());
+        let mut e =
+            Engine::open(probe.clone(), std::sync::Arc::clone(&clock2), config(10, 3)).unwrap();
+        let d = message(e.poll_in("work", e.log.now_monotonic()).unwrap());
+        assert_eq!(d.deliveries, 3, "the named group resumed at attempt 3");
+        // Expire: the next poll is attempt 4, which exceeds max_deliver (3) and dead-letters.
+        clock2.advance_monotonic_nanos(40);
+        match e.poll_in("work", e.log.now_monotonic()).unwrap() {
+            Poll::Parked { offset, .. } => assert_eq!(offset, Offset::ZERO),
+            other => panic!("expected the poison to be dead-lettered, got {other:?}"),
+        }
+        drop(e);
+
+        // The DLQ entry is recorded under group "work" at attempt 4 (MaxDeliver + 1, TOTAL).
+        let entries = read_dlq_entries(&probe).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].group, "work");
+        assert_eq!(
+            entries[0].attempt, 4,
+            "MaxDeliver + 1 counted across the restart"
         );
     }
 
