@@ -104,9 +104,302 @@ pub fn ram_headroom_bytes(ceiling: u64, rss: Option<u64>) -> i64 {
     }
 }
 
+/// The flat per-process fixed-overhead floor the refuse-to-boot guard charges INDEPENDENT of the
+/// tuning knobs: the binary's resident text/data, the runtime (the single mutex-guarded engine
+/// state, the embedded health server, the allocator arenas), and the bounded metric registry
+/// (`~161 KiB`, #97). `docs/RAM_BUDGET.md` term 5 calls ~4 MiB a conservative working figure for the
+/// edge profile; the guard uses exactly that constant so the formula it refuses against is the one
+/// the doc itemizes. It is an ESTIMATE, not a code-asserted bound, so the guard is deliberately
+/// CONSERVATIVE (it charges the floor on TOP of the bounded buffers) and only ever refuses a config
+/// whose bounded buffers ALONE already crowd the ceiling.
+pub const FIXED_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The per-OS-thread RESIDENT stack the guard charges per connection (one connection is one OS thread
+/// in the v1 thread-per-connection server, so this term scales with `max_connections`, as
+/// `docs/RAM_BUDGET.md` term 5 notes). A thread's VIRTUAL stack is large (often 8 MiB) but only the
+/// touched pages are resident; 64 KiB is a generous estimate of the RESIDENT portion under the
+/// broker's shallow per-connection call depth. Keeping it to the resident estimate keeps term 5
+/// aligned with the doc's ~4 MiB fixed-overhead figure for the 32-connection edge profile rather than
+/// charging the unrealized virtual reservation.
+pub const PER_CONNECTION_STACK_BYTES: u64 = 64 * 1024;
+
+/// A generous per-lease byte estimate for the per-group cursor + lease state (`docs/RAM_BUDGET.md`
+/// term 3): each `LeaseTable` entry is a small fixed struct plus the `BTreeMap` node overhead, and
+/// the `AckCursor`'s acked-ahead range is bounded by the same window. ~64 bytes per lease covers
+/// both with margin.
+pub const PER_LEASE_BYTES: u64 = 64;
+
+/// The configuration the refuse-to-boot RAM guard ([`fits_under_ram_ceiling`]) reasons about: the
+/// bounded-buffer knobs from `docs/RAM_BUDGET.md` plus `max_connections` (a server-level cap that
+/// bounds the in-flight set, the read buffers, and the thread stacks). Every field is a CONFIGURED
+/// cap, so the guard's verdict is provable from the config ALONE, never a live RSS reading (RSS at
+/// boot is near-zero and says nothing about the steady-state ceiling the caps imply).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RamFootprintConfig {
+    /// The RAM ceiling in bytes (`ram_ceiling_bytes`); `0` means UNSET, so the guard is a no-op.
+    pub ram_ceiling_bytes: u64,
+    /// `--max-connections`: bounds the in-flight set, the per-connection read buffers, and the OS
+    /// thread stacks all at once (the strongest single RAM lever, `docs/RAM_BUDGET.md` term 2).
+    pub max_connections: u64,
+    /// `--consumer-credit`: the per-connection un-acked MESSAGE count cap. With no byte budget it is
+    /// the only count bound on term 1, so the worst-case message size (a maximal frame) binds.
+    pub consumer_credit: u64,
+    /// `--consumer-credit-bytes`: the per-connection un-acked PAYLOAD-byte budget (`0` = UNLIMITED,
+    /// the byte budget is OFF). The FIRM RAM bound on term 1 when set.
+    pub consumer_credit_bytes: u64,
+    /// `--max-groups`: the live work-group cap (`0` = UNLIMITED). Bounds term 3 with `max_in_flight`.
+    pub max_groups: u64,
+    /// `--max-in-flight`: the per-group delivery window. Bounds the per-group lease/cursor state.
+    pub max_in_flight: u64,
+}
+
+/// The worst-case STEADY-STATE bounded-buffer footprint (in bytes) the configured caps imply,
+/// derived purely from [`RamFootprintConfig`] (no live RSS, no IO). This is the quantity the
+/// refuse-to-boot guard (#115, #19, #10) compares against the ceiling: it is the sum of the
+/// FIRMLY-BOUNDED RAM sources `docs/RAM_BUDGET.md` itemizes, each multiplied out to its CONFIGURED
+/// cap, so a verdict of "does not fit" is a PROOF from the config that the buffers cannot stay under
+/// the ceiling, NOT a live-RSS guess (RSS at boot is near-zero and meaningless as a steady-state
+/// predictor).
+///
+/// The terms (cited to `docs/RAM_BUDGET.md`), and the deliberate honesty about what is and is not
+/// counted:
+///
+/// - **Term 1, per-connection in-flight payloads (the dominant, firmly-bounded term).** Each
+///   connection holds at most `consumer_credit_bytes` un-acked PAYLOAD bytes (the firm RAM bound,
+///   #275): `max_connections * consumer_credit_bytes`. When `consumer_credit_bytes` is `0` (the byte
+///   budget is OFF, only the MESSAGE count binds) there is NO byte-side bound on a connection's
+///   in-flight RAM, so the only provable bound is `consumer_credit` maximal frames each
+///   (`consumer_credit * MAX_FRAME_LEN`): a config with no byte budget therefore cannot be PROVEN to
+///   fit a small ceiling and is correctly refused. This is exactly the term the task names
+///   (`max_connections * consumer_credit_bytes` worst case) and the firm RAM-side bound
+///   `docs/EDGE_CONSTRAINTS.md` lists for the RAM-ceiling row.
+/// - **Term 3, per-group cursor + lease state.** `max_groups * max_in_flight * PER_LEASE_BYTES`.
+/// - **Term 5, fixed overhead + thread stacks.** [`FIXED_OVERHEAD_BYTES`] plus
+///   `max_connections * PER_CONNECTION_STACK_BYTES` (one OS thread per connection).
+///
+/// NOT counted here, and WHY (this is the honest boundary of what the guard can prove):
+///
+/// - **Term 2, the per-connection read buffer**, is bounded only by `max_connections * MAX_FRAME_LEN`
+///   (`~514 MiB` at the edge-tiny `max_connections = 32`), NOT by any credit knob, because
+///   `MAX_FRAME_LEN` is a protocol constant, not a `serve` knob. `docs/RAM_BUDGET.md` is explicit
+///   that this adversarial ~514 MiB spike is realized only if every connection is SIMULTANEOUSLY
+///   mid-assembly of a near-maximal frame (which an edge workload of small records never does) and
+///   is NOT part of the steady-state budget that sums under 64 MiB; bounding it tightly needs an
+///   on-the-wire record-size cap and is tracked as the read-buffer follow-up. Charging it here would
+///   refuse EVERY edge config, including the worked edge-tiny one the doc proves fits, so the guard
+///   deliberately excludes it and asserts the firmly-bounded steady-state sum the doc itemizes.
+/// - **Term 4 (the active segment)** is ~0 in RSS (written straight to file), and **term 6 (dedup)**
+///   costs nothing until a producer opts in, so neither is charged.
+///
+/// Every multiply and add SATURATES, so an unbounded (`0` = off) cap that would overflow instead
+/// saturates to [`u64::MAX`] and the config is correctly refused under any real ceiling.
+#[must_use]
+pub fn worst_case_buffer_bytes(config: &RamFootprintConfig) -> u64 {
+    let max_record = u64::from(ironbus_proto::frame::MAX_FRAME_LEN);
+
+    // Term 1: per-connection un-acked PAYLOAD bytes, the firm RAM bound. With a byte budget set it is
+    // `consumer_credit_bytes` per connection; with it OFF (0 = unlimited) the message COUNT is the
+    // only bound, so the provable worst case is `consumer_credit` maximal frames each (which a small
+    // ceiling cannot fit, so the config is honestly refused rather than waved through).
+    let per_conn_inflight = if config.consumer_credit_bytes == 0 {
+        config.consumer_credit.saturating_mul(max_record)
+    } else {
+        config.consumer_credit_bytes
+    };
+    let term1 = config.max_connections.saturating_mul(per_conn_inflight);
+
+    // Term 3: per-group cursor + lease state.
+    let term3 = config
+        .max_groups
+        .saturating_mul(config.max_in_flight)
+        .saturating_mul(PER_LEASE_BYTES);
+
+    // Term 5: fixed overhead + one OS thread stack per connection.
+    let term5 = FIXED_OVERHEAD_BYTES.saturating_add(
+        config
+            .max_connections
+            .saturating_mul(PER_CONNECTION_STACK_BYTES),
+    );
+
+    term1.saturating_add(term3).saturating_add(term5)
+}
+
+/// The verdict of the refuse-to-boot RAM guard for a configuration ([`fits_under_ram_ceiling`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RamCeilingVerdict {
+    /// No ceiling is configured (`ram_ceiling_bytes == 0`): the guard does not apply, the broker
+    /// boots, and `ironbus_ram_headroom_bytes` reports the unavailable sentinel.
+    Disabled,
+    /// A ceiling is set and the worst-case bounded-buffer footprint fits under it: the broker boots.
+    Fits {
+        /// The worst-case bounded-buffer footprint the configured caps imply.
+        worst_case_bytes: u64,
+        /// The configured ceiling.
+        ceiling_bytes: u64,
+    },
+    /// A ceiling is set and the worst-case bounded-buffer footprint PROVABLY exceeds it: the broker
+    /// REFUSES to boot. The overage is the bytes by which the worst case is over the ceiling.
+    Exceeds {
+        /// The worst-case bounded-buffer footprint the configured caps imply.
+        worst_case_bytes: u64,
+        /// The configured ceiling.
+        ceiling_bytes: u64,
+        /// `worst_case_bytes - ceiling_bytes`: the provable overage the operator must close.
+        overage_bytes: u64,
+    },
+}
+
+/// The refuse-to-boot RAM guard (#115, #19, #10): decides whether the configured caps can PROVABLY
+/// fit the broker's worst-case bounded-buffer footprint under the configured RAM ceiling.
+///
+/// The decision is purely a function of the config (via [`worst_case_buffer_bytes`]), NEVER a live
+/// RSS reading: RSS at boot is near-zero and meaningless as a steady-state predictor, so the guard
+/// asserts only what is PROVABLE, that the configured caps either can or cannot sum under the
+/// ceiling. A `ram_ceiling_bytes` of `0` (the default) disables the guard
+/// ([`RamCeilingVerdict::Disabled`]); a set ceiling yields [`RamCeilingVerdict::Fits`] when the
+/// worst case is at or under it and [`RamCeilingVerdict::Exceeds`] (the refuse-to-boot case) when it
+/// is provably over.
+#[must_use]
+pub fn fits_under_ram_ceiling(config: &RamFootprintConfig) -> RamCeilingVerdict {
+    if config.ram_ceiling_bytes == 0 {
+        return RamCeilingVerdict::Disabled;
+    }
+    let worst_case_bytes = worst_case_buffer_bytes(config);
+    let ceiling_bytes = config.ram_ceiling_bytes;
+    if worst_case_bytes <= ceiling_bytes {
+        RamCeilingVerdict::Fits {
+            worst_case_bytes,
+            ceiling_bytes,
+        }
+    } else {
+        RamCeilingVerdict::Exceeds {
+            worst_case_bytes,
+            ceiling_bytes,
+            overage_bytes: worst_case_bytes - ceiling_bytes,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The edge-tiny preset (`docs/EDGE_CONSTRAINTS.md` / `docs/RAM_BUDGET.md`): 32 connections,
+    /// 8 / 256 KiB consumer credits, 64 groups, 256 in-flight, under a 64 MiB ceiling.
+    fn edge_tiny_footprint() -> RamFootprintConfig {
+        RamFootprintConfig {
+            ram_ceiling_bytes: 64 * 1024 * 1024,
+            max_connections: 32,
+            consumer_credit: 8,
+            consumer_credit_bytes: 256 * 1024,
+            max_groups: 64,
+            max_in_flight: 256,
+        }
+    }
+
+    #[test]
+    fn no_ceiling_disables_the_guard() {
+        let mut cfg = edge_tiny_footprint();
+        cfg.ram_ceiling_bytes = 0;
+        assert_eq!(fits_under_ram_ceiling(&cfg), RamCeilingVerdict::Disabled);
+    }
+
+    #[test]
+    fn edge_tiny_fits_under_its_64_mib_ceiling() {
+        let cfg = edge_tiny_footprint();
+        // The bounded-buffer worst case is term1 (in-flight payloads) + term2 (read buffers) + term3
+        // (group state) + term5 (fixed + thread stacks). The byte budget binds term 1, max_connections
+        // is small (32), so the whole worst case is well under 64 MiB.
+        let worst = worst_case_buffer_bytes(&cfg);
+        assert!(
+            worst <= cfg.ram_ceiling_bytes,
+            "edge-tiny worst case {worst} must fit under the 64 MiB ceiling"
+        );
+        match fits_under_ram_ceiling(&cfg) {
+            RamCeilingVerdict::Fits {
+                worst_case_bytes,
+                ceiling_bytes,
+            } => {
+                assert_eq!(worst_case_bytes, worst);
+                assert_eq!(ceiling_bytes, cfg.ram_ceiling_bytes);
+            }
+            other => panic!("edge-tiny must fit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_blown_up_max_connections_override_is_refused() {
+        // edge-tiny credits but a server-sized connection cap: 4096 * 256 KiB of in-flight bytes alone
+        // is 1 GiB, far over the 64 MiB ceiling, so the guard refuses and names the overage.
+        let mut cfg = edge_tiny_footprint();
+        cfg.max_connections = 4096;
+        match fits_under_ram_ceiling(&cfg) {
+            RamCeilingVerdict::Exceeds {
+                worst_case_bytes,
+                ceiling_bytes,
+                overage_bytes,
+            } => {
+                assert!(worst_case_bytes > ceiling_bytes);
+                assert_eq!(overage_bytes, worst_case_bytes - ceiling_bytes);
+                assert!(
+                    worst_case_bytes > 64 * 1024 * 1024,
+                    "4096 connections blow the 64 MiB ceiling, got {worst_case_bytes}"
+                );
+            }
+            other => panic!("a 4096-connection edge-tiny override must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unlimited_byte_budget_with_default_credit_is_refused_under_a_tiny_ceiling() {
+        // consumer_credit_bytes = 0 (OFF) means the only term-1 bound is the message COUNT, so 64
+        // credits * a ~16 MiB maximal frame each is ~1 GiB per connection: under a 64 MiB ceiling
+        // this cannot be PROVEN to fit and is refused. This is the honest, conservative reading: a
+        // config with no byte budget cannot promise to stay under a small ceiling.
+        let cfg = RamFootprintConfig {
+            ram_ceiling_bytes: 64 * 1024 * 1024,
+            max_connections: 32,
+            consumer_credit: 64,
+            consumer_credit_bytes: 0,
+            max_groups: 64,
+            max_in_flight: 256,
+        };
+        assert!(matches!(
+            fits_under_ram_ceiling(&cfg),
+            RamCeilingVerdict::Exceeds { .. }
+        ));
+    }
+
+    #[test]
+    fn the_worst_case_is_monotonic_in_the_caps() {
+        // Widening any single cap can only grow (never shrink) the provable worst case, so the guard
+        // never spuriously LOOSENS as a config is made more demanding.
+        let base = edge_tiny_footprint();
+        let baseline = worst_case_buffer_bytes(&base);
+        for wider in [
+            RamFootprintConfig {
+                max_connections: base.max_connections + 1,
+                ..base
+            },
+            RamFootprintConfig {
+                consumer_credit_bytes: base.consumer_credit_bytes + 1,
+                ..base
+            },
+            RamFootprintConfig {
+                max_groups: base.max_groups + 1,
+                ..base
+            },
+            RamFootprintConfig {
+                max_in_flight: base.max_in_flight + 1,
+                ..base
+            },
+        ] {
+            assert!(
+                worst_case_buffer_bytes(&wider) >= baseline,
+                "widening a cap must not shrink the worst case"
+            );
+        }
+    }
 
     #[test]
     fn this_process_has_a_nonzero_rss_on_supported_platforms() {
