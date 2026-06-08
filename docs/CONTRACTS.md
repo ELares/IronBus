@@ -319,6 +319,15 @@ frozen `PubAck` (tag 14) body: a fresh produce answers `PubAck` (tag 14) and a d
 untouched, and an old client that never sends a `msg_id` (see the opt-in dedup block below) never
 receives tag 20.
 
+The backpressure controls (#68, #69, implemented in #336) add NO new wire tag: a CoDel / retry
+load-shed rejects a NEW produce with the existing `Err` (tag 12) frame carrying a distinct,
+self-announcing UTF-8 message (`shed under load`, as opposed to the byte-cap shed's `at capacity`).
+The structured, machine-actionable `retry_after_ms` (u32, sentinel `0xFFFFFFFF` = do-not-retry) /
+`shed` (bool) fields the design specifies are owned by the frozen-protocol extension (#11) and are
+NOT in the protocol yet; until #11 lands, the shed rides the bare `Err` frame, so the FrameType
+vocabulary above is unchanged (no renumber, no new tag). See
+[BACKPRESSURE.md](BACKPRESSURE.md), "What this changes on the wire".
+
 ### PubBody (wire body of `Pub`)
 
 Source: `message.rs`. Variable parts use explicit u16 length prefixes.

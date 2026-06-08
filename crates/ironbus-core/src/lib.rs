@@ -10,6 +10,7 @@
 pub(crate) mod raw;
 
 pub mod attempt;
+pub mod backpressure;
 pub mod clock;
 pub mod codec;
 pub mod cursor;

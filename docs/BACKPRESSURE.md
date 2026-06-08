@@ -17,17 +17,28 @@ Both descend from the backpressure-and-overload parent (#10). Their parameters
 flow through the configuration system (#14) and their observability flows through
 the resilience-observability contract (#16, see [METRICS.md](METRICS.md)).
 
-> **Specified, not implemented.** Read this honestly. IronBus **today** ships a
-> narrower backpressure surface: the drop-new / drop-oldest disk-full overflow
-> policy on the durable log (#10, #13, #82) and the per-connection consumer credit
-> window (#65, #275). Those are real and cited below. **Everything in this
-> document beyond them is a design, not running code**: CoDel sojourn shedding,
-> the suspend-reset, the retry budget, the `retry_after_ms` / `shed` wire fields,
-> the fire-and-forget token bucket, and the egress AIMD limiter are SPECIFIED
-> here, not built. The wire fields in particular require a frozen-protocol
-> extension (#11) that has not landed; see [What this changes on the wire](#what-this-changes-on-the-wire-11).
-> Where a control already exists this document says so and cites the source; where
-> it does not, it says "specified."
+> **Implemented (#336), with one wire residual.** The control LOGIC of this design
+> is now BUILT and tested: CoDel sojourn shedding on the produce-admission path, the
+> suspend-reset, the depth/byte backstop, the per-client retry budget (broker-side
+> re-check), the fire-and-forget token bucket, and the egress AIMD limiter all ship
+> in `crates/ironbus-core/src/backpressure.rs` (the pure, clock-seam-driven math)
+> wired into `crates/ironbus-server/src/engine.rs` and `actor.rs`, behind config
+> knobs that ALL DEFAULT TO INERT (so a broker that changes nothing behaves exactly
+> as today). Each control is observable on `/metrics` (the counters and gauges in
+> [Metrics](#metrics-16), pinned in the frozen taxonomy). The baseline below (the
+> drop-new / drop-oldest overflow policy, #10/#13/#82, and the per-connection credit
+> window, #65/#275) is unchanged and composes with the new controls.
+>
+> The ONE part still pending is the **structured wire signal**: the
+> machine-actionable `retry_after_ms` / `shed` fields on the rejection frame are
+> owned by the frozen-protocol extension (#11), which has not landed, so a CoDel /
+> retry shed today rides the existing bare `Err` frame (a distinct, self-announcing
+> "shed under load" message), NOT a structured hint. The retry budget is enforced
+> (it is an accounting control needing no wire change); only the structured hint
+> waits on #11. See [What this changes on the wire](#what-this-changes-on-the-wire-11).
+> The egress limiter and the fire-and-forget bucket exist and are observable; their
+> call sites at a live downstream sink / a wire fire-and-forget tier land with those
+> features (the seam is in place).
 
 ## Contents
 
@@ -424,37 +435,49 @@ once the controls are implemented.
 
 ## Configuration keys (#14)
 
-All keys below are **specified**, not yet wired. They follow the existing `serve`
-flag and `DEFAULT_*` constant conventions (see [CLI.md](CLI.md)); the exact
-spellings are fixed when the controls are implemented under #14. CoDel keys are
-per-topic and clamped; the others are per-connection or global as noted.
+These keys are now IMPLEMENTED (#336) as `serve` flags / `IRONBUS_*` env vars,
+following the existing `serve` flag and `DEFAULT_*` constant conventions (see
+[CLI.md](CLI.md) and [CONFIG.md](CONFIG.md)). The scope shipped is BROKER-WIDE
+(one set per broker), not per-topic: IronBus is a single durable log today, so a
+per-topic CoDel queue is the future work the doc names (where it says `ring_capacity`
+it names a specified per-topic bound; the shipped CoDel measures the broker's
+produce-admission sojourn through the append actor). Every key DEFAULTS to its
+disabling value, so a broker that sets nothing behaves exactly as today.
 
-| key (specified) | scope | default | clamp / bounds | control |
-|-----------------|-------|---------|----------------|---------|
-| `codel_target_ms` | per topic | 5 ms | `[1 ms, 1 s]` | CoDel TARGET (#68) |
-| `codel_interval_ms` | per topic | 100 ms | `[20 ms, 10 s]` | CoDel INTERVAL (#68) |
-| `ring_capacity` | per topic | (specified) | message count | depth backstop (#68) |
-| `ring_byte_cap` | per topic | (the existing `max_total_bytes` byte cap) | bytes | byte backstop (#68) |
-| `retry_budget_ratio` | per client | 0.10 (10%) | `[0, 1]` | retry budget (#69) |
-| `retry_budget_window_ms` | per client | 60000 (60 s) | sliding window | retry budget (#69) |
-| `fire_and_forget_msg_rate` | per connection | 5000 msg/s | rate | token bucket (#69) |
-| `fire_and_forget_byte_rate` | per connection | 5 MiB/s | rate | token bucket (#69) |
-| `fire_and_forget_refill_ms` | per connection | 100 ms | refill granularity | token bucket (#69) |
-| `egress_limit` | global / per sink | 16 (static floor) | AIMD `[4, 128]` | egress limiter (#69) |
+| key | flag | default | clamp / bounds | control |
+|-----|------|---------|----------------|---------|
+| `codel_target_ms` | `--codel-target-ms` | `0` = OFF | CLAMPED to `[1 ms, 1 s]` when on | CoDel TARGET (#68) |
+| `codel_interval_ms` | `--codel-interval-ms` | 100 ms | CLAMPED to `[20 ms, 10 s]` | CoDel INTERVAL (#68) |
+| `ring_capacity` | (the admission backstop, internal) | (depth-bound seam) | message count | depth backstop (#68) |
+| `ring_byte_cap` | `--max-total-bytes` (the existing byte cap) | unchanged | bytes | byte backstop (#68) |
+| `retry_budget_ratio_per_million` | `--retry-budget-ratio-ppm` | `0` = OFF | `[0, 1000000]` ppm | retry budget (#69) |
+| `retry_budget_window_ms` | `--retry-budget-window-ms` | 60000 (60 s) | sliding window | retry budget (#69) |
+| `fire_and_forget_msg_rate` | `--fire-and-forget-msg-rate` | `0` = OFF | rate | token bucket (#69) |
+| `fire_and_forget_byte_rate` | `--fire-and-forget-byte-rate` | `0` = OFF | rate | token bucket (#69) |
+| `fire_and_forget_refill_ms` | `--fire-and-forget-refill-ms` | 100 ms | refill granularity | token bucket (#69) |
+| `egress_limit` | `--egress-limit` | 16 (static floor) | AIMD `[4, 128]` | egress limiter (#69) |
 
 A CoDel value outside its clamp is silently clamped to the nearest bound (never a
 startup error), consistent with the "no per-device tuning" and "cannot refuse to
-start" criteria.
+start" criteria. The retry-budget ratio is expressed in PARTS PER MILLION (`100000`
+= the 10% doc budget) to avoid a float in the IO-free core. CoDel ships with the
+RFC 8289 recommended 5 ms / 100 ms defaults FOR WHEN IT IS ENABLED, but the shipped
+default `codel_target_ms` is `0` (CoDel OFF), so an operator opts in deliberately
+(the conservative, backward-compatible choice the task calls for).
 
 ## Metrics (#16)
 
-All metrics below are **specified** additions to the resilience-observability
-contract in [METRICS.md](METRICS.md). Each follows that contract: a shed is never
-silent, every shed-counter name is `ironbus_*_total` and would join the frozen
-taxonomy (`FROZEN_RESILIENCE_COUNTERS`) as a deliberate, test-gated addition;
-estimate / ratio / limit values are **gauges** (no `_total` suffix), so they stay
-out of the frozen counter set by construction, matching how the existing gauges are
-handled.
+All metrics below are now IMPLEMENTED (#336) additions to the
+resilience-observability contract in [METRICS.md](METRICS.md), rendered on
+`/metrics` and PINNED in the frozen taxonomy golden tests. Each follows the
+contract: a shed is never silent, every shed-counter name is `ironbus_*_total` and
+joined the frozen taxonomy (`FROZEN_RESILIENCE_COUNTERS`) as a deliberate,
+test-gated addition; estimate / ratio / limit values are **gauges** (no `_total`
+suffix), so they stay out of the frozen counter set by construction and are pinned
+only in `FROZEN_METRIC_TYPES`, matching how the existing gauges are handled. The
+labeled `ironbus_retry_shed_total{side}` carries a `side` label, so its sample line
+is excluded from the unlabeled-`_total` resilience-taxonomy test and is pinned in
+`FROZEN_METRIC_TYPES` instead (the same handling as every other labeled series).
 
 **CoDel (#68):**
 

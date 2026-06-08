@@ -37,7 +37,7 @@
 //! GET-only and read-only, with NO route that mutates engine state.
 
 use crate::actor::EngineAccess;
-use crate::engine::{Counters, EngineConfigSnapshot, GroupConsumerStat};
+use crate::engine::{BackpressureSnapshot, Counters, EngineConfigSnapshot, GroupConsumerStat};
 use crate::liveness::LivenessBeacon;
 use crate::metrics::{LatencyHistogram, FSYNC_BUCKET_LE_SECONDS};
 use crate::registry::{FixedHistogram, REGISTRY_BUCKET_LE_SECONDS};
@@ -402,6 +402,8 @@ where
             power_loss_unsafe: g.power_loss_unsafe(),
             unsynced_bytes: g.unsynced_bytes(),
         },
+        // The backpressure controllers' observable state (#68, #69), read under the same lock.
+        backpressure: g.backpressure_snapshot(),
         // Filled in below, outside the engine lock; `None` is the not-yet-read placeholder.
         rss: None,
         groups: g.group_consumer_stats(),
@@ -534,6 +536,12 @@ struct MetricsSnapshot {
     /// injected after the actor job returns; the RAM-headroom gauge degrades to the unavailable
     /// sentinel when it is `None`.
     rss: Option<u64>,
+    /// The backpressure controllers' observable state (#68, #69): the CoDel / retry-budget /
+    /// fire-and-forget / egress shed counters and the sojourn-estimate / retry-ratio / egress-limit
+    /// gauges. Read under the same engine lock as the rest, so every metric is from one instant. All
+    /// counters are additive to the frozen taxonomy; the gauges carry no `_total` suffix, so they
+    /// stay out of the resilience-counter set by construction.
+    backpressure: BackpressureSnapshot,
     /// Per-work-group consumer position, for the lag-by-cursor series (#15, #16).
     groups: Vec<GroupConsumerStat>,
     /// The pre-rendered bounded-metric-registry section (#97): the fixed-bucket fsync-duration and
@@ -663,6 +671,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         fsync,
         edge,
         durability,
+        backpressure,
         rss,
         groups,
         registry,
@@ -685,6 +694,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
     body.push_str(&fsync_histogram_lines(&fsync));
     body.push_str(&edge_metric_lines(&edge, rss));
     body.push_str(&durability_metric_lines(&durability));
+    body.push_str(&backpressure_metric_lines(&backpressure));
     body.push_str(&group_consumer_lines(&groups, flushed));
     body.push_str(&registry);
     body
@@ -716,6 +726,59 @@ fn durability_metric_lines(durability: &DurabilityMetrics) -> String {
          # TYPE ironbus_durability_unsynced_bytes gauge\n\
          ironbus_durability_unsynced_bytes {}\n",
         durability.unsynced_bytes,
+    )
+}
+
+/// Renders the BACKPRESSURE series (#68, #69), additive to the frozen taxonomy: the CoDel /
+/// retry-budget / fire-and-forget / egress shed COUNTERS (every name `ironbus_*_total`, each a
+/// resilience SHED the #16 contract guarantees is never silent, so each is pinned in
+/// `FROZEN_RESILIENCE_COUNTERS`), plus the GAUGES (the CoDel sojourn estimate, the retry ratio, the
+/// AIMD egress limit; no `_total` suffix, so they extend `FROZEN_METRIC_TYPES` without touching the
+/// resilience-counter set, matching how the existing gauges are handled).
+///
+/// `ironbus_retry_ratio` is reported in the same parts-per-million the budget tracks (the gauge is a
+/// plain integer; a dashboard divides by 1e6 for a fraction). With every backpressure knob at its
+/// disabling default the counters are `0` and the gauges report the inert values (a `0` sojourn, a
+/// `0` ratio, the default `16` egress limit), so a zero-config broker still emits the series (the
+/// taxonomy is complete) with no shed activity.
+fn backpressure_metric_lines(bp: &BackpressureSnapshot) -> String {
+    format!(
+        "# HELP ironbus_codel_shed_total New produces shed by the CoDel time-in-queue (sojourn) control (standing admission latency past the target).\n\
+         # TYPE ironbus_codel_shed_total counter\n\
+         ironbus_codel_shed_total {codel_shed}\n\
+         # HELP ironbus_codel_backstop_shed_total New produces shed by the sojourn-independent depth/byte backstop (a stalled drain the CoDel sojourn control cannot see, or the durable-log byte cap).\n\
+         # TYPE ironbus_codel_backstop_shed_total counter\n\
+         ironbus_codel_backstop_shed_total {codel_backstop_shed}\n\
+         # HELP ironbus_codel_interval_resets_total CoDel suspend-gap interval resets (a sleeping edge device that resumed without misfiring a burst of false sheds).\n\
+         # TYPE ironbus_codel_interval_resets_total counter\n\
+         ironbus_codel_interval_resets_total {codel_interval_resets}\n\
+         # HELP ironbus_retry_shed_total Retries throttled broker-side by the per-client retry budget (the anti-amplification re-check).\n\
+         # TYPE ironbus_retry_shed_total counter\n\
+         ironbus_retry_shed_total{{side=\"broker\"}} {retry_shed}\n\
+         # HELP ironbus_fire_and_forget_shed_total Fire-and-forget (un-credited) messages shed by the per-connection token bucket.\n\
+         # TYPE ironbus_fire_and_forget_shed_total counter\n\
+         ironbus_fire_and_forget_shed_total {fire_and_forget_shed}\n\
+         # HELP ironbus_egress_shed_total Downstream egress requests shed at the AIMD concurrency limit.\n\
+         # TYPE ironbus_egress_shed_total counter\n\
+         ironbus_egress_shed_total {egress_shed}\n\
+         # HELP ironbus_codel_sojourn_estimate_ms The current minimum-sojourn estimate (milliseconds) the CoDel control law is acting on.\n\
+         # TYPE ironbus_codel_sojourn_estimate_ms gauge\n\
+         ironbus_codel_sojourn_estimate_ms {codel_sojourn}\n\
+         # HELP ironbus_retry_ratio The observed retry (shed) rate as a fraction of the request rate, in parts-per-million (divide by 1e6 for a fraction); the 10%-budget signal.\n\
+         # TYPE ironbus_retry_ratio gauge\n\
+         ironbus_retry_ratio {retry_ratio}\n\
+         # HELP ironbus_egress_limit The current AIMD egress concurrency limit (between 4 and 128); halves when a downstream sink degrades, climbs back as it heals.\n\
+         # TYPE ironbus_egress_limit gauge\n\
+         ironbus_egress_limit {egress_limit}\n",
+        codel_shed = bp.codel_shed,
+        codel_backstop_shed = bp.codel_backstop_shed,
+        codel_interval_resets = bp.codel_interval_resets,
+        retry_shed = bp.retry_shed,
+        fire_and_forget_shed = bp.fire_and_forget_shed,
+        egress_shed = bp.egress_shed,
+        codel_sojourn = bp.codel_sojourn_estimate_ms,
+        retry_ratio = bp.retry_ratio_per_million,
+        egress_limit = bp.egress_limit,
     )
 }
 
@@ -1487,6 +1550,16 @@ mod tests {
                 durability_level: crate::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap();
@@ -1584,6 +1657,16 @@ mod tests {
                 durability_level: crate::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap();
@@ -2090,6 +2173,16 @@ mod tests {
                 durability_level: crate::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap();
@@ -2217,6 +2310,16 @@ mod tests {
                 durability_level: crate::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap();
@@ -2277,6 +2380,15 @@ mod tests {
                 durability_level: level,
                 flush_interval_ms,
                 flush_max_bytes,
+                // Backpressure controls (#68, #69) default to inert in the metrics test rig.
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap();
@@ -2535,6 +2647,16 @@ mod tests {
                     durability_level: crate::engine::DurabilityLevel::Sync,
                     flush_interval_ms: 0,
                     flush_max_bytes: 0,
+                    // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                    // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                    codel_target_ms: 0,
+                    codel_interval_ms: 0,
+                    retry_budget_ratio_per_million: 0,
+                    retry_budget_window_ms: 0,
+                    fire_and_forget_msg_rate: 0,
+                    fire_and_forget_byte_rate: 0,
+                    fire_and_forget_refill_ms: 0,
+                    egress_limit: 0,
                 },
             )
             .unwrap();
@@ -2573,6 +2695,16 @@ mod tests {
                 durability_level: crate::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap();
@@ -2714,6 +2846,16 @@ mod tests {
                 durability_level: crate::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap();
@@ -2835,6 +2977,16 @@ mod tests {
                 durability_level: crate::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap();
@@ -3031,6 +3183,16 @@ mod tests {
                 durability_level: crate::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap();
@@ -3328,6 +3490,21 @@ mod tests {
         // PubAckDuplicate frames, not a metric.
         "ironbus_dedup_hits_total",
         "ironbus_dedup_out_of_window_total",
+        // The backpressure shed counters (#68, #69): each is a deliberate resilience SHED the #16
+        // contract guarantees is never silent. CoDel sojourn shed and the depth/byte backstop shed
+        // (#68); the fire-and-forget token-bucket shed and the egress AIMD shed (#69); and the
+        // CoDel suspend-gap interval-reset counter (a resilience event: a sleeping device that did
+        // NOT misfire). The `ironbus_retry_shed_total{side="broker"}` counter carries a `side` LABEL
+        // (per docs/BACKPRESSURE.md), so its sample line is excluded from this UNLABELED-`_total`
+        // taxonomy set by construction (the extractor filters on a bare `name value` shape); it is
+        // pinned in `FROZEN_METRIC_TYPES` instead, exactly like the other labeled series. The
+        // backpressure GAUGES (`ironbus_codel_sojourn_estimate_ms`, `ironbus_retry_ratio`,
+        // `ironbus_egress_limit`) carry no `_total` suffix, so they are excluded too.
+        "ironbus_codel_shed_total",
+        "ironbus_codel_backstop_shed_total",
+        "ironbus_codel_interval_resets_total",
+        "ironbus_fire_and_forget_shed_total",
+        "ironbus_egress_shed_total",
     ];
 
     #[test]
@@ -3450,6 +3627,22 @@ mod tests {
         ("ironbus_durability_level_info", "gauge"),
         ("ironbus_durability_power_loss_unsafe", "gauge"),
         ("ironbus_durability_unsynced_bytes", "gauge"),
+        // Backpressure series (#68, #69): the CoDel / retry-budget / fire-and-forget / egress shed
+        // COUNTERS (the unlabeled four plus the labeled `ironbus_retry_shed_total{side}` and the
+        // suspend-gap reset counter), and the sojourn-estimate / retry-ratio / egress-limit GAUGES.
+        // The unlabeled shed counters and the interval-reset counter are ALSO in
+        // FROZEN_RESILIENCE_COUNTERS; the labeled retry counter and the gauges are pinned ONLY here
+        // (the labeled `_total` sample line and the no-`_total` gauges are excluded from the
+        // resilience-taxonomy test by its line-shape filter).
+        ("ironbus_codel_shed_total", "counter"),
+        ("ironbus_codel_backstop_shed_total", "counter"),
+        ("ironbus_codel_interval_resets_total", "counter"),
+        ("ironbus_retry_shed_total", "counter"),
+        ("ironbus_fire_and_forget_shed_total", "counter"),
+        ("ironbus_egress_shed_total", "counter"),
+        ("ironbus_codel_sojourn_estimate_ms", "gauge"),
+        ("ironbus_retry_ratio", "gauge"),
+        ("ironbus_egress_limit", "gauge"),
         // Per-group consumer gauges.
         ("ironbus_group_committed_offset", "gauge"),
         ("ironbus_group_consumer_lag", "gauge"),
@@ -3667,6 +3860,16 @@ mod tests {
                 durability_level: crate::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap();
@@ -3855,6 +4058,16 @@ mod tests {
                 durability_level: crate::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap();
@@ -4054,6 +4267,16 @@ mod tests {
                 durability_level: crate::engine::DurabilityLevel::Sync,
                 flush_interval_ms: 0,
                 flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
             },
         )
         .unwrap();
