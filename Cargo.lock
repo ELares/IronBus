@@ -459,7 +459,10 @@ version = "0.0.0"
 dependencies = [
  "hdrhistogram",
  "ironbus-client",
+ "ironbus-core",
  "ironbus-proto",
+ "ironbus-server",
+ "ironbus-storage",
  "libc",
  "rand",
  "rand_distr",

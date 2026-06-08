@@ -18,16 +18,25 @@
 //!
 //! A closed-loop generator silently erases the tail under overload (coordinated omission), which is
 //! precisely the failure mode an edge queue's p99.9 SLO must rule out. The
-//! [`injected_stall`](crate::injected_stall) self-test SIGSTOPs the broker mid-run and asserts the
+//! [`injected_stall`](crate::injected_stall) self-test freezes the broker mid-run and asserts the
 //! stall shows up in the recorded tail; it FAILS if the tail does not move, so every change to this
-//! harness is gated against re-introducing coordinated omission. That self-test is the only part of
-//! the harness that runs in `cargo test`; the generator itself runs ON DEMAND via the binary and is
-//! deliberately OFF the per-PR CI critical path (like the criterion micro-benches, #112).
+//! harness is gated against re-introducing coordinated omission. The freeze is DETERMINISTIC (#284):
+//! an [`inproc`](crate::inproc) broker (the same `ironbus-server` engine + actor + `serve` the binary
+//! ships) runs over a `FaultFs` whose sync gate parks the group-commit `fdatasync` on a condvar, so
+//! the freeze ALWAYS lands in the tail with no dependence on OS scheduling (the older OS-`SIGSTOP`
+//! path, which was flaky on shared CI runners, is kept as a separate `#[ignore]`d live proof). That
+//! self-test is the only part of the harness that runs in `cargo test`; the generator itself runs ON
+//! DEMAND via the binary and is deliberately OFF the per-PR CI critical path (like the criterion
+//! micro-benches, #112).
 
 pub mod broker;
 pub mod clock;
 pub mod harness;
 pub mod injected_stall;
+/// The in-process broker over a fault-injecting filesystem, the DETERMINISTIC freeze seam for the
+/// #284 injected-stall self-test. The module body is `#![cfg(unix)]` (the shipped broker is
+/// Unix-only), so on a non-Unix target it compiles to nothing.
+pub mod inproc;
 pub mod probe;
 pub mod provenance;
 
