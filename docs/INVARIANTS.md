@@ -67,20 +67,45 @@ roll-forward of a crash that left the highest segment sealed:
 `i2_negative_fixture_a_broken_sequence`, and by the crash-recovery and
 determinism sweeps in `crates/ironbus-storage/tests/`.
 
-### I2: ack implies durable
+### I2: ack implies durable (conditioned on `durability_level=sync`)
 
-**Statement.** No ack is observable for a record that is not covered by a
-returned `fdatasync` on the active segment. The active segment IS the
-write-ahead log; there is no separate WAL file.
+**Statement.** Under the DEFAULT durability level `sync`, no ack is observable for
+a record that is not covered by a returned `fdatasync` on the active segment. The
+active segment IS the write-ahead log; there is no separate WAL file.
 
-**Why it holds.** The append path reserves the next offset and sequence, writes
-the framed record, then returns the offset; the record becomes durable only after
-`Log::sync`, which calls the file's `sync_data` (`fdatasync`). The engine's
-produce path appends and then calls `log.sync()` BEFORE it counts the produce or
-returns, so the producer-visible ack follows the covering fsync. A failed fsync
-is treated as fatal: it freezes the writer read-only (the active segment is
-dropped) and surfaces `WriterFrozen` rather than acking, so a record is never
-acked on a failed durability barrier.
+This invariant is CONDITIONED on `durability_level=sync` (the default, #341,
+#379). The relaxed levels (`interval`, `async`, `none`) are a STRICTLY OPT-IN
+exception: they ack BEFORE the covering `fdatasync` and so WAIVE I2 by design, each
+carrying its own weaker, documented guarantee instead (see below and
+[DURABILITY.md](DURABILITY.md) section 3). An operator who changes nothing runs
+`sync`, so I2 holds for every default broker and zero acknowledged data is lost on
+a power cut.
+
+**Why it holds (under `sync`).** The append path reserves the next offset and
+sequence, writes the framed record, then returns the offset; the record becomes
+durable only after `Log::sync`, which calls the file's `sync_data` (`fdatasync`).
+Under `sync` the engine's `commit_batch` issues that covering `fdatasync` BEFORE
+the append actor releases the ack, so the producer-visible ack follows the
+covering fsync. A failed fsync is treated as fatal: it freezes the writer
+read-only (the active segment is dropped) and surfaces `WriterFrozen` rather than
+acking, so a record is never acked on a failed durability barrier (under every
+level: even a relaxed level surfaces the fatal `WriterFrozen` rather than acking a
+record the writer can no longer own).
+
+**The relaxed levels' weaker guarantee (I2 waived, by opt-in).** Under
+`interval` the ack follows the page-cache `write()` and a background window forces
+the `fdatasync` every `flush_interval_ms` / `flush_max_bytes`, so the worst-case
+acknowledged loss on a power cut is BOUNDED by the smaller of those two triggers
+(at most one flush window). Under `async` the fsync is opportunistic (a roll's
+seal or a clean shutdown), so the loss is unbounded until the next such barrier;
+`none` removes the periodic window entirely (the largest window). The active level
+and its loss exposure are observable (`ironbus_durability_power_loss_unsafe`,
+`ironbus_durability_unsynced_bytes`, `ironbus_durability_level_info`, and the
+materialized-config line), and the unbounded-loss levels refuse to boot without an
+explicit data-loss acknowledgement. The engine `commit_batch` advances the visible
+head via `Log::flush_no_sync` (page-cache, no fsync) for a relaxed deferred batch,
+and `Engine::force_sync` (on a clean shutdown) plus a segment roll's seal are the
+real barriers.
 
 **Where.** `Log::append` and `Log::sync` in
 `crates/ironbus-storage/src/log.rs` (the freeze-on-failed-fsync is in `sync`).
@@ -95,9 +120,11 @@ seeded fault scheduler and the same-seed determinism gate in
 `tests/seeded_faults.rs`, where one `u64` seed drives the whole crash workload and a
 failing case replays from the printed seed, #384). The README
 states it directly: "durable on one node by calling `fdatasync` before it
-acknowledges a write". The opt-in ack-on-buffer mode named in the issue (the
-`none` / `interval` durability modes) is a config knob, not yet implemented;
-see the pending section.
+acknowledges a write". The opt-in ack-on-buffer modes named in the issue (the
+`interval` / `async` / `none` durability levels) ARE now implemented (#341, #379)
+as a strictly opt-in exception to I2: they are off by default, the unbounded-loss
+ones are gated behind an explicit data-loss acknowledgement, and they carry their
+own documented bound instead of I2. See [DURABILITY.md](DURABILITY.md) section 3.
 
 ### I3: bounded, reported loss
 
@@ -372,11 +399,13 @@ Listed so a contributor does not mistake a spec for a guarantee.
   defined (no encryption bit is allocated yet; the flags byte simply has
   reserved space). Tracking: compression #12 / #139, encryption-at-rest #18.
 
-- **Opt-in ack-on-buffer durability mode (I2 exception).** The README lists
-  `fdatasync` (default), `interval`, and `none` durability modes; only the
-  fsync-before-ack default exists in code. The `none` / `interval` modes (the
-  explicitly-labeled opt-in exception to I2) are not implemented. Tracking:
-  durability #6.
+- **Opt-in ack-on-buffer durability levels (I2 exception): IMPLEMENTED.** The
+  README lists `fdatasync` (default), `interval`, and `none` durability modes. All
+  are now implemented (#341, #379): `sync` (the fsync-before-ack default that holds
+  I2), plus the strictly opt-in `interval` (bounded loss), `async`, and `none`
+  (unbounded loss, gated behind `--async-loss-ack`) levels. They are the
+  explicitly-labeled, off-by-default exception to I2; I2 above is conditioned on
+  `durability_level=sync`. Tracking: durability #6, #341, #379. No longer pending.
 
 - **Persistent producer-id high-water (part of I6, #33).** The opt-in per-producer
   dedup window IS implemented (`ironbus_core::dedup::DedupRegistry`, wired on the

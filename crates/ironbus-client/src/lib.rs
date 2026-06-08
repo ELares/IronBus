@@ -729,6 +729,9 @@ mod tests {
                 ram_ceiling_bytes: 0,
                 disk_full_policy: DiskFullPolicy::DropNew,
                 dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: ironbus_server::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
             },
         )
         .unwrap();

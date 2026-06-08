@@ -316,9 +316,20 @@ pub struct Log<F: Filesystem, C: Clock> {
     active_id: u64,
     next_offset: Offset,
     next_seq: Seq,
-    /// The durable (flushed) high-water mark: reads are bounded by this, so a reader
-    /// never observes a record that is not yet on stable storage.
+    /// The read-visibility (flushed) high-water mark: reads are bounded by this, so a reader
+    /// never observes a record at or beyond it. Under the default `sync` level it equals
+    /// `synced_offset` (every visible record is also durable, I2); under a relaxed level it may
+    /// run AHEAD of `synced_offset` by the unsynced window (a `flush_no_sync` raises this without
+    /// the covering fsync).
     flushed_offset: Offset,
+    /// The DURABLE high-water mark: the first offset NOT yet covered by a returned `fdatasync`
+    /// (#341, #379). Advanced only by a real durability barrier: [`Log::sync`], a roll's seal (which
+    /// fsyncs every record in the sealed segment), and recovery (everything recovered is durable).
+    /// A `flush_no_sync` does NOT advance it, so under a relaxed level the records in
+    /// `[synced_offset, flushed_offset)` are exactly the acked-but-not-durable tail a power loss
+    /// would revert. Equal to `flushed_offset` whenever the writer is fully synced. Exposed by
+    /// [`Log::synced_offset`] for the engine's worst-case-loss accounting.
+    synced_offset: Offset,
     /// Every segment in the log, sorted by base offset, for offset-to-segment lookup.
     segments: Vec<SegmentSlot>,
     /// Total durable RECORD bytes (per segment, `write_pos - SEGMENT_HEADER_LEN`) across every
@@ -384,6 +395,15 @@ pub struct Log<F: Filesystem, C: Clock> {
     /// is the flash-wear governor firing, not a disk-full shed). Process-lifetime monotonic, never
     /// reset on a day rollover. Exposed for the `ironbus_daily_write_budget_sheds_total` counter.
     daily_budget_sheds: u64,
+    /// The UNSYNCED record-byte exposure (#341, #379): the logical record bytes (key + headers +
+    /// payload, no framing) appended since the last real durability barrier (`sync` or a roll's seal).
+    /// Accumulated on each [`Log::append`] and RESET to zero by [`Log::sync`] and [`Log::roll`] (the
+    /// barriers that make the unsynced records durable). It is `0` whenever the writer is fully synced
+    /// (so always `0` under the default `sync` level). Under a relaxed level it is the live
+    /// bytes-at-risk a power cut would lose, the `interval` byte-trigger input and the engine's
+    /// loss-exposure gauge. Saturating; a `flush_no_sync` does NOT reset it (those records are visible
+    /// but not yet durable). Exposed by [`Log::unsynced_bytes`].
+    unsynced_record_bytes: u64,
 }
 
 impl<F: Filesystem, C: Clock> Log<F, C> {
@@ -415,6 +435,8 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     next_offset: Offset::ZERO,
                     next_seq: Seq::new(0),
                     flushed_offset: Offset::ZERO,
+                    // A fresh log has no records, so the durable head is also the origin (#341).
+                    synced_offset: Offset::ZERO,
                     segments: Vec::new(),
                     sealed_record_bytes: 0,
                     total_record_count: 0,
@@ -425,6 +447,8 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     // both start at zero; `start_segment` below charges the first segment header.
                     logical_bytes_written: 0,
                     physical_bytes_written: 0,
+                    // A fresh log has no unsynced records (#341).
+                    unsynced_record_bytes: 0,
                     physical_bytes_written_today: 0,
                     physical_write_today_day: 0,
                     daily_budget_sheds: 0,
@@ -547,8 +571,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             active_id: last_id,
             next_offset,
             next_seq,
-            // Everything recovered is durable, so the flush mark is the recovered head.
+            // Everything recovered is durable, so both the visible and the durable head are the
+            // recovered head (#341): a relaxed level's unsynced tail never survives a power loss, so
+            // recovery only ever yields a fully-durable prefix.
             flushed_offset: next_offset,
+            synced_offset: next_offset,
             segments: slots,
             sealed_record_bytes,
             total_record_count,
@@ -564,6 +591,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             // roll-forward below charges the new segment's header).
             logical_bytes_written: 0,
             physical_bytes_written: 0,
+            // Everything recovered is durable (a relaxed level's unsynced tail never survives), so
+            // there is no unsynced exposure right after recovery (#341).
+            unsynced_record_bytes: 0,
             physical_bytes_written_today: 0,
             physical_write_today_day: 0,
             daily_budget_sheds: 0,
@@ -732,9 +762,16 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         self.sealed_record_bytes = self.sealed_record_bytes.saturating_add(old_record_bytes);
         self.start_segment(next_id, self.next_seq, self.next_offset)
             .map_err(|_| StorageError::WriterFrozen)?;
-        // Sealing fsynced every record in the old segment, so the flush mark advances to
-        // the start of the new segment even without an explicit sync.
+        // Sealing fsynced every record in the old segment, so both the visible and the DURABLE
+        // head advance to the start of the new segment even without an explicit sync. Advancing
+        // `synced_offset` here is what bounds a relaxed level's loss to the open segment's unsynced
+        // tail: a roll is a real durability barrier, so every record up to it is durable (#341).
         self.flushed_offset = self.next_offset;
+        self.synced_offset = self.next_offset;
+        // The seal made every previously-unsynced record durable and the new active segment is empty,
+        // so the at-risk exposure resets to zero: this is what bounds the relaxed levels' loss to at
+        // most one open segment's worth of records (#341, #379).
+        self.unsynced_record_bytes = 0;
         Ok(())
     }
 
@@ -992,6 +1029,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         self.logical_bytes_written = self
             .logical_bytes_written
             .saturating_add(u64::try_from(logical).unwrap_or(u64::MAX));
+        // The UNSYNCED exposure (#341, #379): this record's logical bytes are now appended but not yet
+        // covered by a returned fdatasync, so add them to the at-risk total. A real barrier (`sync` or
+        // a roll's seal) resets this to zero; a relaxed level reads it as the live bytes-at-risk.
+        self.unsynced_record_bytes = self
+            .unsynced_record_bytes
+            .saturating_add(u64::try_from(logical).unwrap_or(u64::MAX));
         self.charge_physical(frame_len);
         // Maintain the running total record count the same way the byte total is maintained, so
         // the count-retention bound stays O(1). The active segment's records live in the writer's
@@ -1017,9 +1060,66 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             self.active = None;
             return Err(StorageError::WriterFrozen);
         }
-        // All appended records are now durable and become visible to readers.
+        // All appended records are now durable and become visible to readers: advance BOTH the
+        // visible head and the DURABLE head, so after a `sync` the unsynced window is empty (the
+        // relaxed levels' `synced_offset` catches up to the visible head, #341).
+        self.flushed_offset = self.next_offset;
+        self.synced_offset = self.next_offset;
+        // The covering fsync just made every unsynced record durable, so the at-risk exposure is now
+        // zero (#341): the next relaxed-level window measures from here.
+        self.unsynced_record_bytes = 0;
+        Ok(())
+    }
+
+    /// Advances the read-visibility (flushed) head over the appended records WITHOUT issuing the
+    /// covering `fdatasync` (#341, #379): the relaxed-durability primitive. The record bytes are
+    /// ALREADY in the OS page cache (every [`Log::append`] called `write_all_at`, a synchronous
+    /// page-cache write), so the data is readable; this only makes those page-cache writes visible
+    /// to readers by raising `flushed_offset`. It does NOT make them DURABLE: a power loss before a
+    /// later [`Log::sync`] (or a clean shutdown / segment roll) reverts the unsynced tail, so this
+    /// path WAIVES I2 (ack-implies-durable). Use it only under an opted-in relaxed durability level
+    /// (`interval`/`async`/`none`); the default `sync` level never calls it. Returns the highest
+    /// offset now visible-but-not-yet-durable in `[flushed_before, next_offset)`.
+    ///
+    /// This never calls `sync_data`, so unlike [`Log::sync`] it cannot fail its durability barrier
+    /// and cannot freeze the writer; it only errors if the writer is ALREADY frozen by a prior fatal
+    /// fault (then nothing is made visible and the relaxed level surfaces the same fatal error the
+    /// `sync` level would).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::WriterFrozen`] if a prior fatal fsync already froze the writer.
+    pub fn flush_no_sync(&mut self) -> Result<(), StorageError> {
+        // A frozen writer has no active segment: surface the fatal state rather than silently
+        // advancing the visible head over records the writer can no longer own.
+        self.active()?;
+        // The page-cache writes are already done (each append wrote them); make them readable by
+        // raising the visible head, WITHOUT the fdatasync that `sync` issues. The records are NOT
+        // durable until a later `sync`, a roll's seal, or a clean shutdown flush.
         self.flushed_offset = self.next_offset;
         Ok(())
+    }
+
+    /// The first offset NOT yet covered by a returned `fdatasync` (the DURABLE head): under the
+    /// default `sync` level this equals [`Log::flushed_offset`] (every visible record is also
+    /// durable, I2). Under a relaxed level the visible head ([`Log::flushed_offset`]) may run AHEAD
+    /// of this durable head by the unsynced window, and the records in `[synced_offset, flushed)`
+    /// are exactly the acked-but-not-yet-durable tail a power loss would lose. A `sync` advances
+    /// this to match the visible head; a `flush_no_sync` does not. Exposed so the engine can compute
+    /// the worst-case unsynced exposure for the relaxed levels.
+    #[must_use]
+    pub fn synced_offset(&self) -> Offset {
+        self.synced_offset
+    }
+
+    /// The UNSYNCED record-byte exposure (#341, #379): the logical record bytes (key + headers +
+    /// payload, no framing) appended since the last real durability barrier (`sync` or a roll's seal)
+    /// and not yet covered by a returned `fdatasync`. Always `0` when the writer is fully synced (so
+    /// always `0` under the default `sync` level, where every `commit` syncs). Under a relaxed level
+    /// it is the live bytes-at-risk a power cut would lose, the `interval` byte-trigger input and the
+    /// engine's loss-exposure gauge.
+    #[must_use]
+    pub fn unsynced_bytes(&self) -> u64 {
+        self.unsynced_record_bytes
     }
 
     /// The durable high-water mark: the first offset NOT yet flushed to stable storage.

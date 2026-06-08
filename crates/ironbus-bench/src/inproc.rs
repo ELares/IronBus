@@ -73,6 +73,9 @@ fn engine_config() -> EngineConfig {
         // out-of-band, it does not need the in-broker headroom gauge.
         ram_ceiling_bytes: 0,
         dedup: ironbus_core::dedup::DedupConfig::default(),
+        durability_level: ironbus_server::engine::DurabilityLevel::Sync,
+        flush_interval_ms: 0,
+        flush_max_bytes: 0,
     }
 }
 

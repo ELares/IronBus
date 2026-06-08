@@ -187,6 +187,29 @@ plus `_sum` and `_count`): the produce-time durability-barrier latency. A latenc
 distribution, not a resilience event, so it is also outside the frozen counter
 set.
 
+## Durability-level series (#341, #379)
+
+These surface the active durability level and its power-loss exposure. They are
+GAUGES (no `_total` suffix), so they extend the frozen `(name, type)` contract
+(`FROZEN_METRIC_TYPES`) but are EXCLUDED from the resilience-counter taxonomy
+(`FROZEN_RESILIENCE_COUNTERS`) by construction: a relaxed durability level is an
+opt-in trade, not a resilience shed/loss event.
+
+```
+ironbus_durability_level_info{level=...}   the ACTIVE level (sync|interval|async|none), value always 1
+ironbus_durability_power_loss_unsafe       1 if the active level WAIVES I2 (any relaxed level can lose acked data on a power cut), 0 under the power-loss-safe default sync
+ironbus_durability_unsynced_bytes          acknowledged-but-not-yet-fdatasync'd record bytes currently at risk on a power cut; always 0 under sync, the live loss exposure under a relaxed level
+```
+
+Under the DEFAULT `sync` level, `ironbus_durability_level_info{level="sync"} 1`,
+`ironbus_durability_power_loss_unsafe 0`, and `ironbus_durability_unsynced_bytes 0`:
+a zero-config broker advertises itself as the safe durable level with no exposure.
+An operator alerts on `ironbus_durability_power_loss_unsafe` crossing to `1` (the
+broker can lose acknowledged data) and watches `ironbus_durability_unsynced_bytes`
+as the live bytes-at-risk. The level + loss exposure are also in the startup
+`materialized-config` line (`durability_level=`, `power_loss_safe=`). See
+[DURABILITY.md](DURABILITY.md) for the per-level ack/loss contract.
+
 ## Edge-resource series (#118)
 
 These surface the edge-specific resource pressures #118 names: flash write

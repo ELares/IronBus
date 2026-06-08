@@ -20,14 +20,21 @@ lifecycle see [WAL.md](WAL.md); for the byte-level layouts see
 
 The #50 task body, and the README's "Modes: `fdatasync` (default), `interval`,
 and `none`" line, assume a MENU of durability levels (sync / batch / interval /
-async), each with its own per-level loss guarantee. IronBus v1 does NOT ship that
-menu. It ships exactly ONE durability level, the safe one:
+async), each with its own per-level loss guarantee. The SAFE level is the only
+DEFAULT:
 
-> **An ack means durable.** A `Pub` / `PubAck` is emitted only after the
-> `fdatasync` that covers that record has returned `Ok`. A power loss can never
-> lose an acknowledged record. This is invariant I2 (ack-implies-durable), it is
-> the default, it is the only level the binary exposes, and it cannot be weakened
-> from the command line today.
+> **An ack means durable, by default.** Under the default `sync` level a `Pub` /
+> `PubAck` is emitted only after the `fdatasync` that covers that record has
+> returned `Ok`. A power loss can never lose an acknowledged record. This is
+> invariant I2 (ack-implies-durable), it is the default, and an operator who
+> changes nothing keeps ZERO acknowledged loss on a power cut.
+
+The relaxed levels (`interval`, `async`, `none`) ARE now implemented (#341, #379),
+but they are STRICTLY OPT-IN: an operator must explicitly select a relaxed level
+with `--durability-level`, and the two unbounded-loss levels (`async`, `none`)
+additionally refuse to boot without an explicit data-loss acknowledgement
+(`--async-loss-ack`). The default stays `sync`, so the binary you run with no
+durability flags is byte-for-byte the historical power-loss-safe broker.
 
 The two things the #50 four-level framing calls "sync" and "batch" are not two
 levels in IronBus. They are the SAME safe level, observed once without the
@@ -39,8 +46,9 @@ optimization of the durable level, not a relaxation of it.
 
 The relaxed levels (`interval`, `async` / the README's `none`) trade durability
 for throughput. They are CONTRARY to IronBus's Edge-First safe default, they are
-NOT implemented, and the design below requires an operator to EXPLICITLY opt in
-and accept a stated bounded-or-unbounded loss before any of them can weaken I2.
+IMPLEMENTED but STRICTLY OPT-IN (#341, #379), and they require an operator to
+EXPLICITLY opt in and accept a stated bounded-or-unbounded loss before any of them
+can weaken I2.
 
 ---
 
@@ -157,67 +165,100 @@ contributes a single fsync sample, not one sample per message) is in
 
 ---
 
-## 3. The relaxed durability levels (SPECIFIED, not implemented)
+## 3. The relaxed durability levels (IMPLEMENTED, strictly opt-in)
 
-This section designs the levels #50 assumes but that IronBus deliberately does
-NOT ship. Each is an OPT-IN that an operator must explicitly select and whose
-stated loss they must accept; the default is and remains the durable level in
-section 1. None of these is wired in the binary today: the only durability
-behavior in code is fsync-before-ack (see [INVARIANTS.md](INVARIANTS.md), the
-"Specified, enforcement pending" entry for the ack-on-buffer mode, tracked under
-durability #6).
+This section specifies the levels #50 assumes, now IMPLEMENTED (#341, #379). Each
+is an OPT-IN that an operator must explicitly select and whose stated loss they
+must accept; the default is and remains the durable `sync` level in section 1.
+The level is wired through `EngineConfig::durability_level`; `commit_batch` issues
+the covering `fdatasync` under `sync`, forces one on the `interval` window, and
+defers it under `async`/`none` (advancing the visible head via
+`Log::flush_no_sync`). A segment roll's seal and a clean-shutdown flush
+(`Engine::force_sync`, called by `checkpoint_all_groups`) are the relaxed levels'
+opportunistic / final barriers.
 
 ### The level model
 
-| Level | What it does | Worst-case ACKNOWLEDGED loss on power loss | Power-loss safe? | Status |
-| --- | --- | --- | --- | --- |
-| `sync` (the only shipped level, the default) | ack only after the covering `fdatasync` returns; the group-commit batcher amortizes the sync but never acks before it | ZERO (a torn unsynced tail is truncated and was never acked) | yes | SHIPPED |
-| `interval` | ack on append; a background flusher issues an `fdatasync` on a bounded cadence (every `flush_interval_ms`, or after `flush_max_bytes` of unsynced bytes, whichever first) | BOUNDED: at most the records acked since the last completed `fdatasync`, bounded by the smaller of the time cadence and the byte budget | NO (acked-but-unsynced records in the open window are lost) | SPECIFIED, not implemented |
-| `async` (the README's `none`) | ack on append; an `fdatasync` happens only opportunistically (on roll, on seal, on clean shutdown) | UNBOUNDED until the next `fdatasync`: every record acked since the last sync, with no time or byte ceiling | NO | SPECIFIED, not implemented, and gated behind an explicit data-loss acknowledgement (README) |
+| Level | What it does | When the ack fires | Worst-case ACKNOWLEDGED loss on power loss | Power-loss safe? | Status |
+| --- | --- | --- | --- | --- | --- |
+| `sync` (the default) | ack only after the covering `fdatasync` returns; the group-commit batcher amortizes the sync but never acks before it | AFTER the covering `fdatasync` returns `Ok` | ZERO (a torn unsynced tail is truncated and was never acked) | yes | IMPLEMENTED |
+| `interval` | ack once the record is in the OS page cache; a background window issues an `fdatasync` every `flush_interval_ms` of monotonic time, or after `flush_max_bytes` of unsynced record bytes, whichever first | AFTER the `write()` to the page cache, BEFORE the windowed `fdatasync` | BOUNDED: at most the records acked since the last completed `fdatasync`, bounded by the SMALLER of the time window and the byte budget | NO (acked-but-unsynced records in the open window are lost on a power cut) | IMPLEMENTED |
+| `async` (the README's `none`) | ack once the record is in the page cache; an `fdatasync` happens only OPPORTUNISTICALLY (on a segment roll's seal, on a clean shutdown) | AFTER the `write()` to the page cache; the `fdatasync` is asynchronous to the ack | UNBOUNDED until the next `fdatasync`: every record acked since the last sync, with no IronBus time or byte ceiling (bounded only by the OS dirty-writeback window) | NO | IMPLEMENTED, gated behind an explicit data-loss acknowledgement |
+| `none` | like `async` but NO periodic fsync at all; the only barriers are a segment roll's seal and a clean shutdown | AFTER the `write()` to the page cache | every record acked since the last segment roll or clean shutdown: the LARGEST loss window | NO | IMPLEMENTED, gated behind an explicit data-loss acknowledgement |
 
-Two honesty notes on the naming. First, the #50 "batch" level is NOT a fourth
-row: it is the `sync` level WITH group commit on, which is what IronBus already
-does, so it collapses into the safe `sync` row. Second, the README spells the
-fully-relaxed level `none`; this document also calls it `async` because that is
-the load-bearing property (the fsync is asynchronous to the ack). They are the
-same level.
+The precise ack timing and bound, per level:
+
+- **`sync`**: the ack is released only AFTER `Log::sync` (the covering
+  `fdatasync`) returns `Ok`, so the record is durable when the producer sees the
+  `PubAck`. Worst-case loss is ZERO: on a power cut recovery yields the longest
+  valid prefix and truncates the unsynced tail, which was never acked.
+- **`interval`**: the ack is released after the record's bytes are in the OS page
+  cache (the visible head advances via `Log::flush_no_sync`), which happens
+  BEFORE the windowed `fdatasync`. A background window forces a covering
+  `fdatasync` every `flush_interval_ms` of MONOTONIC time (via the clock seam, so
+  an NTP step never mis-fires it, I6) OR once `flush_max_bytes` of unsynced record
+  bytes accumulate, whichever comes first. The EXACT worst-case loss bound is the
+  records acked since the last completed `fdatasync`, which is bounded by the
+  SMALLER of those two triggers: a crash loses AT MOST one flush window's worth of
+  acked records, never more.
+- **`async`**: the ack is released after the page-cache `write()`; no periodic
+  `fdatasync` is forced. The fsync is asynchronous to the ack and happens only
+  when a segment rolls (the seal fsyncs the sealed segment) or at clean shutdown.
+  Worst-case loss is UNBOUNDED until the next of those events: every record acked
+  since the last sync, with no IronBus-imposed time or byte ceiling (only the OS
+  dirty-writeback window eventually flushes the page cache).
+- **`none`**: identical to `async` except there is no opportunistic mid-run sync
+  to rely on at all beyond a segment roll; the loss window is "since the last
+  segment roll or clean shutdown", the largest of the four.
+
+Two honesty notes on the naming. First, the #50 "batch" level is NOT a fifth row:
+it is the `sync` level WITH group commit on, which is what IronBus already does,
+so it collapses into the safe `sync` row. Second, the README spells the
+fully-relaxed level `none`; this document keeps `async` and `none` distinct only
+in that `none` has NO periodic fsync window where `async` still seals on a roll;
+both ack asynchronously to the fsync.
 
 ### The opt-in contract
 
-Because `interval` and `async` weaken I2, they are gated, not free flags:
+Because `interval`, `async`, and `none` weaken I2, they are gated, not free flags:
 
 - **Off by default, always.** The default is `sync`. An operator gets a relaxed
-  level only by setting it explicitly; there is no implicit downgrade and no way
-  to reach a relaxed level from the current `serve` command line at all (the
-  modes are not wired, see EDGE_TUNING.md: the `interval` / `none` modes are NOT
-  exposed as flags, so you cannot accidentally weaken durability today).
-- **An explicit loss acknowledgement for `async`.** The fully-relaxed `none` /
-  `async` level is gated behind an explicit data-loss acknowledgement (README,
-  Key decisions), not a bare flag, because its loss is unbounded.
-- **The loss is part of the contract, and reported.** A relaxed level's bound is
-  a number the operator is choosing: `interval`'s window (records, or bytes, or
-  milliseconds since the last completed sync) and `async`'s "everything since the
-  last sync". An ack under a relaxed level is a weaker promise and must be
-  documented as such at the call site, never presented as the durable ack.
+  level only by setting `--durability-level` (or `IRONBUS_DURABILITY_LEVEL`)
+  explicitly; there is no implicit downgrade. A broker run with no durability flag
+  is the historical power-loss-safe broker.
+- **An explicit loss acknowledgement for `async`/`none`.** The unbounded-loss
+  levels refuse to BOOT unless `--async-loss-ack` (the explicit
+  `i-accept-acknowledged-data-loss`-style acknowledgement) is set: a fail-closed
+  usage error (exit 1) before any listener opens. `interval`'s loss is bounded by
+  the operator-chosen window, so it is opt-in but NOT gated behind this flag;
+  however, an `interval` with BOTH triggers at `0` is refused (it would silently
+  degrade to the unbounded `async` behavior without the acknowledgement).
+- **The broker LOUDLY announces a waived I2.** When any relaxed level is active
+  the broker logs a startup WARN that I2 is WAIVED, that the broker is NOT
+  power-loss safe, and the worst-case acknowledged loss for the active level, on
+  every boot. The default `sync` logs no such warning.
+- **The loss is part of the contract, and reported.** A relaxed level's bound is a
+  number the operator is choosing. An ack under a relaxed level is a weaker
+  promise and is documented as such, never presented as the durable ack.
 
-### The #14 configuration keys (specified)
+### The #14 configuration keys (implemented)
 
 These follow the existing `serve` flag and `DEFAULT_*` constant conventions (see
-[CLI.md](CLI.md)); the exact spellings are fixed when the modes are implemented
-under [#14](https://github.com/ELares/IronBus/issues/14). All are **specified**,
-not yet wired.
+[CLI.md](CLI.md)) and are wired under [#14](https://github.com/ELares/IronBus/issues/14).
 
-| key (specified) | scope | default | bounds | meaning |
-| --- | --- | --- | --- | --- |
-| `durability_level` | global | `sync` | `sync` \| `interval` \| `async` | the level; `sync` is the only one implemented today |
-| `flush_interval_ms` | global | (n/a until `interval` ships) | `> 0` | `interval`: max time an acked record may be unsynced |
-| `flush_max_bytes` | global | (n/a until `interval` ships) | `> 0` | `interval`: max unsynced bytes before a forced `fdatasync` |
-| `async_loss_ack` | global | `false` | bool | must be `true` to select `async` / `none` (the explicit data-loss acknowledgement) |
+| key | flag | scope | default | bounds | meaning |
+| --- | --- | --- | --- | --- | --- |
+| `durability_level` | `--durability-level` | global | `sync` | `sync` \| `interval` \| `async` \| `none` | the level; `sync` is the power-loss-safe default |
+| `flush_interval_ms` | `--flush-interval-ms` | global | `1000` | `>= 0` | `interval`: max MONOTONIC ms an acked record may be unsynced (`0` disables the time trigger) |
+| `flush_max_bytes` | `--flush-max-bytes` | global | `1048576` | `>= 0` | `interval`: max unsynced record bytes before a forced `fdatasync` (`0` disables the byte trigger) |
+| `async_loss_ack` | `--async-loss-ack` | global | `false` | bool | must be `true` to select `async` / `none` (the explicit data-loss acknowledgement) |
 
-When these land, the harness in section 4 below drives each level through
-crash-at-every-step and asserts the row's stated loss bound (zero for `sync`,
-bounded-and-reported for `interval`, the unbounded-but-declared window for
-`async`). That assertion cannot exist until the levels do.
+The crash harness drives each level through crash-at-every-step and asserts the
+row's stated loss bound: zero for `sync`, bounded-by-the-window for `interval`,
+and the declared window for `async`/`none` (the engine durability tests in
+`crates/ironbus-server/src/engine.rs`, e.g.
+`async_loses_the_unsynced_tail_on_a_power_cut_but_sync_loses_nothing_same_harness`
+and `interval_acks_within_the_window_and_a_crash_loses_at_most_the_window`).
 
 ---
 
@@ -228,13 +269,13 @@ the relaxed levels or on-device hardware.
 
 | #50 acceptance criterion | Status | Where it is proven (or what it waits on) |
 | --- | --- | --- |
-| Property test proves the ack never precedes the level condition | PROVEN for `sync` | `an_ack_is_sent_only_after_the_covering_fsync_completes_i2` (`actor.rs`). The condition is the covering `fdatasync`; the test holds it open and proves the ack cannot arrive. The per-level form (a relaxed level's own condition) needs the relaxed levels first. |
-| Crash injection drops unsynced bytes at arbitrary points; the loss guarantee holds under it | PROVEN for `sync` | `power_loss_at_every_boundary_no_roll` / `_with_rolling`, `power_cut_with_a_holed_unsynced_tail_loses_no_acked_record`, the `power_loss_recovers_the_durable_prefix` proptest (`crash_recovery.rs`). The `sync` guarantee (zero acked loss) holds under all of them. The `interval` / `async` bounds need those levels implemented. |
+| Property test proves the ack never precedes the level condition | PROVEN for `sync`; per-level bounds proven for the relaxed levels | `an_ack_is_sent_only_after_the_covering_fsync_completes_i2` (`actor.rs`) for `sync`. The per-level form (a relaxed level's own bound under a power cut) is the engine durability suite in `engine.rs` (section 3). |
+| Crash injection drops unsynced bytes at arbitrary points; the loss guarantee holds under it | PROVEN | `power_loss_at_every_boundary_no_roll` / `_with_rolling`, `power_cut_with_a_holed_unsynced_tail_loses_no_acked_record`, the `power_loss_recovers_the_durable_prefix` proptest (`crash_recovery.rs`). The `sync` guarantee (zero acked loss) holds under all of them. The `interval` / `async` / `none` bounds are now proven by the engine durability suite (section 3). |
 | fsyncgate fault injection: no false-success on a retried failed sync, and a writer freeze | PROVEN | `fatal_fsync_freeze_loses_no_acked_record`, `fatal_fsync_freeze_during_a_roll_loses_no_acked_record`, `a_sync_fault_at_any_point_loses_no_acked_record` (`crash_recovery.rs`); the freeze itself is `Log::sync` returning `WriterFrozen` (`log.rs`). |
 | Crash-after-create: segments never vanish | PROVEN | the parent-directory fsync in `Log::start_segment` (`log.rs`) plus `recovery_fails_closed_when_a_fault_strikes_the_roll_forward` (`crash_recovery.rs`). |
 | Group commit shows syncs-per-record < 1 under concurrent load | PROVEN | `a_batch_of_concurrent_produces_issues_one_fdatasync_not_n` (`actor.rs`): N produces, one `fdatasync`. |
 | Torn mid-batch write exercises the #5 checksum and #7 stop-at-first-bad-frame path (not just clean truncation) | PROVEN | `last_record_corruption_drops_only_that_record`, `mid_log_header_corruption_stops_at_the_first_bad_record`, `mid_log_body_corruption_stops_at_the_first_bad_record`, `arbitrary_byte_corruption_yields_a_valid_prefix_or_clean_error` (`crash_recovery.rs`); the #45 conformance corpus driven through real recovery in `crates/ironbus-storage/tests/conformance_recovery.rs` and the per-frame corruption cases (including the over-threshold xxh3-field flip) in `crates/ironbus-storage/tests/corruption_corpus.rs`. Recovery stops at the FIRST bad frame and reports a typed `ReasonCode` (I1, I3). |
-| Per-level loss guarantee asserted under crash-at-every-step (zero for `sync`, bounded-and-reported for `interval`, declared window for `async`) | PARTIAL | the `sync` row (zero acked loss) is proven as above; the `interval` and `async` rows CANNOT be asserted until those levels are implemented (section 3). This is the honest gap: the harness shape exists, the levels do not. |
+| Per-level loss guarantee asserted under crash-at-every-step (zero for `sync`, bounded-and-reported for `interval`, declared window for `async`) | PROVEN | the `sync` row (zero acked loss) is proven by the crash-recovery sweeps; the `interval` (loses at most the flush window), `async`, and `none` rows are proven by the engine durability suite (`engine.rs`): `the_default_level_is_sync_and_acks_only_post_fsync_zero_acked_loss`, `async_loses_the_unsynced_tail_on_a_power_cut_but_sync_loses_nothing_same_harness`, `interval_acks_within_the_window_and_a_crash_loses_at_most_the_window`, and the roll/shutdown barrier tests. |
 | Throughput / latency / bytes-at-risk curve across all levels on real ARM SD/eMMC, feeding #19 | RESIDUAL (device) | not host-side reproducible; see section 5. |
 
 The in-flight crash-class work (the EIO and consumed-error block-layer fault
@@ -280,21 +321,25 @@ explicitly NOT a number this document or any host-side test invents.
 
 ## Summary: what is true today
 
-- IronBus v1 ships ONE durability level, `sync`: ack-implies-durable (I2). The
+- IronBus DEFAULTS to ONE durability level, `sync`: ack-implies-durable (I2). The
   group-commit batcher amortizes the `fdatasync` but never acks before it, so the
-  #50 "batch" level is the same safe level, not a relaxation.
-- Zero acknowledged loss on power loss is PROVEN: the ack-ordering property
-  (`..._i2`), the power-loss boundary sweeps, the fsyncgate no-false-success and
-  writer-freeze tests, the crash-after-create roll-forward, the group-commit
-  one-sync-per-batch test, and the stop-at-first-bad-frame corruption path are
-  all in the tree and run per PR.
-- The relaxed `interval` and `async` levels are SPECIFIED here with their loss
-  bounds (bounded by the flush window; unbounded until the next sync) and an
-  explicit, off-by-default opt-in contract, but they are NOT implemented; the
-  default is and remains the durable level.
+  #50 "batch" level is the same safe level, not a relaxation. An operator who
+  changes nothing keeps zero acknowledged loss on a power cut.
+- Zero acknowledged loss on power loss is PROVEN for the default: the ack-ordering
+  property (`..._i2`), the power-loss boundary sweeps, the fsyncgate
+  no-false-success and writer-freeze tests, the crash-after-create roll-forward,
+  the group-commit one-sync-per-batch test, and the stop-at-first-bad-frame
+  corruption path are all in the tree and run per PR.
+- The relaxed `interval`, `async`, and `none` levels are IMPLEMENTED (#341, #379)
+  with their loss bounds (bounded by the flush window; unbounded until the next
+  sync; the largest window) and an explicit, off-by-default opt-in contract: the
+  unbounded-loss levels refuse to boot without `--async-loss-ack`, the broker
+  loudly logs a waived I2, and the active level + its loss exposure are observable
+  (`ironbus_durability_*` gauges and the materialized-config line). The default is
+  and remains the durable level.
 - The across-levels throughput / latency / bytes-at-risk curve on ARM SD/eMMC is
-  a DEVICE residual: it needs both the relaxed levels and the reference hardware,
-  it is not faked host-side, and it feeds #19.
+  a DEVICE residual: it now has the relaxed levels but still needs the reference
+  hardware, it is not faked host-side, and it feeds #19.
 
 ## Cross-references
 

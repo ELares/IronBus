@@ -208,19 +208,35 @@ field and flag are the #4/#87 implementation residual.
 
 | Knob (file key) | Flag / env | Type | Default | Units | Valid range | Reload |
 | --- | --- | --- | --- | --- | --- | --- |
-| `level` | SPECIFIED-NOT-YET-A-FIELD | enum | `fdatasync` | -- | `fdatasync` (shipped) `\| interval \| none` (specified, not wired) | COLD (coupled with the linger knobs) |
-| `group_commit_max_delay_ms` | SPECIFIED-NOT-YET-A-FIELD | u64 | `0` (no linger) | ms | `0` or a positive bound | COLD (coupled with `level`) |
-| `group_commit_max_bytes` | SPECIFIED-NOT-YET-A-FIELD | size | `1048576` (1 MiB cap) | bytes | a positive byte cap | COLD (coupled with `level`) |
+| `durability_level` | `--durability-level` / `IRONBUS_DURABILITY_LEVEL` | enum | `sync` (`DEFAULT_DURABILITY_LEVEL`) | -- | `sync \| interval \| async \| none` | COLD (coupled with the flush knobs and `async_loss_ack`) |
+| `flush_interval_ms` | `--flush-interval-ms` / `IRONBUS_FLUSH_INTERVAL_MS` | u64 | `1000` (`DEFAULT_FLUSH_INTERVAL_MS`) | ms | `>= 0` (`0` disables the time trigger) | COLD (coupled with `durability_level`) |
+| `flush_max_bytes` | `--flush-max-bytes` / `IRONBUS_FLUSH_MAX_BYTES` | size | `1048576` (1 MiB, `DEFAULT_FLUSH_MAX_BYTES`) | bytes | `>= 0` (`0` disables the byte trigger) | COLD (coupled with `durability_level`) |
+| `async_loss_ack` | `--async-loss-ack` / `IRONBUS_ASYNC_LOSS_ACK` | bool | `false` | -- | `true` to enable `async` / `none` | COLD (coupled with `durability_level`) |
 
-The durability `level` enum literal is reconciled per the #14 second-pass and
-#139 decisions: the single shipped level is named **`fdatasync`** (matching the
-README and the actual syscall), NOT `sync` / `batch` / `fsync-batch`. v1 ships
-exactly ONE level, `fdatasync` (ack-after-`fdatasync`, invariant I2), and it
-CANNOT be weakened from the command line; the relaxed `interval` and `none`
-levels are SPECIFIED but deliberately not wired, off by default, and require an
-explicit data-loss acknowledgement before they can weaken I2. This is the
-authority in [DURABILITY.md](DURABILITY.md); this document does not re-spec the
-durability mechanism, only its config keys.
+The durability `durability_level` enum is now IMPLEMENTED (#341, #379). The DEFAULT
+is **`sync`** (ack-after-`fdatasync`, invariant I2, ZERO acked loss on a power cut):
+an operator who changes nothing keeps the power-loss-safe broker. The relaxed
+levels are STRICTLY OPT-IN: `interval` (ack on the page-cache write, bounded loss =
+the smaller of `flush_interval_ms` and `flush_max_bytes`), `async` (ack on the
+page-cache write, opportunistic fsync only, unbounded until the next sync), and
+`none` (no periodic fsync, the largest window). The unbounded-loss levels
+(`async`, `none`) REFUSE to boot without `async_loss_ack = true` (the explicit
+data-loss acknowledgement, the none/async safety gate); an `interval` with BOTH
+flush triggers at `0` is also refused (it would silently degrade to `async`). When
+any relaxed level is active the broker logs a loud startup WARN that I2 is waived
+and the worst-case loss, and surfaces the level + loss exposure on `/metrics`
+(`ironbus_durability_level_info`, `ironbus_durability_power_loss_unsafe`,
+`ironbus_durability_unsynced_bytes`). [DURABILITY.md](DURABILITY.md) is the
+authority for the per-level ack and loss contract; this document specs the keys.
+
+> Naming note: an earlier #14 second-pass draft named the level enum `fdatasync`
+> with `group_commit_max_delay_ms` / `group_commit_max_bytes` linger knobs. The
+> shipped enum is `sync | interval | async | none` (matching the
+> README/DURABILITY.md and the implemented `--durability-level` flag, #341/#379),
+> and the interval window's triggers are `flush_interval_ms` / `flush_max_bytes`.
+> The group-commit batcher's amortization remains hardwired (the #177 append actor
+> drains a batch into one barrier); the flush knobs tune the `interval` window, not
+> the group-commit batch boundary.
 
 The batch-knob names are the #6-frozen `group_commit_max_delay_ms` /
 `group_commit_max_bytes` (NOT the #14 draft's `fsync_interval_ms` /
