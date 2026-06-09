@@ -241,3 +241,72 @@ jobs:
             dist/ironbus-linux-armv7 \
             dist/ironbus-linux-armv7.sha256 \
             dist/SHA256SUMS
+
+  container:
+    name: publish multi-arch image to ghcr.io
+    # The live image source (#334): every rolling build publishes the distroless container to
+    # ghcr.io/elares/ironbus, multi-arch (amd64 + arm64 + armv7), tagged with the calendar version
+    # AND :latest. It rides the SAME verified binaries the build matrix produced (no recompile), so
+    # the verify-before-package property holds: Dockerfile.release copies the pre-built static musl
+    # binary straight in, never compiles. Distinct from the formal `release.yml` container job (which
+    # also pushes the friendly tags on a `v*` tag); see docs/DISTRIBUTION.md channel 3.
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write # push the image to ghcr.io with the built-in GITHUB_TOKEN
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+      - name: stage the three verified binaries per target platform
+        run: |
+          set -euo pipefail
+          # Lay the pre-built, friendly-named binaries out under dist/<TARGETPLATFORM>/ironbus so
+          # Dockerfile.release's per-platform COPY selects the matching one for each manifest layer
+          # (amd64 -> ironbus-linux-amd64, arm64 -> ironbus-linux-arm64, arm/v7 -> ironbus-linux-armv7).
+          # These are the EXACT bytes the build matrix produced and checksummed; no recompile here.
+          # upload/download-artifact drop the +x bit, so restore it (Dockerfile.release also chmods).
+          for pair in \
+            "linux/amd64:ironbus-linux-amd64" \
+            "linux/arm64:ironbus-linux-arm64" \
+            "linux/arm/v7:ironbus-linux-armv7"; do
+            plat="${pair%%:*}"
+            asset="${pair##*:}"
+            mkdir -p "dist/${plat}"
+            cp "artifacts/${asset}/${asset}" "dist/${plat}/ironbus"
+            chmod 0755 "dist/${plat}/ironbus"
+          done
+          ls -lR dist
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - name: log in to ghcr.io with the built-in GITHUB_TOKEN
+        env:
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # ghcr.io is this repo's own registry, so the workflow's built-in GITHUB_TOKEN (with the
+          # job-scoped `packages: write` above) is enough; no external/org secret is needed. Feed the
+          # token on stdin (never an argv `-p`, which would leak it into the process table / logs).
+          printf '%s' "${TOKEN}" | docker login ghcr.io -u "${ACTOR}" --password-stdin
+      - name: build and push the multi-arch image (amd64 + arm64 + armv7)
+        env:
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The package is the lowercased repository under ghcr.io (ghcr.io/elares/ironbus). Build a
+          # single multi-platform manifest from the three pre-built binaries and push BOTH the calendar
+          # version and :latest in one invocation. COPY-only Dockerfile (no RUN executes the foreign
+          # binary), so the cross-arch layers need no QEMU emulation.
+          repo="ghcr.io/$(printf '%s' "${REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          docker buildx build \
+            -f Dockerfile.release \
+            --platform linux/amd64,linux/arm64,linux/arm/v7 \
+            -t "${repo}:${VERSION}" \
+            -t "${repo}:latest" \
+            --push \
+            .
+          echo "pushed ${repo}:${VERSION} and ${repo}:latest (linux/amd64,linux/arm64,linux/arm/v7)"

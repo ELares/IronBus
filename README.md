@@ -79,6 +79,14 @@ Prefer to grab the binary yourself? Download the static `musl` binary for your C
 
 Every push to main publishes a fresh `YYYY.MMDD.N` build (calendar-versioned, the three static binaries plus a consolidated `SHA256SUMS` and a Sigstore provenance attestation), so `releases/latest` and the installer always resolve to the newest build. See [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) for every channel.
 
+**Prefer a container?** Every build also publishes a multi-arch (amd64 / arm64 / armv7) distroless image to `ghcr.io/elares/ironbus`, so you can pull and run without installing anything (mind the loopback / security note above):
+
+```sh
+docker pull ghcr.io/elares/ironbus:latest
+docker run --rm -v ironbus-data:/var/lib/ironbus -p 127.0.0.1:7777:7777 \
+  ghcr.io/elares/ironbus:latest serve --data-dir /var/lib/ironbus
+```
+
 **Build from source** (the developer / alternative path, on any host with a Rust toolchain):
 
 ```sh
