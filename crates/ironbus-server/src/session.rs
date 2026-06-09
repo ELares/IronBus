@@ -1907,18 +1907,26 @@ mod tests {
         let delivered: Vec<u64> = frames
             .iter()
             .filter(|(ty, _)| *ty == FrameType::Deliver)
-            .map(|(_, b)| ironbus_proto::message::decode_deliver(b).expect("valid Deliver").offset)
+            .map(|(_, b)| {
+                ironbus_proto::message::decode_deliver(b)
+                    .expect("valid Deliver")
+                    .offset
+            })
             .collect();
         let mut pending_to: Option<u64> = None;
         for (ty, b) in &frames {
             match *ty {
                 FrameType::GapMarker => {
-                    pending_to =
-                        Some(ironbus_proto::message::decode_gap_marker(b).expect("valid GapMarker").to);
+                    pending_to = Some(
+                        ironbus_proto::message::decode_gap_marker(b)
+                            .expect("valid GapMarker")
+                            .to,
+                    );
                 }
                 FrameType::Deliver => {
-                    let off =
-                        ironbus_proto::message::decode_deliver(b).expect("valid Deliver").offset;
+                    let off = ironbus_proto::message::decode_deliver(b)
+                        .expect("valid Deliver")
+                        .offset;
                     if let Some(to) = pending_to.take() {
                         assert_eq!(
                             off, to,
