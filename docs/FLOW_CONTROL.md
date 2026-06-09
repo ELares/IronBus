@@ -370,8 +370,16 @@ does NOT redefine it; it ties the PFLOW wire signal to it:
   shed by the token bucket. The producer's accept loop is never blocked; it simply
   loses the over-rate messages, counted by `ironbus_fire_and_forget_shed_total`.
 - **Acked publishes are unaffected** by pause or budget: they flow on the credited
-  path. The only backpressure an acked producer sees is the durable-log overflow
-  (`"at capacity"`), which is the #10 disk-full policy, not PFLOW.
+  path. The backpressure an acked producer sees is the durable-log overflow
+  (`"at capacity"`, the #10 disk-full policy, not PFLOW), the CoDel latency shed
+  (`"shed under load"`, #68), and the fsync-HEADROOM shed (`"wal fsync headroom
+  exhausted"`, #378): the un-fsynced backlog hit its configured
+  `--wal-fsync-headroom-bytes` and a group-commit drain could not free it under a
+  relaxed durability level, so the new produce is shed to keep the loss window
+  bounded. Under the default `sync` level the headroom THROTTLES instead (a forced
+  group-commit drain, then admit), so an acked producer there never sees the headroom
+  shed. All three reject NEW work only and never drop an already-accepted record
+  (see [BACKPRESSURE.md, Part C](BACKPRESSURE.md#part-c-fsync-headroom-admission-credits-378)).
 - **The structured `shed` / `retry_after_ms` hint** (BACKPRESSURE.md, "The
   `retry_after_ms` and `shed` wire signal") is the machine-actionable companion: when
   a tier that gets a response is shed, the broker can set `shed = true` (and a

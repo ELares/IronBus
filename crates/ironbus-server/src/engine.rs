@@ -21,7 +21,7 @@ use crate::registry::MetricRegistry;
 use ironbus_core::attempt::{
     decode_attempt_snapshot, encode_attempt_snapshot, ATTEMPT_SNAPSHOT_MIN_LEN,
 };
-use ironbus_core::backpressure::{AimdLimiter, Codel, RetryBudget, TokenBucket};
+use ironbus_core::backpressure::{AimdLimiter, Codel, FsyncHeadroom, RetryBudget, TokenBucket};
 use ironbus_core::clock::Clock;
 use ironbus_core::cursor::AckCursor;
 use ironbus_core::delivery::{DeliveryConfig, Disposition};
@@ -445,6 +445,23 @@ pub struct EngineConfig {
     /// as the doc default floor (16) by the limiter; the AIMD bounds always apply. See
     /// [`ironbus_core::backpressure::AimdLimiter`].
     pub egress_limit: u32,
+    /// The fsync-headroom admission window in BYTES (#378, refining the #67 / #177 WAL backpressure
+    /// seam): the most un-fsynced (buffered-but-not-yet-`fdatasync`'d) record bytes the BUFFERED write
+    /// frontier may run ahead of the DURABLE (synced) frontier before a new produce is throttled (the
+    /// append actor forces a group-commit flush first, which drains the backlog) or, if a flush cannot
+    /// drain it, shed with the typed [`AppendOutcome`]/`ProduceOutcome` headroom signal. It reuses the
+    /// storage log's [`crate::engine::Engine::unsynced_bytes`] frontier (the #341 relaxed-durability
+    /// tracking), so it bounds the GROUP-COMMIT backlog under `sync` (a memory guard) and the LOSS
+    /// WINDOW under a relaxed level (a bounded-loss guard), distinct from CoDel's queue-latency shed.
+    ///
+    /// Default `0` (DISABLED): the un-fsynced frontier is bounded only by the existing controls (under
+    /// `sync` every group-commit drains it; under a relaxed level the `interval` window or a
+    /// roll/shutdown does), so a zero-config broker is byte-for-byte unchanged. A small headroom is the
+    /// opt-in for a tight RAM / loss-window bound. It NEVER drops an accepted record (the shed rejects
+    /// NEW work, decided before the append, so I2 holds) and NEVER wedges on an oversized produce (an
+    /// empty backlog always admits the next record). See [`ironbus_core::backpressure::FsyncHeadroom`]
+    /// and `docs/BACKPRESSURE.md`.
+    pub wal_fsync_headroom_bytes: u64,
 }
 
 /// An error from the engine.
@@ -981,6 +998,14 @@ pub struct Backpressure {
     /// Egress requests shed at the AIMD concurrency limit. The `ironbus_egress_shed_total` counter.
     /// Saturating.
     egress_shed: u64,
+    /// The fsync-headroom admission credit (#378): bounds the un-fsynced (buffered-but-not-durable)
+    /// write frontier to a configured byte headroom. Disabled (always admits) unless the headroom is
+    /// non-zero. PURE math; the engine feeds it the live `unsynced_bytes()` frontier.
+    fsync_headroom: FsyncHeadroom,
+    /// fsync-headroom sheds (#378): a new produce shed because admitting it would push the un-fsynced
+    /// backlog past the configured headroom even AFTER a group-commit drain. The
+    /// `ironbus_wal_fsync_headroom_shed_total` counter. Saturating.
+    wal_headroom_shed: u64,
 }
 
 impl Backpressure {
@@ -997,6 +1022,7 @@ impl Backpressure {
             config.fire_and_forget_byte_rate,
             config.fire_and_forget_refill_ms,
             config.egress_limit,
+            config.wal_fsync_headroom_bytes,
         )
     }
 
@@ -1015,6 +1041,7 @@ impl Backpressure {
         fire_and_forget_byte_rate: u64,
         fire_and_forget_refill_ms: u64,
         egress_limit: u32,
+        wal_fsync_headroom_bytes: u64,
     ) -> Backpressure {
         Backpressure {
             codel: Codel::from_millis(codel_target_ms, codel_interval_ms),
@@ -1033,11 +1060,13 @@ impl Backpressure {
                 ironbus_core::backpressure::EGRESS_LIMIT_MIN,
                 ironbus_core::backpressure::EGRESS_LIMIT_MAX,
             ),
+            fsync_headroom: FsyncHeadroom::new(wal_fsync_headroom_bytes),
             codel_shed: 0,
             codel_backstop_shed: 0,
             retry_shed: 0,
             fire_and_forget_shed: 0,
             egress_shed: 0,
+            wal_headroom_shed: 0,
         }
     }
 }
@@ -1066,6 +1095,12 @@ pub struct BackpressureSnapshot {
     pub egress_shed: u64,
     /// The `ironbus_egress_limit` gauge: the current AIMD egress concurrency limit (4..=128).
     pub egress_limit: u32,
+    /// The `ironbus_wal_fsync_headroom_shed_total` counter (#378): new produces shed because the
+    /// un-fsynced backlog could not be drained below the headroom.
+    pub wal_headroom_shed: u64,
+    /// The `ironbus_wal_fsync_headroom_bytes` gauge (#378): the configured fsync-headroom window in
+    /// bytes (`0` = disabled / unbounded).
+    pub wal_fsync_headroom_bytes: u64,
 }
 
 /// A snapshot of one work-group's consumer position, for the metrics endpoint (#16): an
@@ -2661,6 +2696,48 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             self.backpressure.codel_backstop_shed.saturating_add(1);
     }
 
+    /// Whether the fsync-headroom admission credit is ENABLED (#378): a non-zero
+    /// `wal_fsync_headroom_bytes`. The append actor reads this to decide whether the headroom path
+    /// applies at all, so a zero-config broker takes the byte-for-byte historical path.
+    #[must_use]
+    pub fn wal_headroom_enabled(&self) -> bool {
+        self.backpressure.fsync_headroom.is_enabled()
+    }
+
+    /// The configured fsync-headroom window in BYTES (#378), `0` = disabled. Exposed for the
+    /// `ironbus_wal_fsync_headroom_bytes` gauge and the materialized-config introspection.
+    #[must_use]
+    pub fn wal_fsync_headroom_bytes(&self) -> u64 {
+        self.backpressure.fsync_headroom.headroom_bytes()
+    }
+
+    /// The fsync-headroom ADMISSION decision for a new produce of `record_bytes` logical bytes (#378):
+    /// returns `true` to ADMIT, `false` to throttle/shed, given the LIVE un-fsynced backlog
+    /// (`unsynced_bytes()`, the #341 frontier) the storage log tracks. It reuses that frontier, so it
+    /// bounds the GROUP-COMMIT backlog under `sync` and the LOSS WINDOW under a relaxed level.
+    ///
+    /// PURE read (no IO, no clock, no mutation): it consults the configured headroom against the
+    /// current frontier only. When the headroom is disabled (the default) it always admits, so the
+    /// produce path is unchanged. The NO-WEDGE floor lives in the pure
+    /// [`FsyncHeadroom::would_admit`]: an EMPTY backlog always admits, so an oversized produce never
+    /// deadlocks. The caller (the append actor) composes this with the group-commit DRAIN: it forces a
+    /// flush (which resets the frontier to `0`) BEFORE the final shed decision, so a shed happens only
+    /// when a drain was possible and still insufficient. It NEVER drops an accepted record (the
+    /// decision is taken before the append), so I2 holds.
+    #[must_use]
+    pub fn wal_headroom_admit(&self, record_bytes: u64) -> bool {
+        self.backpressure
+            .fsync_headroom
+            .would_admit(self.log.unsynced_bytes(), record_bytes)
+    }
+
+    /// Records one fsync-headroom shed (#378): a new produce rejected because the un-fsynced backlog
+    /// could not be drained below the headroom even after a group-commit flush. Bumps the
+    /// `ironbus_wal_fsync_headroom_shed_total` counter (a shed is never silent). Saturating.
+    pub fn record_wal_headroom_shed(&mut self) {
+        self.backpressure.wal_headroom_shed = self.backpressure.wal_headroom_shed.saturating_add(1);
+    }
+
     /// The broker-side per-client retry-budget re-check (#69): records one ORIGINAL request the
     /// broker ACCEPTED at the current monotonic instant, feeding the accept-based throttle so the
     /// observed retry ratio stays meaningful. Called when a produce (or other request) is admitted.
@@ -2754,6 +2831,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             fire_and_forget_shed: self.backpressure.fire_and_forget_shed,
             egress_shed: self.backpressure.egress_shed,
             egress_limit: self.backpressure.egress.limit(),
+            wal_headroom_shed: self.backpressure.wal_headroom_shed,
+            wal_fsync_headroom_bytes: self.backpressure.fsync_headroom.headroom_bytes(),
         }
     }
 
@@ -4593,6 +4672,7 @@ mod tests {
             fire_and_forget_byte_rate: 0,
             fire_and_forget_refill_ms: 0,
             egress_limit: 0,
+            wal_fsync_headroom_bytes: 0,
         }
     }
 
@@ -9698,6 +9778,7 @@ mod tests {
             fire_and_forget_byte_rate: 0,
             fire_and_forget_refill_ms: 0,
             egress_limit: 0,
+            wal_fsync_headroom_bytes: 0,
             ..config(10, 5)
         };
         let fs = InMemoryFs::new();
@@ -9766,6 +9847,162 @@ mod tests {
             assert_eq!(DurabilityLevel::parse(name), Some(level));
         }
         assert_eq!(DurabilityLevel::parse("bogus"), None);
+    }
+
+    // ---- #378 fsync-headroom admission credit ----
+
+    #[test]
+    fn the_default_headroom_is_off_and_never_sheds() {
+        // THE TEETH for the safe default (#378): with the headroom at `0` (the compiled default) the
+        // admission credit is DISABLED, so it admits every produce regardless of the un-fsynced
+        // backlog, and the broker is byte-for-byte unchanged.
+        let cfg = config(10, 5);
+        assert_eq!(
+            cfg.wal_fsync_headroom_bytes, 0,
+            "the default headroom is off"
+        );
+        let e = open(cfg);
+        assert!(!e.wal_headroom_enabled(), "a zero headroom is disabled");
+        assert_eq!(e.wal_fsync_headroom_bytes(), 0);
+        // Even a record larger than any plausible headroom is admitted when the control is off.
+        assert!(e.wal_headroom_admit(1_000_000), "disabled always admits");
+    }
+
+    #[test]
+    fn the_headroom_admits_within_the_window_and_sheds_past_it_against_the_live_frontier() {
+        // THE TEETH for the headroom math reusing the live `unsynced_bytes()` frontier (#378, #341):
+        // under a RELAXED level (async), each `produce` advances the un-fsynced backlog (a commit
+        // defers the fsync, so the frontier GROWS), and the headroom admits while the next record
+        // fits and SHEDS once it would exceed the configured bound. This is the loss-window cap.
+        let headroom = 64u64;
+        let cfg = EngineConfig {
+            wal_fsync_headroom_bytes: headroom,
+            ..config_durability(DurabilityLevel::Async, 0, 0)
+        };
+        let fs = InMemoryFs::new();
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_durability(fs, clock, cfg);
+        assert!(e.wal_headroom_enabled());
+        assert_eq!(e.wal_fsync_headroom_bytes(), headroom);
+
+        // An empty backlog ALWAYS admits, even an oversized record (the no-wedge floor).
+        assert_eq!(e.unsynced_bytes(), 0);
+        assert!(
+            e.wal_headroom_admit(10_000),
+            "an empty backlog admits even an oversized record (no wedge)"
+        );
+
+        // Produce 16-byte records under async: the frontier grows by 16 each commit (no fsync), so
+        // after 4 the backlog is 64 (exactly the headroom). The 5th would push past it -> shed.
+        let payload = [0xab_u8; 16];
+        for _ in 0..4 {
+            // While the next record fits within the headroom, the credit admits it.
+            assert!(
+                e.wal_headroom_admit(payload.len() as u64),
+                "a record that fits the remaining headroom is admitted"
+            );
+            produce_d(&mut e, &payload);
+        }
+        assert_eq!(
+            e.unsynced_bytes(),
+            64,
+            "async deferred every fsync, so the un-fsynced backlog is the 4x16 bytes"
+        );
+        // The backlog is at the headroom: a 5th record would exceed it, so the credit sheds it.
+        assert!(
+            !e.wal_headroom_admit(payload.len() as u64),
+            "a non-empty backlog at the headroom sheds the next produce (the loss-window cap)"
+        );
+        // The accepted records are untouched (no data loss): the head still reflects all 4.
+        assert_eq!(
+            e.flushed_offset(),
+            Offset::new(4),
+            "the shed rejected NEW work only; the 4 accepted records are still durable-pending"
+        );
+    }
+
+    #[test]
+    fn a_sync_drains_the_backlog_and_re_admits() {
+        // THE TEETH for the throttle-then-admit composition (#378): a real durability barrier
+        // (`force_sync`, the same fsync `commit_batch` issues under `sync`) drains the un-fsynced
+        // frontier to zero, so the headroom that had filled is freed and the next produce is admitted
+        // again. Under the default `sync` level this is exactly what the actor's group-commit drain
+        // does, so the headroom THROTTLES (drain-then-admit) and never sheds.
+        let headroom = 64u64;
+        let cfg = EngineConfig {
+            wal_fsync_headroom_bytes: headroom,
+            ..config_durability(DurabilityLevel::Async, 0, 0)
+        };
+        let fs = InMemoryFs::new();
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_durability(fs, clock, cfg);
+        let payload = [0xcd_u8; 16];
+        for _ in 0..4 {
+            produce_d(&mut e, &payload);
+        }
+        assert_eq!(e.unsynced_bytes(), 64, "the backlog filled the headroom");
+        assert!(
+            !e.wal_headroom_admit(payload.len() as u64),
+            "at the headroom the next produce is shed before a drain"
+        );
+        // A real durability barrier drains the un-fsynced frontier to zero (the writer caught up).
+        e.force_sync().unwrap();
+        assert_eq!(
+            e.unsynced_bytes(),
+            0,
+            "a sync drained the un-fsynced backlog (the writer caught up)"
+        );
+        // With the backlog drained the headroom re-admits, so the producer makes progress again.
+        assert!(
+            e.wal_headroom_admit(payload.len() as u64),
+            "after the sync drained the backlog, the headroom admits again"
+        );
+    }
+
+    #[test]
+    fn the_sync_level_keeps_a_zero_backlog_so_the_headroom_never_sheds_there() {
+        // THE TEETH for the safe-default composition (#378 + #341): under the default `sync` level
+        // every `produce` issues the covering fsync, so the un-fsynced backlog is ALWAYS zero after a
+        // commit. The headroom therefore never has a non-empty backlog to shed against: under `sync`
+        // it can only ever THROTTLE (and with the actor's drain it admits), never lose, never shed.
+        let cfg = EngineConfig {
+            wal_fsync_headroom_bytes: 8,
+            ..config(10, 5)
+        };
+        assert_eq!(cfg.durability_level, DurabilityLevel::Sync);
+        let mut e = open(cfg);
+        let big = [0u8; 4096];
+        for _ in 0..6 {
+            // Each produce syncs (sync level), so before the next produce the backlog is zero and the
+            // empty-backlog floor admits even this 4 KiB record despite the tiny 8-byte headroom.
+            assert_eq!(
+                e.unsynced_bytes(),
+                0,
+                "sync leaves no backlog between produces"
+            );
+            assert!(
+                e.wal_headroom_admit(big.len() as u64),
+                "an empty backlog admits the next record even past a tiny headroom (no wedge)"
+            );
+            e.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: &big,
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            e.flushed_offset(),
+            Offset::new(6),
+            "every produce was admitted and durable"
+        );
+        assert_eq!(
+            e.backpressure_snapshot().wal_headroom_shed,
+            0,
+            "sync never sheds on the headroom"
+        );
     }
 
     // ---- Backpressure controls (#68, #69): deterministic engine-level tests over a ManualClock ----

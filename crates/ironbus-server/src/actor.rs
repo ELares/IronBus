@@ -111,6 +111,17 @@ pub enum ProduceOutcome {
     /// "shed under load" error, keep the session (a later produce succeeds once the standing delay
     /// clears).
     Shed,
+    /// An fsync-HEADROOM shed (#378): the un-fsynced (buffered-but-not-durable) write frontier is at
+    /// its configured headroom and a group-commit drain could NOT reduce it (it persists only under a
+    /// relaxed durability level, where a commit defers the fsync; under `sync` the drain always frees
+    /// the headroom, so this is never reached). The NEW produce is shed to keep the un-fsynced backlog
+    /// (the loss window / RAM bound) within the headroom. Distinct from [`ProduceOutcome::Shed`] (a
+    /// CoDel latency shed) and [`ProduceOutcome::AtCapacity`] (a disk-full byte-cap shed), so a
+    /// producer can tell a headroom shed from the others. It NEVER drops an already-accepted record
+    /// (the buffered records stay and are made durable by their level's barrier; only this NEW produce
+    /// is rejected, decided before its append), so I2 / no-data-loss hold. Reply a stable typed error,
+    /// keep the session (a later produce succeeds once the writer catches up).
+    WalHeadroomShed,
     /// A fatal storage error (a frozen writer): reply an error AND end the session.
     Fatal(EngineError),
     /// A transient produce failure: reply a generic error, keep the session.
@@ -465,6 +476,22 @@ fn produce_once<F: Filesystem, C: Clock + Clone>(
         engine.retry_budget_record_shed();
         return ProduceOutcome::Shed;
     }
+    // The fsync-headroom admission (#378), decided before the append exactly as the real actor does,
+    // so the direct path preserves the headroom-shed taxonomy and the no-data-loss property. A no-op
+    // when the headroom is disabled (the default). `produce_once` is a one-message group commit, so
+    // under `sync` the frontier is drained before each call and this never sheds; under a relaxed
+    // level the un-fsynced backlog can accumulate across calls, and once it fills the headroom this
+    // sheds the NEW produce (a drain cannot reduce a deferred-sync backlog).
+    if engine.wal_headroom_enabled() {
+        let record_bytes =
+            u64::try_from(append.key.len() + append.headers.len() + append.payload.len())
+                .unwrap_or(u64::MAX);
+        if !engine.wal_headroom_admit(record_bytes) {
+            engine.record_wal_headroom_shed();
+            engine.retry_budget_record_shed();
+            return ProduceOutcome::WalHeadroomShed;
+        }
+    }
     let view = Append {
         timestamp_ms: append.timestamp_ms,
         flags: ironbus_core::types::RecordFlags::from_bits(append.flags),
@@ -579,6 +606,42 @@ where
                         engine.retry_budget_record_shed();
                         let _ = reply.send(ProduceOutcome::Shed);
                         continue;
+                    }
+                    // fsync-HEADROOM admission (#378), decided BEFORE the append so it rejects only
+                    // NEW work and never drops an already-accepted record (I2 / no-data-loss hold). It
+                    // bounds the un-fsynced (buffered-but-not-durable) write frontier to the configured
+                    // headroom, reusing the engine's `unsynced_bytes()` frontier (the #341 tracking).
+                    // A no-op when the headroom is disabled (the default), so the append path is
+                    // byte-for-byte unchanged for a broker that has not opted in.
+                    if engine.wal_headroom_enabled() {
+                        // The new record's LOGICAL bytes (key + headers + payload), the same units the
+                        // un-fsynced frontier is measured in.
+                        let record_bytes = u64::try_from(
+                            append.key.len() + append.headers.len() + append.payload.len(),
+                        )
+                        .unwrap_or(u64::MAX);
+                        if !engine.wal_headroom_admit(record_bytes) {
+                            // The headroom is exhausted: DRAIN first. `flush_pending` issues the ONE
+                            // group-commit barrier for the parked batch. Under the default `sync` level
+                            // (and a DUE `interval` window) that is a real `fdatasync`, so it resets the
+                            // un-fsynced frontier to `0` and the record is then admitted by the no-wedge
+                            // floor: the headroom THROTTLES (drain-then-admit), never sheds, never loses.
+                            // Under a relaxed `async`/`none` level a commit DEFERS the fsync, so the
+                            // frontier does NOT drain; the re-check still fails and the new produce is
+                            // SHED to keep the loss window within the headroom. The already-buffered
+                            // records are untouched (they stay durable-pending and are made durable by
+                            // their level's barrier), so only this NEW produce is rejected.
+                            flush_pending(&mut engine, &mut pending);
+                            if !engine.wal_headroom_admit(record_bytes) {
+                                // The drain could not free the headroom (a relaxed level deferring the
+                                // fsync): shed this NEW produce with the typed, self-announcing signal,
+                                // count it (a shed is never silent), and keep the session open.
+                                engine.record_wal_headroom_shed();
+                                engine.retry_budget_record_shed();
+                                let _ = reply.send(ProduceOutcome::WalHeadroomShed);
+                                continue;
+                            }
+                        }
                     }
                     // Append (write, NO fsync) and park the reply; the covering fsync is issued once
                     // for the whole batch by `flush_pending` below.
@@ -762,6 +825,7 @@ mod tests {
             fire_and_forget_byte_rate: 0,
             fire_and_forget_refill_ms: 0,
             egress_limit: 0,
+            wal_fsync_headroom_bytes: 0,
         }
     }
 
@@ -818,6 +882,118 @@ mod tests {
         let _ = handle.shutdown();
         drop(handle);
         actor.join().unwrap()
+    }
+
+    /// The actor test config with the durability level and the fsync-headroom overridden, sharing the
+    /// default test knobs (#378). Lets a headroom test drive the real append-actor group-commit path
+    /// under a chosen durability level.
+    fn config_headroom(level: crate::engine::DurabilityLevel, headroom_bytes: u64) -> EngineConfig {
+        EngineConfig {
+            durability_level: level,
+            wal_fsync_headroom_bytes: headroom_bytes,
+            ..config()
+        }
+    }
+
+    /// Builds a fault-fs + `ManualClock` rig over `config_headroom(level, headroom_bytes)` and spawns
+    /// the append actor, returning the handle, the actor join handle, and the fault control (#378).
+    #[allow(clippy::type_complexity)]
+    fn rig_headroom(
+        level: crate::engine::DurabilityLevel,
+        headroom_bytes: u64,
+    ) -> (
+        EngineHandle<FaultFs<InMemoryFs>, ManualClock>,
+        std::thread::JoinHandle<Engine<FaultFs<InMemoryFs>, ManualClock>>,
+        FaultControl,
+    ) {
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let engine = Engine::open(
+            fs,
+            ManualClock::new(),
+            config_headroom(level, headroom_bytes),
+        )
+        .unwrap();
+        let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        (handle, actor, control)
+    }
+
+    #[test]
+    fn a_relaxed_level_headroom_sheds_the_over_backlog_produce_with_no_accepted_record_lost() {
+        // THE TEETH for the fsync-headroom shed over the REAL append actor (#378): under a relaxed
+        // `async` level a commit DEFERS the fsync, so the un-fsynced backlog grows across produces.
+        // With a tight headroom, once the backlog fills, the next produce is SHED with the typed
+        // `WalHeadroomShed` (a self-announcing signal), while every accepted record stays durable
+        // (no-data-loss: the shed rejects NEW work only). A 16-byte payload and a 64-byte headroom:
+        // the first 4 fit (4x16 = 64), the 5th would exceed it and is shed.
+        let (handle, actor, _control) = rig_headroom(crate::engine::DurabilityLevel::Async, 64);
+        let payload = [0xab_u8; 16];
+        // The first 4 produces fill the headroom exactly; each is accepted (async acks pre-fsync).
+        for i in 0..4u64 {
+            match handle.produce(append(&payload)).unwrap() {
+                ProduceOutcome::Appended(o) => {
+                    assert_eq!(o.get(), i, "accepted at the next offset");
+                }
+                other => panic!("produce {i} should be Appended, got {other:?}"),
+            }
+        }
+        // The 5th produce would push the un-fsynced backlog past the 64-byte headroom; a drain cannot
+        // free it (async defers the fsync), so it is shed with the typed headroom signal.
+        match handle.produce(append(&payload)).unwrap() {
+            ProduceOutcome::WalHeadroomShed => {}
+            other => panic!("the over-backlog produce should be WalHeadroomShed, got {other:?}"),
+        }
+        // NO DATA LOSS: the 4 accepted records are still the durable-pending head; the shed dropped
+        // only the NEW produce, never an accepted one. The shed counter incremented exactly once.
+        let (head, sheds) = handle
+            .with(|e| {
+                (
+                    e.flushed_offset().get(),
+                    e.backpressure_snapshot().wal_headroom_shed,
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            head, 4,
+            "the 4 accepted records are intact; only the new produce was shed"
+        );
+        assert_eq!(
+            sheds, 1,
+            "exactly one fsync-headroom shed was counted (never silent)"
+        );
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn the_sync_level_headroom_throttles_via_the_group_commit_drain_and_never_sheds() {
+        // THE TEETH for the safe-default composition over the REAL actor (#378 + #341): under the
+        // default `sync` level each group commit issues the covering fsync, draining the un-fsynced
+        // backlog to zero, so a tight headroom THROTTLES (drain-then-admit) and NEVER sheds, even for
+        // records far larger than the headroom. We use an 8-byte headroom and 4 KiB payloads: every
+        // produce is admitted and durable, and no headroom shed is ever counted.
+        let (handle, actor, _control) = rig_headroom(crate::engine::DurabilityLevel::Sync, 8);
+        let payload = [0xcd_u8; 4096];
+        for i in 0..6u64 {
+            match handle.produce(append(&payload)).unwrap() {
+                ProduceOutcome::Appended(o) => {
+                    assert_eq!(o.get(), i);
+                }
+                other => panic!("sync produce {i} should be Appended, got {other:?}"),
+            }
+        }
+        let (head, sheds) = handle
+            .with(|e| {
+                (
+                    e.flushed_offset().get(),
+                    e.backpressure_snapshot().wal_headroom_shed,
+                )
+            })
+            .unwrap();
+        assert_eq!(head, 6, "every sync produce was admitted and made durable");
+        assert_eq!(
+            sheds, 0,
+            "the sync level drains every batch, so the headroom never sheds"
+        );
+        let _ = recover(handle, actor);
     }
 
     #[test]

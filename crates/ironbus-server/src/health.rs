@@ -772,7 +772,13 @@ fn backpressure_metric_lines(bp: &BackpressureSnapshot) -> String {
          ironbus_retry_ratio {retry_ratio}\n\
          # HELP ironbus_egress_limit The current AIMD egress concurrency limit (between 4 and 128); halves when a downstream sink degrades, climbs back as it heals.\n\
          # TYPE ironbus_egress_limit gauge\n\
-         ironbus_egress_limit {egress_limit}\n",
+         ironbus_egress_limit {egress_limit}\n\
+         # HELP ironbus_wal_fsync_headroom_shed_total New produces shed by the fsync-headroom admission credit (#378): the un-fsynced buffered-but-not-durable backlog hit the configured headroom and a group-commit drain could not free it (only reached under a relaxed durability level deferring the fsync), so the new produce was rejected to keep the loss window / RAM bound within the headroom; never drops an accepted record.\n\
+         # TYPE ironbus_wal_fsync_headroom_shed_total counter\n\
+         ironbus_wal_fsync_headroom_shed_total {wal_headroom_shed}\n\
+         # HELP ironbus_wal_fsync_headroom_bytes The configured fsync-headroom admission window in bytes (#378): the most un-fsynced buffered-but-not-durable record bytes the write frontier may run ahead of the durable frontier before a produce is throttled (a group-commit drain forced first) or shed; 0 = disabled (unbounded by this control).\n\
+         # TYPE ironbus_wal_fsync_headroom_bytes gauge\n\
+         ironbus_wal_fsync_headroom_bytes {wal_fsync_headroom_bytes}\n",
         codel_shed = bp.codel_shed,
         codel_backstop_shed = bp.codel_backstop_shed,
         codel_interval_resets = bp.codel_interval_resets,
@@ -782,6 +788,8 @@ fn backpressure_metric_lines(bp: &BackpressureSnapshot) -> String {
         codel_sojourn = bp.codel_sojourn_estimate_ms,
         retry_ratio = bp.retry_ratio_per_million,
         egress_limit = bp.egress_limit,
+        wal_headroom_shed = bp.wal_headroom_shed,
+        wal_fsync_headroom_bytes = bp.wal_fsync_headroom_bytes,
     )
 }
 
@@ -1563,6 +1571,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap();
@@ -1670,6 +1679,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap();
@@ -2186,6 +2196,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap();
@@ -2323,6 +2334,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap();
@@ -2392,6 +2404,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap();
@@ -2660,6 +2673,7 @@ mod tests {
                     fire_and_forget_byte_rate: 0,
                     fire_and_forget_refill_ms: 0,
                     egress_limit: 0,
+                    wal_fsync_headroom_bytes: 0,
                 },
             )
             .unwrap();
@@ -2708,6 +2722,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap();
@@ -2859,6 +2874,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap();
@@ -2990,6 +3006,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap();
@@ -3198,6 +3215,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap();
@@ -3510,6 +3528,13 @@ mod tests {
         "ironbus_codel_interval_resets_total",
         "ironbus_fire_and_forget_shed_total",
         "ironbus_egress_shed_total",
+        // The fsync-headroom shed counter (#378): a new produce shed because the un-fsynced backlog
+        // (the loss window / RAM bound) could not be drained below the configured headroom (only
+        // reached under a relaxed durability level that defers the fsync). A deliberate resilience
+        // SHED the #16 contract guarantees is never silent, an unlabeled `_total`, so it joins this
+        // set. The companion `ironbus_wal_fsync_headroom_bytes` is a GAUGE (no `_total`), so it is
+        // excluded here and pinned only in `FROZEN_METRIC_TYPES`.
+        "ironbus_wal_fsync_headroom_shed_total",
     ];
 
     #[test]
@@ -3645,9 +3670,14 @@ mod tests {
         ("ironbus_retry_shed_total", "counter"),
         ("ironbus_fire_and_forget_shed_total", "counter"),
         ("ironbus_egress_shed_total", "counter"),
+        // The fsync-headroom admission (#378): the shed COUNTER (an unlabeled `_total`, also in
+        // FROZEN_RESILIENCE_COUNTERS) and the configured-headroom GAUGE (no `_total`, pinned only
+        // here, like the other backpressure gauges).
+        ("ironbus_wal_fsync_headroom_shed_total", "counter"),
         ("ironbus_codel_sojourn_estimate_ms", "gauge"),
         ("ironbus_retry_ratio", "gauge"),
         ("ironbus_egress_limit", "gauge"),
+        ("ironbus_wal_fsync_headroom_bytes", "gauge"),
         // Per-group consumer gauges.
         ("ironbus_group_committed_offset", "gauge"),
         ("ironbus_group_consumer_lag", "gauge"),
@@ -3875,6 +3905,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap();
@@ -4073,6 +4104,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap();
@@ -4282,6 +4314,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap();
