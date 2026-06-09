@@ -29,6 +29,11 @@ pub struct OfflineReader<F: Filesystem> {
     /// the reader yields has an offset strictly below this; no durable record exists at or
     /// above it.
     durable_head: Offset,
+    /// The oldest retained offset: the base offset of the first (lowest-id) segment, the low end
+    /// of the durable range `[earliest_retained, durable_head)`. Equal to `durable_head` for an
+    /// empty directory (the range is empty). Reaped segments raise this above zero, so an offline
+    /// consumer-reset (#299) clamps a chosen offset into the records that still exist.
+    earliest_retained: Offset,
     /// What the durable prefix dropped to reach the last intact record (a torn or corrupt
     /// active tail), in the same shape recovery reports. Empty for a clean directory.
     loss_report: LossReport,
@@ -53,6 +58,9 @@ impl<F: Filesystem> OfflineReader<F> {
         let total = ids.len();
         let mut next_base_offset = 0u64;
         let mut next_base_seq = 0u64;
+        // The oldest retained offset: the base offset of the FIRST segment, captured in the loop
+        // below. An empty directory leaves it at the durable head (an empty range).
+        let mut earliest_retained = 0u64;
         let mut loss_report = LossReport::new();
         for (i, &id) in ids.iter().enumerate() {
             let name = segment_file_name(id);
@@ -69,6 +77,10 @@ impl<F: Filesystem> OfflineReader<F> {
             }
             let base_offset = header.base_offset.get();
             let base_seq = header.base_seq.get();
+            if i == 0 {
+                // The first (lowest-id) segment's base offset is the oldest retained offset.
+                earliest_retained = base_offset;
+            }
             if i > 0 && (base_offset != next_base_offset || base_seq != next_base_seq) {
                 return Err(StorageError::SegmentChainBroken {
                     segment_id: id,
@@ -98,12 +110,28 @@ impl<F: Filesystem> OfflineReader<F> {
                 loss_report.push(LossEvent::span(id, scan.valid_end, physical_len, 1, reason));
             }
         }
+        // With no segments the range is empty; pin earliest to the head so `[earliest, head)` is
+        // the empty range `[head, head)` rather than `[0, head)` for a never-written directory.
+        if ids.is_empty() {
+            earliest_retained = next_base_offset;
+        }
         Ok(OfflineReader {
             fs,
             segment_ids: ids,
             durable_head: Offset::new(next_base_offset),
+            earliest_retained: Offset::new(earliest_retained),
             loss_report,
         })
+    }
+
+    /// The oldest retained offset: the low end of the durable range `[earliest_retained,
+    /// durable_head)`. Zero for a never-reaped directory; raised by segment reaping. Equal to the
+    /// durable head for an empty directory (the range is empty). The offline consumer-reset (#299)
+    /// clamps a chosen offset to `[earliest_retained, durable_head]` so a reset never lands in a
+    /// reaped hole or past the head.
+    #[must_use]
+    pub fn earliest_retained(&self) -> Offset {
+        self.earliest_retained
     }
 
     /// The durable high-water mark: the offset just past the last durable record. Every record
@@ -181,9 +209,29 @@ mod tests {
     fn an_empty_directory_reads_nothing() {
         let reader = OfflineReader::open(InMemoryFs::new()).unwrap();
         assert_eq!(reader.durable_head(), Offset::ZERO);
+        // The durable range is empty: earliest == head == 0.
+        assert_eq!(reader.earliest_retained(), Offset::ZERO);
         assert!(reader.segment_ids().is_empty());
         assert!(reader.loss_report().is_empty());
         assert!(all_records(&reader).is_empty());
+    }
+
+    #[test]
+    fn earliest_retained_is_zero_for_a_never_reaped_log_and_below_the_head() {
+        let mut log =
+            Log::open(InMemoryFs::new(), ManualClock::new(), LogConfig::default()).unwrap();
+        for i in 0..5u8 {
+            append(&mut log, &[i; 4]);
+        }
+        log.sync().unwrap();
+        let head = log.flushed_offset();
+        let fs = log.into_filesystem();
+
+        let reader = OfflineReader::open(fs).unwrap();
+        // A log that has never been reaped retains from offset 0 up to the head.
+        assert_eq!(reader.earliest_retained(), Offset::ZERO);
+        assert_eq!(reader.durable_head(), head);
+        assert!(reader.earliest_retained() <= reader.durable_head());
     }
 
     #[test]

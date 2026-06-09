@@ -225,7 +225,23 @@ committed cursor. It is the committed watermark plus a run-length acked-ahead se
 this is read as the legacy committed-only format (its leading 8 LE bytes the committed
 offset). The default work-group's checkpoint file is `cursor.ckpt`; a named group's is
 `cursor-<hex(name)>.ckpt`, where the group name is lowercase-hex-encoded so a path-unsafe
-name is a safe, reversible filename.
+name is a safe, reversible filename. The OFFLINE `admin consumer-reset` verb (#299) rewrites
+this exact file: it writes the `AckCursor::resume(target)` snapshot (committed watermark, no
+ahead set) through the same dual-slot CRC checkpoint, so the broker's recovery reads it
+natively. The canonical filename helper is `ironbus_storage::naming::cursor_checkpoint_name`,
+which the engine and the offline verb share so the names cannot drift.
+
+### DLQ redrive watermark (the offline redrive checkpoint, #299)
+
+Source: `crates/ironbus-storage/src/admin.rs`. The OFFLINE `admin dlq-redrive` verb records how
+far it has re-injected the durable DLQ records onto the main log in `dlq-redrive.ckpt`, which is
+the SAME two-slot CRC checkpoint slot format above (no new on-disk format), with an 8-byte
+payload: a little-endian `u64` count of leading DLQ records already redriven. Its absence means
+"nothing redriven yet". The watermark is advanced ONLY after the re-injected records are fsynced
+to the main log, so a crash before the advance re-redrives that suffix (at-least-once) rather than
+skipping it, and a completed redrive re-run re-injects nothing (idempotent). The filename never
+begins with `cursor`/`attempts` and is not a segment file, so it is inert to cursor/attempt
+recovery and to the log.
 
 ### Attempt-count snapshot (the checkpoint payload, #358)
 

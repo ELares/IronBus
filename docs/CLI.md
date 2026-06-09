@@ -19,9 +19,13 @@ flag and code does.
 > `segments`, `dlq`, `retention`, `config`, `recovery report`, `completions`) and a
 > versioned `--json` schema contract; those verbs are NOT implemented in the current binary
 > and are deliberately absent here. The `scrub` and `repair` verbs (#92) and their
-> versioned `--json` schemas (`ironbus.cli.scrub.v1` / `ironbus.cli.repair.v1`), and the
-> `top` verb (#93) with its `ironbus.cli.top.v1` `--json` schema, ARE implemented and
-> documented below. This reference enumerates only what `main.rs` actually parses and runs.
+> versioned `--json` schemas (`ironbus.cli.scrub.v1` / `ironbus.cli.repair.v1`), the
+> `top` verb (#93) with its `ironbus.cli.top.v1` `--json` schema, and the OFFLINE mutating
+> `admin consumer-reset` / `admin dlq-redrive` verbs (#299) with their
+> `ironbus.cli.admin-consumer-reset.v1` / `ironbus.cli.admin-dlq-redrive.v1` schemas, ARE
+> implemented and documented below (the MUTATING WIRE admin verbs and `force-reap` remain
+> deferred to the authed admin surface #380/#106). This reference enumerates only what
+> `main.rs` actually parses and runs.
 
 ## Command summary
 
@@ -35,6 +39,8 @@ flag and code does.
 | `dump` | offline (reads `--data-dir`) | Unix only in v1 | Stream every durable record (or, with `--dlq`, the dead-letter sink). |
 | `scrub` | offline (reads `--data-dir`) | Unix only in v1 | Strictly read-only full integrity scan: report every corruption / torn-tail / checksum issue (the plan). Never writes. |
 | `repair` | offline (reads `--data-dir`) | Unix only in v1 | Default the same read-only plan as `scrub`; `--apply` quarantines and truncates under the exclusive lock (recovery made explicit). |
+| `admin consumer-reset` | OFFLINE MUTATING (reads + rewrites `--data-dir`) | Unix only in v1 | Rewrite a work-group's durable cursor checkpoint to `--to <offset\|earliest\|latest>`, clamped to the durable range, under the exclusive lock (broker stopped). An out-of-range explicit offset is rejected. (#299) |
+| `admin dlq-redrive` | OFFLINE MUTATING (reads + rewrites `--data-dir`) | Unix only in v1 | Re-inject the dead-lettered records from the durable DLQ sink back onto the main log, crash-safely and idempotently, under the exclusive lock (broker stopped). (#299) |
 | `top` | LIVE (polls `/admin`) any; OFFLINE (reads `--data-dir`) Unix only in v1 | Strictly read-only status view. LIVE polls the broker's `/admin` v1 JSON; OFFLINE renders only the file-derived panels behind a mandatory banner. |
 | `help` / `--help` / `-h` | neither | any | Print the usage banner. |
 | `version` / `--version` / `-V` | neither | any | Print a single `ironbus <version>` line. |
@@ -520,6 +526,91 @@ object plus an `applied` boolean:
 
 ```json
 {"schema":"ironbus.cli.repair.v1","data_dir":"<dir>","segments":<n>,"skipped_spans":<k>,"data_loss_spans":<d>,"data_loss_bytes":<db>,"torn_tail_bytes":<tb>,"applied":<bool>,"events":[...],"ok":<bool>,"exit_code":<code>}
+```
+
+## `admin consumer-reset` / `admin dlq-redrive` (offline MUTATING; Unix only in v1)
+
+The OFFLINE, AUTH-FREE subset of the mutating admin surface (#299). Both operate on a STOPPED
+broker's `--data-dir`: they take the SAME exclusive data-dir lock `serve` holds, so a running
+broker blocks them with exit `5` ("stop the broker first") and they can never race a live writer.
+This is the broker-stopped contract: the safety boundary is "the broker is stopped and the operator
+owns the bytes on disk", which needs no authentication because there is no network surface. The
+MUTATING WIRE forms (the same actions on a LIVE broker) and `admin force-reap` (reaping stuck leases
+on a running broker, which has no offline meaning) need connection-scoped auth and are DEFERRED to
+the authed admin surface ([#380](https://github.com/ELares/IronBus/issues/380) /
+[#106](https://github.com/ELares/IronBus/issues/106)); `admin force-reap` is a clean usage error
+here, naming the deferral. The mutation reuses the broker's EXACT on-disk codecs (the dual-slot CRC
+checkpoint and the `AckCursor` snapshot for the cursor; the segmented log's append+fsync for the
+redrive), so a crash mid-operation leaves a recoverable data directory, never a corrupt log.
+
+### `admin consumer-reset`
+
+Rewrites a work-group's durable cursor checkpoint to a chosen offset, so the broker resumes the
+group from there on its next start (re-reading or skipping records as the operator intends).
+
+| Flag | Type | Default | Values | Meaning |
+|------|------|---------|--------|---------|
+| `--data-dir <dir>` | path | required | path | The stopped broker's data directory. |
+| `--group <name>` | string | required | any name (`""` = the default group) | The work-group whose cursor is rewritten. Required even for the default group, so a reset is never applied to the wrong cursor by omission. |
+| `--to <target>` | string | required | a `u64` offset, or `earliest` / `latest` | The committed offset to rewrite to. `earliest` is the oldest retained offset; `latest` is the durable head. |
+| `--json` | flag | off (human text) | n/a | Emit the versioned `ironbus.cli.admin-consumer-reset.v1` result object. |
+
+The target is clamped to the durable range `[earliest_retained, head]`: `earliest`/`latest` resolve
+to the range ends; an explicit `--to <offset>` OUTSIDE the range is REJECTED with exit `1` (rather
+than silently snapped), so an operator who names an offset that does not exist sees the mistake. The
+rewritten cursor is the `AckCursor::resume(target)` snapshot (the committed watermark, no
+acked-ahead set) written through the same crash-safe dual-slot CRC checkpoint the broker writes, to
+`cursor.ckpt` (the default group) or `cursor-<hex(name)>.ckpt` (a named group).
+
+Exit codes: `0` success, `1` usage (bad flag, missing `--data-dir`/`--group`/`--to`, or an
+out-of-range explicit offset), `2` data dir not found, `4` structurally corrupt/blocked, `5` a
+broker holds the lock, `70` IO fault.
+
+Human form:
+
+```
+admin consumer-reset: group "orders" cursor 12 -> 4 (durable range [0, 10])
+```
+
+`--json` form (the single versioned result object, `ironbus.cli.admin-consumer-reset.v1`):
+
+```json
+{"schema":"ironbus.cli.admin-consumer-reset.v1","data_dir":"<dir>","group":"<name>","committed":<n>,"previous_committed":<n|null>,"earliest_retained":<e>,"head":<h>,"ok":true,"exit_code":0}
+```
+
+### `admin dlq-redrive`
+
+Re-injects the dead-lettered records from the durable DLQ sink (`dlq/`) back onto the MAIN log, so a
+poison batch an operator has fixed can be reprocessed.
+
+| Flag | Type | Default | Values | Meaning |
+|------|------|---------|--------|---------|
+| `--data-dir <dir>` | path | required | path | The stopped broker's data directory. |
+| `--json` | flag | off (human text) | n/a | Emit the versioned `ironbus.cli.admin-dlq-redrive.v1` result object. |
+
+Crash-safe, idempotent ordering: the un-redriven DLQ records' ORIGINAL key/headers/payload/timestamp
+are appended to the main log via the log's own append path and fsynced FIRST, then a durable redrive
+watermark (a dual-slot CRC `dlq-redrive.ckpt`, the count of DLQ records already re-injected) is
+advanced. The watermark makes a COMPLETED redrive idempotent: a re-run sees the watermark at the DLQ
+depth and re-injects nothing (no duplicates). A crash BETWEEN the fsync and the watermark advance
+leaves the records re-injected but the watermark not advanced, so the next run re-injects that suffix
+again (at-least-once); the main log and the DLQ sink are intact and recoverable at every instant. The
+DLQ sink is PRESERVED (redrive copies forward; it does not delete the sink). An absent or empty DLQ
+redrives zero records and is not an error.
+
+Exit codes: `0` success (including the idempotent zero-redriven re-run), `2` data dir not found, `4`
+structurally corrupt/blocked, `5` a broker holds the lock, `70` IO fault.
+
+Human form:
+
+```
+admin dlq-redrive: re-injected 4 of 4 DLQ record(s) onto the main log (0 already redriven)
+```
+
+`--json` form (the single versioned result object, `ironbus.cli.admin-dlq-redrive.v1`):
+
+```json
+{"schema":"ironbus.cli.admin-dlq-redrive.v1","data_dir":"<dir>","redriven":<n>,"dlq_records":<total>,"already_redriven":<prior>,"ok":true,"exit_code":0}
 ```
 
 ## `top` (LIVE: any platform; OFFLINE: Unix only in v1)

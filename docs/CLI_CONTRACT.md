@@ -269,6 +269,56 @@ torn/corrupt tail) is its own schema, the promotion of [`CLI.md`](CLI.md)'s
 `bytes`/`events[]` shape as the `ironbus.loss-report.v1` events (segment id, start, end,
 reason), so the CLI loss object and the recovery loss report agree on every field name.
 
+#### `admin-consumer-reset` (offline MUTATING; the `admin consumer-reset` result, #299)
+
+The single result object of the OFFLINE consumer reset. The verb operates on a STOPPED
+broker's `--data-dir` under the exclusive data-dir lock, so it is never a wire surface and
+needs no auth (the MUTATING WIRE form is deferred to the authed admin surface #380/#106).
+
+```json
+{
+  "schema": "ironbus.cli.admin-consumer-reset.v1",
+  "data_dir": "<dir>",
+  "group": "<name>",
+  "committed": 4,
+  "previous_committed": 12,
+  "earliest_retained": 0,
+  "head": 10,
+  "ok": true,
+  "exit_code": 0
+}
+```
+
+`committed` is the resolved, range-clamped offset the cursor was rewritten to;
+`previous_committed` is the prior durable committed offset, or `null` if the group had no
+durable cursor before. `earliest_retained`/`head` are the durable range the target was
+clamped against. An explicit `--to <offset>` outside `[earliest_retained, head]` is REJECTED
+(exit `1`, the `ironbus.cli.result.v1` envelope, not this object); `earliest`/`latest`
+resolve to the range ends.
+
+#### `admin-dlq-redrive` (offline MUTATING; the `admin dlq-redrive` result, #299)
+
+The single result object of the OFFLINE DLQ redrive (re-inject the dead-lettered records onto
+the main log, crash-safely and idempotently, under the exclusive lock).
+
+```json
+{
+  "schema": "ironbus.cli.admin-dlq-redrive.v1",
+  "data_dir": "<dir>",
+  "redriven": 4,
+  "dlq_records": 4,
+  "already_redriven": 0,
+  "ok": true,
+  "exit_code": 0
+}
+```
+
+`redriven` is how many DLQ records this run re-injected (0 on an idempotent re-run after a
+completed redrive); `dlq_records` is the DLQ depth; `already_redriven` is the durable redrive
+watermark on entry. The crash-safe ordering (records fsynced, THEN the watermark advanced) and
+the at-least-once re-redrive on a crash before the watermark advance are described in
+[`CLI.md`](CLI.md).
+
 #### The error/result object (every command; emitted on a non-zero exit)
 
 The terminal object on ANY non-zero exit path (except usage exit `1`, see 1.2). It is the
@@ -361,6 +411,14 @@ online/offline-capable/offline-only, is the SAME tagging as the command-tree dia
 table does not introduce a new classification, it states the flag interaction over the
 existing one.
 
+> Note (#299): the MUTATING consumer-reset and DLQ-redrive actions ship today only in their
+> OFFLINE-ONLY forms, `admin consumer-reset` and `admin dlq-redrive`, which read and rewrite a
+> STOPPED broker's `--data-dir` under the exclusive lock (and so are tan/offline-only: they refuse
+> a running broker, never connect, and reject `--online`). The blue `consumer reset` / `dlq
+> redrive` WIRE leaves above (and `force-reap` on a live broker) remain DEFERRED to the authed admin
+> surface (#380/#106): a mutating action over the wire needs connection-scoped auth, so it cannot
+> share the unauthenticated trust model and is intentionally not shipped here.
+
 ### 2.3 `--data-dir`, `--addr`, `--json`
 
 These keep their [`CLI.md`](CLI.md) meaning unchanged. `--data-dir` is the offline source
@@ -449,6 +507,11 @@ return these codes are tracked under the children of
   [#92](https://github.com/ELares/IronBus/issues/92).
 - `top` (the live/offline TUI, read-only, degrades to text):
   [#93](https://github.com/ELares/IronBus/issues/93).
+- `admin consumer-reset` / `admin dlq-redrive` (the OFFLINE, broker-stopped subset of the mutating
+  admin surface): [#299](https://github.com/ELares/IronBus/issues/299). The MUTATING WIRE forms and
+  `force-reap` (a live-broker operation) stay deferred to the authed admin surface
+  [#380](https://github.com/ELares/IronBus/issues/380) / [#106](https://github.com/ELares/IronBus/issues/106),
+  since a mutating action over the wire needs connection-scoped auth.
 - `consumer` group (`ls`/`info`/`lag`/`reset`/`purge`/`pause`/`resume`), `segments`
   (`ls`/`verify`), `dlq` (`ls`/`redrive`/`purge`), `retention` (`info`/`reap`), `info`,
   `tap`, `wire`, `bench`, `config` (`check`/`print`/`schema`/`get`/`set`/`reload`),
