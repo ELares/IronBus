@@ -382,6 +382,47 @@ impl LeaseTable {
         NackOutcome::Requeued { deadline }
     }
 
+    /// The delivery count (attempt number) of the lease at `offset` IF the next [`claim`] at `now`
+    /// would be a REDELIVERY, else `None` (#402). A redelivery is what a claim produces when an
+    /// existing lease has EXPIRED (its deadline is at or before `now`): the message was already
+    /// delivered `deliveries` times and the next claim would be attempt `deliveries + 1`. Returns
+    /// `None` for an offset with no lease (a FIRST delivery, never a redelivery to throttle) or one
+    /// whose lease is still active (it is in-flight, not reclaimable). Used by the broker to decide
+    /// whether to consult the retry budget BEFORE claiming, so a throttled redelivery is DEFERRED via
+    /// [`defer_redelivery`] without consuming a generation or bumping the attempt count.
+    ///
+    /// [`claim`]: LeaseTable::claim
+    /// [`defer_redelivery`]: LeaseTable::defer_redelivery
+    #[must_use]
+    pub fn pending_redelivery_attempt(&self, offset: Offset, now: u64) -> Option<u32> {
+        match self.leases.get(&offset.get()) {
+            Some(lease) if now >= lease.deadline => Some(lease.deliveries),
+            _ => None,
+        }
+    }
+
+    /// DEFERS a redelivery by re-arming an EXPIRED lease's deadline to `now + delay_nanos`, WITHOUT
+    /// bumping the delivery count or the generation (#402): the retry-throttle SPACES OUT a redelivery
+    /// storm rather than dropping any message, so an at-least-once message still redelivers later. It
+    /// is a no-op (returns `false`) unless a lease at `offset` exists AND is expired at `now` (only an
+    /// expired, reclaimable lease is a redelivery candidate); an active lease is left untouched. Unlike
+    /// [`nack`], it does NOT consume a generation (no holder is being fenced: the prior attempt already
+    /// expired) and does NOT change the attempt count, so the message's `MaxDeliver` budget is
+    /// unaffected and only genuine deliveries count toward it. The deadline is NOT clamped to the
+    /// per-attempt hard cap (like [`nack`], a deferral schedules the NEXT attempt, which may fall
+    /// further out than one visibility window).
+    ///
+    /// [`nack`]: LeaseTable::nack
+    pub fn defer_redelivery(&mut self, offset: Offset, now: u64, delay_nanos: u64) -> bool {
+        match self.leases.get_mut(&offset.get()) {
+            Some(lease) if now >= lease.deadline => {
+                lease.deadline = now.saturating_add(delay_nanos);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The offsets whose visibility has expired at `now` (deadline at or before `now`),
     /// in ascending order. These are reclaimable: the janitor redelivers them by
     /// claiming them again.
@@ -451,6 +492,69 @@ mod tests {
         // Redeliver by re-claiming after expiry, so tok0 is now stale.
         let _ = t.claim(off(0), 1000);
         assert_eq!(t.nack(&tok0, 1000, 0), NackOutcome::Fenced);
+    }
+
+    #[test]
+    fn pending_redelivery_attempt_only_for_an_expired_lease() {
+        // The retry-throttle seam (#402): a redelivery candidate is an offset with an EXPIRED lease.
+        let mut t = LeaseTable::new(cfg());
+        // No lease yet: not a redelivery (a first claim, never throttled).
+        assert_eq!(t.pending_redelivery_attempt(off(0), 0), None);
+        let _tok0 = token(t.claim(off(0), 0));
+        // Active lease (now < deadline 30): in-flight, not reclaimable, so not a redelivery candidate.
+        assert_eq!(t.pending_redelivery_attempt(off(0), 10), None);
+        // Past the deadline: the next claim would be attempt 2 (a redelivery), reporting the prior
+        // attempt count (1).
+        assert_eq!(t.pending_redelivery_attempt(off(0), 30), Some(1));
+        assert_eq!(t.pending_redelivery_attempt(off(0), 1000), Some(1));
+    }
+
+    #[test]
+    fn defer_redelivery_spaces_out_without_bumping_the_attempt_or_generation() {
+        // THE no-data-loss core (#402): a deferral re-arms the deadline of an expired lease WITHOUT
+        // bumping the delivery count or the generation, so the message redelivers LATER (spaced out)
+        // and still counts only genuine deliveries toward MaxDeliver.
+        let mut t = LeaseTable::new(cfg());
+        let tok0 = token(t.claim(off(0), 0));
+        // Expired at now=30. Defer by 100 ns: the deadline moves to 130, no claim consumed.
+        assert!(
+            t.defer_redelivery(off(0), 30, 100),
+            "an expired lease defers"
+        );
+        // Not reclaimable until the deferred deadline; the original token is NOT fenced (no generation
+        // was consumed), so the still-working holder could even ack it.
+        assert_eq!(t.expired(30), Vec::<Offset>::new(), "deferred past now");
+        assert_eq!(t.expired(129), Vec::<Offset>::new());
+        assert_eq!(
+            t.expired(130),
+            vec![off(0)],
+            "reclaimable at the deferred deadline"
+        );
+        // The delivery count was NOT bumped by the deferral: the next claim is attempt 2, exactly as
+        // if the deferral had never happened (a deferral is not a delivery).
+        match t.claim(off(0), 130) {
+            Claim::Granted {
+                token: tok1,
+                deliveries,
+            } => {
+                assert_eq!(deliveries, 2, "the deferral did not count as a delivery");
+                assert_ne!(tok1.generation, tok0.generation, "the claim still fences");
+            }
+            other => panic!("expected Granted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn defer_redelivery_is_a_no_op_on_an_active_or_absent_lease() {
+        // A deferral only touches an EXPIRED lease: an active lease (mid-attempt) and an absent offset
+        // are left untouched, so the throttle never disturbs an in-flight delivery or a first claim.
+        let mut t = LeaseTable::new(cfg());
+        assert!(!t.defer_redelivery(off(0), 0, 100), "no lease: no-op");
+        let tok0 = token(t.claim(off(0), 0));
+        assert!(!t.defer_redelivery(off(0), 10, 100), "active lease: no-op");
+        // The active lease still expires on its ORIGINAL schedule (deadline 30), untouched.
+        assert!(t.holds_active(&tok0, 29));
+        assert!(!t.holds_active(&tok0, 30));
     }
 
     #[test]

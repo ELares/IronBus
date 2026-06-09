@@ -1076,6 +1076,7 @@ fn cmd_pub(addr: &str, key: &[u8], payload: &[u8], out: &mut impl Write) -> Resu
             key,
             headers: b"",
             dedup: None,
+            fire_and_forget: false,
             payload,
         })
         .map_err(|e| classify(addr, "publishing to", &e))?;

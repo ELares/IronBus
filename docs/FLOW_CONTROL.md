@@ -323,6 +323,17 @@ ordering of Part 1.
 
 ### Fire-and-forget drop-and-report with a grace window
 
+> **The fire-and-forget WIRE TIER and the egress AIMD are now LIVE (#11, #402).** The
+> fire-and-forget tier this section describes is wired: a producer marks a publish
+> fire-and-forget with the additive `PUB_FLAG_FIRE_AND_FORGET` PUB flag (bit 6) and does
+> not wait for a `PubAck`; the broker drops it under the fire-and-forget token bucket
+> (counted in `ironbus_fire_and_forget_shed_total`) or appends it durably with no ack.
+> Separately, the **egress AIMD** (#69) now adjusts the EFFECTIVE per-consumer egress
+> credit WITHIN the negotiated #292 ceiling (it never exceeds the cap): a prompt ack
+> drives an additive increase, a would-block / slow-ack / nack drives a multiplicative
+> decrease (`ironbus_egress_limit` / `ironbus_egress_shed_total` move). Both are off by
+> default. The structured `retry_after_ms` / `shed` PFLOW hint below still awaits #11.
+
 The enforcement that makes PFLOW honest (a producer cannot evade it by ignoring the
 hint) is the **fire-and-forget token bucket** already specified in
 [BACKPRESSURE.md](BACKPRESSURE.md), "The fire-and-forget token bucket." This document

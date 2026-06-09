@@ -394,7 +394,15 @@ impl Client {
     /// Returns a [`ClientError`] on an IO error, an over-large field, or a server error.
     pub fn produce_dedup(&mut self, message: &PubBody<'_>) -> Result<ProduceAck, ClientError> {
         let mut body = Vec::new();
-        encode_pub(message, &mut body).map_err(ClientError::Body)?;
+        // The default produce path is ALWAYS at-least-once: force the fire-and-forget bit clear so a
+        // caller who set it on the body still gets the unchanged PubAck path here (the opt-in QoS-0
+        // path is the explicit `produce_fire_and_forget`). Backward-compat: an old caller never set
+        // the field (it defaults false), so this is a no-op for them.
+        let at_least_once = PubBody {
+            fire_and_forget: false,
+            ..*message
+        };
+        encode_pub(&at_least_once, &mut body).map_err(ClientError::Body)?;
         self.send(FrameType::Pub, &body)?;
         match self.read_frame()? {
             // A fresh produce: a PubAck whose body is the 8-byte assigned offset.
@@ -423,6 +431,36 @@ impl Client {
             }
             (other, _) => Err(ClientError::Unexpected(other)),
         }
+    }
+
+    /// Produces a message on the FIRE-AND-FORGET (QoS-0, #11, #402) fast path: it sets the additive
+    /// `PUB_FLAG_FIRE_AND_FORGET` wire bit and does NOT wait for a `PubAck`, so it returns the moment
+    /// the frame is written. The broker MAY drop the produce under load (gated by its fire-and-forget
+    /// token bucket) WITHOUT acking, and otherwise appends it durably but sends no `PubAck`, so the
+    /// producer accepts loss BY CONTRACT. This is the README "optional fire-and-forget fast path": it
+    /// trades the at-least-once guarantee for throughput and no round-trip. Use [`Client::produce`]
+    /// for the default at-least-once path (an assigned offset, unchanged).
+    ///
+    /// The `message.fire_and_forget` field is forced `true` by this method, so the flag and the
+    /// caller's intent can never disagree; any `dedup` block the caller set is still sent (a QoS-0
+    /// produce may also opt into dedup). No reply is read, so this never blocks on the broker.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error or an over-large field. It does NOT surface a
+    /// broker-side drop (there is no reply to surface), by the QoS-0 contract.
+    pub fn produce_fire_and_forget(&mut self, message: &PubBody<'_>) -> Result<(), ClientError> {
+        let mut body = Vec::new();
+        // Force the fire-and-forget marker regardless of the caller's field, so the wire bit always
+        // reflects the method's contract.
+        let faf = PubBody {
+            fire_and_forget: true,
+            ..*message
+        };
+        encode_pub(&faf, &mut body).map_err(ClientError::Body)?;
+        self.send(FrameType::Pub, &body)?;
+        // Fire and forget: do NOT read a reply. The broker sends no PubAck for a fire-and-forget
+        // produce (whether it appended it or dropped it under load), so awaiting one would hang.
+        Ok(())
     }
 
     /// Fetches up to `max` messages. Returns the delivered messages (possibly fewer, or
@@ -976,6 +1014,7 @@ mod tests {
                 key: b"k",
                 headers: b"",
                 dedup: None,
+                fire_and_forget: false,
                 payload: b"client-msg",
             })
             .unwrap();
@@ -990,6 +1029,53 @@ mod tests {
         // Nothing left to fetch.
         assert!(c.fetch(10).unwrap().messages.is_empty());
 
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn produce_fire_and_forget_sends_no_ack_yet_the_record_is_durable_end_to_end() {
+        // The #11 QoS-0 fast path end-to-end: `produce_fire_and_forget` returns WITHOUT awaiting a
+        // PubAck (the producer fired and forgot), yet the broker still appended the record durably
+        // (the default bucket is disabled, so it is appended, not dropped). A following at-least-once
+        // produce on the SAME connection still gets its PubAck (the no-ack did NOT desync the stream),
+        // and a fetch sees BOTH records, proving the QoS-0 one landed.
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+        // Fire-and-forget: returns immediately, no reply read.
+        c.produce_fire_and_forget(&PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false, // forced true by the method
+            payload: b"qos0",
+        })
+        .unwrap();
+        // A normal at-least-once produce on the same connection still gets its PubAck at offset 1,
+        // proving the prior no-ack frame did not leave a stray reply on the wire.
+        let offset = c
+            .produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"alo",
+            })
+            .unwrap();
+        assert_eq!(
+            offset, 1,
+            "the at-least-once produce landed after the QoS-0 one"
+        );
+        // Fetch: both records are durable; the QoS-0 record landed at offset 0.
+        let messages = c.fetch(10).unwrap().messages;
+        assert_eq!(messages.len(), 2, "both records are durable");
+        assert_eq!(messages[0].offset, 0);
+        assert_eq!(messages[0].payload, b"qos0");
+        assert_eq!(messages[1].payload, b"alo");
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
@@ -1012,6 +1098,7 @@ mod tests {
             key: b"",
             headers: b"",
             dedup: Some(dedup),
+            fire_and_forget: false,
             payload: b"v1",
         };
         let first = c.produce_dedup(&body).unwrap();
@@ -1026,6 +1113,7 @@ mod tests {
         // The idempotent retry (same producer + msg_id; payload differs but dedup keys on msg_id).
         let retry = c
             .produce_dedup(&PubBody {
+                fire_and_forget: false,
                 payload: b"v2-ignored",
                 ..body
             })
@@ -1065,6 +1153,7 @@ mod tests {
                     key: b"",
                     headers: b"",
                     dedup: None,
+                    fire_and_forget: false,
                     payload: p,
                 })
                 .unwrap();
@@ -1122,6 +1211,7 @@ mod tests {
                 key: b"k",
                 headers: b"",
                 dedup: None,
+                fire_and_forget: false,
                 payload: &[i],
             })
             .unwrap();
@@ -1148,6 +1238,7 @@ mod tests {
                 key: b"",
                 headers: b"",
                 dedup: None,
+                fire_and_forget: false,
                 payload: b"x",
             })
             .unwrap_err()
@@ -1537,6 +1628,7 @@ mod tests {
                 key: b"",
                 headers: b"",
                 dedup: None,
+                fire_and_forget: false,
                 payload: b"retry-me",
             })
             .unwrap();
@@ -1579,6 +1671,7 @@ mod tests {
                 key: b"",
                 headers: b"",
                 dedup: None,
+                fire_and_forget: false,
                 payload: p,
             })
             .unwrap();
@@ -1625,6 +1718,7 @@ mod tests {
                     key: b"",
                     headers: b"",
                     dedup: None,
+                    fire_and_forget: false,
                     payload: b"m",
                 })
                 .unwrap();
@@ -1680,6 +1774,7 @@ mod tests {
                     key: b"",
                     headers: b"",
                     dedup: None,
+                    fire_and_forget: false,
                     payload: b"m",
                 })
                 .unwrap();
@@ -1714,6 +1809,7 @@ mod tests {
                     key: b"",
                     headers: b"",
                     dedup: None,
+                    fire_and_forget: false,
                     payload: b"m",
                 })
                 .unwrap();
@@ -1748,6 +1844,7 @@ mod tests {
                     key: b"",
                     headers: b"",
                     dedup: None,
+                    fire_and_forget: false,
                     payload: b"m",
                 })
                 .unwrap();
@@ -1802,6 +1899,7 @@ mod tests {
                     key: b"",
                     headers: b"",
                     dedup: None,
+                    fire_and_forget: false,
                     payload: b"m",
                 })
                 .unwrap();
@@ -1858,6 +1956,7 @@ mod tests {
                     key: b"",
                     headers: b"",
                     dedup: None,
+                    fire_and_forget: false,
                     payload: &payload,
                 })
                 .unwrap();
@@ -1905,6 +2004,7 @@ mod tests {
                     key: b"",
                     headers: b"",
                     dedup: None,
+                    fire_and_forget: false,
                     payload: &big,
                 })
                 .unwrap();

@@ -414,6 +414,7 @@ fn send_loop(
             key: b"",
             headers: b"",
             dedup: None,
+            fire_and_forget: false,
             payload: &payload,
         }) {
             Ok(_) => {

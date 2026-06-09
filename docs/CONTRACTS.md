@@ -476,7 +476,7 @@ Source: `message.rs`. Variable parts use explicit u16 length prefixes.
 
 | field         | type   | width | notes |
 |---------------|--------|-------|-------|
-| `flags`       | u8     | 1     | producer record flags (the server derives storage flags like `HAS_KEY`); bit 7 (`PUB_FLAG_HAS_DEDUP`, `0b1000_0000`) is a WIRE-only signal that the opt-in dedup block follows, masked OFF before the byte becomes a stored record flag |
+| `flags`       | u8     | 1     | producer record flags (the server derives storage flags like `HAS_KEY`); bit 7 (`PUB_FLAG_HAS_DEDUP`, `0b1000_0000`) is a WIRE-only signal that the opt-in dedup block follows, and bit 6 (`PUB_FLAG_FIRE_AND_FORGET`, `0b0100_0000`) is a WIRE-only QoS-0 marker (#11); BOTH bits (`PUB_WIRE_ONLY_FLAGS`) are masked OFF before the byte becomes a stored record flag |
 | `timestamp_ms`| u64    | 8     | producer time, milliseconds |
 | `key_len`     | u16    | 2     | length of the key |
 | `key`         | bytes  | `key_len` | routing/ordering key (empty if none) |
@@ -497,6 +497,15 @@ bound, default ~100k ids OR ~2 min on the monotonic clock) is a benign dedup hit
 `PubAckDuplicate` (tag 20) with the ORIGINAL offset and appends no second copy. A produce whose
 `epoch` is below the broker's known high-water for `producer_id` is FENCED (answered an `Err`), so a
 zombie session reusing an old `producer_id` cannot replay stale ids.
+
+The OPT-IN fire-and-forget marker (bit 6, `PUB_FLAG_FIRE_AND_FORGET`) is the QoS-0 fast path (#11,
+#402): a producer sets it and does NOT wait for a `PubAck`. The broker may DROP the produce under its
+fire-and-forget token bucket WITHOUT acking (the QoS-0 producer accepts loss by contract, counted in
+`ironbus_fire_and_forget_shed_total`), and when NOT shed appends it durably as usual but sends NO
+`PubAck`. It carries no extra block, so it never changes the body layout; the default (bit clear) is
+the unchanged at-least-once `PubAck` path. A client opts in with `Client::produce_fire_and_forget`; the
+default `Client::produce` is unchanged. The `FrameType` tag vocabulary is UNCHANGED (only the additive
+flag).
 
 There is NO topic field and NO trace-id header list. `key`, `headers`, `producer_id`, and `msg_id`
 are each bounded by `u16::MAX`.
