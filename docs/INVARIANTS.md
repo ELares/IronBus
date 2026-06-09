@@ -520,7 +520,14 @@ defined as the code uses it.
   force-reaped by the drop-oldest policy). The cursor resets UP to
   earliest-retained and the truncation surfaces exactly once; a later poll no
   longer re-truncates the same gap. `Engine::poll_in` (the `committed < earliest`
-  branch) in `crates/ironbus-server/src/engine.rs`.
+  branch) in `crates/ironbus-server/src/engine.rs`. The session maps this one
+  outcome to the wire `Truncated` frame for a legacy consumer, or to the richer
+  consumer-visible `GapMarker` frame (the explicit skipped span `[from, to)` plus
+  a reason) for a consumer that negotiated gap-marker support (#346); either way
+  the skip is surfaced once and never silent. The marker does NOT change the
+  offset lifecycle below: the skipped offsets stay permanently absent (never
+  reissued or reused), so I5 (offset monotonic, never-reuse) is unaffected; the
+  marker only makes the existing sparse-offset gap EXPLICIT to the consumer.
 
 - **earliest_retained / earliest offset.** The lowest offset still on disk. It
   rises above 0 only once retention or the drop-oldest policy has reaped a prefix.

@@ -557,6 +557,83 @@ pub fn decode_truncated(body: &[u8]) -> Result<TruncatedBody, BodyError> {
     })
 }
 
+/// The reason a span of offsets is permanently absent from the DELIVER stream, carried in the
+/// one-byte `reason` field of a [`GapMarkerBody`] (#346). The values are append-only and map onto
+/// the recovery-side cause: a retention/trim reap, or a future key-compaction skip (#337). An
+/// unknown value a future server might send is tolerated by the client as "absent for an
+/// unspecified reason" rather than rejected, so the reason field can grow without a new frame.
+pub mod gap_reason {
+    /// The span fell below the trim/retention horizon: the disk-full drop-oldest policy (or a
+    /// retention reap) removed a contiguous prefix out from under a slow consumer, so its cursor
+    /// resumed above the hole (#82, #84). This is the cause the legacy `Truncated` frame (tag 18)
+    /// signals; a gap-marker-capable consumer receives this richer marker instead.
+    pub const TRIMMED: u8 = 1;
+    /// The span was removed by key-compaction: a later record for the same key superseded the
+    /// offsets in the hole, so they are permanently absent mid-stream (#337). Reserved for the
+    /// compaction work; no path emits it yet, but the wire reason is pinned so compaction is purely
+    /// additive when it lands.
+    pub const COMPACTED: u8 = 2;
+}
+
+/// A consumer-visible gap marker (the `GapMarker` frame body, #346, refs #59, #9): the broker tells
+/// a consumer that the half-open offset span `[from, to)` is PERMANENTLY ABSENT (skipped) from the
+/// DELIVER stream, so a consumer tracking contiguity learns the jump is a bounded, reported gap
+/// rather than message loss. It is the OPT-IN, richer twin of [`TruncatedBody`]: a consumer that
+/// advertised gap-marker support (the #292 `Connect` capability bit) receives this INSTEAD of a
+/// `Truncated` advisory, so the two never double-signal the same gap; an old consumer keeps the
+/// legacy `Truncated`. The `bytes_skipped` and `reason` are sourced from the already-frozen
+/// `loss-report.v1` skip record (`0` bytes when the cause is byte-untracked, e.g. a plain trim).
+///
+/// Layout: `from: u64`, `to: u64`, `bytes_skipped: u64`, then a one-byte `reason` (a fixed 25-byte
+/// layout; see [`gap_reason`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GapMarkerBody {
+    /// The first absent offset (inclusive): the last offset the consumer saw plus one, i.e. where
+    /// the hole begins.
+    pub from: u64,
+    /// The first present offset after the hole (exclusive): delivery resumes here, and this is the
+    /// offset of the record the marker immediately precedes.
+    pub to: u64,
+    /// The reported bytes lost in the hole, from the `loss-report.v1` skip record; `0` when the
+    /// cause is byte-untracked (a plain retention/trim reap reports the record-count span via
+    /// `to - from`, not a byte total).
+    pub bytes_skipped: u64,
+    /// Why the span is absent (a [`gap_reason`] value: trimmed / compacted). An unknown value is
+    /// tolerated by a reader as "absent for an unspecified reason", never an error.
+    pub reason: u8,
+}
+
+/// Encodes a `GapMarker` body onto the end of `out` (a fixed 25-byte layout).
+pub fn encode_gap_marker(marker: &GapMarkerBody, out: &mut Vec<u8>) {
+    out.extend_from_slice(&marker.from.to_le_bytes());
+    out.extend_from_slice(&marker.to.to_le_bytes());
+    out.extend_from_slice(&marker.bytes_skipped.to_le_bytes());
+    out.push(marker.reason);
+}
+
+/// Decodes a `GapMarker` body (a fixed 25-byte layout; a short or overlong body is rejected). The
+/// `reason` byte is NOT validated here (an unknown reason is a valid, tolerated marker, decoded
+/// verbatim), only the length is, so the codec stays cap-before-alloc and panic-free.
+///
+/// # Errors
+/// Returns a [`BodyError`] on a short body or trailing bytes.
+pub fn decode_gap_marker(body: &[u8]) -> Result<GapMarkerBody, BodyError> {
+    let mut r = Reader::new(body);
+    let from = r.u64()?;
+    let to = r.u64()?;
+    let bytes_skipped = r.u64()?;
+    let reason = r.u8()?;
+    if !r.at_end() {
+        return Err(BodyError::TrailingBytes);
+    }
+    Ok(GapMarkerBody {
+        from,
+        to,
+        bytes_skipped,
+        reason,
+    })
+}
+
 /// The version of the `Connect`/`Info` handshake body framing (#292, refs #275, #65, #11). The
 /// handshake bodies were EMPTY before this; version `1` is the first non-empty layout. It is the
 /// handshake-BODY version, distinct from the (still un-wired) `wire_protocol_version` integer #71/#11
@@ -576,6 +653,14 @@ pub const CONNECT_FLAG_HAS_CREDIT: u8 = 0b0000_0001;
 /// byte budget and the server applies its own default (#292).
 pub const CONNECT_FLAG_HAS_CREDIT_BYTES: u8 = 0b0000_0010;
 
+/// The `Connect` CAPABILITY bit (#346) by which a consumer advertises that it UNDERSTANDS the
+/// consumer-visible `GapMarker` frame (tag 21): when set, the server may send a [`GapMarkerBody`] in
+/// place of the legacy `Truncated` advisory across a skipped span; when clear (an old client, or one
+/// that opts out) the server keeps sending `Truncated` and NEVER sends the new `GapMarker` tag, so an
+/// old consumer that would error on an unknown frame is not broken. It is a pure capability flag (no
+/// associated value), so it occupies no slot in the v1 field block beyond this `flags` bit.
+pub const CONNECT_FLAG_WANTS_GAP_MARKER: u8 = 0b0000_0100;
+
 /// The `Info` presence-flag bit signalling that the server's advertised per-consumer message-credit
 /// fields (`negotiated` + `cap`) are present (#292). A server that does not advertise leaves it clear,
 /// and a client then keeps its own local credit (backward-compat).
@@ -584,6 +669,14 @@ pub const INFO_FLAG_HAS_CREDIT: u8 = 0b0000_0001;
 /// The `Info` presence-flag bit signalling that the server's advertised per-consumer byte-budget
 /// fields (`negotiated` + `cap`) are present (#292).
 pub const INFO_FLAG_HAS_CREDIT_BYTES: u8 = 0b0000_0010;
+
+/// The `Info` CAPABILITY bit (#346) by which the server CONFIRMS it will emit consumer-visible
+/// `GapMarker` frames for this connection (the consumer requested it via [`CONNECT_FLAG_WANTS_GAP_MARKER`]
+/// AND the server supports it). When clear (an old server, or one with the marker disabled) the
+/// client knows it will still see the legacy `Truncated` advisory and keeps handling it. The
+/// negotiation is AND: the marker is active only when both peers set their bit, so either side opting
+/// out falls back to the legacy advisory.
+pub const INFO_FLAG_GAP_MARKER: u8 = 0b0000_0100;
 
 /// A client's handshake request (the `Connect` frame body, #292). The client MAY request a
 /// per-consumer message credit and/or byte budget; the server clamps each to its own cap and replies
@@ -606,6 +699,10 @@ pub struct ConnectBody {
     /// The per-consumer byte budget the client requests, or `None` to defer to the server default.
     /// `Some(b)` asks for at most `b` un-acked payload bytes; the server clamps it to its cap.
     pub requested_credit_bytes: Option<u64>,
+    /// Whether this consumer UNDERSTANDS the `GapMarker` frame (tag 21) and wants it in place of the
+    /// legacy `Truncated` advisory across a skipped span (#346). `false` (the default, and an old
+    /// client) means the server keeps sending `Truncated` and never sends the new tag.
+    pub wants_gap_marker: bool,
 }
 
 /// The number of bytes in the `Connect` v1 known-field block: `flags: u8` + `requested_credit: u32` +
@@ -626,6 +723,9 @@ pub fn encode_connect(req: &ConnectBody, out: &mut Vec<u8>) {
     }
     if req.requested_credit_bytes.is_some() {
         flags |= CONNECT_FLAG_HAS_CREDIT_BYTES;
+    }
+    if req.wants_gap_marker {
+        flags |= CONNECT_FLAG_WANTS_GAP_MARKER;
     }
     out.push(flags);
     out.extend_from_slice(&req.requested_credit.unwrap_or(0).to_le_bytes());
@@ -674,9 +774,11 @@ pub fn decode_connect(body: &[u8]) -> Result<ConnectBody, BodyError> {
     let requested_credit = (flags & CONNECT_FLAG_HAS_CREDIT != 0).then_some(credit);
     let requested_credit_bytes =
         (flags & CONNECT_FLAG_HAS_CREDIT_BYTES != 0).then_some(credit_bytes);
+    let wants_gap_marker = flags & CONNECT_FLAG_WANTS_GAP_MARKER != 0;
     Ok(ConnectBody {
         requested_credit,
         requested_credit_bytes,
+        wants_gap_marker,
     })
 }
 
@@ -712,6 +814,11 @@ pub struct InfoBody {
     /// The server's per-consumer byte-budget advertisement, or `None` if the server does not
     /// advertise. When `Some`, the client adopts `negotiated` as its byte budget for this connection.
     pub credit_bytes: Option<CreditAdvert<u64>>,
+    /// Whether the server CONFIRMS it will emit `GapMarker` frames (tag 21) for this connection
+    /// (#346): `true` only when the client advertised [`ConnectBody::wants_gap_marker`] AND the
+    /// server supports it. `false` (an old server, or the marker disabled) tells the client it will
+    /// still see the legacy `Truncated` advisory.
+    pub gap_marker: bool,
 }
 
 /// The number of bytes in the `Info` v1 known-field block: `flags: u8` + `credit.negotiated: u32` +
@@ -732,6 +839,9 @@ pub fn encode_info(info: &InfoBody, out: &mut Vec<u8>) {
     }
     if info.credit_bytes.is_some() {
         flags |= INFO_FLAG_HAS_CREDIT_BYTES;
+    }
+    if info.gap_marker {
+        flags |= INFO_FLAG_GAP_MARKER;
     }
     out.push(flags);
     let credit = info.credit.unwrap_or(CreditAdvert {
@@ -788,9 +898,11 @@ pub fn decode_info(body: &[u8]) -> Result<InfoBody, BodyError> {
         negotiated: credit_bytes_negotiated,
         cap: credit_bytes_cap,
     });
+    let gap_marker = flags & INFO_FLAG_GAP_MARKER != 0;
     Ok(InfoBody {
         credit,
         credit_bytes,
+        gap_marker,
     })
 }
 
@@ -840,6 +952,92 @@ mod tests {
     fn truncated_rejects_a_short_or_overlong_body() {
         assert_eq!(decode_truncated(&[0u8; 15]), Err(BodyError::Truncated));
         assert_eq!(decode_truncated(&[0u8; 17]), Err(BodyError::TrailingBytes));
+    }
+
+    #[test]
+    fn gap_marker_round_trips() {
+        let marker = GapMarkerBody {
+            from: 0x0102_0304_0506_0708,
+            to: 0x1112_1314_1516_1718,
+            bytes_skipped: 0x2122_2324_2526_2728,
+            reason: gap_reason::TRIMMED,
+        };
+        let mut buf = Vec::new();
+        encode_gap_marker(&marker, &mut buf);
+        assert_eq!(
+            buf.len(),
+            25,
+            "fixed 25-byte body: three u64 fields + u8 reason"
+        );
+        assert_eq!(decode_gap_marker(&buf).unwrap(), marker);
+        // The fields are LE in declared order: from, to, bytes_skipped, reason.
+        assert_eq!(&buf[..8], &marker.from.to_le_bytes());
+        assert_eq!(&buf[8..16], &marker.to.to_le_bytes());
+        assert_eq!(&buf[16..24], &marker.bytes_skipped.to_le_bytes());
+        assert_eq!(buf[24], gap_reason::TRIMMED);
+    }
+
+    #[test]
+    fn gap_marker_rejects_a_short_or_overlong_body() {
+        assert_eq!(decode_gap_marker(&[0u8; 24]), Err(BodyError::Truncated));
+        assert_eq!(decode_gap_marker(&[0u8; 26]), Err(BodyError::TrailingBytes));
+    }
+
+    #[test]
+    fn gap_marker_tolerates_an_unknown_reason() {
+        // An unknown future reason byte (e.g. 200) is a VALID, tolerated marker, decoded verbatim,
+        // not an error: the reason field can grow without a new frame.
+        let marker = GapMarkerBody {
+            from: 10,
+            to: 14,
+            bytes_skipped: 99,
+            reason: 200,
+        };
+        let mut buf = Vec::new();
+        encode_gap_marker(&marker, &mut buf);
+        assert_eq!(decode_gap_marker(&buf).unwrap(), marker);
+        assert_eq!(decode_gap_marker(&buf).unwrap().reason, 200);
+    }
+
+    #[test]
+    fn connect_carries_the_gap_marker_capability_bit() {
+        // A consumer that wants gap markers sets the capability bit; the bit round-trips and a
+        // default (old client) request leaves it clear.
+        let req = ConnectBody {
+            requested_credit: None,
+            requested_credit_bytes: None,
+            wants_gap_marker: true,
+        };
+        let mut buf = Vec::new();
+        encode_connect(&req, &mut buf);
+        // The flags byte sits right after the 3-byte version/length header.
+        assert_eq!(
+            buf[3] & CONNECT_FLAG_WANTS_GAP_MARKER,
+            CONNECT_FLAG_WANTS_GAP_MARKER,
+            "the capability bit is set in the flags byte"
+        );
+        assert!(decode_connect(&buf).unwrap().wants_gap_marker);
+        // An EMPTY (old-client) Connect body never advertises the capability.
+        assert!(!decode_connect(&[]).unwrap().wants_gap_marker);
+    }
+
+    #[test]
+    fn info_carries_the_gap_marker_capability_bit() {
+        let info = InfoBody {
+            credit: None,
+            credit_bytes: None,
+            gap_marker: true,
+        };
+        let mut buf = Vec::new();
+        encode_info(&info, &mut buf);
+        assert_eq!(
+            buf[3] & INFO_FLAG_GAP_MARKER,
+            INFO_FLAG_GAP_MARKER,
+            "the capability confirmation bit is set in the flags byte"
+        );
+        assert!(decode_info(&buf).unwrap().gap_marker);
+        // An EMPTY (old-server) Info body never confirms the capability.
+        assert!(!decode_info(&[]).unwrap().gap_marker);
     }
 
     #[test]
@@ -1212,6 +1410,7 @@ mod tests {
             let _ = decode_deliver(&bytes);
             let _ = decode_dead_letter(&bytes);
             let _ = decode_truncated(&bytes);
+            let _ = decode_gap_marker(&bytes);
             let _ = decode_cumulative_ack(&bytes);
             let _ = decode_pub_ack(&bytes);
             // The #292 handshake bodies are attack surface too (a hostile Connect at the server, a
@@ -1291,8 +1490,9 @@ mod tests {
         fn any_connect_round_trips(
             credit in proptest::option::of(any::<u32>()),
             credit_bytes in proptest::option::of(any::<u64>()),
+            wants_gap_marker in any::<bool>(),
         ) {
-            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: credit_bytes };
+            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: credit_bytes, wants_gap_marker };
             let mut buf = Vec::new();
             encode_connect(&req, &mut buf);
             prop_assert_eq!(buf[0], HANDSHAKE_BODY_VERSION, "the body leads with its version");
@@ -1300,20 +1500,35 @@ mod tests {
         }
 
         /// An Info body round-trips for any combination of present/absent advertised credit and byte
-        /// budget (#292): the negotiated value and the cap survive for each present dimension.
+        /// budget (#292) and the gap-marker capability bit (#346): each survives the round-trip.
         #[test]
         fn any_info_round_trips(
             credit in proptest::option::of((any::<u32>(), any::<u32>())),
             credit_bytes in proptest::option::of((any::<u64>(), any::<u64>())),
+            gap_marker in any::<bool>(),
         ) {
             let info = InfoBody {
                 credit: credit.map(|(negotiated, cap)| CreditAdvert { negotiated, cap }),
                 credit_bytes: credit_bytes.map(|(negotiated, cap)| CreditAdvert { negotiated, cap }),
+                gap_marker,
             };
             let mut buf = Vec::new();
             encode_info(&info, &mut buf);
             prop_assert_eq!(buf[0], HANDSHAKE_BODY_VERSION, "the body leads with its version");
             prop_assert_eq!(decode_info(&buf).unwrap(), info);
+        }
+
+        /// A GapMarker body round-trips for any from/to/bytes/reason (#346) and is always exactly the
+        /// fixed 25-byte layout (three LE u64 fields then a one-byte reason). Any reason byte is a
+        /// valid, tolerated marker (the codec does not validate the reason), so an unknown future
+        /// reason still round-trips.
+        #[test]
+        fn any_gap_marker_round_trips(from in any::<u64>(), to in any::<u64>(), bytes_skipped in any::<u64>(), reason in any::<u8>()) {
+            let marker = GapMarkerBody { from, to, bytes_skipped, reason };
+            let mut buf = Vec::new();
+            encode_gap_marker(&marker, &mut buf);
+            prop_assert_eq!(buf.len(), 25, "GapMarker is a fixed 25-byte body");
+            prop_assert_eq!(decode_gap_marker(&buf).unwrap(), marker);
         }
 
         /// FORWARD-COMPAT: a future version may append fields after the v1 block; a v1 reader tolerates
@@ -1324,7 +1539,7 @@ mod tests {
             credit in proptest::option::of(any::<u32>()),
             trailing in prop::collection::vec(any::<u8>(), 0..64),
         ) {
-            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: None };
+            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: None, wants_gap_marker: false };
             let mut buf = Vec::new();
             encode_connect(&req, &mut buf);
             let mut extended = buf.clone();
@@ -1334,6 +1549,7 @@ mod tests {
             let info = InfoBody {
                 credit: credit.map(|c| CreditAdvert { negotiated: c, cap: c }),
                 credit_bytes: None,
+                gap_marker: false,
             };
             let mut ibuf = Vec::new();
             encode_info(&info, &mut ibuf);
@@ -1378,7 +1594,8 @@ mod tests {
             decode_connect(&[]).unwrap(),
             ConnectBody {
                 requested_credit: None,
-                requested_credit_bytes: None
+                requested_credit_bytes: None,
+                wants_gap_marker: false,
             }
         );
     }
@@ -1392,7 +1609,8 @@ mod tests {
             decode_info(&[]).unwrap(),
             InfoBody {
                 credit: None,
-                credit_bytes: None
+                credit_bytes: None,
+                gap_marker: false,
             }
         );
     }
@@ -1402,10 +1620,12 @@ mod tests {
         let req = ConnectBody {
             requested_credit: Some(32),
             requested_credit_bytes: Some(1024),
+            wants_gap_marker: true,
         };
         let mut buf = Vec::new();
         encode_connect(&req, &mut buf);
-        // version(1) + field_len(2) + flags(1) + credit(4) + credit_bytes(8) = 16 bytes.
+        // version(1) + field_len(2) + flags(1) + credit(4) + credit_bytes(8) = 16 bytes. The gap-marker
+        // capability is a pure flags bit, so it adds NO bytes to the v1 field block.
         assert_eq!(buf.len(), 3 + usize::from(CONNECT_V1_FIELD_LEN));
         assert_eq!(buf[0], HANDSHAKE_BODY_VERSION);
         assert_eq!(decode_connect(&buf).unwrap(), req);
@@ -1422,9 +1642,11 @@ mod tests {
                 negotiated: 1024,
                 cap: 8 * 1024 * 1024,
             }),
+            gap_marker: true,
         };
         let mut buf = Vec::new();
         encode_info(&info, &mut buf);
+        // The gap-marker confirmation is a pure flags bit, so it adds NO bytes to the v1 field block.
         assert_eq!(buf.len(), 3 + usize::from(INFO_V1_FIELD_LEN));
         assert_eq!(buf[0], HANDSHAKE_BODY_VERSION);
         assert_eq!(decode_info(&buf).unwrap(), info);

@@ -96,6 +96,18 @@ pub enum FrameType {
     /// `msg_id` never receives it. Body: the original durable `offset` as a little-endian `u64`
     /// (8 bytes), identical in shape to `PubAck`.
     PubAckDuplicate,
+    /// Server advisory that a half-open span of offsets `[from, to)` is PERMANENTLY ABSENT from the
+    /// DELIVER stream (skipped), so a consumer that tracks contiguity learns the jump is a bounded,
+    /// reported gap rather than message loss (#346, #59, #9). Emitted just BEFORE the next delivery
+    /// across the gap, exactly once per gap. It is the consumer-visible, per-consumer-OPT-IN twin of
+    /// [`FrameType::Truncated`] (tag 18): a consumer that advertised it understands gap markers (via
+    /// the `Connect` capability bit, #292) receives this richer marker INSTEAD of `Truncated` (no
+    /// double-signal), and an old consumer that never advertised it keeps receiving the legacy
+    /// `Truncated` and is never sent this NEW append-only tag. Body: the gap's `from`/`to` (exclusive)
+    /// offsets and `bytes_skipped` as little-endian `u64`s, then a one-byte `reason` (trimmed /
+    /// compacted), sourced from the already-frozen `loss-report.v1` skip record. The `Deliver` (tag
+    /// 13) body is UNCHANGED.
+    GapMarker,
 }
 
 impl FrameType {
@@ -123,6 +135,7 @@ impl FrameType {
             FrameType::Truncated => 18,
             FrameType::CumulativeAck => 19,
             FrameType::PubAckDuplicate => 20,
+            FrameType::GapMarker => 21,
         }
     }
 
@@ -151,6 +164,7 @@ impl FrameType {
             18 => FrameType::Truncated,
             19 => FrameType::CumulativeAck,
             20 => FrameType::PubAckDuplicate,
+            21 => FrameType::GapMarker,
             _ => return None,
         })
     }
@@ -283,7 +297,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 20] = [
+    const ALL_TYPES: [FrameType; 21] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -304,6 +318,7 @@ mod tests {
         FrameType::Truncated,
         FrameType::CumulativeAck,
         FrameType::PubAckDuplicate,
+        FrameType::GapMarker,
     ];
 
     #[test]
@@ -342,6 +357,7 @@ mod tests {
         assert_eq!(FrameType::Truncated.as_u8(), 18);
         assert_eq!(FrameType::CumulativeAck.as_u8(), 19);
         assert_eq!(FrameType::PubAckDuplicate.as_u8(), 20);
+        assert_eq!(FrameType::GapMarker.as_u8(), 21);
     }
 
     #[test]
@@ -527,7 +543,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 21u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 22u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);

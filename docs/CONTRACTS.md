@@ -343,8 +343,9 @@ test in `frame.rs`. They start at 1 and are contiguous.
 | 18  | `Truncated` | server to client | `TruncatedBody` (16 bytes, below) |
 | 19  | `CumulativeAck` | client to server | `CumulativeAckBody` (below): the exclusive `up_to` offset then the group name |
 | 20  | `PubAckDuplicate` | server to client | the ORIGINAL durable `offset` as an 8-byte LE u64 (a benign dedup hit, #33): same body shape as `PubAck`, `duplicate = true` by the frame type alone, `rc = 0` |
+| 21  | `GapMarker` | server to client | `GapMarkerBody` (25 bytes, below): a permanently-absent offset span `[from, to)` + `bytes_skipped` + reason (#346). The consumer-visible, per-consumer OPT-IN twin of `Truncated` (tag 18); sent only to a consumer that advertised the capability, in place of `Truncated`, so an old consumer never receives it |
 
-`from_u8` returns `None` for tag 0 and for tags 21 and above (unknown, still framed by the
+`from_u8` returns `None` for tag 0 and for tags 22 and above (unknown, still framed by the
 envelope).
 
 The dedup-hit response (#33) deliberately uses the NEW append-only tag 20 rather than mutating the
@@ -387,7 +388,7 @@ set, so an absent value means "use the server default", and there is no unbounde
 
 | field         | type | width | notes |
 |---------------|------|-------|-------|
-| `flags`       | u8   | 1     | presence bits: bit 0 (`CONNECT_FLAG_HAS_CREDIT`) the message-credit request is present; bit 1 (`CONNECT_FLAG_HAS_CREDIT_BYTES`) the byte-budget request is present |
+| `flags`       | u8   | 1     | presence/capability bits: bit 0 (`CONNECT_FLAG_HAS_CREDIT`) the message-credit request is present; bit 1 (`CONNECT_FLAG_HAS_CREDIT_BYTES`) the byte-budget request is present; bit 2 (`CONNECT_FLAG_WANTS_GAP_MARKER`, #346) the consumer UNDERSTANDS the `GapMarker` frame (tag 21) and wants it in place of `Truncated` (a pure capability flag: no associated value, occupies no slot in the block) |
 | `requested_credit` | u32 LE | 4 | the per-consumer MESSAGE credit the client wants (meaningful iff bit 0); the server negotiates `min(request, server cap)` |
 | `requested_credit_bytes` | u64 LE | 8 | the per-consumer BYTE budget the client wants (meaningful iff bit 1) |
 
@@ -396,7 +397,7 @@ its cap, so the advertised `negotiated` value is the one the client adopts):
 
 | field         | type | width | notes |
 |---------------|------|-------|-------|
-| `flags`       | u8   | 1     | presence bits: bit 0 (`INFO_FLAG_HAS_CREDIT`) the message-credit advert is present; bit 1 (`INFO_FLAG_HAS_CREDIT_BYTES`) the byte-budget advert is present |
+| `flags`       | u8   | 1     | presence/capability bits: bit 0 (`INFO_FLAG_HAS_CREDIT`) the message-credit advert is present; bit 1 (`INFO_FLAG_HAS_CREDIT_BYTES`) the byte-budget advert is present; bit 2 (`INFO_FLAG_GAP_MARKER`, #346) the server CONFIRMS it will emit `GapMarker` frames for this connection (set iff the client advertised `CONNECT_FLAG_WANTS_GAP_MARKER` AND the server supports it; the negotiation is AND) |
 | `credit.negotiated` | u32 LE | 4 | the per-consumer MESSAGE credit NEGOTIATED for this connection (`min(request, cap)`, or the default when the client requested nothing) |
 | `credit.cap`  | u32 LE | 4 | the server's hard message-credit cap (informational; the negotiated value never exceeds it) |
 | `credit_bytes.negotiated` | u64 LE | 8 | the per-consumer BYTE budget negotiated for this connection |
@@ -490,6 +491,30 @@ Trailing bytes are rejected.
 | `skipped`           | u64  | 8     | how many records the consumer skipped (`earliest_retained - old_cursor`) |
 
 Trailing bytes are rejected.
+
+### GapMarkerBody (wire body of `GapMarker`, tag 21, fixed 25 bytes)
+
+The consumer-visible gap marker (#346, refs #59, #9): the broker tells a consumer that the half-open
+offset span `[from, to)` is PERMANENTLY ABSENT (skipped) from the DELIVER stream, so a reader tracking
+contiguity learns the offset jump is a bounded, REPORTED gap rather than message loss. Emitted just
+BEFORE the next delivery across the gap, exactly once per gap, and ONLY to a consumer that negotiated
+gap-marker support (the `Connect` capability bit below); such a consumer receives this INSTEAD of a
+`Truncated` advisory (no double-signal). `bytes_skipped` and `reason` are sourced from the
+already-frozen `loss-report.v1` skip record.
+
+| field           | type | width | notes |
+|-----------------|------|-------|-------|
+| `from`          | u64  | 8     | the first absent offset (inclusive): where the hole begins (the last delivered offset plus one) |
+| `to`            | u64  | 8     | the first present offset after the hole (exclusive): delivery resumes here, and the next record (if any) carries this offset |
+| `bytes_skipped` | u64  | 8     | the reported bytes lost in the hole (from `loss-report.v1`); `0` when the cause is byte-untracked (a plain retention/trim reap, whose span is the record count `to - from`) |
+| `reason`        | u8   | 1     | why the span is absent: `1` = `gap_reason::TRIMMED` (a retention / disk-full drop-oldest reap), `2` = `gap_reason::COMPACTED` (#337 key-compaction, reserved, no path emits it yet). An unknown future value is TOLERATED by a reader (decoded verbatim, never an error), so the reason field grows without a new frame |
+
+Trailing bytes are rejected; the `reason` byte is NOT validated by the codec (an unknown reason is a
+valid, tolerated marker). The frame is the OPT-IN, richer twin of `Truncated`: for a trim, `to ==
+earliest_retained` and `from == earliest_retained - skipped`, so the same hole the legacy
+`Truncated` (tag 18) names is carried with explicit `[from, to)` bounds and a reason. Future
+key-compaction (#337) will emit MID-STREAM `[from, to)` holes (`reason = COMPACTED`) through the same
+frame, additively.
 
 ### SubBody (wire body of `Sub`)
 
@@ -633,7 +658,10 @@ unacked) at a crash redelivers (at-least-once safe).
 
 A tagged enum: `Message(Delivery)`, `Parked { offset, record }` (poison, dead-lettered),
 `Truncated { earliest_retained, skipped }` (cursor fell below the oldest retained record),
-or `Idle` (nothing deliverable now).
+or `Idle` (nothing deliverable now). The `Truncated` outcome is engine-internal and consumer
+capability-agnostic: the SESSION maps it to the wire `Truncated` frame (tag 18) for a legacy consumer,
+or to the richer `GapMarker` frame (tag 21) for a consumer that negotiated gap-marker support (#346),
+so the choice of wire frame is a session concern, not an engine one.
 
 ### Counters (in-memory operational metrics)
 
@@ -723,8 +751,8 @@ code; the code is canonical.
   `CONNECT 0x08`, `PING 0x09`, `PONG 0x0A`, `ERR 0x0B`. The frozen implementation tags are
   `Connect 1`, `Info 2`, `Ping 3`, `Pong 4`, `Pub 5`, `Sub 6`, `Unsub 7`, `Ack 8`,
   `Nack 9`, `Flow 10`, `Ok 11`, `Err 12`, `Deliver 13`, `PubAck 14`, `AckStatus 15`,
-  `FlowEnd 16`, `DeadLetter 17`, `Truncated 18`, `CumulativeAck 19`, `PubAckDuplicate 20`. None
-  of the draft's numbers match.
+  `FlowEnd 16`, `DeadLetter 17`, `Truncated 18`, `CumulativeAck 19`, `PubAckDuplicate 20`,
+  `GapMarker 21`. None of the draft's numbers match.
 - **Deliver/MSG.** The draft's `MSG` carried `offset, attempt, header list, key, payload`.
   The real `DeliverBody` carries `offset, generation, flags, timestamp_ms, key, headers,
   payload` and has NO `attempt` field on the wire.
@@ -742,11 +770,12 @@ code; the code is canonical.
   stream_id, max_frame_size` and `INFO` carried a version, negotiated max frame size, and a
   capabilities header list. The implementation now carries the per-consumer CREDIT negotiation
   (#292: the client's requested credit in `Connect`, the server's advertised defaults/caps and the
-  negotiated value in `Info`; see `ConnectBody`/`InfoBody` above), in a versioned, length-prefixed,
-  forward-compatible body. The OTHER draft fields (`auth_method`/`auth_blob`, the reserved
-  `stream_id`, a negotiated `max_frame_size`, the `wire_protocol_version` integer, and the capability
-  bitset) are still NOT on the wire; the body framing is designed so they can be appended as future
-  fields without a re-break. The empty-body case stays valid in both directions (an old peer).
+  negotiated value in `Info`; see `ConnectBody`/`InfoBody` above) plus the first per-consumer
+  CAPABILITY bit (#346: the gap-marker capability, `Connect` bit 2 / `Info` bit 2), in a versioned,
+  length-prefixed, forward-compatible body. The OTHER draft fields (`auth_method`/`auth_blob`, the
+  reserved `stream_id`, a negotiated `max_frame_size`, and the `wire_protocol_version` integer) are
+  still NOT on the wire; the body framing is designed so they can be appended as future fields without
+  a re-break. The empty-body case stays valid in both directions (an old peer).
 - **Sub.** The draft's `SUB` carried `consumer, credit, start_mode, start_offset` and a
   close flag. The real `SubBody` is just the work-group name (the whole body). There is no
   start-mode/start-offset selector and no in-frame credit; `Unsub` is its own frame (tag 7).
@@ -865,7 +894,7 @@ the `AckStatus` byte, so the frozen wire is byte-for-byte unchanged. A later wir
 |-----------------------------------|--------------------|--------|
 | `OK`                              | a verb succeeded (ack committed, cumulative ack advanced or a no-op, fresh produce appended) | generic success |
 | `DUPLICATE`                       | a benign dedup hit: the `msg_id` was in the window, so the ORIGINAL offset is returned with no second append (`duplicate = true`, `rc = 0`, never an error) | `AppendOutcome::Duplicate` |
-| `OFFSET_TRIMMED`                  | a read fell below the trim/retention horizon; the cursor reset up to `earliest_retained` and the skip is surfaced ONCE | `Poll::Truncated` |
+| `OFFSET_TRIMMED`                  | a read fell below the trim/retention horizon; the cursor reset up to `earliest_retained` and the skip is surfaced ONCE (as the wire `Truncated` frame, or, for a gap-marker consumer, the richer `GapMarker` frame with explicit `[from, to)` + reason, #346) | `Poll::Truncated` |
 | `ERR_CUMULATIVE_ACK_NOT_ALLOWED`  | a cumulative ack on a competing / `key_shared` / unknown / not-marked-broadcast group | `EngineError::CumulativeAckOnWorkGroup` |
 | `ERR_ACK_NOT_OWNED`               | an ack/nack/term/progress on a lease this consumer does not own (never delivered, or a stale generation) | `AckResult::Fenced` / `NackResult::Fenced` (wire status `0`) |
 | `ERR_CUMULATIVE_ACK_OUT_OF_RANGE` | a broadcast cumulative ack whose `up_to` is past the durable head or below earliest-retained | `EngineError::CumulativeAckOutOfRange` |

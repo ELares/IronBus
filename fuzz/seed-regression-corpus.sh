@@ -141,6 +141,13 @@ printf '' | place info_body                                         # empty = ol
 printf '\011\000\000' | place info_body                             # version 9 (unknown), zero block
 printf '\001\377\377' | place info_body                             # version 1, field_len=0xffff, no block
 
+# gap_marker body (#346): a fixed 25-byte layout `[ from:u64 ][ to:u64 ][ bytes_skipped:u64 ][ reason:u8 ]`.
+# An empty body and a short/overlong body must each be a typed error, never a panic. A full 25-byte
+# marker is the valid shape (`from=0, to=0, bytes_skipped=0, reason=1` = TRIMMED).
+printf '' | place gap_marker_body                                   # empty = too short for from
+printf '\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\001' | place gap_marker_body  # 25 bytes, reason=TRIMMED
+printf '\377\377\377\377\377\377\377\377' | place gap_marker_body   # 8 bytes: short (truncated)
+
 # cursor_snapshot: a torn/hostile durable checkpoint payload must never crash recovery.
 printf '' | place cursor_snapshot                                   # empty snapshot
 printf '\001' | place cursor_snapshot                               # one stray byte
