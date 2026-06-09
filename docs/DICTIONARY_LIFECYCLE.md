@@ -1,18 +1,24 @@
 # Trained per-type dictionary lifecycle (the self-contained-distribution design)
 
-This document is the DESIGN spec for IronBus's trained per-message-type compression
-dictionaries (#78, parent #12). It is PARTLY IMPLEMENTED. The on-disk compression runtime now
-exists for the default `lz4` codec (#387, `crates/ironbus-core/src/compress.rs`): the
-self-describing descriptor carries the `dict_id` field (§8), the `DictResolver` SEAM (§3, §4)
-is in place (the default `NoDictionaries` resolver holds nothing), and an unresolved `dict_id`
-is the bounded POISON class routed to #8 as `ReasonCode::UnresolvedDictId` (§5, IMPLEMENTED in
-`crates/ironbus-storage/src/loss.rs`). What stays DEFERRED is the zstd-specific machinery: the
-`ZDICT` training call (§1), the sidecar-IO write/read and `include_bytes!` embed (§3), and the
-measured before/after ratio (§7), all behind the opt-in zstd feature per
-[ADR 0003](adr/0003-default-compression-lz4-zstd-opt-in.md). On the default `lz4` path every
-frame is written with `dict_id = 0` (no dictionary), so a dictionary-BEARING frame is still
-only ever produced by a future zstd-feature writer. This doc pins the contract for the
-remaining residual.
+This document is the lifecycle spec for IronBus's trained per-message-type compression
+dictionaries (#78, parent #12). It is now IMPLEMENTED behind the OPT-IN `zstd` Cargo feature
+(#357). The on-disk compression runtime for the default `lz4` codec landed first (#387,
+`crates/ironbus-core/src/compress.rs`): the self-describing descriptor carries the `dict_id`
+field (§8), the `DictResolver` SEAM (§3, §4) is in place, and an unresolved `dict_id` is the
+bounded POISON class routed to #8 as `ReasonCode::UnresolvedDictId` (§5,
+`crates/ironbus-storage/src/loss.rs`). The zstd-specific machinery is now IMPLEMENTED behind
+the opt-in `zstd` feature per [ADR 0003](adr/0003-default-compression-lz4-zstd-opt-in.md): the
+zstd codec id 2 (`ironbus_core::compress`, with the same decompression-bomb cap and
+corrupt-never-panics resilience as `lz4`), the `ZDICT` training call + the content-addressed
+`dict_id` (`ironbus_core::dict`, §1, §2), the sidecar-IO write/read + the content-validated
+resolver (`ironbus_storage::dict_store`, §3, §4), the measured before/after ratio (§7), and the
+`ironbus dict` train/install/ls CLI. On the DEFAULT (non-zstd) build none of this is compiled:
+every frame is written with `dict_id = 0` (no dictionary), and a record carrying the zstd codec
+id is read as UNKNOWN-codec POISON, never a crash, so the default binary stays pure Rust and
+byte-for-byte unchanged. The `include_bytes!` build-time embed of an active set (§3b) is the
+one remaining residual: the runtime sidecar (the primary, binary-independent copy) and the
+resolver's embedded-set seam (`CachingDictResolver::add_embedded`) are implemented; wiring a
+`build.rs` to compile `dicts/active/` into the binary is a follow-up.
 
 It is a lifecycle-and-format document, not a byte-layout reference. For the exact on-disk
 record, segment, and footer byte layouts see [CONTRACTS.md](CONTRACTS.md) and the
@@ -110,9 +116,12 @@ ironbus dict train \
    The broker embeds the active set at build time (Section 3) and writes the sidecar at
    runtime (Section 3).
 
-**IMPL-RESIDUAL:** the actual `ZDICT_trainFromBuffer` call (and the zstd dependency that
-carries it) is the implementation follow-up. This section specifies its inputs, its output,
-the floors, and the operator flow; the C training call is the only residual.
+**IMPLEMENTED (#357, opt-in `zstd` feature):** the `ZDICT_trainFromBuffer` call is
+`ironbus_core::dict::train_dictionary` (via the `zstd` crate's `zdict_builder` feature),
+enforcing the `MIN_SAMPLES` / `TARGET_SAMPLES` / `MIN_DISTINCT_BYTES` floors fail-closed; the
+operator surface is `ironbus dict train --type <t> --samples <dir>` (with `--out`,
+`--target-dict-bytes`, `--min-samples`, `--json`), which emits `dicts/<dict_id>.zstd` and a
+`--json` summary including the measured ratio (§7).
 
 ## 2. dict_id: a content-addressed, collision-checked, registry-free id
 
@@ -242,9 +251,12 @@ dependency.
   of the OLDER build, which may not include a dictionary a newer producer used. That gap is
   exactly why the sidecar is resolved first (Section 4).
 
-**IMPL-RESIDUAL:** the runtime sidecar write/read IO and the `build.rs` + `include_bytes!`
-embedding are the implementation follow-up. This section specifies the on-disk layout, the
-content-name integrity check, the durability ordering, and the embedding mechanism.
+**IMPLEMENTED (#357, opt-in `zstd` feature):** the runtime sidecar write/read IO is
+`ironbus_storage::dict_store::DictSidecarStore` (write-once, content-named, fsync-blob-then-
+dir-sync durability ordering, content-hash-on-read integrity check that treats a mismatched or
+absent blob as ABSENT). The `build.rs` + `include_bytes!` embed of the active set (§3b) is the
+one remaining follow-up; the resolver already accepts an embedded set via
+`CachingDictResolver::add_embedded`, so wiring the build-time compile-in is additive.
 
 ## 4. Resolution order: on-disk sidecar FIRST, then the embedded set
 
@@ -393,9 +405,12 @@ is honest and reproducible.
   the reference ARM device under the run discipline (#113), not faked host-side, because the
   whole point is the realized edge flash and uplink saving.
 
-**IMPL-RESIDUAL:** running the two-arm bench on a real per-type corpus and recording the measured
-ratio. This section specifies the method (one variable, real telemetry, the ratio formula, the
-bench/#114 surface, on-device per #19); the number is the residual.
+**IMPLEMENTED (#357, opt-in `zstd` feature):** the two-arm measurement is wired into
+`ironbus dict train`, which reports `ratio_no_dict`, `ratio_with_dict`, and `ratio_gain`
+(`ratio_with_dict / ratio_no_dict`) over the training corpus at a fixed zstd level (the §7
+one-variable method); the `--json` summary carries the numbers. The CANONICAL on-device edge
+number on a real per-type corpus (per #19/#113) is the one remaining residual: the method,
+the formula, and the tooling are implemented; the archived device number is the follow-up.
 
 ## 8. The v1 frame's dict_id reservation (proof this is additive)
 
@@ -439,12 +454,12 @@ the dict_id space. The reservation is concrete:
 
 | #78 acceptance criterion | Status |
 |--------------------------|--------|
-| CLI trains a dictionary from collected samples and emits a content-hash dict_id | SPECIFIED-HERE (Sections 1, 2); the `ZDICT` call is IMPL-RESIDUAL |
-| A frame written with a dictionary is decodable using only the on-disk sidecar (binary-independent) | SPECIFIED-HERE (Sections 3a, 4) |
-| The same frame is decodable from the embedded set when the sidecar is absent | SPECIFIED-HERE (Sections 3b, 4) |
+| CLI trains a dictionary from collected samples and emits a content-hash dict_id | IMPLEMENTED (Sections 1, 2, #357): `ironbus dict train` -> `ironbus_core::dict::train_dictionary` (ZDICT) + `truncate_u32(BLAKE3-256)` dict_id |
+| A frame written with a dictionary is decodable using only the on-disk sidecar (binary-independent) | IMPLEMENTED (Sections 3a, 4, #357): `ironbus_storage::dict_store::DictSidecarStore` + `CachingDictResolver` (sidecar-first, content-validated) |
+| The same frame is decodable from the embedded set when the sidecar is absent | IMPLEMENTED-SEAM (Sections 3b, 4, #357): the resolver serves an embedded set via `CachingDictResolver::add_embedded`; the `build.rs`/`include_bytes!` compile-in is the one follow-up |
 | An unresolved dict_id is quarantined via #8, not crashed or silently dropped | IMPLEMENTED (Section 5, #357/#387): `PoisonUnresolvedDict` -> `ReasonCode::UnresolvedDictId` -> #8 |
-| Dictionaries are immutable; a re-train yields a new dict_id and leaves old data readable | SPECIFIED-HERE (Sections 2, 6) |
-| A documented before/after ratio on real telemetry shows the dictionary win over no-dictionary per-batch | METHOD SPECIFIED-HERE (Section 7); the measured number is IMPL-RESIDUAL |
+| Dictionaries are immutable; a re-train yields a new dict_id and leaves old data readable | IMPLEMENTED (Sections 2, 6, #357): content-addressed dict_id + write-once sidecar store make reuse impossible by construction |
+| A documented before/after ratio on real telemetry shows the dictionary win over no-dictionary per-batch | METHOD + TOOLING IMPLEMENTED (Section 7, #357): `ironbus dict train` reports `ratio_no_dict`/`ratio_with_dict`/`ratio_gain`; the archived on-device number is the residual |
 
 ## Cross-references
 

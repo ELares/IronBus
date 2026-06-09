@@ -23,6 +23,12 @@ otlp = ["ironbus-server/otlp"]
 # server's `edge-min` marker, which MUST NOT enable `otlp`, so the binary links no opentelemetry and
 # shrinks versus an `otlp` build (#99).
 edge-min = ["ironbus-server/edge-min"]
+# OPT-IN zstd codec + the trained-dictionary lifecycle (#357). NON-DEFAULT: compiling it in pulls
+# the vendored-C `zstd` library (static-linked) and the BLAKE3 dict_id hash, and enables the
+# `ironbus dict train`/`install`/`ls` subcommands. The DEFAULT binary, its SBOM, and the cffi-ban
+# gate are UNCHANGED (zstd absent by default), per ADR-0003. Forwards the feature to storage (the
+# sidecar IO) and through it to ironbus-core (the codec + training).
+zstd = ["ironbus-storage/zstd", "ironbus-core/zstd"]
 
 [dependencies]
 ironbus-core = { path = "../ironbus-core", version = "0.0.0" }

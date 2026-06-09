@@ -36,7 +36,15 @@ is the resolved position.
   simple and the supply-chain audit (cargo-deny, the SBOM) free of vendored C on
   the default path.
 - Operators who want zstd's higher ratio opt in explicitly via a feature and
-  accept the vendored-C dependency; cargo-deny will gate it through a C-FFI
-  allowlist (#102) once that dependency is actually introduced.
+  accept the vendored-C dependency; cargo-deny gates it through a C-FFI allowlist
+  (#102). IMPLEMENTED in #357: the opt-in `zstd` Cargo feature of `ironbus-core`
+  (threaded up to `ironbus-storage` and `ironbus-cli`) adds the zstd codec (id 2)
+  and the trained-dictionary lifecycle. The `zstd-sys` vendored-C crate is built
+  VENDORED + STATIC (the `pkg-config` feature is OFF, so it compiles the bundled
+  `zstd.1.5.7` C rather than linking a system libzstd, the #77 musl requirement)
+  and is the sole, explicitly allowed C-FFI in `deny.toml`. The DEFAULT build,
+  its SBOM, and the `scripts/ci/cffi-ban.sh` gate (which scope to the default
+  `ironbus-cli` graph) carry ZERO zstd and stay byte-for-byte unchanged; the
+  opt-in path is covered by the `zstd-feature` CI job.
 - The README issue-table row for #12 is now historical on the default-codec
   point and should be read against this ADR and the #139 decision.

@@ -8,6 +8,15 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# DEFAULT: no feature. The shipped storage engine is pure Rust (ADR-0003); the dictionary sidecar
+# IO and the zstd codec are pulled ONLY by the opt-in `zstd` feature below, so the default graph is
+# unchanged.
+default = []
+# OPT-IN zstd: forwards ironbus-core's `zstd` feature so the on-disk dictionary sidecar store
+# (`dicts/<dict_id>.zstd`) and the zstd codec compile in. NON-DEFAULT, off the default build (#357).
+zstd = ["ironbus-core/zstd"]
+
 [dependencies]
 crc32c = "0.6"
 ironbus-core = { path = "../ironbus-core", version = "0.0.0" }
