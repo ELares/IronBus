@@ -78,10 +78,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-          - armv7-unknown-linux-musleabihf
+        # `target` is the internal cargo/cross BUILD triple (unchanged); `asset` is the published,
+        # human-friendly binary name. The `unknown` vendor field in a Linux triple confuses non-Rust
+        # edge operators, so the released asset drops the triple for an obvious CPU-arch name. The
+        # mapping is pinned here so the build step stages the friendly name and every consumer
+        # (SHA256SUMS, attestation, the release assets, the installer, the docs) agrees.
+        include:
+          - target: x86_64-unknown-linux-musl
+            asset: ironbus-linux-amd64
+          - target: aarch64-unknown-linux-musl
+            asset: ironbus-linux-arm64
+          - target: armv7-unknown-linux-musleabihf
+            asset: ironbus-linux-armv7
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -130,14 +138,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          out="dist/ironbus-${{ matrix.target }}"
+          # Stage the binary under its FRIENDLY published name (the `unknown`-vendored triple is only
+          # the internal cargo/cross target); the per-binary .sha256 is named with that same bare
+          # asset name so `sha256sum -c` works from the download dir. The consolidated SHA256SUMS is
+          # built once in the publish job.
+          out="dist/${{ matrix.asset }}"
           cp "target/${{ matrix.target }}/release/ironbus" "$out"
-          # The per-binary .sha256 is named with the bare asset name so `sha256sum -c` works from
-          # the download dir; the consolidated SHA256SUMS is built once in the publish job.
-          ( cd dist && sha256sum "ironbus-${{ matrix.target }}" > "ironbus-${{ matrix.target }}.sha256" )
+          ( cd dist && sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256" )
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ironbus-${{ matrix.target }}
+          name: ${{ matrix.asset }}
           path: dist/*
           if-no-files-found: error
 
@@ -159,16 +169,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          # Copy the three binaries and their per-binary .sha256 out of the per-target artifacts,
-          # then build one SHA256SUMS over the three binaries (the installer's source of truth).
-          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf; do
-            cp "artifacts/ironbus-${t}/ironbus-${t}" "dist/ironbus-${t}"
-            cp "artifacts/ironbus-${t}/ironbus-${t}.sha256" "dist/ironbus-${t}.sha256"
+          # Copy the three FRIENDLY-named binaries and their per-binary .sha256 out of the per-asset
+          # artifacts, then build one SHA256SUMS over the three binaries (the installer's source of
+          # truth). The asset names are the published, human-friendly names; the triple stays the
+          # internal build target only.
+          for a in ironbus-linux-amd64 ironbus-linux-arm64 ironbus-linux-armv7; do
+            cp "artifacts/${a}/${a}" "dist/${a}"
+            cp "artifacts/${a}/${a}.sha256" "dist/${a}.sha256"
           done
           ( cd dist && sha256sum \
-              ironbus-x86_64-unknown-linux-musl \
-              ironbus-aarch64-unknown-linux-musl \
-              ironbus-armv7-unknown-linux-musleabihf \
+              ironbus-linux-amd64 \
+              ironbus-linux-arm64 \
+              ironbus-linux-armv7 \
               > SHA256SUMS )
           # Self-check: the consolidated file must verify before it ships, so a bad upload can
           # never produce a release whose SHA256SUMS does not match its own binaries.
@@ -179,9 +191,9 @@ jobs:
           # Keyless Sigstore build-provenance over the binaries + SHA256SUMS, so a verifier can
           # anchor the whole set to one provenance (verify with `gh attestation verify`).
           subject-path: |
-            dist/ironbus-x86_64-unknown-linux-musl
-            dist/ironbus-aarch64-unknown-linux-musl
-            dist/ironbus-armv7-unknown-linux-musleabihf
+            dist/ironbus-linux-amd64
+            dist/ironbus-linux-arm64
+            dist/ironbus-linux-armv7
             dist/SHA256SUMS
       - name: create the rolling GitHub Release
         env:
@@ -205,13 +217,14 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/ELares/IronBus/main/scripts/install.sh | sh
           \`\`\`
 
-          Or grab the static \`musl\` binary for your CPU from this release, \`chmod +x\`, and run:
+          Each binary is a static \`musl\` build (no runtime dependency, not even a libc). Grab the
+          one for your CPU from this release, \`chmod +x\`, and run:
 
           | Edge CPU | Asset |
           | --- | --- |
-          | Raspberry Pi 4 / 5 (64-bit) and other arm64 | \`ironbus-aarch64-unknown-linux-musl\` |
-          | Raspberry Pi 32-bit / armv7 | \`ironbus-armv7-unknown-linux-musleabihf\` |
-          | x86_64 / amd64 | \`ironbus-x86_64-unknown-linux-musl\` |
+          | Raspberry Pi 4 / 5 (64-bit) and other arm64 | \`ironbus-linux-arm64\` |
+          | Raspberry Pi 32-bit / armv7 | \`ironbus-linux-armv7\` |
+          | x86_64 / amd64 | \`ironbus-linux-amd64\` |
 
           Verify integrity with \`sha256sum -c SHA256SUMS\`, and provenance with \`gh attestation verify <asset> --repo ${REPO}\`. See docs/DISTRIBUTION.md for all channels.
           EOF
@@ -221,10 +234,10 @@ jobs:
             --title "$VERSION" \
             --target "$SHA" \
             --notes "$notes" \
-            dist/ironbus-x86_64-unknown-linux-musl \
-            dist/ironbus-x86_64-unknown-linux-musl.sha256 \
-            dist/ironbus-aarch64-unknown-linux-musl \
-            dist/ironbus-aarch64-unknown-linux-musl.sha256 \
-            dist/ironbus-armv7-unknown-linux-musleabihf \
-            dist/ironbus-armv7-unknown-linux-musleabihf.sha256 \
+            dist/ironbus-linux-amd64 \
+            dist/ironbus-linux-amd64.sha256 \
+            dist/ironbus-linux-arm64 \
+            dist/ironbus-linux-arm64.sha256 \
+            dist/ironbus-linux-armv7 \
+            dist/ironbus-linux-armv7.sha256 \
             dist/SHA256SUMS

@@ -126,18 +126,20 @@ impl Fixture {
     }
 }
 
-/// Build a fixture: write `ironbus-<target>` with `payload`, and a `SHA256SUMS` over it (plus a
-/// second, unrelated asset entry so the "select the right line" path is exercised).
+/// Build a fixture: write the friendly-named asset (`ironbus-linux-amd64`) with `payload`, and a
+/// `SHA256SUMS` over it (plus a second, unrelated asset entry so the "select the right line" path is
+/// exercised). The asset names match the published, human-friendly release assets, not the internal
+/// build triple.
 fn fixture(payload: &[u8]) -> Fixture {
     let dir = tempdir::TempDir::new("ib-installer");
-    let asset = "ironbus-x86_64-unknown-linux-musl".to_string();
+    let asset = "ironbus-linux-amd64".to_string();
     std::fs::write(dir.path().join(&asset), payload).unwrap();
 
     let other = b"a different architecture's bytes";
-    std::fs::write(dir.path().join("ironbus-aarch64-unknown-linux-musl"), other).unwrap();
+    std::fs::write(dir.path().join("ironbus-linux-arm64"), other).unwrap();
 
     let mut sums = String::new();
-    sums.push_str(&sums_line(other, "ironbus-aarch64-unknown-linux-musl"));
+    sums.push_str(&sums_line(other, "ironbus-linux-arm64"));
     sums.push_str(&sums_line(payload, &asset));
     std::fs::write(dir.path().join("SHA256SUMS"), sums).unwrap();
 
@@ -179,15 +181,11 @@ fn an_asset_absent_from_sha256sums_is_rejected() {
     let fx = fixture(payload);
     // Ask to verify an asset name that has no entry in SHA256SUMS; a missing checksum is a
     // failure, never a pass.
-    std::fs::write(
-        fx.dir().join("ironbus-armv7-unknown-linux-musleabihf"),
-        payload,
-    )
-    .unwrap();
+    std::fs::write(fx.dir().join("ironbus-linux-armv7"), payload).unwrap();
     let code = run_verify(
         fx.dir(),
-        "ironbus-armv7-unknown-linux-musleabihf",
-        "ironbus-armv7-unknown-linux-musleabihf",
+        "ironbus-linux-armv7",
+        "ironbus-linux-armv7",
         "SHA256SUMS",
     );
     assert_ne!(

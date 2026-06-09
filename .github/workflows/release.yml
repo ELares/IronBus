@@ -66,10 +66,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-          - armv7-unknown-linux-musleabihf
+        # `target` is the internal cargo/cross BUILD triple (unchanged); `asset` is the published,
+        # human-friendly binary name. The released binary drops the `unknown`-vendored triple for an
+        # obvious CPU-arch name; the triple stays the build target only. The `.deb` packages now use
+        # the friendly `ironbus-linux-<arch>.deb` name too (set in package-deb), mirroring the binary
+        # asset name, so they carry no `unknown` triple either.
+        include:
+          - target: x86_64-unknown-linux-musl
+            asset: ironbus-linux-amd64
+          - target: aarch64-unknown-linux-musl
+            asset: ironbus-linux-arm64
+          - target: armv7-unknown-linux-musleabihf
+            asset: ironbus-linux-armv7
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -115,14 +123,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          out="dist/ironbus-${{ matrix.target }}"
+          # Stage the binary under its FRIENDLY published name (the `unknown`-vendored triple is only
+          # the internal cargo/cross target); the per-binary .sha256 is named with that same bare
+          # asset name so `sha256sum -c` works from the download dir. The consolidated SHA256SUMS is
+          # built once in the publish job.
+          out="dist/${{ matrix.asset }}"
           cp "target/${{ matrix.target }}/release/ironbus" "$out"
-          # The per-binary .sha256 is named with the bare asset name so `sha256sum -c` works from
-          # the download dir; the consolidated SHA256SUMS is built once in the publish job.
-          ( cd dist && sha256sum "ironbus-${{ matrix.target }}" > "ironbus-${{ matrix.target }}.sha256" )
+          ( cd dist && sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256" )
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ironbus-${{ matrix.target }}
+          name: ${{ matrix.asset }}
           path: dist/*
           if-no-files-found: error
 
@@ -134,12 +144,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # `target` is the cargo BUILD triple; `asset` is the friendly binary name produced by the
+        # `build` job (what package-deb downloads + stages); `deb_arch` is the Debian architecture.
+        # The `.deb` itself now uses the friendly `ironbus-linux-<arch>.deb` name (mirroring `asset`,
+        # via `--output dist/${ASSET}.deb`), so the .deb filenames carry no `unknown` triple either.
         include:
           - target: x86_64-unknown-linux-musl
+            asset: ironbus-linux-amd64
             deb_arch: amd64
           - target: aarch64-unknown-linux-musl
+            asset: ironbus-linux-arm64
             deb_arch: arm64
           - target: armv7-unknown-linux-musleabihf
+            asset: ironbus-linux-armv7
             deb_arch: armhf
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -151,11 +168,12 @@ jobs:
           tool: cargo-deb
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ironbus-${{ matrix.target }}
+          name: ${{ matrix.asset }}
           path: dist
       - name: build the .deb from the verified static binary (no recompile)
         env:
           TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
           DEB_ARCH: ${{ matrix.deb_arch }}
         run: |
           set -euo pipefail
@@ -165,30 +183,30 @@ jobs:
           # `Architecture` from the `--target` triple (amd64/arm64/armhf), NOT from the host. Without
           # `--target` every leg would label `amd64` (the ubuntu-latest host), so the aarch64/armv7
           # .debs would declare amd64 and `dpkg -i` would refuse them on an arm node. We pass the
-          # per-triple binary and `--target`, matching docs/DISTRIBUTION.md. --no-build skips the
+          # friendly-named binary and `--target`, matching docs/DISTRIBUTION.md. --no-build skips the
           # compile (ships the exact reproducible release bytes, not a fresh glibc rebuild);
           # --no-strip preserves the embedded SBOM and the reproducible bytes.
           mkdir -p "target/${TARGET}/release"
-          install -m 0755 "dist/ironbus-${TARGET}" "target/${TARGET}/release/ironbus"
+          install -m 0755 "dist/${ASSET}" "target/${TARGET}/release/ironbus"
           cargo deb -p ironbus-cli --target "${TARGET}" --no-build --no-strip \
-            --output "dist/ironbus-${TARGET}.deb"
+            --output "dist/${ASSET}.deb"
           ls -l dist/*.deb
           # A self-check: dpkg-deb can parse the package and it lists the binary, the unit, and the
           # conffile, so a broken metadata change is caught at the tag, not on a device.
-          dpkg-deb -I "dist/ironbus-${TARGET}.deb"
-          dpkg-deb -c "dist/ironbus-${TARGET}.deb" | grep -E 'usr/bin/ironbus|ironbus.service|etc/ironbus/ironbus.env'
+          dpkg-deb -I "dist/${ASSET}.deb"
+          dpkg-deb -c "dist/${ASSET}.deb" | grep -E 'usr/bin/ironbus|ironbus.service|etc/ironbus/ironbus.env'
           # ASSERT the Debian Architecture matches this leg's triple. A mislabeled .deb (the amd64-for-
           # everything bug) now FAILS the job instead of shipping a package an arm `dpkg -i` rejects.
-          actual_arch="$(dpkg-deb -f "dist/ironbus-${TARGET}.deb" Architecture)"
+          actual_arch="$(dpkg-deb -f "dist/${ASSET}.deb" Architecture)"
           if [ "${actual_arch}" != "${DEB_ARCH}" ]; then
-            echo "::error::ironbus-${TARGET}.deb declares Architecture '${actual_arch}', expected '${DEB_ARCH}'"
+            echo "::error::${ASSET}.deb declares Architecture '${actual_arch}', expected '${DEB_ARCH}'"
             exit 1
           fi
-          echo "ironbus-${TARGET}.deb Architecture = ${actual_arch} (matches ${DEB_ARCH})"
+          echo "${ASSET}.deb Architecture = ${actual_arch} (matches ${DEB_ARCH})"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ironbus-deb-${{ matrix.target }}
-          path: dist/ironbus-${{ matrix.target }}.deb
+          path: dist/${{ matrix.asset }}.deb
           if-no-files-found: error
 
   container:
@@ -205,7 +223,7 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ironbus-x86_64-unknown-linux-musl
+          name: ironbus-linux-amd64
           path: dist
       - name: build the distroless image from the verified static binary
         run: |
@@ -217,9 +235,9 @@ jobs:
           # it), so restore it before the build. Dockerfile.release also does `COPY --chmod=0755`, so
           # the image entrypoint is executable even if a future build path drops this; together the
           # `docker run ... --version` smoke below can never fail permission-denied on the binary.
-          chmod 0755 "dist/ironbus-x86_64-unknown-linux-musl"
+          chmod 0755 "dist/ironbus-linux-amd64"
           docker build -f Dockerfile.release \
-            --build-arg IRONBUS_BIN=dist/ironbus-x86_64-unknown-linux-musl \
+            --build-arg IRONBUS_BIN=dist/ironbus-linux-amd64 \
             -t "ironbus:${{ github.event.inputs.tag || github.ref_name }}" .
           # Smoke: the non-root entrypoint runs (--version is a pure stdout-and-exit, no data dir).
           docker run --rm "ironbus:${{ github.event.inputs.tag || github.ref_name }}" --version
@@ -301,21 +319,29 @@ jobs:
           # as the installer's source of truth), and the per-target .deb (built by package-deb from
           # the same verified binary), then build one SHA256SUMS over all three binaries AND the
           # three .deb packages so the checksummed-release channel covers the .deb too.
-          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf; do
-            cp "artifacts/ironbus-${t}/ironbus-${t}" "dist/ironbus-${t}"
-            cp "artifacts/ironbus-${t}/ironbus-${t}.sha256" "dist/ironbus-${t}.sha256"
-            cp "artifacts/ironbus-deb-${t}/ironbus-${t}.deb" "dist/ironbus-${t}.deb"
+          # Map each build triple to its friendly asset name. The binary AND the .deb both ship under
+          # that friendly name (`ironbus-linux-<arch>` / `ironbus-linux-<arch>.deb`), so neither
+          # carries the `unknown`-vendored triple; only the build-target triple `t` keeps it.
+          for pair in \
+            "x86_64-unknown-linux-musl:ironbus-linux-amd64" \
+            "aarch64-unknown-linux-musl:ironbus-linux-arm64" \
+            "armv7-unknown-linux-musleabihf:ironbus-linux-armv7"; do
+            t="${pair%%:*}"
+            a="${pair##*:}"
+            cp "artifacts/${a}/${a}" "dist/${a}"
+            cp "artifacts/${a}/${a}.sha256" "dist/${a}.sha256"
+            cp "artifacts/ironbus-deb-${t}/${a}.deb" "dist/${a}.deb"
           done
           # The syft CycloneDX SBOM (dist/ironbus.cyclonedx.json) was written in this same job; fold
           # it into SHA256SUMS so the scannable manifest is checksummed alongside the binaries and
           # .deb packages (#367).
           ( cd dist && sha256sum \
-              ironbus-x86_64-unknown-linux-musl \
-              ironbus-aarch64-unknown-linux-musl \
-              ironbus-armv7-unknown-linux-musleabihf \
-              ironbus-x86_64-unknown-linux-musl.deb \
-              ironbus-aarch64-unknown-linux-musl.deb \
-              ironbus-armv7-unknown-linux-musleabihf.deb \
+              ironbus-linux-amd64 \
+              ironbus-linux-arm64 \
+              ironbus-linux-armv7 \
+              ironbus-linux-amd64.deb \
+              ironbus-linux-arm64.deb \
+              ironbus-linux-armv7.deb \
               ironbus.cyclonedx.json \
               > SHA256SUMS )
           # Self-check: the consolidated file must verify before it ships, so a bad upload can
@@ -327,12 +353,12 @@ jobs:
           # Keyless Sigstore build-provenance over every shipped artifact, per SECURITY.md. The
           # SHA256SUMS is attested too, so a verifier can anchor the whole set to one provenance.
           subject-path: |
-            dist/ironbus-x86_64-unknown-linux-musl
-            dist/ironbus-aarch64-unknown-linux-musl
-            dist/ironbus-armv7-unknown-linux-musleabihf
-            dist/ironbus-x86_64-unknown-linux-musl.deb
-            dist/ironbus-aarch64-unknown-linux-musl.deb
-            dist/ironbus-armv7-unknown-linux-musleabihf.deb
+            dist/ironbus-linux-amd64
+            dist/ironbus-linux-arm64
+            dist/ironbus-linux-armv7
+            dist/ironbus-linux-amd64.deb
+            dist/ironbus-linux-arm64.deb
+            dist/ironbus-linux-armv7.deb
             dist/SHA256SUMS
             dist/ironbus.sbom.json
             dist/ironbus.cyclonedx.json
@@ -367,15 +393,15 @@ jobs:
             --verify-tag \
             $prerelease_flag \
             --notes "Static musl binaries for the three edge triples (x86_64, aarch64, armv7) and a .deb package per triple, each with a SHA256 checksum, a consolidated SHA256SUMS (over the binaries, the .deb packages, and the CycloneDX SBOM), a cargo-auditable SBOM (ironbus.sbom.json), a syft CycloneDX SBOM (ironbus.cyclonedx.json, scannable with syft/grype), and a keyless Sigstore build-provenance attestation over every artifact. Verify integrity with: sha256sum -c SHA256SUMS, and provenance with: gh attestation verify <artifact> --repo $REPO. The fail-closed installer (scripts/install.sh) verifies the checksum before installing; the distroless container image is built and (opt-in) published by the release workflow. See docs/DISTRIBUTION.md for all four channels and CHANGELOG.md for changes." \
-            dist/ironbus-x86_64-unknown-linux-musl \
-            dist/ironbus-x86_64-unknown-linux-musl.sha256 \
-            dist/ironbus-aarch64-unknown-linux-musl \
-            dist/ironbus-aarch64-unknown-linux-musl.sha256 \
-            dist/ironbus-armv7-unknown-linux-musleabihf \
-            dist/ironbus-armv7-unknown-linux-musleabihf.sha256 \
-            dist/ironbus-x86_64-unknown-linux-musl.deb \
-            dist/ironbus-aarch64-unknown-linux-musl.deb \
-            dist/ironbus-armv7-unknown-linux-musleabihf.deb \
+            dist/ironbus-linux-amd64 \
+            dist/ironbus-linux-amd64.sha256 \
+            dist/ironbus-linux-arm64 \
+            dist/ironbus-linux-arm64.sha256 \
+            dist/ironbus-linux-armv7 \
+            dist/ironbus-linux-armv7.sha256 \
+            dist/ironbus-linux-amd64.deb \
+            dist/ironbus-linux-arm64.deb \
+            dist/ironbus-linux-armv7.deb \
             dist/SHA256SUMS \
             dist/ironbus.sbom.json \
             dist/ironbus.cyclonedx.json

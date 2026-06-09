@@ -47,13 +47,18 @@ never ship without an audit-trail entry. Tag a release only after the entries ar
 
 ## What the release produces
 
-For each of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, and
-`armv7-unknown-linux-musleabihf`:
+For each of the three build targets `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, and
+`armv7-unknown-linux-musleabihf`, the published binary asset carries a friendly CPU-arch name
+(`ironbus-linux-amd64`, `ironbus-linux-arm64`, `ironbus-linux-armv7` respectively); the
+`unknown`-vendored triple stays the internal cargo/cross build target only:
 
-- `ironbus-<triple>`: the static binary (no `PT_INTERP`, no `NEEDED` libs; asserted in the job).
-- `ironbus-<triple>.sha256`: its SHA256 checksum.
-- `ironbus-<triple>.deb`: the Debian package built from that verified binary (no recompile),
-  self-checked with `dpkg-deb -c` in the `package-deb` job.
+- `ironbus-linux-<arch>`: the static `musl` binary (no `PT_INTERP`, no `NEEDED` libs; asserted in the
+  job). It has no runtime dependency even though the friendly name drops `musl`.
+- `ironbus-linux-<arch>.sha256`: its SHA256 checksum.
+- `ironbus-linux-<arch>.deb`: the Debian package built from that verified binary (no recompile),
+  self-checked with `dpkg-deb -c` in the `package-deb` job. The `.deb` now mirrors the friendly
+  binary asset name (`ironbus-linux-amd64.deb`, `ironbus-linux-arm64.deb`, `ironbus-linux-armv7.deb`),
+  so it carries no `unknown`-vendored triple either; the triple stays the cargo `--target` only.
 
 Plus, once per release:
 
@@ -81,8 +86,9 @@ and not yet a stability promise (see SECURITY.md); a `v1+` tag publishes a full 
 ## Install (the fail-closed installer)
 
 `scripts/install.sh` is a `curl | sh`-style installer that detects the host architecture, maps it
-to a musl triple, downloads the matching `ironbus-<triple>` binary AND the release `SHA256SUMS`,
-and verifies the binary's SHA256 against `SHA256SUMS` BEFORE installing. It is **fail-closed**: any
+to a friendly asset suffix, downloads the matching `ironbus-linux-<arch>` binary (e.g.
+`ironbus-linux-arm64`) AND the release `SHA256SUMS`, and verifies the binary's SHA256 against
+`SHA256SUMS` BEFORE installing. It is **fail-closed**: any
 download error, a missing or mismatched checksum, a malformed `SHA256SUMS`, or an unsupported
 platform aborts with a non-zero exit and installs nothing. It never `eval`s or `sh`-pipes any
 downloaded content. There is no insecure / skip-verification override.
@@ -129,10 +135,10 @@ failed starts, and the explicit `migrate` format gate) is also in
 ```sh
 # Integrity (one file for all three binaries, or the per-binary .sha256):
 sha256sum -c SHA256SUMS                              # checks every listed asset present locally
-sha256sum -c ironbus-x86_64-unknown-linux-musl.sha256
+sha256sum -c ironbus-linux-amd64.sha256
 
 # Provenance (it was built by this repo's Release workflow, signed via Sigstore, no key needed):
-gh attestation verify ironbus-x86_64-unknown-linux-musl --repo ELares/IronBus
+gh attestation verify ironbus-linux-amd64 --repo ELares/IronBus
 
 # Dependency manifest (the embedded or attached SBOM):
 rust-audit-info ironbus.sbom.json
@@ -152,7 +158,7 @@ syft convert ironbus.cyclonedx.json -o cyclonedx-json    # or spdx-json, syft-ta
 grype sbom:ironbus.cyclonedx.json
 
 # Equivalently, scan the downloaded binary directly (syft/grype generate the SBOM on the fly):
-grype ./ironbus-x86_64-unknown-linux-musl
+grype ./ironbus-linux-amd64
 ```
 
 The CycloneDX SBOM and the embedded `cargo-auditable` SBOM (`ironbus.sbom.json`) describe the SAME

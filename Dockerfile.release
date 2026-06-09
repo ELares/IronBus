@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 #
 # IronBus distroless image built from an ALREADY-VERIFIED release binary (#104), with no compile
-# step. The release workflow downloads the static musl `ironbus-<triple>` artifact, verifies it
-# against the signed SHA256SUMS (the same fail-closed check scripts/install.sh enforces), and only
-# then passes it here as IRONBUS_BIN. This keeps the container on the exact reproducible bytes the
-# release ships, and the verify-before-package property holds: the image is never built over an
-# unverified binary.
+# step. The release workflow downloads the friendly-named static musl `ironbus-linux-<arch>` artifact
+# (e.g. `ironbus-linux-amd64`), verifies it against the signed SHA256SUMS (the same fail-closed check
+# scripts/install.sh enforces), and only then passes it here as IRONBUS_BIN. This keeps the container
+# on the exact reproducible bytes the release ships, and the verify-before-package property holds: the
+# image is never built over an unverified binary.
 #
 # Build (from the repo root, with a verified binary staged under dist/):
 #   docker build -f Dockerfile.release \
-#     --build-arg IRONBUS_BIN=dist/ironbus-x86_64-unknown-linux-musl \
+#     --build-arg IRONBUS_BIN=dist/ironbus-linux-amd64 \
 #     -t ghcr.io/elares/ironbus:latest .
 #
 # The runtime stage and its non-root user, CA certs, tzdata, required writable volume, and reserved

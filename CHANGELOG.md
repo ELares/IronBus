@@ -6,6 +6,9 @@ to follow Semantic Versioning once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Changed
+- Renamed the published release binary assets to friendly CPU-arch names: `ironbus-linux-amd64`, `ironbus-linux-arm64`, `ironbus-linux-armv7` (dropping the `unknown`-vendored `musl` triple, which stays the internal cargo/cross build target). The installer (`detect_target` + download URL), its tests, both release workflows (staging, `SHA256SUMS`, attestation, release assets, notes table), and the install docs (README, DISTRIBUTION, RELEASING) are updated to match. The `.deb` packages were renamed to match (`ironbus-linux-amd64.deb`, `ironbus-linux-arm64.deb`, `ironbus-linux-armv7.deb`), so no published asset carries the `unknown` triple; it stays the cargo `--target` only. The binaries are still static `musl` with no runtime dependency.
+
 ### Fixed
 - Hardened the upgrade rollback against the two-rename re-entry window (Closes #348).
   - `ironbus rollback` now restores `ironbus.prev` over the destination WITHOUT first moving the destination onto `.prev`, so a power cut between the renames preserves the last known-good bytes and a re-entry converges to the good binary.

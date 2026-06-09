@@ -3,8 +3,10 @@
 #
 # IronBus fail-closed installer (#103).
 #
-# Downloads the static musl `ironbus` binary that matches this host's architecture from a GitHub
-# Release, verifies its SHA256 against the release's signed `SHA256SUMS`, and installs it. It is
+# Downloads the static `ironbus` binary that matches this host's architecture from a GitHub Release,
+# verifies its SHA256 against the release's signed `SHA256SUMS`, and installs it. The release assets
+# carry friendly CPU-arch names (`ironbus-linux-amd64` / `-arm64` / `-armv7`); they are static musl
+# builds with no runtime dependency (not even a libc). It is
 # FAIL-CLOSED: it NEVER places a binary it has not verified. Any download failure, a missing or
 # mismatched checksum, or an unsupported platform aborts with a non-zero exit and installs nothing.
 # It does not `eval` or `sh`-pipe any downloaded content; the only thing fetched is the binary and
@@ -19,7 +21,8 @@
 #   --version <tag>        Release tag to install (default: latest). Pin this for reproducibility.
 #   --bin-dir <dir>        Install directory (default: /usr/local/bin, or $HOME/.local/bin if the
 #                          default is not writable).
-#   --target <triple>      Force the musl target instead of auto-detecting from `uname -m`.
+#   --target <arch>        Force the asset arch suffix (linux-amd64 / linux-arm64 / linux-armv7)
+#                          instead of auto-detecting from `uname -m`.
 #   --verify-provenance    Additionally verify the keyless Sigstore build-provenance attestation
 #                          with `gh attestation verify`. FAIL-CLOSED: if requested and `gh` is
 #                          absent or verification fails, the install aborts. (Without this flag the
@@ -42,13 +45,16 @@ REPO="ELares/IronBus"
 log() { printf 'ironbus-install: %s\n' "$*" >&2; }
 die() { printf 'ironbus-install: error: %s\n' "$*" >&2; exit 1; }
 
-# Map `uname -m` to the musl release target. Unknown -> empty (caller treats it as unsupported).
+# Map `uname -m` to the FRIENDLY release asset suffix (the published asset is `ironbus-<suffix>`,
+# e.g. `ironbus-linux-arm64`). These static binaries are the `unknown`-vendored musl build targets
+# internally, but ship under obvious CPU-arch names. Unknown -> empty (caller treats it as
+# unsupported).
 detect_target() {
     arch="${1:-$(uname -m)}"
     case "$arch" in
-        x86_64 | amd64) printf '%s' "x86_64-unknown-linux-musl" ;;
-        aarch64 | arm64) printf '%s' "aarch64-unknown-linux-musl" ;;
-        armv7l | armv7 | armhf) printf '%s' "armv7-unknown-linux-musleabihf" ;;
+        x86_64 | amd64) printf '%s' "linux-amd64" ;;
+        aarch64 | arm64) printf '%s' "linux-arm64" ;;
+        armv7l | armv7 | armhf) printf '%s' "linux-armv7" ;;
         *) printf '' ;;
     esac
 }
