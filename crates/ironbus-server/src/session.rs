@@ -1856,6 +1856,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // a thorough end-to-end teeth test for the #411 COMPACTED marker
     fn a_gap_marker_consumer_reading_across_a_compacted_hole_gets_one_compacted_marker() {
         // TEETH (#411): a gap-marker-capable consumer draining a COMPACTED log receives a GapMarker
         // with reason COMPACTED for the interior sparse-offset hole, NOT a TRIMMED marker, NOT a
