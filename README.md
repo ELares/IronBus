@@ -28,7 +28,7 @@ We rank the tenets, and when two conflict we resolve in this order: **Resilient 
 
 | Tenet | What it means in practice |
 | --- | --- |
-| **Simple** | One logical queue, one binary, one config file with safe defaults, a tiny length-framed binary wire protocol you can inspect with the built-in `ironbus tap` and `ironbus wire` commands. Install to first message in under a minute. No ZooKeeper, no JVM, no external dependencies. |
+| **Simple** | One logical queue, one binary, one config file with safe defaults, a tiny length-framed binary wire protocol whose stored records you can decode with the built-in `ironbus peek` and `ironbus dump` commands. Install to first message in under a minute (see the [Quick start](#quick-start-from-install-to-many-producers-and-consumers)). No ZooKeeper, no JVM, no external dependencies. |
 | **Resilient** | Every acknowledged durable write survives power loss. Startup always recovers a consistent prefix. A torn tail or a poison record or segment is skipped, never fatal, with loss bounded and reported as a number. |
 | **HyperScale** | High per-core throughput on edge hardware (not horizontal scale-out): a bounded ring-buffer core with structural backpressure, group-commit `fdatasync`, and zero-copy fan-out, sustaining tens of thousands of small messages per second per core. |
 | **Edge First** | RAM ceilings, flash-wear budgets, and brownout behavior are first-class configuration, not afterthoughts. The queue spills to disk and sheds load rather than blocking producers or running out of memory. |
@@ -52,6 +52,128 @@ We rank the tenets, and when two conflict we resolve in this order: **Resilient 
 - Not replicated. v1 is single-node durable. No quorum, no leader election. Replication is reserved for a post-1.0 milestone and the version scheme leaves room for it.
 - Not exactly-once. At-least-once is the contract, with an optional fire-and-forget fast path. No exactly-once handshake.
 - Not a Kafka wire-protocol clone, and not a Windows product in v1 (Windows fsync and path semantics differ enough to threaten the durability guarantee).
+
+---
+
+## Quick start: from install to many producers and consumers
+
+IronBus is one static binary that is **both the broker and the CLI**. Below is the whole loop: install it, start the broker on your edge device, then point producers and consumers at it. The local examples use the default address `127.0.0.1:7777`, so you can drop `--addr` when everything runs on the same box.
+
+> Security heads-up: the wire protocol is **not yet encrypted or authenticated** (TLS and auth are designed but not implemented). Keep the broker bound to loopback or a trusted LAN behind a firewall or an SSH / WireGuard tunnel. Do not expose it to the open internet.
+
+### 1. Install
+
+**Build from source** (works today, on any host with a Rust toolchain):
+
+```sh
+git clone https://github.com/ELares/IronBus.git
+cd IronBus
+cargo build --release
+# the single binary is now at target/release/ironbus
+```
+
+For an **edge device**, cross-compile the one static `musl` binary and copy it over (no runtime dependencies, not even a libc to install):
+
+```sh
+rustup target add aarch64-unknown-linux-musl   # or armv7-unknown-linux-musleabihf, x86_64-unknown-linux-musl
+cargo build --release --target aarch64-unknown-linux-musl
+scp target/aarch64-unknown-linux-musl/release/ironbus pi@edge-device:/usr/local/bin/ironbus
+```
+
+The **released channels** (the checksummed binaries, the fail-closed `curl | sh` installer, a Debian `.deb`, and a distroless container image) go live with the first tagged release; see [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md). Until then, build from source.
+
+### 2. Start the broker on the edge
+
+The only required flag is `--data-dir` (the durable log, the consumer cursors, and the dead-letter sink all live there). Use the `edge-tiny` profile for a small-RAM, flash-gentle node:
+
+```sh
+ironbus serve --data-dir /var/lib/ironbus --profile edge-tiny
+```
+
+- `--profile edge-tiny` selects the small-RAM preset (8 MiB segments, tiny credits, 32 connections) plus a **64 MiB RAM ceiling that refuses to boot if the configured caps cannot fit**, so the broker can never surprise you by growing past its budget.
+- By default the broker binds **loopback only** (`127.0.0.1:7777`) and acknowledges a write **only after `fdatasync`**, so a power cut loses zero acknowledged messages. To let producers and consumers on **other machines** reach it, bind the device's address (mind the security note above):
+
+  ```sh
+  ironbus serve --data-dir /var/lib/ironbus --profile edge-tiny --addr 0.0.0.0:7777
+  ```
+
+- Optional health and metrics: add `--health-addr 127.0.0.1:9090` to expose `GET /healthz`, `/readyz`, and `/metrics`.
+- `Ctrl-C` (or `SIGTERM` / `SIGHUP`) stops gracefully: it flushes every consumer cursor and exits cleanly, and a restart resumes from the durable log. For an always-on node, run it under systemd (the `.deb` ships a ready unit, so `sudo systemctl enable --now ironbus` is all you need once it is installed).
+
+### 3. Producers: one, or many
+
+The broker is **one durable, totally ordered log**. Any number of producers append to it; the order is the order the broker fsynced them.
+
+```sh
+# Publish one message. It prints the durable offset once the record is fsynced
+# (a printed offset means the message is on disk).
+ironbus pub 'hello edge'
+
+# Attach a key (keys drive key-shared ordering on the consumer side).
+ironbus pub --key sensor-12 '{"temp":21.4}'
+
+# Take the payload from a pipeline (stdin) instead of an argument.
+read_sensor | ironbus pub --key sensor-12
+```
+
+**Many producers** is just running `ironbus pub` from as many processes or hosts as you like; each opens its own connection and the broker serializes them all into the single ordered log. A quick local burst:
+
+```sh
+for i in $(seq 1 1000); do ironbus pub "event-$i"; done
+```
+
+(For a long-lived, high-rate producer, link the `ironbus-client` Rust crate instead of forking a process per message.)
+
+### 4. Consumers: one, or many
+
+A consumer joins a named **work-group**, fetches messages, and disposes of each: `--ack` (commit, never redelivered), `--nack` (redeliver later), or `--term` (drop). Delivery is at-least-once, so an un-acked message redelivers after its visibility timeout.
+
+```sh
+# Read up to 10 from the "orders" group and commit them.
+ironbus sub --group orders --max 10 --ack
+```
+
+Each message prints as `#<offset> gen=<token> key=<key> payload=<payload>`, followed by `fetched <n> message(s)`. Omit the disposition to **peek** (print without committing; the messages redeliver after the timeout):
+
+```sh
+ironbus sub --group orders --max 5
+```
+
+**Many consumers** is where the work-group model matters. You pick the pattern when you start the broker and the group:
+
+- **Competing (a shared work queue, the default for a named group).** Run several consumers on the same group at once and the broker hands each a disjoint slice, exactly like several SQS workers draining one queue. Just start more of them:
+
+  ```sh
+  # In three terminals (or three services), all on the same group:
+  ironbus sub --group orders --max 100 --ack
+  ```
+
+- **Key-shared (parallel, but the same key stays in order).** Start the broker with `--key-shared-group orders`; then every record for a given key always goes to one member (ordered per key) while different keys drain in parallel across members:
+
+  ```sh
+  ironbus serve --data-dir /var/lib/ironbus --profile edge-tiny --key-shared-group orders
+  ```
+
+- **Broadcast (fan-out, every consumer sees everything).** Start the broker with `--broadcast-group audit`; a broadcast group is a group-of-one tap that sees every record in order. Commit its cursor in one move with `cumulative-ack`:
+
+  ```sh
+  ironbus serve --data-dir /var/lib/ironbus --profile edge-tiny --broadcast-group audit
+  # then, from the consumer side:
+  ironbus sub --group audit --max 100                    # observe the stream
+  ironbus cumulative-ack --group audit --up-to <offset>  # commit up to (exclusive) <offset>
+  ```
+
+### 5. Inspect the data directly (no running broker)
+
+Because the durable log is just files, you can decode it with the broker stopped:
+
+```sh
+ironbus peek  --data-dir /var/lib/ironbus   # a bounded window of durable records
+ironbus dump  --data-dir /var/lib/ironbus   # every durable record
+ironbus scrub --data-dir /var/lib/ironbus   # read-only integrity scan that reports any corruption
+```
+
+For every flag, default, and exit code, see the [CLI reference (docs/CLI.md)](docs/CLI.md); for a longer narrative walkthrough see [docs/USAGE.md](docs/USAGE.md).
 
 ---
 
@@ -157,7 +279,7 @@ Security ([#18](https://github.com/ELares/IronBus/issues/18)) is shaped for devi
 The same binary that runs the broker is the CLI, in the spirit of the NATS CLI but with a real view into the stored data:
 
 - `pub` and `sub` for quick interaction, `bench` for load generation.
-- `info`, `consumer ls`, and `lag` for live state.
+- `top` for live state (throughput, lag, fsync latency, backpressure, and corruption events); the finer-grained `info`, `consumer ls`, and `lag` views are planned.
 - `peek` and `dump` to decode and display stored records straight from the data directory, even with no server running.
 - `repair` and `scrub` to drive corruption recovery on demand.
 - `top`, a live TUI showing throughput, lag, fsync latency, backpressure, and corruption events.
