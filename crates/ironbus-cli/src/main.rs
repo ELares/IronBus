@@ -1538,6 +1538,14 @@ struct ServeFlags {
     disk_full_policy: Option<String>,
     visibility_ms: Option<u64>,
     enable_admin: bool,
+    /// Turn ON the OTLP span export (#99, #352): the `--enable-otlp-export` bare flag. OFF by
+    /// default. Honored only when the broker is built with the non-default `otlp` feature; on the
+    /// default build, setting it logs a clear "built without otlp" diagnostic and export stays off.
+    enable_otlp_export: bool,
+    /// The OTLP collector endpoint (#352): `--otlp-endpoint <url>`, e.g. `http://127.0.0.1:4317`
+    /// (plaintext gRPC). `None` falls back to the default endpoint when export is on. Read only when
+    /// export is on AND the `otlp` feature is built in.
+    otlp_endpoint: Option<String>,
     health_addr: Option<String>,
     /// The `/healthz` liveness hysteresis window in ms (#95); `None` falls back to the default.
     health_liveness_window_ms: Option<u64>,
@@ -1716,6 +1724,15 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             "--enable-admin" => {
                 f.enable_admin = true;
                 i += 1;
+            }
+            // A bare boolean flag (no value): advance ONE token, not two, or the loop spins. Turns on
+            // OTLP span export (#352); honored only on an `otlp`-featured build.
+            "--enable-otlp-export" => {
+                f.enable_otlp_export = true;
+                i += 1;
+            }
+            "--otlp-endpoint" => {
+                f.otlp_endpoint = Some(take_value("--otlp-endpoint", args, &mut i)?);
             }
             flag if flag.starts_with("--") => {
                 return Err(CliError::Usage(format!("unknown flag `{flag}` for serve")))
@@ -1979,6 +1996,10 @@ fn parse_serve_flags_with_env_and_reader(
                 preset.visibility_ms,
             )?,
             enable_admin: resolve_bool("--enable-admin", f.enable_admin, env)?,
+            // OTLP span export (#352): off by default; the endpoint has no compiled default (falls
+            // back in the server crate when on). flag > env > default, exactly like the other knobs.
+            enable_otlp_export: resolve_bool("--enable-otlp-export", f.enable_otlp_export, env)?,
+            otlp_endpoint: resolve_opt_string("--otlp-endpoint", f.otlp_endpoint, env),
             health_liveness_window_ms: resolve_number(
                 "--health-liveness-window-ms",
                 f.health_liveness_window_ms,
@@ -2533,6 +2554,18 @@ struct ServeConfig {
     /// network, the #105/#107 threat model), so it must run only where `/metrics` is already
     /// trusted. It exposes no mutating action and no secret material.
     enable_admin: bool,
+    /// Turn ON OTLP span export (#99, #352). OFF by default. When set AND the broker is built with
+    /// the non-default `otlp` feature, the bounded span queue drains into the concrete
+    /// opentelemetry-otlp gRPC exporter shipping to [`Self::otlp_endpoint`]. On the DEFAULT build (no
+    /// `otlp` feature), setting this logs a clear "built without otlp" diagnostic and export stays
+    /// off, so the flag is harmless on the shipped binary. Platform-neutral (validated on every
+    /// platform); only the Unix serve path wires the exporter.
+    enable_otlp_export: bool,
+    /// The OTLP collector endpoint (#352): where the span exporter ships when export is on, e.g.
+    /// `http://127.0.0.1:4317` (plaintext gRPC, the default OTLP/gRPC port). `None` falls back to the
+    /// in-crate default endpoint. Read only when export is on AND the `otlp` feature is built in;
+    /// inert otherwise.
+    otlp_endpoint: Option<String>,
     /// The `/healthz` liveness hysteresis window in MILLISECONDS (#95): the broker's accept loop ticks
     /// a monotonic-clock progress beacon every iteration (idle too), and `/healthz` answers 503 only
     /// after this long with no tick, so a slow-but-progressing fsync never fails liveness and a
@@ -2661,6 +2694,8 @@ impl ServeConfig {
             disk_full_policy: DiskFullPolicyArg::DropNew,
             visibility_ms: DEFAULT_VISIBILITY_MS,
             enable_admin: false,
+            enable_otlp_export: false,
+            otlp_endpoint: None,
             health_liveness_window_ms: DEFAULT_HEALTH_LIVENESS_WINDOW_MS,
             health_allow_public: false,
             dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
@@ -2913,12 +2948,25 @@ fn cmd_serve(
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     // Install the structured-tracing subscriber with the JSON log layer (#16, #99) before any broker
-    // work, so startup events are structured too. OTLP span export stays OFF by runtime default and,
-    // on this default build, is COMPILED OUT entirely (the `otlp` feature is off), so the only
-    // steady-state cost is the JSON log formatting. The returned bounded span queue is the
-    // drop-and-count export buffer; with export off it simply stays empty.
-    let _span_queue =
-        ironbus_server::obs::init_tracing(ironbus_server::obs::TracingConfig::default());
+    // work, so startup events are structured too. OTLP span export (#352) stays OFF by runtime default
+    // and, on this default build, is COMPILED OUT entirely (the `otlp` feature is off), so the only
+    // steady-state cost is the JSON log formatting. When `--enable-otlp-export` is set AND the broker
+    // was built with the `otlp` feature, the concrete exporter ships spans to `--otlp-endpoint`; when
+    // the feature is OFF, setting the flag logs a clear "built without otlp" diagnostic and export
+    // stays off (the seam is absent). The returned bounded span queue is the drop-and-count export
+    // buffer; with export off it simply stays empty.
+    if config.enable_otlp_export && !ironbus_server::obs::otlp_compiled_in() {
+        writeln!(
+            out,
+            "WARN: --enable-otlp-export was set but this broker was built WITHOUT the `otlp` \
+             feature; OTLP span export is disabled (rebuild with --features otlp to enable it)"
+        )?;
+    }
+    let _span_queue = ironbus_server::obs::init_tracing(&ironbus_server::obs::TracingConfig {
+        otlp_export_enabled: config.enable_otlp_export,
+        otlp_endpoint: config.otlp_endpoint.clone(),
+        ..ironbus_server::obs::TracingConfig::default()
+    });
 
     // SECURE-BIND guard (#95, the #107 bind invariant), FAIL-CLOSED and FIRST: resolve and classify
     // `--health-addr` before ANY broker side effect (no data dir touched, no lock taken, no listener
@@ -3281,6 +3329,12 @@ fn cmd_serve(
         // (the recurring #288/#99 footgun).
         config.ram_ceiling_bytes,
         config.enable_admin,
+        // The #352 OTLP export knobs are read only on the Unix serve path (they build the
+        // TracingConfig the exporter wires), so the non-Unix stub must consume them too or the
+        // Windows `-D warnings` build trips field-never-read, invisible to a macOS reviewer (the
+        // recurring #288/#99 footgun). `otlp_endpoint` is borrowed (it is an owned Option).
+        config.enable_otlp_export,
+        &config.otlp_endpoint,
         // The #95 health knobs are read only on the Unix serve path, so the non-Unix stub must
         // consume them too or the Windows `-D warnings` build trips field-never-read, invisible to a
         // macOS reviewer (the recurring #288/#99 footgun).
@@ -4985,6 +5039,8 @@ mod tests {
             disk_full_policy: DiskFullPolicyArg::DropNew,
             visibility_ms: DEFAULT_VISIBILITY_MS,
             enable_admin: false,
+            enable_otlp_export: false,
+            otlp_endpoint: None,
             health_liveness_window_ms: DEFAULT_HEALTH_LIVENESS_WINDOW_MS,
             health_allow_public: false,
             dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
@@ -6556,6 +6612,8 @@ mod tests {
             disk_full_policy: DiskFullPolicyArg::DropNew,
             visibility_ms: DEFAULT_VISIBILITY_MS,
             enable_admin: false,
+            enable_otlp_export: false,
+            otlp_endpoint: None,
             health_liveness_window_ms: DEFAULT_HEALTH_LIVENESS_WINDOW_MS,
             health_allow_public: false,
             dedup_max_ids: DEFAULT_DEDUP_MAX_IDS,
@@ -7759,6 +7817,33 @@ mod tests {
         ])
         .unwrap();
         assert!(on.config.enable_admin, "admin is on with --enable-admin");
+        assert_eq!(on.config.max_in_flight, 8, "the trailing flag still parses");
+    }
+
+    #[test]
+    fn serve_otlp_export_is_off_by_default_and_set_by_the_flags() {
+        // OTLP span export (#352) is opt-in: absent the flags it is off with no endpoint.
+        let off = parse_serve_flags(&["--data-dir".to_string(), "/tmp/x".to_string()]).unwrap();
+        assert!(!off.config.enable_otlp_export, "export is off by default");
+        assert!(off.config.otlp_endpoint.is_none(), "no endpoint by default");
+        // `--enable-otlp-export` is a bare boolean (advances one token); `--otlp-endpoint` takes a
+        // value. Both parse, and a trailing flag after the bare flag still parses.
+        let on = parse_serve_flags(&[
+            "--data-dir".to_string(),
+            "/tmp/x".to_string(),
+            "--enable-otlp-export".to_string(),
+            "--otlp-endpoint".to_string(),
+            "http://collector:4317".to_string(),
+            "--max-in-flight".to_string(),
+            "8".to_string(),
+        ])
+        .unwrap();
+        assert!(on.config.enable_otlp_export, "export is on with the flag");
+        assert_eq!(
+            on.config.otlp_endpoint.as_deref(),
+            Some("http://collector:4317"),
+            "the endpoint is parsed"
+        );
         assert_eq!(on.config.max_in_flight, 8, "the trailing flag still parses");
     }
 
