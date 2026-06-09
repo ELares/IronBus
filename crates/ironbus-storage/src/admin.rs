@@ -376,11 +376,14 @@ pub fn redrive_dlq<F: Filesystem, C: Clock>(
     for entry in &entries[start..] {
         log.append(&Append {
             timestamp_ms: entry.timestamp_ms,
-            // The original record's flags are not separately carried by the DLQ entry; the log
-            // re-derives HAS_KEY from the key, and a redriven record is a fresh main-log record, so
-            // EMPTY flags (plus the derived key flag) is correct. COMPRESSED is not reconstructed
-            // here because the DLQ entry holds the DECODED original payload.
-            flags: RecordFlags::EMPTY,
+            // The payload is the original VERBATIM (the sink never decodes it), so a compressed
+            // original is still compressed here: the COMPRESSED flag MUST be carried back or the
+            // consumer would get a compressed stream labeled uncompressed. The main-log append
+            // re-derives HAS_KEY (from the key) and HAS_XXH3 (from the size), so only the content
+            // flag (COMPRESSED) is preserved from the stored DLQ record.
+            flags: RecordFlags::from_bits(
+                entry.original_flags.bits() & RecordFlags::COMPRESSED.bits(),
+            ),
             key: &entry.key,
             headers: &entry.headers,
             payload: &entry.payload,
@@ -636,6 +639,45 @@ mod tests {
         );
         // The DLQ sink is preserved (redrive copies forward, it does not delete the sink).
         assert_eq!(read_dlq_entries(&fs).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn redrive_preserves_the_compressed_flag_so_a_consumer_can_decompress() {
+        // A compressed source record (the default lz4 codec, #387) is stored in the DLQ with its
+        // payload VERBATIM (still compressed) plus the COMPRESSED flag. Redrive must carry COMPRESSED
+        // back, or a consumer would receive a compressed stream labeled uncompressed (garbage).
+        let fs = log_with(2);
+        let mut sink = DlqSink::open(&fs, ManualClock::new(), cfg()).unwrap();
+        let compressed_payload = b"\x04\x00\x00\x00lz4-stream-bytes".to_vec();
+        let src = OwnedRecord {
+            offset: Offset::new(100),
+            seq: Seq::new(100),
+            timestamp_ms: 1100,
+            flags: RecordFlags::COMPRESSED.with(RecordFlags::HAS_KEY),
+            key: b"k".to_vec(),
+            headers: b"hdr".to_vec(),
+            payload: compressed_payload.clone(),
+        };
+        sink.append_poison("orders", &src, 6).unwrap();
+
+        // The DLQ entry must carry the original COMPRESSED bit (it is not decoded by the sink).
+        let entries = read_dlq_entries(&fs).unwrap();
+        assert!(
+            entries[0].original_flags.contains(RecordFlags::COMPRESSED),
+            "the DLQ entry carries the original COMPRESSED flag"
+        );
+
+        let (outcome, fs) = redrive_dlq(fs, ManualClock::new(), cfg()).unwrap();
+        assert_eq!(outcome.redriven, 1);
+        let tail = main_records(&fs).pop().unwrap();
+        assert!(
+            tail.flags.contains(RecordFlags::COMPRESSED),
+            "the redriven record keeps COMPRESSED so the consumer can decompress it"
+        );
+        assert_eq!(
+            tail.payload, compressed_payload,
+            "the compressed payload is preserved verbatim across the redrive"
+        );
     }
 
     #[test]
