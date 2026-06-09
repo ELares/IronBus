@@ -971,6 +971,21 @@ impl Session {
                         .retain(|&offset, _| offset >= earliest_retained.get());
                     self.emit_truncation(out, earliest_retained.get(), skipped);
                 }
+                // The group's cursor advanced across a KEY-COMPACTION hole (#337, #411): the offsets
+                // in `[from, to)` were superseded by a later record for the same key, so they are
+                // permanently absent mid-stream (the engine already acked the cursor past them). A
+                // gap-marker-capable consumer (#292/#346) gets a `GapMarker` with reason COMPACTED so
+                // it can tell the offset jump is a bounded, reported gap rather than message loss; a
+                // non-capable consumer takes the unchanged SILENT advance (it has no gap-marker frame,
+                // and a compacted hole is not a loss, so emitting the legacy `Truncated` would
+                // mislabel it as a reap). The marker only consumes a credit slot when it is actually
+                // emitted, so a non-capable consumer's batch is byte-for-byte unchanged. Keep draining
+                // either way: the next poll resumes at `to`.
+                Ok(Poll::Compacted { from, to }) => {
+                    if self.gap_marker_enabled {
+                        Self::emit_compaction(out, from.get(), to.get());
+                    }
+                }
                 // Nothing more deliverable right now: end the batch early.
                 Ok(Poll::Idle) => break,
                 Err(e) if e.is_fatal() => {
@@ -1027,6 +1042,31 @@ impl Session {
             );
             reply(out, FrameType::Truncated, &frame_body);
         }
+    }
+
+    /// Emits the consumer-visible `GapMarker` (tag 21) for a KEY-COMPACTION hole (#337, #411): the
+    /// half-open span `[from, to)` was removed by compaction (a later record for the same key
+    /// superseded those offsets), so they are PERMANENTLY ABSENT mid-stream while the surrounding
+    /// segment is present. This is the COMPACTED twin of [`Session::emit_truncation`]'s TRIMMED case:
+    /// same delivery path, same frame, only the `reason` differs (`COMPACTED` vs `TRIMMED`), so the
+    /// distinct cause is correct on the wire. `bytes_skipped` is `0` (a compaction hole is reported by
+    /// its record-count span `to - from`, not a byte total, matching the trim convention and the
+    /// already-frozen `loss-report.v1` field). The caller only invokes this for a gap-marker-capable
+    /// consumer; a non-capable consumer silently advances (a compacted hole is not a loss, so it gets
+    /// NO frame and never the legacy `Truncated`), so the two never double-signal. The capability gate
+    /// lives at the call site (the per-poll loop), so this carries no `&self` state.
+    fn emit_compaction(out: &mut Vec<u8>, from: u64, to: u64) {
+        let mut frame_body = Vec::new();
+        encode_gap_marker(
+            &GapMarkerBody {
+                from,
+                to,
+                bytes_skipped: 0,
+                reason: gap_reason::COMPACTED,
+            },
+            &mut frame_body,
+        );
+        reply(out, FrameType::GapMarker, &frame_body);
     }
 
     fn handle_sub<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
@@ -1722,6 +1762,272 @@ mod tests {
                 .count(),
             3,
             "all three contiguous records delivered: {frames:?}"
+        );
+    }
+
+    /// Opens an engine with a tiny segment cap (so a handful of keyed produces roll into several
+    /// sealed segments) and OPT-IN key compaction enabled (#337), so the off-hot-path compactor can
+    /// remove superseded versions and leave a SPARSE-OFFSET interior hole for the #411 tests.
+    fn compacting_engine() -> Engine<InMemoryFs, ManualClock> {
+        let mut e = Engine::open(
+            InMemoryFs::new(),
+            ManualClock::new(),
+            EngineConfig {
+                log: LogConfig {
+                    max_segment_bytes: 200,
+                    ..LogConfig::default()
+                },
+                lease: LeaseConfig {
+                    visibility_nanos: 30,
+                    hard_cap_nanos: 100,
+                },
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight: 64,
+                consumer_credit: 64,
+                consumer_credit_bytes: 0,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                ram_ceiling_bytes: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: crate::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
+            },
+        )
+        .unwrap();
+        e.set_compaction_config(ironbus_storage::compaction::CompactionConfig::enabled());
+        e
+    }
+
+    /// Produces a churning keyed workload across several rolled segments, then runs the off-hot-path
+    /// compaction pass, leaving an INTERIOR sparse-offset hole: only the latest version per key (plus
+    /// the one-shot survivors) remains, so a poll that drains the log crosses at least one
+    /// compacted-away run.
+    fn produce_compacted_log<C: Clock + Clone>(e: &DirectEngine<InMemoryFs, C>) {
+        // A one-shot survivor at offset 0, then a churning key whose old versions are superseded,
+        // then more one-shot survivors: this puts a compacted-away run BETWEEN present records, so the
+        // consumer reads ACROSS an interior hole (not just a leading one).
+        produce_keyed(e, b"head", b"v");
+        for v in 0..8u8 {
+            produce_keyed(e, b"churn", &[v; 16]);
+        }
+        produce_keyed(e, b"tail", b"v");
+        // One more produce after the rolls triggers the reaper-then-compactor pass (off the hot path).
+        produce_keyed(e, b"flush", b"v");
+    }
+
+    /// The ground-truth compacted holes the workload leaves, discovered by draining a FRESH probe
+    /// engine built and produced IDENTICALLY (same config, same in-memory FS, same deterministic key
+    /// order) at the ENGINE level: each `Poll::Compacted { from, to }` is one half-open hole. This
+    /// keeps the test honest WITHOUT adding a test-only read accessor to the engine: the session is
+    /// asserted to emit a `GapMarker` for exactly these spans.
+    fn compacted_holes_via_probe() -> Vec<(u64, u64)> {
+        let probe = DirectEngine::new(compacting_engine());
+        produce_compacted_log(&probe);
+        let mut holes = Vec::new();
+        loop {
+            // Take the poll result by VALUE (the `RefMut` borrow ends at the semicolon) so the `ack`
+            // below can re-borrow the engine without aliasing.
+            let outcome = probe.engine_mut().poll(0).unwrap();
+            match outcome {
+                Poll::Message(d) => {
+                    probe.engine_mut().ack(&d.token);
+                }
+                Poll::Compacted { from, to } => holes.push((from.get(), to.get())),
+                Poll::Idle => break,
+                other => panic!("unexpected probe poll outcome: {other:?}"),
+            }
+        }
+        holes
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // a thorough end-to-end teeth test for the #411 COMPACTED marker
+    fn a_gap_marker_consumer_reading_across_a_compacted_hole_gets_one_compacted_marker() {
+        // TEETH (#411): a gap-marker-capable consumer draining a COMPACTED log receives a GapMarker
+        // with reason COMPACTED for the interior sparse-offset hole, NOT a TRIMMED marker, NOT a
+        // legacy Truncated, and NOT a loss; the marker's [from, to) is the exact compacted-away run,
+        // delivery resumes at `to`, and every surviving record is still delivered.
+        let e = DirectEngine::new(compacting_engine());
+        produce_compacted_log(&e);
+        let holes = compacted_holes_via_probe();
+        assert!(
+            !holes.is_empty(),
+            "the workload must leave at least one compacted-away interior hole"
+        );
+
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &e,
+            &frame(FrameType::Connect, &gap_marker_connect_body()),
+            &mut out,
+        )
+        .unwrap();
+        // Drain the whole log in one generous batch.
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &64u32.to_le_bytes()), &mut out)
+            .expect("the session stays open across a compacted hole");
+        let frames = decode_all(&out);
+
+        // EXACTLY the holes are surfaced as COMPACTED GapMarkers, and NO legacy Truncated frame.
+        let markers: Vec<_> = frames
+            .iter()
+            .filter(|(ty, _)| *ty == FrameType::GapMarker)
+            .map(|(_, b)| ironbus_proto::message::decode_gap_marker(b).expect("valid GapMarker"))
+            .collect();
+        assert_eq!(
+            markers.len(),
+            holes.len(),
+            "exactly one GapMarker per compacted hole: {frames:?}"
+        );
+        assert!(
+            !frames.iter().any(|(ty, _)| *ty == FrameType::Truncated),
+            "a compacted hole is NEVER the legacy Truncated (no double-signal): {frames:?}"
+        );
+        for (marker, &(from, to)) in markers.iter().zip(holes.iter()) {
+            assert_eq!(
+                marker.reason,
+                ironbus_proto::message::gap_reason::COMPACTED,
+                "a compaction hole is reason COMPACTED, not TRIMMED: {marker:?}"
+            );
+            assert_eq!(
+                marker.from, from,
+                "the marker begins at the first absent offset"
+            );
+            assert_eq!(marker.to, to, "delivery resumes at the next present offset");
+            assert!(marker.to > marker.from, "the compacted span is non-empty");
+            assert_eq!(
+                marker.bytes_skipped, 0,
+                "a compaction hole is byte-untracked; the span is the record count to-from"
+            );
+        }
+        // Independently pin the span against the actual DELIVERY STREAM, NOT `holes` (which the probe
+        // builds from the same engine code, so an engine-side off-by-one in `to` would mask itself,
+        // #411 review): (a) the first Deliver after each COMPACTED marker resumes at exactly `to`, and
+        // (b) no compacted-away offset in any [from, to) is ever delivered.
+        let delivered: Vec<u64> = frames
+            .iter()
+            .filter(|(ty, _)| *ty == FrameType::Deliver)
+            .map(|(_, b)| {
+                ironbus_proto::message::decode_deliver(b)
+                    .expect("valid Deliver")
+                    .offset
+            })
+            .collect();
+        let mut pending_to: Option<u64> = None;
+        for (ty, b) in &frames {
+            match *ty {
+                FrameType::GapMarker => {
+                    pending_to = Some(
+                        ironbus_proto::message::decode_gap_marker(b)
+                            .expect("valid GapMarker")
+                            .to,
+                    );
+                }
+                FrameType::Deliver => {
+                    let off = ironbus_proto::message::decode_deliver(b)
+                        .expect("valid Deliver")
+                        .offset;
+                    if let Some(to) = pending_to.take() {
+                        assert_eq!(
+                            off, to,
+                            "delivery resumes at the marker `to`, verified against the stream not the probe"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        for marker in &markers {
+            assert!(
+                !delivered.iter().any(|&o| o >= marker.from && o < marker.to),
+                "no compacted-away offset in [{}, {}) is delivered: {delivered:?}",
+                marker.from,
+                marker.to
+            );
+        }
+
+        // Every survivor was still delivered (the latest-value-per-key view is intact).
+        assert!(
+            frames
+                .iter()
+                .filter(|(ty, _)| *ty == FrameType::Deliver)
+                .count()
+                >= 3,
+            "the survivors (head, latest churn, tail, flush) are still delivered: {frames:?}"
+        );
+
+        // A later fetch emits NO spurious marker for the same gap (the cursor advanced past it once).
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &64u32.to_le_bytes()), &mut out)
+            .unwrap();
+        let frames2 = decode_all(&out);
+        assert!(
+            !frames2.iter().any(|(ty, _)| *ty == FrameType::GapMarker),
+            "no re-marking of the same compacted hole: {frames2:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_capable_consumer_reading_across_a_compacted_hole_advances_silently() {
+        // TEETH (#411): a consumer that did NOT negotiate the gap marker, draining the SAME compacted
+        // log, advances SILENTLY across the hole: NO GapMarker, NO legacy Truncated, NO error. A
+        // compacted hole is not a loss, so a non-capable consumer's stream is byte-for-byte unchanged
+        // (the backward-compatible silent-advance the engine had before #411).
+        let e = DirectEngine::new(compacting_engine());
+        produce_compacted_log(&e);
+        assert!(
+            !compacted_holes_via_probe().is_empty(),
+            "the workload must leave a compacted hole"
+        );
+
+        // Connect WITHOUT the gap-marker capability (an old, empty Connect).
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &64u32.to_le_bytes()), &mut out)
+            .expect("the session stays open across a compacted hole");
+        let frames = decode_all(&out);
+        assert!(
+            !frames.iter().any(|(ty, _)| *ty == FrameType::GapMarker),
+            "a non-capable consumer is NEVER sent a GapMarker for a compacted hole: {frames:?}"
+        );
+        assert!(
+            !frames.iter().any(|(ty, _)| *ty == FrameType::Truncated),
+            "a compacted hole is NOT a trim; a non-capable consumer gets no Truncated either: {frames:?}"
+        );
+        // The survivors still all arrive, in ascending order, ending with FlowEnd: the silent advance
+        // crossed the hole without dropping a survivor.
+        let delivered: Vec<u64> = frames
+            .iter()
+            .filter(|(ty, _)| *ty == FrameType::Deliver)
+            .map(|(_, b)| decode_deliver(b).expect("valid Deliver").offset)
+            .collect();
+        assert!(delivered.len() >= 3, "all survivors delivered: {frames:?}");
+        let mut sorted = delivered.clone();
+        sorted.sort_unstable();
+        assert_eq!(delivered, sorted, "survivors delivered in ascending order");
+        assert_eq!(
+            frames.last().map(|(ty, _)| *ty),
+            Some(FrameType::FlowEnd),
+            "the batch still terminates with FlowEnd"
         );
     }
 

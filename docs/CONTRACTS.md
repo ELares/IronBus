@@ -567,14 +567,18 @@ already-frozen `loss-report.v1` skip record.
 | `from`          | u64  | 8     | the first absent offset (inclusive): where the hole begins (the last delivered offset plus one) |
 | `to`            | u64  | 8     | the first present offset after the hole (exclusive): delivery resumes here, and the next record (if any) carries this offset |
 | `bytes_skipped` | u64  | 8     | the reported bytes lost in the hole (from `loss-report.v1`); `0` when the cause is byte-untracked (a plain retention/trim reap, whose span is the record count `to - from`) |
-| `reason`        | u8   | 1     | why the span is absent: `1` = `gap_reason::TRIMMED` (a retention / disk-full drop-oldest reap), `2` = `gap_reason::COMPACTED` (#337 key-compaction, reserved, no path emits it yet). An unknown future value is TOLERATED by a reader (decoded verbatim, never an error), so the reason field grows without a new frame |
+| `reason`        | u8   | 1     | why the span is absent: `1` = `gap_reason::TRIMMED` (a retention / disk-full drop-oldest reap), `2` = `gap_reason::COMPACTED` (#337 key-compaction; EMITTED since #411 when a gap-marker-capable consumer reads across a mid-stream compacted hole). An unknown future value is TOLERATED by a reader (decoded verbatim, never an error), so the reason field grows without a new frame |
 
 Trailing bytes are rejected; the `reason` byte is NOT validated by the codec (an unknown reason is a
 valid, tolerated marker). The frame is the OPT-IN, richer twin of `Truncated`: for a trim, `to ==
 earliest_retained` and `from == earliest_retained - skipped`, so the same hole the legacy
-`Truncated` (tag 18) names is carried with explicit `[from, to)` bounds and a reason. Future
-key-compaction (#337) will emit MID-STREAM `[from, to)` holes (`reason = COMPACTED`) through the same
-frame, additively.
+`Truncated` (tag 18) names is carried with explicit `[from, to)` bounds and a reason. Key-compaction
+(#337) emits MID-STREAM `[from, to)` holes with `reason = COMPACTED` through the SAME frame
+(additively, no wire change): since #411, when a gap-marker-capable consumer reads across a compacted
+hole the server sends one such `GapMarker` with `bytes_skipped == 0` (the span is the record count
+`to - from`, a compaction hole is byte-untracked and is NOT a loss). A NON-capable consumer takes the
+silent cursor-advance instead (no frame), so a compacted hole never reaches an old consumer and never
+double-signals.
 
 ### SubBody (wire body of `Sub`)
 
@@ -955,6 +959,7 @@ the `AckStatus` byte, so the frozen wire is byte-for-byte unchanged. A later wir
 | `OK`                              | a verb succeeded (ack committed, cumulative ack advanced or a no-op, fresh produce appended) | generic success |
 | `DUPLICATE`                       | a benign dedup hit: the `msg_id` was in the window, so the ORIGINAL offset is returned with no second append (`duplicate = true`, `rc = 0`, never an error) | `AppendOutcome::Duplicate` |
 | `OFFSET_TRIMMED`                  | a read fell below the trim/retention horizon; the cursor reset up to `earliest_retained` and the skip is surfaced ONCE (as the wire `Truncated` frame, or, for a gap-marker consumer, the richer `GapMarker` frame with explicit `[from, to)` + reason, #346) | `Poll::Truncated` |
+| `OFFSET_COMPACTED`                | a read crossed an INTERIOR key-compaction hole; the cursor advanced past the `[from, to)` run and the skip is surfaced ONCE as a `GapMarker(reason = COMPACTED)` to a gap-marker consumer (a non-capable consumer advances silently). NOT a loss: the latest-value-per-key view is intact, the cursor still reaches head, no `LossReport` (#337, #411) | `Poll::Compacted` |
 | `ERR_CUMULATIVE_ACK_NOT_ALLOWED`  | a cumulative ack on a competing / `key_shared` / unknown / not-marked-broadcast group | `EngineError::CumulativeAckOnWorkGroup` |
 | `ERR_ACK_NOT_OWNED`               | an ack/nack/term/progress on a lease this consumer does not own (never delivered, or a stale generation) | `AckResult::Fenced` / `NackResult::Fenced` (wire status `0`) |
 | `ERR_CUMULATIVE_ACK_OUT_OF_RANGE` | a broadcast cumulative ack whose `up_to` is past the durable head or below earliest-retained | `EngineError::CumulativeAckOutOfRange` |

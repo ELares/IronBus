@@ -393,7 +393,10 @@ assumes, and the spec is honest about it.
   deliver), so the cursor advances past the gap exactly as if those offsets had been acked.
   This is distinct from the below-earliest TRUNCATION signal (`Poll::Truncated`, WAL.md), which
   fires when a reaper deletes records UNDER a cursor; a compaction gap is above-or-at the
-  cursor and is a normal forward skip, not a truncation. The two signals stay separate.
+  cursor and is a normal forward skip, not a truncation. The engine surfaces the forward skip as
+  the distinct `Poll::Compacted { from, to }` (#411), which the session maps to
+  `GapMarker(reason = COMPACTED)` for a gap-marker-capable consumer and swallows silently for a
+  non-capable one. The two signals stay separate.
 
 ---
 
@@ -446,19 +449,22 @@ key-mapping and flash-bound rewriting). The cleaner is therefore:
 
 ## Honest limits and what is deliberately deferred
 
-- **Implemented (#337).** The COMPACTED header flag, the v2 compaction-metadata footer block,
+- **Implemented (#337, #411).** The COMPACTED header flag, the v2 compaction-metadata footer block,
   the covered-range recovery rules, the sparse-offset read/skip path (a reader and the engine
-  poll skip a compacted hole), the `Compacted` gap-reason CODE (`gap_reason::COMPACTED = 2`), and
-  the cleaner are all built. What is deliberately DEFERRED as a safe follow-up (the core is
-  complete): the consumer-facing EMISSION of `GapMarker(reason = COMPACTED)` when a gap-marker-
-  capable consumer reads across a compacted hole (today the engine advances the cursor SILENTLY;
-  the reason code and the #346 frame are ready, the emission is tracked in #411, and it is NOT a
-  loss or correctness gap, the cursor still reaches head with the correct latest-value view), the
-  advanced `min_dirty_ratio` BYTE accounting (count is shipped; bytes is the better flash-cost
-  proxy, an open question below), a standalone `ironbus compact` CLI verb (the off-hot-path engine
-  pass and the `serve --compact` knob are shipped), and the explicit TOMBSTONE flag bit (the
-  empty-payload convention is shipped). None of those affect the crash-safety or the format, which
-  are complete and correct.
+  poll skip a compacted hole), the `Compacted` gap-reason CODE (`gap_reason::COMPACTED = 2`), the
+  cleaner, AND (since #411) the consumer-facing EMISSION of `GapMarker(reason = COMPACTED)` when a
+  gap-marker-capable consumer reads across a compacted hole are all built. The engine surfaces the
+  skip as a `Poll::Compacted { from, to }` (the interior, sparse-offset twin of the below-earliest
+  `Poll::Truncated`), and the session maps it to a `GapMarker` with the exact `[from, to)` span and
+  `reason = COMPACTED` for a gap-marker-capable consumer; a NON-capable consumer keeps the silent
+  cursor-advance (a compacted hole is not a loss, so it gets no frame and never the legacy
+  `Truncated`), so the wire format is unchanged and only the already-defined reason is now emitted.
+  What is still deliberately DEFERRED as a safe follow-up (the core is complete): the advanced
+  `min_dirty_ratio` BYTE accounting (count is shipped; bytes is the better flash-cost proxy, an open
+  question below), a standalone `ironbus compact` CLI verb (the off-hot-path engine pass and the
+  `serve --compact` knob are shipped), and the explicit TOMBSTONE flag bit (the empty-payload
+  convention is shipped). None of those affect the crash-safety or the format, which are complete
+  and correct.
 - **It costs CPU and flash; it is for changelog topics only.** Stated up front; restated here.
   A general durable queue should leave it OFF.
 - **It forces a format-version bump.** A broker that has ever written a compacted segment
@@ -516,9 +522,19 @@ key-mapping and flash-bound rewriting). The cleaner is therefore:
 - Sparse-offset read / skip-the-gap (never a recovery `LossEvent`, so never in the loss-bytes
   counters): the storage read path skips an absent offset, and the engine poll advances the cursor
   past a compacted hole (`compaction_off_by_default_and_opt_in_skips_holes_on_poll` in
-  `crates/ironbus-server/src/engine.rs`). The advance is SILENT today; emitting the consumer-facing
-  `GapMarker(reason = COMPACTED)` for a gap-marker-capable consumer is the #411 follow-up (the
-  reason code is defined and round-tripped, only the engine-side emit is unwired).
+  `crates/ironbus-server/src/engine.rs`, which now also asserts the poll surfaces a
+  `Poll::Compacted { from, to }` for each hole).
+- Consumer-facing COMPACTED emission (#411): a gap-marker-capable consumer reading ACROSS a
+  compacted hole receives EXACTLY ONE `GapMarker(reason = COMPACTED)` with the exact `[from, to)`
+  span, never a `Truncated` and never a loss
+  (`a_gap_marker_consumer_reading_across_a_compacted_hole_gets_one_compacted_marker` in
+  `crates/ironbus-server/src/session.rs`); a NON-capable consumer reading the SAME compacted log
+  advances SILENTLY with no marker and no error
+  (`a_non_capable_consumer_reading_across_a_compacted_hole_advances_silently`). The reason is correct
+  by construction: the interior compacted hole is the distinct `Poll::Compacted` (above
+  `earliest_retained`, segment present), structurally separate from the below-earliest trim that
+  returns `Poll::Truncated`. The wire format is UNCHANGED: only the already-defined
+  `gap_reason::COMPACTED` is now emitted.
 - The cleaner off by default and off the hot path: the same engine test asserts a produce that
   triggers a compaction pass returns its offset normally (the append is never blocked), and that
   no v2 segment is written until an operator opts in.
