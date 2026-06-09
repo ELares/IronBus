@@ -468,12 +468,92 @@ jobs:
             target/x86_64-unknown-linux-musl/release/ironbus \
             x86_64-unknown-linux-musl
       # C-FFI ban (#102, #139): assert no crate in the shipped musl graph pulls a C-compiled
-      # component, a build script that compiles C, or a `links` native-library key. IronBus is pure
-      # Rust today, so this is a forward guard; it scopes to the shipped graph so a dev-only tool's
-      # C-builder never trips it, and it complements the deny.toml name bans by also catching an
-      # unknown `links`/C-builder crate deny.toml has no rule for.
+      # component, a build script that compiles C, or a `links` native-library key. The opt-in zstd
+      # codec (#357) is the only vendored-C allowance and is behind the NON-DEFAULT `zstd` feature,
+      # so this DEFAULT-graph ban (built without `--features zstd`) stays clean: zstd is absent.
       - name: C-FFI ban on the shipped dependency graph
         run: sh scripts/ci/cffi-ban.sh x86_64-unknown-linux-musl
+      # Regression guard for the ADR-0003 / #357 invariant: the DEFAULT shipped graph carries NO
+      # zstd (and no blake3). If a refactor ever made the zstd feature default-on, the default
+      # binary's SBOM and the cffi-ban above would silently acquire the vendored-C codec; this fails
+      # FIRST and explicitly. It checks the same default `ironbus-cli` normal+build graph the SBOM
+      # and cffi-ban scope to.
+      - name: assert the DEFAULT shipped graph is zstd-free (ADR-0003, #357)
+        run: |
+          set -euo pipefail
+          graph="$(cargo tree -p ironbus-cli -e normal,build --target x86_64-unknown-linux-musl --prefix none --locked)"
+          if echo "$graph" | grep -qiE 'zstd|blake3'; then
+            echo "::error::the DEFAULT shipped graph contains zstd/blake3; the zstd codec must stay opt-in (ADR-0003, #357)"
+            echo "$graph" | grep -iE 'zstd|blake3'
+            exit 1
+          fi
+          echo "ok: the default shipped graph is zstd-free (the zstd codec is opt-in only)"
+
+  zstd-feature:
+    name: opt-in zstd codec (build + test + musl static-link)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: zstd-feature
+      - name: install musl tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+      # The OPT-IN zstd codec + trained-dictionary lifecycle (#357): build and TEST the feature so
+      # the opt-in path (the zstd codec id 2, ZDICT training, the sidecar IO, the dict CLI) is
+      # covered per-PR, with the teeth tests (round-trip, corrupt-stream-is-typed-error,
+      # decompression-bomb-capped, trained-dict-improves-ratio, unresolved-dict-is-poison). The
+      # default build is unchanged; this job is the only one that compiles `--features zstd`.
+      - name: build and test the opt-in zstd feature
+        run: |
+          set -euo pipefail
+          cargo build --workspace --features zstd --locked
+          cargo test --workspace --features zstd --locked
+      # cargo-deny under the feature: assert the new vendored-C C-FFI (zstd-sys) is the EXPLICITLY
+      # allowed dependency (deny.toml resolves all-features), so the supply-chain gate passes for the
+      # feature build, not just the default one.
+      - name: cargo-deny accepts the opt-in zstd C-FFI under all-features
+        uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2
+        with:
+          tool: cargo-deny@0.19.8
+      - run: cargo deny check
+      # The #77 musl static-link verification: the opt-in zstd C must be VENDORED and STATIC-linked
+      # (the `pkg-config` feature is OFF, so zstd-sys compiles the bundled C source rather than
+      # dynamically linking a system libzstd). Cross-build the `--features zstd` binary for musl and
+      # assert it is still a static ELF (no PT_INTERP, no NEEDED), so the vendored zstd C did not
+      # introduce a dynamic dependency.
+      - name: zstd-feature musl static-link verification (#77)
+        run: |
+          set -euo pipefail
+          target="x86_64-unknown-linux-musl"
+          bin="target/${target}/release/ironbus"
+          rm -f "$bin"
+          cargo build --release --locked --features zstd -p ironbus-cli --target "$target"
+          test -x "$bin"
+          if readelf -l "$bin" | grep -q 'INTERP'; then
+            echo "::error::the --features zstd musl binary has a PT_INTERP segment: zstd was dynamically linked, not vendored-static (#77)"
+            exit 1
+          fi
+          if readelf -d "$bin" 2>/dev/null | grep -q 'NEEDED'; then
+            echo "::error::the --features zstd musl binary lists NEEDED shared libs: zstd was not static-linked (#77)"
+            exit 1
+          fi
+          echo "ok: the --features zstd musl binary is static (vendored zstd C is static-linked, #77)"
+          # The feature graph DOES carry the vendored-C zstd-sys (the inverse of the default-graph
+          # assertion in the SBOM job), proving the codec is present exactly when opted in.
+          if cargo tree -p ironbus-cli --features zstd -e normal --target "$target" --prefix none --locked | grep -qi 'zstd-sys'; then
+            echo "ok: zstd-sys is present in the feature graph (opt-in active)"
+          else
+            echo "::error::zstd-sys missing from the feature graph"
+            exit 1
+          fi
 
   fuzz-corpus:
     name: fuzz regression corpus is current (#385)

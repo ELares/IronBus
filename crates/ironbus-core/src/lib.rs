@@ -18,6 +18,11 @@ pub mod config;
 pub mod cursor;
 pub mod dedup;
 pub mod delivery;
+/// The trained-dictionary lifecycle compute (ZDICT training, content-addressed `dict_id`), behind
+/// the OPT-IN `zstd` feature. IO-free: the on-disk sidecar IO and the embedded set live above this
+/// in storage/cli (`docs/DICTIONARY_LIFECYCLE.md`). Absent entirely from the default build.
+#[cfg(feature = "zstd")]
+pub mod dict;
 pub mod format;
 pub mod keyshared;
 pub mod lease;

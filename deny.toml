@@ -35,23 +35,42 @@ wildcards = "deny"
 # C-building build script), and declares no `links` key, so it satisfies the C-FFI ban below and the
 # cffi-ban.sh structural guard with no allowlist entry needed (only `links`/C-builder crates need one).
 #
+# THE OPT-IN zstd C-FFI ALLOWANCE (#357, #75/#76/#77, the #102 C-FFI allowlist). The maintainer
+# APPROVED the opt-in zstd codec: it is behind the NON-DEFAULT `zstd` Cargo feature of ironbus-core
+# (threaded up to storage and the CLI), so the DEFAULT build, its SBOM, and the cffi-ban gate (which
+# scope to the shipped `ironbus-cli` DEFAULT graph) carry ZERO zstd and stay byte-for-byte unchanged
+# (ADR-0003: the default codec stays pure-Rust lz4_flex). cargo-deny, however, resolves with
+# `all-features` (see `[graph]`), so it DOES see the feature tree, and `zstd-sys` (the vendored-C
+# zstd binding, `links = "zstd"`) is therefore DELIBERATELY NOT name-banned below: it is the
+# explicitly allowed C-FFI under the feature. It is `MIT/Apache-2.0` (on the license allow-list) and
+# is built VENDORED + STATIC (the `pkg-config` feature is NOT enabled, so zstd-sys compiles the
+# bundled `zstd.1.5.7` C source rather than dynamically linking a system libzstd: the #77 musl
+# static requirement). Its transitive `zstd`/`zstd-safe` are pure-Rust wrappers; `blake3` (the
+# content-addressed dict_id hash) is pulled by the same feature and built with its `pure` feature so
+# it compiles NO C/assembly (`CC0-1.0 OR Apache-2.0`, accepted via the Apache-2.0 arm; `cc` is a
+# build-dep of both but runs nothing on the default graph and is off the SHIPPED graph). The
+# `scripts/ci/cffi-ban.sh` STRUCTURAL guard still bans zstd-sys/zstd on the DEFAULT graph it scopes
+# to, so the default build can never acquire the C-FFI silently; the allowance is feature-only.
+#
 # C-FFI BAN (#102). The best-known vendored-C / native crates are name-banned below as a
 # belt-and-suspenders layer; the STRUCTURAL forward guard is `scripts/ci/cffi-ban.sh` (run by the
 # CI `sbom` job over the shipped musl graph), which also catches an UNKNOWN `links` / C-builder
 # crate this name list has no rule for. ALLOWLIST: `libc` and `nix` are pure-Rust bindings to OS
 # SYSCALLS (no compiled C, no C-building build script), are on the license allow-list above, and
-# are off the record path, so they are permitted (they are also exempted in cffi-ban.sh). Add a
-# crate here (and to that script's allowlist) ONLY if it is proven pure Rust; if an opt-in
-# vendored-C codec (e.g. zstd-sys behind a feature) is ever introduced it must be added to BOTH the
-# allowlist and a documented #12 C-FFI allowance, never silently.
+# are off the record path, so they are permitted (they are also exempted in cffi-ban.sh). The ONLY
+# vendored-C allowance is the opt-in `zstd-sys` above (feature-gated, off the default graph). Add a
+# crate here (and to that script's allowlist) ONLY if it is proven pure Rust; any further opt-in
+# vendored-C dependency must be added to BOTH the allowlist and a documented #12 C-FFI allowance,
+# never silently.
 [[bans.deny]]
 name = "openssl-sys" # vendored/system OpenSSL via a C build script; use rustls (pure Rust) instead.
 [[bans.deny]]
 name = "openssl" # the openssl-sys wrapper, same C linkage.
 [[bans.deny]]
 name = "libz-sys" # zlib C linkage; use a pure-Rust inflate/deflate (miniz_oxide) instead.
-[[bans.deny]]
-name = "zstd-sys" # vendored zstd C; zstd is opt-in only and not on the default path (#12, #139).
+# NOTE: `zstd-sys` is DELIBERATELY NOT banned (see the opt-in zstd C-FFI allowance comment above):
+# it is the maintainer-approved opt-in vendored-C codec, feature-gated and absent from the default
+# graph the cffi-ban.sh + SBOM gates scope to (#357).
 [[bans.deny]]
 name = "lz4-sys" # the C lz4 binding; the default codec is lz4_flex (pure Rust) (#12, #139).
 [[bans.deny]]
