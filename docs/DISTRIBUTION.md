@@ -63,10 +63,14 @@ The package installs:
   `ironbus` system user (created by the postinst) against `/var/lib/ironbus`.
 - `/etc/ironbus/ironbus.env`, the default config (a dpkg conffile, so local edits survive upgrades).
 
-The unit is installed but NOT enabled or started automatically; enable it deliberately:
+The published `.deb` asset carries the same friendly CPU-arch name as the binary,
+`ironbus-linux-<arch>.deb` (`ironbus-linux-amd64.deb`, `ironbus-linux-arm64.deb`,
+`ironbus-linux-armv7.deb`), so it too drops the `unknown`-vendored triple; the triple stays the cargo
+`--target` only. The unit is installed but NOT enabled or started automatically; enable it
+deliberately:
 
 ```sh
-sudo dpkg -i ironbus_<version>_<arch>.deb
+sudo dpkg -i ironbus-linux-<arch>.deb
 sudo systemctl enable --now ironbus
 ```
 

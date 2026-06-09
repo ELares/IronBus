@@ -55,9 +55,10 @@ For each of the three build targets `x86_64-unknown-linux-musl`, `aarch64-unknow
 - `ironbus-linux-<arch>`: the static `musl` binary (no `PT_INTERP`, no `NEEDED` libs; asserted in the
   job). It has no runtime dependency even though the friendly name drops `musl`.
 - `ironbus-linux-<arch>.sha256`: its SHA256 checksum.
-- `ironbus-<triple>.deb`: the Debian package built from that verified binary (no recompile),
-  self-checked with `dpkg-deb -c` in the `package-deb` job. The `.deb` keeps the Debian-arch-derived
-  `ironbus-<triple>.deb` name, unaffected by the binary asset rename.
+- `ironbus-linux-<arch>.deb`: the Debian package built from that verified binary (no recompile),
+  self-checked with `dpkg-deb -c` in the `package-deb` job. The `.deb` now mirrors the friendly
+  binary asset name (`ironbus-linux-amd64.deb`, `ironbus-linux-arm64.deb`, `ironbus-linux-armv7.deb`),
+  so it carries no `unknown`-vendored triple either; the triple stays the cargo `--target` only.
 
 Plus, once per release:
 
