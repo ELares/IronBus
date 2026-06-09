@@ -213,48 +213,96 @@ jobs:
     name: distroless container image
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
-      packages: write # push to ghcr.io when publishing is enabled
+      packages: write # push the image to ghcr.io with the built-in GITHUB_TOKEN
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ironbus-linux-amd64
-          path: dist
-      - name: build the distroless image from the verified static binary
+          path: artifacts
+      - name: smoke the distroless image (amd64) from the verified static binary
         run: |
           set -euo pipefail
-          # Build FROM the verified release artifact (Dockerfile.release copies it in, no recompile),
-          # so the image carries the exact reproducible bytes the `build` job produced. This always
-          # runs, proving the Dockerfile is valid and the binary runs as the non-root user.
-          # The downloaded artifact lost its Unix +x bit (upload/download-artifact do not preserve
-          # it), so restore it before the build. Dockerfile.release also does `COPY --chmod=0755`, so
-          # the image entrypoint is executable even if a future build path drops this; together the
-          # `docker run ... --version` smoke below can never fail permission-denied on the binary.
+          # Build the amd64 image FROM the verified release artifact (Dockerfile.release copies it in,
+          # no recompile) and run it, proving the Dockerfile is valid and the binary runs as the
+          # non-root user before any push. The downloaded artifact lost its Unix +x bit
+          # (upload/download-artifact do not preserve it), so restore it; Dockerfile.release also does
+          # `COPY --chmod=0755`, so the entrypoint can never be permission-denied.
+          mkdir -p dist
+          cp "artifacts/ironbus-linux-amd64/ironbus-linux-amd64" "dist/ironbus-linux-amd64"
           chmod 0755 "dist/ironbus-linux-amd64"
           docker build -f Dockerfile.release \
             --build-arg IRONBUS_BIN=dist/ironbus-linux-amd64 \
             -t "ironbus:${{ github.event.inputs.tag || github.ref_name }}" .
           # Smoke: the non-root entrypoint runs (--version is a pure stdout-and-exit, no data dir).
           docker run --rm "ironbus:${{ github.event.inputs.tag || github.ref_name }}" --version
-      # Registry publishing is OPT-IN (#334): it needs an org-level registry login and is a no-op
-      # unless the `IRONBUS_PUBLISH_IMAGE` repository variable is set to `true`, so the build above
-      # always gates the Dockerfile while the credentialed push stays a deliberate, separately-enabled
-      # step.
-      - name: log in to ghcr.io and push (opt-in)
-        if: vars.IRONBUS_PUBLISH_IMAGE == 'true'
+      - name: stage the three verified binaries per target platform
+        run: |
+          set -euo pipefail
+          # Lay the pre-built, friendly-named binaries out under dist/<TARGETPLATFORM>/ironbus so
+          # Dockerfile.release's per-platform COPY selects the matching one for each manifest layer
+          # (amd64 -> ironbus-linux-amd64, arm64 -> ironbus-linux-arm64, arm/v7 -> ironbus-linux-armv7).
+          # These are the EXACT bytes the build job produced and checksummed; no recompile here.
+          for pair in \
+            "linux/amd64:ironbus-linux-amd64" \
+            "linux/arm64:ironbus-linux-arm64" \
+            "linux/arm/v7:ironbus-linux-armv7"; do
+            plat="${pair%%:*}"
+            asset="${pair##*:}"
+            mkdir -p "dist/${plat}"
+            cp "artifacts/${asset}/${asset}" "dist/${plat}/ironbus"
+            chmod 0755 "dist/${plat}/ironbus"
+          done
+          ls -lR dist
+      - name: determine prerelease (0.x does not move :latest)
+        id: prerelease
         env:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          repo="ghcr.io/$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
-          docker tag "ironbus:${TAG}" "${repo}:${TAG}"
-          docker push "${repo}:${TAG}"
+          # Mirror the publish job: a `v0.` (or bare `v0`) tag is pre-1.0, so it pushes only the
+          # version tag, never :latest (just as a 0.x release does not move `releases/latest`).
+          case "$TAG" in
+            v0.*|v0) echo "value=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "value=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - name: log in to ghcr.io with the built-in GITHUB_TOKEN
+        env:
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # ghcr.io is this repo's own registry, so the built-in GITHUB_TOKEN (with the job-scoped
+          # `packages: write` above) is enough; no external/org secret. Token on stdin, never argv.
+          printf '%s' "${TOKEN}" | docker login ghcr.io -u "${ACTOR}" --password-stdin
+      - name: build and push the multi-arch image (amd64 + arm64 + armv7)
+        env:
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          PRERELEASE: ${{ steps.prerelease.outputs.value }}
+        run: |
+          set -euo pipefail
+          # Publish to ghcr.io on every formal `v*` release (no longer opt-in): a single multi-platform
+          # manifest from the three pre-built binaries, tagged with the version, plus :latest for a
+          # non-prerelease. COPY-only Dockerfile (no RUN executes the foreign binary), so the cross-arch
+          # layers need no QEMU. This matches the rolling channel's live image; see docs/DISTRIBUTION.md.
+          repo="ghcr.io/$(printf '%s' "${REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          tags=( -t "${repo}:${TAG}" )
+          if [ "${PRERELEASE}" != "true" ]; then
+            tags+=( -t "${repo}:latest" )
+          fi
+          docker buildx build \
+            -f Dockerfile.release \
+            --platform linux/amd64,linux/arm64,linux/arm/v7 \
+            "${tags[@]}" \
+            --push \
+            .
+          echo "pushed ${repo}:${TAG} (linux/amd64,linux/arm64,linux/arm/v7; :latest=$([ "${PRERELEASE}" != "true" ] && echo yes || echo no))"
 
   publish:
     name: publish release

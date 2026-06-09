@@ -1,35 +1,76 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 #
-# IronBus distroless image built from an ALREADY-VERIFIED release binary (#104), with no compile
-# step. The release workflow downloads the friendly-named static musl `ironbus-linux-<arch>` artifact
-# (e.g. `ironbus-linux-amd64`), verifies it against the signed SHA256SUMS (the same fail-closed check
-# scripts/install.sh enforces), and only then passes it here as IRONBUS_BIN. This keeps the container
-# on the exact reproducible bytes the release ships, and the verify-before-package property holds: the
-# image is never built over an unverified binary.
+# IronBus distroless image built from an ALREADY-VERIFIED release binary (#104, #334), with no
+# compile step. The release workflow downloads the friendly-named static musl `ironbus-linux-<arch>`
+# artifact (e.g. `ironbus-linux-amd64`), verifies it against the signed SHA256SUMS (the same
+# fail-closed check scripts/install.sh enforces), and only then stages it here. This keeps the
+# container on the exact reproducible bytes the release ships, and the verify-before-package property
+# holds: the image is never built over an unverified binary. There is NO recompile in this image; the
+# binary is copied straight in.
 #
-# Build (from the repo root, with a verified binary staged under dist/):
-#   docker build -f Dockerfile.release \
-#     --build-arg IRONBUS_BIN=dist/ironbus-linux-amd64 \
-#     -t ghcr.io/elares/ironbus:latest .
+# This Dockerfile drives TWO build shapes, both COPY-only (no `RUN`, so no foreign code executes
+# during the build and a cross-arch build needs no QEMU emulation):
+#
+#   1. Single-platform, explicit binary (the formal release.yml smoke + push). Pass IRONBUS_BIN as the
+#      path to a single staged binary; the per-platform selection is bypassed:
+#        docker build -f Dockerfile.release \
+#          --build-arg IRONBUS_BIN=dist/ironbus-linux-amd64 \
+#          -t ghcr.io/elares/ironbus:latest .
+#
+#   2. Multi-platform manifest (the rolling-release.yml ghcr publish, #334). Leave IRONBUS_BIN empty
+#      and stage the three verified binaries under `dist/<TARGETPLATFORM>/ironbus`, i.e.
+#      `dist/linux/amd64/ironbus`, `dist/linux/arm64/ironbus`, `dist/linux/arm/v7/ironbus`. BuildKit
+#      sets TARGETPLATFORM per requested platform, so one COPY selects the matching pre-built binary
+#      for each architecture layer (amd64 -> ironbus-linux-amd64, arm64 -> ironbus-linux-arm64,
+#      arm/v7 -> ironbus-linux-armv7), with no shell and no recompile:
+#        docker buildx build -f Dockerfile.release \
+#          --platform linux/amd64,linux/arm64,linux/arm/v7 \
+#          -t ghcr.io/elares/ironbus:latest --push .
 #
 # The runtime stage and its non-root user, CA certs, tzdata, required writable volume, and reserved
 # `FROM scratch` note are identical to Dockerfile; see that file and docs/DISTRIBUTION.md.
 
+# IRONBUS_BIN is the single-platform override (shape 1). Defaulted empty so shape 2 (per-platform
+# selection from dist/<TARGETPLATFORM>/ironbus) is the fallback when it is not passed.
+ARG IRONBUS_BIN=""
+
+# A throwaway shell-bearing stage that resolves the binary to copy. It runs on the BUILD platform
+# (busybox:musl, --platform=$BUILDPLATFORM), never the target platform, so a cross-arch build does
+# NOT need QEMU. It only moves a file; no foreign code runs. TARGETPLATFORM is the platform of the
+# image layer BuildKit is currently assembling (linux/amd64, linux/arm64, or linux/arm/v7).
+FROM --platform=$BUILDPLATFORM busybox:1.37.0-musl AS stage
 ARG IRONBUS_BIN
+ARG TARGETPLATFORM
+WORKDIR /stage
+# Copy the whole staged dist context in; the select step picks exactly one binary out of it.
+COPY dist /dist
+# Resolve the binary: prefer the explicit IRONBUS_BIN (shape 1); otherwise select the pre-built
+# binary for this layer's TARGETPLATFORM (shape 2). Fail loudly if neither resolves, so a broken
+# build context can never produce an image over a missing/empty binary.
+RUN set -eu; \
+    if [ -n "${IRONBUS_BIN}" ]; then \
+      src="/${IRONBUS_BIN}"; \
+    else \
+      src="/dist/${TARGETPLATFORM}/ironbus"; \
+    fi; \
+    if [ ! -s "${src}" ]; then \
+      echo "Dockerfile.release: binary '${src}' is missing or empty (IRONBUS_BIN='${IRONBUS_BIN}', TARGETPLATFORM='${TARGETPLATFORM}')" >&2; \
+      exit 1; \
+    fi; \
+    cp "${src}" /stage/ironbus; \
+    chmod 0755 /stage/ironbus
 
 FROM gcr.io/distroless/static:nonroot AS runtime
-ARG IRONBUS_BIN
 LABEL org.opencontainers.image.source="https://github.com/ELares/IronBus" \
       org.opencontainers.image.description="IronBus durable edge message queue (distroless static)" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
-# The verified static musl binary, copied in directly (no recompile). `--chmod=0755` is REQUIRED:
-# `actions/upload-artifact`/`download-artifact` do not preserve the Unix executable bit, so the
-# staged `IRONBUS_BIN` arrives mode 0644. A plain `COPY` would carry that 0644 into the image and the
-# release smoke (`docker run ... --version`) would fail permission-denied; distroless/static has no
-# shell, so a `RUN chmod` is not an option. `COPY --chmod` (BuildKit, default on the runner) sets the
-# mode at copy time so the entrypoint is executable.
-COPY --chmod=0755 ${IRONBUS_BIN} /usr/local/bin/ironbus
+# The verified static musl binary, copied in directly (no recompile). It is already mode 0755 from the
+# stage above, but `--chmod=0755` is kept belt-and-suspenders: `actions/upload-artifact` /
+# `download-artifact` do not preserve the Unix executable bit, so a future path that copies straight
+# from the context could arrive mode 0644 and the smoke (`docker run ... --version`) would fail
+# permission-denied; distroless/static has no shell, so a `RUN chmod` is not an option here.
+COPY --chmod=0755 --from=stage /stage/ironbus /usr/local/bin/ironbus
 
 ENV IRONBUS_DATA_DIR=/var/lib/ironbus \
     IRONBUS_ADDR=0.0.0.0:7777

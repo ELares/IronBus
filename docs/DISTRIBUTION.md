@@ -21,11 +21,15 @@ There are two release CHANNELS the GitHub Releases come from:
   and the installer's `--version latest`) resolves to the newest rolling build. This is the
   continuous channel that makes "install" mean "grab the binary for your arch from the latest
   release". It carries NO changelog gate (rolling builds are continuous, not curated) and does not
-  build the `.deb` or container.
+  attach the `.deb`. It DOES publish the distroless container image: every rolling build pushes a
+  multi-arch (amd64/arm64/armv7) image to `ghcr.io/elares/ironbus`, tagged `:latest` and
+  `:YYYY.MMDD.N`, so the registry image is the live, continuously-published one (#334).
 - A **formal, tagged** release cut on a `v*` tag by the maintainer (`.github/workflows/release.yml`).
-  This is the curated channel: it adds the `.deb` per triple, the distroless container image, the
-  syft CycloneDX SBOM, and a changelog gate (an empty `## [Unreleased]` FAILS the release before any
-  binary is built). A 0.x tag is published as a prerelease, so it does not move `releases/latest`.
+  This is the curated channel: it adds the `.deb` per triple, the syft CycloneDX SBOM, and a
+  changelog gate (an empty `## [Unreleased]` FAILS the release before any binary is built), and it
+  pushes the same multi-arch container image to `ghcr.io/elares/ironbus` (tagged `:vX.Y.Z`, plus
+  `:latest` for a non-prerelease). A 0.x tag is published as a prerelease, so it does not move
+  `releases/latest` or the image `:latest`.
 
 Plus the lifecycle on an unattended edge node: an atomic in-place [upgrade](#in-place-upgrade-and-rollback)
 that never overwrites the live binary, one-command rollback, fall-back after N failed starts, and an
@@ -137,23 +141,54 @@ docker run --rm \
   ironbus:dev
 ```
 
-### Publishing
+### Published image: `ghcr.io/elares/ironbus` (#334)
 
-The release workflow builds the image FROM the already-verified release artifact (no recompile)
-using `Dockerfile.release`, which copies the binary that passed the `SHA256SUMS` check, preserving
-verify-before-package. Publishing to a registry (e.g. `ghcr.io/elares/ironbus`) requires registry
-credentials provisioned at the org level; the build step is in `.github/workflows/release.yml`
-behind an explicit opt-in, and the documented push command is:
+The image IS published to GitHub Container Registry. **Every rolling build** (every push to main,
+`.github/workflows/rolling-release.yml`) builds the distroless image FROM the three already-verified
+release binaries (no recompile) and pushes a `linux/amd64` + `linux/arm64` + `linux/arm/v7`
+multi-arch manifest to `ghcr.io/elares/ironbus`, tagged with the calendar version AND `:latest`:
+
+- `ghcr.io/elares/ironbus:latest` always tracks the newest rolling build.
+- `ghcr.io/elares/ironbus:YYYY.MMDD.N` pins a specific rolling build.
+
+The formal `v*` channel (`.github/workflows/release.yml`) pushes the same multi-arch manifest on a
+tag, tagged `:vX.Y.Z` plus `:latest` (a 0.x prerelease pushes only the version tag, never moving
+`:latest`). Both channels build with `Dockerfile.release`, a COPY-only image that copies the binary
+that passed the `SHA256SUMS` check straight in, so the verify-before-package property holds and no
+QEMU is needed (no foreign code runs during the build). The push uses the workflow's built-in
+`GITHUB_TOKEN` with `packages: write` (ghcr.io is the repo's own registry), so no external or
+org-level secret is required.
+
+Pull and run (the image is multi-arch, so `docker` selects the layer for your CPU automatically):
+
+```sh
+docker pull ghcr.io/elares/ironbus:latest
+docker run --rm \
+  -v ironbus-data:/var/lib/ironbus \
+  -p 127.0.0.1:7777:7777 \
+  ghcr.io/elares/ironbus:latest serve --data-dir /var/lib/ironbus
+```
+
+The data dir MUST be a writable volume owned by the nonroot uid (65532); the image itself is
+read-only (see [Required writable volume](#required-writable-volume)). The wire protocol is not yet
+encrypted or authenticated, so the example binds the host port to loopback (`127.0.0.1:7777:7777`);
+expose it to other machines only behind a firewall or an SSH / WireGuard tunnel, never to the open
+internet.
+
+**Package visibility (a one-time maintainer action).** The FIRST push CREATES the
+`ghcr.io/elares/ironbus` package, which GitHub defaults to **private** (visible only to the repo).
+An anonymous `docker pull` needs the package set to **public**, which is a one-time package-settings
+toggle the maintainer makes in the GitHub UI (the package's *Package settings -> Danger Zone ->
+Change visibility*) or via the API. The workflow push itself works with `GITHUB_TOKEN` regardless of
+visibility; only the public anonymous pull depends on this toggle.
+
+To build the image by hand from a verified binary (the single-arch path, e.g. for a local smoke):
 
 ```sh
 docker build -f Dockerfile.release \
   --build-arg IRONBUS_BIN=dist/ironbus-linux-amd64 \
-  -t ghcr.io/elares/ironbus:<tag> .
-docker push ghcr.io/elares/ironbus:<tag>
+  -t ghcr.io/elares/ironbus:local .
 ```
-
-Registry publishing (the credentialed push to ghcr.io) is tracked as a focused follow-up (#334) so
-the build and the verified-artifact wiring land now without blocking on org-level registry secrets.
 
 ## 4. Checksummed GitHub Releases
 
