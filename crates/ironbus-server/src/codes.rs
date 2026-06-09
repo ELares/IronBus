@@ -32,8 +32,9 @@ use crate::engine::EngineError;
 /// the conformance vectors and any external client may assert against it.
 ///
 /// The `ERR_*` codes name a REJECTION (a verb the engine refused); the bare codes ([`Self::OK`],
-/// [`Self::DUPLICATE`], [`Self::OFFSET_TRIMMED`]) name a non-error observable SIGNAL (a success, a
-/// benign dedup hit, a below-trim-horizon read).
+/// [`Self::DUPLICATE`], [`Self::OFFSET_TRIMMED`], [`Self::OFFSET_COMPACTED`]) name a non-error
+/// observable SIGNAL (a success, a benign dedup hit, a below-trim-horizon read, a key-compaction
+/// hole crossing).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ErrorCode(&'static str);
 
@@ -62,6 +63,17 @@ impl ErrorCode {
     /// poll outcome the consumer learns its lost span from. The contract's `OFFSET_TRIMMED`.
     #[allow(non_upper_case_globals)]
     pub const OFFSET_TRIMMED: ErrorCode = ErrorCode("OFFSET_TRIMMED");
+
+    /// A read crossed a key-COMPACTION hole (#337, #411): one or more INTERIOR offsets were removed by
+    /// compaction (a later record for the same key superseded them), so they are permanently absent
+    /// mid-stream while the surrounding segment is present. The engine advances the cursor past the
+    /// `[from, to)` run and surfaces it ONCE as the `Poll::Compacted` signal, which the session maps
+    /// to a `GapMarker(reason = COMPACTED)` for a gap-marker-capable consumer (a non-capable consumer
+    /// advances silently). Not an `EngineError` and NOT a loss (the latest-value-per-key view is
+    /// intact, the cursor still reaches head, no `LossReport`): it is the consumer-facing, non-loss
+    /// twin of `OFFSET_TRIMMED`. The contract's `OFFSET_COMPACTED`.
+    #[allow(non_upper_case_globals)]
+    pub const OFFSET_COMPACTED: ErrorCode = ErrorCode("OFFSET_COMPACTED");
 
     // ----- rejection codes (one per EngineError, plus the fenced-ack / producer-fence outcomes) -----
 
@@ -174,6 +186,7 @@ mod tests {
         );
         assert_eq!(ErrorCode::ERR_ACK_NOT_OWNED.as_str(), "ERR_ACK_NOT_OWNED");
         assert_eq!(ErrorCode::OFFSET_TRIMMED.as_str(), "OFFSET_TRIMMED");
+        assert_eq!(ErrorCode::OFFSET_COMPACTED.as_str(), "OFFSET_COMPACTED");
         assert_eq!(
             ErrorCode::ERR_PRODUCER_FENCED.as_str(),
             "ERR_PRODUCER_FENCED"

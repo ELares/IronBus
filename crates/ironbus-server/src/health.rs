@@ -3074,6 +3074,7 @@ mod tests {
                         }
                         Poll::Parked { .. } => {}
                         Poll::Truncated { .. } => panic!("unexpected truncation"),
+                        Poll::Compacted { .. } => panic!("unexpected compaction"),
                         Poll::Idle => break,
                     }
                 }
@@ -3127,6 +3128,7 @@ mod tests {
                         Poll::Message(d) => assert_eq!(g.ack(&d.token), AckResult::Acked),
                         Poll::Parked { .. } => {}
                         Poll::Truncated { .. } => panic!("unexpected truncation"),
+                        Poll::Compacted { .. } => panic!("unexpected compaction"),
                         Poll::Idle => break,
                     }
                 }

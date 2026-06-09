@@ -665,6 +665,24 @@ pub enum Poll {
         /// How many records the group skipped: `earliest_retained - old_cursor`.
         skipped: u64,
     },
+    /// The group's cursor advanced across a KEY-COMPACTION hole (#337, #411): one or more offsets in
+    /// `[from, to)` were removed by compaction (a later record for the same key superseded them), so
+    /// they are PERMANENTLY ABSENT mid-stream while the surrounding segment is present. This is
+    /// structurally distinct from [`Poll::Truncated`]: a trim reaps a below-earliest PREFIX, whereas a
+    /// compaction hole is interior (the offsets are above `earliest_retained`, the segment is still
+    /// there). It is NOT data loss and NOT a missing record (the latest-value-per-key view is intact
+    /// and the cursor still reaches head), so it carries no truncation counter and no `LossReport`; it
+    /// is purely the consumer-FACING half of the sparse-offset contract. The engine has ALREADY acked
+    /// the group's cursor past the whole `[from, to)` run before returning, so the next poll resumes at
+    /// `to` and the same hole never re-signals. The caller surfaces it as a `GapMarker` with
+    /// `reason = COMPACTED` to a gap-marker-capable consumer (#346/#292); a non-capable consumer takes
+    /// the unchanged silent-advance (it has no gap-marker support, and a compacted hole is not a loss).
+    Compacted {
+        /// The first absent (compacted-away) offset, inclusive: where the hole begins.
+        from: Offset,
+        /// The first present offset after the hole, exclusive: delivery resumes here.
+        to: Offset,
+    },
     /// Nothing is deliverable right now (all caught up, or the in-flight window is full).
     Idle,
 }
@@ -3347,18 +3365,29 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     // SPARSE-OFFSET tolerance for a compacted log (#337): if the record the read
                     // returned is NOT at `off`, then `off` was COMPACTED AWAY (a superseded value
                     // removed by a later record for its key). The read advanced to the next present
-                    // survivor. A compaction gap is NOT data loss and NOT a missing record: the
-                    // offset is treated as ALREADY-SATISFIED (there is nothing to deliver there), so
-                    // the cursor advances past the hole exactly as if it had been acked. The lease
-                    // just claimed at `off` is released and the offset is marked acked, then the loop
-                    // re-examines the next offset. This is the #346/#59 `Compacted` gap-marker
-                    // semantics on the read side; for a dense (non-compacted) log the offsets always
-                    // match, so this branch is never taken and the hot path is unchanged.
+                    // survivor at `record.offset`, so the WHOLE half-open run `[off, record.offset)`
+                    // is compacted-away (every offset between is absent). A compaction gap is NOT data
+                    // loss and NOT a missing record: those offsets are ALREADY-SATISFIED (nothing to
+                    // deliver there), so the cursor is acked past the entire run as if each had been
+                    // acked. The lease just claimed at `off` is released first. This is the interior,
+                    // sparse-offset twin of the below-earliest trim above: a trim reaps a PREFIX (the
+                    // `committed < earliest` branch returns `Poll::Truncated`), whereas this hole is
+                    // ABOVE `earliest` with the segment still present, so it is surfaced as the
+                    // distinct `Poll::Compacted` (the caller maps it to `GapMarker(reason=COMPACTED)`
+                    // for a capable consumer, #346/#411; a non-capable consumer silently advances). For
+                    // a dense (non-compacted) log the offsets always match, so this branch is never
+                    // taken and the hot path is unchanged.
                     if record.offset != off {
                         g.leases.ack(&token);
-                        g.cursor.ack(off);
-                        offset += 1;
-                        continue;
+                        let mut hole = offset;
+                        while hole < record.offset.get() {
+                            g.cursor.ack(Offset::new(hole));
+                            hole += 1;
+                        }
+                        return Ok(Poll::Compacted {
+                            from: off,
+                            to: record.offset,
+                        });
                     }
                     match self.delivery.disposition(deliveries) {
                         Disposition::Deliver => {
@@ -3877,13 +3906,25 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 return Err(EngineError::MissingRecord { offset });
             };
             // SPARSE-OFFSET tolerance for a compacted log (#337): a record returned at an offset
-            // ABOVE `off` means `off` was COMPACTED AWAY (a superseded value). It is treated as
-            // already-satisfied, so the cursor advances past the hole and the scan moves on, exactly
-            // as the competing poll path does. For a dense log this branch is never taken.
+            // ABOVE `off` means `off` was COMPACTED AWAY (a superseded value). The read advanced to
+            // the next present survivor at `record.offset`, so the whole half-open run
+            // `[off, record.offset)` is compacted-away. Those offsets are already-satisfied (nothing
+            // to deliver, never routed), so the cursor is acked past the entire run. The compacted
+            // offsets were never claimed, so the router holds no entry for them. This is surfaced as
+            // the distinct `Poll::Compacted` (the caller maps it to `GapMarker(reason=COMPACTED)` for
+            // a capable consumer, #346/#411; a non-capable member silently advances), the interior
+            // twin of the below-earliest trim above (which returns `Poll::Truncated`). For a dense log
+            // this branch is never taken.
             if record.offset != off {
-                g.cursor.ack(off);
-                offset += 1;
-                continue;
+                let mut hole = offset;
+                while hole < record.offset.get() {
+                    g.cursor.ack(Offset::new(hole));
+                    hole += 1;
+                }
+                return Ok(Poll::Compacted {
+                    from: off,
+                    to: record.offset,
+                });
             }
             let Some(router) = g.router.as_ref() else {
                 // Unreachable: the mode check above proved the router is present.
@@ -4643,8 +4684,12 @@ mod tests {
         );
 
         // Drain via poll: the consumer sees ONLY the survivors (latest per key + the one-shot key),
-        // at their ORIGINAL offsets, SKIPPING the compacted holes without a MissingRecord error.
+        // at their ORIGINAL offsets, SKIPPING the compacted holes without a MissingRecord error. The
+        // compacted holes now surface as a one-time `Poll::Compacted { from, to }` (#411): the engine
+        // has already acked the cursor across each `[from, to)` run, so the drain just records the span
+        // and keeps polling. Each span is a half-open, ascending, non-overlapping interval.
         let mut delivered: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut compacted_spans: Vec<(u64, u64)> = Vec::new();
         loop {
             match e.poll(0).unwrap() {
                 Poll::Message(d) => {
@@ -4652,9 +4697,25 @@ mod tests {
                     delivered.push((off, d.record.payload.clone()));
                     assert_eq!(e.ack(&d.token), AckResult::Acked);
                 }
+                Poll::Compacted { from, to } => {
+                    assert!(from.get() < to.get(), "a compacted span is non-empty");
+                    compacted_spans.push((from.get(), to.get()));
+                }
                 Poll::Idle => break,
                 other => panic!("unexpected poll outcome: {other:?}"),
             }
+        }
+        // At least one compacted hole was crossed (the superseded versions were removed), and the spans
+        // are strictly ascending and non-overlapping (the offset invariants hold across the holes).
+        assert!(
+            !compacted_spans.is_empty(),
+            "the drain crossed at least one compacted hole"
+        );
+        for w in compacted_spans.windows(2) {
+            assert!(
+                w[0].1 <= w[1].0,
+                "compacted spans are ascending and disjoint"
+            );
         }
         // The surviving alpha/beta are at their LATEST original offsets (sparse), gamma is present,
         // and no superseded version was delivered.
@@ -5114,6 +5175,7 @@ mod tests {
                 Poll::Idle => break,
                 Poll::Parked { offset, .. } => panic!("unexpected park at {}", offset.get()),
                 Poll::Truncated { .. } => panic!("unexpected truncation"),
+                Poll::Compacted { .. } => panic!("unexpected compaction"),
             }
         }
         assert_eq!(
@@ -5164,6 +5226,7 @@ mod tests {
                 Poll::Idle => break,
                 Poll::Parked { offset, .. } => panic!("unexpected park at {}", offset.get()),
                 Poll::Truncated { .. } => panic!("unexpected truncation"),
+                Poll::Compacted { .. } => panic!("unexpected compaction"),
             }
         }
         // A 64-byte slot holds the leading 3 acked-ahead runs (offsets 1, 3, 5), so those are
@@ -6041,6 +6104,7 @@ mod tests {
                 Poll::Idle => break,
                 Poll::Parked { offset, .. } => panic!("unexpected park at {}", offset.get()),
                 Poll::Truncated { .. } => panic!("unexpected truncation"),
+                Poll::Compacted { .. } => panic!("unexpected compaction"),
             }
         }
         assert_eq!(
@@ -7245,6 +7309,7 @@ mod tests {
                     }
                     Poll::Parked { .. } => {}
                     Poll::Truncated { .. } => panic!("unexpected truncation"),
+                    Poll::Compacted { .. } => panic!("unexpected compaction"),
                     Poll::Idle => break,
                 }
                 now += 1;
@@ -7453,6 +7518,7 @@ mod tests {
                     Poll::Message(d) => assert_eq!(e.ack(&d.token), AckResult::Acked),
                     Poll::Parked { .. } => {}
                     Poll::Truncated { .. } => panic!("unexpected truncation"),
+                    Poll::Compacted { .. } => panic!("unexpected compaction"),
                     Poll::Idle => break,
                 }
                 lease_now += 1;
@@ -7726,6 +7792,7 @@ mod tests {
                 Poll::Message(d) => assert_eq!(e.ack_in("stuck", &d.token), AckResult::Acked),
                 Poll::Idle => break,
                 Poll::Truncated { .. } => panic!("must not re-truncate the same gap"),
+                Poll::Compacted { .. } => panic!("unexpected compaction"),
                 Poll::Parked { .. } => {}
             }
         }
@@ -7761,6 +7828,7 @@ mod tests {
                         assert_eq!(e.ack(&d.token), AckResult::Acked);
                     }
                     Poll::Truncated { .. } => panic!("a caught-up consumer is never truncated"),
+                    Poll::Compacted { .. } => panic!("unexpected compaction"),
                     Poll::Parked { .. } => {}
                     Poll::Idle => break,
                 }
