@@ -288,6 +288,28 @@ single oldest sealed segment *ignoring* consumer-safety, returning `None` when o
 active segment remains. It can delete records below a slow group's cursor; the engine is
 responsible for surfacing the resulting truncation to that group.
 
+### Optional key-based compaction (#337): the opposite of the reaper
+
+Compaction is the IMPLEMENTED, OPT-IN, OFF-BY-DEFAULT counterpart to the reaper. The reaper
+deletes WHOLE sealed segments by age/size/count, cheaply, never looking inside. The COMPACTOR
+(`Log::maybe_compact` over `crate::compaction`) looks INSIDE a run of adjacent dirty sealed
+segments, keeps the latest record per key (plus a tombstone within its 24h TTL, plus every
+keyless record), and rewrites only those SURVIVORS into a fresh `version=2` compacted segment,
+KEEPING each survivor's ORIGINAL offset and sequence. The result is a SPARSE offset range:
+offsets are never renumbered or reused, so I5 holds (it removes offsets, never invents one). It
+is for changelog/state-snapshot topics, costs CPU and flash, and so is OFF by default.
+
+The clean is write-new-then-retire-originals whose SINGLE commit point is the durable appearance
+of the new compacted segment (the directory fsync), after which the originals are
+unlink-then-dir-fsynced (the same drain-safe discipline the reaper uses). A crash at any step
+recovers deterministically: the originals win before the commit, the compacted segment after,
+never a torn mix. Recovery resolves an overlapping range from the v2 covered-range footer
+metadata, with no manifest. It runs OFF the hot path (only sealed segments, only a new file,
+never the active segment), so it never races or blocks an append. The order with retention is
+fixed (`compact_and_delete`): the cheap whole-segment reaper runs FIRST, then the compactor. The
+full design, the survivor rules, and the crash-recovery argument are in
+[COMPACTION.md](COMPACTION.md); the v2 byte layout is in [CONTRACTS.md](CONTRACTS.md).
+
 ---
 
 ## Crash mid-write and truncation
@@ -420,15 +442,10 @@ code.
   Consumer-safe retention (`Log::reap`) is always consumer-safe; the *only* way to delete
   below a lagging cursor today is the explicit `DropOldest` disk-full policy, which then
   emits the truncation signal. There is no `consumer_safe` config field.
-- **Compaction (#83) / an archival offload sink.** #135 mentions an optional compactor
-  and an archival sink (`WAL_ttl_seconds` analogue, a `state=1 offloaded` enum). Neither
-  exists; there is no compaction and no offload. The optional, opt-in, key-based compactor
-  is now DESIGNED (specified, not implemented) in [COMPACTION.md](COMPACTION.md), adapted
-  to this no-manifest directory model: a compacted segment self-describes its covered offset
-  range in the header (a v2-header field plus a COMPACTED flag bit), recovery prefers it over
-  the originals for that range, and the single atomic commit point is the durable appearance
-  of the new segment, after which the originals are rename-then-unlinked. The archival offload
-  sink remains unspecified.
+- **An archival offload sink.** #135 mentions an archival sink (`WAL_ttl_seconds` analogue,
+  a `state=1 offloaded` enum). It does not exist; there is no offload. (The optional, opt-in,
+  key-based COMPACTOR that #135 mentioned alongside it is now IMPLEMENTED, #337; see the
+  retention-and-compaction note below.) The archival offload sink remains unspecified.
 - **A `quarantined` segment side-state.** The README and the resilience story mention
   quarantining an unreadable segment. The lifecycle states in code are active / sealed
   (plus reaped); a corrupt segment surfaces a typed `StorageError` at scan time rather

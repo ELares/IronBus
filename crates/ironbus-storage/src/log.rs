@@ -275,13 +275,74 @@ struct SegmentSlot {
     base_offset: u64,
     /// How many records this segment holds. Meaningful for a SEALED segment (set on its roll or
     /// at recovery); the active segment's live count is read from the writer, so the slot's value
-    /// for the active segment is `0` until it is sealed.
+    /// for the active segment is `0` until it is sealed. For a COMPACTED segment this is the
+    /// SURVIVOR count (sparse), NOT the covered count.
     record_count: u64,
     /// The maximum producer timestamp (milliseconds since the Unix epoch) across this segment's
     /// records, or `0` if it is empty. Tracked as the MAX (producer timestamps are not monotonic)
     /// so the age-retention reaper deletes a segment only when ALL its records are older than the
     /// bound. Meaningful for a SEALED segment, like `record_count`.
     max_timestamp_ms: u64,
+    /// For a COMPACTED (v2) segment (#337): the covered range `[covered_base_offset,
+    /// covered_end_offset)` of the ORIGINAL source set this segment supersedes (the SPARSE survivor
+    /// offsets within are a subset of `[base_offset, covered_end_offset)`). `None` for an ordinary
+    /// segment, whose actual range is the dense `[base_offset, base_offset + record_count)`. A read
+    /// against a compacted slot routes through the v2 scan and skips absent offsets.
+    compacted_covered: Option<CompactedCover>,
+}
+
+/// The covered offset/sequence span a COMPACTED segment declares in its v2 metadata block (#337):
+/// the source set's true range, used by recovery to abut the chain and to identify a superseded
+/// original. A compacted segment's records are sparse WITHIN this range.
+// The `covered_` prefix mirrors the on-disk v2 block field names (CONTRACTS.md) on purpose, so the
+// struct reads 1:1 against the byte layout; the shared prefix is intentional, not noise.
+#[allow(clippy::struct_field_names)]
+#[derive(Clone, Copy, Debug)]
+struct CompactedCover {
+    covered_base_offset: u64,
+    covered_end_offset: u64,
+    covered_base_seq: u64,
+    covered_end_seq: u64,
+}
+
+impl SegmentSlot {
+    /// The lowest covered offset of this segment: for a COMPACTED segment its true
+    /// `covered_base_offset` (which may be BELOW the lowest survivor's `base_offset`), for an
+    /// ordinary segment `base_offset`. Used by the read path and the reaper so a compacted hole's
+    /// offsets resolve to the segment that supersedes them.
+    fn covered_base_offset(&self) -> u64 {
+        match self.compacted_covered {
+            Some(c) => c.covered_base_offset,
+            None => self.base_offset,
+        }
+    }
+}
+
+/// One ORDINARY (v1) segment discovered during compaction-aware recovery (#337): its recovered
+/// scan facts, used to reconcile against the compacted segments and then build the chain.
+struct OrdinaryCandidate {
+    id: u64,
+    base_offset: u64,
+    base_seq: u64,
+    record_count: u64,
+    max_timestamp_ms: u64,
+    valid_end: u64,
+    sealed: bool,
+    file_len: u64,
+    tail_reason: Option<ReasonCode>,
+    last_seq: Seq,
+    header: SegmentHeader,
+}
+
+/// One COMPACTED (v2) segment discovered during compaction-aware recovery (#337): its survivor
+/// facts plus the covered source range from its v2 metadata block, used to supersede the originals
+/// it replaced and to abut the chain by covered range.
+struct CompactedCandidate {
+    id: u64,
+    record_count: u64,
+    max_timestamp_ms: u64,
+    cover: CompactedCover,
+    valid_end: u64,
 }
 
 /// The validated segment chain `Log::recover` rebuilds from a streaming scan of every segment:
@@ -456,7 +517,22 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 log.start_segment(FIRST_SEGMENT_ID, Seq::new(0), Offset::ZERO)?;
                 Ok(log)
             }
-            Some(last_id) => Self::recover(fs, clock, config, &ids, last_id),
+            Some(last_id) => {
+                // Compaction reconciliation (#337): if ANY segment is COMPACTED (v2), recovery must
+                // resolve a possibly-overlapping offset range from the self-describing v2 metadata,
+                // because a compacted segment has a high id but covers a LOW range, and a crash may
+                // have left both it and the originals it replaced. The reconciliation runs FIRST,
+                // physically retiring superseded originals and redundant orphan compacted segments,
+                // then the surviving set is recovered as a v2-aware chain. When NO compacted segment
+                // is present (the overwhelmingly common case) the directory is all-ordinary and the
+                // existing v1 recovery runs UNCHANGED, so a non-compacted log's recovery is
+                // byte-for-byte the same code path it always was.
+                if crate::compaction::directory_has_compacted_segment(&fs)? {
+                    Self::recover_with_compaction(fs, clock, config, &ids)
+                } else {
+                    Self::recover(fs, clock, config, &ids, last_id)
+                }
+            }
         }
     }
 
@@ -493,6 +569,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 base_offset,
                 record_count: scan.record_count,
                 max_timestamp_ms: scan.max_timestamp_ms,
+                // This v1 path is only reached for an all-ordinary directory (the compaction
+                // reconciliation in `open` routes a directory containing a compacted segment
+                // elsewhere), so every slot here is ordinary.
+                compacted_covered: None,
             });
             if i > 0 && (base_offset != next_base_offset || base_seq != next_base_seq) {
                 return Err(StorageError::SegmentChainBroken {
@@ -681,6 +761,359 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         Ok(log)
     }
 
+    /// Recovers a data directory that contains at least one COMPACTED (v2) segment (#337),
+    /// resolving a possibly-overlapping offset range deterministically from the self-describing v2
+    /// metadata, with NO compaction-specific repair beyond two generic file-set reconciliations and
+    /// NO manifest. It is reached only when [`compaction::directory_has_compacted_segment`] is true;
+    /// an all-ordinary directory takes the unchanged v1 [`Log::recover`] path.
+    ///
+    /// The reconciliation, in order:
+    /// 1. Classify each segment as ordinary or compacted. A compacted-flagged segment whose
+    ///    trailing footer/block is torn or CRC-mismatched did NOT reach its commit point: it is an
+    ///    orphan from a crash before the directory fsync, discarded (unlinked).
+    /// 2. A committed compacted segment is AUTHORITATIVE over every original whose offset range is
+    ///    fully inside its covered range (the crash-after-commit-during-retire case): those
+    ///    superseded originals are unlinked.
+    /// 3. Two compacted segments never partially overlap by construction; if a crash somehow left
+    ///    two with overlapping covered ranges, the HIGHER segment id (the later clean, by ADR 0002
+    ///    monotonicity) wins and the lower is unlinked.
+    /// 4. The surviving set (compacted segments plus uncompacted originals) is sorted by
+    ///    covered/actual offset range (NOT by id, since a compacted id no longer tracks its range)
+    ///    and must stitch into one offset-contiguous-at-the-segment-boundary chain; the sequence
+    ///    half advances by the covered SPAN across a compacted segment, not the survivor count.
+    ///
+    /// Neither reconciliation emits a `LossReport` event: a discarded orphan's data is fully present
+    /// in the originals, and an unlinked superseded original's surviving records are present in the
+    /// compacted segment, so no durable record is actually lost (the I1 to I4 invariants hold).
+    fn recover_with_compaction(
+        fs: F,
+        clock: C,
+        config: LogConfig,
+        ids: &[u64],
+    ) -> Result<Log<F, C>, StorageError> {
+        // Step 1: classify every segment.
+        let mut ordinaries: Vec<OrdinaryCandidate> = Vec::new();
+        let mut compacteds: Vec<CompactedCandidate> = Vec::new();
+        for &id in ids {
+            let reader = SegmentReader::open(fs.open(&segment_file_name(id))?)?;
+            if reader.header().is_compacted() {
+                if let Some(scan) = reader.scan_compacted()? {
+                    compacteds.push(CompactedCandidate {
+                        id,
+                        record_count: scan.records.len() as u64,
+                        max_timestamp_ms: scan.max_timestamp_ms,
+                        cover: CompactedCover {
+                            covered_base_offset: scan.meta.covered_base_offset,
+                            covered_end_offset: scan.meta.covered_end_offset,
+                            covered_base_seq: scan.meta.covered_base_seq,
+                            covered_end_seq: scan.meta.covered_end_seq,
+                        },
+                        valid_end: scan.valid_end,
+                    });
+                } else {
+                    // A compacted-flagged segment with a torn/CRC-bad trailing footer or block did
+                    // NOT reach its commit point: discard it as a crash-before-commit orphan.
+                    fs.remove(&segment_file_name(id))?;
+                    fs.sync_dir()?;
+                }
+            } else {
+                let scan = reader.scan_recovery()?;
+                ordinaries.push(OrdinaryCandidate {
+                    id,
+                    base_offset: scan.header.base_offset.get(),
+                    base_seq: scan.header.base_seq.get(),
+                    record_count: scan.record_count,
+                    max_timestamp_ms: scan.max_timestamp_ms,
+                    valid_end: scan.valid_end,
+                    sealed: scan.footer.is_some(),
+                    file_len: fs.open(&segment_file_name(id))?.len()?,
+                    tail_reason: scan.tail_reason,
+                    last_seq: scan.last_seq,
+                    header: scan.header,
+                });
+            }
+        }
+
+        // Step 3: two compacted segments with overlapping covered ranges => higher id wins.
+        compacteds.sort_by(|a, b| {
+            a.cover
+                .covered_base_offset
+                .cmp(&b.cover.covered_base_offset)
+        });
+        let mut keep_compacted: Vec<CompactedCandidate> = Vec::new();
+        for cand in compacteds {
+            if let Some(prev) = keep_compacted.last() {
+                let overlaps = cand.cover.covered_base_offset < prev.cover.covered_end_offset;
+                if overlaps {
+                    // The higher id is the later clean (ADR 0002 monotonicity): keep it, drop the
+                    // lower. Because we iterate in covered-base order, `prev` is the lower base; the
+                    // overlap tie-break is by id.
+                    if cand.id > prev.id {
+                        let dropped = keep_compacted.pop();
+                        if let Some(d) = dropped {
+                            fs.remove(&segment_file_name(d.id))?;
+                            fs.sync_dir()?;
+                        }
+                        keep_compacted.push(cand);
+                    } else {
+                        fs.remove(&segment_file_name(cand.id))?;
+                        fs.sync_dir()?;
+                    }
+                    continue;
+                }
+            }
+            keep_compacted.push(cand);
+        }
+
+        // Step 2: drop any ordinary segment fully inside some surviving compacted segment's covered
+        // range (a superseded original from a crash mid-retire). Unlink it; its surviving records
+        // are present in the compacted segment, so this is not a loss.
+        let mut keep_ordinary: Vec<OrdinaryCandidate> = Vec::new();
+        for ord in ordinaries {
+            let ord_end = ord.base_offset.saturating_add(ord.record_count);
+            let superseded = keep_compacted.iter().any(|c| {
+                ord.base_offset >= c.cover.covered_base_offset
+                    && ord_end <= c.cover.covered_end_offset
+            });
+            if superseded {
+                fs.remove(&segment_file_name(ord.id))?;
+                fs.sync_dir()?;
+            } else {
+                keep_ordinary.push(ord);
+            }
+        }
+
+        // Step 4: build the reconciled, offset-ordered slot list and verify the chain stitches at
+        // segment boundaries. Each entry carries its covered/actual base and end so the continuity
+        // check uses the covered span across a compacted segment.
+        Self::build_compacted_chain(fs, clock, config, keep_ordinary, keep_compacted)
+    }
+
+    /// Stitches the reconciled ordinary + compacted candidate set into the recovered [`Log`],
+    /// validating offset-and-sequence continuity at every segment boundary (the covered span across
+    /// a compacted segment, the dense span across an ordinary one), recovering the active segment's
+    /// torn tail or rolling it forward, and seeding the running totals. Split out of
+    /// [`Log::recover_with_compaction`] to keep each function focused. It mirrors the structure of
+    /// the v1 [`Log::recover`], which is itself long: the chain walk, the active-segment torn-tail or
+    /// roll-forward, and the I3 cap check are one cohesive recovery procedure that does not factor
+    /// cleanly below the line limit without obscuring it.
+    #[allow(clippy::too_many_lines)]
+    fn build_compacted_chain(
+        fs: F,
+        clock: C,
+        config: LogConfig,
+        ordinaries: Vec<OrdinaryCandidate>,
+        compacteds: Vec<CompactedCandidate>,
+    ) -> Result<Log<F, C>, StorageError> {
+        // A reconciled chain entry, sorted by covered/actual base offset.
+        enum Entry {
+            Ordinary(OrdinaryCandidate),
+            Compacted(CompactedCandidate),
+        }
+        let mut entries: Vec<Entry> = Vec::with_capacity(ordinaries.len() + compacteds.len());
+        entries.extend(ordinaries.into_iter().map(Entry::Ordinary));
+        entries.extend(compacteds.into_iter().map(Entry::Compacted));
+        // Sort by covered/actual base offset; the id no longer proxies offset order.
+        entries.sort_by_key(|e| match e {
+            Entry::Ordinary(o) => o.base_offset,
+            Entry::Compacted(c) => c.cover.covered_base_offset,
+        });
+
+        let mut slots: Vec<SegmentSlot> = Vec::with_capacity(entries.len());
+        let mut next_base_offset = 0u64;
+        let mut next_base_seq = 0u64;
+        let mut durable_bytes = 0u64;
+        let mut total_record_count = 0u64;
+        // The highest-offset-range ORDINARY entry is the active segment candidate; track its index.
+        let mut active_ordinary: Option<OrdinaryCandidate> = None;
+        let total = entries.len();
+        for (i, entry) in entries.into_iter().enumerate() {
+            let is_last = i + 1 == total;
+            // The covered/actual base and end, plus the sequence span, for the continuity check.
+            let (base_offset, base_seq, end_offset, end_seq, rec_count, max_ts, valid_end, id) =
+                match &entry {
+                    Entry::Ordinary(o) => (
+                        o.base_offset,
+                        o.base_seq,
+                        o.base_offset.saturating_add(o.record_count),
+                        o.base_seq.saturating_add(o.record_count),
+                        o.record_count,
+                        o.max_timestamp_ms,
+                        o.valid_end,
+                        o.id,
+                    ),
+                    Entry::Compacted(c) => (
+                        c.cover.covered_base_offset,
+                        c.cover.covered_base_seq,
+                        c.cover.covered_end_offset,
+                        c.cover.covered_end_seq,
+                        c.record_count,
+                        c.max_timestamp_ms,
+                        c.valid_end,
+                        c.id,
+                    ),
+                };
+            if i > 0 && (base_offset != next_base_offset || base_seq != next_base_seq) {
+                return Err(StorageError::SegmentChainBroken {
+                    segment_id: id,
+                    expected_base_offset: next_base_offset,
+                    found_base_offset: base_offset,
+                    expected_base_seq: next_base_seq,
+                    found_base_seq: base_seq,
+                });
+            }
+            // Every NON-final ordinary segment must be sealed (the same rule v1 recovery applies).
+            // A compacted segment is always born sealed, so it is always allowed mid-chain.
+            if let Entry::Ordinary(o) = &entry {
+                if !is_last && !o.sealed {
+                    return Err(StorageError::UnsealedPredecessor { segment_id: o.id });
+                }
+            }
+            // Advance the offset/seq expectation by the COVERED span (which, for an ordinary
+            // segment, reduces to the dense span). The durable-bytes and count totals charge the
+            // actual on-disk record region and survivor/record count, not the covered span.
+            next_base_offset = end_offset;
+            next_base_seq = end_seq;
+            durable_bytes =
+                durable_bytes.saturating_add(valid_end.saturating_sub(SEGMENT_HEADER_LEN as u64));
+            total_record_count = total_record_count.saturating_add(rec_count);
+
+            let slot = SegmentSlot {
+                id,
+                base_offset,
+                record_count: rec_count,
+                max_timestamp_ms: max_ts,
+                compacted_covered: match &entry {
+                    Entry::Ordinary(_) => None,
+                    Entry::Compacted(c) => Some(c.cover),
+                },
+            };
+            slots.push(slot);
+
+            // The active segment is the highest-offset-range ORDINARY entry. A compacted segment is
+            // never active. We track the last ordinary entry seen; because entries are offset-sorted
+            // and the active ordinary segment has the highest range, the LAST ordinary entry is it.
+            if let Entry::Ordinary(o) = entry {
+                active_ordinary = Some(o);
+            }
+        }
+
+        let next_offset = Offset::new(next_base_offset);
+        let next_seq = Seq::new(next_base_seq);
+        let persisted_quarantine_bytes = crate::quarantine::persisted_bytes(&fs);
+        // The active segment's on-disk record bytes are subtracted back out of the sealed total only
+        // when the active segment is an unsealed ordinary one (it is the WAL, not a sealed
+        // predecessor). If the highest entry is a SEALED segment we roll forward (no active record
+        // bytes to subtract).
+        let active = active_ordinary;
+        let active_is_unsealed = active.as_ref().is_some_and(|a| !a.sealed);
+        let active_record_bytes = if active_is_unsealed {
+            active
+                .as_ref()
+                .map_or(0, |a| a.valid_end.saturating_sub(SEGMENT_HEADER_LEN as u64))
+        } else {
+            0
+        };
+        let sealed_record_bytes = durable_bytes.saturating_sub(active_record_bytes);
+
+        let mut log = Log {
+            fs,
+            clock,
+            config,
+            active: None,
+            active_id: active.as_ref().map_or(0, |a| a.id),
+            next_offset,
+            next_seq,
+            flushed_offset: next_offset,
+            synced_offset: next_offset,
+            segments: slots,
+            sealed_record_bytes,
+            total_record_count,
+            recovered_truncated_bytes: 0,
+            loss_report: LossReport::new(),
+            quarantined_bytes: persisted_quarantine_bytes,
+            logical_bytes_written: 0,
+            physical_bytes_written: 0,
+            unsynced_record_bytes: 0,
+            physical_bytes_written_today: 0,
+            physical_write_today_day: 0,
+            daily_budget_sheds: 0,
+        };
+
+        match active {
+            // The highest-range entry is an UNSEALED ordinary segment: it is the active WAL. Drop
+            // any torn or unsynced tail and resume appending at the valid prefix end, exactly as the
+            // v1 recovery does.
+            Some(a) if !a.sealed => {
+                let name = segment_file_name(a.id);
+                let file = log.fs.open(&name)?;
+                if a.valid_end < a.file_len {
+                    log.recovered_truncated_bytes = a.file_len - a.valid_end;
+                    let reason = a.tail_reason.unwrap_or(ReasonCode::TornTail);
+                    let event = LossEvent::span(a.id, a.valid_end, a.file_len, 1, reason);
+                    log.loss_report.push(event);
+                    if crate::quarantine::is_corruption_skip(reason) {
+                        let captured = crate::quarantine::quarantine_corrupt_span(
+                            &log.fs,
+                            &file,
+                            &event,
+                            log.config.max_quarantine_bytes,
+                        );
+                        if captured > 0 {
+                            log.quarantined_bytes = crate::quarantine::persisted_bytes(&log.fs);
+                        }
+                    }
+                    file.set_len(a.valid_end)?;
+                    file.sync_all()?;
+                }
+                let record_count =
+                    u32::try_from(a.record_count).map_err(|_| StorageError::SegmentFull)?;
+                log.active = Some(SegmentWriter::resume(
+                    file,
+                    a.header,
+                    a.valid_end,
+                    record_count,
+                    a.last_seq,
+                    a.max_timestamp_ms,
+                ));
+            }
+            // The highest-range entry is a SEALED ordinary segment (a crash after sealing but before
+            // the next was created): roll forward into a fresh active segment, continuing the offset
+            // and sequence space.
+            Some(a) => {
+                let next_id = a.id.checked_add(1).ok_or(StorageError::SegmentFull)?;
+                log.start_segment(next_id, next_seq, next_offset)?;
+            }
+            // No ordinary segment at all (every surviving segment is compacted): roll forward into a
+            // fresh active segment past the highest covered range, so appends resume into a clean
+            // segment. The fresh id is one past the highest segment id seen.
+            None => {
+                let next_id = log
+                    .segments
+                    .iter()
+                    .map(|s| s.id)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or(StorageError::SegmentFull)?;
+                log.start_segment(next_id, next_seq, next_offset)?;
+            }
+        }
+
+        // I3 bounded-loss caps, identical to the v1 path: fail closed rather than accept unbounded
+        // silent loss. The reconciliation itself emits no loss event (no durable record was lost),
+        // so the only loss here is an active-segment torn tail, exactly as in v1 recovery.
+        let per_event_cap = log
+            .config
+            .max_segment_bytes
+            .min(LossReport::PER_EVENT_BYTE_CAP);
+        let global_cap = LossReport::global_loss_cap_bytes(durable_bytes).max(per_event_cap);
+        log.loss_report
+            .check_caps(per_event_cap, global_cap)
+            .map_err(StorageError::ExcessiveRecoveryLoss)?;
+        Ok(log)
+    }
+
     /// Creates a fresh segment `id` with the given base, makes it durable (header sync
     /// plus dir sync), and installs it as the active segment.
     fn start_segment(
@@ -725,18 +1158,38 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             base_offset: base_offset.get(),
             record_count: 0,
             max_timestamp_ms: 0,
+            // A freshly started active segment is always an ordinary (v1) segment; only the
+            // off-hot-path cleaner ever writes a compacted segment, and it never becomes active.
+            compacted_covered: None,
         });
         Ok(())
+    }
+
+    /// The next FRESH segment id, strictly greater than any id ever used: `max(active_id, the
+    /// highest slot id) + 1`. With compaction (#337) a compacted segment carries a HIGH id but a LOW
+    /// covered range, so the highest slot id can exceed `active_id`; a fresh id must clear it to
+    /// honor ADR 0002 (ids never recycled). For a plain log the max id is `active_id`, so this is
+    /// `active_id + 1`.
+    fn next_fresh_segment_id(&self) -> Result<u64, StorageError> {
+        let highest = self
+            .segments
+            .iter()
+            .map(|s| s.id)
+            .max()
+            .unwrap_or(self.active_id)
+            .max(self.active_id);
+        highest.checked_add(1).ok_or(StorageError::SegmentFull)
     }
 
     /// Seals the active segment and starts the next one, continuing the offset and
     /// sequence space. The old segment is sealed (durable footer) BEFORE the new segment
     /// becomes discoverable, so a crash in between is recovered by rolling forward.
     fn roll(&mut self) -> Result<(), StorageError> {
-        let next_id = self
-            .active_id
-            .checked_add(1)
-            .ok_or(StorageError::SegmentFull)?;
+        // The next active segment id is strictly greater than ANY id ever used (ADR 0002), which now
+        // includes COMPACTED segments (#337): a compacted segment took a FRESH high id, so the
+        // active roll must skip past it rather than collide with `active_id + 1`. A plain log (no
+        // compacted segment) has `active_id` as the max id, so this reduces to `active_id + 1`.
+        let next_id = self.next_fresh_segment_id()?;
         // Take the active writer out and seal it. From here, any error leaves `active` as
         // `None` and the writer frozen; surface `WriterFrozen` (the fatal, never-retried
         // state) rather than the raw IO error, so the in-flight produce ends its session
@@ -1215,7 +1668,14 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // never below the last segment's base, never below the oldest base). Once front
         // reaping can advance `oldest` past a small `flushed`, reorder these two so a
         // reaped offset reports OffsetOutOfRange instead of an empty read.
-        let oldest = self.segments.first().map_or(0, |slot| slot.base_offset);
+        // The oldest retained offset is the FIRST segment's covered base (for a compacted segment
+        // this is its `covered_base_offset`, which can be BELOW its lowest surviving offset; a read
+        // that targets a compacted-away offset in that range is valid and simply skips forward over
+        // the gap to the next present survivor).
+        let oldest = self
+            .segments
+            .first()
+            .map_or(0, SegmentSlot::covered_base_offset);
         if start_v < oldest {
             return Err(StorageError::OffsetOutOfRange {
                 requested: start_v,
@@ -1224,12 +1684,31 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         }
         let mut out = Vec::new();
         for slot in &self.segments[self.segment_index_for(start_v)..] {
-            if slot.base_offset >= flushed {
+            if slot.covered_base_offset() >= flushed {
                 // This segment, and every later one, begins beyond the durable end.
                 break;
             }
-            let scan = SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?.scan()?;
-            for record in scan.records {
+            // A COMPACTED segment is SPARSE: read its survivors via the v2 scan and push each at its
+            // ORIGINAL offset. A read that lands on a compacted-away offset naturally ADVANCES to the
+            // next present survivor (the absent offsets simply have no record), so the read path skips
+            // the gap rather than stalling, and never reports MissingRecord for a compacted hole. An
+            // ordinary segment uses the dense v1 scan exactly as before.
+            let records = if slot.compacted_covered.is_some() {
+                match SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?
+                    .scan_compacted()?
+                {
+                    Some(scan) => scan.records,
+                    // A compacted slot that no longer scans as a valid compacted segment is a
+                    // structural inconsistency the recovery reconciliation should have prevented;
+                    // surface it rather than silently serving nothing.
+                    None => return Err(StorageError::WriterFrozen),
+                }
+            } else {
+                SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?
+                    .scan()?
+                    .records
+            };
+            for record in records {
                 let offset = record.offset.get();
                 if offset < start_v {
                     continue; // before the requested start (only in the first segment)
@@ -1320,7 +1799,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         let now_ms = self.clock.now_unix_millis();
         // Loop while a SECOND slot exists: that keeps the ACTIVE segment (the last slot) off the
         // table, so with only one slot (the single segment IS the active one) the loop ends.
-        while let Some(next_base) = self.segments.get(1).map(|slot| slot.base_offset) {
+        // The "fully consumed" test is the NEXT segment's COVERED base (== the oldest segment's
+        // covered end): every offset in the oldest segment, including any compacted-away holes, is
+        // strictly below it, so a consumer at or past it needs none of them.
+        while let Some(next_base) = self.segments.get(1).map(SegmentSlot::covered_base_offset) {
             let oldest = self.segments[0];
             // Is the OLDEST sealed segment eligible under any enabled bound? Size and count are
             // log-wide totals; age is per-segment (the oldest segment's max timestamp).
@@ -1337,18 +1819,16 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 break;
             }
             // The oldest segment is fully consumed only if it ends at or below the protect floor.
-            // Its end is exactly the next segment's base (contiguous), so every record in it is
-            // strictly below `next_base <= protect_below_offset`, hence needed by no consumer.
+            // Its end is exactly the next segment's covered base (contiguous), so every record in it
+            // is strictly below `next_base <= protect_below_offset`, hence needed by no consumer.
             if next_base > protect_below_offset {
                 break;
             }
             let name = segment_file_name(oldest.id);
             // The reaped segment's durable RECORD bytes and COUNT, read the SAME way the running
-            // totals were accumulated (`valid_end - SEGMENT_HEADER_LEN` and `record_count`), so
-            // both decrements are exact. A streaming recovery scan avoids materializing payloads.
-            let scan = SegmentReader::open(self.fs.open(&name)?)?.scan_recovery()?;
-            let segment_record_bytes = scan.valid_end.saturating_sub(SEGMENT_HEADER_LEN as u64);
-            let segment_record_count = scan.record_count;
+            // totals were accumulated. A compacted oldest segment is read via the v2 scan.
+            let (segment_record_bytes, segment_record_count) =
+                self.segment_record_bytes_and_count(&oldest)?;
             // Unlink, then dir-sync so the removal is durable, BEFORE touching in-memory state:
             // if either fails the slot stays and the running totals are untouched, so memory never
             // claims a segment is gone while it survives on disk.
@@ -1425,11 +1905,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         let oldest = self.segments[0];
         let name = segment_file_name(oldest.id);
         // Read the reaped segment's durable RECORD bytes and COUNT the SAME way the running totals
-        // were accumulated (`valid_end - SEGMENT_HEADER_LEN` and `record_count`), so both
-        // decrements are exact. A streaming recovery scan avoids materializing payloads.
-        let scan = SegmentReader::open(self.fs.open(&name)?)?.scan_recovery()?;
-        let segment_record_bytes = scan.valid_end.saturating_sub(SEGMENT_HEADER_LEN as u64);
-        let segment_record_count = scan.record_count;
+        // were accumulated, so both decrements are exact. A compacted oldest segment is read via the
+        // v2 scan.
+        let (segment_record_bytes, segment_record_count) =
+            self.segment_record_bytes_and_count(&oldest)?;
         // Unlink, then dir-sync so the removal is durable, BEFORE touching in-memory state: if
         // either fails the slot stays and the running totals are untouched, so memory never claims
         // a segment is gone while it survives on disk.
@@ -1446,6 +1925,119 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         }))
     }
 
+    /// Runs ONE rate-limited, OFF-HOT-PATH key-compaction pass if compaction is enabled and a run of
+    /// adjacent dirty SEALED segments meets the trigger (#337). It NEVER touches the active segment,
+    /// so it does not race or block an append; the single writer (the append actor) calls this
+    /// between commits, not inside the critical section. A pass reads N adjacent dirty sealed source
+    /// segments, writes the survivors (keeping their ORIGINAL sparse offsets) into a fresh
+    /// `version` = 2 compacted segment, fsyncs it, dir-fsyncs (the atomic commit point), then
+    /// retires the originals, and finally replaces the covered ordinary slots in memory with the new
+    /// compacted slot. A crash at any step is recovered deterministically by [`Log::open`].
+    ///
+    /// Returns the [`crate::compaction::CompactionOutcome`] (an empty outcome when compaction is off
+    /// or no run met the trigger).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::WriterFrozen`] if the writer is frozen (no compaction on a dead
+    /// writer), or propagates an IO/segment error from the pass. On an error mid-retire the
+    /// directory may be partially swapped; the next [`Log::open`] reconciles it deterministically.
+    pub fn maybe_compact(
+        &mut self,
+        config: &crate::compaction::CompactionConfig,
+    ) -> Result<crate::compaction::CompactionOutcome, StorageError> {
+        if !config.enabled {
+            return Ok(crate::compaction::CompactionOutcome::default());
+        }
+        // Never compact on a frozen writer (it has no active segment to protect against, but the
+        // log is degraded; do no extra IO).
+        self.active()?;
+        let Some(source_ids) =
+            crate::compaction::select_dirty_run(&self.fs, &self.clock, config, self.active_id)?
+        else {
+            return Ok(crate::compaction::CompactionOutcome::default());
+        };
+        // The fresh compacted id is strictly greater than ANY id ever used (ADR 0002): a compacted
+        // segment carries a HIGH id but a LOW covered range. The active roll uses the SAME allocator,
+        // so the active segment never collides with a compacted id.
+        let fresh_id = self.next_fresh_segment_id()?;
+        // Capture the source segments' on-disk record bytes and counts BEFORE the pass retires them
+        // (after retire the files are gone), so the running-total adjustment below is exact. Each is
+        // read the same way the running totals were accumulated.
+        let source_set: std::collections::HashSet<u64> = source_ids.iter().copied().collect();
+        let mut source_bytes = 0u64;
+        let mut source_count = 0u64;
+        // Clone the covered slots out so we do not hold a borrow of `self.segments` across the
+        // mutating call below.
+        let covered_slots: Vec<SegmentSlot> = self
+            .segments
+            .iter()
+            .filter(|s| source_set.contains(&s.id))
+            .copied()
+            .collect();
+        for slot in &covered_slots {
+            let (bytes, count) = self.segment_record_bytes_and_count(slot)?;
+            source_bytes = source_bytes.saturating_add(bytes);
+            source_count = source_count.saturating_add(count);
+        }
+        let outcome =
+            crate::compaction::compact_run(&self.fs, &self.clock, config, &source_ids, fresh_id)?;
+        // Update the in-memory slot set to match the swapped directory: drop the covered ordinary
+        // slots and insert the new compacted slot in their place, recomputed from the just-written
+        // segment so the running totals stay exact. The sealed-record-byte total changes by the
+        // (smaller) survivor bytes replacing the (larger) source bytes.
+        if let Some(compacted_id) = outcome.compacted_segment_id {
+            self.install_compacted_slot(compacted_id, &source_set, source_bytes, source_count)?;
+        }
+        Ok(outcome)
+    }
+
+    /// Replaces the in-memory ordinary slots covered by a freshly written compacted segment with the
+    /// compacted slot, adjusting the running byte and count totals so they stay exact (#337). The
+    /// source segments' bytes and counts are captured by the caller BEFORE the pass retired them.
+    /// Called only by [`Log::maybe_compact`] after a successful pass.
+    fn install_compacted_slot(
+        &mut self,
+        compacted_id: u64,
+        source_set: &std::collections::HashSet<u64>,
+        source_bytes: u64,
+        source_count: u64,
+    ) -> Result<(), StorageError> {
+        let reader = SegmentReader::open(self.fs.open(&segment_file_name(compacted_id))?)?;
+        let Some(scan) = reader.scan_compacted()? else {
+            // The just-written segment must scan as a valid compacted segment; if not, surface a
+            // fatal error rather than corrupt the in-memory totals.
+            return Err(StorageError::WriterFrozen);
+        };
+        let survivor_bytes = scan.valid_end.saturating_sub(SEGMENT_HEADER_LEN as u64);
+        let survivor_count = scan.records.len() as u64;
+        // Drop the covered ordinary slots, then insert the compacted slot, then re-sort by covered
+        // base offset so the slot vector stays offset-ordered for the binary search.
+        self.segments.retain(|s| !source_set.contains(&s.id));
+        self.segments.push(SegmentSlot {
+            id: compacted_id,
+            base_offset: scan.header.base_offset.get(),
+            record_count: survivor_count,
+            max_timestamp_ms: scan.max_timestamp_ms,
+            compacted_covered: Some(CompactedCover {
+                covered_base_offset: scan.meta.covered_base_offset,
+                covered_end_offset: scan.meta.covered_end_offset,
+                covered_base_seq: scan.meta.covered_base_seq,
+                covered_end_seq: scan.meta.covered_end_seq,
+            }),
+        });
+        self.segments.sort_by_key(SegmentSlot::covered_base_offset);
+        // Adjust the running totals: the survivors replace the (larger) source set on disk.
+        self.sealed_record_bytes = self
+            .sealed_record_bytes
+            .saturating_sub(source_bytes)
+            .saturating_add(survivor_bytes);
+        self.total_record_count = self
+            .total_record_count
+            .saturating_sub(source_count)
+            .saturating_add(survivor_count);
+        Ok(())
+    }
+
     /// The OLDEST retained log offset: the oldest segment's `base_offset`, the first offset still
     /// present in the durable log. `0` for a fresh log or one that has never been reaped. After a
     /// reap (consumer-safe [`Log::reap`] or forced [`Log::reap_oldest_forced`]) this rises to the
@@ -1453,16 +2045,56 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// read at an offset below this is [`StorageError::OffsetOutOfRange`].
     #[must_use]
     pub fn earliest_offset(&self) -> Offset {
-        Offset::new(self.segments.first().map_or(0, |slot| slot.base_offset))
+        // The COVERED base of the first segment: for a compacted oldest segment this is the lowest
+        // covered (source) offset, the true low end of the durable range, even though its lowest
+        // surviving record sits above it.
+        Offset::new(
+            self.segments
+                .first()
+                .map_or(0, SegmentSlot::covered_base_offset),
+        )
     }
 
     /// The index in `segments` of the segment whose range holds `offset` (the slot with
     /// the largest `base_offset` not exceeding `offset`). Callers guarantee `offset` is
     /// at least the oldest base offset.
+    /// The durable RECORD bytes (`valid_end - SEGMENT_HEADER_LEN`) and record COUNT of one segment,
+    /// read the SAME way the running totals were accumulated, so a reap's decrement is exact. A
+    /// COMPACTED segment is read via the v2 scan (its survivors are sparse and would fail the dense
+    /// v1 recovery scan); an ordinary segment uses the streaming recovery scan. Used by the reapers
+    /// so they can reclaim a compacted oldest segment too.
+    fn segment_record_bytes_and_count(
+        &self,
+        slot: &SegmentSlot,
+    ) -> Result<(u64, u64), StorageError> {
+        let name = segment_file_name(slot.id);
+        let reader = SegmentReader::open(self.fs.open(&name)?)?;
+        if slot.compacted_covered.is_some() {
+            match reader.scan_compacted()? {
+                Some(scan) => Ok((
+                    scan.valid_end.saturating_sub(SEGMENT_HEADER_LEN as u64),
+                    scan.records.len() as u64,
+                )),
+                None => Err(StorageError::WriterFrozen),
+            }
+        } else {
+            let scan = reader.scan_recovery()?;
+            Ok((
+                scan.valid_end.saturating_sub(SEGMENT_HEADER_LEN as u64),
+                scan.record_count,
+            ))
+        }
+    }
+
     fn segment_index_for(&self, offset: u64) -> usize {
+        // Search by the segment's COVERED base offset, not the survivor base: for a compacted
+        // segment the covered base can be BELOW the lowest survivor, and a target offset in that
+        // (compacted-away) sub-range still belongs to the compacted segment, where the read advances
+        // forward to the next present survivor. For an ordinary segment the covered base IS the
+        // base, so this reduces to the original search.
         match self
             .segments
-            .binary_search_by(|slot| slot.base_offset.cmp(&offset))
+            .binary_search_by(|slot| slot.covered_base_offset().cmp(&offset))
         {
             Ok(index) => index,
             Err(0) => 0,

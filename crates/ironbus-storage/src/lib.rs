@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod checkpoint;
+pub mod compaction;
 pub mod dlq;
 pub mod fault;
 pub mod fs;

@@ -10,8 +10,10 @@
 use crate::io::RandomAccessFile;
 use crate::loss::{CapViolation, ReasonCode};
 use ironbus_core::codec::{self, DecodeError, RecordView};
-use ironbus_core::format::{RECORD_HEADER_LEN, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN};
-use ironbus_core::segment::{SegmentError, SegmentFooter, SegmentHeader};
+use ironbus_core::format::{
+    COMPACTION_META_LEN, RECORD_HEADER_LEN, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN,
+};
+use ironbus_core::segment::{CompactionMeta, SegmentError, SegmentFooter, SegmentHeader};
 use ironbus_core::types::{Offset, RecordFlags, Seq};
 use std::io;
 
@@ -327,6 +329,98 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         }
     }
 
+    /// Creates a fresh COMPACTED (`version` = 2) segment for the key-compaction cleaner (#337),
+    /// writing the v2 header at offset 0. The header MUST carry the
+    /// [`ironbus_core::format::SEGMENT_FLAG_COMPACTED`] flag, so its `version` byte encodes as 2.
+    /// Unlike [`SegmentWriter::create`] the records this writer appends keep their ORIGINAL,
+    /// now-SPARSE offsets and sequences ([`SegmentWriter::append_at`]) rather than the dense
+    /// `base_offset + record_count` an ordinary append assigns, and the writer is sealed with the
+    /// trailing v2 metadata block ([`SegmentWriter::seal_compacted`]).
+    ///
+    /// # Errors
+    /// Propagates IO errors writing the header.
+    pub fn create_compacted(
+        file: F,
+        header: SegmentHeader,
+    ) -> Result<SegmentWriter<F>, StorageError> {
+        debug_assert!(
+            header.is_compacted(),
+            "create_compacted requires the COMPACTED flag so the header encodes version 2"
+        );
+        file.write_all_at(&header.encode(), 0)?;
+        Ok(SegmentWriter {
+            file,
+            header,
+            write_pos: SEGMENT_HEADER_LEN as u64,
+            record_count: 0,
+            last_seq: header.base_seq,
+            max_timestamp_ms: 0,
+        })
+    }
+
+    /// Appends one survivor record at its ORIGINAL offset and sequence into a COMPACTED segment
+    /// (#337), so the compacted segment is SPARSE: offsets are never renumbered or reused, which
+    /// preserves invariant I5. Unlike [`SegmentWriter::append`] this does NOT derive the offset
+    /// from `base_offset + record_count` (the survivors are not dense), and it does NOT validate
+    /// sequence continuity (the survivor sequences are sparse too); the caller (the cleaner) passes
+    /// records already in ascending offset order with their verbatim original ids. The frame stores
+    /// the record's own `seq` from the [`RecordView`], so the survivor's original sequence lands on
+    /// disk verbatim.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::SegmentFull`] if the byte length would overflow or the record is too
+    /// large to frame, or an IO error from the write.
+    pub fn append_at(
+        &mut self,
+        offset: Offset,
+        record: &RecordView<'_>,
+    ) -> Result<Offset, StorageError> {
+        if self.record_count == u32::MAX {
+            return Err(StorageError::SegmentFull);
+        }
+        let mut buf = Vec::new();
+        codec::encode(record, &mut buf).map_err(|_| StorageError::SegmentFull)?;
+        let len = u64::try_from(buf.len()).map_err(|_| StorageError::SegmentFull)?;
+        let end = self
+            .write_pos
+            .checked_add(len)
+            .ok_or(StorageError::SegmentFull)?;
+        self.file.write_all_at(&buf, self.write_pos)?;
+        self.write_pos = end;
+        self.record_count += 1;
+        self.last_seq = record.seq;
+        self.max_timestamp_ms = self.max_timestamp_ms.max(record.timestamp_ms);
+        Ok(offset)
+    }
+
+    /// Seals a COMPACTED segment (#337): writes the v2 footer (version 2) immediately followed by
+    /// the 44-byte v2 compaction-metadata block as ONE contiguous final write, then a full
+    /// `sync_all`. The footer and the block become durable together, so a crash that leaves a torn
+    /// block (failing its own CRC) is indistinguishable from a crash before the compaction commit
+    /// point and recovery treats it as such (the originals win). This is the storage half of the
+    /// atomic swap; the caller dir-fsyncs the parent directory next (the commit point) and then
+    /// retires the originals.
+    ///
+    /// `footer.segment_id` and `meta` must describe this segment and its covered source range. The
+    /// caller guarantees `footer.record_count` and `footer.last_seq` match the survivors appended.
+    ///
+    /// # Errors
+    /// Propagates the underlying IO error writing or syncing the trailing bytes.
+    pub fn seal_compacted(
+        self,
+        footer: &SegmentFooter,
+        meta: &CompactionMeta,
+    ) -> Result<(), StorageError> {
+        // One contiguous trailing write: the 32-byte v2 footer then the 44-byte metadata block,
+        // so footer + block are durable at the same instant after the single `sync_all`.
+        let mut trailer = [0u8; SEGMENT_FOOTER_LEN + COMPACTION_META_LEN];
+        trailer[..SEGMENT_FOOTER_LEN].copy_from_slice(&footer.encode_v2());
+        trailer[SEGMENT_FOOTER_LEN..].copy_from_slice(&meta.encode());
+        self.file.write_all_at(&trailer, self.write_pos)?;
+        self.file.sync_all()?;
+        Ok(())
+    }
+
     /// The log offset the NEXT appended record will receive. Saturates at
     /// `u64::MAX` if the offset space is exhausted; [`SegmentWriter::append`] refuses
     /// to mint a wrapped offset and returns [`StorageError::SegmentFull`] instead.
@@ -472,6 +566,34 @@ pub struct RecoveryScan {
     pub tail_reason: Option<ReasonCode>,
     /// The byte offset at which the valid record region ends (the durable prefix length).
     pub valid_end: u64,
+}
+
+/// The result of scanning a COMPACTED (`version` = 2) segment (#337): the validated v2 header, its
+/// SPARSE survivor records (in ascending offset order, with their ORIGINAL offsets and sequences),
+/// the v2 footer, and the trailing compaction-metadata block declaring the covered source range.
+///
+/// A compacted segment's records are SPARSE: the survivor sequences are not contiguous, so the
+/// dense `seq == base_seq + index` continuity check the ordinary scan applies does NOT hold here.
+/// Instead each frame is CRC-validated and its sequence is required only to be strictly INCREASING
+/// and to fall within the covered sequence span; the covered offset/sequence spans come from the
+/// trailing block, not from the survivor count. The block's own CRC gates trust: a torn or
+/// mismatched block (or a missing/short one) makes the segment NOT a valid compacted segment, which
+/// recovery treats as a crash before the compaction commit point (the originals win).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactedScan {
+    /// The validated v2 segment header (the COMPACTED flag is set).
+    pub header: SegmentHeader,
+    /// The survivor records, in ascending offset order, with their original sparse offsets/seqs.
+    pub records: Vec<OwnedRecord>,
+    /// The v2 footer (record count and last survivor sequence).
+    pub footer: SegmentFooter,
+    /// The trailing v2 compaction-metadata block: the covered source offset/sequence spans and the
+    /// highest covered source id, which recovery uses to resolve an overlapping range.
+    pub meta: CompactionMeta,
+    /// The byte offset at which the record region ends (the start of the footer).
+    pub valid_end: u64,
+    /// The maximum producer timestamp across the survivors (or `0` if empty), for the reaper.
+    pub max_timestamp_ms: u64,
 }
 
 /// The running result of a streaming body walk: see [`SegmentReader::scan_body_streaming`].
@@ -632,6 +754,117 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             cursor += consumed;
         }
         Ok((records, cursor as u64, clean))
+    }
+
+    /// Scans a COMPACTED (`version` = 2) segment (#337): validates the v2 header (the caller's
+    /// [`SegmentReader::open`] already accepted it), reads its SPARSE survivor records, the v2
+    /// footer, and the trailing 44-byte compaction-metadata block, and returns them as a
+    /// [`CompactedScan`]. Returns `Ok(None)` when the segment is NOT a valid compacted segment
+    /// (the header lacks the COMPACTED flag, or the trailing footer/block is torn, short, or
+    /// CRC-mismatched), which recovery treats as a crash before the compaction commit point (the
+    /// originals remain authoritative).
+    ///
+    /// Unlike the ordinary scan, the survivor sequences are NOT required to be contiguous (they are
+    /// sparse), only CRC-valid and strictly INCREASING and within the covered sequence span. Each
+    /// survivor's ORIGINAL log offset is reconstructed from its stored sequence and the constant
+    /// offset-minus-sequence delta (`base_offset - base_seq`), which is invariant across the whole
+    /// log because offsets and sequences advance in lockstep from the origin; a compacted segment
+    /// keeps the same delta, so the survivor offsets are exact.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::FooterSegmentMismatch`] if the footer names a different segment,
+    /// [`StorageError::RecoveredSequenceMismatch`] if a survivor's sequence is out of order or out
+    /// of the covered span, or an IO error.
+    pub fn scan_compacted(&self) -> Result<Option<CompactedScan>, StorageError> {
+        if !self.header.is_compacted() {
+            return Ok(None);
+        }
+        let header_end = SEGMENT_HEADER_LEN as u64;
+        let footer_len = SEGMENT_FOOTER_LEN as u64;
+        let block_len = COMPACTION_META_LEN as u64;
+        // A compacted segment's final bytes are [records][footer(32)][meta block(44)]. Anything
+        // shorter than header + footer + block cannot be a valid compacted segment.
+        if self.file_len < header_end + footer_len + block_len {
+            return Ok(None);
+        }
+        // Decode the trailing 44 bytes as the compaction-metadata block, and the 32 bytes before it
+        // as the v2 footer. The block's own CRC gates trust: a torn/short/mismatched block means
+        // this is not a committed compacted segment (treat as crash-before-commit).
+        let block_start = self.file_len - block_len;
+        let footer_start = block_start - footer_len;
+        let mut mbuf = [0u8; COMPACTION_META_LEN];
+        self.file.read_exact_at(&mut mbuf, block_start)?;
+        let Ok(meta) = CompactionMeta::decode(&mbuf) else {
+            return Ok(None);
+        };
+        let mut fbuf = [0u8; SEGMENT_FOOTER_LEN];
+        self.file.read_exact_at(&mut fbuf, footer_start)?;
+        let Ok(footer) = SegmentFooter::decode(&fbuf) else {
+            return Ok(None);
+        };
+
+        // Read and validate the SPARSE survivor records. The offset-minus-seq delta is constant for
+        // the whole log, so each survivor's original offset is `seq + delta` where `delta` is the
+        // header's `base_offset - base_seq`. Sequences must be strictly increasing and within the
+        // covered span; a CRC failure or an out-of-span/out-of-order sequence is a hard error (a
+        // corrupt compacted segment is never silently served).
+        let base_off = self.header.base_offset.get();
+        let base_seq = self.header.base_seq.get();
+        let body_len = usize::try_from(footer_start.saturating_sub(header_end))
+            .map_err(|_| StorageError::SegmentFull)?;
+        let mut body = vec![0u8; body_len];
+        if body_len > 0 {
+            self.file.read_exact_at(&mut body, header_end)?;
+        }
+        let mut records: Vec<OwnedRecord> = Vec::new();
+        let mut cursor = 0usize;
+        let mut max_timestamp_ms = 0u64;
+        let mut prev_seq: Option<u64> = None;
+        while cursor < body.len() {
+            let Ok((view, consumed)) = codec::decode(&body[cursor..]) else {
+                // A torn or corrupt frame inside a committed compacted segment is corruption, not a
+                // torn tail (the footer+block are present and CRC-valid past this point), so the
+                // segment is structurally inconsistent: refuse it rather than serve a partial set.
+                return Ok(None);
+            };
+            let seq = view.seq.get();
+            // Strictly increasing and within the covered sequence span.
+            if seq < base_seq || seq >= meta.covered_end_seq || prev_seq.is_some_and(|p| seq <= p) {
+                return Err(StorageError::RecoveredSequenceMismatch {
+                    index: records.len(),
+                    expected: prev_seq.map_or(base_seq, |p| p + 1),
+                    found: seq,
+                });
+            }
+            prev_seq = Some(seq);
+            // Reconstruct the original offset from the constant offset-minus-seq delta.
+            let offset = Offset::new(base_off.wrapping_add(seq.wrapping_sub(base_seq)));
+            max_timestamp_ms = max_timestamp_ms.max(view.timestamp_ms);
+            records.push(OwnedRecord::from_view(offset, &view));
+            cursor += consumed;
+        }
+        // The footer must describe THIS body and bind to THIS segment id.
+        if footer.segment_id != self.header.segment_id {
+            return Err(StorageError::FooterSegmentMismatch {
+                header: self.header.segment_id,
+                footer: footer.segment_id,
+            });
+        }
+        if u64::from(footer.record_count) != records.len() as u64
+            || cursor as u64 != footer_start - header_end
+        {
+            // The footer's record count or the body length disagrees with the decoded survivors:
+            // the segment is not a self-consistent compacted segment.
+            return Ok(None);
+        }
+        Ok(Some(CompactedScan {
+            header: self.header,
+            records,
+            footer,
+            meta,
+            valid_end: footer_start,
+            max_timestamp_ms,
+        }))
     }
 
     /// Like [`SegmentReader::scan`], but returns only the metadata [`Log::recover`] needs

@@ -152,9 +152,9 @@ Frozen offsets (`segment_header_offsets`). Bytes `[44, 60)` are reserved (zero).
 | offset | field            | type     | notes |
 |--------|------------------|----------|-------|
 | `[0, 8)`   | `magic`          | bytes[8] | frozen `"IRONBUS\0"` |
-| `[8, 9)`   | `version`        | u8       | `FORMAT_VERSION` = 1 |
+| `[8, 9)`   | `version`        | u8       | `FORMAT_VERSION` = 1, or `FORMAT_VERSION_COMPACTED` = 2 on a COMPACTED segment ONLY (#337, below); a v1 reader rejects any other value |
 | `[9, 10)`  | `checksum_algo`  | u8       | frozen `0x1` = CRC32C; a v1 reader rejects any other value |
-| `[10, 12)` | `flags`          | u16      | reserved in v1 (zero); preserved on read, not interpreted |
+| `[10, 12)` | `flags`          | u16      | reserved in v1 (zero); preserved on read, not interpreted. Bit 0 (`SEGMENT_FLAG_COMPACTED` = `0x0001`, #337) marks a COMPACTED segment, which stamps `version` = 2 (below) |
 | `[12, 20)` | `segment_id`     | u64      | monotonic segment identifier |
 | `[20, 28)` | `base_seq`       | u64      | sequence of the first record in the segment |
 | `[28, 36)` | `base_offset`    | u64      | log offset of the first record in the segment |
@@ -184,6 +184,50 @@ Written when a segment is sealed. Frozen offsets (`segment_footer_offsets`). Byt
 - `DEFAULT_SEGMENT_ROLL_HOURS` = 1.
 - A record never spans two segments (the config validator keeps the max record size
   below the segment size).
+
+### v2 COMPACTED segment (the compaction delta, #337)
+
+Source: `crates/ironbus-core/src/format.rs` (the v2 consts), `crates/ironbus-core/src/segment.rs`
+(`CompactionMeta`), `crates/ironbus-storage/src/compaction.rs` (the writer).
+
+A COMPACTED segment is the output of an optional key-compaction clean (see
+[COMPACTION.md](COMPACTION.md)). It is structurally a normal segment with two ADDITIVE facts: the
+`SEGMENT_FLAG_COMPACTED` (`0x0001`) bit in the header `flags`, and a 44-byte compaction-metadata
+block written immediately AFTER the standard 32-byte footer as the file's FINAL bytes. The header
+and footer `version` bytes are stamped `FORMAT_VERSION_COMPACTED` = 2 on a compacted segment
+(only); the footer is otherwise the IDENTICAL 32-byte layout. A v1 (non-compacted) segment is
+byte-for-byte unchanged: the version byte is `2` ONLY when the COMPACTED flag is set. A v1-only
+reader REFUSES a `version` = 2 segment with a typed `UnsupportedVersion` (fail-closed). The
+records inside a compacted segment are the SURVIVORS, written at their ORIGINAL (sparse) offsets
+and sequences; each survivor's original offset is reconstructed on read from its stored sequence
+and the constant offset-minus-sequence delta.
+
+A compacted segment's on-disk shape is therefore:
+`[64-byte header (version 2, COMPACTED flag)] [survivor record frames, sparse seqs] [32-byte footer (version 2)] [44-byte CompactionMeta block]`.
+
+#### CompactionMeta block (on-disk, 44 bytes)
+
+Frozen offsets (`compaction_meta_offsets`). `block_crc` covers `[0, 40)`. The covered spans are the
+ORIGINAL source set's TRUE ranges (NOT the sparse survivor range), so recovery advances its
+chain-continuity expectation across the compacted segment by the covered span, not the survivor
+count.
+
+| offset (from block start) | field | type | notes |
+|---|---|---|---|
+| `[0, 8)`   | `covered_base_offset` | u64 | the source set's TRUE starting offset (its own field, NOT an alias of `base_offset`) |
+| `[8, 16)`  | `covered_end_offset`  | u64 | one past the highest covered SOURCE offset |
+| `[16, 24)` | `covered_base_seq`    | u64 | the source set's TRUE starting sequence |
+| `[24, 32)` | `covered_end_seq`     | u64 | one past the highest covered SOURCE sequence |
+| `[32, 40)` | `highest_covered_source_id` | u64 | the highest segment id this clean supersedes (the recovery tie-break) |
+| `[40, 44)` | `block_crc`           | u32 | CRC32C over `[0, 40)` of this block |
+
+The block is self-validating exactly like the footer: a reader of a `version` = 2 segment reads
+the trailing block, checks `block_crc`, and rejects a torn or mismatched block the same way a torn
+footer is rejected, so a half-written compacted segment never parses as a valid compacted segment
+(it falls into the crash-before-commit recovery case). The footer and this block are one
+contiguous trailing write, so they become durable together. Nothing in the header reserved region
+`[44, 60)` is touched (it stays owned by at-rest encryption), so a compacted-AND-encrypted segment
+has room for both.
 
 ---
 

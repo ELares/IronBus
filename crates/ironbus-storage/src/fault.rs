@@ -75,6 +75,12 @@ pub struct FaultControl {
     /// A monotonic count of every `sync_dir` that ran (whether or not it failed), so a test can
     /// assert the directory-publish boundary was actually reached (no false pass).
     sync_dir_count: Arc<AtomicU64>,
+    /// While non-zero, every `sync_dir` whose 1-based ordinal is AT OR ABOVE this threshold fails
+    /// (the first `threshold - 1` succeed). `0` disables it. This lets a test commit one
+    /// directory-publish boundary (the compaction commit point, #337) and then crash on a LATER one
+    /// (a retire dir-fsync), so the crash window is precisely between the compacted-segment commit
+    /// and the originals being durably removed.
+    fail_sync_dir_after: Arc<AtomicU64>,
 }
 
 /// A condvar-backed gate the sync path waits on while closed (#177): `open` starts open (syncs pass),
@@ -135,8 +141,22 @@ impl FaultControl {
         self.sync_dir_count.load(Ordering::SeqCst)
     }
 
+    /// Arms a THRESHOLD `sync_dir` failure (#337): once `threshold` is non-zero, the `threshold`-th
+    /// `sync_dir` and every one after it fails, while the first `threshold - 1` succeed. Used to
+    /// crash a compaction precisely AFTER the commit-point dir-fsync but DURING the retire dir-fsync,
+    /// so a test can prove the durable compacted segment wins and the still-present originals are
+    /// dropped, with no record lost or doubled. `0` disables it. Counts the CURRENT `sync_dir_count`
+    /// as the baseline, so call it just before the pass.
+    pub fn fail_sync_dir_after(&self, threshold: u64) {
+        self.fail_sync_dir_after.store(threshold, Ordering::SeqCst);
+    }
+
     fn sync_dir_should_fail(&self) -> bool {
-        self.fail_sync_dir.load(Ordering::SeqCst)
+        if self.fail_sync_dir.load(Ordering::SeqCst) {
+            return true;
+        }
+        let threshold = self.fail_sync_dir_after.load(Ordering::SeqCst);
+        threshold != 0 && self.sync_dir_count.load(Ordering::SeqCst) >= threshold
     }
 
     fn record_sync_dir(&self) {

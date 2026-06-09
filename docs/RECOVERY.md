@@ -443,7 +443,46 @@ it because there is no resync in the code.
 
 ---
 
-## 6. Cross-references and consistency
+## 6. Compaction: resolving an overlapping offset range (#337)
+
+Optional key-based compaction (`docs/COMPACTION.md`) is the one feature that lets ONE segment
+file (a `version=2` COMPACTED segment) be authoritative for an offset RANGE that the originals
+also cover, until the originals are retired. A crash mid-swap can therefore leave the directory
+holding BOTH the compacted segment and the originals it replaced. Recovery resolves the overlap
+DETERMINISTICALLY from the files alone, with NO manifest and NO compaction-specific repair beyond
+two generic file-set reconciliations. This runs only when a compacted segment is present
+(`Log::recover_with_compaction`); an all-ordinary directory takes the unchanged v1 path
+(section 1), so a log that has never been compacted recovers exactly as before.
+
+The resolution, in order:
+
+1. **Classify** each segment as ordinary or compacted (the COMPACTED header flag). A
+   compacted-flagged segment whose trailing footer or 44-byte covered-range block is torn or
+   CRC-mismatched did NOT reach its commit point (the directory fsync): it is a crash-before-commit
+   orphan, discarded (unlinked). A half-written compacted segment thus never parses as a valid one.
+2. **A committed compacted segment is authoritative** over every ordinary segment whose
+   `[base_offset, base_offset + record_count)` is fully inside its covered range
+   `[covered_base_offset, covered_end_offset)` (read from the v2 block): those superseded originals
+   are unlinked (the crash-after-commit-during-retire case). Their surviving records are present in
+   the compacted segment, so this is NOT a loss.
+3. **Two compacted segments never partially overlap** by construction (a clean covers a contiguous
+   run of whole source segments). If a crash somehow left two with overlapping covered ranges, the
+   HIGHER segment id (the later clean, by ADR 0002 monotonicity) wins and the lower is unlinked.
+4. **The surviving set stitches a contiguous-at-the-segment-boundary chain**, sorted by
+   COVERED/ACTUAL offset range (NOT by id, since a compacted id no longer tracks its range). The
+   continuity check advances the offset AND sequence expectation by the COVERED SPAN across a
+   compacted segment (the survivors are sparse, so the survivor count does not), which reduces to
+   the v1 exact `base_offset`/`base_seq` check for an all-ordinary log.
+
+Each step is a pure function of the self-describing durable bytes (I4), so recovery stays
+deterministic. NEITHER reconciliation emits a `LossReport` event (no durable record is actually
+lost), the I3 caps and the I1 to I4 invariants hold, and the durable head never regresses. This is
+verified in `crates/ironbus-storage/tests/compaction_crash.rs` (crash before/after the commit,
+overlap resolution, the before-vs-after identical-recovery gate, and the fail-closed v2 refusal).
+
+---
+
+## 7. Cross-references and consistency
 
 - The intact-record predicate (section 1.2) is identical to the one in
   [CONTRACTS.md](CONTRACTS.md) ("A record is intact only when ...") and is the

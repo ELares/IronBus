@@ -202,13 +202,27 @@ from the recovered head, never below it. The id newtypes are exhaustion-loud:
 rather than wrapping, and the offset space treats `u64::MAX` as exhausted rather
 than reusing 0.
 
+**Why it holds under COMPACTION (#337).** Optional key-based compaction (`docs/COMPACTION.md`)
+upholds I5 too: a survivor rewritten into a `version=2` compacted segment keeps its ORIGINAL
+offset and ORIGINAL sequence verbatim, so compaction REMOVES offsets (leaving permanent sparse
+gaps) but never INVENTS, SHIFTS, or REUSES one. A compacted segment takes a FRESH, never-recycled
+segment id strictly greater than any id ever used (ADR 0002), so the active roll skips past it
+(`Log::next_fresh_segment_id`) and never collides. Recovery resolves an overlapping range from the
+v2 covered-range footer metadata and recomputes `next_offset`/`next_seq` from the covered SPANS
+(not the survivor count), so the offset/sequence head never regresses across a compaction + crash.
+The crash-recovery sweep (`compaction_crash.rs`) asserts the recovered survivor offsets are a
+strictly-increasing, unique subset of the originals' offsets, with the head unchanged.
+
 **Where.** `Offset` and `Seq` in `crates/ironbus-core/src/types.rs`
 (`checked_next`, and the doc contract that `None` is a loud failure).
 `Log::append` reserves before writing; `Log::recover` and
 `scan_recover_chain` recompute `next_offset` and `next_seq` from the chain, in
 `crates/ironbus-storage/src/log.rs`. `AckCursor::ack` refuses to overflow the
 range end at `u64::MAX` (`acking_the_max_offset_never_overflows_or_collapses_committed`
-in `crates/ironbus-core/src/cursor.rs`).
+in `crates/ironbus-core/src/cursor.rs`). For compaction: `compaction::select_survivors` keeps the
+original ids, `SegmentWriter::append_at` writes a survivor at its original offset/seq,
+`Log::next_fresh_segment_id` allocates a never-colliding id, and
+`Log::recover_with_compaction` resolves the overlap (all in `crates/ironbus-storage/src/`).
 
 #### I5b: checkpoint lower bound (committed cursor)
 

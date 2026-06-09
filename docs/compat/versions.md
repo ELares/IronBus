@@ -38,15 +38,14 @@ or breaking (a new value means a new layout that an old reader fail-closed refus
 | Loss-report `schema_version` | `1` | `ironbus_storage::loss` `LossReport::SCHEMA_VERSION`; frozen by `golden_loss_report_v1_serialization_is_frozen` | Append-only within v1 (a new field or reason does not bump it); a field rename/removal/reorder takes a new version. | #120, #21 |
 | CLI `--json` schema `ironbus.cli.scrub.vN` | `1` | `ironbus-cli` `SCRUB_SCHEMA_VERSION`; emitted by `write_plan_json`; pinned by `scrub_json_carries_the_versioned_schema_and_exit_code` | Append-only: a new OPTIONAL field does not bump `N`; a field rename/removal/type-change bumps `N` (gated by SemVer, cannot ride a patch). Per [CLI_CONTRACT.md](../CLI_CONTRACT.md) §1.5. | #136, #92 |
 | CLI `--json` schema `ironbus.cli.repair.vN` | `1` | `ironbus-cli` `REPAIR_SCHEMA_VERSION`; emitted by `write_plan_json` | Append-only (same rule as the scrub schema; carries the additional `applied` field). | #136, #92 |
-<<<<<<< HEAD
 | CLI `--json` schema `ironbus.cli.admin-consumer-reset.vN` | `1` | `ironbus-cli` `ADMIN_CONSUMER_RESET_SCHEMA_VERSION`; emitted by `write_consumer_reset_result`; pinned by `admin_consumer_reset_rewrites_the_cursor_and_emits_the_versioned_json` | Append-only: a new OPTIONAL field does not bump `N`; a rename/removal/type-change bumps `N` (gated by SemVer). Per [CLI_CONTRACT.md](../CLI_CONTRACT.md) §1.5. | #136, #299 |
 | CLI `--json` schema `ironbus.cli.admin-dlq-redrive.vN` | `1` | `ironbus-cli` `ADMIN_DLQ_REDRIVE_SCHEMA_VERSION`; emitted by `write_dlq_redrive_result`; pinned by `admin_dlq_redrive_re_injects_and_is_idempotent` | Append-only (same rule as the consumer-reset schema). | #136, #299 |
-| `FrameType` tag set | `1..=20`, contiguous (`Connect`=1 .. `CumulativeAck`=19, `PubAckDuplicate`=20) | `ironbus_proto::frame::FrameType::as_u8`/`from_u8`; frozen by `type_tags_have_their_exact_frozen_wire_values` | Append-only. The next frame takes tag 21; no existing tag's meaning ever changes. | #11, #33 |
-=======
 | `FrameType` tag set | `1..=21`, contiguous (`Connect`=1 .. `CumulativeAck`=19, `PubAckDuplicate`=20, `GapMarker`=21) | `ironbus_proto::frame::FrameType::as_u8`/`from_u8`; frozen by `type_tags_have_their_exact_frozen_wire_values` | Append-only. The next frame takes tag 22; no existing tag's meaning ever changes. | #11, #33, #346 |
-| `GapMarker` reason vocabulary | `1` = `TRIMMED`, `2` = `COMPACTED` (reserved, #337) | `ironbus_proto::message::gap_reason` (`TRIMMED`/`COMPACTED`); round-tripped by `any_gap_marker_round_trips`, unknown-tolerant per `gap_marker_tolerates_an_unknown_reason` | Append-only and TOLERATED on unknown (a reader decodes an unknown reason verbatim as "absent for an unspecified reason", never an error), so the reason field grows without a new frame. | #346, #337, #59 |
+| `GapMarker` reason vocabulary | `1` = `TRIMMED`, `2` = `COMPACTED` (#337) | `ironbus_proto::message::gap_reason` (`TRIMMED`/`COMPACTED`); round-tripped by `any_gap_marker_round_trips`, unknown-tolerant per `gap_marker_tolerates_an_unknown_reason` | Append-only and TOLERATED on unknown (a reader decodes an unknown reason verbatim as "absent for an unspecified reason", never an error), so the reason field grows without a new frame. | #346, #337, #59 |
 | `Connect`/`Info` capability bits | `Connect` bit 2 (`CONNECT_FLAG_WANTS_GAP_MARKER`), `Info` bit 2 (`INFO_FLAG_GAP_MARKER`) | `ironbus_proto::message::{CONNECT_FLAG_WANTS_GAP_MARKER, INFO_FLAG_GAP_MARKER}`; round-tripped by `connect_carries_the_gap_marker_capability_bit` / `info_carries_the_gap_marker_capability_bit` | Append-only within the v1 handshake block: a new capability claims a higher flag bit (no new field bytes); an old peer leaves it clear and the feature falls back. The negotiation is AND (active iff both peers set their bit). | #346, #292, #11 |
->>>>>>> origin/main
+| Storage compaction format `FORMAT_VERSION_COMPACTED` | `2` (only on a COMPACTED segment) | `ironbus_core::format::FORMAT_VERSION_COMPACTED`, checked in `ironbus_core::segment::SegmentHeader::decode` (paired with the `SEGMENT_FLAG_COMPACTED` flag); the fail-closed refusal in `SegmentHeader::decode_v1_only` | Breaking-on-the-new-shape. A compacted segment stamps `version = 2`; a v1-only reader REFUSES it. A log that has never been compacted is byte-identical v1, so the bump is invisible to it. | #337, #126 |
+| `SegmentHeader.flags` `SEGMENT_FLAG_COMPACTED` bit | bit 0 (`0x0001`) | `ironbus_core::format::SEGMENT_FLAG_COMPACTED`; pinned by `frozen_compaction_v2_values_and_offsets` | Append-only segment-flag bit. Distinct from the at-rest encryption bit; a compacted segment sets it and stamps `version = 2`. A v1 reader treats `flags` as preserved-but-not-interpreted; the paired `version = 2` is what makes it fail closed. | #337, #18 |
+| v2 compaction-metadata block | 44 bytes (`COMPACTION_META_LEN`): `covered_base_offset`/`covered_end_offset`/`covered_base_seq`/`covered_end_seq`/`highest_covered_source_id` (5 × u64) + `block_crc` (u32 over `[0,40)`) | `ironbus_core::format::{COMPACTION_META_LEN, compaction_meta_offsets, COMPACTION_META_CRC_RANGE}` and `ironbus_core::segment::CompactionMeta`; round-tripped by `compaction_meta_round_trips_and_rejects_corruption` | Additive on a `version = 2` segment ONLY: written after the footer as the file's final bytes, CRC-protected on its own so a torn block is rejected like a torn footer. Absent on any v1 segment. | #337 |
 | `PubBody` dedup opt-in (`PUB_FLAG_HAS_DEDUP`) | flags bit 7 (`0b1000_0000`); when set, a `producer_id` (u16-var), `epoch` (u64), `msg_id` (u16-var) block follows the headers, before the payload | `ironbus_proto::message::PUB_FLAG_HAS_DEDUP` and `PubDedup`; round-tripped by `any_pub_with_dedup_round_trips` | Append-only and OPT-IN. A dedup-disabled produce leaves the bit clear and omits the block, so the body is byte-for-byte the pre-#33 layout. The bit is a WIRE signal, masked off before the byte becomes a stored record flag, so it never collides with a future `RecordFlags` bit. | #33, #3 |
 | `AckOp` sub-tag set | `0..=3` (`Ack`=0, `Nack`=1, `Term`=2, `Progress`=3) | `ironbus_proto::message::AckOp::as_u8`/`from_u8`; frozen by `ackop_tags_have_their_exact_frozen_wire_values` | Append-only. The next op takes tag 4. | #9, #11 |
 | `ReasonCode` vocabulary | codes `1..=7` (`TornTail`=1 .. `ScrubberSuspect`=6, `UnresolvedDictId`=7) | `ironbus_storage::loss::ReasonCode::code`; frozen by `golden_reason_code_vocabulary_is_frozen` and `reason_codes_are_stable_and_distinct` | Append-only. A new reason gets a new code/name/label and does NOT bump `schema_version`. | #11, #59, #357 |
@@ -188,8 +187,18 @@ one is frozen), update the affected rows above, then re-pin the digest with
 below.
 
 ```text
-format-layout-sha256: 59773de3d5eda9f78be52bda388df2a73b1accd2ca575c4100dfdd1179cbcb0a
+format-layout-sha256: 1ba45310148ec1b9c613bd68d475793039e3e8994be5d8f1d5bd34ca9f9c1454
 ```
+
+The digest was last re-pinned for the ADDITIVE v2 compaction delta (#337): the
+`FORMAT_VERSION_COMPACTED` value, the `SEGMENT_FLAG_COMPACTED` flag bit, and the
+`COMPACTION_META_LEN` / `compaction_meta_offsets` / `COMPACTION_META_CRC_RANGE` block layout were
+APPENDED to `format.rs`. Every v1 layout-constant LINE is unchanged byte-for-byte (the v1
+record/segment/footer offsets, magics, sizes, and `FORMAT_VERSION = 1` are untouched, so a v1
+segment is byte-identical and a v1 reader is unchanged); only the new v2 lines were added, which
+shifted the whole-file digest. A v2 (compacted) segment is the only one that carries `version = 2`;
+a v1-only reader REFUSES it (fail-closed), so the bump is breaking-on-the-new-shape but invisible to
+a log that has never been compacted.
 
 The duplicate-integer check that #132 also asks for (no two open branches claiming the same
 `FORMAT_VERSION`) is a git-server-side concern this registry makes mechanical: because the
