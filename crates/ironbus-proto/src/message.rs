@@ -26,6 +26,13 @@ pub enum BodyError {
     },
     /// Trailing bytes remained after a fixed-layout body was fully read.
     TrailingBytes,
+    /// A handshake (`Connect`/`Info`) body carried an unknown body-framing version (#292): the
+    /// reader cannot interpret a version it does not know, so it is a typed error rather than a
+    /// best-effort parse. An EMPTY body is never this error (it is the historical no-fields case).
+    BadHandshakeVersion {
+        /// The unrecognized handshake body version byte.
+        version: u8,
+    },
 }
 
 impl core::fmt::Display for BodyError {
@@ -36,6 +43,9 @@ impl core::fmt::Display for BodyError {
             BodyError::FieldTooLarge => write!(f, "a variable field exceeds the u16 wire limit"),
             BodyError::BadAckOp { op } => write!(f, "unknown ack op {op}"),
             BodyError::TrailingBytes => write!(f, "unexpected trailing bytes in the body"),
+            BodyError::BadHandshakeVersion { version } => {
+                write!(f, "unknown handshake body version {version}")
+            }
         }
     }
 }
@@ -67,6 +77,13 @@ impl<'a> Reader<'a> {
     fn u16(&mut self) -> Result<u16, BodyError> {
         let b = self.take(2)?;
         Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn u32(&mut self) -> Result<u32, BodyError> {
+        let b = self.take(4)?;
+        let mut a = [0u8; 4];
+        a.copy_from_slice(b);
+        Ok(u32::from_le_bytes(a))
     }
 
     fn u64(&mut self) -> Result<u64, BodyError> {
@@ -540,6 +557,243 @@ pub fn decode_truncated(body: &[u8]) -> Result<TruncatedBody, BodyError> {
     })
 }
 
+/// The version of the `Connect`/`Info` handshake body framing (#292, refs #275, #65, #11). The
+/// handshake bodies were EMPTY before this; version `1` is the first non-empty layout. It is the
+/// handshake-BODY version, distinct from the (still un-wired) `wire_protocol_version` integer #71/#11
+/// will carry as a FIELD inside this same body. An empty body (length 0) is the historical case and
+/// stays valid: it decodes to "no advertised/requested values" (see [`decode_connect`] /
+/// [`decode_info`]), so an old peer that sends an empty body still negotiates correctly.
+pub const HANDSHAKE_BODY_VERSION: u8 = 1;
+
+/// The `Connect` presence-flag bit signalling that a `requested_credit` (the per-consumer message
+/// credit the client wants) is present and meaningful. When clear, the client requests NO specific
+/// message credit and the server applies its own default (#292). There is no `request(MAX)`/unbounded
+/// value: a client either names a finite `u32` it wants (clamped to the server cap) or names nothing.
+pub const CONNECT_FLAG_HAS_CREDIT: u8 = 0b0000_0001;
+
+/// The `Connect` presence-flag bit signalling that a `requested_credit_bytes` (the per-consumer byte
+/// budget the client wants) is present and meaningful. When clear, the client requests NO specific
+/// byte budget and the server applies its own default (#292).
+pub const CONNECT_FLAG_HAS_CREDIT_BYTES: u8 = 0b0000_0010;
+
+/// The `Info` presence-flag bit signalling that the server's advertised per-consumer message-credit
+/// fields (`negotiated` + `cap`) are present (#292). A server that does not advertise leaves it clear,
+/// and a client then keeps its own local credit (backward-compat).
+pub const INFO_FLAG_HAS_CREDIT: u8 = 0b0000_0001;
+
+/// The `Info` presence-flag bit signalling that the server's advertised per-consumer byte-budget
+/// fields (`negotiated` + `cap`) are present (#292).
+pub const INFO_FLAG_HAS_CREDIT_BYTES: u8 = 0b0000_0010;
+
+/// A client's handshake request (the `Connect` frame body, #292). The client MAY request a
+/// per-consumer message credit and/or byte budget; the server clamps each to its own cap and replies
+/// the negotiated value in [`InfoBody`]. A field is REQUESTED only when its presence bit is set in
+/// `flags`; an absent field means "use the server default" (there is no unbounded/`MAX` request on the
+/// wire). An EMPTY `Connect` body (an old client) decodes to all-absent, so the server uses its
+/// defaults: backward-compatible by construction.
+///
+/// Layout (version-prefixed, length-prefixed, forward-compatible): `body_version: u8`
+/// ([`HANDSHAKE_BODY_VERSION`]), `field_len: u16` (the length of the v1 known-field block that
+/// follows), then the v1 block: `flags: u8`, `requested_credit: u32 LE`, `requested_credit_bytes:
+/// u64 LE`. Any bytes past `field_len` (a FUTURE version's appended fields, e.g. the #71
+/// `wire_protocol_version`) are TOLERATED and ignored by a v1 reader. An empty body is the
+/// all-absent default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConnectBody {
+    /// The per-consumer message credit the client requests, or `None` to defer to the server default.
+    /// `Some(n)` asks for at most `n` un-acked messages; the server delivers `min(n, server cap)`.
+    pub requested_credit: Option<u32>,
+    /// The per-consumer byte budget the client requests, or `None` to defer to the server default.
+    /// `Some(b)` asks for at most `b` un-acked payload bytes; the server clamps it to its cap.
+    pub requested_credit_bytes: Option<u64>,
+}
+
+/// The number of bytes in the `Connect` v1 known-field block: `flags: u8` + `requested_credit: u32` +
+/// `requested_credit_bytes: u64`.
+const CONNECT_V1_FIELD_LEN: u16 = 1 + 4 + 8;
+
+/// Encodes a `Connect` body onto the end of `out` (#292). The result is the version byte, the v1
+/// field-block length, then the v1 block; an all-`None` request still encodes a well-formed
+/// (non-empty) v1 body whose presence flags are clear, which the server reads as "use my defaults".
+/// To emit the historical EMPTY `Connect` body (the old-client case) the caller simply sends an empty
+/// body and does NOT call this; [`decode_connect`] accepts both.
+pub fn encode_connect(req: &ConnectBody, out: &mut Vec<u8>) {
+    out.push(HANDSHAKE_BODY_VERSION);
+    out.extend_from_slice(&CONNECT_V1_FIELD_LEN.to_le_bytes());
+    let mut flags = 0u8;
+    if req.requested_credit.is_some() {
+        flags |= CONNECT_FLAG_HAS_CREDIT;
+    }
+    if req.requested_credit_bytes.is_some() {
+        flags |= CONNECT_FLAG_HAS_CREDIT_BYTES;
+    }
+    out.push(flags);
+    out.extend_from_slice(&req.requested_credit.unwrap_or(0).to_le_bytes());
+    out.extend_from_slice(&req.requested_credit_bytes.unwrap_or(0).to_le_bytes());
+}
+
+/// Decodes a `Connect` body (#292), cap-before-alloc and panic-free.
+///
+/// An EMPTY body is the historical old-client case and decodes to an all-`None` request (the server
+/// then uses its defaults). A non-empty body MUST carry the version byte and the `u16` field-length;
+/// the v1 known fields are read from the front of the declared block and any trailing bytes (a future
+/// version's appended fields) are tolerated and ignored, so a newer client's longer body still decodes
+/// its v1 fields here. A body that is non-empty but too short to hold the `field_len` it declares is a
+/// typed [`BodyError`], never a panic or an over-read (the `field_len` is bounded against the actual
+/// body by [`Reader::take`] BEFORE any read, so a hostile length cannot force an over-allocation).
+///
+/// # Errors
+/// Returns [`BodyError::Truncated`] if a non-empty body is too short for the version/length header or
+/// the declared field block, or [`BodyError::BadHandshakeVersion`] for an unknown body version.
+pub fn decode_connect(body: &[u8]) -> Result<ConnectBody, BodyError> {
+    // The empty body is the old-client case: no fields requested, server uses its defaults.
+    if body.is_empty() {
+        return Ok(ConnectBody::default());
+    }
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != HANDSHAKE_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    // `field_len` is the declared length of the version's known-field block; the reader takes exactly
+    // that many bytes (cap-before-alloc: `take` bounds-checks it against the actual body, so a hostile
+    // length is a typed Truncated, never an allocation), and only the v1 fields are parsed from the
+    // front of it. Any bytes past the v1 fields, and any bytes after the whole block, are a future
+    // version's appended fields, tolerated and ignored (forward-compat).
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    let mut fr = Reader::new(block);
+    // The v1 fields sit at FIXED positions in the block (`flags`, then the credit u32, then the byte
+    // budget u64); the presence flags govern only whether a slot's VALUE is meaningful, not whether it
+    // occupies space. Every slot is therefore always consumed in order, so a clear flag still advances
+    // past its bytes and a later set flag reads from the right offset. A v1 block shorter than the v1
+    // fields (a sender that declared a smaller block) reads what is present and defaults the rest.
+    let flags = fr.u8().unwrap_or(0);
+    let credit = fr.u32().unwrap_or(0);
+    let credit_bytes = fr.u64().unwrap_or(0);
+    let requested_credit = (flags & CONNECT_FLAG_HAS_CREDIT != 0).then_some(credit);
+    let requested_credit_bytes =
+        (flags & CONNECT_FLAG_HAS_CREDIT_BYTES != 0).then_some(credit_bytes);
+    Ok(ConnectBody {
+        requested_credit,
+        requested_credit_bytes,
+    })
+}
+
+/// One advertised credit dimension in the `Info` body (#292): the NEGOTIATED value the client should
+/// adopt for this connection and the server's hard CAP it can never exceed. Generic over the credit
+/// width (`u32` for the message count, `u64` for the byte budget).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreditAdvert<T> {
+    /// The negotiated value for THIS connection (the server has already clamped the client's request to
+    /// its cap, or substituted its default when the client requested nothing).
+    pub negotiated: T,
+    /// The server's hard cap for this dimension (informational; the negotiated value never exceeds it).
+    pub cap: T,
+}
+
+/// The server's handshake advertisement (the `Info` frame body, #292). The server advertises the
+/// NEGOTIATED per-consumer credit (already clamped to its cap, or its default when the client
+/// requested nothing) and its hard CAP, for both the message count and the byte budget; the client
+/// reads them and applies the negotiated value to its consumer flow control. An EMPTY `Info` body (an
+/// old server) decodes to all-absent, so a new client keeps its own local credit: backward-compatible
+/// in this direction too.
+///
+/// Layout (the same version/length framing as [`ConnectBody`]): `body_version: u8`, `field_len: u16`,
+/// then the v1 block: `flags: u8`, `credit.negotiated: u32 LE`, `credit.cap: u32 LE`,
+/// `credit_bytes.negotiated: u64 LE`, `credit_bytes.cap: u64 LE`. Trailing bytes past the block are a
+/// future version's fields, tolerated and ignored. An empty body is the all-absent case.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InfoBody {
+    /// The server's per-consumer message-credit advertisement, or `None` if the server does not
+    /// advertise (an old server, or a deliberate non-advertisement). When `Some`, the client adopts
+    /// `negotiated` as its message credit for this connection.
+    pub credit: Option<CreditAdvert<u32>>,
+    /// The server's per-consumer byte-budget advertisement, or `None` if the server does not
+    /// advertise. When `Some`, the client adopts `negotiated` as its byte budget for this connection.
+    pub credit_bytes: Option<CreditAdvert<u64>>,
+}
+
+/// The number of bytes in the `Info` v1 known-field block: `flags: u8` + `credit.negotiated: u32` +
+/// `credit.cap: u32` + `credit_bytes.negotiated: u64` + `credit_bytes.cap: u64`.
+const INFO_V1_FIELD_LEN: u16 = 1 + 4 + 4 + 8 + 8;
+
+/// Encodes an `Info` body onto the end of `out` (#292): the version byte, the v1 field-block length,
+/// then the v1 block. An all-`None` advertisement still encodes a well-formed (non-empty) v1 body whose
+/// presence flags are clear, which a client reads as "no advertisement, keep my local credit". To emit
+/// the historical EMPTY `Info` body (the old-server case) the caller sends an empty body and does NOT
+/// call this; [`decode_info`] accepts both.
+pub fn encode_info(info: &InfoBody, out: &mut Vec<u8>) {
+    out.push(HANDSHAKE_BODY_VERSION);
+    out.extend_from_slice(&INFO_V1_FIELD_LEN.to_le_bytes());
+    let mut flags = 0u8;
+    if info.credit.is_some() {
+        flags |= INFO_FLAG_HAS_CREDIT;
+    }
+    if info.credit_bytes.is_some() {
+        flags |= INFO_FLAG_HAS_CREDIT_BYTES;
+    }
+    out.push(flags);
+    let credit = info.credit.unwrap_or(CreditAdvert {
+        negotiated: 0,
+        cap: 0,
+    });
+    out.extend_from_slice(&credit.negotiated.to_le_bytes());
+    out.extend_from_slice(&credit.cap.to_le_bytes());
+    let credit_bytes = info.credit_bytes.unwrap_or(CreditAdvert {
+        negotiated: 0,
+        cap: 0,
+    });
+    out.extend_from_slice(&credit_bytes.negotiated.to_le_bytes());
+    out.extend_from_slice(&credit_bytes.cap.to_le_bytes());
+}
+
+/// Decodes an `Info` body (#292), cap-before-alloc and panic-free.
+///
+/// An EMPTY body is the historical old-server case and decodes to an all-`None` advertisement (the
+/// client then keeps its own local credit). A non-empty body carries the version byte and `u16`
+/// field-length; the v1 fields are read from the front of the declared block and any trailing bytes (a
+/// future version's appended fields) are tolerated and ignored. A non-empty body too short for its
+/// declared block is a typed [`BodyError`], never a panic or over-read (the declared `field_len` is
+/// bounds-checked against the actual body BEFORE any read).
+///
+/// # Errors
+/// Returns [`BodyError::Truncated`] if a non-empty body is too short for the header or the declared
+/// field block, or [`BodyError::BadHandshakeVersion`] for an unknown body version.
+pub fn decode_info(body: &[u8]) -> Result<InfoBody, BodyError> {
+    // The empty body is the old-server case: no advertisement, the client keeps its local credit.
+    if body.is_empty() {
+        return Ok(InfoBody::default());
+    }
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != HANDSHAKE_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    let mut fr = Reader::new(block);
+    // As in `decode_connect`, every v1 slot occupies a fixed position and is always consumed in order;
+    // the presence flag only governs whether the slot's value is meaningful.
+    let flags = fr.u8().unwrap_or(0);
+    let credit_negotiated = fr.u32().unwrap_or(0);
+    let credit_cap = fr.u32().unwrap_or(0);
+    let credit_bytes_negotiated = fr.u64().unwrap_or(0);
+    let credit_bytes_cap = fr.u64().unwrap_or(0);
+    let credit = (flags & INFO_FLAG_HAS_CREDIT != 0).then_some(CreditAdvert {
+        negotiated: credit_negotiated,
+        cap: credit_cap,
+    });
+    let credit_bytes = (flags & INFO_FLAG_HAS_CREDIT_BYTES != 0).then_some(CreditAdvert {
+        negotiated: credit_bytes_negotiated,
+        cap: credit_bytes_cap,
+    });
+    Ok(InfoBody {
+        credit,
+        credit_bytes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -960,6 +1214,11 @@ mod tests {
             let _ = decode_truncated(&bytes);
             let _ = decode_cumulative_ack(&bytes);
             let _ = decode_pub_ack(&bytes);
+            // The #292 handshake bodies are attack surface too (a hostile Connect at the server, a
+            // hostile Info at the client): decoding any byte string is a typed BodyError or a valid
+            // view, never a panic / over-read / over-allocation.
+            let _ = decode_connect(&bytes);
+            let _ = decode_info(&bytes);
             // SUB is infallible: any byte string is a valid body, and decoding it recovers the
             // exact bytes as the group, so it cannot panic either.
             prop_assert_eq!(decode_sub(&bytes).group, bytes.as_slice());
@@ -1024,5 +1283,186 @@ mod tests {
             prop_assert_eq!(buf.as_slice(), group.as_slice(), "the SUB body is exactly the group name");
             prop_assert_eq!(decode_sub(&buf), SubBody { group: &group });
         }
+
+        /// A Connect body round-trips for any combination of present/absent requested credit and
+        /// byte budget (#292): the version/length framing is recovered and each optional field comes
+        /// back exactly as sent (present -> Some(value), absent -> None).
+        #[test]
+        fn any_connect_round_trips(
+            credit in proptest::option::of(any::<u32>()),
+            credit_bytes in proptest::option::of(any::<u64>()),
+        ) {
+            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: credit_bytes };
+            let mut buf = Vec::new();
+            encode_connect(&req, &mut buf);
+            prop_assert_eq!(buf[0], HANDSHAKE_BODY_VERSION, "the body leads with its version");
+            prop_assert_eq!(decode_connect(&buf).unwrap(), req);
+        }
+
+        /// An Info body round-trips for any combination of present/absent advertised credit and byte
+        /// budget (#292): the negotiated value and the cap survive for each present dimension.
+        #[test]
+        fn any_info_round_trips(
+            credit in proptest::option::of((any::<u32>(), any::<u32>())),
+            credit_bytes in proptest::option::of((any::<u64>(), any::<u64>())),
+        ) {
+            let info = InfoBody {
+                credit: credit.map(|(negotiated, cap)| CreditAdvert { negotiated, cap }),
+                credit_bytes: credit_bytes.map(|(negotiated, cap)| CreditAdvert { negotiated, cap }),
+            };
+            let mut buf = Vec::new();
+            encode_info(&info, &mut buf);
+            prop_assert_eq!(buf[0], HANDSHAKE_BODY_VERSION, "the body leads with its version");
+            prop_assert_eq!(decode_info(&buf).unwrap(), info);
+        }
+
+        /// FORWARD-COMPAT: a future version may append fields after the v1 block; a v1 reader tolerates
+        /// the trailing bytes and still recovers the v1 fields. Appending arbitrary bytes to a v1
+        /// Connect/Info body never changes the decoded v1 fields and never errors.
+        #[test]
+        fn handshake_tolerates_trailing_future_fields(
+            credit in proptest::option::of(any::<u32>()),
+            trailing in prop::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: None };
+            let mut buf = Vec::new();
+            encode_connect(&req, &mut buf);
+            let mut extended = buf.clone();
+            extended.extend_from_slice(&trailing);
+            prop_assert_eq!(decode_connect(&extended).unwrap(), req, "trailing future bytes are ignored");
+
+            let info = InfoBody {
+                credit: credit.map(|c| CreditAdvert { negotiated: c, cap: c }),
+                credit_bytes: None,
+            };
+            let mut ibuf = Vec::new();
+            encode_info(&info, &mut ibuf);
+            ibuf.extend_from_slice(&trailing);
+            prop_assert_eq!(decode_info(&ibuf).unwrap(), info, "trailing future bytes are ignored");
+        }
+
+        /// DECODE SAFETY: a hostile handshake body (an arbitrary version byte and an arbitrary declared
+        /// field length, with too few bytes to back it) is a typed BodyError, never a panic or an
+        /// over-allocation. The declared `field_len` can claim up to 65535 bytes while the body holds
+        /// only a few; the cap-before-alloc `take` rejects it as Truncated.
+        #[test]
+        fn handshake_oversized_declared_length_is_a_typed_error(
+            version in any::<u8>(),
+            declared in any::<u16>(),
+            tail in prop::collection::vec(any::<u8>(), 0..8),
+        ) {
+            let mut buf = vec![version];
+            buf.extend_from_slice(&declared.to_le_bytes());
+            buf.extend_from_slice(&tail);
+            // Whatever the inputs, decode returns a typed Result and never panics or over-allocates.
+            let c = decode_connect(&buf);
+            let i = decode_info(&buf);
+            if version != HANDSHAKE_BODY_VERSION {
+                prop_assert_eq!(c, Err(BodyError::BadHandshakeVersion { version }));
+                prop_assert_eq!(i, Err(BodyError::BadHandshakeVersion { version }));
+            } else if usize::from(declared) > tail.len() {
+                prop_assert_eq!(c, Err(BodyError::Truncated));
+                prop_assert_eq!(i, Err(BodyError::Truncated));
+            } else {
+                prop_assert!(c.is_ok() && i.is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn empty_connect_body_is_the_old_client_no_request() {
+        // The historical empty Connect body (an old client) decodes to all-absent: the server then
+        // uses its defaults. This is the backward-compat anchor in the client->server direction.
+        assert_eq!(decode_connect(&[]).unwrap(), ConnectBody::default());
+        assert_eq!(
+            decode_connect(&[]).unwrap(),
+            ConnectBody {
+                requested_credit: None,
+                requested_credit_bytes: None
+            }
+        );
+    }
+
+    #[test]
+    fn empty_info_body_is_the_old_server_no_advert() {
+        // The historical empty Info body (an old server) decodes to all-absent: a new client keeps its
+        // own local credit. This is the backward-compat anchor in the server->client direction.
+        assert_eq!(decode_info(&[]).unwrap(), InfoBody::default());
+        assert_eq!(
+            decode_info(&[]).unwrap(),
+            InfoBody {
+                credit: None,
+                credit_bytes: None
+            }
+        );
+    }
+
+    #[test]
+    fn connect_round_trips_a_full_request() {
+        let req = ConnectBody {
+            requested_credit: Some(32),
+            requested_credit_bytes: Some(1024),
+        };
+        let mut buf = Vec::new();
+        encode_connect(&req, &mut buf);
+        // version(1) + field_len(2) + flags(1) + credit(4) + credit_bytes(8) = 16 bytes.
+        assert_eq!(buf.len(), 3 + usize::from(CONNECT_V1_FIELD_LEN));
+        assert_eq!(buf[0], HANDSHAKE_BODY_VERSION);
+        assert_eq!(decode_connect(&buf).unwrap(), req);
+    }
+
+    #[test]
+    fn info_round_trips_a_full_advert() {
+        let info = InfoBody {
+            credit: Some(CreditAdvert {
+                negotiated: 32,
+                cap: 64,
+            }),
+            credit_bytes: Some(CreditAdvert {
+                negotiated: 1024,
+                cap: 8 * 1024 * 1024,
+            }),
+        };
+        let mut buf = Vec::new();
+        encode_info(&info, &mut buf);
+        assert_eq!(buf.len(), 3 + usize::from(INFO_V1_FIELD_LEN));
+        assert_eq!(buf[0], HANDSHAKE_BODY_VERSION);
+        assert_eq!(decode_info(&buf).unwrap(), info);
+    }
+
+    #[test]
+    fn handshake_rejects_an_unknown_body_version() {
+        // version 2 is unknown to this v1 reader: a typed error, never a best-effort parse.
+        let buf = [2u8, 0, 0];
+        assert_eq!(
+            decode_connect(&buf),
+            Err(BodyError::BadHandshakeVersion { version: 2 })
+        );
+        assert_eq!(
+            decode_info(&buf),
+            Err(BodyError::BadHandshakeVersion { version: 2 })
+        );
+    }
+
+    #[test]
+    fn handshake_rejects_a_declared_length_past_the_body() {
+        // version 1, field_len = 0xffff, but no field bytes follow: cap-before-alloc Truncated.
+        let mut buf = vec![HANDSHAKE_BODY_VERSION];
+        buf.extend_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(decode_connect(&buf), Err(BodyError::Truncated));
+        assert_eq!(decode_info(&buf), Err(BodyError::Truncated));
+    }
+
+    #[test]
+    fn handshake_header_alone_without_a_block_is_truncated() {
+        // A single version byte with no u16 length is too short for the header.
+        assert_eq!(
+            decode_connect(&[HANDSHAKE_BODY_VERSION]),
+            Err(BodyError::Truncated)
+        );
+        assert_eq!(
+            decode_info(&[HANDSHAKE_BODY_VERSION]),
+            Err(BodyError::Truncated)
+        );
     }
 }

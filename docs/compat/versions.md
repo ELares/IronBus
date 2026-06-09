@@ -33,7 +33,8 @@ or breaking (a new value means a new layout that an old reader fail-closed refus
 | Segment header version | `1` (= `FORMAT_VERSION`) | `format::segment_header_offsets::VERSION` (offset 8), checked in `ironbus_core::segment::SegmentHeader::decode` | Breaking. Same integer as `FORMAT_VERSION`; stamped per segment. | #4, #5 |
 | Segment footer version | `1` (= `FORMAT_VERSION`) | `format::segment_footer_offsets::VERSION` (offset 2), checked in `ironbus_core::segment::SegmentFooter::decode` | Breaking. Same integer as `FORMAT_VERSION`; stamped per sealed segment. | #4, #5 |
 | Cursor checkpoint snapshot version | `1` | `ironbus_core::cursor` `SNAPSHOT_VERSION`, checked in `AckCursor::decode_snapshot` | Breaking. Versioned SEPARATELY from `FORMAT_VERSION`; a v1 reader refuses any other value. | #7 |
-| Wire protocol version | `1` (specified; NOT YET ON THE WIRE) | specified as the `wire_protocol_version` handshake field; the `Connect`/`Info` bodies are EMPTY today (`ironbus_server::session` `dispatch`) | Negotiate (`min(client, server)`); see [Wire-version negotiation](#wire-version-negotiation). Wiring owned by #11. | #126, #132, #11 |
+| Wire protocol version | `1` (specified; the version INTEGER is NOT YET ON THE WIRE) | specified as the `wire_protocol_version` handshake field; the `Connect`/`Info` bodies are now NON-empty (they carry the #292 credit negotiation) but carry no version integer yet (`ironbus_server::session` `handle_connect`) | Negotiate (`min(client, server)`); see [Wire-version negotiation](#wire-version-negotiation). The #292 versioned handshake body is the carrier; the integer field's wiring is owned by #11/#71. | #126, #132, #11 |
+| Handshake body version (`Connect`/`Info`) | `1` | `ironbus_proto::message::HANDSHAKE_BODY_VERSION`; round-tripped by `any_connect_round_trips`/`any_info_round_trips`, rejected-on-unknown by `handshake_rejects_an_unknown_body_version` | Append-only WITHIN a version (a new optional field is appended after the v1 block and tolerated by an old reader, `handshake_tolerates_trailing_future_fields`); a field reinterpretation takes a new `body_version`. The EMPTY body stays valid (an old peer). This is the #292 carrier the `wire_protocol_version` integer + capability bitset append to. | #292, #11, #71 |
 | Loss-report `schema_version` | `1` | `ironbus_storage::loss` `LossReport::SCHEMA_VERSION`; frozen by `golden_loss_report_v1_serialization_is_frozen` | Append-only within v1 (a new field or reason does not bump it); a field rename/removal/reorder takes a new version. | #120, #21 |
 | CLI `--json` schema `ironbus.cli.scrub.vN` | `1` | `ironbus-cli` `SCRUB_SCHEMA_VERSION`; emitted by `write_plan_json`; pinned by `scrub_json_carries_the_versioned_schema_and_exit_code` | Append-only: a new OPTIONAL field does not bump `N`; a field rename/removal/type-change bumps `N` (gated by SemVer, cannot ride a patch). Per [CLI_CONTRACT.md](../CLI_CONTRACT.md) §1.5. | #136, #92 |
 | CLI `--json` schema `ironbus.cli.repair.vN` | `1` | `ironbus-cli` `REPAIR_SCHEMA_VERSION`; emitted by `write_plan_json` | Append-only (same rule as the scrub schema; carries the additional `applied` field). | #136, #92 |
@@ -75,7 +76,8 @@ unknown value. The three actions, consistent with [COMPATIBILITY.md](../COMPATIB
 | `RecordFlags` unknown bits (within a known version) | TOLERATE + PRESERVE | yes | #5, #12 | `RecordFlags::unknown_bits` (kept verbatim, never interpreted) |
 | `codec` id (durable path) | POISON | yes | #12, #387 | IMPLEMENTED: `ironbus_core::compress::decompress_payload` returns `PoisonUnknownCodec` for an unknown id; `ReasonCode::for_decompress_error` routes it to #8 (reported loss, advance) as `CorruptRecordBody`, never a crash |
 | `dict_id` (durable path) | POISON | yes | #12, #78, #357 | IMPLEMENTED: a non-zero unresolved `dict_id` returns `PoisonUnresolvedDict`, routed to #8 as `ReasonCode::UnresolvedDictId` (reported loss; see DICTIONARY_LIFECYCLE.md §5). ZDICT training is deferred with `zstd` |
-| Wire protocol version | NEGOTIATE | n/a | #126, #132, #11 | specified `min(client, server)`; handshake bodies empty today, wiring owned by #11 |
+| Wire protocol version | NEGOTIATE | n/a | #126, #132, #11 | specified `min(client, server)`; the handshake bodies now carry the #292 credit negotiation, but the version INTEGER's wiring is still owned by #11/#71 |
+| Handshake body version (`Connect`/`Info`) | REFUSE an unknown `body_version` (typed, keep the connection); TOLERATE trailing future fields within a known version | yes (append-only fields within a version) | #292, #11 | `BodyError::BadHandshakeVersion` (unknown version is a typed error, the server replies `Err` / the client surfaces `ClientError::Body`, the connection is not silently misread); trailing-bytes tolerance proven by `handshake_tolerates_trailing_future_fields` |
 | `FrameType` tag (unknown tag over a known envelope) | REFUSE that frame (typed), keep the connection | yes | #11 | `ClientError::UnknownFrameType` (client); server replies a generic `Err`, does not drop the connection |
 | `AckOp` sub-tag | REFUSE that op (typed) | yes | #9, #11 | `AckOp::from_u8` returns the typed `BadAckOp` |
 | `ReasonCode` (unknown code on read) | TOLERATE (render the numeric span; unknown name) | yes | #11, #59 | append-only rule: a pre-`ScrubberSuspect` reader still reads a code-6 event's numeric span |
@@ -95,9 +97,14 @@ decode input is a per-record loss, not a corruption of the log. This matches the
 ## Wire-version negotiation
 
 This is the architecture deliverable for the wire protocol version (#132). It specifies the
-handshake; the WIRING is the implementation residual owned by #11. The handshake bodies are
-EMPTY today (`ironbus_server::session` `dispatch` replies `Info` with `&[]`;
-`ironbus_client` `connect_with` sends `&[]`), so nothing below is asserted as implemented.
+handshake; the WIRING of the version INTEGER is the implementation residual owned by #11/#71.
+The handshake bodies are NO LONGER empty: since #292 they carry the per-consumer CREDIT
+negotiation (`ironbus_server::session` `handle_connect` replies a versioned `InfoBody`;
+`ironbus_client` `connect_with` sends a versioned `ConnectBody`), in a `body_version`-prefixed,
+`field_len`-delimited body that TOLERATES trailing future fields. That body is the carrier the
+`wire_protocol_version` integer and the capability bitset append to; only those fields, not the
+body itself, are still unimplemented, so points 1 to 4 below remain a specification while point 5
+(and the body-framing seam) is now realized.
 
 Specification:
 
@@ -122,10 +129,14 @@ Specification:
    at the envelope level (forward compatibility) and is refused per-frame with a typed error;
    negotiation reduces, but does not replace, the frozen-tag forward-compatibility seam.
 
-Until #11 wires this, the wire is versioned only IMPLICITLY by the frozen tag set and the
-fixed body layouts; there is no version integer to negotiate yet. See the "Specified but not
-yet implemented" and "Discrepancies" sections of [COMPATIBILITY.md](../COMPATIBILITY.md),
-which state the same residual.
+Until #11/#71 add the integer, the wire is versioned by the frozen tag set, the fixed body
+layouts, AND (since #292) the handshake body's own `body_version` byte; there is no separate
+`wire_protocol_version` integer to negotiate yet. The #292 per-consumer credit negotiation is the
+first realized handshake-body content and follows the same NEGOTIATE-with-a-floor shape: the
+effective per-consumer credit is `min(client request, server cap)`, no unbounded value is
+representable, and the negotiated value is advertised in `Info`. See the "Specified but not yet
+implemented" and "Discrepancies" sections of [COMPATIBILITY.md](../COMPATIBILITY.md), which state
+the same residual.
 
 ## Migration and the 0.x promise
 

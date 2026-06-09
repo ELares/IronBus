@@ -175,12 +175,19 @@ The credit is an **in-flight grant**, decremented per delivered message and rest
 per ack. The accounting is exactly the implemented per-connection model
 (`crates/ironbus-server/src/session.rs`), stated here as the normative rule:
 
-- **The ceiling is per connection.** Each connection has a standing message ceiling
-  `consumer_credit` (default 64) and a byte budget `consumer_credit_bytes` (default
-  8 MiB; `0` = unlimited), read once from the engine on the first `Flow` and cached.
-  The connection's `leased` set IS the in-flight accounting: its size is the
-  messages in flight, and the sum of its entries' payload bytes is the bytes in
-  flight.
+- **The ceiling is per connection, and NEGOTIATED (#292).** Each connection has a
+  standing message ceiling `consumer_credit` (default 64) and a byte budget
+  `consumer_credit_bytes` (default 8 MiB; `0` = unlimited). The effective ceiling for a
+  connection is the NEGOTIATED value `min(client request, server cap)`: the client MAY
+  request a credit in its `Connect` body, the server clamps it to its cap (or substitutes
+  its default when the client requests nothing), and advertises the negotiated value in
+  `Info` (see [Part 3](#part-3-negotiation-and-compatibility-11) and
+  [CONTRACTS.md](CONTRACTS.md) `ConnectBody`/`InfoBody`). The negotiated value is fixed at
+  `Connect` time (read LOCALLY off the engine handle, no actor round-trip, so the handshake
+  cannot head-of-line-block behind a stalled produce), and an old client that sends an empty
+  `Connect` simply gets the server default. The connection's `leased` set IS the in-flight
+  accounting: its size is the messages in flight, and the sum of its entries' payload bytes is
+  the bytes in flight.
 - **Decrement on send.** Each `Deliver` the broker streams for a `Flow` inserts the
   message into `leased`, occupying one message slot and its payload bytes. The
   remaining message credit at any instant is `ceiling - leased.len()`; the remaining
@@ -236,9 +243,12 @@ Credit is **per connection and never carried across connections.** On a new
 connection the credit is re-advertised from scratch:
 
 - A fresh connection starts with an **empty `leased` set** and therefore the **full
-  ceiling** available. The server reads `consumer_credit` / `consumer_credit_bytes`
-  from the engine on that connection's first `Flow` and caches them for that
-  connection only.
+  ceiling** available. The server fixes that connection's NEGOTIATED `consumer_credit` /
+  `consumer_credit_bytes` (#292: `min(client request, server cap)`, or the server default
+  when the client requests nothing) at its `Connect` and caches them for that connection
+  only; a re-`Connect` re-negotiates idempotently. The negotiation is per connection, so the
+  re-advertise-from-scratch rule holds: a new connection's credit is its own negotiated value,
+  never inherited.
 - The broker **never** carries a previous connection's in-flight count, its `leased`
   set, or any "outstanding credit" into the new connection. The new connection's
   flow control is computed entirely from its own (initially empty) `leased` set.
@@ -421,15 +431,20 @@ old reader:
   frozen wire bytes, pinned by `type_tags_have_their_exact_frozen_wire_values` in
   `crates/ironbus-proto/src/frame.rs`. PFLOW reuses the `Flow` tag with the direction
   bit; it does NOT add a new frame type, so the frozen tag set is unchanged.
-- **Capability negotiation is the #11 handshake residual.** Whether a connection
-  supports the structured FLOW body and PFLOW is, in the fully-wired design, advertised
-  in the `Connect` / `Info` handshake. Those bodies are **empty today** (no negotiated
-  state, see [CONTRACTS.md](CONTRACTS.md)), so the capability bit and the
-  `min(client, server)` wire-version negotiation are the same #11 handshake residual
-  the version registry already tracks ([compat/versions.md](compat/versions.md):
-  "handshake bodies empty today, wiring owned by #11"). Until that lands, a server
-  emits the bare four-byte FLOW body and never
-  asserts PFLOW, which is exactly the behavior in the binary today.
+- **Capability negotiation is the #11 handshake residual; per-consumer CREDIT
+  negotiation already rides the handshake (#292).** Whether a connection supports the
+  structured FLOW body and PFLOW is, in the fully-wired design, advertised in the
+  `Connect` / `Info` handshake. Those bodies are **no longer empty**: since #292 they
+  carry the per-consumer credit negotiation in a versioned, length-prefixed,
+  forward-compatible body (`ConnectBody`/`InfoBody`, see [CONTRACTS.md](CONTRACTS.md)),
+  so the effective `consumer_credit` / `consumer_credit_bytes` is negotiated
+  `min(client request, server cap)` rather than only a server default. The structured-FLOW
+  capability bit and the `min(client, server)` WIRE-VERSION negotiation are still the #11
+  handshake residual the version registry tracks
+  ([compat/versions.md](compat/versions.md)), now as FUTURE fields appended to the #292
+  handshake body (which tolerates unknown trailing bytes) rather than to an empty one. Until
+  that lands, a server emits the bare four-byte FLOW body and never asserts PFLOW, which is
+  exactly the behavior in the binary today.
 
 In short: the **carrier and the state machine are frozen here** (the #72 architecture
 deliverable); the **bytes on the wire and the broker/producer logic are the #11 /

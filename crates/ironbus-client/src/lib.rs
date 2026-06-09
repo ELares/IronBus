@@ -13,9 +13,9 @@
 
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
-    decode_dead_letter, decode_deliver, decode_pub_ack, decode_truncated, encode_ack,
-    encode_cumulative_ack, encode_pub, encode_sub, AckBody, AckOp, BodyError, CumulativeAckBody,
-    PubBody, SubBody,
+    decode_dead_letter, decode_deliver, decode_info, decode_pub_ack, decode_truncated, encode_ack,
+    encode_connect, encode_cumulative_ack, encode_pub, encode_sub, AckBody, AckOp, BodyError,
+    ConnectBody, CumulativeAckBody, PubBody, SubBody,
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -80,6 +80,16 @@ pub struct ClientConfig {
     pub read_timeout: Option<Duration>,
     /// Cap on each blocking write while sending a request. `None` blocks forever.
     pub write_timeout: Option<Duration>,
+    /// The per-consumer MESSAGE credit this client REQUESTS in its `Connect` handshake body (#292),
+    /// or `None` to defer to the server default. The server NEGOTIATES the effective credit as
+    /// `min(request, server cap)`; the client adopts the negotiated value the server advertises in
+    /// `Info` (see [`Client::negotiated_credit`]). There is no unbounded request: a finite `u32` or
+    /// nothing. An empty/old server ignores it, and the client keeps its local default.
+    pub requested_consumer_credit: Option<u32>,
+    /// The per-consumer BYTE budget this client requests in its `Connect` handshake body (#292), or
+    /// `None` to defer to the server default. Negotiated and adopted exactly like
+    /// `requested_consumer_credit`.
+    pub requested_consumer_credit_bytes: Option<u64>,
 }
 
 impl Default for ClientConfig {
@@ -88,6 +98,11 @@ impl Default for ClientConfig {
             connect_timeout: Some(Duration::from_secs(10)),
             read_timeout: Some(Duration::from_secs(30)),
             write_timeout: Some(Duration::from_secs(30)),
+            // The client requests nothing by default, so an unconfigured client behaves the same as
+            // before #292 (it sends an all-absent Connect body, which the server reads as "use my
+            // defaults"); a caller opts into a specific credit by setting these.
+            requested_consumer_credit: None,
+            requested_consumer_credit_bytes: None,
         }
     }
 }
@@ -181,6 +196,16 @@ pub enum ProgressOutcome {
 pub struct Client {
     stream: TcpStream,
     buf: Vec<u8>,
+    /// The per-consumer MESSAGE credit NEGOTIATED for this connection (#292), learned from the
+    /// server's `Info` body at handshake: the server has already clamped this client's `Connect`
+    /// request to its cap (or substituted its default). `None` if the server did not advertise (an
+    /// old/empty `Info`), in which case the client keeps its own local credit (backward-compat).
+    /// [`Client::fetch`] caps its requested batch at this value, so the negotiated credit GOVERNS the
+    /// consumer pull on the client side too (the server enforces it independently).
+    negotiated_credit: Option<u32>,
+    /// The per-consumer BYTE budget negotiated for this connection (#292), the byte-side companion to
+    /// `negotiated_credit`. `None` if the server did not advertise.
+    negotiated_credit_bytes: Option<u64>,
 }
 
 impl Client {
@@ -209,15 +234,54 @@ impl Client {
         let mut client = Client {
             stream,
             buf: Vec::new(),
+            negotiated_credit: None,
+            negotiated_credit_bytes: None,
         };
-        client.send(FrameType::Connect, &[])?;
+        // The #292 handshake: send a versioned Connect body carrying any requested credit (an
+        // all-absent body when the caller requested nothing, which the server reads as "use my
+        // defaults"), then read the Info advertisement and adopt the negotiated credit.
+        let mut connect_body = Vec::new();
+        encode_connect(
+            &ConnectBody {
+                requested_credit: config.requested_consumer_credit,
+                requested_credit_bytes: config.requested_consumer_credit_bytes,
+            },
+            &mut connect_body,
+        );
+        client.send(FrameType::Connect, &connect_body)?;
         match client.read_frame()? {
-            (FrameType::Info, _) => Ok(client),
+            (FrameType::Info, body) => {
+                // Parse the (possibly empty) Info body. An EMPTY/old-server Info decodes to no
+                // advertisement, leaving the negotiated credit `None`, so the client keeps its local
+                // credit (backward-compat in the server->client direction). A malformed Info body is a
+                // typed error, never a panic.
+                let info = decode_info(&body).map_err(ClientError::Body)?;
+                client.negotiated_credit = info.credit.map(|c| c.negotiated);
+                client.negotiated_credit_bytes = info.credit_bytes.map(|c| c.negotiated);
+                Ok(client)
+            }
             (FrameType::Err, body) => {
                 Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
             }
             (other, _) => Err(ClientError::Unexpected(other)),
         }
+    }
+
+    /// The per-consumer MESSAGE credit NEGOTIATED for this connection (#292), or `None` if the server
+    /// did not advertise one (an old or empty `Info`, in which case the client keeps its local
+    /// credit). The server has already clamped this client's `Connect` request to its cap, so this is
+    /// the effective `min(request, server cap)` (or the server default when the client requested
+    /// nothing). [`Client::fetch`] caps its batch at this value.
+    #[must_use]
+    pub fn negotiated_credit(&self) -> Option<u32> {
+        self.negotiated_credit
+    }
+
+    /// The per-consumer BYTE budget negotiated for this connection (#292), or `None` if the server did
+    /// not advertise one. `Some(0)` means the server advertised an UNLIMITED byte budget.
+    #[must_use]
+    pub fn negotiated_credit_bytes(&self) -> Option<u64> {
+        self.negotiated_credit_bytes
     }
 
     /// Resolves `addr` and connects to the first address that accepts, honoring an optional
@@ -303,10 +367,22 @@ impl Client {
     /// Fetches up to `max` messages. Returns the delivered messages (possibly fewer, or
     /// none if the queue is empty within the consumer window).
     ///
+    /// The requested batch is capped at the NEGOTIATED per-consumer credit (#292) when the server
+    /// advertised one: a `max` above the negotiated credit is reduced to it, so the negotiated value
+    /// GOVERNS the client-side pull (the server enforces the same ceiling independently, so this is the
+    /// client honoring what it agreed to rather than over-requesting and being clamped). When the
+    /// server advertised no credit (an old/empty `Info`), `max` is sent unchanged (the client keeps its
+    /// local credit, backward-compat).
+    ///
     /// # Errors
     /// Returns a [`ClientError`] on an IO error, a server error, or a server that delivers
     /// more messages than the requested credit.
     pub fn fetch(&mut self, max: u32) -> Result<Fetch, ClientError> {
+        // Cap the request at the negotiated credit (when known): the negotiated value governs the pull.
+        let max = match self.negotiated_credit {
+            Some(credit) => max.min(credit),
+            None => max,
+        };
         self.send(FrameType::Flow, &max.to_le_bytes())?;
         // The credit caps the TOTAL frames the server may stream back before FlowEnd: each granted
         // slot yields at most one delivery OR one dead-letter advisory OR one truncation advisory,
@@ -1060,6 +1136,38 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_info_from_an_old_server_leaves_the_client_on_its_local_credit() {
+        // #292 backward-compat (server->client direction): a pre-#292 server replies an EMPTY Info
+        // body. The client decodes it to "no advertisement", so its negotiated credit is None and a
+        // fetch sends the requested credit UNCHANGED (the client keeps its own local credit). The
+        // client even requested a credit in its Connect, which the old server simply ignored.
+        let script = frame(FrameType::Info, b""); // an old server's empty Info
+        let (addr, handle) = raw_server(script);
+        let c = Client::connect_with(addr, &config_requesting_credit(Some(7), Some(99))).unwrap();
+        assert_eq!(
+            c.negotiated_credit(),
+            None,
+            "an empty Info advertises nothing: the client keeps its local credit"
+        );
+        assert_eq!(c.negotiated_credit_bytes(), None);
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_malformed_info_body_is_a_typed_error_not_a_panic() {
+        // #292 decode safety: a hostile/corrupt Info body (an unknown handshake version) is a typed
+        // ClientError::Body, never a panic. version byte 9, then a zero field length.
+        let script = frame(FrameType::Info, &[9u8, 0, 0]);
+        let (addr, handle) = raw_server(script);
+        match Client::connect(addr).unwrap_err() {
+            ClientError::Body(_) => {}
+            other => panic!("expected a typed Body error, got {other:?}"),
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn fetch_rejects_more_deliveries_than_the_requested_credit() {
         fn deliver(offset: u64) -> Vec<u8> {
             let mut body = Vec::new();
@@ -1328,6 +1436,135 @@ mod tests {
             "acking the three freed the credit for three more"
         );
 
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    /// A `ClientConfig` that requests a per-consumer credit, for the #292 negotiation tests.
+    fn config_requesting_credit(credit: Option<u32>, credit_bytes: Option<u64>) -> ClientConfig {
+        ClientConfig {
+            requested_consumer_credit: credit,
+            requested_consumer_credit_bytes: credit_bytes,
+            ..ClientConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_client_request_below_the_cap_is_honored_as_the_negotiated_credit() {
+        // #292: a broker cap of 10, a client that requests 4 -> negotiated min(4, 10) = 4. The Info
+        // advertisement carries 4 as the negotiated value and 10 as the cap, and the negotiated credit
+        // governs the pull: a fetch(1000) delivers at most 4.
+        let (addr, shutdown, handle) = start_server_with_credit(10);
+        let mut producer = Client::connect(addr).unwrap();
+        for _ in 0..20 {
+            producer
+                .produce(&PubBody {
+                    flags: 0,
+                    timestamp_ms: 0,
+                    key: b"",
+                    headers: b"",
+                    dedup: None,
+                    payload: b"m",
+                })
+                .unwrap();
+        }
+        let mut c = Client::connect_with(addr, &config_requesting_credit(Some(4), None)).unwrap();
+        assert_eq!(
+            c.negotiated_credit(),
+            Some(4),
+            "min(request 4, cap 10) = 4 is advertised"
+        );
+        let first = c.fetch(1000).unwrap().messages;
+        assert_eq!(
+            first.len(),
+            4,
+            "the negotiated credit of 4 governs the pull"
+        );
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_client_request_above_the_cap_is_clamped_to_the_cap() {
+        // #292: a broker cap of 3, a client that requests 100 -> negotiated min(100, 3) = 3. A request
+        // can only TIGHTEN, never raise, the server cap; the client cannot exceed it.
+        let (addr, shutdown, handle) = start_server_with_credit(3);
+        let mut producer = Client::connect(addr).unwrap();
+        for _ in 0..10 {
+            producer
+                .produce(&PubBody {
+                    flags: 0,
+                    timestamp_ms: 0,
+                    key: b"",
+                    headers: b"",
+                    dedup: None,
+                    payload: b"m",
+                })
+                .unwrap();
+        }
+        let mut c = Client::connect_with(addr, &config_requesting_credit(Some(100), None)).unwrap();
+        assert_eq!(
+            c.negotiated_credit(),
+            Some(3),
+            "min(request 100, cap 3) = 3: the request cannot raise the cap"
+        );
+        let first = c.fetch(1000).unwrap().messages;
+        assert_eq!(
+            first.len(),
+            3,
+            "the server enforces the cap of 3 regardless of the request"
+        );
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_client_that_requests_nothing_gets_the_server_default() {
+        // #292 backward-compat (an "old client" semantics): a client that requests no credit gets the
+        // server default advertised as the negotiated value, and the pull is governed by that default.
+        let (addr, shutdown, handle) = start_server_with_credit(5);
+        let mut producer = Client::connect(addr).unwrap();
+        for _ in 0..12 {
+            producer
+                .produce(&PubBody {
+                    flags: 0,
+                    timestamp_ms: 0,
+                    key: b"",
+                    headers: b"",
+                    dedup: None,
+                    payload: b"m",
+                })
+                .unwrap();
+        }
+        // The default ClientConfig requests nothing.
+        let mut c = Client::connect(addr).unwrap();
+        assert_eq!(
+            c.negotiated_credit(),
+            Some(5),
+            "no request -> the server default (5) is the negotiated value"
+        );
+        let first = c.fetch(1000).unwrap().messages;
+        assert_eq!(first.len(), 5, "the server default of 5 governs the pull");
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn the_negotiated_byte_budget_is_advertised() {
+        // #292/#275: the server advertises its byte budget too. With a cap of 4096 and a client that
+        // requests 1024, the negotiated byte budget is min(1024, 4096) = 1024.
+        let (addr, shutdown, handle) = start_server_with_credit_and_bytes(64, 4096);
+        let c = Client::connect_with(addr, &config_requesting_credit(None, Some(1024))).unwrap();
+        assert_eq!(
+            c.negotiated_credit_bytes(),
+            Some(1024),
+            "min(request 1024, cap 4096) = 1024"
+        );
+        assert_eq!(
+            c.negotiated_credit(),
+            Some(64),
+            "no message-credit request -> the server default (64)"
+        );
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }

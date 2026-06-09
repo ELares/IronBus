@@ -25,9 +25,10 @@ use ironbus_core::lease::LeaseToken;
 use ironbus_core::types::Offset;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
-    decode_ack, decode_cumulative_ack, decode_pub, decode_sub, encode_dead_letter, encode_deliver,
-    encode_pub_ack, encode_truncated, AckOp, DeadLetterBody, DeliverBody, PubAckBody,
-    TruncatedBody, DEAD_LETTER_MAX_DELIVER, PUB_FLAG_HAS_DEDUP,
+    decode_ack, decode_connect, decode_cumulative_ack, decode_pub, decode_sub, encode_dead_letter,
+    encode_deliver, encode_info, encode_pub_ack, encode_truncated, AckOp, CreditAdvert,
+    DeadLetterBody, DeliverBody, InfoBody, PubAckBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER,
+    PUB_FLAG_HAS_DEDUP,
 };
 use ironbus_storage::fs::Filesystem;
 use std::collections::HashMap;
@@ -171,18 +172,32 @@ pub struct Session {
     /// per-consumer message credit and the byte budget (#275) are derived from it directly and cannot
     /// drift.
     leased: HashMap<u64, Lease>,
-    /// The per-CONSUMER (per-connection) in-flight credit ceiling (#65), cached from
-    /// [`Engine::consumer_credit`] on the first Flow. `None` until then: the engine is the source of
-    /// truth for the ceiling (so a `serve` flag sets it once for every connection), and a session is
-    /// created before it has an engine handle. Once set it never changes for the life of the
-    /// connection. The remaining message credit at any moment is `ceiling - leased.len()`.
+    /// The per-CONSUMER (per-connection) in-flight credit ceiling (#65), the NEGOTIATED value for this
+    /// connection (#292). `None` until it is fixed; once set it never changes for the life of the
+    /// connection, and the remaining message credit at any moment is `ceiling - leased.len()`. It is
+    /// fixed at the FIRST of two points: at `Connect` time, to `min(client request, server cap)` when
+    /// the client's `Connect` body requested a credit (the #292 negotiation); otherwise lazily on the
+    /// first Flow, to the engine default ([`Engine::consumer_credit`]), exactly the pre-#292 behavior
+    /// (so an old client that sends an empty `Connect` still gets the server default). The engine is the
+    /// source of truth for the cap (a `serve` flag sets it once for every connection), and a session is
+    /// created before it has an engine handle, so the default cannot be read at construction.
     credit_ceiling: Option<u32>,
-    /// The per-CONSUMER (per-connection) in-flight BYTE budget (#275), cached from
-    /// [`Engine::consumer_credit_bytes`] on the first Flow alongside `credit_ceiling`. `None` until
-    /// then, for the same reason. Once set it never changes for the life of the connection. `0` means
-    /// UNLIMITED (the byte budget is off, only the message credit binds). The remaining byte budget
-    /// at any moment is `ceiling_bytes - (sum of leased values' bytes)`.
+    /// The per-CONSUMER (per-connection) in-flight BYTE budget (#275), the NEGOTIATED value for this
+    /// connection (#292), fixed alongside `credit_ceiling` at `Connect` time (clamped to the server
+    /// cap) or lazily on the first Flow (the engine default). `None` until fixed; once set it never
+    /// changes. `0` means UNLIMITED (the byte budget is off, only the message credit binds). The
+    /// remaining byte budget at any moment is `ceiling_bytes - (sum of leased values' bytes)`.
     credit_ceiling_bytes: Option<u64>,
+    /// The per-consumer message credit the client REQUESTED in its `Connect` body (#292), `None` if it
+    /// requested nothing (an old client, or a deliberate defer-to-default). Held so the clamp against
+    /// the server cap can be applied LAZILY on the first Flow if the engine could not be read at
+    /// `Connect` time (a transiently unavailable actor): `credit_ceiling` is normally fixed at Connect,
+    /// but if that read fails this request is honored the next time the ceiling is computed. Never an
+    /// unbounded value (the wire has no `request(MAX)`).
+    requested_credit: Option<u32>,
+    /// The per-consumer byte budget the client requested in its `Connect` body (#292), the byte-side
+    /// companion to `requested_credit`. Same lazy-clamp fallback.
+    requested_credit_bytes: Option<u64>,
     /// This connection's stable `key_shared` member identity (#64): the rendezvous-hash seed the
     /// engine routes a key's records to. Minted once per connection by the server from an atomic
     /// counter, so two concurrently-live connections never collide. Only consulted for a group
@@ -299,11 +314,12 @@ impl Session {
         out: &mut Vec<u8>,
     ) -> Result<bool, SessionError> {
         match FrameType::from_u8(type_tag) {
-            // A repeated Connect is idempotent today (the handshake carries no negotiated
-            // state yet); once Connect carries capabilities, decide whether to reject one.
+            // The handshake: parse any negotiated credit request, clamp it to the server cap, and
+            // reply the advertised Info (#292). A repeated Connect re-negotiates idempotently. It is
+            // infallible (the caps are read LOCALLY off the handle, no actor round-trip, #177), so it
+            // returns `false` directly (no committed-cursor progress).
             Some(FrameType::Connect) => {
-                self.connected = true;
-                reply(out, FrameType::Info, &[]);
+                self.handle_connect(engine, body, out);
                 Ok(false)
             }
             Some(FrameType::Ping) => {
@@ -333,6 +349,74 @@ impl Session {
                 Ok(false)
             }
         }
+    }
+
+    /// Handles a `Connect` (#292): decodes the (possibly empty) handshake body, NEGOTIATES the
+    /// per-consumer credit as `min(client request, server cap)` (or the server default when the client
+    /// requested nothing), fixes it for this connection, and replies an `Info` advertising the
+    /// negotiated value plus the server cap.
+    ///
+    /// Backward-compat both directions:
+    /// - An OLD client sends an EMPTY `Connect` body, which decodes to an all-absent request, so the
+    ///   negotiated credit is the server default (exactly the pre-#292 behavior).
+    /// - The reply is always a versioned `Info` body; an OLD client ignores the body and is unaffected,
+    ///   and an OLD server (no #292) replies an empty `Info`, which a new client tolerates by keeping
+    ///   its local credit (handled client-side).
+    ///
+    /// A malformed (non-empty but unparseable) `Connect` body is a typed reject (`Err` reply), never a
+    /// panic, and the connection stays open so the client can re-handshake.
+    fn handle_connect<
+        F: Filesystem + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) {
+        let req = match decode_connect(body) {
+            Ok(req) => req,
+            // A non-empty but malformed Connect body: surface a typed error and keep the connection
+            // open. The credit is not fixed, so a subsequent valid Connect/Flow still negotiates.
+            Err(e) => {
+                reply_err(out, &e.to_string());
+                return;
+            }
+        };
+        self.connected = true;
+        // Record the client's request (re-recorded on a repeated Connect, which re-negotiates
+        // idempotently). It is also used by the lazy `credit_ceiling` fallback for a session that never
+        // ran a Connect through this handler (some tests inject `connected` directly).
+        self.requested_credit = req.requested_credit;
+        self.requested_credit_bytes = req.requested_credit_bytes;
+        // The server caps, read LOCALLY off the handle (NO actor round-trip), so the handshake never
+        // touches the actor's checkpoint/fsync path and a stalled produce on one connection cannot
+        // head-of-line-block this Connect (invariant 4, #177). The caps are static engine config.
+        let (cap_credit, cap_credit_bytes) = engine.consumer_credit_caps();
+        // NEGOTIATE: min(client request, server cap), or the server default when nothing was requested.
+        let negotiated_credit = negotiate_credit(req.requested_credit, cap_credit);
+        let negotiated_credit_bytes =
+            negotiate_credit_bytes(req.requested_credit_bytes, cap_credit_bytes);
+        // Fix the negotiated values for this connection (the lazy `credit_ceiling` /
+        // `credit_ceiling_bytes` accessors return these cached values without re-reading the engine).
+        self.credit_ceiling = Some(negotiated_credit);
+        self.credit_ceiling_bytes = Some(negotiated_credit_bytes);
+        // Advertise the negotiated value plus the server cap, so the client adopts the negotiated
+        // credit for its own flow control and learns the cap it can never exceed.
+        let info = InfoBody {
+            credit: Some(CreditAdvert {
+                negotiated: negotiated_credit,
+                cap: cap_credit,
+            }),
+            credit_bytes: Some(CreditAdvert {
+                negotiated: negotiated_credit_bytes,
+                cap: cap_credit_bytes,
+            }),
+        };
+        let mut info_body = Vec::new();
+        encode_info(&info, &mut info_body);
+        reply(out, FrameType::Info, &info_body);
     }
 
     fn handle_pub<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
@@ -602,10 +686,13 @@ impl Session {
             }
         }
     }
-    /// The per-CONSUMER (per-connection) in-flight credit ceiling (#65) for this session, cached
-    /// from the engine on the first call. The engine is the source of truth (a `serve` flag sets it
-    /// once for every connection), and it is already floored to at least 1. Reads through the actor
-    /// once, then caches, so the round-trip is paid only on the first Flow.
+    /// The per-CONSUMER (per-connection) in-flight credit ceiling (#65) for this session: the
+    /// NEGOTIATED value (#292). Normally fixed at `Connect` time (to `min(client request, server cap)`)
+    /// and returned from the cache here; if it was not fixed (an old client that never sent a Connect,
+    /// or a Connect whose engine read failed), it is computed here on the first Flow by reading the
+    /// engine cap and clamping the stored client request to it. The engine is the source of truth for
+    /// the cap (a `serve` flag sets it once for every connection), already floored to at least 1.
+    /// Reads through the actor at most once, then caches.
     ///
     /// # Errors
     /// Returns [`SessionError::ActorGone`] if the actor exited before the read.
@@ -620,14 +707,19 @@ impl Session {
         if let Some(c) = self.credit_ceiling {
             return Ok(c);
         }
-        let c = engine.with(|e| e.consumer_credit())?;
+        // Not fixed at Connect: read the cap and clamp the stored request to it (the lazy half of the
+        // #292 negotiation), so a client request honored late behaves exactly as if fixed at Connect.
+        let cap = engine.with(|e| e.consumer_credit())?;
+        let c = negotiate_credit(self.requested_credit, cap);
         self.credit_ceiling = Some(c);
         Ok(c)
     }
 
-    /// The per-CONSUMER (per-connection) in-flight BYTE budget (#275) for this session, cached from
-    /// the engine on the first call alongside [`Session::credit_ceiling`]. The engine is the source
-    /// of truth (a `serve` flag sets it once for every connection). `0` means unlimited.
+    /// The per-CONSUMER (per-connection) in-flight BYTE budget (#275) for this session: the NEGOTIATED
+    /// value (#292), the byte-side companion to [`Session::credit_ceiling`]. Normally fixed at
+    /// `Connect`; otherwise computed here on the first Flow by clamping the stored request to the
+    /// engine cap. The engine is the source of truth (a `serve` flag sets it once for every
+    /// connection). `0` means unlimited.
     ///
     /// # Errors
     /// Returns [`SessionError::ActorGone`] if the actor exited before the read.
@@ -642,7 +734,8 @@ impl Session {
         if let Some(c) = self.credit_ceiling_bytes {
             return Ok(c);
         }
-        let c = engine.with(|e| e.consumer_credit_bytes())?;
+        let cap = engine.with(|e| e.consumer_credit_bytes())?;
+        let c = negotiate_credit_bytes(self.requested_credit_bytes, cap);
         self.credit_ceiling_bytes = Some(c);
         Ok(c)
     }
@@ -1057,6 +1150,26 @@ fn lease_bytes(record: &ironbus_storage::segment::OwnedRecord) -> u64 {
         .saturating_add(record.headers.len())
         .saturating_add(record.payload.len());
     u64::try_from(len).unwrap_or(u64::MAX)
+}
+
+/// The #292 per-consumer MESSAGE-credit negotiation: `min(client request, server cap)` when the
+/// client requested a credit, else the server cap (the default). There is no unbounded request on the
+/// wire, so a request can only ever TIGHTEN the server cap, never raise it. The cap is already floored
+/// to >= 1 by the engine, and `min` preserves that floor, so the result is always >= 1.
+fn negotiate_credit(requested: Option<u32>, cap: u32) -> u32 {
+    requested.map_or(cap, |want| want.min(cap))
+}
+
+/// The #292 per-consumer BYTE-budget negotiation. A server cap of `0` is UNLIMITED (the byte budget is
+/// off); a client request against an unlimited cap is honored as-is (it can only ADD a finite budget,
+/// which is a tightening, never lift an off-switch the server did not set), and against a finite cap a
+/// request is clamped by `min`. A client that requests nothing gets the server cap (the default).
+fn negotiate_credit_bytes(requested: Option<u64>, cap: u64) -> u64 {
+    match requested {
+        Some(want) if cap == 0 => want,
+        Some(want) => want.min(cap),
+        None => cap,
+    }
 }
 
 /// Encodes a response frame. Bodies here are tiny (<= 8 bytes, or a short literal), well
@@ -2220,6 +2333,11 @@ mod tests {
         fn now_monotonic_nanos(&self) -> u64 {
             0
         }
+        fn consumer_credit_caps(&self) -> (u32, u64) {
+            // The default caps, read locally (this mock has no engine to query): the #292 handshake
+            // negotiation uses these without an actor round-trip, so a produce-only test is unaffected.
+            (64, 0)
+        }
     }
 
     #[test]
@@ -3147,6 +3265,119 @@ mod tests {
         assert!(
             batch2.is_empty(),
             "a saturated consumer gets an empty batch until it frees a slot"
+        );
+    }
+
+    /// Connects a session with a `Connect` body REQUESTING a per-consumer credit (#292), returning the
+    /// session and the negotiated credit the server advertised in its Info reply.
+    fn connected_session_requesting<C: Clock + Clone + 'static>(
+        e: &DirectEngine<InMemoryFs, C>,
+        requested_credit: Option<u32>,
+        requested_credit_bytes: Option<u64>,
+    ) -> (Session, CreditAdvert<u32>) {
+        let mut s = Session::new();
+        let mut connect_body = Vec::new();
+        ironbus_proto::message::encode_connect(
+            &ironbus_proto::message::ConnectBody {
+                requested_credit,
+                requested_credit_bytes,
+            },
+            &mut connect_body,
+        );
+        let mut out = Vec::new();
+        s.process(e, &frame(FrameType::Connect, &connect_body), &mut out)
+            .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::Info, "Connect is answered with Info");
+        let info = ironbus_proto::message::decode_info(&body).unwrap();
+        (s, info.credit.expect("the server advertises its credit"))
+    }
+
+    #[test]
+    fn a_connect_credit_request_below_the_cap_is_the_negotiated_credit() {
+        // #292 negotiation at the session layer: a server cap of 10, a Connect requesting 4 ->
+        // negotiated min(4, 10) = 4, advertised in Info, and it GOVERNS the pull (a Flow asking 1000
+        // delivers exactly 4).
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(engine_credit(Arc::clone(&clock), 10, 64));
+        let (mut s, advert) = connected_session_requesting(&e, Some(4), None);
+        assert_eq!(advert.negotiated, 4, "min(request 4, cap 10) = 4");
+        assert_eq!(advert.cap, 10, "the server cap is advertised");
+        for _ in 0..20 {
+            produce(&e, b"m");
+        }
+        let batch = fetch(&mut s, &e, 1000);
+        assert_eq!(
+            batch.len(),
+            4,
+            "the negotiated credit of 4 governs the pull, not the cap 10 or the requested 1000"
+        );
+    }
+
+    #[test]
+    fn a_connect_credit_request_above_the_cap_is_clamped_to_the_cap() {
+        // #292: a server cap of 3, a Connect requesting 100 -> negotiated min(100, 3) = 3. A request
+        // can only TIGHTEN, never raise, the server cap.
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(engine_credit(Arc::clone(&clock), 3, 64));
+        let (mut s, advert) = connected_session_requesting(&e, Some(100), None);
+        assert_eq!(advert.negotiated, 3, "min(request 100, cap 3) = 3");
+        for _ in 0..20 {
+            produce(&e, b"m");
+        }
+        assert_eq!(
+            fetch(&mut s, &e, 1000).len(),
+            3,
+            "the cap of 3 binds the pull regardless of the request"
+        );
+    }
+
+    #[test]
+    fn an_empty_connect_uses_the_server_default_credit() {
+        // #292 backward-compat (client->server): an OLD client sends an EMPTY Connect body, so the
+        // negotiated credit is the server default (the cap), advertised in Info and governing the pull.
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(engine_credit(Arc::clone(&clock), 5, 64));
+        // An empty Connect body, exactly as a pre-#292 client sends.
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::Info);
+        let info = ironbus_proto::message::decode_info(&body).unwrap();
+        let advert = info
+            .credit
+            .expect("the server still advertises on an empty Connect");
+        assert_eq!(
+            advert.negotiated, 5,
+            "an empty Connect -> the server default (5) is the negotiated credit"
+        );
+        for _ in 0..12 {
+            produce(&e, b"m");
+        }
+        assert_eq!(
+            fetch(&mut s, &e, 1000).len(),
+            5,
+            "the server default of 5 governs the pull for an old client"
+        );
+    }
+
+    #[test]
+    fn a_malformed_connect_body_is_a_typed_error_not_a_panic() {
+        // #292 decode safety at the server: a hostile/corrupt Connect body (an unknown handshake
+        // version) is answered with a typed Err, never a panic, and the connection stays open.
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(engine_credit(Arc::clone(&clock), 5, 64));
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        // version 9 (unknown), then a zero field-length: a typed BadHandshakeVersion inside decode.
+        s.process(&e, &frame(FrameType::Connect, &[9u8, 0, 0]), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Err,
+            "a malformed Connect body is a typed Err, not a panic"
         );
     }
 

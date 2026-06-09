@@ -323,8 +323,8 @@ test in `frame.rs`. They start at 1 and are contiguous.
 
 | tag | FrameType   | direction | body |
 |-----|-------------|-----------|------|
-| 1   | `Connect`   | client to server | empty today (no negotiated state yet); the server ignores the body |
-| 2   | `Info`      | server to client | empty today |
+| 1   | `Connect`   | client to server | `ConnectBody` (below): the client's per-consumer credit request (#292); an EMPTY body is still valid (an old client, server uses its defaults) |
+| 2   | `Info`      | server to client | `InfoBody` (below): the server's advertised per-consumer credit defaults/caps and the negotiated value (#292); an EMPTY body is still valid (an old server, client keeps its local credit) |
 | 3   | `Ping`      | either    | empty |
 | 4   | `Pong`      | either    | empty |
 | 5   | `Pub`       | client to server | `PubBody` (below) |
@@ -361,6 +361,53 @@ The structured, machine-actionable `retry_after_ms` (u32, sentinel `0xFFFFFFFF` 
 NOT in the protocol yet; until #11 lands, the shed rides the bare `Err` frame, so the FrameType
 vocabulary above is unchanged (no renumber, no new tag). See
 [BACKPRESSURE.md](BACKPRESSURE.md), "What this changes on the wire".
+
+### ConnectBody / InfoBody (wire bodies of `Connect` / `Info`, #292)
+
+Source: `message.rs`. The handshake bodies were EMPTY before #292; they now carry the per-consumer
+credit negotiation in a VERSIONED, LENGTH-PREFIXED, FORWARD-COMPATIBLE body so future fields (for
+example the #71/#11 `wire_protocol_version` + capability bitset) can be appended without re-breaking.
+The empty-body case stays valid in BOTH directions (the backward-compat anchor): an old client sends an
+empty `Connect`, and a new client tolerates an old server's empty `Info`.
+
+Both bodies share the same outer framing:
+
+| field        | type | width | notes |
+|--------------|------|-------|-------|
+| `body_version`| u8  | 1     | the handshake-body framing version (`HANDSHAKE_BODY_VERSION` = 1). An unknown version is a typed `BodyError::BadHandshakeVersion`, never a best-effort parse. Distinct from the (un-wired) `wire_protocol_version`, which #71/#11 will carry as a FIELD inside the block. |
+| `field_len`  | u16  | 2     | the length of the version's KNOWN-field block that follows. The decoder takes exactly this many bytes (cap-before-alloc: bounds-checked against the actual body BEFORE any read, so a hostile length is a typed `Truncated`, never an over-allocation). |
+| `block`      | bytes| `field_len` | the version's known fields (below). The v1 fields are read from the FRONT of the block; any bytes past the v1 fields, and any bytes after the whole block, are a FUTURE version's appended fields, TOLERATED and ignored (forward-compat). |
+
+An EMPTY body (length 0) is the historical case and decodes to "no fields": for `Connect`, no credit
+requested (the server uses its defaults); for `Info`, no advertisement (the client keeps its local
+credit). It carries no version byte.
+
+`ConnectBody` v1 block (the client's request; each value is meaningful only when its presence flag is
+set, so an absent value means "use the server default", and there is no unbounded/`request(MAX)` value):
+
+| field         | type | width | notes |
+|---------------|------|-------|-------|
+| `flags`       | u8   | 1     | presence bits: bit 0 (`CONNECT_FLAG_HAS_CREDIT`) the message-credit request is present; bit 1 (`CONNECT_FLAG_HAS_CREDIT_BYTES`) the byte-budget request is present |
+| `requested_credit` | u32 LE | 4 | the per-consumer MESSAGE credit the client wants (meaningful iff bit 0); the server negotiates `min(request, server cap)` |
+| `requested_credit_bytes` | u64 LE | 8 | the per-consumer BYTE budget the client wants (meaningful iff bit 1) |
+
+`InfoBody` v1 block (the server's advertisement; the server has already clamped the client's request to
+its cap, so the advertised `negotiated` value is the one the client adopts):
+
+| field         | type | width | notes |
+|---------------|------|-------|-------|
+| `flags`       | u8   | 1     | presence bits: bit 0 (`INFO_FLAG_HAS_CREDIT`) the message-credit advert is present; bit 1 (`INFO_FLAG_HAS_CREDIT_BYTES`) the byte-budget advert is present |
+| `credit.negotiated` | u32 LE | 4 | the per-consumer MESSAGE credit NEGOTIATED for this connection (`min(request, cap)`, or the default when the client requested nothing) |
+| `credit.cap`  | u32 LE | 4 | the server's hard message-credit cap (informational; the negotiated value never exceeds it) |
+| `credit_bytes.negotiated` | u64 LE | 8 | the per-consumer BYTE budget negotiated for this connection |
+| `credit_bytes.cap` | u64 LE | 8 | the server's hard byte-budget cap (`0` = unlimited) |
+
+The negotiation: the effective per-consumer credit is `min(client request, server cap)`, or the server
+default when the client requests nothing. A request can only ever TIGHTEN the server cap, never raise
+it; no unbounded value is representable on the wire. The negotiated credit then GOVERNS the consumer
+pull (the existing `consumer_credit` / `consumer_credit_bytes` flow control, see
+[FLOW_CONTROL.md](FLOW_CONTROL.md)). The `Connect`/`Info` FrameType tags (1, 2) are UNCHANGED: only the
+previously-empty BODY gained this additive, version-prefixed format, so the frozen tag freeze holds.
 
 ### PubBody (wire body of `Pub`)
 
@@ -693,8 +740,13 @@ code; the code is canonical.
   about whether PubAck deserves its own verb: it does (#179).
 - **Connect/Info.** The draft's `CONNECT` carried `queue_name, auth_method, auth_blob,
   stream_id, max_frame_size` and `INFO` carried a version, negotiated max frame size, and a
-  capabilities header list. Both bodies are EMPTY in the implementation today (the
-  handshake carries no negotiated state yet). The reserved `stream_id` does not exist.
+  capabilities header list. The implementation now carries the per-consumer CREDIT negotiation
+  (#292: the client's requested credit in `Connect`, the server's advertised defaults/caps and the
+  negotiated value in `Info`; see `ConnectBody`/`InfoBody` above), in a versioned, length-prefixed,
+  forward-compatible body. The OTHER draft fields (`auth_method`/`auth_blob`, the reserved
+  `stream_id`, a negotiated `max_frame_size`, the `wire_protocol_version` integer, and the capability
+  bitset) are still NOT on the wire; the body framing is designed so they can be appended as future
+  fields without a re-break. The empty-body case stays valid in both directions (an old peer).
 - **Sub.** The draft's `SUB` carried `consumer, credit, start_mode, start_offset` and a
   close flag. The real `SubBody` is just the work-group name (the whole body). There is no
   start-mode/start-offset selector and no in-frame credit; `Unsub` is its own frame (tag 7).
@@ -896,5 +948,8 @@ code today. They are aspirational and MUST NOT be treated as a current byte cont
 - **Wire verbs from the draft with no implementation:** the auth handshake fields in
   `Connect` (`auth_method`, `auth_blob`, `stream_id`, `max_frame_size`), the `Info`
   capabilities list, the `Sub` start-mode/start-offset selector, and the producer-flow
-  (`PFLOW`)/pause direction of `Flow`. The frame tags exist but carry empty or reduced
-  bodies today; capability negotiation, auth, and producer flow control are future work.
+  (`PFLOW`)/pause direction of `Flow`. The `Connect`/`Info` bodies now carry the #292 per-consumer
+  CREDIT negotiation (above); the auth fields, `stream_id`, a negotiated `max_frame_size`, the
+  `wire_protocol_version` integer, and the capability bitset are still future work, appendable as
+  future fields of the versioned handshake body. The `Sub` selector and producer flow control remain
+  unimplemented.

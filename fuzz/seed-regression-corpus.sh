@@ -131,6 +131,16 @@ printf '' | place deliver_body
 printf '\377\377\377\377' | place dead_letter_body                  # overlong leading length
 printf '' | place dead_letter_body
 
+# connect/info handshake bodies (#292): `[ version:u8 ][ field_len:u16 LE ][ block ][ trailing ]`.
+# An EMPTY body is the historical old-peer no-fields case (valid); an unknown version, and a declared
+# field_len that overruns the body, are the canonical hostile shapes a typed error must catch.
+printf '' | place connect_body                                      # empty = old-client no request
+printf '\011\000\000' | place connect_body                          # version 9 (unknown), zero block
+printf '\001\377\377' | place connect_body                          # version 1, field_len=0xffff, no block
+printf '' | place info_body                                         # empty = old-server no advert
+printf '\011\000\000' | place info_body                             # version 9 (unknown), zero block
+printf '\001\377\377' | place info_body                             # version 1, field_len=0xffff, no block
+
 # cursor_snapshot: a torn/hostile durable checkpoint payload must never crash recovery.
 printf '' | place cursor_snapshot                                   # empty snapshot
 printf '\001' | place cursor_snapshot                               # one stray byte
