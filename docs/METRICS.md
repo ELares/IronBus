@@ -557,7 +557,7 @@ The `ironbus admin --health-addr <host:port>` CLI renders segments, consumers,
 lag, and the last-skip-offset from this body alone, never parsing a metric name,
 so the diagnostics survive a metric rename and a dashboard break.
 
-## Tracing and the OTLP export feature gate (#99)
+## Tracing and the OTLP export feature gate (#99, #352)
 
 The broker instruments with the `tracing` crate and installs a JSON log layer by
 default at `serve` startup. ERROR and WARN events (the corruption-skip, freeze,
@@ -567,12 +567,59 @@ leanest edge build exports no sampled spans.
 
 OTLP span export is behind the **non-default** `otlp` Cargo feature on
 `ironbus-server` and is off at runtime by default; the default-shipped binary and
-the size-optimized `edge-min` build link **zero** opentelemetry crates. Export
-goes through a bounded, lossy queue that **drops and counts** spans rather than
-blocking the thread-per-core core, so a slow or unreachable collector can never
-stall a produce. The concrete opentelemetry-otlp socket exporter is a tracked
-follow-up; the queue, the drop counter, the sampling decision, and the
-feature-gated compile-out are real and tested today.
+the size-optimized `edge-min` build link **zero** opentelemetry crates (verify
+with `cargo tree --edges normal | grep opentelemetry`, which returns nothing on
+the default build and the tree only with `--features otlp`). Export goes through
+a bounded, lossy queue that **drops and counts** spans rather than blocking the
+thread-per-core core, so a slow or unreachable collector can never stall a
+produce.
+
+### The concrete exporter (#352)
+
+The concrete opentelemetry-otlp span exporter is wired and tested behind the
+`otlp` feature. The queue, the drop counter, the sampling decision, and the
+feature-gated compile-out are real on every build; the exporter itself is
+compiled in **only** with `otlp`.
+
+- **Transport: plaintext gRPC (tonic, no TLS).** This is the deliberate
+  C-FFI-minimizing choice. OTLP to a co-located collector is plaintext
+  `http://host:4317`, so no TLS stack is linked: the otlp build pulls
+  **no** `rustls` / `ring` / `aws-lc` / `native-tls` / `openssl`, keeping even
+  the feature build pure Rust (so the deny.toml `[bans]` C-FFI denylist, which
+  `cargo deny check` evaluates over all features, stays green). The default graph
+  is untouched either way.
+- **Wiring.** When the broker is **built with** `otlp` and started with
+  `serve --enable-otlp-export`, a dedicated drain thread (owning a small
+  current-thread Tokio runtime, **off** the thread-per-core path) ticks the
+  bounded span queue, maps each drained span onto an OTLP span honoring the
+  head-based sampling decision, and ships the batch to the configured collector.
+  A slow or down collector never blocks a produce: the queue keeps
+  dropping-and-counting, and a failed ship is logged and discarded.
+- **The flag.** `serve --enable-otlp-export` turns export on (off by default);
+  `serve --otlp-endpoint <url>` (or `IRONBUS_OTLP_ENDPOINT`) sets the collector
+  endpoint, defaulting to `http://127.0.0.1:4317`. On the **default build** (no
+  `otlp` feature), `--enable-otlp-export` logs a clear
+  `WARN: ... built WITHOUT the otlp feature` line and export stays off, so the
+  flag is harmless on the shipped binary. The in-process recorder behavior is
+  unchanged whenever export is off.
+- **Building it in.** `cargo build --features otlp` (server) or
+  `cargo build -p ironbus-cli --features otlp` (the broker binary). The MSRV
+  (1.78) holds: the plaintext tonic path avoids the high-MSRV url/idna/icu crate
+  family.
+
+### Collector setup
+
+Run any OTLP/gRPC collector on the endpoint, e.g.:
+
+```shell
+docker run -p 4317:4317 otel/opentelemetry-collector:latest
+ironbus serve --data-dir /var/lib/ironbus \
+  --enable-otlp-export --otlp-endpoint http://127.0.0.1:4317
+```
+
+(the broker must be built `--features otlp`). Plaintext gRPC; terminate TLS at a
+sidecar/proxy if the collector is remote, since the exporter ships no TLS by
+design.
 
 ## See also
 

@@ -3,7 +3,12 @@
 all-features = true
 
 [licenses]
-# Permissive licenses only, per the governance decision (#22).
+# Permissive licenses only, per the governance decision (#22). cargo-deny resolves with all-features
+# (see `[graph]`), so this list must cover the FEATURE-gated trees too. The non-default `otlp` span
+# exporter (#352) was reviewed against this list: every crate in the `opentelemetry`/`opentelemetry-otlp`
+# gRPC tree is `MIT` / `Apache-2.0` / `BSD-2-Clause` / `BSD-3-Clause` (a few `Unicode-3.0`), all already
+# present below, so the otlp tree adds NO new license (the entries below ARE the opentelemetry tree's
+# license set; see the `[bans]` comment for the full per-crate review).
 allow = [
   "MIT",
   "Apache-2.0",
@@ -93,10 +98,24 @@ name = "mimalloc" # vendored mimalloc C.
 # with `zmij`/`unicode-ident` adding the already-allowed Unicode-3.0) and pure Rust, so the license
 # allow-list above already covers the whole tree and no new entry is needed. NONE of these is an
 # opentelemetry crate: OTLP span export is behind the NON-DEFAULT `otlp` feature of `ironbus-server`,
-# so the default and `edge-min` builds link zero opentelemetry. The concrete opentelemetry-otlp
-# exporter (which would add `opentelemetry`, `opentelemetry-otlp`, `tonic`/`prost`, and a larger
-# permissive tree to review) is a deliberate follow-up; until it lands behind `otlp`, the #139
-# pure-Rust DATA-path policy is unchanged (tracing is observability, off the record path).
+# so the default and `edge-min` builds link zero opentelemetry (verify with `cargo tree --edges
+# normal`, which is opentelemetry-free on the default build).
+#
+# The CONCRETE OTLP exporter (#99, #352) landed behind that NON-DEFAULT `otlp` feature: it adds
+# `opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp` (0.27, MSRV 1.71.1, below the 1.78 floor)
+# and their transitive gRPC tree (`tonic`, `prost`, `tokio`, `hyper`, `h2`, `tower`, `http`, `bytes`,
+# the `futures-*`/`pin-project`/`async-*` crates, ...). cargo-deny resolves with `all-features` (see
+# `[graph]` above), so it DOES see this tree, and its licenses were REVIEWED: every transitive crate is
+# `MIT`, `Apache-2.0`, `BSD-2-Clause`, or `BSD-3-Clause` (a few `Unicode-3.0` via `unicode-ident`), all
+# ALREADY on the `allow` list above, so the otlp tree needs NO new license entry (the `allow` list is
+# the opentelemetry tree's license set; nothing was added because nothing was missing). The TRANSPORT
+# is PLAINTEXT gRPC (`grpc-tonic`, default-features off, NO TLS feature): a deliberate choice so the
+# otlp build pulls NO `rustls`/`ring`/`aws-lc-sys`/`native-tls`/`openssl-sys` (all on the `[bans]`
+# denylist below, which cargo-deny evaluates under all-features), keeping even the FEATURE build pure
+# Rust. The whole tree declares no `links` key and runs no C-building build script, so the #102 C-FFI
+# ban holds for it too; the #139 pure-Rust DATA-path policy is unchanged (span export is observability,
+# off the record path, and absent entirely from the default/`edge-min` graph the cffi-ban + SBOM gates
+# scope to). The deny `[bans]` denylist and the cffi-ban allowlist are NOT weakened.
 #
 # The TOML config-FILE layer (#85, #86, #382) adds the maintainer-APPROVED `toml` crate to
 # `ironbus-cli` for the `--config <path>` parser (the decision recorded in docs/CONFIG.md section 5).

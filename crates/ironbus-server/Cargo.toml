@@ -13,12 +13,17 @@ authors.workspace = true
 # the JSON log layer are always compiled, but OTLP span export is behind the non-default `otlp`
 # feature below, so neither the default binary nor the `edge-min` build links opentelemetry (#99).
 default = []
-# OTLP span export (#99): the feature-gated, non-default export seam. Compiling this in enables the
-# bounded-lossy-queue drain into the (separately tracked) opentelemetry-otlp socket exporter. Kept
-# OFF by default and out of `edge-min` so the default/edge-min dependency graph is opentelemetry-free
-# and the binary stays small. The concrete exporter crate wiring is a deliberate follow-up; this
-# feature today gates the dep-free export-seam scaffold.
-otlp = []
+# OTLP span export (#99, #352): the feature-gated, non-default export seam. Compiling this in pulls
+# the opentelemetry / opentelemetry-otlp / opentelemetry_sdk tree and wires the bounded-lossy-queue
+# drain into the concrete OTLP-over-the-wire span exporter. Kept OFF by default and out of `edge-min`
+# so the default/edge-min dependency graph is opentelemetry-free and the binary stays small. The
+# optional deps below are pulled ONLY by this feature, so `cargo build` (default) links none of them.
+otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tokio",
+]
 # The size-optimized edge build profile marker (#99, build-dist): a deliberately EMPTY feature that
 # selects the leanest tracing surface. It MUST NOT enable `otlp`, so an `edge-min` build compiles the
 # OTLP export out entirely and the binary shrinks measurably versus an `otlp` build. It is a marker
@@ -39,6 +44,32 @@ ironbus-storage = { path = "../ironbus-storage", version = "0.0.0" }
 # at or below the workspace 1.78 floor.
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "std"] }
+
+# OTLP span export (#99, #352), OPTIONAL and pulled ONLY by the non-default `otlp` feature above, so
+# the DEFAULT and `edge-min` builds link ZERO opentelemetry crates (verify with
+# `cargo tree --edges normal` having no opentelemetry; the SBOM-diff + C-FFI gates run on that
+# default graph and are unchanged). TRANSPORT CHOICE (the #352 C-FFI-minimization decision): the
+# gRPC/tonic exporter with NO TLS feature. OTLP to a co-located collector is plaintext
+# `http://host:4317`, so no TLS stack is linked: this deliberately avoids `rustls` (which pulls the
+# `ring`/`aws-lc-sys` vendored-C/asm crypto the deny.toml `[bans]` denylist forbids) and avoids
+# `native-tls`/`openssl-sys` entirely. The whole pulled tree (tonic, prost, hyper, h2, tower, tokio,
+# http, bytes, ...) is PURE RUST with no `links` key and no C-building build script, so even the
+# `--features otlp` build carries no C-FFI; the only TLS-free transport keeps the otlp build clean,
+# not just the default one. `default-features = false` drops opentelemetry-otlp's default
+# `reqwest`/`http` surface; `grpc-tonic` selects the tonic transport; `trace` scopes the SDK to the
+# span pipeline (no metrics/logs). MSRV: opentelemetry-otlp 0.27 declares MSRV 1.71.1, below the
+# workspace 1.78 floor, and its transitive tree resolves at or under 1.78 (validated by the
+# `msrv (1.78)` CI gate). The opentelemetry tree is Apache-2.0; its transitive licenses are added to
+# the deny.toml allow-list (cargo-deny resolves all-features, so it sees this tree).
+opentelemetry = { version = "0.27", optional = true, default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.27", optional = true, default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.27", optional = true, default-features = false, features = ["grpc-tonic", "trace"] }
+# The OTLP gRPC exporter's batch span processor and the tonic channel need a Tokio runtime; the
+# exporter spins a SMALL current-thread runtime on its own drain thread (NOT the broker's
+# thread-per-core path), so the export IO never touches a core. Optional, `otlp`-only: the default
+# build links no tokio. `rt` + `net` + `time` is the minimal surface (a current-thread runtime, the
+# TCP socket, and the batch timer); no `rt-multi-thread`, no `macros`.
+tokio = { version = "1", optional = true, default-features = false, features = ["rt", "net", "time"] }
 
 [dev-dependencies]
 tempfile = "3"
