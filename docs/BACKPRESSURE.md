@@ -498,7 +498,11 @@ record's logical bytes `r`:
   by shedding new produces once the backlog fills, so an operator who opts into a
   relaxed level for throughput can still cap the worst-case loss in bytes. This is the
   byte-trigger of the `interval` window applied as an ADMISSION gate rather than a
-  periodic flush.
+  periodic flush. OPERATOR NOTE: under the `interval` level, set
+  `wal_fsync_headroom_bytes` >= the interval byte budget (`flush_max_bytes`); a
+  headroom smaller than the interval flush threshold sheds new produces before the
+  interval flush would have drained the backlog (correct and loss-safe, just tighter
+  than intended). Under `sync` there is no such interaction (every commit fsyncs).
 
 ### Safe default and no data loss
 
