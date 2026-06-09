@@ -29,9 +29,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write # create the tag + GitHub Release
-  id-token: write # keyless Sigstore signing via OIDC
-  attestations: write # store the build-provenance attestation
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -59,14 +57,17 @@ jobs:
           # CalVer string used only as a tag + a printed version, never semver-parsed, so the
           # leading zeros are fine.
           DATE="$(date -u +%Y.%m%d)"
-          # N is the per-day build number: count of existing releases whose tag starts with
-          # "$DATE." (so 2026.0609.1, then .2, ...), plus one. The next day's first build, with no
-          # prior "$DATE." releases, computes 1 again, so each day resets.
-          existing="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName \
-            --jq "[.[] | select(.tagName | test(\"^\($DATE)\\\\.\"))] | length")"
-          build=$((existing + 1))
+          # N is the per-day build number: the MAX of the existing same-day build numbers plus
+          # one, NOT count + one. Counting is gap-fragile: a deleted tag, or an operator-created
+          # tag that jumped ahead, would make count+1 collide with an existing tag and
+          # `gh release create` would fail, shipping nothing. max+1 is robust against gaps. The
+          # next day, with no prior "$DATE." releases, max is 0 so the first build is 1, so each
+          # day resets. `startswith` + `split(".")` avoids escaping the date's own dots in a regex.
+          maxn="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName \
+            --jq "[.[].tagName | select(startswith(\"${DATE}.\")) | split(\".\")[-1] | tonumber] | max // 0")"
+          build=$((maxn + 1))
           VERSION="${DATE}.${build}"
-          echo "computed rolling version: $VERSION (existing $DATE.* releases: $existing)"
+          echo "computed rolling version: $VERSION (highest existing $DATE.* build: $maxn)"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
   build:
@@ -144,6 +145,10 @@ jobs:
     name: publish rolling release
     needs: [version, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the tag + GitHub Release
+      id-token: write # keyless Sigstore signing via OIDC
+      attestations: write # store the build-provenance attestation
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
