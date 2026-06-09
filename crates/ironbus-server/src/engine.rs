@@ -1209,17 +1209,11 @@ const GROUP_CKPT_SUFFIX: &str = ".ckpt";
 const GROUP_ATTEMPTS_PREFIX: &str = "attempts-";
 
 /// Lowercase-hex-encodes bytes, for embedding a graphic-ASCII work-group name in a safe,
-/// reversible filename (a name may contain `/`, `:`, etc., which are unsafe in a path).
+/// reversible filename (a name may contain `/`, `:`, etc., which are unsafe in a path). Delegates
+/// to the storage layer's encoder so the engine and the offline admin verbs (#299) share one
+/// implementation and cannot drift on the on-disk checkpoint names.
 fn hex_encode(bytes: &[u8]) -> String {
-    // A 16-entry table indexed by a nibble (0..=15): no `Option`, no fallback, and the index
-    // is provably in bounds, so the encoding cannot silently produce a wrong digit.
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        s.push(char::from(HEX[usize::from(b >> 4)]));
-        s.push(char::from(HEX[usize::from(b & 0x0f)]));
-    }
-    s
+    ironbus_storage::naming::hex_encode(bytes)
 }
 
 /// Decodes lowercase or uppercase hex back to bytes, or `None` if the input is not even-length
@@ -1240,12 +1234,13 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// The durable checkpoint filename for a named work-group: `cursor-<hex(name)>.ckpt`.
+/// The durable checkpoint filename for a named work-group: `cursor-<hex(name)>.ckpt`. Delegates to
+/// the storage layer's canonical name so the engine's writes and the offline admin verbs' rewrites
+/// (#299) target byte-for-byte the same file. Only ever called for a NAMED group here (the default
+/// group uses [`CURSOR_CHECKPOINT`] directly); the storage helper would also map the empty name to
+/// `cursor.ckpt`, which matches [`CURSOR_CHECKPOINT`].
 fn group_checkpoint_name(group: &str) -> String {
-    format!(
-        "{GROUP_CKPT_PREFIX}{}{GROUP_CKPT_SUFFIX}",
-        hex_encode(group.as_bytes())
-    )
+    ironbus_storage::naming::cursor_checkpoint_name(group)
 }
 
 /// The durable per-message attempt-count checkpoint filename for a work-group (#358): the default

@@ -26,6 +26,47 @@ pub fn segment_file_name(segment_id: u64) -> String {
     format!("{PREFIX}{segment_id:016x}{SUFFIX}")
 }
 
+/// The on-disk file name of the default work-group's durable cursor checkpoint (`cursor.ckpt`).
+/// The empty group name is the default; a path-unsafe name in [`cursor_checkpoint_name`] is
+/// lowercase-hex-encoded, so the default and the named files never collide (`cursor.` vs
+/// `cursor-`). This is the SAME name the broker writes (`ironbus-server`'s engine), kept here so
+/// the storage layer (and the offline admin verbs) and the engine agree on one set of names.
+const DEFAULT_CURSOR_CHECKPOINT: &str = "cursor.ckpt";
+/// The filename prefix of a NAMED work-group's durable cursor checkpoint, ahead of the hex name.
+const NAMED_CURSOR_PREFIX: &str = "cursor-";
+/// The filename suffix of a named work-group's durable cursor checkpoint.
+const NAMED_CURSOR_SUFFIX: &str = ".ckpt";
+
+/// The durable cursor-checkpoint file name for a work-group: `cursor.ckpt` for the default group
+/// (the empty name), else `cursor-<hex(name)>.ckpt` with the name lowercase-hex-encoded so a
+/// path-unsafe character (`/`, `:`, ...) never reaches the filesystem. This is the canonical name
+/// the broker writes and the offline admin verbs (consumer-reset, #299) rewrite.
+#[must_use]
+pub fn cursor_checkpoint_name(group: &str) -> String {
+    if group.is_empty() {
+        DEFAULT_CURSOR_CHECKPOINT.to_string()
+    } else {
+        format!(
+            "{NAMED_CURSOR_PREFIX}{}{NAMED_CURSOR_SUFFIX}",
+            hex_encode(group.as_bytes())
+        )
+    }
+}
+
+/// Lowercase-hex-encodes bytes, for embedding a graphic-ASCII work-group name in a safe,
+/// reversible filename. A 16-entry nibble table makes the encoding total (no fallback, the index
+/// is provably in bounds), so it can never silently emit a wrong digit.
+#[must_use]
+pub fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(char::from(HEX[usize::from(b >> 4)]));
+        s.push(char::from(HEX[usize::from(b & 0x0f)]));
+    }
+    s
+}
+
 /// Parses a segment file name back to its segment id, returning `None` for any name
 /// that is not a canonical segment file (any foreign file in the data directory).
 ///
@@ -77,6 +118,27 @@ mod tests {
         assert_eq!(segment_file_name(1), "seg-0000000000000001.log");
         assert_eq!(segment_file_name(255), "seg-00000000000000ff.log");
         assert_eq!(segment_file_name(u64::MAX), "seg-ffffffffffffffff.log");
+    }
+
+    #[test]
+    fn cursor_checkpoint_names_match_the_brokers() {
+        // The default group is `cursor.ckpt`; a named group is `cursor-<hex(name)>.ckpt`. These are
+        // the exact names the broker engine writes, so the offline consumer-reset rewrites the same
+        // file the broker resumes from.
+        assert_eq!(cursor_checkpoint_name(""), "cursor.ckpt");
+        assert_eq!(cursor_checkpoint_name("orders"), "cursor-6f7264657273.ckpt");
+        // A path-unsafe name is hex-encoded, never reaching the filesystem as `/` or `:`.
+        assert_eq!(cursor_checkpoint_name("a/b"), "cursor-612f62.ckpt");
+        // The default and named forms can never collide (`cursor.` vs `cursor-`).
+        assert!(cursor_checkpoint_name("").starts_with("cursor."));
+        assert!(cursor_checkpoint_name("x").starts_with("cursor-"));
+    }
+
+    #[test]
+    fn hex_encode_is_lowercase_and_two_digits_per_byte() {
+        assert_eq!(hex_encode(b""), "");
+        assert_eq!(hex_encode(&[0x00, 0x0f, 0xff]), "000fff");
+        assert_eq!(hex_encode(b"AB"), "4142");
     }
 
     #[test]

@@ -73,6 +73,12 @@ pub struct DlqEntry {
     pub headers: Vec<u8>,
     /// The original record's payload (preserved verbatim).
     pub payload: Vec<u8>,
+    /// The stored DLQ record's flags. The payload is preserved VERBATIM (compressed if the original
+    /// was, since the sink never decodes it), so the `COMPRESSED` bit here MUST be carried back to a
+    /// redriven record or the consumer would receive a compressed stream labeled uncompressed. The
+    /// re-derivable bits (`HAS_KEY`, `HAS_XXH3`) are recomputed by the main-log append, so a redrive
+    /// masks this to the content flags it must preserve.
+    pub original_flags: RecordFlags,
 }
 
 /// Encodes the dead-letter metadata header followed by the original headers, the blob that becomes
@@ -181,6 +187,7 @@ pub fn decode_entry(record: &OwnedRecord) -> Option<DlqEntry> {
         key: record.key.clone(),
         headers: meta.original_headers,
         payload: record.payload.clone(),
+        original_flags: record.flags,
     })
 }
 

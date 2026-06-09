@@ -77,6 +77,13 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
+// The offline mutating-admin reset target (#299). The enum is platform-independent (a plain choice
+// of offset/earliest/latest), so it is imported unconditionally: the cross-platform flag parser,
+// the unit tests, the Unix `cmd_admin_consumer_reset`, and its non-Unix stub all name it. The
+// actual data-dir mutation (`reset_consumer`/`redrive_dlq`, which open the on-disk store) is
+// Unix-only, alongside the rest of the storage path.
+use ironbus_storage::admin::ResetTarget;
+
 #[cfg(unix)]
 use ironbus_core::delivery::DeliveryConfig;
 #[cfg(unix)]
@@ -640,6 +647,8 @@ USAGE:
                   [--ack | --nack [--delay-ms <n>] | --term]
     ironbus cumulative-ack [--addr <host:port>] [--group <name>] --up-to <offset>
     ironbus admin --health-addr <host:port>
+    ironbus admin consumer-reset --data-dir <dir> --group <name> --to <offset|earliest|latest> [--json]
+    ironbus admin dlq-redrive --data-dir <dir> [--json]
     ironbus peek  --data-dir <dir> [--from-offset <n>] [--limit <n>] [--json]
     ironbus dump  --data-dir <dir> [--limit <n>] [--json] [--dlq]
                   [--raw] [--require-dict]
@@ -732,6 +741,17 @@ Notes:
     last-skip-offset, all from the /admin document alone (it never parses a metric name). It sends
     the version-pinning Accept header, so a schema mismatch is a clear error, not a misrender. The
     broker must have been started with --enable-admin; otherwise /admin is a 404 and admin says so.
+    admin consumer-reset and admin dlq-redrive are OFFLINE mutating admin verbs (#299): they operate
+    on a STOPPED broker's --data-dir, taking the same exclusive data-dir lock serve holds, so they
+    refuse (exit 5) if a broker is running and can never race a live writer. consumer-reset rewrites
+    a work-group's durable cursor checkpoint to --to <offset|earliest|latest> (clamped to the durable
+    range; an out-of-range explicit offset is rejected, exit 1) using the broker's exact crash-safe
+    dual-slot checkpoint, so the broker resumes the group from there on its next start. dlq-redrive
+    re-injects the dead-lettered records from the durable DLQ sink back onto the main log (append and
+    fsync the records, then advance a durable redrive watermark), crash-safely and idempotently (a
+    re-run after a completed redrive re-injects nothing). The MUTATING WIRE admin verbs (the same
+    actions on a LIVE broker) and force-reap (reaping stuck leases on a running broker) need
+    connection-scoped auth and are deferred to the authed admin surface (#380/#106).
     pub reads the payload from the argument, or from stdin if omitted (an empty input
     publishes an empty message, which is a valid record).
     sub prints one line per message; at most one disposition applies to the batch:
@@ -3550,6 +3570,25 @@ const DEFAULT_PEEK_LIMIT: u64 = 10;
 /// cannot be reached; [`CliError::Internal`] if the response is not a usable admin v1 body (e.g.
 /// `/admin` is not enabled, or the broker serves a different schema version).
 fn run_admin(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    // The MUTATING offline admin subverbs (#299) are dispatched by a leading subcommand word, ahead
+    // of the read-only `/admin` introspection (which takes only flags). The mutating WIRE verbs (an
+    // online consumer-reset/dlq-redrive on a LIVE broker) and FORCE-REAP are DEFERRED to the authed
+    // admin surface (#380/#106): a mutating surface over the wire needs connection-scoped auth, so
+    // only the auth-free OFFLINE (broker-stopped, data-dir) subset ships here.
+    match args.first().map(String::as_str) {
+        Some("consumer-reset") => return run_admin_consumer_reset(&args[1..], out),
+        Some("dlq-redrive") => return run_admin_dlq_redrive(&args[1..], out),
+        Some("force-reap") => {
+            return Err(CliError::Usage(
+                "admin force-reap reaps stuck leases on a LIVE broker, an online authenticated \
+                 operation deferred to the authed admin surface (#380); there are no live leases \
+                 to reap offline"
+                    .to_string(),
+            ));
+        }
+        _ => {}
+    }
+    // No mutating subverb: the read-only `/admin` introspection (#15, #99), which takes only flags.
     let mut health_addr: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
@@ -3574,6 +3613,120 @@ fn run_admin(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         )
     })?;
     cmd_admin(&health_addr, out)
+}
+
+/// Parses and runs `admin consumer-reset` (#299): the OFFLINE consumer reset. It rewrites a
+/// work-group's durable cursor checkpoint to a chosen offset (`--to <offset|earliest|latest>`),
+/// clamped to the durable range `[earliest_retained, head]`, reusing the broker's exact dual-slot
+/// CRC checkpoint + `AckCursor` snapshot codecs. The broker MUST be STOPPED: this takes the same
+/// exclusive data-dir lock `serve` holds and refuses (exit 5) if a broker is running, so a reset
+/// can never race a live writer. An out-of-range explicit offset is rejected (exit 1).
+///
+/// # Errors
+/// [`CliError::Usage`] for a bad flag, a missing `--data-dir`/`--group`/`--to`, or an out-of-range
+/// target; [`CliError::NotFound`] (exit 2) if the data dir is absent; [`CliError::Unreachable`]
+/// (exit 5) if a broker holds the lock; [`CliError::Corrupt`] (exit 4) if the chain is unreadable;
+/// [`CliError::Internal`] (exit 70) on an IO fault.
+fn run_admin_consumer_reset(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let mut data_dir: Option<String> = None;
+    let mut group: Option<String> = None;
+    let mut to: Option<String> = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data-dir" => data_dir = Some(take_value("--data-dir", args, &mut i)?),
+            "--group" => group = Some(take_value("--group", args, &mut i)?),
+            "--to" => to = Some(take_value("--to", args, &mut i)?),
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!(
+                    "unknown flag `{flag}` for admin consumer-reset"
+                )));
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "admin consumer-reset takes no positional arguments, got `{other}`"
+                )));
+            }
+        }
+    }
+    let data_dir = data_dir.ok_or_else(|| {
+        CliError::Usage("admin consumer-reset requires `--data-dir <dir>`".to_string())
+    })?;
+    // The group is REQUIRED but may be the empty string (the default group): an operator must name
+    // the group explicitly so a reset is never applied to the wrong cursor by omission. Pass
+    // `--group ""` for the default group.
+    let group = group.ok_or_else(|| {
+        CliError::Usage(
+            "admin consumer-reset requires `--group <name>` (use --group \"\" for the default group)"
+                .to_string(),
+        )
+    })?;
+    let to = to.ok_or_else(|| {
+        CliError::Usage("admin consumer-reset requires `--to <offset|earliest|latest>`".to_string())
+    })?;
+    let target = parse_reset_target(&to)?;
+    cmd_admin_consumer_reset(Path::new(&data_dir), &group, target, json, out)
+}
+
+/// Parses an `admin consumer-reset --to` value: a bare unsigned offset, or the `earliest`/`latest`
+/// keywords (case-insensitive), into a storage [`ResetTarget`]. A non-numeric, non-keyword value is
+/// a usage error naming the offending input. Platform-independent (pure string parsing into a plain
+/// enum); only the data-dir mutation it feeds is Unix-gated.
+fn parse_reset_target(raw: &str) -> Result<ResetTarget, CliError> {
+    match raw.to_ascii_lowercase().as_str() {
+        "earliest" => Ok(ResetTarget::Earliest),
+        "latest" => Ok(ResetTarget::Latest),
+        _ => raw.parse::<u64>().map(ResetTarget::Offset).map_err(|_| {
+            CliError::Usage(format!(
+                "`--to` needs an offset, `earliest`, or `latest`, got `{raw}`"
+            ))
+        }),
+    }
+}
+
+/// Parses and runs `admin dlq-redrive` (#299): the OFFLINE DLQ redrive. It re-injects the
+/// dead-lettered records from the durable DLQ sink (`dlq/`) back onto the main log, crash-safely
+/// (append+fsync the records, then advance a durable redrive watermark) and idempotently (a re-run
+/// after a completed redrive re-injects nothing). The broker MUST be STOPPED: it takes the
+/// exclusive data-dir lock and refuses (exit 5) if a broker is running.
+///
+/// # Errors
+/// [`CliError::Usage`] for a bad flag or a missing `--data-dir`; [`CliError::NotFound`] (exit 2)
+/// if the data dir is absent; [`CliError::Unreachable`] (exit 5) if a broker holds the lock;
+/// [`CliError::Corrupt`] (exit 4) if the chain is unreadable; [`CliError::Internal`] (exit 70) on
+/// an IO fault.
+fn run_admin_dlq_redrive(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let mut data_dir: Option<String> = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data-dir" => data_dir = Some(take_value("--data-dir", args, &mut i)?),
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!(
+                    "unknown flag `{flag}` for admin dlq-redrive"
+                )));
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "admin dlq-redrive takes no positional arguments, got `{other}`"
+                )));
+            }
+        }
+    }
+    let data_dir = data_dir.ok_or_else(|| {
+        CliError::Usage("admin dlq-redrive requires `--data-dir <dir>`".to_string())
+    })?;
+    cmd_admin_dlq_redrive(Path::new(&data_dir), json, out)
 }
 
 /// Fetches and renders the `/admin` v1 view (#15, #99). Kept apart from [`run_admin`] (the flag
@@ -4632,6 +4785,202 @@ fn cmd_repair(
     ))
 }
 
+/// The current schema version of the `admin consumer-reset` `--json` result object
+/// (`ironbus.cli.admin-consumer-reset.vN`), per [`docs/CLI_CONTRACT.md`]. Append-only: a new
+/// OPTIONAL field is additive (no bump); a rename/removal/type-change bumps this. Registered in
+/// `docs/compat/versions.md`.
+#[cfg(unix)]
+const ADMIN_CONSUMER_RESET_SCHEMA_VERSION: u32 = 1;
+/// The current schema version of the `admin dlq-redrive` `--json` result object
+/// (`ironbus.cli.admin-dlq-redrive.vN`). Same bump rule.
+#[cfg(unix)]
+const ADMIN_DLQ_REDRIVE_SCHEMA_VERSION: u32 = 1;
+
+/// Maps a storage [`ironbus_storage::admin::AdminError`] onto the frozen CLI exit-code scheme: an
+/// out-of-range reset target is a usage error (exit 1, the operator asked for an offset that does
+/// not exist), and a storage fault is classified exactly as the read-only offline verbs classify it
+/// (missing dir -> 2, corrupt chain -> 4, IO fault -> 70).
+#[cfg(unix)]
+fn map_admin_err(data_dir: &Path, e: ironbus_storage::admin::AdminError) -> CliError {
+    use ironbus_storage::admin::AdminError;
+    match e {
+        AdminError::OutOfRange { .. } | AdminError::InvalidGroup(_) => {
+            CliError::Usage(e.to_string())
+        }
+        AdminError::Storage(s) => map_offline_err(data_dir, &s),
+    }
+}
+
+/// Takes the exclusive data-dir lock the way `repair --apply` does, so an offline mutating admin
+/// verb (#299) can never race a LIVE broker: a running broker holds the lock, so this fails fast
+/// with exit 5 and changes nothing (the broker-stopped contract). A missing dir is exit 2, a
+/// non-directory or unwritable path the usual `map_dir_error` mapping. Returns the held lock, kept
+/// alive for the caller's mutation and released by `close(2)` on drop.
+#[cfg(unix)]
+fn lock_stopped_broker(data_dir: &Path, verb: &str) -> Result<dirlock::DirLock, CliError> {
+    if !data_dir.exists() {
+        return Err(CliError::NotFound(format!(
+            "no data directory at {}",
+            data_dir.display()
+        )));
+    }
+    dirlock::prepare_data_dir(data_dir).map_err(|e| map_dir_error(&e))?;
+    dirlock::DirLock::acquire(data_dir).map_err(|e| match e {
+        dirlock::DirError::AlreadyLocked(_) => CliError::Unreachable(format!(
+            "cannot {verb} {}: a broker holds its exclusive lock (stop the broker first)",
+            data_dir.display()
+        )),
+        other => map_dir_error(&other),
+    })
+}
+
+/// Runs `admin consumer-reset` (#299): the OFFLINE consumer reset, under the exclusive data-dir
+/// lock. Rewrites the group's durable cursor checkpoint to the resolved, range-clamped offset using
+/// the broker's exact codecs, then writes the versioned result (human or
+/// `ironbus.cli.admin-consumer-reset.v1`).
+#[cfg(unix)]
+fn cmd_admin_consumer_reset(
+    data_dir: &Path,
+    group: &str,
+    target: ResetTarget,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    // Take the lock FIRST so a running broker blocks us (exit 5) before any read or write.
+    let _lock = lock_stopped_broker(data_dir, "reset the consumer of")?;
+    let (outcome, _fs) =
+        ironbus_storage::admin::reset_consumer(StdFs::new(data_dir.to_path_buf()), group, target)
+            .map_err(|e| map_admin_err(data_dir, e))?;
+    write_consumer_reset_result(data_dir, group, &outcome, json, out)
+}
+
+/// Writes the `admin consumer-reset` result: the human line or the versioned
+/// `ironbus.cli.admin-consumer-reset.v1` `--json` object. Emitted on the success path (exit 0); a
+/// rejected target or a storage fault returned earlier as a typed error.
+#[cfg(unix)]
+fn write_consumer_reset_result(
+    data_dir: &Path,
+    group: &str,
+    outcome: &ironbus_storage::admin::ResetOutcome,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    if json {
+        write!(
+            out,
+            "{{\"schema\":\"ironbus.cli.admin-consumer-reset.v{ADMIN_CONSUMER_RESET_SCHEMA_VERSION}\",\"data_dir\":\"{}\",\"group\":\"{}\",\"committed\":{},",
+            escape_json(&data_dir.display().to_string()),
+            escape_json(group),
+            outcome.committed,
+        )?;
+        match outcome.previous_committed {
+            Some(p) => write!(out, "\"previous_committed\":{p},")?,
+            None => write!(out, "\"previous_committed\":null,")?,
+        }
+        writeln!(
+            out,
+            "\"earliest_retained\":{},\"head\":{},\"ok\":true,\"exit_code\":0}}",
+            outcome.earliest_retained, outcome.head,
+        )?;
+    } else {
+        let group_label = if group.is_empty() {
+            "(default)".to_string()
+        } else {
+            format!("{group:?}")
+        };
+        let from = outcome
+            .previous_committed
+            .map_or_else(|| "(none)".to_string(), |p| p.to_string());
+        writeln!(
+            out,
+            "admin consumer-reset: group {group_label} cursor {from} -> {} (durable range [{}, {}])",
+            outcome.committed, outcome.earliest_retained, outcome.head,
+        )?;
+    }
+    Ok(())
+}
+
+/// Runs `admin dlq-redrive` (#299): the OFFLINE DLQ redrive, under the exclusive data-dir lock.
+/// Re-injects the un-redriven DLQ records onto the main log crash-safely and idempotently, then
+/// writes the versioned result (human or `ironbus.cli.admin-dlq-redrive.v1`).
+#[cfg(unix)]
+fn cmd_admin_dlq_redrive(
+    data_dir: &Path,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let _lock = lock_stopped_broker(data_dir, "redrive the DLQ of")?;
+    let (outcome, _fs) = ironbus_storage::admin::redrive_dlq(
+        StdFs::new(data_dir.to_path_buf()),
+        SystemClock::new(),
+        LogConfig::default(),
+    )
+    .map_err(|e| map_admin_err(data_dir, e))?;
+    write_dlq_redrive_result(data_dir, &outcome, json, out)
+}
+
+/// Writes the `admin dlq-redrive` result: the human line or the versioned
+/// `ironbus.cli.admin-dlq-redrive.v1` `--json` object (exit 0 on success, including the idempotent
+/// zero-redriven re-run).
+#[cfg(unix)]
+fn write_dlq_redrive_result(
+    data_dir: &Path,
+    outcome: &ironbus_storage::admin::RedriveOutcome,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    if json {
+        writeln!(
+            out,
+            "{{\"schema\":\"ironbus.cli.admin-dlq-redrive.v{ADMIN_DLQ_REDRIVE_SCHEMA_VERSION}\",\"data_dir\":\"{}\",\"redriven\":{},\"dlq_records\":{},\"already_redriven\":{},\"ok\":true,\"exit_code\":0}}",
+            escape_json(&data_dir.display().to_string()),
+            outcome.redriven,
+            outcome.dlq_records,
+            outcome.already_redriven,
+        )?;
+    } else {
+        writeln!(
+            out,
+            "admin dlq-redrive: re-injected {} of {} DLQ record(s) onto the main log ({} already redriven)",
+            outcome.redriven, outcome.dlq_records, outcome.already_redriven,
+        )?;
+    }
+    Ok(())
+}
+
+/// `admin consumer-reset` requires Unix in v1 (the on-disk storage and the exclusive `flock(2)`
+/// lock are POSIX), like `scrub`/`repair`. The stub consumes every parameter so the Windows
+/// `-D warnings` build stays clean.
+#[cfg(not(unix))]
+fn cmd_admin_consumer_reset(
+    data_dir: &Path,
+    group: &str,
+    target: ResetTarget,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let _ = (data_dir, group, target, json, out);
+    Err(CliError::Internal(
+        "ironbus admin consumer-reset requires a Unix host in v1: on-disk storage is Unix-only"
+            .to_string(),
+    ))
+}
+
+/// `admin dlq-redrive` requires Unix in v1, for the same reason as `admin consumer-reset`. The stub
+/// consumes every parameter.
+#[cfg(not(unix))]
+fn cmd_admin_dlq_redrive(
+    data_dir: &Path,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let _ = (data_dir, json, out);
+    Err(CliError::Internal(
+        "ironbus admin dlq-redrive requires a Unix host in v1: on-disk storage is Unix-only"
+            .to_string(),
+    ))
+}
+
 /// Maps an upgrade/rollback error to the frozen exit-code scheme: a missing rollback copy is a
 /// usage error (1; the operator asked to roll back where nothing was upgraded), an IO fault is
 /// internal (70).
@@ -5548,6 +5897,387 @@ mod tests {
         }
         drop(engine);
         dir
+    }
+
+    // --- offline mutating admin verbs (#299) ---
+
+    /// A reset/redrive run over `args`, capturing stdout and the exit code, for the admin tests.
+    #[cfg(unix)]
+    fn run_admin_verb(args: &[&str]) -> (String, u8) {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let mut buf = Vec::new();
+        match run(&owned, &mut buf) {
+            Ok(()) => (String::from_utf8(buf).unwrap(), 0),
+            Err(e) => (String::from_utf8(buf).unwrap(), e.exit_code()),
+        }
+    }
+
+    /// Reads a group's durable committed offset back from its cursor checkpoint, proving the broker
+    /// (or an `OfflineReader`) resumes from where the reset wrote it.
+    #[cfg(unix)]
+    fn read_committed_offset(dir: &std::path::Path, group: &str) -> Option<u64> {
+        use ironbus_core::cursor::AckCursor;
+        use ironbus_storage::checkpoint::Checkpoint;
+        use ironbus_storage::fs::Filesystem;
+        use ironbus_storage::naming::cursor_checkpoint_name;
+        let fs = StdFs::new(dir.to_path_buf());
+        let name = cursor_checkpoint_name(group);
+        if !fs.exists(&name).unwrap() {
+            return None;
+        }
+        let (_, recovered) = Checkpoint::open(fs.open(&name).unwrap()).unwrap();
+        let payload = recovered?;
+        Some(
+            AckCursor::decode_snapshot(&payload)
+                .unwrap()
+                .committed()
+                .get(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_consumer_reset_rewrites_the_cursor_and_emits_the_versioned_json() {
+        let dir = make_data_dir("admin-reset", 10);
+        let (out, code) = run_admin_verb(&[
+            "admin",
+            "consumer-reset",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--group",
+            "orders",
+            "--to",
+            "4",
+            "--json",
+        ]);
+        assert_eq!(code, 0, "{out}");
+        assert!(
+            out.contains("\"schema\":\"ironbus.cli.admin-consumer-reset.v1\""),
+            "carries the versioned schema: {out}"
+        );
+        assert!(out.contains("\"committed\":4"), "{out}");
+        assert!(out.contains("\"head\":10"), "{out}");
+        assert!(out.contains("\"ok\":true,\"exit_code\":0"), "{out}");
+        // The cursor the broker resumes from is now exactly 4.
+        assert_eq!(read_committed_offset(&dir, "orders"), Some(4));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_broker_resumes_a_named_group_from_the_reset_offset() {
+        // The teeth: after an offline reset of a NAMED group, the REAL engine rediscovers the group
+        // at open and resumes it from the rewritten cursor (clamped to the durable range). This
+        // proves the reset wrote a cursor the broker reads natively, not just bytes we can decode.
+        let dir = make_data_dir("admin-reset-resume", 12);
+        let (_o, code) = run_admin_verb(&[
+            "admin",
+            "consumer-reset",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--group",
+            "orders",
+            "--to",
+            "7",
+        ]);
+        assert_eq!(code, 0);
+
+        let engine = open_disk_engine(&dir, &test_serve_config(64, 1), &[], &[]).unwrap();
+        assert_eq!(
+            engine.committed_offset_in("orders"),
+            ironbus_core::types::Offset::new(7),
+            "the broker resumes the named group from the reset offset"
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_consumer_reset_earliest_and_latest_hit_the_range_ends() {
+        let dir = make_data_dir("admin-reset-ends", 6);
+        let (_o, c1) = run_admin_verb(&[
+            "admin",
+            "consumer-reset",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--group",
+            "g",
+            "--to",
+            "latest",
+        ]);
+        assert_eq!(c1, 0);
+        assert_eq!(
+            read_committed_offset(&dir, "g"),
+            Some(6),
+            "latest is the head"
+        );
+        let (_o, c2) = run_admin_verb(&[
+            "admin",
+            "consumer-reset",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--group",
+            "g",
+            "--to",
+            "earliest",
+        ]);
+        assert_eq!(c2, 0);
+        assert_eq!(
+            read_committed_offset(&dir, "g"),
+            Some(0),
+            "earliest is offset 0"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_consumer_reset_out_of_range_is_a_usage_error_and_writes_nothing() {
+        let dir = make_data_dir("admin-reset-oor", 5);
+        let (out, code) = run_admin_verb(&[
+            "admin",
+            "consumer-reset",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--group",
+            "g",
+            "--to",
+            "99",
+            "--json",
+        ]);
+        assert_eq!(code, EXIT_USAGE, "out-of-range is a usage error: {out}");
+        // A rejected reset wrote no cursor file (no stdout JSON either, since it failed before write).
+        assert_eq!(
+            read_committed_offset(&dir, "g"),
+            None,
+            "no cursor was written"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_consumer_reset_rejects_a_group_name_the_broker_would_skip() {
+        // A non-graphic group name (here, a space) is one the engine's group discovery would skip,
+        // so the reset refuses it as a usage error rather than writing an ignored cursor.
+        let dir = make_data_dir("admin-reset-badgroup", 4);
+        let (out, code) = run_admin_verb(&[
+            "admin",
+            "consumer-reset",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--group",
+            "bad name",
+            "--to",
+            "0",
+        ]);
+        assert_eq!(code, EXIT_USAGE, "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_consumer_reset_refuses_a_running_broker() {
+        // A broker holds the exclusive data-dir lock: the offline reset must fail fast with exit 5
+        // (unreachable / stop-the-broker-first), never touching the cursor.
+        let dir = make_data_dir("admin-reset-locked", 5);
+        dirlock::prepare_data_dir(&dir).unwrap();
+        let held = dirlock::DirLock::acquire(&dir).unwrap();
+        let (out, code) = run_admin_verb(&[
+            "admin",
+            "consumer-reset",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--group",
+            "g",
+            "--to",
+            "2",
+        ]);
+        assert_eq!(
+            code, EXIT_UNREACHABLE,
+            "a running broker blocks the reset: {out}"
+        );
+        assert_eq!(
+            read_committed_offset(&dir, "g"),
+            None,
+            "the cursor was not touched"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_consumer_reset_missing_data_dir_is_not_found() {
+        let dir = std::env::temp_dir().join(format!(
+            "ironbus-cli-admin-reset-absent-{}-xyz",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_o, code) = run_admin_verb(&[
+            "admin",
+            "consumer-reset",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--group",
+            "g",
+            "--to",
+            "0",
+        ]);
+        assert_eq!(code, EXIT_NOT_FOUND);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_consumer_reset_requires_group_and_to() {
+        let dir = make_data_dir("admin-reset-args", 3);
+        // Missing --group.
+        let (_o, c1) = run_admin_verb(&[
+            "admin",
+            "consumer-reset",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--to",
+            "0",
+        ]);
+        assert_eq!(c1, EXIT_USAGE);
+        // Missing --to.
+        let (_o, c2) = run_admin_verb(&[
+            "admin",
+            "consumer-reset",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--group",
+            "g",
+        ]);
+        assert_eq!(c2, EXIT_USAGE);
+        // A bad --to value.
+        let (_o, c3) = run_admin_verb(&[
+            "admin",
+            "consumer-reset",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--group",
+            "g",
+            "--to",
+            "banana",
+        ]);
+        assert_eq!(c3, EXIT_USAGE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dead-letters `poison` records into the data directory's DLQ sink (the broker's exact sink),
+    /// so the redrive verb has poison to re-inject.
+    #[cfg(unix)]
+    fn seed_dlq(dir: &std::path::Path, poison: u64) {
+        use ironbus_core::types::{Offset, Seq};
+        use ironbus_storage::dlq::DlqSink;
+        use ironbus_storage::segment::OwnedRecord;
+        let fs = StdFs::new(dir.to_path_buf());
+        let mut sink = DlqSink::open(&fs, SystemClock::new(), LogConfig::default()).unwrap();
+        for i in 0..poison {
+            let src = OwnedRecord {
+                offset: Offset::new(500 + i),
+                seq: Seq::new(500 + i),
+                timestamp_ms: 7000 + i,
+                flags: RecordFlags::EMPTY,
+                key: b"pk".to_vec(),
+                headers: b"".to_vec(),
+                payload: format!("poison-{i}").into_bytes(),
+            };
+            sink.append_poison("orders", &src, 6).unwrap();
+        }
+    }
+
+    /// Counts the durable main-log records in the data directory (offline), for the redrive assertions.
+    #[cfg(unix)]
+    fn main_log_len(dir: &std::path::Path) -> u64 {
+        let reader = OfflineReader::open(StdFs::new(dir.to_path_buf())).unwrap();
+        let mut n = 0u64;
+        for &id in reader.segment_ids() {
+            n += reader.read_segment(id).unwrap().len() as u64;
+        }
+        n
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_dlq_redrive_re_injects_and_is_idempotent() {
+        let dir = make_data_dir("admin-redrive", 3);
+        seed_dlq(&dir, 4);
+        let before = main_log_len(&dir);
+
+        let (out, code) = run_admin_verb(&[
+            "admin",
+            "dlq-redrive",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--json",
+        ]);
+        assert_eq!(code, 0, "{out}");
+        assert!(
+            out.contains("\"schema\":\"ironbus.cli.admin-dlq-redrive.v1\""),
+            "versioned schema: {out}"
+        );
+        assert!(out.contains("\"redriven\":4"), "{out}");
+        assert!(out.contains("\"dlq_records\":4"), "{out}");
+        assert!(out.contains("\"already_redriven\":0"), "{out}");
+        assert_eq!(
+            main_log_len(&dir),
+            before + 4,
+            "the 4 poison records re-injected"
+        );
+
+        // A re-run after a completed redrive re-injects NOTHING (idempotent, no duplicates).
+        let (out2, code2) = run_admin_verb(&[
+            "admin",
+            "dlq-redrive",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--json",
+        ]);
+        assert_eq!(code2, 0, "{out2}");
+        assert!(
+            out2.contains("\"redriven\":0"),
+            "a re-run redrives nothing: {out2}"
+        );
+        assert!(out2.contains("\"already_redriven\":4"), "{out2}");
+        assert_eq!(
+            main_log_len(&dir),
+            before + 4,
+            "no duplicates on the re-run"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_dlq_redrive_refuses_a_running_broker() {
+        let dir = make_data_dir("admin-redrive-locked", 2);
+        seed_dlq(&dir, 2);
+        let before = main_log_len(&dir);
+        dirlock::prepare_data_dir(&dir).unwrap();
+        let held = dirlock::DirLock::acquire(&dir).unwrap();
+        let (out, code) =
+            run_admin_verb(&["admin", "dlq-redrive", "--data-dir", dir.to_str().unwrap()]);
+        assert_eq!(
+            code, EXIT_UNREACHABLE,
+            "a running broker blocks redrive: {out}"
+        );
+        drop(held);
+        assert_eq!(main_log_len(&dir), before, "the main log was not touched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_force_reap_is_deferred_to_the_authed_surface() {
+        // force-reap reaps stuck leases on a LIVE broker (online + auth); it is a clean usage error
+        // here, naming the deferral, never a silent no-op.
+        let (out, code) = run_admin_verb(&["admin", "force-reap", "--data-dir", "/tmp/whatever"]);
+        assert_eq!(code, EXIT_USAGE);
+        let _ = out;
     }
 
     #[cfg(unix)]
