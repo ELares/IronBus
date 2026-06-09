@@ -1,11 +1,17 @@
 # Optional key-based log compaction (the no-manifest design)
 
-This document is the DESIGN spec for IronBus's optional, opt-in, Kafka-style KEY-BASED
-log compaction (#83, parent #13). It is SPECIFIED, NOT YET IMPLEMENTED: no compaction
-code exists in the source today (verified absent; the WAL doc lists it under
-[Specified but not yet implemented](WAL.md#specified-but-not-yet-implemented), and #135's
-optional compactor is unbuilt). This doc pins the contract so the future implementation
-has one honest target.
+This document is the spec for IronBus's optional, opt-in, Kafka-style KEY-BASED log
+compaction (#83, parent #13). It is now IMPLEMENTED (#337): the cleaner, the v2 compacted
+segment format, the atomic swap, the fail-closed `version=2` bump, the overlapping-range
+recovery, and the sparse-offset read path are all in the source. The implementation lives in
+`crates/ironbus-storage/src/compaction.rs` (the cleaner and the trigger), the v2 format consts
+and the `CompactionMeta` block in `crates/ironbus-core/src/{format,segment}.rs`, the
+compacted-segment writer/reader and the overlapping-range recovery in
+`crates/ironbus-storage/src/{segment,log}.rs`, and the off-hot-path wiring plus the
+sparse-offset poll in `crates/ironbus-server/src/engine.rs`. It is OFF by default
+(`serve --compact` / `Engine::set_compaction_config`). This doc remains the
+behavior-and-contract reference; the byte layouts are in [CONTRACTS.md](CONTRACTS.md) and the
+registry rows in [compat/versions.md](compat/versions.md).
 
 It is a behavior-and-format document, not a byte-layout reference. For the exact on-disk
 record, segment, and footer byte layouts see [CONTRACTS.md](CONTRACTS.md); for the file
@@ -440,9 +446,19 @@ key-mapping and flash-bound rewriting). The cleaner is therefore:
 
 ## Honest limits and what is deliberately deferred
 
-- **Specified, not implemented.** No code exists. The COMPACTED header flag, the v2
-  compaction-metadata footer block, the covered-range recovery rules, the sparse-offset read
-  path, the `Compacted` skip reason, and the cleaner are all unbuilt. This doc is the target.
+- **Implemented (#337).** The COMPACTED header flag, the v2 compaction-metadata footer block,
+  the covered-range recovery rules, the sparse-offset read/skip path (a reader and the engine
+  poll skip a compacted hole), the `Compacted` gap-reason CODE (`gap_reason::COMPACTED = 2`), and
+  the cleaner are all built. What is deliberately DEFERRED as a safe follow-up (the core is
+  complete): the consumer-facing EMISSION of `GapMarker(reason = COMPACTED)` when a gap-marker-
+  capable consumer reads across a compacted hole (today the engine advances the cursor SILENTLY;
+  the reason code and the #346 frame are ready, the emission is tracked in #411, and it is NOT a
+  loss or correctness gap, the cursor still reaches head with the correct latest-value view), the
+  advanced `min_dirty_ratio` BYTE accounting (count is shipped; bytes is the better flash-cost
+  proxy, an open question below), a standalone `ironbus compact` CLI verb (the off-hot-path engine
+  pass and the `serve --compact` knob are shipped), and the explicit TOMBSTONE flag bit (the
+  empty-payload convention is shipped). None of those affect the crash-safety or the format, which
+  are complete and correct.
 - **It costs CPU and flash; it is for changelog topics only.** Stated up front; restated here.
   A general durable queue should leave it OFF.
 - **It forces a format-version bump.** A broker that has ever written a compacted segment
@@ -477,20 +493,32 @@ key-mapping and flash-bound rewriting). The cleaner is therefore:
 
 ---
 
-## Where this will be verified (when implemented)
+## Where this is verified
 
 - Survivor selection (last-value-per-key, tombstone TTL, keyless carry-through, no reorder, no
-  offset rewrite): compactor unit tests over crafted multi-segment inputs.
+  offset rewrite): `crates/ironbus-storage/src/compaction.rs` unit tests
+  (`compaction_keeps_latest_per_key_at_original_offsets_drops_superseded`,
+  `a_tombstone_within_ttl_is_kept_then_dropped_when_aged_out`).
 - Crash-before / crash-after the commit point recovering via longest-valid-prefix with no
-  special repair: a fault-injection test in the crash-recovery sweep
-  (`crates/ironbus-storage/tests/crash_recovery.rs`), injecting a power loss at the directory
-  fsync (commit point) and mid-retire, asserting the originals win before and the compacted
-  segment wins after, with no `LossReport` event either way.
-- Open readers never read freed data during retire: a reader holding an open handle to an
-  original drains it after the rename-then-unlink (the same discipline the reaper already uses).
-- Sparse-offset read / skip-the-gap and the `Compacted` skip reason as a #59 SkipEvent reason
-  (never a recovery `LossEvent`, so never in the loss-bytes counters): read-path and #59
-  SkipEvent tests.
-- The cleaner off by default, rate-limited, and append-priority: an engine test that a produce
-  is never blocked behind a compaction fsync (the sync-gating fault fs the #177 actor test
-  already uses).
+  special repair: `crates/ironbus-storage/tests/compaction_crash.rs`, injecting a `sync_dir`
+  failure at the directory fsync (the commit point) and mid-retire via the fault fs, asserting
+  the originals win before (`crash_before_the_commit_point_keeps_the_originals`) and the
+  compacted segment wins after (`crash_after_the_commit_during_retire_keeps_the_compacted_set`),
+  with no `LossReport` event either way, and that before-vs-after recover IDENTICALLY
+  (`recovery_is_identical_whether_the_crash_was_before_or_after_a_full_retire`).
+- The v2 fail-closed bump: a v1-only reader REFUSES a compacted segment on disk
+  (`a_v1_only_reader_fails_closed_on_a_compacted_segment_on_disk`, plus the core
+  `a_v1_only_reader_fails_closed_on_a_compacted_header`). A v1 segment is byte-identical
+  (`a_non_compacted_header_is_byte_identical_to_v1`).
+- Open readers never read freed data during retire: the in-memory disk keeps an open handle's
+  inode alive after the unlink-then-dir-fsync (the same discipline the reaper already uses), so a
+  drained read never reads freed bytes.
+- Sparse-offset read / skip-the-gap (never a recovery `LossEvent`, so never in the loss-bytes
+  counters): the storage read path skips an absent offset, and the engine poll advances the cursor
+  past a compacted hole (`compaction_off_by_default_and_opt_in_skips_holes_on_poll` in
+  `crates/ironbus-server/src/engine.rs`). The advance is SILENT today; emitting the consumer-facing
+  `GapMarker(reason = COMPACTED)` for a gap-marker-capable consumer is the #411 follow-up (the
+  reason code is defined and round-tripped, only the engine-side emit is unwired).
+- The cleaner off by default and off the hot path: the same engine test asserts a produce that
+  triggers a compaction pass returns its offset normally (the append is never blocked), and that
+  no v2 segment is written until an operator opts in.

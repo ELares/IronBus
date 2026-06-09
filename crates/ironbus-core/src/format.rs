@@ -164,6 +164,65 @@ pub mod segment_footer_offsets {
 /// Byte range the segment footer CRC32C covers: `[0, 28)`.
 pub const SEGMENT_FOOTER_CRC_RANGE: core::ops::Range<usize> = 0..28;
 
+// --- Optional key-based compaction: the additive v2 on-disk delta (#337). ---
+//
+// A compacted segment is the only segment that carries `version` = 2. It is structurally a
+// normal segment (a 64-byte header, record frames, a 32-byte footer) with two ADDITIVE facts:
+// the `COMPACTED` header flag bit, and a 44-byte compaction-metadata block written immediately
+// AFTER the sealed footer as the file's final bytes. A v1 (`version` = 1) segment is UNCHANGED
+// byte-for-byte: the version byte is stamped `2` ONLY when the `COMPACTED` flag is set, so a
+// non-compacted header and footer encode exactly as before. A v1-only reader REFUSES a
+// `version` = 2 segment (the fail-closed bump). See `docs/COMPACTION.md` and `docs/CONTRACTS.md`.
+
+/// The on-disk format version a COMPACTED segment stamps in its header and footer `version`
+/// bytes (#337): `2`. A v1-only reader refuses it, so an old reader fail-closed REFUSES a
+/// compacted log rather than silently misreading its sparse offsets. Only a compacted segment
+/// ever carries this version; an ordinary segment stays [`FORMAT_VERSION`] (`1`).
+pub const FORMAT_VERSION_COMPACTED: u8 = 2;
+
+/// The segment-header `flags` bit (at `[10, 12)`, inside the CRC-covered bytes `[0, 60)`) that
+/// marks a segment as the output of a key-compaction clean (#337): `0x0001`. It is a DISTINCT
+/// bit from the at-rest encryption flag (a compacted segment may also be encrypted), and a
+/// segment carrying it stamps `version` = [`FORMAT_VERSION_COMPACTED`]. A v1 reader treats the
+/// `flags` field as preserved-but-not-interpreted, so it never looks for the trailing block; the
+/// `version` = 2 bump is what makes such a reader fail closed rather than mis-stitch the sparse
+/// chain.
+pub const SEGMENT_FLAG_COMPACTED: u16 = 0x0001;
+
+/// Total size in bytes of the v2 compaction-metadata block (#337), written immediately AFTER the
+/// 32-byte sealed footer as a compacted segment's final bytes: `44`. It carries the source set's
+/// covered offset and sequence spans plus the highest covered source id, CRC32C-protected on its
+/// own so a torn trailing block is rejected exactly like a torn footer (it then falls into the
+/// crash-before-commit recovery case).
+pub const COMPACTION_META_LEN: usize = 44;
+
+/// Byte offsets of each field within the 44-byte v2 compaction-metadata block (little-endian),
+/// written after the footer as a compacted segment's final bytes (#337). The block self-describes
+/// the ORIGINAL source set this compacted segment supersedes: its true covered offset span
+/// `[covered_base_offset, covered_end_offset)` and the parallel covered SEQUENCE span
+/// `[covered_base_seq, covered_end_seq)` (recovery advances both expectations across the segment),
+/// plus the highest covered source segment id (the recovery tie-break). `block_crc` covers
+/// `[0, 40)`.
+pub mod compaction_meta_offsets {
+    /// Offset of the `covered_base_offset: u64` field (the source set's TRUE starting offset, its
+    /// own field, never an alias of the header `base_offset`).
+    pub const COVERED_BASE_OFFSET: usize = 0;
+    /// Offset of the `covered_end_offset: u64` field (one past the highest covered SOURCE offset).
+    pub const COVERED_END_OFFSET: usize = 8;
+    /// Offset of the `covered_base_seq: u64` field (the source set's TRUE starting sequence).
+    pub const COVERED_BASE_SEQ: usize = 16;
+    /// Offset of the `covered_end_seq: u64` field (one past the highest covered SOURCE sequence).
+    pub const COVERED_END_SEQ: usize = 24;
+    /// Offset of the `highest_covered_source_id: u64` field (the highest segment id this clean
+    /// supersedes, the deterministic recovery tie-break).
+    pub const HIGHEST_COVERED_SOURCE_ID: usize = 32;
+    /// Offset of the `block_crc: u32` field. The CRC covers bytes `[0, 40)`.
+    pub const BLOCK_CRC: usize = 40;
+}
+
+/// Byte range the v2 compaction-metadata block CRC32C covers: `[0, 40)`.
+pub const COMPACTION_META_CRC_RANGE: core::ops::Range<usize> = 0..40;
+
 #[cfg(test)]
 mod tests {
     use super::header_offsets as off;
@@ -246,5 +305,29 @@ mod tests {
     fn record_size_limits() {
         assert_eq!(DEFAULT_MAX_RECORD_BYTES, 16 * 1024 * 1024);
         assert_eq!(MAX_RECORD_BYTES_CEILING, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn frozen_compaction_v2_values_and_offsets() {
+        use compaction_meta_offsets as moff;
+        // The v2 compaction delta (#337) is ADDITIVE and pinned: a compacted segment carries
+        // version 2, the COMPACTED flag is bit 0, and the trailing block is exactly 44 bytes.
+        assert_eq!(FORMAT_VERSION_COMPACTED, 2);
+        assert_eq!(SEGMENT_FLAG_COMPACTED, 0x0001);
+        assert_eq!(COMPACTION_META_LEN, 44);
+        // The block's five u64 fields are tightly packed, then a u32 CRC at the end.
+        assert_eq!(moff::COVERED_BASE_OFFSET, 0);
+        assert_eq!(moff::COVERED_END_OFFSET, 8);
+        assert_eq!(moff::COVERED_BASE_SEQ, 16);
+        assert_eq!(moff::COVERED_END_SEQ, 24);
+        assert_eq!(moff::HIGHEST_COVERED_SOURCE_ID, 32);
+        assert_eq!(moff::BLOCK_CRC, 40);
+        assert_eq!(moff::BLOCK_CRC + 4, COMPACTION_META_LEN);
+        assert_eq!(COMPACTION_META_CRC_RANGE, 0..40);
+        // The v2 version is exactly 2 and the v1 baseline is 1, so refuse-on-unknown fails closed
+        // (a v1-only reader rejects the higher version). Pinned as concrete values to keep the
+        // assertion non-constant and the bump explicit.
+        assert_eq!(FORMAT_VERSION_COMPACTED, 2);
+        assert_eq!(FORMAT_VERSION, 1);
     }
 }

@@ -6,9 +6,11 @@
 //! records between them use the frame in [`crate::codec`].
 
 use crate::format::{
-    segment_footer_offsets as foff, segment_header_offsets as hoff, CHECKSUM_ALGO_CRC32C,
-    FORMAT_VERSION, SEGMENT_FOOTER_CRC_RANGE, SEGMENT_FOOTER_LEN, SEGMENT_FOOTER_MAGIC,
-    SEGMENT_HEADER_CRC_RANGE, SEGMENT_HEADER_LEN, SEGMENT_MAGIC,
+    compaction_meta_offsets as moff, segment_footer_offsets as foff,
+    segment_header_offsets as hoff, CHECKSUM_ALGO_CRC32C, COMPACTION_META_CRC_RANGE,
+    COMPACTION_META_LEN, FORMAT_VERSION, FORMAT_VERSION_COMPACTED, SEGMENT_FLAG_COMPACTED,
+    SEGMENT_FOOTER_CRC_RANGE, SEGMENT_FOOTER_LEN, SEGMENT_FOOTER_MAGIC, SEGMENT_HEADER_CRC_RANGE,
+    SEGMENT_HEADER_LEN, SEGMENT_MAGIC,
 };
 use crate::raw::{read_u16, read_u32, read_u64};
 use crate::types::{Offset, Seq};
@@ -74,12 +76,30 @@ impl core::fmt::Display for SegmentError {
 impl std::error::Error for SegmentError {}
 
 impl SegmentHeader {
+    /// Whether this header marks a COMPACTED segment (the output of a key-compaction clean,
+    /// #337): the [`SEGMENT_FLAG_COMPACTED`] bit is set in `flags`. A compacted segment is the
+    /// only one that stamps `version` = [`FORMAT_VERSION_COMPACTED`] and carries a trailing v2
+    /// compaction-metadata block; an ordinary segment never sets the bit.
+    #[must_use]
+    pub fn is_compacted(&self) -> bool {
+        self.flags & SEGMENT_FLAG_COMPACTED != 0
+    }
+
     /// Encodes the header into its fixed 64-byte on-disk form.
+    ///
+    /// The `version` byte is stamped [`FORMAT_VERSION_COMPACTED`] (`2`) ONLY when the
+    /// [`SEGMENT_FLAG_COMPACTED`] bit is set in `flags` (#337); otherwise it stays
+    /// [`FORMAT_VERSION`] (`1`), so a non-compacted header is byte-for-byte the v1 layout. A v1
+    /// reader refuses the version-2 bump (fail-closed) rather than mis-stitching the sparse chain.
     #[must_use]
     pub fn encode(&self) -> [u8; SEGMENT_HEADER_LEN] {
         let mut h = [0u8; SEGMENT_HEADER_LEN];
         h[hoff::MAGIC..hoff::MAGIC + 8].copy_from_slice(&SEGMENT_MAGIC);
-        h[hoff::VERSION] = FORMAT_VERSION;
+        h[hoff::VERSION] = if self.is_compacted() {
+            FORMAT_VERSION_COMPACTED
+        } else {
+            FORMAT_VERSION
+        };
         h[hoff::CHECKSUM_ALGO] = CHECKSUM_ALGO_CRC32C;
         h[hoff::FLAGS..hoff::FLAGS + 2].copy_from_slice(&self.flags.to_le_bytes());
         h[hoff::SEGMENT_ID..hoff::SEGMENT_ID + 8].copy_from_slice(&self.segment_id.to_le_bytes());
@@ -93,12 +113,36 @@ impl SegmentHeader {
         h
     }
 
-    /// Decodes a header from the first 64 bytes of `bytes`.
+    /// Decodes a header from the first 64 bytes of `bytes`, accepting BOTH the v1 layout
+    /// (`version` = 1, no [`SEGMENT_FLAG_COMPACTED`] bit) and the additive v2 compacted layout
+    /// (`version` = [`FORMAT_VERSION_COMPACTED`] with the [`SEGMENT_FLAG_COMPACTED`] bit set, #337).
+    /// The version and the flag must AGREE: a `version` = 2 without the flag, or the flag without
+    /// `version` = 2, is a structural inconsistency rejected as [`SegmentError::UnsupportedVersion`]
+    /// (a half-written or foreign header never parses as a valid compacted segment).
     ///
     /// # Errors
-    /// Returns a [`SegmentError`] if the input is too short, the magic, version, or
-    /// checksum algorithm is wrong, or the header CRC does not match.
+    /// Returns a [`SegmentError`] if the input is too short, the magic, version, or checksum
+    /// algorithm is wrong, the version and the COMPACTED flag disagree, or the header CRC does not
+    /// match.
     pub fn decode(bytes: &[u8]) -> Result<SegmentHeader, SegmentError> {
+        Self::decode_inner(bytes, true)
+    }
+
+    /// Decodes a header as a STRICTLY v1 reader would: it REFUSES the v2 compacted layout with
+    /// [`SegmentError::UnsupportedVersion`]`(2)` rather than interpret it (#337). This is the
+    /// fail-closed contract a pre-compaction reader follows, kept as an explicit, testable path so
+    /// the "a v1 reader refuses a compacted log" guarantee is provable, not just asserted. The
+    /// online recovery path uses [`SegmentHeader::decode`] (which understands v2); this is the
+    /// old-binary-meets-new-data refusal.
+    ///
+    /// # Errors
+    /// Returns [`SegmentError::UnsupportedVersion`] for ANY `version` other than `1`, plus the
+    /// same structural errors as [`SegmentHeader::decode`].
+    pub fn decode_v1_only(bytes: &[u8]) -> Result<SegmentHeader, SegmentError> {
+        Self::decode_inner(bytes, false)
+    }
+
+    fn decode_inner(bytes: &[u8], allow_v2: bool) -> Result<SegmentHeader, SegmentError> {
         if bytes.len() < SEGMENT_HEADER_LEN {
             return Err(SegmentError::Truncated);
         }
@@ -106,7 +150,16 @@ impl SegmentHeader {
             return Err(SegmentError::BadMagic);
         }
         let version = bytes[hoff::VERSION];
-        if version != FORMAT_VERSION {
+        let flags = read_u16(bytes, hoff::FLAGS);
+        let compacted = flags & SEGMENT_FLAG_COMPACTED != 0;
+        // Fail-closed version gate (#337). A v1 reader refuses any non-1 version. A v2-aware reader
+        // additionally accepts version 2, but ONLY when it is paired with the COMPACTED flag, and
+        // rejects a v1 header that nonetheless carries the COMPACTED flag (a contradiction a
+        // half-written or foreign file could leave). So the version and the flag are mutually gating:
+        // neither without the other parses as valid.
+        let v1_ok = version == FORMAT_VERSION && !compacted;
+        let v2_ok = allow_v2 && version == FORMAT_VERSION_COMPACTED && compacted;
+        if !(v1_ok || v2_ok) {
             return Err(SegmentError::UnsupportedVersion(version));
         }
         let algo = bytes[hoff::CHECKSUM_ALGO];
@@ -121,18 +174,32 @@ impl SegmentHeader {
             base_seq: Seq::new(read_u64(bytes, hoff::BASE_SEQ)),
             base_offset: Offset::new(read_u64(bytes, hoff::BASE_OFFSET)),
             created_unix_ms: read_u64(bytes, hoff::CREATED_MS),
-            flags: read_u16(bytes, hoff::FLAGS),
+            flags,
         })
     }
 }
 
 impl SegmentFooter {
-    /// Encodes the footer into its fixed 32-byte on-disk form.
+    /// Encodes the footer into its fixed 32-byte on-disk form, stamping the v1 `version` byte.
     #[must_use]
     pub fn encode(&self) -> [u8; SEGMENT_FOOTER_LEN] {
+        self.encode_with_version(FORMAT_VERSION)
+    }
+
+    /// Encodes the footer stamping the v2 compacted `version` byte ([`FORMAT_VERSION_COMPACTED`]),
+    /// for a compacted segment's footer (#337). The layout is byte-for-byte the v1 footer except
+    /// for the one `version` byte, so a v2 footer is the same 32-byte shape; the trailing v2
+    /// compaction-metadata block follows it as the file's final bytes. A v1-only reader refuses
+    /// this footer's version exactly as it refuses the v2 header.
+    #[must_use]
+    pub fn encode_v2(&self) -> [u8; SEGMENT_FOOTER_LEN] {
+        self.encode_with_version(FORMAT_VERSION_COMPACTED)
+    }
+
+    fn encode_with_version(&self, version: u8) -> [u8; SEGMENT_FOOTER_LEN] {
         let mut f = [0u8; SEGMENT_FOOTER_LEN];
         f[foff::MAGIC..foff::MAGIC + 2].copy_from_slice(&SEGMENT_FOOTER_MAGIC.to_le_bytes());
-        f[foff::VERSION] = FORMAT_VERSION;
+        f[foff::VERSION] = version;
         f[foff::CHECKSUM_ALGO] = CHECKSUM_ALGO_CRC32C;
         f[foff::SEGMENT_ID..foff::SEGMENT_ID + 8].copy_from_slice(&self.segment_id.to_le_bytes());
         f[foff::LAST_SEQ..foff::LAST_SEQ + 8].copy_from_slice(&self.last_seq.get().to_le_bytes());
@@ -143,13 +210,15 @@ impl SegmentFooter {
         f
     }
 
-    /// Decodes a footer from the first 32 bytes of `bytes` (the last 32 bytes of a
-    /// sealed segment). The caller should also verify `segment_id` matches the header
-    /// and `last_seq >= header.base_seq`.
+    /// Decodes a footer from the first 32 bytes of `bytes` (the last 32 bytes of a sealed
+    /// segment, or, for a compacted segment, the 32 bytes immediately before the trailing v2
+    /// block). The footer SHAPE is identical for v1 and v2; only the `version` byte differs, so
+    /// this accepts both v1 (`version` = 1) and the v2 compacted footer (#337). The caller should
+    /// also verify `segment_id` matches the header and `last_seq >= header.base_seq`.
     ///
     /// # Errors
-    /// Returns a [`SegmentError`] if too short, the magic, version, or checksum
-    /// algorithm is wrong, or the footer CRC does not match.
+    /// Returns a [`SegmentError`] if too short, the magic is wrong, the version is neither 1 nor
+    /// 2, the checksum algorithm is wrong, or the footer CRC does not match.
     pub fn decode(bytes: &[u8]) -> Result<SegmentFooter, SegmentError> {
         if bytes.len() < SEGMENT_FOOTER_LEN {
             return Err(SegmentError::Truncated);
@@ -158,7 +227,7 @@ impl SegmentFooter {
             return Err(SegmentError::BadMagic);
         }
         let version = bytes[foff::VERSION];
-        if version != FORMAT_VERSION {
+        if version != FORMAT_VERSION && version != FORMAT_VERSION_COMPACTED {
             return Err(SegmentError::UnsupportedVersion(version));
         }
         let algo = bytes[foff::CHECKSUM_ALGO];
@@ -172,6 +241,82 @@ impl SegmentFooter {
             segment_id: read_u64(bytes, foff::SEGMENT_ID),
             last_seq: Seq::new(read_u64(bytes, foff::LAST_SEQ)),
             record_count: read_u32(bytes, foff::RECORD_COUNT),
+        })
+    }
+}
+
+/// The v2 compaction-metadata block (#337): a 44-byte CRC-protected trailer written immediately
+/// AFTER a compacted segment's footer as the file's final bytes. It self-describes the ORIGINAL
+/// source set this compacted segment supersedes, so recovery resolves an overlapping offset range
+/// (a compacted segment plus the not-yet-retired originals it replaced) from the file alone, with
+/// no manifest. The covered SPANS are the source set's TRUE offset and sequence range, NOT the
+/// (sparse) survivor range, so recovery advances its chain-continuity expectation across the
+/// compacted segment by the covered span, not the survivor count.
+///
+/// It is pure and IO-free (the encode/decode live in `ironbus-core` per the layering rule); the
+/// storage cleaner writes it and recovery reads it. A torn or mismatched block fails `block_crc`
+/// and is rejected exactly like a torn footer, which is indistinguishable from a crash before the
+/// compaction commit point and is recovered as such.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactionMeta {
+    /// The source set's TRUE starting offset (the lowest covered SOURCE offset), its OWN field,
+    /// never an alias of the header `base_offset`: they differ when the first source segment's
+    /// leading records were all superseded. Recovery abuts the predecessor here.
+    pub covered_base_offset: u64,
+    /// One past the highest covered SOURCE offset: where this compacted segment's covered range
+    /// ends and the successor segment must begin.
+    pub covered_end_offset: u64,
+    /// The source set's TRUE starting sequence (parallel to `covered_base_offset`).
+    pub covered_base_seq: u64,
+    /// One past the highest covered SOURCE sequence: recovery advances the sequence expectation by
+    /// this across the compacted segment (the survivors are sparse, so the survivor count does
+    /// not).
+    pub covered_end_seq: u64,
+    /// The highest segment id this clean supersedes: the deterministic recovery tie-break for two
+    /// overlapping compacted segments (the higher-id, later clean wins).
+    pub highest_covered_source_id: u64,
+}
+
+impl CompactionMeta {
+    /// Encodes the block into its fixed 44-byte on-disk form, with `block_crc` over `[0, 40)`.
+    #[must_use]
+    pub fn encode(&self) -> [u8; COMPACTION_META_LEN] {
+        let mut b = [0u8; COMPACTION_META_LEN];
+        b[moff::COVERED_BASE_OFFSET..moff::COVERED_BASE_OFFSET + 8]
+            .copy_from_slice(&self.covered_base_offset.to_le_bytes());
+        b[moff::COVERED_END_OFFSET..moff::COVERED_END_OFFSET + 8]
+            .copy_from_slice(&self.covered_end_offset.to_le_bytes());
+        b[moff::COVERED_BASE_SEQ..moff::COVERED_BASE_SEQ + 8]
+            .copy_from_slice(&self.covered_base_seq.to_le_bytes());
+        b[moff::COVERED_END_SEQ..moff::COVERED_END_SEQ + 8]
+            .copy_from_slice(&self.covered_end_seq.to_le_bytes());
+        b[moff::HIGHEST_COVERED_SOURCE_ID..moff::HIGHEST_COVERED_SOURCE_ID + 8]
+            .copy_from_slice(&self.highest_covered_source_id.to_le_bytes());
+        let crc = crc32c::crc32c(&b[COMPACTION_META_CRC_RANGE]);
+        b[moff::BLOCK_CRC..moff::BLOCK_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+        b
+    }
+
+    /// Decodes the block from its 44 trailing bytes, validating `block_crc`. A short or
+    /// CRC-mismatched block is rejected the same way a torn footer is, so a half-written compacted
+    /// segment never parses as a valid compacted segment.
+    ///
+    /// # Errors
+    /// Returns [`SegmentError::Truncated`] if shorter than [`COMPACTION_META_LEN`], or
+    /// [`SegmentError::BadCrc`] if `block_crc` does not match.
+    pub fn decode(bytes: &[u8]) -> Result<CompactionMeta, SegmentError> {
+        if bytes.len() < COMPACTION_META_LEN {
+            return Err(SegmentError::Truncated);
+        }
+        if crc32c::crc32c(&bytes[COMPACTION_META_CRC_RANGE]) != read_u32(bytes, moff::BLOCK_CRC) {
+            return Err(SegmentError::BadCrc);
+        }
+        Ok(CompactionMeta {
+            covered_base_offset: read_u64(bytes, moff::COVERED_BASE_OFFSET),
+            covered_end_offset: read_u64(bytes, moff::COVERED_END_OFFSET),
+            covered_base_seq: read_u64(bytes, moff::COVERED_BASE_SEQ),
+            covered_end_seq: read_u64(bytes, moff::COVERED_END_SEQ),
+            highest_covered_source_id: read_u64(bytes, moff::HIGHEST_COVERED_SOURCE_ID),
         })
     }
 }
@@ -276,6 +421,121 @@ mod tests {
             Err(SegmentError::Truncated)
         );
     }
+
+    fn compacted_header() -> SegmentHeader {
+        SegmentHeader {
+            segment_id: 50,
+            base_seq: Seq::new(7),
+            base_offset: Offset::new(7),
+            created_unix_ms: 1_700_000_000_000,
+            flags: SEGMENT_FLAG_COMPACTED,
+        }
+    }
+
+    #[test]
+    fn a_non_compacted_header_is_byte_identical_to_v1() {
+        // Backward compat: a header with no COMPACTED flag encodes the EXACT v1 bytes (version
+        // byte 1), so a v1-only reader reads it unchanged. The version-2 bump is opt-in per the
+        // flag, never stamped on an ordinary segment.
+        let h = sample_header();
+        let bytes = h.encode();
+        assert_eq!(bytes[hoff::VERSION], FORMAT_VERSION);
+        assert!(!h.is_compacted());
+        // It decodes both v2-aware and v1-only, identically (no behavior change for v1 segments).
+        assert_eq!(SegmentHeader::decode(&bytes).unwrap(), h);
+        assert_eq!(SegmentHeader::decode_v1_only(&bytes).unwrap(), h);
+    }
+
+    #[test]
+    fn a_compacted_header_stamps_v2_and_round_trips() {
+        let h = compacted_header();
+        let bytes = h.encode();
+        assert_eq!(bytes[hoff::VERSION], FORMAT_VERSION_COMPACTED);
+        assert!(h.is_compacted());
+        assert_eq!(SegmentHeader::decode(&bytes).unwrap(), h);
+    }
+
+    #[test]
+    fn a_v1_only_reader_fails_closed_on_a_compacted_header() {
+        // The fail-closed guarantee (#337): a pre-compaction (v1-only) reader REFUSES a compacted
+        // segment with a typed UnsupportedVersion(2) rather than silently mis-reading its sparse
+        // offsets. This is the old-binary-meets-new-data refusal.
+        let bytes = compacted_header().encode();
+        assert_eq!(
+            SegmentHeader::decode_v1_only(&bytes),
+            Err(SegmentError::UnsupportedVersion(FORMAT_VERSION_COMPACTED))
+        );
+    }
+
+    #[test]
+    fn version_and_compacted_flag_must_agree() {
+        // A version-2 header WITHOUT the COMPACTED flag, or a v1 header WITH the flag, is a
+        // structural contradiction (a half-written or foreign file) and is refused, so neither
+        // half can parse without the other.
+        let mut v2_no_flag = compacted_header().encode();
+        v2_no_flag[hoff::FLAGS..hoff::FLAGS + 2].copy_from_slice(&0u16.to_le_bytes());
+        let crc = crc32c::crc32c(&v2_no_flag[SEGMENT_HEADER_CRC_RANGE]);
+        v2_no_flag[hoff::HEADER_CRC..hoff::HEADER_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            SegmentHeader::decode(&v2_no_flag),
+            Err(SegmentError::UnsupportedVersion(FORMAT_VERSION_COMPACTED))
+        );
+
+        // v1 version byte but the COMPACTED flag set: rejected as UnsupportedVersion(1).
+        let mut v1_with_flag = sample_header().encode();
+        v1_with_flag[hoff::FLAGS..hoff::FLAGS + 2]
+            .copy_from_slice(&SEGMENT_FLAG_COMPACTED.to_le_bytes());
+        let crc = crc32c::crc32c(&v1_with_flag[SEGMENT_HEADER_CRC_RANGE]);
+        v1_with_flag[hoff::HEADER_CRC..hoff::HEADER_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            SegmentHeader::decode(&v1_with_flag),
+            Err(SegmentError::UnsupportedVersion(FORMAT_VERSION))
+        );
+    }
+
+    #[test]
+    fn a_v2_footer_round_trips_and_only_the_version_byte_differs() {
+        let f = SegmentFooter {
+            segment_id: 50,
+            last_seq: Seq::new(42),
+            record_count: 3,
+        };
+        let v1 = f.encode();
+        let v2 = f.encode_v2();
+        assert_eq!(v1[foff::VERSION], FORMAT_VERSION);
+        assert_eq!(v2[foff::VERSION], FORMAT_VERSION_COMPACTED);
+        // Everything except the version byte and the recomputed CRC is identical.
+        assert_eq!(
+            v1[foff::SEGMENT_ID..foff::FOOTER_CRC],
+            v2[foff::SEGMENT_ID..foff::FOOTER_CRC]
+        );
+        // Both decode to the same footer (the version byte is not part of the decoded struct).
+        assert_eq!(SegmentFooter::decode(&v1).unwrap(), f);
+        assert_eq!(SegmentFooter::decode(&v2).unwrap(), f);
+    }
+
+    #[test]
+    fn compaction_meta_round_trips_and_rejects_corruption() {
+        let m = CompactionMeta {
+            covered_base_offset: 100,
+            covered_end_offset: 130,
+            covered_base_seq: 100,
+            covered_end_seq: 130,
+            highest_covered_source_id: 4,
+        };
+        let bytes = m.encode();
+        assert_eq!(bytes.len(), COMPACTION_META_LEN);
+        assert_eq!(CompactionMeta::decode(&bytes).unwrap(), m);
+        // A short block is truncated; a flipped byte fails the block CRC (so a torn trailing block
+        // is rejected exactly like a torn footer).
+        assert_eq!(
+            CompactionMeta::decode(&bytes[..40]),
+            Err(SegmentError::Truncated)
+        );
+        let mut torn = bytes;
+        torn[0] ^= 0x01;
+        assert_eq!(CompactionMeta::decode(&torn), Err(SegmentError::BadCrc));
+    }
 }
 
 #[cfg(test)]
@@ -316,6 +576,40 @@ mod proptests {
             // CRC32C catches every single-bit error in a 64-byte structure, and magic,
             // version, and checksum-algo flips are caught structurally.
             prop_assert!(SegmentHeader::decode(&b).is_err());
+        }
+
+        #[test]
+        fn compaction_meta_roundtrip(
+            cbo in any::<u64>(), ceo in any::<u64>(), cbs in any::<u64>(),
+            ces in any::<u64>(), hid in any::<u64>(),
+        ) {
+            let m = CompactionMeta {
+                covered_base_offset: cbo,
+                covered_end_offset: ceo,
+                covered_base_seq: cbs,
+                covered_end_seq: ces,
+                highest_covered_source_id: hid,
+            };
+            prop_assert_eq!(CompactionMeta::decode(&m.encode()).unwrap(), m);
+        }
+
+        #[test]
+        fn compaction_meta_bit_flip_always_rejected(
+            cbo in any::<u64>(), idx in any::<prop::sample::Index>(), bit in 0u8..8,
+        ) {
+            let m = CompactionMeta {
+                covered_base_offset: cbo,
+                covered_end_offset: cbo.wrapping_add(10),
+                covered_base_seq: cbo,
+                covered_end_seq: cbo.wrapping_add(10),
+                highest_covered_source_id: 3,
+            };
+            let mut b = m.encode();
+            let i = idx.index(b.len());
+            b[i] ^= 1u8 << bit;
+            // CRC32C catches every single-bit error in the 44-byte block, so a torn or rotted
+            // trailing block is always rejected (and recovery then treats it as crash-before-commit).
+            prop_assert!(CompactionMeta::decode(&b).is_err());
         }
     }
 }

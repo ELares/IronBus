@@ -1527,6 +1527,9 @@ struct ServeFlags {
     max_retained_bytes: Option<u64>,
     max_age_ms: Option<u64>,
     max_messages: Option<u64>,
+    /// OPT-IN key compaction (#337): `--compact` turns it on (off by default). A bare boolean flag
+    /// like `allow_unlimited_deliver`.
+    compact: bool,
     max_groups: Option<usize>,
     group_idle_evict_ms: Option<u64>,
     /// The refuse-to-boot RAM ceiling in bytes (#115); `None` falls back to the profile preset (`0`
@@ -1623,6 +1626,11 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             // A bare boolean flag (no value): advance ONE token, not two, or the loop spins.
             "--allow-unlimited-deliver" => {
                 f.allow_unlimited_deliver = true;
+                i += 1;
+            }
+            // OPT-IN key compaction (#337), off by default: a bare boolean flag.
+            "--compact" => {
+                f.compact = true;
                 i += 1;
             }
             "--backoff-ms" => {
@@ -1992,6 +2000,9 @@ fn parse_serve_flags_with_env_and_reader(
                 env,
                 DEFAULT_MAX_MESSAGES,
             )?,
+            // OPT-IN key compaction (#337), OFF by default: not a profile preset (it is a per-topic
+            // changelog policy), so it resolves from the `--compact` flag / `IRONBUS_COMPACT` env only.
+            compact: resolve_bool("--compact", f.compact, env)?,
             max_groups: resolve_number("--max-groups", f.max_groups, env, preset.max_groups)?,
             group_idle_evict_ms: resolve_number(
                 "--group-idle-evict-ms",
@@ -2542,6 +2553,14 @@ struct ServeConfig {
     /// segments while the log's total record count is over this many messages. `0` = disabled,
     /// the default.
     max_messages: u64,
+    /// OPT-IN key-based log compaction (#337), OFF by default. When `true` the broker enables the
+    /// off-hot-path compactor: after each produce-path reaper run it runs one rate-limited pass over
+    /// a run of adjacent dirty SEALED segments, rewriting the survivors (the latest record per key,
+    /// keeping their ORIGINAL sparse offsets) into a fresh v2 compacted segment. It is for
+    /// changelog / state-snapshot topics where only the latest value per key matters, and it costs
+    /// CPU + flash, so a general durable queue leaves it OFF (the default). It never touches the
+    /// active segment, so it never blocks an append. See `docs/COMPACTION.md`.
+    compact: bool,
     /// The cap on the number of live work-groups, including the default (refs #240, #9, #10):
     /// bounds consumer-state memory once the wire can name groups, so an unauthenticated client
     /// cannot exhaust memory by naming endless groups. `0` = unlimited (the cap is off); the
@@ -2708,6 +2727,8 @@ impl ServeConfig {
             max_retained_bytes: DEFAULT_MAX_RETAINED_BYTES,
             max_age_ms: DEFAULT_MAX_AGE_MS,
             max_messages: DEFAULT_MAX_MESSAGES,
+            // Key compaction (#337) is OFF by default.
+            compact: false,
             max_groups: DEFAULT_MAX_GROUPS,
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
             ram_ceiling_bytes: DEFAULT_RAM_CEILING_BYTES,
@@ -3341,6 +3362,11 @@ fn cmd_serve(
         config.max_retained_bytes,
         config.max_age_ms,
         config.max_messages,
+        // The #337 key-compaction opt-in is read only on the Unix serve path (it enables the
+        // engine's off-hot-path compactor), so the non-Unix stub must consume it too or the Windows
+        // `-D warnings` build trips field-never-read, invisible to a macOS reviewer (the recurring
+        // #288/#99 footgun).
+        config.compact,
         config.max_groups,
         config.group_idle_evict_ms,
         // The #115 refuse-to-boot RAM ceiling is read only on the Unix serve path (it wires the
@@ -3540,6 +3566,12 @@ fn open_disk_engine(
     )
     .map_err(|e| CliError::Internal(format!("opening broker at {}: {e}", data_dir.display())))?;
     let mut engine = engine;
+    // Enable OPT-IN key compaction (#337) when `--compact` was passed (OFF by default). It runs the
+    // off-hot-path compactor after each produce-path reaper run; it never touches the active segment,
+    // so it cannot block an append. A broker without `--compact` is byte-for-byte unchanged.
+    if config.compact {
+        engine.set_compaction_config(ironbus_storage::compaction::CompactionConfig::enabled());
+    }
     // Declare the key_shared groups (#64) server-side: a configured group enters key_shared mode
     // when a consumer first subscribes. An empty slice is a no-op, so every group stays competing.
     engine.set_configured_key_shared_groups(key_shared_groups.iter().cloned());
@@ -5382,6 +5414,8 @@ mod tests {
             max_retained_bytes: DEFAULT_MAX_RETAINED_BYTES,
             max_age_ms: DEFAULT_MAX_AGE_MS,
             max_messages: DEFAULT_MAX_MESSAGES,
+            // Key compaction (#337) is OFF by default.
+            compact: false,
             max_groups: DEFAULT_MAX_GROUPS,
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
             ram_ceiling_bytes: DEFAULT_RAM_CEILING_BYTES,
@@ -7336,6 +7370,8 @@ mod tests {
             max_retained_bytes: DEFAULT_MAX_RETAINED_BYTES,
             max_age_ms: DEFAULT_MAX_AGE_MS,
             max_messages: DEFAULT_MAX_MESSAGES,
+            // Key compaction (#337) is OFF by default.
+            compact: false,
             max_groups: DEFAULT_MAX_GROUPS,
             group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
             ram_ceiling_bytes: DEFAULT_RAM_CEILING_BYTES,

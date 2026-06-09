@@ -1693,6 +1693,16 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// backpressure knob behaves exactly as today. See [`Backpressure`] and
     /// [`ironbus_core::backpressure`].
     backpressure: Backpressure,
+    /// The OPT-IN, OFF-BY-DEFAULT key-compaction configuration (#337): when enabled, after the
+    /// produce-path reaper runs the engine runs ONE rate-limited, off-hot-path compaction pass over
+    /// a run of adjacent dirty SEALED segments, rewriting the survivors (keeping their original
+    /// sparse offsets) into a fresh v2 compacted segment. It NEVER touches the active segment, so it
+    /// never races or blocks an append. The default is DISABLED, so a broker that does not opt in is
+    /// byte-for-byte unchanged. Set with [`Engine::set_compaction_config`]. The order is fixed and
+    /// load-bearing (`compact_and_delete`): the cheap whole-segment reaper runs FIRST, then the
+    /// compactor, so CPU and flash are never spent compacting a segment about to be reaped. See
+    /// [`ironbus_storage::compaction`] and `docs/COMPACTION.md`.
+    compaction: ironbus_storage::compaction::CompactionConfig,
 }
 
 /// The file name of the work-group's durable committed-cursor checkpoint.
@@ -1894,9 +1904,30 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // durable snapshot, so a broker that configures none of them is byte-for-byte the
             // historical broker.
             backpressure,
+            // Key compaction (#337) is OFF by default: an operator opts a topic in via
+            // `set_compaction_config`. A broker that does not is byte-for-byte unchanged (no v2
+            // segment is ever written, no compaction pass ever runs).
+            compaction: ironbus_storage::compaction::CompactionConfig::default(),
         };
         engine.seed_registry_from_recovered_state(flushed);
         Ok(engine)
+    }
+
+    /// Enables (or reconfigures) OPT-IN key compaction (#337), OFF by default. When enabled, the
+    /// engine runs ONE rate-limited, OFF-HOT-PATH compaction pass after each produce-path reaper run
+    /// (the `compact_and_delete` order: reaper first, then compactor). Compaction only ever touches
+    /// SEALED segments and writes a NEW v2 segment, never the active one, so it cannot race or block
+    /// an append. Pass a [`CompactionConfig`](ironbus_storage::compaction::CompactionConfig) with
+    /// `enabled: true` to turn it on; the default is disabled.
+    pub fn set_compaction_config(&mut self, config: ironbus_storage::compaction::CompactionConfig) {
+        self.compaction = config;
+    }
+
+    /// The current key-compaction configuration (#337). Disabled by default. Read-only echo for the
+    /// introspection / config surface.
+    #[must_use]
+    pub fn compaction_config(&self) -> ironbus_storage::compaction::CompactionConfig {
+        self.compaction
     }
 
     /// Seeds the metric registry from the recovered durable state (#97), so the per-consumer lag
@@ -2995,15 +3026,25 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// state. It is called only after the produce already succeeded and was counted, so a reap
     /// error does not undo a durable record.
     fn reap_for_retention(&mut self) -> Result<(), EngineError> {
-        if self.retention == RetentionBounds::default() {
-            return Ok(());
+        // The `compact_and_delete` order (#337) is fixed and load-bearing: the cheap WHOLE-SEGMENT
+        // reaper runs FIRST (so CPU and flash are never spent compacting a segment about to be
+        // reaped), THEN, if compaction is enabled, one rate-limited compaction pass.
+        if self.retention != RetentionBounds::default() {
+            let protect_below = self.min_committed_offset();
+            let outcome = self.log.reap(self.retention, protect_below)?;
+            self.counters.segments_reaped = self
+                .counters
+                .segments_reaped
+                .saturating_add(outcome.segments_reaped);
         }
-        let protect_below = self.min_committed_offset();
-        let outcome = self.log.reap(self.retention, protect_below)?;
-        self.counters.segments_reaped = self
-            .counters
-            .segments_reaped
-            .saturating_add(outcome.segments_reaped);
+        // The OPT-IN, OFF-HOT-PATH compaction pass (#337): a no-op unless an operator enabled it.
+        // It only ever reads SEALED segments and writes a NEW v2 segment, never the active one, so
+        // it does not race or block the append path. It runs here, off the critical produce write,
+        // after the produce already succeeded and was acked.
+        if self.compaction.enabled {
+            // A frozen writer has no active segment; skip compaction rather than touch a dead log.
+            let _ = self.log.maybe_compact(&self.compaction)?;
+        }
         Ok(())
     }
 
@@ -3303,6 +3344,22 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                         // Surface it loudly rather than silently stalling if an invariant breaks.
                         return Err(EngineError::MissingRecord { offset });
                     };
+                    // SPARSE-OFFSET tolerance for a compacted log (#337): if the record the read
+                    // returned is NOT at `off`, then `off` was COMPACTED AWAY (a superseded value
+                    // removed by a later record for its key). The read advanced to the next present
+                    // survivor. A compaction gap is NOT data loss and NOT a missing record: the
+                    // offset is treated as ALREADY-SATISFIED (there is nothing to deliver there), so
+                    // the cursor advances past the hole exactly as if it had been acked. The lease
+                    // just claimed at `off` is released and the offset is marked acked, then the loop
+                    // re-examines the next offset. This is the #346/#59 `Compacted` gap-marker
+                    // semantics on the read side; for a dense (non-compacted) log the offsets always
+                    // match, so this branch is never taken and the hot path is unchanged.
+                    if record.offset != off {
+                        g.leases.ack(&token);
+                        g.cursor.ack(off);
+                        offset += 1;
+                        continue;
+                    }
                     match self.delivery.disposition(deliveries) {
                         Disposition::Deliver => {
                             self.counters.delivered += 1;
@@ -3730,6 +3787,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     ///
     /// # Errors
     /// As [`Engine::poll_in`].
+    // The key-shared poll scan (claim, route, deliver, and the #337 sparse-offset hole skip) is one
+    // cohesive loop; splitting it would thread the router/cursor/lease state through a helper and
+    // obscure the per-offset decision, so the function runs a few lines over the soft limit.
+    #[allow(clippy::too_many_lines)]
     pub fn poll_in_member(
         &mut self,
         group: &str,
@@ -3815,6 +3876,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             let Some(record) = self.log.read_from(off, 1)?.into_iter().next() else {
                 return Err(EngineError::MissingRecord { offset });
             };
+            // SPARSE-OFFSET tolerance for a compacted log (#337): a record returned at an offset
+            // ABOVE `off` means `off` was COMPACTED AWAY (a superseded value). It is treated as
+            // already-satisfied, so the cursor advances past the hole and the scan moves on, exactly
+            // as the competing poll path does. For a dense log this branch is never taken.
+            if record.offset != off {
+                g.cursor.ack(off);
+                offset += 1;
+                continue;
+            }
             let Some(router) = g.router.as_ref() else {
                 // Unreachable: the mode check above proved the router is present.
                 return Err(EngineError::MissingRecord { offset });
@@ -4534,6 +4604,86 @@ mod tests {
         assert_eq!(e.committed_offset(), Offset::new(2));
 
         assert!(matches!(e.poll(0).unwrap(), Poll::Idle));
+    }
+
+    // An engine config with a tiny segment cap so a handful of keyed produces roll into several
+    // sealed segments, giving the off-hot-path compactor adjacent dirty sources (#337).
+    fn small_segment_config() -> EngineConfig {
+        EngineConfig {
+            log: LogConfig {
+                max_segment_bytes: 200,
+                ..LogConfig::default()
+            },
+            ..config(64, 5)
+        }
+    }
+
+    #[test]
+    fn compaction_off_by_default_and_opt_in_skips_holes_on_poll() {
+        // Off by default: the engine's compaction config is disabled, so no v2 segment is written
+        // and a normal dense poll is unchanged.
+        let mut e = open(small_segment_config());
+        assert!(!e.compaction_config().enabled);
+
+        // Enable compaction, then produce multiple versions per key across several rolled segments.
+        e.set_compaction_config(ironbus_storage::compaction::CompactionConfig::enabled());
+        let mut last_alpha = Offset::ZERO;
+        let mut last_beta = Offset::ZERO;
+        for v in 0..6u8 {
+            last_alpha = produce_keyed(&mut e, b"alpha", &[v; 12]);
+            last_beta = produce_keyed(&mut e, b"beta", &[v + 100; 12]);
+        }
+        // A produce after the rolls runs the off-hot-path compaction pass (reaper-then-compactor),
+        // which never blocks this append (it returns the new offset normally).
+        let last = produce_keyed(&mut e, b"gamma", b"only");
+        assert_eq!(
+            last.get(),
+            12,
+            "the append path is never blocked by compaction"
+        );
+
+        // Drain via poll: the consumer sees ONLY the survivors (latest per key + the one-shot key),
+        // at their ORIGINAL offsets, SKIPPING the compacted holes without a MissingRecord error.
+        let mut delivered: Vec<(u64, Vec<u8>)> = Vec::new();
+        loop {
+            match e.poll(0).unwrap() {
+                Poll::Message(d) => {
+                    let off = d.offset.get();
+                    delivered.push((off, d.record.payload.clone()));
+                    assert_eq!(e.ack(&d.token), AckResult::Acked);
+                }
+                Poll::Idle => break,
+                other => panic!("unexpected poll outcome: {other:?}"),
+            }
+        }
+        // The surviving alpha/beta are at their LATEST original offsets (sparse), gamma is present,
+        // and no superseded version was delivered.
+        let offsets: Vec<u64> = delivered.iter().map(|(o, _)| *o).collect();
+        assert!(
+            offsets.contains(&last_alpha.get()),
+            "latest alpha delivered at its offset"
+        );
+        assert!(
+            offsets.contains(&last_beta.get()),
+            "latest beta delivered at its offset"
+        );
+        assert!(
+            offsets.contains(&last.get()),
+            "the one-shot gamma delivered"
+        );
+        // Offsets strictly increasing (the poll skipped the compacted holes), and the cursor reached
+        // the head (every offset, present or compacted-away, is satisfied).
+        let mut sorted = offsets.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            offsets, sorted,
+            "delivered in ascending order, holes skipped"
+        );
+        assert_eq!(
+            e.committed_offset().get(),
+            13,
+            "the cursor advanced past every hole to the head"
+        );
     }
 
     #[test]
