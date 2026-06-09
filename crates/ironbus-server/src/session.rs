@@ -1900,6 +1900,44 @@ mod tests {
                 "a compaction hole is byte-untracked; the span is the record count to-from"
             );
         }
+        // Independently pin the span against the actual DELIVERY STREAM, NOT `holes` (which the probe
+        // builds from the same engine code, so an engine-side off-by-one in `to` would mask itself,
+        // #411 review): (a) the first Deliver after each COMPACTED marker resumes at exactly `to`, and
+        // (b) no compacted-away offset in any [from, to) is ever delivered.
+        let delivered: Vec<u64> = frames
+            .iter()
+            .filter(|(ty, _)| *ty == FrameType::Deliver)
+            .map(|(_, b)| ironbus_proto::message::decode_deliver(b).expect("valid Deliver").offset)
+            .collect();
+        let mut pending_to: Option<u64> = None;
+        for (ty, b) in &frames {
+            match *ty {
+                FrameType::GapMarker => {
+                    pending_to =
+                        Some(ironbus_proto::message::decode_gap_marker(b).expect("valid GapMarker").to);
+                }
+                FrameType::Deliver => {
+                    let off =
+                        ironbus_proto::message::decode_deliver(b).expect("valid Deliver").offset;
+                    if let Some(to) = pending_to.take() {
+                        assert_eq!(
+                            off, to,
+                            "delivery resumes at the marker `to`, verified against the stream not the probe"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        for marker in &markers {
+            assert!(
+                !delivered.iter().any(|&o| o >= marker.from && o < marker.to),
+                "no compacted-away offset in [{}, {}) is delivered: {delivered:?}",
+                marker.from,
+                marker.to
+            );
+        }
+
         // Every survivor was still delivered (the latest-value-per-key view is intact).
         assert!(
             frames
