@@ -60,8 +60,8 @@ four prefix bytes alone, never an allocation (`decode_frame`; test
 
 ### The frozen FrameType tag set
 
-The wire verb is a one-byte tag. The frozen set runs from `Connect` = 1 through `Truncated`
-= 18, contiguous (`FrameType::as_u8` / `from_u8` in `frame.rs`; the full table is in
+The wire verb is a one-byte tag. The frozen set runs from `Connect` = 1 through `GapMarker`
+= 21, contiguous (`FrameType::as_u8` / `from_u8` in `frame.rs`; the full table is in
 [CONTRACTS.md](CONTRACTS.md) under "FrameType tags").
 
 The tags are FROZEN by this discipline, each clause backed by a test in `frame.rs`:
@@ -76,17 +76,18 @@ The tags are FROZEN by this discipline, each clause backed by a test in `frame.r
   round-trips through `as_u8`/`from_u8` with no duplicates, and that tags 0 and 255 are
   unknown.
 - **A new frame takes a new tag.** The set is `#[non_exhaustive]` and append-only by
-  convention; the next frame type takes tag 21, leaving every existing tag's meaning intact.
+  convention; the next frame type takes tag 22, leaving every existing tag's meaning intact.
   This is how `PubAck`/`AckStatus`/`FlowEnd` (14 to 16), `DeadLetter`/`Truncated` (17, 18),
-  `CumulativeAck` (19), and `PubAckDuplicate` (20, the #33 dedup-hit response that keeps the
-  frozen `PubAck` body intact) were added without disturbing earlier verbs.
+  `CumulativeAck` (19), `PubAckDuplicate` (20, the #33 dedup-hit response that keeps the
+  frozen `PubAck` body intact), and `GapMarker` (21, the #346 consumer-visible gap marker that
+  leaves the `Deliver` body frozen) were added without disturbing earlier verbs.
 
 ### Unknown tags are forward-compatible at the envelope level
 
 Because the length prefix is independent of the body codecs, an unknown tag still frames:
 `decode_frame` returns the raw `type_tag`, the body, and the consumed length for ANY tag
 value. Only `FrameType::from_u8` reports the tag unknown (returns `None`). This is proven by
-the proptest `an_unknown_type_tag_still_frames` (tags 19..=255 round-trip through the
+the proptest `an_unknown_type_tag_still_frames` (tags 22..=255 round-trip through the
 envelope; `from_u8` is `None`).
 
 What each peer does with an unknown KNOWN-envelope frame:
@@ -162,6 +163,34 @@ layout is in [CONTRACTS.md](CONTRACTS.md) under "ConnectBody / InfoBody"; the ru
   `Info` as `ClientError::Body` (`a_malformed_info_body_is_a_typed_error_not_a_panic`). Both decoders
   are fuzzed (`fuzz/fuzz_targets/connect_body.rs`, `info_body.rs`) and proptested
   (`handshake_oversized_declared_length_is_a_typed_error`).
+
+### The GapMarker frame is per-consumer OPT-IN via the handshake capability (#346)
+
+The `GapMarker` frame (tag 21) is the consumer-visible signal that a half-open offset span `[from,
+to)` is PERMANENTLY ABSENT from the DELIVER stream (a trim today, key-compaction #337 tomorrow), so a
+consumer tracking contiguity does not mistake the offset jump for message loss. Because the bundled
+client REFUSES an unknown frame tag (`ClientError::UnknownFrameType`, the frozen-tag rule above), the
+new frame is gated behind a HANDSHAKE CAPABILITY so an old client is never sent a tag it cannot parse:
+
+- **The capability is a single AND-negotiated bit.** A consumer that understands the frame sets
+  `Connect` flags bit 2 (`CONNECT_FLAG_WANTS_GAP_MARKER`); the server, which always supports it,
+  confirms with `Info` flags bit 2 (`INFO_FLAG_GAP_MARKER`). The capability is ACTIVE only when both
+  bits are set. It is a pure flag (no associated value), so it occupies no bytes in the v1 handshake
+  block and is appendable exactly like the credit fields above.
+- **An old consumer keeps the legacy `Truncated` (tag 18); it is never sent tag 21.** A consumer that
+  did not advertise the capability (a pre-#346 client, or one that opted out) gets the same `Truncated`
+  advisory for a skipped span it always did, so it is not broken. The server chooses the wire frame
+  per-connection from its `gap_marker_enabled` flag, so the two NEVER both fire for the same gap (no
+  double-signal). Proven by `a_gap_marker_consumer_gets_a_gap_marker_not_truncated_with_the_exact_range_and_reason`
+  (server), `an_old_server_leaves_the_gap_marker_capability_off` and
+  `a_gap_marker_capable_client_surfaces_a_gap_as_a_typed_event` (client).
+- **The `Deliver` body is UNCHANGED.** The marker is a SEPARATE frame, not a flag or field added to
+  `DeliverBody`, so the frozen DELIVER codec and a normal contiguous delivery are byte-for-byte as
+  before (`a_normal_contiguous_delivery_emits_no_gap_marker_for_a_gap_marker_consumer`).
+- **The `reason` byte is forward-tolerant.** `decode_gap_marker` does not validate the reason, so a
+  future reason (`COMPACTED` = 2, or beyond) decodes as a valid marker rather than an error
+  (`gap_marker_tolerates_an_unknown_reason`). The decoder is fuzzed
+  (`fuzz/fuzz_targets/gap_marker_body.rs`) and proptested (`any_gap_marker_round_trips`).
 
 ## On-disk compatibility
 

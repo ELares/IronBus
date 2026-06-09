@@ -26,9 +26,9 @@ use ironbus_core::types::Offset;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
     decode_ack, decode_connect, decode_cumulative_ack, decode_pub, decode_sub, encode_dead_letter,
-    encode_deliver, encode_info, encode_pub_ack, encode_truncated, AckOp, CreditAdvert,
-    DeadLetterBody, DeliverBody, InfoBody, PubAckBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER,
-    PUB_FLAG_HAS_DEDUP,
+    encode_deliver, encode_gap_marker, encode_info, encode_pub_ack, encode_truncated, gap_reason,
+    AckOp, CreditAdvert, DeadLetterBody, DeliverBody, GapMarkerBody, InfoBody, PubAckBody,
+    TruncatedBody, DEAD_LETTER_MAX_DELIVER, PUB_FLAG_HAS_DEDUP,
 };
 use ironbus_storage::fs::Filesystem;
 use std::collections::HashMap;
@@ -156,6 +156,10 @@ struct Lease {
 /// redeliver until acked). The freed slot restores BOTH the message credit and the message's bytes;
 /// when the message is recounted against whoever next claims it, it re-occupies exactly its bytes
 /// once (the redelivery overwrites the same offset key in `leased`, so the byte total never doubles).
+// Each bool is an INDEPENDENT piece of per-connection protocol state (handshake done, key_shared
+// membership, broadcast registration, gap-marker capability), not a set of related options that
+// would read better as one enum/bitset, so the four-bool count is intentional rather than a smell.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default)]
 pub struct Session {
     connected: bool,
@@ -214,6 +218,14 @@ pub struct Session {
     /// The default group (`""`) is never registered (its consumers do not SUB), so this stays
     /// `false` for an unsubscribed connection.
     registered_subscription: bool,
+    /// Whether this consumer negotiated the consumer-visible `GapMarker` frame (#346): set at
+    /// `Connect` time when the client advertised [`ironbus_proto::message::CONNECT_FLAG_WANTS_GAP_MARKER`].
+    /// When `true`, a skipped span is surfaced as a `GapMarker` (tag 21, the richer `[from, to)` +
+    /// `bytes_skipped` + reason marker); when `false` (an old client, or one that opted out) the
+    /// SAME gap is surfaced as the legacy `Truncated` advisory (tag 18), so the two NEVER
+    /// double-signal and an old consumer that would error on an unknown frame is never sent the new
+    /// tag. Default `false` (backward-compatible).
+    gap_marker_enabled: bool,
 }
 
 impl Session {
@@ -390,6 +402,11 @@ impl Session {
         // ran a Connect through this handler (some tests inject `connected` directly).
         self.requested_credit = req.requested_credit;
         self.requested_credit_bytes = req.requested_credit_bytes;
+        // Negotiate the consumer-visible gap marker (#346): the server always SUPPORTS it, so the
+        // capability is active exactly when this consumer advertised it understands the frame. A
+        // gap-marker consumer receives `GapMarker` (tag 21) for a skipped span; one that did not
+        // advertise keeps the legacy `Truncated` (tag 18), so an old client is never sent the new tag.
+        self.gap_marker_enabled = req.wants_gap_marker;
         // The server caps, read LOCALLY off the handle (NO actor round-trip), so the handshake never
         // touches the actor's checkpoint/fsync path and a stalled produce on one connection cannot
         // head-of-line-block this Connect (invariant 4, #177). The caps are static engine config.
@@ -413,6 +430,9 @@ impl Session {
                 negotiated: negotiated_credit_bytes,
                 cap: cap_credit_bytes,
             }),
+            // Confirm the gap-marker capability the server activated for this connection, so the
+            // client knows whether to expect `GapMarker` (tag 21) or the legacy `Truncated` (#346).
+            gap_marker: self.gap_marker_enabled,
         };
         let mut info_body = Vec::new();
         encode_info(&info, &mut info_body);
@@ -938,15 +958,7 @@ impl Session {
                 }) => {
                     self.leased
                         .retain(|&offset, _| offset >= earliest_retained.get());
-                    let mut frame_body = Vec::new();
-                    encode_truncated(
-                        &TruncatedBody {
-                            earliest_retained: earliest_retained.get(),
-                            skipped,
-                        },
-                        &mut frame_body,
-                    );
-                    reply(out, FrameType::Truncated, &frame_body);
+                    self.emit_truncation(out, earliest_retained.get(), skipped);
                 }
                 // Nothing more deliverable right now: end the batch early.
                 Ok(Poll::Idle) => break,
@@ -969,6 +981,41 @@ impl Session {
         self.leased.retain(|&offset, _| offset >= committed);
         reply(out, FrameType::FlowEnd, &delivered.to_le_bytes());
         Ok(())
+    }
+
+    /// Emits the in-band advisory for a `Poll::Truncated` skip: a consumer that negotiated the
+    /// gap-marker capability (#346) gets the richer, consumer-visible `GapMarker` (tag 21) for the
+    /// skipped span `[from, to)` where `to == earliest_retained` (delivery resumes at the oldest
+    /// record still present) and `from == earliest_retained - skipped` (where the cursor was), reason
+    /// TRIMMED (the disk-full drop-oldest reap) with `bytes_skipped == 0` (a force-reap trim is
+    /// byte-untracked: the span is reported by its record count `to - from`, matching the recovery-side
+    /// `loss-report.v1` convention). A consumer WITHOUT the capability gets the legacy `Truncated`
+    /// (tag 18) instead, so the two NEVER double-signal and an old consumer is never sent the new tag.
+    fn emit_truncation(&self, out: &mut Vec<u8>, earliest_retained: u64, skipped: u64) {
+        let mut frame_body = Vec::new();
+        if self.gap_marker_enabled {
+            let to = earliest_retained;
+            let from = to.saturating_sub(skipped);
+            encode_gap_marker(
+                &GapMarkerBody {
+                    from,
+                    to,
+                    bytes_skipped: 0,
+                    reason: gap_reason::TRIMMED,
+                },
+                &mut frame_body,
+            );
+            reply(out, FrameType::GapMarker, &frame_body);
+        } else {
+            encode_truncated(
+                &TruncatedBody {
+                    earliest_retained,
+                    skipped,
+                },
+                &mut frame_body,
+            );
+            reply(out, FrameType::Truncated, &frame_body);
+        }
     }
 
     fn handle_sub<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
@@ -1485,6 +1532,182 @@ mod tests {
         assert!(
             frames2.iter().any(|(ty, _)| *ty == FrameType::Deliver),
             "delivery resumes from the oldest retained record: {frames2:?}"
+        );
+    }
+
+    /// A `Connect` body that advertises the gap-marker capability (#346).
+    fn gap_marker_connect_body() -> Vec<u8> {
+        let mut body = Vec::new();
+        ironbus_proto::message::encode_connect(
+            &ironbus_proto::message::ConnectBody {
+                requested_credit: None,
+                requested_credit_bytes: None,
+                wants_gap_marker: true,
+            },
+            &mut body,
+        );
+        body
+    }
+
+    #[test]
+    fn the_info_confirms_the_gap_marker_capability_only_when_the_client_advertises_it() {
+        // The server confirms the gap-marker capability in Info iff the client advertised it (#346):
+        // an old (empty) Connect gets gap_marker=false, an advertising Connect gets gap_marker=true.
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(engine_drop_oldest(Arc::clone(&clock), 0));
+
+        let mut s_old = Session::new();
+        let mut out = Vec::new();
+        s_old
+            .process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::Info);
+        assert!(
+            !ironbus_proto::message::decode_info(&body)
+                .unwrap()
+                .gap_marker,
+            "an old (empty) Connect is NOT confirmed for gap markers"
+        );
+
+        let mut s_new = Session::new();
+        out.clear();
+        s_new
+            .process(
+                &e,
+                &frame(FrameType::Connect, &gap_marker_connect_body()),
+                &mut out,
+            )
+            .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::Info);
+        assert!(
+            ironbus_proto::message::decode_info(&body)
+                .unwrap()
+                .gap_marker,
+            "an advertising Connect IS confirmed for gap markers"
+        );
+    }
+
+    #[test]
+    fn a_gap_marker_consumer_gets_a_gap_marker_not_truncated_with_the_exact_range_and_reason() {
+        // TEETH (#346): a consumer that negotiated the gap marker, reading across a force-reaped
+        // (trimmed) span, receives EXACTLY ONE GapMarker (tag 21) and NO legacy Truncated frame
+        // (no double-signal); the marker's [from, to) and reason match the reaped span, delivery
+        // resumes at `to`, and a later contiguous fetch emits NO spurious marker.
+        let clock = Arc::new(ManualClock::new());
+        let one = {
+            let probe = DirectEngine::new(engine_drop_oldest(Arc::clone(&clock), 0));
+            produce(&probe, &[0xab; 16]);
+            let bytes = probe.engine_mut().durable_record_bytes();
+            bytes
+        };
+        let e = DirectEngine::new(engine_drop_oldest(Arc::clone(&clock), 4 * one));
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        // Connect WITH the gap-marker capability.
+        s.process(
+            &e,
+            &frame(FrameType::Connect, &gap_marker_connect_body()),
+            &mut out,
+        )
+        .unwrap();
+
+        // Lease offset 0 (a stuck consumer: the cursor sits at 0), then race the producer past the
+        // cap so DropOldest force-reaps the leased prefix.
+        produce(&e, &[0xab; 16]);
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(delivered_tokens(&out).len(), 1, "leased offset 0");
+        for _ in 0..20 {
+            produce(&e, &[0xab; 16]);
+        }
+        let earliest = e.engine_mut().earliest_retained_offset().get();
+        assert!(earliest > 0, "the leased records were force-reaped");
+
+        // The next fetch returns EXACTLY ONE GapMarker and ZERO Truncated frames.
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .expect("the session stays open after a gap");
+        let frames = decode_all(&out);
+        let markers: Vec<_> = frames
+            .iter()
+            .filter(|(ty, _)| *ty == FrameType::GapMarker)
+            .collect();
+        assert_eq!(markers.len(), 1, "exactly one GapMarker frame: {frames:?}");
+        assert!(
+            !frames.iter().any(|(ty, _)| *ty == FrameType::Truncated),
+            "a gap-marker consumer is NEVER also sent the legacy Truncated (no double-signal): {frames:?}"
+        );
+        let marker =
+            ironbus_proto::message::decode_gap_marker(&markers[0].1).expect("valid GapMarker body");
+        // The cursor was at 0 (it leased but never acked offset 0), so the hole is [0, earliest).
+        assert_eq!(marker.from, 0, "the hole begins where the cursor was");
+        assert_eq!(marker.to, earliest, "delivery resumes at earliest-retained");
+        assert!(marker.to > marker.from, "the skipped span is non-empty");
+        assert_eq!(
+            marker.reason,
+            ironbus_proto::message::gap_reason::TRIMMED,
+            "a force-reap trim is reason TRIMMED"
+        );
+        assert_eq!(
+            marker.bytes_skipped, 0,
+            "a trim is byte-untracked; the span is the record count to-from"
+        );
+        assert_eq!(
+            frames.last().map(|(ty, _)| *ty),
+            Some(FrameType::FlowEnd),
+            "the batch still terminates with FlowEnd"
+        );
+
+        // A later fetch delivers normally and emits NO spurious gap marker for the same gap.
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
+        let frames2 = decode_all(&out);
+        assert!(
+            !frames2.iter().any(|(ty, _)| *ty == FrameType::GapMarker),
+            "no re-marking of the same gap: {frames2:?}"
+        );
+        assert!(
+            frames2.iter().any(|(ty, _)| *ty == FrameType::Deliver),
+            "delivery resumes from the oldest retained record: {frames2:?}"
+        );
+    }
+
+    #[test]
+    fn a_normal_contiguous_delivery_emits_no_gap_marker_for_a_gap_marker_consumer() {
+        // TEETH (#346): a gap-marker consumer reading a contiguous stream (no trim) sees ONLY
+        // deliveries, never a spurious GapMarker. The marker is for real holes only.
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(engine_drop_oldest(Arc::clone(&clock), 0));
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &e,
+            &frame(FrameType::Connect, &gap_marker_connect_body()),
+            &mut out,
+        )
+        .unwrap();
+        for _ in 0..3 {
+            produce(&e, &[0xcd; 8]);
+        }
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &5u32.to_le_bytes()), &mut out)
+            .unwrap();
+        let frames = decode_all(&out);
+        assert!(
+            !frames.iter().any(|(ty, _)| *ty == FrameType::GapMarker),
+            "no spurious gap marker on a contiguous stream: {frames:?}"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|(ty, _)| *ty == FrameType::Deliver)
+                .count(),
+            3,
+            "all three contiguous records delivered: {frames:?}"
         );
     }
 
@@ -3292,6 +3515,7 @@ mod tests {
             &ironbus_proto::message::ConnectBody {
                 requested_credit,
                 requested_credit_bytes,
+                wants_gap_marker: false,
             },
             &mut connect_body,
         );

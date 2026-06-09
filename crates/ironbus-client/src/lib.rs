@@ -13,9 +13,9 @@
 
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
-    decode_dead_letter, decode_deliver, decode_info, decode_pub_ack, decode_truncated, encode_ack,
-    encode_connect, encode_cumulative_ack, encode_pub, encode_sub, AckBody, AckOp, BodyError,
-    ConnectBody, CumulativeAckBody, PubBody, SubBody,
+    decode_dead_letter, decode_deliver, decode_gap_marker, decode_info, decode_pub_ack,
+    decode_truncated, encode_ack, encode_connect, encode_cumulative_ack, encode_pub, encode_sub,
+    AckBody, AckOp, BodyError, ConnectBody, CumulativeAckBody, PubBody, SubBody,
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -90,6 +90,13 @@ pub struct ClientConfig {
     /// `None` to defer to the server default. Negotiated and adopted exactly like
     /// `requested_consumer_credit`.
     pub requested_consumer_credit_bytes: Option<u64>,
+    /// Whether this client ADVERTISES that it understands the consumer-visible `GapMarker` frame
+    /// (#346): when `true`, the `Connect` sets the gap-marker capability bit, and the server may
+    /// surface a skipped span as a typed `Gap` ([`Fetch::gaps`]) instead of the legacy `Truncation`.
+    /// When `false` (the default, backward-compatible) the client does not advertise it and keeps
+    /// receiving the legacy `Truncation` advisory. A caller checks [`Client::gap_marker_enabled`]
+    /// after connecting to learn whether the server confirmed it.
+    pub request_gap_marker: bool,
 }
 
 impl Default for ClientConfig {
@@ -103,6 +110,10 @@ impl Default for ClientConfig {
             // defaults"); a caller opts into a specific credit by setting these.
             requested_consumer_credit: None,
             requested_consumer_credit_bytes: None,
+            // Off by default: an unconfigured client does not advertise gap-marker support, so it
+            // keeps receiving the legacy `Truncation` advisory exactly as before (#346). A caller
+            // that tracks contiguity opts in by setting this.
+            request_gap_marker: false,
         }
     }
 }
@@ -149,6 +160,28 @@ pub struct Truncation {
     pub skipped: u64,
 }
 
+/// A consumer-visible GAP marker (#346): the broker told this consumer that the half-open offset
+/// span `[from, to)` is PERMANENTLY ABSENT (skipped) from the DELIVER stream, so a reader tracking
+/// contiguity knows the offset jump is a bounded, REPORTED gap rather than message loss. It is the
+/// richer, opt-in replacement for [`Truncation`]: a client that advertised gap-marker support (see
+/// [`ClientConfig::request_gap_marker`] / [`Client::gap_marker_enabled`]) receives this typed event
+/// for a skipped span INSTEAD of a `Truncation`, so the two never both fire for the same gap. The
+/// next delivery in the batch (if any) is at offset `to`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gap {
+    /// The first absent offset (inclusive): where the hole begins (the last seen offset plus one).
+    pub from: u64,
+    /// The first present offset after the hole (exclusive): delivery resumes here.
+    pub to: u64,
+    /// The reported bytes lost in the hole (from the recovery-side `loss-report.v1`); `0` when the
+    /// cause is byte-untracked (a plain retention/trim reap, whose span is the record count
+    /// `to - from`).
+    pub bytes_skipped: u64,
+    /// Why the span is absent: `1` = trimmed (a retention/disk-full reap), `2` = compacted (#337,
+    /// reserved); an unknown future value is surfaced verbatim, never an error.
+    pub reason: u8,
+}
+
 /// The result of a [`Client::fetch`]: the messages delivered in the batch, any in-band dead-letter
 /// advisories for offsets the broker skipped as poison, and any truncation advisories for a cursor
 /// the broker reset because the disk-full drop-oldest policy reaped its records, all during the
@@ -160,8 +193,15 @@ pub struct Fetch {
     /// Dead-letter advisories for offsets dropped as poison during this fetch (usually empty).
     pub dead_letters: Vec<DeadLetter>,
     /// Truncation advisories for a cursor reset below the oldest retained record during this fetch
-    /// (usually empty; only under the disk-full drop-oldest policy, #82, #84).
+    /// (usually empty; only under the disk-full drop-oldest policy, #82, #84). For a
+    /// gap-marker-capable connection (#346) a skipped span arrives in `gaps` instead, so this stays
+    /// empty.
     pub truncations: Vec<Truncation>,
+    /// Consumer-visible gap markers for skipped offset spans during this fetch (#346): present only
+    /// when this connection negotiated gap-marker support (see [`Client::gap_marker_enabled`]), in
+    /// which case a skipped span arrives here as a typed [`Gap`] instead of in `truncations`. Usually
+    /// empty.
+    pub gaps: Vec<Gap>,
 }
 
 /// The outcome of a [`Client::produce`] / [`Client::produce_dedup`] call: the assigned (or, on a
@@ -206,6 +246,12 @@ pub struct Client {
     /// The per-consumer BYTE budget negotiated for this connection (#292), the byte-side companion to
     /// `negotiated_credit`. `None` if the server did not advertise.
     negotiated_credit_bytes: Option<u64>,
+    /// Whether the gap-marker capability is ACTIVE on this connection (#346): `true` only when this
+    /// client advertised it ([`ClientConfig::request_gap_marker`]) AND the server confirmed it in
+    /// `Info`. When `true`, a skipped span arrives in [`Fetch::gaps`] as a typed [`Gap`]; when `false`
+    /// (an old server, or the client did not advertise), a skipped span arrives in
+    /// [`Fetch::truncations`] as the legacy advisory.
+    gap_marker_enabled: bool,
 }
 
 impl Client {
@@ -236,15 +282,18 @@ impl Client {
             buf: Vec::new(),
             negotiated_credit: None,
             negotiated_credit_bytes: None,
+            gap_marker_enabled: false,
         };
         // The #292 handshake: send a versioned Connect body carrying any requested credit (an
         // all-absent body when the caller requested nothing, which the server reads as "use my
-        // defaults"), then read the Info advertisement and adopt the negotiated credit.
+        // defaults") and the #346 gap-marker capability bit, then read the Info advertisement and
+        // adopt the negotiated credit and the confirmed gap-marker capability.
         let mut connect_body = Vec::new();
         encode_connect(
             &ConnectBody {
                 requested_credit: config.requested_consumer_credit,
                 requested_credit_bytes: config.requested_consumer_credit_bytes,
+                wants_gap_marker: config.request_gap_marker,
             },
             &mut connect_body,
         );
@@ -258,6 +307,9 @@ impl Client {
                 let info = decode_info(&body).map_err(ClientError::Body)?;
                 client.negotiated_credit = info.credit.map(|c| c.negotiated);
                 client.negotiated_credit_bytes = info.credit_bytes.map(|c| c.negotiated);
+                // The gap-marker capability is active only when the server CONFIRMED it (it does so
+                // only when the client advertised it), so an old server's empty Info leaves it off.
+                client.gap_marker_enabled = info.gap_marker;
                 Ok(client)
             }
             (FrameType::Err, body) => {
@@ -282,6 +334,15 @@ impl Client {
     #[must_use]
     pub fn negotiated_credit_bytes(&self) -> Option<u64> {
         self.negotiated_credit_bytes
+    }
+
+    /// Whether the consumer-visible gap-marker capability is ACTIVE on this connection (#346): `true`
+    /// only when this client advertised it ([`ClientConfig::request_gap_marker`]) AND the server
+    /// confirmed it. When `true`, a skipped offset span arrives in [`Fetch::gaps`] as a typed [`Gap`];
+    /// when `false`, it arrives in [`Fetch::truncations`] as the legacy advisory.
+    #[must_use]
+    pub fn gap_marker_enabled(&self) -> bool {
+        self.gap_marker_enabled
     }
 
     /// Resolves `addr` and connects to the first address that accepts, honoring an optional
@@ -391,14 +452,17 @@ impl Client {
         let mut messages = Vec::new();
         let mut dead_letters = Vec::new();
         let mut truncations = Vec::new();
-        // The total advisory + delivery frames seen so far, the quantity the credit bounds.
-        let over_credit = |m: &[Message], d: &[DeadLetter], t: &[Truncation]| {
-            m.len() + d.len() + t.len() >= limit
+        let mut gaps = Vec::new();
+        // The total advisory + delivery frames seen so far, the quantity the credit bounds. A
+        // GapMarker, like a delivery / dead-letter / truncation, consumes one credit slot server-side,
+        // so it counts here too (a buggy or hostile server cannot stream any of them without bound).
+        let over_credit = |m: &[Message], d: &[DeadLetter], t: &[Truncation], g: &[Gap]| {
+            m.len() + d.len() + t.len() + g.len() >= limit
         };
         loop {
             match self.read_frame()? {
                 (FrameType::Deliver, body) => {
-                    if over_credit(&messages, &dead_letters, &truncations) {
+                    if over_credit(&messages, &dead_letters, &truncations, &gaps) {
                         return Err(ClientError::BadResponse(
                             "server streamed more frames than the requested credit",
                         ));
@@ -417,7 +481,7 @@ impl Client {
                 // An in-band dead-letter advisory for an offset skipped as poison (#63). It is
                 // not a delivery, so it carries its own offset and does not ack.
                 (FrameType::DeadLetter, body) => {
-                    if over_credit(&messages, &dead_letters, &truncations) {
+                    if over_credit(&messages, &dead_letters, &truncations, &gaps) {
                         return Err(ClientError::BadResponse(
                             "server streamed more frames than the requested credit",
                         ));
@@ -433,7 +497,7 @@ impl Client {
                 // (#82, #84). It is not a delivery and does not ack; it names where delivery
                 // resumed and how many records were skipped.
                 (FrameType::Truncated, body) => {
-                    if over_credit(&messages, &dead_letters, &truncations) {
+                    if over_credit(&messages, &dead_letters, &truncations, &gaps) {
                         return Err(ClientError::BadResponse(
                             "server streamed more frames than the requested credit",
                         ));
@@ -444,12 +508,31 @@ impl Client {
                         skipped: t.skipped,
                     });
                 }
+                // An in-band gap marker (#346): the consumer-visible, opt-in replacement for the
+                // Truncated advisory. A skipped offset span `[from, to)` is permanently absent, so a
+                // reader tracking contiguity learns the jump is a bounded, reported gap rather than
+                // loss. Only seen on a gap-marker-capable connection; an old server never sends it.
+                (FrameType::GapMarker, body) => {
+                    if over_credit(&messages, &dead_letters, &truncations, &gaps) {
+                        return Err(ClientError::BadResponse(
+                            "server streamed more frames than the requested credit",
+                        ));
+                    }
+                    let g = decode_gap_marker(&body).map_err(ClientError::Body)?;
+                    gaps.push(Gap {
+                        from: g.from,
+                        to: g.to,
+                        bytes_skipped: g.bytes_skipped,
+                        reason: g.reason,
+                    });
+                }
                 // The FlowEnd frame terminates the batch (its body is the delivered count).
                 (FrameType::FlowEnd, _) => {
                     return Ok(Fetch {
                         messages,
                         dead_letters,
                         truncations,
+                        gaps,
                     })
                 }
                 (FrameType::Err, body) => {
@@ -1292,6 +1375,138 @@ mod tests {
             ClientError::BadResponse(_) => {}
             other => panic!("expected BadResponse, got {other:?}"),
         }
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    /// An `Info` body that confirms the gap-marker capability (#346).
+    fn info_with_gap_marker() -> Vec<u8> {
+        let mut body = Vec::new();
+        ironbus_proto::message::encode_info(
+            &ironbus_proto::message::InfoBody {
+                credit: None,
+                credit_bytes: None,
+                gap_marker: true,
+            },
+            &mut body,
+        );
+        frame(FrameType::Info, &body)
+    }
+
+    /// A `ClientConfig` that advertises gap-marker support.
+    fn config_wanting_gap_marker() -> ClientConfig {
+        ClientConfig {
+            request_gap_marker: true,
+            ..ClientConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_gap_marker_capable_client_surfaces_a_gap_as_a_typed_event() {
+        // TEETH (#346): a client that advertised gap-marker support and whose server confirmed it
+        // receives a skipped span as a typed `Gap` in `fetch().gaps` (NOT a `Truncation`), with the
+        // exact [from, to), byte count, and reason. The FlowEnd still terminates the batch.
+        let mut g_body = Vec::new();
+        ironbus_proto::message::encode_gap_marker(
+            &ironbus_proto::message::GapMarkerBody {
+                from: 7,
+                to: 12,
+                bytes_skipped: 0,
+                reason: ironbus_proto::message::gap_reason::TRIMMED,
+            },
+            &mut g_body,
+        );
+        let mut script = info_with_gap_marker();
+        script.extend(frame(FrameType::GapMarker, &g_body));
+        script.extend(frame(FrameType::FlowEnd, &0u32.to_le_bytes()));
+        let (addr, handle) = raw_server(script);
+        let mut c = Client::connect_with(addr, &config_wanting_gap_marker()).unwrap();
+        assert!(
+            c.gap_marker_enabled(),
+            "the server confirmed the gap-marker capability"
+        );
+        let fetched = c.fetch(10).unwrap();
+        assert!(fetched.messages.is_empty(), "no messages in this batch");
+        assert!(
+            fetched.truncations.is_empty(),
+            "a gap-marker client gets a Gap, never a Truncation"
+        );
+        assert_eq!(
+            fetched.gaps,
+            vec![Gap {
+                from: 7,
+                to: 12,
+                bytes_skipped: 0,
+                reason: ironbus_proto::message::gap_reason::TRIMMED,
+            }],
+            "the skipped span is surfaced as a typed Gap with the exact range and reason"
+        );
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_gap_marker_counts_against_the_credit() {
+        // A GapMarker counts as one frame toward the credit bound (like a delivery / dead-letter /
+        // truncation), so a server that streams more than the credit is rejected.
+        fn gap(off: u64) -> Vec<u8> {
+            let mut body = Vec::new();
+            ironbus_proto::message::encode_gap_marker(
+                &ironbus_proto::message::GapMarkerBody {
+                    from: off,
+                    to: off + 1,
+                    bytes_skipped: 0,
+                    reason: ironbus_proto::message::gap_reason::TRIMMED,
+                },
+                &mut body,
+            );
+            frame(FrameType::GapMarker, &body)
+        }
+        let mut script = info_with_gap_marker();
+        script.extend(gap(1));
+        script.extend(gap(2)); // one past the credit of 1
+        let (addr, handle) = raw_server(script);
+        let mut c = Client::connect_with(addr, &config_wanting_gap_marker()).unwrap();
+        match c.fetch(1).unwrap_err() {
+            ClientError::BadResponse(_) => {}
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn an_old_server_leaves_the_gap_marker_capability_off() {
+        // BACKWARD-COMPAT (#346): a client may advertise gap-marker support, but a pre-#346 server
+        // replies an EMPTY Info (no confirmation), so the capability stays OFF and the client keeps
+        // receiving the legacy Truncation advisory. The client is not broken by opting in.
+        let mut t_body = Vec::new();
+        ironbus_proto::message::encode_truncated(
+            &ironbus_proto::message::TruncatedBody {
+                earliest_retained: 9,
+                skipped: 2,
+            },
+            &mut t_body,
+        );
+        let mut script = frame(FrameType::Info, b""); // an old server's empty Info: no confirmation
+        script.extend(frame(FrameType::Truncated, &t_body));
+        script.extend(frame(FrameType::FlowEnd, &0u32.to_le_bytes()));
+        let (addr, handle) = raw_server(script);
+        let mut c = Client::connect_with(addr, &config_wanting_gap_marker()).unwrap();
+        assert!(
+            !c.gap_marker_enabled(),
+            "an old server does not confirm the capability, so it stays off"
+        );
+        let fetched = c.fetch(10).unwrap();
+        assert!(fetched.gaps.is_empty(), "no Gap from an old server");
+        assert_eq!(
+            fetched.truncations,
+            vec![Truncation {
+                earliest_retained: 9,
+                skipped: 2
+            }],
+            "the legacy Truncation advisory is still surfaced"
+        );
         drop(c);
         handle.join().unwrap();
     }
