@@ -7,8 +7,14 @@
 # be byte-reproducible. Listing them here is a no-op for every other `cross` caller (CI's
 # cross-build and the 32-bit parser job do not set `SOURCE_DATE_EPOCH`, so an unset var is simply
 # not forwarded), so this only affects the release path.
+#
+# `IRONBUS_BUILD_VERSION` is the rolling-release workflow's calendar version `YYYY.MMDD.N`; it is
+# read at compile time by `option_env!` in the `version` verb so `ironbus version` reports the
+# published build (it is unset and ignored on every other `cross` caller, so the dev/CI build
+# falls back to `CARGO_PKG_VERSION` and the lockfile is untouched).
 [build.env]
 passthrough = [
     "SOURCE_DATE_EPOCH",
     "RUSTFLAGS",
+    "IRONBUS_BUILD_VERSION",
 ]

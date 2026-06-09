@@ -1,0 +1,225 @@
+name: Rolling release
+
+# Publish a calendar-versioned GitHub Release on EVERY push to main, so installing IronBus on an
+# edge device is "grab the latest release" (or run `scripts/install.sh`, which auto-detects the arch
+# and pulls the latest release). This is the CONTINUOUS channel; the formal `v*` channel
+# (`release.yml`) keeps the .deb + container + changelog gate. See docs/DISTRIBUTION.md.
+#
+# Each rolling build ships the three static musl edge binaries (x86_64, aarch64, armv7), a
+# per-binary `.sha256`, one consolidated `SHA256SUMS`, and a keyless Sigstore build-provenance
+# attestation over the binaries + `SHA256SUMS`. The build matrix reuses release.yml's proven static
+# musl setup VERBATIM (same `cross`, same reproducible RUSTFLAGS + `SOURCE_DATE_EPOCH`, same
+# static-link `readelf` assertion, same staging), and additionally stamps the calendar version into
+# the binary via `IRONBUS_BUILD_VERSION` (read by `option_env!` in the `version` verb, forwarded
+# into the cross container by Cross.toml).
+#
+# The version is `YYYY.MMDD.N` (UTC date + per-day build number); the first push of a day is `.1`,
+# the next `.2`, the next day resets. The release is a NORMAL release (not a prerelease, not a
+# draft), so GitHub's `releases/latest` points at the newest rolling build and the installer's
+# default-latest works. Skip a build by putting `[skip release]` in the head commit message.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Serialize close-together pushes so two builds never collide on the per-day build number (a NORMAL
+# release tag is unique; without this, two near-simultaneous pushes could both compute the same N).
+concurrency:
+  group: rolling-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write # create the tag + GitHub Release
+  id-token: write # keyless Sigstore signing via OIDC
+  attestations: write # store the build-provenance attestation
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  version:
+    name: compute calendar version
+    # The workflow_dispatch path always runs; a push runs unless the head commit says skip.
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip release]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+    steps:
+      - id: compute
+        name: compute YYYY.MMDD.N
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # The UTC calendar date with leading-zero month/day, e.g. 2026.0609. This is a deliberate
+          # CalVer string used only as a tag + a printed version, never semver-parsed, so the
+          # leading zeros are fine.
+          DATE="$(date -u +%Y.%m%d)"
+          # N is the per-day build number: count of existing releases whose tag starts with
+          # "$DATE." (so 2026.0609.1, then .2, ...), plus one. The next day's first build, with no
+          # prior "$DATE." releases, computes 1 again, so each day resets.
+          existing="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName \
+            --jq "[.[] | select(.tagName | test(\"^\($DATE)\\\\.\"))] | length")"
+          build=$((existing + 1))
+          VERSION="${DATE}.${build}"
+          echo "computed rolling version: $VERSION (existing $DATE.* releases: $existing)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: rolling-${{ matrix.target }}
+      - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2
+        with:
+          tool: cross
+      - name: cross build the static ironbus binary (reproducible invocation, stamped version)
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The reproducible release invocation pinned in RELEASING.md (#101), reused VERBATIM from
+          # release.yml: SOURCE_DATE_EPOCH is the head commit's date (not the runner wall clock); the
+          # --remap-path-prefix pair drops the checkout dir and the cargo cache out of the binary's
+          # embedded panic/track_caller/file!() strings; --locked uses the committed Cargo.lock.
+          # CARGO_INCREMENTAL=0 is pinned in .cargo/config.toml. Cross.toml forwards SOURCE_DATE_EPOCH,
+          # RUSTFLAGS, and IRONBUS_BUILD_VERSION into the cross container.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          export RUSTFLAGS="-D warnings --remap-path-prefix=${PWD}=/ironbus --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+          # Stamp the calendar version into the binary; option_env!("IRONBUS_BUILD_VERSION") in the
+          # version verb reads it, so `ironbus version` reports the published rolling build. This is
+          # compile-time only and leaves Cargo.lock at 0.0.0, so --locked still holds.
+          export IRONBUS_BUILD_VERSION="$VERSION"
+          # Inspect only a freshly produced artifact, never a stale cached one.
+          rm -f "target/${{ matrix.target }}/release/ironbus"
+          cross build --release --locked -p ironbus-cli --target "${{ matrix.target }}"
+      - name: assert the binary is statically linked
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/ironbus"
+          test -x "$bin"
+          # A static (including static-PIE) ELF carries no PT_INTERP segment and no NEEDED lib.
+          if readelf -l "$bin" | grep -q 'INTERP'; then
+            echo "::error::$bin has a PT_INTERP segment, it is dynamically linked"
+            exit 1
+          fi
+          if readelf -d "$bin" 2>/dev/null | grep -q 'NEEDED'; then
+            echo "::error::$bin lists NEEDED shared libraries, it is not static"
+            exit 1
+          fi
+      - name: stage the artifact and its checksum
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          out="dist/ironbus-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/ironbus" "$out"
+          # The per-binary .sha256 is named with the bare asset name so `sha256sum -c` works from
+          # the download dir; the consolidated SHA256SUMS is built once in the publish job.
+          ( cd dist && sha256sum "ironbus-${{ matrix.target }}" > "ironbus-${{ matrix.target }}.sha256" )
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ironbus-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish rolling release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+      - name: collect the binaries and build the consolidated SHA256SUMS
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Copy the three binaries and their per-binary .sha256 out of the per-target artifacts,
+          # then build one SHA256SUMS over the three binaries (the installer's source of truth).
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf; do
+            cp "artifacts/ironbus-${t}/ironbus-${t}" "dist/ironbus-${t}"
+            cp "artifacts/ironbus-${t}/ironbus-${t}.sha256" "dist/ironbus-${t}.sha256"
+          done
+          ( cd dist && sha256sum \
+              ironbus-x86_64-unknown-linux-musl \
+              ironbus-aarch64-unknown-linux-musl \
+              ironbus-armv7-unknown-linux-musleabihf \
+              > SHA256SUMS )
+          # Self-check: the consolidated file must verify before it ships, so a bad upload can
+          # never produce a release whose SHA256SUMS does not match its own binaries.
+          ( cd dist && sha256sum -c SHA256SUMS )
+          ls -l dist
+      - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          # Keyless Sigstore build-provenance over the binaries + SHA256SUMS, so a verifier can
+          # anchor the whole set to one provenance (verify with `gh attestation verify`).
+          subject-path: |
+            dist/ironbus-x86_64-unknown-linux-musl
+            dist/ironbus-aarch64-unknown-linux-musl
+            dist/ironbus-armv7-unknown-linux-musleabihf
+            dist/SHA256SUMS
+      - name: create the rolling GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # The install table maps the edge CPU to its asset. Heredoc keeps the markdown readable;
+          # no changelog gate (rolling builds are continuous, not curated). A NORMAL release (no
+          # --prerelease, no --draft) so releases/latest resolves to this newest build.
+          notes="$(cat <<EOF
+          Automatic rolling build \`${VERSION}\` from commit \`${SHA}\`.
+
+          ## Install
+
+          One line (auto-detects your CPU arch and verifies the checksum):
+
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/ELares/IronBus/main/scripts/install.sh | sh
+          \`\`\`
+
+          Or grab the static \`musl\` binary for your CPU from this release, \`chmod +x\`, and run:
+
+          | Edge CPU | Asset |
+          | --- | --- |
+          | Raspberry Pi 4 / 5 (64-bit) and other arm64 | \`ironbus-aarch64-unknown-linux-musl\` |
+          | Raspberry Pi 32-bit / armv7 | \`ironbus-armv7-unknown-linux-musleabihf\` |
+          | x86_64 / amd64 | \`ironbus-x86_64-unknown-linux-musl\` |
+
+          Verify integrity with \`sha256sum -c SHA256SUMS\`, and provenance with \`gh attestation verify <asset> --repo ${REPO}\`. See docs/DISTRIBUTION.md for all channels.
+          EOF
+          )"
+          gh release create "$VERSION" \
+            --repo "$REPO" \
+            --title "$VERSION" \
+            --target "$SHA" \
+            --notes "$notes" \
+            dist/ironbus-x86_64-unknown-linux-musl \
+            dist/ironbus-x86_64-unknown-linux-musl.sha256 \
+            dist/ironbus-aarch64-unknown-linux-musl \
+            dist/ironbus-aarch64-unknown-linux-musl.sha256 \
+            dist/ironbus-armv7-unknown-linux-musleabihf \
+            dist/ironbus-armv7-unknown-linux-musleabihf.sha256 \
+            dist/SHA256SUMS
