@@ -27,8 +27,11 @@ other, each by a single byte:
 - The **on-disk format** is `FORMAT_VERSION` (`crates/ironbus-core/src/format.rs`), currently
   `1`. It stamps the record header, the segment header, and the segment footer.
 - The **wire protocol** is, today, the frozen `FrameType` tag set plus the fixed body
-  layouts. There is no separately negotiated wire-version integer on the wire yet (see the
-  discrepancies); the Connect/Info handshake carries no version field.
+  layouts. There is no separately negotiated `wire_protocol_version` INTEGER on the wire yet (see
+  the discrepancies). The Connect/Info handshake bodies DO now carry the #292 per-consumer credit
+  negotiation in a versioned, length-prefixed, forward-compatible body (the additive handshake-body
+  change below), whose own `body_version` byte and appendable field block are the seam the
+  `wire_protocol_version` integer will slot into.
 
 Within version 1 both formats are frozen: the byte layouts and tag values do not change.
 "Frozen" is enforced by pinning tests, described per surface below. A future incompatible
@@ -123,6 +126,42 @@ that happened to set bit 7 on a no-dedup produce will have that bit CLEARED in t
 (and no dedup block is parsed, since the server reads bit 7 to decide whether the block is
 present). Bit 7 sits well above `RecordFlags::KNOWN` (`0b111`), so this does not collide with any
 storage flag; it is the single producer-flag bit the wire now reserves.
+
+### The Connect/Info handshake bodies are an ADDITIVE, version-prefixed change (#292)
+
+The `Connect` (tag 1) and `Info` (tag 2) bodies were EMPTY before #292; they now carry the
+per-consumer credit negotiation. This is an ADDITIVE wire change, NOT a frozen-tag break: the
+FrameType tags are unchanged (no renumber, no new tag, the `type_tags_have_their_exact_frozen_wire_values`
+pin still holds); only the previously-empty BODY of two existing tags gained a format. The body
+layout is in [CONTRACTS.md](CONTRACTS.md) under "ConnectBody / InfoBody"; the rules that ride on it:
+
+- **The body is versioned and length-prefixed for forward compatibility.** It leads with a
+  `body_version: u8` (`HANDSHAKE_BODY_VERSION` = 1) and a `field_len: u16` naming the known-field
+  block, so a future version can APPEND fields (the #71/#11 `wire_protocol_version` integer and
+  capability bitset are the planned ones) without re-breaking: a v1 reader reads its v1 fields from
+  the front of the block and TOLERATES any trailing bytes (`handshake_tolerates_trailing_future_fields`
+  proptest in `message.rs`). This is the same unknown-trailing-bytes forward-compat discipline
+  `RecordFlags` uses for unknown flag bits, applied to a whole appendable body.
+- **The empty-body case stays valid in BOTH directions (the backward-compat anchor).** An EMPTY
+  `Connect` body (a pre-#292 client) decodes to "no request", so the server uses its defaults exactly
+  as before (`empty_connect_body_is_the_old_client_no_request`; the server-side
+  `an_empty_connect_uses_the_server_default_credit`). An EMPTY `Info` body (a pre-#292 server)
+  decodes to "no advertisement", so a new client keeps its own LOCAL credit
+  (`empty_info_body_is_the_old_server_no_advert`; the client-side
+  `an_empty_info_from_an_old_server_leaves_the_client_on_its_local_credit`). So an old client meeting
+  a new server, and a new client meeting an old server, both still negotiate (or fall back) correctly.
+- **The negotiation can only TIGHTEN, never raise, the server cap.** The effective per-consumer
+  credit is `min(client request, server cap)`, or the server default when the client requested
+  nothing; no unbounded / `request(MAX)` value is representable on the wire (the request is a finite
+  `u32`/`u64` or absent). So a hostile or buggy client cannot lift the server's per-consumer ceiling.
+- **A malformed handshake body is a typed error, never a panic or over-allocation.** An unknown
+  `body_version` is `BodyError::BadHandshakeVersion`; a declared `field_len` past the body is a
+  cap-before-alloc `BodyError::Truncated` (the length is bounds-checked against the actual body BEFORE
+  any read). The server answers a malformed `Connect` with a typed `Err` and keeps the connection
+  open (`a_malformed_connect_body_is_a_typed_error_not_a_panic`); the client surfaces a malformed
+  `Info` as `ClientError::Body` (`a_malformed_info_body_is_a_typed_error_not_a_panic`). Both decoders
+  are fuzzed (`fuzz/fuzz_targets/connect_body.rs`, `info_body.rs`) and proptested
+  (`handshake_oversized_declared_length_is_a_typed_error`).
 
 ## On-disk compatibility
 
@@ -242,7 +281,7 @@ compatibility policy) specify a single registry and a set of CI gates. The state
 | MSRV bump rule (minor-only, six-month-old floor, changelog note) | #126 | DOCUMENTED in the README; not separately CI-asserted. |
 | SemVer / 0.x promise (formats versioned independently of the API) | #126, #132 | PARTIAL. The pre-release status is stated (CHANGELOG, `0.0.0`); the on-disk format is a single versioned byte; the wire has no separate version integer yet. |
 | `storage_format_version` is a single versioned integer | #126 | IMPLEMENTED as `FORMAT_VERSION` (= 1), stamped in the record and segment headers/footer. |
-| `wire_protocol_version` negotiated in the handshake | #126, #132 | NOT IMPLEMENTED. The Connect/Info handshake bodies are empty; there is no wire-version field. |
+| `wire_protocol_version` negotiated in the handshake | #126, #132 | PARTIAL. The Connect/Info handshake bodies are NO LONGER empty: they carry the #292 per-consumer CREDIT negotiation in a versioned, length-prefixed, forward-compatible body, and the credit is negotiated `min(client request, server cap)`. A separate `wire_protocol_version` INTEGER is still NOT on the wire; the body's `body_version` byte plus its appendable field block are the seam it slots into. |
 | `docs/compat/versions.md` registry with a row per version | #126, #132 | PRESENT. [`docs/compat/versions.md`](compat/versions.md) holds the version table, the refuse/poison/negotiate classification table, and the wire-negotiation spec; one row per versioned id-space, each cited to its code symbol. |
 | CI gate: an encoding change must touch the registry | #126, #132 | PRESENT. `scripts/check-format-registry.sh` (the `format-registry` CI job) hashes the layout `pub const`s in `format.rs` and fails unless the digest pinned in `docs/compat/versions.md` matches, so an encoding change cannot land without updating the registry. |
 | CI gate: no duplicate version integer across branches | #132 | MECHANICAL via the registry. The `FORMAT_VERSION` value lives on one line in `format.rs` and one row in the registry, so two branches bumping to the same next integer collide as a git MERGE CONFLICT on the second merge (the "turn a collision into a git conflict" mechanism); there is no separate cross-branch CI scanner. |
@@ -263,23 +302,24 @@ enforcement, and the registry is the allocation document on top of them.
 These compatibility features are specified by #132 / #126 (or the README/diagrams) but are
 verifiably ABSENT from the code today. They MUST NOT be assumed present.
 
-- **Capability and version negotiation in Connect/Info.** The handshake carries no
-  negotiated state: the client sends `Connect` with an empty body and the server replies
-  `Info` with an empty body (`session.rs` `dispatch`, comment "the handshake carries no
-  negotiated state yet"; `client/lib.rs` `connect_with` sends `&[]` and accepts `Info`). No
-  `wire_protocol_version`, `max_frame_size`, `auth_method`/`auth_blob`, `stream_id`, or
-  capability flags cross the wire. A `min(client, server)` version pick, an INFO capability
-  list, and capability-gated optional behavior are all future work (the server module header
-  notes "capability negotiation [is a] follow-up"; CONTRACTS.md lists the same draft fields as
-  unimplemented).
+- **Capability and version negotiation in Connect/Info (PARTIAL).** The handshake bodies now
+  carry the #292 per-consumer CREDIT negotiation (`session.rs` `handle_connect`,
+  `client/lib.rs` `connect_with` sends a `ConnectBody` and parses the `InfoBody`), so the
+  handshake is no longer empty and the per-consumer credit is negotiated `min(client request,
+  server cap)`. What is STILL absent: a `wire_protocol_version` integer, `max_frame_size`,
+  `auth_method`/`auth_blob`, `stream_id`, and a capability bitset. The body is designed to carry
+  them as appended fields (its `body_version` byte and `field_len`-delimited block tolerate
+  unknown trailing bytes), so the `min(client, server)` version pick, the capability list, and
+  capability-gated behavior remain future work that slots into this body without a re-break.
 - **A negotiated per-connection `max_frame_size`.** The decoder supports a tightening cap
   (`decode_frame_with_cap`), but no value is negotiated; every connection uses the absolute
-  `MAX_FRAME_LEN`.
-- **A separate `wire_protocol_version` integer on the wire.** The wire is versioned only
-  implicitly by the frozen tag set and fixed body layouts; there is no version byte crossing the
-  handshake to negotiate down or reject. The `min(client, server)` negotiation is SPECIFIED in
-  [`docs/compat/versions.md`](compat/versions.md) (the architecture deliverable); wiring it into
-  the empty `Connect`/`Info` bodies is the implementation residual owned by #11.
+  `MAX_FRAME_LEN`. (It would be a future field of the #292 handshake body.)
+- **A separate `wire_protocol_version` integer on the wire.** The wire is versioned by the frozen
+  tag set and fixed body layouts, plus (since #292) the handshake body's own `body_version` byte; a
+  separate `wire_protocol_version` INTEGER negotiated `min(client, server)` is still not on the wire.
+  The negotiation is SPECIFIED in [`docs/compat/versions.md`](compat/versions.md) (the architecture
+  deliverable); the #292 versioned handshake body is now the carrier it appends a field to, and the
+  remaining wiring is the residual owned by #11/#71.
 - **A multi-version on-disk MIGRATION path (the migrator itself).** The `ironbus migrate` verb now
   exists as a GATE (it detects a differing on-disk format version and refuses a silent bump, see the
   registry table above), but there is still no code that REWRITES v1 bytes into a future layout: a v1
@@ -294,13 +334,17 @@ verifiably ABSENT from the code today. They MUST NOT be assumed present.
 
 Where the implementation diverges from the #132 / #126 specification:
 
-- **No wire-version negotiation surface (specified, not wired).** #132 mandates a handshake
-  that "picks `min(client, server)` wire_protocol_version" and a server that "never speaks a
-  version it did not advertise in INFO." That rule is now fully SPECIFIED in
-  [`docs/compat/versions.md`](compat/versions.md) (the architecture deliverable), but the code
-  still has neither a wire-version integer nor any handshake payload, so it is unenforceable
-  today and the wiring is the residual owned by #11. Forward compatibility on the wire rests
-  entirely on the frozen append-only tag set plus typed unknown-tag handling until then.
+- **A partial wire-negotiation surface (credit wired, version integer not).** #132 mandates a
+  handshake that "picks `min(client, server)` wire_protocol_version" and a server that "never
+  speaks a version it did not advertise in INFO." That rule is fully SPECIFIED in
+  [`docs/compat/versions.md`](compat/versions.md). The code now HAS a handshake PAYLOAD: the #292
+  per-consumer credit negotiation rides a versioned, length-prefixed `Connect`/`Info` body and
+  negotiates the credit `min(client request, server cap)`. What is still missing is the
+  `wire_protocol_version` INTEGER itself and the `min(client, server)` version pick; the #292 body
+  is the carrier those fields append to (its `body_version` byte and appendable block), so the
+  remaining wiring is the residual owned by #11/#71. Forward compatibility on the wire rests on the
+  frozen append-only tag set, typed unknown-tag handling, AND the new tolerant-trailing-bytes
+  handshake body.
 - **The central registry and the encoding-change CI gate now exist; the duplicate-integer
   check is conflict-based, not a scanner.** #126 / #132 require a single
   `docs/compat/versions.md` with a row per version, CI that fails an encoding change without a
@@ -331,7 +375,9 @@ Where the implementation diverges from the #132 / #126 specification:
   refuse-on-unknown plus the explicit `migrate` gate.
 
 Accuracy note: every "implemented" claim above is tied to a named constant, function, or test
-in the cited file. The negotiation and migration items are listed as absent because no wire
-payload, registry file, or `migrate` verb was found in the source; if any of these lands
-later, this document should move the item from the "absent" list to the enforced rules with a
-citation.
+in the cited file. The handshake now carries a wire PAYLOAD (the #292 per-consumer credit
+negotiation, `ConnectBody`/`InfoBody` in `message.rs`), so the credit half of the negotiation
+surface is implemented and cited; the `wire_protocol_version` integer and the remaining capability
+fields are still absent and are listed as such. The migration items are listed as absent because no
+in-place migrator was found in the source; if any of these lands later, this document should move
+the item from the "absent" list to the enforced rules with a citation.

@@ -93,6 +93,12 @@ fn drive_target(target: &str, file: &Path, data: &[u8]) {
         "dead_letter_body" => replay(file, || {
             let _ = message::decode_dead_letter(data);
         }),
+        "connect_body" => replay(file, || {
+            let _ = message::decode_connect(data);
+        }),
+        "info_body" => replay(file, || {
+            let _ = message::decode_info(data);
+        }),
         other => panic!("no replay wired for fuzz target {other:?}; add it to drive_target"),
     }
 }
@@ -109,6 +115,8 @@ const TARGETS: &[&str] = &[
     "ack_body",
     "deliver_body",
     "dead_letter_body",
+    "connect_body",
+    "info_body",
 ];
 
 /// SHA-256 the bytes to a lowercase hex string, matching the content-addressed seed file names.

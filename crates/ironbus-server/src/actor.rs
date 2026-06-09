@@ -170,6 +170,15 @@ pub struct EngineHandle<F: Filesystem, C: Clock> {
     /// (a `ManualClock` clone aliases via `Arc`, a `SystemClock` clone keeps the same monotonic
     /// origin), so the two readings are comparable.
     clock: C,
+    /// The static per-consumer credit caps (#65, #275, #292), snapshotted from the engine config at
+    /// `spawn_actor` time so the `Connect` handshake can NEGOTIATE the per-consumer credit WITHOUT a
+    /// round-trip through the actor. They are fixed for the life of the engine (a `serve` flag sets
+    /// them once for every connection), so a cheap copy in the handle is exact and never drifts. Reading
+    /// them off the actor is what keeps `Connect` (like `Ping`) off the actor's checkpoint/fsync path, so
+    /// a stalled produce on one connection cannot head-of-line-block another connection's handshake
+    /// (invariant 4, #177). `.0` is the message-count cap (`consumer_credit`, floored to >= 1), `.1` is
+    /// the byte-budget cap (`consumer_credit_bytes`, `0` = unlimited).
+    consumer_credit_caps: (u32, u64),
 }
 
 // Derived `Clone` would demand `F: Clone`; the handle clones the `SyncSender` and the clock (`C` is
@@ -179,11 +188,21 @@ impl<F: Filesystem, C: Clock + Clone> Clone for EngineHandle<F, C> {
         EngineHandle {
             tx: self.tx.clone(),
             clock: self.clock.clone(),
+            consumer_credit_caps: self.consumer_credit_caps,
         }
     }
 }
 
 impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
+    /// The static per-consumer credit caps (#292): `(consumer_credit, consumer_credit_bytes)`,
+    /// snapshotted from the engine config at `spawn_actor`. Read by the `Connect` handshake to
+    /// negotiate the per-consumer credit WITHOUT a round-trip through the actor (so a stalled produce
+    /// cannot head-of-line-block a handshake, #177). `.0` is floored to >= 1; `.1` of `0` is unlimited.
+    #[must_use]
+    pub fn consumer_credit_caps(&self) -> (u32, u64) {
+        self.consumer_credit_caps
+    }
+
     /// Submits a produce for the next group commit and AWAITS its outcome. The reply arrives only
     /// after the covering `commit_batch` fsync completes (I2), so a `PubAck` derived from
     /// [`ProduceOutcome::Appended`] is always ack-implies-durable. Blocks while the bounded channel is
@@ -295,6 +314,12 @@ pub trait EngineAccess<F: Filesystem, C: Clock> {
     /// admission sojourn (#68). It is the same clock the engine reads at dequeue, so the two readings
     /// are comparable.
     fn now_monotonic_nanos(&self) -> u64;
+
+    /// The static per-consumer credit caps `(consumer_credit, consumer_credit_bytes)` (#292), read
+    /// LOCALLY (no actor round-trip), so the `Connect` handshake negotiates the per-consumer credit
+    /// off the actor's hot path and a stalled produce cannot head-of-line-block a handshake (#177).
+    /// `.0` is the message-count cap (floored to >= 1); `.1` of `0` is unlimited.
+    fn consumer_credit_caps(&self) -> (u32, u64);
 }
 
 impl<F: Filesystem + 'static, C: Clock + Clone + 'static> EngineAccess<F, C>
@@ -315,6 +340,11 @@ impl<F: Filesystem + 'static, C: Clock + Clone + 'static> EngineAccess<F, C>
     fn now_monotonic_nanos(&self) -> u64 {
         // A LOCAL clock read, no actor round-trip: the handle holds a clone of the engine's clock.
         self.clock.now_monotonic_nanos()
+    }
+
+    fn consumer_credit_caps(&self) -> (u32, u64) {
+        // A LOCAL read of the snapshotted caps, no actor round-trip (the #177 head-of-line guard).
+        EngineHandle::consumer_credit_caps(self)
     }
 }
 
@@ -360,6 +390,11 @@ impl<F: Filesystem, C: Clock + Clone> EngineAccess<F, C> for DirectEngine<F, C> 
     fn now_monotonic_nanos(&self) -> u64 {
         self.engine.borrow().now_monotonic()
     }
+
+    fn consumer_credit_caps(&self) -> (u32, u64) {
+        let e = self.engine.borrow();
+        (e.consumer_credit(), e.consumer_credit_bytes())
+    }
 }
 
 /// A test-only [`EngineAccess`] over a `Mutex`-guarded engine, so a test that drives the health
@@ -393,6 +428,13 @@ impl<F: Filesystem, C: Clock + Clone> EngineAccess<F, C> for SharedEngine<F, C> 
         self.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .now_monotonic()
+    }
+
+    fn consumer_credit_caps(&self) -> (u32, u64) {
+        let e = self
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (e.consumer_credit(), e.consumer_credit_bytes())
     }
 }
 
@@ -478,6 +520,9 @@ where
     // stamp a produce's enqueue instant (the CoDel sojourn measurement, #68) with the SAME clock the
     // actor reads at dequeue.
     let clock = engine.clock_clone();
+    // Snapshot the static per-consumer credit caps (#292) BEFORE the engine moves into the actor, so
+    // the Connect handshake can negotiate them off the actor's hot path (no round-trip, #177).
+    let consumer_credit_caps = (engine.consumer_credit(), engine.consumer_credit_bytes());
     let join = std::thread::Builder::new()
         .name("ironbus-append-actor".to_string())
         .spawn(move || run_actor(engine, &rx))
@@ -485,7 +530,14 @@ where
         // for the LIBRARY hot paths; spawning the single actor at boot is a startup step. Surface it
         // by propagating the panic only here (boot), never on a request path.
         .expect("spawning the append actor thread");
-    (EngineHandle { tx, clock }, join)
+    (
+        EngineHandle {
+            tx,
+            clock,
+            consumer_credit_caps,
+        },
+        join,
+    )
 }
 
 /// The actor's run loop. It blocks for one command, then DRAINS every command already queued
