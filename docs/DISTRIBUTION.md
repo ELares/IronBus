@@ -34,8 +34,11 @@ bump is never silent.
 
 ## 1. The fail-closed installer
 
-`scripts/install.sh` detects the host architecture, maps it to a musl triple, downloads the matching
-`ironbus-<triple>` binary AND the release `SHA256SUMS`, and verifies the SHA256 BEFORE installing. It
+`scripts/install.sh` detects the host architecture, maps it to a friendly asset suffix, downloads the
+matching `ironbus-linux-<arch>` binary (e.g. `ironbus-linux-arm64`) AND the release `SHA256SUMS`, and
+verifies the SHA256 BEFORE installing. The asset is a static `musl` binary with no runtime dependency
+even though the friendly name drops `musl`; the `unknown`-vendored triple stays the internal build
+target only. It
 is fail-closed: any download error, a missing or mismatched checksum, a malformed `SHA256SUMS`, or an
 unsupported platform aborts with a non-zero exit and installs nothing. It never `eval`s or `sh`-pipes
 downloaded content, and there is no skip-verification override. On an upgrade it retains the prior
@@ -140,7 +143,7 @@ behind an explicit opt-in, and the documented push command is:
 
 ```sh
 docker build -f Dockerfile.release \
-  --build-arg IRONBUS_BIN=dist/ironbus-x86_64-unknown-linux-musl \
+  --build-arg IRONBUS_BIN=dist/ironbus-linux-amd64 \
   -t ghcr.io/elares/ironbus:<tag> .
 docker push ghcr.io/elares/ironbus:<tag>
 ```
@@ -150,11 +153,15 @@ the build and the verified-artifact wiring land now without blocking on org-leve
 
 ## 4. Checksummed GitHub Releases
 
-Each release publishes, for `x86_64`, `aarch64`, and `armv7` musl triples: the static binary, a
-per-binary `.sha256`, one consolidated `SHA256SUMS`, and a keyless Sigstore build-provenance
-attestation over the binaries and `SHA256SUMS`. This is the source of truth the installer, the
-`.deb`, and the container all consume. Verify integrity with `sha256sum -c SHA256SUMS` and provenance
-with `gh attestation verify <binary> --repo ELares/IronBus`.
+Each release publishes, for the three edge CPUs, a friendly-named static binary
+(`ironbus-linux-amd64` for x86_64/amd64, `ironbus-linux-arm64` for arm64 / Raspberry Pi 4-5 64-bit,
+`ironbus-linux-armv7` for armv7 / 32-bit Pi), a per-binary `.sha256`, one consolidated `SHA256SUMS`,
+and a keyless Sigstore build-provenance attestation over the binaries and `SHA256SUMS`. Each binary is
+a static `musl` build with no runtime dependency (the friendly name drops `musl`; the
+`unknown`-vendored triple is only the internal cargo build target). This is the source of truth the
+installer, the `.deb`, and the container all consume. The installer auto-detects the host arch and
+picks the matching asset. Verify integrity with `sha256sum -c SHA256SUMS` and provenance with
+`gh attestation verify <binary> --repo ELares/IronBus`.
 
 These releases come from the two channels above: the **rolling** channel (automatic on every main
 push, `YYYY.MMDD.N`, the three binaries + `SHA256SUMS` + provenance) and the **formal** `v*` channel

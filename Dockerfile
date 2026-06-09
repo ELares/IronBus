@@ -24,7 +24,7 @@
 #   docker build -t ironbus:dev .
 #
 # Or build from a release artifact without recompiling (CI path; see .github/workflows/release.yml):
-#   docker build --build-arg IRONBUS_BIN=dist/ironbus-x86_64-unknown-linux-musl \
+#   docker build --build-arg IRONBUS_BIN=dist/ironbus-linux-amd64 \
 #     -f Dockerfile.release .
 
 ARG RUST_VERSION=1.78

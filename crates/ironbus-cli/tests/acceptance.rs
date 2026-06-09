@@ -553,7 +553,7 @@ fn golden_path_acceptance_install_to_recovery_to_upgrade() {
         //     REJECTED. This runs the ACTUAL installer `verify_checksum`.
         let fx = scratch.join("fixture");
         std::fs::create_dir_all(&fx).expect("create the installer fixture dir");
-        let asset = "ironbus-x86_64-unknown-linux-musl";
+        let asset = "ironbus-linux-amd64";
         let genuine = b"the genuine ironbus binary bytes".as_slice();
         std::fs::write(fx.join(asset), genuine).expect("write the genuine fixture asset");
         let digest = sha256_hex(&fx.join(asset));

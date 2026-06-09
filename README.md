@@ -73,9 +73,9 @@ Prefer to grab the binary yourself? Download the static `musl` binary for your C
 
 | Edge CPU | Asset |
 | --- | --- |
-| arm64 / Raspberry Pi 4 / 5 (64-bit) | `ironbus-aarch64-unknown-linux-musl` |
-| armv7 / Raspberry Pi (32-bit) | `ironbus-armv7-unknown-linux-musleabihf` |
-| x86_64 / amd64 | `ironbus-x86_64-unknown-linux-musl` |
+| arm64 / Raspberry Pi 4 / 5 (64-bit) | `ironbus-linux-arm64` |
+| armv7 / Raspberry Pi (32-bit) | `ironbus-linux-armv7` |
+| x86_64 / amd64 | `ironbus-linux-amd64` |
 
 Every push to main publishes a fresh `YYYY.MMDD.N` build (calendar-versioned, the three static binaries plus a consolidated `SHA256SUMS` and a Sigstore provenance attestation), so `releases/latest` and the installer always resolve to the newest build. See [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) for every channel.
 
