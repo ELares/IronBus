@@ -542,6 +542,17 @@ impl Session {
                 reply_err(out, "shed under load");
                 Ok(())
             }
+            // An fsync-HEADROOM shed (#378): the un-fsynced backlog (the loss window / RAM bound) is
+            // at its configured headroom and a group-commit drain could not free it (a relaxed
+            // durability level deferring the fsync), so this NEW produce is shed to keep the backlog
+            // bounded. A distinct, stable message so a producer can tell it from the CoDel latency
+            // shed ("shed under load") and the disk-full byte-cap shed ("at capacity"). The connection
+            // stays open (a later produce succeeds once the writer catches up); no accepted record is
+            // dropped, so this is reject-new-work only, like the byte-cap shed.
+            ProduceOutcome::WalHeadroomShed => {
+                reply_err(out, "wal fsync headroom exhausted");
+                Ok(())
+            }
             ProduceOutcome::Failed(_) => {
                 reply_err(out, "produce failed");
                 Ok(())
@@ -1309,6 +1320,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap()
@@ -1401,6 +1413,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap()
@@ -1451,6 +1464,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap()
@@ -2492,6 +2506,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap()
@@ -2606,6 +2621,70 @@ mod tests {
             one_response(&out).0,
             FrameType::Pong,
             "the connection stays open after a shed"
+        );
+    }
+
+    /// A mock [`EngineAccess`] that ALWAYS returns [`ProduceOutcome::WalHeadroomShed`] for a produce
+    /// (#378), so the session's outcome-to-wire mapping for the fsync-headroom shed is tested in
+    /// isolation: it must surface the typed, distinct `wal fsync headroom exhausted` `Err`. The
+    /// `with`/`now_monotonic_nanos` paths are unused by a produce-only test.
+    struct HeadroomShedEngine;
+    impl crate::actor::EngineAccess<InMemoryFs, ManualClock> for HeadroomShedEngine {
+        fn produce(
+            &self,
+            _append: crate::actor::OwnedAppend,
+        ) -> Result<ProduceOutcome, crate::actor::ActorGone> {
+            // The engine shed this NEW produce because the un-fsynced backlog hit the headroom and a
+            // drain could not free it (#378). Nothing was appended (the mock has no log), so the
+            // no-data-loss property holds by construction.
+            Ok(ProduceOutcome::WalHeadroomShed)
+        }
+        fn with<R, J>(&self, _job: J) -> Result<R, crate::actor::ActorGone>
+        where
+            R: Send + 'static,
+            J: FnOnce(&mut Engine<InMemoryFs, ManualClock>) -> R + Send + 'static,
+        {
+            Err(crate::actor::ActorGone)
+        }
+        fn now_monotonic_nanos(&self) -> u64 {
+            0
+        }
+        fn consumer_credit_caps(&self) -> (u32, u64) {
+            (64, 0)
+        }
+    }
+
+    #[test]
+    fn an_fsync_headroom_shed_surfaces_the_typed_distinct_err_over_the_session() {
+        // The wire-facing #378 property: a `ProduceOutcome::WalHeadroomShed` maps to a typed,
+        // self-announcing `wal fsync headroom exhausted` `Err`, DISTINCT from the CoDel "shed under
+        // load" and the byte-cap "at capacity", so a producer can tell which control fired and back
+        // off. The connection stays open (the session keeps processing).
+        let e = HeadroomShedEngine;
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        connect_and_pub(&mut s, &e, &mut out);
+        let (ty, body) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::Err,
+            "an fsync-headroom shed is a typed Err, not a silent drop"
+        );
+        assert_eq!(
+            body, b"wal fsync headroom exhausted",
+            "the headroom shed Err is self-announcing and distinct from `shed under load` and `at capacity`"
+        );
+        // The session keeps going (the shed did not end the connection).
+        out.clear();
+        s.process(&e, &frame(FrameType::Ping, b""), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Pong,
+            "the connection stays open after an fsync-headroom shed"
         );
     }
 
@@ -3022,6 +3101,7 @@ mod tests {
                     fire_and_forget_byte_rate: 0,
                     fire_and_forget_refill_ms: 0,
                     egress_limit: 0,
+                    wal_fsync_headroom_bytes: 0,
                 },
             )
             .unwrap(),
@@ -3399,6 +3479,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap()
@@ -3448,6 +3529,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap()
@@ -4170,6 +4252,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap()

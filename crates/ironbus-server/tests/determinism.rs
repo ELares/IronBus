@@ -54,6 +54,7 @@ fn config() -> EngineConfig {
         fire_and_forget_byte_rate: 0,
         fire_and_forget_refill_ms: 0,
         egress_limit: 0,
+        wal_fsync_headroom_bytes: 0,
     }
 }
 

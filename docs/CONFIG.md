@@ -272,6 +272,7 @@ backpressure). They are the load-based complement to the byte cap; see
 | `fire_and_forget_byte_rate` | `--fire-and-forget-byte-rate` / `IRONBUS_FIRE_AND_FORGET_BYTE_RATE` | u64 | `0` = off | bytes/s | `0` (off) or any u64 | COLD |
 | `fire_and_forget_refill_ms` | `--fire-and-forget-refill-ms` / `IRONBUS_FIRE_AND_FORGET_REFILL_MS` | u64 | `100` | ms | `> 0` | COLD |
 | `egress_limit` | `--egress-limit` / `IRONBUS_EGRESS_LIMIT` | u32 | `16` (`DEFAULT_EGRESS_LIMIT`) | count | AIMD-bounded to `[4, 128]` | COLD |
+| `wal_fsync_headroom_bytes` | `--wal-fsync-headroom-bytes` / `IRONBUS_WAL_FSYNC_HEADROOM_BYTES` | u64 | `0` = OFF (`DEFAULT_WAL_FSYNC_HEADROOM_BYTES`) | bytes | `0` (unbounded) or any byte count | COLD |
 
 A CoDel value outside its clamp is SILENTLY CLAMPED to the nearest bound (never a
 startup error), per the "no per-device tuning" and "cannot refuse to start over a
@@ -286,6 +287,11 @@ at its floor (16). Each control is observable on `/metrics`
 `ironbus_codel_interval_resets_total`, `ironbus_retry_shed_total`,
 `ironbus_fire_and_forget_shed_total`, `ironbus_egress_shed_total`, and the gauges
 `ironbus_codel_sojourn_estimate_ms`, `ironbus_retry_ratio`, `ironbus_egress_limit`).
+The fsync-headroom admission credit (`wal_fsync_headroom_bytes`, #378) bounds the
+un-fsynced write backlog: under `sync` it throttles the group-commit backlog (a RAM
+guard, never loses), under a relaxed durability level it caps the loss window in bytes
+by shedding new produces. Off by default; observable as
+`ironbus_wal_fsync_headroom_shed_total` and `ironbus_wal_fsync_headroom_bytes`.
 
 > Wire-signal residual (#11): the machine-actionable `retry_after_ms` / `shed`
 > fields on the rejection frame are owned by the frozen-protocol extension (#11) and

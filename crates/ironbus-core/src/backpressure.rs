@@ -673,6 +673,94 @@ impl RetryBudget {
     }
 }
 
+/// The default fsync-headroom admission window in BYTES (#378): the most un-fsynced (buffered but
+/// not yet durable) record bytes the write frontier may run ahead of the durable frontier before a
+/// new produce is throttled (the group-commit flush is forced first) or, if a flush cannot drain it,
+/// shed. `0` DISABLES the headroom (the un-fsynced frontier is bounded only by the existing controls:
+/// under `sync` the group-commit boundary already drains it every batch; under a relaxed level only
+/// the `interval` window or a roll/shutdown does). The shipped default is `0` (OFF), so a zero-config
+/// broker behaves exactly as today; an operator opts in to a tight RAM / loss-window bound.
+pub const DEFAULT_WAL_FSYNC_HEADROOM_BYTES: u64 = 0;
+
+/// The pure, IO-free fsync-headroom admission credit (#378, refining the #67 / #177 WAL backpressure
+/// seam). It bounds how far the BUFFERED (appended-but-not-yet-`fdatasync`'d) write frontier may run
+/// ahead of the DURABLE (synced) frontier, so a producer outrunning fsync cannot grow an unbounded
+/// un-fsynced backlog (a memory guard under any level, and a bounded-loss-window guard under a
+/// relaxed durability level).
+///
+/// This is the BYTE-dimension complement to the CoDel admission (#336): CoDel sheds on standing
+/// QUEUE LATENCY (sojourn), this sheds on the un-fsynced BACKLOG SIZE. The two compose without
+/// interaction: each is consulted before the append and either admits or sheds NEW work only, so
+/// neither ever drops an already-accepted record (I2 holds).
+///
+/// The frontier itself is owned by the storage log (`unsynced_bytes()`, the #341 relaxed-durability
+/// tracking): this type only does the threshold MATH, so it stays IO-free and lives in core. The
+/// caller passes the current un-fsynced backlog and the new record's logical bytes; the decision is
+/// whether ADMITTING this record would push the backlog past the configured headroom.
+///
+/// A `headroom_bytes` of `0` is DISABLED ([`FsyncHeadroom::is_enabled`] is false and every admission
+/// is granted), the safe default. A non-zero headroom is the opt-in tight bound.
+#[derive(Clone, Copy, Debug)]
+pub struct FsyncHeadroom {
+    /// The configured un-fsynced byte headroom. `0` = DISABLED (unbounded, the safe default).
+    headroom_bytes: u64,
+}
+
+impl FsyncHeadroom {
+    /// Builds the admission credit from the configured byte headroom. `0` disables it (the un-fsynced
+    /// frontier is unbounded by this control), which is the backward-compatible default.
+    #[must_use]
+    pub fn new(headroom_bytes: u64) -> FsyncHeadroom {
+        FsyncHeadroom { headroom_bytes }
+    }
+
+    /// Whether the headroom is ENABLED (a non-zero bound). When disabled every admission is granted,
+    /// so a zero-config broker is unchanged.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.headroom_bytes != 0
+    }
+
+    /// The configured headroom in bytes (`0` = disabled), for the observability gauge.
+    #[must_use]
+    pub fn headroom_bytes(&self) -> u64 {
+        self.headroom_bytes
+    }
+
+    /// The admission decision for a NEW produce, given the CURRENT un-fsynced backlog
+    /// (`unsynced_now`, the storage frontier `unsynced_bytes()`) and the new record's `record_bytes`
+    /// (its logical key + headers + payload, the same units the backlog is measured in). Returns
+    /// `true` to ADMIT, `false` to throttle/shed.
+    ///
+    /// Disabled (`headroom_bytes == 0`) always admits. When enabled, the rule is: admit unless there
+    /// is ALREADY a non-empty backlog AND appending this record would push the backlog PAST the
+    /// headroom. The "already a non-empty backlog" guard is the NO-WEDGE floor: when the backlog is
+    /// empty the record is always admitted even if it alone exceeds the headroom (a single record
+    /// larger than the whole headroom must still make progress, exactly like the per-consumer
+    /// byte-credit's one-message floor), because the caller's contract is to DRAIN the backlog (force
+    /// a group-commit flush, which resets `unsynced_now` to `0`) before consulting this again, so a
+    /// shed only ever happens when a drain is possible and still insufficient.
+    ///
+    /// Pure: no IO, no clock, no allocation. The caller composes it with the drain (a `commit_batch`
+    /// flush) so the actual control law is "flush first, then admit-or-shed", and this method is the
+    /// shed half.
+    #[must_use]
+    pub fn would_admit(&self, unsynced_now: u64, record_bytes: u64) -> bool {
+        if self.headroom_bytes == 0 {
+            // Disabled: the frontier is unbounded by this control, so every produce is admitted.
+            return true;
+        }
+        if unsynced_now == 0 {
+            // The no-wedge floor: an empty backlog always admits the next record, even one larger
+            // than the whole headroom, so the broker can never deadlock on an oversized produce.
+            return true;
+        }
+        // A non-empty backlog: admit only if the new record fits within the remaining headroom.
+        // Saturating add so an enormous record can never wrap into a false admit.
+        unsynced_now.saturating_add(record_bytes) <= self.headroom_bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,6 +1144,67 @@ mod tests {
             r.observed_ratio_per_million(),
             0,
             "the window decayed the sheds"
+        );
+    }
+
+    // ---- fsync headroom (#378) ----
+
+    #[test]
+    fn fsync_headroom_disabled_admits_everything() {
+        // The SAFE DEFAULT: a `0` headroom is OFF, so every produce is admitted regardless of the
+        // backlog (a zero-config broker is unchanged).
+        let h = FsyncHeadroom::new(0);
+        assert!(!h.is_enabled());
+        assert!(h.would_admit(0, 100));
+        assert!(h.would_admit(u64::MAX, u64::MAX), "disabled never sheds");
+    }
+
+    #[test]
+    fn fsync_headroom_admits_within_the_window() {
+        // Enabled: while the backlog plus the new record stays within the headroom, admit.
+        let h = FsyncHeadroom::new(1000);
+        assert!(h.is_enabled());
+        assert_eq!(h.headroom_bytes(), 1000);
+        assert!(h.would_admit(0, 500), "empty backlog always admits");
+        assert!(h.would_admit(500, 500), "exactly at the headroom admits");
+        assert!(h.would_admit(400, 100), "within the headroom admits");
+    }
+
+    #[test]
+    fn fsync_headroom_sheds_past_the_window_with_a_nonempty_backlog() {
+        // The shed: a NON-EMPTY backlog plus the new record exceeds the headroom, so the new produce
+        // is throttled/shed (the caller drains first; this is the post-drain shed half).
+        let h = FsyncHeadroom::new(1000);
+        assert!(
+            !h.would_admit(600, 500),
+            "600 + 500 > 1000 with a non-empty backlog sheds"
+        );
+        assert!(
+            !h.would_admit(1000, 1),
+            "already at the headroom sheds the next"
+        );
+    }
+
+    #[test]
+    fn fsync_headroom_never_wedges_on_an_oversized_record() {
+        // The NO-WEDGE floor: an EMPTY backlog admits the next record even if it alone exceeds the
+        // whole headroom, so a single record larger than the headroom still makes progress (the
+        // caller will have drained the backlog to empty before re-consulting).
+        let h = FsyncHeadroom::new(1000);
+        assert!(
+            h.would_admit(0, 5000),
+            "an oversized record on an empty backlog still admits (no deadlock)"
+        );
+    }
+
+    #[test]
+    fn fsync_headroom_saturates_and_never_wraps_into_a_false_admit() {
+        // A huge record on a non-empty backlog must not wrap the add into a small value that would
+        // falsely admit; the saturating add keeps the comparison correct.
+        let h = FsyncHeadroom::new(1000);
+        assert!(
+            !h.would_admit(1, u64::MAX),
+            "u64::MAX + 1 saturates above the headroom, so it sheds, never wraps"
         );
     }
 }
