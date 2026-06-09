@@ -447,13 +447,18 @@ key-mapping and flash-bound rewriting). The cleaner is therefore:
 ## Honest limits and what is deliberately deferred
 
 - **Implemented (#337).** The COMPACTED header flag, the v2 compaction-metadata footer block,
-  the covered-range recovery rules, the sparse-offset read path, the `Compacted` gap reason, and
+  the covered-range recovery rules, the sparse-offset read/skip path (a reader and the engine
+  poll skip a compacted hole), the `Compacted` gap-reason CODE (`gap_reason::COMPACTED = 2`), and
   the cleaner are all built. What is deliberately DEFERRED as a safe follow-up (the core is
-  complete): the advanced `min_dirty_ratio` BYTE accounting (count is shipped; bytes is the
-  better flash-cost proxy, an open question below), a standalone `ironbus compact` CLI verb (the
-  off-hot-path engine pass and the `serve --compact` knob are shipped), and the explicit
-  TOMBSTONE flag bit (the empty-payload convention is shipped). None of those affect the
-  crash-safety or the format, which are complete and correct.
+  complete): the consumer-facing EMISSION of `GapMarker(reason = COMPACTED)` when a gap-marker-
+  capable consumer reads across a compacted hole (today the engine advances the cursor SILENTLY;
+  the reason code and the #346 frame are ready, the emission is tracked in #411, and it is NOT a
+  loss or correctness gap, the cursor still reaches head with the correct latest-value view), the
+  advanced `min_dirty_ratio` BYTE accounting (count is shipped; bytes is the better flash-cost
+  proxy, an open question below), a standalone `ironbus compact` CLI verb (the off-hot-path engine
+  pass and the `serve --compact` knob are shipped), and the explicit TOMBSTONE flag bit (the
+  empty-payload convention is shipped). None of those affect the crash-safety or the format, which
+  are complete and correct.
 - **It costs CPU and flash; it is for changelog topics only.** Stated up front; restated here.
   A general durable queue should leave it OFF.
 - **It forces a format-version bump.** A broker that has ever written a compacted segment
@@ -508,11 +513,12 @@ key-mapping and flash-bound rewriting). The cleaner is therefore:
 - Open readers never read freed data during retire: the in-memory disk keeps an open handle's
   inode alive after the unlink-then-dir-fsync (the same discipline the reaper already uses), so a
   drained read never reads freed bytes.
-- Sparse-offset read / skip-the-gap and the `Compacted` gap reason (never a recovery `LossEvent`,
-  so never in the loss-bytes counters): the storage read path skips an absent offset, and the
-  engine poll advances the cursor past a compacted hole
-  (`compaction_off_by_default_and_opt_in_skips_holes_on_poll` in
-  `crates/ironbus-server/src/engine.rs`).
+- Sparse-offset read / skip-the-gap (never a recovery `LossEvent`, so never in the loss-bytes
+  counters): the storage read path skips an absent offset, and the engine poll advances the cursor
+  past a compacted hole (`compaction_off_by_default_and_opt_in_skips_holes_on_poll` in
+  `crates/ironbus-server/src/engine.rs`). The advance is SILENT today; emitting the consumer-facing
+  `GapMarker(reason = COMPACTED)` for a gap-marker-capable consumer is the #411 follow-up (the
+  reason code is defined and round-tripped, only the engine-side emit is unwired).
 - The cleaner off by default and off the hot path: the same engine test asserts a produce that
   triggers a compaction pass returns its offset normally (the append is never blocked), and that
   no v2 segment is written until an operator opts in.
