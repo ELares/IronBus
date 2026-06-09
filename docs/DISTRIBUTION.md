@@ -11,6 +11,22 @@ only the packaging. There are four channels, each fail-closed verified before it
 3. A distroless container image (`gcr.io/distroless/static`).
 4. The checksummed GitHub Releases (the raw binaries + `SHA256SUMS` + SBOM + provenance).
 
+There are two release CHANNELS the GitHub Releases come from:
+
+- A **rolling, calendar-versioned** release published AUTOMATICALLY on EVERY push to main
+  (`.github/workflows/rolling-release.yml`), versioned `YYYY.MMDD.N` (the UTC date plus a per-day
+  build number). Each rolling build ships the three static musl binaries, their per-binary
+  `.sha256`, a consolidated `SHA256SUMS`, and a keyless Sigstore build-provenance attestation. It is
+  a NORMAL release, so GitHub's `releases/latest` (and therefore the `curl | sh` installer's default
+  and the installer's `--version latest`) resolves to the newest rolling build. This is the
+  continuous channel that makes "install" mean "grab the binary for your arch from the latest
+  release". It carries NO changelog gate (rolling builds are continuous, not curated) and does not
+  build the `.deb` or container.
+- A **formal, tagged** release cut on a `v*` tag by the maintainer (`.github/workflows/release.yml`).
+  This is the curated channel: it adds the `.deb` per triple, the distroless container image, the
+  syft CycloneDX SBOM, and a changelog gate (an empty `## [Unreleased]` FAILS the release before any
+  binary is built). A 0.x tag is published as a prerelease, so it does not move `releases/latest`.
+
 Plus the lifecycle on an unattended edge node: an atomic in-place [upgrade](#in-place-upgrade-and-rollback)
 that never overwrites the live binary, one-command rollback, fall-back after N failed starts, and an
 explicit [`migrate` gate](#on-disk-format-compatibility-and-the-migrate-gate) so an on-disk format
@@ -134,12 +150,17 @@ the build and the verified-artifact wiring land now without blocking on org-leve
 
 ## 4. Checksummed GitHub Releases
 
-Each tagged release publishes, for `x86_64`, `aarch64`, and `armv7` musl triples: the static binary,
-a per-binary `.sha256`, one consolidated `SHA256SUMS`, a cargo-auditable SBOM, and a keyless Sigstore
-build-provenance attestation over every artifact. This is the source of truth the installer, the
+Each release publishes, for `x86_64`, `aarch64`, and `armv7` musl triples: the static binary, a
+per-binary `.sha256`, one consolidated `SHA256SUMS`, and a keyless Sigstore build-provenance
+attestation over the binaries and `SHA256SUMS`. This is the source of truth the installer, the
 `.deb`, and the container all consume. Verify integrity with `sha256sum -c SHA256SUMS` and provenance
-with `gh attestation verify <binary> --repo ELares/IronBus`. Details in
-[RELEASING.md](../RELEASING.md#what-the-release-produces).
+with `gh attestation verify <binary> --repo ELares/IronBus`.
+
+These releases come from the two channels above: the **rolling** channel (automatic on every main
+push, `YYYY.MMDD.N`, the three binaries + `SHA256SUMS` + provenance) and the **formal** `v*` channel
+(which additionally attaches the cargo-auditable and CycloneDX SBOMs, the `.deb` packages, and rides
+the changelog gate). The `curl | sh` installer and the `releases/latest` default both resolve to the
+newest rolling build. Details in [RELEASING.md](../RELEASING.md#what-the-release-produces).
 
 ## In-place upgrade and rollback
 

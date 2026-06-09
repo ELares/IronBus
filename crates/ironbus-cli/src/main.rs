@@ -951,12 +951,17 @@ fn run(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             Ok(())
         }
         // A single deterministic version line. `--version`/`-V`/`version` all print the same
-        // `ironbus <semver>` and exit 0, so an operator (and the CI cross-build smoke, #100) can
+        // `ironbus <version>` and exit 0, so an operator (and the CI cross-build smoke, #100) can
         // identify the build with no broker, no data dir, and no socket. The version is the
-        // workspace package version compiled in via Cargo's `CARGO_PKG_VERSION`, so it tracks the
-        // crate version automatically and cannot drift from the manifest.
+        // compile-time `IRONBUS_BUILD_VERSION` if set (the rolling-release workflow stamps the
+        // calendar version `YYYY.MMDD.N` there) and otherwise the workspace package version from
+        // Cargo's `CARGO_PKG_VERSION` (the normal dev/CI/test case). `option_env!` is read at
+        // compile time and leaves `Cargo.lock` untouched, so it never breaks `cargo build
+        // --locked` the way a `Cargo.toml` version bump would (the lockfile pins the workspace
+        // crates at `0.0.0`).
         "version" | "--version" | "-V" => {
-            writeln!(out, "ironbus {}", env!("CARGO_PKG_VERSION"))?;
+            let version = option_env!("IRONBUS_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
+            writeln!(out, "ironbus {version}")?;
             Ok(())
         }
         other => Err(CliError::Usage(format!("unknown subcommand `{other}`"))),
@@ -7263,13 +7268,17 @@ mod tests {
     #[test]
     fn run_dispatches_version_without_a_server() {
         // `version`, `--version`, and `-V` are the same deterministic, broker-free, socket-free
-        // line `ironbus <crate-version>`, exit 0. This is exactly what the #100 cross-build smoke
-        // executes on each target, so assert the program name and the compiled crate version.
+        // line `ironbus <version>`, exit 0. This is exactly what the #100 cross-build smoke
+        // executes on each target, so assert the program name and the compiled version. The
+        // expected version uses the SAME `option_env!(...).unwrap_or(...)` fallback the verb uses,
+        // so this passes when `IRONBUS_BUILD_VERSION` is unset (the normal dev/CI/test case, where
+        // both sides resolve to `CARGO_PKG_VERSION`) AND when the rolling-release workflow sets it.
+        let expected = option_env!("IRONBUS_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
         for form in ["version", "--version", "-V"] {
             let mut buf = Vec::new();
             run(&[form.to_string()], &mut buf).unwrap();
             let out = String::from_utf8(buf).unwrap();
-            assert_eq!(out, format!("ironbus {}\n", env!("CARGO_PKG_VERSION")));
+            assert_eq!(out, format!("ironbus {expected}\n"));
         }
     }
 

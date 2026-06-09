@@ -63,7 +63,23 @@ IronBus is one static binary that is **both the broker and the CLI**. Below is t
 
 ### 1. Install
 
-**Build from source** (works today, on any host with a Rust toolchain):
+**The seamless path (recommended).** One line auto-detects your CPU arch, downloads the matching static `musl` binary from the latest release, and verifies its checksum before installing (fail-closed, no skip-verify override):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ELares/IronBus/main/scripts/install.sh | sh
+```
+
+Prefer to grab the binary yourself? Download the static `musl` binary for your CPU from the [latest release](https://github.com/ELares/IronBus/releases/latest), `chmod +x`, and run it (no runtime dependencies, not even a libc to install):
+
+| Edge CPU | Asset |
+| --- | --- |
+| arm64 / Raspberry Pi 4 / 5 (64-bit) | `ironbus-aarch64-unknown-linux-musl` |
+| armv7 / Raspberry Pi (32-bit) | `ironbus-armv7-unknown-linux-musleabihf` |
+| x86_64 / amd64 | `ironbus-x86_64-unknown-linux-musl` |
+
+Every push to main publishes a fresh `YYYY.MMDD.N` build (calendar-versioned, the three static binaries plus a consolidated `SHA256SUMS` and a Sigstore provenance attestation), so `releases/latest` and the installer always resolve to the newest build. See [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) for every channel.
+
+**Build from source** (the developer / alternative path, on any host with a Rust toolchain):
 
 ```sh
 git clone https://github.com/ELares/IronBus.git
@@ -72,15 +88,13 @@ cargo build --release
 # the single binary is now at target/release/ironbus
 ```
 
-For an **edge device**, cross-compile the one static `musl` binary and copy it over (no runtime dependencies, not even a libc to install):
+For an **edge device** without network access to the release, cross-compile the one static `musl` binary and copy it over:
 
 ```sh
 rustup target add aarch64-unknown-linux-musl   # or armv7-unknown-linux-musleabihf, x86_64-unknown-linux-musl
 cargo build --release --target aarch64-unknown-linux-musl
 scp target/aarch64-unknown-linux-musl/release/ironbus pi@edge-device:/usr/local/bin/ironbus
 ```
-
-The **released channels** (the checksummed binaries, the fail-closed `curl | sh` installer, a Debian `.deb`, and a distroless container image) go live with the first tagged release; see [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md). Until then, build from source.
 
 ### 2. Start the broker on the edge
 

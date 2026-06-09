@@ -1,10 +1,26 @@
 # Releasing IronBus
 
-IronBus ships as a single static `musl` binary for three edge triples. A release is cut by
-pushing a version tag; the `Release` workflow (`.github/workflows/release.yml`) builds, signs,
-and publishes the artifacts. The build path reuses the same `cross` static-link setup the CI
-`musl build` jobs prove on every PR, and the SBOM path is exercised per-PR by the CI `sbom` job,
-so a tagged release does not run unproven steps.
+IronBus ships as a single static `musl` binary for three edge triples, through two release
+channels:
+
+- **Rolling, calendar-versioned** releases, published AUTOMATICALLY on EVERY push to main by the
+  `Rolling release` workflow (`.github/workflows/rolling-release.yml`). The version is `YYYY.MMDD.N`
+  (the UTC date plus a per-day build number, e.g. `2026.0609.1` then `2026.0609.2`, resetting the
+  next day). Each rolling build publishes the three static musl binaries, their per-binary
+  `.sha256`, a consolidated `SHA256SUMS`, and a Sigstore build-provenance attestation, as a NORMAL
+  release, so `releases/latest` (and the `curl | sh` installer's default) always points at the
+  newest rolling build. The version is stamped into the binary via `IRONBUS_BUILD_VERSION` (read by
+  `option_env!` in the `version` verb, forwarded into the cross container by `Cross.toml`), so
+  `ironbus version` reports the published calendar version without touching `Cargo.lock`. There is
+  NO changelog gate and no `.deb`/container on this channel (rolling builds are continuous, not
+  curated). Skip a build by putting `[skip release]` in the head commit message.
+- **Formal, tagged** releases, cut by the maintainer by pushing a `v*` tag, built by the `Release`
+  workflow (`.github/workflows/release.yml`). This is the curated channel described below: it adds
+  the `.deb` per triple, the distroless container, the CycloneDX SBOM, and the changelog gate.
+
+The build path on both channels reuses the same `cross` static-link setup the CI `musl build` jobs
+prove on every PR (and the SBOM path is exercised per-PR by the CI `sbom` job), so neither release
+runs unproven steps.
 
 ## Cut a release
 
