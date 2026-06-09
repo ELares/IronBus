@@ -49,7 +49,7 @@ zstd = { version = "0.13", optional = true, default-features = false, features =
 # PORTABLE pure-Rust backend, so blake3's build script compiles NO C/assembly (`cc` is a build-dep but
 # runs nothing under `pure`): blake3 stays pure Rust and adds no C-FFI. It is pulled only by the `zstd`
 # feature, so it is absent from the default graph; its `CC0-1.0 OR Apache-2.0` license resolves via the
-# Apache-2.0 arm and `CC0-1.0` is added to the deny allow-list.
+# already-allowed Apache-2.0 arm (no deny allow-list entry is added).
 blake3 = { version = ">=1.5.5, <1.8.1", optional = true, default-features = false, features = ["std", "pure"] }
 
 [dev-dependencies]
