@@ -1152,23 +1152,34 @@ fn lease_bytes(record: &ironbus_storage::segment::OwnedRecord) -> u64 {
     u64::try_from(len).unwrap_or(u64::MAX)
 }
 
-/// The #292 per-consumer MESSAGE-credit negotiation: `min(client request, server cap)` when the
-/// client requested a credit, else the server cap (the default). There is no unbounded request on the
-/// wire, so a request can only ever TIGHTEN the server cap, never raise it. The cap is already floored
-/// to >= 1 by the engine, and `min` preserves that floor, so the result is always >= 1.
+/// The #292 per-consumer MESSAGE-credit negotiation. A finite request tightens via `min(request,
+/// cap)`; a `0` request (no meaningful budget, since a 0 ceiling delivers nothing) or no request takes
+/// the server cap. A request can only ever TIGHTEN the server cap, never raise it. The cap is already
+/// floored to >= 1 by the engine, so the result is always >= 1.
 fn negotiate_credit(requested: Option<u32>, cap: u32) -> u32 {
-    requested.map_or(cap, |want| want.min(cap))
+    // A request of 0 messages carries no meaningful budget (a 0 message ceiling delivers nothing),
+    // so it is treated as "no request" and gets the server default; any finite request only
+    // tightens via `min` and can never exceed the server cap.
+    match requested {
+        Some(0) | None => cap,
+        Some(want) => want.min(cap),
+    }
 }
 
-/// The #292 per-consumer BYTE-budget negotiation. A server cap of `0` is UNLIMITED (the byte budget is
-/// off); a client request against an unlimited cap is honored as-is (it can only ADD a finite budget,
-/// which is a tightening, never lift an off-switch the server did not set), and against a finite cap a
-/// request is clamped by `min`. A client that requests nothing gets the server cap (the default).
+/// The #292 per-consumer BYTE-budget negotiation. A byte budget of `0` means UNLIMITED (the budget is
+/// OFF). A client may only TIGHTEN, never raise: against an UNLIMITED server cap (`0`) a client may set
+/// any finite budget (or stay unlimited); against a FINITE server cap an unlimited request (`0`) is
+/// clamped DOWN to the cap, so a client can NEVER disable a budget the server set (the #275 byte-budget
+/// guarantee). A client that requests nothing gets the server cap (the default).
 fn negotiate_credit_bytes(requested: Option<u64>, cap: u64) -> u64 {
     match requested {
+        // A `0` (unlimited) request, or no request, takes the server cap: unlimited only if the
+        // server itself is unlimited (cap == 0), otherwise clamped to the finite cap.
+        Some(0) | None => cap,
+        // Server unlimited: the client tightens to a finite budget of its choosing.
         Some(want) if cap == 0 => want,
+        // Both finite: tighten to the smaller.
         Some(want) => want.min(cap),
-        None => cap,
     }
 }
 
@@ -3330,6 +3341,31 @@ mod tests {
             3,
             "the cap of 3 binds the pull regardless of the request"
         );
+    }
+
+    #[test]
+    fn a_zero_byte_request_cannot_disable_a_finite_cap() {
+        // A byte budget of 0 means UNLIMITED. A client requesting 0 against a FINITE server cap
+        // must be clamped DOWN to the cap, never granted unlimited, so it cannot turn off the
+        // in-flight-byte ceiling the server set (the #275 byte-budget / memory-exhaustion guard).
+        assert_eq!(negotiate_credit_bytes(Some(0), 8), 8);
+        assert_eq!(negotiate_credit_bytes(Some(0), 64 * 1024), 64 * 1024);
+        // Against an unlimited server (cap 0), a 0 request stays unlimited (both off).
+        assert_eq!(negotiate_credit_bytes(Some(0), 0), 0);
+        // A finite request still only tightens.
+        assert_eq!(negotiate_credit_bytes(Some(4), 8), 4);
+        assert_eq!(negotiate_credit_bytes(Some(20), 8), 8);
+        assert_eq!(negotiate_credit_bytes(None, 8), 8);
+    }
+
+    #[test]
+    fn a_zero_message_request_falls_back_to_the_server_credit() {
+        // A 0-message request carries no budget (delivers nothing), so it takes the server default
+        // rather than self-disabling; finite requests tighten.
+        assert_eq!(negotiate_credit(Some(0), 64), 64);
+        assert_eq!(negotiate_credit(None, 64), 64);
+        assert_eq!(negotiate_credit(Some(16), 64), 16);
+        assert_eq!(negotiate_credit(Some(100), 64), 64);
     }
 
     #[test]
