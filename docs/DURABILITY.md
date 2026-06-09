@@ -252,6 +252,17 @@ These follow the existing `serve` flag and `DEFAULT_*` constant conventions (see
 | `flush_interval_ms` | `--flush-interval-ms` | global | `1000` | `>= 0` | `interval`: max MONOTONIC ms an acked record may be unsynced (`0` disables the time trigger) |
 | `flush_max_bytes` | `--flush-max-bytes` | global | `1048576` | `>= 0` | `interval`: max unsynced record bytes before a forced `fdatasync` (`0` disables the byte trigger) |
 | `async_loss_ack` | `--async-loss-ack` | global | `false` | bool | must be `true` to select `async` / `none` (the explicit data-loss acknowledgement) |
+| `wal_fsync_headroom_bytes` | `--wal-fsync-headroom-bytes` | global | `0` = OFF | bytes (`0` = unbounded) | the fsync-headroom admission credit (#378): caps the un-fsynced backlog. Under `sync` it throttles the group-commit backlog (a RAM guard); under a relaxed level it CAPS THE LOSS WINDOW in bytes by shedding new produces once the backlog fills |
+
+The fsync-headroom credit (`wal_fsync_headroom_bytes`, #378) is the admission-time
+companion to the `interval` byte trigger: where `flush_max_bytes` periodically FLUSHES
+the unsynced tail, the headroom THROTTLES OR SHEDS NEW produces once the unsynced
+backlog reaches the bound, so under a relaxed level the worst-case acknowledged loss is
+held within the configured headroom even without a periodic flush. It reuses the same
+`unsynced_bytes()` frontier this section tracks and is decided before the append, so it
+never drops an accepted record. Off by default (the un-fsynced frontier is then bounded
+only by the level's own barriers). See
+[BACKPRESSURE.md, Part C](BACKPRESSURE.md#part-c-fsync-headroom-admission-credits-378).
 
 The crash harness drives each level through crash-at-every-step and asserts the
 row's stated loss bound: zero for `sync`, bounded-by-the-window for `interval`,

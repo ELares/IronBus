@@ -58,6 +58,11 @@ the resilience-observability contract (#16, see [METRICS.md](METRICS.md)).
   - [The fire-and-forget token bucket](#the-fire-and-forget-token-bucket)
   - [The egress AIMD concurrency limiter](#the-egress-aimd-concurrency-limiter)
   - [Why backpressure cannot amplify into a retry storm](#why-backpressure-cannot-amplify-into-a-retry-storm)
+- [Part C: fsync-headroom admission credits (#378)](#part-c-fsync-headroom-admission-credits-378)
+  - [Reusing the un-fsynced frontier](#reusing-the-un-fsynced-frontier)
+  - [The control law: drain first, then admit or shed](#the-control-law-drain-first-then-admit-or-shed)
+  - [How it composes with #336 (CoDel) and #341 (durability)](#how-it-composes-with-336-codel-and-341-durability)
+  - [Safe default and no data loss](#safe-default-and-no-data-loss)
 - [Configuration keys (#14)](#configuration-keys-14)
 - [Metrics (#16)](#metrics-16)
 - [What this changes on the wire (#11)](#what-this-changes-on-the-wire-11)
@@ -436,6 +441,81 @@ once the controls are implemented.
 
 ---
 
+## Part C: fsync-headroom admission credits (#378)
+
+Refines the #67 / #177 WAL backpressure seam. Where Part A (CoDel) sheds on standing
+**queue latency** and the byte cap sheds on **disk-full**, the fsync-headroom credit
+bounds the **un-fsynced backlog**: how far the BUFFERED (appended-but-not-yet-
+`fdatasync`'d) write frontier may run ahead of the DURABLE (synced) frontier. A
+producer outrunning fsync would otherwise grow that backlog without bound (an
+out-of-memory path under any level, and an unbounded acknowledged-loss window under a
+relaxed durability level). The credit bounds it.
+
+### Reusing the un-fsynced frontier
+
+The storage log already tracks the exact un-fsynced exposure as
+`unsynced_bytes()` (the #341 relaxed-durability accounting: the logical record bytes
+appended since the last real durability barrier, reset to `0` on a `sync` or a
+segment roll's seal). The credit does **only the threshold math** against that
+frontier, so the pure decision (`FsyncHeadroom::would_admit`) lives in the IO-free
+core (`ironbus-core`); the engine feeds it the live frontier through the storage seam.
+
+### The control law: drain first, then admit or shed
+
+The decision is taken in the append actor **before** the record is appended, so it
+rejects NEW work only and never drops an already-accepted record (I2 holds). Given
+the configured headroom `H` (bytes), the current un-fsynced backlog `U`, and the new
+record's logical bytes `r`:
+
+1. If `H == 0` (the default, DISABLED) or `U == 0` (an empty backlog), ADMIT. The
+   empty-backlog rule is the NO-WEDGE floor: a single record larger than the whole
+   headroom still makes progress, exactly like the per-consumer byte-credit's
+   one-message floor, so the broker can never deadlock on an oversized produce.
+2. Else if `U + r <= H`, ADMIT (the record fits the remaining headroom).
+3. Else the headroom is exhausted: **DRAIN** the pending group-commit batch (the
+   actor's normal `flush_pending`, one barrier for the whole batch), then re-check.
+   - Under the default `sync` level (and a DUE `interval` window) the drain is a real
+     `fdatasync`, so `U` resets to `0` and the record is then admitted by the
+     no-wedge floor. The headroom THROTTLES (drain-then-admit); it **never sheds and
+     never loses** under `sync`.
+   - Under a relaxed `async` / `none` level a commit DEFERS the fsync, so `U` does
+     not drain; the re-check still fails and the NEW produce is SHED with the typed,
+     self-announcing `ProduceOutcome::WalHeadroomShed` (the bare `Err` message
+     `wal fsync headroom exhausted`, distinct from CoDel's `shed under load` and the
+     byte cap's `at capacity`). The already-buffered records are untouched (they stay
+     durable-pending and are made durable by the level's own barrier), so only the
+     new produce is rejected.
+
+### How it composes with #336 (CoDel) and #341 (durability)
+
+- **With CoDel (#336):** orthogonal. CoDel sheds on the standing admission SOJOURN
+  (latency); the headroom sheds on the un-fsynced BACKLOG SIZE. Each is consulted
+  before the append and each admits-or-sheds NEW work only, so neither interacts with
+  or weakens the other. A broker can run both, either, or neither.
+- **With durability levels (#341):** under `sync` the headroom bounds the GROUP-COMMIT
+  backlog (a memory / RAM guard; it throttles, never loses). Under a relaxed level it
+  bounds the LOSS WINDOW (the acknowledged-but-unsynced tail a power cut would revert),
+  by shedding new produces once the backlog fills, so an operator who opts into a
+  relaxed level for throughput can still cap the worst-case loss in bytes. This is the
+  byte-trigger of the `interval` window applied as an ADMISSION gate rather than a
+  periodic flush. OPERATOR NOTE: under the `interval` level, set
+  `wal_fsync_headroom_bytes` >= the interval byte budget (`flush_max_bytes`); a
+  headroom smaller than the interval flush threshold sheds new produces before the
+  interval flush would have drained the backlog (correct and loss-safe, just tighter
+  than intended). Under `sync` there is no such interaction (every commit fsyncs).
+
+### Safe default and no data loss
+
+The headroom defaults to `0` (OFF): the un-fsynced frontier is then bounded only by
+the existing controls (under `sync` every group-commit drains it; under a relaxed
+level the `interval` window or a roll / clean shutdown does), so a zero-config broker
+is byte-for-byte unchanged. A small headroom is the opt-in for a tight RAM /
+loss-window bound. The shed rejects NEW work only and is decided before the append, so
+no accepted (acked, or to-be-acked) record is ever dropped or left non-durable: the
+durability / ack path and I2 are untouched, exactly the #336 shed contract.
+
+---
+
 ## Configuration keys (#14)
 
 These keys are now IMPLEMENTED (#336) as `serve` flags / `IRONBUS_*` env vars,
@@ -459,6 +539,7 @@ disabling value, so a broker that sets nothing behaves exactly as today.
 | `fire_and_forget_byte_rate` | `--fire-and-forget-byte-rate` | `0` = OFF | rate | token bucket (#69) |
 | `fire_and_forget_refill_ms` | `--fire-and-forget-refill-ms` | 100 ms | refill granularity | token bucket (#69) |
 | `egress_limit` | `--egress-limit` | 16 (static floor) | AIMD `[4, 128]` | egress limiter (#69) |
+| `wal_fsync_headroom_bytes` | `--wal-fsync-headroom-bytes` | `0` = OFF | bytes (`0` = unbounded) | fsync-headroom admission (#378) |
 
 A CoDel value outside its clamp is silently clamped to the nearest bound (never a
 startup error), consistent with the "no per-device tuning" and "cannot refuse to
@@ -509,6 +590,19 @@ fired: a rising `codel_shed_total` is standing latency, a rising
 watch it stay near or below the 10% budget under overload. `ironbus_egress_limit`
 makes the AIMD backoff visible (it halves when a sink degrades, climbs back as it
 heals).
+
+**fsync-headroom (#378):**
+
+| metric | kind | meaning |
+|--------|------|---------|
+| `ironbus_wal_fsync_headroom_shed_total` | counter | new produces shed because the un-fsynced backlog could not be drained below the headroom (only under a relaxed durability level that defers the fsync) |
+| `ironbus_wal_fsync_headroom_bytes` | gauge | the configured headroom in bytes (`0` = disabled / unbounded) |
+
+The shed counter is pinned in `FROZEN_RESILIENCE_COUNTERS` (a shed is never silent);
+the headroom gauge carries no `_total` suffix and is pinned only in
+`FROZEN_METRIC_TYPES`. Under the default `sync` level the headroom THROTTLES
+(drain-then-admit) rather than sheds, so `ironbus_wal_fsync_headroom_shed_total` stays
+`0` there; a rising value is a relaxed-level broker keeping its loss window bounded.
 
 ## What this changes on the wire (#11)
 

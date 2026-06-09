@@ -254,6 +254,12 @@ const DEFAULT_FIRE_AND_FORGET_REFILL_MS: u64 =
 /// engine default (16); the AIMD bounds `[4, 128]` always apply.
 const DEFAULT_EGRESS_LIMIT: u32 = ironbus_server::engine::DEFAULT_EGRESS_LIMIT;
 
+/// The default fsync-headroom admission window in BYTES for `serve` (#378), aliased to the core
+/// default (`0` = OFF). A zero-config broker is unchanged; a non-zero value is the opt-in tight RAM /
+/// loss-window bound on the un-fsynced write frontier.
+const DEFAULT_WAL_FSYNC_HEADROOM_BYTES: u64 =
+    ironbus_core::backpressure::DEFAULT_WAL_FSYNC_HEADROOM_BYTES;
+
 /// The default COUNT bound on each per-producer dedup window for `serve` (#3, #33), aliased to the
 /// engine's [`ironbus_core::dedup::DEFAULT_MAX_IDS`] so the CLI and engine default are one source of
 /// truth. Dedup is OFF by default and activates per-producer only when a publish carries a `msg_id`;
@@ -1592,6 +1598,8 @@ struct ServeFlags {
     fire_and_forget_refill_ms: Option<u64>,
     /// The starting / static-floor egress concurrency limit (#69); `None` -> default (16).
     egress_limit: Option<u32>,
+    /// The fsync-headroom admission window in BYTES (#378); `None` -> default (`0` = off).
+    wal_fsync_headroom_bytes: Option<u64>,
     key_shared_groups: Vec<String>,
     broadcast_groups: Vec<String>,
 }
@@ -1720,6 +1728,10 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             }
             "--egress-limit" => {
                 f.egress_limit = Some(take_number("--egress-limit", args, &mut i)?);
+            }
+            "--wal-fsync-headroom-bytes" => {
+                f.wal_fsync_headroom_bytes =
+                    Some(take_number("--wal-fsync-headroom-bytes", args, &mut i)?);
             }
             // A bare boolean flag (no value): advance ONE token, not two, or the loop spins. The
             // explicit data-loss acknowledgement that gates the unbounded-loss durability levels.
@@ -2127,6 +2139,14 @@ fn parse_serve_flags_with_env_and_reader(
                 f.egress_limit,
                 env,
                 DEFAULT_EGRESS_LIMIT,
+            )?,
+            // The fsync-headroom admission window (#378), flag > env > default `0` (OFF), so a
+            // zero-config broker is unchanged; a non-zero value bounds the un-fsynced write frontier.
+            wal_fsync_headroom_bytes: resolve_number(
+                "--wal-fsync-headroom-bytes",
+                f.wal_fsync_headroom_bytes,
+                env,
+                DEFAULT_WAL_FSYNC_HEADROOM_BYTES,
             )?,
         },
         key_shared_groups: f.key_shared_groups,
@@ -2698,6 +2718,14 @@ struct ServeConfig {
     /// The starting / static-floor EGRESS concurrency limit for the AIMD downstream limiter (#69),
     /// adapted within `[4, 128]`. `0` is treated as the doc default floor (16) by the limiter.
     egress_limit: u32,
+    /// The fsync-HEADROOM admission window in BYTES (#378): the most un-fsynced (buffered-but-not-
+    /// durable) record bytes the BUFFERED write frontier may run ahead of the DURABLE frontier before
+    /// a new produce is throttled (a group-commit drain forced first) or shed. `0` = DISABLED (the
+    /// default), so a zero-config broker is unchanged; a non-zero value is the opt-in tight RAM /
+    /// loss-window bound on the un-fsynced backlog. Under `sync` it throttles (drain-then-admit, never
+    /// loses); under a relaxed durability level it caps the loss window by shedding new produces once
+    /// the un-fsynced backlog fills. Reuses the engine's `unsynced_bytes()` frontier (#341).
+    wal_fsync_headroom_bytes: u64,
 }
 
 // Only the Unix `bench` execution path constructs a default `ServeConfig` (the isolated broker); on
@@ -2759,6 +2787,7 @@ impl ServeConfig {
             fire_and_forget_byte_rate: 0,
             fire_and_forget_refill_ms: DEFAULT_FIRE_AND_FORGET_REFILL_MS,
             egress_limit: DEFAULT_EGRESS_LIMIT,
+            wal_fsync_headroom_bytes: DEFAULT_WAL_FSYNC_HEADROOM_BYTES,
         }
     }
 }
@@ -2907,7 +2936,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: &Path) -
          max_retained_bytes={} max_age_ms={} max_messages={} health_liveness_window_ms={} \
          enable_admin={} ram_ceiling_bytes={} durability_level={durability_level} \
          power_loss_safe={power_loss_safe} compression={compression} flush_interval_ms={} \
-         flush_max_bytes={} async_loss_ack={}",
+         flush_max_bytes={} async_loss_ack={} wal_fsync_headroom_bytes={}",
         config.profile.name(),
         config.profile_schema_version,
         config.max_connections,
@@ -2931,6 +2960,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: &Path) -
         config.flush_interval_ms,
         config.flush_max_bytes,
         config.async_loss_ack,
+        config.wal_fsync_headroom_bytes,
         data_dir = data_dir.display(),
     )
 }
@@ -3418,6 +3448,11 @@ fn cmd_serve(
         config.fire_and_forget_byte_rate,
         config.fire_and_forget_refill_ms,
         config.egress_limit,
+        // The #378 fsync-headroom knob is read only on the Unix serve path (it wires the engine's
+        // wal_fsync_headroom_bytes), so the non-Unix stub must consume it too or the Windows
+        // `-D warnings` build trips field-never-read, invisible to a macOS reviewer (the recurring
+        // #288/#99 footgun).
+        config.wal_fsync_headroom_bytes,
         key_shared_groups,
         // Read the broadcast groups under cfg(not(unix)) too: a field/param read only on cfg(unix)
         // breaks the Windows `-D warnings` build invisibly to a macOS reviewer (#288 note).
@@ -3562,6 +3597,11 @@ fn open_disk_engine(
             fire_and_forget_byte_rate: config.fire_and_forget_byte_rate,
             fire_and_forget_refill_ms: config.fire_and_forget_refill_ms,
             egress_limit: config.egress_limit,
+            // The fsync-headroom admission window (#378), wired from `--wal-fsync-headroom-bytes`.
+            // Default `0` = OFF (the un-fsynced frontier is bounded only by the group-commit
+            // drain under `sync` / the interval window under a relaxed level), so a zero-config
+            // broker is unchanged; a non-zero value is the opt-in tight RAM / loss-window bound.
+            wal_fsync_headroom_bytes: config.wal_fsync_headroom_bytes,
         },
     )
     .map_err(|e| CliError::Internal(format!("opening broker at {}: {e}", data_dir.display())))?;
@@ -5446,6 +5486,7 @@ mod tests {
             fire_and_forget_byte_rate: 0,
             fire_and_forget_refill_ms: DEFAULT_FIRE_AND_FORGET_REFILL_MS,
             egress_limit: DEFAULT_EGRESS_LIMIT,
+            wal_fsync_headroom_bytes: DEFAULT_WAL_FSYNC_HEADROOM_BYTES,
         }
     }
 
@@ -6527,6 +6568,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap();
@@ -7031,6 +7073,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap();
@@ -7108,6 +7151,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap();
@@ -7402,6 +7446,7 @@ mod tests {
             fire_and_forget_byte_rate: 0,
             fire_and_forget_refill_ms: DEFAULT_FIRE_AND_FORGET_REFILL_MS,
             egress_limit: DEFAULT_EGRESS_LIMIT,
+            wal_fsync_headroom_bytes: DEFAULT_WAL_FSYNC_HEADROOM_BYTES,
         }
     }
 
@@ -8393,6 +8438,50 @@ mod tests {
     }
 
     #[test]
+    fn the_wal_fsync_headroom_resolves_flag_over_env_over_default_and_logs_it() {
+        // The #378 knob follows the standard flag > env > default precedence, defaults to OFF, and is
+        // surfaced on the materialized-config startup line so an operator sees the active bound.
+        // Default: OFF (0), a zero-config broker is unchanged.
+        let parsed = parse_serve_flags(&serve_args(&[])).unwrap();
+        assert_eq!(
+            parsed.config.wal_fsync_headroom_bytes, DEFAULT_WAL_FSYNC_HEADROOM_BYTES,
+            "the default headroom is the compiled default (0 = off)"
+        );
+        assert_eq!(
+            parsed.config.wal_fsync_headroom_bytes, 0,
+            "the compiled default is off"
+        );
+
+        // Env var sets it when no flag is given.
+        let env = fixed_env(&[("IRONBUS_WAL_FSYNC_HEADROOM_BYTES", "65536")]);
+        let from_env = parse_serve_flags_with_env(&serve_args(&[]), &env).unwrap();
+        assert_eq!(
+            from_env.config.wal_fsync_headroom_bytes, 65536,
+            "the env var applies when no flag is given"
+        );
+
+        // The flag overrides the env var.
+        let from_flag =
+            parse_serve_flags_with_env(&serve_args(&["--wal-fsync-headroom-bytes", "4096"]), &env)
+                .unwrap();
+        assert_eq!(
+            from_flag.config.wal_fsync_headroom_bytes, 4096,
+            "the flag overrides the env var (flag > env)"
+        );
+
+        // The materialized-config startup line carries the resolved value.
+        let line = materialized_config_line(
+            &from_flag.config,
+            "127.0.0.1:7777",
+            Path::new("/var/lib/ironbus"),
+        );
+        assert!(
+            line.contains("wal_fsync_headroom_bytes=4096"),
+            "the materialized-config line surfaces the resolved headroom: {line}"
+        );
+    }
+
+    #[test]
     fn an_invalid_env_value_is_a_typed_error_naming_the_env_var() {
         // A non-numeric env value where a number is expected is a usage error that NAMES THE ENV VAR
         // (not the flag), exactly as a bad flag value names the flag.
@@ -9089,6 +9178,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap();
@@ -9165,6 +9255,7 @@ mod tests {
                 fire_and_forget_byte_rate: 0,
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
             },
         )
         .unwrap();

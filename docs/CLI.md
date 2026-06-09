@@ -124,6 +124,7 @@ broker opens.
 | `--fire-and-forget-byte-rate <n>` | u64 | `0` (DISABLED) | bytes/second | The fire-and-forget token bucket's BYTE rate (#69). `0` (with the message rate) disables the bucket. The doc default is `5242880` (5 MiB/s). |
 | `--fire-and-forget-refill-ms <n>` | u64 | `100` | milliseconds | The fire-and-forget token bucket's refill granularity (#69): sizes the burst ceiling (`rate * refill_ms / 1000`). |
 | `--egress-limit <n>` | u32 | `16` (`DEFAULT_EGRESS_LIMIT`) | count | The starting / static-floor EGRESS concurrency limit for the AIMD downstream limiter (#69): in-flight requests to a downstream sink, adapted up additively (+1 on a clean window) and down multiplicatively (x0.5 on a timeout / 429 / 503), bounded to `[4, 128]`. `0` is treated as the default floor (16). |
+| `--wal-fsync-headroom-bytes <n>` | u64 | `0` (DISABLED, `DEFAULT_WAL_FSYNC_HEADROOM_BYTES`) | bytes | The fsync-HEADROOM admission credit (#378): the most un-fsynced (buffered-but-not-durable) record bytes the BUFFERED write frontier may run ahead of the DURABLE frontier. `0` (the default) DISABLES it (a zero-config broker is unchanged). When set, a new produce that would push the un-fsynced backlog past the headroom first forces a group-commit drain; under `--durability-level sync` the drain frees the headroom and the produce is admitted (THROTTLE, never loses), under a relaxed level the drain defers the fsync so the produce is SHED with a typed `wal fsync headroom exhausted` signal (bounding the loss window). It NEVER drops an already-accepted record (I2 holds) and never wedges on an oversized produce. Reuses the engine's `unsynced_bytes()` frontier (#341). |
 
 ### `serve` validation (each a usage error, exit 1)
 
@@ -198,6 +199,7 @@ it). With no `--profile`, the default profile is `balanced`, whose values ARE th
 | `--flush-interval-ms` | `IRONBUS_FLUSH_INTERVAL_MS` |
 | `--flush-max-bytes` | `IRONBUS_FLUSH_MAX_BYTES` |
 | `--async-loss-ack` | `IRONBUS_ASYNC_LOSS_ACK` |
+| `--wal-fsync-headroom-bytes` | `IRONBUS_WAL_FSYNC_HEADROOM_BYTES` |
 | `--visibility-timeout-ms` | `IRONBUS_VISIBILITY_TIMEOUT_MS` |
 | `--health-addr` | `IRONBUS_HEALTH_ADDR` |
 | `--health-allow-public` | `IRONBUS_HEALTH_ALLOW_PUBLIC` (`true`/`1` or `false`/`0`) |

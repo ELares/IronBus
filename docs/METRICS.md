@@ -106,6 +106,7 @@ snapshot already dominates the replay increments nothing).
 | `ironbus_retry_shed_total{side="broker"}` | A retry is THROTTLED broker-side by the per-client **retry budget** (the Google SRE accept-based adaptive throttle): the client's recent accept rate fell, so its retries are bounded to the budget ratio (#69). The `side` label is `broker` (the broker-side re-check; a future client library mirrors it as `client`). | **Anti-amplification**: a buggy or hostile client that ignores its own throttle is shed broker-side, so a retry storm cannot multiply the offered load. Zero unless the retry budget is enabled. |
 | `ironbus_fire_and_forget_shed_total` | A fire-and-forget (un-credited) message is shed by the per-connection **token bucket** because either bucket (message or byte) was empty (#69). | **Uncontrolled-tier cap**: the QoS-0-equivalent path is bounded to its configured rate so it cannot bypass the consumer-credit brake or starve credited traffic. It sheds fire-and-forget messages and NOTHING ELSE (the credited path is untouched). Zero unless the bucket is enabled. |
 | `ironbus_egress_shed_total` | A downstream-egress request is shed at the **AIMD** concurrency limit (#69): the in-flight count reached the current adaptive limit. | **Egress backpressure**: a degrading downstream sink (the AIMD limit halved) sheds new egress rather than piling on, so a slow sink does not convert into upstream backlog. Zero until egress sinks are wired (the limiter and its counter exist; the egress call sites land with the sink features). |
+| `ironbus_wal_fsync_headroom_shed_total` | A NEW `produce` is shed by the **fsync-headroom** admission credit (#378): the un-fsynced (buffered-but-not-durable) backlog was at the configured `--wal-fsync-headroom-bytes` and a group-commit drain could not free it (only reachable under a relaxed durability level that defers the fsync). | **Un-fsynced backlog bound** (a memory / loss-window guard): the broker refuses the *new* write to keep the un-fsynced frontier within the headroom. Decided BEFORE the append, so it NEVER drops an already-accepted record (I2 holds). Under the default `sync` level the headroom THROTTLES (drain-then-admit) instead of shedding, so this stays `0` there; a rising value is a relaxed-level broker capping its loss window. |
 
 ### Recovery-loss series (startup, per reason)
 
@@ -230,6 +231,7 @@ resilience-counter taxonomy (`FROZEN_RESILIENCE_COUNTERS`) by construction.
 ironbus_codel_sojourn_estimate_ms          the current minimum-sojourn estimate (ms) the CoDel control law is acting on
 ironbus_retry_ratio                        the observed retry (shed) rate as a fraction of the request rate, in parts-per-million (divide by 1e6); the 10%-budget signal
 ironbus_egress_limit                       the current AIMD egress concurrency limit (between 4 and 128); halves on a degrading sink, climbs back as it heals
+ironbus_wal_fsync_headroom_bytes           the configured fsync-headroom admission window in bytes (#378); 0 = disabled / unbounded
 ```
 
 `ironbus_retry_ratio` makes the anti-amplification claim observable: an operator
