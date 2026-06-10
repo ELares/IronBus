@@ -497,6 +497,107 @@ pub fn read_descriptor(stored: &[u8]) -> Result<(u8, u32, u32, &[u8]), Decompres
     ))
 }
 
+/// Validates the SHAPE of a compressed payload's descriptor WITHOUT decompressing (#438):
+/// the produce-time gate for a wire PUB that carries the `COMPRESSED` bit.
+///
+/// The broker is store-and-forward, so a record it acks is decoded only by its CONSUMERS;
+/// before this gate, nothing validated a producer-supplied descriptor at produce time, and
+/// one undecodable record cost EVERY consumer group max-deliver visibility-timeout cycles
+/// of typed decode failures before it dead-lettered (#438, post-#430). Each rule here is a
+/// header-only check (a [`DESCRIPTOR_LEN`]-byte parse, NO decompression, so the produce hot
+/// path pays no codec CPU) and rejects what the shipped read side
+/// ([`decompress_payload`], for a codec the reader implements) can never decode, with ONE
+/// deliberate, documented exception where the gate is STRICTER than the read side (the
+/// empty-stream rule below):
+///
+/// - The payload must parse as a well-formed descriptor ([`read_descriptor`] succeeds):
+///   shorter than [`DESCRIPTOR_LEN`] and no reader can even frame the header.
+/// - The codec id must be one of the REGISTERED ids ([`CODEC_ID_NONE`], [`CODEC_ID_LZ4`],
+///   [`CODEC_ID_ZSTD`]; the append-only registry in `docs/compat/versions.md`), regardless
+///   of what THIS build implements: a `zstd` record produced through a default-build broker
+///   is still decodable by a `zstd`-capable consumer, so the gate must not narrow the
+///   registry to the broker's own feature set. An UNREGISTERED id (a typo'd future producer,
+///   or garbage) fails fast at the source instead of poisoning every consumer.
+/// - The claimed `uncompressed_len` must be within `max_decompressed` (callers pass
+///   [`DEFAULT_MAX_DECOMPRESSED_BYTES`], the SAME constant every shipped reader and the
+///   #437 write seam enforce): an over-cap claim would be durably acked and then refused by
+///   every reader's bomb guard (#76) before allocation, on every delivery attempt.
+/// - The stream must be plausibly decodable for the named codec: a `none`-codec stream's
+///   length must equal the claimed `uncompressed_len` exactly (the read side's
+///   [`DecompressError::BadRawLength`] check), and an `lz4`/`zstd` stream must be non-empty.
+///   For lz4 the non-empty rule mirrors the read side exactly: an lz4 block needs at least
+///   one token byte even for empty output (the canonical lz4 of `b""` is the single byte
+///   `0x00`), so `lz4_flex` rejects an empty stream for ANY claimed length. For zstd the
+///   rule is deliberately STRICTER than the read side on exactly one degenerate input, the
+///   9-byte descriptor (codec `zstd`, any resolvable `dict_id`, claim 0) with an EMPTY
+///   stream: the locked `zstd` decoder accepts it
+///   (`Decompressor::decompress_to_buffer(&[], &mut [])` is `Ok` with 0 bytes written), but
+///   the wire contract (`docs/CONTRACTS.md`) normatively requires a non-empty stream under a
+///   compressing codec, and a genuine zstd encoder never emits an empty frame (an empty
+///   payload still gets a frame header), so only hand-crafted bytes hit the gap. Pinned by
+///   `zstd_empty_stream_claim_zero_is_the_documented_strictness_exception`.
+///
+/// The `dict_id` is deliberately NOT validated: dictionary resolution is a READER capability
+/// (the on-disk sidecar plus the embedded set, `docs/DICTIONARY_LIFECYCLE.md` §5), so the
+/// broker cannot know which ids a consumer resolves; an unresolvable id stays the read-side
+/// POISON path it always was. Stream CONTENT is likewise not checked (that would require
+/// decompressing): a syntactically corrupt stream behind a well-formed descriptor still
+/// reaches consumers, exactly as a corrupt raw payload would.
+///
+/// # Errors
+/// Returns the matching [`DecompressError`] variant (the existing taxonomy; no new error
+/// vocabulary): [`DecompressError::TruncatedDescriptor`],
+/// [`DecompressError::PoisonUnknownCodec`], [`DecompressError::DecompressedTooLarge`],
+/// [`DecompressError::BadRawLength`], or [`DecompressError::CorruptStream`].
+pub fn validate_descriptor_shape(
+    stored: &[u8],
+    max_decompressed: u32,
+) -> Result<(), DecompressError> {
+    // WHY: a payload shorter than the fixed descriptor has no header any reader can parse.
+    let (codec_id, _dict_id, uncompressed_len, stream) = read_descriptor(stored)?;
+
+    // WHY: the codec id space is the append-only registry (none/lz4/zstd per
+    // docs/compat/versions.md). The check is against the REGISTERED ids, not Codec::from_id
+    // (the build-implemented set), so a store-and-forward broker without the zstd feature
+    // still accepts a zstd record its consumers may decode; an unregistered id can be
+    // decoded by NO conforming reader, so it is rejected at the source.
+    if !matches!(codec_id, CODEC_ID_NONE | CODEC_ID_LZ4 | CODEC_ID_ZSTD) {
+        return Err(DecompressError::PoisonUnknownCodec(codec_id));
+    }
+
+    // WHY: every shipped reader enforces this cap against the CLAIM before allocating (the
+    // #76 decompression-bomb guard), so an over-cap claim is undeliverable everywhere; the
+    // same DEFAULT_MAX_DECOMPRESSED_BYTES constant keeps the write gate and the readers on
+    // one number (the #437 seam's raw-store guard uses it too).
+    if uncompressed_len > max_decompressed {
+        return Err(DecompressError::DecompressedTooLarge {
+            claimed: uncompressed_len,
+            cap: max_decompressed,
+        });
+    }
+
+    if codec_id == CODEC_ID_NONE {
+        // WHY: a none-codec descriptor stores the raw payload after the header, and the read
+        // side requires the stream length to equal the claim EXACTLY (BadRawLength); the
+        // length is in the header, so the check is free here and a mismatch is undecodable.
+        if stream.len() != uncompressed_len as usize {
+            return Err(DecompressError::BadRawLength);
+        }
+    } else if stream.is_empty() {
+        // WHY: the wire contract (docs/CONTRACTS.md) requires a NON-EMPTY stream under a
+        // compressing codec, and no genuine encoder emits one: an lz4 block needs at least
+        // one token byte even for empty output (lz4_flex returns ExpectedAnotherByte ->
+        // CorruptStream on empty input), and a zstd encoder always emits a frame header.
+        // For lz4 this mirrors the read side exactly. For zstd it is deliberately STRICTER
+        // on one degenerate input (empty stream + claim 0, which the zstd decoder accepts
+        // as a 0-byte output): the contract is normative, and only hand-crafted bytes,
+        // never an encoder, produce that shape. See the rustdoc above and the pinning test
+        // `zstd_empty_stream_claim_zero_is_the_documented_strictness_exception`.
+        return Err(DecompressError::CorruptStream);
+    }
+    Ok(())
+}
+
 /// Decompresses a record's STORED payload back to the original payload.
 ///
 /// `flags` are the decoded record's flags (whether the `COMPRESSED` bit is set), `stored`
@@ -933,6 +1034,339 @@ mod tests {
             "a zstd record on a default build is poison"
         );
     }
+
+    /// Builds a raw descriptor + stream payload for the shape-validation tests (#438).
+    fn descriptor(codec_id: u8, dict_id: u32, uncompressed_len: u32, stream: &[u8]) -> Vec<u8> {
+        let mut v = vec![codec_id];
+        v.extend_from_slice(&dict_id.to_le_bytes());
+        v.extend_from_slice(&uncompressed_len.to_le_bytes());
+        v.extend_from_slice(stream);
+        v
+    }
+
+    #[test]
+    fn shape_validation_accepts_a_writer_produced_descriptor() {
+        // The gate must accept exactly what an honest compressor emits: the broker's own
+        // seam output and a producer-compressed publish are the same bytes.
+        let out = compress_payload(&compressible(4096), &lz4_config()).unwrap();
+        assert!(out.compressed, "the fixture genuinely compresses");
+        validate_descriptor_shape(&out.stored, DEFAULT_MAX_DECOMPRESSED_BYTES)
+            .expect("a well-formed compressed object passes the shape gate");
+    }
+
+    #[test]
+    fn shape_validation_rejects_a_truncated_descriptor_like_the_read_side() {
+        // Shorter than DESCRIPTOR_LEN: no reader can frame the header. Same typed error as
+        // the read side, so the gate and the readers cannot drift.
+        let garbage = b"garbage!"; // 8 bytes < DESCRIPTOR_LEN (9)
+        assert_eq!(
+            validate_descriptor_shape(garbage, DEFAULT_MAX_DECOMPRESSED_BYTES),
+            Err(DecompressError::TruncatedDescriptor)
+        );
+        assert_eq!(
+            decompress_payload(
+                RecordFlags::COMPRESSED,
+                garbage,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES
+            )
+            .unwrap_err(),
+            DecompressError::TruncatedDescriptor
+        );
+    }
+
+    #[test]
+    fn shape_validation_rejects_an_unregistered_codec_id() {
+        // Id 7 is outside the append-only registry (none/lz4/zstd): NO conforming reader
+        // can ever decode it, so the produce gate fails it at the source.
+        let stored = descriptor(7, DICT_ID_NONE, 4, b"abcd");
+        assert_eq!(
+            validate_descriptor_shape(&stored, DEFAULT_MAX_DECOMPRESSED_BYTES),
+            Err(DecompressError::PoisonUnknownCodec(7))
+        );
+        assert_eq!(
+            decompress_payload(
+                RecordFlags::COMPRESSED,
+                &stored,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES
+            )
+            .unwrap_err(),
+            DecompressError::PoisonUnknownCodec(7)
+        );
+    }
+
+    #[test]
+    fn shape_validation_accepts_the_registered_zstd_id_on_every_build() {
+        // The broker is store-and-forward: a zstd record produced through a default-build
+        // broker is decodable by a zstd-capable CONSUMER, so the gate checks the REGISTERED
+        // id space (docs/compat/versions.md), never the build-implemented set. The shape
+        // passes on both the default and the zstd-feature build (content is not checked).
+        let stored = descriptor(CODEC_ID_ZSTD, DICT_ID_NONE, 64, b"not a real zstd frame");
+        validate_descriptor_shape(&stored, DEFAULT_MAX_DECOMPRESSED_BYTES)
+            .expect("registered id 2 passes the shape gate regardless of the build");
+    }
+
+    #[test]
+    fn shape_validation_does_not_judge_dict_ids() {
+        // Dictionary resolution is a READER capability (sidecar + embedded set), unknowable
+        // at the broker, so a non-zero dict_id passes the shape gate and stays the read-side
+        // poison path it always was.
+        let stored = descriptor(CODEC_ID_LZ4, 0xDEAD_BEEF, 64, b"stream");
+        validate_descriptor_shape(&stored, DEFAULT_MAX_DECOMPRESSED_BYTES)
+            .expect("a non-zero dict_id is a reader concern, not a shape fault");
+    }
+
+    #[test]
+    fn shape_validation_rejects_an_over_cap_claim_like_the_readers_bomb_guard() {
+        // The cap binds the CLAIM (#76): every shipped reader refuses it before allocating,
+        // so an acked over-cap record would stall every consumer. Same constant, same error.
+        let stored = descriptor(
+            CODEC_ID_LZ4,
+            DICT_ID_NONE,
+            DEFAULT_MAX_DECOMPRESSED_BYTES + 1,
+            b"x",
+        );
+        let expected = DecompressError::DecompressedTooLarge {
+            claimed: DEFAULT_MAX_DECOMPRESSED_BYTES + 1,
+            cap: DEFAULT_MAX_DECOMPRESSED_BYTES,
+        };
+        assert_eq!(
+            validate_descriptor_shape(&stored, DEFAULT_MAX_DECOMPRESSED_BYTES),
+            Err(expected)
+        );
+        assert_eq!(
+            decompress_payload(
+                RecordFlags::COMPRESSED,
+                &stored,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES
+            )
+            .unwrap_err(),
+            expected
+        );
+        // An AT-cap claim is the largest legal one (the readers reject only strictly above).
+        let at_cap = descriptor(
+            CODEC_ID_LZ4,
+            DICT_ID_NONE,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+            b"x",
+        );
+        validate_descriptor_shape(&at_cap, DEFAULT_MAX_DECOMPRESSED_BYTES)
+            .expect("an at-cap claim is shape-legal");
+    }
+
+    #[test]
+    fn shape_validation_pins_the_none_codec_exact_length_rule() {
+        // COMPRESSED + codec none IS wire-legal: the read side returns the stream verbatim
+        // when its length equals the claim, and rejects a mismatch as BadRawLength. The gate
+        // mirrors both halves exactly.
+        let legal = descriptor(CODEC_ID_NONE, DICT_ID_NONE, 2, b"ab");
+        validate_descriptor_shape(&legal, DEFAULT_MAX_DECOMPRESSED_BYTES)
+            .expect("a length-consistent none-codec object is wire-legal");
+        assert_eq!(
+            decompress_payload(
+                RecordFlags::COMPRESSED,
+                &legal,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES
+            )
+            .unwrap(),
+            b"ab",
+            "the read side decodes it to the inner raw bytes"
+        );
+        let mismatched = descriptor(CODEC_ID_NONE, DICT_ID_NONE, 3, b"ab");
+        assert_eq!(
+            validate_descriptor_shape(&mismatched, DEFAULT_MAX_DECOMPRESSED_BYTES),
+            Err(DecompressError::BadRawLength)
+        );
+        assert_eq!(
+            decompress_payload(
+                RecordFlags::COMPRESSED,
+                &mismatched,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES
+            )
+            .unwrap_err(),
+            DecompressError::BadRawLength
+        );
+    }
+
+    /// Mutation teeth for the none-codec EXACTNESS rule (#438 review finding 3): the suite
+    /// above only covers a stream SHORTER than its claim, so weakening either side's
+    /// `stream.len() != claim` to `stream.len() < claim` survived every test. A stream
+    /// LONGER than the claim is equally undecodable on the wire contract (which bytes are
+    /// the payload?), so BOTH the produce gate and the read side must reject it as
+    /// `BadRawLength`. Verified by applying the `<` mutant to each side in turn: this test
+    /// fails, the rest of the suite cannot be relied on to.
+    #[test]
+    fn a_none_codec_stream_longer_than_its_claim_is_rejected_by_both_sides() {
+        let longer = descriptor(CODEC_ID_NONE, DICT_ID_NONE, 2, b"abc");
+        assert_eq!(
+            validate_descriptor_shape(&longer, DEFAULT_MAX_DECOMPRESSED_BYTES),
+            Err(DecompressError::BadRawLength),
+            "the gate rejects a none-codec stream longer than its claim"
+        );
+        assert_eq!(
+            decompress_payload(
+                RecordFlags::COMPRESSED,
+                &longer,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES
+            )
+            .unwrap_err(),
+            DecompressError::BadRawLength,
+            "the read side rejects it identically"
+        );
+    }
+
+    #[test]
+    fn shape_validation_rejects_an_empty_stream_under_a_compressing_codec() {
+        // An empty LZ4 stream cannot be a valid lz4 block (lz4 needs at least one token
+        // byte, even for empty output: the canonical lz4 of b"" is the single byte 0x00),
+        // so for lz4 the gate and the read side agree for ANY claimed length, including 0.
+        // The zstd half of the non-empty rule is NOT a read-side mirror on a claim of 0; it
+        // is the gate's one documented strictness exception, pinned separately by
+        // `zstd_empty_stream_claim_zero_is_the_documented_strictness_exception`.
+        let empty = descriptor(CODEC_ID_LZ4, DICT_ID_NONE, 0, b"");
+        assert_eq!(
+            validate_descriptor_shape(&empty, DEFAULT_MAX_DECOMPRESSED_BYTES),
+            Err(DecompressError::CorruptStream)
+        );
+        assert_eq!(
+            decompress_payload(
+                RecordFlags::COMPRESSED,
+                &empty,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES
+            )
+            .unwrap_err(),
+            DecompressError::CorruptStream,
+            "the read side agrees: an empty lz4 stream is corrupt"
+        );
+    }
+
+    /// The premise sanity for the #438 gate-contract property
+    /// (`proptests::shape_gate_never_rejects_a_decodable_record_except_the_documented_exception`):
+    /// a targeted, deterministic set of inputs the read side GENUINELY decodes, so the
+    /// "decoder-accept implies gate-accept" direction is exercised by construction, not
+    /// vacuously (a raw random stream decodes with probability ~0). The gate must accept
+    /// every one of them; the ONE decodable input the gate rejects is pinned separately by
+    /// the strictness-exception tests.
+    #[test]
+    fn the_shape_gate_accepts_every_genuinely_decodable_premise_case() {
+        let mut cases: Vec<(&str, Vec<u8>, Vec<u8>)> = Vec::new(); // (name, stored, payload)
+
+        // none-codec: the stream IS the payload and the claim matches exactly.
+        cases.push((
+            "none, exact length",
+            descriptor(CODEC_ID_NONE, DICT_ID_NONE, 3, b"abc"),
+            b"abc".to_vec(),
+        ));
+        // none-codec, empty payload: claim 0 over an empty stream is decodable AND
+        // gate-legal (the non-empty-stream rule binds only the compressing codecs).
+        cases.push((
+            "none, empty payload",
+            descriptor(CODEC_ID_NONE, DICT_ID_NONE, 0, b""),
+            Vec::new(),
+        ));
+        // lz4: a genuine block (the same encode call compress_payload makes), claim == the
+        // payload length.
+        let payload = compressible(4096);
+        let block = lz4_flex::block::compress(&payload);
+        cases.push((
+            "lz4, genuine block",
+            descriptor(
+                CODEC_ID_LZ4,
+                DICT_ID_NONE,
+                u32::try_from(payload.len()).unwrap(),
+                &block,
+            ),
+            payload,
+        ));
+        // lz4 of the EMPTY payload: the canonical single token byte 0x00 with claim 0, a
+        // NON-empty stream for a zero-length output (decodable and gate-legal, unlike the
+        // empty-stream descriptor).
+        let empty_block = lz4_flex::block::compress(b"");
+        assert_eq!(empty_block, [0u8], "the canonical lz4 block of b\"\"");
+        cases.push((
+            "lz4, empty payload",
+            descriptor(CODEC_ID_LZ4, DICT_ID_NONE, 0, &empty_block),
+            Vec::new(),
+        ));
+        // zstd, on a feature build only (a default build poisons codec id 2 at decode, so
+        // there is no decodable zstd premise case there).
+        #[cfg(feature = "zstd")]
+        {
+            let payload = compressible(4096);
+            let frame = zstd::bulk::compress(&payload, DEFAULT_ZSTD_LEVEL).unwrap();
+            cases.push((
+                "zstd, genuine frame",
+                descriptor(
+                    CODEC_ID_ZSTD,
+                    DICT_ID_NONE,
+                    u32::try_from(payload.len()).unwrap(),
+                    &frame,
+                ),
+                payload,
+            ));
+            // The genuine zstd frame of the empty payload: a NON-empty stream (the frame
+            // header) with claim 0, which is exactly why the strictness exception costs a
+            // real producer nothing.
+            let empty_frame = zstd::bulk::compress(b"", DEFAULT_ZSTD_LEVEL).unwrap();
+            assert!(!empty_frame.is_empty());
+            cases.push((
+                "zstd, empty payload",
+                descriptor(CODEC_ID_ZSTD, DICT_ID_NONE, 0, &empty_frame),
+                Vec::new(),
+            ));
+        }
+
+        for (name, stored, expected) in cases {
+            let decoded = decompress_payload(
+                RecordFlags::COMPRESSED,
+                &stored,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES,
+            )
+            .unwrap_or_else(|e| panic!("premise case {name:?} must be decodable, got {e:?}"));
+            assert_eq!(decoded, expected, "case {name:?}: the read side decodes it");
+            validate_descriptor_shape(&stored, DEFAULT_MAX_DECOMPRESSED_BYTES)
+                .unwrap_or_else(|e| panic!("the gate rejected decodable case {name:?}: {e:?}"));
+        }
+    }
+
+    /// On a DEFAULT (non-zstd) build the degenerate zstd-empty-stream-claim-0 descriptor is
+    /// rejected by BOTH sides (the gate as an empty stream, the read side as unknown-codec
+    /// POISON since id 2 is unimplemented here), so the gate's strictness exception is
+    /// observable only on a `zstd`-feature build; its read-side-ACCEPTS half is pinned in
+    /// `zstd_tests::zstd_empty_stream_claim_zero_is_the_documented_strictness_exception`.
+    #[cfg(not(feature = "zstd"))]
+    #[test]
+    fn zstd_empty_stream_claim_zero_is_rejected_by_both_sides_on_a_default_build() {
+        let degenerate = descriptor(CODEC_ID_ZSTD, DICT_ID_NONE, 0, b"");
+        assert_eq!(
+            degenerate.len(),
+            DESCRIPTOR_LEN,
+            "the 9-byte degenerate descriptor"
+        );
+        assert_eq!(
+            validate_descriptor_shape(&degenerate, DEFAULT_MAX_DECOMPRESSED_BYTES),
+            Err(DecompressError::CorruptStream),
+            "the gate rejects the empty stream"
+        );
+        assert_eq!(
+            decompress_payload(
+                RecordFlags::COMPRESSED,
+                &degenerate,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES
+            )
+            .unwrap_err(),
+            DecompressError::PoisonUnknownCodec(CODEC_ID_ZSTD),
+            "a default build cannot decode codec id 2 at all"
+        );
+    }
 }
 
 /// Teeth for the OPT-IN zstd codec (id 2) and the trained-dictionary lifecycle. Compiled only on a
@@ -1063,6 +1497,56 @@ mod zstd_tests {
         assert_eq!(err, DecompressError::CorruptStream);
     }
 
+    /// THE documented strictness exception of the #438 produce gate, pinned deterministically:
+    /// the 9-byte descriptor (codec `zstd`, `dict_id` 0, claim 0) with an EMPTY stream is the
+    /// ONE input the read side ACCEPTS but `validate_descriptor_shape` rejects. Empirically,
+    /// the locked `zstd` 0.13.3 `Decompressor::decompress_to_buffer(&[], &mut [])` returns
+    /// `Ok` with 0 bytes written, so `decompress_payload` yields an empty payload; the gate
+    /// still rejects because the wire contract (`docs/CONTRACTS.md`) normatively requires a
+    /// non-empty stream under a compressing codec, and a genuine zstd encoder never emits an
+    /// empty frame (compressing an empty payload still emits a frame header), so only
+    /// hand-crafted bytes reach this gap. Everywhere else the gate's rejection set is a
+    /// subset of the read side's (the proptest
+    /// `shape_gate_never_rejects_a_decodable_record_except_the_documented_exception`).
+    #[test]
+    fn zstd_empty_stream_claim_zero_is_the_documented_strictness_exception() {
+        let mut degenerate = vec![CODEC_ID_ZSTD];
+        degenerate.extend_from_slice(&DICT_ID_NONE.to_le_bytes());
+        degenerate.extend_from_slice(&0u32.to_le_bytes()); // claim 0
+        assert_eq!(
+            degenerate.len(),
+            DESCRIPTOR_LEN,
+            "empty stream: descriptor only"
+        );
+
+        // The read side ACCEPTS: a zstd-build reader decodes it to the empty payload.
+        let back = decompress_payload(
+            RecordFlags::COMPRESSED,
+            &degenerate,
+            &NoDictionaries,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+        .expect("zstd 0.13 accepts an empty stream for a claim of 0");
+        assert!(back.is_empty(), "and the decoded payload is empty");
+
+        // A genuine zstd encoder NEVER produces this shape: even the empty payload
+        // compresses to a non-empty frame (the frame header), which is why the strictness
+        // costs no real producer anything.
+        let genuine_empty_frame = zstd::bulk::compress(b"", DEFAULT_ZSTD_LEVEL).unwrap();
+        assert!(
+            !genuine_empty_frame.is_empty(),
+            "a real zstd frame for the empty payload is non-empty"
+        );
+
+        // The gate REJECTS: the wire contract requires a non-empty stream under a
+        // compressing codec, deliberately stricter than the permissive zstd read side here.
+        assert_eq!(
+            validate_descriptor_shape(&degenerate, DEFAULT_MAX_DECOMPRESSED_BYTES),
+            Err(DecompressError::CorruptStream),
+            "the produce gate enforces the normative non-empty-stream contract"
+        );
+    }
+
     #[test]
     fn an_unresolved_zstd_dict_id_is_poison() {
         // A zstd record stamped with a non-zero dict_id the resolver does not hold is the distinct
@@ -1172,6 +1656,103 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
+    /// A STRUCTURED stream for the chaos arm of the #438 gate-contract case: empty,
+    /// arbitrary bytes, or a GENUINE codec stream (the same `lz4_flex`/`zstd` encode calls
+    /// `compress_payload` makes).
+    fn structured_stream() -> proptest::strategy::BoxedStrategy<Vec<u8>> {
+        let empty = Just(Vec::new());
+        let arbitrary = proptest::collection::vec(any::<u8>(), 0..4096);
+        let lz4 = proptest::collection::vec(any::<u8>(), 0..4096)
+            .prop_map(|p| lz4_flex::block::compress(&p));
+        #[cfg(feature = "zstd")]
+        {
+            let zstd_frame = proptest::collection::vec(any::<u8>(), 0..4096)
+                .prop_map(|p| zstd::bulk::compress(&p, DEFAULT_ZSTD_LEVEL).expect("zstd encode"));
+            prop_oneof![empty, arbitrary, lz4, zstd_frame].boxed()
+        }
+        #[cfg(not(feature = "zstd"))]
+        {
+            prop_oneof![empty, arbitrary, lz4].boxed()
+        }
+    }
+
+    /// Genuinely encodes `payload` for `codec_id` with the SAME calls `compress_payload`
+    /// makes. Only called with codec ids this build can encode.
+    fn genuine_stream(codec_id: u8, payload: &[u8]) -> Vec<u8> {
+        match codec_id {
+            CODEC_ID_NONE => payload.to_vec(),
+            CODEC_ID_LZ4 => lz4_flex::block::compress(payload),
+            #[cfg(feature = "zstd")]
+            CODEC_ID_ZSTD => {
+                zstd::bulk::compress(payload, DEFAULT_ZSTD_LEVEL).expect("zstd encode")
+            }
+            other => unreachable!("codec id {other} is not encodable on this build"),
+        }
+    }
+
+    /// One generated `(codec_id, dict_id, claim, stream)` case for the #438 gate-contract
+    /// property, drawn from three arms so the decoder-accepts premise GENUINELY fires (the
+    /// review proved a raw-random-bytes generator hits a decodable input with probability ~0,
+    /// and measurement showed even structured streams stay vacuous while the claim is drawn
+    /// INDEPENDENTLY, since decode requires claim == decoded length exactly):
+    ///
+    /// - CHAOS: every field independent (unregistered ids, arbitrary dicts, mismatched
+    ///   claims, streams from `structured_stream`), probing the rejection sets.
+    /// - HONEST: a genuine encode with claim == payload length and no dict, decodable by
+    ///   construction on every build (`none`/`lz4`; plus `zstd` on a feature build).
+    /// - CLAIM-0 BOUNDARY: compressing codecs with claim 0 over an empty stream or the
+    ///   genuine codec stream of the EMPTY payload, the neighborhood of the documented
+    ///   zstd-empty-stream strictness exception, so the exception branch itself is exercised
+    ///   by random cases on a zstd build.
+    fn gate_contract_case() -> proptest::strategy::BoxedStrategy<(u8, u32, u32, Vec<u8>)> {
+        let chaos = (
+            0u8..=3,
+            prop_oneof![Just(DICT_ID_NONE), any::<u32>()],
+            0u32..=DEFAULT_MAX_DECOMPRESSED_BYTES + 1024,
+            structured_stream(),
+        )
+            .boxed();
+
+        #[cfg(feature = "zstd")]
+        let encodable_ids =
+            prop_oneof![Just(CODEC_ID_NONE), Just(CODEC_ID_LZ4), Just(CODEC_ID_ZSTD)];
+        #[cfg(not(feature = "zstd"))]
+        let encodable_ids = prop_oneof![Just(CODEC_ID_NONE), Just(CODEC_ID_LZ4)];
+        let honest = (
+            encodable_ids,
+            proptest::collection::vec(any::<u8>(), 0..4096),
+        )
+            .prop_map(|(codec_id, payload)| {
+                let claim = u32::try_from(payload.len()).expect("payload < 4096");
+                let stream = genuine_stream(codec_id, &payload);
+                (codec_id, DICT_ID_NONE, claim, stream)
+            })
+            .boxed();
+
+        let empty_payload_streams = {
+            let empty = Just(Vec::new());
+            let lz4_of_empty = Just(lz4_flex::block::compress(b""));
+            #[cfg(feature = "zstd")]
+            {
+                let zstd_of_empty =
+                    Just(zstd::bulk::compress(b"", DEFAULT_ZSTD_LEVEL).expect("zstd encode"));
+                prop_oneof![empty, lz4_of_empty, zstd_of_empty].boxed()
+            }
+            #[cfg(not(feature = "zstd"))]
+            {
+                prop_oneof![empty, lz4_of_empty].boxed()
+            }
+        };
+        let claim_zero_boundary = (
+            prop_oneof![Just(CODEC_ID_LZ4), Just(CODEC_ID_ZSTD)],
+            empty_payload_streams,
+        )
+            .prop_map(|(codec_id, stream)| (codec_id, DICT_ID_NONE, 0u32, stream))
+            .boxed();
+
+        prop_oneof![chaos, honest, claim_zero_boundary].boxed()
+    }
+
     proptest! {
         // Round-trip: decompress(compress(x)) == x for arbitrary payloads across the raw-store
         // boundary, with both raw-stored and compressed outcomes exercised.
@@ -1202,6 +1783,59 @@ mod proptests {
         ) {
             let _ = decompress_payload(RecordFlags::COMPRESSED, &stored, &NoDictionaries, cap);
             let _ = read_descriptor(&stored);
+            let _ = validate_descriptor_shape(&stored, cap);
+        }
+
+        // The #438 gate contract over STRUCTURED descriptors (see `gate_contract_case`:
+        // a chaos arm, an honest-encode arm, and the claim-0 boundary arm): everything
+        // the read side ACCEPTS, the gate also accepts, EXCEPT the single documented
+        // degenerate input where the gate is deliberately stricter (codec zstd, EMPTY stream,
+        // claim 0: a permissive zstd decoder yields the empty payload, the wire contract
+        // demands a non-empty stream; pinned deterministically by the strictness-exception
+        // tests). Equivalently: the gate's rejection set is a subset of the readers' rejection
+        // set, modulo that one enumerated input. The converse (gate-accept implies
+        // decoder-accept) does NOT hold by design and is not asserted: corrupt stream content,
+        // a registered-but-unimplemented codec, and an unresolved dict_id all pass the shape
+        // gate and stay read-side concerns. The decoder-accepts premise genuinely fires here:
+        // the honest arm is decodable BY CONSTRUCTION (measured: the read side accepts ~42%
+        // of generated cases on the default build and ~50% on a zstd build, where the
+        // degenerate exception branch itself fired 555 times in 10000 cases), whereas
+        // raw random bytes decode with probability ~0 and left the previous property vacuous;
+        // the deterministic premise set in
+        // `tests::the_shape_gate_accepts_every_genuinely_decodable_premise_case` additionally
+        // guarantees the premise regardless of generator luck.
+        #[test]
+        fn shape_gate_never_rejects_a_decodable_record_except_the_documented_exception(
+            (codec_id, dict_id, claim, stream) in gate_contract_case(),
+        ) {
+            let mut stored = vec![codec_id];
+            stored.extend_from_slice(&dict_id.to_le_bytes());
+            stored.extend_from_slice(&claim.to_le_bytes());
+            stored.extend_from_slice(&stream);
+            let validated = validate_descriptor_shape(&stored, DEFAULT_MAX_DECOMPRESSED_BYTES);
+            let decoded = decompress_payload(
+                RecordFlags::COMPRESSED,
+                &stored,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES,
+            );
+            if decoded.is_ok() {
+                if codec_id == CODEC_ID_ZSTD && stream.is_empty() && claim == 0 {
+                    // The enumerated strictness exception, and nothing else: reachable only
+                    // on a zstd-feature build (a default build poisons codec id 2 at decode).
+                    prop_assert_eq!(
+                        validated,
+                        Err(DecompressError::CorruptStream),
+                        "the gate rejects the degenerate zstd-empty-claim-0 descriptor"
+                    );
+                } else {
+                    prop_assert!(
+                        validated.is_ok(),
+                        "the gate rejected a record the read side decodes: {:?}",
+                        validated
+                    );
+                }
+            }
         }
 
         // A bomb sweep: any claimed length over the cap is rejected before allocation, for any
