@@ -130,12 +130,26 @@ in. The model is spill, then shed, with retention draining behind it:
   count exceeds this bound). Each is `0` = off by default; they compose, so a segment is
   reclaimed if ANY enabled bound trips.
 
-Retention is consumer-safe: it never deletes a record a group still needs. The reclaim
-unit is a whole sealed segment, never a partial one and never the active segment. A
-segment is reclaimed oldest first, and only once every consumer group has committed past
-it, so the slowest group's records are never reaped. There is no disk-full drop-oldest
-policy: when the cap is full, IronBus sheds the new produce, it does not delete old
-acknowledged records.
+Retention is consumer-safe: it never deletes a record a consumer still needs. The
+reclaim unit is a whole sealed segment, never a partial one and never the active
+segment. A segment is reclaimed oldest first, and only once every TOUCHED consumer group
+has committed past it, so the slowest consumer's records are never reaped. A group is
+touched once it has ever seen any consumer interaction (a poll, ack, nack, term,
+progress, cumulative ack, or subscribe) or has durable cursor state from an earlier run.
+The structural default group (the unnamed wire group) of a deployment that only consumes
+through NAMED groups stays untouched, so it does not hold every retention bound at
+offset 0 forever (#424). The moment anything consumes through the default group it gets
+the full slow-consumer protection, and its durable cursor checkpoint preserves that
+protection across restarts (a graceful stop writes one; a consumer that never committed
+anything has no durable claim, so after an unclean restart it is unprotected until it
+interacts again). A consumer that first arrives after older records were reaped resumes
+at the oldest retained record with a one-time truncation notice.
+
+The DEFAULT disk-full policy is drop-new: when the byte cap is hit, IronBus sheds the
+new produce, it does not delete old acknowledged records. The opt-in
+`--disk-full-policy drop-oldest` instead force-reaps the oldest sealed segment to admit
+the new produce; a consumer whose records were force-reaped sees a one-time truncation
+notice and resumes at the oldest record still present.
 
 The two relevant metrics on `/metrics` are `ironbus_produce_rejected_total` (produces shed
 by the byte cap) and `ironbus_segments_reaped_total` (segments reclaimed by retention).
