@@ -289,8 +289,8 @@ fn a_gnu_wget_is_invoked_with_https_only_and_a_tls_floor() {
         code, 0,
         "the stubbed download must succeed, stderr: {stderr}"
     );
-    let argv = std::fs::read_to_string(&argv_log).expect("the wget stub recorded its argv");
-    let args: Vec<&str> = argv.lines().collect();
+    let recorded = std::fs::read_to_string(&argv_log).expect("the wget stub recorded its argv");
+    let args: Vec<&str> = recorded.lines().collect();
     assert!(
         args.contains(&"--https-only"),
         "wget MUST be pinned to HTTPS, argv: {args:?}"
@@ -382,8 +382,8 @@ fn a_limited_wget_with_only_https_only_is_still_accepted() {
         code, 0,
         "the stubbed download must succeed, stderr: {stderr}"
     );
-    let argv = std::fs::read_to_string(&argv_log).expect("the wget stub recorded its argv");
-    let args: Vec<&str> = argv.lines().collect();
+    let recorded = std::fs::read_to_string(&argv_log).expect("the wget stub recorded its argv");
+    let args: Vec<&str> = recorded.lines().collect();
     assert!(
         args.contains(&"--https-only"),
         "the limited wget is still HTTPS-pinned, argv: {args:?}"
@@ -424,8 +424,8 @@ fn curl_is_preferred_over_wget_when_both_exist() {
         code, 0,
         "the stubbed download must succeed, stderr: {stderr}"
     );
-    let argv = std::fs::read_to_string(&curl_log).expect("the curl stub recorded its argv");
-    let args: Vec<&str> = argv.lines().collect();
+    let recorded = std::fs::read_to_string(&curl_log).expect("the curl stub recorded its argv");
+    let args: Vec<&str> = recorded.lines().collect();
     assert!(
         args.contains(&"--proto") && args.contains(&"=https") && args.contains(&"--tlsv1.2"),
         "the curl path keeps its TLS pin, argv: {args:?}"
