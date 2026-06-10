@@ -1192,6 +1192,34 @@ mod tests {
         );
     }
 
+    /// Mutation teeth for the none-codec EXACTNESS rule (#438 review finding 3): the suite
+    /// above only covers a stream SHORTER than its claim, so weakening either side's
+    /// `stream.len() != claim` to `stream.len() < claim` survived every test. A stream
+    /// LONGER than the claim is equally undecodable on the wire contract (which bytes are
+    /// the payload?), so BOTH the produce gate and the read side must reject it as
+    /// `BadRawLength`. Verified by applying the `<` mutant to each side in turn: this test
+    /// fails, the rest of the suite cannot be relied on to.
+    #[test]
+    fn a_none_codec_stream_longer_than_its_claim_is_rejected_by_both_sides() {
+        let longer = descriptor(CODEC_ID_NONE, DICT_ID_NONE, 2, b"abc");
+        assert_eq!(
+            validate_descriptor_shape(&longer, DEFAULT_MAX_DECOMPRESSED_BYTES),
+            Err(DecompressError::BadRawLength),
+            "the gate rejects a none-codec stream longer than its claim"
+        );
+        assert_eq!(
+            decompress_payload(
+                RecordFlags::COMPRESSED,
+                &longer,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES
+            )
+            .unwrap_err(),
+            DecompressError::BadRawLength,
+            "the read side rejects it identically"
+        );
+    }
+
     #[test]
     fn shape_validation_rejects_an_empty_stream_under_a_compressing_codec() {
         // An empty LZ4 stream cannot be a valid lz4 block (lz4 needs at least one token
