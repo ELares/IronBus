@@ -141,6 +141,15 @@ fn boot_edge_tiny(data_dir: &str) -> Booted {
             "127.0.0.1:0",
             "--health-addr",
             "127.0.0.1:0",
+            // Compression OFF: the write-amp gate below is the HISTORICAL raw-bytes measurement
+            // of the edge write path (group commit, page-aligned writes). Under the now-wired
+            // default `lz4` (#430) the same tiny repeated-letter workload writes far fewer
+            // LOGICAL (stored) bytes against the same fixed physical page cost, so the
+            // physical/logical ratio of this synthetic workload would no longer measure the
+            // write path. The gate is codec-independent; the codec's own accounting is pinned
+            // by the engine compression tests.
+            "--compression",
+            "none",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

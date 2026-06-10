@@ -10,7 +10,21 @@
 //! silent or slow broker surfaces as an error rather than wedging the caller forever. The
 //! client also never trusts the peer's framing: it rejects an unknown frame type, a
 //! wrong-shape response body, and more deliveries than it asked for.
+//!
+//! Broker-side payload compression (#430, ADR-0003) is TRANSPARENT here: a delivery whose
+//! flags carry the `COMPRESSED` bit is decompressed back to the original payload before it is
+//! handed to the caller (with the bit cleared from [`Message::flags`]), so the end-to-end
+//! pub/sub payload contract is byte-identical whether the broker ran `--compression none` or
+//! `lz4`. The decode is bounded by the per-record decompressed-size cap (a bomb guard) and
+//! resolves NO trained dictionaries: a record referencing a missing dictionary (a `zstd`-build
+//! broker concern; the `lz4` path never references one) surfaces as the typed
+//! [`ClientError::Decompress`] with `PoisonUnresolvedDict`, never a panic, as does an unknown
+//! codec or a corrupt stream.
 
+use ironbus_core::compress::{
+    decompress_payload, DecompressError, NoDictionaries, DEFAULT_MAX_DECOMPRESSED_BYTES,
+};
+use ironbus_core::types::RecordFlags;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
     decode_dead_letter, decode_deliver, decode_gap_marker, decode_info, decode_pub_ack,
@@ -40,6 +54,13 @@ pub enum ClientError {
     BadResponse(&'static str),
     /// The connection closed before a complete response arrived.
     Closed,
+    /// A delivered payload carried the `COMPRESSED` flag but could not be decompressed back to
+    /// the original bytes (#430): an unknown codec (e.g. a `zstd` record read by this pure-Rust
+    /// client), a dictionary this client cannot resolve (`PoisonUnresolvedDict`; the client
+    /// resolves none), an over-cap claimed size (a decompression bomb), or a corrupt stream. A
+    /// typed error, never a panic; the broker stored and delivered the record faithfully, so the
+    /// mismatch is between the record's codec needs and THIS client build.
+    Decompress(DecompressError),
 }
 
 impl core::fmt::Display for ClientError {
@@ -55,6 +76,7 @@ impl core::fmt::Display for ClientError {
             }
             ClientError::BadResponse(why) => write!(f, "malformed response: {why}"),
             ClientError::Closed => write!(f, "connection closed mid-response"),
+            ClientError::Decompress(e) => write!(f, "delivered payload decompression: {e}"),
         }
     }
 }
@@ -125,7 +147,11 @@ pub struct Message {
     pub offset: u64,
     /// The lease generation (the fencing token) to ack it with.
     pub generation: u64,
-    /// Record flags as stored.
+    /// Record flags for the payload AS HANDED TO THE CALLER: the stored flags, except that the
+    /// `COMPRESSED` bit is CLEARED after the client's transparent decompression (#430), because
+    /// the payload below is the decompressed original, not the stored object. A delivery this
+    /// client cannot decompress never reaches here (it is the typed
+    /// [`ClientError::Decompress`]), so the bit is never set on a returned message.
     pub flags: u8,
     /// Producer timestamp, milliseconds since the Unix epoch.
     pub timestamp_ms: u64,
@@ -133,7 +159,8 @@ pub struct Message {
     pub key: Vec<u8>,
     /// The headers blob (empty if none).
     pub headers: Vec<u8>,
-    /// The message payload.
+    /// The message payload: the ORIGINAL produced bytes, after any transparent decompression
+    /// (#430).
     pub payload: Vec<u8>,
 }
 
@@ -506,14 +533,33 @@ impl Client {
                         ));
                     }
                     let d = decode_deliver(&body).map_err(ClientError::Body)?;
+                    // Transparent broker-side decompression (#430): a delivery carrying the
+                    // COMPRESSED bit is decompressed back to the original payload (and the bit
+                    // cleared), so the caller sees exactly the bytes the producer published,
+                    // codec-independent. Bounded by the decompressed-size cap (a bomb guard) and
+                    // dictionary-free (`NoDictionaries`; the lz4 path never references one); a
+                    // payload this build cannot decode is the typed `Decompress` error, no panic.
+                    let flags = RecordFlags::from_bits(d.flags);
+                    let (flags, payload) = if flags.contains(RecordFlags::COMPRESSED) {
+                        let payload = decompress_payload(
+                            flags,
+                            d.payload,
+                            &NoDictionaries,
+                            DEFAULT_MAX_DECOMPRESSED_BYTES,
+                        )
+                        .map_err(ClientError::Decompress)?;
+                        (d.flags & !RecordFlags::COMPRESSED.bits(), payload)
+                    } else {
+                        (d.flags, d.payload.to_vec())
+                    };
                     messages.push(Message {
                         offset: d.offset,
                         generation: d.generation,
-                        flags: d.flags,
+                        flags,
                         timestamp_ms: d.timestamp_ms,
                         key: d.key.to_vec(),
                         headers: d.headers.to_vec(),
-                        payload: d.payload.to_vec(),
+                        payload,
                     });
                 }
                 // An in-band dead-letter advisory for an offset skipped as poison (#63). It is
