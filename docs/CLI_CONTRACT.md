@@ -262,8 +262,9 @@ line already in [`CLI.md`](CLI.md):
 }
 ```
 
-`crc` is `ok` (the offline reader only yields records that passed CRC) and `codec` is
-`none` until on-disk compression lands, matching [`CLI.md`](CLI.md). `decoded` is `true`
+`crc` is `ok` (the offline reader only yields records that passed CRC) and `codec` names
+the REAL stored codec (#430): `none` for a raw-stored record, `lz4` for a compressed one,
+matching [`CLI.md`](CLI.md). `decoded` is `true`
 normally; for a compressed record whose dictionary is missing it is `false` with a
 `reason` field (`"missing-dict:<id>"`), per the #136 body and
 [`DICTIONARY_LIFECYCLE.md`](DICTIONARY_LIFECYCLE.md) (a missing dictionary is a

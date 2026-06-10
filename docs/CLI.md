@@ -415,18 +415,20 @@ read-only. `--data-dir` is REQUIRED. Takes no positional arguments.
 | `--limit <n>` | u64 | none (all records) | records | The maximum number of records to show. Omitted, every record is streamed. |
 | `--json` | flag (no value) | off (human text) | n/a | Emit NDJSON instead of the human line. |
 | `--dlq` | flag (no value) | off | n/a | Stream the dead-letter sink (`dlq/`) instead of the main log. An absent or empty `dlq/` shows nothing. |
-| `--raw` | flag (no value) | off | n/a | Show the on-disk frame rather than the decoded logical message. GATED on on-disk compression (#12): the codec is always `none` today, so it renders the same field set as the decoded form. Accepted now to pin the frozen surface. Rejected with `--dlq`. |
-| `--require-dict` | flag (no value) | off | n/a | Fail strictly (exit 3) on a record whose compression dictionary is missing, instead of degrading to `decoded:false`. GATED on #12: no record carries a dictionary today, so it never trips. Rejected with `--dlq`. |
+| `--raw` | flag (no value) | off | n/a | Show the on-disk frame rather than the decoded logical message: for a compressed record (#430), `bytes` is the STORED (descriptor + stream) length and no decode is attempted; for a raw-stored record it renders the same field set as the decoded form. Rejected with `--dlq`. |
+| `--require-dict` | flag (no value) | off | n/a | Fail strictly (exit 3) on a record whose compression dictionary is missing, instead of degrading to `decoded:false`. The `lz4` path never references a dictionary (its `dict_id` is always 0), so this only trips on a `zstd`-build dictionary record whose sidecar is absent. Rejected with `--dlq`. |
 
 Note: `dump` has NO `--from-offset`; it always starts at offset 0. Only `peek` accepts
 `--from-offset`/`--offset`.
 
-`--raw` and `--require-dict` are the committed surface for the missing-dictionary degrade /
-strict path the #136 design specifies; that behavior is only MEANINGFUL once on-disk
-compression (#12) lands (the codec is always `none` today). They are accepted now so a
-script written against the frozen surface keeps working, but they are inert until #12: the
-output is unchanged and `--require-dict` never trips. This is documented as a residual gated
-on #12, not faked compression.
+`--raw` and `--require-dict` are the committed #136 surface, LIVE since the write path was
+wired (#430). A compressed record decodes by default (`codec` names the real stored codec,
+`bytes` is the original payload length, `decoded:true`); one that cannot be decoded degrades
+structurally (`decoded:false` plus a `reason`, `missing-dict:<id>` for an unresolved
+dictionary) unless `--require-dict` makes the missing dictionary strict (exit 3). `--raw`
+shows the stored frame instead and never decodes. A raw-stored record (sub-threshold,
+incompressible, or a `--compression none` broker) renders the historical field set
+unchanged under every flag combination.
 
 ## `scrub` (offline; Unix only in v1)
 
@@ -713,7 +715,8 @@ The same record, `--json` form (NDJSON, one object per line):
 ```
 
 `crc` is always `ok` (the offline reader only yields records that passed their CRC) and
-`codec` is always `none` until on-disk compression lands. Only sizes are printed, never
+`codec` names the real stored codec (`none` for a raw-stored record, `lz4` for a compressed
+one, #430). Only sizes are printed, never
 the raw key or payload bytes, so a binary payload never corrupts the stream.
 
 A torn or corrupt tail is MARKED, never hidden, after the records. Human form:

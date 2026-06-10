@@ -361,7 +361,8 @@ ironbus dump --data-dir /var/lib/ironbus --json
 
 Each record line carries the offset, the timestamp, the payload byte length, the key byte
 length, the CRC status (always `ok`, since the reader only yields records that passed their
-checksum), and the codec (always `none` until on-disk compression lands):
+checksum), and the REAL stored codec (`none` for a raw-stored record; `lz4`, with a
+`decoded=true` marker, for a record the wired write path compressed, #430):
 
 ```
 offset=0 ts_ms=100 bytes=5 key_bytes=6 crc=ok codec=none
