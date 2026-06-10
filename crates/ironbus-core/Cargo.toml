@@ -8,6 +8,18 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# DEFAULT: NO feature. The shipped binary, the SBOM, and the cffi-ban gate scope to this empty
+# feature set, so the default codec stays pure-Rust lz4_flex (ADR-0003) and the default dependency
+# graph carries NO vendored C: `cargo tree -e normal` is zstd-free by default.
+default = []
+# OPT-IN zstd codec + trained-dictionary lifecycle (#357, #75/#76/#77, #12). NON-DEFAULT by design:
+# the `zstd` C library (vendored, static-linked, via `zstd-sys`) and the BLAKE3 content-hash used for
+# the dict_id are pulled ONLY by this feature, so the DEFAULT build is byte-for-byte unchanged and
+# the cffi-ban on the default graph stays clean. An operator who wants zstd's higher ratio opts in
+# explicitly and accepts the vendored-C dependency (gated by the deny.toml C-FFI allowlist, #102).
+zstd = ["dep:zstd", "dep:blake3"]
+
 [dependencies]
 crc32c = "0.6"
 xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
@@ -18,6 +30,27 @@ xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
 # 0.11+ declare a 1.81 minimum and would fail the `msrv (1.78)` CI job. `default-features = false`
 # drops the `frame` format (and its xxhash dependency); IronBus uses only the block API.
 lz4_flex = { version = "0.10", default-features = false, features = ["safe-encode", "safe-decode", "checked-decode"] }
+
+# OPT-IN, behind the non-default `zstd` feature ONLY (`dep:zstd`), so `cargo build` (default) links
+# NEITHER this nor its transitive `zstd-safe`/`zstd-sys` vendored-C tree. `default-features = false`
+# drops zstd's default `bindgen` (no runtime clang needed: zstd-sys ships pre-generated bindings) and
+# its `legacy`/`arrays` surface IronBus does not use; `zdict_builder` enables the `ZDICT_trainFromBuffer`
+# training API the dictionary lifecycle (#357) needs. CRUCIALLY the `pkg-config` feature is NOT enabled,
+# so zstd-sys VENDORS and STATICALLY compiles the bundled `zstd.1.5.7` C source (via its `cc` build dep)
+# rather than dynamically linking a system libzstd: this is the #77 musl-static requirement, verified in
+# the feature CI job. zstd-sys is `MIT/Apache-2.0` (on the deny allow-list) and is the SOLE C-FFI in the
+# whole project, permitted ONLY here under the deny.toml C-FFI allowlist (#102); the FFI lives inside the
+# zstd crate, so IronBus code adds no `unsafe`.
+zstd = { version = "0.13", optional = true, default-features = false, features = ["zdict_builder"] }
+# OPT-IN, `zstd`-feature only: the content-addressed dict_id is `truncate_u32(BLAKE3-256(dict_bytes))`
+# per docs/DICTIONARY_LIFECYCLE.md §2. Pinned `>=1.5.5, <1.8.1` because blake3 1.8.1+ moved to
+# edition 2024 (rustc >= 1.85) which would break the `msrv (1.78)` CI gate; 1.5.5..=1.8.0 are edition
+# 2021. `default-features = false` keeps `std` for `Vec`/`Hash` but the `pure` feature selects the
+# PORTABLE pure-Rust backend, so blake3's build script compiles NO C/assembly (`cc` is a build-dep but
+# runs nothing under `pure`): blake3 stays pure Rust and adds no C-FFI. It is pulled only by the `zstd`
+# feature, so it is absent from the default graph; its `CC0-1.0 OR Apache-2.0` license resolves via the
+# already-allowed Apache-2.0 arm (no deny allow-list entry is added).
+blake3 = { version = ">=1.5.5, <1.8.1", optional = true, default-features = false, features = ["std", "pure"] }
 
 [dev-dependencies]
 criterion = "0.5"

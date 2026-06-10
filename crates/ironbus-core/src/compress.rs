@@ -65,6 +65,14 @@ pub enum Codec {
     /// LZ4 block compression via the pure-Rust `lz4_flex` codec (ADR-0003 default). Frozen
     /// id `1`.
     Lz4,
+    /// Zstandard block compression via the OPT-IN, vendored-C `zstd` codec (ADR-0003, frozen
+    /// id `2`). Present ONLY on a build with the `zstd` feature: on the DEFAULT pure-Rust
+    /// build this variant does not exist, so [`Codec::from_id`] returns `None` for id `2` and
+    /// a `zstd` record is correctly treated as an UNKNOWN-codec POISON (never a crash). The
+    /// optional `dict_id` carried alongside it selects a trained dictionary
+    /// (`docs/DICTIONARY_LIFECYCLE.md`).
+    #[cfg(feature = "zstd")]
+    Zstd,
 }
 
 impl Codec {
@@ -74,17 +82,25 @@ impl Codec {
         match self {
             Codec::None => CODEC_ID_NONE,
             Codec::Lz4 => CODEC_ID_LZ4,
+            #[cfg(feature = "zstd")]
+            Codec::Zstd => CODEC_ID_ZSTD,
         }
     }
 
     /// The codec for a frozen on-disk id byte, or `None` for an id this build does not
-    /// implement (an UNKNOWN codec: a future `zstd` = 2, or garbage). An unknown id is
-    /// POISON on the decode path, not an error this constructor decides.
+    /// implement (an UNKNOWN codec). An unknown id is POISON on the decode path, not an error
+    /// this constructor decides.
+    ///
+    /// Id `2` (`zstd`) resolves to [`Codec::Zstd`] ONLY on a build with the `zstd` feature; on
+    /// the default pure-Rust build id `2` is UNKNOWN here, which is exactly what makes a `zstd`
+    /// record poison rather than a crash on a default reader.
     #[must_use]
     pub const fn from_id(id: u8) -> Option<Codec> {
         match id {
             CODEC_ID_NONE => Some(Codec::None),
             CODEC_ID_LZ4 => Some(Codec::Lz4),
+            #[cfg(feature = "zstd")]
+            CODEC_ID_ZSTD => Some(Codec::Zstd),
             _ => None,
         }
     }
@@ -94,11 +110,14 @@ impl Codec {
 pub const CODEC_ID_NONE: u8 = 0;
 /// Frozen codec id: LZ4 block compression (`lz4_flex`, the ADR-0003 default).
 pub const CODEC_ID_LZ4: u8 = 1;
-/// Reserved codec id for the opt-in `zstd` codec (ADR-0003). NOT implemented on the
-/// default build: a record carrying this id on a build without the `zstd` feature is
-/// POISON, never a crash. Reserved here so the id space allocation is explicit and the
-/// POISON-on-unknown test can name the exact future id it must reject.
-pub const CODEC_ID_ZSTD_RESERVED: u8 = 2;
+/// Frozen codec id for the OPT-IN `zstd` codec (ADR-0003). Implemented ONLY on a build with the
+/// `zstd` feature; on the DEFAULT build a record carrying this id is UNKNOWN-codec POISON, never a
+/// crash. The const is always defined (the id-space allocation is explicit and frozen regardless of
+/// the build) so the POISON-on-unknown test can name the exact id a default build must reject.
+pub const CODEC_ID_ZSTD: u8 = 2;
+/// Deprecated alias for [`CODEC_ID_ZSTD`], kept so existing references to the pre-implementation
+/// "reserved" name continue to resolve. New code should use [`CODEC_ID_ZSTD`].
+pub const CODEC_ID_ZSTD_RESERVED: u8 = CODEC_ID_ZSTD;
 
 /// The no-dictionary sentinel `dict_id`. A `dict_id` of `0` means "decode without a
 /// dictionary"; the trainer never emits it (see `docs/DICTIONARY_LIFECYCLE.md` §8).
@@ -132,6 +151,11 @@ pub enum CompressError {
     /// The raw payload is larger than a `u32` can describe, so its `uncompressed_len`
     /// cannot be carried in the descriptor.
     PayloadTooLarge,
+    /// The configured codec is the OPT-IN `zstd` codec but its underlying C library returned an
+    /// error while compressing this payload. A typed error, never a panic; the caller can fall
+    /// back to a raw store or surface the failure. Only reachable on a `zstd`-feature build.
+    #[cfg(feature = "zstd")]
+    ZstdEncode,
 }
 
 /// An error returned by [`decompress_payload`].
@@ -174,6 +198,8 @@ impl core::fmt::Display for CompressError {
             CompressError::PayloadTooLarge => {
                 write!(f, "payload is too large to compress (length exceeds u32)")
             }
+            #[cfg(feature = "zstd")]
+            CompressError::ZstdEncode => write!(f, "zstd compression failed"),
         }
     }
 }
@@ -220,9 +246,19 @@ impl DecompressError {
     }
 }
 
+/// The default zstd compression level used when the OPT-IN `zstd` codec is selected. `3` is
+/// zstd's own default: a balanced speed/ratio point appropriate for an edge node's compress
+/// budget. Only consulted on a `zstd`-feature build.
+#[cfg(feature = "zstd")]
+pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
+
 /// Knobs that govern how [`compress_payload`] decides to compress a record.
+///
+/// The optional dictionary bytes (`dict`) are a borrowed slice, so this carries a lifetime; the
+/// IO-free core never owns the dictionary, it only borrows the bytes a higher layer resolved (the
+/// sidecar/embedded set lives in storage/cli, `docs/DICTIONARY_LIFECYCLE.md` §3-§4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CompressConfig {
+pub struct CompressConfig<'d> {
     /// The codec to compress NEW writes with. [`Codec::None`] disables compression (every
     /// record is stored raw, byte-for-byte the uncompressed layout).
     pub codec: Codec,
@@ -233,26 +269,39 @@ pub struct CompressConfig {
     /// `lz4` path this is always `0`; a trained dictionary is a `zstd` feature
     /// (`docs/DICTIONARY_LIFECYCLE.md`).
     pub dict_id: u32,
+    /// The trained dictionary bytes to compress with, when `dict_id != 0` and the codec is
+    /// `zstd`. `None` means no dictionary (the only case on the `lz4` path). The bytes are
+    /// borrowed from whatever resolved them; the core does not own them.
+    pub dict: Option<&'d [u8]>,
+    /// The zstd compression level (consulted only by the `zstd` codec). Ignored by `lz4`/`none`.
+    pub zstd_level: i32,
 }
 
-impl Default for CompressConfig {
-    fn default() -> CompressConfig {
+impl Default for CompressConfig<'_> {
+    fn default() -> CompressConfig<'static> {
         CompressConfig {
             codec: Codec::Lz4,
             raw_store_threshold: DEFAULT_RAW_STORE_THRESHOLD,
             dict_id: DICT_ID_NONE,
+            dict: None,
+            #[cfg(feature = "zstd")]
+            zstd_level: DEFAULT_ZSTD_LEVEL,
+            #[cfg(not(feature = "zstd"))]
+            zstd_level: 0,
         }
     }
 }
 
-impl CompressConfig {
+impl CompressConfig<'_> {
     /// A config that disables compression entirely: every record is stored raw.
     #[must_use]
-    pub const fn disabled() -> CompressConfig {
+    pub const fn disabled() -> CompressConfig<'static> {
         CompressConfig {
             codec: Codec::None,
             raw_store_threshold: DEFAULT_RAW_STORE_THRESHOLD,
             dict_id: DICT_ID_NONE,
+            dict: None,
+            zstd_level: 0,
         }
     }
 }
@@ -302,7 +351,9 @@ impl Compressed {
 ///
 /// # Errors
 /// Returns [`CompressError::PayloadTooLarge`] if the payload length exceeds `u32::MAX`, so
-/// its `uncompressed_len` cannot be carried in the descriptor.
+/// its `uncompressed_len` cannot be carried in the descriptor. On a `zstd`-feature build,
+/// returns [`CompressError::ZstdEncode`] if the zstd C library fails to compress (a typed
+/// error, never a panic).
 pub fn compress_payload(
     payload: &[u8],
     config: &CompressConfig,
@@ -322,6 +373,8 @@ pub fn compress_payload(
         // Unreachable: handled by the early-return above. Kept exhaustive without a panic.
         Codec::None => return Ok(store_raw(payload)),
         Codec::Lz4 => lz4_flex::block::compress(payload),
+        #[cfg(feature = "zstd")]
+        Codec::Zstd => zstd_compress(payload, config)?,
     };
 
     let mut descriptor = Vec::with_capacity(DESCRIPTOR_LEN + stream.len());
@@ -348,6 +401,47 @@ fn store_raw(payload: &[u8]) -> Compressed {
         stored: payload.to_vec(),
         compressed: false,
     }
+}
+
+/// Compresses `payload` with the OPT-IN `zstd` codec, optionally with the trained dictionary in
+/// `config.dict`. Returns a typed [`CompressError::ZstdEncode`] on any zstd-library error, never a
+/// panic. The FFI lives entirely inside the `zstd` crate, so this wrapper adds no `unsafe`.
+#[cfg(feature = "zstd")]
+fn zstd_compress(payload: &[u8], config: &CompressConfig) -> Result<Vec<u8>, CompressError> {
+    match config.dict {
+        // A trained-dictionary compress: prime the compressor with the dictionary bytes. An empty
+        // dictionary is treated as no dictionary (the plain bulk-compress path), so a degenerate
+        // dict never errors here.
+        Some(dict) if !dict.is_empty() => {
+            zstd::bulk::Compressor::with_dictionary(config.zstd_level, dict)
+                .and_then(|mut c| c.compress(payload))
+                .map_err(|_| CompressError::ZstdEncode)
+        }
+        _ => {
+            zstd::bulk::compress(payload, config.zstd_level).map_err(|_| CompressError::ZstdEncode)
+        }
+    }
+}
+
+/// Decompresses a `zstd` stream into a buffer of EXACTLY `out_len` bytes, optionally with the
+/// trained dictionary `dict`, returning [`DecompressError::CorruptStream`] on any zstd-library
+/// error OR a length mismatch. The output is bounded to `out_len` (the cap-checked claimed
+/// length): zstd's bulk decompressor will not write past the buffer it is handed, so a stream that
+/// claims to decode larger fails as a typed error, never an over-allocation or a panic.
+#[cfg(feature = "zstd")]
+fn zstd_decompress(stream: &[u8], dict: &[u8], out_len: usize) -> Result<Vec<u8>, DecompressError> {
+    let mut out = vec![0u8; out_len];
+    let written = if dict.is_empty() {
+        zstd::bulk::Decompressor::new().and_then(|mut d| d.decompress_to_buffer(stream, &mut out))
+    } else {
+        zstd::bulk::Decompressor::with_dictionary(dict)
+            .and_then(|mut d| d.decompress_to_buffer(stream, &mut out))
+    }
+    .map_err(|_| DecompressError::CorruptStream)?;
+    if written != out_len {
+        return Err(DecompressError::CorruptStream);
+    }
+    Ok(out)
 }
 
 /// Resolves a non-zero `dict_id` to its dictionary bytes, or signals it is unresolved.
@@ -435,10 +529,20 @@ pub fn decompress_payload<R: DictResolver>(
     // POISON: a codec id this build does not implement. Reported loss, never a crash.
     let codec = Codec::from_id(codec_id).ok_or(DecompressError::PoisonUnknownCodec(codec_id))?;
 
-    // POISON: a non-zero dict_id the resolver cannot resolve (absent sidecar + embedded).
-    if dict_id != DICT_ID_NONE && resolver.resolve(dict_id).is_none() {
-        return Err(DecompressError::PoisonUnresolvedDict(dict_id));
-    }
+    // POISON: a non-zero dict_id the resolver cannot resolve (absent sidecar + embedded). Keep the
+    // resolved bytes so the zstd path can actually prime its decompressor with them; the lz4/none
+    // paths ignore them (they are dict-free), so resolution there is purely the poison gate. The
+    // binding is consumed by the zstd arm; on a default (non-zstd) build it is the poison gate only,
+    // so it is explicitly discarded to stay warning-clean under `-D warnings`.
+    let dict_bytes: &[u8] = if dict_id == DICT_ID_NONE {
+        &[]
+    } else {
+        resolver
+            .resolve(dict_id)
+            .ok_or(DecompressError::PoisonUnresolvedDict(dict_id))?
+    };
+    #[cfg(not(feature = "zstd"))]
+    let _ = dict_bytes;
 
     // Decompression-bomb guard: reject an over-cap claim BEFORE allocating anything.
     if uncompressed_len > max_decompressed {
@@ -472,6 +576,12 @@ pub fn decompress_payload<R: DictResolver>(
             }
             Ok(out)
         }
+        // The OPT-IN zstd codec, with the SAME resilience as lz4: the cap is enforced above before
+        // allocation, the output is sized to exactly the claimed length, a corrupt/hostile stream
+        // is a typed `CorruptStream` (never a panic), and the dict (if any) was resolved or this
+        // path was never reached (poison). `dict_bytes` is the resolved dictionary or empty.
+        #[cfg(feature = "zstd")]
+        Codec::Zstd => zstd_decompress(stream, dict_bytes, out_len),
     }
 }
 
@@ -479,11 +589,12 @@ pub fn decompress_payload<R: DictResolver>(
 mod tests {
     use super::*;
 
-    fn lz4_config() -> CompressConfig {
+    fn lz4_config() -> CompressConfig<'static> {
         CompressConfig {
             codec: Codec::Lz4,
             raw_store_threshold: DEFAULT_RAW_STORE_THRESHOLD,
             dict_id: DICT_ID_NONE,
+            ..CompressConfig::default()
         }
     }
 
@@ -503,8 +614,19 @@ mod tests {
         assert_eq!(Codec::Lz4.id(), 1);
         assert_eq!(Codec::from_id(0), Some(Codec::None));
         assert_eq!(Codec::from_id(1), Some(Codec::Lz4));
-        // The reserved zstd id and any garbage are UNKNOWN on this build.
-        assert_eq!(Codec::from_id(CODEC_ID_ZSTD_RESERVED), None);
+        // The frozen zstd id is 2; the const is always defined regardless of the build.
+        assert_eq!(CODEC_ID_ZSTD, 2);
+        // On a build WITHOUT the zstd feature, id 2 is UNKNOWN (poison); with the feature it
+        // resolves to the zstd codec. This is exactly what makes a default-build reader treat a
+        // zstd record as unknown-codec poison rather than a crash.
+        #[cfg(not(feature = "zstd"))]
+        assert_eq!(Codec::from_id(CODEC_ID_ZSTD), None);
+        #[cfg(feature = "zstd")]
+        {
+            assert_eq!(Codec::from_id(CODEC_ID_ZSTD), Some(Codec::Zstd));
+            assert_eq!(Codec::Zstd.id(), 2);
+        }
+        // Garbage is UNKNOWN on every build.
         assert_eq!(Codec::from_id(200), None);
         assert_eq!(DESCRIPTOR_LEN, 9);
     }
@@ -600,9 +722,17 @@ mod tests {
 
     #[test]
     fn unknown_codec_is_poison_not_a_crash() {
-        // Hand-craft a descriptor with the reserved zstd id (a future codec this build lacks).
+        // Hand-craft a descriptor with a codec id this build does not implement. On a build WITHOUT
+        // the zstd feature, the zstd id (2) is itself unknown and is the canonical case (a default
+        // reader meeting a zstd record); on a build WITH the feature, id 2 is known, so use an id
+        // (200) that is unknown on EVERY build to keep this assertion build-agnostic. The
+        // zstd-on-default-build poison case is pinned by `zstd_record_is_unknown_codec_poison`.
+        #[cfg(not(feature = "zstd"))]
+        let unknown_id = CODEC_ID_ZSTD;
+        #[cfg(feature = "zstd")]
+        let unknown_id = 200u8;
         let mut stored = Vec::new();
-        stored.push(CODEC_ID_ZSTD_RESERVED);
+        stored.push(unknown_id);
         stored.extend_from_slice(&0u32.to_le_bytes()); // dict_id
         stored.extend_from_slice(&16u32.to_le_bytes()); // uncompressed_len
         stored.extend_from_slice(&[0xAB; 8]); // a stream we never reach
@@ -613,10 +743,7 @@ mod tests {
             DEFAULT_MAX_DECOMPRESSED_BYTES,
         )
         .unwrap_err();
-        assert_eq!(
-            err,
-            DecompressError::PoisonUnknownCodec(CODEC_ID_ZSTD_RESERVED)
-        );
+        assert_eq!(err, DecompressError::PoisonUnknownCodec(unknown_id));
         assert!(err.is_poison(), "unknown codec is the POISON class");
     }
 
@@ -628,6 +755,7 @@ mod tests {
             codec: Codec::Lz4,
             raw_store_threshold: DEFAULT_RAW_STORE_THRESHOLD,
             dict_id: 0x1234_5678,
+            ..CompressConfig::default()
         };
         let out = compress_payload(&payload, &cfg).unwrap();
         assert!(out.compressed);
@@ -663,6 +791,7 @@ mod tests {
             codec: Codec::Lz4,
             raw_store_threshold: DEFAULT_RAW_STORE_THRESHOLD,
             dict_id: 0x1234_5678,
+            ..CompressConfig::default()
         };
         let out = compress_payload(&payload, &cfg).unwrap();
         let back = decompress_payload(
@@ -776,6 +905,264 @@ mod tests {
         )
         .unwrap();
         assert_eq!(back, payload);
+    }
+
+    /// On a DEFAULT (non-zstd) build, a record written by a zstd-feature writer (codec id 2) is
+    /// read as UNKNOWN-codec POISON, never a crash: the default reader cannot decode zstd, so it
+    /// routes the record to the #8 quarantine as reported loss. This is the load-bearing
+    /// cross-build property: a default binary never panics on a zstd record.
+    #[cfg(not(feature = "zstd"))]
+    #[test]
+    fn zstd_record_is_unknown_codec_poison_on_a_default_build() {
+        let mut stored = Vec::new();
+        stored.push(CODEC_ID_ZSTD); // the zstd id this default build does not implement
+        stored.extend_from_slice(&0u32.to_le_bytes()); // dict_id
+        stored.extend_from_slice(&64u32.to_le_bytes()); // uncompressed_len
+        stored.extend_from_slice(&[0x28, 0xB5, 0x2F, 0xFD, 0x00]); // a (real) zstd magic-led stream
+        let err = decompress_payload(
+            RecordFlags::COMPRESSED,
+            &stored,
+            &NoDictionaries,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+        .unwrap_err();
+        assert_eq!(err, DecompressError::PoisonUnknownCodec(CODEC_ID_ZSTD));
+        assert!(
+            err.is_poison(),
+            "a zstd record on a default build is poison"
+        );
+    }
+}
+
+/// Teeth for the OPT-IN zstd codec (id 2) and the trained-dictionary lifecycle. Compiled only on a
+/// `zstd`-feature build; the default build's cross-build poison behaviour is pinned in `mod tests`.
+#[cfg(all(test, feature = "zstd"))]
+mod zstd_tests {
+    use super::*;
+
+    fn zstd_config(dict_id: u32, dict: Option<&[u8]>) -> CompressConfig<'_> {
+        CompressConfig {
+            codec: Codec::Zstd,
+            raw_store_threshold: DEFAULT_RAW_STORE_THRESHOLD,
+            dict_id,
+            dict,
+            zstd_level: DEFAULT_ZSTD_LEVEL,
+        }
+    }
+
+    /// A resolver that holds exactly one dictionary, for the dict round-trip tests.
+    struct OneDict<'a>(u32, &'a [u8]);
+    impl DictResolver for OneDict<'_> {
+        fn resolve(&self, id: u32) -> Option<&[u8]> {
+            (id == self.0).then_some(self.1)
+        }
+    }
+
+    fn compressible(len: usize) -> Vec<u8> {
+        b"ironbus.sensor.telemetry.v1 {\"temp\":21.5,\"unit\":\"C\",\"seq\":42} "
+            .iter()
+            .copied()
+            .cycle()
+            .take(len)
+            .collect()
+    }
+
+    #[test]
+    fn zstd_round_trips_without_a_dictionary() {
+        let payload = compressible(4096);
+        let out = compress_payload(&payload, &zstd_config(DICT_ID_NONE, None)).unwrap();
+        assert!(
+            out.compressed,
+            "a compressible payload compresses under zstd"
+        );
+        assert!(out.stored.len() < payload.len(), "zstd shrinks the payload");
+        // The descriptor carries codec id 2.
+        let (codec_id, dict_id, _, _) = read_descriptor(&out.stored).unwrap();
+        assert_eq!(codec_id, CODEC_ID_ZSTD);
+        assert_eq!(dict_id, DICT_ID_NONE);
+        let back = decompress_payload(
+            RecordFlags::COMPRESSED,
+            &out.stored,
+            &NoDictionaries,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+        .unwrap();
+        assert_eq!(back, payload, "zstd decompress(compress(x)) == x");
+    }
+
+    #[test]
+    fn a_corrupt_zstd_stream_is_a_typed_error_never_a_panic() {
+        // A descriptor that claims a plausible length but whose stream is not a valid zstd frame
+        // must be a typed CorruptStream, never a panic.
+        let mut stored = Vec::new();
+        stored.push(CODEC_ID_ZSTD);
+        stored.extend_from_slice(&0u32.to_le_bytes());
+        stored.extend_from_slice(&64u32.to_le_bytes());
+        stored.extend_from_slice(&[0xFF; 16]); // garbage, not a zstd frame
+        let err = decompress_payload(
+            RecordFlags::COMPRESSED,
+            &stored,
+            &NoDictionaries,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+        .unwrap_err();
+        assert_eq!(err, DecompressError::CorruptStream);
+        assert!(
+            !err.is_poison(),
+            "a corrupt stream is a body-corruption reject, not poison"
+        );
+    }
+
+    #[test]
+    fn a_zstd_decompression_bomb_is_capped_before_allocation() {
+        // A real zstd stream that decodes to a LARGE output, but a descriptor claim OVER the cap,
+        // is rejected before any allocation by the same cap that guards lz4.
+        let big = compressible(2 * 1024 * 1024);
+        let stream = zstd::bulk::compress(&big, DEFAULT_ZSTD_LEVEL).unwrap();
+        let mut stored = Vec::new();
+        stored.push(CODEC_ID_ZSTD);
+        stored.extend_from_slice(&0u32.to_le_bytes());
+        stored.extend_from_slice(&u32::MAX.to_le_bytes()); // claim ~4 GiB, over the cap
+        stored.extend_from_slice(&stream);
+        let err = decompress_payload(
+            RecordFlags::COMPRESSED,
+            &stored,
+            &NoDictionaries,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            DecompressError::DecompressedTooLarge {
+                claimed: u32::MAX,
+                cap: DEFAULT_MAX_DECOMPRESSED_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn a_zstd_stream_that_decodes_past_the_claim_is_a_typed_error() {
+        // The claim and the stream are independently attacker-controlled. A descriptor that claims
+        // a SMALL length but carries a zstd frame decoding to a LARGER length must be a typed
+        // CorruptStream (the bounded buffer rejects the overflow), never a panic.
+        let real = vec![0x5Au8; 4096];
+        let stream = zstd::bulk::compress(&real, DEFAULT_ZSTD_LEVEL).unwrap();
+        let mut stored = Vec::new();
+        stored.push(CODEC_ID_ZSTD);
+        stored.extend_from_slice(&0u32.to_le_bytes());
+        stored.extend_from_slice(&16u32.to_le_bytes()); // LIE: claim 16, well under the cap
+        stored.extend_from_slice(&stream);
+        let err = decompress_payload(
+            RecordFlags::COMPRESSED,
+            &stored,
+            &NoDictionaries,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+        .unwrap_err();
+        assert_eq!(err, DecompressError::CorruptStream);
+    }
+
+    #[test]
+    fn an_unresolved_zstd_dict_id_is_poison() {
+        // A zstd record stamped with a non-zero dict_id the resolver does not hold is the distinct
+        // POISON (intact frame, absent dictionary), not a crash. Compress WITHOUT a real dict so we
+        // do not need the resolver at write time; the read-time gate is what is under test.
+        let payload = compressible(4096);
+        let cfg = zstd_config(0x0BAD_F00D, None);
+        let out = compress_payload(&payload, &cfg).unwrap();
+        let err = decompress_payload(
+            RecordFlags::COMPRESSED,
+            &out.stored,
+            &NoDictionaries,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+        .unwrap_err();
+        assert_eq!(err, DecompressError::PoisonUnresolvedDict(0x0BAD_F00D));
+        assert!(err.is_poison());
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)] // a test ratio measurement; the byte counts are small
+    fn a_trained_dictionary_round_trips_and_improves_the_ratio() {
+        // Train a dictionary over a corpus of small, same-shaped records (the realistic per-type
+        // case), then compress a held-out record of that type with and without the dictionary. The
+        // dictionary must (a) beat the no-dictionary zstd ratio on a small record, which is the
+        // whole point of a trained dictionary, and (b) round-trip through the full codec path.
+        let dict = crate::dict::train_dictionary(&sample_corpus(), 16 * 1024)
+            .expect("training over a representative corpus succeeds");
+        assert!(!dict.bytes.is_empty(), "a non-empty dictionary was trained");
+        assert_ne!(
+            dict.dict_id, DICT_ID_NONE,
+            "the dict_id is never the sentinel"
+        );
+
+        // The RATIO claim, measured over a held-out BATCH of small records of the same type (the
+        // §7 per-batch unit) at the raw zstd-stream level, so the never-expand/raw-store guard does
+        // not obscure the dictionary's win on a few-hundred-byte record (where an unprimed zstd
+        // window finds nothing but a primed one does). Both arms compress the SAME corpus at the
+        // SAME level; the ONLY variable is the dictionary (the §7 method).
+        let held_out: Vec<Vec<u8>> = (9000..9200u32).map(record_for).collect();
+        let mut no_dict_total = 0usize;
+        let mut with_dict_total = 0usize;
+        let mut raw_total = 0usize;
+        let with_dict_compressor =
+            zstd::bulk::Compressor::with_dictionary(DEFAULT_ZSTD_LEVEL, &dict.bytes).unwrap();
+        let mut with_dict_compressor = with_dict_compressor;
+        for rec in &held_out {
+            raw_total += rec.len();
+            no_dict_total += zstd::bulk::compress(rec, DEFAULT_ZSTD_LEVEL).unwrap().len();
+            with_dict_total += with_dict_compressor.compress(rec).unwrap().len();
+        }
+        let ratio_no_dict = raw_total as f64 / no_dict_total as f64;
+        let ratio_with_dict = raw_total as f64 / with_dict_total as f64;
+        assert!(
+            ratio_with_dict > ratio_no_dict,
+            "the trained dictionary improves the per-batch ratio: {ratio_with_dict:.2}x with vs \
+             {ratio_no_dict:.2}x without (raw {raw_total} B -> {with_dict_total} B with dict, \
+             {no_dict_total} B without)"
+        );
+
+        // The dictionary-compressed record round-trips through the FULL codec path with a resolver
+        // that holds the dict. Use a sub-threshold-immune record by lowering the raw-store
+        // threshold so the descriptor path is exercised end to end.
+        let record = record_for(9999);
+        let cfg = CompressConfig {
+            codec: Codec::Zstd,
+            raw_store_threshold: 1, // force the compressed path for the round-trip check
+            dict_id: dict.dict_id,
+            dict: Some(&dict.bytes),
+            zstd_level: DEFAULT_ZSTD_LEVEL,
+        };
+        let out = compress_payload(&record, &cfg).unwrap();
+        assert!(out.compressed, "the descriptor path was exercised");
+        let resolver = OneDict(dict.dict_id, &dict.bytes);
+        let back = decompress_payload(
+            RecordFlags::COMPRESSED,
+            &out.stored,
+            &resolver,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+        .unwrap();
+        assert_eq!(back, record, "a dictionary-compressed record round-trips");
+    }
+
+    /// A representative per-type corpus: many small JSON-ish telemetry records that share keys,
+    /// schema, and units, which is exactly the cross-record redundancy a trained dictionary
+    /// captures.
+    fn sample_corpus() -> Vec<Vec<u8>> {
+        (0..2000u32).map(record_for).collect()
+    }
+
+    fn record_for(i: u32) -> Vec<u8> {
+        format!(
+            "{{\"type\":\"sensor.telemetry.v1\",\"device\":\"hive-{:04}\",\"temp\":{}.{},\"unit\":\"C\",\"rssi\":-{},\"seq\":{}}}",
+            i % 64,
+            18 + (i % 12),
+            i % 10,
+            40 + (i % 50),
+            i
+        )
+        .into_bytes()
     }
 }
 

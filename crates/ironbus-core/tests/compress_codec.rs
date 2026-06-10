@@ -210,7 +210,7 @@ proptest! {
         payload in proptest::collection::vec(any::<u8>(), 0..8192),
     ) {
         let cfg = if use_lz4 {
-            CompressConfig { codec: Codec::Lz4, raw_store_threshold: DEFAULT_RAW_STORE_THRESHOLD, dict_id: 0 }
+            CompressConfig { codec: Codec::Lz4, raw_store_threshold: DEFAULT_RAW_STORE_THRESHOLD, dict_id: 0, ..CompressConfig::default() }
         } else {
             CompressConfig::disabled()
         };

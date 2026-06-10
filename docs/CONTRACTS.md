@@ -76,14 +76,15 @@ inside the CRC-covered body, so it consumes NO new header bytes and shifts NO ex
 field; `FORMAT_VERSION` stays 1 and the format-registry digest (the `pub const` layout in
 `format.rs`) is unchanged. This is the reservation `docs/DICTIONARY_LIFECYCLE.md` §8 and the
 codec/dict id rows of [compat/versions.md](compat/versions.md) describe, now IMPLEMENTED for
-the `lz4` codec.
+the `lz4` codec (the pure-Rust default) and, behind the OPT-IN `zstd` feature, the `zstd`
+codec + the trained-dictionary lifecycle (#357).
 
 | offset (within the payload) | field             | type | notes |
 |-----------------------------|-------------------|------|-------|
-| `[0, 1)`   | `codec_id`         | u8   | frozen: `0` = none, `1` = lz4 (the ADR-0003 pure-Rust default). An UNKNOWN id (a future `zstd` = 2, or garbage) is POISON on decode, never a crash |
-| `[1, 5)`   | `dict_id`          | u32  | the compression dictionary id; `0` = no dictionary (the v1 case). A non-zero id the reader cannot resolve is POISON (`UnresolvedDictId`, see DICTIONARY_LIFECYCLE.md §5) |
-| `[5, 9)`   | `uncompressed_len` | u32  | the original payload length, checked against the per-unit decompressed cap BEFORE allocation (the decompression-bomb guard, #76) |
-| `[9, ...)` | `stream`           | bytes| the codec stream (for `lz4`, an lz4 block; for `none`, the raw bytes) |
+| `[0, 1)`   | `codec_id`         | u8   | frozen: `0` = none, `1` = lz4 (the ADR-0003 pure-Rust default), `2` = zstd (OPT-IN `zstd` feature only). On a default (non-zstd) build, codec id `2` (or any garbage) is an UNKNOWN id and is POISON on decode, never a crash |
+| `[1, 5)`   | `dict_id`          | u32  | the compression dictionary id; `0` = no dictionary (the only value the `lz4` default writes). A non-zero id the reader cannot resolve (sidecar + embedded both absent) is POISON (`UnresolvedDictId`, see DICTIONARY_LIFECYCLE.md §5). Trained dictionaries are a `zstd`-feature capability (#357) |
+| `[5, 9)`   | `uncompressed_len` | u32  | the original payload length, checked against the per-unit decompressed cap BEFORE allocation (the decompression-bomb guard, #76), for `lz4` and `zstd` alike |
+| `[9, ...)` | `stream`           | bytes| the codec stream (for `lz4`, an lz4 block; for `zstd`, a zstd frame; for `none`, the raw bytes) |
 
 Two write guards keep compression always safe and never lossy on size:
 

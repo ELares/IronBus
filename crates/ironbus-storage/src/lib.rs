@@ -5,6 +5,10 @@
 pub mod admin;
 pub mod checkpoint;
 pub mod compaction;
+/// The on-disk trained-dictionary sidecar store and resolver (`dicts/<dict_id>.zstd`), behind the
+/// OPT-IN `zstd` feature (#357, `docs/DICTIONARY_LIFECYCLE.md` §3-§4). Absent from the default build.
+#[cfg(feature = "zstd")]
+pub mod dict_store;
 pub mod dlq;
 pub mod fault;
 pub mod fs;

@@ -69,6 +69,16 @@ mod config_file;
 /// mutation surface); this is the safe SIGHUP/re-read reload path only.
 mod config_reload;
 
+/// The OPT-IN `dict` subcommand group (#357, `docs/DICTIONARY_LIFECYCLE.md`): `dict train` (ZDICT
+/// training over a per-type sample corpus, emitting a content-named dictionary and a `--json`
+/// summary with the measured before/after ratio), `dict install` (copy a trained dictionary into a
+/// data dir's `dicts/` sidecar store), and `dict ls` (list the sidecars in a data dir). Compiled
+/// ONLY on a build with the `zstd` feature (the trained-dictionary lifecycle is a zstd capability);
+/// absent from the default build, where `dict` is an unknown subcommand. Unix-only, like the rest
+/// of the on-disk store path.
+#[cfg(all(unix, feature = "zstd"))]
+mod dict_cmd;
+
 use ironbus_client::{Client, ClientError};
 use ironbus_core::clock::Clock;
 use ironbus_proto::message::PubBody;
@@ -673,6 +683,10 @@ USAGE:
     ironbus rollback --dest <path>
     ironbus record-start --dest <path> (--failed | --ok | --check)
     ironbus migrate --data-dir <dir> [--allow <to-version>]
+    ironbus dict train --type <t> --samples <dir> [--out <dir>] [--target-dict-bytes <n>]
+                  [--min-samples <n>] [--json]            (opt-in: build --features zstd)
+    ironbus dict install --data-dir <dir> --dict <path> [--json]   (opt-in: --features zstd)
+    ironbus dict ls --data-dir <dir> [--json]                      (opt-in: --features zstd)
     ironbus help
     ironbus version
 
@@ -949,6 +963,7 @@ fn run(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         "rollback" => run_rollback(rest, out),
         "record-start" => run_record_start(rest, out),
         "migrate" => run_migrate(rest, out),
+        "dict" => run_dict(rest, out),
         "help" | "--help" | "-h" => {
             writeln!(out, "{USAGE}")?;
             Ok(())
@@ -4242,6 +4257,27 @@ fn run_migrate(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let data_dir = data_dir
         .ok_or_else(|| CliError::Usage("migrate requires `--data-dir <dir>`".to_string()))?;
     cmd_migrate(Path::new(&data_dir), allow, out)
+}
+
+/// Dispatches the OPT-IN `dict` subcommand group (#357). On a build WITH the `zstd` feature it
+/// delegates to [`dict_cmd::run_dict`] (`train` / `install` / `ls`); on a build WITHOUT it,
+/// `dict` is not available and this returns a usage error naming the feature, so the default
+/// pure-Rust binary neither carries the zstd dependency nor silently accepts the verb.
+#[cfg(all(unix, feature = "zstd"))]
+fn run_dict(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    dict_cmd::run_dict(args, out)
+}
+
+/// The `dict` verb is OPT-IN behind the `zstd` feature and Unix-only (it touches the on-disk
+/// sidecar store). This stub keeps the default / non-Unix binary's subcommand table honest: it
+/// names the feature rather than pretending the verb does not exist.
+#[cfg(not(all(unix, feature = "zstd")))]
+fn run_dict(_args: &[String], _out: &mut impl Write) -> Result<(), CliError> {
+    Err(CliError::Usage(
+        "`dict` requires a build with the `zstd` feature (the trained-dictionary lifecycle is a \
+         zstd capability); rebuild with `--features zstd`"
+            .to_string(),
+    ))
 }
 
 /// Decodes a data directory offline and writes its durable records (from `from_offset`, at most
