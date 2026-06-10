@@ -453,6 +453,12 @@ impl Session {
             reply_err(out, "malformed pub body");
             return Ok(());
         };
+        // The QoS-0 no-frame contract (#11): a fire-and-forget producer NEVER reads a reply, so the
+        // session must send NO frame for a flagged produce on ANY disposition (append, drop, shed,
+        // capacity, fence, failure), or the one unexpected frame would permanently desync the
+        // client's reply stream (its next produce would consume the stale frame). Captured here and
+        // consulted on every reply site below.
+        let fire_and_forget = msg.fire_and_forget;
         // Enforce the dedup id length caps (#33) at the wire boundary, BEFORE the bytes cross into
         // owned storage. The `producer_id` keys the per-producer window map and the `msg_id` keys the
         // per-window ring; both are wire-supplied and attacker-chosen (up to the 64 KiB wire field
@@ -460,11 +466,15 @@ impl Session {
         // connection-preserving rejection (NOT a panic, NOT a frame change), like a malformed body.
         if let Some(d) = msg.dedup.as_ref() {
             if d.producer_id.len() > MAX_PRODUCER_ID_LEN {
-                reply_err(out, "producer_id too long");
+                if !fire_and_forget {
+                    reply_err(out, "producer_id too long");
+                }
                 return Ok(());
             }
             if d.msg_id.len() > MAX_MSG_ID_LEN {
-                reply_err(out, "msg_id too long");
+                if !fire_and_forget {
+                    reply_err(out, "msg_id too long");
+                }
                 return Ok(());
             }
         }
@@ -529,13 +539,19 @@ impl Session {
             // below the broker's known high-water. Reject it with a distinct, stable message; the
             // connection stays open so the producer can re-handshake with a fresh epoch.
             ProduceOutcome::Fenced => {
-                reply_err(out, "fenced: stale producer epoch");
+                if !fire_and_forget {
+                    reply_err(out, "fenced: stale producer epoch");
+                }
                 Ok(())
             }
             // A fatal error (frozen writer) would fail every future produce, so end the
             // session rather than masquerade as a transient failure.
             ProduceOutcome::Fatal(e) => {
-                reply_err(out, "fatal storage error");
+                // The session ends either way; for a fire-and-forget produce even this frame is
+                // suppressed (the client detects the close out of band, never a desync).
+                if !fire_and_forget {
+                    reply_err(out, "fatal storage error");
+                }
                 Err(SessionError::EngineFatal(e))
             }
             // The durable-log byte cap shed (drop-new): a distinct, stable message so a
@@ -543,7 +559,9 @@ impl Session {
             // stays open, so the producer can keep going (a later produce succeeds once
             // retention frees space).
             ProduceOutcome::AtCapacity => {
-                reply_err(out, "at capacity");
+                if !fire_and_forget {
+                    reply_err(out, "at capacity");
+                }
                 Ok(())
             }
             // The CoDel load-shed (#68): the broker is overloaded past the controlled-delay target,
@@ -555,7 +573,9 @@ impl Session {
             // `shed`) waits on the frozen-protocol extension (#11), per docs/BACKPRESSURE.md; until
             // then the shed rides the existing bare `Err` frame, exactly like the byte-cap shed.
             ProduceOutcome::Shed => {
-                reply_err(out, "shed under load");
+                if !fire_and_forget {
+                    reply_err(out, "shed under load");
+                }
                 Ok(())
             }
             // An fsync-HEADROOM shed (#378): the un-fsynced backlog (the loss window / RAM bound) is
@@ -566,11 +586,15 @@ impl Session {
             // stays open (a later produce succeeds once the writer catches up); no accepted record is
             // dropped, so this is reject-new-work only, like the byte-cap shed.
             ProduceOutcome::WalHeadroomShed => {
-                reply_err(out, "wal fsync headroom exhausted");
+                if !fire_and_forget {
+                    reply_err(out, "wal fsync headroom exhausted");
+                }
                 Ok(())
             }
             ProduceOutcome::Failed(_) => {
-                reply_err(out, "produce failed");
+                if !fire_and_forget {
+                    reply_err(out, "produce failed");
+                }
                 Ok(())
             }
         }
@@ -2884,6 +2908,121 @@ mod tests {
         .unwrap();
         s.process(e, &frame(FrameType::Pub, &pub_body), out)
             .unwrap();
+    }
+
+    /// Sends a FIRE-AND-FORGET pub (the QoS-0 flag set) against any mock engine and returns the
+    /// raw reply bytes, for the per-disposition no-frame contract tests (#11).
+    fn connect_and_pub_faf<
+        C: Clock + Clone + 'static,
+        E: crate::actor::EngineAccess<InMemoryFs, C>,
+    >(
+        s: &mut Session,
+        e: &E,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        s.process(e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: true,
+                payload: b"qos0",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        s.process(e, &frame(FrameType::Pub, &pub_body), &mut out)
+            .unwrap();
+        out
+    }
+
+    /// A mock whose produce path always reports the durable-log byte cap (drop-new) shed.
+    struct AtCapacityEngine;
+    impl crate::actor::EngineAccess<InMemoryFs, ManualClock> for AtCapacityEngine {
+        fn produce(
+            &self,
+            _append: crate::actor::OwnedAppend,
+        ) -> Result<ProduceOutcome, crate::actor::ActorGone> {
+            Ok(ProduceOutcome::AtCapacity)
+        }
+        fn with<R, J>(&self, _job: J) -> Result<R, crate::actor::ActorGone>
+        where
+            R: Send + 'static,
+            J: FnOnce(&mut Engine<InMemoryFs, ManualClock>) -> R + Send + 'static,
+        {
+            Err(crate::actor::ActorGone)
+        }
+        fn now_monotonic_nanos(&self) -> u64 {
+            0
+        }
+        fn consumer_credit_caps(&self) -> (u32, u64) {
+            (64, 0)
+        }
+    }
+
+    /// A mock whose produce path always fences (a stale producer epoch, #33).
+    struct FencedEngine;
+    impl crate::actor::EngineAccess<InMemoryFs, ManualClock> for FencedEngine {
+        fn produce(
+            &self,
+            _append: crate::actor::OwnedAppend,
+        ) -> Result<ProduceOutcome, crate::actor::ActorGone> {
+            Ok(ProduceOutcome::Fenced)
+        }
+        fn with<R, J>(&self, _job: J) -> Result<R, crate::actor::ActorGone>
+        where
+            R: Send + 'static,
+            J: FnOnce(&mut Engine<InMemoryFs, ManualClock>) -> R + Send + 'static,
+        {
+            Err(crate::actor::ActorGone)
+        }
+        fn now_monotonic_nanos(&self) -> u64 {
+            0
+        }
+        fn consumer_credit_caps(&self) -> (u32, u64) {
+            (64, 0)
+        }
+    }
+
+    #[test]
+    fn a_fire_and_forget_pub_sends_no_frame_on_every_non_appended_disposition() {
+        // THE QoS-0 NO-FRAME CONTRACT (#11, the review blocker): a fire-and-forget producer never
+        // reads a reply, so ANY frame on ANY disposition (a CoDel shed, the byte-cap shed, the
+        // fsync-headroom shed, a dedup fence) would permanently desync its reply stream. Each mock
+        // forces one disposition; all must produce ZERO reply bytes while the session stays open.
+        let mut s = Session::new();
+        let out = connect_and_pub_faf(&mut s, &ShedEngine);
+        assert!(
+            out.is_empty(),
+            "CoDel shed sent a frame to a QoS-0 pub: {out:?}"
+        );
+
+        let mut s = Session::new();
+        let out = connect_and_pub_faf(&mut s, &HeadroomShedEngine);
+        assert!(
+            out.is_empty(),
+            "headroom shed sent a frame to a QoS-0 pub: {out:?}"
+        );
+
+        let mut s = Session::new();
+        let out = connect_and_pub_faf(&mut s, &AtCapacityEngine);
+        assert!(
+            out.is_empty(),
+            "at-capacity sent a frame to a QoS-0 pub: {out:?}"
+        );
+
+        let mut s = Session::new();
+        let out = connect_and_pub_faf(&mut s, &FencedEngine);
+        assert!(
+            out.is_empty(),
+            "a fence sent a frame to a QoS-0 pub: {out:?}"
+        );
     }
 
     #[test]

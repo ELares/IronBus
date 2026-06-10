@@ -250,9 +250,12 @@ const DEFAULT_FIRE_AND_FORGET_BYTE_RATE: u64 =
 /// engine default (100 ms).
 const DEFAULT_FIRE_AND_FORGET_REFILL_MS: u64 =
     ironbus_server::engine::DEFAULT_FIRE_AND_FORGET_REFILL_MS;
-/// The default starting / static-floor egress concurrency limit for `serve` (#69), aliased to the
-/// engine default (16); the AIMD bounds `[4, 128]` always apply.
-const DEFAULT_EGRESS_LIMIT: u32 = ironbus_server::engine::DEFAULT_EGRESS_LIMIT;
+/// The default `--egress-limit` for `serve` (#69, #402): `0` = the egress AIMD is OFF (inert), so a
+/// zero-config broker grants the full configured consumer credit exactly as before the AIMD existed.
+/// A NON-ZERO value opts in and seeds the AIMD's starting limit (the engine clamps it to `[4, 128]`;
+/// `ironbus_server::engine::DEFAULT_EGRESS_LIMIT` = 16 is only the engine's internal seed when
+/// enabled, NOT the CLI default).
+const DEFAULT_EGRESS_LIMIT: u32 = 0;
 
 /// The default fsync-headroom admission window in BYTES for `serve` (#378), aliased to the core
 /// default (`0` = OFF). A zero-config broker is unchanged; a non-zero value is the opt-in tight RAM /
@@ -8664,6 +8667,18 @@ mod tests {
         );
         drop(held);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_zero_config_serve_leaves_the_egress_aimd_off() {
+        // The inert-default contract (#402, the review blocker): with NO flags, --egress-limit
+        // resolves to 0 (the engine's AIMD-enabled gate is egress_limit != 0), so a zero-config
+        // broker grants the full consumer credit exactly as before the AIMD existed.
+        let parsed = parse_serve_flags(&serve_args(&[])).unwrap();
+        assert_eq!(
+            parsed.config.egress_limit, 0,
+            "the compiled default must leave the egress AIMD OFF"
+        );
     }
 
     #[test]
