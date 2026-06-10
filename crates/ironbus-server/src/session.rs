@@ -488,7 +488,9 @@ impl Session {
         // group of that offset burns max-deliver visibility-timeout cycles of typed
         // `ClientError::Decompress` failures before the record dead-letters. The check is a
         // 9-byte header parse, NO decompression (the produce hot path pays no codec CPU; stream
-        // CONTENT stays a read-side concern), against the same read-side rules and the same
+        // CONTENT stays a read-side concern), against the read-side rules (deliberately STRICTER
+        // than the zstd read side on exactly one degenerate input, the empty-stream claim-0
+        // descriptor; see `validate_descriptor_shape`) and the same
         // `DEFAULT_MAX_DECOMPRESSED_BYTES` cap every shipped reader and the #437 seam enforce. A
         // failure is a typed, connection-preserving rejection exactly like the wire-boundary
         // rejections above (a malformed body, an over-long dedup id); for a fire-and-forget

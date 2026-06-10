@@ -518,7 +518,12 @@ the REGISTERED ids (`none`/`lz4`/`zstd` per [compat/versions.md](compat/versions
 of the broker's own build: a `zstd` record is a consumer capability), the claimed
 `uncompressed_len` must be within the readers' per-unit decompressed cap
 (`DEFAULT_MAX_DECOMPRESSED_BYTES`), a `none`-codec stream's length must equal the claim exactly,
-and an `lz4`/`zstd` stream must be non-empty. A violation is rejected with an `Err` (tag 12)
+and an `lz4`/`zstd` stream must be non-empty. The non-empty rule is NORMATIVE: a genuine encoder
+never emits an empty stream (an lz4 block needs at least one token byte even for empty output,
+and zstd compresses even the empty payload to a non-empty frame), so on one hand-craftable
+degenerate input (codec `zstd`, claimed length 0, EMPTY stream, which a permissive zstd decoder
+accepts as a 0-byte output) the gate is deliberately STRICTER than the read side; everywhere
+else its rejection set is a subset of the readers'. A violation is rejected with an `Err` (tag 12)
 carrying `malformed compressed descriptor: <detail>` and nothing is appended (no offset is
 consumed); a fire-and-forget violation is dropped with NO frame (the QoS-0 no-frame contract).
 `dict_id` and stream CONTENT are deliberately not judged at produce (a reader capability and

@@ -505,8 +505,10 @@ pub fn read_descriptor(stored: &[u8]) -> Result<(u8, u32, u32, &[u8]), Decompres
 /// one undecodable record cost EVERY consumer group max-deliver visibility-timeout cycles
 /// of typed decode failures before it dead-lettered (#438, post-#430). Each rule here is a
 /// header-only check (a [`DESCRIPTOR_LEN`]-byte parse, NO decompression, so the produce hot
-/// path pays no codec CPU) and rejects exactly what the shipped read side
-/// ([`decompress_payload`], for a codec the reader implements) can never decode:
+/// path pays no codec CPU) and rejects what the shipped read side
+/// ([`decompress_payload`], for a codec the reader implements) can never decode, with ONE
+/// deliberate, documented exception where the gate is STRICTER than the read side (the
+/// empty-stream rule below):
 ///
 /// - The payload must parse as a well-formed descriptor ([`read_descriptor`] succeeds):
 ///   shorter than [`DESCRIPTOR_LEN`] and no reader can even frame the header.
@@ -522,10 +524,18 @@ pub fn read_descriptor(stored: &[u8]) -> Result<(u8, u32, u32, &[u8]), Decompres
 ///   every reader's bomb guard (#76) before allocation, on every delivery attempt.
 /// - The stream must be plausibly decodable for the named codec: a `none`-codec stream's
 ///   length must equal the claimed `uncompressed_len` exactly (the read side's
-///   [`DecompressError::BadRawLength`] check), and an `lz4`/`zstd` stream must be non-empty
-///   (an empty stream cannot be a valid lz4 block or zstd frame, even for a claimed length
-///   of 0: lz4 needs at least one token byte and zstd a frame header, so the read side
-///   returns [`DecompressError::CorruptStream`] on it).
+///   [`DecompressError::BadRawLength`] check), and an `lz4`/`zstd` stream must be non-empty.
+///   For lz4 the non-empty rule mirrors the read side exactly: an lz4 block needs at least
+///   one token byte even for empty output (the canonical lz4 of `b""` is the single byte
+///   `0x00`), so `lz4_flex` rejects an empty stream for ANY claimed length. For zstd the
+///   rule is deliberately STRICTER than the read side on exactly one degenerate input, the
+///   9-byte descriptor (codec `zstd`, any resolvable `dict_id`, claim 0) with an EMPTY
+///   stream: the locked `zstd` decoder accepts it
+///   (`Decompressor::decompress_to_buffer(&[], &mut [])` is `Ok` with 0 bytes written), but
+///   the wire contract (`docs/CONTRACTS.md`) normatively requires a non-empty stream under a
+///   compressing codec, and a genuine zstd encoder never emits an empty frame (an empty
+///   payload still gets a frame header), so only hand-crafted bytes hit the gap. Pinned by
+///   `zstd_empty_stream_claim_zero_is_the_documented_strictness_exception`.
 ///
 /// The `dict_id` is deliberately NOT validated: dictionary resolution is a READER capability
 /// (the on-disk sidecar plus the embedded set, `docs/DICTIONARY_LIFECYCLE.md` §5), so the
@@ -574,10 +584,15 @@ pub fn validate_descriptor_shape(
             return Err(DecompressError::BadRawLength);
         }
     } else if stream.is_empty() {
-        // WHY: an empty stream under a compressing codec is undecodable for ANY claimed
-        // length, including 0: an lz4 block needs at least one token byte (lz4_flex returns
-        // ExpectedAnotherByte -> CorruptStream on empty input) and a zstd frame needs its
-        // header, so the read side can never produce bytes from it.
+        // WHY: the wire contract (docs/CONTRACTS.md) requires a NON-EMPTY stream under a
+        // compressing codec, and no genuine encoder emits one: an lz4 block needs at least
+        // one token byte even for empty output (lz4_flex returns ExpectedAnotherByte ->
+        // CorruptStream on empty input), and a zstd encoder always emits a frame header.
+        // For lz4 this mirrors the read side exactly. For zstd it is deliberately STRICTER
+        // on one degenerate input (empty stream + claim 0, which the zstd decoder accepts
+        // as a 0-byte output): the contract is normative, and only hand-crafted bytes,
+        // never an encoder, produce that shape. See the rustdoc above and the pinning test
+        // `zstd_empty_stream_claim_zero_is_the_documented_strictness_exception`.
         return Err(DecompressError::CorruptStream);
     }
     Ok(())
@@ -1179,9 +1194,12 @@ mod tests {
 
     #[test]
     fn shape_validation_rejects_an_empty_stream_under_a_compressing_codec() {
-        // An empty stream cannot be a valid lz4 block (lz4 needs at least one token byte,
-        // even for empty output: the canonical lz4 of b"" is the single byte 0x00) or a zstd
-        // frame, so the read side fails it for ANY claimed length, including 0.
+        // An empty LZ4 stream cannot be a valid lz4 block (lz4 needs at least one token
+        // byte, even for empty output: the canonical lz4 of b"" is the single byte 0x00),
+        // so for lz4 the gate and the read side agree for ANY claimed length, including 0.
+        // The zstd half of the non-empty rule is NOT a read-side mirror on a claim of 0; it
+        // is the gate's one documented strictness exception, pinned separately by
+        // `zstd_empty_stream_claim_zero_is_the_documented_strictness_exception`.
         let empty = descriptor(CODEC_ID_LZ4, DICT_ID_NONE, 0, b"");
         assert_eq!(
             validate_descriptor_shape(&empty, DEFAULT_MAX_DECOMPRESSED_BYTES),
@@ -1197,6 +1215,38 @@ mod tests {
             .unwrap_err(),
             DecompressError::CorruptStream,
             "the read side agrees: an empty lz4 stream is corrupt"
+        );
+    }
+
+    /// On a DEFAULT (non-zstd) build the degenerate zstd-empty-stream-claim-0 descriptor is
+    /// rejected by BOTH sides (the gate as an empty stream, the read side as unknown-codec
+    /// POISON since id 2 is unimplemented here), so the gate's strictness exception is
+    /// observable only on a `zstd`-feature build; its read-side-ACCEPTS half is pinned in
+    /// `zstd_tests::zstd_empty_stream_claim_zero_is_the_documented_strictness_exception`.
+    #[cfg(not(feature = "zstd"))]
+    #[test]
+    fn zstd_empty_stream_claim_zero_is_rejected_by_both_sides_on_a_default_build() {
+        let degenerate = descriptor(CODEC_ID_ZSTD, DICT_ID_NONE, 0, b"");
+        assert_eq!(
+            degenerate.len(),
+            DESCRIPTOR_LEN,
+            "the 9-byte degenerate descriptor"
+        );
+        assert_eq!(
+            validate_descriptor_shape(&degenerate, DEFAULT_MAX_DECOMPRESSED_BYTES),
+            Err(DecompressError::CorruptStream),
+            "the gate rejects the empty stream"
+        );
+        assert_eq!(
+            decompress_payload(
+                RecordFlags::COMPRESSED,
+                &degenerate,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES
+            )
+            .unwrap_err(),
+            DecompressError::PoisonUnknownCodec(CODEC_ID_ZSTD),
+            "a default build cannot decode codec id 2 at all"
         );
     }
 }
@@ -1327,6 +1377,56 @@ mod zstd_tests {
         )
         .unwrap_err();
         assert_eq!(err, DecompressError::CorruptStream);
+    }
+
+    /// THE documented strictness exception of the #438 produce gate, pinned deterministically:
+    /// the 9-byte descriptor (codec `zstd`, `dict_id` 0, claim 0) with an EMPTY stream is the
+    /// ONE input the read side ACCEPTS but `validate_descriptor_shape` rejects. Empirically,
+    /// the locked `zstd` 0.13.3 `Decompressor::decompress_to_buffer(&[], &mut [])` returns
+    /// `Ok` with 0 bytes written, so `decompress_payload` yields an empty payload; the gate
+    /// still rejects because the wire contract (`docs/CONTRACTS.md`) normatively requires a
+    /// non-empty stream under a compressing codec, and a genuine zstd encoder never emits an
+    /// empty frame (compressing an empty payload still emits a frame header), so only
+    /// hand-crafted bytes reach this gap. Everywhere else the gate's rejection set is a
+    /// subset of the read side's (the proptest
+    /// `shape_gate_never_rejects_a_decodable_record_except_the_documented_exception`).
+    #[test]
+    fn zstd_empty_stream_claim_zero_is_the_documented_strictness_exception() {
+        let mut degenerate = vec![CODEC_ID_ZSTD];
+        degenerate.extend_from_slice(&DICT_ID_NONE.to_le_bytes());
+        degenerate.extend_from_slice(&0u32.to_le_bytes()); // claim 0
+        assert_eq!(
+            degenerate.len(),
+            DESCRIPTOR_LEN,
+            "empty stream: descriptor only"
+        );
+
+        // The read side ACCEPTS: a zstd-build reader decodes it to the empty payload.
+        let back = decompress_payload(
+            RecordFlags::COMPRESSED,
+            &degenerate,
+            &NoDictionaries,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+        .expect("zstd 0.13 accepts an empty stream for a claim of 0");
+        assert!(back.is_empty(), "and the decoded payload is empty");
+
+        // A genuine zstd encoder NEVER produces this shape: even the empty payload
+        // compresses to a non-empty frame (the frame header), which is why the strictness
+        // costs no real producer anything.
+        let genuine_empty_frame = zstd::bulk::compress(b"", DEFAULT_ZSTD_LEVEL).unwrap();
+        assert!(
+            !genuine_empty_frame.is_empty(),
+            "a real zstd frame for the empty payload is non-empty"
+        );
+
+        // The gate REJECTS: the wire contract requires a non-empty stream under a
+        // compressing codec, deliberately stricter than the permissive zstd read side here.
+        assert_eq!(
+            validate_descriptor_shape(&degenerate, DEFAULT_MAX_DECOMPRESSED_BYTES),
+            Err(DecompressError::CorruptStream),
+            "the produce gate enforces the normative non-empty-stream contract"
+        );
     }
 
     #[test]
