@@ -12,8 +12,9 @@
 //!   payload, leaves the [`crate::types::RecordFlags::COMPRESSED`] bit CLEAR, and writes
 //!   no descriptor. So every record written before this module existed, and every frozen
 //!   conformance vector, decodes identically: a v1 reader needs this module only when the
-//!   `COMPRESSED` bit is set, and that bit was never set on a v1 frame (see
-//!   `docs/DICTIONARY_LIFECYCLE.md` §8).
+//!   `COMPRESSED` bit is set, and that bit was never set on a v1 frame until #430 wired the
+//!   write path (the broker now sets it on compressed stores under the default `lz4` codec;
+//!   see `docs/DICTIONARY_LIFECYCLE.md` §8).
 //! - A COMPRESSED record sets the `COMPRESSED` bit and makes the payload a self-describing
 //!   compressed object: a fixed [`DESCRIPTOR_LEN`]-byte descriptor (the codec id, the
 //!   `dict_id`, and the `uncompressed_len`) followed by the codec stream. The descriptor

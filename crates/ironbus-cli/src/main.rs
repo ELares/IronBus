@@ -3985,8 +3985,11 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     }
     let data_dir =
         data_dir.ok_or_else(|| CliError::Usage("dump requires `--data-dir <dir>`".to_string()))?;
-    // `--raw` and `--require-dict` are meaningless against the DLQ sink (it has no compressed
-    // frames either), so reject the combination as a usage error rather than silently ignore it.
+    // `--raw` and `--require-dict` are rejected with `--dlq` as a usage error rather than
+    // silently ignored: the DLQ view renders the sink's own entry form, not the record frame,
+    // so neither flag has an effect there. NOT because the sink is compression-free: a
+    // compressed record CAN dead-letter (its flag intact), and the redrive preserves the flag
+    // verbatim.
     if dlq && (raw || require_dict) {
         return Err(CliError::Usage(
             "`--raw`/`--require-dict` are not valid with `--dlq`".to_string(),
@@ -7274,7 +7277,10 @@ mod tests {
             !text.contains("decoded="),
             "a raw-stored record keeps the historical field set (no decode involved): {text}"
         );
-        // --raw/--require-dict are rejected against the DLQ sink (no compressed frames there either).
+        // --raw/--require-dict are rejected against the DLQ sink as a usage error. Not because
+        // the DLQ is compression-free (a compressed record CAN dead-letter, flag intact, and the
+        // redrive preserves the flag): the DLQ view renders the sink's entry form, where neither
+        // flag applies.
         let mut bad = Vec::new();
         let e = run_dump(
             &[

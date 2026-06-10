@@ -143,4 +143,9 @@ freezes the log read-only and alerts. See README and
 - **#12 write-path wiring**: DONE (#387 runtime, #430 wiring). `serve
   --compression lz4` (the default) compresses each compressible payload of 64
   bytes or more on the produce path; `dump` shows the real stored codec and
-  the client decompresses transparently on deliver.
+  the client decompresses transparently on deliver. A workload of
+  already-compressed or encrypted payloads pays the per-record compression
+  attempt as pure waste (the never-expand guard stores them raw anyway), so
+  `--compression none` is the right call for it; note the attempt runs on the
+  single-writer produce path, before the fsync, so its CPU cost adds directly
+  to produce latency.

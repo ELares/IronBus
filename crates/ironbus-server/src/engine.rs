@@ -478,8 +478,9 @@ pub struct EngineConfig {
     /// the 64-byte raw-store threshold ([`ironbus_core::compress::DEFAULT_RAW_STORE_THRESHOLD`])
     /// or one the codec cannot strictly shrink (the never-expand guard) is stored raw with the
     /// flag clear, indistinguishable from an uncompressed write. A record whose flags ALREADY
-    /// carry [`RecordFlags::COMPRESSED`] (a producer-compressed publish, or a DLQ redrive
-    /// re-appending a stored record) passes through UNCHANGED, never double-wrapped.
+    /// carry [`RecordFlags::COMPRESSED`] (a producer-compressed publish) passes through
+    /// UNCHANGED, never double-wrapped. (The DLQ redrive preserves the flag too, but it appends
+    /// via `Log::append` directly, below this seam.)
     pub compression: Codec,
 }
 
@@ -2626,8 +2627,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// cap ([`DEFAULT_MAX_DECOMPRESSED_BYTES`]) raw, so the write side never emits a record the
     /// shipped read side refuses. A
     /// message whose flags ALREADY carry [`RecordFlags::COMPRESSED`] (a producer-compressed
-    /// publish, or the DLQ redrive re-appending a stored record) passes through UNCHANGED, so a
-    /// stored object is never double-wrapped. `produced_bytes` deliberately counts the ORIGINAL
+    /// publish arriving over the wire) passes through UNCHANGED, so a stored object is never
+    /// double-wrapped. The DLQ redrive also preserves the flag on the records it re-injects, but
+    /// NOT via this guard: it re-appends through `Log::append` directly and never reaches this
+    /// seam (the flag is carried verbatim there, see `ironbus_storage::admin::redrive_dlq`).
+    /// `produced_bytes` deliberately counts the ORIGINAL
     /// logical payload bytes, never the stored bytes (see [`Counters::produced_bytes`]).
     ///
     /// # Errors
@@ -2637,10 +2641,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// written and no statistic moves on an error.
     pub fn append_no_sync(&mut self, message: &Append<'_>) -> Result<Offset, EngineError> {
         // The write-path compression seam (#430, ADR-0003). The pass-through guard on an ALREADY
-        // COMPRESSED message is load-bearing twice over: the wire legally delivers bit 0 set (a
-        // producer may publish a pre-compressed stored object), and the DLQ redrive re-appends
-        // records that already carry the flag; compressing either again would wrap a descriptor
-        // in a descriptor and decode to garbage.
+        // COMPRESSED message is load-bearing: the wire legally delivers bit 0 set (a producer may
+        // publish a pre-compressed stored object), and compressing it again would wrap a
+        // descriptor in a descriptor and decode to garbage. (The DLQ redrive also re-injects
+        // records carrying the flag, but it appends via `Log::append` directly and never reaches
+        // this seam; the flag is preserved verbatim there.)
         //
         // Store RAW when the payload exceeds the readers' per-unit decompressed cap
         // (`DEFAULT_MAX_DECOMPRESSED_BYTES`): every shipped reader (the client fetch decode, the
