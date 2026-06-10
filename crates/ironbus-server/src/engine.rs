@@ -23,7 +23,9 @@ use ironbus_core::attempt::{
 };
 use ironbus_core::backpressure::{AimdLimiter, Codel, FsyncHeadroom, RetryBudget, TokenBucket};
 use ironbus_core::clock::Clock;
-use ironbus_core::compress::{compress_payload, Codec, CompressConfig};
+use ironbus_core::compress::{
+    compress_payload, Codec, CompressConfig, DEFAULT_MAX_DECOMPRESSED_BYTES,
+};
 use ironbus_core::cursor::AckCursor;
 use ironbus_core::delivery::{DeliveryConfig, Disposition};
 use ironbus_core::keyshared::{KeyOrdering, KeyRouter, MemberId, RouteDecision};
@@ -2619,7 +2621,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// `append_with_policy`, so the CRC, the byte-cap and segment-roll checks,
     /// `durable_record_bytes`, and the #118 write-amp meters all account the STORED bytes. The two
     /// ADR-0003 write guards (the 64-byte raw-store threshold and the never-expand guard) keep a
-    /// small or incompressible payload stored raw, byte-identical to an uncompressed write. A
+    /// small or incompressible payload stored raw, byte-identical to an uncompressed write; a
+    /// third, seam-local guard stores a payload LARGER than the readers' per-unit decompressed
+    /// cap ([`DEFAULT_MAX_DECOMPRESSED_BYTES`]) raw, so the write side never emits a record the
+    /// shipped read side refuses. A
     /// message whose flags ALREADY carry [`RecordFlags::COMPRESSED`] (a producer-compressed
     /// publish, or the DLQ redrive re-appending a stored record) passes through UNCHANGED, so a
     /// stored object is never double-wrapped. `produced_bytes` deliberately counts the ORIGINAL
@@ -2636,10 +2641,20 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // producer may publish a pre-compressed stored object), and the DLQ redrive re-appends
         // records that already carry the flag; compressing either again would wrap a descriptor
         // in a descriptor and decode to garbage.
+        //
+        // Store RAW when the payload exceeds the readers' per-unit decompressed cap
+        // (`DEFAULT_MAX_DECOMPRESSED_BYTES`): every shipped reader (the client fetch decode, the
+        // CLI dump/peek) rejects a compressed descriptor whose claimed `uncompressed_len` is over
+        // that cap BEFORE allocating (the #76 bomb guard), so compressing such a payload would
+        // durably ACK a record those readers refuse with `DecompressedTooLarge` (a consumer stall
+        // on a pseudo-poison record). The write side must never emit a record the shipped read
+        // side refuses; a raw store never consults the cap, so an over-cap record (legal up to
+        // the record bound) stays readable everywhere.
         let comp;
         let stored;
         let to_append: &Append<'_> = if self.compress.codec == Codec::None
             || message.flags.contains(RecordFlags::COMPRESSED)
+            || message.payload.len() > DEFAULT_MAX_DECOMPRESSED_BYTES as usize
         {
             message
         } else {
@@ -11323,6 +11338,74 @@ mod tests {
         let d = message(e.poll(0).unwrap());
         assert!(!d.record.flags.contains(RecordFlags::COMPRESSED));
         assert_eq!(d.record.payload, original);
+    }
+
+    #[test]
+    fn a_compressible_payload_over_the_readers_cap_stores_raw_and_round_trips() {
+        use ironbus_core::compress::{
+            decompress_payload, NoDictionaries, DEFAULT_MAX_DECOMPRESSED_BYTES,
+        };
+        // One byte OVER the readers' per-unit decompressed cap: highly compressible, but the
+        // seam's cap guard MUST store it raw. Compressed, its descriptor would claim an
+        // `uncompressed_len` above the cap every shipped reader (the client fetch decode, the
+        // CLI dump/peek) enforces BEFORE allocating, so the record would be durably ACKED and
+        // then refused with `DecompressedTooLarge` on every read: a consumer stall on a
+        // pseudo-poison record the broker itself manufactured.
+        let cap = DEFAULT_MAX_DECOMPRESSED_BYTES as usize;
+        let original = compressible(cap + 1);
+        let mut e = open(lz4_config());
+        produce(&mut e, &original);
+        let d = message(e.poll(0).unwrap());
+        assert!(
+            !d.record.flags.contains(RecordFlags::COMPRESSED),
+            "an over-cap payload is stored raw, never compressed"
+        );
+        assert_eq!(
+            d.record.payload, original,
+            "the raw store carries the payload verbatim"
+        );
+        // The shipped read-side decode accepts it: the cap binds only a COMPRESSED claim, so the
+        // over-cap raw record round-trips instead of being pseudo-poison.
+        let back = decompress_payload(
+            d.record.flags,
+            &d.record.payload,
+            &NoDictionaries,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+        .unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn a_compressible_payload_at_the_readers_cap_compresses_and_round_trips() {
+        use ironbus_core::compress::{
+            decompress_payload, NoDictionaries, DEFAULT_MAX_DECOMPRESSED_BYTES,
+        };
+        // Exactly AT the cap (the largest legal compressed claim, since the readers reject only
+        // a claim STRICTLY above it): the seam compresses, and the shipped read-side decode under
+        // the default cap accepts and recovers it. Together with the over-cap test above this
+        // pins the guard to the readers' exact boundary.
+        let cap = DEFAULT_MAX_DECOMPRESSED_BYTES as usize;
+        let original = compressible(cap);
+        let mut e = open(lz4_config());
+        produce(&mut e, &original);
+        let d = message(e.poll(0).unwrap());
+        assert!(
+            d.record.flags.contains(RecordFlags::COMPRESSED),
+            "an at-cap payload still compresses"
+        );
+        assert!(
+            d.record.payload.len() < original.len(),
+            "strictly smaller (never-expand)"
+        );
+        let back = decompress_payload(
+            d.record.flags,
+            &d.record.payload,
+            &NoDictionaries,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+        .unwrap();
+        assert_eq!(back, original, "the decode recovers the original payload");
     }
 
     #[test]
