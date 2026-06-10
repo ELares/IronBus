@@ -70,9 +70,13 @@ pub enum ClientError {
     /// and `generation` name the poison record's lease, so a caller can ack it
     /// ([`Client::ack`]) to skip it, or nack it toward the broker's `max_deliver` dead-letter
     /// path, instead of stalling on endless redelivery. Only the FIRST failure in a batch is
-    /// reported. Broker-side validation that rejects such a record at produce time is a
-    /// follow-up, tracked separately; until then a producer-compressed record is only checked
-    /// here, on read.
+    /// reported. Since #438 the broker ALSO validates the descriptor SHAPE at produce time (a
+    /// truncated descriptor, an unregistered codec id, an over-cap claimed size, a
+    /// length-inconsistent `none` stream, or an empty `lz4`/`zstd` stream is rejected with a
+    /// `malformed compressed descriptor` `Err`, never acked), so on a #438+ broker this error
+    /// indicates a capability mismatch this build cannot resolve (a `zstd` record on a default
+    /// build, an unresolvable `dict_id`), a corrupt stream behind a well-shaped descriptor, or
+    /// a malformed record produced before the broker was upgraded.
     Decompress {
         /// The typed decompression failure.
         source: DecompressError,

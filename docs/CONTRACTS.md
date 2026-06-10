@@ -508,6 +508,24 @@ the unchanged at-least-once `PubAck` path. A client opts in with `Client::produc
 default `Client::produce` is unchanged. The `FrameType` tag vocabulary is UNCHANGED (only the additive
 flag).
 
+A PUB whose `flags` carry `RecordFlags::COMPRESSED` (bit 0, a REAL stored record flag, not a
+wire-only bit) declares its payload is an already-compressed object: the fixed 9-byte descriptor
+plus the codec stream (see [Compressed payload descriptor](#compressed-payload-descriptor-when-compressed-is-set)).
+The broker passes such a payload through its write seam untouched (never double-wrapped, #430),
+and since #438 it validates the descriptor SHAPE at produce time, a header-only parse with NO
+decompression: the payload must be at least the 9-byte descriptor, the codec id must be one of
+the REGISTERED ids (`none`/`lz4`/`zstd` per [compat/versions.md](compat/versions.md), regardless
+of the broker's own build: a `zstd` record is a consumer capability), the claimed
+`uncompressed_len` must be within the readers' per-unit decompressed cap
+(`DEFAULT_MAX_DECOMPRESSED_BYTES`), a `none`-codec stream's length must equal the claim exactly,
+and an `lz4`/`zstd` stream must be non-empty. A violation is rejected with an `Err` (tag 12)
+carrying `malformed compressed descriptor: <detail>` and nothing is appended (no offset is
+consumed); a fire-and-forget violation is dropped with NO frame (the QoS-0 no-frame contract).
+`dict_id` and stream CONTENT are deliberately not judged at produce (a reader capability and
+codec work, respectively), so a corrupt stream behind a well-shaped descriptor remains a
+read-side `ClientError::Decompress`. The gate sits at the WIRE boundary only: the engine's own
+compressed writes and the DLQ redrive's direct re-injection do not pass through it.
+
 There is NO topic field and NO trace-id header list. `key`, `headers`, `producer_id`, and `msg_id`
 are each bounded by `u16::MAX`.
 
