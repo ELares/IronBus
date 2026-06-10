@@ -1471,9 +1471,13 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         self.next_seq = next_seq;
         self.next_offset = next_offset;
         // Write-amplification accounting (#118), charged only after the append returned Ok (a failed
-        // append wrote nothing). Logical = the user payload the application asked us to store (key +
-        // headers + payload, no framing); physical = the encoded frame actually written to the
-        // segment. `physical / logical` over the run is the flash write-amplification ratio.
+        // append wrote nothing). Logical = the STORED payload this append carries (key + headers +
+        // payload, no framing); under the #430 write path the engine compresses BEFORE this append,
+        // so these are post-compression stored bytes, not the producer-facing logical bytes (the
+        // engine's `produced_bytes` keeps that meaning). Physical = the encoded frame actually
+        // written to the segment. `physical / logical` over the run is the flash write-amplification
+        // ratio, defined over stored bytes: under the default codec it can inflate for small
+        // compressible payloads even as the real flash wear per user byte falls.
         let logical = record
             .key
             .len()

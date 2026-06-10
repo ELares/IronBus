@@ -57,7 +57,7 @@ not a hard requirement.
 | | `--max-retained-bytes` / `--max-age-ms` / `--max-messages` | `0` = off (each) | enable at least one, sized to the device | Retention reaps whole old, fully-consumed sealed segments (consumer-safe, never below the slowest consumer, never the active segment). Bounding the on-disk footprint bounds the rewrite/erase volume the flash sees over time (write amplification, #19). |
 | | `--disk-full-policy` | `drop-new` | `drop-new` (default) | When `--max-total-bytes` is hit, drop-new sheds the over-cap produce and preserves older accepted data, avoiding the extra force-reap writes (and the consumer truncation) that `drop-oldest` incurs. |
 | **Limited CPU** | (single-writer, always on) | n/a | n/a | Produces serialize through one writer and one `fdatasync` at a time; there is no thread-count knob to tune. Keep `--max-connections` (default `256`) modest so accept/decode work stays bounded. |
-| | `--compression` | `lz4` (the #139 default; zstd opt-in behind a feature) | `lz4` (default) or `none` | Per the #139 decision, lz4_flex (cheap, pure Rust) is the default codec and zstd is opt-in only behind a feature, never on the default path. NOTE: the codec RUNTIME and the `--compression <none\|lz4>` knob shipped (#387), but the serve write path is NOT yet wired to the runtime: records are still stored raw (the offline reader prints `codec = none`), so the knob, echoed in the materialized-config line, does not change bytes on disk yet. |
+| | `--compression` | `lz4` (the #139 default; zstd opt-in behind a feature) | `lz4` (default) or `none` | Per the #139 decision, lz4_flex (cheap, pure Rust) is the default codec and zstd is opt-in only behind a feature, never on the default path. The write path is WIRED (#387 runtime, #430 wiring): a compressible payload of 64 bytes or more is stored compressed behind the `COMPRESSED` record flag (smaller or incompressible payloads store raw by design), the materialized-config `compression=` echo matches the bytes on disk, the offline reader prints the real stored codec, and the client decompresses transparently on deliver. `none` stores every record raw, byte-for-byte the historical layout. |
 | **Intermittent power** | `--durability-level` | `sync` | `sync` (default) | Every acknowledged durable write is `fdatasync`'d before the ack under the DEFAULT `sync` level, so a power loss never loses an acknowledged write. The relaxed levels (`interval` / `async` / `none`, #341 / #379) are strictly OPT-IN: `async` / `none` refuse to boot without the explicit `--async-loss-ack` acknowledgement, and any relaxed level logs a loud I2-waived startup WARN, so you cannot accidentally weaken durability from the command line. Keep `sync` on a device that can brown out. |
 | | `--disk-full-policy` | `drop-new` | `drop-new` (default) | On a device that may brown out mid-write, drop-new avoids the extra reaping writes of `drop-oldest`; the older accepted (and already-`fdatasync`'d) data is preserved. |
 | | graceful shutdown (always on, #195) | n/a | n/a | SIGINT / SIGTERM / SIGHUP stops accepting, flushes every work-group's committed cursor, and exits 0, so a clean shutdown does not redelivery-replay acked work. Un-acked in-flight messages still correctly redeliver (at-least-once). |
@@ -140,6 +140,12 @@ freezes the log read-only and alerts. See README and
   validate-whole-then-swap `--config` re-read engine ships (#382) but runs only
   as a startup self-check; no runtime trigger is wired yet (SIGHUP is graceful
   stop), see #431.
-- **#12 write-path wiring**: the compression codec runtime and the
-  `--compression` knob shipped (#387), but the serve write path does not yet
-  invoke the runtime, so stored records remain raw (`codec = none` on disk).
+- **#12 write-path wiring**: DONE (#387 runtime, #430 wiring). `serve
+  --compression lz4` (the default) compresses each compressible payload of 64
+  bytes or more on the produce path; `dump` shows the real stored codec and
+  the client decompresses transparently on deliver. A workload of
+  already-compressed or encrypted payloads pays the per-record compression
+  attempt as pure waste (the never-expand guard stores them raw anyway), so
+  `--compression none` is the right call for it; note the attempt runs on the
+  single-writer produce path, before the fsync, so its CPU cost adds directly
+  to produce latency.

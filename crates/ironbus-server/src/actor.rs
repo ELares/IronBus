@@ -894,6 +894,9 @@ mod tests {
             fire_and_forget_refill_ms: 0,
             egress_limit: 0,
             wal_fsync_headroom_bytes: 0,
+            // Compression OFF (#430): the actor tests pin the historical byte-identical image;
+            // the engine compression tests cover the lz4 path.
+            compression: ironbus_core::compress::Codec::None,
         }
     }
 

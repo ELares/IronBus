@@ -147,7 +147,7 @@ codec defaults the rest of #20 fixes.
 | Disk-full policy | `--disk-full-policy` | `drop-new` | brownout-friendly shed; avoids drop-oldest force-reap writes |
 | Checkpoint interval | `--checkpoint-interval` | `1024` | cursor checkpoint cadence far below one write per ack; bounds post-crash redelivery |
 | Durability level | `--durability-level` | `sync` (ack-after-`fdatasync`) | power-loss-safe default; the relaxed `interval`/`async`/`none` levels are opt-in only, and `async`/`none` need `--async-loss-ack` (#341, #379) |
-| Codec | `--compression` (#387) | `lz4` = lz4_flex (zstd opt-in behind a feature) | cheap on ARM, pure Rust; the serve write path is not yet wired to the codec runtime, so records are still stored raw (#12) |
+| Codec | `--compression` (#387, wired by #430) | `lz4` = lz4_flex (zstd opt-in behind a feature) | cheap on ARM, pure Rust; the write path stores compressible payloads of 64 bytes or more compressed (per-record, behind the `COMPRESSED` flag), and the client decompresses transparently (#12) |
 | Retention | `--max-retained-bytes` / `--max-age-ms` / `--max-messages` | enable at least one, device-sized | bounds on-disk footprint and the erase/rewrite volume the flash sees |
 
 ### Why it sums under the 64 MiB ceiling
@@ -381,7 +381,10 @@ document does not restate or re-derive them.
   measurable (criterion 4).** The active segment is the WAL: append-only,
   large, never recycled in v1; the append actor group-commits one `fdatasync`
   per batch; the data-dir write amplification is a measured metric with a
-  `>= 4x` edge gate. Owned by [DURABILITY.md](DURABILITY.md) and
+  `>= 4x` edge gate. The ratio is defined over STORED (post-compression #430)
+  bytes: under the default codec it can inflate for small compressible
+  payloads even as the real flash wear per user byte falls. Owned by
+  [DURABILITY.md](DURABILITY.md) and
   [EDGE_RUN_DISCIPLINE.md](EDGE_RUN_DISCIPLINE.md) (the gate), with the metric
   contract in [#118](https://github.com/ELares/IronBus/issues/118).
 - **Codec justified against ARM cost; cold-only higher zstd (criterion 7).**

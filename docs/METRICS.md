@@ -258,7 +258,7 @@ shed is a resilience event that is never silent). Every name below is pinned by 
 rename or type change fails CI until this doc and the contract are bumped together.
 
 ```
-ironbus_logical_bytes_written          counter, bytes   user payload appended this run (key + headers + payload, no framing); the write-amplification denominator
+ironbus_logical_bytes_written          counter, bytes   STORED payload bytes appended this run (key + headers + payload as stored, post-compression under a non-`none` codec; no framing); the write-amplification denominator
 ironbus_physical_bytes_written         counter, bytes   bytes actually written to segments this run (record frames + segment headers/footers); the real flash-wear write volume and the write-amplification numerator
 ironbus_write_amp_ratio                gauge, ratio     physical / logical, rendered with 3 decimals (0.000 until the first byte is produced)
 ironbus_ram_headroom_bytes             gauge, bytes     ram_ceiling_bytes minus the process RSS, or -1 when no ceiling is set or RSS is unavailable on this platform
@@ -271,8 +271,13 @@ ironbus_daily_write_budget_sheds_total counter          produces shed because th
 
 **Write amplification.** `ironbus_physical_bytes_written / ironbus_logical_bytes_written`
 is the per-run flash write amplification: how many bytes of flash an SSD/eMMC wear
-model is charged for each byte of user payload, counting record framing (header +
-trailer + length fields) plus segment headers and footers. Both counters are
+model is charged for each byte of stored payload, counting record framing (header +
+trailer + length fields) plus segment headers and footers. Since the #430 write-path
+compression wiring the denominator meters STORED (post-compression) payload bytes,
+not the producer-facing logical bytes (`ironbus_produced_bytes_total` keeps that
+producer-logical meaning): under the default `lz4` codec a compressible payload
+shrinks the denominator, so the RATIO can inflate for small compressible payloads
+even as the real flash wear per user byte falls. Both counters are
 process-lifetime monotonic (a retention reap frees disk but does not un-write the
 bytes a wear counter already charged), and reset to zero on each broker open (a run
 starts a fresh amplification window). The derived `ironbus_write_amp_ratio` gauge is

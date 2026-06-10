@@ -391,6 +391,13 @@ fn send_loop(
     run_start: Nanos,
     config: &RunConfig,
 ) -> Result<SendOutcome, RunError> {
+    // An all-zeros payload (only the 16-byte token at the front varies). Since #430 wired the
+    // write path, the spawned `serve` (no `--compression` override, see `broker.rs`) compresses
+    // with the DEFAULT `lz4` codec, and all-zeros is the BEST-CASE compressible workload: the
+    // throughput and write-amplification numbers this harness reports are therefore NOT
+    // representative for incompressible (already-compressed or encrypted) payloads. Deliberately
+    // unchanged, for run-to-run comparability; measure an incompressible workload with
+    // `--compression none` or a realistic corpus instead.
     let mut payload = vec![0u8; payload_bytes];
     let mut rng = StdRng::seed_from_u64(config.seed);
     // The exponential's lambda is the rate (per second); its mean interval is 1/rate seconds.

@@ -931,6 +931,12 @@ fn golden_path_drop_oldest_truncates_a_stuck_consumer() {
             "4096",
             "--max-total-bytes",
             "7000",
+            // Compression OFF: this test's roll/reap sizing arithmetic (above) is defined over
+            // the RAW payload bytes on disk. The now-wired default `lz4` (#430) would shrink the
+            // repeated-"a" payload far below the segment/total caps so no reap would ever
+            // trigger; the force-reap behavior under test is codec-independent.
+            "--compression",
+            "none",
         ],
     );
 

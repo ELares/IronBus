@@ -528,9 +528,10 @@ config warning: backpressure.disk_full_policy = "drop-oldest" has no effect:
 `compression.dictionary_id` is meaningful only when a codec is selected; a
 non-zero dictionary id with `codec = "none"` is a misconfiguration. The codec
 RUNTIME and the `serve --compression <none|lz4>` flag shipped (#387, default
-`lz4`), but the serve write path is not yet wired to the runtime (records are
-still stored raw, so the stored codec reads `none` today), and the
-`[compression]` FILE keys remain SPECIFIED-NOT-YET-A-FIELD (the section is
+`lz4`) and the serve write path is WIRED to the runtime (#430): records with a
+compressible payload of 64 bytes or more are stored compressed behind the
+`COMPRESSED` record flag, exactly what the materialized-config line echoes.
+The `[compression]` FILE keys remain SPECIFIED-NOT-YET-A-FIELD (the section is
 reserved and tolerated), owned by #12; the validator is named here for
 completeness of the coupled-set surface #14 requires.
 

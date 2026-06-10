@@ -55,6 +55,9 @@ fn config() -> EngineConfig {
         fire_and_forget_refill_ms: 0,
         egress_limit: 0,
         wal_fsync_headroom_bytes: 0,
+        // Compression OFF (#430): the determinism image is unchanged by the new compression
+        // field; the lz4 determinism case builds its config explicitly.
+        compression: ironbus_core::compress::Codec::None,
     }
 }
 
@@ -63,8 +66,15 @@ fn config() -> EngineConfig {
 /// `cursor.ckpt` (exactly as the server session loop does). Returns the full disk image
 /// (segments AND a non-empty `cursor.ckpt`) as a sorted list of (file name, bytes).
 fn run_workload() -> Vec<(String, Vec<u8>)> {
-    let mut engine = Engine::open(InMemoryFs::new(), ManualClock::new(), config()).unwrap();
-    for payload in [&b"a"[..], b"b", b"c"] {
+    run_workload_with(config(), &[&b"a"[..], b"b", b"c"])
+}
+
+/// [`run_workload`], parameterized over the engine config and the produced payloads, so the lz4
+/// determinism case (#430) drives the same lifecycle with write-path compression on and payloads
+/// large enough (>= the 64-byte raw-store threshold) that the codec genuinely runs.
+fn run_workload_with(config: EngineConfig, payloads: &[&[u8]]) -> Vec<(String, Vec<u8>)> {
+    let mut engine = Engine::open(InMemoryFs::new(), ManualClock::new(), config).unwrap();
+    for payload in payloads {
         engine
             .produce(&Append {
                 timestamp_ms: 0,
@@ -75,7 +85,7 @@ fn run_workload() -> Vec<(String, Vec<u8>)> {
             })
             .unwrap();
     }
-    for _ in 0..3 {
+    for _ in 0..payloads.len() {
         match engine.poll(0).unwrap() {
             Poll::Message(d) => {
                 engine.ack(&d.token);
@@ -123,5 +133,40 @@ fn the_same_engine_lifecycle_produces_a_byte_identical_disk_image() {
         first, second,
         "the engine lifecycle is not deterministic: ambient time or randomness leaked into the \
          disk image (segments or the cursor checkpoint)"
+    );
+}
+
+#[test]
+fn the_lz4_lifecycle_produces_a_byte_identical_disk_image() {
+    // The same determinism property with write-path compression ON (#430): lz4 (`lz4_flex` block
+    // compression) is a pure function of its input, so two identical runs under the manual clock
+    // still produce byte-identical images. The payloads are repeated text well over the 64-byte
+    // raw-store threshold, so the codec genuinely runs (the COMPRESSED flag is set on disk); a
+    // run-vs-run comparison deliberately avoids freezing the compressed bytes themselves, which
+    // would couple the format gate to the `lz4_flex` version.
+    let lz4_config = || EngineConfig {
+        compression: ironbus_core::compress::Codec::Lz4,
+        ..config()
+    };
+    let big_a = b"alpha ".repeat(64);
+    let big_b = b"beta ".repeat(64);
+    let big_c = b"gamma ".repeat(64);
+    let payloads: [&[u8]; 3] = [&big_a, &big_b, &big_c];
+    let first = run_workload_with(lz4_config(), &payloads);
+    let second = run_workload_with(lz4_config(), &payloads);
+    assert_eq!(
+        first, second,
+        "the lz4 write path is not deterministic: run-vs-run images differ"
+    );
+    // Non-vacuity: the compressed image is genuinely smaller than the raw-store image of the
+    // same workload, so this test really exercised the codec, not three raw stores.
+    let none_image = run_workload_with(config(), &payloads);
+    let total =
+        |image: &[(String, Vec<u8>)]| -> usize { image.iter().map(|(_, bytes)| bytes.len()).sum() };
+    assert!(
+        total(&first) < total(&none_image),
+        "the lz4 image ({}) undercuts the raw image ({}), proving compression ran",
+        total(&first),
+        total(&none_image)
     );
 }

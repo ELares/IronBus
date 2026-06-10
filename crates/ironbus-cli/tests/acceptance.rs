@@ -1146,6 +1146,12 @@ fn golden_path_acceptance_install_to_recovery_to_upgrade() {
                 "4096",
                 "--max-total-bytes",
                 "7000",
+                // Compression OFF: this step's roll/reap sizing arithmetic is defined over the
+                // RAW payload bytes on disk. The now-wired default `lz4` (#430) would shrink the
+                // repeated-"a" payload far below the segment/total caps so no force-reap would
+                // ever trigger; the truncation behavior under test is codec-independent.
+                "--compression",
+                "none",
             ],
         );
         // The `stuck` group consumes and acks offset 0, then stays put.
