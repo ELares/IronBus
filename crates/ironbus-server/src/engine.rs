@@ -11414,13 +11414,26 @@ mod tests {
             compress_payload, decompress_payload, CompressConfig, NoDictionaries,
             DEFAULT_MAX_DECOMPRESSED_BYTES,
         };
-        // A producer-compressed stored object, exactly what the DLQ redrive re-appends and what
-        // a producer may legally deliver with bit 0 set (PUB_WIRE_ONLY_FLAGS masks only bits 6
-        // and 7). The seam MUST pass it through untouched: re-compressing would wrap the
-        // descriptor in a descriptor and decode to garbage.
-        let original = compressible(4096);
+        // A producer-compressed stored object, exactly what a producer may legally deliver with
+        // bit 0 set (PUB_WIRE_ONLY_FLAGS masks only bits 6 and 7). The seam MUST pass it through
+        // untouched: re-compressing would wrap the descriptor in a descriptor and decode to
+        // garbage.
+        //
+        // The fixture must be a RECOMPRESSIBLE stored object for this test to have teeth: an lz4
+        // stream over ordinary text is itself incompressible, so on such a fixture a DELETED
+        // pass-through guard is masked by the never-expand guard (the re-compress attempt expands
+        // and stores the same bytes raw). lz4-of-1-MiB-of-zeros is a few KiB of highly repetitive
+        // match tokens that recompress to tens of bytes, so a double-wrap changes the stored
+        // bytes and the byte-identity assertion below catches it.
+        let original = vec![0u8; 1024 * 1024];
         let comp = compress_payload(&original, &CompressConfig::default()).unwrap();
         assert!(comp.compressed, "the fixture payload genuinely compresses");
+        let rewrap = compress_payload(&comp.stored, &CompressConfig::default()).unwrap();
+        assert!(
+            rewrap.compressed,
+            "the stored object must itself be recompressible, or this test cannot \
+             distinguish the pass-through guard from the never-expand guard"
+        );
 
         let mut e = open(lz4_config());
         e.produce(&Append {
