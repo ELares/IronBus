@@ -336,3 +336,199 @@ mod tempdir {
         }
     }
 }
+
+/// Like [`run_install_binary`], but with `mv` overridden (after sourcing) so that any rename whose
+/// TARGET is exactly the destination fails, simulating an ENOSPC / IO error on the FINAL swap (the
+/// #421 stranded-host case). Every other `mv` (the `.prev` retention rename) passes through to the
+/// real tool, so the function runs all the way to the final swap and fails exactly there.
+fn run_install_binary_with_failing_final_swap(
+    src: &std::path::Path,
+    dest: &std::path::Path,
+) -> i32 {
+    let script = installer_path();
+    let cmd = format!(
+        ". \"$IB_INSTALLER\"; \
+         mv() {{ for ib_last do :; done; \
+                 if [ \"$ib_last\" = \"$IB_FAIL_DEST\" ]; then return 1; fi; \
+                 command mv \"$@\"; }}; \
+         install_binary \"{}\" \"{}\"",
+        src.display(),
+        dest.display()
+    );
+    let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(cmd)
+        .env("IRONBUS_INSTALL_SH_SOURCED", "1")
+        .env("IB_INSTALLER", &script)
+        .env("IB_FAIL_DEST", dest)
+        .status()
+        .expect("failed to run /bin/sh");
+    status.code().unwrap_or(-1)
+}
+
+#[test]
+fn a_same_version_rerun_is_a_noop_that_preserves_ironbus_prev() {
+    // IDEMPOTENT RE-RUN (#422): re-running the installer with bytes IDENTICAL to the live binary
+    // (a config-management convergence run, a retry after an unrelated failure) must be a no-op
+    // SUCCESS. In particular it must NOT overwrite `ironbus.prev`: doing so would replace the
+    // only rollback copy with bytes identical to the live binary, so "rollback" would reinstall
+    // the very build it is rolling back from.
+    let dir = tempdir::TempDir::new("ib-same-version");
+    let dest = dir.path().join("ironbus");
+    let prev = dir.path().join("ironbus.prev");
+
+    // The host is at v2, with v1 retained as the rollback copy from a prior upgrade.
+    let v1 = b"ironbus v1 (the rollback copy)";
+    let v2 = b"ironbus v2 (the live binary)";
+    std::fs::write(&dest, v2).unwrap();
+    std::fs::write(&prev, v1).unwrap();
+
+    // Re-run the install with the SAME v2 bytes.
+    let src = dir.path().join("staged-v2-again");
+    std::fs::write(&src, v2).unwrap();
+    let code = run_install_binary(&src, &dest);
+    assert_eq!(
+        code, 0,
+        "a same-version re-run must exit 0 (idempotent success)"
+    );
+
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        v2,
+        "the live binary is unchanged by a same-version re-run"
+    );
+    assert_eq!(
+        std::fs::read(&prev).unwrap(),
+        v1,
+        "a same-version re-run MUST NOT clobber ironbus.prev (the only rollback copy)"
+    );
+}
+
+#[test]
+fn the_rollback_copy_survives_an_upgrade_then_a_same_version_rerun() {
+    // The #422 end-to-end sequence: upgrade v1 to v2, then re-run the v2 install. After BOTH runs
+    // `ironbus.prev` must still hold the v1 bytes, so `ironbus rollback` (and the systemd
+    // fall-back-after-N mechanism) can actually return to the prior version instead of
+    // reinstalling the live one.
+    let dir = tempdir::TempDir::new("ib-upgrade-rerun");
+    let dest = dir.path().join("ironbus");
+    let prev = dir.path().join("ironbus.prev");
+
+    let v1 = b"ironbus v1 (the prior version)";
+    let v2 = b"ironbus v2 (the upgrade)";
+    std::fs::write(&dest, v1).unwrap();
+
+    // Upgrade v1 to v2: the rollback copy is v1.
+    let src_upgrade = dir.path().join("staged-v2");
+    std::fs::write(&src_upgrade, v2).unwrap();
+    assert_eq!(
+        run_install_binary(&src_upgrade, &dest),
+        0,
+        "the upgrade must succeed"
+    );
+    assert_eq!(
+        std::fs::read(&prev).unwrap(),
+        v1,
+        "after the upgrade, .prev = v1"
+    );
+
+    // Same-version re-run of v2.
+    let src_rerun = dir.path().join("staged-v2-rerun");
+    std::fs::write(&src_rerun, v2).unwrap();
+    assert_eq!(
+        run_install_binary(&src_rerun, &dest),
+        0,
+        "the same-version re-run must exit 0"
+    );
+
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        v2,
+        "the live binary is still v2"
+    );
+    assert_eq!(
+        std::fs::read(&prev).unwrap(),
+        v1,
+        "ironbus.prev still holds the OLD version's bytes after the re-run (rollback intact)"
+    );
+}
+
+#[test]
+fn a_failed_swap_leaves_the_original_binary_at_the_destination() {
+    // FAILURE SAFETY (#421): a failed install must leave the host with the binary it already had.
+    // The old implementation moved the live binary to `.prev` BEFORE the final rename, so a
+    // failure at the final step stranded the host with NO binary at the destination. With
+    // copy-based retention the live binary is never moved, so EVERY failure point (staging,
+    // retention, the final rename) leaves the original present at the destination.
+    let old = b"ironbus v1 (the live binary)";
+
+    // Phase 1: point dest at a path whose parent directory is read-only after the original binary
+    // is staged into it, so every write into that directory fails. The install must fail without
+    // touching the original (and without fabricating a `.prev`). A root user bypasses directory
+    // permissions, so this phase is skipped under root (CI runs unprivileged).
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .is_some_and(|s| s.trim() == "0");
+    if !is_root {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir::TempDir::new("ib-failed-swap-rodir");
+        let ro_dir = dir.path().join("ro-bin");
+        std::fs::create_dir(&ro_dir).unwrap();
+        let dest = ro_dir.join("ironbus");
+        std::fs::write(&dest, old).unwrap();
+        let src = dir.path().join("staged-v2");
+        std::fs::write(&src, b"ironbus v2 (the upgrade)").unwrap();
+
+        let mut perms = std::fs::metadata(&ro_dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&ro_dir, perms).unwrap();
+
+        let code = run_install_binary(&src, &dest);
+
+        // Restore write permission FIRST so the TempDir cleanup can remove the tree even if an
+        // assertion below fails.
+        let mut perms = std::fs::metadata(&ro_dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&ro_dir, perms).unwrap();
+
+        assert_ne!(code, 0, "an install into a read-only directory must fail");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            old,
+            "the ORIGINAL binary must still be present at the destination after the failure"
+        );
+        assert!(
+            !ro_dir.join("ironbus.prev").exists(),
+            "a failed install must not fabricate an ironbus.prev"
+        );
+    }
+
+    // Phase 2: drive the function all the way to the FINAL swap and fail exactly there (the
+    // ENOSPC / IO-error case from #421), via an `mv` override that rejects only a rename onto the
+    // destination. The live binary must still be at the destination afterwards; under the old
+    // two-rename swap it had already been moved to `.prev` and the destination was left EMPTY.
+    let dir = tempdir::TempDir::new("ib-failed-swap-final");
+    let dest = dir.path().join("ironbus");
+    let prev = dir.path().join("ironbus.prev");
+    std::fs::write(&dest, old).unwrap();
+    let src = dir.path().join("staged-v2");
+    std::fs::write(&src, b"ironbus v2 (the upgrade)").unwrap();
+
+    let code = run_install_binary_with_failing_final_swap(&src, &dest);
+    assert_ne!(code, 0, "a failed final swap must report failure");
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        old,
+        "a failed FINAL swap must leave the live binary untouched at the destination (#421)"
+    );
+    // The retention ran before the failed swap and COPIED the live bytes, so `.prev` exists and
+    // holds the same known-good bytes; the host stays healthy with its rollback copy intact.
+    assert_eq!(
+        std::fs::read(&prev).unwrap(),
+        old,
+        "the rollback copy holds the live (old) bytes after a failed final swap"
+    );
+}
