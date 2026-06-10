@@ -66,7 +66,9 @@ mod config_file;
 /// that needs it, and the re-read RELOAD that validates the whole candidate, rejects a cold-key
 /// change atomically, and swaps ONLY on full success (a broken reload keeps the old config). The
 /// MUTATING wire `CONFIG SET` verbs need the #106 auth and are NOT here (no unauthenticated remote
-/// mutation surface); this is the safe SIGHUP/re-read reload path only.
+/// mutation surface); this is the safe local re-read reload path only, and it runs at most once,
+/// as a startup self-check: no signal invokes it at runtime (SIGHUP is bound to graceful stop, the
+/// #195 residual, see #431; the runtime trigger is the #380 surface, refs #88).
 mod config_reload;
 
 /// The OPT-IN `dict` subcommand group (#357, `docs/DICTIONARY_LIFECYCLE.md`): `dict train` (ZDICT
@@ -751,7 +753,11 @@ Notes:
     fully-caught-up (committed at the head, no acked-ahead set), lease-free, non-key-shared named
     group is evicted; the default group is never evicted and a group that is behind is never evicted,
     so a consumer's committed position is never lost. The durable per-group checkpoint is kept, so a
-    re-subscribe resumes where it left off. The sweep is clock-driven (run on produce and poll, no
+    re-subscribe resumes where it left off. An evicted group's durable position also keeps
+    pinning the retention protect floor until the group returns or an explicit unsub releases it
+    (#432), so eviction reclaims memory, never retention protection (drop-oldest force-reaps
+    still ignore the floor; the unsub release is in-memory only, so a restart re-pins the
+    renounced group at its durable checkpoint until it drains or unsubscribes again). The sweep is clock-driven (run on produce and poll, no
     background thread). An explicit unsub of a now-idle named group reclaims it immediately.
     --disk-full-policy (default drop-new) sets what an over-cap produce does once --max-total-bytes
     is hit: drop-new sheds it (preserving older data); drop-oldest force-reaps the oldest sealed

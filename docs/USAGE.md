@@ -145,7 +145,13 @@ protection across restarts. The checkpoint is what carries the protection: the l
 write is offset-gated by `--checkpoint-interval`, and a consumer that never committed
 anything writes no checkpoint even on a graceful stop, so after a restart it is
 unprotected until it interacts again. A consumer that first arrives after older records were reaped resumes
-at the oldest retained record with a one-time truncation notice.
+at the oldest retained record with a one-time truncation notice. An idle-evicted group
+(`--group-idle-evict-ms`) keeps its protection: its durable position pins the floor as a ghost
+until the group returns or an explicit unsub releases it (#432), so memory reclaim never
+silently weakens retention protection (the opt-in drop-oldest force-reap still ignores the
+floor, ghost or live). The unsub release is in-memory only: the durable checkpoint is never
+deleted, so a restart resumes the renounced group as a live consumer at its old position,
+re-pinning the floor until it drains or is unsubscribed again.
 
 The DEFAULT disk-full policy is drop-new: when the byte cap is hit, IronBus sheds the
 new produce, it does not delete old acknowledged records. The opt-in
@@ -270,6 +276,15 @@ message that was leased but not yet acked when the signal arrived still redelive
 the restart, which is the correct at-least-once behavior. The everyday `pub`/`sub` flow
 also resumes cleanly because each short-lived `sub` connection closes and flushes its
 cursor on disconnect.
+
+All three signals mean STOP; none of them means reload. In particular, SIGHUP is NOT a
+config re-read (#431): it performs the same graceful stop as SIGTERM (flushes the cursors,
+exits 0). To change configuration, edit the file (or env vars or flags) and restart the
+broker: the validate-whole-then-swap re-read engine ships, but it runs only as a startup
+self-check, and the runtime trigger is tracked in #380 (refs #88). Mind the supervisor
+interaction: under the packaged systemd unit's `Restart=on-failure`, a clean stop is NOT
+restarted, so a `kill -HUP` sent in the expectation of a reload leaves the broker DOWN
+until it is started again.
 
 The per-message delivery-attempt count is ALSO durable, so `MaxDeliver` is a hard
 guarantee across an unclean restart, not best-effort. Each group's in-flight
