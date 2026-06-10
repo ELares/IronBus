@@ -124,6 +124,25 @@ fn push_var(out: &mut Vec<u8>, field: &[u8]) -> Result<(), BodyError> {
 /// this bit clear, so the body is byte-for-byte the historical layout (additive, opt-in).
 pub const PUB_FLAG_HAS_DEDUP: u8 = 0b1000_0000;
 
+/// The PUB-body WIRE flag bit that marks a publish as FIRE-AND-FORGET (QoS-0, #11, #402): the
+/// producer does NOT wait for a `PubAck` and accepts loss by contract, so the broker MAY drop this
+/// produce under load (gated by the fire-and-forget token bucket, #336) WITHOUT acking, and when it
+/// does NOT shed it appends the record durably as usual but sends NO `PubAck` (the producer fired
+/// and forgot). Like [`PUB_FLAG_HAS_DEDUP`] this is a WIRE-ONLY flag on the PUB body's `flags` byte,
+/// NOT a stored record flag: the server masks it OUT before the byte becomes
+/// [`ironbus_core::types::RecordFlags`], so it never pollutes the stored record flags. It sits at
+/// bit 6 (`0b0100_0000`), well above `RecordFlags::KNOWN` (`0b111`) and distinct from the dedup bit
+/// (bit 7). The default (at-least-once) produce leaves this bit clear, so the body is byte-for-byte
+/// the historical layout and an old client always gets the unchanged `PubAck` path (additive,
+/// opt-in). Adds NO new frame tag (the `FrameType` vocabulary is unchanged); only this additive flag.
+pub const PUB_FLAG_FIRE_AND_FORGET: u8 = 0b0100_0000;
+
+/// The MASK of WIRE-ONLY PUB-body flag bits (the dedup-block bit and the fire-and-forget bit) that
+/// the server MUST clear before the `flags` byte becomes a stored [`ironbus_core::types::RecordFlags`]
+/// (#33, #11): neither is record state, so neither may pollute the stored flags or collide with a
+/// future record-flag bit. Both sit well above `RecordFlags::KNOWN` (`0b111`).
+pub const PUB_WIRE_ONLY_FLAGS: u8 = PUB_FLAG_HAS_DEDUP | PUB_FLAG_FIRE_AND_FORGET;
+
 /// The opt-in dedup metadata a producer attaches to a PUB to request effectively-once dedup
 /// (#33): a `producer_id` (the dedup identity; empty is the anonymous/session-scoped default),
 /// a monotonic `epoch` (the fencing token; a higher epoch fences an older zombie session), and
@@ -149,12 +168,15 @@ pub struct PubDedup<'a> {
 /// `headers: u16-len + bytes`, an OPT-IN dedup block (present iff the [`PUB_FLAG_HAS_DEDUP`] bit of
 /// `flags` is set: `producer_id: u16-len + bytes`, `epoch: u64`, `msg_id: u16-len + bytes`), then
 /// `payload` (the remainder of the body). With the dedup bit clear the layout is byte-for-byte
-/// the historical one (#33, additive).
+/// the historical one (#33, additive). The [`PUB_FLAG_FIRE_AND_FORGET`] bit (bit 6) is an additive
+/// boolean signal carried in the SAME `flags` byte (no extra block, so it never changes the layout);
+/// it marks a QoS-0 publish (#11, #402).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PubBody<'a> {
     /// Producer record flags (the codec/server derives storage flags such as `HAS_KEY`). The
-    /// wire-only [`PUB_FLAG_HAS_DEDUP`] bit (bit 7) signals the dedup block and is masked off by
-    /// the server before this becomes a stored record flag.
+    /// wire-only [`PUB_FLAG_HAS_DEDUP`] bit (bit 7) signals the dedup block and the
+    /// [`PUB_FLAG_FIRE_AND_FORGET`] bit (bit 6) marks a QoS-0 publish; BOTH are masked off
+    /// ([`PUB_WIRE_ONLY_FLAGS`]) by the server before this becomes a stored record flag.
     pub flags: u8,
     /// Producer timestamp, milliseconds since the Unix epoch.
     pub timestamp_ms: u64,
@@ -166,6 +188,12 @@ pub struct PubBody<'a> {
     /// (the [`PUB_FLAG_HAS_DEDUP`] bit). `None` for the default no-dedup produce, so today's
     /// behavior is unchanged.
     pub dedup: Option<PubDedup<'a>>,
+    /// Whether this publish is FIRE-AND-FORGET (QoS-0, #11, #402): `true` sets the
+    /// [`PUB_FLAG_FIRE_AND_FORGET`] wire bit, so the broker may drop the produce under load WITHOUT
+    /// acking and otherwise appends it durably but sends NO `PubAck`. `false` (the default) is the
+    /// historical at-least-once path with the unchanged `PubAck`, so an old client is byte-for-byte
+    /// unchanged. The bit is derived from THIS field by the encoder, not from `flags`.
+    pub fire_and_forget: bool,
     /// The message payload.
     pub payload: &'a [u8],
 }
@@ -173,18 +201,24 @@ pub struct PubBody<'a> {
 /// Encodes a PUB body onto the end of `out`. When `msg.dedup` is `Some`, the
 /// [`PUB_FLAG_HAS_DEDUP`] bit is forced set in the written flags byte and the dedup block is
 /// emitted after the headers; when `None`, the bit is forced clear, so the encoded body cannot
-/// claim a dedup block it does not carry (or omit one it does).
+/// claim a dedup block it does not carry (or omit one it does). The [`PUB_FLAG_FIRE_AND_FORGET`]
+/// bit is set iff `msg.fire_and_forget` (the QoS-0 marker, #11), derived from the field so it and
+/// the caller's intent can never disagree.
 ///
 /// # Errors
 /// Returns [`BodyError::FieldTooLarge`] if the key, headers, `producer_id`, or `msg_id` exceed
 /// `u16::MAX`.
 pub fn encode_pub(msg: &PubBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
-    // Derive the on-wire dedup bit from the presence of the block, not from the caller's flags, so
-    // the bit and the body can never disagree.
-    let flags = match msg.dedup {
-        Some(_) => msg.flags | PUB_FLAG_HAS_DEDUP,
-        None => msg.flags & !PUB_FLAG_HAS_DEDUP,
-    };
+    // Derive the on-wire dedup and fire-and-forget bits from the fields, not from the caller's
+    // flags, so the bits and the body/intent can never disagree. Start by clearing both wire-only
+    // bits the caller may have set, then OR in exactly what the fields say.
+    let mut flags = msg.flags & !PUB_WIRE_ONLY_FLAGS;
+    if msg.dedup.is_some() {
+        flags |= PUB_FLAG_HAS_DEDUP;
+    }
+    if msg.fire_and_forget {
+        flags |= PUB_FLAG_FIRE_AND_FORGET;
+    }
     out.push(flags);
     out.extend_from_slice(&msg.timestamp_ms.to_le_bytes());
     push_var(out, msg.key)?;
@@ -225,6 +259,9 @@ pub fn decode_pub(body: &[u8]) -> Result<PubBody<'_>, BodyError> {
     } else {
         None
     };
+    // The fire-and-forget (QoS-0) marker is a boolean read directly off the SAME flags byte (#11):
+    // it adds no block, so it never changes the layout or the payload boundary.
+    let fire_and_forget = flags & PUB_FLAG_FIRE_AND_FORGET != 0;
     let payload = r.rest();
     Ok(PubBody {
         flags,
@@ -232,6 +269,7 @@ pub fn decode_pub(body: &[u8]) -> Result<PubBody<'_>, BodyError> {
         key,
         headers,
         dedup,
+        fire_and_forget,
         payload,
     })
 }
@@ -1084,6 +1122,7 @@ mod tests {
             key: b"order-42",
             headers: b"h",
             dedup: None,
+            fire_and_forget: false,
             payload: b"the payload bytes",
         };
         let mut buf = Vec::new();
@@ -1125,6 +1164,7 @@ mod tests {
             key: b"",
             headers: b"",
             dedup: None,
+            fire_and_forget: false,
             payload: b"",
         };
         let mut buf = Vec::new();
@@ -1143,6 +1183,7 @@ mod tests {
             key: &big,
             headers: b"",
             dedup: None,
+            fire_and_forget: false,
             payload: b"",
         };
         let mut buf = Vec::new();
@@ -1159,6 +1200,7 @@ mod tests {
                 key: b"abc",
                 headers: b"de",
                 dedup: None,
+                fire_and_forget: false,
                 payload: b"xyz",
             },
             &mut buf,
@@ -1223,6 +1265,7 @@ mod tests {
             key: &big,
             headers: &big,
             dedup: None,
+            fire_and_forget: false,
             payload: b"tail",
         };
         let mut buf = Vec::new();
@@ -1243,6 +1286,7 @@ mod tests {
             key: b"k",
             headers: b"h",
             dedup: Some(dedup),
+            fire_and_forget: false,
             payload: b"p",
         };
         let mut buf = Vec::new();
@@ -1264,6 +1308,7 @@ mod tests {
             key: b"key",
             headers: b"hd",
             dedup: None,
+            fire_and_forget: false,
             payload: b"payload",
         };
         let mut buf = Vec::new();
@@ -1283,6 +1328,81 @@ mod tests {
     }
 
     #[test]
+    fn a_fire_and_forget_pub_sets_the_wire_bit_and_round_trips() {
+        // The QoS-0 marker (#11): `fire_and_forget: true` sets bit 6 in the encoded flags byte and
+        // round-trips, while the dedup bit and the layout are untouched (no extra block).
+        let msg = PubBody {
+            flags: 0b0000_0010,
+            timestamp_ms: 7,
+            key: b"k",
+            headers: b"h",
+            dedup: None,
+            fire_and_forget: true,
+            payload: b"p",
+        };
+        let mut buf = Vec::new();
+        encode_pub(&msg, &mut buf).unwrap();
+        assert_eq!(
+            buf[0] & PUB_FLAG_FIRE_AND_FORGET,
+            PUB_FLAG_FIRE_AND_FORGET,
+            "the fire-and-forget wire bit is set"
+        );
+        assert_eq!(buf[0] & PUB_FLAG_HAS_DEDUP, 0, "the dedup bit stays clear");
+        let got = decode_pub(&buf).unwrap();
+        assert!(got.fire_and_forget, "decode recovers the QoS-0 marker");
+        assert_eq!(got.dedup, None);
+        assert_eq!(got.payload, b"p");
+    }
+
+    #[test]
+    fn a_non_fire_and_forget_pub_leaves_the_bit_clear_and_is_the_historical_layout() {
+        // The DEFAULT (at-least-once) produce never sets bit 6, so the body is byte-for-byte the
+        // historical layout and an old broker reads it unchanged (backward-compat).
+        let msg = PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: b"x",
+        };
+        let mut buf = Vec::new();
+        encode_pub(&msg, &mut buf).unwrap();
+        assert_eq!(buf[0], 0, "no wire-only bit set on the default produce");
+        let got = decode_pub(&buf).unwrap();
+        assert!(!got.fire_and_forget);
+    }
+
+    #[test]
+    fn fire_and_forget_and_dedup_compose_in_the_one_flags_byte() {
+        // Both wire-only bits can be set at once: a QoS-0 produce that also opts into dedup. They
+        // occupy distinct bits (6 and 7) and both round-trip, with the dedup block present.
+        let dedup = PubDedup {
+            producer_id: b"p",
+            epoch: 3,
+            msg_id: b"m",
+        };
+        let msg = PubBody {
+            flags: 0,
+            timestamp_ms: 1,
+            key: b"",
+            headers: b"",
+            dedup: Some(dedup),
+            fire_and_forget: true,
+            payload: b"z",
+        };
+        let mut buf = Vec::new();
+        encode_pub(&msg, &mut buf).unwrap();
+        assert_eq!(buf[0] & PUB_FLAG_FIRE_AND_FORGET, PUB_FLAG_FIRE_AND_FORGET);
+        assert_eq!(buf[0] & PUB_FLAG_HAS_DEDUP, PUB_FLAG_HAS_DEDUP);
+        let got = decode_pub(&buf).unwrap();
+        assert!(got.fire_and_forget);
+        assert_eq!(got.dedup, Some(dedup));
+        assert_eq!(got.payload, b"z");
+    }
+
+    #[test]
     fn encode_clears_a_stray_dedup_bit_when_there_is_no_block() {
         // A caller that sets bit 7 in flags but provides no dedup block must NOT produce a body that
         // claims a block: the bit is derived from `dedup`, so it is force-cleared.
@@ -1292,6 +1412,7 @@ mod tests {
             key: b"",
             headers: b"",
             dedup: None,
+            fire_and_forget: false,
             payload: b"x",
         };
         let mut buf = Vec::new();
@@ -1357,10 +1478,12 @@ mod tests {
             headers in prop::collection::vec(any::<u8>(), 0..300),
             payload in prop::collection::vec(any::<u8>(), 0..1024),
         ) {
-            // A no-dedup body never sets the wire dedup bit; `encode_pub` force-clears it, so clear
-            // it here too to keep the round-trip exact (the bit is derived from `dedup`, not `flags`).
-            let flags = flags & !PUB_FLAG_HAS_DEDUP;
-            let msg = PubBody { flags, timestamp_ms, key: &key, headers: &headers, dedup: None, payload: &payload };
+            // The wire-only bits are DERIVED, not passed through `flags`: the dedup bit from
+            // `dedup` and the fire-and-forget bit from the `fire_and_forget` field. Clear BOTH in the
+            // input flags and derive `fire_and_forget` from the (cleared) input so the round-trip is
+            // exact regardless of which bits the arbitrary `flags` set (#33, #11).
+            let flags = flags & !PUB_WIRE_ONLY_FLAGS;
+            let msg = PubBody { flags, timestamp_ms, key: &key, headers: &headers, dedup: None, fire_and_forget: false, payload: &payload };
             let mut buf = Vec::new();
             encode_pub(&msg, &mut buf).unwrap();
             prop_assert_eq!(decode_pub(&buf).unwrap(), msg);
@@ -1381,7 +1504,7 @@ mod tests {
             payload in prop::collection::vec(any::<u8>(), 0..512),
         ) {
             let dedup = PubDedup { producer_id: &producer_id, epoch, msg_id: &msg_id };
-            let msg = PubBody { flags, timestamp_ms, key: &key, headers: &headers, dedup: Some(dedup), payload: &payload };
+            let msg = PubBody { flags, timestamp_ms, key: &key, headers: &headers, dedup: Some(dedup), fire_and_forget: false, payload: &payload };
             let mut buf = Vec::new();
             encode_pub(&msg, &mut buf).unwrap();
             let got = decode_pub(&buf).unwrap();

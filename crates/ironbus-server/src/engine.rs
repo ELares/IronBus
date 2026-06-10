@@ -982,6 +982,13 @@ pub struct Backpressure {
     /// The egress AIMD concurrency limiter (#69). Always within `[4, 128]`; the seam a future
     /// gradient estimator slots into.
     egress: AimdLimiter,
+    /// Whether the egress AIMD actively GOVERNS the per-consumer egress credit (#69, #402). The
+    /// limiter is always constructed (the gauge reports its limit even when off), but it only BINDS
+    /// the effective per-Flow credit and reacts to keep-up signals when an operator opted in via a
+    /// non-zero `--egress-limit`. `false` (the default `egress_limit == 0`) is INERT: the per-Flow
+    /// credit and the ack/nack signals are byte-for-byte the historical behavior, so a zero-config
+    /// broker is unchanged.
+    egress_aimd_enabled: bool,
     /// CoDel sojourn sheds: a new produce rejected because the admission sojourn stayed above TARGET
     /// for a full INTERVAL. The `ironbus_codel_shed_total` counter. Saturating.
     codel_shed: u64,
@@ -1060,6 +1067,10 @@ impl Backpressure {
                 ironbus_core::backpressure::EGRESS_LIMIT_MIN,
                 ironbus_core::backpressure::EGRESS_LIMIT_MAX,
             ),
+            // The AIMD only GOVERNS the egress credit when an operator opts in (a non-zero
+            // `--egress-limit`); a `0` leaves it inert (the gauge still reports the static 16), so the
+            // default per-consumer credit path is unchanged.
+            egress_aimd_enabled: egress_limit != 0,
             fsync_headroom: FsyncHeadroom::new(wal_fsync_headroom_bytes),
             codel_shed: 0,
             codel_backstop_shed: 0,
@@ -2763,11 +2774,58 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// `ironbus_retry_shed_total` counter. When the budget is disabled, never throttles.
     pub fn retry_budget_should_throttle(&mut self) -> bool {
         let now = self.log.now_monotonic();
-        let throttle = self.backpressure.retry_budget.should_throttle(now);
+        Self::retry_budget_throttle(&mut self.backpressure, now)
+    }
+
+    /// The retry-throttle decision over the broker-wide budget (#69, #402), as an ASSOCIATED function
+    /// taking `&mut Backpressure` (a field disjoint from `self.groups`) so the `poll` loop can consult
+    /// it WHILE holding a `&mut WorkGroup` borrow (the borrow checker allows the disjoint field). At
+    /// monotonic `now`, returns `true` to THROTTLE this retry (the budget is exhausted) and counts the
+    /// throttle in `ironbus_retry_shed_total{side="broker"}` (never silent). When the budget is
+    /// disabled (the default), never throttles. See [`ironbus_core::backpressure::RetryBudget`].
+    fn retry_budget_throttle(backpressure: &mut Backpressure, now: u64) -> bool {
+        let throttle = backpressure.retry_budget.should_throttle(now);
         if throttle {
-            self.backpressure.retry_shed = self.backpressure.retry_shed.saturating_add(1);
+            backpressure.retry_shed = backpressure.retry_shed.saturating_add(1);
         }
         throttle
+    }
+
+    /// The retry-throttle redelivery decision (#402), as an ASSOCIATED function over the disjoint
+    /// fields (`backpressure`, `delivery`, `lease_config`) plus the polled group's `leases`, so the
+    /// `poll` loops can call it while holding a `&mut WorkGroup` borrow. Returns `true` if the offset
+    /// is a REDELIVERY (an expired lease, so the next claim would be attempt >= 2) AND the broker-side
+    /// retry budget is exhausted, in which case it DEFERS the redelivery (pushes the lease deadline
+    /// out by the next attempt's backoff, floored to one visibility window) WITHOUT bumping the
+    /// attempt count or the generation: the redelivery is SPACED OUT, never dropped, so the
+    /// at-least-once message still redelivers on a later poll until `MaxDeliver` routes it to the DLQ
+    /// (no data loss). A FIRST delivery (no lease) returns `false` and is never throttled. When the
+    /// budget is disabled (the default), it returns `false` and the redelivery path is unchanged. The
+    /// throttle counts in `ironbus_retry_shed_total{side="broker"}` (a throttle is never silent).
+    fn retry_throttle_defer(
+        backpressure: &mut Backpressure,
+        delivery: &DeliveryConfig,
+        lease_config: LeaseConfig,
+        leases: &mut LeaseTable,
+        off: Offset,
+        now: u64,
+    ) -> bool {
+        let Some(prior_attempt) = leases.pending_redelivery_attempt(off, now) else {
+            // Not a redelivery candidate (no lease, or the lease is still active): never throttled.
+            return false;
+        };
+        if !Self::retry_budget_throttle(backpressure, now) {
+            return false;
+        }
+        // The deferral delay: the configured backoff for the NEXT attempt, floored to one visibility
+        // window, so the storm is spaced out by at least a real interval (a deferral always makes
+        // progress in time).
+        let next_attempt = prior_attempt.saturating_add(1);
+        let defer = delivery
+            .nack_backoff(next_attempt)
+            .max(lease_config.visibility_nanos.max(1));
+        leases.defer_redelivery(off, now, defer);
+        true
     }
 
     /// The fire-and-forget (un-credited) admission decision (#69): tries to admit one fire-and-forget
@@ -2789,23 +2847,68 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         admit
     }
 
-    /// The egress concurrency budget under the AIMD limiter (#69): the current limit on in-flight
-    /// requests to a downstream sink (within `[4, 128]`). The caller compares it against the live
-    /// in-flight count to decide whether to dispatch or shed an egress request.
+    /// The egress concurrency budget under the AIMD limiter (#69): the current limit (within
+    /// `[4, 128]`). Exposed for the `ironbus_egress_limit` gauge and the AIMD-aware per-consumer
+    /// egress credit. The gauge reports it even when the AIMD is inert (the static 16 default).
     #[must_use]
     pub fn egress_limit(&self) -> u32 {
         self.backpressure.egress.limit()
     }
 
-    /// Reports a CLEAN egress window to the AIMD limiter (#69): additive increase of the egress
-    /// concurrency limit by one (capped at 128). Called after a window with no downstream failure.
+    /// Whether the egress AIMD actively GOVERNS the per-consumer egress credit (#69, #402): `true`
+    /// only when an operator opted in via a non-zero `--egress-limit`. When `false` (the default) the
+    /// per-consumer credit path is byte-for-byte the historical behavior, so a zero-config broker is
+    /// unchanged. The session reads this to decide whether to apply the AIMD cap and feed the signals.
+    #[must_use]
+    pub fn egress_aimd_enabled(&self) -> bool {
+        self.backpressure.egress_aimd_enabled
+    }
+
+    /// The AIMD-limited per-Flow egress GRANT for a consumer whose negotiated credit ceiling is
+    /// `ceiling` (#69, #402): `min(ceiling, current AIMD limit)`, so the AIMD adjusts the effective
+    /// credit WITHIN the negotiated #292 cap and NEVER exceeds it. When the AIMD is inert (the
+    /// default), it returns `ceiling` unchanged, so the per-consumer credit is exactly the negotiated
+    /// value. The session uses this as one of the `min` terms bounding a Flow batch.
+    #[must_use]
+    pub fn egress_grant_within(&self, ceiling: u32) -> u32 {
+        if self.backpressure.egress_aimd_enabled {
+            ceiling.min(self.backpressure.egress.limit())
+        } else {
+            ceiling
+        }
+    }
+
+    /// KEEP-UP signal to the egress AIMD (#69, #402): the consumer kept up (it ACKED promptly), so
+    /// additive-increase the egress limit by one (capped at 128). A no-op when the AIMD is inert, so
+    /// an unconfigured broker never moves the limit off its static default. Called on a clean ack.
+    pub fn egress_keep_up(&mut self) {
+        if self.backpressure.egress_aimd_enabled {
+            self.backpressure.egress.on_success();
+        }
+    }
+
+    /// FALLING-BEHIND signal to the egress AIMD (#69, #402): the consumer fell behind (a would-block
+    /// at the egress grant with a near-full in-flight set, slow acks, or a nack), so
+    /// multiplicative-decrease the egress limit (halve, floored at 4) and count the throttled grant in
+    /// `ironbus_egress_shed_total` (never silent). A no-op when the AIMD is inert. The asymmetry
+    /// (halve fast, climb slowly) throttles a slow consumer smoothly instead of oscillating.
+    pub fn egress_falling_behind(&mut self) {
+        if self.backpressure.egress_aimd_enabled {
+            self.backpressure.egress.on_failure();
+            self.backpressure.egress_shed = self.backpressure.egress_shed.saturating_add(1);
+        }
+    }
+
+    /// Reports a CLEAN egress window to the AIMD limiter (#69): additive increase by one (capped at
+    /// 128), UNGATED (it always moves the limit). Retained as the raw limiter knob for tests and a
+    /// future downstream-sink call site; the session uses the AIMD-enabled-gated [`Engine::egress_keep_up`].
     pub fn egress_on_success(&mut self) {
         self.backpressure.egress.on_success();
     }
 
     /// Reports a FAILED egress signal to the AIMD limiter (#69): multiplicative decrease (halve,
-    /// floored at 4) on a downstream timeout / 429 / 503. Called when the downstream degrades, so the
-    /// limit backs off fast while a recovery probes slowly.
+    /// floored at 4), UNGATED. The raw limiter knob; the session uses the gated
+    /// [`Engine::egress_falling_behind`].
     pub fn egress_on_failure(&mut self) {
         self.backpressure.egress.on_failure();
     }
@@ -3338,6 +3441,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     ///
     /// # Errors
     /// As [`Engine::poll`].
+    // The poll loop is one cohesive scan (truncation, compaction-hole, retry-throttle, claim,
+    // disposition, dead-letter capture); splitting it would scatter the single in-flight-window walk
+    // across helpers and obscure the order the cases must be checked in. Mirrors `poll_in_member`.
+    #[allow(clippy::too_many_lines)]
     pub fn poll_in(&mut self, group: &str, now: u64) -> Result<Poll, EngineError> {
         // Mark the group being polled active FIRST (if it is already live), so the sweep below never
         // evicts the very group this poll is about to drain (#277): a poll IS activity, so refreshing
@@ -3427,6 +3534,20 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         while offset < window_end {
             let off = Offset::new(offset);
             if g.cursor.is_acked(off) {
+                offset += 1;
+                continue;
+            }
+            // RETRY-THROTTLE enforcement (#402): a REDELIVERY under an exhausted budget is DEFERRED
+            // (spaced out), never dropped. See [`Engine::retry_throttle_defer`]. A `true` means it was
+            // deferred this poll, so skip it (it redelivers later, at-least-once intact).
+            if Self::retry_throttle_defer(
+                &mut self.backpressure,
+                &self.delivery,
+                self.lease_config,
+                &mut g.leases,
+                off,
+                now,
+            ) {
                 offset += 1;
                 continue;
             }
@@ -4017,6 +4138,20 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     continue;
                 }
                 RouteDecision::Deliver => {}
+            }
+            // RETRY-THROTTLE enforcement (#402), key_shared path: a REDELIVERY routed to this member
+            // under an exhausted budget is DEFERRED (spaced out), never dropped. See
+            // [`Engine::retry_throttle_defer`]. A `true` skips it on this poll (it redelivers later).
+            if Self::retry_throttle_defer(
+                &mut self.backpressure,
+                &self.delivery,
+                self.lease_config,
+                &mut g.leases,
+                off,
+                now,
+            ) {
+                offset += 1;
+                continue;
             }
             // Routed to this member and the key is free: commit the claim now.
             match g.leases.claim(off, now) {
@@ -10283,5 +10418,203 @@ mod tests {
             );
         }
         assert_eq!(e.backpressure_snapshot().fire_and_forget_shed, 0);
+    }
+
+    // ---- Retry-throttle ENFORCEMENT in the redelivery path (#402): DEFERS, never drops ----
+
+    #[test]
+    fn the_retry_throttle_defers_a_redelivery_but_never_drops_it_and_it_reaches_the_dlq() {
+        // THE TEETH for the retry-throttle enforcement (#402): with the budget EXHAUSTED, a
+        // redelivery is DEFERRED (spaced out) rather than delivered, but the at-least-once message is
+        // NEVER dropped: once the budget window rolls it redelivers, and after MaxDeliver attempts it
+        // reaches the DLQ. We drive a shared ManualClock so the budget window and the lease deadlines
+        // are exact and deterministic.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        // max_deliver = 3 (the 4th attempt is poison); a tiny 1 ms budget window so we can roll it; a
+        // ratio of 1 ppm (~0% budget) so a single shed-storm throttles the very next redelivery.
+        let mut cfg = config(64, 3);
+        cfg.retry_budget_ratio_per_million = 1;
+        cfg.retry_budget_window_ms = 1; // 1 ms window (1_000_000 ns)
+        let mut e = open_with_clock(cfg, std::sync::Arc::clone(&clock));
+
+        // Produce one at-least-once message and deliver it once (attempt 1).
+        let off = e
+            .produce(&Append {
+                timestamp_ms: 1,
+                flags: RecordFlags::EMPTY,
+                key: b"k",
+                headers: b"h",
+                payload: b"v",
+            })
+            .unwrap();
+        let d1 = message(e.poll_now().unwrap());
+        assert_eq!(d1.offset, off);
+        assert_eq!(d1.deliveries, 1, "first delivery");
+
+        // Exhaust the budget: a storm of broker sheds makes accepts collapse, so the next retry is
+        // throttled (numerator > 0, budget rounds to 0 at 1 ppm).
+        for _ in 0..1000 {
+            e.retry_budget_record_shed();
+        }
+        // Expire the lease so the next poll WOULD redeliver (attempt 2).
+        clock.advance_monotonic_nanos(40);
+        let shed_before = e.backpressure_snapshot().retry_shed;
+        // The redelivery is THROTTLED: the poll defers it and returns Idle (the message is NOT
+        // delivered now), but it is NOT lost (still in flight, attempt count untouched).
+        assert!(
+            matches!(e.poll_now().unwrap(), Poll::Idle),
+            "an exhausted budget DEFERS the redelivery (no delivery this poll)"
+        );
+        assert_eq!(
+            e.backpressure_snapshot().retry_shed,
+            shed_before + 1,
+            "the deferred redelivery is counted as a throttle (never silent)"
+        );
+        assert_eq!(
+            e.counters().dead_lettered,
+            0,
+            "NOT dropped, NOT dead-lettered"
+        );
+        assert_eq!(
+            e.committed_offset(),
+            Offset::ZERO,
+            "still uncommitted, still in flight"
+        );
+
+        // Roll the budget window (advance past 1 ms) so the storm decays and retries are permitted
+        // again, and advance past the deferral so the lease is reclaimable. The message redelivers.
+        clock.advance_monotonic_nanos(5_000_000); // 5 ms: past the 1 ms window AND any deferral
+        let d2 = message(e.poll_now().unwrap());
+        assert_eq!(d2.offset, off);
+        assert_eq!(
+            d2.deliveries, 2,
+            "the deferral did NOT bump the attempt count: this is the genuine 2nd delivery"
+        );
+
+        // Drive the remaining genuine attempts to MaxDeliver, rolling the window each time so the
+        // throttle never blocks forward progress, until the message is dead-lettered. Every message
+        // still eventually reaches the DLQ: at-least-once + MaxDeliver intact, no data loss.
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            assert!(
+                guard < 50,
+                "the message must reach the DLQ in bounded polls"
+            );
+            clock.advance_monotonic_nanos(5_000_000); // roll the window + expire the lease
+            match e.poll_now().unwrap() {
+                Poll::Message(d) => {
+                    assert_eq!(d.offset, off, "still the same message redelivering");
+                }
+                Poll::Parked { offset, .. } => {
+                    assert_eq!(offset, off, "the poison parked is our message");
+                    break;
+                }
+                Poll::Idle => { /* a transient throttle: roll again and retry */ }
+                other => panic!("unexpected poll outcome {other:?}"),
+            }
+        }
+        assert_eq!(
+            e.counters().dead_lettered,
+            1,
+            "the message reached the DLQ at MaxDeliver: NO data loss, the throttle only deferred"
+        );
+        assert_eq!(
+            e.committed_offset(),
+            Offset::new(off.get() + 1),
+            "committed past the poison after the DLQ move"
+        );
+    }
+
+    #[test]
+    fn a_disabled_retry_budget_never_defers_a_redelivery() {
+        // The safe default: with the budget at its inert default, a redelivery is delivered
+        // immediately on the next poll (never deferred), so the redelivery path is unchanged.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(64, 5), std::sync::Arc::clone(&clock));
+        let off = e.produce(&append_at(b"v")).unwrap();
+        let d1 = message(e.poll_now().unwrap());
+        assert_eq!(d1.deliveries, 1);
+        // Even after a storm of sheds, a DISABLED budget never throttles, so the redelivery is prompt.
+        for _ in 0..1000 {
+            e.retry_budget_record_shed();
+        }
+        clock.advance_monotonic_nanos(40);
+        let d2 = message(e.poll_now().unwrap());
+        assert_eq!(d2.offset, off);
+        assert_eq!(d2.deliveries, 2, "a disabled budget redelivers at once");
+        assert_eq!(
+            e.backpressure_snapshot().retry_shed,
+            0,
+            "no throttles when disabled"
+        );
+    }
+
+    // ---- Egress AIMD wired to the per-consumer egress credit (#402) ----
+
+    #[test]
+    fn the_egress_aimd_is_inert_by_default_and_grants_the_full_ceiling() {
+        // The safe default: with `egress_limit == 0` the AIMD does NOT govern the per-consumer credit,
+        // so `egress_grant_within` returns the negotiated ceiling unchanged and the keep-up /
+        // falling-behind signals are no-ops (the gauge still reports the static 16).
+        let mut e = open(config(64, 5));
+        assert!(!e.egress_aimd_enabled(), "inert by default");
+        assert_eq!(e.egress_grant_within(64), 64, "the full ceiling is granted");
+        e.egress_falling_behind();
+        e.egress_falling_behind();
+        assert_eq!(
+            e.egress_limit(),
+            16,
+            "the limit does not move when the AIMD is inert"
+        );
+        assert_eq!(
+            e.backpressure_snapshot().egress_shed,
+            0,
+            "no shed counted when inert"
+        );
+        e.egress_keep_up();
+        assert_eq!(e.egress_limit(), 16, "keep-up is a no-op when inert");
+    }
+
+    #[test]
+    fn the_egress_aimd_decreases_on_falling_behind_and_recovers_on_keep_up_within_the_cap() {
+        // THE TEETH for the egress AIMD (#402): when enabled, a falling-behind signal multiplicatively
+        // decreases the effective egress credit (within the negotiated cap), and keep-up additively
+        // recovers it, NEVER exceeding the negotiated ceiling. We start at 8 so the moves are crisp.
+        let mut cfg = config(64, 5);
+        cfg.egress_limit = 8; // opt in to the AIMD, starting limit 8
+        let mut e = open(cfg);
+        assert!(e.egress_aimd_enabled());
+        // The grant is min(ceiling, AIMD limit): with a ceiling of 4 the limiter never exceeds it.
+        assert_eq!(
+            e.egress_grant_within(4),
+            4,
+            "AIMD never exceeds the negotiated cap"
+        );
+        assert_eq!(
+            e.egress_grant_within(64),
+            8,
+            "the AIMD limit binds below a big ceiling"
+        );
+        // Falling behind halves the limit and counts the throttled grant.
+        e.egress_falling_behind();
+        assert_eq!(e.egress_limit(), 4, "halved on falling behind");
+        assert_eq!(
+            e.backpressure_snapshot().egress_shed,
+            1,
+            "the throttled grant is counted"
+        );
+        e.egress_falling_behind();
+        assert_eq!(e.egress_limit(), 4, "floored at 4, never collapses to zero");
+        // Keep-up climbs additively, but the grant stays within the negotiated ceiling.
+        for _ in 0..200 {
+            e.egress_keep_up();
+        }
+        assert_eq!(e.egress_limit(), 128, "additive recovery, capped at 128");
+        assert_eq!(
+            e.egress_grant_within(64),
+            64,
+            "even a recovered AIMD never grants beyond the negotiated ceiling"
+        );
     }
 }

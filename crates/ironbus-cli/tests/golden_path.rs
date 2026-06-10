@@ -1157,6 +1157,7 @@ fn graceful_shutdown_on_sigterm_checkpoints_the_cursor_and_does_not_redeliver() 
                 key: b"",
                 headers: b"",
                 dedup: None,
+                fire_and_forget: false,
                 payload,
             })
             .expect("produce");
@@ -1212,6 +1213,7 @@ fn graceful_shutdown_on_sigterm_checkpoints_the_cursor_and_does_not_redeliver() 
             key: b"",
             headers: b"",
             dedup: None,
+            fire_and_forget: false,
             payload: b"m3",
         })
         .expect("produce after restart");

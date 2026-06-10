@@ -237,6 +237,7 @@ pub fn probe_op_latency_us(addr: &str) -> Option<f64> {
                 key: b"",
                 headers: b"",
                 dedup: None,
+                fire_and_forget: false,
                 payload: &payload,
             })
             .is_ok();

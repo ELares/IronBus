@@ -28,7 +28,7 @@ use ironbus_proto::message::{
     decode_ack, decode_connect, decode_cumulative_ack, decode_pub, decode_sub, encode_dead_letter,
     encode_deliver, encode_gap_marker, encode_info, encode_pub_ack, encode_truncated, gap_reason,
     AckOp, CreditAdvert, DeadLetterBody, DeliverBody, GapMarkerBody, InfoBody, PubAckBody,
-    TruncatedBody, DEAD_LETTER_MAX_DELIVER, PUB_FLAG_HAS_DEDUP,
+    TruncatedBody, DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
 };
 use ironbus_storage::fs::Filesystem;
 use std::collections::HashMap;
@@ -453,6 +453,12 @@ impl Session {
             reply_err(out, "malformed pub body");
             return Ok(());
         };
+        // The QoS-0 no-frame contract (#11): a fire-and-forget producer NEVER reads a reply, so the
+        // session must send NO frame for a flagged produce on ANY disposition (append, drop, shed,
+        // capacity, fence, failure), or the one unexpected frame would permanently desync the
+        // client's reply stream (its next produce would consume the stale frame). Captured here and
+        // consulted on every reply site below.
+        let fire_and_forget = msg.fire_and_forget;
         // Enforce the dedup id length caps (#33) at the wire boundary, BEFORE the bytes cross into
         // owned storage. The `producer_id` keys the per-producer window map and the `msg_id` keys the
         // per-window ring; both are wire-supplied and attacker-chosen (up to the 64 KiB wire field
@@ -460,11 +466,15 @@ impl Session {
         // connection-preserving rejection (NOT a panic, NOT a frame change), like a malformed body.
         if let Some(d) = msg.dedup.as_ref() {
             if d.producer_id.len() > MAX_PRODUCER_ID_LEN {
-                reply_err(out, "producer_id too long");
+                if !fire_and_forget {
+                    reply_err(out, "producer_id too long");
+                }
                 return Ok(());
             }
             if d.msg_id.len() > MAX_MSG_ID_LEN {
-                reply_err(out, "msg_id too long");
+                if !fire_and_forget {
+                    reply_err(out, "msg_id too long");
+                }
                 return Ok(());
             }
         }
@@ -485,7 +495,10 @@ impl Session {
         });
         let append = OwnedAppend {
             timestamp_ms: msg.timestamp_ms,
-            flags: msg.flags & !PUB_FLAG_HAS_DEDUP,
+            // Mask BOTH wire-only PUB flag bits (dedup bit 7, fire-and-forget bit 6) out of the
+            // stored record flags (#33, #11): neither is record state. The fire-and-forget marker is
+            // carried in its own field below, not in the stored flags.
+            flags: msg.flags & !PUB_WIRE_ONLY_FLAGS,
             key: msg.key.to_vec(),
             headers: msg.headers.to_vec(),
             payload: msg.payload.to_vec(),
@@ -495,10 +508,23 @@ impl Session {
             // Read just before the produce crosses the channel, so the sojourn captures the queue
             // wait. CoDel-off (the default) ignores this entirely.
             enqueue_monotonic_nanos: engine.now_monotonic_nanos(),
+            // The QoS-0 fire-and-forget marker (#11, #402), from the additive PUB flag bit. When set,
+            // the broker may drop the produce under the fire-and-forget bucket WITHOUT acking, and
+            // otherwise appends it durably but sends NO PubAck (handled in the match below).
+            fire_and_forget: msg.fire_and_forget,
         };
         match engine.produce(append)? {
             ProduceOutcome::Appended(offset) => {
                 reply_pub_ack(out, FrameType::PubAck, offset);
+                Ok(())
+            }
+            // A FIRE-AND-FORGET (QoS-0, #11, #402) produce sends NO frame, in BOTH dispositions: when
+            // APPENDED durably (the producer fired and forgot; the record is durable via the covering
+            // group-commit fsync, exactly like a normal produce, the client simply did not wait for
+            // the ack) and when DROPPED by the fire-and-forget token bucket (#336) under load (the
+            // QoS-0 producer accepts loss by contract; the drop was counted in
+            // `ironbus_fire_and_forget_shed_total`). The connection stays open either way.
+            ProduceOutcome::FireAndForgetAppended(_) | ProduceOutcome::FireAndForgetDropped => {
                 Ok(())
             }
             // A BENIGN dedup hit (#33): the `msg_id` was already in the producer's window, so the
@@ -513,13 +539,19 @@ impl Session {
             // below the broker's known high-water. Reject it with a distinct, stable message; the
             // connection stays open so the producer can re-handshake with a fresh epoch.
             ProduceOutcome::Fenced => {
-                reply_err(out, "fenced: stale producer epoch");
+                if !fire_and_forget {
+                    reply_err(out, "fenced: stale producer epoch");
+                }
                 Ok(())
             }
             // A fatal error (frozen writer) would fail every future produce, so end the
             // session rather than masquerade as a transient failure.
             ProduceOutcome::Fatal(e) => {
-                reply_err(out, "fatal storage error");
+                // The session ends either way; for a fire-and-forget produce even this frame is
+                // suppressed (the client detects the close out of band, never a desync).
+                if !fire_and_forget {
+                    reply_err(out, "fatal storage error");
+                }
                 Err(SessionError::EngineFatal(e))
             }
             // The durable-log byte cap shed (drop-new): a distinct, stable message so a
@@ -527,7 +559,9 @@ impl Session {
             // stays open, so the producer can keep going (a later produce succeeds once
             // retention frees space).
             ProduceOutcome::AtCapacity => {
-                reply_err(out, "at capacity");
+                if !fire_and_forget {
+                    reply_err(out, "at capacity");
+                }
                 Ok(())
             }
             // The CoDel load-shed (#68): the broker is overloaded past the controlled-delay target,
@@ -539,7 +573,9 @@ impl Session {
             // `shed`) waits on the frozen-protocol extension (#11), per docs/BACKPRESSURE.md; until
             // then the shed rides the existing bare `Err` frame, exactly like the byte-cap shed.
             ProduceOutcome::Shed => {
-                reply_err(out, "shed under load");
+                if !fire_and_forget {
+                    reply_err(out, "shed under load");
+                }
                 Ok(())
             }
             // An fsync-HEADROOM shed (#378): the un-fsynced backlog (the loss window / RAM bound) is
@@ -550,11 +586,15 @@ impl Session {
             // stays open (a later produce succeeds once the writer catches up); no accepted record is
             // dropped, so this is reject-new-work only, like the byte-cap shed.
             ProduceOutcome::WalHeadroomShed => {
-                reply_err(out, "wal fsync headroom exhausted");
+                if !fire_and_forget {
+                    reply_err(out, "wal fsync headroom exhausted");
+                }
                 Ok(())
             }
             ProduceOutcome::Failed(_) => {
-                reply_err(out, "produce failed");
+                if !fire_and_forget {
+                    reply_err(out, "produce failed");
+                }
                 Ok(())
             }
         }
@@ -601,7 +641,14 @@ impl Session {
         match ack.op {
             AckOp::Ack => {
                 let status = match engine.with(move |e| e.ack_in(&group, &token))? {
-                    AckResult::Acked => 1u8,
+                    AckResult::Acked => {
+                        // EGRESS AIMD keep-up signal (#69, #402): a clean ack is the consumer keeping
+                        // up, so additive-increase the egress limit (a no-op when the AIMD is inert).
+                        // It feeds the SAME limiter the Flow path reads through `egress_grant_within`,
+                        // so a consumer that acks promptly slowly recovers its egress credit.
+                        engine.with(crate::engine::Engine::egress_keep_up)?;
+                        1u8
+                    }
                     AckResult::Fenced => 0u8,
                 };
                 self.leased.remove(&ack.offset);
@@ -612,6 +659,11 @@ impl Session {
                 let delay = ack.delay_ms;
                 match engine.with(move |e| e.nack_in(&group, &token, delay))? {
                     Ok(NackResult::Requeued) => {
+                        // EGRESS AIMD falling-behind signal (#69, #402): a nack means the consumer
+                        // could not process the message, so multiplicatively-decrease the egress limit
+                        // (a no-op when the AIMD is inert). Repeated nacks throttle the egress credit
+                        // smoothly, the failure half of the AIMD asymmetry.
+                        engine.with(crate::engine::Engine::egress_falling_behind)?;
                         self.leased.remove(&ack.offset);
                         reply(out, FrameType::AckStatus, &[1]);
                         Ok(())
@@ -880,7 +932,23 @@ impl Session {
         let ceiling = self.credit_ceiling(engine)?;
         let held = u32::try_from(self.leased.len()).unwrap_or(u32::MAX);
         let remaining = ceiling.saturating_sub(held);
-        let credits = requested.min(remaining);
+        // The negotiated per-consumer credit bound, before the egress AIMD.
+        let want = requested.min(remaining);
+        // EGRESS AIMD (#69, #402): adjust the EFFECTIVE per-consumer egress credit WITHIN the
+        // negotiated #292 ceiling. `egress_grant_within(ceiling)` is `min(ceiling, AIMD limit)`, so the
+        // limiter never exceeds the negotiated cap; when the AIMD is inert (the default) it returns the
+        // ceiling unchanged, so `credits` is exactly `want` and the path is byte-for-byte historical.
+        // A real, observable WOULD-BLOCK is when the consumer wanted MORE than the limiter grants while
+        // ALREADY holding a near-full in-flight set (it is not keeping up): that is the falling-behind
+        // signal, so the AIMD multiplicatively decreases (and counts the throttled grant). A clean
+        // keep-up (prompt acks) drives the additive increase on the ack path.
+        let aimd_grant = engine.with(move |e| e.egress_grant_within(ceiling))?;
+        let credits = want.min(aimd_grant);
+        if aimd_grant < want && held >= aimd_grant {
+            // The limiter is binding below what the consumer wants AND the consumer is already holding
+            // at least a grant's worth un-acked (slow acks / falling behind): decrease and count it.
+            engine.with(crate::engine::Engine::egress_falling_behind)?;
+        }
         // The per-consumer BYTE budget (#275): `0` means unlimited (the byte budget is off, only the
         // message credit binds). When set, a delivery is refused once this connection's in-flight
         // bytes have reached the budget, EXCEPT the floor-of-one: a connection holding nothing
@@ -1318,7 +1386,8 @@ mod tests {
     use ironbus_core::lease::LeaseConfig;
     use ironbus_core::types::RecordFlags;
     use ironbus_proto::message::{
-        decode_deliver, encode_ack, encode_pub, AckBody, PubBody, PubDedup,
+        decode_deliver, decode_pub_ack, encode_ack, encode_pub, AckBody, PubBody, PubDedup,
+        PUB_FLAG_FIRE_AND_FORGET,
     };
     use ironbus_storage::fs::InMemoryFs;
     use ironbus_storage::log::{Append, LogConfig};
@@ -2831,6 +2900,7 @@ mod tests {
                 key: b"",
                 headers: b"",
                 dedup: None,
+                fire_and_forget: false,
                 payload: b"p",
             },
             &mut pub_body,
@@ -2838,6 +2908,121 @@ mod tests {
         .unwrap();
         s.process(e, &frame(FrameType::Pub, &pub_body), out)
             .unwrap();
+    }
+
+    /// Sends a FIRE-AND-FORGET pub (the QoS-0 flag set) against any mock engine and returns the
+    /// raw reply bytes, for the per-disposition no-frame contract tests (#11).
+    fn connect_and_pub_faf<
+        C: Clock + Clone + 'static,
+        E: crate::actor::EngineAccess<InMemoryFs, C>,
+    >(
+        s: &mut Session,
+        e: &E,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        s.process(e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: true,
+                payload: b"qos0",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        s.process(e, &frame(FrameType::Pub, &pub_body), &mut out)
+            .unwrap();
+        out
+    }
+
+    /// A mock whose produce path always reports the durable-log byte cap (drop-new) shed.
+    struct AtCapacityEngine;
+    impl crate::actor::EngineAccess<InMemoryFs, ManualClock> for AtCapacityEngine {
+        fn produce(
+            &self,
+            _append: crate::actor::OwnedAppend,
+        ) -> Result<ProduceOutcome, crate::actor::ActorGone> {
+            Ok(ProduceOutcome::AtCapacity)
+        }
+        fn with<R, J>(&self, _job: J) -> Result<R, crate::actor::ActorGone>
+        where
+            R: Send + 'static,
+            J: FnOnce(&mut Engine<InMemoryFs, ManualClock>) -> R + Send + 'static,
+        {
+            Err(crate::actor::ActorGone)
+        }
+        fn now_monotonic_nanos(&self) -> u64 {
+            0
+        }
+        fn consumer_credit_caps(&self) -> (u32, u64) {
+            (64, 0)
+        }
+    }
+
+    /// A mock whose produce path always fences (a stale producer epoch, #33).
+    struct FencedEngine;
+    impl crate::actor::EngineAccess<InMemoryFs, ManualClock> for FencedEngine {
+        fn produce(
+            &self,
+            _append: crate::actor::OwnedAppend,
+        ) -> Result<ProduceOutcome, crate::actor::ActorGone> {
+            Ok(ProduceOutcome::Fenced)
+        }
+        fn with<R, J>(&self, _job: J) -> Result<R, crate::actor::ActorGone>
+        where
+            R: Send + 'static,
+            J: FnOnce(&mut Engine<InMemoryFs, ManualClock>) -> R + Send + 'static,
+        {
+            Err(crate::actor::ActorGone)
+        }
+        fn now_monotonic_nanos(&self) -> u64 {
+            0
+        }
+        fn consumer_credit_caps(&self) -> (u32, u64) {
+            (64, 0)
+        }
+    }
+
+    #[test]
+    fn a_fire_and_forget_pub_sends_no_frame_on_every_non_appended_disposition() {
+        // THE QoS-0 NO-FRAME CONTRACT (#11, the review blocker): a fire-and-forget producer never
+        // reads a reply, so ANY frame on ANY disposition (a CoDel shed, the byte-cap shed, the
+        // fsync-headroom shed, a dedup fence) would permanently desync its reply stream. Each mock
+        // forces one disposition; all must produce ZERO reply bytes while the session stays open.
+        let mut s = Session::new();
+        let out = connect_and_pub_faf(&mut s, &ShedEngine);
+        assert!(
+            out.is_empty(),
+            "CoDel shed sent a frame to a QoS-0 pub: {out:?}"
+        );
+
+        let mut s = Session::new();
+        let out = connect_and_pub_faf(&mut s, &HeadroomShedEngine);
+        assert!(
+            out.is_empty(),
+            "headroom shed sent a frame to a QoS-0 pub: {out:?}"
+        );
+
+        let mut s = Session::new();
+        let out = connect_and_pub_faf(&mut s, &AtCapacityEngine);
+        assert!(
+            out.is_empty(),
+            "at-capacity sent a frame to a QoS-0 pub: {out:?}"
+        );
+
+        let mut s = Session::new();
+        let out = connect_and_pub_faf(&mut s, &FencedEngine);
+        assert!(
+            out.is_empty(),
+            "a fence sent a frame to a QoS-0 pub: {out:?}"
+        );
     }
 
     #[test]
@@ -3010,6 +3195,7 @@ mod tests {
                 key: b"",
                 headers: b"",
                 dedup: None,
+                fire_and_forget: false,
                 payload: b"round-trip",
             },
             &mut pub_body,
@@ -3055,6 +3241,7 @@ mod tests {
                     epoch,
                     msg_id,
                 }),
+                fire_and_forget: false,
                 payload,
             },
             &mut body,
@@ -3139,6 +3326,7 @@ mod tests {
                     key: b"",
                     headers: b"",
                     dedup: None,
+                    fire_and_forget: false,
                     payload: b"same",
                 },
                 &mut body,
@@ -3302,6 +3490,7 @@ mod tests {
                 key: b"k",
                 headers: b"",
                 dedup: None,
+                fire_and_forget: false,
                 payload: b"hello",
             },
             &mut pub_body,
@@ -3343,6 +3532,7 @@ mod tests {
                 key: b"",
                 headers: b"",
                 dedup: None,
+                fire_and_forget: false,
                 payload,
             },
             &mut body,
@@ -3459,6 +3649,7 @@ mod tests {
                 key: b"",
                 headers: b"",
                 dedup: None,
+                fire_and_forget: false,
                 payload: b"x",
             },
             &mut pub_body,
@@ -3527,6 +3718,7 @@ mod tests {
                 key: b"",
                 headers: b"",
                 dedup: None,
+                fire_and_forget: false,
                 payload: b"trickled-payload",
             },
             &mut pub_body,
@@ -3887,6 +4079,113 @@ mod tests {
         assert!(
             batch2.is_empty(),
             "a saturated consumer gets an empty batch until it frees a slot"
+        );
+    }
+
+    /// Processes a PUB (built from `msg`) on a connected session against `e`, returning EVERY reply
+    /// frame (zero for a fire-and-forget produce). For the #11 QoS-0 wire-tier session tests.
+    fn pub_replies<C: Clock + Clone + 'static>(
+        s: &mut Session,
+        e: &DirectEngine<InMemoryFs, C>,
+        msg: &PubBody<'_>,
+    ) -> Vec<(FrameType, Vec<u8>)> {
+        let mut body = Vec::new();
+        encode_pub(msg, &mut body).unwrap();
+        let mut out = Vec::new();
+        s.process(e, &frame(FrameType::Pub, &body), &mut out)
+            .expect("a non-fatal pub never ends the session");
+        decode_all(&out)
+    }
+
+    #[test]
+    fn an_old_client_without_the_qos0_flag_gets_the_unchanged_at_least_once_pub_ack() {
+        // BACKWARD-COMPAT (#11): a client that never sets the fire-and-forget flag takes the
+        // historical at-least-once path and ALWAYS gets a PubAck with the assigned offset, unchanged.
+        let e = DirectEngine::new(engine());
+        let mut s = connected_session(&e);
+        let replies = pub_replies(
+            &mut s,
+            &e,
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"v",
+            },
+        );
+        assert_eq!(replies.len(), 1, "the at-least-once path always replies");
+        assert_eq!(replies[0].0, FrameType::PubAck, "an unchanged PubAck");
+        assert_eq!(
+            decode_pub_ack(&replies[0].1).unwrap().offset,
+            0,
+            "the assigned offset"
+        );
+    }
+
+    #[test]
+    fn a_fire_and_forget_pub_gets_no_reply_but_is_durable() {
+        // THE TEETH for the QoS-0 wire tier at the session boundary (#11): a fire-and-forget PUB
+        // (the additive flag set) produces NO reply frame, yet the record is appended durably (the
+        // producer fired and forgot). The default bucket is disabled, so it is appended, not dropped.
+        let e = DirectEngine::new(engine());
+        let mut s = connected_session(&e);
+        let replies = pub_replies(
+            &mut s,
+            &e,
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: true,
+                payload: b"qos0",
+            },
+        );
+        assert!(
+            replies.is_empty(),
+            "a fire-and-forget produce sends NO frame (the client fired and forgot), got {replies:?}"
+        );
+        // The record is still durable: the connection appended it, only the ack was withheld.
+        assert_eq!(
+            e.engine_mut().flushed_offset().get(),
+            1,
+            "the QoS-0 record is durable even though no PubAck was sent"
+        );
+    }
+
+    #[test]
+    fn the_qos0_wire_flag_does_not_leak_into_the_stored_record_flags() {
+        // The fire-and-forget bit is WIRE-ONLY (#11): like the dedup bit, it is masked out before the
+        // flags byte becomes a stored RecordFlags, so a delivered/stored record never carries it.
+        let e = DirectEngine::new(engine());
+        let mut s = connected_session(&e);
+        let _ = pub_replies(
+            &mut s,
+            &e,
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: true,
+                payload: b"v",
+            },
+        );
+        // Poll the stored record and inspect its delivered flags: the wire-only fire-and-forget bit
+        // (64) must NOT be present (it never crossed into the stored record state).
+        let d = match e.engine_mut().poll_now().unwrap() {
+            Poll::Message(d) => d,
+            other => panic!("expected the QoS-0 record to be deliverable, got {other:?}"),
+        };
+        assert_eq!(
+            d.record.flags.bits() & PUB_FLAG_FIRE_AND_FORGET,
+            0,
+            "the wire-only QoS-0 bit never pollutes the stored record flags"
         );
     }
 

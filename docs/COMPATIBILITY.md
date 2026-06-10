@@ -120,13 +120,21 @@ preservation guarantee for unknown flag bits is enforced on the storage side (ne
 and the wire codec does not strip bits, so a flag a newer producer sets is not silently
 dropped at the framing layer.
 
-One exception is now DEFINED: `PubBody.flags` bit 7 (`PUB_FLAG_HAS_DEDUP`, `0b1000_0000`) is the
-#33 wire-only signal that an opt-in dedup block follows the headers. It is STRIPPED before the
-byte becomes a stored `RecordFlags` (`Session::handle_pub` masks it off), so a pre-#33 client
-that happened to set bit 7 on a no-dedup produce will have that bit CLEARED in the stored record
-(and no dedup block is parsed, since the server reads bit 7 to decide whether the block is
-present). Bit 7 sits well above `RecordFlags::KNOWN` (`0b111`), so this does not collide with any
-storage flag; it is the single producer-flag bit the wire now reserves.
+Two exceptions are now DEFINED, both WIRE-ONLY producer-flag bits that the server STRIPS
+(`PUB_WIRE_ONLY_FLAGS`) before the byte becomes a stored `RecordFlags` (`Session::handle_pub` masks
+them off), and both sitting well above `RecordFlags::KNOWN` (`0b111`) so neither collides with any
+storage flag:
+
+- `PubBody.flags` bit 7 (`PUB_FLAG_HAS_DEDUP`, `0b1000_0000`) is the #33 wire-only signal that an
+  opt-in dedup block follows the headers. A pre-#33 client that happened to set bit 7 on a no-dedup
+  produce has that bit CLEARED in the stored record (and no dedup block is parsed, since the server
+  reads bit 7 to decide whether the block is present).
+- `PubBody.flags` bit 6 (`PUB_FLAG_FIRE_AND_FORGET`, `0b0100_0000`) is the #11/#402 wire-only QoS-0
+  marker: a producer sets it to opt into the fire-and-forget tier (no `PubAck`, droppable under the
+  fire-and-forget bucket). It carries no extra block, so it never changes the body layout; the
+  default (bit clear) is the unchanged at-least-once `PubAck` path, so an old client is byte-for-byte
+  unchanged. It is an ADDITIVE flag only: the `FrameType` tag vocabulary is unchanged (the
+  `type_tags_have_their_exact_frozen_wire_values` pin still holds).
 
 ### The Connect/Info handshake bodies are an ADDITIVE, version-prefixed change (#292)
 

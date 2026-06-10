@@ -17,30 +17,47 @@ Both descend from the backpressure-and-overload parent (#10). Their parameters
 flow through the configuration system (#14) and their observability flows through
 the resilience-observability contract (#16, see [METRICS.md](METRICS.md)).
 
-> **Implemented (#336), with one wire residual.** The control LOGIC of this design
-> is now BUILT and tested: CoDel sojourn shedding on the produce-admission path, the
-> suspend-reset, the depth/byte backstop, the per-client retry budget (broker-side
-> re-check), the fire-and-forget token bucket, and the egress AIMD limiter all ship
-> in `crates/ironbus-core/src/backpressure.rs` (the pure, clock-seam-driven math)
-> wired into `crates/ironbus-server/src/engine.rs` and `actor.rs`, behind config
+> **Implemented (#336) and WIRED LIVE (#402), with one structured-wire residual.**
+> The control LOGIC of this design is built, tested, AND attached to live call sites:
+> CoDel sojourn shedding on the produce-admission path, the suspend-reset, the
+> depth/byte backstop, the per-client retry budget, the fire-and-forget token bucket,
+> and the egress AIMD limiter all ship in `crates/ironbus-core/src/backpressure.rs`
+> (the pure, clock-seam-driven math) wired into
+> `crates/ironbus-server/src/engine.rs`, `actor.rs`, and `session.rs`, behind config
 > knobs that ALL DEFAULT TO INERT (so a broker that changes nothing behaves exactly
 > as today). Each control is observable on `/metrics` (the counters and gauges in
-> [Metrics](#metrics-16), pinned in the frozen taxonomy). The baseline below (the
-> drop-new / drop-oldest overflow policy, #10/#13/#82, and the per-connection credit
-> window, #65/#275) is unchanged and composes with the new controls.
+> [Metrics](#metrics-16), pinned in the frozen taxonomy), and the counters/gauges now
+> MOVE under load. The baseline below (the drop-new / drop-oldest overflow policy,
+> #10/#13/#82, and the per-connection credit window, #65/#275) is unchanged and
+> composes with the new controls.
+>
+> What is now LIVE (#402, this PR), beyond the already-shipped CoDel produce-admission
+> shed (#336):
+> - **The retry-throttle ENFORCEMENT.** `retry_budget_should_throttle` is now consulted
+>   in the REDELIVERY path (the `poll` loops): a redelivery under an exhausted budget is
+>   DEFERRED (its lease deadline pushed out by the attempt's backoff), never dropped, so
+>   a redelivery storm is rate-limited but every at-least-once message still eventually
+>   redelivers until `MaxDeliver` routes it to the DLQ. `ironbus_retry_shed_total{side}`
+>   counts each throttled (deferred) attempt.
+> - **The fire-and-forget (QoS-0) WIRE TIER (#11).** A new ADDITIVE PUB flag
+>   (`PUB_FLAG_FIRE_AND_FORGET`, bit 6) marks a publish fire-and-forget: the client does
+>   not wait for a `PubAck`, the broker may DROP it under the fire-and-forget token
+>   bucket (#336) WITHOUT acking, and when not shed appends it durably but sends NO
+>   `PubAck`. `ironbus_fire_and_forget_shed_total` counts the drops. The FrameType
+>   vocabulary is UNCHANGED (only the additive flag); see
+>   [What this changes on the wire](#what-this-changes-on-the-wire-11).
+> - **The egress AIMD.** The AIMD limiter now adjusts the EFFECTIVE per-consumer egress
+>   credit WITHIN the negotiated #292 ceiling (it never exceeds the cap): additive
+>   increase on a prompt ack, multiplicative decrease on a would-block / slow-ack / nack.
+>   `ironbus_egress_limit` and `ironbus_egress_shed_total` now move. Off by default
+>   (`--egress-limit 0`), so a zero-config broker's credit path is unchanged.
 >
 > The ONE part still pending is the **structured wire signal**: the
 > machine-actionable `retry_after_ms` / `shed` fields on the rejection frame are
-> owned by the frozen-protocol extension (#11), which has not landed, so a CoDel /
-> retry shed today rides the existing bare `Err` frame (a distinct, self-announcing
-> "shed under load" message), NOT a structured hint. The retry budget's accounting
-> (accept/shed counts) is wired in the append actor, but its broker-side throttle
-> enforcement call site, like the egress AIMD and the fire-and-forget tier, lands with
-> the redelivery/egress wiring (tracked in #402); only the structured wire hint
-> waits on #11. See [What this changes on the wire](#what-this-changes-on-the-wire-11).
-> The egress limiter and the fire-and-forget bucket exist and are observable; their
-> call sites at a live downstream sink / a wire fire-and-forget tier land with those
-> features (the seam is in place).
+> owned by a further frozen-protocol extension (#11), which has not landed, so a CoDel /
+> retry / headroom shed today rides the existing bare `Err` frame (a distinct,
+> self-announcing message), NOT a structured hint. See
+> [What this changes on the wire](#what-this-changes-on-the-wire-11).
 
 ## Contents
 
@@ -293,8 +310,10 @@ falls, the client's own retry rate is throttled toward the budget, so the
 figure is the budget the 60 s window enforces: sustained retries above 10% of the
 request rate are throttled at the source. These are two composed mechanisms, not one derivation: the accept-based formula is the throttling vehicle (it gates each retry probabilistically as the accept rate falls), and the 10 percent over 60 s figure is the IronBus design budget that the broker also re-checks; the formula does not by itself derive the 10 percent number, it is the mechanism by which the budget is held.
 
-The budget is two-sided by design (the broker-side accounting is wired today; the
-broker-side throttle ENFORCEMENT call site lands with the redelivery wiring, #402):
+The budget is two-sided by design (the broker-side accounting AND the broker-side
+throttle ENFORCEMENT are both wired today, #402: the enforcement is in the redelivery
+path, where an exhausted budget DEFERS a redelivery, spacing the storm out without ever
+dropping an at-least-once message):
 
 - **Client-side** (in the client library, the first line of defense): the client
   throttles its own retries against its local window before a retry ever reaches the
@@ -355,9 +374,18 @@ bucket**, distinct from the durable-path credit:
 | byte rate | 5 MiB/s | tokens refilled at this byte rate |
 | refill granularity | 100 ms | the bucket refills every 100 ms (so the burst ceiling is ~500 messages / ~512 KiB) |
 
+This tier is now WIRED LIVE (#11, #402): a producer marks a publish fire-and-forget
+with the additive `PUB_FLAG_FIRE_AND_FORGET` PUB flag (bit 6) and does NOT wait for a
+`PubAck`. The broker gates the produce on this token bucket BEFORE the CoDel / append
+path; an exhausted bucket DROPS the produce without acking (the QoS-0 producer accepts
+loss by contract), and when admitted the broker appends the record durably as usual but
+sends NO `PubAck`. The client opts in via `Client::produce_fire_and_forget`; the default
+`Client::produce` is unchanged at-least-once with its `PubAck`. See
+[What this changes on the wire](#what-this-changes-on-the-wire-11).
+
 A fire-and-forget message consumes one message token and `payload_size` byte tokens;
-when either bucket is empty the message is **shed** (with the `shed` signal above,
-if the tier is one that gets a response) rather than admitted. The two critical
+when either bucket is empty the message is **shed** (dropped without an ack, counted in
+`ironbus_fire_and_forget_shed_total`) rather than admitted. The two critical
 properties:
 
 - **It caps the uncontrolled tier.** The bucket bounds the fire-and-forget rate to
@@ -400,6 +428,19 @@ overflow disposition; a shed egress is counted (see [Metrics](#metrics-16)). The
 `+1 / x0.5` law is the standard AIMD that converges to a fair, stable operating point
 and reacts fast to a degrading downstream (halving) while probing for recovery slowly
 (additive), which is exactly the asymmetry a degraded sink needs.
+
+This is now WIRED LIVE (#402): the AIMD adjusts the EFFECTIVE per-consumer egress
+credit WITHIN the negotiated per-connection ceiling (#292), which is the hard cap the
+AIMD never exceeds. The Flow fetch bounds its batch by
+`min(requested, remaining, egress_grant_within(ceiling))`, where the grant is
+`min(ceiling, AIMD limit)`. The keep-up SIGNAL is a real, observable one: a prompt ack
+(the consumer is keeping up) drives the additive increase; a would-block at the egress
+grant with a near-full in-flight set, or a nack (the consumer is falling behind), drives
+the multiplicative decrease and counts the throttled grant in
+`ironbus_egress_shed_total`. It is OFF by default (`--egress-limit 0` leaves the limiter
+inert: the gauge still reports the static 16 but the credit path is byte-for-byte
+unchanged), so a zero-config broker is unaffected; an operator opts in with a non-zero
+`--egress-limit`.
 
 ### Why backpressure cannot amplify into a retry storm
 
@@ -606,8 +647,34 @@ the headroom gauge carries no `_total` suffix and is pinned only in
 
 ## What this changes on the wire (#11)
 
-The `retry_after_ms` and `shed` fields are the **only** part of this design that
-touches the frozen wire protocol, and they are **not** in the protocol today. The
+### The fire-and-forget (QoS-0) PUB flag (LIVE, #11, #402)
+
+The QoS-0 fire-and-forget tier adds ONE thing to the wire: an **additive PUB-body flag
+bit**, `PUB_FLAG_FIRE_AND_FORGET` (`0b0100_0000`, bit 6), in the PUB body's existing
+`flags` byte. It does **not** add or change any `FrameType` tag (the frozen tag
+vocabulary is untouched), and it does **not** change the PUB body layout (it carries no
+extra block, unlike the dedup bit). It is forward- and backward-compatible:
+
+- An **old client** never sets the bit (it defaults clear), so its PUB body is
+  byte-for-byte the historical layout and it always takes the at-least-once `PubAck`
+  path, unchanged.
+- A **new client** sets the bit on a fire-and-forget publish and does not wait for a
+  reply. The broker may DROP the publish under the fire-and-forget token bucket
+  WITHOUT acking, and otherwise appends it durably but sends NO `PubAck`.
+- Like the dedup bit (bit 7), the fire-and-forget bit is **wire-only**: the broker masks
+  it out (`PUB_WIRE_ONLY_FLAGS`) before the `flags` byte becomes a stored `RecordFlags`,
+  so it never pollutes the stored record state and never collides with a future
+  record-flag bit (both sit well above `RecordFlags::KNOWN`, `0b111`).
+
+The bit is pinned in the proto round-trip tests (`a_fire_and_forget_pub_sets_the_wire_bit_and_round_trips`,
+`fire_and_forget_and_dedup_compose_in_the_one_flags_byte`), exactly like the dedup bit.
+See [CONTRACTS.md](CONTRACTS.md), [COMPATIBILITY.md](COMPATIBILITY.md), and
+[compat/versions.md](compat/versions.md).
+
+### The `retry_after_ms` / `shed` structured hint (still pending #11)
+
+The `retry_after_ms` and `shed` fields are the **only remaining** part of this design
+that touches the frozen wire protocol, and they are **not** in the protocol today. The
 frozen frame surface (see [CONTRACTS.md](CONTRACTS.md)) carries one rejection frame,
 `Err` (tag 12), a bare UTF-8 message with no structured retry hint, and the client
 nack op on the `Ack` frame already carries a `delay_ms` in the **client-to-server**

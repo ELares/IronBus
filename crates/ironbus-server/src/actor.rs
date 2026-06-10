@@ -70,6 +70,14 @@ pub struct OwnedAppend {
     /// route through the actor channel), which reads as a zero sojourn (below TARGET, never sheds), so
     /// the field is backward-compatible and CoDel-off behavior is unchanged.
     pub enqueue_monotonic_nanos: u64,
+    /// Whether the producer marked this publish FIRE-AND-FORGET (QoS-0, #11, #402): the client did
+    /// NOT wait for a `PubAck` and accepts loss by contract. When `true`, the broker gates the
+    /// produce on the fire-and-forget token bucket (#336) and DROPS it (without acking) if the bucket
+    /// is exhausted; when admitted it appends the record durably as usual but sends NO `PubAck`.
+    /// `false` (the default) is the historical at-least-once path with the unchanged `PubAck`, so an
+    /// old client is byte-for-byte unchanged. Derived from the wire `PUB_FLAG_FIRE_AND_FORGET` bit by
+    /// the session.
+    pub fire_and_forget: bool,
 }
 
 /// An owned copy of a produce's dedup identity (#33), so it can cross the actor channel (the wire
@@ -122,6 +130,18 @@ pub enum ProduceOutcome {
     /// is rejected, decided before its append), so I2 / no-data-loss hold. Reply a stable typed error,
     /// keep the session (a later produce succeeds once the writer catches up).
     WalHeadroomShed,
+    /// A FIRE-AND-FORGET (QoS-0, #11, #402) produce that was APPENDED durably but gets NO `PubAck`:
+    /// the producer fired and forgot, so the broker appends the record (covering group-commit fsync,
+    /// exactly like a normal produce) but the session sends nothing back. Carries the assigned offset
+    /// for the actor's accounting / tests; the session ignores it and replies no frame. This is NOT
+    /// an at-least-once promise (the client did not wait for it), so the no-ack is by contract.
+    FireAndForgetAppended(Offset),
+    /// A FIRE-AND-FORGET (QoS-0, #11, #402) produce DROPPED by the fire-and-forget token bucket
+    /// (#336) under load: the broker did NOT append it and sends NO frame, because the QoS-0 producer
+    /// accepts loss by contract. Counted by `ironbus_fire_and_forget_shed_total` (a shed is never
+    /// silent). It NEVER touches the at-least-once path (the bucket governs only this tier), so a
+    /// depleted bucket sheds fire-and-forget messages and NOTHING ELSE.
+    FireAndForgetDropped,
     /// A fatal storage error (a frozen writer): reply an error AND end the session.
     Fatal(EngineError),
     /// A transient produce failure: reply a generic error, keep the session.
@@ -469,6 +489,15 @@ fn produce_once<F: Filesystem, C: Clock + Clone>(
     engine: &mut Engine<F, C>,
     append: &OwnedAppend,
 ) -> ProduceOutcome {
+    // FIRE-AND-FORGET (QoS-0, #11) admission, decided FIRST and only for a fire-and-forget produce,
+    // exactly as the real actor does, so the direct path preserves the QoS-0 drop-no-ack contract.
+    // An exhausted bucket DROPS it (no append, no ack); the bucket governs only this tier.
+    if append.fire_and_forget {
+        let payload_bytes = u64::try_from(append.payload.len()).unwrap_or(u64::MAX);
+        if !engine.fire_and_forget_admit(payload_bytes) {
+            return ProduceOutcome::FireAndForgetDropped;
+        }
+    }
     // The CoDel admission shed (#68), decided before the append exactly as the real actor does, so
     // the direct path preserves the load-shed taxonomy and the no-data-loss property (it never
     // appends a record it shed). A no-op when CoDel is disabled.
@@ -500,11 +529,17 @@ fn produce_once<F: Filesystem, C: Clock + Clone>(
         payload: &append.payload,
     };
     match engine.append_no_sync_dedup(&view, dedup_request(append)) {
-        // A fresh append: the covering fsync decides durability (I2).
-        Ok(crate::engine::AppendOutcome::Appended(offset)) => match engine.commit_batch() {
-            Ok(()) => ProduceOutcome::Appended(offset),
-            Err(e) => ProduceOutcome::Fatal(e),
-        },
+        // A fresh append: the covering fsync decides durability (I2). A fire-and-forget produce is
+        // made durable identically but maps to the no-ack outcome (#11), so the direct path matches
+        // the real actor's QoS-0 contract.
+        Ok(crate::engine::AppendOutcome::Appended(offset)) => {
+            engine.retry_budget_record_accept();
+            match engine.commit_batch() {
+                Ok(()) if append.fire_and_forget => ProduceOutcome::FireAndForgetAppended(offset),
+                Ok(()) => ProduceOutcome::Appended(offset),
+                Err(e) => ProduceOutcome::Fatal(e),
+            }
+        }
         // A dedup hit: nothing appended, but still commit (a no-op fsync) so a hit on an id recorded
         // earlier in this same one-message batch is durable before the reply (I2 uniformity).
         Ok(crate::engine::AppendOutcome::Duplicate(offset)) => match engine.commit_batch() {
@@ -595,11 +630,30 @@ where
         for cmd in commands {
             match cmd {
                 Command::Produce { append, reply } => {
+                    // FIRE-AND-FORGET (QoS-0, #11, #402) admission, decided FIRST and only for a
+                    // produce the client marked fire-and-forget. The per-connection token bucket
+                    // (#336) caps this un-credited tier: an exhausted bucket DROPS the produce
+                    // (without acking and without appending), because the QoS-0 producer accepts
+                    // loss by contract. The bucket governs ONLY this tier, so it NEVER touches the
+                    // at-least-once path; a non-fire-and-forget produce skips this entirely. When
+                    // disabled (the default rate of 0), the bucket always admits, so a QoS-0 produce
+                    // under an unconfigured broker is appended-but-not-acked, never dropped.
+                    if append.fire_and_forget {
+                        let payload_bytes = u64::try_from(append.payload.len()).unwrap_or(u64::MAX);
+                        if !engine.fire_and_forget_admit(payload_bytes) {
+                            // Dropped by the bucket (counted in `ironbus_fire_and_forget_shed_total`):
+                            // the producer fired and forgot, so send NO frame and keep the session.
+                            let _ = reply.send(ProduceOutcome::FireAndForgetDropped);
+                            continue;
+                        }
+                    }
                     // CoDel controlled-delay shed (#68), decided BEFORE the append so it rejects only
                     // NEW work and never drops an already-accepted record (I2 holds). The sojourn is
                     // `now - enqueue` on the monotonic clock seam; a sustained admission delay above
                     // TARGET sheds this produce. When CoDel is disabled (the default) this is always
-                    // false, so the append path is byte-for-byte unchanged.
+                    // false, so the append path is byte-for-byte unchanged. A fire-and-forget produce
+                    // shed by CoDel also gets no ack (the session maps the Shed outcome to no frame
+                    // for a fire-and-forget pub), so the contract holds either way.
                     if engine.codel_admit(append.enqueue_monotonic_nanos) {
                         // The shed counts as a request the broker shed (the retry-budget signal), then
                         // replies a stable "shed under load" outcome; the connection stays open.
@@ -657,10 +711,15 @@ where
                             // An accepted produce feeds the broker-side retry-budget accept count
                             // (#69), so the observed retry ratio stays meaningful under load.
                             engine.retry_budget_record_accept();
-                            pending.push(PendingProduce {
-                                outcome: PendingOutcome::Appended(offset),
-                                reply,
-                            });
+                            // A fire-and-forget (QoS-0) produce is appended durably exactly like a
+                            // normal produce (covering group-commit fsync) but gets NO `PubAck`, so
+                            // park it as the no-ack outcome; a normal produce parks as `Appended`.
+                            let outcome = if append.fire_and_forget {
+                                PendingOutcome::FireAndForgetAppended(offset)
+                            } else {
+                                PendingOutcome::Appended(offset)
+                            };
+                            pending.push(PendingProduce { outcome, reply });
                         }
                         // A BENIGN dedup hit (#33): nothing was appended, but its original offset may
                         // be an id recorded earlier in THIS uncommitted batch, so PARK the reply behind
@@ -737,6 +796,11 @@ enum PendingOutcome {
     /// `PubAckDuplicate` once the batch is durable, so a hit on an id recorded earlier in THIS batch
     /// never replies before that id's offset is durable (I2).
     Duplicate(Offset),
+    /// A FIRE-AND-FORGET (QoS-0, #11, #402) append at this offset, pending the covering fsync: it is
+    /// made durable in the SAME group commit as a normal produce, but the session sends NO `PubAck`
+    /// (the producer fired and forgot). On a sync FAILURE it becomes `Fatal` like any parked produce,
+    /// so a frozen writer still ends the session rather than silently losing a record it appended.
+    FireAndForgetAppended(Offset),
 }
 
 /// Issues the SINGLE `commit_batch` fsync that covers every parked produce, then releases each parked
@@ -762,6 +826,10 @@ where
                     PendingOutcome::Appended(offset) => ProduceOutcome::Appended(offset),
                     // A dedup hit replies PubAckDuplicate now that the covering batch is durable (#33).
                     PendingOutcome::Duplicate(offset) => ProduceOutcome::AppendedDuplicate(offset),
+                    // A fire-and-forget produce is durable now, but the session sends NO PubAck (#11).
+                    PendingOutcome::FireAndForgetAppended(offset) => {
+                        ProduceOutcome::FireAndForgetAppended(offset)
+                    }
                 };
                 let _ = p.reply.send(outcome);
             }
@@ -853,6 +921,15 @@ mod tests {
             payload: payload.to_vec(),
             dedup: None,
             enqueue_monotonic_nanos: 0,
+            fire_and_forget: false,
+        }
+    }
+
+    /// A FIRE-AND-FORGET (QoS-0, #11) owned produce, for the actor-level fire-and-forget tier tests.
+    fn append_faf(payload: &[u8]) -> OwnedAppend {
+        OwnedAppend {
+            fire_and_forget: true,
+            ..append(payload)
         }
     }
 
@@ -871,6 +948,7 @@ mod tests {
                 msg_id: msg_id.to_vec(),
             }),
             enqueue_monotonic_nanos: 0,
+            fire_and_forget: false,
         }
     }
 
@@ -1226,6 +1304,111 @@ mod tests {
             handle.with(|e| e.flushed_offset().get()).unwrap(),
             1,
             "the fenced produce appended nothing (head stays at the one accepted record)"
+        );
+        let _ = recover(handle, actor);
+    }
+
+    // ---- The #11 wire QoS-0 fire-and-forget tier over the REAL append actor (#402) ----
+
+    /// The actor test config with the fire-and-forget token bucket enabled at a TINY message rate, so
+    /// the burst ceiling is small and a test can deterministically exhaust it. `msg_rate` of 10 with a
+    /// 100 ms refill gives a burst ceiling of `10 * 100 / 1000 = 1` message, so the FIRST
+    /// fire-and-forget produce drains the bucket and the SECOND (at the same `ManualClock` instant) is
+    /// dropped. Byte dimension off (the message dimension binds, for a crisp count).
+    fn config_faf() -> EngineConfig {
+        EngineConfig {
+            fire_and_forget_msg_rate: 10,
+            fire_and_forget_byte_rate: 0,
+            fire_and_forget_refill_ms: 100,
+            ..config()
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn rig_faf() -> (
+        EngineHandle<FaultFs<InMemoryFs>, ManualClock>,
+        std::thread::JoinHandle<Engine<FaultFs<InMemoryFs>, ManualClock>>,
+        FaultControl,
+    ) {
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let engine = Engine::open(fs, ManualClock::new(), config_faf()).unwrap();
+        let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        (handle, actor, control)
+    }
+
+    #[test]
+    fn a_fire_and_forget_produce_under_an_exhausted_bucket_is_dropped_with_no_ack_and_no_crash() {
+        // THE TEETH for the QoS-0 drop-under-bucket-no-ack (#11, #402): with the fire-and-forget
+        // bucket exhausted, a fire-and-forget produce is DROPPED (not appended, no ack), counted in
+        // ironbus_fire_and_forget_shed_total, while the broker keeps serving (no crash). The bucket
+        // governs ONLY this tier.
+        let (handle, actor, _control) = rig_faf();
+        // The bucket starts full at a ceiling of 1 (10 msg/s * 100 ms). The first fire-and-forget
+        // produce is ADMITTED and appended durably, but gets NO PubAck.
+        match handle.produce(append_faf(b"q0")).unwrap() {
+            ProduceOutcome::FireAndForgetAppended(o) => assert_eq!(o.get(), 0),
+            other => panic!("first QoS-0 produce should be appended-no-ack, got {other:?}"),
+        }
+        // The bucket is now empty (ManualClock has not advanced, so no refill). The next
+        // fire-and-forget produce is DROPPED (no append, no ack).
+        match handle.produce(append_faf(b"q1")).unwrap() {
+            ProduceOutcome::FireAndForgetDropped => {}
+            other => panic!("the over-bucket QoS-0 produce should be dropped, got {other:?}"),
+        }
+        // NO DATA LOSS for the at-least-once path: a normal produce is NEVER dropped, even with the
+        // fire-and-forget bucket exhausted (the bucket governs only the QoS-0 tier).
+        match handle.produce(append(b"alo")).unwrap() {
+            ProduceOutcome::Appended(o) => {
+                assert_eq!(o.get(), 1, "the at-least-once produce appended");
+            }
+            other => panic!("an at-least-once produce must never be dropped, got {other:?}"),
+        }
+        let (head, faf_shed) = handle
+            .with(|e| {
+                (
+                    e.flushed_offset().get(),
+                    e.backpressure_snapshot().fire_and_forget_shed,
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            head, 2,
+            "exactly the admitted QoS-0 produce (offset 0) and the at-least-once produce (offset 1) \
+             are durable; the dropped QoS-0 produce was never appended"
+        );
+        assert_eq!(
+            faf_shed, 1,
+            "exactly one fire-and-forget drop counted (never silent)"
+        );
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn a_fire_and_forget_produce_with_the_bucket_disabled_is_appended_but_never_acked() {
+        // The safe default: with the fire-and-forget bucket DISABLED (the default rate of 0), a QoS-0
+        // produce is always APPENDED durably but still gets NO PubAck (the producer fired and forgot),
+        // and it is never dropped. A normal produce on the same actor still gets its PubAck.
+        let (handle, actor, _control) = rig();
+        match handle.produce(append_faf(b"q")).unwrap() {
+            ProduceOutcome::FireAndForgetAppended(o) => assert_eq!(o.get(), 0),
+            other => panic!("a QoS-0 produce should be appended-no-ack, got {other:?}"),
+        }
+        // The at-least-once produce on the same actor is unchanged: a normal Appended (PubAck path).
+        match handle.produce(append(b"n")).unwrap() {
+            ProduceOutcome::Appended(o) => assert_eq!(o.get(), 1),
+            other => panic!("a normal produce should be Appended, got {other:?}"),
+        }
+        assert_eq!(
+            handle.with(|e| e.flushed_offset().get()).unwrap(),
+            2,
+            "both records are durable (the QoS-0 one too); only the ack differs"
+        );
+        assert_eq!(
+            handle
+                .with(|e| e.backpressure_snapshot().fire_and_forget_shed)
+                .unwrap(),
+            0,
+            "a disabled bucket never drops a QoS-0 produce"
         );
         let _ = recover(handle, actor);
     }
