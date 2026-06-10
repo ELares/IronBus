@@ -75,6 +75,15 @@ impl Broker {
             // reflects every committed offset (the write-amplification sampler reads it).
             "--checkpoint-interval".into(),
             "1".into(),
+            // Pin the codec EXPLICITLY to `lz4`, the shipped ADR-0003 default (#430, #439),
+            // instead of inheriting whatever the binary's default happens to be: a recorded
+            // baseline must self-describe what it measured, and a future default-codec flip must
+            // not silently change the workload the #114 rolling-median gate compares across
+            // releases. `extra` is appended AFTER these args and the serve parser takes the LAST
+            // occurrence of a repeated flag, so a caller can still override (e.g.
+            // `--compression none` for an explicit raw-write-path comparison run).
+            "--compression".into(),
+            "lz4".into(),
         ];
         args.extend(extra.iter().map(|s| (*s).to_string()));
 

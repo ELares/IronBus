@@ -45,6 +45,13 @@
 //!    opt-in daily-write-budget series are present and off (`ironbus_daily_write_budget_over 0`),
 //!    confirming the budget governor is wired but unset by default.
 //!
+//! A SECOND test in this file (#439) is the lz4 COMPANION write-amp gate: the same boot and the
+//! same workload with NO `--compression` flag, so the codec the SHIPPED binary defaults to (`lz4`,
+//! ADR-0003, wired by #430) is bounded by its own DERIVED threshold (see
+//! `WRITE_AMP_GATE_LZ4_MILLI`). The raw gate keeps `--compression none` and the historical 4x
+//! contract; without the companion no CI gate would bound the write amplification of the
+//! configuration operators actually get.
+//!
 //! WHAT THIS GATE DELIBERATELY LEAVES DEVICE-ONLY:
 //! - A precise RSS-under-the-64-MiB-ceiling assertion. The guard proves the CONFIGURED CAPS fit (a
 //!   provable-from-config property, asserted here via the real headroom value), but a shared CI
@@ -73,6 +80,33 @@ const BUILT_BIN: &str = env!("CARGO_BIN_EXE_ironbus");
 /// fixed three-decimal string, no float in the exposition).
 const WRITE_AMP_GATE_MILLI: u64 = 4000;
 
+/// The #439 companion gate's write-amp bound for the SHIPPED DEFAULT `lz4` codec, in milli-units
+/// (compared integer-exact like [`WRITE_AMP_GATE_MILLI`]). DERIVED for compressed brokers, not
+/// inherited from the raw gate's 4x, because post-#430 the ratio's denominator is STORED
+/// (post-compression) bytes (`docs/EDGE_CONSTRAINTS.md`), which lz4 shrinks for this workload
+/// while the physical framing/page cost stays fixed.
+///
+/// Derivation, measured on this exact `publish_gate_workload` mix:
+/// - Observed: `ironbus_logical_bytes_written = 54`, `ironbus_physical_bytes_written = 382`,
+///   `ironbus_write_amp_ratio = 7.074x`, byte-identical across 30 consecutive runs (the workload
+///   is deterministic: 6 sequential pubs, no timing-dependent checkpoint, and `lz4_flex` encoding
+///   is deterministic). The stored 54 bytes are the four tiny payloads (1+2+3+2 = 8 bytes, each
+///   under the 64-byte raw-store threshold so stored raw) plus the 512-byte and 1024-byte
+///   repeated-letter payloads collapsed by lz4 to ~23 stored bytes each.
+/// - Bound: 20.000x, about 2.8x headroom over the observed 7.074x. That is the same proportional
+///   headroom philosophy as the raw gate (typical ~1.2x against its 4x contract bound: ~3.3x),
+///   absorbing cross-platform or framing-detail drift in the fixed physical cost without ever
+///   letting a real regression hide: an unexplained 10x regression (70.7x; broken compression
+///   accounting, framing bloat, a checkpoint storm) fails it by 3.5x, and even a doubling of the
+///   deterministic measurement plus margin stays diagnosable below it.
+/// - Why not 4x: 4x is the flash-endurance contract over USER bytes (device bytes per user byte,
+///   #19). Under lz4 this workload's real flash wear per USER byte is 382 physical bytes for 1544
+///   user bytes, about 0.25x, BETTER than the raw run's 1.212x; only the stored-bytes denominator
+///   makes the metric read 7.074x. Inheriting 4x here would fail a configuration whose real wear
+///   improved, while a workload-derived 20x bound still catches every regression that actually
+///   writes more device bytes.
+const WRITE_AMP_GATE_LZ4_MILLI: u64 = 20_000;
+
 /// The `-1` sentinel `ironbus_ram_headroom_bytes` reports when no RAM ceiling is configured or RSS
 /// is unavailable. See `crates/ironbus-server/src/rss.rs`. The edge-tiny serve path now sets a real
 /// ceiling, so the gauge reports a real headroom and this is what it must NO LONGER be.
@@ -92,17 +126,23 @@ impl Drop for ChildGuard {
     }
 }
 
-/// A self-cleaning scratch directory under the system temp root, unique per run.
+/// A self-cleaning scratch directory under the system temp root, unique per run AND per test. The
+/// process-wide counter is load-bearing now that this binary holds TWO tests: they start
+/// concurrently in one process, so pid + wall-clock nanos alone COLLIDED on a coarse-granularity
+/// clock (both tests read the same nanosecond), making the second broker hit the #89 single-broker
+/// data-dir lock while the colliding `remove_dir_all` raced the first broker's live data dir.
 struct Scratch(std::path::PathBuf);
 impl Scratch {
     fn new() -> Self {
+        static UNIQUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
-            "ironbus-edge-tiny-budget-{}-{}",
+            "ironbus-edge-tiny-budget-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system time after the epoch")
-                .as_nanos()
+                .as_nanos(),
+            UNIQUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).expect("create the scratch dir");
@@ -129,28 +169,27 @@ struct Booted {
 /// `materialized-config` line from STDERR (the same boot/parse pattern as `acceptance.rs`; the
 /// config line moved to stderr in #87). Fails fast (a bounded recv timeout) if the broker dies
 /// before announcing both addresses, so a broken boot is a prompt failure, never a hang.
-fn boot_edge_tiny(data_dir: &str) -> Booted {
+///
+/// `compression` is the `--compression` value to pin, or `None` to pass NO flag at all so the
+/// broker runs whatever codec the SHIPPED binary defaults to (the #439 lz4 companion gate boots
+/// this way on purpose: it gates the default configuration, not a hand-picked one).
+fn boot_edge_tiny(data_dir: &str, compression: Option<&str>) -> Booted {
+    let mut args = vec![
+        "serve",
+        "--profile",
+        "edge-tiny",
+        "--data-dir",
+        data_dir,
+        "--addr",
+        "127.0.0.1:0",
+        "--health-addr",
+        "127.0.0.1:0",
+    ];
+    if let Some(codec) = compression {
+        args.extend(["--compression", codec]);
+    }
     let mut child = Command::new(BUILT_BIN)
-        .args([
-            "serve",
-            "--profile",
-            "edge-tiny",
-            "--data-dir",
-            data_dir,
-            "--addr",
-            "127.0.0.1:0",
-            "--health-addr",
-            "127.0.0.1:0",
-            // Compression OFF: the write-amp gate below is the HISTORICAL raw-bytes measurement
-            // of the edge write path (group commit, page-aligned writes). Under the now-wired
-            // default `lz4` (#430) the same tiny repeated-letter workload writes far fewer
-            // LOGICAL (stored) bytes against the same fixed physical page cost, so the
-            // physical/logical ratio of this synthetic workload would no longer measure the
-            // write path. The gate is codec-independent; the codec's own accounting is pinned
-            // by the engine compression tests.
-            "--compression",
-            "none",
-        ])
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -260,6 +299,21 @@ fn pub_one(wire: &str, payload: &str) {
     panic!("pub of {payload:?} never succeeded; the edge-tiny broker appears dead");
 }
 
+/// THE gate workload, shared verbatim by the raw (`--compression none`) gate and the #439 lz4
+/// companion gate so the two measure the SAME payload mix: a few pubs of mixed-but-small payloads
+/// (a handful of KiB total, so no cap can trip). The two large repeated-letter payloads are highly
+/// compressible, which is exactly what makes the lz4 gate's threshold derivation different from
+/// the raw gate's (see `WRITE_AMP_GATE_LZ4_MILLI`). Bounded and deterministic; `pub_one` retries
+/// only a connection-time race.
+fn publish_gate_workload(wire: &str) {
+    let big_d = "d".repeat(512);
+    let big_f = "f".repeat(1024);
+    let payloads = ["a", "bb", "ccc", &big_d, "ee", &big_f];
+    for p in payloads {
+        pub_one(wire, p);
+    }
+}
+
 /// A minimal blocking HTTP/1.0 GET against a loopback health `addr`, retrying a just-spawned health
 /// thread, used to read the broker's `/metrics`. Bounded retries + a read timeout keep it from
 /// hanging on a dead endpoint.
@@ -360,7 +414,15 @@ fn edge_tiny_profile_is_within_the_documented_edge_budget() {
         .expect("utf8 data dir")
         .to_string();
 
-    let booted = boot_edge_tiny(&data_dir);
+    // Compression OFF: the write-amp gate below is the HISTORICAL raw-bytes measurement
+    // of the edge write path (group commit, page-aligned writes). Under the now-wired
+    // default `lz4` (#430) the same tiny repeated-letter workload writes far fewer
+    // LOGICAL (stored) bytes against the same fixed physical page cost, so the
+    // physical/logical ratio of this synthetic workload would no longer measure the
+    // write path. The gate is codec-independent; the codec's own accounting is pinned
+    // by the engine compression tests. The SHIPPED default lz4 configuration has its
+    // own companion write-amp gate below (#439).
+    let booted = boot_edge_tiny(&data_dir, Some("none"));
 
     // ====================================================================================
     // PROPERTY 1: the tiny-profile KNOBS ARE IN EFFECT (the budget is actually applied).
@@ -385,12 +447,7 @@ fn edge_tiny_profile_is_within_the_documented_edge_budget() {
     // are populated WITHOUT any chance of tripping a cap (no byte cap is set; the workload is a
     // handful of KiB). Bounded and deterministic; pub_one retries only a connection-time race.
     // ====================================================================================
-    let big_d = "d".repeat(512);
-    let big_f = "f".repeat(1024);
-    let payloads = ["a", "bb", "ccc", &big_d, "ee", &big_f];
-    for p in payloads {
-        pub_one(&booted.wire, p);
-    }
+    publish_gate_workload(&booted.wire);
 
     let metrics = http_get(&booted.health, "/metrics");
 
@@ -476,5 +533,86 @@ fn edge_tiny_profile_is_within_the_documented_edge_budget() {
     assert_eq!(
         budget_over, 0,
         "the daily write budget is unset by default, so the over-budget gauge is 0: {metrics}"
+    );
+}
+
+/// The #439 lz4 COMPANION write-amp gate: the same edge-tiny boot and the same payload mix as the
+/// raw gate above, but with NO `--compression` flag, so the broker runs the codec the SHIPPED
+/// binary defaults to (`lz4`, ADR-0003, wired by #430). The raw gate above stays the historical
+/// framing/checkpoint regression contract (`--compression none`, the 4x `EDGE_CONSTRAINTS.md`
+/// bound); without this companion, NO CI gate would bound the write amplification of the
+/// configuration operators actually get, which is the #439 gap.
+///
+/// WHY THE BOUND IS NOT THE RAW GATE'S 4x: post-#430 the ratio's denominator
+/// (`ironbus_logical_bytes_written`, the #118 meter) is STORED bytes, post-compression
+/// (`docs/EDGE_CONSTRAINTS.md`: "The ratio is defined over STORED (post-compression #430) bytes:
+/// under the default codec it can inflate for small compressible payloads even as the real flash
+/// wear per user byte falls"). This workload's two large repeated-letter payloads collapse from
+/// 512/1024 bytes to a few dozen stored bytes each, while the physical cost per record (framing,
+/// page-aligned group-commit writes, checkpoints) is essentially FIXED, so the same workload that
+/// measures under 4x raw legitimately measures far above 4x here. The 4x flash-endurance contract
+/// is about device bytes per USER byte; dividing by stored bytes after compression shrinks the
+/// denominator without adding any flash wear, so 4x is the wrong contract for a compressed broker
+/// and this gate derives its own bound (see `WRITE_AMP_GATE_LZ4_MILLI`).
+#[test]
+fn edge_tiny_write_amp_is_bounded_under_the_shipped_default_lz4_codec() {
+    let scratch = Scratch::new();
+    let data_dir = scratch
+        .0
+        .join("data")
+        .to_str()
+        .expect("utf8 data dir")
+        .to_string();
+
+    // NO --compression flag: this gate exercises the DEFAULT the shipped binary boots with.
+    let booted = boot_edge_tiny(&data_dir, None);
+
+    // Pin that the shipped default IS lz4 (ADR-0003). If the default codec ever changes, this
+    // fails loudly and the bound below must be re-derived for the new default, instead of the
+    // gate silently measuring something the derivation comment no longer describes.
+    assert_config(&booted.materialized_config, "compression", "lz4");
+
+    // The SAME bounded workload as the raw gate, byte for byte, so the derived bound below stays
+    // tied to a known payload mix.
+    publish_gate_workload(&booted.wire);
+
+    let metrics = http_get(&booted.health, "/metrics");
+
+    // The #118 meters are live and ordered under lz4 too: logical (STORED bytes) advanced, and
+    // the device never writes fewer bytes than it stores.
+    let logical = metric_u64(&metrics, "ironbus_logical_bytes_written")
+        .expect("/metrics exposes ironbus_logical_bytes_written");
+    let physical = metric_u64(&metrics, "ironbus_physical_bytes_written")
+        .expect("/metrics exposes ironbus_physical_bytes_written");
+    assert!(
+        logical > 0,
+        "the bounded workload advanced the logical-bytes counter: {metrics}"
+    );
+    assert!(
+        physical >= logical,
+        "physical bytes ({physical}) are never fewer than logical (stored) bytes ({logical}): {metrics}"
+    );
+
+    let amp_milli = write_amp_milli(&metrics)
+        .expect("/metrics exposes a parseable ironbus_write_amp_ratio under lz4");
+    eprintln!(
+        "[edge-tiny-budget-lz4] logical={logical} physical={physical} write_amp={}.{:03}x",
+        amp_milli / 1000,
+        amp_milli % 1000
+    );
+    assert!(
+        amp_milli > 0,
+        "after a real produce the write-amp ratio is non-zero (the workload moved the counters): {metrics}"
+    );
+    assert!(
+        amp_milli < WRITE_AMP_GATE_LZ4_MILLI,
+        "write amplification {}.{:03}x under the shipped default lz4 codec must stay UNDER the \
+         derived companion bound of {}.{:03}x (see WRITE_AMP_GATE_LZ4_MILLI for the derivation; \
+         an unexplained jump here means the default configuration's write path regressed: framing \
+         bloat, a checkpoint storm, or broken compression accounting): {metrics}",
+        amp_milli / 1000,
+        amp_milli % 1000,
+        WRITE_AMP_GATE_LZ4_MILLI / 1000,
+        WRITE_AMP_GATE_LZ4_MILLI % 1000,
     );
 }

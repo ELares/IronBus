@@ -1008,4 +1008,37 @@ mod tests {
         fill_payload(&mut c, PayloadShape::Random, 43, ROUND_TRIP_TOKEN_LEN);
         assert_ne!(a, c);
     }
+
+    // GOLDEN VECTORS shared verbatim with the twin generator's test (the same arrays appear in
+    // crates/ironbus-bench/src/harness.rs): the two fills cannot import each other (ironbus-cli ships only a binary target),
+    // so each side pins its OUTPUT against the same constants. If either fork drifts, its own
+    // test fails against the shared bytes, closing the unpinned-fork gap the #439 review found.
+    const GOLDEN_REALISTIC_48: [u8; 48] = [
+        116, 115, 61, 48, 48, 48, 48, 48, 48, 32, 115, 101, 110, 115, 111, 114, 61, 101, 100, 103,
+        101, 32, 116, 101, 109, 112, 61, 50, 49, 46, 53, 32, 111, 99, 99, 61, 49, 32, 98, 97, 116,
+        116, 61, 57, 56, 32, 114, 115,
+    ];
+    const GOLDEN_LCG_SEQ7_48: [u8; 48] = [
+        13, 122, 233, 98, 194, 35, 231, 240, 4, 111, 220, 44, 176, 201, 62, 192, 123, 176, 80, 223,
+        215, 244, 165, 51, 114, 152, 231, 209, 196, 159, 237, 222, 67, 193, 230, 97, 13, 30, 222,
+        219, 123, 19, 219, 39, 236, 191, 169, 2,
+    ];
+
+    #[test]
+    fn the_fill_matches_the_bench_harness_twin_golden_vectors() {
+        let mut p = vec![0u8; 16 + 48];
+        fill_payload(&mut p, PayloadShape::Realistic, 7, 16);
+        assert_eq!(
+            p[16..],
+            GOLDEN_REALISTIC_48,
+            "realistic fill drifted from the twin"
+        );
+        let mut p = vec![0u8; 16 + 48];
+        fill_payload(&mut p, PayloadShape::Random, 7, 16);
+        assert_eq!(
+            p[16..],
+            GOLDEN_LCG_SEQ7_48,
+            "random fill drifted from the twin"
+        );
+    }
 }
