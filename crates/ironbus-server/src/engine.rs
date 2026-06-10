@@ -1610,6 +1610,17 @@ struct WorkGroup {
     touched: bool,
 }
 
+/// What happens to an evicted group's `group_last_checkpointed` entry (#432): `Keep` leaves it
+/// as a GHOST that keeps pinning the retention protect floor at the eviction-point head (the
+/// idle sweep's policy: eviction reclaims memory, never retention protection); `Release` removes
+/// it (the explicit-`Unsub` policy: the consumer renounced the position, so the pin is opt-out
+/// by unsubscribe, never implicit by absence).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GhostPolicy {
+    Keep,
+    Release,
+}
+
 impl WorkGroup {
     fn new(config: LeaseConfig, now: u64) -> WorkGroup {
         WorkGroup::resume(AckCursor::new(), config, now)
@@ -2505,6 +2516,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             };
             (cursor, read_group_attempts(fs, group)?)
         };
+        // Inserting the live group below also SUPERSEDES any ghost floor pin (#432): once the
+        // name is live, `min_committed_offset` reads the touched resumed cursor (exactly the
+        // ghost's value) instead of the ghost entry, so the floor follows the returning
+        // consumer's live progress immediately, no checkpoint write needed. This resume-at-ghost
+        // property holds for THIS consumer path only: the serve-flag declared-group paths
+        // (`set_key_ordering_in`, `set_broadcast_in`) create an absent group fresh at offset 0
+        // without resuming, which supersedes the ghost with a LOWER (more conservative) pin
+        // until the declared group drains; the floor can move down there, never up.
         self.group_last_checkpointed
             .insert(group.to_string(), cursor.committed().get());
         let g = resume_work_group(
@@ -3293,11 +3312,31 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// that only consumes through named groups, silently disabling every retention bound. With
     /// no touched group at all the floor is the durable head: no consumer has ever shown intent,
     /// so every sealed record is reapable once a retention bound trips.
+    ///
+    /// GHOST entries also pin (#432): a `group_last_checkpointed` entry whose group is NOT live
+    /// is an idle-evicted group's durable position, kept by the sweep so eviction (a memory
+    /// reclaim) never silently weakens retention protection the way absence would. A ghost is
+    /// touched by construction (it carried durable state). The ghost is superseded the moment
+    /// the group returns (the live group takes over via the touched filter: the consumer paths
+    /// resume at exactly the ghost's value, while the serve-flag declared-group paths create
+    /// fresh at offset 0, a LOWER and therefore safe pin) and is released by an explicit Unsub
+    /// ([`Engine::evict_group_if_idle`]). Note the pin binds only the consumer-safe reaper:
+    /// `reap_oldest_forced` under drop-oldest deliberately ignores the floor, ghost or live.
+    /// The ghost set is bounded by the distinct group names ever checkpointed (the same class
+    /// of bound as the on-disk checkpoint files, which open already loads unboundedly by
+    /// design); each retention pass scans it with one live-map lookup per entry.
     fn min_committed_offset(&self) -> u64 {
-        self.groups
+        let live = self
+            .groups
             .values()
             .filter(|g| g.touched)
-            .map(|g| g.cursor.committed().get())
+            .map(|g| g.cursor.committed().get());
+        let ghosts = self
+            .group_last_checkpointed
+            .iter()
+            .filter(|(name, _)| !self.groups.contains_key(name.as_str()))
+            .map(|(_, &committed)| committed);
+        live.chain(ghosts)
             .min()
             .unwrap_or_else(|| self.flushed_offset().get())
     }
@@ -3330,7 +3369,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// caught up, so the checkpoint records the head), so BOTH an in-process re-subscribe (which
     /// re-creates the group by resuming that checkpoint, see [`Engine::group_entry`]) AND a restart
     /// resume exactly where it left off. The checkpoint file is KEPT, never deleted: deleting it
-    /// would reset a re-created group to offset 0 and redeliver the whole already-acked log. If the
+    /// would reset a re-created group to offset 0 and redeliver the whole already-acked log. The
+    /// in-memory `group_last_checkpointed` entry is ALSO kept as a GHOST (#432) that keeps
+    /// pinning the retention protect floor at the eviction-point head until the group returns
+    /// (the live resumed cursor supersedes it) or an explicit `Unsub` releases it, so an idle
+    /// eviction reclaims memory without silently weakening retention protection (a restart would
+    /// re-pin the durable cursor as a live touched group anyway, so the ghost only makes the
+    /// pre-restart runtime consistent with that). If the
     /// checkpoint write fails, the group is KEPT in memory (not evicted), so a disk error can never
     /// cost a committed position. Evicting frees the group's slot against the `max_groups` cap
     /// immediately.
@@ -3355,7 +3400,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .map(|(name, _)| name.clone())
             .collect();
         for name in evictable {
-            self.evict_group(&name)?;
+            // The sweep KEEPS the ghost (#432): an idle consumer never renounced its position,
+            // so its eviction-point checkpoint keeps pinning the retention protect floor.
+            self.evict_group(&name, GhostPolicy::Keep)?;
         }
         Ok(())
     }
@@ -3371,9 +3418,18 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// next sweep retries. The checkpoint file is kept (never deleted), so a later re-`Sub` resumes
     /// from the head and redelivers nothing.
     ///
+    /// The `ghost` policy (#432) decides whether the group's `group_last_checkpointed` entry
+    /// survives the removal as a GHOST that keeps pinning the retention protect floor at the
+    /// eviction-point head. The idle sweep KEEPS the ghost: an idle consumer did not renounce its
+    /// position, and a restart would re-pin it anyway (recovery resumes every durable cursor as a
+    /// live touched group), so keeping the ghost makes the pre-restart runtime consistent with
+    /// what a restart already enforces. An explicit `Unsub` RELEASES it: the consumer named the
+    /// group and walked away, so pinning becomes opt-out by unsubscribe, never implicit by
+    /// absence.
+    ///
     /// # Errors
     /// Propagates a storage error from writing the group's checkpoint.
-    fn evict_group(&mut self, group: &str) -> Result<(), EngineError> {
+    fn evict_group(&mut self, group: &str, ghost: GhostPolicy) -> Result<(), EngineError> {
         let committed = match self.groups.get(group) {
             Some(g) => g.cursor.committed().get(),
             None => return Ok(()),
@@ -3381,10 +3437,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // Persist the cursor at the head BEFORE removing the group. `write_group_checkpoint` is
         // unconditional (unlike the interval/has-advanced gate of `checkpoint_group`), so the
         // checkpoint is durably at the head even if no interval checkpoint had fired since the group
-        // caught up. Only after this succeeds do we drop the in-memory state.
+        // caught up. Only after this succeeds do we drop the in-memory state. The
+        // `write_group_checkpoint` call also refreshes `group_last_checkpointed`, so a kept ghost
+        // pins at exactly the eviction-point head.
         self.write_group_checkpoint(group, committed)?;
         self.groups.remove(group);
-        self.group_last_checkpointed.remove(group);
+        if ghost == GhostPolicy::Release {
+            self.group_last_checkpointed.remove(group);
+        }
         Ok(())
     }
 
@@ -3452,16 +3512,30 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return false;
         }
         let flushed = self.log.flushed_offset().get();
-        let evictable = match self.groups.get(group) {
-            // `now == last_activity` with a window of 0 makes the idle clause vacuously true, so the
-            // predicate reduces to exactly the position-safety clauses; the explicit Unsub is what
-            // authorizes skipping the idle wait.
-            Some(g) => Self::is_evictable(group, g, flushed, g.last_activity, 0),
-            None => false,
+        let Some(g) = self.groups.get(group) else {
+            // The group is not live: it may have been sweep-evicted earlier while this connection
+            // stayed subscribed, leaving a GHOST floor entry (#432). The explicit Unsub is the
+            // consumer renouncing the position, so release the ghost here. Safe to remove
+            // unconditionally in this arm: a `group_last_checkpointed` key absent from
+            // `self.groups` is by definition a ghost (a live group's entry is the checkpoint
+            // interval gate and is only touched while the group is live), and the default group
+            // `""` is always live so it can never reach this arm. The release is in-memory only
+            // (the `cursor-<hex>.ckpt` is never deleted), so a restart conservatively re-pins via
+            // recovery. Any connection that can speak the wire can release any ghost by name
+            // (SUB then UNSUB on an absent group): that matches the pre-#106 trust model, where
+            // an unauthenticated peer can already produce, consume, and ack on any group; the
+            // authed surface (#106/#380) is where per-group rights would land.
+            self.group_last_checkpointed.remove(group);
+            return false;
         };
+        // `now == last_activity` with a window of 0 makes the idle clause vacuously true, so the
+        // predicate reduces to exactly the position-safety clauses; the explicit Unsub is what
+        // authorizes skipping the idle wait.
+        let evictable = Self::is_evictable(group, g, flushed, g.last_activity, 0);
         // Persist-then-drop. A checkpoint write error leaves the group live (the `is_ok`), so the
         // explicit reclaim, like the sweep, never trades a committed position for a disk hiccup.
-        evictable && self.evict_group(group).is_ok()
+        // The explicit Unsub RELEASES the ghost (#432): pinning is opt-out by unsubscribe.
+        evictable && self.evict_group(group, GhostPolicy::Release).is_ok()
     }
 
     /// Claims and returns the next deliverable message, or [`Poll::Idle`] if none is
@@ -9635,6 +9709,173 @@ mod tests {
         assert!(
             !e.evict_group_if_idle("ghost"),
             "an unknown group is a no-op"
+        );
+        // The reclaimed group leaves NO ghost floor entry (#432): an explicit Unsub releases the
+        // pin, so its entry is gone, while the live groups keep their interval-gate entries.
+        assert!(
+            !e.group_last_checkpointed.contains_key("caught"),
+            "explicit unsub releases the ghost"
+        );
+    }
+
+    // ---- Ghost checkpoints and the retention protect floor (#432) ----
+
+    // Retention bounds (small segments, byte bound) plus the idle-eviction window, so a test can
+    // sweep-evict a caught-up group and watch its GHOST pin (or not pin) the protect floor.
+    fn config_with_retention_and_evict(max_retained_bytes: u64, evict_ms: u64) -> EngineConfig {
+        let mut cfg = config_with_retention(max_retained_bytes);
+        cfg.group_idle_evict_ms = evict_ms;
+        cfg
+    }
+
+    // Drains the named group to the head at `now`, acking everything. Never touches the default
+    // group (#424): these tests must control exactly which groups pin the floor.
+    fn drain_named(e: &mut Engine<InMemoryFs, ManualClock>, group: &str, now: u64) {
+        while let Poll::Message(d) = e.poll_in(group, now).unwrap() {
+            assert_eq!(e.ack_in(group, &d.token), AckResult::Acked);
+        }
+    }
+
+    #[test]
+    fn a_sweep_evicted_groups_ghost_pins_the_retention_floor() {
+        // The #432 contract: an idle sweep eviction reclaims MEMORY, never retention protection.
+        // After "g" is evicted at head H, its ghost keeps the floor at H, so records produced
+        // after the eviction can never be reaped out from under the absent consumer, and the
+        // durable log cannot shrink to the bound. An explicit Unsub then releases the pin and
+        // retention catches up.
+        let mut e = open(config_with_retention(0));
+        produce(&mut e, &[0xab; 16]);
+        let one = e.durable_record_bytes();
+
+        let mut e = open(config_with_retention_and_evict(2 * one, 10));
+        produce(&mut e, &[0xab; 16]);
+        drain_named(&mut e, "g", 0);
+        assert_eq!(e.committed_offset_in("g"), e.flushed_offset(), "caught up");
+        // Sweep at 11 ms via a DRIVER group's poll ("g" idle since 0 is past the 10 ms window;
+        // polling "g" itself would refresh it, and polling the default group would touch it).
+        let _ = e.poll_in("driver", 11 * MS).unwrap();
+        assert!(!e.has_group("g"), "g was sweep-evicted");
+        assert!(
+            e.group_last_checkpointed.contains_key("g"),
+            "the sweep kept g's ghost"
+        );
+        // Keep the driver pinned at the head so only g's ghost can hold the floor down.
+        for _ in 0..30 {
+            produce(&mut e, &[0xab; 16]);
+            drain_named(&mut e, "driver", 12 * MS);
+        }
+        assert!(
+            e.durable_record_bytes() > 2 * one,
+            "the ghost pins the floor at the eviction head, so retention cannot reach the bound: {} > {}",
+            e.durable_record_bytes(),
+            2 * one
+        );
+        // The explicit Unsub releases the ghost; the next produce reaps to the bound.
+        assert!(!e.evict_group_if_idle("g"), "g is not live, nothing evicts");
+        assert!(
+            !e.group_last_checkpointed.contains_key("g"),
+            "the explicit unsub released the ghost"
+        );
+        produce(&mut e, &[0xab; 16]);
+        drain_named(&mut e, "driver", 13 * MS);
+        assert!(
+            e.durable_record_bytes() <= 2 * one,
+            "with the ghost released retention reaches the bound: {} <= {}",
+            e.durable_record_bytes(),
+            2 * one
+        );
+    }
+
+    #[test]
+    fn a_returning_group_supersedes_its_ghost_and_the_floor_follows_it() {
+        // The ghost is a stand-in, not a permanent pin: when the evicted group returns, the live
+        // resumed cursor (at exactly the ghost's value) takes over, and as the returning consumer
+        // drains, the floor follows its live progress and retention catches up with no Unsub.
+        let mut e = open(config_with_retention(0));
+        produce(&mut e, &[0xab; 16]);
+        let one = e.durable_record_bytes();
+
+        let mut e = open(config_with_retention_and_evict(2 * one, 10));
+        produce(&mut e, &[0xab; 16]);
+        drain_named(&mut e, "g", 0);
+        let evicted_at = e.committed_offset_in("g");
+        let _ = e.poll_in("driver", 11 * MS).unwrap();
+        assert!(!e.has_group("g"), "g was sweep-evicted");
+        for _ in 0..20 {
+            produce(&mut e, &[0xab; 16]);
+            drain_named(&mut e, "driver", 12 * MS);
+        }
+        assert!(e.durable_record_bytes() > 2 * one, "ghost pinning");
+        // g returns: it resumes exactly at its ghost's offset (nothing below was needed, nothing
+        // above was reaped), supersedes the ghost, drains, and the floor follows it to the head.
+        let first = e.poll_in("g", 13 * MS).unwrap();
+        assert!(
+            matches!(first, Poll::Message(_)),
+            "resumes at the ghost offset, no truncation"
+        );
+        assert_eq!(
+            e.committed_offset_in("g"),
+            evicted_at,
+            "resumed at the eviction head"
+        );
+        drain_named(&mut e, "g", 14 * MS);
+        produce(&mut e, &[0xab; 16]);
+        drain_named(&mut e, "g", 15 * MS);
+        drain_named(&mut e, "driver", 15 * MS);
+        assert!(
+            e.durable_record_bytes() <= 2 * one,
+            "the returned group caught up, the floor rose, retention reached the bound: {} <= {}",
+            e.durable_record_bytes(),
+            2 * one
+        );
+    }
+
+    #[test]
+    fn a_sweep_evicted_ghost_is_resumed_live_and_touched_across_reopen() {
+        // Restart consistency (#432): the ghost is in-memory, but the cursor checkpoint it mirrors
+        // is durable, so a reopen resumes the evicted group as a LIVE touched group at the same
+        // offset, pinning the floor exactly as the ghost did before the restart.
+        let mut e = open(config_with_retention(0));
+        produce(&mut e, &[0xab; 16]);
+        let one = e.durable_record_bytes();
+
+        let cfg = || config_with_retention_and_evict(2 * one, 10);
+        let mut e = open(cfg());
+        produce(&mut e, &[0xab; 16]);
+        drain_named(&mut e, "g", 0);
+        let evicted_at = e.committed_offset_in("g");
+        let _ = e.poll_in("driver", 11 * MS).unwrap();
+        assert!(!e.has_group("g"));
+
+        let fs = e.into_filesystem();
+        let mut e = Engine::open(fs, ManualClock::new(), cfg()).unwrap();
+        assert!(e.has_group("g"), "recovery resumed the evicted group live");
+        assert_eq!(e.committed_offset_in("g"), evicted_at, "at its checkpoint");
+        for _ in 0..20 {
+            produce(&mut e, &[0xab; 16]);
+            drain_named(&mut e, "driver", 1);
+        }
+        assert!(
+            e.durable_record_bytes() > 2 * one,
+            "the resumed live group pins across the restart exactly as the ghost did"
+        );
+    }
+
+    #[test]
+    fn producer_only_head_fallback_is_unchanged_with_no_ghosts() {
+        // The #424 producer-only fallback survives #432: with no named group ever created, no
+        // ghost exists, the untouched default group still does not pin, and retention reaps.
+        let mut e = open(config_with_retention(0));
+        produce(&mut e, &[0xab; 16]);
+        let one = e.durable_record_bytes();
+
+        let mut e = open(config_with_retention_and_evict(2 * one, 10));
+        for _ in 0..30 {
+            produce(&mut e, &[0xab; 16]);
+        }
+        assert!(
+            e.counters().segments_reaped >= 1,
+            "no consumer, no ghost: the floor is the head and old segments reaped"
         );
     }
 
