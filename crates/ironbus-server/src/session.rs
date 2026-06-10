@@ -4225,6 +4225,261 @@ mod tests {
         );
     }
 
+    // ---- Produce-time COMPRESSED-descriptor shape validation at the wire boundary (#438) ----
+
+    /// An engine with the lz4 write-path compression seam ON (#430), so the #438 wire tests can
+    /// pin that a producer-compressed PUB passes THROUGH the seam untouched (the #437
+    /// pass-through guard), not merely past a disabled codec.
+    fn engine_lz4() -> Engine<InMemoryFs, ManualClock> {
+        Engine::open(
+            InMemoryFs::new(),
+            ManualClock::new(),
+            EngineConfig {
+                compression: ironbus_core::compress::Codec::Lz4,
+                log: LogConfig::default(),
+                lease: LeaseConfig {
+                    visibility_nanos: 30,
+                    hard_cap_nanos: 100,
+                },
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight: 10,
+                consumer_credit: 64,
+                consumer_credit_bytes: 0,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+                ram_ceiling_bytes: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: crate::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
+                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Builds a raw `descriptor + stream` compressed-object payload for the #438 wire tests.
+    fn raw_descriptor(codec_id: u8, dict_id: u32, uncompressed_len: u32, stream: &[u8]) -> Vec<u8> {
+        let mut v = vec![codec_id];
+        v.extend_from_slice(&dict_id.to_le_bytes());
+        v.extend_from_slice(&uncompressed_len.to_le_bytes());
+        v.extend_from_slice(stream);
+        v
+    }
+
+    /// Sends one PUB whose record flags carry the COMPRESSED bit over `payload`, returning every
+    /// reply frame.
+    fn compressed_pub_replies<C: Clock + Clone + 'static>(
+        s: &mut Session,
+        e: &DirectEngine<InMemoryFs, C>,
+        payload: &[u8],
+        fire_and_forget: bool,
+    ) -> Vec<(FrameType, Vec<u8>)> {
+        pub_replies(
+            s,
+            e,
+            &PubBody {
+                flags: RecordFlags::COMPRESSED.bits(),
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget,
+                payload,
+            },
+        )
+    }
+
+    #[test]
+    fn a_well_formed_producer_compressed_pub_still_round_trips() {
+        // The #437 pass-through behavior is UNCHANGED by the #438 gate: a producer-compressed
+        // PUB (bit 0 over a real compressed object) is acked, stored byte-identical (never
+        // double-wrapped, even through an lz4-compression engine), and one read-side decode
+        // recovers the original.
+        use ironbus_core::compress::{
+            compress_payload, decompress_payload, CompressConfig, NoDictionaries,
+        };
+        let original = vec![0u8; 1024 * 1024];
+        let comp = compress_payload(&original, &CompressConfig::default()).unwrap();
+        assert!(comp.compressed, "the fixture genuinely compresses");
+
+        let e = DirectEngine::new(engine_lz4());
+        let mut s = connected_session(&e);
+        let replies = compressed_pub_replies(&mut s, &e, &comp.stored, false);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            replies[0].0,
+            FrameType::PubAck,
+            "a legal producer-compressed publish is acked"
+        );
+        assert_eq!(decode_pub_ack(&replies[0].1).unwrap().offset, 0);
+
+        let d = match e.engine_mut().poll_now().unwrap() {
+            Poll::Message(d) => d,
+            other => panic!("expected the compressed record, got {other:?}"),
+        };
+        assert!(d.record.flags.contains(RecordFlags::COMPRESSED));
+        assert_eq!(
+            d.record.payload, comp.stored,
+            "stored verbatim, never double-wrapped"
+        );
+        let back = decompress_payload(
+            d.record.flags,
+            &d.record.payload,
+            &NoDictionaries,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+        .unwrap();
+        assert_eq!(back, original, "one decode recovers the original");
+    }
+
+    #[test]
+    fn a_compressed_pub_over_garbage_is_rejected_and_appends_nothing() {
+        // THE #438 TEETH: bit 0 over bytes that are not a descriptor used to be acked durably
+        // (the broker is store-and-forward), and post-#430 every consumer group then burned
+        // max-deliver visibility-timeout cycles failing to decode the record. The broker now
+        // rejects it at produce: a typed, connection-preserving Err, the durable head does not
+        // move, and the connection stays usable.
+        let e = DirectEngine::new(engine());
+        let mut s = connected_session(&e);
+        let replies = compressed_pub_replies(&mut s, &e, b"garbage!", false);
+        assert_eq!(replies.len(), 1, "exactly one reply frame");
+        assert_eq!(
+            replies[0].0,
+            FrameType::Err,
+            "a typed rejection, not an ack"
+        );
+        assert!(
+            replies[0].1.starts_with(b"malformed compressed descriptor"),
+            "the Err is self-announcing, got {:?}",
+            String::from_utf8_lossy(&replies[0].1)
+        );
+        // Nothing was appended: the durable head is unchanged and nothing is deliverable.
+        assert_eq!(
+            e.engine_mut().flushed_offset().get(),
+            0,
+            "the durable head did not move"
+        );
+        assert_eq!(
+            e.engine_mut().counters().produced,
+            0,
+            "no produce was counted"
+        );
+        assert!(matches!(e.engine_mut().poll_now().unwrap(), Poll::Idle));
+        // The connection is still open and usable: a follow-up legal produce is acked at the
+        // offset the rejected publish never consumed.
+        let (ty, body) = pub_reply(&mut s, &e, b"after");
+        assert_eq!(ty, FrameType::PubAck);
+        assert_eq!(
+            body,
+            0u64.to_le_bytes(),
+            "the rejected publish consumed no offset"
+        );
+    }
+
+    #[test]
+    fn a_compressed_pub_with_an_over_cap_claim_is_rejected() {
+        // The claimed uncompressed_len binds every reader's bomb guard (#76) BEFORE allocation,
+        // so an acked over-cap record would be refused by every consumer on every delivery
+        // attempt; the gate uses the same DEFAULT_MAX_DECOMPRESSED_BYTES constant the readers
+        // and the #437 write seam use.
+        use ironbus_core::compress::CODEC_ID_LZ4;
+        let e = DirectEngine::new(engine());
+        let mut s = connected_session(&e);
+        let payload = raw_descriptor(CODEC_ID_LZ4, 0, DEFAULT_MAX_DECOMPRESSED_BYTES + 1, b"xx");
+        let replies = compressed_pub_replies(&mut s, &e, &payload, false);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].0, FrameType::Err);
+        assert!(
+            String::from_utf8_lossy(&replies[0].1).contains("exceeds the decompressed cap"),
+            "got {:?}",
+            String::from_utf8_lossy(&replies[0].1)
+        );
+        assert_eq!(e.engine_mut().flushed_offset().get(), 0);
+    }
+
+    #[test]
+    fn a_compressed_pub_with_an_unregistered_codec_id_is_rejected() {
+        // An id outside the append-only registry (none/lz4/zstd, docs/compat/versions.md) is
+        // decodable by NO conforming reader: a typo'd future producer fails fast at the source
+        // instead of poisoning every consumer group.
+        let e = DirectEngine::new(engine());
+        let mut s = connected_session(&e);
+        let payload = raw_descriptor(9, 0, 4, b"abcd");
+        let replies = compressed_pub_replies(&mut s, &e, &payload, false);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].0, FrameType::Err);
+        assert!(
+            String::from_utf8_lossy(&replies[0].1).contains("unknown compression codec id 9"),
+            "got {:?}",
+            String::from_utf8_lossy(&replies[0].1)
+        );
+        assert_eq!(e.engine_mut().flushed_offset().get(), 0);
+    }
+
+    #[test]
+    fn wire_legal_descriptor_variants_are_still_acked() {
+        // COMPRESSED + codec none with a length-consistent stream is wire-legal (the read side
+        // returns the inner bytes verbatim), and the REGISTERED-but-opt-in zstd id (2) must be
+        // accepted by a store-and-forward broker on ANY build: a zstd-capable consumer can
+        // decode what this broker's own build cannot.
+        use ironbus_core::compress::{CODEC_ID_NONE, CODEC_ID_ZSTD};
+        let e = DirectEngine::new(engine());
+        let mut s = connected_session(&e);
+        let none_codec = raw_descriptor(CODEC_ID_NONE, 0, 2, b"ab");
+        let replies = compressed_pub_replies(&mut s, &e, &none_codec, false);
+        assert_eq!(replies[0].0, FrameType::PubAck, "codec none is wire-legal");
+        let zstd = raw_descriptor(CODEC_ID_ZSTD, 0, 64, b"opaque-to-this-build");
+        let replies = compressed_pub_replies(&mut s, &e, &zstd, false);
+        assert_eq!(
+            replies[0].0,
+            FrameType::PubAck,
+            "the registered zstd id is accepted on every build"
+        );
+    }
+
+    #[test]
+    fn a_fire_and_forget_compressed_pub_over_garbage_sends_no_frame_and_appends_nothing() {
+        // The QoS-0 no-frame contract (#11) holds for the #438 rejection too: a fire-and-forget
+        // producer never reads a reply, so even this rejection sends NO frame (one frame would
+        // permanently desync the reply stream); the record is dropped, nothing is appended, and
+        // the session stays usable. This matches the dedup-id-cap precedent (a silent drop, no
+        // counter: the engine's shed counters meter engine-decided load sheds, not
+        // wire-malformed input that never reached the engine).
+        let e = DirectEngine::new(engine());
+        let mut s = connected_session(&e);
+        let replies = compressed_pub_replies(&mut s, &e, b"garbage!", true);
+        assert!(
+            replies.is_empty(),
+            "no frame to a QoS-0 producer, got {replies:?}"
+        );
+        assert_eq!(
+            e.engine_mut().flushed_offset().get(),
+            0,
+            "nothing was appended"
+        );
+        // The session is still open: a ping answers.
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Ping, b""), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Pong);
+    }
+
     /// Connects a session with a `Connect` body REQUESTING a per-consumer credit (#292), returning the
     /// session and the negotiated credit the server advertised in its Info reply.
     fn connected_session_requesting<C: Clock + Clone + 'static>(
