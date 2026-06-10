@@ -56,6 +56,41 @@ A byte-identical re-run is a no-op that preserves `ironbus.prev` (#422). Full us
 curl -fsSL https://raw.githubusercontent.com/ELares/IronBus/main/scripts/install.sh | sh
 ```
 
+### Install destination: the script vs the `.deb`, and `IRONBUS_INSTALL_DEST` (#433)
+
+The two channels place the binary at DIFFERENT default paths, and the packaged systemd unit is
+wired to the `.deb`'s:
+
+- The **script** installs to `/usr/local/bin/ironbus` when that dir is writable (typically a root
+  run), else `~/.local/bin/ironbus`: the standalone path.
+- The **`.deb`** installs `/usr/bin/ironbus`, and the packaged unit hardcodes
+  `ExecStart=/usr/bin/ironbus serve` plus `Environment=IRONBUS_BIN=/usr/bin/ironbus`, so the whole
+  fall-back-after-N mechanism (`record-start`, `rollback`, `ironbus.prev`) operates on
+  `/usr/bin/ironbus` and ONLY there.
+
+On a host running the packaged unit, the script's default would therefore upgrade a binary the
+service never executes: the unit keeps running `/usr/bin/ironbus`, and `/usr/local/bin` usually
+precedes `/usr/bin` on PATH, so the interactive `ironbus` and the running broker can be two
+different versions indefinitely while the unit's rollback machinery never sees script-side
+upgrades. The installer detects this (`systemctl cat ironbus`, falling back to the unit file under
+`/etc/systemd/system` then `/lib/systemd/system`) and prints a loud warning, never an error, when
+the unit's `ExecStart` binary differs from the chosen destination; a host without systemd (or
+without the unit) sees no warning.
+
+Unit users pair the script with the unit by setting `IRONBUS_INSTALL_DEST` to the FULL destination
+path. It bypasses the default directory selection (and `--bin-dir`) and flows through the same
+atomic install, so the same-version no-op (#422) and the `ironbus.prev` retention (#421) operate
+on the override path:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ELares/IronBus/main/scripts/install.sh \
+  | sudo IRONBUS_INSTALL_DEST=/usr/bin/ironbus sh
+```
+
+`IRONBUS_INSTALL_DEST` is validated fail-closed: it must be an absolute path, must not name a
+directory, and its parent directory must already exist and be writable; anything else aborts with
+an error naming the problem and installs nothing.
+
 ## 2. The Debian `.deb` package
 
 Built with [`cargo deb`](https://github.com/kornelski/cargo-deb) ([archived 2026-06-05](https://web.archive.org/web/20260605144432/https://github.com/kornelski/cargo-deb)) from the verified static binary; the
