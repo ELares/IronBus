@@ -20,7 +20,7 @@
 //! hot path.
 
 use ironbus_bench::broker::{resolve_ironbus_binary, Broker};
-use ironbus_bench::harness::{run_open_loop, RunConfig, DEFAULT_SEED};
+use ironbus_bench::harness::{run_open_loop, PayloadEntropy, RunConfig, DEFAULT_SEED};
 use ironbus_bench::provenance::Provenance;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -31,6 +31,7 @@ struct Opts {
     rate_hz: f64,
     duration: Duration,
     payload_bytes: usize,
+    payload_entropy: PayloadEntropy,
     fetch_batch: u32,
     seed: u64,
     max_total_bytes: Option<u64>,
@@ -44,6 +45,7 @@ impl Default for Opts {
             rate_hz: d.target_rate_hz,
             duration: d.duration,
             payload_bytes: d.payload_bytes,
+            payload_entropy: d.payload_entropy,
             fetch_batch: d.fetch_batch,
             seed: DEFAULT_SEED,
             max_total_bytes: None,
@@ -94,15 +96,18 @@ fn main() -> ExitCode {
         target_rate_hz: opts.rate_hz,
         duration: opts.duration,
         payload_bytes: opts.payload_bytes,
+        payload_entropy: opts.payload_entropy,
         fetch_batch: opts.fetch_batch,
         seed: opts.seed,
     };
 
     eprintln!(
-        "running open-loop bench: rate={} msg/s, duration={:?}, payload={} B, against {} (pid {})",
+        "running open-loop bench: rate={} msg/s, duration={:?}, payload={} B ({}), against {} \
+         (pid {})",
         config.target_rate_hz,
         config.duration,
         config.payload_bytes,
+        config.payload_entropy.as_str(),
         broker.addr(),
         broker.pid(),
     );
@@ -205,10 +210,11 @@ fn reproduce_command(opts: &Opts) -> String {
     use std::fmt::Write as _;
     let mut cmd = format!(
         "cargo run --release -p ironbus-bench -- --rate {} --duration-secs {} \
-         --payload-bytes {} --fetch-batch {} --seed {}",
+         --payload-bytes {} --payload-entropy {} --fetch-batch {} --seed {}",
         opts.rate_hz,
         opts.duration.as_secs(),
         opts.payload_bytes,
+        opts.payload_entropy.as_str(),
         opts.fetch_batch,
         opts.seed,
     );
@@ -230,6 +236,11 @@ OPTIONS:
     --rate <msg/s>            Target arrival rate (open-loop). Default 5000.
     --duration-secs <n>       Run duration in seconds. Default 5.
     --payload-bytes <n>       Payload size in bytes (>= 16). Default 256.
+    --payload-entropy <e>     Payload body entropy: realistic (compressible telemetry shape, the
+                              default) or random (incompressible, the codec worst case). The
+                              spawned broker runs the shipped default codec, pinned explicitly
+                              (--compression lz4), so realistic vs random brackets the real
+                              compression effect (#439).
     --fetch-batch <n>         Receiver fetch credit window. Default 256.
     --seed <n>                Deterministic Poisson-jitter seed.
     --max-total-bytes <n>     Broker durable-log byte cap (drives the #10 shed-not-OOM overload).
@@ -254,6 +265,14 @@ fn parse_args() -> Result<Opts, String> {
                 opts.duration = Duration::from_secs(secs);
             }
             "--payload-bytes" => opts.payload_bytes = next_parse(&mut args, "--payload-bytes")?,
+            "--payload-entropy" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--payload-entropy needs a value".to_string())?;
+                opts.payload_entropy = PayloadEntropy::parse(&raw).ok_or_else(|| {
+                    format!("--payload-entropy must be realistic or random, got {raw:?}")
+                })?;
+            }
             "--fetch-batch" => opts.fetch_batch = next_parse(&mut args, "--fetch-batch")?,
             "--seed" => opts.seed = next_parse(&mut args, "--seed")?,
             "--max-total-bytes" => {

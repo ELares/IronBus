@@ -53,6 +53,6 @@ pub use comparison::{
     littles_law_occupancy, ComparisonReport, ComparisonRow, DurabilityLabel, Placement,
     ReportError, System,
 };
-pub use harness::{run_open_loop, Percentiles, RunConfig, RunError, RunReport};
+pub use harness::{run_open_loop, PayloadEntropy, Percentiles, RunConfig, RunError, RunReport};
 pub use provenance::Provenance;
 pub use regression::{evaluate, Baseline, Breach, GateOutcome, History, Override, RunPoint};

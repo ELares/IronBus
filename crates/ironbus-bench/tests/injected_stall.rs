@@ -137,6 +137,10 @@ fn calibrated_config(op_latency_us: f64) -> RunConfig {
         target_rate_hz: rate,
         duration,
         payload_bytes: 128,
+        // The default compressible-realistic body (#439). The stall proof measures the TAIL
+        // SHAPE, not byte budgets, so the entropy choice is not load-bearing here; the default
+        // keeps this test on the same honest workload as a real bench run.
+        payload_entropy: ironbus_bench::harness::PayloadEntropy::default(),
         fetch_batch: 256,
         seed: 0xC0FF_EE00_1111_2222,
     }
