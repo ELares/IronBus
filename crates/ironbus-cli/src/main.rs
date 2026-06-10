@@ -4470,9 +4470,7 @@ fn write_record(
     // decode is involved (an uncompressed record, or `--raw`), keeping those lines byte-identical
     // to the pre-#430 output.
     let (codec, bytes, decoded): (String, usize, Option<Result<(), String>>) =
-        if !record.flags.contains(RecordFlags::COMPRESSED) {
-            ("none".to_string(), record.payload.len(), None)
-        } else {
+        if record.flags.contains(RecordFlags::COMPRESSED) {
             let codec = match read_descriptor(&record.payload) {
                 Ok((codec_id, _, _, _)) => codec_name(codec_id),
                 // Shorter than a descriptor: nothing to name; the decode below degrades it.
@@ -4495,6 +4493,8 @@ fn write_record(
                     ),
                 }
             }
+        } else {
+            ("none".to_string(), record.payload.len(), None)
         };
     if json {
         write!(
@@ -4507,7 +4507,7 @@ fn write_record(
         )?;
         match &decoded {
             None => {}
-            Some(Ok(_)) => write!(out, ",\"decoded\":true")?,
+            Some(Ok(())) => write!(out, ",\"decoded\":true")?,
             Some(Err(reason)) => write!(out, ",\"decoded\":false,\"reason\":\"{reason}\"")?,
         }
         writeln!(out, "}}")?;
@@ -4522,7 +4522,7 @@ fn write_record(
         )?;
         match &decoded {
             None => {}
-            Some(Ok(_)) => write!(out, " decoded=true")?,
+            Some(Ok(())) => write!(out, " decoded=true")?,
             Some(Err(reason)) => write!(out, " decoded=false reason={reason}")?,
         }
         writeln!(out)?;

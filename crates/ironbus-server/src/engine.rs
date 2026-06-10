@@ -1850,6 +1850,17 @@ const ATTEMPTS_CHECKPOINT: &str = "attempts.ckpt";
 /// signature stays simple.
 type RecoveredAttempts<File> = (AttemptsCheckpoint<File>, Option<Vec<u8>>);
 
+/// Materializes the engine's write-path compression configuration (#430, ADR-0003): the
+/// configured codec over the frozen defaults (the 64-byte raw-store threshold, `dict_id` 0, no
+/// dictionary, the default zstd level). Kept out of [`Engine::open`] so the open path stays
+/// readable; the seam itself lives in [`Engine::append_no_sync`].
+fn compress_config(codec: Codec) -> CompressConfig<'static> {
+    CompressConfig {
+        codec,
+        ..CompressConfig::default()
+    }
+}
+
 // The engine requires `C: Clone` so it can hand the secondary durable DLQ sink (#63) its own clock
 // (see `Log::clock_clone`). Every shipped clock (`ManualClock`, `Arc<ManualClock>`, `SystemClock`)
 // is `Clone`, so this is not a usability regression.
@@ -2042,13 +2053,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // `set_compaction_config`. A broker that does not is byte-for-byte unchanged (no v2
             // segment is ever written, no compaction pass ever runs).
             compaction: ironbus_storage::compaction::CompactionConfig::default(),
-            // The write-path compression seam (#430, ADR-0003): the configured codec with the
-            // frozen defaults (64-byte raw-store threshold, dict_id 0, no dictionary). With
-            // `Codec::None` the seam never runs, so the disk image is byte-for-byte historical.
-            compress: CompressConfig {
-                codec: config.compression,
-                ..CompressConfig::default()
-            },
+            // The #430 write-path compression seam; `Codec::None` makes it a pass-through,
+            // so the disk image is byte-for-byte historical.
+            compress: compress_config(config.compression),
         };
         engine.seed_registry_from_recovered_state(flushed);
         Ok(engine)
