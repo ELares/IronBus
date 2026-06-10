@@ -30,6 +30,21 @@
 #                          the `gh` CLI and Rekor reachability, which an edge device may lack.)
 #   --help                 Show this help.
 #
+# Environment:
+#   IRONBUS_INSTALL_DEST   FULL destination path for the binary (e.g. /usr/bin/ironbus), not a
+#                          directory. When set it bypasses the default /usr/local/bin vs
+#                          ~/.local/bin selection AND --bin-dir, and flows through the same atomic
+#                          install (same-version no-op, ironbus.prev retention). Pair it with the
+#                          packaged systemd unit, whose ExecStart runs /usr/bin/ironbus. Validated
+#                          FAIL-CLOSED: a relative path, a directory, or a missing or unwritable
+#                          parent directory aborts with a clear error and installs nothing.
+#   IRONBUS_UNIT_FILES     Advanced/test surface: space-separated candidate unit-file paths the
+#                          unit-mismatch warning consults when `systemctl cat` is unavailable.
+#                          Default: /etc/systemd/system/ironbus.service then
+#                          /lib/systemd/system/ironbus.service (first readable one wins). Lets a
+#                          test harness point the detection at fixtures; normal installs never
+#                          need to set it.
+#
 # This installer is intentionally fail-closed and has NO insecure / skip-verification override.
 
 set -eu
@@ -319,6 +334,202 @@ install_binary() {
     return 0
 }
 
+# Resolve the FINAL install destination for the verified binary (#433), honoring the
+# IRONBUS_INSTALL_DEST environment override. Sets `ironbus_resolved_dest` for the caller (a global,
+# like install_binary's `ironbus_install_skipped`, so a validation failure can `die` in the
+# caller's own shell rather than inside a command-substitution subshell whose exit a careless
+# caller could ignore). Sourced by the test harness, so it must stay POSIX-sh portable and
+# side-effect-free at definition time.
+#
+#   resolve_install_dest [bin_dir]
+#
+#   - IRONBUS_INSTALL_DEST set (non-empty): it is the FULL destination path of the binary itself
+#     (e.g. /usr/bin/ironbus, pairing the script with the packaged systemd unit's ExecStart), NOT
+#     a directory to put it in. It bypasses the default /usr/local/bin vs ~/.local/bin selection
+#     AND --bin-dir, and flows through install_binary unchanged, so the same-version no-op guard
+#     (#422) and the `<dest>.prev` rollback retention (#421) operate on the override path exactly
+#     as on a default one. FAIL-CLOSED validation, each failure dying with an error that names the
+#     problem:
+#       * a relative path is refused (a destination that depends on the caller's cwd is an
+#         accident waiting to happen, never an intent);
+#       * a path that IS a directory (or ends in `/`) is refused: the override names the binary
+#         file itself;
+#       * a parent directory that does not exist or is not writable is refused: the installer
+#         creates only the DEFAULT install dir, never an override's parents, and a non-writable
+#         parent would otherwise surface later as a less actionable staging error.
+#   - Otherwise: the explicit --bin-dir, else /usr/local/bin when writable, else ~/.local/bin (the
+#     pre-#433 default selection, unchanged), with the chosen dir created via `mkdir -p` and the
+#     binary named `ironbus` inside it.
+resolve_install_dest() {
+    rid_bin_dir="${1:-}"
+    if [ -n "${IRONBUS_INSTALL_DEST:-}" ]; then
+        rid_dest="$IRONBUS_INSTALL_DEST"
+        case "$rid_dest" in
+            /*) : ;;
+            *) die "IRONBUS_INSTALL_DEST must be an absolute path to the binary (got the relative path: $rid_dest)" ;;
+        esac
+        case "$rid_dest" in
+            */) die "IRONBUS_INSTALL_DEST must name the binary file itself, not a directory (got: $rid_dest; try ${rid_dest}ironbus)" ;;
+        esac
+        if [ -d "$rid_dest" ]; then
+            die "IRONBUS_INSTALL_DEST is a directory, not a binary path: $rid_dest (set it to the full file path, e.g. ${rid_dest}/ironbus)"
+        fi
+        rid_parent="${rid_dest%/*}"
+        [ -n "$rid_parent" ] || rid_parent="/"
+        if [ ! -d "$rid_parent" ]; then
+            die "IRONBUS_INSTALL_DEST parent directory does not exist: $rid_parent (create it first; the installer only creates the default install dir, never an override's parents)"
+        fi
+        if [ ! -w "$rid_parent" ]; then
+            die "IRONBUS_INSTALL_DEST parent directory is not writable: $rid_parent (re-run with enough privilege to write it)"
+        fi
+        ironbus_resolved_dest="$rid_dest"
+        return 0
+    fi
+    if [ -z "$rid_bin_dir" ]; then
+        if [ -w /usr/local/bin ] 2>/dev/null; then
+            rid_bin_dir="/usr/local/bin"
+        else
+            rid_bin_dir="${HOME}/.local/bin"
+        fi
+    fi
+    mkdir -p "$rid_bin_dir" || die "could not create install dir: $rid_bin_dir"
+    ironbus_resolved_dest="${rid_bin_dir}/ironbus"
+}
+
+# Parse the ExecStart binary path from systemd unit text on STDIN and print it (or nothing).
+# Shell builtins ONLY (`read`, `case`, parameter expansion): the test harness calls the unit
+# detection on a PATH that resolves nothing but stub tools, so no grep/awk/sed/head may be used
+# here. Mirrors systemd's own override semantics: a later `ExecStart=` line wins (a drop-in
+# override appears after the base unit in `systemctl cat` output), an empty `ExecStart=` resets,
+# and whitespace around the `=` is ignored ("ExecStart =" names the same key, and a value's
+# leading whitespace is trimmed rather than parsed as an empty first word, which would act as a
+# reset). The value is the first word after the `=`, with systemd's Exec prefixes stripped:
+# "@", "-", ":", "+", "!", "!!", stackable in any order (systemd.service(5)). An unstripped
+# prefix could never equal the install destination, so a prefixed unit would fire a spurious
+# mismatch warning whose suggested IRONBUS_INSTALL_DEST remedy resolve_install_dest would then
+# itself refuse. (This repo's own unit uses NO prefix on ExecStart; the `+` lines in
+# packaging/systemd/ironbus.service are the ExecStartPre/Post/StopPost helpers, #420.)
+unit_execstart_from_stdin() {
+    uefs_bin=""
+    uefs_tab="$(printf '\t')"
+    while IFS= read -r uefs_line; do
+        # Cheap pre-filter; the key check below decides for real.
+        case "$uefs_line" in
+            ExecStart*=*) : ;;
+            *) continue ;;
+        esac
+        # The key is everything before the first "=", minus the literal "ExecStart"; only
+        # whitespace may remain ("ExecStart =" matches, "ExecStartPre=" must NOT).
+        uefs_key="${uefs_line%%=*}"
+        uefs_key="${uefs_key#ExecStart}"
+        while true; do
+            case "$uefs_key" in
+                ' '*) uefs_key="${uefs_key# }" ;;
+                "$uefs_tab"*) uefs_key="${uefs_key#"$uefs_tab"}" ;;
+                *) break ;;
+            esac
+        done
+        [ -z "$uefs_key" ] || continue
+        uefs_val="${uefs_line#*=}"
+        # systemd ignores whitespace around "=": trim the value's leading whitespace so
+        # "ExecStart= /usr/bin/x" parses to the path instead of an empty word (a reset).
+        while true; do
+            case "$uefs_val" in
+                ' '*) uefs_val="${uefs_val# }" ;;
+                "$uefs_tab"*) uefs_val="${uefs_val#"$uefs_tab"}" ;;
+                *) break ;;
+            esac
+        done
+        # Strip stacked Exec prefixes one character at a time. POSIX bracket-class rules: "!"
+        # must not be first (it would negate the class) and "-" must be last (anywhere else it
+        # could form a range), so the class is written [@:+!-].
+        while true; do
+            case "$uefs_val" in
+                [@:+!-]*) uefs_val="${uefs_val#?}" ;;
+                *) break ;;
+            esac
+        done
+        # First word: cut at the first space or tab (systemd separates argv with either).
+        uefs_val="${uefs_val%% *}"
+        uefs_val="${uefs_val%%"$uefs_tab"*}"
+        uefs_bin="$uefs_val"
+    done
+    printf '%s' "$uefs_bin"
+}
+
+# Detect the path of the binary the host's `ironbus` systemd unit actually runs (#433). Prints the
+# unit's ExecStart binary path on stdout, or nothing when no unit can be found. CHEAP and
+# POSIX-safe by construction: every external tool is guarded with `command -v`, the parsing uses
+# only shell builtins (see unit_execstart_from_stdin), and every probe failure degrades to "no
+# unit found" rather than an error, so a non-systemd host (or a restricted PATH) just gets no
+# warning, never a broken install. Sources, in order:
+#   1. `systemctl cat ironbus` when systemctl exists: the authoritative view, including drop-in
+#      overrides.
+#   2. Otherwise (no systemctl, or it knows no such unit) the unit files the .deb or an operator
+#      would place, first readable one wins: /etc/systemd/system/ironbus.service, then
+#      /lib/systemd/system/ironbus.service, read with shell redirection (no `cat` needed). The
+#      candidate list is overridable via IRONBUS_UNIT_FILES (space-separated; an advanced/test
+#      surface, see the header), so the test harness can point the detection at fixtures instead
+#      of the host's real unit files.
+unit_exec_binary() {
+    if command -v systemctl >/dev/null 2>&1; then
+        # DELIBERATE TRADE: `systemctl cat` can block on a wedged systemd and POSIX sh has no
+        # portable timeout; accepted, because any failure here degrades to no warning, never a hang
+        # the install depends on for correctness.
+        ueb_text="$(systemctl cat ironbus 2>/dev/null)" || ueb_text=""
+        if [ -n "$ueb_text" ]; then
+            printf '%s\n' "$ueb_text" | unit_execstart_from_stdin
+            return 0
+        fi
+    fi
+    # The unquoted expansion is deliberate: the candidates are split on whitespace.
+    # shellcheck disable=SC2086
+    for ueb_file in ${IRONBUS_UNIT_FILES:-/etc/systemd/system/ironbus.service /lib/systemd/system/ironbus.service}; do
+        if [ -r "$ueb_file" ]; then
+            unit_execstart_from_stdin <"$ueb_file"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# After the destination is chosen (override or default), warn LOUDLY when the host's ironbus
+# systemd unit runs a DIFFERENT binary path than that destination (#433). A WARNING, never a
+# failure: the install itself is correct, so the exit-0 path continues. Without this, an operator
+# following the README one-liner next to the packaged unit gets a silent version split: the
+# packaged unit hardcodes ExecStart=/usr/bin/ironbus (and IRONBUS_BIN=/usr/bin/ironbus for the
+# whole fall-back-after-N machinery) while the script defaults to /usr/local/bin, so the service
+# keeps running the unit's binary, PATH usually shadows it interactively, and the unit's
+# rollback/record-start state never sees script-side upgrades. Finding NO unit binary (no
+# systemctl and no unit file, i.e. a non-systemd host) prints nothing.
+#
+#   warn_if_unit_binary_differs <dest>
+warn_if_unit_binary_differs() {
+    wub_dest="$1"
+    wub_unit_bin="$(unit_exec_binary)"
+    if [ -z "$wub_unit_bin" ] || [ "$wub_unit_bin" = "$wub_dest" ]; then
+        return 0
+    fi
+    log "##############################################################################"
+    log "WARNING: the ironbus systemd unit runs a DIFFERENT binary than this install"
+    log "         destination; the two paths WILL hold different versions over time."
+    log ""
+    log "  install destination:        $wub_dest"
+    log "  systemd unit (ExecStart):   $wub_unit_bin"
+    log ""
+    log "The service keeps executing $wub_unit_bin; this install does not"
+    log "change what the unit runs. The shell may also resolve 'ironbus' to the"
+    log "install destination first on PATH, so the interactive CLI and the running"
+    log "broker can be two different versions indefinitely, and the unit's"
+    log "fall-back/rollback machinery (ironbus.prev next to ITS binary) never sees"
+    log "upgrades installed here."
+    log ""
+    log "To upgrade the binary the unit actually runs, re-run the installer with:"
+    log "  IRONBUS_INSTALL_DEST=$wub_unit_bin"
+    log "##############################################################################"
+    return 0
+}
+
 # Build the release asset base URL for a tag (or the /latest/download redirect).
 asset_base_url() {
     version="$1"
@@ -352,12 +563,24 @@ main() {
             --target=*) force_target="${1#--target=}"; shift ;;
             --verify-provenance) verify_provenance="1"; shift ;;
             --help | -h)
-                sed -n '2,40p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
+                # DRIFT RISK, accepted: this line range must track the header comment block at the
+                # top of this file; growing or shrinking the header without updating the range
+                # silently truncates or over-extends the --help text.
+                sed -n '2,48p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
                 exit 0
                 ;;
             *) die "unknown argument: $1 (try --help)" ;;
         esac
     done
+
+    # EAGER FAIL-CLOSED VALIDATION (#433): when IRONBUS_INSTALL_DEST is set, validate it NOW,
+    # before anything is downloaded; a typo'd override must die before bytes move, not after.
+    # With the override set, resolve_install_dest only validates (it creates no directories), so
+    # this early call has no side effects. The post-download resolve below remains the one whose
+    # result is installed to, and the only one that may mkdir a DEFAULT install dir.
+    if [ -n "${IRONBUS_INSTALL_DEST:-}" ]; then
+        resolve_install_dest "$bin_dir"
+    fi
 
     target="$force_target"
     [ -n "$target" ] || target="$(detect_target)"
@@ -392,17 +615,25 @@ main() {
         log "provenance OK"
     fi
 
-    # Choose the install dir: the explicit --bin-dir, else /usr/local/bin, else ~/.local/bin.
-    if [ -z "$bin_dir" ]; then
-        if [ -w /usr/local/bin ] 2>/dev/null; then
-            bin_dir="/usr/local/bin"
-        else
-            bin_dir="${HOME}/.local/bin"
-        fi
+    # Choose the destination (#433): the IRONBUS_INSTALL_DEST override (the FULL binary path,
+    # validated fail-closed in resolve_install_dest), else the explicit --bin-dir, else
+    # /usr/local/bin, else ~/.local/bin.
+    resolve_install_dest "$bin_dir"
+    dest="$ironbus_resolved_dest"
+    bin_dir="${dest%/*}"
+    [ -n "$bin_dir" ] || bin_dir="/"
+    if [ -n "${IRONBUS_INSTALL_DEST:-}" ]; then
+        log "IRONBUS_INSTALL_DEST override in effect: installing to $dest"
     fi
-    mkdir -p "$bin_dir" || die "could not create install dir: $bin_dir"
 
-    dest="${bin_dir}/ironbus"
+    # UNIT-AWARENESS (#433): if this host's ironbus systemd unit runs a DIFFERENT binary path than
+    # the destination just chosen, say so LOUDLY before installing (a warning, never a failure:
+    # the packaged unit hardcodes ExecStart=/usr/bin/ironbus while the script defaults to
+    # /usr/local/bin, so an operator following the README one-liner next to the .deb unit would
+    # otherwise upgrade a binary the service never executes). Deliberately BEFORE install_binary,
+    # so the warning also prints on the same-version no-op path below: the mismatch is about
+    # WHERE the binary lives, not about whether bytes moved this run.
+    warn_if_unit_binary_differs "$dest"
     # Install atomically, retaining any prior binary as `ironbus.prev` for rollback (#133 step 10).
     # This runs ONLY after the fail-closed checksum (and optional provenance) verification above has
     # passed, so it never weakens verify-before-install: the new binary is fully verified before the
