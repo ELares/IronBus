@@ -108,6 +108,14 @@ count means "consecutive genuinely-failed starts" and a HEALTHY broker is never 
   the SINGLE place the counter is incremented, so one crash cycle bumps it by exactly 1 (no
   double-count) and a deliberate `systemctl stop` (a clean exit) leaves it untouched.
 
+All three helper lines carry systemd's `+` full-privilege Exec prefix (#420; supported since systemd
+231), so they are exempt from `User=ironbus` and the `ProtectSystem=strict` filesystem sandbox, while
+`ExecStart` itself stays fully sandboxed. They have to be: the counter lives next to the binary under
+the read-only `/usr`, and a rollback replaces the root-owned binary. Without the prefix every counter
+write failed with EROFS, the failed `ExecStartPost` made systemd kill a healthy broker at the end of
+the grace window and restart it forever, and the EROFS-failed `ExecStopPost` meant the
+fall-back-after-N mechanism could never trigger.
+
 So a node that cannot start a freshly-upgraded binary heals itself to the prior bytes after N genuine
 consecutive failed starts, while an unclean power loss of a working broker never accumulates toward a
 rollback (the consult-only `ExecStartPre` does not bump, and `ExecStartPost --ok` cleared the budget
