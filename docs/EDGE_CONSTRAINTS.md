@@ -209,7 +209,16 @@ To be precise about what this section delivers versus what it does not:
   `>= 4x fails` flash-endurance gate (the flash-endurance row above), the byte
   counters advance with `physical >= logical`, and `ironbus_ram_headroom_bytes`
   reports a REAL value (non-negative, under the 64 MiB ceiling), not the `-1`
-  sentinel.
+  sentinel. That raw-bytes gate pins `--compression none` (the historical
+  framing/checkpoint contract); a COMPANION gate in the same file
+  ([#439](https://github.com/ELares/IronBus/issues/439)) boots the same profile
+  with NO `--compression` flag, pins via the materialized-config line that the
+  shipped default is `lz4`, and bounds the same workload's
+  `ironbus_write_amp_ratio` at a derived `20x` (observed `7.074x`): the bound is
+  NOT the 4x contract because the ratio is defined over STORED
+  (post-compression) bytes, which lz4 shrinks for small compressible payloads
+  even as the real flash wear per user byte falls, so the default configuration
+  has its own regression gate without misreading the flash-endurance contract.
 - **The #115 device residual (what stays device-only):** the PRECISE
   RSS-under-64-MiB measurement under a real RAM burst. The boot guard proves the
   CONFIGURED CAPS fit (a provable-from-config property the CI gate asserts via the
