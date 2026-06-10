@@ -47,14 +47,15 @@ Read this before the arithmetic, because it changes how you should read it:
   knob is therefore a no-op (there is nothing to set it on), so the guard does
   not model an mmap term: term 4 (the active segment) is ~0 in RSS.
 
-The itemized per-buffer budget, the refuse-to-boot guard, the per-topic floor,
-and the auto edge profile that [#115](https://github.com/ELares/IronBus/issues/115)
-*specifies* are a follow-up; the enforcement and the auto-profile are tracked
-under [#20](https://github.com/ELares/IronBus/issues/20),
-[#87](https://github.com/ELares/IronBus/issues/87), and
+The itemized per-buffer budget, the refuse-to-boot guard, and the auto edge
+profile that [#115](https://github.com/ELares/IronBus/issues/115) specifies are
+now SHIPPED (the guard above, plus `--profile edge-tiny`,
+[#87](https://github.com/ELares/IronBus/issues/87)); the per-topic RAM floor (a
+multi-queue concept) and the tighter read-buffer bound remain follow-ups under
+[#20](https://github.com/ELares/IronBus/issues/20) and
 [#117](https://github.com/ELares/IronBus/issues/117). What follows is the
-honest accounting against the code as it ships, so the budget can be met by
-configuration in the meantime.
+honest accounting against the code as it ships, so an operator can also do the
+sizing by hand when no ceiling is set.
 
 Throughout, MiB = 1024 * 1024 bytes and KiB = 1024 bytes.
 

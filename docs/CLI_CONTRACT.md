@@ -10,15 +10,20 @@ versioned machine-output format, the mode-forcing global flags, and a non-zero e
 for a structured-but-degraded result.
 
 > Scope. This document specifies a CONTRACT (the JSON shape, the flag semantics, the
-> exit-code meaning). It is **specified, not yet implemented**: the current binary parses
-> only the surface enumerated in [`CLI.md`](CLI.md) and maps only the six exit codes
-> `0/1/2/4/5/70`. The verb IMPLEMENTATIONS that emit these schemas (`scrub`/`repair`
-> [#92](https://github.com/ELares/IronBus/issues/92), `top`
-> [#93](https://github.com/ELares/IronBus/issues/93), `consumer lag`, `segments`,
-> `dlq`, `retention`, `info`, `tap`, `wire`, `bench`, `config`, `recovery report`,
-> `completions`) are tracked under the children of
-> [#15](https://github.com/ELares/IronBus/issues/15). This doc is the COMMAND-MAP and
-> `--json`/flags/exit-code DESIGN, not the verb impls.
+> exit-code meaning). It is **partially implemented**: the binary now maps the
+> exit-code-3 handled-corruption gate (`scrub`/`repair`, alongside `0/1/2/4/5/70`) and
+> emits versioned `ironbus.cli.<command>.vN` `--json` objects for the shipped verbs
+> (`scrub`/`repair` [#92](https://github.com/ELares/IronBus/issues/92), `top`
+> [#93](https://github.com/ELares/IronBus/issues/93), the offline `admin consumer-reset`/
+> `admin dlq-redrive` [#299](https://github.com/ELares/IronBus/issues/299) with
+> `ironbus.cli.admin-consumer-reset.v1` / `ironbus.cli.admin-dlq-redrive.v1`, and the
+> `dict` subcommands, which exist only on an opt-in `--features zstd` build). The
+> GLOBAL mode flags (`--config`/`--offline`/`--online` as global, every-verb flags;
+> the shipped `--config` is a `serve` flag, #382) and the remaining verb
+> IMPLEMENTATIONS (`consumer lag`, `segments`, `dlq`, `retention`, `info`, `tap`,
+> `wire`, `config`, `recovery report`, `completions`) are still tracked under the
+> children of [#15](https://github.com/ELares/IronBus/issues/15). This doc is the
+> COMMAND-MAP and `--json`/flags/exit-code DESIGN, not the verb impls.
 
 ## Where this fits
 
@@ -26,8 +31,8 @@ Three documents describe the CLI, in order of abstraction:
 
 - [`USAGE.md`](USAGE.md): the prose walkthrough (how to use the binary, worked examples).
 - [`CLI.md`](CLI.md): the exhaustive map of the surface that SHIPS TODAY, every flag with
-  its type/default/unit cited to a `main.rs` constant, and the six exit codes the binary
-  emits. Canonical for what is implemented.
+  its type/default/unit cited to a `main.rs` constant, and the seven exit codes the binary
+  emits (`0`/`1`/`2`/`3`/`4`/`5`/`70`). Canonical for what is implemented.
 - This file: the frozen CONTRACT for the DESIGNED machine surface (the versioned `--json`
   schema, the global flags, the exit-code-3 gate). Canonical for what scripts may rely on
   once the verbs land.
@@ -520,12 +525,19 @@ return these codes are tracked under the children of
 
 When a verb lands, its PR registers its schema row in [`compat/versions.md`](compat/versions.md)
 (1.5), golden-pins the JSON shape, and wires the flag/exit-code behavior this doc freezes.
-Until then, the shipped surface is exactly the six verbs and six exit codes in
-[`CLI.md`](CLI.md), and this contract is SPECIFIED, not implemented.
+Until then, the shipped surface is the sixteen subcommands (plus `help`/`version`) in the
+`main.rs` usage text: `serve`, `pub`, `sub`, `cumulative-ack`, `admin` (the read-only
+health fetch plus the offline `consumer-reset`/`dlq-redrive`), `peek`, `dump`, `scrub`,
+`repair`, `top`, `bench`, `upgrade`, `rollback`, `record-start`, `migrate`, and `dict`
+(`train`/`install`/`ls`, present only on an opt-in `--features zstd` build), with the
+seven exit codes (`0`/`1`/`2`/`3`/`4`/`5`/`70`) in [`CLI.md`](CLI.md); and this contract
+is PARTIALLY implemented, per the scope note at the top (the exit-code-3 gate and the
+versioned `--json` schemas of the shipped verbs are in the binary; the global mode flags
+and the remaining verbs are not).
 
 ## Cross-references
 
-- [`CLI.md`](CLI.md): the shipped surface, the six exit codes, the offline output shapes
+- [`CLI.md`](CLI.md): the shipped surface, the seven exit codes, the offline output shapes
   this contract promotes to v1 schemas.
 - [`diagrams/07-cli-command-tree.dot`](diagrams/07-cli-command-tree.dot): the frozen
   verb/noun tree with the online/offline/offline-only tagging this doc's global-flag rules

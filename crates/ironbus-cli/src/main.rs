@@ -215,10 +215,11 @@ const DEFAULT_DURABILITY_LEVEL: &str = "sync";
 /// The default compression codec for `serve` (#12, #387): `lz4`, the pure-Rust default codec per
 /// [ADR-0003](../../../docs/adr/0003-default-compression-lz4-zstd-opt-in.md). The codec runtime,
 /// its raw-store / never-expand guards, and its decoder resilience live in
-/// `ironbus_core::compress`; an operator selects `none` to store every record raw (the historical
-/// byte layout) or `lz4` to compress compressible records. The opt-in `zstd` codec (behind a
-/// feature, with its level knob and trained dictionaries) is deferred per ADR-0003 and is not a
-/// valid value on the default build.
+/// `ironbus_core::compress`. NOTE the knob selects the codec and is echoed in the
+/// materialized-config line, but the serve WRITE PATH is not yet wired to the runtime, so every
+/// record is still stored raw (the stored codec is always `none`) regardless of the selection.
+/// The opt-in `zstd` codec (behind a feature, with its level knob and trained dictionaries) is
+/// deferred per ADR-0003 and is not a valid value on the default build.
 const DEFAULT_COMPRESSION: &str = "lz4";
 
 /// The default `--flush-interval-ms` for the `interval` durability level (#341), in MILLISECONDS: the
@@ -386,9 +387,10 @@ impl DurabilityLevelArg {
 
 /// The compression CODEC parsed from `serve --compression` (#12, #387). A platform-neutral, `Copy`
 /// mirror of [`ironbus_core::compress::Codec`], so it lives in the (non-Unix-gated) [`ServeConfig`]
-/// and is parsed/validated on EVERY platform; the Unix on-disk write path maps it to the codec
-/// runtime's config. The default is [`CompressionArg::Lz4`] (the ADR-0003 pure-Rust default codec);
-/// `none` stores every record raw (the historical byte layout, byte-for-byte). The opt-in `zstd`
+/// and is parsed/validated on EVERY platform. The default is [`CompressionArg::Lz4`] (the
+/// ADR-0003 pure-Rust default codec). NOTE the serve write path is NOT yet wired to the codec
+/// runtime: the resolved value is validated and echoed in the materialized-config line, but every
+/// record is still stored raw today (the stored codec is always `none`). The opt-in `zstd`
 /// codec is deferred per ADR-0003 and is not accepted on the default build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompressionArg {
@@ -788,9 +790,12 @@ Notes:
     key/payload sizes (NDJSON with --json). It is read-only and never mutates the directory;
     an empty or never-poisoned broker shows nothing.
     dump --raw shows the on-disk frame and --require-dict fails strictly (exit 3) on a record
-    whose dictionary is missing. On-disk compression (#12) is not yet implemented (the codec is
-    always none), so today every record decodes plainly: --raw renders the same field set and
-    --require-dict never trips. The flags are the committed surface for when #12 lands.
+    whose dictionary is missing. The compression codec RUNTIME and the serve --compression
+    <none|lz4> knob shipped (#12, #387, default lz4), but the serve write path is NOT yet wired
+    to the runtime: records are still STORED RAW (the stored codec is always none; the
+    materialized-config compression= field echoes the selected knob, not the bytes on disk), so
+    today every record decodes plainly, --raw renders the same field set, and --require-dict
+    never trips. The flags are the committed surface for when the write-path wiring lands.
     scrub is an offline, strictly READ-ONLY full integrity scan of the data dir (no broker): it
     reports every corruption, torn-tail, or checksum issue it finds (the plan) and marks, never
     hides, what recovery would quarantine. It exits 0 if clean (a torn-tail-only result stays 0,
@@ -2686,14 +2691,15 @@ struct ServeConfig {
     /// to boot without `async_loss_ack` (the none/async safety gate). Platform-neutral so it is
     /// validated on every platform; the Unix on-disk path maps it to the engine enum.
     durability_level: DurabilityLevelArg,
-    /// The COMPRESSION CODEC (#12, #387): which codec the on-disk compression runtime
-    /// (`ironbus_core::compress`) compresses NEW writes with. Default [`CompressionArg::Lz4`] (the
-    /// ADR-0003 pure-Rust default codec); [`CompressionArg::None`] stores every record raw,
-    /// byte-for-byte the historical layout. The runtime's raw-store / never-expand guards and its
-    /// decoder resilience (the decompressed-size cap, unknown-codec POISON) are codec-independent.
-    /// Platform-neutral so it is parsed/validated on every platform; the Unix on-disk path maps it to
-    /// the codec runtime's config. The opt-in `zstd` codec (and its level knob) is deferred per
-    /// ADR-0003 and not accepted on the default build.
+    /// The COMPRESSION CODEC knob (#12, #387). Default [`CompressionArg::Lz4`] (the ADR-0003
+    /// pure-Rust default codec). NOTE the serve write path is NOT yet wired to the codec runtime
+    /// (`ironbus_core::compress`): the resolved knob is validated and echoed in the
+    /// materialized-config line, but every record is still stored raw today (the stored codec is
+    /// always `none`), so the knob does not change bytes on disk yet. The runtime's raw-store /
+    /// never-expand guards and its decoder resilience (the decompressed-size cap, unknown-codec
+    /// POISON) are codec-independent. Platform-neutral so it is parsed/validated on every
+    /// platform. The opt-in `zstd` codec (and its level knob) is deferred per ADR-0003 and not
+    /// accepted on the default build.
     compression: CompressionArg,
     /// The `interval` level's TIME window in MILLISECONDS (#341): the most time an acked-but-unsynced
     /// record may sit before a forced `fdatasync`, bounding the worst-case loss. Only consulted under
@@ -2949,9 +2955,10 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: &Path) -
     // off the startup log, the same surface the `ironbus_durability_*` gauges expose on `/metrics`.
     let durability_level = config.durability_level.as_str();
     let power_loss_safe = !config.durability_level.waives_i2();
-    // The compression codec (#12, #387) the on-disk codec runtime compresses new writes with; an
-    // operator reads the active codec straight off the startup log. `none` is the historical
-    // raw-store behavior.
+    // The compression codec KNOB (#12, #387), echoed so an operator reads the selected value
+    // straight off the startup log. NOTE this echoes the knob, not the bytes on disk: the serve
+    // write path is not yet wired to the codec runtime, so records are still stored raw (the
+    // stored codec is always `none`) regardless of the selection.
     let compression = config.compression.as_str();
     format!(
         "materialized-config profile={} profile_schema_version={} addr={addr} \
@@ -3454,10 +3461,10 @@ fn cmd_serve(
         // I2-waived warning), so the non-Unix stub must consume them too or the Windows `-D warnings`
         // build trips field-never-read, invisible to a macOS reviewer (the recurring #288/#99 footgun).
         config.durability_level,
-        // The #12/#387 compression codec is read only on the Unix serve path (it wires the codec
-        // runtime's config and the materialized-config line), so the non-Unix stub must consume it
-        // too or the Windows `-D warnings` build trips field-never-read, invisible to a macOS
-        // reviewer (the recurring #288/#99 footgun).
+        // The #12/#387 compression codec knob is read only on the Unix serve path (it feeds the
+        // materialized-config line; the write-path wiring to the codec runtime has not landed),
+        // so the non-Unix stub must consume it too or the Windows `-D warnings` build trips
+        // field-never-read, invisible to a macOS reviewer (the recurring #288/#99 footgun).
         config.compression,
         config.flush_interval_ms,
         config.flush_max_bytes,

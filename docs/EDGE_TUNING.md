@@ -9,28 +9,33 @@ target table in [SLO.md](SLO.md), and the resource-exhaustion mitigations in
 every flag below is defined canonically in CLI.md and verified against the
 `main.rs` and `engine.rs` constants.
 
-## Honesty up front: these are recommended MANUAL settings, not an auto profile
+## Honesty up front: `--profile edge-tiny` now sets these for you
 
-There is no `--profile` flag and no auto-selected "edge" or "tiny" profile in the
-shipped binary. The README and #135 describe segments defaulting to "64 MiB or
-8 MiB on the edge profile", but **there is no profile selection in the code**: the
-default segment size is always 64 MiB. An `EDGE_SEGMENT_BYTES` constant (8 MiB)
-exists in `crates/ironbus-core/src/format.rs`, but it is **unwired**. To get the
-8 MiB edge segment size today you must pass `--max-segment-bytes 8388608`
-explicitly (see [WAL.md](WAL.md), the discrepancies section, and the flag table
-at the end of that doc).
+Named-profile selection is SHIPPED (#87): `serve --profile edge-tiny` stamps the
+small-RAM, flash-gentle preset in one move (the 8 MiB `EDGE_SEGMENT_BYTES`
+segment size, tight per-connection credits, few connections and groups,
+`drop-new`, and the 64 MiB `ram_ceiling_bytes` refuse-to-boot ceiling), then any
+explicit key still overrides an individual knob (precedence profile < env <
+flag; the exact preset values are in [CONFIG.md](CONFIG.md) section 6). With no
+profile the default stays `balanced` (exactly the compiled-in `DEFAULT_*` set,
+64 MiB segments), so a zero-config broker is unchanged.
 
-Likewise, the broader TOML config file, named profiles, and hot reload are
-SEPARATE follow-ups (#85 / #87 / #88) and not yet implemented; the env-var layer
-(`IRONBUS_<FLAG>`) is the only config surface beyond flags. The auto-selected RAM
-budget itself (the 64 MiB ceiling itemized into a per-buffer budget with a
-refuse-to-boot guard) is the deliverable of #115 and is likewise NOT yet wired:
-SLO.md lists it as a stated target, not a shipped guard.
+The TOML config FILE (`serve --config <path>`) is also SHIPPED (#382), on the
+precedence `flag > env > FILE > default`; the env-var layer (`IRONBUS_<FLAG>`)
+sits between flags and the file as before. The validate-whole-then-swap re-read
+RELOAD engine ships too, but it runs only as a startup self-check: no runtime
+trigger is wired yet (SIGHUP is graceful stop, not reload), see #431. The other
+residual on that surface is the MUTATING wire `CONFIG SET`/`SAVE` admin verbs,
+which wait on the #106 connection-scoped auth (#380). The refuse-to-boot RAM guard (#115) is wired
+too: with `--ram-ceiling-bytes` set (which `edge-tiny` does, to 64 MiB), a
+broker whose configured caps provably exceed the ceiling refuses to start (the
+worst-case formula is in [RAM_BUDGET.md](RAM_BUDGET.md)).
 
-So everything below is a set of RECOMMENDED MANUAL flag values an operator passes
-on the `serve` command line (or via the matching `IRONBUS_*` env var). When the
-auto-profile lands (#115 for the RAM budget, #87 for profile selection), these
-become the values a `--profile tiny`-style switch would set for you.
+So everything below is BOTH the rationale for what `--profile edge-tiny` sets
+for you AND the per-knob reference for an operator who tunes an individual
+value past the preset on the `serve` command line (or via the matching
+`IRONBUS_*` env var or a `--config` file key); an explicit key always wins
+over the profile.
 
 ## The constraint table
 
@@ -41,7 +46,7 @@ not a hard requirement.
 
 | Hardware constraint | Knob(s) | Default | Recommended edge value | Why |
 |---|---|---|---|---|
-| **Limited RAM** (e.g. the 64 MiB ceiling, #115) | `--max-segment-bytes` | `67108864` (64 MiB); min `4096` | `8388608` (8 MiB) | The active segment is buffered/served from memory; an 8 MiB roll size (the unwired `EDGE_SEGMENT_BYTES` value) keeps the working set small and bounds the largest single in-memory region. |
+| **Limited RAM** (e.g. the 64 MiB ceiling, #115) | `--max-segment-bytes` | `67108864` (64 MiB); min `4096` | `8388608` (8 MiB) | The active segment is buffered/served from memory; an 8 MiB roll size (the `EDGE_SEGMENT_BYTES` value, which `--profile edge-tiny` sets for you) keeps the working set small and bounds the largest single in-memory region. |
 | | `--consumer-credit` | `64`; min `1` | `64` (default, or lower) | Caps the per-CONNECTION un-acked message count. The default is already small and memory-justified; keep it or lower it on a very tight box. |
 | | `--consumer-credit-bytes` | `8388608` (8 MiB); `0` = unlimited | `8388608` (8 MiB) | The per-CONNECTION un-acked BYTE budget. This is the firm RAM-side bound: a large-payload consumer cannot blow the ceiling despite a small message count, since a fetch stops once in-flight bytes reach the budget (hard floor of one message so it never wedges). Do NOT set `0` on the edge. |
 | | `--max-in-flight` | `1024`; min `1` | a few hundred or fewer | The per-GROUP max-ack-pending window. Lower it so the in-flight set across a group cannot pin many records' worth of lease state in memory at once. |
@@ -52,8 +57,8 @@ not a hard requirement.
 | | `--max-retained-bytes` / `--max-age-ms` / `--max-messages` | `0` = off (each) | enable at least one, sized to the device | Retention reaps whole old, fully-consumed sealed segments (consumer-safe, never below the slowest consumer, never the active segment). Bounding the on-disk footprint bounds the rewrite/erase volume the flash sees over time (write amplification, #19). |
 | | `--disk-full-policy` | `drop-new` | `drop-new` (default) | When `--max-total-bytes` is hit, drop-new sheds the over-cap produce and preserves older accepted data, avoiding the extra force-reap writes (and the consumer truncation) that `drop-oldest` incurs. |
 | **Limited CPU** | (single-writer, always on) | n/a | n/a | Produces serialize through one writer and one `fdatasync` at a time; there is no thread-count knob to tune. Keep `--max-connections` (default `256`) modest so accept/decode work stays bounded. |
-| | compression codec | n/a (lz4_flex is the design default; zstd opt-in) | n/a | Per the #139 decision, lz4_flex (cheap, pure Rust) is the default codec and zstd is opt-in only behind a feature, never on the default path. NOTE: on-disk compression has NOT landed (the offline reader prints `codec = none`); there is no `serve` codec flag today, so this is a design choice, not a knob you set. |
-| **Intermittent power** | `fdatasync` before ack (always on) | n/a | n/a | Every acknowledged durable write is `fdatasync`'d before the ack, so a power loss never loses an acknowledged write. This is the always-on default; the README's `interval` / `none` modes are NOT exposed as `serve` flags, so you cannot accidentally weaken it from the command line. |
+| | `--compression` | `lz4` (the #139 default; zstd opt-in behind a feature) | `lz4` (default) or `none` | Per the #139 decision, lz4_flex (cheap, pure Rust) is the default codec and zstd is opt-in only behind a feature, never on the default path. NOTE: the codec RUNTIME and the `--compression <none\|lz4>` knob shipped (#387), but the serve write path is NOT yet wired to the runtime: records are still stored raw (the offline reader prints `codec = none`), so the knob, echoed in the materialized-config line, does not change bytes on disk yet. |
+| **Intermittent power** | `--durability-level` | `sync` | `sync` (default) | Every acknowledged durable write is `fdatasync`'d before the ack under the DEFAULT `sync` level, so a power loss never loses an acknowledged write. The relaxed levels (`interval` / `async` / `none`, #341 / #379) are strictly OPT-IN: `async` / `none` refuse to boot without the explicit `--async-loss-ack` acknowledgement, and any relaxed level logs a loud I2-waived startup WARN, so you cannot accidentally weaken durability from the command line. Keep `sync` on a device that can brown out. |
 | | `--disk-full-policy` | `drop-new` | `drop-new` (default) | On a device that may brown out mid-write, drop-new avoids the extra reaping writes of `drop-oldest`; the older accepted (and already-`fdatasync`'d) data is preserved. |
 | | graceful shutdown (always on, #195) | n/a | n/a | SIGINT / SIGTERM / SIGHUP stops accepting, flushes every work-group's committed cursor, and exits 0, so a clean shutdown does not redelivery-replay acked work. Un-acked in-flight messages still correctly redeliver (at-least-once). |
 | | `--checkpoint-interval` | `1024` | `1024` (default) | After an abrupt (non-graceful) power cut, at most this many messages redeliver. It bounds the post-crash replay; recovery itself always restores the longest valid prefix and bounds + reports any corruption-skip loss (see below). |
@@ -77,9 +82,12 @@ The four RAM-side knobs bound different buffers, and they compose:
 
 The product of the per-connection byte budget and the connection cap, plus the
 active-segment buffer and the bounded per-group state, is what an operator sizes
-under the device's RAM ceiling. The auto-itemized per-buffer budget that
-provably sums under 64 MiB with a refuse-to-boot guard is the #115 deliverable
-and is not yet shipped; until then the operator does this sizing by hand.
+under the device's RAM ceiling. The auto-itemized per-buffer budget with a
+refuse-to-boot guard is now SHIPPED (#115): set `--ram-ceiling-bytes` (or
+`--profile edge-tiny`, which sets the 64 MiB ceiling) and a broker whose
+worst-case bounded-buffer footprint provably exceeds the ceiling refuses to
+start (the formula is in [RAM_BUDGET.md](RAM_BUDGET.md)). With no ceiling set,
+the operator does this sizing by hand.
 
 ### Write amplification and flash endurance (#19)
 
@@ -114,8 +122,9 @@ freezes the log read-only and alerts. See README and
 - [CLI.md](CLI.md): the canonical, exhaustive flag map (type, default, unit) for
   every `serve` knob named here, each cited to its `main.rs` constant, plus the
   `IRONBUS_*` env-var mapping.
-- [WAL.md](WAL.md): the segment-roll / overflow mechanics, the unwired
-  `EDGE_SEGMENT_BYTES` note, and what #135 specifies but the code does not yet
+- [WAL.md](WAL.md): the segment-roll / overflow mechanics, the
+  `EDGE_SEGMENT_BYTES` note (the 8 MiB value is now selectable via
+  `--profile edge-tiny`, #87), and what #135 specifies but the code does not
   implement.
 - [SLO.md](SLO.md): the steady-state RAM ceiling (64 MiB, #115) and write
   amplification (#19) targets, both marked as stated targets not yet ratified.
@@ -124,11 +133,13 @@ freezes the log read-only and alerts. See README and
 
 ## Follow-ups (not yet shipped)
 
-- **#115**: the `tiny` profile RAM budget (the 64 MiB ceiling itemized into a
-  per-buffer budget with a refuse-to-boot guard). Until it lands, the RAM sizing
-  above is manual.
-- **#87** (with #85 / #88): the named-profile selection (and the TOML config
-  file and hot reload). Until it lands, there is no `--profile` switch; you pass
-  the individual flags.
 - **#19**: ratifies the write-amplification target against a measured baseline
   on the reference edge device.
+- **#380 / #106**: the MUTATING wire `CONFIG SET` / `SAVE` admin verbs (the
+  runtime config-change surface) wait on connection-scoped auth. The
+  validate-whole-then-swap `--config` re-read engine ships (#382) but runs only
+  as a startup self-check; no runtime trigger is wired yet (SIGHUP is graceful
+  stop), see #431.
+- **#12 write-path wiring**: the compression codec runtime and the
+  `--compression` knob shipped (#387), but the serve write path does not yet
+  invoke the runtime, so stored records remain raw (`codec = none` on disk).

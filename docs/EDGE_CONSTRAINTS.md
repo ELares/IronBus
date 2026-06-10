@@ -34,14 +34,18 @@ conceptual knobs and the profile/clock design that #20 owns.
 
 Read this before the tables, because it frames how to read them.
 
-- **This is a DESIGN deliverable, not a runtime feature.** It SPECIFIES the
-  `tiny` profile and its defaults; it does NOT claim a `--profile tiny` switch
-  exists. There is no profile-selection flag in the shipped binary
-  ([EDGE_TUNING.md](EDGE_TUNING.md) confirms this), the 64 MiB RAM ceiling is
-  NOT enforced by a boot guard ([RAM_BUDGET.md](RAM_BUDGET.md) is explicit about
-  that), and the shipped DEFAULT knob values are server-sized, not edge-safe.
-  The runtime ENFORCEMENT and the selection flag are the implementation
-  residuals named per row.
+- **The selection flag and the boot guard now SHIP.** The profile this document
+  specifies is selectable as `serve --profile edge-tiny`
+  ([#87](https://github.com/ELares/IronBus/issues/87);
+  [EDGE_TUNING.md](EDGE_TUNING.md) is the operator runbook for it), and the
+  64 MiB RAM ceiling IS enforced by the refuse-to-boot guard when
+  `--ram-ceiling-bytes` is set, which `edge-tiny` does
+  ([#115](https://github.com/ELares/IronBus/issues/115):
+  `ironbus_server::rss::fits_under_ram_ceiling` plus the CLI
+  `validate_ram_ceiling`, a provable-from-config worst-case check, per
+  [RAM_BUDGET.md](RAM_BUDGET.md)). The shipped DEFAULT knob values remain
+  server-sized, not edge-safe, and the guard is OFF with no ceiling set, so an
+  edge box should run `--profile edge-tiny` rather than the defaults.
 - **The safe path is the DEFAULT.** Durability (ack-after-`fdatasync`,
   fatal-fsync, torn-tail truncation) is the DEFAULT level `sync` and cannot be
   weakened without an explicit `--durability-level` opt-in; the unbounded-loss
@@ -117,14 +121,16 @@ Notes that keep the table honest:
 
 The `tiny` profile is THE documented default for an unattended, battery-less ARM
 box. This section SPECIFIES its values and shows them summing under the 64 MiB
-RAM ceiling. It does NOT claim a runtime `--profile tiny` switch: today these are
-the individual flag values an operator passes (or sets via `IRONBUS_*` env
-vars), and the auto-selection flag is the #115 / #17 / #87 residual noted at the
-end.
+RAM ceiling. The runtime switch is SHIPPED as `serve --profile edge-tiny`
+([#87](https://github.com/ELares/IronBus/issues/87)): one flag stamps the
+tuning values below (durability and the codec stay the safe compiled defaults,
+and retention stays an operator-sized choice, so the preset does not set those
+three rows), and an explicit flag or `IRONBUS_*` env var still overrides an
+individual knob (precedence profile < env < flag).
 
 ### The specified `tiny` defaults
 
-These are the values a future `--profile tiny` would set. They are the worked
+These are the values `--profile edge-tiny` sets. They are the worked
 edge configuration from [RAM_BUDGET.md](RAM_BUDGET.md), kept byte-identical so
 the two docs never drift, plus the edge-relevant durability, retention, and
 codec defaults the rest of #20 fixes.
@@ -141,7 +147,7 @@ codec defaults the rest of #20 fixes.
 | Disk-full policy | `--disk-full-policy` | `drop-new` | brownout-friendly shed; avoids drop-oldest force-reap writes |
 | Checkpoint interval | `--checkpoint-interval` | `1024` | cursor checkpoint cadence far below one write per ack; bounds post-crash redelivery |
 | Durability level | `--durability-level` | `sync` (ack-after-`fdatasync`) | power-loss-safe default; the relaxed `interval`/`async`/`none` levels are opt-in only, and `async`/`none` need `--async-loss-ack` (#341, #379) |
-| Codec | (design default, no flag) | lz4_flex (zstd opt-in) | cheap on ARM, pure Rust; on-disk compression not yet landed |
+| Codec | `--compression` (#387) | `lz4` = lz4_flex (zstd opt-in behind a feature) | cheap on ARM, pure Rust; the serve write path is not yet wired to the codec runtime, so records are still stored raw (#12) |
 | Retention | `--max-retained-bytes` / `--max-age-ms` / `--max-messages` | enable at least one, device-sized | bounds on-disk footprint and the erase/rewrite volume the flash sees |
 
 ### Why it sums under the 64 MiB ceiling
@@ -450,7 +456,8 @@ The implementation residuals (design done, code follow-up) are:
 - [ADR-0003](adr/0003-default-compression-lz4-zstd-opt-in.md): lz4_flex default
   codec, zstd opt-in only (#12, #139).
 - [WAL.md](WAL.md): the active-segment-is-the-WAL model, segment roll, the
-  unwired `EDGE_SEGMENT_BYTES`, and retention mechanics (#135, #13).
+  `EDGE_SEGMENT_BYTES` note (the 8 MiB value `--profile edge-tiny` selects,
+  #87), and retention mechanics (#135, #13).
 - [CLI.md](CLI.md): the canonical flag-and-default reference, each cited to its
   `main.rs` constant.
 - The `Clock` trait seam (`crates/ironbus-core/src/clock.rs`) and the record
