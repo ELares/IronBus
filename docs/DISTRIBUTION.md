@@ -132,6 +132,15 @@ on the last healthy start). `StartLimitIntervalSec=0` disables systemd's start-r
 fall-back-after-N logic, not the rate limiter, governs restarts. N is `--max-failed-starts`
 (default 3).
 
+### Signals and config changes (the unit)
+
+The broker treats SIGINT, SIGTERM, and SIGHUP identically as a graceful stop: it stops accepting,
+flushes every work-group's committed cursor, and exits 0. SIGHUP is NOT a config reload (#431; the
+runtime reload trigger is tracked in #380, refs #88), and because the unit uses
+`Restart=on-failure`, a clean stop is not restarted: a `kill -HUP` sent in the expectation of a
+reload leaves the broker DOWN until `systemctl start ironbus`. To change configuration, edit
+`/etc/ironbus/ironbus.env` (or the `--config` TOML file) and run `systemctl restart ironbus`.
+
 ## 3. The distroless container image
 
 `Dockerfile` builds a multi-stage image whose runtime stage is `gcr.io/distroless/static:nonroot`.

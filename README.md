@@ -120,7 +120,7 @@ ironbus serve --data-dir /var/lib/ironbus --profile edge-tiny
   ```
 
 - Optional health and metrics: add `--health-addr 127.0.0.1:9090` to expose `GET /healthz`, `/readyz`, and `/metrics`.
-- `Ctrl-C` (or `SIGTERM` / `SIGHUP`) stops gracefully: it flushes every consumer cursor and exits cleanly, and a restart resumes from the durable log. For an always-on node, run it under systemd (the `.deb` ships a ready unit, so `sudo systemctl enable --now ironbus` is all you need once it is installed).
+- `Ctrl-C` (or `SIGTERM` / `SIGHUP`) stops gracefully: it flushes every consumer cursor and exits cleanly, and a restart resumes from the durable log. `SIGHUP` also stops; it does not reload config (#431), so change config with a restart. Mind that the unit ships `Restart=on-failure`: a clean stop stays down until you `systemctl start ironbus` again. For an always-on node, run it under systemd (the `.deb` ships a ready unit, so `sudo systemctl enable --now ironbus` is all you need once it is installed).
 
 ### 3. Producers: one, or many
 

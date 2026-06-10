@@ -75,7 +75,12 @@ anywhere.
 Starts the broker: opens (creating if absent) the durable log under `--data-dir`, binds
 the wire protocol on `--addr`, optionally binds the health endpoints on `--health-addr`,
 and runs until signalled. SIGINT, SIGTERM, or SIGHUP triggers a graceful stop: the serve
-loop stops accepting, flushes every work-group's committed cursor, and exits 0.
+loop stops accepting, flushes every work-group's committed cursor, and exits 0. SIGHUP is
+NOT a config reload (#431): all three signals stop the broker identically, and a config
+change requires a restart (the re-read engine runs only as a startup self-check; the runtime
+trigger is tracked in #380, refs #88). Under a supervisor that restarts only on failure
+(the packaged unit ships `Restart=on-failure`), a SIGHUP'd broker exits 0 cleanly and STAYS
+DOWN until it is started again.
 
 `--data-dir` is REQUIRED; omitting it is a usage error. `serve` takes no positional
 arguments. All numeric flags reject a non-numeric value as a usage error before the
@@ -215,9 +220,12 @@ only (no single-var mapping, since a list with a per-group meaning does not flat
 scalar). The compiled-in named PROFILES and the `--profile` selector are implemented
 (#87, see `--profile` above); the TOML config FILE (`--config`), its strict typed-key /
 literal-grammar / coupled-set validation, and the immutable-config atomic re-read RELOAD
-are implemented (#382, see `--config` above and `docs/CONFIG.md`). The remaining residual is
-the MUTATING wire `CONFIG SET`/`SAVE` admin verbs, which need the #106 connection-scoped
-auth (there is no unauthenticated remote config mutation).
+engine are implemented (#382, see `--config` above and `docs/CONFIG.md`). The reload engine
+runs exactly once, as a startup self-check; no runtime trigger is wired yet (SIGHUP is
+graceful stop, not reload, #431; the trigger is tracked in #380, refs #88), so applying a
+config change requires restarting the broker. The other remaining residual is the MUTATING
+wire `CONFIG SET`/`SAVE` admin verbs, which need the #106 connection-scoped auth (there is
+no unauthenticated remote config mutation).
 
 ### `serve` data_dir lifecycle and the single-broker lock (#89)
 
