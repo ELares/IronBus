@@ -19,10 +19,11 @@
 use crate::actor::{ActorGone, EngineAccess, OwnedAppend, OwnedDedup, ProduceOutcome};
 use crate::engine::{AckResult, EngineError, NackResult, Poll, ProgressResult};
 use ironbus_core::clock::Clock;
+use ironbus_core::compress::{validate_descriptor_shape, DEFAULT_MAX_DECOMPRESSED_BYTES};
 use ironbus_core::dedup::{MAX_MSG_ID_LEN, MAX_PRODUCER_ID_LEN};
 use ironbus_core::keyshared::{KeyOrdering, MemberId};
 use ironbus_core::lease::LeaseToken;
-use ironbus_core::types::Offset;
+use ironbus_core::types::{Offset, RecordFlags};
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
     decode_ack, decode_connect, decode_cumulative_ack, decode_pub, decode_sub, encode_dead_letter,
@@ -474,6 +475,33 @@ impl Session {
             if d.msg_id.len() > MAX_MSG_ID_LEN {
                 if !fire_and_forget {
                     reply_err(out, "msg_id too long");
+                }
+                return Ok(());
+            }
+        }
+        // Produce-time COMPRESSED-descriptor SHAPE validation (#438). Bit 0 of the PUB flags is a
+        // REAL stored record flag the wire legally carries (`PUB_WIRE_ONLY_FLAGS` masks only bits
+        // 6 and 7): a producer may publish a pre-compressed stored object, and the engine's write
+        // seam deliberately passes it through untouched (#437, never double-wrapped). The broker
+        // is store-and-forward, so nothing downstream ever parses the bytes: without this gate any
+        // producer could durably ack a record NO reader can decode, and post-#430 every consumer
+        // group of that offset burns max-deliver visibility-timeout cycles of typed
+        // `ClientError::Decompress` failures before the record dead-letters. The check is a
+        // 9-byte header parse, NO decompression (the produce hot path pays no codec CPU; stream
+        // CONTENT stays a read-side concern), against the same read-side rules and the same
+        // `DEFAULT_MAX_DECOMPRESSED_BYTES` cap every shipped reader and the #437 seam enforce. A
+        // failure is a typed, connection-preserving rejection exactly like the wire-boundary
+        // rejections above (a malformed body, an over-long dedup id); for a fire-and-forget
+        // produce it is a silent drop with NO frame (the QoS-0 no-frame contract, #11) and no
+        // counter, matching the dedup-id-cap precedent (the engine's shed counters meter only
+        // engine-decided load sheds, which this is not). This gate lives at the WIRE boundary
+        // ONLY: the engine's own compressed output and the DLQ redrive's direct `Log::append`
+        // re-injection (`ironbus_storage::admin::redrive_dlq`) never pass through a session, so
+        // neither is affected.
+        if RecordFlags::from_bits(msg.flags).contains(RecordFlags::COMPRESSED) {
+            if let Err(e) = validate_descriptor_shape(msg.payload, DEFAULT_MAX_DECOMPRESSED_BYTES) {
+                if !fire_and_forget {
+                    reply_err(out, &format!("malformed compressed descriptor: {e}"));
                 }
                 return Ok(());
             }

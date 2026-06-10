@@ -497,6 +497,92 @@ pub fn read_descriptor(stored: &[u8]) -> Result<(u8, u32, u32, &[u8]), Decompres
     ))
 }
 
+/// Validates the SHAPE of a compressed payload's descriptor WITHOUT decompressing (#438):
+/// the produce-time gate for a wire PUB that carries the `COMPRESSED` bit.
+///
+/// The broker is store-and-forward, so a record it acks is decoded only by its CONSUMERS;
+/// before this gate, nothing validated a producer-supplied descriptor at produce time, and
+/// one undecodable record cost EVERY consumer group max-deliver visibility-timeout cycles
+/// of typed decode failures before it dead-lettered (#438, post-#430). Each rule here is a
+/// header-only check (a [`DESCRIPTOR_LEN`]-byte parse, NO decompression, so the produce hot
+/// path pays no codec CPU) and rejects exactly what the shipped read side
+/// ([`decompress_payload`], for a codec the reader implements) can never decode:
+///
+/// - The payload must parse as a well-formed descriptor ([`read_descriptor`] succeeds):
+///   shorter than [`DESCRIPTOR_LEN`] and no reader can even frame the header.
+/// - The codec id must be one of the REGISTERED ids ([`CODEC_ID_NONE`], [`CODEC_ID_LZ4`],
+///   [`CODEC_ID_ZSTD`]; the append-only registry in `docs/compat/versions.md`), regardless
+///   of what THIS build implements: a `zstd` record produced through a default-build broker
+///   is still decodable by a `zstd`-capable consumer, so the gate must not narrow the
+///   registry to the broker's own feature set. An UNREGISTERED id (a typo'd future producer,
+///   or garbage) fails fast at the source instead of poisoning every consumer.
+/// - The claimed `uncompressed_len` must be within `max_decompressed` (callers pass
+///   [`DEFAULT_MAX_DECOMPRESSED_BYTES`], the SAME constant every shipped reader and the
+///   #437 write seam enforce): an over-cap claim would be durably acked and then refused by
+///   every reader's bomb guard (#76) before allocation, on every delivery attempt.
+/// - The stream must be plausibly decodable for the named codec: a `none`-codec stream's
+///   length must equal the claimed `uncompressed_len` exactly (the read side's
+///   [`DecompressError::BadRawLength`] check), and an `lz4`/`zstd` stream must be non-empty
+///   (an empty stream cannot be a valid lz4 block or zstd frame, even for a claimed length
+///   of 0: lz4 needs at least one token byte and zstd a frame header, so the read side
+///   returns [`DecompressError::CorruptStream`] on it).
+///
+/// The `dict_id` is deliberately NOT validated: dictionary resolution is a READER capability
+/// (the on-disk sidecar plus the embedded set, `docs/DICTIONARY_LIFECYCLE.md` §5), so the
+/// broker cannot know which ids a consumer resolves; an unresolvable id stays the read-side
+/// POISON path it always was. Stream CONTENT is likewise not checked (that would require
+/// decompressing): a syntactically corrupt stream behind a well-formed descriptor still
+/// reaches consumers, exactly as a corrupt raw payload would.
+///
+/// # Errors
+/// Returns the matching [`DecompressError`] variant (the existing taxonomy; no new error
+/// vocabulary): [`DecompressError::TruncatedDescriptor`],
+/// [`DecompressError::PoisonUnknownCodec`], [`DecompressError::DecompressedTooLarge`],
+/// [`DecompressError::BadRawLength`], or [`DecompressError::CorruptStream`].
+pub fn validate_descriptor_shape(
+    stored: &[u8],
+    max_decompressed: u32,
+) -> Result<(), DecompressError> {
+    // WHY: a payload shorter than the fixed descriptor has no header any reader can parse.
+    let (codec_id, _dict_id, uncompressed_len, stream) = read_descriptor(stored)?;
+
+    // WHY: the codec id space is the append-only registry (none/lz4/zstd per
+    // docs/compat/versions.md). The check is against the REGISTERED ids, not Codec::from_id
+    // (the build-implemented set), so a store-and-forward broker without the zstd feature
+    // still accepts a zstd record its consumers may decode; an unregistered id can be
+    // decoded by NO conforming reader, so it is rejected at the source.
+    if !matches!(codec_id, CODEC_ID_NONE | CODEC_ID_LZ4 | CODEC_ID_ZSTD) {
+        return Err(DecompressError::PoisonUnknownCodec(codec_id));
+    }
+
+    // WHY: every shipped reader enforces this cap against the CLAIM before allocating (the
+    // #76 decompression-bomb guard), so an over-cap claim is undeliverable everywhere; the
+    // same DEFAULT_MAX_DECOMPRESSED_BYTES constant keeps the write gate and the readers on
+    // one number (the #437 seam's raw-store guard uses it too).
+    if uncompressed_len > max_decompressed {
+        return Err(DecompressError::DecompressedTooLarge {
+            claimed: uncompressed_len,
+            cap: max_decompressed,
+        });
+    }
+
+    if codec_id == CODEC_ID_NONE {
+        // WHY: a none-codec descriptor stores the raw payload after the header, and the read
+        // side requires the stream length to equal the claim EXACTLY (BadRawLength); the
+        // length is in the header, so the check is free here and a mismatch is undecodable.
+        if stream.len() != uncompressed_len as usize {
+            return Err(DecompressError::BadRawLength);
+        }
+    } else if stream.is_empty() {
+        // WHY: an empty stream under a compressing codec is undecodable for ANY claimed
+        // length, including 0: an lz4 block needs at least one token byte (lz4_flex returns
+        // ExpectedAnotherByte -> CorruptStream on empty input) and a zstd frame needs its
+        // header, so the read side can never produce bytes from it.
+        return Err(DecompressError::CorruptStream);
+    }
+    Ok(())
+}
+
 /// Decompresses a record's STORED payload back to the original payload.
 ///
 /// `flags` are the decoded record's flags (whether the `COMPRESSED` bit is set), `stored`
@@ -933,6 +1019,186 @@ mod tests {
             "a zstd record on a default build is poison"
         );
     }
+
+    /// Builds a raw descriptor + stream payload for the shape-validation tests (#438).
+    fn descriptor(codec_id: u8, dict_id: u32, uncompressed_len: u32, stream: &[u8]) -> Vec<u8> {
+        let mut v = vec![codec_id];
+        v.extend_from_slice(&dict_id.to_le_bytes());
+        v.extend_from_slice(&uncompressed_len.to_le_bytes());
+        v.extend_from_slice(stream);
+        v
+    }
+
+    #[test]
+    fn shape_validation_accepts_a_writer_produced_descriptor() {
+        // The gate must accept exactly what an honest compressor emits: the broker's own
+        // seam output and a producer-compressed publish are the same bytes.
+        let out = compress_payload(&compressible(4096), &lz4_config()).unwrap();
+        assert!(out.compressed, "the fixture genuinely compresses");
+        validate_descriptor_shape(&out.stored, DEFAULT_MAX_DECOMPRESSED_BYTES)
+            .expect("a well-formed compressed object passes the shape gate");
+    }
+
+    #[test]
+    fn shape_validation_rejects_a_truncated_descriptor_like_the_read_side() {
+        // Shorter than DESCRIPTOR_LEN: no reader can frame the header. Same typed error as
+        // the read side, so the gate and the readers cannot drift.
+        let garbage = b"garbage!"; // 8 bytes < DESCRIPTOR_LEN (9)
+        assert_eq!(
+            validate_descriptor_shape(garbage, DEFAULT_MAX_DECOMPRESSED_BYTES),
+            Err(DecompressError::TruncatedDescriptor)
+        );
+        assert_eq!(
+            decompress_payload(
+                RecordFlags::COMPRESSED,
+                garbage,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES
+            )
+            .unwrap_err(),
+            DecompressError::TruncatedDescriptor
+        );
+    }
+
+    #[test]
+    fn shape_validation_rejects_an_unregistered_codec_id() {
+        // Id 7 is outside the append-only registry (none/lz4/zstd): NO conforming reader
+        // can ever decode it, so the produce gate fails it at the source.
+        let stored = descriptor(7, DICT_ID_NONE, 4, b"abcd");
+        assert_eq!(
+            validate_descriptor_shape(&stored, DEFAULT_MAX_DECOMPRESSED_BYTES),
+            Err(DecompressError::PoisonUnknownCodec(7))
+        );
+        assert_eq!(
+            decompress_payload(
+                RecordFlags::COMPRESSED,
+                &stored,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES
+            )
+            .unwrap_err(),
+            DecompressError::PoisonUnknownCodec(7)
+        );
+    }
+
+    #[test]
+    fn shape_validation_accepts_the_registered_zstd_id_on_every_build() {
+        // The broker is store-and-forward: a zstd record produced through a default-build
+        // broker is decodable by a zstd-capable CONSUMER, so the gate checks the REGISTERED
+        // id space (docs/compat/versions.md), never the build-implemented set. The shape
+        // passes on both the default and the zstd-feature build (content is not checked).
+        let stored = descriptor(CODEC_ID_ZSTD, DICT_ID_NONE, 64, b"not a real zstd frame");
+        validate_descriptor_shape(&stored, DEFAULT_MAX_DECOMPRESSED_BYTES)
+            .expect("registered id 2 passes the shape gate regardless of the build");
+    }
+
+    #[test]
+    fn shape_validation_does_not_judge_dict_ids() {
+        // Dictionary resolution is a READER capability (sidecar + embedded set), unknowable
+        // at the broker, so a non-zero dict_id passes the shape gate and stays the read-side
+        // poison path it always was.
+        let stored = descriptor(CODEC_ID_LZ4, 0xDEAD_BEEF, 64, b"stream");
+        validate_descriptor_shape(&stored, DEFAULT_MAX_DECOMPRESSED_BYTES)
+            .expect("a non-zero dict_id is a reader concern, not a shape fault");
+    }
+
+    #[test]
+    fn shape_validation_rejects_an_over_cap_claim_like_the_readers_bomb_guard() {
+        // The cap binds the CLAIM (#76): every shipped reader refuses it before allocating,
+        // so an acked over-cap record would stall every consumer. Same constant, same error.
+        let stored = descriptor(
+            CODEC_ID_LZ4,
+            DICT_ID_NONE,
+            DEFAULT_MAX_DECOMPRESSED_BYTES + 1,
+            b"x",
+        );
+        let expected = DecompressError::DecompressedTooLarge {
+            claimed: DEFAULT_MAX_DECOMPRESSED_BYTES + 1,
+            cap: DEFAULT_MAX_DECOMPRESSED_BYTES,
+        };
+        assert_eq!(
+            validate_descriptor_shape(&stored, DEFAULT_MAX_DECOMPRESSED_BYTES),
+            Err(expected)
+        );
+        assert_eq!(
+            decompress_payload(
+                RecordFlags::COMPRESSED,
+                &stored,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES
+            )
+            .unwrap_err(),
+            expected
+        );
+        // An AT-cap claim is the largest legal one (the readers reject only strictly above).
+        let at_cap = descriptor(
+            CODEC_ID_LZ4,
+            DICT_ID_NONE,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+            b"x",
+        );
+        validate_descriptor_shape(&at_cap, DEFAULT_MAX_DECOMPRESSED_BYTES)
+            .expect("an at-cap claim is shape-legal");
+    }
+
+    #[test]
+    fn shape_validation_pins_the_none_codec_exact_length_rule() {
+        // COMPRESSED + codec none IS wire-legal: the read side returns the stream verbatim
+        // when its length equals the claim, and rejects a mismatch as BadRawLength. The gate
+        // mirrors both halves exactly.
+        let legal = descriptor(CODEC_ID_NONE, DICT_ID_NONE, 2, b"ab");
+        validate_descriptor_shape(&legal, DEFAULT_MAX_DECOMPRESSED_BYTES)
+            .expect("a length-consistent none-codec object is wire-legal");
+        assert_eq!(
+            decompress_payload(
+                RecordFlags::COMPRESSED,
+                &legal,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES
+            )
+            .unwrap(),
+            b"ab",
+            "the read side decodes it to the inner raw bytes"
+        );
+        let mismatched = descriptor(CODEC_ID_NONE, DICT_ID_NONE, 3, b"ab");
+        assert_eq!(
+            validate_descriptor_shape(&mismatched, DEFAULT_MAX_DECOMPRESSED_BYTES),
+            Err(DecompressError::BadRawLength)
+        );
+        assert_eq!(
+            decompress_payload(
+                RecordFlags::COMPRESSED,
+                &mismatched,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES
+            )
+            .unwrap_err(),
+            DecompressError::BadRawLength
+        );
+    }
+
+    #[test]
+    fn shape_validation_rejects_an_empty_stream_under_a_compressing_codec() {
+        // An empty stream cannot be a valid lz4 block (lz4 needs at least one token byte,
+        // even for empty output: the canonical lz4 of b"" is the single byte 0x00) or a zstd
+        // frame, so the read side fails it for ANY claimed length, including 0.
+        let empty = descriptor(CODEC_ID_LZ4, DICT_ID_NONE, 0, b"");
+        assert_eq!(
+            validate_descriptor_shape(&empty, DEFAULT_MAX_DECOMPRESSED_BYTES),
+            Err(DecompressError::CorruptStream)
+        );
+        assert_eq!(
+            decompress_payload(
+                RecordFlags::COMPRESSED,
+                &empty,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES
+            )
+            .unwrap_err(),
+            DecompressError::CorruptStream,
+            "the read side agrees: an empty lz4 stream is corrupt"
+        );
+    }
 }
 
 /// Teeth for the OPT-IN zstd codec (id 2) and the trained-dictionary lifecycle. Compiled only on a
@@ -1202,6 +1468,25 @@ mod proptests {
         ) {
             let _ = decompress_payload(RecordFlags::COMPRESSED, &stored, &NoDictionaries, cap);
             let _ = read_descriptor(&stored);
+            let _ = validate_descriptor_shape(&stored, cap);
+        }
+
+        // The produce-time shape gate (#438) NEVER rejects a record the shipped read side can
+        // decode: the gate's rejection set is a subset of the readers' rejection set, so no
+        // legal producer-compressed publish is refused. (The converse does not hold by design:
+        // a well-shaped descriptor over a corrupt stream, or a registered-but-unimplemented
+        // codec/dict, passes the shape gate and stays a read-side concern.)
+        #[test]
+        fn shape_validation_never_rejects_a_decodable_record(
+            stored in proptest::collection::vec(any::<u8>(), 0..4096),
+            cap in 0u32..(16 * 1024 * 1024),
+        ) {
+            if decompress_payload(RecordFlags::COMPRESSED, &stored, &NoDictionaries, cap).is_ok() {
+                prop_assert!(
+                    validate_descriptor_shape(&stored, cap).is_ok(),
+                    "the shape gate rejected a record the read side decodes"
+                );
+            }
         }
 
         // A bomb sweep: any claimed length over the cap is rejected before allocation, for any
