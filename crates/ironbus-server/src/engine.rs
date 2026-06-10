@@ -1591,16 +1591,22 @@ struct WorkGroup {
     /// Whether ANY consumer interaction has EVER been observed for this group (#424): a poll,
     /// ack, nack, term, progress, cumulative ack, or an explicit subscribe in this process, or
     /// any durable consumer state (a cursor or attempts checkpoint) found at open. Every group
-    /// except the boot-created default group starts `true`: a NAMED group only ever comes to
-    /// exist through a consumer op or a durable-state resume. The boot-created default group
-    /// (`""`) starts `false` when it carries NO durable state, because it exists structurally
-    /// (it is the wire's unnamed group) whether or not anyone consumes through it. The retention
-    /// protect floor ([`Engine::min_committed_offset`]) skips a group that is still untouched,
-    /// so a deployment that only consumes through named groups is not pinned at offset 0 forever
-    /// by the phantom default group. The flag is in-memory only: a default-group consumer whose
-    /// commits were never yet checkpointed (the cadence is `checkpoint_interval`; a graceful
-    /// stop also checkpoints) resumes untouched after an unclean restart, the documented trade
-    /// for adding no new durable state.
+    /// except the boot-created default group starts `true`: a NAMED group comes to exist through
+    /// a consumer op, a durable-state resume, or a serve-time declaration (`set_broadcast_in` /
+    /// `set_key_ordering_in` create their groups before any consumer exists, and a DECLARED
+    /// group deliberately keeps the conservative pre-#424 pinning until its consumers arrive).
+    /// The boot-created default group (`""`) starts `false` when it carries NO durable state,
+    /// because it exists structurally (it is the wire's unnamed group) whether or not anyone
+    /// consumes through it. The retention protect floor ([`Engine::min_committed_offset`]) skips
+    /// a group that is still untouched, so a deployment that only consumes through named groups
+    /// is not pinned at offset 0 forever by the phantom default group. The flag is in-memory
+    /// only, the documented trade for adding no new durable state: a default-group consumer is
+    /// protected across a restart only once a cursor (or attempts) checkpoint actually exists on
+    /// disk. The live write is offset-gated ([`Engine::maybe_checkpoint`] writes only after
+    /// `checkpoint_interval` newly committed offsets) and the shutdown write
+    /// ([`Engine::checkpoint_cursor`], driven by the server on drain and connection close) skips
+    /// a cursor with nothing to record, so a consumer that polled but never committed resumes
+    /// untouched even after a graceful stop.
     touched: bool,
 }
 
@@ -1620,9 +1626,10 @@ impl WorkGroup {
             broadcast: false,
             subscribers: std::collections::BTreeSet::new(),
             last_activity: now,
-            // Touched by default (#424): a named group is only ever created by a consumer op or
-            // resumed from durable state. The single exception, the boot-created default group
-            // with no durable state, is flipped to untouched right after open inserts it.
+            // Touched by default (#424): a named group is created by a consumer op, a durable
+            // resume, or a serve-time declaration, and every one of those keeps the conservative
+            // pinning. The single exception, the boot-created default group with no durable
+            // state, is flipped to untouched right after open inserts it.
             touched: true,
         }
     }
@@ -7694,7 +7701,11 @@ mod tests {
 
     // Produces one 16-byte record then drains the NAMED group `worker` to the head, acking
     // everything, `n` times. The default group is never polled, acked, or subscribed: this is the
-    // named-groups-only deployment shape that #424 is about.
+    // named-groups-only deployment shape that #424 is about. The drain is EXHAUSTIVE on purpose:
+    // a one-time `Truncated` (the worker re-created after a reopen resumes at offset 0, below the
+    // reaped earliest, and is reset up with the #84 signal) continues the drain rather than
+    // silently ending it, and any other non-message outcome panics, so a partial drain can never
+    // leave the worker behind and turn a later floor assertion into a flake.
     fn produce_and_consume_all_in_worker(
         e: &mut Engine<InMemoryFs, ManualClock>,
         n: usize,
@@ -7702,11 +7713,65 @@ mod tests {
     ) {
         for _ in 0..n {
             produce(e, &[0xab; 16]);
-            while let Poll::Message(d) = e.poll_in("worker", *now).unwrap() {
-                assert_eq!(e.ack_in("worker", &d.token), AckResult::Acked);
-                *now += 1;
+            loop {
+                match e.poll_in("worker", *now).unwrap() {
+                    Poll::Message(d) => {
+                        assert_eq!(e.ack_in("worker", &d.token), AckResult::Acked);
+                        *now += 1;
+                    }
+                    Poll::Truncated { .. } => {}
+                    Poll::Idle => break,
+                    other => panic!("unexpected poll result draining worker: {other:?}"),
+                }
             }
         }
+    }
+
+    #[test]
+    fn a_producer_only_deployment_reaps_with_no_consumer_at_all() {
+        // The fallback floor: with NO touched group (the sole group is the untouched default
+        // group), the floor is the durable head, so a producer-only deployment still honors its
+        // retention bounds instead of growing to the hard cap. Mutation coverage: reverting the
+        // fallback to 0 fails this test.
+        let mut e = open(config_with_retention(0));
+        produce(&mut e, &[0xab; 16]);
+        let one = e.durable_record_bytes();
+
+        let mut e = open(config_with_retention(2 * one));
+        for _ in 0..30 {
+            produce(&mut e, &[0xab; 16]);
+        }
+        assert!(
+            e.counters().segments_reaped >= 1,
+            "no consumer ever existed, so the floor is the head and old segments reaped"
+        );
+        assert!(
+            e.durable_record_bytes() <= 2 * one,
+            "the live durable bytes dropped to or under the bound: {} <= {}",
+            e.durable_record_bytes(),
+            2 * one
+        );
+    }
+
+    #[test]
+    fn a_subscribed_default_group_pins_retention_before_its_first_poll() {
+        // An explicit SUB on the default group is consumer intent BEFORE any poll: it must pin
+        // the floor, or records produced between the SUB and the first FLOW could be reaped out
+        // from under the consumer that announced itself. Mutation coverage: removing the
+        // subscribe_in touch fails this test.
+        let mut e = open(config_with_retention(0));
+        produce(&mut e, &[0xab; 16]);
+        let one = e.durable_record_bytes();
+
+        let mut e = open(config_with_retention(2 * one));
+        e.subscribe_in(DEFAULT_GROUP, MemberId::new(1)).unwrap();
+        let mut now = 0u64;
+        produce_and_consume_all_in_worker(&mut e, 30, &mut now);
+        assert_eq!(
+            e.counters().segments_reaped,
+            0,
+            "a subscribed default group is touched and pins the floor at 0"
+        );
     }
 
     #[test]

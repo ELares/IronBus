@@ -135,14 +135,16 @@ reclaim unit is a whole sealed segment, never a partial one and never the active
 segment. A segment is reclaimed oldest first, and only once every TOUCHED consumer group
 has committed past it, so the slowest consumer's records are never reaped. A group is
 touched once it has ever seen any consumer interaction (a poll, ack, nack, term,
-progress, cumulative ack, or subscribe) or has durable cursor state from an earlier run.
+progress, or subscribe; for a named broadcast group, a cumulative ack) or has a durable
+cursor or attempts checkpoint from an earlier run.
 The structural default group (the unnamed wire group) of a deployment that only consumes
 through NAMED groups stays untouched, so it does not hold every retention bound at
 offset 0 forever (#424). The moment anything consumes through the default group it gets
 the full slow-consumer protection, and its durable cursor checkpoint preserves that
-protection across restarts (a graceful stop writes one; a consumer that never committed
-anything has no durable claim, so after an unclean restart it is unprotected until it
-interacts again). A consumer that first arrives after older records were reaped resumes
+protection across restarts. The checkpoint is what carries the protection: the live
+write is offset-gated by `--checkpoint-interval`, and a consumer that never committed
+anything writes no checkpoint even on a graceful stop, so after a restart it is
+unprotected until it interacts again. A consumer that first arrives after older records were reaped resumes
 at the oldest retained record with a one-time truncation notice.
 
 The DEFAULT disk-full policy is drop-new: when the byte cap is hit, IronBus sheds the
