@@ -1347,30 +1347,56 @@ fn golden_path_acceptance_install_to_recovery_to_upgrade() {
     }
 
     // ===========================================================================================
-    // STEP 10 (#17): UPGRADE in place via the REAL installer (atomic swap; the prior binary is
-    // retained as the REAL `ironbus.prev` the installer itself creates); assert the data dir opens
-    // cleanly with no migration within the major version.
+    // STEP 10 (#17, #422): UPGRADE in place via the REAL installer (atomic swap; the prior binary
+    // is retained as the REAL `ironbus.prev` the installer itself creates), then a SAME-VERSION
+    // re-run that must be a no-op preserving `ironbus.prev`; assert the data dir opens cleanly
+    // with no migration within the major version.
     // Invariant proved: an in-place atomic binary swap retains a genuine rollback copy
-    // (`ironbus.prev`, a real product feature of `scripts/install.sh`) and the SAME data dir opens
-    // cleanly (no format migration within the major version).
+    // (`ironbus.prev`, a real product feature of `scripts/install.sh`), a byte-identical re-run
+    // never clobbers that copy (#422), and the SAME data dir opens cleanly (no format migration
+    // within the major version).
     // ===========================================================================================
     {
         // The in-place upgrade through the REAL installer: re-verify the new artifact (the
         // installer never places an unverified binary, even on upgrade), then run the ACTUAL
         // `scripts/install.sh install_binary`, which on an upgrade retains the prior binary as
         // `ironbus.prev` (a real product feature, #133 step 10 rollback safety) before atomically
-        // swapping the new (re-verified) binary into place. We use the SAME built binary as the
-        // "new" version (the v1 format is frozen, so a same-major upgrade reads the same data dir
-        // with no migration); the point under test is the real SWAP MECHANICS, the REAL `.prev`
-        // retention, and the CLEAN REOPEN, not a version bump.
+        // swapping the new (re-verified) binary into place.
+        //
+        // The staged "new" version must DIFFER in bytes from the installed one: install_binary's
+        // same-version guard (#422) treats a byte-identical re-run as an idempotent no-op that
+        // retains nothing, so staging the built binary verbatim would never reach the upgrade
+        // path at all. We stage the SAME built binary with a short trailing padding appended: a
+        // distinct SHA256, so the installer takes the genuine upgrade path, while the v1 format
+        // stays frozen (no migration is in play). The padded intermediate is NEVER EXECUTED
+        // (appended bytes keep a Linux ELF loadable but invalidate the macOS code signature):
+        // after asserting the REAL `.prev` retention and the #422 no-op re-run against it, the
+        // step upgrades once more to the pristine built binary and runs THAT, so the swap
+        // mechanics, the `.prev` retention, the same-version guard, and the clean reopen are all
+        // proved on both platforms.
         let prev = bin_dir.join("ironbus.prev");
         // The exact bytes currently installed: the upgrade must retain THESE verbatim as .prev.
         let prior_bytes = std::fs::read(&installed).expect("read the currently-installed binary");
         let staging = scratch.join("staging-upgrade");
         std::fs::create_dir_all(&staging).expect("create the upgrade staging dir");
         let asset = "ironbus-upgrade";
-        std::fs::copy(BUILT_BIN, staging.join(asset)).expect("stage the upgrade binary");
-        let digest = sha256_hex(&staging.join(asset));
+        let staged = staging.join(asset);
+        std::fs::copy(BUILT_BIN, &staged).expect("stage the upgrade binary");
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&staged)
+                .expect("open the staged upgrade binary for append");
+            f.write_all(b"\nironbus-acceptance-upgrade-padding\n")
+                .expect("append the version-distinguishing padding");
+            f.sync_all().expect("persist the staged upgrade binary");
+        }
+        let upgrade_bytes = std::fs::read(&staged).expect("read the staged upgrade binary");
+        assert_ne!(
+            upgrade_bytes, prior_bytes,
+            "#17: the staged upgrade differs in bytes from the installed binary (a genuine upgrade)"
+        );
+        let digest = sha256_hex(&staged);
         std::fs::write(staging.join("SHA256SUMS"), format!("{digest}  {asset}\n"))
             .expect("write the upgrade SHA256SUMS");
         assert_eq!(
@@ -1383,10 +1409,10 @@ fn golden_path_acceptance_install_to_recovery_to_upgrade() {
             "#17: no ironbus.prev exists before the upgrade (it is a REAL artifact the installer creates, not fabricated here)"
         );
         // Install the re-verified upgrade via the REAL installer (not a fabricated rename): it is
-        // an UPGRADE (a binary already lives at `installed`), so install.sh retains the prior
-        // binary as ironbus.prev itself.
+        // an UPGRADE (a binary already lives at `installed` and the bytes differ), so install.sh
+        // retains the prior binary as ironbus.prev itself.
         assert_eq!(
-            installer_install(&staging.join(asset), &installed),
+            installer_install(&staged, &installed),
             0,
             "#17: the real installer performs the in-place upgrade"
         );
@@ -1400,6 +1426,62 @@ fn golden_path_acceptance_install_to_recovery_to_upgrade() {
             std::fs::read(&prev).expect("read ironbus.prev"),
             prior_bytes,
             "#17: ironbus.prev holds the EXACT previous binary bytes (a real rollback copy, not fabricated)"
+        );
+        assert_eq!(
+            std::fs::read(&installed).expect("read the upgraded binary"),
+            upgrade_bytes,
+            "#17: the upgraded binary is in place"
+        );
+
+        // SAME-VERSION RE-RUN (#422), pinned at the acceptance level: re-running the REAL
+        // installer with bytes identical to the live binary (a config-management convergence run,
+        // a retry after an unrelated failure) is a no-op SUCCESS that PRESERVES ironbus.prev.
+        // Without the guard this re-run would overwrite the only rollback copy with bytes
+        // identical to the live binary, leaving nothing to roll back to.
+        assert_eq!(
+            installer_install(&staged, &installed),
+            0,
+            "#422: a same-version re-run of the real installer exits 0 (idempotent no-op)"
+        );
+        assert_eq!(
+            std::fs::read(&prev).expect("read ironbus.prev after the re-run"),
+            prior_bytes,
+            "#422: a same-version re-run preserves ironbus.prev (the rollback copy is not clobbered)"
+        );
+        assert_eq!(
+            std::fs::read(&installed).expect("read the live binary after the re-run"),
+            upgrade_bytes,
+            "#422: a same-version re-run leaves the live binary unchanged"
+        );
+
+        // FINAL upgrade to the pristine built binary (different bytes again, so the installer
+        // takes the real upgrade path once more) and prove the upgraded binary RUNS. The padded
+        // intermediate is never executed, which keeps this step valid under macOS code signing.
+        let final_asset = "ironbus-upgrade-final";
+        let final_staged = staging.join(final_asset);
+        std::fs::copy(BUILT_BIN, &final_staged).expect("stage the final upgrade binary");
+        let final_digest = sha256_hex(&final_staged);
+        std::fs::write(
+            staging.join("SHA256SUMS"),
+            format!("{final_digest}  {final_asset}\n"),
+        )
+        .expect("write the final upgrade SHA256SUMS");
+        assert_eq!(
+            installer_verify(&staging, final_asset, final_asset, "SHA256SUMS"),
+            0,
+            "#17: the final upgrade artifact is re-verified before the swap"
+        );
+        assert_eq!(
+            installer_install(&final_staged, &installed),
+            0,
+            "#17: the real installer performs the final in-place upgrade"
+        );
+        // The retention ran again: ironbus.prev now holds the intermediate's bytes and the live
+        // binary the pristine ones. Both are REAL installer artifacts.
+        assert_eq!(
+            std::fs::read(&prev).expect("read ironbus.prev after the final upgrade"),
+            upgrade_bytes,
+            "#17: the final upgrade retained the intermediate binary as ironbus.prev"
         );
         assert!(installed.exists(), "#17: the upgraded binary is in place");
 
@@ -1429,9 +1511,9 @@ fn golden_path_acceptance_install_to_recovery_to_upgrade() {
         drop(broker3);
         summary.pass(Step {
             n: 10,
-            name: "upgrade in place (atomic swap, ironbus.prev retained); data dir opens cleanly, no migration",
-            invariants: "atomic-swap,clean-reopen-no-migration",
-            issues: "#17",
+            name: "upgrade in place (atomic swap, ironbus.prev retained; same-version re-run is a no-op preserving it); data dir opens cleanly, no migration",
+            invariants: "atomic-swap,prev-preserved-on-rerun,clean-reopen-no-migration",
+            issues: "#17,#422",
             scope: Scope::Ci,
         });
     }

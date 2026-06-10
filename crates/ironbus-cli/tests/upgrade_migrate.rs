@@ -5,9 +5,11 @@
 //! the style of `installer_verify.rs` and `acceptance.rs`, so the product invariants are proved on
 //! the shipped surface, not only on the library's unit tests:
 //!
-//! - `upgrade` swaps an already-verified new binary over the live one, retains the prior binary as
-//!   `<dest>.prev`, and `rollback` restores it; the start-attempt counter (`record-start`) drives
-//!   the fall-back-after-N decision.
+//! - `upgrade` swaps an already-verified new binary over the live one and retains the prior binary
+//!   as `<dest>.prev` (committed only AFTER the single atomic swap, so a failed swap leaves the
+//!   destination and any pre-existing `.prev` untouched, #421; a byte-identical re-run is a no-op
+//!   touching neither, #422), and `rollback` restores it; the start-attempt counter
+//!   (`record-start`) drives the fall-back-after-N decision.
 //! - `migrate` REFUSES a silent on-disk format bump (a data dir whose stamped format version differs
 //!   from this build's), and reports "no migration needed" for a same-major (current-version) data
 //!   dir, which opens with no migration.
@@ -50,10 +52,18 @@ impl Drop for Scratch {
 
 /// Runs `ironbus <args...>` and returns (`exit_code`, stdout, stderr).
 fn run_ironbus(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(BUILT_BIN)
-        .args(args)
-        .output()
-        .expect("failed to run the ironbus binary");
+    run_ironbus_env(args, &[])
+}
+
+/// Like [`run_ironbus`] but with extra environment variables set ON THE CHILD process only (so a
+/// test-only failpoint can be armed without mutating this multi-threaded test process's env).
+fn run_ironbus_env(args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
+    let mut cmd = Command::new(BUILT_BIN);
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("failed to run the ironbus binary");
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -133,6 +143,122 @@ fn a_fresh_upgrade_creates_no_prev() {
     assert_eq!(code, 0, "fresh upgrade must succeed (stderr={err})");
     assert_eq!(std::fs::read(&dest).unwrap(), new);
     assert!(!prev.exists(), "a fresh install creates no ironbus.prev");
+}
+
+#[test]
+fn a_same_version_upgrade_is_a_noop_that_preserves_prev() {
+    // SAME-VERSION GUARD (#422) over the real verb, the twin of the installer's: `ironbus upgrade`
+    // with a new binary byte-identical to the live one is a no-op SUCCESS that touches NOTHING:
+    // not the live binary, not `ironbus.prev` (clobbering it would replace the only rollback copy
+    // with bytes identical to the live binary), and not the start-attempt counter (a no-op re-run
+    // must not clear the failure budget of a binary that may be mid-failure-streak).
+    let scr = Scratch::new("same-version-it");
+    let dest = scr.path().join("ironbus");
+    let prev = scr.path().join("ironbus.prev");
+    let counter = scr.path().join(".ironbus-start-attempts");
+    let v1 = b"ironbus v1 (the rollback copy)";
+    let v2 = b"ironbus v2 (the live binary)";
+    std::fs::write(&dest, v2).unwrap();
+    std::fs::write(&prev, v1).unwrap();
+    std::fs::write(&counter, "2").unwrap();
+
+    let staged = scr.path().join("staged-v2-again");
+    std::fs::write(&staged, v2).unwrap();
+    let (code, out, err) = run_ironbus(&[
+        "upgrade",
+        "--new-binary",
+        staged.to_str().unwrap(),
+        "--dest",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code, 0,
+        "a same-version upgrade is a no-op SUCCESS (stdout={out} stderr={err})"
+    );
+    assert!(
+        out.contains("nothing to do"),
+        "the no-op is reported, not silently absorbed (got: {out})"
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        v2,
+        "the live binary is unchanged"
+    );
+    assert_eq!(
+        std::fs::read(&prev).unwrap(),
+        v1,
+        "a same-version upgrade MUST NOT clobber ironbus.prev (#422)"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&counter).unwrap(),
+        "2",
+        "a same-version no-op leaves the failure budget untouched"
+    );
+}
+
+#[test]
+fn a_failed_final_rename_leaves_dest_present_and_the_old_prev_intact() {
+    // THE #421 ORDERING TEETH over the real verb: the pre-fix `atomic_swap_with_prev` retained the
+    // live binary by RENAME before the final rename, so a failed final rename stranded the host
+    // with NO binary at the destination (and the retention had clobbered any pre-existing good
+    // `.prev`). With copy-based retention staged until the swap succeeds, a failed final rename
+    // leaves BOTH the destination AND the old rollback copy byte-identical to before, with no
+    // staging temps left behind. The failure is forced exactly at the final rename via the
+    // debug-build-only IRONBUS_TEST_FAIL_FINAL_RENAME failpoint (set on the child process only).
+    if !cfg!(debug_assertions) {
+        // The failpoint is compiled out of release builds, so the failure cannot be injected there;
+        // the contract is still proved by every debug CI run of this test.
+        return;
+    }
+    let scr = Scratch::new("failed-final-rename-it");
+    let dest = scr.path().join("ironbus");
+    let prev = scr.path().join("ironbus.prev");
+    let v1 = b"ironbus v1 (the prior known-good rollback copy)";
+    let v2 = b"ironbus v2 (the live binary)";
+    std::fs::write(&dest, v2).unwrap();
+    std::fs::write(&prev, v1).unwrap();
+    let staged = scr.path().join("staged-v3");
+    std::fs::write(&staged, b"ironbus v3 (the upgrade that fails to land)").unwrap();
+
+    let (code, _out, err) = run_ironbus_env(
+        &[
+            "upgrade",
+            "--new-binary",
+            staged.to_str().unwrap(),
+            "--dest",
+            dest.to_str().unwrap(),
+        ],
+        &[("IRONBUS_TEST_FAIL_FINAL_RENAME", "1")],
+    );
+    assert_eq!(
+        code, 70,
+        "an IO fault at the final rename is the frozen internal exit code (stderr={err})"
+    );
+    assert!(
+        err.contains("installing to"),
+        "the error names the failing step (stderr={err})"
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        v2,
+        "the live binary is byte-identical to before the failed rename (the host is never \
+         stranded without a binary, #421)"
+    );
+    assert_eq!(
+        std::fs::read(&prev).unwrap(),
+        v1,
+        "the PRE-EXISTING rollback copy is byte-identical to before (never clobbered by a failed \
+         install, #421)"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(scr.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "ironbus" && n != "ironbus.prev" && n != "staged-v3")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no staging temps survive a failed final rename: {leftovers:?}"
+    );
 }
 
 #[test]
