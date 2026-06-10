@@ -263,135 +263,117 @@ fn run_download(stub_dir: &std::path::Path, url: &str, dest: &std::path::Path) -
 }
 
 #[test]
-fn a_gnu_wget_is_invoked_with_https_only_and_a_tls_floor() {
-    // TLS enforcement on the wget fallback (#423): when wget's --help advertises --https-only
-    // and --secure-protocol (GNU wget), the download helper must pass both, mirroring the curl
-    // path's `--proto '=https' --tlsv1.2`, and use -nv (not -q) so a failure reports why.
-    let dir = tempdir::TempDir::new("ib-wget-gnu");
-    let argv_log = dir.path().join("wget-argv");
+fn a_gnu_wget_1x_is_refused_with_no_download() {
+    // FAIL-CLOSED (#423): GNU wget 1.x honors --https-only ONLY in recursive mode (verified on
+    // GNU Wget 1.25.0: a plain-http URL and an https-to-http 302 both fetch over plaintext with
+    // exit 0), so the helper must classify it from `wget --version` and refuse before any fetch.
+    let dir = tempdir::TempDir::new("ib-wget-gnu1");
+    let fetched = dir.path().join("wget-fetched");
     write_stub(
         dir.path(),
         "wget",
         &format!(
             concat!(
                 "case \"$1\" in\n",
-                "  --help) printf '%s\\n' '  --https-only' '  --secure-protocol=PR'; exit 0 ;;\n",
+                "  --version) printf '%s\\n' 'GNU Wget 1.21.3 built on linux-gnu.'; exit 0 ;;\n",
                 "esac\n",
                 "printf '%s\\n' \"$@\" > \"{log}\"\n",
                 "exit 0\n"
             ),
-            log = argv_log.display()
-        ),
-    );
-    let dest = dir.path().join("dest");
-    let (code, stderr) = run_download(dir.path(), "https://example.invalid/asset", &dest);
-    assert_eq!(
-        code, 0,
-        "the stubbed download must succeed, stderr: {stderr}"
-    );
-    let recorded = std::fs::read_to_string(&argv_log).expect("the wget stub recorded its argv");
-    let args: Vec<&str> = recorded.lines().collect();
-    assert!(
-        args.contains(&"--https-only"),
-        "wget MUST be pinned to HTTPS, argv: {args:?}"
-    );
-    assert!(
-        args.contains(&"--secure-protocol=TLSv1_2"),
-        "a GNU wget must also get the TLS version floor, argv: {args:?}"
-    );
-    assert!(
-        args.contains(&"-nv"),
-        "-nv must replace -q so error detail survives, argv: {args:?}"
-    );
-    assert!(
-        !args.contains(&"-q"),
-        "-q must be gone (it suppressed all error detail), argv: {args:?}"
-    );
-}
-
-#[test]
-fn a_wget_that_cannot_enforce_https_fails_closed_with_no_download() {
-    // FAIL-CLOSED (#423): a wget whose --help advertises no --https-only (real BusyBox) cannot
-    // refuse a plain-HTTP redirect, and SHA256SUMS rides the same channel as the binary, so
-    // proceeding would let a network-position attacker defeat the checksum gate. The helper must
-    // abort with a clear error and MUST NOT invoke wget to fetch anything.
-    let dir = tempdir::TempDir::new("ib-wget-busybox");
-    let invoked = dir.path().join("wget-invoked");
-    write_stub(
-        dir.path(),
-        "wget",
-        &format!(
-            concat!(
-                "case \"$1\" in\n",
-                "  --help) printf '%s\\n' 'BusyBox wget: -q -O FILE -T SEC URL'; exit 0 ;;\n",
-                "esac\n",
-                "printf '%s\\n' \"$@\" > \"{log}\"\n",
-                "exit 0\n"
-            ),
-            log = invoked.display()
+            log = fetched.display()
         ),
     );
     let dest = dir.path().join("dest");
     let (code, stderr) = run_download(dir.path(), "https://example.invalid/asset", &dest);
     assert_ne!(
         code, 0,
-        "an HTTPS-incapable wget MUST fail closed, never downgrade"
+        "GNU wget 1.x MUST be refused, never trusted to pin HTTPS"
     );
     assert!(
-        stderr.contains("cannot enforce HTTPS"),
-        "the error must say WHY it refused, stderr: {stderr}"
+        !fetched.exists(),
+        "the refusal must happen BEFORE any fetch is attempted"
     );
     assert!(
-        stderr.contains("curl or GNU wget"),
-        "the error must suggest a capable tool, stderr: {stderr}"
+        stderr.contains("recursive mode") && stderr.contains("install curl"),
+        "the error must name the wget 1.x reason and the remedy, stderr: {stderr}"
     );
-    assert!(
-        !invoked.exists(),
-        "NO download may happen on the fail-closed path"
-    );
-    assert!(
-        !dest.exists(),
-        "no destination file may be created on the fail-closed path"
-    );
+    assert!(!dest.exists(), "nothing may be downloaded");
 }
 
 #[test]
-fn a_limited_wget_with_only_https_only_is_still_accepted() {
-    // The middle case (#423): some limited wget builds know --https-only but not
-    // --secure-protocol. --https-only alone still pins the scheme (a plain-HTTP URL or redirect
-    // is refused), so the helper accepts it and must NOT pass the unsupported flag.
-    let dir = tempdir::TempDir::new("ib-wget-limited");
-    let argv_log = dir.path().join("wget-argv");
+fn a_wget2_is_refused_with_no_download() {
+    // FAIL-CLOSED (#423): wget2's enforcement was empirically DISPROVEN on wget2 2.2.1
+    // (--https-only skips the command-line URL; its redirect refusal exits 0 with no output
+    // file; --https-enforce=hard silently falls back to plaintext when the TLS connect fails),
+    // so wget2 is refused exactly like wget 1.x: classified from --version, no fetch attempted.
+    let dir = tempdir::TempDir::new("ib-wget2");
+    let fetched = dir.path().join("wget-fetched");
     write_stub(
         dir.path(),
         "wget",
         &format!(
             concat!(
                 "case \"$1\" in\n",
-                "  --help) printf '%s\\n' '  --https-only'; exit 0 ;;\n",
+                "  --version) printf '%s\\n' 'GNU Wget2 2.2.1 - multithreaded metalink/file/website downloader'; exit 0 ;;\n",
                 "esac\n",
                 "printf '%s\\n' \"$@\" > \"{log}\"\n",
                 "exit 0\n"
             ),
-            log = argv_log.display()
+            log = fetched.display()
         ),
     );
     let dest = dir.path().join("dest");
     let (code, stderr) = run_download(dir.path(), "https://example.invalid/asset", &dest);
-    assert_eq!(
+    assert_ne!(
         code, 0,
-        "the stubbed download must succeed, stderr: {stderr}"
-    );
-    let recorded = std::fs::read_to_string(&argv_log).expect("the wget stub recorded its argv");
-    let args: Vec<&str> = recorded.lines().collect();
-    assert!(
-        args.contains(&"--https-only"),
-        "the limited wget is still HTTPS-pinned, argv: {args:?}"
+        "wget2 MUST be refused: its enforcement is disproven, not just unproven"
     );
     assert!(
-        !args.iter().any(|a| a.starts_with("--secure-protocol")),
-        "an unsupported flag must not be passed, argv: {args:?}"
+        !fetched.exists(),
+        "the refusal must happen BEFORE any fetch is attempted"
     );
+    assert!(
+        stderr.contains("wget2") && stderr.contains("install curl"),
+        "the error must name the wget2 evidence and the remedy, stderr: {stderr}"
+    );
+    assert!(!dest.exists(), "nothing may be downloaded");
+}
+
+#[test]
+fn a_busybox_or_unrecognized_wget_is_refused_with_no_download() {
+    // FAIL-CLOSED (#423): BusyBox wget rejects --version with a usage error and has no HTTPS
+    // enforcement flags at all; anything the classifier cannot recognize is refused the same way.
+    let dir = tempdir::TempDir::new("ib-wget-busybox");
+    let fetched = dir.path().join("wget-fetched");
+    write_stub(
+        dir.path(),
+        "wget",
+        &format!(
+            concat!(
+                "case \"$1\" in\n",
+                "  --version) printf '%s\\n' 'wget: unrecognized option: version' >&2; exit 1 ;;\n",
+                "esac\n",
+                "printf '%s\\n' \"$@\" > \"{log}\"\n",
+                "exit 0\n"
+            ),
+            log = fetched.display()
+        ),
+    );
+    let dest = dir.path().join("dest");
+    let (code, stderr) = run_download(dir.path(), "https://example.invalid/asset", &dest);
+    assert_ne!(
+        code, 0,
+        "an unrecognized wget MUST fail closed, never downgrade"
+    );
+    assert!(
+        !fetched.exists(),
+        "the refusal must happen BEFORE any fetch is attempted"
+    );
+    assert!(
+        stderr.contains("cannot enforce HTTPS") && stderr.contains("install curl"),
+        "the error must say why and name the remedy, stderr: {stderr}"
+    );
+    assert!(!dest.exists(), "nothing may be downloaded");
 }
 
 #[test]

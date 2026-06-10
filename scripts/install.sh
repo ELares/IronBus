@@ -124,52 +124,81 @@ verify_checksum() {
     return 0
 }
 
-# Probe the available `wget` for HTTPS enforcement support and print the TLS flags to use, by
-# scanning its `--help` text (GNU wget prints help on stdout, BusyBox prints usage on stderr, so
-# both streams are captured). Prints nothing and returns non-zero when the wget advertises no
-# `--https-only` at all: such a wget follows a plain-HTTP redirect, and SHA256SUMS travels over
-# the same channel as the binary, so a network-position attacker who downgrades BOTH fetches
-# defeats the checksum gate entirely. The caller must treat that as an ERROR and fail closed,
-# never proceed downgradable (#423).
-wget_tls_flags() {
-    # `--help` exits non-zero on some builds (BusyBox); the usage text still prints, tolerate it.
-    wget_help="$(wget --help 2>&1)" || true
-    case "$wget_help" in
-        *--https-only*) : ;;
-        *) return 1 ;;
-    esac
-    case "$wget_help" in
-        # GNU wget: pin the scheme AND the minimum TLS version, mirroring the curl path's
-        # `--proto '=https' --tlsv1.2`.
-        *--secure-protocol*) printf '%s' '--https-only --secure-protocol=TLSv1_2' ;;
-        # A limited (BusyBox-style) wget that knows `--https-only` but not `--secure-protocol`:
-        # `--https-only` alone still pins the scheme (a plain-HTTP URL or redirect is refused),
-        # so it is accepted; only the minimum-TLS-version pin is unavailable on such a build.
-        *) printf '%s' '--https-only' ;;
+# Classify the available `wget` from the FIRST LINE of `wget --version` (run under LC_ALL=C so
+# the banner is never translated). Prints one of: gnu-wget-1 | wget2 | unknown. BusyBox and other
+# minimal builds reject `--version` with a usage error; that classifies as `unknown`.
+#
+# Why every flavor below is REFUSED by `download` (#423): NO known wget can be trusted to pin the
+# URL scheme across redirects for a NON-RECURSIVE single-file download, and SHA256SUMS travels
+# over the same channel as the binary, so one plaintext hop lets a network-position attacker
+# defeat the checksum gate entirely. Empirical record (2026-06-10):
+#
+#   - GNU wget 1.x: `--https-only` is honored ONLY in recursive mode (in wget's source,
+#     opt.https_only is consulted only by download_child in src/recur.c). Verified on GNU Wget
+#     1.25.0: `wget --https-only --secure-protocol=TLSv1_2 -nv -O out URL` (a) fetched a plain
+#     http:// URL over plaintext with exit 0, and (b) followed an https-to-plain-http 302 and
+#     fetched the body with exit 0. The flags are accepted and silently do nothing here.
+#   - GNU wget2: tested on wget2 2.2.1 (GnuTLS build) and DISPROVEN, so it is refused too:
+#     (a) `--https-only` does not apply to the command-line URL (a plain http:// URL downloads
+#     over plaintext, exit 0); (b) its refusal of an https-to-http redirect EXITS 0 with no
+#     output file, so a caller gets no failure signal; (c) `--https-enforce=hard` rewrites http
+#     to https but silently FALLS BACK TO PLAINTEXT when the TLS connect fails (verified against
+#     an http-only host: a plain `GET / HTTP/1.1` on the wire, exit 0, while reporting the URL
+#     as https://); (d) combining `--https-only --https-enforce=hard` (either order) disables
+#     the upgrade entirely and fetches the plain http:// URL over plaintext again. Unproven (here
+#     disproven) enforcement is not trusted.
+#   - BusyBox / anything unrecognized: no HTTPS-enforcement flags at all; never enforceable.
+wget_flavor() {
+    # Some builds (BusyBox) exit non-zero on --version; the text still prints, tolerate it.
+    wget_version="$(LC_ALL=C wget --version 2>&1)" || true
+    # Keep only the first line, with no external tool: the test harness calls these helpers on a
+    # PATH that resolves nothing but stub tools (so no `head`).
+    wget_nl='
+'
+    wget_version="${wget_version%%"${wget_nl}"*}"
+    case "$wget_version" in
+        "GNU Wget 1."*) printf '%s' 'gnu-wget-1' ;;
+        "GNU Wget2"*) printf '%s' 'wget2' ;;
+        *) printf '%s' 'unknown' ;;
     esac
 }
 
-# Download <url> to <dest>, failing on any HTTP or transport error. Uses curl or wget; never
-# pipes the body to a shell. Returns non-zero on failure so the caller can fail closed. BOTH
-# tool paths enforce HTTPS (refuse a plain-HTTP URL or redirect): the checksum gate downstream
-# is only as strong as the transport pin on the SHA256SUMS fetch (#423).
+# Download <url> to <dest> over HTTPS only; never pipes the body to a shell. Decision table:
+#
+#   curl (preferred)   used, with `--proto '=https' --tlsv1.2` pinning the scheme on every hop
+#                      and the TLS floor; returns non-zero on any HTTP or transport error so the
+#                      caller can fail closed.
+#   wget, any flavor   REFUSED: `download` exits via `die` before any fetch is attempted. GNU
+#                      wget 1.x only honors --https-only recursively, wget2's enforcement was
+#                      empirically disproven, and BusyBox has no enforcement flags at all (see
+#                      wget_flavor above for the full evidence). A flavor-specific error names
+#                      the reason and the remedies.
+#   neither            exits via `die`.
+#
+# The wget and no-tool branches deliberately `die` (exit) rather than return non-zero: no call
+# site invokes download in a subshell, and exiting is the strongest fail-closed signal, so a
+# future caller cannot ignore the status and proceed downgradable (#423).
 download() {
     url="$1"
     dest="$2"
+    remedy="install curl, or download it manually over HTTPS and verify it against SHA256SUMS"
     if command -v curl >/dev/null 2>&1; then
         # -f: fail on HTTP >= 400; -S: show errors; -L: follow redirects; -o: to file.
         curl -fSL --proto '=https' --tlsv1.2 -o "$dest" "$url"
     elif command -v wget >/dev/null 2>&1; then
-        # A wget that cannot enforce HTTPS is an ERROR, never a silent downgrade (fail-closed).
-        tls_flags="$(wget_tls_flags)" \
-            || die "the available wget cannot enforce HTTPS (no --https-only support); install curl or GNU wget (refusing a downgradable download of $url)"
-        # -nv (not -q): terse on success, but the error line survives, so a failed download on a
-        # wget-only host says why. $tls_flags is word-split deliberately: it is one of the two
-        # fixed flag strings printed by wget_tls_flags above, never derived from input.
-        # shellcheck disable=SC2086
-        wget $tls_flags -nv -O "$dest" "$url"
+        case "$(wget_flavor)" in
+            gnu-wget-1)
+                die "GNU wget 1.x cannot enforce HTTPS for a single-file download (--https-only is honored only in recursive mode, so a plain-http URL or an https-to-http redirect is fetched anyway; verified on GNU Wget 1.25.0); refusing to download $url with it; $remedy"
+                ;;
+            wget2)
+                die "wget2 is not trusted to enforce HTTPS (tested on wget2 2.2.1: --https-only skips the command-line URL, its redirect refusal exits 0, and --https-enforce=hard falls back to plaintext when TLS fails); refusing to download $url with it; $remedy"
+                ;;
+            *)
+                die "the available wget (BusyBox or an unrecognized build) cannot enforce HTTPS; refusing to download $url with it; $remedy"
+                ;;
+        esac
     else
-        die "need curl or wget to download $url"
+        die "need curl to download $url (wget is refused: no flavor provably enforces HTTPS for a single-file download)"
     fi
 }
 
