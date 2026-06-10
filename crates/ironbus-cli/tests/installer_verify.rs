@@ -456,10 +456,12 @@ fn the_rollback_copy_survives_an_upgrade_then_a_same_version_rerun() {
 #[test]
 fn a_failed_swap_leaves_the_original_binary_at_the_destination() {
     // FAILURE SAFETY (#421): a failed install must leave the host with the binary it already had.
-    // The old implementation moved the live binary to `.prev` BEFORE the final rename, so a
-    // failure at the final step stranded the host with NO binary at the destination. With
-    // copy-based retention the live binary is never moved, so EVERY failure point (staging,
-    // retention, the final rename) leaves the original present at the destination.
+    // Phase 1 (a read-only install dir) fails at the STAGING step, before anything could touch the
+    // destination; that invariant held on the pre-fix implementation too, so phase 1 pins a shared
+    // baseline, not the #421 fix. Phase 2 is the part with #421 teeth: it drives install_binary all
+    // the way to the FINAL swap and fails exactly there. The pre-fix implementation had already
+    // moved the live binary to `.prev` by that point, leaving the destination EMPTY; the
+    // staged-retention implementation leaves it untouched.
     let old = b"ironbus v1 (the live binary)";
 
     // Phase 1: point dest at a path whose parent directory is read-only after the original binary
@@ -524,11 +526,63 @@ fn a_failed_swap_leaves_the_original_binary_at_the_destination() {
         old,
         "a failed FINAL swap must leave the live binary untouched at the destination (#421)"
     );
-    // The retention ran before the failed swap and COPIED the live bytes, so `.prev` exists and
-    // holds the same known-good bytes; the host stays healthy with its rollback copy intact.
+    // The retention only STAGED a copy before the swap; it is committed to `.prev` exclusively
+    // AFTER a successful swap, so a failed swap commits no `.prev` here (none pre-existed) and the
+    // staged temp is discarded. A pre-existing `.prev` surviving the same failure is pinned by
+    // `a_failed_final_swap_preserves_a_pre_existing_rollback_copy` below.
+    assert!(
+        !prev.exists(),
+        "a failed final swap must not commit a rollback copy (retention is post-swap only)"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "ironbus" && n != "staged-v2")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no staging temps survive a failed final swap: {leftovers:?}"
+    );
+}
+
+#[test]
+fn a_failed_final_swap_preserves_a_pre_existing_rollback_copy() {
+    // THE #421 ORDERING HAZARD: if the retention were COMMITTED over `.prev` before the final
+    // swap, a failed final swap (the ENOSPC case) would already have replaced a PRE-EXISTING good
+    // rollback copy (v1) with bytes identical to the live binary (v2): the failed v3 install would
+    // leave prev=v2 and the host's only OLDER known-good (v1) gone. With the retention merely
+    // STAGED until the swap succeeds, a failed final swap leaves BOTH the destination AND the old
+    // rollback copy byte-identical to before.
+    let dir = tempdir::TempDir::new("ib-failed-swap-prev");
+    let dest = dir.path().join("ironbus");
+    let prev = dir.path().join("ironbus.prev");
+    let v1 = b"ironbus v1 (the prior known-good rollback copy)";
+    let v2 = b"ironbus v2 (the live binary)";
+    std::fs::write(&dest, v2).unwrap();
+    std::fs::write(&prev, v1).unwrap();
+    let src = dir.path().join("staged-v3");
+    std::fs::write(&src, b"ironbus v3 (the upgrade that fails to land)").unwrap();
+
+    let code = run_install_binary_with_failing_final_swap(&src, &dest);
+    assert_ne!(code, 0, "a failed final swap must report failure");
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        v2,
+        "the live binary is byte-identical to before the failed swap"
+    );
     assert_eq!(
         std::fs::read(&prev).unwrap(),
-        old,
-        "the rollback copy holds the live (old) bytes after a failed final swap"
+        v1,
+        "the PRE-EXISTING rollback copy is byte-identical to before: a failed swap must never \
+         replace the older known-good with bytes identical to the live binary (#421 ordering)"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "ironbus" && n != "ironbus.prev" && n != "staged-v3")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no staging temps survive a failed final swap: {leftovers:?}"
     );
 }

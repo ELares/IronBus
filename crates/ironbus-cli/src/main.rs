@@ -842,9 +842,11 @@ Notes:
     fast rather than corrupting the log with concurrent writers.
     upgrade swaps an ALREADY-VERIFIED new binary (--new-binary) over the live one (--dest) WITHOUT
     overwriting it in place: it stages the new bytes to a sibling temp on the same filesystem,
-    fsyncs, retains the prior binary as <dest>.prev (one-command rollback), then renames atomically
-    (POSIX), so a power cut mid-upgrade leaves either the old or the new binary, never a truncated
-    one. The fail-closed download/verify is scripts/install.sh; upgrade is the post-verify swap.
+    fsyncs, renames atomically (POSIX), and only then commits a staged copy of the prior binary as
+    <dest>.prev (one-command rollback), so a power cut mid-upgrade leaves either the old or the new
+    binary, never a truncated one, and a failed swap never destroys an existing rollback copy. A
+    byte-identical new binary is a no-op that touches neither the live binary nor <dest>.prev.
+    The fail-closed download/verify is scripts/install.sh; upgrade is the post-verify swap.
     --max-failed-starts (default 3) is the N the systemd unit consults for fall-back.
     rollback restores <dest>.prev over --dest (the same atomic swap) and clears the start counter.
     record-start --failed/--ok/--check drives the consecutive-failed-start counter the systemd unit
@@ -4081,7 +4083,8 @@ fn random_suffix() -> String {
 }
 
 /// Parses and runs `upgrade`: atomically swap an already-verified new binary over the live one,
-/// retaining the prior binary as `<dest>.prev` (#104). The download/verify is the fail-closed
+/// retaining the prior binary as `<dest>.prev` (#104; the retention is committed only after the
+/// swap, and a byte-identical re-run is a no-op, #421/#422). The download/verify is the fail-closed
 /// `scripts/install.sh`; this verb is the post-verify atomic swap, so it never weakens
 /// verify-before-install. Unix-only (atomic `rename(2)`); the non-Unix `cmd_upgrade` stub errors.
 ///
@@ -5115,8 +5118,11 @@ fn map_upgrade_err(e: &upgrade::UpgradeError) -> CliError {
 
 /// Atomically swaps the already-verified `new_binary` over `dest`, retaining the prior binary as
 /// `<dest>.prev` (#104). Never overwrites the live binary in place: it stages to a sibling temp,
-/// fsyncs, retains the prior bytes, then renames atomically (POSIX). The caller has ALREADY verified
-/// `new_binary` (the fail-closed `scripts/install.sh`), so this never weakens verify-before-install.
+/// fsyncs, performs the single atomic rename (POSIX), and only then commits the staged copy of the
+/// prior bytes onto `<dest>.prev`, so no failure can strand the host without a binary or destroy a
+/// pre-existing rollback copy (#421). A byte-identical new binary is a no-op that touches neither
+/// `dest` nor `.prev` (#422). The caller has ALREADY verified `new_binary` (the fail-closed
+/// `scripts/install.sh`), so this never weakens verify-before-install.
 #[cfg(unix)]
 fn cmd_upgrade(
     new_binary: &Path,
@@ -5132,7 +5138,21 @@ fn cmd_upgrade(
         )));
     }
     let had_prior = dest.exists();
-    upgrade::atomic_swap_with_prev(new_binary, dest).map_err(|e| map_upgrade_err(&e))?;
+    let outcome =
+        upgrade::atomic_swap_with_prev(new_binary, dest).map_err(|e| map_upgrade_err(&e))?;
+    if outcome == upgrade::SwapOutcome::SkippedSameVersion {
+        // SAME-VERSION no-op (#422): NOTHING was changed, deliberately including the start-attempt
+        // counter; a re-run of the version already live must not clear the failure budget of a
+        // binary that may be mid-failure-streak, and must not clobber the rollback copy.
+        writeln!(
+            out,
+            "{} already holds the new binary's exact bytes (same version); nothing to do (the \
+             rollback copy at {}, if any, is untouched)",
+            dest.display(),
+            upgrade::prev_path(dest).display()
+        )?;
+        return Ok(());
+    }
     // A new binary is a fresh start budget: clear any stale failed-start count so a prior version's
     // failures do not trip the fall-back for this one.
     upgrade::record_successful_start(dest)

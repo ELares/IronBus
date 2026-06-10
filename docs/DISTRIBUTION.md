@@ -45,9 +45,12 @@ even though the friendly name drops `musl`; the `unknown`-vendored triple stays 
 target only. It
 is fail-closed: any download error, a missing or mismatched checksum, a malformed `SHA256SUMS`, or an
 unsupported platform aborts with a non-zero exit and installs nothing. It never `eval`s or `sh`-pipes
-downloaded content, and there is no skip-verification override. On an upgrade it retains the prior
-binary as `ironbus.prev` (an atomic same-directory move) before the atomic swap, so a rollback copy
-always exists. Full usage is in [RELEASING.md](../RELEASING.md#install-the-fail-closed-installer).
+downloaded content, and there is no skip-verification override. On an upgrade it stages a COPY of the
+live binary to a sibling temp (the live binary is never moved), swaps the new verified binary into
+place with ONE atomic same-directory rename, and only then commits the staged copy as `ironbus.prev`,
+so a failed install leaves both the live binary and any pre-existing `ironbus.prev` untouched (#421).
+A byte-identical re-run is a no-op that preserves `ironbus.prev` (#422). Full usage is in
+[RELEASING.md](../RELEASING.md#install-the-fail-closed-installer).
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ELares/IronBus/main/scripts/install.sh | sh
@@ -214,12 +217,20 @@ A running broker is a binary with an open WAL, so an upgrade is a lifecycle oper
 install. The `ironbus upgrade` verb (and the installer's `install_binary`/shell twin) enforce two
 properties:
 
-- **The live binary is never overwritten in place.** The new bytes are written to a sibling temp file
-  ON THE SAME FILESYSTEM, fsynced, the current binary is retained as `<dest>.prev` via an atomic
-  same-directory rename, then the new file is `rename(2)`d over the destination. `rename` is atomic
-  on POSIX, so **a power cut mid-upgrade leaves either the old binary (rename not yet applied) or the
-  new binary fully on disk, never a truncated one.** The fsync before the rename guarantees the new
-  bytes are durable before the rename publishes them.
+- **The live binary is never overwritten in place, and a failed upgrade never destroys the rollback
+  copy (#421).** The new bytes are written to a sibling temp file ON THE SAME FILESYSTEM, the current
+  binary is COPIED (never moved) to a second sibling temp, the new file is `rename(2)`d over the
+  destination in ONE atomic step, and only then is the staged copy committed as `<dest>.prev`.
+  `rename` is atomic on POSIX, so **a power cut mid-upgrade leaves either the old binary (rename not
+  yet applied) or the new binary fully on disk, never a truncated one.** A failed final rename leaves
+  the destination AND any pre-existing `<dest>.prev` exactly as they were. A crash between the swap
+  and the `.prev` commit leaves `.prev` one version stale: an OLDER known-good binary, which is the
+  deliberate safer trade versus committing first and leaving `.prev` byte-identical to the
+  possibly-bad binary just installed. A byte-identical re-run is a no-op that touches neither the
+  destination nor `.prev` (#422). The `ironbus upgrade` verb fsyncs the staged files before the
+  rename and the directory after it, so the new bytes are durable before the rename publishes them;
+  POSIX `sh` has no portable fsync, so the shell installer enforces the same ordering and atomicity
+  but cannot make the same durability promise: the Rust verb is the durably-synced path of the pair.
 - **A node that cannot start the new binary falls back to `ironbus.prev` after N failed starts**
   (default N = 3). The systemd unit records each failed start and, at the threshold, runs
   `ironbus rollback` to restore the prior known-good bytes. See the
