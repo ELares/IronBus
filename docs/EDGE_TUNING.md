@@ -20,12 +20,13 @@ flag; the exact preset values are in [CONFIG.md](CONFIG.md) section 6). With no
 profile the default stays `balanced` (exactly the compiled-in `DEFAULT_*` set,
 64 MiB segments), so a zero-config broker is unchanged.
 
-The TOML config FILE (`serve --config <path>`) and the immutable-config atomic
-re-read RELOAD engine are also SHIPPED (#382), on the precedence
-`flag > env > FILE > default`; the env-var layer (`IRONBUS_<FLAG>`) sits between
-flags and the file as before. The remaining residual on that surface is the
-MUTATING wire `CONFIG SET`/`SAVE` admin verbs, which wait on the #106
-connection-scoped auth (#380). The refuse-to-boot RAM guard (#115) is wired
+The TOML config FILE (`serve --config <path>`) is also SHIPPED (#382), on the
+precedence `flag > env > FILE > default`; the env-var layer (`IRONBUS_<FLAG>`)
+sits between flags and the file as before. The validate-whole-then-swap re-read
+RELOAD engine ships too, but it runs only as a startup self-check: no runtime
+trigger is wired yet (SIGHUP is graceful stop, not reload), see #431. The other
+residual on that surface is the MUTATING wire `CONFIG SET`/`SAVE` admin verbs,
+which wait on the #106 connection-scoped auth (#380). The refuse-to-boot RAM guard (#115) is wired
 too: with `--ram-ceiling-bytes` set (which `edge-tiny` does, to 64 MiB), a
 broker whose configured caps provably exceed the ceiling refuses to start (the
 worst-case formula is in [RAM_BUDGET.md](RAM_BUDGET.md)).
@@ -135,8 +136,10 @@ freezes the log read-only and alerts. See README and
 - **#19**: ratifies the write-amplification target against a measured baseline
   on the reference edge device.
 - **#380 / #106**: the MUTATING wire `CONFIG SET` / `SAVE` admin verbs (the
-  runtime config-change surface) wait on connection-scoped auth; the shipped
-  reload path is the validate-whole-then-swap `--config` re-read (#382).
+  runtime config-change surface) wait on connection-scoped auth. The
+  validate-whole-then-swap `--config` re-read engine ships (#382) but runs only
+  as a startup self-check; no runtime trigger is wired yet (SIGHUP is graceful
+  stop), see #431.
 - **#12 write-path wiring**: the compression codec runtime and the
   `--compression` knob shipped (#387), but the serve write path does not yet
   invoke the runtime, so stored records remain raw (`codec = none` on disk).
