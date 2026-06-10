@@ -94,10 +94,19 @@ use std::process::ExitCode;
 // Unix-only, alongside the rest of the storage path.
 use ironbus_storage::admin::ResetTarget;
 
+#[cfg(all(unix, not(feature = "zstd")))]
+use ironbus_core::compress::NoDictionaries;
+#[cfg(unix)]
+use ironbus_core::compress::{
+    decompress_payload, read_descriptor, DecompressError, DictResolver, CODEC_ID_LZ4,
+    CODEC_ID_NONE, CODEC_ID_ZSTD, DEFAULT_MAX_DECOMPRESSED_BYTES, DICT_ID_NONE,
+};
 #[cfg(unix)]
 use ironbus_core::delivery::DeliveryConfig;
 #[cfg(unix)]
 use ironbus_core::lease::LeaseConfig;
+#[cfg(unix)]
+use ironbus_core::types::RecordFlags;
 #[cfg(unix)]
 use ironbus_server::actor::{spawn_actor, DEFAULT_CHANNEL_BOUND};
 #[cfg(unix)]
@@ -106,8 +115,12 @@ use ironbus_server::engine::{DiskFullPolicy, DurabilityLevel, Engine, EngineConf
 use ironbus_server::health::serve_health;
 #[cfg(unix)]
 use ironbus_server::server::serve;
+#[cfg(all(unix, feature = "zstd"))]
+use ironbus_storage::dict_store::{CachingDictResolver, DictSidecarStore, DICTS_SUBDIR};
 #[cfg(unix)]
 use ironbus_storage::dlq::{read_dlq_entries, DlqEntry};
+#[cfg(all(unix, feature = "zstd"))]
+use ironbus_storage::fs::Filesystem;
 #[cfg(unix)]
 use ironbus_storage::fs::StdFs;
 #[cfg(unix)]
@@ -212,14 +225,14 @@ const DEFAULT_DISK_FULL_POLICY: &str = "drop-new";
 /// levels (`interval`/`async`/`none`) are strictly opt-in and weaken I2 by a documented loss window.
 const DEFAULT_DURABILITY_LEVEL: &str = "sync";
 
-/// The default compression codec for `serve` (#12, #387): `lz4`, the pure-Rust default codec per
-/// [ADR-0003](../../../docs/adr/0003-default-compression-lz4-zstd-opt-in.md). The codec runtime,
-/// its raw-store / never-expand guards, and its decoder resilience live in
-/// `ironbus_core::compress`. NOTE the knob selects the codec and is echoed in the
-/// materialized-config line, but the serve WRITE PATH is not yet wired to the runtime, so every
-/// record is still stored raw (the stored codec is always `none`) regardless of the selection.
-/// The opt-in `zstd` codec (behind a feature, with its level knob and trained dictionaries) is
-/// deferred per ADR-0003 and is not a valid value on the default build.
+/// The default compression codec for `serve` (#12, #387, wired by #430): `lz4`, the pure-Rust
+/// default codec per [ADR-0003](../../../docs/adr/0003-default-compression-lz4-zstd-opt-in.md).
+/// The codec runtime, its raw-store / never-expand guards, and its decoder resilience live in
+/// `ironbus_core::compress`. The resolved knob is threaded into `EngineConfig::compression`, so
+/// the serve WRITE PATH compresses each compressible payload at or over the 64-byte threshold
+/// behind `RecordFlags::COMPRESSED`; the materialized-config `compression=` echo matches the
+/// bytes on disk. The opt-in `zstd` codec (behind a feature, with its level knob and trained
+/// dictionaries) is deferred per ADR-0003 and is not a valid value on the default build.
 const DEFAULT_COMPRESSION: &str = "lz4";
 
 /// The default `--flush-interval-ms` for the `interval` durability level (#341), in MILLISECONDS: the
@@ -385,13 +398,13 @@ impl DurabilityLevelArg {
     }
 }
 
-/// The compression CODEC parsed from `serve --compression` (#12, #387). A platform-neutral, `Copy`
-/// mirror of [`ironbus_core::compress::Codec`], so it lives in the (non-Unix-gated) [`ServeConfig`]
-/// and is parsed/validated on EVERY platform. The default is [`CompressionArg::Lz4`] (the
-/// ADR-0003 pure-Rust default codec). NOTE the serve write path is NOT yet wired to the codec
-/// runtime: the resolved value is validated and echoed in the materialized-config line, but every
-/// record is still stored raw today (the stored codec is always `none`). The opt-in `zstd`
-/// codec is deferred per ADR-0003 and is not accepted on the default build.
+/// The compression CODEC parsed from `serve --compression` (#12, #387, wired by #430). A
+/// platform-neutral, `Copy` mirror of [`ironbus_core::compress::Codec`], so it lives in the
+/// (non-Unix-gated) [`ServeConfig`] and is parsed/validated on EVERY platform. The default is
+/// [`CompressionArg::Lz4`] (the ADR-0003 pure-Rust default codec). The resolved value is threaded
+/// into `EngineConfig::compression` by `open_disk_engine`, so the write path stores what the
+/// materialized-config line echoes. The opt-in `zstd` codec is deferred per ADR-0003 and is not
+/// accepted on the default build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompressionArg {
     /// No compression: every record is stored raw, byte-for-byte the historical layout.
@@ -790,12 +803,12 @@ Notes:
     key/payload sizes (NDJSON with --json). It is read-only and never mutates the directory;
     an empty or never-poisoned broker shows nothing.
     dump --raw shows the on-disk frame and --require-dict fails strictly (exit 3) on a record
-    whose dictionary is missing. The compression codec RUNTIME and the serve --compression
-    <none|lz4> knob shipped (#12, #387, default lz4), but the serve write path is NOT yet wired
-    to the runtime: records are still STORED RAW (the stored codec is always none; the
-    materialized-config compression= field echoes the selected knob, not the bytes on disk), so
-    today every record decodes plainly, --raw renders the same field set, and --require-dict
-    never trips. The flags are the committed surface for when the write-path wiring lands.
+    whose dictionary is missing. A broker served with --compression lz4 (#12, #387, wired by
+    #430, default lz4) stores each compressible payload at or over the 64-byte threshold as a
+    compressed object behind the COMPRESSED record flag: dump decodes it back to the original
+    payload and reports the real stored codec, while --raw shows the stored (descriptor +
+    stream) frame; a record stored raw (sub-threshold, incompressible, or --compression none)
+    dumps codec none exactly as before.
     scrub is an offline, strictly READ-ONLY full integrity scan of the data dir (no broker): it
     reports every corruption, torn-tail, or checksum issue it finds (the plan) and marks, never
     hides, what recovery would quarantine. It exits 0 if clean (a torn-tail-only result stays 0,
@@ -2691,15 +2704,15 @@ struct ServeConfig {
     /// to boot without `async_loss_ack` (the none/async safety gate). Platform-neutral so it is
     /// validated on every platform; the Unix on-disk path maps it to the engine enum.
     durability_level: DurabilityLevelArg,
-    /// The COMPRESSION CODEC knob (#12, #387). Default [`CompressionArg::Lz4`] (the ADR-0003
-    /// pure-Rust default codec). NOTE the serve write path is NOT yet wired to the codec runtime
-    /// (`ironbus_core::compress`): the resolved knob is validated and echoed in the
-    /// materialized-config line, but every record is still stored raw today (the stored codec is
-    /// always `none`), so the knob does not change bytes on disk yet. The runtime's raw-store /
-    /// never-expand guards and its decoder resilience (the decompressed-size cap, unknown-codec
-    /// POISON) are codec-independent. Platform-neutral so it is parsed/validated on every
-    /// platform. The opt-in `zstd` codec (and its level knob) is deferred per ADR-0003 and not
-    /// accepted on the default build.
+    /// The COMPRESSION CODEC knob (#12, #387, wired by #430). Default [`CompressionArg::Lz4`]
+    /// (the ADR-0003 pure-Rust default codec). The resolved knob is threaded into
+    /// `EngineConfig::compression` by `open_disk_engine`, so the write path stores each
+    /// compressible payload at or over the 64-byte threshold as a compressed object behind the
+    /// `COMPRESSED` record flag, exactly what the materialized-config line echoes. The runtime's
+    /// raw-store / never-expand guards and its decoder resilience (the decompressed-size cap,
+    /// unknown-codec POISON) are codec-independent. Platform-neutral so it is parsed/validated on
+    /// every platform. The opt-in `zstd` codec (and its level knob) is deferred per ADR-0003 and
+    /// not accepted on the default build.
     compression: CompressionArg,
     /// The `interval` level's TIME window in MILLISECONDS (#341): the most time an acked-but-unsynced
     /// record may sit before a forced `fdatasync`, bounding the worst-case loss. Only consulted under
@@ -2955,10 +2968,11 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: &Path) -
     // off the startup log, the same surface the `ironbus_durability_*` gauges expose on `/metrics`.
     let durability_level = config.durability_level.as_str();
     let power_loss_safe = !config.durability_level.waives_i2();
-    // The compression codec KNOB (#12, #387), echoed so an operator reads the selected value
-    // straight off the startup log. NOTE this echoes the knob, not the bytes on disk: the serve
-    // write path is not yet wired to the codec runtime, so records are still stored raw (the
-    // stored codec is always `none`) regardless of the selection.
+    // The compression codec knob (#12, #387, wired by #430), echoed so an operator reads the
+    // active value straight off the startup log. The same resolved knob feeds
+    // `EngineConfig::compression`, so this echo matches the bytes on disk: under `lz4` each
+    // compressible payload at or over the 64-byte threshold is stored compressed behind the
+    // `COMPRESSED` record flag (sub-threshold and incompressible payloads store raw by design).
     let compression = config.compression.as_str();
     format!(
         "materialized-config profile={} profile_schema_version={} addr={addr} \
@@ -3461,10 +3475,10 @@ fn cmd_serve(
         // I2-waived warning), so the non-Unix stub must consume them too or the Windows `-D warnings`
         // build trips field-never-read, invisible to a macOS reviewer (the recurring #288/#99 footgun).
         config.durability_level,
-        // The #12/#387 compression codec knob is read only on the Unix serve path (it feeds the
-        // materialized-config line; the write-path wiring to the codec runtime has not landed),
-        // so the non-Unix stub must consume it too or the Windows `-D warnings` build trips
-        // field-never-read, invisible to a macOS reviewer (the recurring #288/#99 footgun).
+        // The #12/#387/#430 compression codec knob is read only on the Unix serve path (it feeds
+        // `EngineConfig::compression` and the materialized-config line), so the non-Unix stub
+        // must consume it too or the Windows `-D warnings` build trips field-never-read,
+        // invisible to a macOS reviewer (the recurring #288/#99 footgun).
         config.compression,
         config.flush_interval_ms,
         config.flush_max_bytes,
@@ -3897,7 +3911,18 @@ fn run_peek(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     }
     let data_dir =
         data_dir.ok_or_else(|| CliError::Usage("peek requires `--data-dir <dir>`".to_string()))?;
-    cmd_inspect(Path::new(&data_dir), from_offset, Some(limit), json, out)
+    // `peek` has no `--raw`/`--require-dict` (the frozen #92 surface puts them on `dump` only),
+    // so it always renders the DECODED logical message and degrades structurally on a
+    // missing dictionary.
+    cmd_inspect(
+        Path::new(&data_dir),
+        from_offset,
+        Some(limit),
+        json,
+        false,
+        false,
+        out,
+    )
 }
 
 /// Parses and runs `dump`: stream every durable record from a data directory, one per line
@@ -3930,12 +3955,10 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
                 dlq = true;
                 i += 1;
             }
-            // The committed compression-inspection surface (#92), gated on on-disk compression
-            // (#12). Today the codec is always `none`, so `--raw` (show the on-disk frame) renders
-            // the same field set as the decoded form, and `--require-dict` (fail strictly on a
-            // missing dictionary) never trips because no record carries a dictionary id. The flags
-            // are accepted now so a script written against the frozen surface keeps working once
-            // #12 lands; they are documented as gated, not faked.
+            // The committed compression-inspection surface (#92), LIVE since the write path was
+            // wired (#430): `--raw` shows the on-disk frame of a compressed record (stored sizes,
+            // no decode) and `--require-dict` fails strictly (exit 3) on a record whose
+            // dictionary cannot be resolved, instead of the structured `decoded:false` degrade.
             "--raw" => {
                 raw = true;
                 i += 1;
@@ -3966,10 +3989,7 @@ fn run_dump(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     if dlq {
         return cmd_inspect_dlq(Path::new(&data_dir), limit, json, out);
     }
-    // `raw`/`require_dict` are inert until #12 (codec is always `none`); they are threaded through
-    // so the dispatch records the frozen surface without faking compression.
-    let _ = (raw, require_dict);
-    cmd_inspect(Path::new(&data_dir), 0, limit, json, out)
+    cmd_inspect(Path::new(&data_dir), 0, limit, json, raw, require_dict, out)
 }
 
 /// Parses and runs `scrub` (#92): a strictly READ-ONLY offline full integrity scan of the data dir,
@@ -4309,10 +4329,13 @@ fn cmd_inspect(
     from_offset: u64,
     limit: Option<u64>,
     json: bool,
+    raw: bool,
+    require_dict: bool,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     let reader = OfflineReader::open(StdFs::new(data_dir.to_path_buf()))
         .map_err(|e| map_offline_err(data_dir, &e))?;
+    let resolver = inspect_dict_resolver(data_dir);
     let mut shown: u64 = 0;
     'segments: for &id in reader.segment_ids() {
         if limit.is_some_and(|max| shown >= max) {
@@ -4328,7 +4351,7 @@ fn cmd_inspect(
             if limit.is_some_and(|max| shown >= max) {
                 break 'segments;
             }
-            write_record(record, json, out)?;
+            write_record(record, json, raw, require_dict, &resolver, out)?;
             shown += 1;
         }
     }
@@ -4336,29 +4359,167 @@ fn cmd_inspect(
     Ok(())
 }
 
-/// Writes one record as a human line or a single NDJSON object. `crc` is always `ok` because
-/// the offline reader only yields records that passed their CRC; `codec` is always `none`
-/// until on-disk compression (#12) lands.
+/// The dictionary resolver for an offline inspect pass (#430, the #92/#136 surface) on a `zstd`
+/// build: every sidecar in the data directory's `dicts/` subdirectory, preloaded up front
+/// (sidecar-first per `docs/DICTIONARY_LIFECYCLE.md` §4; the set is small and content-verified on
+/// load). The store is opened only when `dicts/` ALREADY exists, because
+/// [`DictSidecarStore::open`] creates the subdirectory on demand and dump/peek are strictly
+/// READ-ONLY. An id outside the store stays unresolved, which is exactly the `missing-dict`
+/// degrade (or the `--require-dict` strict failure).
+#[cfg(all(unix, feature = "zstd"))]
+fn inspect_dict_resolver(data_dir: &Path) -> CachingDictResolver {
+    let fs = StdFs::new(data_dir.to_path_buf());
+    let mut resolver = CachingDictResolver::new();
+    if fs.subdir_exists(DICTS_SUBDIR).unwrap_or(false) {
+        if let Ok(store) = DictSidecarStore::open(&fs) {
+            let ids = store.list_ids();
+            resolver.preload_from_store(&store, ids);
+        }
+    }
+    resolver
+}
+
+/// The dictionary resolver for an offline inspect pass on the DEFAULT (pure-Rust) build: no
+/// dictionary is ever resolvable. Correct by construction here, not a shortcut: the default
+/// build's only writable codec is `lz4`, whose `dict_id` is always 0 (no dictionary), and a
+/// `zstd` record is an unknown-codec POISON on this build before dictionary resolution is ever
+/// consulted. The sidecar store itself is `zstd`-feature code, absent from this build.
+#[cfg(all(unix, not(feature = "zstd")))]
+fn inspect_dict_resolver(_data_dir: &Path) -> NoDictionaries {
+    NoDictionaries
+}
+
+/// The human-readable name of a frozen on-disk codec id byte for the dump/peek `codec` field
+/// (#430): the three allocated ids by name (`docs/compat/versions.md`; `zstd` renders by name
+/// even on a default build, where it is decode-POISON, because the ID-SPACE allocation is
+/// build-independent), any other id as its decimal number, so an unknown id is shown, not hidden.
 #[cfg(unix)]
-fn write_record(record: &OwnedRecord, json: bool, out: &mut impl Write) -> Result<(), CliError> {
+fn codec_name(codec_id: u8) -> String {
+    match codec_id {
+        CODEC_ID_NONE => "none".to_string(),
+        CODEC_ID_LZ4 => "lz4".to_string(),
+        CODEC_ID_ZSTD => "zstd".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The structured-degrade `reason` string for a compressed record dump/peek could not decode
+/// (#430, the #136 surface): `missing-dict:<id>` is the FROZEN #136 wording; the others name the
+/// typed [`DecompressError`] they mirror. A degraded record is shown (`decoded:false` + reason),
+/// never hidden and never a process failure (except under `--require-dict`, the strict gate).
+#[cfg(unix)]
+fn decode_failure_reason(e: &DecompressError) -> String {
+    match e {
+        DecompressError::PoisonUnresolvedDict(id) => format!("missing-dict:{id}"),
+        DecompressError::PoisonUnknownCodec(id) => format!("unknown-codec:{id}"),
+        DecompressError::DecompressedTooLarge { claimed, .. } => {
+            format!("decompressed-too-large:{claimed}")
+        }
+        DecompressError::TruncatedDescriptor => "truncated-descriptor".to_string(),
+        DecompressError::CorruptStream => "corrupt-stream".to_string(),
+        DecompressError::BadRawLength => "bad-raw-length".to_string(),
+        // The enum is `#[non_exhaustive]`: a future variant degrades generically rather than
+        // breaking this build, and a record is still shown, never hidden.
+        _ => "decode-error".to_string(),
+    }
+}
+
+/// Writes one record as a human line or a single NDJSON object. `crc` is always `ok` because the
+/// offline reader only yields records that passed their CRC (computed over the STORED bytes).
+///
+/// An UNCOMPRESSED record (the flag clear: every record of a `--compression none` broker, plus
+/// the sub-threshold and never-expand raw stores of an lz4 one) renders exactly the historical
+/// field set, byte-for-byte. A COMPRESSED record (#430, the frozen #92/#136 surface) renders the
+/// REAL stored codec from its descriptor; the default (decoded) form decompresses the payload
+/// back to the logical message (`bytes` is the ORIGINAL payload length, `decoded:true`), while
+/// `--raw` shows the on-disk frame (`bytes` is the STORED descriptor+stream length, no decode is
+/// attempted). A compressed record that cannot be decoded degrades to `decoded:false` plus a
+/// `reason` (`missing-dict:<id>` for an unresolved dictionary, per #136) with the STORED length,
+/// unless `--require-dict` is set, in which case an unresolved dictionary fails strictly (exit 3).
+#[cfg(unix)]
+fn write_record(
+    record: &OwnedRecord,
+    json: bool,
+    raw: bool,
+    require_dict: bool,
+    resolver: &impl DictResolver,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    // The strict dictionary gate (#92): an unresolvable non-zero `dict_id` is a hard failure
+    // under `--require-dict`, checked from the descriptor alone so it gates `--raw` (which never
+    // decodes) exactly like the decoded form.
+    if require_dict && record.flags.contains(RecordFlags::COMPRESSED) {
+        if let Ok((_, dict_id, _, _)) = read_descriptor(&record.payload) {
+            if dict_id != DICT_ID_NONE && resolver.resolve(dict_id).is_none() {
+                return Err(CliError::HandledCorruption(format!(
+                    "offset {} references dictionary {dict_id}, which is not in the sidecar \
+                     store; rerun without --require-dict to show it as decoded:false",
+                    record.offset.get(),
+                )));
+            }
+        }
+    }
+    // (codec, bytes, decoded): the historical surface for an uncompressed record; the real
+    // stored codec plus the decode outcome for a compressed one. `decoded` is `None` where no
+    // decode is involved (an uncompressed record, or `--raw`), keeping those lines byte-identical
+    // to the pre-#430 output.
+    let (codec, bytes, decoded): (String, usize, Option<Result<(), String>>) =
+        if !record.flags.contains(RecordFlags::COMPRESSED) {
+            ("none".to_string(), record.payload.len(), None)
+        } else {
+            let codec = match read_descriptor(&record.payload) {
+                Ok((codec_id, _, _, _)) => codec_name(codec_id),
+                // Shorter than a descriptor: nothing to name; the decode below degrades it.
+                Err(_) => "?".to_string(),
+            };
+            if raw {
+                (codec, record.payload.len(), None)
+            } else {
+                match decompress_payload(
+                    record.flags,
+                    &record.payload,
+                    resolver,
+                    DEFAULT_MAX_DECOMPRESSED_BYTES,
+                ) {
+                    Ok(payload) => (codec, payload.len(), Some(Ok(()))),
+                    Err(e) => (
+                        codec,
+                        record.payload.len(),
+                        Some(Err(decode_failure_reason(&e))),
+                    ),
+                }
+            }
+        };
     if json {
-        writeln!(
+        write!(
             out,
-            "{{\"offset\":{},\"ts_ms\":{},\"bytes\":{},\"key_bytes\":{},\"crc\":\"ok\",\"codec\":\"none\"}}",
+            "{{\"offset\":{},\"ts_ms\":{},\"bytes\":{},\"key_bytes\":{},\"crc\":\"ok\",\"codec\":\"{codec}\"",
             record.offset.get(),
             record.timestamp_ms,
-            record.payload.len(),
+            bytes,
             record.key.len(),
         )?;
+        match &decoded {
+            None => {}
+            Some(Ok(_)) => write!(out, ",\"decoded\":true")?,
+            Some(Err(reason)) => write!(out, ",\"decoded\":false,\"reason\":\"{reason}\"")?,
+        }
+        writeln!(out, "}}")?;
     } else {
-        writeln!(
+        write!(
             out,
-            "offset={} ts_ms={} bytes={} key_bytes={} crc=ok codec=none",
+            "offset={} ts_ms={} bytes={} key_bytes={} crc=ok codec={codec}",
             record.offset.get(),
             record.timestamp_ms,
-            record.payload.len(),
+            bytes,
             record.key.len(),
         )?;
+        match &decoded {
+            None => {}
+            Some(Ok(_)) => write!(out, " decoded=true")?,
+            Some(Err(reason)) => write!(out, " decoded=false reason={reason}")?,
+        }
+        writeln!(out)?;
     }
     Ok(())
 }
@@ -5365,9 +5526,11 @@ fn cmd_inspect(
     from_offset: u64,
     limit: Option<u64>,
     json: bool,
+    raw: bool,
+    require_dict: bool,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
-    let _ = (data_dir, from_offset, limit, json, out);
+    let _ = (data_dir, from_offset, limit, json, raw, require_dict, out);
     Err(CliError::Internal(
         "ironbus peek/dump require a Unix host in v1: on-disk storage is Unix-only".to_string(),
     ))
