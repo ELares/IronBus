@@ -60,7 +60,28 @@ pub enum ClientError {
     /// resolves none), an over-cap claimed size (a decompression bomb), or a corrupt stream. A
     /// typed error, never a panic; the broker stored and delivered the record faithfully, so the
     /// mismatch is between the record's codec needs and THIS client build.
-    Decompress(DecompressError),
+    ///
+    /// The batch's state after this error: the connection REMAINS USABLE, because
+    /// [`Client::fetch`] drains the rest of the batch (the remaining frames and the terminating
+    /// `FlowEnd`) before returning it, so the next request reads no stale frames. Everything the
+    /// batch carried is DROPPED, though: messages decoded before (and after) the poison record
+    /// are discarded un-acked, so the broker redelivers them after their visibility timeout, and
+    /// any dead-letter / truncation / gap advisories in the batch are lost with them. `offset`
+    /// and `generation` name the poison record's lease, so a caller can ack it
+    /// ([`Client::ack`]) to skip it, or nack it toward the broker's `max_deliver` dead-letter
+    /// path, instead of stalling on endless redelivery. Only the FIRST failure in a batch is
+    /// reported. Broker-side validation that rejects such a record at produce time is a
+    /// follow-up, tracked separately; until then a producer-compressed record is only checked
+    /// here, on read.
+    Decompress {
+        /// The typed decompression failure.
+        source: DecompressError,
+        /// The log offset of the poison record this error names.
+        offset: u64,
+        /// The lease generation (the fencing token) the poison delivery carried; with `offset`
+        /// it names the exact lease for an ack/nack that skips the record.
+        generation: u64,
+    },
 }
 
 impl core::fmt::Display for ClientError {
@@ -76,7 +97,12 @@ impl core::fmt::Display for ClientError {
             }
             ClientError::BadResponse(why) => write!(f, "malformed response: {why}"),
             ClientError::Closed => write!(f, "connection closed mid-response"),
-            ClientError::Decompress(e) => write!(f, "delivered payload decompression: {e}"),
+            ClientError::Decompress { source, offset, .. } => {
+                write!(
+                    f,
+                    "delivered payload at offset {offset} failed decompression: {source}"
+                )
+            }
         }
     }
 }
@@ -518,21 +544,38 @@ impl Client {
         let mut dead_letters = Vec::new();
         let mut truncations = Vec::new();
         let mut gaps = Vec::new();
+        // The FIRST in-batch decompression failure (#430), held until the batch's terminating
+        // FlowEnd has been read: the remaining frames are DRAINED first so the connection stays
+        // framed and usable for the next request, then the error is returned. Aborting
+        // mid-window instead would leave the unread batch tail (and the FlowEnd) in the buffer,
+        // desynchronizing every later request on this connection.
+        let mut poison: Option<ClientError> = None;
         // The total advisory + delivery frames seen so far, the quantity the credit bounds. A
-        // GapMarker, like a delivery / dead-letter / truncation, consumes one credit slot server-side,
-        // so it counts here too (a buggy or hostile server cannot stream any of them without bound).
-        let over_credit = |m: &[Message], d: &[DeadLetter], t: &[Truncation], g: &[Gap]| {
-            m.len() + d.len() + t.len() + g.len() >= limit
-        };
+        // GapMarker, like a delivery / dead-letter / truncation, consumes one credit slot
+        // server-side, so it counts here too, as does every frame drained after a decompression
+        // failure (a buggy or hostile server cannot stream any of them without bound).
+        let mut frames = 0usize;
         loop {
-            match self.read_frame()? {
+            let (frame_type, body) = self.read_frame()?;
+            // The credit check binds every batch frame uniformly (deliveries, advisories, and
+            // the post-poison drain); FlowEnd and Err terminate the batch and are exempt.
+            if !matches!(frame_type, FrameType::FlowEnd | FrameType::Err) {
+                if frames >= limit {
+                    return Err(ClientError::BadResponse(
+                        "server streamed more frames than the requested credit",
+                    ));
+                }
+                frames += 1;
+            }
+            match (frame_type, body) {
                 (FrameType::Deliver, body) => {
-                    if over_credit(&messages, &dead_letters, &truncations, &gaps) {
-                        return Err(ClientError::BadResponse(
-                            "server streamed more frames than the requested credit",
-                        ));
-                    }
                     let d = decode_deliver(&body).map_err(ClientError::Body)?;
+                    // Draining after a decompression failure: the frame is consumed (keeping the
+                    // connection framed) but the delivery is dropped un-acked, so the broker
+                    // redelivers it after its visibility timeout.
+                    if poison.is_some() {
+                        continue;
+                    }
                     // Transparent broker-side decompression (#430): a delivery carrying the
                     // COMPRESSED bit is decompressed back to the original payload (and the bit
                     // cleared), so the caller sees exactly the bytes the producer published,
@@ -541,14 +584,25 @@ impl Client {
                     // payload this build cannot decode is the typed `Decompress` error, no panic.
                     let flags = RecordFlags::from_bits(d.flags);
                     let (flags, payload) = if flags.contains(RecordFlags::COMPRESSED) {
-                        let payload = decompress_payload(
+                        match decompress_payload(
                             flags,
                             d.payload,
                             &NoDictionaries,
                             DEFAULT_MAX_DECOMPRESSED_BYTES,
-                        )
-                        .map_err(ClientError::Decompress)?;
-                        (d.flags & !RecordFlags::COMPRESSED.bits(), payload)
+                        ) {
+                            Ok(payload) => (d.flags & !RecordFlags::COMPRESSED.bits(), payload),
+                            // The poison record's offset and lease generation travel with the
+                            // error, so the caller can ack/nack-skip it; the rest of the batch
+                            // is drained (see `poison` above) before the error is returned.
+                            Err(source) => {
+                                poison = Some(ClientError::Decompress {
+                                    source,
+                                    offset: d.offset,
+                                    generation: d.generation,
+                                });
+                                continue;
+                            }
+                        }
                     } else {
                         (d.flags, d.payload.to_vec())
                     };
@@ -565,11 +619,6 @@ impl Client {
                 // An in-band dead-letter advisory for an offset skipped as poison (#63). It is
                 // not a delivery, so it carries its own offset and does not ack.
                 (FrameType::DeadLetter, body) => {
-                    if over_credit(&messages, &dead_letters, &truncations, &gaps) {
-                        return Err(ClientError::BadResponse(
-                            "server streamed more frames than the requested credit",
-                        ));
-                    }
                     let dl = decode_dead_letter(&body).map_err(ClientError::Body)?;
                     dead_letters.push(DeadLetter {
                         offset: dl.offset,
@@ -581,11 +630,6 @@ impl Client {
                 // (#82, #84). It is not a delivery and does not ack; it names where delivery
                 // resumed and how many records were skipped.
                 (FrameType::Truncated, body) => {
-                    if over_credit(&messages, &dead_letters, &truncations, &gaps) {
-                        return Err(ClientError::BadResponse(
-                            "server streamed more frames than the requested credit",
-                        ));
-                    }
                     let t = decode_truncated(&body).map_err(ClientError::Body)?;
                     truncations.push(Truncation {
                         earliest_retained: t.earliest_retained,
@@ -597,11 +641,6 @@ impl Client {
                 // reader tracking contiguity learns the jump is a bounded, reported gap rather than
                 // loss. Only seen on a gap-marker-capable connection; an old server never sends it.
                 (FrameType::GapMarker, body) => {
-                    if over_credit(&messages, &dead_letters, &truncations, &gaps) {
-                        return Err(ClientError::BadResponse(
-                            "server streamed more frames than the requested credit",
-                        ));
-                    }
                     let g = decode_gap_marker(&body).map_err(ClientError::Body)?;
                     gaps.push(Gap {
                         from: g.from,
@@ -610,14 +649,20 @@ impl Client {
                         reason: g.reason,
                     });
                 }
-                // The FlowEnd frame terminates the batch (its body is the delivered count).
+                // The FlowEnd frame terminates the batch (its body is the delivered count). A
+                // pending decompression failure is surfaced HERE, after the whole batch
+                // (including this FlowEnd) has been consumed, so the connection is left exactly
+                // where a successful fetch would leave it.
                 (FrameType::FlowEnd, _) => {
-                    return Ok(Fetch {
-                        messages,
-                        dead_letters,
-                        truncations,
-                        gaps,
-                    })
+                    return match poison {
+                        Some(e) => Err(e),
+                        None => Ok(Fetch {
+                            messages,
+                            dead_letters,
+                            truncations,
+                            gaps,
+                        }),
+                    }
                 }
                 (FrameType::Err, body) => {
                     return Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
@@ -2211,9 +2256,101 @@ mod tests {
         let (addr, handle) = raw_server(script);
         let mut c = Client::connect(addr).unwrap();
         match c.fetch(10).unwrap_err() {
-            ClientError::Decompress(DecompressError::PoisonUnknownCodec(7)) => {}
-            other => panic!("expected Decompress(PoisonUnknownCodec(7)), got {other:?}"),
+            ClientError::Decompress {
+                source: DecompressError::PoisonUnknownCodec(7),
+                offset: 0,
+                generation: 1,
+            } => {}
+            other => panic!("expected Decompress with PoisonUnknownCodec(7), got {other:?}"),
         }
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_decompress_error_drains_the_batch_so_the_same_client_can_fetch_again() {
+        // The #430 desync fix: a mid-batch decompression failure must not abort mid-window
+        // (that would leave the batch tail and the FlowEnd unread, so every later request on
+        // the connection reads stale frames). The client drains the batch-mates and the FlowEnd
+        // first, carries the poison record's offset + lease generation in the error (so the
+        // caller can ack/nack-skip it), and the SAME client's next fetch reads the next batch
+        // cleanly.
+        use ironbus_core::compress::DecompressError;
+        let mut stored = vec![7u8]; // codec id 7: unallocated
+        stored.extend_from_slice(&0u32.to_le_bytes()); // dict_id 0
+        stored.extend_from_slice(&16u32.to_le_bytes()); // claimed uncompressed_len
+        stored.extend_from_slice(b"not a real stream");
+        let mut poison_body = Vec::new();
+        encode_deliver(
+            &DeliverBody {
+                offset: 5,
+                generation: 9,
+                flags: RecordFlags::COMPRESSED.bits(),
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                payload: &stored,
+            },
+            &mut poison_body,
+        )
+        .unwrap();
+        let mut mate_body = Vec::new();
+        encode_deliver(
+            &DeliverBody {
+                offset: 6,
+                generation: 1,
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                payload: b"batch-mate",
+            },
+            &mut mate_body,
+        )
+        .unwrap();
+        let mut next_body = Vec::new();
+        encode_deliver(
+            &DeliverBody {
+                offset: 7,
+                generation: 1,
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                payload: b"next-batch",
+            },
+            &mut next_body,
+        )
+        .unwrap();
+        let mut script = frame(FrameType::Info, b"");
+        // Batch one: the poison delivery, then a healthy batch-mate, then the FlowEnd.
+        script.extend(frame(FrameType::Deliver, &poison_body));
+        script.extend(frame(FrameType::Deliver, &mate_body));
+        script.extend(frame(FrameType::FlowEnd, &2u32.to_le_bytes()));
+        // Batch two: one healthy delivery. Were the read desynced, the first batch's unread
+        // tail (the batch-mate or its FlowEnd) would surface here instead.
+        script.extend(frame(FrameType::Deliver, &next_body));
+        script.extend(frame(FrameType::FlowEnd, &1u32.to_le_bytes()));
+        let (addr, handle) = raw_server(script);
+        let mut c = Client::connect(addr).unwrap();
+        match c.fetch(10).unwrap_err() {
+            ClientError::Decompress {
+                source: DecompressError::PoisonUnknownCodec(7),
+                offset: 5,
+                generation: 9,
+            } => {}
+            other => panic!("expected the offset-carrying Decompress error, got {other:?}"),
+        }
+        // The same client, no reconnect: the poison batch was fully drained (its batch-mates
+        // dropped un-acked, for redelivery), so this fetch reads batch two cleanly.
+        let fetched = c.fetch(10).unwrap();
+        assert_eq!(
+            fetched.messages.len(),
+            1,
+            "no stale frames bleed over from the poisoned batch"
+        );
+        assert_eq!(fetched.messages[0].offset, 7);
+        assert_eq!(fetched.messages[0].payload, b"next-batch");
         drop(c);
         handle.join().unwrap();
     }
