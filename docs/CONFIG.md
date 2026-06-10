@@ -76,9 +76,9 @@ precedence; the strict typed-key validation, the shared literal grammar, the
 coupled-set validators, and the immutable-config + atomic re-read RELOAD are wired
 (#382). The remaining residual is the MUTATING wire `CONFIG SET`/`SAVE` admin verbs,
 which need the #106 connection-scoped auth (no unauthenticated remote config
-mutation). [CONTRACTS.md](CONTRACTS.md) states the same boundary
-from the byte-model side ("There is NO TOML config document in the
-implementation today").
+mutation). [CONTRACTS.md](CONTRACTS.md) records the same boundary from the
+byte-model side (the TOML config FILE is IMPLEMENTED, #382, and the mutating
+wire `CONFIG SET`/`SAVE` verbs are the deferred residual).
 
 ---
 
@@ -521,9 +521,12 @@ config warning: backpressure.disk_full_policy = "drop-oldest" has no effect:
 ### Coupled set 6: compression codec vs dictionary id
 
 `compression.dictionary_id` is meaningful only when a codec is selected; a
-non-zero dictionary id with `codec = "none"` is a misconfiguration. On-disk
-compression is not landed (`codec` reads `none` today), so this whole set is
-SPECIFIED-NOT-YET-A-FIELD, owned by #12; the validator is named here for
+non-zero dictionary id with `codec = "none"` is a misconfiguration. The codec
+RUNTIME and the `serve --compression <none|lz4>` flag shipped (#387, default
+`lz4`), but the serve write path is not yet wired to the runtime (records are
+still stored raw, so the stored codec reads `none` today), and the
+`[compression]` FILE keys remain SPECIFIED-NOT-YET-A-FIELD (the section is
+reserved and tolerated), owned by #12; the validator is named here for
 completeness of the coupled-set surface #14 requires.
 
 ```

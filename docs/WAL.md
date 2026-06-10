@@ -383,9 +383,9 @@ All of these are `ironbus serve` flags (`crates/ironbus-cli/src/main.rs`), mappe
 | `--checkpoint-interval` | `EngineConfig::checkpoint_interval` | 1024 | Checkpoint the cursor after it advances this many offsets. |
 | `--disk-full-policy` | `EngineConfig::disk_full_policy` | `drop-new` | `drop-new` (shed) or `drop-oldest` (force-reap the oldest sealed segment then accept). |
 
-The 8 MiB edge segment size exists as a constant (`EDGE_SEGMENT_BYTES` in
-`core/src/format.rs`) but is **not** wired to a profile switch; to use it today you pass
-`--max-segment-bytes 8388608` explicitly (see the discrepancies section).
+The 8 MiB edge segment size (`EDGE_SEGMENT_BYTES` in `core/src/format.rs`) is now
+selectable via the shipped profile switch (#87): `serve --profile edge-tiny` sets it,
+or pass `--max-segment-bytes 8388608` explicitly (see the discrepancies section).
 
 ---
 
@@ -406,26 +406,26 @@ code.
 - **A manifest / manifest edit log.** #135 has the reaper and append actor mutate a
   manifest. There is none, by design: `naming.rs` states the directory of
   self-describing files is the authority.
-- **Preallocation (`fallocate`) and generation-stamped recycling.** #135 preallocates
-  segments to full roll size and recycles up to 2 sealed-then-deleted files. Neither
-  exists: segments grow as records are appended, and ADR 0002 forbids recycling a
-  segment id in v1 (nonce-reuse safety for encryption at rest), pinned by the test
+- **Generation-stamped recycling.** #135 recycles up to 2 sealed-then-deleted files.
+  Recycling does not exist, by decision: ADR 0002 forbids recycling a segment id in v1
+  (nonce-reuse safety for encryption at rest), pinned by the test
   `segment_ids_increase_monotonically_and_are_never_recycled`. There are no generation
-  tags in the segment header. The cross-platform preallocation design (the four-primitive
-  shim, default-ON preallocation to roll size, per-OS implementations, and the
-  ENOSPC-at-roll fail-fast path) is now SPECIFIED in
-  [PREALLOCATION.md](PREALLOCATION.md), which also resolves the recycling question
-  honestly: v1 never recycles, and no generation stamp is added to the #5 header because,
-  with ids never reused, it is unnecessary (recycling becomes a v2 nonce-safety decision,
-  #40).
+  tags in the segment header; with ids never reused, none is needed (recycling becomes
+  a v2 nonce-safety decision, #40). Preallocation, by contrast, is now IMPLEMENTED
+  (#330): `start_segment` preallocates each new active segment to the roll size
+  best-effort through the `RandomAccessFile::preallocate` seam (Linux `fallocate`,
+  macOS `fcntl(F_PREALLOCATE)`, falling back to grow-on-append), per the design in
+  [PREALLOCATION.md](PREALLOCATION.md).
 - **A dedicated append actor + commit thread, group-commit batching, admission
   credits.** The single append actor and group-commit batching are now SHIPPED (#177):
   `actor.rs` owns the `Engine`, drains a batch of queued produces, and issues one
-  `fdatasync` per drained batch (the storage "one write plus one sync per group"). What
-  is still NOT present from the #135 sketch is the explicit 1 MiB group-commit byte cap
-  (the actor drains whatever is available each pass rather than to a byte target) and the
-  fsync-headroom admission credits; the bounded `sync_channel` provides backpressure in
-  their place. A separate commit thread distinct from the append thread is not split out.
+  `fdatasync` per drained batch (the storage "one write plus one sync per group"). The
+  fsync-headroom admission credits are also now SHIPPED (#378): the opt-in
+  `--wal-fsync-headroom-bytes` (default `0` = off) bounds the un-fsynced write frontier.
+  What is still NOT present from the #135 sketch is the explicit 1 MiB group-commit byte
+  cap (the actor drains whatever is available each pass rather than to a byte target);
+  the bounded `sync_channel` provides backpressure in its place. A separate commit
+  thread distinct from the append thread is not split out.
 - **A separate recovery-checkpoint (durable-point) deletion watermark.** #135 gates
   deletion on the minimum of three watermarks, one of which is a `(durable_seq,
   durable_offset)` durable point published by a checkpointer on every roll / 1000 ms
@@ -458,10 +458,11 @@ code.
 These are places where the implementation and the #135 text diverge in a way worth
 flagging (beyond the simply-not-yet-built items above). The code wins.
 
-- **"Edge profile" is not a profile.** #135 and the README say segments default to
-  64 MiB "or 8 MiB on the edge profile." There is no profile selection in the code; the
-  default is always 64 MiB, and `EDGE_SEGMENT_BYTES` (8 MiB) is an unused constant unless
-  an operator passes `--max-segment-bytes 8388608`.
+- **"Edge profile" is now a real profile switch.** #135 and the README say segments
+  default to 64 MiB "or 8 MiB on the edge profile." Profile selection is now SHIPPED
+  (#87): the default stays 64 MiB (the `balanced` preset), and
+  `serve --profile edge-tiny` selects the 8 MiB `EDGE_SEGMENT_BYTES` segment size (an
+  explicit `--max-segment-bytes` still overrides it).
 - **Segment roll is by size only; the 24 h / age roll is not on the active segment.**
   #135 and the README say a segment rolls at "64 MiB or 24 h, whichever comes first"
   (and `DEFAULT_SEGMENT_ROLL_HOURS = 1` exists as a constant). `Log::append` rolls on the

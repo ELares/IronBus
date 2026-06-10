@@ -10,15 +10,17 @@ versioned machine-output format, the mode-forcing global flags, and a non-zero e
 for a structured-but-degraded result.
 
 > Scope. This document specifies a CONTRACT (the JSON shape, the flag semantics, the
-> exit-code meaning). It is **specified, not yet implemented**: the current binary parses
-> only the surface enumerated in [`CLI.md`](CLI.md) and maps only the six exit codes
-> `0/1/2/4/5/70`. The verb IMPLEMENTATIONS that emit these schemas (`scrub`/`repair`
-> [#92](https://github.com/ELares/IronBus/issues/92), `top`
-> [#93](https://github.com/ELares/IronBus/issues/93), `consumer lag`, `segments`,
-> `dlq`, `retention`, `info`, `tap`, `wire`, `bench`, `config`, `recovery report`,
-> `completions`) are tracked under the children of
-> [#15](https://github.com/ELares/IronBus/issues/15). This doc is the COMMAND-MAP and
-> `--json`/flags/exit-code DESIGN, not the verb impls.
+> exit-code meaning). It is **partially implemented**: the binary now maps the
+> exit-code-3 handled-corruption gate (`scrub`/`repair`, alongside `0/1/2/4/5/70`) and
+> emits versioned `ironbus.cli.<command>.vN` `--json` objects for the shipped verbs
+> (`scrub`/`repair` [#92](https://github.com/ELares/IronBus/issues/92), `top`
+> [#93](https://github.com/ELares/IronBus/issues/93), the `dict` subcommands). The
+> GLOBAL mode flags (`--config`/`--offline`/`--online` as global, every-verb flags;
+> the shipped `--config` is a `serve` flag, #382) and the remaining verb
+> IMPLEMENTATIONS (`consumer lag`, `segments`, `dlq`, `retention`, `info`, `tap`,
+> `wire`, `config`, `recovery report`, `completions`) are still tracked under the
+> children of [#15](https://github.com/ELares/IronBus/issues/15). This doc is the
+> COMMAND-MAP and `--json`/flags/exit-code DESIGN, not the verb impls.
 
 ## Where this fits
 
