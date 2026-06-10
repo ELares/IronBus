@@ -124,8 +124,35 @@ verify_checksum() {
     return 0
 }
 
+# Probe the available `wget` for HTTPS enforcement support and print the TLS flags to use, by
+# scanning its `--help` text (GNU wget prints help on stdout, BusyBox prints usage on stderr, so
+# both streams are captured). Prints nothing and returns non-zero when the wget advertises no
+# `--https-only` at all: such a wget follows a plain-HTTP redirect, and SHA256SUMS travels over
+# the same channel as the binary, so a network-position attacker who downgrades BOTH fetches
+# defeats the checksum gate entirely. The caller must treat that as an ERROR and fail closed,
+# never proceed downgradable (#423).
+wget_tls_flags() {
+    # `--help` exits non-zero on some builds (BusyBox); the usage text still prints, tolerate it.
+    wget_help="$(wget --help 2>&1)" || true
+    case "$wget_help" in
+        *--https-only*) : ;;
+        *) return 1 ;;
+    esac
+    case "$wget_help" in
+        # GNU wget: pin the scheme AND the minimum TLS version, mirroring the curl path's
+        # `--proto '=https' --tlsv1.2`.
+        *--secure-protocol*) printf '%s' '--https-only --secure-protocol=TLSv1_2' ;;
+        # A limited (BusyBox-style) wget that knows `--https-only` but not `--secure-protocol`:
+        # `--https-only` alone still pins the scheme (a plain-HTTP URL or redirect is refused),
+        # so it is accepted; only the minimum-TLS-version pin is unavailable on such a build.
+        *) printf '%s' '--https-only' ;;
+    esac
+}
+
 # Download <url> to <dest>, failing on any HTTP or transport error. Uses curl or wget; never
-# pipes the body to a shell. Returns non-zero on failure so the caller can fail closed.
+# pipes the body to a shell. Returns non-zero on failure so the caller can fail closed. BOTH
+# tool paths enforce HTTPS (refuse a plain-HTTP URL or redirect): the checksum gate downstream
+# is only as strong as the transport pin on the SHA256SUMS fetch (#423).
 download() {
     url="$1"
     dest="$2"
@@ -133,7 +160,14 @@ download() {
         # -f: fail on HTTP >= 400; -S: show errors; -L: follow redirects; -o: to file.
         curl -fSL --proto '=https' --tlsv1.2 -o "$dest" "$url"
     elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$dest" "$url"
+        # A wget that cannot enforce HTTPS is an ERROR, never a silent downgrade (fail-closed).
+        tls_flags="$(wget_tls_flags)" \
+            || die "the available wget cannot enforce HTTPS (no --https-only support); install curl or GNU wget (refusing a downgradable download of $url)"
+        # -nv (not -q): terse on success, but the error line survives, so a failed download on a
+        # wget-only host says why. $tls_flags is word-split deliberately: it is one of the two
+        # fixed flag strings printed by wget_tls_flags above, never derived from input.
+        # shellcheck disable=SC2086
+        wget $tls_flags -nv -O "$dest" "$url"
     else
         die "need curl or wget to download $url"
     fi

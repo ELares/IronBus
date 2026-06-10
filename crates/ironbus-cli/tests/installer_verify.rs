@@ -227,6 +227,215 @@ fn a_malformed_checksum_line_is_rejected() {
     assert_ne!(code, 0, "a malformed checksum line MUST be rejected");
 }
 
+/// Write an executable `sh` stub tool named `name` into `dir`. The stub body must use only shell
+/// builtins (`printf`, `case`, `exit`), because `run_download` restricts PATH to the stub dir and
+/// an external command would not resolve there.
+fn write_stub(dir: &std::path::Path, name: &str, body: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Source the installer and invoke its `download <url> <dest>` helper with PATH restricted to
+/// `stub_dir` ONLY, so the helper sees exactly the stub `curl`/`wget` placed there and nothing
+/// else (in particular, the host's real curl is invisible when no curl stub exists). Returns the
+/// exit code plus the captured stderr, so a test can assert both the fail-closed status and the
+/// clarity of the error message. No network is touched: a stub is the only tool that can run.
+fn run_download(stub_dir: &std::path::Path, url: &str, dest: &std::path::Path) -> (i32, String) {
+    let script = installer_path();
+    let cmd = format!(
+        ". \"$IB_INSTALLER\"; download \"{url}\" \"{}\"",
+        dest.display()
+    );
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(cmd)
+        .env("IRONBUS_INSTALL_SH_SOURCED", "1")
+        .env("IB_INSTALLER", &script)
+        .env("PATH", stub_dir)
+        .output()
+        .expect("failed to run /bin/sh");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn a_gnu_wget_is_invoked_with_https_only_and_a_tls_floor() {
+    // TLS enforcement on the wget fallback (#423): when wget's --help advertises --https-only
+    // and --secure-protocol (GNU wget), the download helper must pass both, mirroring the curl
+    // path's `--proto '=https' --tlsv1.2`, and use -nv (not -q) so a failure reports why.
+    let dir = tempdir::TempDir::new("ib-wget-gnu");
+    let argv_log = dir.path().join("wget-argv");
+    write_stub(
+        dir.path(),
+        "wget",
+        &format!(
+            concat!(
+                "case \"$1\" in\n",
+                "  --help) printf '%s\\n' '  --https-only' '  --secure-protocol=PR'; exit 0 ;;\n",
+                "esac\n",
+                "printf '%s\\n' \"$@\" > \"{log}\"\n",
+                "exit 0\n"
+            ),
+            log = argv_log.display()
+        ),
+    );
+    let dest = dir.path().join("dest");
+    let (code, stderr) = run_download(dir.path(), "https://example.invalid/asset", &dest);
+    assert_eq!(
+        code, 0,
+        "the stubbed download must succeed, stderr: {stderr}"
+    );
+    let argv = std::fs::read_to_string(&argv_log).expect("the wget stub recorded its argv");
+    let args: Vec<&str> = argv.lines().collect();
+    assert!(
+        args.contains(&"--https-only"),
+        "wget MUST be pinned to HTTPS, argv: {args:?}"
+    );
+    assert!(
+        args.contains(&"--secure-protocol=TLSv1_2"),
+        "a GNU wget must also get the TLS version floor, argv: {args:?}"
+    );
+    assert!(
+        args.contains(&"-nv"),
+        "-nv must replace -q so error detail survives, argv: {args:?}"
+    );
+    assert!(
+        !args.contains(&"-q"),
+        "-q must be gone (it suppressed all error detail), argv: {args:?}"
+    );
+}
+
+#[test]
+fn a_wget_that_cannot_enforce_https_fails_closed_with_no_download() {
+    // FAIL-CLOSED (#423): a wget whose --help advertises no --https-only (real BusyBox) cannot
+    // refuse a plain-HTTP redirect, and SHA256SUMS rides the same channel as the binary, so
+    // proceeding would let a network-position attacker defeat the checksum gate. The helper must
+    // abort with a clear error and MUST NOT invoke wget to fetch anything.
+    let dir = tempdir::TempDir::new("ib-wget-busybox");
+    let invoked = dir.path().join("wget-invoked");
+    write_stub(
+        dir.path(),
+        "wget",
+        &format!(
+            concat!(
+                "case \"$1\" in\n",
+                "  --help) printf '%s\\n' 'BusyBox wget: -q -O FILE -T SEC URL'; exit 0 ;;\n",
+                "esac\n",
+                "printf '%s\\n' \"$@\" > \"{log}\"\n",
+                "exit 0\n"
+            ),
+            log = invoked.display()
+        ),
+    );
+    let dest = dir.path().join("dest");
+    let (code, stderr) = run_download(dir.path(), "https://example.invalid/asset", &dest);
+    assert_ne!(
+        code, 0,
+        "an HTTPS-incapable wget MUST fail closed, never downgrade"
+    );
+    assert!(
+        stderr.contains("cannot enforce HTTPS"),
+        "the error must say WHY it refused, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("curl or GNU wget"),
+        "the error must suggest a capable tool, stderr: {stderr}"
+    );
+    assert!(
+        !invoked.exists(),
+        "NO download may happen on the fail-closed path"
+    );
+    assert!(
+        !dest.exists(),
+        "no destination file may be created on the fail-closed path"
+    );
+}
+
+#[test]
+fn a_limited_wget_with_only_https_only_is_still_accepted() {
+    // The middle case (#423): some limited wget builds know --https-only but not
+    // --secure-protocol. --https-only alone still pins the scheme (a plain-HTTP URL or redirect
+    // is refused), so the helper accepts it and must NOT pass the unsupported flag.
+    let dir = tempdir::TempDir::new("ib-wget-limited");
+    let argv_log = dir.path().join("wget-argv");
+    write_stub(
+        dir.path(),
+        "wget",
+        &format!(
+            concat!(
+                "case \"$1\" in\n",
+                "  --help) printf '%s\\n' '  --https-only'; exit 0 ;;\n",
+                "esac\n",
+                "printf '%s\\n' \"$@\" > \"{log}\"\n",
+                "exit 0\n"
+            ),
+            log = argv_log.display()
+        ),
+    );
+    let dest = dir.path().join("dest");
+    let (code, stderr) = run_download(dir.path(), "https://example.invalid/asset", &dest);
+    assert_eq!(
+        code, 0,
+        "the stubbed download must succeed, stderr: {stderr}"
+    );
+    let argv = std::fs::read_to_string(&argv_log).expect("the wget stub recorded its argv");
+    let args: Vec<&str> = argv.lines().collect();
+    assert!(
+        args.contains(&"--https-only"),
+        "the limited wget is still HTTPS-pinned, argv: {args:?}"
+    );
+    assert!(
+        !args.iter().any(|a| a.starts_with("--secure-protocol")),
+        "an unsupported flag must not be passed, argv: {args:?}"
+    );
+}
+
+#[test]
+fn curl_is_preferred_over_wget_when_both_exist() {
+    // The helper's tool ordering is part of its interface: curl first, wget only as the
+    // fallback. With both stubs present, curl must be the one invoked (with its TLS pin), and
+    // the wget stub must never run, not even for the --help probe.
+    let dir = tempdir::TempDir::new("ib-curl-preferred");
+    let curl_log = dir.path().join("curl-argv");
+    let wget_log = dir.path().join("wget-invoked");
+    write_stub(
+        dir.path(),
+        "curl",
+        &format!(
+            "printf '%s\\n' \"$@\" > \"{}\"\nexit 0\n",
+            curl_log.display()
+        ),
+    );
+    write_stub(
+        dir.path(),
+        "wget",
+        &format!(
+            "printf '%s\\n' \"$@\" > \"{}\"\nexit 0\n",
+            wget_log.display()
+        ),
+    );
+    let dest = dir.path().join("dest");
+    let (code, stderr) = run_download(dir.path(), "https://example.invalid/asset", &dest);
+    assert_eq!(
+        code, 0,
+        "the stubbed download must succeed, stderr: {stderr}"
+    );
+    let argv = std::fs::read_to_string(&curl_log).expect("the curl stub recorded its argv");
+    let args: Vec<&str> = argv.lines().collect();
+    assert!(
+        args.contains(&"--proto") && args.contains(&"=https") && args.contains(&"--tlsv1.2"),
+        "the curl path keeps its TLS pin, argv: {args:?}"
+    );
+    assert!(
+        !wget_log.exists(),
+        "wget must not run at all when curl exists"
+    );
+}
+
 #[test]
 fn an_upgrade_retains_the_prior_binary_as_ironbus_prev() {
     // ROLLBACK SAFETY (#133 step 10): installing over an existing binary must retain the PRIOR
