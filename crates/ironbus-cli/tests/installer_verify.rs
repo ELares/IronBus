@@ -227,6 +227,197 @@ fn a_malformed_checksum_line_is_rejected() {
     assert_ne!(code, 0, "a malformed checksum line MUST be rejected");
 }
 
+/// Write an executable `sh` stub tool named `name` into `dir`. The stub body must use only shell
+/// builtins (`printf`, `case`, `exit`), because `run_download` restricts PATH to the stub dir and
+/// an external command would not resolve there.
+fn write_stub(dir: &std::path::Path, name: &str, body: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Source the installer and invoke its `download <url> <dest>` helper with PATH restricted to
+/// `stub_dir` ONLY, so the helper sees exactly the stub `curl`/`wget` placed there and nothing
+/// else (in particular, the host's real curl is invisible when no curl stub exists). Returns the
+/// exit code plus the captured stderr, so a test can assert both the fail-closed status and the
+/// clarity of the error message. No network is touched: a stub is the only tool that can run.
+fn run_download(stub_dir: &std::path::Path, url: &str, dest: &std::path::Path) -> (i32, String) {
+    let script = installer_path();
+    let cmd = format!(
+        ". \"$IB_INSTALLER\"; download \"{url}\" \"{}\"",
+        dest.display()
+    );
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(cmd)
+        .env("IRONBUS_INSTALL_SH_SOURCED", "1")
+        .env("IB_INSTALLER", &script)
+        .env("PATH", stub_dir)
+        .output()
+        .expect("failed to run /bin/sh");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn a_gnu_wget_1x_is_refused_with_no_download() {
+    // FAIL-CLOSED (#423): GNU wget 1.x honors --https-only ONLY in recursive mode (verified on
+    // GNU Wget 1.25.0: a plain-http URL and an https-to-http 302 both fetch over plaintext with
+    // exit 0), so the helper must classify it from `wget --version` and refuse before any fetch.
+    let dir = tempdir::TempDir::new("ib-wget-gnu1");
+    let fetched = dir.path().join("wget-fetched");
+    write_stub(
+        dir.path(),
+        "wget",
+        &format!(
+            concat!(
+                "case \"$1\" in\n",
+                "  --version) printf '%s\\n' 'GNU Wget 1.21.3 built on linux-gnu.'; exit 0 ;;\n",
+                "esac\n",
+                "printf '%s\\n' \"$@\" > \"{log}\"\n",
+                "exit 0\n"
+            ),
+            log = fetched.display()
+        ),
+    );
+    let dest = dir.path().join("dest");
+    let (code, stderr) = run_download(dir.path(), "https://example.invalid/asset", &dest);
+    assert_ne!(
+        code, 0,
+        "GNU wget 1.x MUST be refused, never trusted to pin HTTPS"
+    );
+    assert!(
+        !fetched.exists(),
+        "the refusal must happen BEFORE any fetch is attempted"
+    );
+    assert!(
+        stderr.contains("recursive mode") && stderr.contains("install curl"),
+        "the error must name the wget 1.x reason and the remedy, stderr: {stderr}"
+    );
+    assert!(!dest.exists(), "nothing may be downloaded");
+}
+
+#[test]
+fn a_wget2_is_refused_with_no_download() {
+    // FAIL-CLOSED (#423): wget2's enforcement was empirically DISPROVEN on wget2 2.2.1
+    // (--https-only skips the command-line URL; its redirect refusal exits 0 with no output
+    // file; --https-enforce=hard silently falls back to plaintext when the TLS connect fails),
+    // so wget2 is refused exactly like wget 1.x: classified from --version, no fetch attempted.
+    let dir = tempdir::TempDir::new("ib-wget2");
+    let fetched = dir.path().join("wget-fetched");
+    write_stub(
+        dir.path(),
+        "wget",
+        &format!(
+            concat!(
+                "case \"$1\" in\n",
+                "  --version) printf '%s\\n' 'GNU Wget2 2.2.1 - multithreaded metalink/file/website downloader'; exit 0 ;;\n",
+                "esac\n",
+                "printf '%s\\n' \"$@\" > \"{log}\"\n",
+                "exit 0\n"
+            ),
+            log = fetched.display()
+        ),
+    );
+    let dest = dir.path().join("dest");
+    let (code, stderr) = run_download(dir.path(), "https://example.invalid/asset", &dest);
+    assert_ne!(
+        code, 0,
+        "wget2 MUST be refused: its enforcement is disproven, not just unproven"
+    );
+    assert!(
+        !fetched.exists(),
+        "the refusal must happen BEFORE any fetch is attempted"
+    );
+    assert!(
+        stderr.contains("wget2") && stderr.contains("install curl"),
+        "the error must name the wget2 evidence and the remedy, stderr: {stderr}"
+    );
+    assert!(!dest.exists(), "nothing may be downloaded");
+}
+
+#[test]
+fn a_busybox_or_unrecognized_wget_is_refused_with_no_download() {
+    // FAIL-CLOSED (#423): BusyBox wget rejects --version with a usage error and has no HTTPS
+    // enforcement flags at all; anything the classifier cannot recognize is refused the same way.
+    let dir = tempdir::TempDir::new("ib-wget-busybox");
+    let fetched = dir.path().join("wget-fetched");
+    write_stub(
+        dir.path(),
+        "wget",
+        &format!(
+            concat!(
+                "case \"$1\" in\n",
+                "  --version) printf '%s\\n' 'wget: unrecognized option: version' >&2; exit 1 ;;\n",
+                "esac\n",
+                "printf '%s\\n' \"$@\" > \"{log}\"\n",
+                "exit 0\n"
+            ),
+            log = fetched.display()
+        ),
+    );
+    let dest = dir.path().join("dest");
+    let (code, stderr) = run_download(dir.path(), "https://example.invalid/asset", &dest);
+    assert_ne!(
+        code, 0,
+        "an unrecognized wget MUST fail closed, never downgrade"
+    );
+    assert!(
+        !fetched.exists(),
+        "the refusal must happen BEFORE any fetch is attempted"
+    );
+    assert!(
+        stderr.contains("cannot enforce HTTPS") && stderr.contains("install curl"),
+        "the error must say why and name the remedy, stderr: {stderr}"
+    );
+    assert!(!dest.exists(), "nothing may be downloaded");
+}
+
+#[test]
+fn curl_is_preferred_over_wget_when_both_exist() {
+    // The helper's tool ordering is part of its interface: curl first, wget only as the
+    // fallback. With both stubs present, curl must be the one invoked (with its TLS pin), and
+    // the wget stub must never run, not even for the --help probe.
+    let dir = tempdir::TempDir::new("ib-curl-preferred");
+    let curl_log = dir.path().join("curl-argv");
+    let wget_log = dir.path().join("wget-invoked");
+    write_stub(
+        dir.path(),
+        "curl",
+        &format!(
+            "printf '%s\\n' \"$@\" > \"{}\"\nexit 0\n",
+            curl_log.display()
+        ),
+    );
+    write_stub(
+        dir.path(),
+        "wget",
+        &format!(
+            "printf '%s\\n' \"$@\" > \"{}\"\nexit 0\n",
+            wget_log.display()
+        ),
+    );
+    let dest = dir.path().join("dest");
+    let (code, stderr) = run_download(dir.path(), "https://example.invalid/asset", &dest);
+    assert_eq!(
+        code, 0,
+        "the stubbed download must succeed, stderr: {stderr}"
+    );
+    let recorded = std::fs::read_to_string(&curl_log).expect("the curl stub recorded its argv");
+    let args: Vec<&str> = recorded.lines().collect();
+    assert!(
+        args.contains(&"--proto") && args.contains(&"=https") && args.contains(&"--tlsv1.2"),
+        "the curl path keeps its TLS pin, argv: {args:?}"
+    );
+    assert!(
+        !wget_log.exists(),
+        "wget must not run at all when curl exists"
+    );
+}
+
 #[test]
 fn an_upgrade_retains_the_prior_binary_as_ironbus_prev() {
     // ROLLBACK SAFETY (#133 step 10): installing over an existing binary must retain the PRIOR
@@ -335,4 +526,254 @@ mod tempdir {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+}
+
+/// Like [`run_install_binary`], but with `mv` overridden (after sourcing) so that any rename whose
+/// TARGET is exactly the destination fails, simulating an ENOSPC / IO error on the FINAL swap (the
+/// #421 stranded-host case). Every other `mv` (the `.prev` retention rename) passes through to the
+/// real tool, so the function runs all the way to the final swap and fails exactly there.
+fn run_install_binary_with_failing_final_swap(
+    src: &std::path::Path,
+    dest: &std::path::Path,
+) -> i32 {
+    let script = installer_path();
+    let cmd = format!(
+        ". \"$IB_INSTALLER\"; \
+         mv() {{ for ib_last do :; done; \
+                 if [ \"$ib_last\" = \"$IB_FAIL_DEST\" ]; then return 1; fi; \
+                 command mv \"$@\"; }}; \
+         install_binary \"{}\" \"{}\"",
+        src.display(),
+        dest.display()
+    );
+    let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(cmd)
+        .env("IRONBUS_INSTALL_SH_SOURCED", "1")
+        .env("IB_INSTALLER", &script)
+        .env("IB_FAIL_DEST", dest)
+        .status()
+        .expect("failed to run /bin/sh");
+    status.code().unwrap_or(-1)
+}
+
+#[test]
+fn a_same_version_rerun_is_a_noop_that_preserves_ironbus_prev() {
+    // IDEMPOTENT RE-RUN (#422): re-running the installer with bytes IDENTICAL to the live binary
+    // (a config-management convergence run, a retry after an unrelated failure) must be a no-op
+    // SUCCESS. In particular it must NOT overwrite `ironbus.prev`: doing so would replace the
+    // only rollback copy with bytes identical to the live binary, so "rollback" would reinstall
+    // the very build it is rolling back from.
+    let dir = tempdir::TempDir::new("ib-same-version");
+    let dest = dir.path().join("ironbus");
+    let prev = dir.path().join("ironbus.prev");
+
+    // The host is at v2, with v1 retained as the rollback copy from a prior upgrade.
+    let v1 = b"ironbus v1 (the rollback copy)";
+    let v2 = b"ironbus v2 (the live binary)";
+    std::fs::write(&dest, v2).unwrap();
+    std::fs::write(&prev, v1).unwrap();
+
+    // Re-run the install with the SAME v2 bytes.
+    let src = dir.path().join("staged-v2-again");
+    std::fs::write(&src, v2).unwrap();
+    let code = run_install_binary(&src, &dest);
+    assert_eq!(
+        code, 0,
+        "a same-version re-run must exit 0 (idempotent success)"
+    );
+
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        v2,
+        "the live binary is unchanged by a same-version re-run"
+    );
+    assert_eq!(
+        std::fs::read(&prev).unwrap(),
+        v1,
+        "a same-version re-run MUST NOT clobber ironbus.prev (the only rollback copy)"
+    );
+}
+
+#[test]
+fn the_rollback_copy_survives_an_upgrade_then_a_same_version_rerun() {
+    // The #422 end-to-end sequence: upgrade v1 to v2, then re-run the v2 install. After BOTH runs
+    // `ironbus.prev` must still hold the v1 bytes, so `ironbus rollback` (and the systemd
+    // fall-back-after-N mechanism) can actually return to the prior version instead of
+    // reinstalling the live one.
+    let dir = tempdir::TempDir::new("ib-upgrade-rerun");
+    let dest = dir.path().join("ironbus");
+    let prev = dir.path().join("ironbus.prev");
+
+    let v1 = b"ironbus v1 (the prior version)";
+    let v2 = b"ironbus v2 (the upgrade)";
+    std::fs::write(&dest, v1).unwrap();
+
+    // Upgrade v1 to v2: the rollback copy is v1.
+    let src_upgrade = dir.path().join("staged-v2");
+    std::fs::write(&src_upgrade, v2).unwrap();
+    assert_eq!(
+        run_install_binary(&src_upgrade, &dest),
+        0,
+        "the upgrade must succeed"
+    );
+    assert_eq!(
+        std::fs::read(&prev).unwrap(),
+        v1,
+        "after the upgrade, .prev = v1"
+    );
+
+    // Same-version re-run of v2.
+    let src_rerun = dir.path().join("staged-v2-rerun");
+    std::fs::write(&src_rerun, v2).unwrap();
+    assert_eq!(
+        run_install_binary(&src_rerun, &dest),
+        0,
+        "the same-version re-run must exit 0"
+    );
+
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        v2,
+        "the live binary is still v2"
+    );
+    assert_eq!(
+        std::fs::read(&prev).unwrap(),
+        v1,
+        "ironbus.prev still holds the OLD version's bytes after the re-run (rollback intact)"
+    );
+}
+
+#[test]
+fn a_failed_swap_leaves_the_original_binary_at_the_destination() {
+    // FAILURE SAFETY (#421): a failed install must leave the host with the binary it already had.
+    // Phase 1 (a read-only install dir) fails at the STAGING step, before anything could touch the
+    // destination; that invariant held on the pre-fix implementation too, so phase 1 pins a shared
+    // baseline, not the #421 fix. Phase 2 is the part with #421 teeth: it drives install_binary all
+    // the way to the FINAL swap and fails exactly there. The pre-fix implementation had already
+    // moved the live binary to `.prev` by that point, leaving the destination EMPTY; the
+    // staged-retention implementation leaves it untouched.
+    let old = b"ironbus v1 (the live binary)";
+
+    // Phase 1: point dest at a path whose parent directory is read-only after the original binary
+    // is staged into it, so every write into that directory fails. The install must fail without
+    // touching the original (and without fabricating a `.prev`). A root user bypasses directory
+    // permissions, so this phase is skipped under root (CI runs unprivileged).
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .is_some_and(|s| s.trim() == "0");
+    if !is_root {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir::TempDir::new("ib-failed-swap-rodir");
+        let ro_dir = dir.path().join("ro-bin");
+        std::fs::create_dir(&ro_dir).unwrap();
+        let dest = ro_dir.join("ironbus");
+        std::fs::write(&dest, old).unwrap();
+        let src = dir.path().join("staged-v2");
+        std::fs::write(&src, b"ironbus v2 (the upgrade)").unwrap();
+
+        let mut perms = std::fs::metadata(&ro_dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&ro_dir, perms).unwrap();
+
+        let code = run_install_binary(&src, &dest);
+
+        // Restore write permission FIRST so the TempDir cleanup can remove the tree even if an
+        // assertion below fails.
+        let mut perms = std::fs::metadata(&ro_dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&ro_dir, perms).unwrap();
+
+        assert_ne!(code, 0, "an install into a read-only directory must fail");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            old,
+            "the ORIGINAL binary must still be present at the destination after the failure"
+        );
+        assert!(
+            !ro_dir.join("ironbus.prev").exists(),
+            "a failed install must not fabricate an ironbus.prev"
+        );
+    }
+
+    // Phase 2: drive the function all the way to the FINAL swap and fail exactly there (the
+    // ENOSPC / IO-error case from #421), via an `mv` override that rejects only a rename onto the
+    // destination. The live binary must still be at the destination afterwards; under the old
+    // two-rename swap it had already been moved to `.prev` and the destination was left EMPTY.
+    let dir = tempdir::TempDir::new("ib-failed-swap-final");
+    let dest = dir.path().join("ironbus");
+    let prev = dir.path().join("ironbus.prev");
+    std::fs::write(&dest, old).unwrap();
+    let src = dir.path().join("staged-v2");
+    std::fs::write(&src, b"ironbus v2 (the upgrade)").unwrap();
+
+    let code = run_install_binary_with_failing_final_swap(&src, &dest);
+    assert_ne!(code, 0, "a failed final swap must report failure");
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        old,
+        "a failed FINAL swap must leave the live binary untouched at the destination (#421)"
+    );
+    // The retention only STAGED a copy before the swap; it is committed to `.prev` exclusively
+    // AFTER a successful swap, so a failed swap commits no `.prev` here (none pre-existed) and the
+    // staged temp is discarded. A pre-existing `.prev` surviving the same failure is pinned by
+    // `a_failed_final_swap_preserves_a_pre_existing_rollback_copy` below.
+    assert!(
+        !prev.exists(),
+        "a failed final swap must not commit a rollback copy (retention is post-swap only)"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "ironbus" && n != "staged-v2")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no staging temps survive a failed final swap: {leftovers:?}"
+    );
+}
+
+#[test]
+fn a_failed_final_swap_preserves_a_pre_existing_rollback_copy() {
+    // THE #421 ORDERING HAZARD: if the retention were COMMITTED over `.prev` before the final
+    // swap, a failed final swap (the ENOSPC case) would already have replaced a PRE-EXISTING good
+    // rollback copy (v1) with bytes identical to the live binary (v2): the failed v3 install would
+    // leave prev=v2 and the host's only OLDER known-good (v1) gone. With the retention merely
+    // STAGED until the swap succeeds, a failed final swap leaves BOTH the destination AND the old
+    // rollback copy byte-identical to before.
+    let dir = tempdir::TempDir::new("ib-failed-swap-prev");
+    let dest = dir.path().join("ironbus");
+    let prev = dir.path().join("ironbus.prev");
+    let v1 = b"ironbus v1 (the prior known-good rollback copy)";
+    let v2 = b"ironbus v2 (the live binary)";
+    std::fs::write(&dest, v2).unwrap();
+    std::fs::write(&prev, v1).unwrap();
+    let src = dir.path().join("staged-v3");
+    std::fs::write(&src, b"ironbus v3 (the upgrade that fails to land)").unwrap();
+
+    let code = run_install_binary_with_failing_final_swap(&src, &dest);
+    assert_ne!(code, 0, "a failed final swap must report failure");
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        v2,
+        "the live binary is byte-identical to before the failed swap"
+    );
+    assert_eq!(
+        std::fs::read(&prev).unwrap(),
+        v1,
+        "the PRE-EXISTING rollback copy is byte-identical to before: a failed swap must never \
+         replace the older known-good with bytes identical to the live binary (#421 ordering)"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "ironbus" && n != "ironbus.prev" && n != "staged-v3")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no staging temps survive a failed final swap: {leftovers:?}"
+    );
 }

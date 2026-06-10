@@ -4,14 +4,23 @@
 //! A running broker is a binary with an open WAL, so an upgrade is a lifecycle operation, not a
 //! one-shot install. Two safety properties are the whole point of this module:
 //!
-//! - **The live binary is never overwritten in place.** [`atomic_swap_with_prev`] writes the new
-//!   bytes to a sibling temp file ON THE SAME FILESYSTEM, fsyncs it (so a power loss never leaves a
-//!   truncated binary at the destination), retains the CURRENT binary as `<dest>.prev` via an atomic
-//!   same-directory `mv`, then `rename(2)`s the new file over the destination. `rename` is atomic on
+//! - **The live binary is never overwritten in place, and no failure path can strand the host
+//!   without it (#421).** [`atomic_swap_with_prev`] writes the new bytes to a sibling temp file ON
+//!   THE SAME FILESYSTEM and fsyncs it (so a power loss never leaves a truncated binary at the
+//!   destination), stages a COPY of the CURRENT binary to a second sibling temp (also fsynced; the
+//!   live binary is never moved), performs the SINGLE atomic `rename(2)` of the new bytes over the
+//!   destination, and only THEN commits the staged copy onto `<dest>.prev`. `rename` is atomic on
 //!   POSIX, so a power cut mid-upgrade leaves EITHER the old binary (rename not yet applied) or the
-//!   new binary fully on disk, never a half-written one. This is the exact contract `scripts/
-//!   install.sh`'s `install_binary` helper enforces in shell; the Rust side here mirrors it so the
-//!   `ironbus upgrade` subcommand can perform a verified swap without re-implementing the download.
+//!   new binary fully on disk, never a half-written one. A FAILED final rename leaves the
+//!   destination AND any pre-existing `<dest>.prev` exactly as they were (only the two temps are
+//!   removed). DELIBERATE TRADE: a crash between the swap and the `.prev` commit leaves `.prev`
+//!   one version stale, an OLDER known-good binary, which is safer than committing first and
+//!   leaving `.prev` byte-identical to the possibly-bad binary just installed. A SAME-VERSION
+//!   re-run (the destination already holds exactly the new bytes) is a no-op that touches neither
+//!   the destination nor `.prev` (#422). These are the same swap semantics `scripts/install.sh`'s
+//!   `install_binary` helper enforces in shell, so the `ironbus upgrade` subcommand can perform a
+//!   verified swap without re-implementing the download; POSIX sh cannot portably fsync, though,
+//!   so this Rust verb is the durably-synced path of the pair.
 //!
 //! - **A node that cannot start the new binary falls back to `ironbus.prev` after N failed starts.**
 //!   A tiny start-attempt counter file ([`COUNTER_FILE`]) next to the binary records consecutive
@@ -150,73 +159,181 @@ pub fn failed_fingerprint_path(dest: &Path) -> PathBuf {
         .join(FAILED_FINGERPRINT_FILE)
 }
 
+/// The outcome of a successful [`atomic_swap_with_prev`]: either the new bytes were installed, or
+/// the destination already held exactly those bytes and the swap was a deliberate no-op (#422).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapOutcome {
+    /// The staged new bytes were renamed onto the destination (and, on an upgrade, the prior
+    /// binary's bytes were committed to `<dest>.prev`).
+    Installed,
+    /// The destination already held byte-identical content: nothing was changed, and in particular
+    /// `<dest>.prev` (the rollback copy) was NOT clobbered with bytes identical to the live binary.
+    SkippedSameVersion,
+}
+
 /// Atomically installs the already-verified bytes at `src` over `dest`, retaining any prior binary
-/// at `dest` as `<dest>.prev`, NEVER overwriting the live binary in place.
+/// at `dest` as `<dest>.prev`, NEVER overwriting the live binary in place and NEVER letting a
+/// failure destroy either the live binary or a pre-existing rollback copy.
 ///
-/// CONTRACT (mirrors `scripts/install.sh`'s `install_binary`; the caller has ALREADY verified
-/// `src`, so this never weakens verify-before-install):
-/// 1. Copy `src` to a sibling temp `<dest>.tmp.<pid>` on the SAME filesystem and `chmod 0755` it, so
-///    a reader never sees a partial file.
-/// 2. `fsync` the temp file, so a power loss after the rename cannot surface a truncated binary
-///    (the bytes are on stable storage before the rename publishes them).
-/// 3. If `dest` exists, retain it as `<dest>.prev` via an atomic same-directory `rename`, so the
-///    prior known-good bytes survive for rollback (a FRESH install retains nothing).
-/// 4. `rename` the temp over `dest` (atomic on POSIX), then `fsync` the parent directory so the
-///    rename itself is durable.
+/// CONTRACT (the same swap semantics as `scripts/install.sh`'s `install_binary`; the caller has
+/// ALREADY verified `src`, so this never weakens verify-before-install):
+/// 1. SAME-VERSION GUARD (#422): if `dest` exists and its bytes equal `src`'s, return
+///    [`SwapOutcome::SkippedSameVersion`] touching NOTHING. Retaining here would overwrite the only
+///    rollback copy with bytes identical to the live binary, leaving nothing to roll back to.
+/// 2. Copy `src` to a sibling temp `<dest>.tmp.<pid>` on the SAME filesystem and `chmod 0755` it, so
+///    a reader never sees a partial file; `fsync` it so a power loss after the rename cannot
+///    surface a truncated binary.
+/// 3. If `dest` exists, STAGE its bytes to a second sibling temp `<dest>.prev.tmp.<pid>` by COPY
+///    (the live binary is never moved) and `fsync` that copy too. `<dest>.prev` is not touched yet.
+///    This reads the live binary, so an existing-but-unreadable `dest` fails closed (the older
+///    rename-based retention needed no read access). A FRESH install stages nothing.
+/// 4. `rename` the new-binary temp over `dest`: the SINGLE operation that changes `dest`, atomic on
+///    POSIX. Then `fsync` the parent directory so the rename itself is durable. If the rename
+///    fails, both temps are removed and `dest` AND any pre-existing `<dest>.prev` are left exactly
+///    as they were.
+/// 5. Only THEN commit the staged copy onto `<dest>.prev` (atomic same-directory `rename`), and
+///    `fsync` the directory again. DELIBERATE TRADE: a crash between step 4 and step 5 leaves
+///    `.prev` one version stale, an OLDER known-good binary, which is safer than committing first
+///    and leaving `.prev` byte-identical to the possibly-bad binary just installed.
+///
+/// The `rollback` side deliberately does NOT reuse this swap: `rollback_to_prev` must never move
+/// the live binary onto `.prev` at all (#348), so it uses [`restore_prev_over_dest`].
 ///
 /// # Errors
-/// [`UpgradeError::Io`] on any IO failure, naming the step. On a staging/fsync failure the temp is
-/// cleaned up and `dest` is untouched.
-pub fn atomic_swap_with_prev(src: &Path, dest: &Path) -> Result<(), UpgradeError> {
+/// [`UpgradeError::Io`] on any IO failure, naming the step. No failure path removes `dest` or
+/// clobbers a pre-existing `<dest>.prev`; failures before or at the final rename leave the host
+/// with the binary (and rollback copy) it already had, and a failure after it (the `.prev` commit
+/// or a directory fsync) leaves the new binary correctly installed with the OLD `.prev` retained.
+pub fn atomic_swap_with_prev(src: &Path, dest: &Path) -> Result<SwapOutcome, UpgradeError> {
     let io_err = |step: &str| {
         let step = step.to_string();
         move |e: io::Error| UpgradeError::Io(step.clone(), e)
     };
 
-    // 1. Stage next to the destination on the same filesystem, mode 0755 from creation.
+    // 1. SAME-VERSION GUARD (#422): a byte-identical re-run is a no-op that touches nothing, so an
+    //    idempotent re-provision can never clobber the rollback copy. Reading either file is
+    //    required anyway (src is staged below; dest is read for retention), so a read failure here
+    //    is a hard error rather than an ambiguous fall-through.
+    if dest.exists() {
+        let new_bytes = fs::read(src).map_err(io_err(&format!(
+            "reading the new binary at {}",
+            src.display()
+        )))?;
+        let cur_bytes = fs::read(dest).map_err(io_err(&format!(
+            "reading the live binary at {} for the same-version comparison",
+            dest.display()
+        )))?;
+        if new_bytes == cur_bytes {
+            return Ok(SwapOutcome::SkippedSameVersion);
+        }
+    }
+
+    // 2. Stage next to the destination on the same filesystem, mode 0755 from creation, and fsync
+    //    so the bytes are durable before the rename publishes them.
     let pid = std::process::id();
     let tmp = sibling_temp(dest, pid);
     copy_mode_0755(src, &tmp).map_err(io_err(&format!(
         "staging the new binary at {}",
         tmp.display()
     )))?;
-
-    // 2. fsync the staged file so its bytes are durable before the rename publishes it.
     if let Err(e) = fsync_path(&tmp) {
         let _ = fs::remove_file(&tmp);
         return Err(UpgradeError::Io(format!("fsyncing {}", tmp.display()), e));
     }
 
-    // 3. Retain the current binary as <dest>.prev (atomic same-dir rename) BEFORE the swap.
-    if dest.exists() {
-        let prev = prev_path(dest);
-        if let Err(e) = fs::rename(dest, &prev) {
+    // 3. STAGE the retention copy of the current binary (never moving it), fsynced. `<dest>.prev`
+    //    itself is untouched until after the swap succeeds, so a failed swap cannot have replaced a
+    //    pre-existing good rollback copy with bytes identical to the live binary.
+    let staged_prev = if dest.exists() {
+        let prev_tmp = prev_sibling_temp(dest, pid);
+        if let Err(e) = copy_mode_0755(dest, &prev_tmp) {
             let _ = fs::remove_file(&tmp);
+            let _ = fs::remove_file(&prev_tmp);
             return Err(UpgradeError::Io(
-                format!("retaining the prior binary as {}", prev.display()),
+                format!(
+                    "staging the prior binary for retention at {}",
+                    prev_tmp.display()
+                ),
                 e,
             ));
         }
-    }
+        if let Err(e) = fsync_path(&prev_tmp) {
+            let _ = fs::remove_file(&tmp);
+            let _ = fs::remove_file(&prev_tmp);
+            return Err(UpgradeError::Io(
+                format!("fsyncing {}", prev_tmp.display()),
+                e,
+            ));
+        }
+        Some(prev_tmp)
+    } else {
+        None
+    };
 
-    // 4. Atomically swap the new binary into place, then fsync the directory so the rename persists.
-    if let Err(e) = fs::rename(&tmp, dest) {
+    // 4. Atomically swap the new binary into place: the SINGLE operation that changes `dest`. On
+    //    failure, remove both temps; `dest` and any pre-existing `.prev` are exactly as they were.
+    if let Err(e) = final_rename(&tmp, dest) {
         let _ = fs::remove_file(&tmp);
+        if let Some(prev_tmp) = &staged_prev {
+            let _ = fs::remove_file(prev_tmp);
+        }
         return Err(UpgradeError::Io(
             format!("installing to {}", dest.display()),
             e,
         ));
     }
     if let Some(dir) = dest.parent() {
-        // Best-effort: a directory fsync failure (e.g. an fs that does not support it) does not undo
-        // the atomic rename, which already happened, so it is logged-not-fatal at the call site; we
-        // surface it here so the caller can warn, but the binary is already correctly in place.
-        fsync_dir(dir).map_err(io_err(&format!(
-            "fsyncing the install dir {}",
-            dir.display()
-        )))?;
+        // A directory fsync failure does not undo the atomic rename, which already happened; the
+        // new binary is correctly in place. Surface the error (the caller warns), after discarding
+        // the uncommitted retention temp so no failure path leaves stray temps behind.
+        if let Err(e) = fsync_dir(dir) {
+            if let Some(prev_tmp) = &staged_prev {
+                let _ = fs::remove_file(prev_tmp);
+            }
+            return Err(UpgradeError::Io(
+                format!("fsyncing the install dir {}", dir.display()),
+                e,
+            ));
+        }
     }
-    Ok(())
+
+    // 5. COMMIT the retention only now that the new binary is live: one atomic same-directory
+    //    rename replaces `.prev` with the staged copy of the just-replaced binary, then the
+    //    directory fsync makes the commit durable. A failure here never removes `dest` (the new
+    //    binary stands) and never clobbers the old `.prev` (one version stale, an older known-good).
+    if let Some(prev_tmp) = staged_prev {
+        let prev = prev_path(dest);
+        if let Err(e) = fs::rename(&prev_tmp, &prev) {
+            let _ = fs::remove_file(&prev_tmp);
+            return Err(UpgradeError::Io(
+                format!("committing the rollback copy to {}", prev.display()),
+                e,
+            ));
+        }
+        if let Some(dir) = dest.parent() {
+            fsync_dir(dir).map_err(io_err(&format!(
+                "fsyncing the install dir {} after committing the rollback copy",
+                dir.display()
+            )))?;
+        }
+    }
+    Ok(SwapOutcome::Installed)
+}
+
+/// The final `rename(2)` of the staged new binary onto the destination, with a TEST-ONLY failpoint:
+/// in a debug build, setting `IRONBUS_TEST_FAIL_FINAL_RENAME` forces the rename to fail WITHOUT
+/// touching anything, so the failure-path contract (the destination stays present and a
+/// pre-existing `.prev` stays intact) is provable over the real shipped binary in
+/// `crates/ironbus-cli/tests/upgrade_migrate.rs`. The failpoint can only force the FAILURE path
+/// (fail-closed; never a bogus success) and is compiled out of release builds entirely.
+fn final_rename(tmp: &Path, dest: &Path) -> io::Result<()> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("IRONBUS_TEST_FAIL_FINAL_RENAME").is_some() {
+        return Err(io::Error::other(
+            "injected failure (IRONBUS_TEST_FAIL_FINAL_RENAME is set; debug builds only)",
+        ));
+    }
+    fs::rename(tmp, dest)
 }
 
 /// Rolls back to the retained `<dest>.prev`, restoring it over `dest` and clearing the start-attempt
@@ -342,6 +459,15 @@ pub fn should_fall_back(dest: &Path, failed_starts: u32, max_failed_starts: u32)
 fn sibling_temp(dest: &Path, pid: u32) -> PathBuf {
     let mut name = dest.as_os_str().to_os_string();
     name.push(format!(".tmp.{pid}"));
+    PathBuf::from(name)
+}
+
+/// The sibling temp the retention copy is STAGED to (`<dest>.prev.tmp.<pid>`) before it is
+/// committed onto `<dest>.prev`; same-directory so the commit rename is a same-fs atomic move.
+/// Matches the `${dest}.prev.tmp.$$` name `scripts/install.sh` uses for the same purpose.
+fn prev_sibling_temp(dest: &Path, pid: u32) -> PathBuf {
+    let mut name = dest.as_os_str().to_os_string();
+    name.push(format!("{PREV_SUFFIX}.tmp.{pid}"));
     PathBuf::from(name)
 }
 
@@ -550,7 +676,12 @@ mod tests {
         let src = scr.path().join("staged-new");
         fs::write(&src, new).unwrap();
 
-        atomic_swap_with_prev(&src, &dest).expect("the atomic swap must succeed");
+        let outcome = atomic_swap_with_prev(&src, &dest).expect("the atomic swap must succeed");
+        assert_eq!(
+            outcome,
+            SwapOutcome::Installed,
+            "differing bytes take the real install path"
+        );
 
         assert_eq!(
             fs::read(&dest).unwrap(),
@@ -594,6 +725,43 @@ mod tests {
             "a fresh install creates no .prev (nothing to retain)"
         );
     }
+
+    #[test]
+    fn a_same_version_swap_is_a_noop_that_preserves_prev() {
+        // SAME-VERSION GUARD (#422), the Rust twin of the installer's: a swap whose new bytes are
+        // identical to the live binary's is a no-op SUCCESS that touches NOTHING. In particular it
+        // must not overwrite `.prev`: that would replace the only rollback copy with bytes
+        // identical to the live binary, so "rollback" would reinstall the very build it is rolling
+        // back from.
+        let scr = Scratch::new("same-version");
+        let dest = scr.path().join("ironbus");
+        let prev = prev_path(&dest);
+        let v1 = b"ironbus v1 (the rollback copy)";
+        let v2 = b"ironbus v2 (the live binary)";
+        fs::write(&dest, v2).unwrap();
+        fs::write(&prev, v1).unwrap();
+
+        let src = scr.path().join("staged-v2-again");
+        fs::write(&src, v2).unwrap();
+        let outcome = atomic_swap_with_prev(&src, &dest)
+            .expect("a same-version re-run is a no-op SUCCESS, not an error");
+        assert_eq!(
+            outcome,
+            SwapOutcome::SkippedSameVersion,
+            "byte-identical bytes are reported as the deliberate skip"
+        );
+        assert_eq!(fs::read(&dest).unwrap(), v2, "the live binary is unchanged");
+        assert_eq!(
+            fs::read(&prev).unwrap(),
+            v1,
+            "a same-version re-run MUST NOT clobber .prev (the only rollback copy)"
+        );
+    }
+
+    // NOTE: the failed-FINAL-rename path (dest present and a pre-existing `.prev` intact after the
+    // failure) is proved over the REAL shipped binary in tests/upgrade_migrate.rs via the
+    // debug-only IRONBUS_TEST_FAIL_FINAL_RENAME failpoint, where the env var is set on the child
+    // process only (setting it in this multi-threaded unit-test process would be racy).
 
     #[test]
     fn rollback_restores_the_prev_bytes_and_clears_the_counter() {

@@ -124,18 +124,81 @@ verify_checksum() {
     return 0
 }
 
-# Download <url> to <dest>, failing on any HTTP or transport error. Uses curl or wget; never
-# pipes the body to a shell. Returns non-zero on failure so the caller can fail closed.
+# Classify the available `wget` from the FIRST LINE of `wget --version` (run under LC_ALL=C so
+# the banner is never translated). Prints one of: gnu-wget-1 | wget2 | unknown. BusyBox and other
+# minimal builds reject `--version` with a usage error; that classifies as `unknown`.
+#
+# Why every flavor below is REFUSED by `download` (#423): NO known wget can be trusted to pin the
+# URL scheme across redirects for a NON-RECURSIVE single-file download, and SHA256SUMS travels
+# over the same channel as the binary, so one plaintext hop lets a network-position attacker
+# defeat the checksum gate entirely. Empirical record (2026-06-10):
+#
+#   - GNU wget 1.x: `--https-only` is honored ONLY in recursive mode (in wget's source,
+#     opt.https_only is consulted only by download_child in src/recur.c). Verified on GNU Wget
+#     1.25.0: `wget --https-only --secure-protocol=TLSv1_2 -nv -O out URL` (a) fetched a plain
+#     http:// URL over plaintext with exit 0, and (b) followed an https-to-plain-http 302 and
+#     fetched the body with exit 0. The flags are accepted and silently do nothing here.
+#   - GNU wget2: tested on wget2 2.2.1 (GnuTLS build) and DISPROVEN, so it is refused too:
+#     (a) `--https-only` does not apply to the command-line URL (a plain http:// URL downloads
+#     over plaintext, exit 0); (b) its refusal of an https-to-http redirect EXITS 0 with no
+#     output file, so a caller gets no failure signal; (c) `--https-enforce=hard` rewrites http
+#     to https but silently FALLS BACK TO PLAINTEXT when the TLS connect fails (verified against
+#     an http-only host: a plain `GET / HTTP/1.1` on the wire, exit 0, while reporting the URL
+#     as https://); (d) combining `--https-only --https-enforce=hard` (either order) disables
+#     the upgrade entirely and fetches the plain http:// URL over plaintext again. Unproven (here
+#     disproven) enforcement is not trusted.
+#   - BusyBox / anything unrecognized: no HTTPS-enforcement flags at all; never enforceable.
+wget_flavor() {
+    # Some builds (BusyBox) exit non-zero on --version; the text still prints, tolerate it.
+    wget_version="$(LC_ALL=C wget --version 2>&1)" || true
+    # Keep only the first line, with no external tool: the test harness calls these helpers on a
+    # PATH that resolves nothing but stub tools (so no `head`).
+    wget_nl='
+'
+    wget_version="${wget_version%%"${wget_nl}"*}"
+    case "$wget_version" in
+        "GNU Wget 1."*) printf '%s' 'gnu-wget-1' ;;
+        "GNU Wget2"*) printf '%s' 'wget2' ;;
+        *) printf '%s' 'unknown' ;;
+    esac
+}
+
+# Download <url> to <dest> over HTTPS only; never pipes the body to a shell. Decision table:
+#
+#   curl (preferred)   used, with `--proto '=https' --tlsv1.2` pinning the scheme on every hop
+#                      and the TLS floor; returns non-zero on any HTTP or transport error so the
+#                      caller can fail closed.
+#   wget, any flavor   REFUSED: `download` exits via `die` before any fetch is attempted. GNU
+#                      wget 1.x only honors --https-only recursively, wget2's enforcement was
+#                      empirically disproven, and BusyBox has no enforcement flags at all (see
+#                      wget_flavor above for the full evidence). A flavor-specific error names
+#                      the reason and the remedies.
+#   neither            exits via `die`.
+#
+# The wget and no-tool branches deliberately `die` (exit) rather than return non-zero: no call
+# site invokes download in a subshell, and exiting is the strongest fail-closed signal, so a
+# future caller cannot ignore the status and proceed downgradable (#423).
 download() {
     url="$1"
     dest="$2"
+    remedy="install curl, or download it manually over HTTPS and verify it against SHA256SUMS"
     if command -v curl >/dev/null 2>&1; then
         # -f: fail on HTTP >= 400; -S: show errors; -L: follow redirects; -o: to file.
         curl -fSL --proto '=https' --tlsv1.2 -o "$dest" "$url"
     elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$dest" "$url"
+        case "$(wget_flavor)" in
+            gnu-wget-1)
+                die "GNU wget 1.x cannot enforce HTTPS for a single-file download (--https-only is honored only in recursive mode, so a plain-http URL or an https-to-http redirect is fetched anyway; verified on GNU Wget 1.25.0); refusing to download $url with it; $remedy"
+                ;;
+            wget2)
+                die "wget2 is not trusted to enforce HTTPS (tested on wget2 2.2.1: --https-only skips the command-line URL, its redirect refusal exits 0, and --https-enforce=hard falls back to plaintext when TLS fails); refusing to download $url with it; $remedy"
+                ;;
+            *)
+                die "the available wget (BusyBox or an unrecognized build) cannot enforce HTTPS; refusing to download $url with it; $remedy"
+                ;;
+        esac
     else
-        die "need curl or wget to download $url"
+        die "need curl to download $url (wget is refused: no flavor provably enforces HTTPS for a single-file download)"
     fi
 }
 
@@ -144,35 +207,115 @@ download() {
 # isolation (see crates/ironbus-cli/tests/installer_verify.rs), so it must stay side-effect-free at
 # definition time and be POSIX-sh portable.
 #
-#   install_binary <src> <dest>
+#   install_binary <src> <dest> [version-label]
 #
 # CONTRACT (the caller has ALREADY passed fail-closed verification before calling this, so this
 # function never weakens verify-before-install):
+#   - SAME-VERSION re-run (<dest> exists and its SHA256 equals <src>'s): a no-op SUCCESS (#422).
+#     Neither <dest> nor `<dest>.prev` is touched, so an idempotent re-provision (config management
+#     re-running the installer for the version already live) can never clobber the rollback copy
+#     with bytes identical to the live binary. Sets ironbus_install_skipped=1 for the caller.
 #   - Stages <src> next to <dest> as a sibling temp, chmods it 0755, so a reader never sees a
 #     partial file and an interrupted install never leaves a truncated binary at <dest>.
-#   - UPGRADE (a file already exists at <dest>): retains the CURRENT <dest> as `<dest>.prev` (an
-#     atomic same-directory `mv`, so the prior binary is never half-moved) BEFORE swapping the new
-#     binary into place, so an operator can roll back to the prior known-good bytes.
+#   - UPGRADE (a file already exists at <dest>): STAGES the CURRENT <dest> bytes to a sibling temp
+#     by COPY, never by moving the live binary (#421), and commits that staged copy over
+#     `<dest>.prev` (one atomic same-directory `mv`) only AFTER the final swap has succeeded. So a
+#     failed final swap leaves <dest> AND any pre-existing `<dest>.prev` exactly as they were: a
+#     pre-existing good rollback copy is never replaced with bytes identical to the live binary by
+#     an install that did not land. DELIBERATE TRADE: a crash between the final swap and the
+#     `.prev` commit leaves `.prev` one version stale, an OLDER known-good binary, which is safer
+#     than committing first and leaving `.prev` byte-identical to the possibly-bad binary just
+#     installed. The live binary stays in place throughout, so there is never a window where
+#     <dest> does not exist for a supervised restart to land in.
+#   - Exactly ONE operation changes <dest>: the final atomic `mv`. If it fails, the live binary
+#     AND any existing `.prev` are UNTOUCHED (the retention only STAGED a copy; nothing committed),
+#     so every failure path leaves the host with the binary it already had (or, on a fresh install,
+#     still nothing), never with neither the old binary nor the new one.
+#   - FAIL-CLOSED ON AN UNREADABLE <dest>: the retention READS the live binary (`cp -p`), so an
+#     existing-but-unreadable <dest> now fails the install closed (a deliberate behavior change:
+#     the older `mv`-based retention needed no read permission). A live binary the installer
+#     cannot read for retention is not upgraded over.
+#   - SYMLINK at <dest>: a same-bytes re-run skips and leaves the symlink in place. With differing
+#     bytes, `<dest>.prev` receives a regular-file COPY of the symlink TARGET's bytes, and the
+#     final `mv` replaces the symlink ITSELF with a regular file (the old target file is left on
+#     disk, no longer referenced from <dest>).
 #   - FRESH install (nothing at <dest>): retains nothing, so no spurious `.prev` is created.
-# Returns non-zero (without installing) on any IO error.
+# Returns non-zero (live binary and any existing `.prev` untouched) on any IO error before or at
+# the final swap. If the swap succeeded but the `.prev` commit then fails, the install itself
+# stands (the host runs the new, verified binary) and the old `.prev`, one version stale, is kept;
+# that is reported as a warning, not a failure.
 install_binary() {
     src="$1"
     dest="$2"
-    tmp_dest="${dest}.tmp.$$"
-    cp "$src" "$tmp_dest" || { log "could not stage the binary next to $dest"; return 1; }
-    chmod 0755 "$tmp_dest" || { log "could not chmod the staged binary"; rm -f "$tmp_dest"; return 1; }
+    version_label="${3:-}"
+    ironbus_install_skipped=0
 
-    if [ -e "$dest" ]; then
-        prev_dest="${dest}.prev"
-        if ! mv -f "$dest" "$prev_dest"; then
-            log "could not retain the previous binary as $prev_dest"
-            rm -f "$tmp_dest"
-            return 1
+    # SAME-VERSION GUARD (#422): if the destination already holds EXACTLY the bytes we are about
+    # to install, this run is an idempotent re-provision, not an upgrade. Skip BOTH the `.prev`
+    # retention and the swap: retaining here would overwrite the only rollback copy with bytes
+    # identical to the live binary, leaving nothing to roll back to. If no sha256 tool exists the
+    # comparison cannot run; fall through and install normally (never skip on an ambiguous answer).
+    if [ -f "$dest" ]; then
+        new_sum="$(sha256_of "$src")" || new_sum=""
+        cur_sum="$(sha256_of "$dest")" || cur_sum=""
+        if [ -n "$new_sum" ] && [ "$new_sum" = "$cur_sum" ]; then
+            # Only a pinned tag (v*) reads naturally inline; "latest" (or any other channel word)
+            # is parenthesized so the line never claims a literal version named "latest".
+            case "$version_label" in
+                "") log "ironbus already installed at $dest, nothing to do" ;;
+                v*) log "ironbus $version_label already installed at $dest, nothing to do" ;;
+                *) log "ironbus ($version_label) already installed at $dest, nothing to do" ;;
+            esac
+            ironbus_install_skipped=1
+            return 0
         fi
-        log "retained the previous binary as $prev_dest (rollback copy)"
     fi
 
-    mv -f "$tmp_dest" "$dest" || { log "could not install to $dest"; return 1; }
+    tmp_dest="${dest}.tmp.$$"
+    cp "$src" "$tmp_dest" || { log "could not stage the binary next to $dest"; rm -f "$tmp_dest"; return 1; }
+    chmod 0755 "$tmp_dest" || { log "could not chmod the staged binary"; rm -f "$tmp_dest"; return 1; }
+
+    prev_dest="${dest}.prev"
+    prev_tmp="${prev_dest}.tmp.$$"
+    prev_staged=0
+    if [ -e "$dest" ]; then
+        # ROLLBACK RETENTION (#421), STAGED ONLY: `cp -p` the CURRENT binary's bytes to a sibling
+        # temp WITHOUT unlinking or moving the live binary, and WITHOUT touching `<dest>.prev` yet.
+        # The staged copy is committed over `.prev` only AFTER the final swap succeeds, so a failed
+        # swap can never have replaced a pre-existing good `.prev` with bytes identical to the live
+        # binary. (The pre-fix `mv <dest> <dest>.prev` retention opened a window where <dest> did
+        # not exist and a failed final swap stranded the host with NO binary at <dest>.)
+        if ! cp -p "$dest" "$prev_tmp"; then
+            log "could not stage the previous binary for retention as $prev_dest"
+            rm -f "$tmp_dest" "$prev_tmp"
+            return 1
+        fi
+        prev_staged=1
+    fi
+
+    # SINGLE ATOMIC SWAP (#421): this `mv` is the ONLY operation that changes <dest>. On success a
+    # reader sees the old binary or the new one, never a missing or partial file. On failure the
+    # live binary is UNTOUCHED (the retention above only STAGED a copy) and any pre-existing
+    # `.prev` is UNTOUCHED too (nothing has committed over it); discard both temps and report.
+    if ! mv -f "$tmp_dest" "$dest"; then
+        log "could not install to $dest (the existing binary and rollback copy, if any, are untouched)"
+        rm -f "$tmp_dest" "$prev_tmp"
+        return 1
+    fi
+
+    if [ "$prev_staged" = "1" ]; then
+        # COMMIT THE RETENTION only now that the new binary is live: one atomic same-directory `mv`
+        # replaces `.prev` with the staged copy of the just-replaced binary. A crash between the
+        # swap above and this commit leaves `.prev` one version stale (an OLDER known-good), the
+        # deliberate trade documented in the contract. If the commit itself fails, the completed
+        # install stands and the old `.prev` (if any) is kept; warn rather than fail the install.
+        if mv -f "$prev_tmp" "$prev_dest"; then
+            log "retained the previous binary as $prev_dest (rollback copy)"
+        else
+            log "warning: could not commit the rollback copy to $prev_dest (keeping the existing one, if any; it is one version stale)"
+            rm -f "$prev_tmp"
+        fi
+    fi
     return 0
 }
 
@@ -195,6 +338,9 @@ main() {
     bin_dir=""
     force_target=""
     verify_provenance="0"
+    # Set late (after the install dir is chosen) but initialized here so the EXIT trap below can
+    # reference it under `set -u` before that point.
+    dest=""
 
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -223,7 +369,10 @@ main() {
 
     workdir="$(mktemp -d "${TMPDIR:-/tmp}/ironbus-install.XXXXXX")" || die "could not create a temp dir"
     # Clean up the scratch dir on any exit; a half-downloaded, unverified binary never survives.
-    trap 'rm -rf "$workdir"' EXIT INT TERM
+    # Also remove install_binary's two sibling staging temps if an interrupt lands mid-install
+    # ($dest is empty until the install dir is chosen below, so this is a no-op before then; the
+    # temps never hold the only copy of anything, so removing them is always safe).
+    trap 'rm -rf "$workdir"; if [ -n "$dest" ]; then rm -f "${dest}.tmp.$$" "${dest}.prev.tmp.$$"; fi' EXIT INT TERM
 
     log "downloading the binary and SHA256SUMS"
     download "${base}/${asset}" "${workdir}/${asset}" || die "download failed: ${base}/${asset}"
@@ -258,7 +407,14 @@ main() {
     # This runs ONLY after the fail-closed checksum (and optional provenance) verification above has
     # passed, so it never weakens verify-before-install: the new binary is fully verified before the
     # `.prev` retention or the swap touch the install dir.
-    install_binary "${workdir}/${asset}" "$dest" || die "could not install to $dest"
+    install_binary "${workdir}/${asset}" "$dest" "$version" || die "could not install to $dest"
+
+    # Idempotent same-version re-run (#422): the verified bytes are already live at $dest; nothing
+    # was changed and the existing rollback copy (if any) is preserved. install_binary already
+    # printed the "nothing to do" line; report success and stop here.
+    if [ "${ironbus_install_skipped:-0}" = "1" ]; then
+        exit 0
+    fi
 
     log "installed verified ironbus to $dest"
     case ":${PATH}:" in

@@ -5,9 +5,11 @@
 //! the style of `installer_verify.rs` and `acceptance.rs`, so the product invariants are proved on
 //! the shipped surface, not only on the library's unit tests:
 //!
-//! - `upgrade` swaps an already-verified new binary over the live one, retains the prior binary as
-//!   `<dest>.prev`, and `rollback` restores it; the start-attempt counter (`record-start`) drives
-//!   the fall-back-after-N decision.
+//! - `upgrade` swaps an already-verified new binary over the live one and retains the prior binary
+//!   as `<dest>.prev` (committed only AFTER the single atomic swap, so a failed swap leaves the
+//!   destination and any pre-existing `.prev` untouched, #421; a byte-identical re-run is a no-op
+//!   touching neither, #422), and `rollback` restores it; the start-attempt counter
+//!   (`record-start`) drives the fall-back-after-N decision.
 //! - `migrate` REFUSES a silent on-disk format bump (a data dir whose stamped format version differs
 //!   from this build's), and reports "no migration needed" for a same-major (current-version) data
 //!   dir, which opens with no migration.
@@ -50,10 +52,18 @@ impl Drop for Scratch {
 
 /// Runs `ironbus <args...>` and returns (`exit_code`, stdout, stderr).
 fn run_ironbus(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(BUILT_BIN)
-        .args(args)
-        .output()
-        .expect("failed to run the ironbus binary");
+    run_ironbus_env(args, &[])
+}
+
+/// Like [`run_ironbus`] but with extra environment variables set ON THE CHILD process only (so a
+/// test-only failpoint can be armed without mutating this multi-threaded test process's env).
+fn run_ironbus_env(args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
+    let mut cmd = Command::new(BUILT_BIN);
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("failed to run the ironbus binary");
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -133,6 +143,122 @@ fn a_fresh_upgrade_creates_no_prev() {
     assert_eq!(code, 0, "fresh upgrade must succeed (stderr={err})");
     assert_eq!(std::fs::read(&dest).unwrap(), new);
     assert!(!prev.exists(), "a fresh install creates no ironbus.prev");
+}
+
+#[test]
+fn a_same_version_upgrade_is_a_noop_that_preserves_prev() {
+    // SAME-VERSION GUARD (#422) over the real verb, the twin of the installer's: `ironbus upgrade`
+    // with a new binary byte-identical to the live one is a no-op SUCCESS that touches NOTHING:
+    // not the live binary, not `ironbus.prev` (clobbering it would replace the only rollback copy
+    // with bytes identical to the live binary), and not the start-attempt counter (a no-op re-run
+    // must not clear the failure budget of a binary that may be mid-failure-streak).
+    let scr = Scratch::new("same-version-it");
+    let dest = scr.path().join("ironbus");
+    let prev = scr.path().join("ironbus.prev");
+    let counter = scr.path().join(".ironbus-start-attempts");
+    let v1 = b"ironbus v1 (the rollback copy)";
+    let v2 = b"ironbus v2 (the live binary)";
+    std::fs::write(&dest, v2).unwrap();
+    std::fs::write(&prev, v1).unwrap();
+    std::fs::write(&counter, "2").unwrap();
+
+    let staged = scr.path().join("staged-v2-again");
+    std::fs::write(&staged, v2).unwrap();
+    let (code, out, err) = run_ironbus(&[
+        "upgrade",
+        "--new-binary",
+        staged.to_str().unwrap(),
+        "--dest",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code, 0,
+        "a same-version upgrade is a no-op SUCCESS (stdout={out} stderr={err})"
+    );
+    assert!(
+        out.contains("nothing to do"),
+        "the no-op is reported, not silently absorbed (got: {out})"
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        v2,
+        "the live binary is unchanged"
+    );
+    assert_eq!(
+        std::fs::read(&prev).unwrap(),
+        v1,
+        "a same-version upgrade MUST NOT clobber ironbus.prev (#422)"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&counter).unwrap(),
+        "2",
+        "a same-version no-op leaves the failure budget untouched"
+    );
+}
+
+#[test]
+fn a_failed_final_rename_leaves_dest_present_and_the_old_prev_intact() {
+    // THE #421 ORDERING TEETH over the real verb: the pre-fix `atomic_swap_with_prev` retained the
+    // live binary by RENAME before the final rename, so a failed final rename stranded the host
+    // with NO binary at the destination (and the retention had clobbered any pre-existing good
+    // `.prev`). With copy-based retention staged until the swap succeeds, a failed final rename
+    // leaves BOTH the destination AND the old rollback copy byte-identical to before, with no
+    // staging temps left behind. The failure is forced exactly at the final rename via the
+    // debug-build-only IRONBUS_TEST_FAIL_FINAL_RENAME failpoint (set on the child process only).
+    if !cfg!(debug_assertions) {
+        // The failpoint is compiled out of release builds, so the failure cannot be injected there;
+        // the contract is still proved by every debug CI run of this test.
+        return;
+    }
+    let scr = Scratch::new("failed-final-rename-it");
+    let dest = scr.path().join("ironbus");
+    let prev = scr.path().join("ironbus.prev");
+    let v1 = b"ironbus v1 (the prior known-good rollback copy)";
+    let v2 = b"ironbus v2 (the live binary)";
+    std::fs::write(&dest, v2).unwrap();
+    std::fs::write(&prev, v1).unwrap();
+    let staged = scr.path().join("staged-v3");
+    std::fs::write(&staged, b"ironbus v3 (the upgrade that fails to land)").unwrap();
+
+    let (code, _out, err) = run_ironbus_env(
+        &[
+            "upgrade",
+            "--new-binary",
+            staged.to_str().unwrap(),
+            "--dest",
+            dest.to_str().unwrap(),
+        ],
+        &[("IRONBUS_TEST_FAIL_FINAL_RENAME", "1")],
+    );
+    assert_eq!(
+        code, 70,
+        "an IO fault at the final rename is the frozen internal exit code (stderr={err})"
+    );
+    assert!(
+        err.contains("installing to"),
+        "the error names the failing step (stderr={err})"
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        v2,
+        "the live binary is byte-identical to before the failed rename (the host is never \
+         stranded without a binary, #421)"
+    );
+    assert_eq!(
+        std::fs::read(&prev).unwrap(),
+        v1,
+        "the PRE-EXISTING rollback copy is byte-identical to before (never clobbered by a failed \
+         install, #421)"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(scr.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "ironbus" && n != "ironbus.prev" && n != "staged-v3")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no staging temps survive a failed final rename: {leftovers:?}"
+    );
 }
 
 #[test]
@@ -297,6 +423,77 @@ fn unit_wiring_a_healthy_binary_does_not_roll_back_on_unclean_power_loss() {
         b"healthy binary",
         "the healthy binary survived repeated unclean power losses untouched"
     );
+}
+
+// --- #420: the packaged unit file's privileged-helper wiring ------------------------------------
+
+#[test]
+fn the_packaged_unit_keeps_the_privileged_helper_wiring() {
+    // The root cause of #420 was that NOTHING asserted the shipped unit's content: dropping a `+`
+    // Exec prefix re-ships the fleet-wide healthy-broker kill loop (the EROFS-failed ExecStartPost
+    // makes systemd kill a HEALTHY broker at the end of the grace window, and Restart=on-failure
+    // with the rate limiter disabled retries forever), and no compile, unit-test, or release gate
+    // catches it. So this test pins the unit file's load-bearing lines: the three lifecycle helpers
+    // run privileged (`+`), the broker itself does NOT, and the directives the fall-back-after-N
+    // design leans on are present.
+    let unit_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/systemd/ironbus.service");
+    let unit = std::fs::read_to_string(&unit_path).unwrap_or_else(|e| {
+        panic!(
+            "the packaged unit must exist at {}: {e}",
+            unit_path.display()
+        )
+    });
+
+    // (a) Each lifecycle hook appears EXACTLY once (the counter means "consecutive genuinely-failed
+    // starts" only if each hook has ONE job) and runs with the `+` full-privilege prefix.
+    for hook in ["ExecStartPre=", "ExecStartPost=", "ExecStopPost="] {
+        let values: Vec<&str> = unit.lines().filter_map(|l| l.strip_prefix(hook)).collect();
+        assert_eq!(
+            values.len(),
+            1,
+            "{hook} must appear exactly once in the packaged unit, got {values:?}"
+        );
+        assert!(
+            values[0].starts_with("+/bin/sh"),
+            "{hook} must run privileged via `+/bin/sh` (#420): a dropped `+` makes every counter \
+             write fail with EROFS under ProtectSystem=strict and re-ships the healthy-broker \
+             kill loop (got: {hook}{})",
+            values[0]
+        );
+    }
+
+    // (b) The broker itself stays fully sandboxed: no `+` on ExecStart. (strip_prefix("ExecStart=")
+    // cannot match the Pre/Post hook lines above, whose prefix continues with "Pre="/"Post=".)
+    let exec_start: Vec<&str> = unit
+        .lines()
+        .filter_map(|l| l.strip_prefix("ExecStart="))
+        .collect();
+    assert_eq!(
+        exec_start.len(),
+        1,
+        "the packaged unit must hold exactly one ExecStart=, got {exec_start:?}"
+    );
+    assert!(
+        !exec_start[0].starts_with('+'),
+        "ExecStart (the broker) must NOT carry the `+` prefix; the sandbox exemption is for the \
+         three helpers only (got: ExecStart={})",
+        exec_start[0]
+    );
+
+    // (c) The directives the fall-back-after-N design leans on. Losing any of these silently
+    // changes the failure semantics the unit-wiring lifecycle tests above prove.
+    for line in [
+        "StartLimitIntervalSec=0",
+        "Restart=on-failure",
+        "ProtectSystem=strict",
+        "User=ironbus",
+    ] {
+        assert!(
+            unit.lines().any(|l| l.trim() == line),
+            "the packaged unit must keep `{line}` (the fall-back-after-N design depends on it)"
+        );
+    }
 }
 
 // --- #348: two-rename re-entry window, over the real binary -------------------------------------
