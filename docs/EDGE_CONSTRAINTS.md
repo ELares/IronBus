@@ -381,7 +381,10 @@ document does not restate or re-derive them.
   measurable (criterion 4).** The active segment is the WAL: append-only,
   large, never recycled in v1; the append actor group-commits one `fdatasync`
   per batch; the data-dir write amplification is a measured metric with a
-  `>= 4x` edge gate. Owned by [DURABILITY.md](DURABILITY.md) and
+  `>= 4x` edge gate. The ratio is defined over STORED (post-compression #430)
+  bytes: under the default codec it can inflate for small compressible
+  payloads even as the real flash wear per user byte falls. Owned by
+  [DURABILITY.md](DURABILITY.md) and
   [EDGE_RUN_DISCIPLINE.md](EDGE_RUN_DISCIPLINE.md) (the gate), with the metric
   contract in [#118](https://github.com/ELares/IronBus/issues/118).
 - **Codec justified against ARM cost; cold-only higher zstd (criterion 7).**

@@ -136,6 +136,15 @@ storage flag:
   unchanged. It is an ADDITIVE flag only: the `FrameType` tag vocabulary is unchanged (the
   `type_tags_have_their_exact_frozen_wire_values` pin still holds).
 
+### Mixed-version rollout with write-path compression (#430)
+
+Upgrading only the broker flips real compression on by default (`serve --compression` defaults
+to `lz4`), and a pre-#430 client receives the descriptor + codec stream bytes verbatim with the
+`COMPRESSED` bit set, which is spec-legal but silently different from the produced payload. The
+operational rule is therefore: upgrade consumers to a #430+ client FIRST, or run the broker with
+`--compression none` during the transition. A client downgrade after compressed data exists
+regresses those consumers to the raw stored bytes for every compressed record still retained.
+
 ### The Connect/Info handshake bodies are an ADDITIVE, version-prefixed change (#292)
 
 The `Connect` (tag 1) and `Info` (tag 2) bodies were EMPTY before #292; they now carry the

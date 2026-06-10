@@ -810,7 +810,7 @@ fn edge_metric_lines(edge: &EdgeMetrics, rss: Option<u64>) -> String {
     // The write-amplification counters and the derived ratio (#118).
     let _ = write!(
         s,
-        "# HELP ironbus_logical_bytes_written Logical bytes appended this run (user payload: key + headers + payload, no framing); the write-amplification denominator.\n\
+        "# HELP ironbus_logical_bytes_written Stored payload bytes appended this run (key + headers + payload as stored, post-compression under a non-none codec; no framing); the write-amplification denominator.\n\
          # TYPE ironbus_logical_bytes_written counter\n\
          ironbus_logical_bytes_written {logical}\n\
          # HELP ironbus_physical_bytes_written Physical bytes appended to segments this run (record frames plus segment headers and footers); the real flash-wear write volume and the write-amplification numerator.\n\
