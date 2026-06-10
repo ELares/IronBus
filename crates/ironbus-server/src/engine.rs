@@ -1588,6 +1588,26 @@ struct WorkGroup {
     /// purely monotonic timestamp is enough because the sweep only ever subtracts it from a later
     /// `now`, never compares it across wall-clock boundaries.
     last_activity: u64,
+    /// Whether ANY consumer interaction has EVER been observed for this group (#424): a poll,
+    /// ack, nack, term, progress, cumulative ack, or an explicit subscribe in this process, or
+    /// any durable consumer state (a cursor or attempts checkpoint) found at open. Every group
+    /// except the boot-created default group starts `true`: a NAMED group comes to exist through
+    /// a consumer op, a durable-state resume, or a serve-time declaration (`set_broadcast_in` /
+    /// `set_key_ordering_in` create their groups before any consumer exists, and a DECLARED
+    /// group deliberately keeps the conservative pre-#424 pinning until its consumers arrive).
+    /// The boot-created default group (`""`) starts `false` when it carries NO durable state,
+    /// because it exists structurally (it is the wire's unnamed group) whether or not anyone
+    /// consumes through it. The retention protect floor ([`Engine::min_committed_offset`]) skips
+    /// a group that is still untouched, so a deployment that only consumes through named groups
+    /// is not pinned at offset 0 forever by the phantom default group. The flag is in-memory
+    /// only, the documented trade for adding no new durable state: a default-group consumer is
+    /// protected across a restart only once a cursor (or attempts) checkpoint actually exists on
+    /// disk. The live write is offset-gated ([`Engine::maybe_checkpoint`] writes only after
+    /// `checkpoint_interval` newly committed offsets) and the shutdown write
+    /// ([`Engine::checkpoint_cursor`], driven by the server on drain and connection close) skips
+    /// a cursor with nothing to record, so a consumer that polled but never committed resumes
+    /// untouched even after a graceful stop.
+    touched: bool,
 }
 
 impl WorkGroup {
@@ -1606,6 +1626,11 @@ impl WorkGroup {
             broadcast: false,
             subscribers: std::collections::BTreeSet::new(),
             last_activity: now,
+            // Touched by default (#424): a named group is created by a consumer op, a durable
+            // resume, or a serve-time declaration, and every one of those keeps the conservative
+            // pinning. The single exception, the boot-created default group with no durable
+            // state, is flipped to untouched right after open inserts it.
+            touched: true,
         }
     }
 }
@@ -1847,13 +1872,20 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // plus the redeliveries not yet checkpointed when the crash hit; never below the durable floor).
         let cursor = resume_cursor_from_snapshot(recovered.as_deref(), flushed);
         let default_committed = cursor.committed().get();
-        let default_group = resume_work_group(
+        let mut default_group = resume_work_group(
             cursor,
             recovered_attempts.as_deref(),
             config.lease,
             opened_at,
             flushed,
         );
+        // The boot-created default group starts UNTOUCHED (#424) when it carries no durable
+        // consumer state at all: no `cursor.ckpt` and no `attempts.ckpt`. It exists structurally
+        // (the wire's unnamed group), so its fresh offset-0 cursor must not pin the retention
+        // protect floor for a deployment that only consumes through named groups. The first
+        // consumer interaction in this process, or any durable state at the next open, marks it
+        // a real consumer with the full slow-consumer protection.
+        default_group.touched = recovered.is_some() || recovered_attempts.is_some();
         let mut groups = BTreeMap::new();
         groups.insert(DEFAULT_GROUP.to_string(), default_group);
         // Discover and resume each NAMED work-group from its own `cursor-<hex>.ckpt` (#60),
@@ -2983,7 +3015,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // size, age, or count bound, by deleting whole old SEALED segments while the log is over the
         // retention bound, but never one any consumer still needs. Run once per group commit so space
         // is freed as the log grows; it is a no-op unless a bound is set. The protect floor is the
-        // MINIMUM committed offset across every group, so the slowest group's records are never reaped.
+        // MINIMUM committed offset across every TOUCHED group (#424), so the slowest consumer's
+        // records are never reaped while an untouched structural group cannot pin the floor.
         self.reap_for_retention()?;
         // Idle named-group eviction sweep (#277): the produce seam is the second deterministic tick
         // (the poll seam is the first), so a broker that produces but is not being polled still
@@ -3171,8 +3204,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let mut last = at_capacity;
         loop {
             // Prefer the consumer-safe reaper: if retention is also configured, it may free a
-            // fully-consumed segment with NO data loss. The protect floor is the slowest group's
-            // committed offset, so this never drops a needed record.
+            // fully-consumed segment with NO data loss. The protect floor is the slowest TOUCHED
+            // group's committed offset (#424), so this never drops a record a consumer needs.
             let protect_below = self.min_committed_offset();
             let safe = self.log.reap(self.retention, protect_below)?;
             self.counters.segments_reaped = self
@@ -3214,8 +3247,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// Reclaims disk by reaping fully-consumed old sealed segments when the durable log trips any
     /// enabled retention bound (size, age, or count) (refs #13, #80). A no-op when every bound is
     /// `0` (the default, retention off). The protect floor is the minimum committed offset across
-    /// ALL consumer groups (the default group `""` always exists, so the min is well-defined), so
-    /// a record any group has not yet consumed is never reaped. The age bound reads `now` from the
+    /// every TOUCHED consumer group (#424): a group that has ever seen a consumer interaction or
+    /// durable consumer state. A never-touched group (the boot-created default group `""` of a
+    /// deployment that only consumes through named groups) does not pin the floor, and with no
+    /// touched group at all the floor is the durable head. A record any touched group has not
+    /// yet consumed is never reaped. The age bound reads `now` from the
     /// engine clock seam (shared with the log), so the deterministic sim drives it. Counts the
     /// reaped segments (saturating), regardless of which bound triggered.
     ///
@@ -3248,16 +3284,22 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         Ok(())
     }
 
-    /// The minimum committed offset across every work-group: the protect floor for retention, so
-    /// the slowest group's unconsumed records are never reaped. The default group (`""`) always
-    /// exists, so the iterator is never empty; a fresh group sits at offset 0, which keeps the
-    /// floor at 0 (reaping nothing) until it has consumed something, exactly the safe behavior.
+    /// The retention protect floor: the minimum committed offset across every work-group that
+    /// has ever seen a consumer interaction or durable consumer state (`touched`, #424). A
+    /// touched group sitting at offset 0 keeps the floor at 0 (reaping nothing), exactly the
+    /// safe behavior for a real, slow consumer. An UNTOUCHED group is skipped: the boot-created
+    /// default group (`""`) exists structurally whether or not anyone consumes through it, and
+    /// before #424 its virgin offset-0 cursor pinned the floor at 0 forever for a deployment
+    /// that only consumes through named groups, silently disabling every retention bound. With
+    /// no touched group at all the floor is the durable head: no consumer has ever shown intent,
+    /// so every sealed record is reapable once a retention bound trips.
     fn min_committed_offset(&self) -> u64 {
         self.groups
             .values()
+            .filter(|g| g.touched)
             .map(|g| g.cursor.committed().get())
             .min()
-            .unwrap_or(0)
+            .unwrap_or_else(|| self.flushed_offset().get())
     }
 
     /// Evicts (reclaims the in-memory state of) every NAMED work-group that has been IDLE past the
@@ -3452,6 +3494,8 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // needlessly evicting-and-re-creating it.
         if let Some(g) = self.groups.get_mut(group) {
             g.last_activity = now;
+            // A poll is a consumer interaction (#424): the group now pins the retention floor.
+            g.touched = true;
         }
         // Sweep idle named groups against the clock seam at the START of every poll (#277), BEFORE
         // the cap gate below, so an evicted slot is freed in time to admit a new group on this same
@@ -3489,6 +3533,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // also covers a freshly created/resumed group and the `or_insert_with` fallback, so EVERY
         // poll (deliverable or idle) keeps the polled group alive against the next sweep.
         g.last_activity = now;
+        g.touched = true;
         let committed = g.cursor.committed().get();
         // Below-earliest truncation signal (#84): if this group's next-deliverable offset (its
         // committed cursor) is below the oldest retained record, its data was force-reaped out from
@@ -3913,6 +3958,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 group: group.to_string(),
             });
         }
+        // An explicit subscribe is a consumer interaction (#424): the group (the default group
+        // included) now pins the retention floor like any other live consumer.
+        g.touched = true;
         g.subscribers.insert(member);
         Ok(())
     }
@@ -4048,6 +4096,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // Mark the key_shared group active (#277); it is never evicted, but keeping its timestamp
         // current is consistent and cheap.
         g.last_activity = now;
+        g.touched = true;
         let committed = g.cursor.committed().get();
         // The same below-earliest truncation signal as poll_in (#84): reset the cursor up to the
         // oldest retained record and surface the truncation once. The router's in-flight key map is
@@ -4243,6 +4292,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             return AckResult::Fenced;
         };
         g.last_activity = now;
+        g.touched = true;
         match g.leases.ack(token) {
             AckOutcome::Acked => {
                 g.cursor.ack(token.offset);
@@ -4321,6 +4371,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // A cumulative ack IS activity: refresh the stamp so the idle sweep does not reclaim the
         // group out from under a consumer that is committing via cumulative ack rather than poll.
         g.last_activity = now;
+        g.touched = true;
         let before = g.cursor.committed().get();
         // Commit the single broadcast cursor up to `up_to`. `commit_up_to` is idempotent and
         // monotonic: an `up_to` at or below `committed` is a no-op success (the re-ack case) and the
@@ -4381,6 +4432,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         };
         // The nack marks the group active (#277): a consumer requeueing work is still using it.
         g.last_activity = now;
+        g.touched = true;
         let attempt = g.leases.deliveries(token).unwrap_or(0);
         let delay_nanos = self.delivery.effective_nack_delay(attempt, explicit_nanos);
         Ok(match g.leases.nack(token, now, delay_nanos) {
@@ -4423,6 +4475,7 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         };
         // Extending a lease marks the group active (#277): a consumer reporting progress is working.
         g.last_activity = now;
+        g.touched = true;
         match g.leases.extend(token, now) {
             ExtendOutcome::Extended(_) => ProgressResult::Extended,
             ExtendOutcome::CapReached => ProgressResult::CapReached,
@@ -7642,6 +7695,193 @@ mod tests {
             e.counters().segments_reaped >= 1,
             "once the slow group caught up the old segments are reaped"
         );
+    }
+
+    // ---- The untouched default group and the protect floor (#424) ----
+
+    // Produces one 16-byte record then drains the NAMED group `worker` to the head, acking
+    // everything, `n` times. The default group is never polled, acked, or subscribed: this is the
+    // named-groups-only deployment shape that #424 is about. The drain is EXHAUSTIVE on purpose:
+    // a one-time `Truncated` (the worker re-created after a reopen resumes at offset 0, below the
+    // reaped earliest, and is reset up with the #84 signal) continues the drain rather than
+    // silently ending it, and any other non-message outcome panics, so a partial drain can never
+    // leave the worker behind and turn a later floor assertion into a flake.
+    fn produce_and_consume_all_in_worker(
+        e: &mut Engine<InMemoryFs, ManualClock>,
+        n: usize,
+        now: &mut u64,
+    ) {
+        for _ in 0..n {
+            produce(e, &[0xab; 16]);
+            loop {
+                match e.poll_in("worker", *now).unwrap() {
+                    Poll::Message(d) => {
+                        assert_eq!(e.ack_in("worker", &d.token), AckResult::Acked);
+                        *now += 1;
+                    }
+                    Poll::Truncated { .. } => {}
+                    Poll::Idle => break,
+                    other => panic!("unexpected poll result draining worker: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_producer_only_deployment_reaps_with_no_consumer_at_all() {
+        // The fallback floor: with NO touched group (the sole group is the untouched default
+        // group), the floor is the durable head, so a producer-only deployment still honors its
+        // retention bounds instead of growing to the hard cap. Mutation coverage: reverting the
+        // fallback to 0 fails this test.
+        let mut e = open(config_with_retention(0));
+        produce(&mut e, &[0xab; 16]);
+        let one = e.durable_record_bytes();
+
+        let mut e = open(config_with_retention(2 * one));
+        for _ in 0..30 {
+            produce(&mut e, &[0xab; 16]);
+        }
+        assert!(
+            e.counters().segments_reaped >= 1,
+            "no consumer ever existed, so the floor is the head and old segments reaped"
+        );
+        assert!(
+            e.durable_record_bytes() <= 2 * one,
+            "the live durable bytes dropped to or under the bound: {} <= {}",
+            e.durable_record_bytes(),
+            2 * one
+        );
+    }
+
+    #[test]
+    fn a_subscribed_default_group_pins_retention_before_its_first_poll() {
+        // An explicit SUB on the default group is consumer intent BEFORE any poll: it must pin
+        // the floor, or records produced between the SUB and the first FLOW could be reaped out
+        // from under the consumer that announced itself. Mutation coverage: removing the
+        // subscribe_in touch fails this test.
+        let mut e = open(config_with_retention(0));
+        produce(&mut e, &[0xab; 16]);
+        let one = e.durable_record_bytes();
+
+        let mut e = open(config_with_retention(2 * one));
+        e.subscribe_in(DEFAULT_GROUP, MemberId::new(1)).unwrap();
+        let mut now = 0u64;
+        produce_and_consume_all_in_worker(&mut e, 30, &mut now);
+        assert_eq!(
+            e.counters().segments_reaped,
+            0,
+            "a subscribed default group is touched and pins the floor at 0"
+        );
+    }
+
+    #[test]
+    fn an_untouched_default_group_does_not_pin_retention() {
+        // A deployment that only ever consumes through NAMED groups: before #424 the structural
+        // default group sat at committed 0 forever, pinned the protect floor, and silently
+        // disabled every retention bound (the log grew to the hard cap, then drop-new shed every
+        // produce). The untouched default group must NOT pin the floor: with the named group
+        // drained to the head, producing past the bound reaps.
+        let mut e = open(config_with_retention(0));
+        produce(&mut e, &[0xab; 16]);
+        let one = e.durable_record_bytes();
+
+        let mut e = open(config_with_retention(2 * one));
+        let mut now = 0u64;
+        produce_and_consume_all_in_worker(&mut e, 30, &mut now);
+        assert!(
+            e.counters().segments_reaped >= 1,
+            "an untouched default group does not pin the floor, so old segments reaped"
+        );
+        assert!(
+            e.durable_record_bytes() <= 2 * one,
+            "the live durable bytes dropped to or under the bound: {} <= {}",
+            e.durable_record_bytes(),
+            2 * one
+        );
+    }
+
+    #[test]
+    fn a_polled_default_group_pins_retention_like_any_consumer() {
+        // ONE default-group poll (here it leases offset 0 and never acks) marks it a real
+        // consumer: it pins the floor at 0 exactly like the named slow group in
+        // `a_slow_group_prevents_reaping_the_segments_it_still_needs`, so a real default-group
+        // consumer keeps the full slow-consumer protection.
+        let mut e = open(config_with_retention(0));
+        produce(&mut e, &[0xab; 16]);
+        let one = e.durable_record_bytes();
+
+        let mut e = open(config_with_retention(2 * one));
+        produce(&mut e, &[0xab; 16]);
+        assert!(matches!(e.poll(0).unwrap(), Poll::Message(_)));
+
+        let mut now = 100u64;
+        produce_and_consume_all_in_worker(&mut e, 30, &mut now);
+        assert_eq!(
+            e.counters().segments_reaped,
+            0,
+            "a polled default group is touched and pins the floor at 0"
+        );
+    }
+
+    #[test]
+    fn an_untouched_default_group_stays_untouched_across_reopen() {
+        // Nothing durable is ever written for a group nobody consumed from, so a restart resumes
+        // the default group untouched and named-groups-only retention keeps reaping.
+        let mut e = open(config_with_retention(0));
+        produce(&mut e, &[0xab; 16]);
+        let one = e.durable_record_bytes();
+
+        let mut e = open(config_with_retention(2 * one));
+        let mut now = 0u64;
+        produce_and_consume_all_in_worker(&mut e, 10, &mut now);
+
+        let fs = e.into_filesystem();
+        let mut e = Engine::open(fs, ManualClock::new(), config_with_retention(2 * one)).unwrap();
+        let reaped_before = e.counters().segments_reaped;
+        produce_and_consume_all_in_worker(&mut e, 20, &mut now);
+        assert!(
+            e.counters().segments_reaped > reaped_before,
+            "the reopened broker still reaps: the default group resumed untouched"
+        );
+    }
+
+    #[test]
+    fn a_checkpointed_default_group_resumes_touched_across_reopen() {
+        // A default-group consumer whose cursor reached its durable checkpoint resumes TOUCHED:
+        // its committed offset is the floor across the restart, so its unconsumed records stay
+        // protected. The session layer drives the checkpoint cadence, so the test calls
+        // `checkpoint_cursor` explicitly, exactly like a graceful stop does.
+        let mut e = open(config_with_retention(0));
+        produce(&mut e, &[0xab; 16]);
+        let one = e.durable_record_bytes();
+
+        let mut e = open(config_with_retention(2 * one));
+        produce(&mut e, &[0xab; 16]);
+        produce(&mut e, &[0xcd; 16]);
+        let d = match e.poll(0).unwrap() {
+            Poll::Message(d) => d,
+            other => panic!("expected a message, got {other:?}"),
+        };
+        assert_eq!(e.ack(&d.token), AckResult::Acked);
+        e.checkpoint_cursor().unwrap();
+
+        let fs = e.into_filesystem();
+        let mut e = Engine::open(fs, ManualClock::new(), config_with_retention(2 * one)).unwrap();
+        assert_eq!(e.committed_offset(), Offset::new(1), "cursor resumed");
+        // Far over the bound through the named group: the touched default group's floor (1)
+        // still protects its unconsumed record at offset 1 from being reaped.
+        let mut now = 100u64;
+        produce_and_consume_all_in_worker(&mut e, 30, &mut now);
+        let d = match e.poll(now).unwrap() {
+            Poll::Message(d) => d,
+            other => panic!("expected the protected record, got {other:?}"),
+        };
+        assert_eq!(
+            d.offset,
+            Offset::new(1),
+            "the resumed touched default group's unconsumed record survived retention"
+        );
+        assert_eq!(d.record.payload, &[0xcd; 16]);
     }
 
     // ---- Count- and age-based retention end to end (refs #13, #80) ----
