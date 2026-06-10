@@ -10942,4 +10942,240 @@ mod tests {
             "even a recovered AIMD never grants beyond the negotiated ceiling"
         );
     }
+
+    // =============================================================================================
+    // The write-path compression seam (#430, ADR-0003): `EngineConfig::compression` applied in
+    // `append_no_sync`. The `Codec::None` byte-identity half is pinned by every OTHER test in this
+    // module (the shared config passes `Codec::None`) plus the determinism / conformance-vector
+    // suites; these cover the lz4 half: the round trip, the two write guards, the pass-through
+    // (no-double-compression) guard, and the stored-vs-logical byte accounting.
+    // =============================================================================================
+
+    /// The shared test config with lz4 write-path compression (#430). Everything else identical
+    /// to `config(10, 5)`, so any behavioral difference in these tests is the codec alone.
+    fn lz4_config() -> EngineConfig {
+        EngineConfig {
+            compression: Codec::Lz4,
+            ..config(10, 5)
+        }
+    }
+
+    /// A compressible payload of `len` bytes: repeated ASCII text, the shape lz4 shrinks well.
+    fn compressible(len: usize) -> Vec<u8> {
+        b"edge node telemetry "
+            .iter()
+            .copied()
+            .cycle()
+            .take(len)
+            .collect()
+    }
+
+    /// A deterministic high-entropy payload of `len` bytes (xorshift64*), which lz4 cannot
+    /// strictly shrink, so the never-expand guard must store it raw.
+    fn incompressible(len: usize) -> Vec<u8> {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let word = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    #[test]
+    fn lz4_round_trips_a_compressible_payload_through_produce_and_poll() {
+        use ironbus_core::compress::{
+            decompress_payload, NoDictionaries, DEFAULT_MAX_DECOMPRESSED_BYTES,
+        };
+        let original = compressible(4096);
+
+        // The raw-store baseline: the identical workload on a `Codec::None` engine, for the
+        // stored-byte comparison below.
+        let mut none = open(config(10, 5));
+        produce(&mut none, &original);
+        let raw_durable = none.durable_record_bytes();
+
+        let mut e = open(lz4_config());
+        produce(&mut e, &original);
+        // Stored accounting is post-compression: the lz4 engine holds strictly fewer durable
+        // record bytes than the raw-store engine for the same logical produce.
+        assert!(
+            e.durable_record_bytes() < raw_durable,
+            "lz4 durable bytes ({}) must be under the raw-store bytes ({raw_durable})",
+            e.durable_record_bytes()
+        );
+        // `produced_bytes` deliberately counts the ORIGINAL logical payload bytes (#430), so the
+        // producer-facing throughput meaning is codec-independent.
+        assert_eq!(e.counters().produced_bytes, original.len() as u64);
+        assert_eq!(none.counters().produced_bytes, original.len() as u64);
+
+        // The DELIVERED record carries the COMPRESSED flag and the STORED (descriptor + stream)
+        // bytes, which differ from (and undercut) the original; the consumer-side decode
+        // recovers the original payload exactly.
+        let d = message(e.poll(0).unwrap());
+        assert!(
+            d.record.flags.contains(RecordFlags::COMPRESSED),
+            "the stored record carries COMPRESSED, got {:?}",
+            d.record.flags
+        );
+        assert_ne!(
+            d.record.payload, original,
+            "the stored bytes are not the raw payload"
+        );
+        assert!(
+            d.record.payload.len() < original.len(),
+            "strictly smaller (never-expand)"
+        );
+        let back = decompress_payload(
+            d.record.flags,
+            &d.record.payload,
+            &NoDictionaries,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+        .unwrap();
+        assert_eq!(back, original, "the decode recovers the original payload");
+    }
+
+    #[test]
+    fn a_sub_threshold_payload_stores_raw_even_with_lz4_configured() {
+        use ironbus_core::compress::DEFAULT_RAW_STORE_THRESHOLD;
+        // One byte under the 64-byte raw-store threshold: compressible in principle, but the
+        // guard stores it raw, byte-for-byte the no-compression layout.
+        let original = vec![b'x'; DEFAULT_RAW_STORE_THRESHOLD - 1];
+        let mut none = open(config(10, 5));
+        produce(&mut none, &original);
+        let mut e = open(lz4_config());
+        produce(&mut e, &original);
+        assert_eq!(
+            e.durable_record_bytes(),
+            none.durable_record_bytes(),
+            "a raw store is byte-identical to the no-compression encoder"
+        );
+        let d = message(e.poll(0).unwrap());
+        assert!(!d.record.flags.contains(RecordFlags::COMPRESSED));
+        assert_eq!(d.record.payload, original);
+    }
+
+    #[test]
+    fn an_incompressible_payload_stores_raw_under_the_never_expand_guard() {
+        let original = incompressible(4096);
+        let mut none = open(config(10, 5));
+        produce(&mut none, &original);
+        let mut e = open(lz4_config());
+        produce(&mut e, &original);
+        assert_eq!(
+            e.durable_record_bytes(),
+            none.durable_record_bytes(),
+            "a never-expand raw store is byte-identical to the no-compression encoder"
+        );
+        let d = message(e.poll(0).unwrap());
+        assert!(!d.record.flags.contains(RecordFlags::COMPRESSED));
+        assert_eq!(d.record.payload, original);
+    }
+
+    #[test]
+    fn an_already_compressed_append_passes_through_byte_identical() {
+        use ironbus_core::compress::{
+            compress_payload, decompress_payload, CompressConfig, NoDictionaries,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        };
+        // A producer-compressed stored object, exactly what the DLQ redrive re-appends and what
+        // a producer may legally deliver with bit 0 set (PUB_WIRE_ONLY_FLAGS masks only bits 6
+        // and 7). The seam MUST pass it through untouched: re-compressing would wrap the
+        // descriptor in a descriptor and decode to garbage.
+        let original = compressible(4096);
+        let comp = compress_payload(&original, &CompressConfig::default()).unwrap();
+        assert!(comp.compressed, "the fixture payload genuinely compresses");
+
+        let mut e = open(lz4_config());
+        e.produce(&Append {
+            timestamp_ms: 0,
+            flags: RecordFlags::COMPRESSED,
+            key: b"",
+            headers: b"",
+            payload: &comp.stored,
+        })
+        .unwrap();
+        let d = message(e.poll(0).unwrap());
+        assert!(d.record.flags.contains(RecordFlags::COMPRESSED));
+        assert_eq!(
+            d.record.payload, comp.stored,
+            "the already-compressed payload is stored verbatim, never double-wrapped"
+        );
+        let back = decompress_payload(
+            d.record.flags,
+            &d.record.payload,
+            &NoDictionaries,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        )
+        .unwrap();
+        assert_eq!(back, original, "one decode recovers the original");
+    }
+
+    #[test]
+    fn the_byte_cap_meters_stored_bytes_not_logical_bytes() {
+        // A 2 KiB durable-byte cap against 1 KiB compressible payloads (raw frame ~1068 bytes:
+        // 36-byte header + payload + 8-byte trailer). Raw-stored, two produces reach the cap and
+        // the third is the AtCapacity drop-new shed; lz4-stored frames are tens of bytes, so the
+        // same workload stays far under the cap and every produce is accepted. This pins that the
+        // cap accounts POST-compression stored bytes (the on-flash truth), not logical bytes.
+        let capped_log = LogConfig {
+            max_total_bytes: 2048,
+            ..LogConfig::default()
+        };
+        let payload = compressible(1024);
+
+        let mut none = open(EngineConfig {
+            log: capped_log,
+            ..config(10, 5)
+        });
+        for _ in 0..2 {
+            none.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: &payload,
+            })
+            .unwrap();
+        }
+        let err = none
+            .produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: &payload,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Storage(e) if e.is_at_capacity()),
+            "raw-stored, the third 1 KiB produce trips the 2 KiB cap, got {err:?}"
+        );
+
+        let mut lz4 = open(EngineConfig {
+            log: capped_log,
+            compression: Codec::Lz4,
+            ..config(10, 5)
+        });
+        for i in 0..8 {
+            lz4.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: &payload,
+            })
+            .unwrap_or_else(|e| panic!("lz4-stored produce {i} stays under the cap: {e:?}"));
+        }
+        assert!(
+            lz4.durable_record_bytes() < 2048,
+            "eight compressed 1 KiB produces hold fewer stored bytes than two raw ones: {}",
+            lz4.durable_record_bytes()
+        );
+    }
 }

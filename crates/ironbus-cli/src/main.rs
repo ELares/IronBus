@@ -7244,10 +7244,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn dump_accepts_raw_and_require_dict_flags_inertly_today() {
-        // The #12-gated flags are accepted now: with the codec always `none` they do not change the
-        // output (no record carries a dictionary, so --require-dict never trips) and --raw renders
-        // the same field set. This pins the frozen flag surface without faking compression.
+    fn dump_raw_and_require_dict_on_raw_stored_records_render_the_historical_form() {
+        // The #92 flags are LIVE since #430 wired the write path, but a RAW-STORED record (here:
+        // sub-threshold payloads, stored raw even under the default lz4) renders exactly the
+        // historical field set under both flags: `--raw` changes nothing for an uncompressed
+        // frame, and `--require-dict` never trips because no record references a dictionary.
         let dir = make_data_dir("dumpraw", 3);
         let mut buf = Vec::new();
         run_dump(
@@ -7263,6 +7264,10 @@ mod tests {
         let text = String::from_utf8(buf).unwrap();
         assert_eq!(text.lines().count(), 3, "all three records dump: {text}");
         assert!(text.contains("codec=none"), "{text}");
+        assert!(
+            !text.contains("decoded="),
+            "a raw-stored record keeps the historical field set (no decode involved): {text}"
+        );
         // --raw/--require-dict are rejected against the DLQ sink (no compressed frames there either).
         let mut bad = Vec::new();
         let e = run_dump(
@@ -7276,6 +7281,148 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(e.exit_code(), EXIT_USAGE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A data directory whose single record was written through the REAL wired serve path
+    /// (`open_disk_engine`, #430) with the given codec arg and a ~400-byte compressible payload
+    /// (well over the 64-byte raw-store threshold), for the dump codec-surface tests.
+    #[cfg(unix)]
+    fn make_codec_data_dir(tag: &str, codec: CompressionArg) -> (std::path::PathBuf, Vec<u8>) {
+        let payload: Vec<u8> = b"edge node telemetry "
+            .iter()
+            .copied()
+            .cycle()
+            .take(400)
+            .collect();
+        let dir = std::env::temp_dir().join(format!("ironbus-cli-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = ServeConfig {
+            compression: codec,
+            ..test_serve_config(64, 1)
+        };
+        let mut engine = open_disk_engine(&dir, &config, &[], &[]).unwrap();
+        engine
+            .produce(&Append {
+                timestamp_ms: 100,
+                flags: RecordFlags::EMPTY,
+                key: b"k",
+                headers: b"",
+                payload: &payload,
+            })
+            .unwrap();
+        drop(engine);
+        (dir, payload)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_decodes_an_lz4_record_and_raw_shows_the_stored_frame() {
+        // A broker served with --compression lz4 (#430): the decoded (default) dump renders the
+        // REAL stored codec and the ORIGINAL payload length with decoded=true; --raw renders the
+        // stored (descriptor + stream) frame, strictly smaller, with no decode involved.
+        let (dir, payload) = make_codec_data_dir("dumplz4", CompressionArg::Lz4);
+
+        let mut buf = Vec::new();
+        run_dump(
+            &["--data-dir".to_string(), dir.display().to_string()],
+            &mut buf,
+        )
+        .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let expected = format!(
+            "bytes={} key_bytes=1 crc=ok codec=lz4 decoded=true",
+            payload.len()
+        );
+        assert!(
+            text.contains(&expected),
+            "the decoded dump shows the real codec and the original length: {text}"
+        );
+
+        let mut buf = Vec::new();
+        run_dump(
+            &[
+                "--data-dir".to_string(),
+                dir.display().to_string(),
+                "--raw".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap();
+        let raw_text = String::from_utf8(buf).unwrap();
+        assert!(raw_text.contains("codec=lz4"), "{raw_text}");
+        assert!(
+            !raw_text.contains("decoded="),
+            "--raw shows the on-disk frame, no decode: {raw_text}"
+        );
+        let stored_bytes: usize = raw_text
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix("bytes="))
+            .and_then(|v| v.parse().ok())
+            .expect("the raw line carries bytes=");
+        assert!(
+            stored_bytes < payload.len(),
+            "the stored frame ({stored_bytes}) undercuts the original ({})",
+            payload.len()
+        );
+
+        // The NDJSON form carries the same surface (the frozen #92 schema fields).
+        let mut buf = Vec::new();
+        run_dump(
+            &[
+                "--data-dir".to_string(),
+                dir.display().to_string(),
+                "--json".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap();
+        let json_text = String::from_utf8(buf).unwrap();
+        assert!(
+            json_text.contains("\"codec\":\"lz4\",\"decoded\":true"),
+            "{json_text}"
+        );
+        assert!(
+            json_text.contains(&format!("\"bytes\":{}", payload.len())),
+            "{json_text}"
+        );
+
+        // --require-dict does not trip: the lz4 path never references a dictionary (dict_id 0).
+        let mut buf = Vec::new();
+        run_dump(
+            &[
+                "--data-dir".to_string(),
+                dir.display().to_string(),
+                "--require-dict".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_on_a_compression_none_dir_renders_the_historical_form() {
+        // The same compressible payload under --compression none: stored raw, and the dump line
+        // is byte-for-byte the historical field set (codec none, no decoded field), pinning that
+        // the off switch leaves the inspection surface untouched.
+        let (dir, payload) = make_codec_data_dir("dumpnone", CompressionArg::None);
+        let mut buf = Vec::new();
+        run_dump(
+            &["--data-dir".to_string(), dir.display().to_string()],
+            &mut buf,
+        )
+        .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains(&format!(
+                "bytes={} key_bytes=1 crc=ok codec=none",
+                payload.len()
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("decoded="), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

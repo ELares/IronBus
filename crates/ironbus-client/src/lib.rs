@@ -953,6 +953,24 @@ mod tests {
         Arc<AtomicBool>,
         std::thread::JoinHandle<()>,
     ) {
+        start_server_with(
+            consumer_credit,
+            consumer_credit_bytes,
+            ironbus_core::compress::Codec::None,
+        )
+    }
+
+    /// The full rig: an in-process broker with an explicit per-consumer credit, byte budget, AND
+    /// write-path compression codec (#430), for the transparent-decompression end-to-end test.
+    fn start_server_with(
+        consumer_credit: u32,
+        consumer_credit_bytes: u64,
+        compression: ironbus_core::compress::Codec,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
         let engine = Engine::open(
             InMemoryFs::new(),
             SystemClock::new(),
@@ -985,8 +1003,9 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
-                // Compression OFF (#430) unless a test opts in; the transparency test uses its own rig.
-                compression: ironbus_core::compress::Codec::None,
+                // The write-path codec under test (#430): `None` for every historical test
+                // (byte-identical broker), `Lz4` for the transparency end-to-end test.
+                compression,
             },
         )
         .unwrap();
@@ -2078,6 +2097,124 @@ mod tests {
         );
 
         shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_broker_compressed_delivery_is_transparently_decompressed() {
+        // The #430 end-to-end transparency contract: an lz4 broker stores a compressible >= 64 B
+        // payload compressed (pinned by the engine tests) and delivers the STORED bytes with the
+        // COMPRESSED flag; the client decompresses on deliver, so the caller sees exactly the
+        // produced bytes with the flag cleared, indistinguishable from a --compression none run.
+        let (addr, shutdown, handle) = start_server_with(64, 0, ironbus_core::compress::Codec::Lz4);
+        let original: Vec<u8> = b"edge node telemetry "
+            .iter()
+            .copied()
+            .cycle()
+            .take(4096)
+            .collect();
+        let mut c = Client::connect(addr).unwrap();
+        c.produce(&PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"k",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: &original,
+        })
+        .unwrap();
+        let messages = c.fetch(10).unwrap().messages;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].payload, original,
+            "the caller sees the original produced bytes, codec-independent"
+        );
+        assert_eq!(
+            messages[0].flags & RecordFlags::COMPRESSED.bits(),
+            0,
+            "the COMPRESSED bit is cleared on the transparently decompressed message"
+        );
+        assert!(c.ack(messages[0].offset, messages[0].generation).unwrap());
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_scripted_compressed_deliver_decodes_to_the_original_payload() {
+        // The deliver-path decode in isolation (#430): a scripted server streams one Deliver
+        // whose payload is a REAL compressed stored object with bit 0 set; the client returns
+        // the original bytes with the bit cleared. Direct proof the wire bit drives the decode.
+        use ironbus_core::compress::{compress_payload, CompressConfig};
+        let original: Vec<u8> = b"edge node telemetry "
+            .iter()
+            .copied()
+            .cycle()
+            .take(1024)
+            .collect();
+        let comp = compress_payload(&original, &CompressConfig::default()).unwrap();
+        assert!(comp.compressed, "the fixture payload genuinely compresses");
+        let mut body = Vec::new();
+        encode_deliver(
+            &DeliverBody {
+                offset: 0,
+                generation: 1,
+                flags: RecordFlags::COMPRESSED.bits(),
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                payload: &comp.stored,
+            },
+            &mut body,
+        )
+        .unwrap();
+        let mut script = frame(FrameType::Info, b"");
+        script.extend(frame(FrameType::Deliver, &body));
+        script.extend(frame(FrameType::FlowEnd, &1u32.to_le_bytes()));
+        let (addr, handle) = raw_server(script);
+        let mut c = Client::connect(addr).unwrap();
+        let messages = c.fetch(10).unwrap().messages;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].payload, original);
+        assert_eq!(messages[0].flags & RecordFlags::COMPRESSED.bits(), 0);
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_hostile_compressed_deliver_is_a_typed_error_never_a_panic() {
+        // A hostile or mismatched-build deliver (#430): bit 0 set over a descriptor naming a
+        // codec id this build does not implement. The fetch fails with the typed Decompress
+        // error (unknown codec), never a panic and never garbage handed to the caller.
+        use ironbus_core::compress::DecompressError;
+        let mut stored = vec![7u8]; // codec id 7: unallocated
+        stored.extend_from_slice(&0u32.to_le_bytes()); // dict_id 0
+        stored.extend_from_slice(&16u32.to_le_bytes()); // claimed uncompressed_len
+        stored.extend_from_slice(b"not a real stream");
+        let mut body = Vec::new();
+        encode_deliver(
+            &DeliverBody {
+                offset: 0,
+                generation: 1,
+                flags: RecordFlags::COMPRESSED.bits(),
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                payload: &stored,
+            },
+            &mut body,
+        )
+        .unwrap();
+        let mut script = frame(FrameType::Info, b"");
+        script.extend(frame(FrameType::Deliver, &body));
+        script.extend(frame(FrameType::FlowEnd, &1u32.to_le_bytes()));
+        let (addr, handle) = raw_server(script);
+        let mut c = Client::connect(addr).unwrap();
+        match c.fetch(10).unwrap_err() {
+            ClientError::Decompress(DecompressError::PoisonUnknownCodec(7)) => {}
+            other => panic!("expected Decompress(PoisonUnknownCodec(7)), got {other:?}"),
+        }
+        drop(c);
         handle.join().unwrap();
     }
 }
