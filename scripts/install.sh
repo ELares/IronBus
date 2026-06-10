@@ -207,35 +207,115 @@ download() {
 # isolation (see crates/ironbus-cli/tests/installer_verify.rs), so it must stay side-effect-free at
 # definition time and be POSIX-sh portable.
 #
-#   install_binary <src> <dest>
+#   install_binary <src> <dest> [version-label]
 #
 # CONTRACT (the caller has ALREADY passed fail-closed verification before calling this, so this
 # function never weakens verify-before-install):
+#   - SAME-VERSION re-run (<dest> exists and its SHA256 equals <src>'s): a no-op SUCCESS (#422).
+#     Neither <dest> nor `<dest>.prev` is touched, so an idempotent re-provision (config management
+#     re-running the installer for the version already live) can never clobber the rollback copy
+#     with bytes identical to the live binary. Sets ironbus_install_skipped=1 for the caller.
 #   - Stages <src> next to <dest> as a sibling temp, chmods it 0755, so a reader never sees a
 #     partial file and an interrupted install never leaves a truncated binary at <dest>.
-#   - UPGRADE (a file already exists at <dest>): retains the CURRENT <dest> as `<dest>.prev` (an
-#     atomic same-directory `mv`, so the prior binary is never half-moved) BEFORE swapping the new
-#     binary into place, so an operator can roll back to the prior known-good bytes.
+#   - UPGRADE (a file already exists at <dest>): STAGES the CURRENT <dest> bytes to a sibling temp
+#     by COPY, never by moving the live binary (#421), and commits that staged copy over
+#     `<dest>.prev` (one atomic same-directory `mv`) only AFTER the final swap has succeeded. So a
+#     failed final swap leaves <dest> AND any pre-existing `<dest>.prev` exactly as they were: a
+#     pre-existing good rollback copy is never replaced with bytes identical to the live binary by
+#     an install that did not land. DELIBERATE TRADE: a crash between the final swap and the
+#     `.prev` commit leaves `.prev` one version stale, an OLDER known-good binary, which is safer
+#     than committing first and leaving `.prev` byte-identical to the possibly-bad binary just
+#     installed. The live binary stays in place throughout, so there is never a window where
+#     <dest> does not exist for a supervised restart to land in.
+#   - Exactly ONE operation changes <dest>: the final atomic `mv`. If it fails, the live binary
+#     AND any existing `.prev` are UNTOUCHED (the retention only STAGED a copy; nothing committed),
+#     so every failure path leaves the host with the binary it already had (or, on a fresh install,
+#     still nothing), never with neither the old binary nor the new one.
+#   - FAIL-CLOSED ON AN UNREADABLE <dest>: the retention READS the live binary (`cp -p`), so an
+#     existing-but-unreadable <dest> now fails the install closed (a deliberate behavior change:
+#     the older `mv`-based retention needed no read permission). A live binary the installer
+#     cannot read for retention is not upgraded over.
+#   - SYMLINK at <dest>: a same-bytes re-run skips and leaves the symlink in place. With differing
+#     bytes, `<dest>.prev` receives a regular-file COPY of the symlink TARGET's bytes, and the
+#     final `mv` replaces the symlink ITSELF with a regular file (the old target file is left on
+#     disk, no longer referenced from <dest>).
 #   - FRESH install (nothing at <dest>): retains nothing, so no spurious `.prev` is created.
-# Returns non-zero (without installing) on any IO error.
+# Returns non-zero (live binary and any existing `.prev` untouched) on any IO error before or at
+# the final swap. If the swap succeeded but the `.prev` commit then fails, the install itself
+# stands (the host runs the new, verified binary) and the old `.prev`, one version stale, is kept;
+# that is reported as a warning, not a failure.
 install_binary() {
     src="$1"
     dest="$2"
-    tmp_dest="${dest}.tmp.$$"
-    cp "$src" "$tmp_dest" || { log "could not stage the binary next to $dest"; return 1; }
-    chmod 0755 "$tmp_dest" || { log "could not chmod the staged binary"; rm -f "$tmp_dest"; return 1; }
+    version_label="${3:-}"
+    ironbus_install_skipped=0
 
-    if [ -e "$dest" ]; then
-        prev_dest="${dest}.prev"
-        if ! mv -f "$dest" "$prev_dest"; then
-            log "could not retain the previous binary as $prev_dest"
-            rm -f "$tmp_dest"
-            return 1
+    # SAME-VERSION GUARD (#422): if the destination already holds EXACTLY the bytes we are about
+    # to install, this run is an idempotent re-provision, not an upgrade. Skip BOTH the `.prev`
+    # retention and the swap: retaining here would overwrite the only rollback copy with bytes
+    # identical to the live binary, leaving nothing to roll back to. If no sha256 tool exists the
+    # comparison cannot run; fall through and install normally (never skip on an ambiguous answer).
+    if [ -f "$dest" ]; then
+        new_sum="$(sha256_of "$src")" || new_sum=""
+        cur_sum="$(sha256_of "$dest")" || cur_sum=""
+        if [ -n "$new_sum" ] && [ "$new_sum" = "$cur_sum" ]; then
+            # Only a pinned tag (v*) reads naturally inline; "latest" (or any other channel word)
+            # is parenthesized so the line never claims a literal version named "latest".
+            case "$version_label" in
+                "") log "ironbus already installed at $dest, nothing to do" ;;
+                v*) log "ironbus $version_label already installed at $dest, nothing to do" ;;
+                *) log "ironbus ($version_label) already installed at $dest, nothing to do" ;;
+            esac
+            ironbus_install_skipped=1
+            return 0
         fi
-        log "retained the previous binary as $prev_dest (rollback copy)"
     fi
 
-    mv -f "$tmp_dest" "$dest" || { log "could not install to $dest"; return 1; }
+    tmp_dest="${dest}.tmp.$$"
+    cp "$src" "$tmp_dest" || { log "could not stage the binary next to $dest"; rm -f "$tmp_dest"; return 1; }
+    chmod 0755 "$tmp_dest" || { log "could not chmod the staged binary"; rm -f "$tmp_dest"; return 1; }
+
+    prev_dest="${dest}.prev"
+    prev_tmp="${prev_dest}.tmp.$$"
+    prev_staged=0
+    if [ -e "$dest" ]; then
+        # ROLLBACK RETENTION (#421), STAGED ONLY: `cp -p` the CURRENT binary's bytes to a sibling
+        # temp WITHOUT unlinking or moving the live binary, and WITHOUT touching `<dest>.prev` yet.
+        # The staged copy is committed over `.prev` only AFTER the final swap succeeds, so a failed
+        # swap can never have replaced a pre-existing good `.prev` with bytes identical to the live
+        # binary. (The pre-fix `mv <dest> <dest>.prev` retention opened a window where <dest> did
+        # not exist and a failed final swap stranded the host with NO binary at <dest>.)
+        if ! cp -p "$dest" "$prev_tmp"; then
+            log "could not stage the previous binary for retention as $prev_dest"
+            rm -f "$tmp_dest" "$prev_tmp"
+            return 1
+        fi
+        prev_staged=1
+    fi
+
+    # SINGLE ATOMIC SWAP (#421): this `mv` is the ONLY operation that changes <dest>. On success a
+    # reader sees the old binary or the new one, never a missing or partial file. On failure the
+    # live binary is UNTOUCHED (the retention above only STAGED a copy) and any pre-existing
+    # `.prev` is UNTOUCHED too (nothing has committed over it); discard both temps and report.
+    if ! mv -f "$tmp_dest" "$dest"; then
+        log "could not install to $dest (the existing binary and rollback copy, if any, are untouched)"
+        rm -f "$tmp_dest" "$prev_tmp"
+        return 1
+    fi
+
+    if [ "$prev_staged" = "1" ]; then
+        # COMMIT THE RETENTION only now that the new binary is live: one atomic same-directory `mv`
+        # replaces `.prev` with the staged copy of the just-replaced binary. A crash between the
+        # swap above and this commit leaves `.prev` one version stale (an OLDER known-good), the
+        # deliberate trade documented in the contract. If the commit itself fails, the completed
+        # install stands and the old `.prev` (if any) is kept; warn rather than fail the install.
+        if mv -f "$prev_tmp" "$prev_dest"; then
+            log "retained the previous binary as $prev_dest (rollback copy)"
+        else
+            log "warning: could not commit the rollback copy to $prev_dest (keeping the existing one, if any; it is one version stale)"
+            rm -f "$prev_tmp"
+        fi
+    fi
     return 0
 }
 
@@ -258,6 +338,9 @@ main() {
     bin_dir=""
     force_target=""
     verify_provenance="0"
+    # Set late (after the install dir is chosen) but initialized here so the EXIT trap below can
+    # reference it under `set -u` before that point.
+    dest=""
 
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -286,7 +369,10 @@ main() {
 
     workdir="$(mktemp -d "${TMPDIR:-/tmp}/ironbus-install.XXXXXX")" || die "could not create a temp dir"
     # Clean up the scratch dir on any exit; a half-downloaded, unverified binary never survives.
-    trap 'rm -rf "$workdir"' EXIT INT TERM
+    # Also remove install_binary's two sibling staging temps if an interrupt lands mid-install
+    # ($dest is empty until the install dir is chosen below, so this is a no-op before then; the
+    # temps never hold the only copy of anything, so removing them is always safe).
+    trap 'rm -rf "$workdir"; if [ -n "$dest" ]; then rm -f "${dest}.tmp.$$" "${dest}.prev.tmp.$$"; fi' EXIT INT TERM
 
     log "downloading the binary and SHA256SUMS"
     download "${base}/${asset}" "${workdir}/${asset}" || die "download failed: ${base}/${asset}"
@@ -321,7 +407,14 @@ main() {
     # This runs ONLY after the fail-closed checksum (and optional provenance) verification above has
     # passed, so it never weakens verify-before-install: the new binary is fully verified before the
     # `.prev` retention or the swap touch the install dir.
-    install_binary "${workdir}/${asset}" "$dest" || die "could not install to $dest"
+    install_binary "${workdir}/${asset}" "$dest" "$version" || die "could not install to $dest"
+
+    # Idempotent same-version re-run (#422): the verified bytes are already live at $dest; nothing
+    # was changed and the existing rollback copy (if any) is preserved. install_binary already
+    # printed the "nothing to do" line; report success and stop here.
+    if [ "${ironbus_install_skipped:-0}" = "1" ]; then
+        exit 0
+    fi
 
     log "installed verified ironbus to $dest"
     case ":${PATH}:" in

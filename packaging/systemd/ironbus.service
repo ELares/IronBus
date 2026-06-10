@@ -30,6 +30,25 @@
 # `ironbus.prev` WITHOUT first moving the live binary onto `.prev`, so a power cut between the renames
 # (or before the counter clear) re-enters deterministically and converges to the good binary rather
 # than promoting the just-failed bytes. No unit change is needed for this; it is internal to the verbs.
+#
+# The three helper lines run with the `+` full-privilege Exec prefix (#420): they are exempt from
+# User= and the filesystem sandboxing below, while ExecStart itself stays fully sandboxed. Without
+# the prefix, ProtectSystem=strict made /usr read-only for the helpers, so every counter write next
+# to the binary failed with EROFS; the failed ExecStartPost then made systemd kill a HEALTHY broker
+# at the end of the grace window (an infinite kill/restart loop, since Restart=on-failure retries
+# forever with the rate limiter disabled), and the EROFS-failed ExecStopPost meant the
+# fall-back-after-N mechanism could never trigger at all. The helpers must be privileged anyway: a
+# real rollback replaces the root-owned binary at /usr/bin/ironbus.
+#
+# Version floor: the `+` prefix itself dates to systemd v231, but 231 is NOT a supported floor for
+# this unit. The real floor is systemd 235 (StateDirectory=), with 232 needed for $SERVICE_RESULT
+# and ProtectSystem=strict. On exactly 231, $SERVICE_RESULT is never set, so the ExecStopPost guard
+# below would run `record-start --failed` as root on EVERY clean stop, and three clean stops would
+# roll back a healthy binary.
+#
+# NOTE: /etc/ironbus/ironbus.env is root-equivalent input to the `+` helpers (EnvironmentFile=
+# overrides Environment=, so an IRONBUS_BIN set there redirects --dest for the root-run
+# rollback/record-start); it ships root:root 0644 as a dpkg conffile and MUST remain root-owned.
 
 [Unit]
 Description=IronBus durable edge message queue
@@ -60,7 +79,7 @@ Environment=IRONBUS_BIN=/usr/bin/ironbus
 # or past the threshold AND a rollback copy exists, restore ironbus.prev first, so a node that cannot
 # start the new binary heals to the last known-good bytes. `--check` only reads the counter, so this
 # pre-step cannot itself accumulate failures; the increment is owned solely by ExecStopPost below.
-ExecStartPre=/bin/sh -c '/usr/bin/ironbus record-start --dest "${IRONBUS_BIN}" --check | grep -q "fall-back threshold reached" && /usr/bin/ironbus rollback --dest "${IRONBUS_BIN}" || true'
+ExecStartPre=+/bin/sh -c '/usr/bin/ironbus record-start --dest "${IRONBUS_BIN}" --check | grep -q "fall-back threshold reached" && /usr/bin/ironbus rollback --dest "${IRONBUS_BIN}" || true'
 
 ExecStart=/usr/bin/ironbus serve
 
@@ -70,18 +89,20 @@ ExecStart=/usr/bin/ironbus serve
 # never reaches the `--ok` and never clears the counter. A binary that stays up past the window is a
 # genuine successful start and resets the budget to 0. IRONBUS_STARTUP_GRACE_SEC is overridable in
 # /etc/ironbus/ironbus.env (default 10s); keep it shorter than a real first-boot mount/init time.
-ExecStartPost=/bin/sh -c 'sleep "${IRONBUS_STARTUP_GRACE_SEC:-10}"; /usr/bin/ironbus record-start --dest "${IRONBUS_BIN}" --ok'
+ExecStartPost=+/bin/sh -c 'sleep "${IRONBUS_STARTUP_GRACE_SEC:-10}"; /usr/bin/ironbus record-start --dest "${IRONBUS_BIN}" --ok'
 
 # ON STOP: this is the SINGLE place the counter is incremented, and only on a non-clean exit. A clean
 # stop (a deliberate `systemctl stop`, $SERVICE_RESULT == success) is NOT a failed start, so it leaves
 # the counter untouched (the ExecStartPost --ok already cleared a healthy run). A crash/non-zero exit
 # bumps the counter by exactly one, so N consecutive genuine failures (and only those) fall back.
-ExecStopPost=/bin/sh -c '[ "${SERVICE_RESULT}" = "success" ] || /usr/bin/ironbus record-start --dest "${IRONBUS_BIN}" --failed'
+ExecStopPost=+/bin/sh -c '[ "${SERVICE_RESULT}" = "success" ] || /usr/bin/ironbus record-start --dest "${IRONBUS_BIN}" --failed'
 
 Restart=on-failure
 RestartSec=5
 
-# The data dir is the only writable surface the broker needs; harden the rest.
+# The data dir is the only writable surface the broker needs; harden the rest. The sandbox applies
+# to the ExecStart broker process; the `+`-prefixed helper lines above are exempt by design (#420,
+# see the header comment).
 StateDirectory=ironbus
 ProtectSystem=strict
 ProtectHome=true
