@@ -1218,6 +1218,96 @@ mod tests {
         );
     }
 
+    /// The premise sanity for the #438 gate-contract property
+    /// (`proptests::shape_gate_never_rejects_a_decodable_record_except_the_documented_exception`):
+    /// a targeted, deterministic set of inputs the read side GENUINELY decodes, so the
+    /// "decoder-accept implies gate-accept" direction is exercised by construction, not
+    /// vacuously (a raw random stream decodes with probability ~0). The gate must accept
+    /// every one of them; the ONE decodable input the gate rejects is pinned separately by
+    /// the strictness-exception tests.
+    #[test]
+    fn the_shape_gate_accepts_every_genuinely_decodable_premise_case() {
+        let mut cases: Vec<(&str, Vec<u8>, Vec<u8>)> = Vec::new(); // (name, stored, payload)
+
+        // none-codec: the stream IS the payload and the claim matches exactly.
+        cases.push((
+            "none, exact length",
+            descriptor(CODEC_ID_NONE, DICT_ID_NONE, 3, b"abc"),
+            b"abc".to_vec(),
+        ));
+        // none-codec, empty payload: claim 0 over an empty stream is decodable AND
+        // gate-legal (the non-empty-stream rule binds only the compressing codecs).
+        cases.push((
+            "none, empty payload",
+            descriptor(CODEC_ID_NONE, DICT_ID_NONE, 0, b""),
+            Vec::new(),
+        ));
+        // lz4: a genuine block (the same encode call compress_payload makes), claim == the
+        // payload length.
+        let payload = compressible(4096);
+        let block = lz4_flex::block::compress(&payload);
+        cases.push((
+            "lz4, genuine block",
+            descriptor(
+                CODEC_ID_LZ4,
+                DICT_ID_NONE,
+                u32::try_from(payload.len()).unwrap(),
+                &block,
+            ),
+            payload,
+        ));
+        // lz4 of the EMPTY payload: the canonical single token byte 0x00 with claim 0, a
+        // NON-empty stream for a zero-length output (decodable and gate-legal, unlike the
+        // empty-stream descriptor).
+        let empty_block = lz4_flex::block::compress(b"");
+        assert_eq!(empty_block, [0u8], "the canonical lz4 block of b\"\"");
+        cases.push((
+            "lz4, empty payload",
+            descriptor(CODEC_ID_LZ4, DICT_ID_NONE, 0, &empty_block),
+            Vec::new(),
+        ));
+        // zstd, on a feature build only (a default build poisons codec id 2 at decode, so
+        // there is no decodable zstd premise case there).
+        #[cfg(feature = "zstd")]
+        {
+            let payload = compressible(4096);
+            let frame = zstd::bulk::compress(&payload, DEFAULT_ZSTD_LEVEL).unwrap();
+            cases.push((
+                "zstd, genuine frame",
+                descriptor(
+                    CODEC_ID_ZSTD,
+                    DICT_ID_NONE,
+                    u32::try_from(payload.len()).unwrap(),
+                    &frame,
+                ),
+                payload,
+            ));
+            // The genuine zstd frame of the empty payload: a NON-empty stream (the frame
+            // header) with claim 0, which is exactly why the strictness exception costs a
+            // real producer nothing.
+            let empty_frame = zstd::bulk::compress(b"", DEFAULT_ZSTD_LEVEL).unwrap();
+            assert!(!empty_frame.is_empty());
+            cases.push((
+                "zstd, empty payload",
+                descriptor(CODEC_ID_ZSTD, DICT_ID_NONE, 0, &empty_frame),
+                Vec::new(),
+            ));
+        }
+
+        for (name, stored, expected) in cases {
+            let decoded = decompress_payload(
+                RecordFlags::COMPRESSED,
+                &stored,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES,
+            )
+            .unwrap_or_else(|e| panic!("premise case {name:?} must be decodable, got {e:?}"));
+            assert_eq!(decoded, expected, "case {name:?}: the read side decodes it");
+            validate_descriptor_shape(&stored, DEFAULT_MAX_DECOMPRESSED_BYTES)
+                .unwrap_or_else(|e| panic!("the gate rejected decodable case {name:?}: {e:?}"));
+        }
+    }
+
     /// On a DEFAULT (non-zstd) build the degenerate zstd-empty-stream-claim-0 descriptor is
     /// rejected by BOTH sides (the gate as an empty stream, the read side as unknown-codec
     /// POISON since id 2 is unimplemented here), so the gate's strictness exception is
@@ -1538,6 +1628,103 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
+    /// A STRUCTURED stream for the chaos arm of the #438 gate-contract case: empty,
+    /// arbitrary bytes, or a GENUINE codec stream (the same `lz4_flex`/`zstd` encode calls
+    /// `compress_payload` makes).
+    fn structured_stream() -> proptest::strategy::BoxedStrategy<Vec<u8>> {
+        let empty = Just(Vec::new());
+        let arbitrary = proptest::collection::vec(any::<u8>(), 0..4096);
+        let lz4 = proptest::collection::vec(any::<u8>(), 0..4096)
+            .prop_map(|p| lz4_flex::block::compress(&p));
+        #[cfg(feature = "zstd")]
+        {
+            let zstd_frame = proptest::collection::vec(any::<u8>(), 0..4096)
+                .prop_map(|p| zstd::bulk::compress(&p, DEFAULT_ZSTD_LEVEL).expect("zstd encode"));
+            prop_oneof![empty, arbitrary, lz4, zstd_frame].boxed()
+        }
+        #[cfg(not(feature = "zstd"))]
+        {
+            prop_oneof![empty, arbitrary, lz4].boxed()
+        }
+    }
+
+    /// Genuinely encodes `payload` for `codec_id` with the SAME calls `compress_payload`
+    /// makes. Only called with codec ids this build can encode.
+    fn genuine_stream(codec_id: u8, payload: &[u8]) -> Vec<u8> {
+        match codec_id {
+            CODEC_ID_NONE => payload.to_vec(),
+            CODEC_ID_LZ4 => lz4_flex::block::compress(payload),
+            #[cfg(feature = "zstd")]
+            CODEC_ID_ZSTD => {
+                zstd::bulk::compress(payload, DEFAULT_ZSTD_LEVEL).expect("zstd encode")
+            }
+            other => unreachable!("codec id {other} is not encodable on this build"),
+        }
+    }
+
+    /// One generated `(codec_id, dict_id, claim, stream)` case for the #438 gate-contract
+    /// property, drawn from three arms so the decoder-accepts premise GENUINELY fires (the
+    /// review proved a raw-random-bytes generator hits a decodable input with probability ~0,
+    /// and measurement showed even structured streams stay vacuous while the claim is drawn
+    /// INDEPENDENTLY, since decode requires claim == decoded length exactly):
+    ///
+    /// - CHAOS: every field independent (unregistered ids, arbitrary dicts, mismatched
+    ///   claims, streams from `structured_stream`), probing the rejection sets.
+    /// - HONEST: a genuine encode with claim == payload length and no dict, decodable by
+    ///   construction on every build (`none`/`lz4`; plus `zstd` on a feature build).
+    /// - CLAIM-0 BOUNDARY: compressing codecs with claim 0 over an empty stream or the
+    ///   genuine codec stream of the EMPTY payload, the neighborhood of the documented
+    ///   zstd-empty-stream strictness exception, so the exception branch itself is exercised
+    ///   by random cases on a zstd build.
+    fn gate_contract_case() -> proptest::strategy::BoxedStrategy<(u8, u32, u32, Vec<u8>)> {
+        let chaos = (
+            0u8..=3,
+            prop_oneof![Just(DICT_ID_NONE), any::<u32>()],
+            0u32..=DEFAULT_MAX_DECOMPRESSED_BYTES + 1024,
+            structured_stream(),
+        )
+            .boxed();
+
+        #[cfg(feature = "zstd")]
+        let encodable_ids =
+            prop_oneof![Just(CODEC_ID_NONE), Just(CODEC_ID_LZ4), Just(CODEC_ID_ZSTD)];
+        #[cfg(not(feature = "zstd"))]
+        let encodable_ids = prop_oneof![Just(CODEC_ID_NONE), Just(CODEC_ID_LZ4)];
+        let honest = (
+            encodable_ids,
+            proptest::collection::vec(any::<u8>(), 0..4096),
+        )
+            .prop_map(|(codec_id, payload)| {
+                let claim = u32::try_from(payload.len()).expect("payload < 4096");
+                let stream = genuine_stream(codec_id, &payload);
+                (codec_id, DICT_ID_NONE, claim, stream)
+            })
+            .boxed();
+
+        let empty_payload_streams = {
+            let empty = Just(Vec::new());
+            let lz4_of_empty = Just(lz4_flex::block::compress(b""));
+            #[cfg(feature = "zstd")]
+            {
+                let zstd_of_empty =
+                    Just(zstd::bulk::compress(b"", DEFAULT_ZSTD_LEVEL).expect("zstd encode"));
+                prop_oneof![empty, lz4_of_empty, zstd_of_empty].boxed()
+            }
+            #[cfg(not(feature = "zstd"))]
+            {
+                prop_oneof![empty, lz4_of_empty].boxed()
+            }
+        };
+        let claim_zero_boundary = (
+            prop_oneof![Just(CODEC_ID_LZ4), Just(CODEC_ID_ZSTD)],
+            empty_payload_streams,
+        )
+            .prop_map(|(codec_id, stream)| (codec_id, DICT_ID_NONE, 0u32, stream))
+            .boxed();
+
+        prop_oneof![chaos, honest, claim_zero_boundary].boxed()
+    }
+
     proptest! {
         // Round-trip: decompress(compress(x)) == x for arbitrary payloads across the raw-store
         // boundary, with both raw-stored and compressed outcomes exercised.
@@ -1571,21 +1758,55 @@ mod proptests {
             let _ = validate_descriptor_shape(&stored, cap);
         }
 
-        // The produce-time shape gate (#438) NEVER rejects a record the shipped read side can
-        // decode: the gate's rejection set is a subset of the readers' rejection set, so no
-        // legal producer-compressed publish is refused. (The converse does not hold by design:
-        // a well-shaped descriptor over a corrupt stream, or a registered-but-unimplemented
-        // codec/dict, passes the shape gate and stays a read-side concern.)
+        // The #438 gate contract over STRUCTURED descriptors (see `gate_contract_case`:
+        // a chaos arm, an honest-encode arm, and the claim-0 boundary arm): everything
+        // the read side ACCEPTS, the gate also accepts, EXCEPT the single documented
+        // degenerate input where the gate is deliberately stricter (codec zstd, EMPTY stream,
+        // claim 0: a permissive zstd decoder yields the empty payload, the wire contract
+        // demands a non-empty stream; pinned deterministically by the strictness-exception
+        // tests). Equivalently: the gate's rejection set is a subset of the readers' rejection
+        // set, modulo that one enumerated input. The converse (gate-accept implies
+        // decoder-accept) does NOT hold by design and is not asserted: corrupt stream content,
+        // a registered-but-unimplemented codec, and an unresolved dict_id all pass the shape
+        // gate and stay read-side concerns. The decoder-accepts premise genuinely fires here:
+        // the honest arm is decodable BY CONSTRUCTION (measured: the read side accepts ~42%
+        // of generated cases on the default build and ~50% on a zstd build, where the
+        // degenerate exception branch itself fired 555 times in 10000 cases), whereas
+        // raw random bytes decode with probability ~0 and left the previous property vacuous;
+        // the deterministic premise set in
+        // `tests::the_shape_gate_accepts_every_genuinely_decodable_premise_case` additionally
+        // guarantees the premise regardless of generator luck.
         #[test]
-        fn shape_validation_never_rejects_a_decodable_record(
-            stored in proptest::collection::vec(any::<u8>(), 0..4096),
-            cap in 0u32..(16 * 1024 * 1024),
+        fn shape_gate_never_rejects_a_decodable_record_except_the_documented_exception(
+            (codec_id, dict_id, claim, stream) in gate_contract_case(),
         ) {
-            if decompress_payload(RecordFlags::COMPRESSED, &stored, &NoDictionaries, cap).is_ok() {
-                prop_assert!(
-                    validate_descriptor_shape(&stored, cap).is_ok(),
-                    "the shape gate rejected a record the read side decodes"
-                );
+            let mut stored = vec![codec_id];
+            stored.extend_from_slice(&dict_id.to_le_bytes());
+            stored.extend_from_slice(&claim.to_le_bytes());
+            stored.extend_from_slice(&stream);
+            let validated = validate_descriptor_shape(&stored, DEFAULT_MAX_DECOMPRESSED_BYTES);
+            let decoded = decompress_payload(
+                RecordFlags::COMPRESSED,
+                &stored,
+                &NoDictionaries,
+                DEFAULT_MAX_DECOMPRESSED_BYTES,
+            );
+            if decoded.is_ok() {
+                if codec_id == CODEC_ID_ZSTD && stream.is_empty() && claim == 0 {
+                    // The enumerated strictness exception, and nothing else: reachable only
+                    // on a zstd-feature build (a default build poisons codec id 2 at decode).
+                    prop_assert_eq!(
+                        validated,
+                        Err(DecompressError::CorruptStream),
+                        "the gate rejects the degenerate zstd-empty-claim-0 descriptor"
+                    );
+                } else {
+                    prop_assert!(
+                        validated.is_ok(),
+                        "the gate rejected a record the read side decodes: {:?}",
+                        validated
+                    );
+                }
             }
         }
 
