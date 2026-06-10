@@ -76,6 +76,15 @@ pub struct ConfigInfo {
     pub duration_ms: u64,
     /// Payload size in bytes.
     pub payload_bytes: usize,
+    /// The payload BODY entropy (#439): `"realistic"` (compressible telemetry shape, the default)
+    /// or `"random"` (incompressible). Recorded so an archived baseline SELF-DESCRIBES what it
+    /// measured: a `realistic` baseline must never be compared against a `random` run. An
+    /// ADDITIVE field (consumers that ignore unknown fields keep parsing), so the schema version
+    /// is unchanged. NOTE on baseline continuity: runs recorded before #439 sent all-zeros bodies
+    /// (and carry no `payload_entropy` field), so they are not comparable with `realistic` runs;
+    /// per the #439 review no baseline had been archived yet, so no recorded history is
+    /// invalidated.
+    pub payload_entropy: &'static str,
     /// Receiver fetch batch (credit window).
     pub fetch_batch: u32,
     /// The deterministic RNG seed for the Poisson jitter.
@@ -147,6 +156,7 @@ impl Provenance {
                 target_rate_hz: report.config.target_rate_hz,
                 duration_ms: duration_ms(report.config.duration),
                 payload_bytes: report.config.payload_bytes,
+                payload_entropy: report.config.payload_entropy.as_str(),
                 fetch_batch: report.config.fetch_batch,
                 seed: report.config.seed,
             },

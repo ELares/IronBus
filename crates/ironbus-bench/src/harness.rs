@@ -58,6 +58,48 @@ const HIST_SIGFIG: u8 = 3;
 /// The default deterministic RNG seed for the Poisson jitter, so a run is reproducible.
 pub const DEFAULT_SEED: u64 = 0x1B05_C0FF_EE42_7711;
 
+/// The entropy of the generated payload BODY (the bytes after the embedded token), #439.
+///
+/// The harness used to send ALL-ZEROS bodies. Since #430 wired the write path, the spawned broker
+/// compresses with the shipped default `lz4`, and all-zeros is the PATHOLOGICAL BEST CASE for any
+/// codec: every byte-budget and throughput number the harness recorded was best-case, not
+/// representative. The default is now a compressible-but-realistic telemetry shape (the same shape
+/// the `ironbus bench` CLI generates for `--payload-shape realistic`), with an incompressible
+/// option for the codec's worst case. Both fills are deterministic, so runs stay reproducible.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PayloadEntropy {
+    /// A repetitive, codec-friendly ASCII pattern resembling real structured edge telemetry (the
+    /// DEFAULT). Compressible like real `key=value` sensor records, NOT degenerate like zeros.
+    #[default]
+    CompressibleRealistic,
+    /// Deterministic pseudo-random bytes, re-seeded per message: incompressible, the codec's
+    /// worst case (already-compressed or encrypted payloads). Opt-in.
+    Incompressible,
+}
+
+impl PayloadEntropy {
+    /// Parses the `--payload-entropy` value (the same vocabulary as the CLI bench's
+    /// `--payload-shape`: `realistic` is the compressible default, `random` the incompressible
+    /// probe).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<PayloadEntropy> {
+        match value {
+            "realistic" | "real" => Some(PayloadEntropy::CompressibleRealistic),
+            "random" | "noise" => Some(PayloadEntropy::Incompressible),
+            _ => None,
+        }
+    }
+
+    /// The stable string used in the provenance JSON and the reproduce command.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PayloadEntropy::CompressibleRealistic => "realistic",
+            PayloadEntropy::Incompressible => "random",
+        }
+    }
+}
+
 /// Configuration for one open-loop run.
 #[derive(Clone, Debug)]
 pub struct RunConfig {
@@ -68,6 +110,8 @@ pub struct RunConfig {
     pub duration: Duration,
     /// Total payload size in bytes (including the embedded token); floored to [`TOKEN_LEN`].
     pub payload_bytes: usize,
+    /// The payload BODY entropy (#439): compressible-realistic by default, incompressible opt-in.
+    pub payload_entropy: PayloadEntropy,
     /// How many messages the receiver requests per fetch (its credit window).
     pub fetch_batch: u32,
     /// Deterministic RNG seed for the Poisson jitter, so a run is reproducible.
@@ -80,6 +124,7 @@ impl Default for RunConfig {
             target_rate_hz: 5_000.0,
             duration: Duration::from_secs(5),
             payload_bytes: 256,
+            payload_entropy: PayloadEntropy::default(),
             fetch_batch: 256,
             seed: DEFAULT_SEED,
         }
@@ -391,14 +436,17 @@ fn send_loop(
     run_start: Nanos,
     config: &RunConfig,
 ) -> Result<SendOutcome, RunError> {
-    // An all-zeros payload (only the 16-byte token at the front varies). Since #430 wired the
-    // write path, the spawned `serve` (no `--compression` override, see `broker.rs`) compresses
-    // with the DEFAULT `lz4` codec, and all-zeros is the BEST-CASE compressible workload: the
-    // throughput and write-amplification numbers this harness reports are therefore NOT
-    // representative for incompressible (already-compressed or encrypted) payloads. Deliberately
-    // unchanged, for run-to-run comparability; measure an incompressible workload with
-    // `--compression none` or a realistic corpus instead.
+    // The payload body is generated per the configured entropy (#439). The all-zeros body this
+    // loop used to send was the pathological BEST CASE under the broker's lz4 codec (the spawned
+    // `serve` is pinned to `--compression lz4`, the shipped default, see `broker.rs`), so every
+    // recorded number was best-case rather than representative. The default body is now the
+    // compressible-realistic telemetry shape; `Incompressible` re-fills per message for the
+    // worst case. BASELINE CONTINUITY: this changes the default workload, so a recorded baseline
+    // from before this change is not comparable with one after it; per the #439 review there are
+    // NO archived baselines yet (the v0.1.0 baseline is still unrecorded), which is exactly why
+    // the default is made honest NOW, before the first baseline freezes the old workload in.
     let mut payload = vec![0u8; payload_bytes];
+    fill_payload_body(&mut payload, config.payload_entropy, 0);
     let mut rng = StdRng::seed_from_u64(config.seed);
     // The exponential's lambda is the rate (per second); its mean interval is 1/rate seconds.
     let exp =
@@ -413,6 +461,12 @@ fn send_loop(
         let now = now_nanos();
         if intended > now {
             sleep_until(intended, now);
+        }
+        // An incompressible body is re-filled PER MESSAGE (seeded by the sequence number) so the
+        // broker can never amortize repeated bytes across records; the realistic pattern is
+        // seq-independent, already in the buffer from the one-time fill above.
+        if config.payload_entropy == PayloadEntropy::Incompressible {
+            fill_payload_body(&mut payload, PayloadEntropy::Incompressible, sent);
         }
         write_token(&mut payload, intended, sent);
         match sender.produce(&PubBody {
@@ -454,6 +508,42 @@ fn send_loop(
         payload_produced,
         error,
     })
+}
+
+/// Fills the payload BODY (everything after the [`TOKEN_LEN`]-byte token, which the sender stamps
+/// separately) with the chosen entropy (#439). MIRRORS the `ironbus bench` CLI's `fill_payload`
+/// (`crates/ironbus-cli/src/bench.rs`) byte for byte, so the harness and the CLI bench measure the
+/// SAME payload shapes; it cannot be imported because `ironbus-cli` ships only a binary target.
+/// Both fills are deterministic for a given `seq`, so a run stays reproducible.
+fn fill_payload_body(payload: &mut [u8], entropy: PayloadEntropy, seq: u64) {
+    if payload.len() <= TOKEN_LEN {
+        return;
+    }
+    let body = &mut payload[TOKEN_LEN..];
+    match entropy {
+        PayloadEntropy::CompressibleRealistic => {
+            // A short, repeating ASCII record-like pattern: highly compressible, like the
+            // structured key=value telemetry an edge sensor actually emits, but NOT the
+            // degenerate all-zeros best case.
+            const PATTERN: &[u8] = b"ts=000000 sensor=edge temp=21.5 occ=1 batt=98 rssi=-67; ";
+            for (i, b) in body.iter_mut().enumerate() {
+                *b = PATTERN[i % PATTERN.len()];
+            }
+        }
+        PayloadEntropy::Incompressible => {
+            // A tiny self-contained LCG (Numerical Recipes constants), seeded per message so the
+            // fill is incompressible yet deterministic for a given seq.
+            let mut state = seq.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            for b in body.iter_mut() {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                // Keep the low 8 bits of a high-entropy word; the mask makes the narrowing
+                // explicit and well-defined (not a truncating cast).
+                *b = u8::try_from((state >> 33) & 0xff).unwrap_or(0);
+            }
+        }
+    }
 }
 
 /// Writes the intended-send-time token (8-byte nanos LE, then 8-byte seq LE) into the front of
@@ -581,6 +671,84 @@ mod tests {
         let mut payload = vec![0u8; 256];
         write_token(&mut payload, 123_456_789, 42);
         assert_eq!(read_token_time(&payload), Some(123_456_789));
+    }
+
+    #[test]
+    fn the_token_survives_every_entropy_fill() {
+        // The fill writes ONLY the body, so a token stamped before or after a fill is intact.
+        for entropy in [
+            PayloadEntropy::CompressibleRealistic,
+            PayloadEntropy::Incompressible,
+        ] {
+            let mut payload = vec![0u8; 256];
+            write_token(&mut payload, 123_456_789, 42);
+            fill_payload_body(&mut payload, entropy, 42);
+            assert_eq!(read_token_time(&payload), Some(123_456_789));
+        }
+    }
+
+    #[test]
+    fn the_default_body_is_compressible_realistic_and_not_zeros() {
+        // The #439 fix has teeth: the DEFAULT body is the realistic pattern, which has few
+        // distinct byte values per window (compressible) but is NOT the all-zeros degenerate
+        // best case the harness used to send.
+        assert_eq!(
+            PayloadEntropy::default(),
+            PayloadEntropy::CompressibleRealistic
+        );
+        let mut payload = vec![0u8; 256];
+        fill_payload_body(&mut payload, PayloadEntropy::default(), 0);
+        let body = &payload[TOKEN_LEN..];
+        assert!(
+            body.iter().any(|&b| b != 0),
+            "the default body must not be all zeros"
+        );
+        let distinct_real = distinct_bytes(body);
+        let mut rand_payload = vec![0u8; 256];
+        fill_payload_body(&mut rand_payload, PayloadEntropy::Incompressible, 1);
+        let distinct_rand = distinct_bytes(&rand_payload[TOKEN_LEN..]);
+        assert!(
+            distinct_real < distinct_rand,
+            "realistic ({distinct_real}) must use fewer distinct bytes than random ({distinct_rand})"
+        );
+    }
+
+    #[test]
+    fn the_incompressible_fill_is_deterministic_per_seq_and_differs_across_seqs() {
+        // Reproducibility: the same seq always yields the same bytes; different seqs differ, so
+        // the broker can never amortize repeated bodies across records.
+        let mut a = vec![0u8; 256];
+        let mut b = vec![0u8; 256];
+        let mut c = vec![0u8; 256];
+        fill_payload_body(&mut a, PayloadEntropy::Incompressible, 7);
+        fill_payload_body(&mut b, PayloadEntropy::Incompressible, 7);
+        fill_payload_body(&mut c, PayloadEntropy::Incompressible, 8);
+        assert_eq!(a, b, "same seq => same fill");
+        assert_ne!(a, c, "different seq => different fill");
+    }
+
+    #[test]
+    fn payload_entropy_parses_the_cli_vocabulary() {
+        assert_eq!(
+            PayloadEntropy::parse("realistic"),
+            Some(PayloadEntropy::CompressibleRealistic)
+        );
+        assert_eq!(
+            PayloadEntropy::parse("random"),
+            Some(PayloadEntropy::Incompressible)
+        );
+        assert_eq!(PayloadEntropy::parse("zeros"), None);
+        assert_eq!(PayloadEntropy::CompressibleRealistic.as_str(), "realistic");
+        assert_eq!(PayloadEntropy::Incompressible.as_str(), "random");
+    }
+
+    /// Counts distinct byte values, the same compressibility proxy the CLI bench's tests use.
+    fn distinct_bytes(bytes: &[u8]) -> usize {
+        let mut seen = [false; 256];
+        for &b in bytes {
+            seen[b as usize] = true;
+        }
+        seen.iter().filter(|&&s| s).count()
     }
 
     #[test]

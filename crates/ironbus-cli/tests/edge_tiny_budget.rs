@@ -539,7 +539,7 @@ fn edge_tiny_profile_is_within_the_documented_edge_budget() {
 /// The #439 lz4 COMPANION write-amp gate: the same edge-tiny boot and the same payload mix as the
 /// raw gate above, but with NO `--compression` flag, so the broker runs the codec the SHIPPED
 /// binary defaults to (`lz4`, ADR-0003, wired by #430). The raw gate above stays the historical
-/// framing/checkpoint regression contract (`--compression none`, the 4x EDGE_CONSTRAINTS.md
+/// framing/checkpoint regression contract (`--compression none`, the 4x `EDGE_CONSTRAINTS.md`
 /// bound); without this companion, NO CI gate would bound the write amplification of the
 /// configuration operators actually get, which is the #439 gap.
 ///
