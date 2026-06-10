@@ -529,7 +529,10 @@ consumed); a fire-and-forget violation is dropped with NO frame (the QoS-0 no-fr
 `dict_id` and stream CONTENT are deliberately not judged at produce (a reader capability and
 codec work, respectively), so a corrupt stream behind a well-shaped descriptor remains a
 read-side `ClientError::Decompress`. The gate sits at the WIRE boundary only: the engine's own
-compressed writes and the DLQ redrive's direct re-injection do not pass through it.
+compressed writes and the DLQ redrive's direct re-injection do not pass through it. Rollout
+coupling: because this produce gate rejects an UNREGISTERED codec id, registering a future codec
+id requires brokers to learn the new id BEFORE producers emit it (upgrade brokers first, then
+producers); a producer that emits the id against an older broker is rejected at produce.
 
 There is NO topic field and NO trace-id header list. `key`, `headers`, `producer_id`, and `msg_id`
 are each bounded by `u16::MAX`.
