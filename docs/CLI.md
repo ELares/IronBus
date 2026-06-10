@@ -221,7 +221,7 @@ scalar). The compiled-in named PROFILES and the `--profile` selector are impleme
 (#87, see `--profile` above); the TOML config FILE (`--config`), its strict typed-key /
 literal-grammar / coupled-set validation, and the immutable-config atomic re-read RELOAD
 engine are implemented (#382, see `--config` above and `docs/CONFIG.md`). The reload engine
-runs exactly once, as a startup self-check; no runtime trigger is wired yet (SIGHUP is
+runs at most once, as a startup self-check when `--config` is set; no runtime trigger is wired yet (SIGHUP is
 graceful stop, not reload, #431; the trigger is tracked in #380, refs #88), so applying a
 config change requires restarting the broker. The other remaining residual is the MUTATING
 wire `CONFIG SET`/`SAVE` admin verbs, which need the #106 connection-scoped auth (there is

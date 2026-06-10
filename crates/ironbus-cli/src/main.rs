@@ -66,7 +66,7 @@ mod config_file;
 /// that needs it, and the re-read RELOAD that validates the whole candidate, rejects a cold-key
 /// change atomically, and swaps ONLY on full success (a broken reload keeps the old config). The
 /// MUTATING wire `CONFIG SET` verbs need the #106 auth and are NOT here (no unauthenticated remote
-/// mutation surface); this is the safe local re-read reload path only, and it runs exactly once,
+/// mutation surface); this is the safe local re-read reload path only, and it runs at most once,
 /// as a startup self-check: no signal invokes it at runtime (SIGHUP is bound to graceful stop, the
 /// #195 residual, see #431; the runtime trigger is the #380 surface, refs #88).
 mod config_reload;

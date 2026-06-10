@@ -657,7 +657,7 @@ reject-unknown-key-with-a-did-you-mean rule, `--allow-unknown-config`, and the c
 validators live in `ironbus-core::config`; the immutable `Arc<EffectiveConfig>` plus the
 atomic re-read RELOAD (validate the whole config, reject a cold-key change atomically, swap
 only on success) are in `ironbus-cli`. The hot/cold/coupled reload classes are enforced by
-that re-read engine, but the engine runs exactly once, as a startup self-check: NO runtime
+that re-read engine, but the engine runs at most once, as a startup self-check when `--config` is set: NO runtime
 trigger is wired yet (SIGHUP performs a graceful stop exactly like SIGTERM, not a reload,
 #431; the runtime trigger is the #380 admin surface, refs #88), so a config change today
 requires a broker restart. The MUTATING wire `CONFIG SET` admin verbs need the #106 auth and
