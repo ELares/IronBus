@@ -38,6 +38,12 @@
 #                          packaged systemd unit, whose ExecStart runs /usr/bin/ironbus. Validated
 #                          FAIL-CLOSED: a relative path, a directory, or a missing or unwritable
 #                          parent directory aborts with a clear error and installs nothing.
+#   IRONBUS_UNIT_FILES     Advanced/test surface: space-separated candidate unit-file paths the
+#                          unit-mismatch warning consults when `systemctl cat` is unavailable.
+#                          Default: /etc/systemd/system/ironbus.service then
+#                          /lib/systemd/system/ironbus.service (first readable one wins). Lets a
+#                          test harness point the detection at fixtures; normal installs never
+#                          need to set it.
 #
 # This installer is intentionally fail-closed and has NO insecure / skip-verification override.
 
@@ -394,23 +400,59 @@ resolve_install_dest() {
 # Shell builtins ONLY (`read`, `case`, parameter expansion): the test harness calls the unit
 # detection on a PATH that resolves nothing but stub tools, so no grep/awk/sed/head may be used
 # here. Mirrors systemd's own override semantics: a later `ExecStart=` line wins (a drop-in
-# override appears after the base unit in `systemctl cat` output) and an empty `ExecStart=` resets.
-# The value is the first word after `ExecStart=`, with systemd's `+` full-privilege Exec prefix
-# stripped (the only prefix this repo's unit uses; see packaging/systemd/ironbus.service, #420).
+# override appears after the base unit in `systemctl cat` output), an empty `ExecStart=` resets,
+# and whitespace around the `=` is ignored ("ExecStart =" names the same key, and a value's
+# leading whitespace is trimmed rather than parsed as an empty first word, which would act as a
+# reset). The value is the first word after the `=`, with systemd's Exec prefixes stripped:
+# "@", "-", ":", "+", "!", "!!", stackable in any order (systemd.service(5)). An unstripped
+# prefix could never equal the install destination, so a prefixed unit would fire a spurious
+# mismatch warning whose suggested IRONBUS_INSTALL_DEST remedy resolve_install_dest would then
+# itself refuse. (This repo's own unit uses NO prefix on ExecStart; the `+` lines in
+# packaging/systemd/ironbus.service are the ExecStartPre/Post/StopPost helpers, #420.)
 unit_execstart_from_stdin() {
     uefs_bin=""
     uefs_tab="$(printf '\t')"
     while IFS= read -r uefs_line; do
+        # Cheap pre-filter; the key check below decides for real.
         case "$uefs_line" in
-            ExecStart=*)
-                uefs_val="${uefs_line#ExecStart=}"
-                uefs_val="${uefs_val#+}"
-                # First word: cut at the first space or tab (systemd separates argv with either).
-                uefs_val="${uefs_val%% *}"
-                uefs_val="${uefs_val%%"$uefs_tab"*}"
-                uefs_bin="$uefs_val"
-                ;;
+            ExecStart*=*) : ;;
+            *) continue ;;
         esac
+        # The key is everything before the first "=", minus the literal "ExecStart"; only
+        # whitespace may remain ("ExecStart =" matches, "ExecStartPre=" must NOT).
+        uefs_key="${uefs_line%%=*}"
+        uefs_key="${uefs_key#ExecStart}"
+        while true; do
+            case "$uefs_key" in
+                ' '*) uefs_key="${uefs_key# }" ;;
+                "$uefs_tab"*) uefs_key="${uefs_key#"$uefs_tab"}" ;;
+                *) break ;;
+            esac
+        done
+        [ -z "$uefs_key" ] || continue
+        uefs_val="${uefs_line#*=}"
+        # systemd ignores whitespace around "=": trim the value's leading whitespace so
+        # "ExecStart= /usr/bin/x" parses to the path instead of an empty word (a reset).
+        while true; do
+            case "$uefs_val" in
+                ' '*) uefs_val="${uefs_val# }" ;;
+                "$uefs_tab"*) uefs_val="${uefs_val#"$uefs_tab"}" ;;
+                *) break ;;
+            esac
+        done
+        # Strip stacked Exec prefixes one character at a time. POSIX bracket-class rules: "!"
+        # must not be first (it would negate the class) and "-" must be last (anywhere else it
+        # could form a range), so the class is written [@:+!-].
+        while true; do
+            case "$uefs_val" in
+                [@:+!-]*) uefs_val="${uefs_val#?}" ;;
+                *) break ;;
+            esac
+        done
+        # First word: cut at the first space or tab (systemd separates argv with either).
+        uefs_val="${uefs_val%% *}"
+        uefs_val="${uefs_val%%"$uefs_tab"*}"
+        uefs_bin="$uefs_val"
     done
     printf '%s' "$uefs_bin"
 }
@@ -425,16 +467,24 @@ unit_execstart_from_stdin() {
 #      overrides.
 #   2. Otherwise (no systemctl, or it knows no such unit) the unit files the .deb or an operator
 #      would place, first readable one wins: /etc/systemd/system/ironbus.service, then
-#      /lib/systemd/system/ironbus.service, read with shell redirection (no `cat` needed).
+#      /lib/systemd/system/ironbus.service, read with shell redirection (no `cat` needed). The
+#      candidate list is overridable via IRONBUS_UNIT_FILES (space-separated; an advanced/test
+#      surface, see the header), so the test harness can point the detection at fixtures instead
+#      of the host's real unit files.
 unit_exec_binary() {
     if command -v systemctl >/dev/null 2>&1; then
+        # DELIBERATE TRADE: `systemctl cat` can block on a wedged systemd and POSIX sh has no
+        # portable timeout; accepted, because any failure here degrades to no warning, never a hang
+        # the install depends on for correctness.
         ueb_text="$(systemctl cat ironbus 2>/dev/null)" || ueb_text=""
         if [ -n "$ueb_text" ]; then
             printf '%s\n' "$ueb_text" | unit_execstart_from_stdin
             return 0
         fi
     fi
-    for ueb_file in /etc/systemd/system/ironbus.service /lib/systemd/system/ironbus.service; do
+    # The unquoted expansion is deliberate: the candidates are split on whitespace.
+    # shellcheck disable=SC2086
+    for ueb_file in ${IRONBUS_UNIT_FILES:-/etc/systemd/system/ironbus.service /lib/systemd/system/ironbus.service}; do
         if [ -r "$ueb_file" ]; then
             unit_execstart_from_stdin <"$ueb_file"
             return 0
@@ -513,12 +563,24 @@ main() {
             --target=*) force_target="${1#--target=}"; shift ;;
             --verify-provenance) verify_provenance="1"; shift ;;
             --help | -h)
-                sed -n '2,42p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
+                # DRIFT RISK, accepted: this line range must track the header comment block at the
+                # top of this file; growing or shrinking the header without updating the range
+                # silently truncates or over-extends the --help text.
+                sed -n '2,48p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
                 exit 0
                 ;;
             *) die "unknown argument: $1 (try --help)" ;;
         esac
     done
+
+    # EAGER FAIL-CLOSED VALIDATION (#433): when IRONBUS_INSTALL_DEST is set, validate it NOW,
+    # before anything is downloaded; a typo'd override must die before bytes move, not after.
+    # With the override set, resolve_install_dest only validates (it creates no directories), so
+    # this early call has no side effects. The post-download resolve below remains the one whose
+    # result is installed to, and the only one that may mkdir a DEFAULT install dir.
+    if [ -n "${IRONBUS_INSTALL_DEST:-}" ]; then
+        resolve_install_dest "$bin_dir"
+    fi
 
     target="$force_target"
     [ -n "$target" ] || target="$(detect_target)"

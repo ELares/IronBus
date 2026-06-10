@@ -927,14 +927,29 @@ fn a_directory_ironbus_install_dest_is_refused_with_nothing_installed() {
     );
 }
 
+/// Two nonexistent unit-file candidates inside `dir`, shaped like the real default list, so the
+/// detection's FILE FALLBACK can never read a real `/etc/systemd/system/ironbus.service` on a host
+/// where the ironbus `.deb` is installed. EVERY warning test sets `IRONBUS_UNIT_FILES` through
+/// this (or to an explicit fixture), keeping the suite hermetic.
+fn hermetic_unit_files(dir: &std::path::Path) -> String {
+    format!(
+        "{} {}",
+        dir.join("etc-ironbus.service").display(),
+        dir.join("lib-ironbus.service").display()
+    )
+}
+
 #[test]
 fn a_unit_running_a_different_binary_triggers_the_loud_mismatch_warning() {
     // UNIT-AWARENESS (#433): a stub systemctl (the ONLY tool on PATH, like run_download's stubs)
     // reports a unit whose ExecStart runs /usr/bin/ironbus, carrying systemd's `+` full-privilege
-    // prefix (which must be stripped) and trailing argv (which must be cut at the first word),
-    // plus an ExecStartPre line that must NOT be mistaken for ExecStart. Choosing a different
-    // destination must print the LOUD warning naming BOTH paths and the IRONBUS_INSTALL_DEST
-    // remedy, while still exiting 0: a warning, never an error.
+    // prefix (which must be stripped) and trailing argv (which must be cut at the first word).
+    // The ExecStartPre lines name a DIFFERENT binary (/bin/false), one of them AFTER ExecStart:
+    // under the parser's last-wins semantics, wrongly matching ExecStartPre would make the
+    // warning name /bin/false instead, so the exact-line assertions below give the
+    // must-not-match property real teeth. Choosing a different destination must print the LOUD
+    // warning naming BOTH paths and the IRONBUS_INSTALL_DEST remedy, while still exiting 0: a
+    // warning, never an error.
     let dir = tempdir::TempDir::new("ib-unit-warn");
     write_stub(
         dir.path(),
@@ -943,16 +958,20 @@ fn a_unit_running_a_different_binary_triggers_the_loud_mismatch_warning() {
             "case \"$1\" in\n",
             "  cat)\n",
             "    printf '%s\\n' '[Service]' \\\n",
-            "      'ExecStartPre=+/usr/bin/ironbus record-start --check' \\\n",
-            "      'ExecStart=+/usr/bin/ironbus serve'\n",
+            "      'ExecStartPre=+/bin/false preflight' \\\n",
+            "      'ExecStart=+/usr/bin/ironbus serve' \\\n",
+            "      'ExecStartPre=+/bin/false post-exec-check'\n",
             "    exit 0 ;;\n",
             "esac\n",
             "exit 1\n"
         ),
     );
+    // The stub systemctl answers, so the file fallback should never run; pointing it into the
+    // tempdir anyway keeps the test hermetic on hosts where the real unit files exist.
+    let unit_files = hermetic_unit_files(dir.path());
     let (code, stderr) = run_sourced_snippet(
         "warn_if_unit_binary_differs /usr/local/bin/ironbus",
-        &[],
+        &[("IRONBUS_UNIT_FILES", &unit_files)],
         Some(dir.path()),
         dir.path(),
     );
@@ -965,12 +984,36 @@ fn a_unit_running_a_different_binary_triggers_the_loud_mismatch_warning() {
         "the warning must be loud, stderr: {stderr}"
     );
     assert!(
-        stderr.contains("/usr/bin/ironbus") && stderr.contains("/usr/local/bin/ironbus"),
-        "the warning names BOTH the unit's binary and the chosen destination, stderr: {stderr}"
+        stderr.contains("/usr/local/bin/ironbus"),
+        "the warning names the chosen destination, stderr: {stderr}"
+    );
+    // EXACT remedy line, not a substring: a regression that stops cutting the argv tail would
+    // print "IRONBUS_INSTALL_DEST=/usr/bin/ironbus serve" (which resolve_install_dest then
+    // rejects as a remedy), and a substring check would still pass on it.
+    assert!(
+        stderr
+            .lines()
+            .any(|l| l == "ironbus-install:   IRONBUS_INSTALL_DEST=/usr/bin/ironbus"),
+        "the warning names the exact remedy line, stderr: {stderr}"
+    );
+    // Belt and braces: the parsed unit path must be a bare path with no argv tail, hence no space.
+    let remedy_value = stderr
+        .lines()
+        .find_map(|l| l.split("IRONBUS_INSTALL_DEST=").nth(1))
+        .expect("the remedy line is present");
+    assert!(
+        !remedy_value.contains(' '),
+        "the parsed unit path must not contain a space, got: {remedy_value}"
     );
     assert!(
-        stderr.contains("IRONBUS_INSTALL_DEST=/usr/bin/ironbus"),
-        "the warning names the remedy (override to the unit's path), stderr: {stderr}"
+        stderr
+            .lines()
+            .any(|l| l == "ironbus-install:   systemd unit (ExecStart):   /usr/bin/ironbus"),
+        "the warning names the exact unit binary path, stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("/bin/false"),
+        "ExecStartPre lines must never be mistaken for ExecStart, stderr: {stderr}"
     );
 }
 
@@ -979,11 +1022,13 @@ fn no_systemctl_and_no_unit_file_means_no_mismatch_warning() {
     // Non-systemd hosts are unaffected (#433): with NO systemctl on the (restricted) PATH and no
     // readable ironbus unit file, the detection finds nothing, prints nothing, and the install
     // path continues silently. `command -v` guards every probe, so the restricted PATH cannot
-    // break the script either.
+    // break the script either. IRONBUS_UNIT_FILES points at nonexistent tempdir candidates so a
+    // real unit file installed on the host (the .deb's own /etc or /lib path) cannot leak in.
     let dir = tempdir::TempDir::new("ib-unit-nowarn");
+    let unit_files = hermetic_unit_files(dir.path());
     let (code, stderr) = run_sourced_snippet(
         "warn_if_unit_binary_differs /usr/local/bin/ironbus",
-        &[],
+        &[("IRONBUS_UNIT_FILES", &unit_files)],
         Some(dir.path()),
         dir.path(),
     );
@@ -994,5 +1039,110 @@ fn no_systemctl_and_no_unit_file_means_no_mismatch_warning() {
     assert!(
         stderr.is_empty(),
         "no systemctl and no unit file must produce NO output at all, stderr: {stderr}"
+    );
+}
+
+#[test]
+fn the_unit_file_fallback_parses_env_lines_resets_and_stacked_prefixes() {
+    // FILE FALLBACK (#433): with NO systemctl on the restricted PATH, the detection reads the
+    // first READABLE IRONBUS_UNIT_FILES candidate (the first candidate here does not exist, so
+    // iteration matters too). The fixture exercises the whole parser: Environment= lines are
+    // ignored, an earlier ExecStart= loses to a later one, an empty ExecStart= resets, whitespace
+    // around the final line's "=" is tolerated, and its stacked systemd Exec prefixes ("-!!")
+    // plus trailing argv are stripped/cut so the warning names the bare binary path. A trailing
+    // ExecStartPre naming a DIFFERENT binary pins the must-not-match property under last-wins.
+    let dir = tempdir::TempDir::new("ib-unit-file-fallback");
+    let unit = dir.path().join("ironbus.service");
+    std::fs::write(
+        &unit,
+        concat!(
+            "[Service]\n",
+            "Environment=IRONBUS_DATA_DIR=/var/lib/ironbus\n",
+            "Environment=IRONBUS_BIN=/usr/bin/ironbus\n",
+            "ExecStart=/opt/stale/ironbus serve\n",
+            "ExecStart=\n",
+            "ExecStart = -!!/usr/bin/ironbus serve --flag\n",
+            "ExecStartPre=+/bin/false post-exec-check\n",
+        ),
+    )
+    .unwrap();
+    let unit_files = format!(
+        "{} {}",
+        dir.path().join("missing.service").display(),
+        unit.display()
+    );
+    let (code, stderr) = run_sourced_snippet(
+        "warn_if_unit_binary_differs /usr/local/bin/ironbus",
+        &[("IRONBUS_UNIT_FILES", &unit_files)],
+        Some(dir.path()),
+        dir.path(),
+    );
+    assert_eq!(
+        code, 0,
+        "the mismatch is a WARNING; the exit-0 path continues, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("WARNING"),
+        "the file-fallback detection must fire the warning, stderr: {stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|l| l == "ironbus-install:   IRONBUS_INSTALL_DEST=/usr/bin/ironbus"),
+        "the warning names the exact remedy line (prefixes stripped, argv cut), stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("/opt/stale/ironbus"),
+        "a later ExecStart= must override an earlier one (last wins), stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("/bin/false"),
+        "ExecStartPre must never be mistaken for ExecStart, stderr: {stderr}"
+    );
+
+    // THE #435 SPURIOUS-WARNING REPRO, fixed: a PREFIXED ExecStart whose binary EQUALS the
+    // destination must produce NO warning at all. Unstripped, "-!!/usr/bin/ironbus" could never
+    // equal /usr/bin/ironbus, so the old parser warned and then recommended an
+    // IRONBUS_INSTALL_DEST value that resolve_install_dest itself rejects.
+    let (code, stderr) = run_sourced_snippet(
+        "warn_if_unit_binary_differs /usr/bin/ironbus",
+        &[("IRONBUS_UNIT_FILES", &unit_files)],
+        Some(dir.path()),
+        dir.path(),
+    );
+    assert_eq!(
+        code, 0,
+        "a matching destination is silent, stderr: {stderr}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "a prefixed ExecStart matching the destination must NOT warn, stderr: {stderr}"
+    );
+}
+
+#[test]
+fn absent_unit_file_candidates_leave_the_detection_inert() {
+    // The IRONBUS_UNIT_FILES surface is INERT when nothing resolves: a default-shaped
+    // two-candidate list pointing at files that do not exist (the hermetic stand-in for a host
+    // without the .deb's real /etc + /lib unit files) makes unit_exec_binary print NOTHING and
+    // the warning stay silent, exactly the pre-override behavior on a unitless host.
+    let dir = tempdir::TempDir::new("ib-unit-inert");
+    let unit_files = hermetic_unit_files(dir.path());
+    let (code, stderr) = run_sourced_snippet(
+        concat!(
+            "ueb=\"$(unit_exec_binary)\"; [ -z \"$ueb\" ] || exit 9; ",
+            "warn_if_unit_binary_differs /usr/local/bin/ironbus"
+        ),
+        &[("IRONBUS_UNIT_FILES", &unit_files)],
+        Some(dir.path()),
+        dir.path(),
+    );
+    assert_eq!(
+        code, 0,
+        "absent candidates find no unit (exit 9 would mean a phantom binary), stderr: {stderr}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "absent candidates must produce NO output at all, stderr: {stderr}"
     );
 }
