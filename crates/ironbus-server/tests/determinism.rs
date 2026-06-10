@@ -55,6 +55,9 @@ fn config() -> EngineConfig {
         fire_and_forget_refill_ms: 0,
         egress_limit: 0,
         wal_fsync_headroom_bytes: 0,
+        // Compression OFF (#430): the determinism image is unchanged by the new compression
+        // field; the lz4 determinism case builds its config explicitly.
+        compression: ironbus_core::compress::Codec::None,
     }
 }
 

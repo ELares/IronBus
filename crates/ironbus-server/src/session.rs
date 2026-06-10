@@ -1398,6 +1398,7 @@ mod tests {
             InMemoryFs::new(),
             ManualClock::new(),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
                     visibility_nanos: 30,
@@ -1491,6 +1492,7 @@ mod tests {
             InMemoryFs::new(),
             clock,
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
                     visibility_nanos: 30,
@@ -1538,6 +1540,7 @@ mod tests {
             InMemoryFs::new(),
             clock,
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig {
                     max_segment_bytes: 160,
                     max_total_bytes,
@@ -1842,6 +1845,7 @@ mod tests {
             InMemoryFs::new(),
             ManualClock::new(),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig {
                     max_segment_bytes: 200,
                     ..LogConfig::default()
@@ -2851,6 +2855,7 @@ mod tests {
             InMemoryFs::new(),
             clock,
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
                     visibility_nanos: 30,
@@ -3566,6 +3571,7 @@ mod tests {
                 InMemoryFs::new(),
                 ManualClock::new(),
                 EngineConfig {
+                    compression: ironbus_core::compress::Codec::None,
                     log: LogConfig::default().with_max_total_bytes(one),
                     lease: LeaseConfig {
                         visibility_nanos: 30,
@@ -3944,6 +3950,7 @@ mod tests {
             InMemoryFs::new(),
             clock,
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
                     visibility_nanos: 30,
@@ -3996,6 +4003,7 @@ mod tests {
             InMemoryFs::new(),
             clock,
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
                     visibility_nanos: 30,
@@ -4826,6 +4834,7 @@ mod tests {
             InMemoryFs::new(),
             clock,
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
                     visibility_nanos: 30,

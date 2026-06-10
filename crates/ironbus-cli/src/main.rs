@@ -3635,6 +3635,14 @@ fn open_disk_engine(
             // drain under `sync` / the interval window under a relaxed level), so a zero-config
             // broker is unchanged; a non-zero value is the opt-in tight RAM / loss-window bound.
             wal_fsync_headroom_bytes: config.wal_fsync_headroom_bytes,
+            // The per-record write-path compression codec (#430, ADR-0003), wired from
+            // `--compression` (default `lz4`). `none` stores every record raw, byte-for-byte the
+            // historical layout; `zstd` was already rejected at parse on this build, so the two
+            // arms here are exhaustive.
+            compression: match config.compression {
+                CompressionArg::None => ironbus_core::compress::Codec::None,
+                CompressionArg::Lz4 => ironbus_core::compress::Codec::Lz4,
+            },
         },
     )
     .map_err(|e| CliError::Internal(format!("opening broker at {}: {e}", data_dir.display())))?;
@@ -6610,6 +6618,7 @@ mod tests {
             StdFs::new(dir.clone()),
             Arc::clone(&clock),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
                     visibility_nanos: 30,
@@ -7118,6 +7127,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, Vec::new()).unwrap(),
@@ -7196,6 +7206,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, Vec::new()).unwrap(),
@@ -9239,6 +9250,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::from_millis(50, 300_000),
                 delivery: DeliveryConfig::new(1, false, Vec::new()).unwrap(),
@@ -9316,6 +9328,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::from_millis(30_000, 300_000),
                 delivery: DeliveryConfig::new(5, false, Vec::new()).unwrap(),

@@ -1543,6 +1543,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
@@ -1651,6 +1652,7 @@ mod tests {
             InMemoryFs::new(),
             Arc::clone(&clock),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
@@ -2168,6 +2170,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default().with_max_total_bytes(max_total_bytes),
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
@@ -2306,6 +2309,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
@@ -2377,6 +2381,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
@@ -2645,6 +2650,7 @@ mod tests {
                 InMemoryFs::new(),
                 SystemClock::new(),
                 EngineConfig {
+                    compression: ironbus_core::compress::Codec::None,
                     log: LogConfig::default(),
                     lease: LeaseConfig::default(),
                     delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
@@ -2694,6 +2700,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default().with_daily_physical_write_budget_bytes(probe),
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
@@ -2842,6 +2849,7 @@ mod tests {
             InMemoryFs::new(),
             Arc::clone(&clock),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 // Tiny visibility/cap so a redelivery is reclaimable a few ns later.
                 lease: LeaseConfig {
@@ -2974,6 +2982,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig {
                     max_segment_bytes: 160,
                     max_total_bytes: 0,
@@ -3183,6 +3192,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig {
                     max_segment_bytes: 160,
                     max_total_bytes,
@@ -3874,6 +3884,7 @@ mod tests {
             InMemoryFs::new(),
             SystemClock::new(),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default().with_max_total_bytes(1_000_000),
                 lease: LeaseConfig {
                     visibility_nanos: 1234,
@@ -4073,6 +4084,7 @@ mod tests {
             InMemoryFs::new(),
             Arc::clone(&clock),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig {
                     visibility_nanos: 30,
@@ -4286,6 +4298,7 @@ mod tests {
             fs,
             ManualClock::new(),
             EngineConfig {
+                compression: ironbus_core::compress::Codec::None,
                 log: LogConfig::default(),
                 lease: LeaseConfig::default(),
                 delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),

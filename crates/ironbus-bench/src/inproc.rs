@@ -86,6 +86,9 @@ fn engine_config() -> EngineConfig {
         fire_and_forget_refill_ms: 0,
         egress_limit: 0,
         wal_fsync_headroom_bytes: 0,
+        // Compression OFF (#430): the in-process self-test proves the open-loop latency harness,
+        // not the codec, and its recorded baselines predate the wiring (decision 2026-06-10).
+        compression: ironbus_core::compress::Codec::None,
     }
 }
 

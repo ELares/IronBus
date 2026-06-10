@@ -23,13 +23,14 @@ use ironbus_core::attempt::{
 };
 use ironbus_core::backpressure::{AimdLimiter, Codel, FsyncHeadroom, RetryBudget, TokenBucket};
 use ironbus_core::clock::Clock;
+use ironbus_core::compress::{compress_payload, Codec, CompressConfig};
 use ironbus_core::cursor::AckCursor;
 use ironbus_core::delivery::{DeliveryConfig, Disposition};
 use ironbus_core::keyshared::{KeyOrdering, KeyRouter, MemberId, RouteDecision};
 use ironbus_core::lease::{
     AckOutcome, Claim, ExtendOutcome, LeaseConfig, LeaseTable, LeaseToken, NackOutcome,
 };
-use ironbus_core::types::Offset;
+use ironbus_core::types::{Offset, RecordFlags};
 use ironbus_storage::checkpoint::{
     AttemptsCheckpoint, Checkpoint, CountersCheckpoint, ATTEMPTS_PAYLOAD, MAX_PAYLOAD,
 };
@@ -462,6 +463,22 @@ pub struct EngineConfig {
     /// empty backlog always admits the next record). See [`ironbus_core::backpressure::FsyncHeadroom`]
     /// and `docs/BACKPRESSURE.md`.
     pub wal_fsync_headroom_bytes: u64,
+    /// The PER-RECORD payload compression codec for NEW writes (#430, refs #387, #12, #75; ADR-0003):
+    /// the produce path compresses each record's payload into the self-describing stored object
+    /// (the 9-byte descriptor then the codec stream) behind [`RecordFlags::COMPRESSED`], applied at
+    /// the single append seam ([`Engine::append_no_sync`]) so every produce entry (single produce,
+    /// the actor's group-commit drain, dedup) and every downstream byte account (CRC, caps, segment
+    /// roll, `durable_record_bytes`, the #118 write-amp meters) sees the STORED bytes.
+    ///
+    /// [`Codec::None`] (the no-compression sentinel) stores every record raw, byte-for-byte the
+    /// historical layout, so an engine opened with it produces disk images byte-identical to a
+    /// pre-compression broker. [`Codec::Lz4`] applies the ADR-0003 write guards: a payload under
+    /// the 64-byte raw-store threshold ([`ironbus_core::compress::DEFAULT_RAW_STORE_THRESHOLD`])
+    /// or one the codec cannot strictly shrink (the never-expand guard) is stored raw with the
+    /// flag clear, indistinguishable from an uncompressed write. A record whose flags ALREADY
+    /// carry [`RecordFlags::COMPRESSED`] (a producer-compressed publish, or a DLQ redrive
+    /// re-appending a stored record) passes through UNCHANGED, never double-wrapped.
+    pub compression: Codec,
 }
 
 /// An error from the engine.
@@ -750,7 +767,11 @@ pub struct Counters {
     /// Messages appended by `produce`.
     pub produced: u64,
     /// Logical message bytes appended by `produce` (key + headers + payload, excluding the
-    /// record framing). A throughput and flash-wear signal alongside the record count.
+    /// record framing). A throughput signal alongside the record count. With write-path
+    /// compression on (#430) this deliberately counts the ORIGINAL (pre-compression) payload
+    /// bytes the producer sent, so its producer-facing throughput meaning never shifts with the
+    /// codec; the stored (post-compression, on-flash) truth is `durable_record_bytes` and the
+    /// #118 logical/physical write-amp meters.
     pub produced_bytes: u64,
     /// Produces REJECTED because the durable log was at or over its byte cap (the drop-new
     /// shed, refs #10, #13): nothing was written and no offset advanced. A rejected produce is
@@ -1792,6 +1813,12 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// compactor, so CPU and flash are never spent compacting a segment about to be reaped. See
     /// [`ironbus_storage::compaction`] and `docs/COMPACTION.md`.
     compaction: ironbus_storage::compaction::CompactionConfig,
+    /// The per-record write-path compression configuration (#430, ADR-0003), materialized at open
+    /// from [`EngineConfig::compression`] with the frozen defaults (the 64-byte raw-store
+    /// threshold, no dictionary). Consulted on the single append seam
+    /// ([`Engine::append_no_sync`]); a `Codec::None` codec makes the seam a pass-through, so the
+    /// historical broker is byte-for-byte unchanged.
+    compress: CompressConfig<'static>,
 }
 
 /// The file name of the work-group's durable committed-cursor checkpoint.
@@ -2004,6 +2031,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // `set_compaction_config`. A broker that does not is byte-for-byte unchanged (no v2
             // segment is ever written, no compaction pass ever runs).
             compaction: ironbus_storage::compaction::CompactionConfig::default(),
+            // The write-path compression seam (#430, ADR-0003): the configured codec with the
+            // frozen defaults (64-byte raw-store threshold, dict_id 0, no dictionary). With
+            // `Codec::None` the seam never runs, so the disk image is byte-for-byte historical.
+            compress: CompressConfig {
+                codec: config.compression,
+                ..CompressConfig::default()
+            },
         };
         engine.seed_registry_from_recovered_state(flushed);
         Ok(engine)
@@ -2554,13 +2588,57 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// half of group commit (#177): the append actor drains a batch of pending appends through here,
     /// then issues ONE `commit_batch` covering them all.
     ///
+    /// This is also the single write-path COMPRESSION seam (#430, ADR-0003): with a non-`None`
+    /// [`EngineConfig::compression`] codec, the payload is compressed HERE, before
+    /// `append_with_policy`, so the CRC, the byte-cap and segment-roll checks,
+    /// `durable_record_bytes`, and the #118 write-amp meters all account the STORED bytes. The two
+    /// ADR-0003 write guards (the 64-byte raw-store threshold and the never-expand guard) keep a
+    /// small or incompressible payload stored raw, byte-identical to an uncompressed write. A
+    /// message whose flags ALREADY carry [`RecordFlags::COMPRESSED`] (a producer-compressed
+    /// publish, or the DLQ redrive re-appending a stored record) passes through UNCHANGED, so a
+    /// stored object is never double-wrapped. `produced_bytes` deliberately counts the ORIGINAL
+    /// logical payload bytes, never the stored bytes (see [`Counters::produced_bytes`]).
+    ///
     /// # Errors
     /// As [`Engine::produce`]: a drop-new shed (either the byte-cap [`StorageError::AtCapacity`] or
     /// the daily-write-budget [`StorageError::DailyWriteBudgetExceeded`]) surfaces the non-fatal
     /// rejection and increments `produce_rejected`; any other storage error propagates. Nothing is
     /// written and no statistic moves on an error.
     pub fn append_no_sync(&mut self, message: &Append<'_>) -> Result<Offset, EngineError> {
-        let offset = match self.append_with_policy(message) {
+        // The write-path compression seam (#430, ADR-0003). The pass-through guard on an ALREADY
+        // COMPRESSED message is load-bearing twice over: the wire legally delivers bit 0 set (a
+        // producer may publish a pre-compressed stored object), and the DLQ redrive re-appends
+        // records that already carry the flag; compressing either again would wrap a descriptor
+        // in a descriptor and decode to garbage.
+        let comp;
+        let stored;
+        let to_append: &Append<'_> = if self.compress.codec == Codec::None
+            || message.flags.contains(RecordFlags::COMPRESSED)
+        {
+            message
+        } else {
+            match compress_payload(message.payload, &self.compress) {
+                Ok(c) if c.compressed => {
+                    comp = c;
+                    stored = Append {
+                        timestamp_ms: message.timestamp_ms,
+                        flags: message.flags.with(comp.flag()),
+                        key: message.key,
+                        headers: message.headers,
+                        payload: &comp.stored,
+                    };
+                    &stored
+                }
+                // A raw store (the sub-threshold or never-expand guard fired, the stored bytes
+                // are the payload byte-for-byte) or a compress error (only `PayloadTooLarge`,
+                // unreachable for wire-bounded payloads under the record cap): append the
+                // ORIGINAL message unchanged, so the produce error taxonomy is exactly the
+                // historical one and a raw-stored record is byte-identical to a no-compression
+                // write.
+                _ => message,
+            }
+        };
+        let offset = match self.append_with_policy(to_append) {
             Ok(offset) => offset,
             Err(e) => {
                 // A drop-new shed: count the rejection (a shed-rate signal) but advance no produce
@@ -2586,6 +2664,9 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         };
         // The record bytes are counted at append time (the bytes are committed to the active
         // segment), but the durable head and the fsync histogram advance only in `commit_batch`.
+        // Deliberately measured on the ORIGINAL `message`, not the compressed `to_append` (#430):
+        // `produced_bytes` keeps its producer-facing LOGICAL meaning regardless of the codec; the
+        // stored (post-compression) truth is `durable_record_bytes` and the #118 physical meters.
         self.registry.record_appended();
         self.counters.produced += 1;
         let bytes = message.key.len() + message.headers.len() + message.payload.len();
@@ -4861,6 +4942,10 @@ mod tests {
             fire_and_forget_refill_ms: 0,
             egress_limit: 0,
             wal_fsync_headroom_bytes: 0,
+            // Compression OFF in the shared test config (#430), so every existing test's disk
+            // image stays byte-identical to the pre-compression broker; the compression tests
+            // build a config with `Codec::Lz4` explicitly.
+            compression: Codec::None,
         }
     }
 

@@ -939,6 +939,8 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                // Compression OFF (#430) unless a test opts in; the transparency test uses its own rig.
+                compression: ironbus_core::compress::Codec::None,
             },
         )
         .unwrap();
