@@ -425,6 +425,77 @@ fn unit_wiring_a_healthy_binary_does_not_roll_back_on_unclean_power_loss() {
     );
 }
 
+// --- #420: the packaged unit file's privileged-helper wiring ------------------------------------
+
+#[test]
+fn the_packaged_unit_keeps_the_privileged_helper_wiring() {
+    // The root cause of #420 was that NOTHING asserted the shipped unit's content: dropping a `+`
+    // Exec prefix re-ships the fleet-wide healthy-broker kill loop (the EROFS-failed ExecStartPost
+    // makes systemd kill a HEALTHY broker at the end of the grace window, and Restart=on-failure
+    // with the rate limiter disabled retries forever), and no compile, unit-test, or release gate
+    // catches it. So this test pins the unit file's load-bearing lines: the three lifecycle helpers
+    // run privileged (`+`), the broker itself does NOT, and the directives the fall-back-after-N
+    // design leans on are present.
+    let unit_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/systemd/ironbus.service");
+    let unit = std::fs::read_to_string(&unit_path).unwrap_or_else(|e| {
+        panic!(
+            "the packaged unit must exist at {}: {e}",
+            unit_path.display()
+        )
+    });
+
+    // (a) Each lifecycle hook appears EXACTLY once (the counter means "consecutive genuinely-failed
+    // starts" only if each hook has ONE job) and runs with the `+` full-privilege prefix.
+    for hook in ["ExecStartPre=", "ExecStartPost=", "ExecStopPost="] {
+        let values: Vec<&str> = unit.lines().filter_map(|l| l.strip_prefix(hook)).collect();
+        assert_eq!(
+            values.len(),
+            1,
+            "{hook} must appear exactly once in the packaged unit, got {values:?}"
+        );
+        assert!(
+            values[0].starts_with("+/bin/sh"),
+            "{hook} must run privileged via `+/bin/sh` (#420): a dropped `+` makes every counter \
+             write fail with EROFS under ProtectSystem=strict and re-ships the healthy-broker \
+             kill loop (got: {hook}{})",
+            values[0]
+        );
+    }
+
+    // (b) The broker itself stays fully sandboxed: no `+` on ExecStart. (strip_prefix("ExecStart=")
+    // cannot match the Pre/Post hook lines above, whose prefix continues with "Pre="/"Post=".)
+    let exec_start: Vec<&str> = unit
+        .lines()
+        .filter_map(|l| l.strip_prefix("ExecStart="))
+        .collect();
+    assert_eq!(
+        exec_start.len(),
+        1,
+        "the packaged unit must hold exactly one ExecStart=, got {exec_start:?}"
+    );
+    assert!(
+        !exec_start[0].starts_with('+'),
+        "ExecStart (the broker) must NOT carry the `+` prefix; the sandbox exemption is for the \
+         three helpers only (got: ExecStart={})",
+        exec_start[0]
+    );
+
+    // (c) The directives the fall-back-after-N design leans on. Losing any of these silently
+    // changes the failure semantics the unit-wiring lifecycle tests above prove.
+    for line in [
+        "StartLimitIntervalSec=0",
+        "Restart=on-failure",
+        "ProtectSystem=strict",
+        "User=ironbus",
+    ] {
+        assert!(
+            unit.lines().any(|l| l.trim() == line),
+            "the packaged unit must keep `{line}` (the fall-back-after-N design depends on it)"
+        );
+    }
+}
+
 // --- #348: two-rename re-entry window, over the real binary -------------------------------------
 
 /// The fingerprint the CLI records for the known-bad guard: `"<crc32c hex>-<len>"`. Kept in lockstep
