@@ -31,14 +31,24 @@
 # (or before the counter clear) re-enters deterministically and converges to the good binary rather
 # than promoting the just-failed bytes. No unit change is needed for this; it is internal to the verbs.
 #
-# The three helper lines run with the `+` full-privilege Exec prefix (#420; supported since systemd
-# 231): they are exempt from User= and the filesystem sandboxing below, while ExecStart itself stays
-# fully sandboxed. Without the prefix, ProtectSystem=strict made /usr read-only for the helpers, so
-# every counter write next to the binary failed with EROFS; the failed ExecStartPost then made
-# systemd kill a HEALTHY broker at the end of the grace window (an infinite kill/restart loop, since
-# Restart=on-failure retries forever with the rate limiter disabled), and the EROFS-failed
-# ExecStopPost meant the fall-back-after-N mechanism could never trigger at all. The helpers must be
-# privileged anyway: a real rollback replaces the root-owned binary at /usr/bin/ironbus.
+# The three helper lines run with the `+` full-privilege Exec prefix (#420): they are exempt from
+# User= and the filesystem sandboxing below, while ExecStart itself stays fully sandboxed. Without
+# the prefix, ProtectSystem=strict made /usr read-only for the helpers, so every counter write next
+# to the binary failed with EROFS; the failed ExecStartPost then made systemd kill a HEALTHY broker
+# at the end of the grace window (an infinite kill/restart loop, since Restart=on-failure retries
+# forever with the rate limiter disabled), and the EROFS-failed ExecStopPost meant the
+# fall-back-after-N mechanism could never trigger at all. The helpers must be privileged anyway: a
+# real rollback replaces the root-owned binary at /usr/bin/ironbus.
+#
+# Version floor: the `+` prefix itself dates to systemd v231, but 231 is NOT a supported floor for
+# this unit. The real floor is systemd 235 (StateDirectory=), with 232 needed for $SERVICE_RESULT
+# and ProtectSystem=strict. On exactly 231, $SERVICE_RESULT is never set, so the ExecStopPost guard
+# below would run `record-start --failed` as root on EVERY clean stop, and three clean stops would
+# roll back a healthy binary.
+#
+# NOTE: /etc/ironbus/ironbus.env is root-equivalent input to the `+` helpers (EnvironmentFile=
+# overrides Environment=, so an IRONBUS_BIN set there redirects --dest for the root-run
+# rollback/record-start); it ships root:root 0644 as a dpkg conffile and MUST remain root-owned.
 
 [Unit]
 Description=IronBus durable edge message queue

@@ -12,6 +12,7 @@ to follow Semantic Versioning once it reaches a tagged release.
 ### Fixed
 - The systemd unit's three lifecycle helper lines (`ExecStartPre` consult/rollback, `ExecStartPost --ok`, `ExecStopPost --failed`) now run with the `+` full-privilege Exec prefix, while `ExecStart` stays fully sandboxed (Closes #420).
   - Unprefixed, `User=ironbus` + `ProtectSystem=strict` made every counter write next to the binary fail with EROFS: the failed `ExecStartPost` made systemd kill a healthy broker at the end of the grace window and restart it forever (`Restart=on-failure` with the rate limiter disabled), and the failed `ExecStopPost` meant the fall-back-after-N mechanism could never trigger. The helpers need privilege anyway, since a rollback replaces the root-owned binary.
+  - The `+` prefix dates to systemd v231, but 231 is not a supported floor: the unit's real floor is systemd 235 (`StateDirectory=`), with 232 needed for `$SERVICE_RESULT` and `ProtectSystem=strict`. On exactly 231, `$SERVICE_RESULT` is never set, so the `ExecStopPost` guard would run `record-start --failed` as root on every clean stop, and three clean stops would roll back a healthy binary.
   - `docs/DISTRIBUTION.md` unit-wiring section updated to match.
 - Hardened the upgrade rollback against the two-rename re-entry window (Closes #348).
   - `ironbus rollback` now restores `ironbus.prev` over the destination WITHOUT first moving the destination onto `.prev`, so a power cut between the renames preserves the last known-good bytes and a re-entry converges to the good binary.
