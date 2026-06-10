@@ -2519,7 +2519,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // Inserting the live group below also SUPERSEDES any ghost floor pin (#432): once the
         // name is live, `min_committed_offset` reads the touched resumed cursor (exactly the
         // ghost's value) instead of the ghost entry, so the floor follows the returning
-        // consumer's live progress immediately, no checkpoint write needed.
+        // consumer's live progress immediately, no checkpoint write needed. This resume-at-ghost
+        // property holds for THIS consumer path only: the serve-flag declared-group paths
+        // (`set_key_ordering_in`, `set_broadcast_in`) create an absent group fresh at offset 0
+        // without resuming, which supersedes the ghost with a LOWER (more conservative) pin
+        // until the declared group drains; the floor can move down there, never up.
         self.group_last_checkpointed
             .insert(group.to_string(), cursor.committed().get());
         let g = resume_work_group(
@@ -3313,10 +3317,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// is an idle-evicted group's durable position, kept by the sweep so eviction (a memory
     /// reclaim) never silently weakens retention protection the way absence would. A ghost is
     /// touched by construction (it carried durable state). The ghost is superseded the moment
-    /// the group returns (the live resumed cursor takes over via the touched filter) and is
-    /// released by an explicit Unsub ([`Engine::evict_group_if_idle`]). Note the pin binds only
-    /// the consumer-safe reaper: `reap_oldest_forced` under drop-oldest deliberately ignores the
-    /// floor, ghost or live.
+    /// the group returns (the live group takes over via the touched filter: the consumer paths
+    /// resume at exactly the ghost's value, while the serve-flag declared-group paths create
+    /// fresh at offset 0, a LOWER and therefore safe pin) and is released by an explicit Unsub
+    /// ([`Engine::evict_group_if_idle`]). Note the pin binds only the consumer-safe reaper:
+    /// `reap_oldest_forced` under drop-oldest deliberately ignores the floor, ghost or live.
+    /// The ghost set is bounded by the distinct group names ever checkpointed (the same class
+    /// of bound as the on-disk checkpoint files, which open already loads unboundedly by
+    /// design); each retention pass scans it with one live-map lookup per entry.
     fn min_committed_offset(&self) -> u64 {
         let live = self
             .groups
@@ -3513,7 +3521,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // interval gate and is only touched while the group is live), and the default group
             // `""` is always live so it can never reach this arm. The release is in-memory only
             // (the `cursor-<hex>.ckpt` is never deleted), so a restart conservatively re-pins via
-            // recovery.
+            // recovery. Any connection that can speak the wire can release any ghost by name
+            // (SUB then UNSUB on an absent group): that matches the pre-#106 trust model, where
+            // an unauthenticated peer can already produce, consume, and ack on any group; the
+            // authed surface (#106/#380) is where per-group rights would land.
             self.group_last_checkpointed.remove(group);
             return false;
         };

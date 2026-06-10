@@ -741,7 +741,8 @@ Notes:
     re-subscribe resumes where it left off. An evicted group's durable position also keeps
     pinning the retention protect floor until the group returns or an explicit unsub releases it
     (#432), so eviction reclaims memory, never retention protection (drop-oldest force-reaps
-    still ignore the floor). The sweep is clock-driven (run on produce and poll, no
+    still ignore the floor; the unsub release is in-memory only, so a restart re-pins the
+    renounced group at its durable checkpoint until it drains or unsubscribes again). The sweep is clock-driven (run on produce and poll, no
     background thread). An explicit unsub of a now-idle named group reclaims it immediately.
     --disk-full-policy (default drop-new) sets what an over-cap produce does once --max-total-bytes
     is hit: drop-new sheds it (preserving older data); drop-oldest force-reaps the oldest sealed

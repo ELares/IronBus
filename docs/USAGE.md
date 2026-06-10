@@ -149,7 +149,9 @@ at the oldest retained record with a one-time truncation notice. An idle-evicted
 (`--group-idle-evict-ms`) keeps its protection: its durable position pins the floor as a ghost
 until the group returns or an explicit unsub releases it (#432), so memory reclaim never
 silently weakens retention protection (the opt-in drop-oldest force-reap still ignores the
-floor, ghost or live).
+floor, ghost or live). The unsub release is in-memory only: the durable checkpoint is never
+deleted, so a restart resumes the renounced group as a live consumer at its old position,
+re-pinning the floor until it drains or is unsubscribed again.
 
 The DEFAULT disk-full policy is drop-new: when the byte cap is hit, IronBus sheds the
 new produce, it does not delete old acknowledged records. The opt-in
