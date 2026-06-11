@@ -8859,9 +8859,14 @@ mod tests {
         // strict per-verb parser already rejects it as an unknown flag at USAGE level (exit 1),
         // BEFORE touching the filesystem; that is the clear error path the issue asks for (never
         // the confusing `data dir not found` exit 2). This test pins the rejection for all seven
-        // data-dir verbs, so a future shared-parser refactor cannot silently start accepting
-        // (and ignoring) the flag. The offline verbs also read NO env vars, so an
-        // `IRONBUS_STORAGE=memory` in a unit env file cannot leak into them either.
+        // offline data-dir verbs PLUS `top` (dual-mode, but `top --data-dir` is in the docs'
+        // data-dir enumeration, so its strict parser is pinned with the rest), so a future
+        // shared-parser refactor cannot silently start accepting (and ignoring) the flag. The
+        // zstd-only `dict install` / `dict ls` are the feature-gated equivalents (strict per-verb
+        // parsers over `--data-dir` that reject the flag the same way); they are not in the array
+        // because this test must pass on a default (no-zstd) build. The offline verbs also read
+        // NO `IRONBUS_*` env vars, so an `IRONBUS_STORAGE=memory` in a unit env file cannot leak
+        // into them either.
         let verbs: &[&[&str]] = &[
             &["peek", "--storage", "memory"],
             &["dump", "--storage", "memory"],
@@ -8870,6 +8875,7 @@ mod tests {
             &["admin", "consumer-reset", "--storage", "memory"],
             &["admin", "dlq-redrive", "--storage", "memory"],
             &["migrate", "--storage", "memory"],
+            &["top", "--storage", "memory"],
         ];
         for argv in verbs {
             let owned: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
