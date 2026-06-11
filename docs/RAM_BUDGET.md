@@ -393,7 +393,7 @@ configured caps imply provably exceeds the ceiling. The footprint is a CLOSED
 formula in the config (no live RSS), summing the FIRMLY-BOUNDED terms above:
 
 ```
-worst_case = term1 + term3 + term5
+worst_case = term1 + term3 + term4mem + term5
 
 term1 (per-connection in-flight payloads, the firm RAM bound)
      = max_connections * per_conn_inflight
@@ -401,10 +401,23 @@ term1 (per-connection in-flight payloads, the firm RAM bound)
                             consumer_credit * MAX_FRAME_LEN     if it is 0 (UNLIMITED)
 term3 (per-group cursor + lease state)
      = max_groups * max_in_flight * PER_LEASE_BYTES (~64 bytes)
+term4mem (the store, ONLY under --storage memory; 0 on disk)
+     = IN_MEMORY_STORE_IMAGES (2) * max_total_bytes
 term5 (fixed overhead + one OS-thread stack per connection)
      = FIXED_OVERHEAD_BYTES (~4 MiB)
      + max_connections * PER_CONNECTION_STACK_BYTES (~64 KiB resident)
 ```
+
+THE MEMORY-BACKEND STORE FOLD (#445, refs #443): on DISK the store is term 4 of
+the budget above, ~0 in RSS (written straight to file), so the guard does not
+charge it and the disk verdict is the historical one bit-for-bit. Under
+`--storage memory` the store ITSELF is RAM: the engine retains up to
+`--max-total-bytes` of stored bytes, and the in-memory filesystem keeps a SECOND
+byte image per file (the durable image each `sync_data` clones the live bytes
+into, the power-loss-simulation contract), so the guard charges
+`2 * max_total_bytes` and refuses a ceiling below the modeled floor. Memory mode
+already refuses an unlimited (`0`) byte cap at boot, so the store term is always
+finite there.
 
 WHY this is PROVABLE-FROM-CONFIG and not a boot RSS guess: every term is a
 CONFIGURED cap multiplied to its maximum, so the sum is the largest the bounded
