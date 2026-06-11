@@ -1674,15 +1674,24 @@ fn memory_mode_sheds_past_the_byte_cap_and_rss_stays_bounded() {
 
 #[test]
 fn memory_mode_refuses_a_ram_ceiling_below_the_store_floor() {
-    // The #445 store fold at the REAL binary: before it, `--ram-ceiling-bytes 64MiB` plus
-    // `--max-total-bytes 1GiB` BOOTED in memory mode, because the #115 guard modeled connections,
-    // credits, groups, and in-flight only and the store was honestly excluded as ~0 RSS, which is
-    // true ONLY on disk. In memory mode the store is RAM (twice over: the live bytes plus the
-    // durable-image clone), so that exact flag pair must now refuse to boot (exit 1, usage,
-    // BEFORE any listener opens) with a message naming the store term and the knob to lower.
-    let out = Command::new(BIN)
+    // The #445 store fold at the REAL binary, arranged so the STORE TERM ALONE decides the
+    // verdict: the edge-tiny profile's connection terms (32 connections, 256 KiB credit bytes,
+    // 64 groups, 256 in-flight) sum to ~15 MiB, comfortably under the 64 MiB ceiling, so THIS
+    // EXACT invocation booted before the fold (the #115 guard modeled connections, credits,
+    // groups, and in-flight only; the store was honestly excluded as ~0 RSS, which is true only
+    // on disk). With the store folded in, the 1 GiB in-RAM cap is charged at two byte images
+    // (the live bytes plus the durable-image clone) and the same invocation must now refuse to
+    // boot (exit 1, usage, BEFORE any listener opens) with a message naming the store term and
+    // the knob to lower. The small connection terms are load-bearing: under the balanced
+    // defaults, term 1 alone (256 connections x 8 MiB credit bytes = 2 GiB) exceeds the ceiling
+    // and the guard refuses with or without the store fold, so a fold-less mutant would pass.
+    // Here a fold-less mutant BOOTS, and the bounded wait below turns that boot into a loud
+    // failure instead of a hung suite.
+    let child = Command::new(BIN)
         .args([
             "serve",
+            "--profile",
+            "edge-tiny",
             "--storage",
             "memory",
             "--ephemeral-loss-ack",
@@ -1693,14 +1702,39 @@ fn memory_mode_refuses_a_ram_ceiling_below_the_store_floor() {
             "--addr",
             "127.0.0.1:0",
         ])
-        .output()
-        .expect("run ironbus serve");
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ironbus serve");
+    let mut guard = ChildGuard(child);
+    // A bounded poll, deliberately NOT `.output()`: if the store fold regresses, the broker
+    // BOOTS and never exits, and `.output()` would hang the test forever. The deadline converts
+    // "booted" into the failure it is (the guard kills the orphan on the way out).
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = guard.0.try_wait().expect("poll the refused serve") {
+            break status;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the broker BOOTED (still running 10s in): the memory-store fold is gone from the \
+             RAM-ceiling guard, so a 1 GiB in-RAM store was accepted under a 64 MiB ceiling"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert_eq!(
-        out.status.code(),
+        status.code(),
         Some(1),
         "a memory-mode ceiling below the store floor is a usage refusal (exit 1)"
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut stderr = String::new();
+    guard
+        .0
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut stderr)
+        .expect("read the refusal message");
     assert!(
         stderr.contains("refuses to boot"),
         "the refusal is the boot guard: {stderr}"

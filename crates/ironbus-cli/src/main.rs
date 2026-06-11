@@ -2738,9 +2738,13 @@ fn validate_durability(config: &ServeConfig) -> Result<(), CliError> {
 /// - DISK: `worst_case = buffers(conns, credits, groups, in-flight) + fixed` (unchanged, the
 ///   historical verdict bit-for-bit; the store stays uncharged because it is not RAM).
 /// - MEMORY: `worst_case = buffers(...) + fixed + 2 * max_total_bytes` (the store fold). A
-///   `--ram-ceiling-bytes` below that floor REFUSES TO BOOT with a message naming the store term,
-///   so `--ram-ceiling-bytes 64MiB --max-total-bytes 1GiB --storage memory` (which booted before
-///   this fold) is now a provable refusal, never a silent OOM promise.
+///   `--ram-ceiling-bytes` below that floor REFUSES TO BOOT with a message naming the store term.
+///   The config the fold catches is one whose BUFFER terms fit the ceiling while the in-RAM store
+///   does not: edge-tiny knobs (~15 MiB of buffers under the 64 MiB ceiling) with
+///   `--max-total-bytes 1GiB --storage memory` BOOTED before this fold and are now a provable
+///   refusal, never a silent OOM promise. (Under the server-sized balanced defaults the same
+///   ceiling was already refused on term 1 alone, 256 connections x 8 MiB of credit bytes, so the
+///   fold changes nothing there.)
 fn validate_ram_ceiling(config: &ServeConfig) -> Result<(), CliError> {
     // `usize` -> `u64` is lossless on every supported (32/64-bit) target; the saturating fallback is
     // belt-and-braces so a hypothetical >u64 platform could only ever make the worst case LARGER (more
@@ -8418,12 +8422,15 @@ mod tests {
 
     #[test]
     fn memory_storage_folds_the_store_into_the_ram_ceiling_proof() {
-        // THE #445 MEMORY-BACKEND FOLD, the refusal direction. `--ram-ceiling-bytes 64MiB` plus
-        // `--max-total-bytes 1GiB` BOOTED before this fold (the #115 guard modeled connections,
-        // credits, groups, and in-flight only, never the store), which in memory mode is a silent
-        // OOM promise: the store itself is RAM. With the store folded in (charged at 2x for the
-        // in-memory durable-image clone) the same pair is now a provable refusal that NAMES the
-        // store term and the knob to lower. This test FAILS if the fold is removed.
+        // THE #445 MEMORY-BACKEND FOLD, the refusal direction. With THESE edge-tiny buffer caps
+        // (~15 MiB worst case, comfortably under the 64 MiB ceiling), `--max-total-bytes 1GiB`
+        // in memory mode BOOTED before this fold (the #115 guard modeled connections, credits,
+        // groups, and in-flight only, never the store), which in memory mode is a silent OOM
+        // promise: the store itself is RAM. With the store folded in (charged at 2x for the
+        // in-memory durable-image clone) the same config is now a provable refusal that NAMES
+        // the store term and the knob to lower. This test FAILS if the fold is removed. The
+        // small buffer caps are what make that kill possible: under the balanced defaults the
+        // ceiling is exceeded by the connection terms alone and a fold-less mutant still refuses.
         let cfg = ServeConfig {
             storage: StorageArg::Memory,
             ephemeral_loss_ack: true,
