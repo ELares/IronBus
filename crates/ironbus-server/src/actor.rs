@@ -148,6 +148,41 @@ pub enum ProduceOutcome {
     Failed(EngineError),
 }
 
+/// A produce that has been SUBMITTED but whose outcome has not necessarily been awaited yet: the
+/// decoupled half of the pipelined-publish path (#450). The session submits every `Pub` in a pass
+/// through [`EngineAccess::produce_submit`] and parks the submission, so the actor sees the whole
+/// in-flight window in one drain and covers it with ONE group-commit fsync; the parked submissions
+/// are then awaited in FIFO submission order, which is exactly the per-connection reply order the
+/// wire contract promises. I2 is untouched: the actor still releases no produce reply before the
+/// covering `commit_batch`, so `wait` cannot observe an ack that precedes its fsync.
+#[derive(Debug)]
+pub enum ProduceSubmission {
+    /// The outcome is already known: a direct (same-thread) engine performed the produce
+    /// synchronously, so there is nothing to await. The test-only [`EngineAccess`] impls and the
+    /// trait's default `produce_submit` use this arm; it keeps the pipelined session logic exercised
+    /// against a synchronous engine without a thread.
+    Ready(ProduceOutcome),
+    /// The produce is in flight to the append actor; the receiver yields the outcome only after the
+    /// covering group-commit fsync (I2), exactly like [`EngineHandle::produce`]'s awaited reply.
+    Pending(Receiver<ProduceOutcome>),
+}
+
+impl ProduceSubmission {
+    /// Awaits the produce outcome. For a [`ProduceSubmission::Pending`] submission this blocks until
+    /// the actor has issued the covering `commit_batch` and released the reply (I2); for a
+    /// [`ProduceSubmission::Ready`] one it returns immediately.
+    ///
+    /// # Errors
+    /// Returns [`ActorGone`] if the actor exited before replying, so the session ends the
+    /// connection cleanly rather than hanging on a dead actor.
+    pub fn wait(self) -> Result<ProduceOutcome, ActorGone> {
+        match self {
+            ProduceSubmission::Ready(outcome) => Ok(outcome),
+            ProduceSubmission::Pending(rx) => rx.recv().map_err(|_| ActorGone),
+        }
+    }
+}
+
 /// The error a handler sees when the actor is gone (it exited or panicked, so the command channel or
 /// the reply channel is closed). It is a TYPED error, never a panic, so a connection winds down
 /// cleanly instead of hanging forever on a dead actor (invariant: no lost replies / no deadlock).
@@ -244,6 +279,20 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
     /// Returns [`ActorGone`] if the actor exited before the produce could be enqueued or replied,
     /// so the handler ends the connection cleanly rather than hanging.
     pub fn produce(&self, append: OwnedAppend) -> Result<ProduceOutcome, ActorGone> {
+        self.produce_submit(append)?.wait()
+    }
+
+    /// Submits a produce for the next group commit WITHOUT awaiting its outcome, returning the
+    /// pending [`ProduceSubmission`] (#450): the pipelined-publish primitive. The send into the
+    /// bounded channel still blocks when the channel is full (backpressure), but the caller does not
+    /// wait for the covering fsync, so a session can put a whole window of produces in front of the
+    /// actor before awaiting the first reply; the actor drains them as ONE batch and covers the batch
+    /// with one `commit_batch`. The reply itself is still released only after that fsync (I2), so
+    /// awaiting the submission later yields exactly what [`EngineHandle::produce`] would have.
+    ///
+    /// # Errors
+    /// Returns [`ActorGone`] if the actor exited before the produce could be enqueued.
+    pub fn produce_submit(&self, append: OwnedAppend) -> Result<ProduceSubmission, ActorGone> {
         let (reply_tx, reply_rx) = sync_channel(1);
         self.tx
             .send(Command::Produce {
@@ -251,7 +300,7 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
                 reply: reply_tx,
             })
             .map_err(|_| ActorGone)?;
-        reply_rx.recv().map_err(|_| ActorGone)
+        Ok(ProduceSubmission::Pending(reply_rx))
     }
 
     /// Runs `job` on the owned engine and AWAITS its result. Used for every engine operation that is
@@ -331,6 +380,19 @@ pub trait EngineAccess<F: Filesystem, C: Clock> {
     /// Returns [`ActorGone`] if the engine is no longer reachable (the actor exited).
     fn produce(&self, append: OwnedAppend) -> Result<ProduceOutcome, ActorGone>;
 
+    /// Submits a produce WITHOUT awaiting its outcome (#450), so a session can keep a window of
+    /// produces in flight and let the actor group-commit them under ONE fsync. The default
+    /// implementation performs the produce synchronously and returns it already
+    /// [`ProduceSubmission::Ready`], which is exact for the direct (same-thread) engines: there is
+    /// no actor to pipeline into, so the awaited and submitted paths are the same one-message group
+    /// commit. [`EngineHandle`] overrides this with the real non-awaiting channel send.
+    ///
+    /// # Errors
+    /// Returns [`ActorGone`] if the engine is no longer reachable.
+    fn produce_submit(&self, append: OwnedAppend) -> Result<ProduceSubmission, ActorGone> {
+        Ok(ProduceSubmission::Ready(self.produce(append)?))
+    }
+
     /// Runs `job` on the engine and returns its result.
     ///
     /// # Errors
@@ -358,6 +420,12 @@ impl<F: Filesystem + 'static, C: Clock + Clone + 'static> EngineAccess<F, C>
 {
     fn produce(&self, append: OwnedAppend) -> Result<ProduceOutcome, ActorGone> {
         EngineHandle::produce(self, append)
+    }
+
+    fn produce_submit(&self, append: OwnedAppend) -> Result<ProduceSubmission, ActorGone> {
+        // The REAL non-awaiting submit (#450): the produce crosses to the actor now, the covering
+        // fsync is awaited later, so a session window group-commits under one `commit_batch`.
+        EngineHandle::produce_submit(self, append)
     }
 
     fn with<R, J>(&self, job: J) -> Result<R, ActorGone>

@@ -16,7 +16,9 @@
 //! malformed frame envelope is unrecoverable for a length-prefixed stream, so it ends the
 //! session.
 
-use crate::actor::{ActorGone, EngineAccess, OwnedAppend, OwnedDedup, ProduceOutcome};
+use crate::actor::{
+    ActorGone, EngineAccess, OwnedAppend, OwnedDedup, ProduceOutcome, ProduceSubmission,
+};
 use crate::engine::{AckResult, EngineError, NackResult, Poll, ProgressResult};
 use ironbus_core::clock::Clock;
 use ironbus_core::compress::{validate_descriptor_shape, DEFAULT_MAX_DECOMPRESSED_BYTES};
@@ -272,6 +274,18 @@ impl Session {
     /// the buffer has at least that many bytes, so each frame is decoded at most a constant number
     /// of times regardless of how it is trickled.
     ///
+    /// # The pipelined produce window (#450)
+    ///
+    /// Within one pass, `Pub` frames are SUBMITTED to the append actor without awaiting their
+    /// outcomes (the pending ack is PARKED), so a client that pipelines N PUBs into one buffer puts
+    /// all N produces in front of the actor before the first ack is awaited; the actor drains them
+    /// as ONE batch and covers it with one group-commit fsync instead of N. The parked acks are
+    /// released in FIFO submission order BEFORE any non-produce frame's reply, at the
+    /// [`MAX_PARKED_PRODUCES`] safety cap, and at the end of the pass, so the wire reply order is
+    /// exactly the frame order (the per-connection ordering contract) and every non-fire-and-forget
+    /// `Pub` still gets exactly one reply frame. I2 is untouched: the actor releases no produce
+    /// reply before the covering `commit_batch`, so a parked ack can never precede its fsync.
+    ///
     /// # Errors
     /// Returns [`SessionError::BadFrame`] if a frame envelope is malformed (the caller must then
     /// close the connection, a length-prefixed stream cannot resync), [`SessionError::EngineFatal`]
@@ -284,32 +298,77 @@ impl Session {
     ) -> Result<Progress, SessionError> {
         let mut consumed = 0;
         let mut committed_progress = false;
-        loop {
-            match decode_frame(&input[consumed..]).map_err(SessionError::BadFrame)? {
+        // The pass-scoped pipelined window (#450): produces submitted to the actor but not yet
+        // awaited. Scoped to ONE pass so the caller's flush boundary is unchanged: every parked ack
+        // is released into `out` before this method returns.
+        let mut parked: Vec<ParkedPub> = Vec::new();
+        let result = loop {
+            match decode_frame(&input[consumed..]).map_err(SessionError::BadFrame) {
+                Err(e) => break Err(e),
                 // The trailing frame is partial: report how many bytes it needs so the caller does
                 // not re-decode until at least that many have arrived (the #176 fix). `needed` is
                 // relative to the UNCONSUMED remainder (`&input[consumed..]`): the caller drains the
                 // `consumed` prefix, after which the partial frame sits at the front of its buffer
                 // and needs exactly `needed` bytes there, so the threshold the caller compares its
                 // post-drain buffer length against is this `needed` directly.
-                FrameDecode::Incomplete { needed } => {
-                    return Ok(Progress {
+                Ok(FrameDecode::Incomplete { needed }) => {
+                    break Ok(Progress {
                         consumed,
                         needed,
                         committed_progress,
                     });
                 }
-                FrameDecode::Frame {
+                Ok(FrameDecode::Frame {
                     type_tag,
                     body,
                     consumed: n,
-                } => {
+                }) => {
                     // A fatal engine error ends the session AFTER its Err response is
                     // queued (the caller flushes `out`, then closes).
-                    committed_progress |= self.dispatch(engine, type_tag, body, out)?;
+                    if matches!(FrameType::from_u8(type_tag), Some(FrameType::Pub)) {
+                        // The produce path parks its pending ack (the pipelined window, #450)
+                        // instead of awaiting it inline, so the actor can group-commit the whole
+                        // window under one fsync. A produce never advances a COMMITTED cursor, so
+                        // `committed_progress` is untouched, exactly as before.
+                        if let Err(e) = self.handle_pub(engine, body, &mut parked, out) {
+                            break Err(e);
+                        }
+                        // The safety cap: a buffer packed with tiny PUB frames cannot park without
+                        // bound. At the cap the window is released (awaited FIFO) and a new window
+                        // starts; the cap matches the actor channel's default bound, so a capped
+                        // window still group-commits in at most a couple of batches.
+                        if parked.len() >= MAX_PARKED_PRODUCES {
+                            if let Err(e) = drain_parked(&mut parked, out) {
+                                break Err(e);
+                            }
+                        }
+                    } else {
+                        // Any non-produce frame first releases the parked acks, so the reply order
+                        // on the wire is exactly the frame order (FIFO per connection). The
+                        // actor-side ordering is also preserved: the actor flushes its pending
+                        // produce batch before running any job, so an ack/flow/sub still observes
+                        // every prior produce durable.
+                        if let Err(e) = drain_parked(&mut parked, out) {
+                            break Err(e);
+                        }
+                        match self.dispatch(engine, type_tag, body, out) {
+                            Ok(c) => committed_progress |= c,
+                            Err(e) => break Err(e),
+                        }
+                    }
                     consumed += n;
                 }
             }
+        };
+        // End of the pass: release every still-parked ack (FIFO) before returning, so the caller's
+        // single `out` flush carries the whole window's replies. On an error exit the drain still
+        // runs (those produces already reached the actor and their acks belong on the wire before
+        // the close), but the FIRST error wins: a drain error after a loop error is the same fatal
+        // engine event and is subsumed by it.
+        let drained = drain_parked(&mut parked, out);
+        match result {
+            Err(e) => Err(e),
+            Ok(progress) => drained.map(|()| progress),
         }
     }
 
@@ -339,7 +398,14 @@ impl Session {
                 reply(out, FrameType::Pong, &[]);
                 Ok(false)
             }
-            Some(FrameType::Pub) => self.handle_pub(engine, body, out).map(|()| false),
+            // The un-pipelined produce path for a DIRECT dispatch call (the `process` loop
+            // intercepts Pub frames before dispatch so it can park them across the pass, #450): a
+            // one-entry window, submitted and immediately drained, byte-identical replies.
+            Some(FrameType::Pub) => {
+                let mut parked = Vec::new();
+                self.handle_pub(engine, body, &mut parked, out)?;
+                drain_parked(&mut parked, out).map(|()| false)
+            }
             Some(FrameType::Ack) => self.handle_ack(engine, body, out).map(|()| true),
             // A cumulative ack commits the broadcast cursor (when accepted), so it returns `true` to
             // run the interval checkpoint, exactly like a per-message Ack (#288).
@@ -440,17 +506,25 @@ impl Session {
         reply(out, FrameType::Info, &info_body);
     }
 
+    /// Handles a `Pub`: validates the wire body, then SUBMITS the produce to the actor and PARKS
+    /// the pending ack in `parked` (the pipelined window, #450) instead of awaiting it inline. The
+    /// caller releases the parked acks in FIFO submission order (see [`drain_parked`]); every
+    /// immediate (pre-submit) reply below first drains `parked`, so a validation error's `Err`
+    /// frame never overtakes an earlier produce's ack on the wire.
     fn handle_pub<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
         &mut self,
         engine: &E,
         body: &[u8],
+        parked: &mut Vec<ParkedPub>,
         out: &mut Vec<u8>,
     ) -> Result<(), SessionError> {
         if !self.connected {
+            drain_parked(parked, out)?;
             reply_err(out, "not connected");
             return Ok(());
         }
         let Ok(msg) = decode_pub(body) else {
+            drain_parked(parked, out)?;
             reply_err(out, "malformed pub body");
             return Ok(());
         };
@@ -468,12 +542,14 @@ impl Session {
         if let Some(d) = msg.dedup.as_ref() {
             if d.producer_id.len() > MAX_PRODUCER_ID_LEN {
                 if !fire_and_forget {
+                    drain_parked(parked, out)?;
                     reply_err(out, "producer_id too long");
                 }
                 return Ok(());
             }
             if d.msg_id.len() > MAX_MSG_ID_LEN {
                 if !fire_and_forget {
+                    drain_parked(parked, out)?;
                     reply_err(out, "msg_id too long");
                 }
                 return Ok(());
@@ -503,6 +579,7 @@ impl Session {
         if RecordFlags::from_bits(msg.flags).contains(RecordFlags::COMPRESSED) {
             if let Err(e) = validate_descriptor_shape(msg.payload, DEFAULT_MAX_DECOMPRESSED_BYTES) {
                 if !fire_and_forget {
+                    drain_parked(parked, out)?;
                     reply_err(out, &format!("malformed compressed descriptor: {e}"));
                 }
                 return Ok(());
@@ -543,91 +620,17 @@ impl Session {
             // otherwise appends it durably but sends NO PubAck (handled in the match below).
             fire_and_forget: msg.fire_and_forget,
         };
-        match engine.produce(append)? {
-            ProduceOutcome::Appended(offset) => {
-                reply_pub_ack(out, FrameType::PubAck, offset);
-                Ok(())
-            }
-            // A FIRE-AND-FORGET (QoS-0, #11, #402) produce sends NO frame, in BOTH dispositions: when
-            // APPENDED durably (the producer fired and forgot; the record is durable via the covering
-            // group-commit fsync, exactly like a normal produce, the client simply did not wait for
-            // the ack) and when DROPPED by the fire-and-forget token bucket (#336) under load (the
-            // QoS-0 producer accepts loss by contract; the drop was counted in
-            // `ironbus_fire_and_forget_shed_total`). The connection stays open either way.
-            ProduceOutcome::FireAndForgetAppended(_) | ProduceOutcome::FireAndForgetDropped => {
-                Ok(())
-            }
-            // A BENIGN dedup hit (#33): the `msg_id` was already in the producer's window, so the
-            // broker returns the ORIGINAL offset via the NEW PubAckDuplicate frame (the frozen PubAck
-            // body is untouched). It is a SUCCESS (`rc = 0`, `duplicate = true`), never an error, so an
-            // idempotent retry over a lossy edge link does not loop.
-            ProduceOutcome::AppendedDuplicate(offset) => {
-                reply_pub_ack(out, FrameType::PubAckDuplicate, offset);
-                Ok(())
-            }
-            // A stale-epoch fence (#33): a zombie session reused an old `producer_id` with an epoch
-            // below the broker's known high-water. Reject it with a distinct, stable message; the
-            // connection stays open so the producer can re-handshake with a fresh epoch.
-            ProduceOutcome::Fenced => {
-                if !fire_and_forget {
-                    reply_err(out, "fenced: stale producer epoch");
-                }
-                Ok(())
-            }
-            // A fatal error (frozen writer) would fail every future produce, so end the
-            // session rather than masquerade as a transient failure.
-            ProduceOutcome::Fatal(e) => {
-                // The session ends either way; for a fire-and-forget produce even this frame is
-                // suppressed (the client detects the close out of band, never a desync).
-                if !fire_and_forget {
-                    reply_err(out, "fatal storage error");
-                }
-                Err(SessionError::EngineFatal(e))
-            }
-            // The durable-log byte cap shed (drop-new): a distinct, stable message so a
-            // producer can tell a deliberate shed from a transient failure. The connection
-            // stays open, so the producer can keep going (a later produce succeeds once
-            // retention frees space).
-            ProduceOutcome::AtCapacity => {
-                if !fire_and_forget {
-                    reply_err(out, "at capacity");
-                }
-                Ok(())
-            }
-            // The CoDel load-shed (#68): the broker is overloaded past the controlled-delay target,
-            // so this NEW produce was shed to protect tail latency. A distinct, stable message so a
-            // producer can tell a latency-load shed from a disk-full shed (`at capacity`) or a
-            // transient failure. The connection stays open: a later produce succeeds once the standing
-            // delay clears. It NEVER dropped an already-accepted record (the shed is decided before the
-            // append), so I2 holds. The structured machine-actionable retry hint (`retry_after_ms` /
-            // `shed`) waits on the frozen-protocol extension (#11), per docs/BACKPRESSURE.md; until
-            // then the shed rides the existing bare `Err` frame, exactly like the byte-cap shed.
-            ProduceOutcome::Shed => {
-                if !fire_and_forget {
-                    reply_err(out, "shed under load");
-                }
-                Ok(())
-            }
-            // An fsync-HEADROOM shed (#378): the un-fsynced backlog (the loss window / RAM bound) is
-            // at its configured headroom and a group-commit drain could not free it (a relaxed
-            // durability level deferring the fsync), so this NEW produce is shed to keep the backlog
-            // bounded. A distinct, stable message so a producer can tell it from the CoDel latency
-            // shed ("shed under load") and the disk-full byte-cap shed ("at capacity"). The connection
-            // stays open (a later produce succeeds once the writer catches up); no accepted record is
-            // dropped, so this is reject-new-work only, like the byte-cap shed.
-            ProduceOutcome::WalHeadroomShed => {
-                if !fire_and_forget {
-                    reply_err(out, "wal fsync headroom exhausted");
-                }
-                Ok(())
-            }
-            ProduceOutcome::Failed(_) => {
-                if !fire_and_forget {
-                    reply_err(out, "produce failed");
-                }
-                Ok(())
-            }
-        }
+        // SUBMIT the produce to the actor WITHOUT awaiting (#450) and PARK the pending ack: the
+        // caller releases parked acks in FIFO submission order, so the reply this produce eventually
+        // gets is byte-identical to the awaited path's, only written later in the same pass. The
+        // submission still blocks on a FULL actor channel (backpressure), and the actor still
+        // releases the reply only after the covering group-commit fsync (I2).
+        let submission = engine.produce_submit(append)?;
+        parked.push(ParkedPub {
+            submission,
+            fire_and_forget,
+        });
+        Ok(())
     }
 
     /// Handles a consumer acknowledgement (ack, nack, term, or progress) for a delivered
@@ -1406,6 +1409,133 @@ fn reply_pub_ack(out: &mut Vec<u8>, frame_type: FrameType, offset: Offset) {
     reply(out, frame_type, &body);
 }
 
+/// The safety cap on a single pass's pipelined produce window (#450): how many produces a session
+/// may PARK (submitted to the actor, ack not yet awaited) before it must release the window. It
+/// bounds the parked-reply memory for a buffer packed with tiny PUB frames and matches the actor
+/// channel's default bound ([`crate::actor::DEFAULT_CHANNEL_BOUND`]), so a session can never queue
+/// more un-awaited produces than the channel was sized for. In practice the window is far smaller:
+/// the connection loop hands the session one read buffer at a time.
+const MAX_PARKED_PRODUCES: usize = 1024;
+
+/// One produce PARKED in a session's pipelined window (#450): the un-awaited submission plus the
+/// QoS-0 marker the reply mapping needs (a fire-and-forget produce gets NO frame for any
+/// disposition, the #11 no-frame contract).
+struct ParkedPub {
+    /// The submitted-but-not-awaited produce; awaiting it yields the outcome only after the
+    /// covering group-commit fsync (I2).
+    submission: ProduceSubmission,
+    /// Whether the producer marked this publish fire-and-forget (QoS-0, #11): suppresses every
+    /// reply frame for this produce, exactly like the awaited path.
+    fire_and_forget: bool,
+}
+
+/// Releases a parked produce window (#450): awaits each submission IN SUBMISSION ORDER and appends
+/// its reply frame(s) to `out`, so the wire sees exactly the FIFO ack order the per-connection
+/// contract promises. On a fatal outcome the error propagates immediately; the remaining parked
+/// entries are dropped un-replied, which is safe because a batch-covering fsync failure marks EVERY
+/// member of the batch fatal (the actor's `flush_pending`) and the session is closing anyway (the
+/// actor tolerates a dropped reply receiver). After this returns, `parked` is empty.
+fn drain_parked(parked: &mut Vec<ParkedPub>, out: &mut Vec<u8>) -> Result<(), SessionError> {
+    for p in parked.drain(..) {
+        let outcome = p.submission.wait()?;
+        write_pub_reply(outcome, p.fire_and_forget, out)?;
+    }
+    Ok(())
+}
+
+/// Maps one produce outcome to its wire reply, byte-identical to the pre-pipelining inline match:
+/// exactly one frame for a non-fire-and-forget produce (`PubAck`, `PubAckDuplicate`, or a typed
+/// `Err`), and NO frame for a fire-and-forget one (#11). A fatal outcome ends the session.
+fn write_pub_reply(
+    outcome: ProduceOutcome,
+    fire_and_forget: bool,
+    out: &mut Vec<u8>,
+) -> Result<(), SessionError> {
+    match outcome {
+        ProduceOutcome::Appended(offset) => {
+            reply_pub_ack(out, FrameType::PubAck, offset);
+            Ok(())
+        }
+        // A FIRE-AND-FORGET (QoS-0, #11, #402) produce sends NO frame, in BOTH dispositions: when
+        // APPENDED durably (the producer fired and forgot; the record is durable via the covering
+        // group-commit fsync, exactly like a normal produce, the client simply did not wait for
+        // the ack) and when DROPPED by the fire-and-forget token bucket (#336) under load (the
+        // QoS-0 producer accepts loss by contract; the drop was counted in
+        // `ironbus_fire_and_forget_shed_total`). The connection stays open either way.
+        ProduceOutcome::FireAndForgetAppended(_) | ProduceOutcome::FireAndForgetDropped => Ok(()),
+        // A BENIGN dedup hit (#33): the `msg_id` was already in the producer's window, so the
+        // broker returns the ORIGINAL offset via the NEW PubAckDuplicate frame (the frozen PubAck
+        // body is untouched). It is a SUCCESS (`rc = 0`, `duplicate = true`), never an error, so an
+        // idempotent retry over a lossy edge link does not loop.
+        ProduceOutcome::AppendedDuplicate(offset) => {
+            reply_pub_ack(out, FrameType::PubAckDuplicate, offset);
+            Ok(())
+        }
+        // A stale-epoch fence (#33): a zombie session reused an old `producer_id` with an epoch
+        // below the broker's known high-water. Reject it with a distinct, stable message; the
+        // connection stays open so the producer can re-handshake with a fresh epoch.
+        ProduceOutcome::Fenced => {
+            if !fire_and_forget {
+                reply_err(out, "fenced: stale producer epoch");
+            }
+            Ok(())
+        }
+        // A fatal error (frozen writer) would fail every future produce, so end the
+        // session rather than masquerade as a transient failure.
+        ProduceOutcome::Fatal(e) => {
+            // The session ends either way; for a fire-and-forget produce even this frame is
+            // suppressed (the client detects the close out of band, never a desync).
+            if !fire_and_forget {
+                reply_err(out, "fatal storage error");
+            }
+            Err(SessionError::EngineFatal(e))
+        }
+        // The durable-log byte cap shed (drop-new): a distinct, stable message so a
+        // producer can tell a deliberate shed from a transient failure. The connection
+        // stays open, so the producer can keep going (a later produce succeeds once
+        // retention frees space).
+        ProduceOutcome::AtCapacity => {
+            if !fire_and_forget {
+                reply_err(out, "at capacity");
+            }
+            Ok(())
+        }
+        // The CoDel load-shed (#68): the broker is overloaded past the controlled-delay target,
+        // so this NEW produce was shed to protect tail latency. A distinct, stable message so a
+        // producer can tell a latency-load shed from a disk-full shed (`at capacity`) or a
+        // transient failure. The connection stays open: a later produce succeeds once the standing
+        // delay clears. It NEVER dropped an already-accepted record (the shed is decided before the
+        // append), so I2 holds. The structured machine-actionable retry hint (`retry_after_ms` /
+        // `shed`) waits on the frozen-protocol extension (#11), per docs/BACKPRESSURE.md; until
+        // then the shed rides the existing bare `Err` frame, exactly like the byte-cap shed.
+        ProduceOutcome::Shed => {
+            if !fire_and_forget {
+                reply_err(out, "shed under load");
+            }
+            Ok(())
+        }
+        // An fsync-HEADROOM shed (#378): the un-fsynced backlog (the loss window / RAM bound) is
+        // at its configured headroom and a group-commit drain could not free it (a relaxed
+        // durability level deferring the fsync), so this NEW produce is shed to keep the backlog
+        // bounded. A distinct, stable message so a producer can tell it from the CoDel latency
+        // shed ("shed under load") and the disk-full byte-cap shed ("at capacity"). The connection
+        // stays open (a later produce succeeds once the writer catches up); no accepted record is
+        // dropped, so this is reject-new-work only, like the byte-cap shed.
+        ProduceOutcome::WalHeadroomShed => {
+            if !fire_and_forget {
+                reply_err(out, "wal fsync headroom exhausted");
+            }
+            Ok(())
+        }
+        ProduceOutcome::Failed(_) => {
+            if !fire_and_forget {
+                reply_err(out, "produce failed");
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1423,47 +1553,48 @@ mod tests {
     use ironbus_storage::log::{Append, LogConfig};
     use std::sync::Arc;
 
-    fn engine() -> Engine<InMemoryFs, ManualClock> {
-        Engine::open(
-            InMemoryFs::new(),
-            ManualClock::new(),
-            EngineConfig {
-                compression: ironbus_core::compress::Codec::None,
-                log: LogConfig::default(),
-                lease: LeaseConfig {
-                    visibility_nanos: 30,
-                    hard_cap_nanos: 100,
-                },
-                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
-                max_in_flight: 10,
-                consumer_credit: 64,
-                consumer_credit_bytes: 0,
-                checkpoint_interval: 1024,
-                max_retained_bytes: 0,
-                max_age_ms: 0,
-                max_messages: 0,
-                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
-                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
-                ram_ceiling_bytes: 0,
-                disk_full_policy: DiskFullPolicy::DropNew,
-                dedup: ironbus_core::dedup::DedupConfig::default(),
-                durability_level: crate::engine::DurabilityLevel::Sync,
-                flush_interval_ms: 0,
-                flush_max_bytes: 0,
-                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
-                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
-                codel_target_ms: 0,
-                codel_interval_ms: 0,
-                retry_budget_ratio_per_million: 0,
-                retry_budget_window_ms: 0,
-                fire_and_forget_msg_rate: 0,
-                fire_and_forget_byte_rate: 0,
-                fire_and_forget_refill_ms: 0,
-                egress_limit: 0,
-                wal_fsync_headroom_bytes: 0,
+    /// The shared session-test engine config, factored out so the pipelined-window test (#450) can
+    /// open the SAME config over a fault-injecting filesystem (to count fsyncs).
+    fn test_config() -> EngineConfig {
+        EngineConfig {
+            compression: ironbus_core::compress::Codec::None,
+            log: LogConfig::default(),
+            lease: LeaseConfig {
+                visibility_nanos: 30,
+                hard_cap_nanos: 100,
             },
-        )
-        .unwrap()
+            delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+            max_in_flight: 10,
+            consumer_credit: 64,
+            consumer_credit_bytes: 0,
+            checkpoint_interval: 1024,
+            max_retained_bytes: 0,
+            max_age_ms: 0,
+            max_messages: 0,
+            max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+            group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+            ram_ceiling_bytes: 0,
+            disk_full_policy: DiskFullPolicy::DropNew,
+            dedup: ironbus_core::dedup::DedupConfig::default(),
+            durability_level: crate::engine::DurabilityLevel::Sync,
+            flush_interval_ms: 0,
+            flush_max_bytes: 0,
+            // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+            // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+            codel_target_ms: 0,
+            codel_interval_ms: 0,
+            retry_budget_ratio_per_million: 0,
+            retry_budget_window_ms: 0,
+            fire_and_forget_msg_rate: 0,
+            fire_and_forget_byte_rate: 0,
+            fire_and_forget_refill_ms: 0,
+            egress_limit: 0,
+            wal_fsync_headroom_bytes: 0,
+        }
+    }
+
+    fn engine() -> Engine<InMemoryFs, ManualClock> {
+        Engine::open(InMemoryFs::new(), ManualClock::new(), test_config()).unwrap()
     }
 
     /// Decodes one response frame from the front of `out`.
@@ -5235,5 +5366,236 @@ mod tests {
             e.engine_mut().has_group("orders"),
             "UNSUB must not reclaim a group with an in-flight lease"
         );
+    }
+
+    /// Encodes one at-least-once PUB frame carrying `payload`, for the pipelined-window tests
+    /// (#450).
+    fn pub_frame(payload: &[u8]) -> Vec<u8> {
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload,
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        frame(FrameType::Pub, &pub_body)
+    }
+
+    #[test]
+    fn pipelined_pubs_in_one_pass_reply_fifo_acks_in_frame_order() {
+        // The pipelined window's WIRE contract (#450): N PUB frames in ONE input buffer get N
+        // PubAcks with the assigned offsets in FRAME order, and a non-produce frame between them
+        // (a Ping) gets its reply IN PLACE: the parked acks before it are released first, so the
+        // reply order on the wire is exactly the frame order (the per-connection FIFO contract).
+        let e = DirectEngine::new(engine());
+        let mut s = connected_session(&e);
+        let mut input = Vec::new();
+        input.extend_from_slice(&pub_frame(b"a"));
+        input.extend_from_slice(&pub_frame(b"b"));
+        input.extend_from_slice(&frame(FrameType::Ping, b""));
+        input.extend_from_slice(&pub_frame(b"c"));
+        let mut out = Vec::new();
+        let progress = s.process(&e, &input, &mut out).unwrap();
+        assert_eq!(progress.consumed, input.len(), "the whole pass consumed");
+        let frames = decode_all(&out);
+        let kinds: Vec<FrameType> = frames.iter().map(|(t, _)| *t).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                FrameType::PubAck,
+                FrameType::PubAck,
+                FrameType::Pong,
+                FrameType::PubAck
+            ],
+            "replies in frame order: the parked acks are released before the Pong"
+        );
+        let offsets: Vec<u64> = frames
+            .iter()
+            .filter(|(t, _)| *t == FrameType::PubAck)
+            .map(|(_, body)| decode_pub_ack(body).unwrap().offset)
+            .collect();
+        assert_eq!(offsets, vec![0, 1, 2], "FIFO acks carry the FIFO offsets");
+    }
+
+    #[test]
+    fn a_malformed_pub_mid_window_consumes_its_reply_slot_in_order() {
+        // A mid-window rejection must not desync the pipelined reply stream (#450): the malformed
+        // PUB's `Err` frame occupies ITS slot in the FIFO reply order (after the first produce's
+        // ack, before the next produce's), so a pipelining client can map reply k to message k.
+        let e = DirectEngine::new(engine());
+        let mut s = connected_session(&e);
+        let mut input = Vec::new();
+        input.extend_from_slice(&pub_frame(b"a"));
+        // A PUB whose body is too short to decode: a typed, connection-preserving reject.
+        input.extend_from_slice(&frame(FrameType::Pub, b""));
+        input.extend_from_slice(&pub_frame(b"c"));
+        let mut out = Vec::new();
+        let progress = s.process(&e, &input, &mut out).unwrap();
+        assert_eq!(progress.consumed, input.len());
+        let frames = decode_all(&out);
+        let kinds: Vec<FrameType> = frames.iter().map(|(t, _)| *t).collect();
+        assert_eq!(
+            kinds,
+            vec![FrameType::PubAck, FrameType::Err, FrameType::PubAck],
+            "the rejection's Err frame sits in its own reply slot, in frame order"
+        );
+        assert_eq!(decode_pub_ack(&frames[0].1).unwrap().offset, 0);
+        assert_eq!(
+            decode_pub_ack(&frames[2].1).unwrap().offset,
+            1,
+            "the rejected PUB appended nothing, so the next produce takes offset 1"
+        );
+    }
+
+    /// A test-only [`EngineAccess`] wrapper over the REAL [`crate::actor::EngineHandle`] that opens
+    /// the fault-fs sync gate the moment the LAST produce of the expected window has been
+    /// SUBMITTED (#450). It is the determinism seam for the fewer-fsyncs-than-N proof: while the
+    /// gate is closed the actor is provably parked inside the primer's covering fsync, so every
+    /// windowed produce is queued in the channel by the time the gate opens, and the actor's next
+    /// drain covers the WHOLE window with one `commit_batch`. No wall-clock sleep anywhere.
+    struct GateOpeningHandle {
+        inner: crate::actor::EngineHandle<ironbus_storage::fault::FaultFs<InMemoryFs>, ManualClock>,
+        control: ironbus_storage::fault::FaultControl,
+        /// Produces left before the gate opens; `Cell` suffices because a session drives its
+        /// engine access from one thread.
+        remaining: std::cell::Cell<usize>,
+    }
+
+    impl EngineAccess<ironbus_storage::fault::FaultFs<InMemoryFs>, ManualClock> for GateOpeningHandle {
+        fn produce(
+            &self,
+            append: crate::actor::OwnedAppend,
+        ) -> Result<ProduceOutcome, crate::actor::ActorGone> {
+            self.inner.produce(append)
+        }
+        fn produce_submit(
+            &self,
+            append: crate::actor::OwnedAppend,
+        ) -> Result<ProduceSubmission, crate::actor::ActorGone> {
+            let submission = self.inner.produce_submit(append)?;
+            let left = self.remaining.get().saturating_sub(1);
+            self.remaining.set(left);
+            if left == 0 {
+                // The whole window is in the actor's channel: release the parked primer fsync.
+                self.control.open_sync_gate();
+            }
+            Ok(submission)
+        }
+        fn with<R, J>(&self, job: J) -> Result<R, crate::actor::ActorGone>
+        where
+            R: Send + 'static,
+            J: FnOnce(&mut Engine<ironbus_storage::fault::FaultFs<InMemoryFs>, ManualClock>) -> R
+                + Send
+                + 'static,
+        {
+            self.inner.with(job)
+        }
+        fn now_monotonic_nanos(&self) -> u64 {
+            self.inner.now_monotonic_nanos()
+        }
+        fn consumer_credit_caps(&self) -> (u32, u64) {
+            self.inner.consumer_credit_caps()
+        }
+    }
+
+    #[test]
+    fn a_pipelined_window_from_one_connection_group_commits_with_fewer_fsyncs_than_n() {
+        // THE TEETH for the pipelined publish window (#450), at the WIRE/session layer over the
+        // REAL append actor: N PUB frames pipelined into ONE process pass from ONE connection are
+        // covered by ONE group-commit fsync (not N), every record durably lands, and the acks come
+        // back as N correct FIFO PubAcks in frame order. Determinism: the sync gate parks the actor
+        // on a primer produce's covering fsync; the GateOpeningHandle opens the gate only after the
+        // session has SUBMITTED the whole window, so the actor's next drain provably sees all N.
+        use crate::actor::{spawn_actor, DEFAULT_CHANNEL_BOUND};
+        use ironbus_storage::fault::FaultFs;
+
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let engine = Engine::open(fs, ManualClock::new(), test_config()).unwrap();
+        let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+
+        // Handshake BEFORE the gate closes (Connect never touches the actor's fsync path).
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&handle, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+
+        // Park the actor inside a primer produce's covering fsync: a provable barrier. Until the
+        // gate opens the actor consumes NO further command, so the whole window below queues into
+        // the channel and is drained as ONE batch (the same trick as the actor group-commit test).
+        control.close_sync_gate();
+        let primer = handle
+            .produce_submit(crate::actor::OwnedAppend {
+                timestamp_ms: 0,
+                flags: 0,
+                key: Vec::new(),
+                headers: Vec::new(),
+                payload: b"primer".to_vec(),
+                dedup: None,
+                enqueue_monotonic_nanos: 0,
+                fire_and_forget: false,
+            })
+            .unwrap();
+        control.wait_for_sync_gate_entered(1);
+
+        // The pipelined window: N PUB frames in ONE input buffer, ONE process pass. The pass
+        // submits all N (opening the gate on the last submission), then awaits the parked acks.
+        let n: u64 = 8;
+        let mut input = Vec::new();
+        for i in 0..n {
+            input.extend_from_slice(&pub_frame(format!("m{i}").as_bytes()));
+        }
+        let before = control.sync_count();
+        let window_handle = GateOpeningHandle {
+            inner: handle.clone(),
+            control: control.clone(),
+            remaining: std::cell::Cell::new(usize::try_from(n).unwrap()),
+        };
+        let progress = s.process(&window_handle, &input, &mut out).unwrap();
+        assert_eq!(progress.consumed, input.len(), "the whole window consumed");
+
+        // The primer (awaited only now) and the window are all durable.
+        assert!(matches!(primer.wait().unwrap(), ProduceOutcome::Appended(o) if o.get() == 0));
+
+        // N CORRECT FIFO ACKS: one PubAck per PUB, in frame order, with the contiguous offsets
+        // after the primer.
+        let frames = decode_all(&out);
+        assert_eq!(frames.len(), usize::try_from(n).unwrap());
+        let offsets: Vec<u64> = frames
+            .iter()
+            .map(|(t, body)| {
+                assert_eq!(*t, FrameType::PubAck);
+                decode_pub_ack(body).unwrap().offset
+            })
+            .collect();
+        assert_eq!(
+            offsets,
+            (1..=n).collect::<Vec<_>>(),
+            "FIFO acks with contiguous offsets after the primer"
+        );
+
+        // FEWER FSYNCS THAN N: the primer's gated fsync plus ONE covering `commit_batch` for the
+        // whole window. (The `before` snapshot was taken while the actor was parked, so the
+        // primer's own sync is already counted; the delta is the window's.)
+        let window_syncs = control.sync_count() - before;
+        assert_eq!(
+            window_syncs, 1,
+            "the whole pipelined window was covered by ONE group-commit fsync, not {n}"
+        );
+
+        // Durability: every record (primer + window) is at or below the flushed head.
+        let head = handle.with(|e| e.flushed_offset().get()).unwrap();
+        assert_eq!(head, n + 1, "primer + window all durable");
+
+        let _ = handle.shutdown();
+        drop(handle);
+        let _ = actor.join().unwrap();
     }
 }
