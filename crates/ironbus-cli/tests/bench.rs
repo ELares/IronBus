@@ -197,6 +197,115 @@ fn no_fsync_dry_run_flags_the_cost_not_measured() {
 }
 
 #[test]
+fn memory_storage_run_reports_and_never_claims_an_fsync_cost() {
+    // #445: `ironbus bench --storage memory` runs the isolated broker over the REAL
+    // `serve --storage memory` engine path and reports honest RAM-path numbers. The load-bearing
+    // assertions: the run completes and reports (exit 0, populated latency fields for a
+    // round-trip), the additive `storage` JSON field names the backend, the fsync cost is
+    // HONESTLY not measured (the in-memory engine issues no fsync at all, so claiming a cost
+    // would be dishonest), and NO synthetic data directory is ever created (nothing to
+    // auto-delete: the memory broker owns no files).
+    let tmp = PrivateTmp::new();
+    let out = run_bench_in(
+        &tmp,
+        &[
+            "--count",
+            "300",
+            "--mode",
+            "round-trip",
+            "--storage",
+            "memory",
+            "--json",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "bench --storage memory should exit 0; stderr: {stderr}\nstdout: {stdout}"
+    );
+    // The additive backend echo: a recorded RAM-path run is never mistaken for a disk number.
+    assert!(stdout.contains("\"storage\":\"memory\""), "json: {stdout}");
+    assert!(stdout.contains("\"schema_version\":1"), "json: {stdout}");
+    // It really measured: a 300-message round trip populates the latency histogram fields.
+    assert!(
+        !stdout.contains("\"latency_p50_us\":null"),
+        "p50 should be measured for a 300-message memory round trip: {stdout}"
+    );
+    assert!(stdout.contains("\"msgs_per_sec\":"), "json: {stdout}");
+    // THE HONESTY TEETH: no fsync exists in the in-memory engine, so the cost is not measured
+    // and never reported as a number. This FAILS if memory mode starts claiming an fsync cost.
+    assert!(
+        stdout.contains("\"fsync_measured\":false"),
+        "json: {stdout}"
+    );
+    assert!(stdout.contains("\"fsync_cost_us\":null"), "json: {stdout}");
+    // NO files: the memory bench broker never creates a synthetic data directory at all.
+    assert_eq!(
+        tmp.count_bench_dirs(),
+        0,
+        "a memory-mode bench run must never create a synthetic data directory"
+    );
+}
+
+#[test]
+fn memory_storage_keeps_the_entropy_modes_and_names_the_target() {
+    // #439's payload-entropy knob applies UNCHANGED over the memory backend (the fill is
+    // payload-side and storage-agnostic), and the human view names the in-memory target plus the
+    // memory-specific not-measured fsync wording.
+    let tmp = PrivateTmp::new();
+    let out = run_bench_in(
+        &tmp,
+        &[
+            "--count",
+            "100",
+            "--storage",
+            "memory",
+            "--payload-shape",
+            "random",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("isolated synthetic IN-MEMORY broker"),
+        "the human view names the in-memory target: {stdout}"
+    );
+    assert!(
+        stdout.contains("issues no fsync"),
+        "the human fsync line states the memory-mode reason, not the dry-run one: {stdout}"
+    );
+    assert_eq!(tmp.count_bench_dirs(), 0, "no synthetic dir in memory mode");
+}
+
+#[test]
+fn storage_with_a_live_addr_is_refused_at_the_binary() {
+    // `--storage` shapes only the isolated spawned broker; on a live run it would silently mean
+    // nothing, so the real binary refuses it (exit 1) even with the live acknowledgement, and
+    // never connects.
+    let out = run_bench(&[
+        "--count",
+        "1",
+        "--storage",
+        "memory",
+        "--addr",
+        "127.0.0.1:7777",
+        "--i-understand-this-is-live",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--storage with --addr must be exit 1 (usage)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("ISOLATED"), "stderr: {stderr}");
+}
+
+#[test]
 fn a_bounded_run_is_required() {
     // FLASH-ENDURANCE guard: no --duration/--count is a usage error (exit 1). This FAILS if the
     // required-bound guard is removed.

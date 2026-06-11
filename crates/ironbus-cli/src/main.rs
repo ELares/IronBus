@@ -744,6 +744,7 @@ USAGE:
     ironbus bench (--duration <secs> | --count <n>) [--mode <publish|subscribe|round-trip>]
                   [--rate <msg/s>] [--payload-bytes <n>] [--payload-shape <realistic|random>]
                   [--fetch-batch <n>] [--group <name>] [--no-fsync] [--json]
+                  [--storage <disk|memory>]
                   [--addr <host:port> --i-understand-this-is-live]
     ironbus upgrade --new-binary <path> --dest <path> [--max-failed-starts <n>]
     ironbus rollback --dest <path>
@@ -912,9 +913,14 @@ Notes:
     batches the bench broker's cursor checkpoints (the fsync cost is then reported as not measured).
     round-trip mode (the default) measures producer-to-consumer latency through the real durable
     path, so the fsync-cost number is honest. Payloads are realistic (compressible, codec-friendly)
-    by default; --payload-shape random uses incompressible noise. --json emits a single versioned
+    by default; --payload-shape random uses incompressible noise. bench --storage memory spawns the
+    isolated broker over the #443 ephemeral in-memory engine for honest RAM-path numbers next to
+    the disk numbers (bench supplies the ephemeral consent and a default in-RAM byte cap for its
+    own disposable synthetic broker; the fsync cost is reported as not measured, because the
+    in-memory engine issues no fsync at all). --storage shapes only the isolated broker and is
+    refused together with --addr. --json emits a single versioned
     object with explicitly-named latency-histogram fields (latency_p50_us, latency_p99_us,
-    latency_p999_us, latency_max_us).
+    latency_p999_us, latency_max_us) and an additive storage field naming the backend.
     Every serve setting can also be supplied via an environment variable IRONBUS_<FLAG>, the flag
     name uppercased with dashes as underscores (--max-total-bytes -> IRONBUS_MAX_TOTAL_BYTES,
     --data-dir -> IRONBUS_DATA_DIR, --addr -> IRONBUS_ADDR). Precedence is flag > env > default: an
