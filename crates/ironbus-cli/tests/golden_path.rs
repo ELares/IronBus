@@ -1552,11 +1552,15 @@ fn memory_mode_sheds_past_the_byte_cap_and_rss_stays_bounded() {
     //   1. the at-capacity drop-new shed reaches the PRODUCER as the existing typed `at capacity`
     //      error (never a silent drop, never a hang);
     //   2. the broker STAYS ALIVE and keeps serving on the same connection after every shed;
-    //   3. the broker's RSS stays BOUNDED while ~96x the cap is thrown at it. The bound is
-    //      deliberately generous (both store images, 2 * cap, plus a fixed slack for the binary,
-    //      buffers, and allocator overhead): the assertion is "does not grow with the offered
-    //      load", not a byte-exact budget. A regression that retains shed payloads (or leaks per
-    //      produce) blows through it by an order of magnitude.
+    //   3. the broker's RSS stays bounded FOR THIS ACK-PROGRESSING-OR-IDLE WORKLOAD while ~96x
+    //      the cap is thrown at it (no consumer ever attaches here, so nothing dead-letters; the
+    //      DLQ sink is deliberately byte-uncapped, poison evidence is never shed, and sits
+    //      OUTSIDE the modeled floor, so a poison-heavy workload is NOT covered by this bound,
+    //      see docs/RAM_BUDGET.md). The bound is deliberately generous (both store images,
+    //      2 * cap, plus a fixed slack for the binary, buffers, and allocator overhead): the
+    //      assertion is "does not grow with the offered load", not a byte-exact budget. A
+    //      regression that retains shed payloads (or leaks per produce) blows through it by an
+    //      order of magnitude.
     const CAP: u64 = 2 * 1024 * 1024; // --max-total-bytes: a tiny 2 MiB store
     const PAYLOAD_LEN: usize = 64 * 1024; // 64 KiB of incompressible noise per message
     const ATTEMPTS: usize = 3072; // 192 MiB offered, 96x the cap

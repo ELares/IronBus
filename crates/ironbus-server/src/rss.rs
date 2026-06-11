@@ -214,6 +214,16 @@ pub struct RamFootprintConfig {
 ///   [`IN_MEMORY_STORE_IMAGES`] (the live bytes PLUS the durable-image clone the in-memory
 ///   filesystem keeps per file at every `sync_data`). Disk mode passes `0` here, so the disk
 ///   verdict is bit-for-bit the historical one.
+/// - **The dead-letter sink (the DLQ), a DELIBERATE memory-mode exclusion.** The DLQ's log is
+///   byte-UNCAPPED by design (its `LogConfig.max_total_bytes` is `0`: a poison record is the
+///   durable evidence of a dropped message and must never itself be shed), and under
+///   `--storage memory` it lives on the SAME in-memory filesystem as the store, so dead-lettered
+///   bytes are RAM this model does not charge. The store term above bounds the MAIN log only, and
+///   the guard's proof holds for ACK-PROGRESSING workloads: a poison-heavy workload (consumers
+///   that never ack, so records dead-letter after `max_deliver` attempts) grows RSS OUTSIDE this
+///   modeled floor. Capping the DLQ would shed poison evidence, a different design decision; the
+///   honest mitigation is operational, so pair memory mode with consumers that make ack progress,
+///   watch `ironbus_dlq_records_total`, and tune `--max-deliver`.
 /// - **Term 6 (dedup)** costs nothing until a producer opts in, so it is not charged.
 ///
 /// Every multiply and add SATURATES, so an unbounded (`0` = off) cap that would overflow instead

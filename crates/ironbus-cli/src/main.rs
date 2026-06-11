@@ -2745,6 +2745,15 @@ fn validate_durability(config: &ServeConfig) -> Result<(), CliError> {
 ///   refusal, never a silent OOM promise. (Under the server-sized balanced defaults the same
 ///   ceiling was already refused on term 1 alone, 256 connections x 8 MiB of credit bytes, so the
 ///   fold changes nothing there.)
+///
+/// DELIBERATE EXCLUSION, the dead-letter sink: the DLQ's log is byte-UNCAPPED by design (poison
+/// evidence of dropped messages must never itself be shed), and in memory mode it lives on the
+/// SAME in-memory filesystem as the store, so the floor above bounds the MAIN log only and the
+/// proof holds for ACK-PROGRESSING workloads. A poison-heavy workload (consumers that never ack,
+/// dead-lettering at `--max-deliver`) grows RSS outside the modeled floor. Capping the DLQ would
+/// shed that evidence, a different design decision this guard does not make; the mitigation is
+/// operational (consumers that ack, `ironbus_dlq_records_total`, `--max-deliver`). See
+/// `ironbus_server::rss::worst_case_buffer_bytes` and `docs/RAM_BUDGET.md`.
 fn validate_ram_ceiling(config: &ServeConfig) -> Result<(), CliError> {
     // `usize` -> `u64` is lossless on every supported (32/64-bit) target; the saturating fallback is
     // belt-and-braces so a hypothetical >u64 platform could only ever make the worst case LARGER (more
@@ -2781,7 +2790,11 @@ fn validate_ram_ceiling(config: &ServeConfig) -> Result<(), CliError> {
                      `--max-total-bytes` ({max_total_bytes}) is charged TWICE (the live bytes plus \
                      the durable-image clone the in-memory filesystem keeps at each sync), so the \
                      store alone accounts for {store_bytes} bytes of the worst case. Lower \
-                     `--max-total-bytes` or raise the ceiling to cover the store.",
+                     `--max-total-bytes` or raise the ceiling to cover the store. Note: the \
+                     dead-letter sink is OUTSIDE this floor (it is deliberately uncapped, poison \
+                     evidence is never shed, and in memory mode it also lives in RAM), so the \
+                     bound holds for ack-progressing workloads; monitor \
+                     `ironbus_dlq_records_total` and tune `--max-deliver`.",
                     max_total_bytes = config.max_total_bytes,
                     store_bytes = config
                         .max_total_bytes

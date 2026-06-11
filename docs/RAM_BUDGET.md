@@ -417,7 +417,23 @@ byte image per file (the durable image each `sync_data` clones the live bytes
 into, the power-loss-simulation contract), so the guard charges
 `2 * max_total_bytes` and refuses a ceiling below the modeled floor. Memory mode
 already refuses an unlimited (`0`) byte cap at boot, so the store term is always
-finite there.
+finite there. Two honesty caveats on `term4mem`:
+
+- **The 2x is the steady-state RETAINED set, not an instantaneous bound.** The
+  durable image is refreshed by `clone_from` inside `sync_data`; when that clone
+  has to reallocate, the old durable allocation and the incoming bytes can
+  briefly coexist, so an instant mid-sync can exceed two images. Amortized and
+  at steady state, exactly two images are retained per file.
+- **The dead-letter sink (the DLQ) is DELIBERATELY excluded.** The DLQ's log is
+  byte-UNCAPPED by design (a poison record is the durable evidence of a dropped
+  message and must never itself be shed), and in memory mode it lives on the
+  SAME in-memory filesystem as the store, so `term4mem` bounds the MAIN log
+  only. The guard's proof therefore holds for ACK-PROGRESSING workloads; a
+  poison-heavy workload (consumers that never ack, so records dead-letter after
+  `--max-deliver` attempts, default 5) grows RSS OUTSIDE the modeled floor.
+  Capping the DLQ would shed poison evidence, a different design decision.
+  Operationally: pair memory mode with consumers that make ack progress,
+  monitor `ironbus_dlq_records_total`, and tune `--max-deliver`.
 
 WHY this is PROVABLE-FROM-CONFIG and not a boot RSS guess: every term is a
 CONFIGURED cap multiplied to its maximum, so the sum is the largest the bounded
