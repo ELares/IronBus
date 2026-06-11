@@ -8592,6 +8592,213 @@ mod tests {
         );
     }
 
+    // ---- #443 ephemeral in-memory storage backend ----
+
+    #[test]
+    fn memory_storage_refuses_to_boot_without_the_ephemeral_loss_acknowledgement() {
+        // THE EPHEMERAL SAFETY GATE (#443): `--storage memory` without the explicit consent is
+        // refused fail-closed (exit 1, before any listener opens), with a message that states the
+        // loss contract, what an ack still covers, and the flag to set. An ephemeral broker is
+        // never reachable by accident, mirroring the none/async durability gate.
+        let cfg = parse_serve_flags(&serve_args(&[
+            "--storage",
+            "memory",
+            "--max-total-bytes",
+            "1048576",
+        ]))
+        .unwrap()
+        .config;
+        match validate_serve_config(&cfg) {
+            Err(CliError::Usage(m)) => {
+                assert!(m.contains("`--storage memory`"), "names the backend: {m}");
+                assert!(
+                    m.contains("--ephemeral-loss-ack"),
+                    "names the consent flag: {m}"
+                );
+                assert!(
+                    m.contains("loses EVERY acknowledged message"),
+                    "states the loss contract: {m}"
+                );
+                assert!(
+                    m.contains("`--async-loss-ack` does NOT cover this"),
+                    "separates the two loss contracts: {m}"
+                );
+                assert_eq!(CliError::Usage(m).exit_code(), EXIT_USAGE);
+            }
+            other => panic!("memory without the consent must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_storage_refuses_an_unlimited_byte_cap() {
+        // THE RAM BOUND (#443): on disk an unbounded log fills the SD card; in memory it OOMs the
+        // device. `--storage memory` requires an explicit non-zero `--max-total-bytes`, whether
+        // the cap is left at its 0 default or set to 0 explicitly, and the refusal states that
+        // the cap meters STORED (post-compression) bytes.
+        for extra in [&[][..], &["--max-total-bytes", "0"][..]] {
+            let mut args = vec!["--storage", "memory", "--ephemeral-loss-ack"];
+            args.extend_from_slice(extra);
+            let cfg = parse_serve_flags(&serve_args(&args)).unwrap().config;
+            match validate_serve_config(&cfg) {
+                Err(CliError::Usage(m)) => {
+                    assert!(m.contains("--max-total-bytes"), "names the cap flag: {m}");
+                    assert!(
+                        m.contains("STORED") && m.contains("post-compression"),
+                        "states what the cap meters: {m}"
+                    );
+                    assert!(m.contains("OOMs"), "states the failure mode: {m}");
+                    assert_eq!(CliError::Usage(m).exit_code(), EXIT_USAGE);
+                }
+                other => panic!("memory with an unlimited cap must be refused, got {other:?}"),
+            }
+        }
+        // With BOTH the consent and an explicit cap, validation accepts the backend.
+        let ok = parse_serve_flags(&serve_args(&[
+            "--storage",
+            "memory",
+            "--ephemeral-loss-ack",
+            "--max-total-bytes",
+            "1048576",
+        ]))
+        .unwrap()
+        .config;
+        assert!(
+            validate_serve_config(&ok).is_ok(),
+            "memory with the consent and a byte cap must validate"
+        );
+        assert_eq!(ok.storage, StorageArg::Memory);
+    }
+
+    #[test]
+    fn memory_storage_refuses_an_explicit_data_dir() {
+        // `--storage memory` keeps no on-disk state, so a given `--data-dir` would silently mean
+        // nothing; the boot refuses it as a usage error (exit 1, before any listener opens)
+        // echoing the conflicting directory.
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--storage".to_string(),
+                "memory".to_string(),
+                "--ephemeral-loss-ack".to_string(),
+                "--max-total-bytes".to_string(),
+                "1048576".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-memory-mode-never-served".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => {
+                assert!(
+                    m.contains("`--data-dir` must be absent"),
+                    "states the rule: {m}"
+                );
+                assert!(
+                    m.contains("/tmp/ironbus-memory-mode-never-served"),
+                    "echoes the conflicting directory: {m}"
+                );
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_storage_backend_is_a_usage_error_naming_its_source() {
+        // A bad `--storage` value names the FLAG; the same bad value arriving via the
+        // `IRONBUS_STORAGE` env var names the ENV VAR, exactly like the other enum flags.
+        match parse_serve_flags(&serve_args(&["--storage", "floppy"])) {
+            Err(CliError::Usage(m)) => {
+                assert!(
+                    m.contains("`--storage` must be `disk` or `memory`, got `floppy`"),
+                    "names the flag and echoes the value: {m}"
+                );
+                assert_eq!(CliError::Usage(m).exit_code(), EXIT_USAGE);
+            }
+            other => panic!("a bad --storage value must be a usage error, got {other:?}"),
+        }
+        let env_map = |name: &str| -> Option<String> {
+            if name == "IRONBUS_STORAGE" {
+                Some("floppy".to_string())
+            } else {
+                None
+            }
+        };
+        match parse_serve_flags_with_env(&serve_args(&[]), &env_map) {
+            Err(CliError::Usage(m)) => assert!(
+                m.contains("`IRONBUS_STORAGE` must be `disk` or `memory`, got `floppy`"),
+                "names the env var: {m}"
+            ),
+            other => panic!("a bad IRONBUS_STORAGE value must be a usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_storage_backend_resolves_flag_over_env_over_default() {
+        // The standard precedence (#89): the default is disk; `IRONBUS_STORAGE=memory` selects the
+        // memory backend; an explicit `--storage disk` still beats the env var.
+        let none = parse_serve_flags(&serve_args(&[])).unwrap().config;
+        assert_eq!(none.storage, StorageArg::Disk, "the default is disk");
+        let env_map = |name: &str| -> Option<String> {
+            if name == "IRONBUS_STORAGE" {
+                Some("memory".to_string())
+            } else {
+                None
+            }
+        };
+        let from_env = parse_serve_flags_with_env(&serve_args(&[]), &env_map)
+            .unwrap()
+            .config;
+        assert_eq!(from_env.storage, StorageArg::Memory, "env beats the default");
+        let flag_wins = parse_serve_flags_with_env(&serve_args(&["--storage", "disk"]), &env_map)
+            .unwrap()
+            .config;
+        assert_eq!(flag_wins.storage, StorageArg::Disk, "the flag beats env");
+    }
+
+    #[test]
+    fn the_materialized_config_line_carries_the_storage_backend() {
+        // The #443 machine-checkable echo: the default disk line says storage=disk (ADDITIVE, the
+        // historical fields keep their order); memory mode says storage=memory with the data_dir
+        // field carrying the `none` sentinel (no path exists).
+        let disk = parse_serve_flags(&serve_args(&[])).unwrap().config;
+        let line = materialized_config_line(
+            &disk,
+            "127.0.0.1:7777",
+            Some(Path::new("/var/lib/ironbus")),
+        );
+        assert!(line.contains("storage=disk"), "{line}");
+        assert!(line.contains("data_dir=/var/lib/ironbus"), "{line}");
+        let memory = parse_serve_flags(&serve_args(&[
+            "--storage",
+            "memory",
+            "--ephemeral-loss-ack",
+            "--max-total-bytes",
+            "1048576",
+        ]))
+        .unwrap()
+        .config;
+        let line2 = materialized_config_line(&memory, "127.0.0.1:7777", None);
+        assert!(line2.contains("storage=memory"), "{line2}");
+        assert!(line2.contains("data_dir=none"), "{line2}");
+    }
+
+    #[test]
+    fn usage_lists_the_storage_flag_and_the_ephemeral_consent() {
+        // Both #443 flags are documented in the USAGE string, so `ironbus help` surfaces the
+        // backend selector next to its consent gate.
+        assert!(
+            USAGE.contains("--storage <disk|memory>"),
+            "USAGE must document --storage"
+        );
+        assert!(
+            USAGE.contains("--ephemeral-loss-ack"),
+            "USAGE must document --ephemeral-loss-ack"
+        );
+    }
+
     #[test]
     fn serve_parses_the_ram_ceiling_bytes_flag() {
         // The flag takes a value and feeds the guard: a tiny ceiling with the (huge) balanced defaults
