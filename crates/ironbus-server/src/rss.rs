@@ -129,14 +129,21 @@ pub const PER_CONNECTION_STACK_BYTES: u64 = 64 * 1024;
 /// both with margin.
 pub const PER_LEASE_BYTES: u64 = 64;
 
-/// How many full byte IMAGES of the store the in-memory backend (#443) can hold at once, the
-/// multiplier the #445 footprint proof charges per stored byte under `--storage memory`. The
+/// How many full byte IMAGES of the store the in-memory backend (#443) retains at steady state,
+/// the multiplier the #445 footprint proof charges per stored byte under `--storage memory`. The
 /// in-memory `Filesystem` (`InMemoryFs` / `InMemoryFile` in `ironbus-storage`) keeps TWO byte
 /// images per file: the `live` bytes plus the `durable` image a `sync_data` clones them into (the
 /// power-loss simulation contract every conformance suite relies on). At steady state every stored
 /// byte therefore exists twice in RSS, so the worst-case in-memory store footprint is
 /// `2 * max_total_bytes`, not `max_total_bytes`. The directory-level `sync_dir` clone is only a
 /// map of `Arc` pointers (no third byte image), so 2 is the honest multiplier, not a guess.
+///
+/// The 2 is the steady-state RETAINED set, not an instantaneous bound: the durable image is
+/// refreshed by `clone_from` inside `sync_data`, and when that clone reallocates, the old durable
+/// allocation and the incoming bytes can briefly coexist, so an instant mid-sync can exceed two
+/// images. Amortized, exactly two images per file are retained, which is what a STEADY-STATE
+/// footprint proof may honestly charge (the transient is per-file and short-lived; the guard's
+/// fixed-overhead and slack terms absorb it in practice).
 pub const IN_MEMORY_STORE_IMAGES: u64 = 2;
 
 /// The configuration the refuse-to-boot RAM guard ([`fits_under_ram_ceiling`]) reasons about: the

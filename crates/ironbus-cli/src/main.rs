@@ -2733,7 +2733,9 @@ fn validate_durability(config: &ServeConfig) -> Result<(), CliError> {
 /// stored bytes, and the in-memory filesystem keeps a SECOND byte image per file (the durable
 /// image each `sync_data` clones the live bytes into, the power-loss-simulation contract), so the
 /// store's worst case is `2 * max_total_bytes`
-/// ([`ironbus_server::rss::IN_MEMORY_STORE_IMAGES`]). The model here is therefore:
+/// ([`ironbus_server::rss::IN_MEMORY_STORE_IMAGES`]; the 2 is the steady-state RETAINED set, not
+/// an instantaneous bound, since the durable image's `clone_from` realloc transient can briefly
+/// exceed it mid-sync). The model here is therefore:
 ///
 /// - DISK: `worst_case = buffers(conns, credits, groups, in-flight) + fixed` (unchanged, the
 ///   historical verdict bit-for-bit; the store stays uncharged because it is not RAM).
