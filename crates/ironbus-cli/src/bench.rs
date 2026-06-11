@@ -200,6 +200,10 @@ impl BenchConfig {
     /// (the in-memory engine issues NO fsync at all, so there is no durable-write cost to
     /// attribute; reporting one would be dishonest) and only outside the `--no-fsync` dry run
     /// (which batches the cursor checkpoints, so the per-ack durable path is not exercised).
+    /// The callers live in `bench_run.rs` behind `cfg(unix)` (the bench broker is the real
+    /// `serve` path, Unix-only in v1), so on a non-unix build this method is otherwise dead
+    /// code and `-D warnings` refuses the build (the Windows CI lane caught exactly that).
+    #[cfg_attr(not(unix), allow(dead_code))]
     #[must_use]
     pub fn fsync_is_measured(&self) -> bool {
         !self.no_fsync && self.storage == StorageArg::Disk
