@@ -8465,6 +8465,36 @@ mod tests {
     }
 
     #[test]
+    fn the_store_fold_charges_two_images_a_one_image_mutant_boots_here() {
+        // PINS THE MULTIPLIER at the validate level, where the model test alone cannot: the
+        // edge-tiny buffer terms sum to ~15 MiB, so with a 32 MiB store cap the worst case is
+        // ~47 MiB charged at ONE image (fits the 64 MiB ceiling, boots) and ~79 MiB charged at
+        // TWO (refuses). The ceiling sits BETWEEN the one-image and two-image floors, so a
+        // mutant that forgets the durable-image clone and charges the cap once BOOTS this exact
+        // config and fails here. Companion to the rss model test, which pins the literal 2 in
+        // the formula; this one proves the 2 reaches the real boot verdict with no slack.
+        let cfg = ServeConfig {
+            storage: StorageArg::Memory,
+            ephemeral_loss_ack: true,
+            max_total_bytes: 32 * 1024 * 1024,
+            ..edge_tiny_caps()
+        };
+        match validate_serve_config(&cfg) {
+            Err(CliError::Usage(m)) => {
+                assert!(m.contains("refuses to boot"), "{m}");
+                assert!(
+                    m.contains("--max-total-bytes"),
+                    "the refusal names the store knob: {m}"
+                );
+            }
+            other => panic!(
+                "32 MiB of store cap is 64 MiB of store images; with ~15 MiB of buffers that \
+                 provably exceeds the 64 MiB ceiling, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
     fn memory_storage_boots_when_the_ceiling_covers_the_store_and_buffers() {
         // The fold's accepting direction: a memory-mode config whose ceiling covers the buffer
         // terms PLUS both store images (2 * max-total-bytes) validates and boots. 8 MiB of cap

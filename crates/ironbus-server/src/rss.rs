@@ -411,9 +411,17 @@ mod tests {
     #[test]
     fn the_in_memory_store_is_charged_at_two_byte_images() {
         // THE #445 MEMORY-BACKEND FOLD: with the store in RAM, the worst case grows by EXACTLY
-        // `IN_MEMORY_STORE_IMAGES * in_memory_store_bytes` over the same config with a disk store
-        // (the live bytes plus the durable-image clone the in-memory filesystem keeps). This test
-        // FAILS if the store term is dropped from the proof or its clone headroom is forgotten.
+        // twice the store cap over the same config with a disk store. The expectation is a HARD
+        // LITERAL 2, deliberately NOT `IN_MEMORY_STORE_IMAGES`: an expectation computed from the
+        // constant is self-referential and would silently follow a drifted constant (a mutant
+        // setting it to 1 passed the whole suite that way once). The 2 is derived from the
+        // in-memory filesystem itself: `InMemoryFile` retains exactly TWO byte images per file,
+        // `State.live` plus `State.durable` (the image `sync_data`'s `clone_from` refreshes),
+        // and the directory-level `sync_dir` clone copies only a map of `Arc` POINTERS, never a
+        // third byte image. That retained set is the steady state; `clone_from`'s realloc
+        // transient can briefly exceed it mid-sync (see `IN_MEMORY_STORE_IMAGES`). This test
+        // FAILS if the store term is dropped, the clone headroom is forgotten, or the constant
+        // drifts off 2 in either direction.
         let disk = edge_tiny_footprint();
         let mem = RamFootprintConfig {
             in_memory_store_bytes: 8 * 1024 * 1024,
@@ -421,8 +429,8 @@ mod tests {
         };
         assert_eq!(
             worst_case_buffer_bytes(&mem),
-            worst_case_buffer_bytes(&disk) + IN_MEMORY_STORE_IMAGES * 8 * 1024 * 1024,
-            "the in-memory store must be charged at live + durable-clone (2 images)"
+            worst_case_buffer_bytes(&disk) + 2 * 8 * 1024 * 1024,
+            "the in-memory store must be charged at live + durable-clone (exactly 2 images)"
         );
     }
 
@@ -444,7 +452,9 @@ mod tests {
             RamCeilingVerdict::Exceeds {
                 worst_case_bytes, ..
             } => assert!(
-                worst_case_bytes >= IN_MEMORY_STORE_IMAGES * 1024 * 1024 * 1024,
+                // A hard literal 2, not the constant, so a drifted multiplier cannot satisfy a
+                // bound computed from itself.
+                worst_case_bytes >= 2 * 1024 * 1024 * 1024,
                 "the store images dominate the worst case, got {worst_case_bytes}"
             ),
             other => {
