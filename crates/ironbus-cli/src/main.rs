@@ -8448,9 +8448,9 @@ mod tests {
                 );
                 assert_eq!(CliError::Usage(m).exit_code(), EXIT_USAGE);
             }
-            other => panic!(
-                "a 1 GiB in-RAM store under a 64 MiB ceiling must be refused, got {other:?}"
-            ),
+            other => {
+                panic!("a 1 GiB in-RAM store under a 64 MiB ceiling must be refused, got {other:?}")
+            }
         }
         // The SAME knobs on the DISK backend still validate: the disk store is file-backed (~0
         // RSS), so it stays uncharged and the historical disk verdict is unchanged.

@@ -1065,7 +1065,10 @@ mod tests {
         assert_eq!(cfg.storage, StorageArg::Memory);
         assert_eq!(cfg.payload_shape, PayloadShape::Random);
         let json = bench_json(&cfg, &BenchReport::default());
-        assert!(json.contains("\"payload_shape\":\"random\""), "json: {json}");
+        assert!(
+            json.contains("\"payload_shape\":\"random\""),
+            "json: {json}"
+        );
         assert!(json.contains("\"storage\":\"memory\""), "json: {json}");
     }
 

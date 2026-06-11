@@ -1572,7 +1572,9 @@ fn memory_mode_sheds_past_the_byte_cap_and_rss_stays_bounded() {
     for i in 0..ATTEMPTS {
         // An LCG noise fill, reseeded per message: incompressible, so stored bytes equal offered
         // bytes and the cap (which meters STORED, post-compression bytes) engages honestly.
-        let mut state = (i as u64).wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        let mut state = (i as u64)
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
         for b in &mut payload {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)

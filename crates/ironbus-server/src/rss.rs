@@ -447,7 +447,9 @@ mod tests {
                 worst_case_bytes >= IN_MEMORY_STORE_IMAGES * 1024 * 1024 * 1024,
                 "the store images dominate the worst case, got {worst_case_bytes}"
             ),
-            other => panic!("a 1 GiB in-RAM store under a 64 MiB ceiling must be refused, got {other:?}"),
+            other => {
+                panic!("a 1 GiB in-RAM store under a 64 MiB ceiling must be refused, got {other:?}")
+            }
         }
     }
 

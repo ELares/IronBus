@@ -184,7 +184,10 @@ struct IsolatedBroker<F: Filesystem + 'static> {
 impl IsolatedBroker<StdFs> {
     /// Spawns the DISK broker over `data_dir` on a loopback ephemeral port, from the prebuilt,
     /// already-validated bench `ServeConfig`.
-    fn spawn_disk(data_dir: &Path, config: &ServeConfig) -> Result<IsolatedBroker<StdFs>, CliError> {
+    fn spawn_disk(
+        data_dir: &Path,
+        config: &ServeConfig,
+    ) -> Result<IsolatedBroker<StdFs>, CliError> {
         let engine = open_disk_engine(data_dir, config, &[], &[])?;
         IsolatedBroker::from_engine(engine, config)
     }
