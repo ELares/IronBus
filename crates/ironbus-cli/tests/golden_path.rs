@@ -1233,3 +1233,203 @@ fn graceful_shutdown_on_sigterm_checkpoints_the_cursor_and_does_not_redeliver() 
     let _ = broker2.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Boots `ironbus serve --storage memory` (NO `--data-dir`) on an ephemeral loopback port,
+/// returning the un-guarded `Child` (so the caller can SIGTERM it and read its exit status), the
+/// bound wire address, the second stdout line (the #443 ephemeral-contract banner), and a join
+/// handle yielding the broker's accumulated STDERR, where the materialized-config line lands.
+fn start_memory_broker() -> (
+    Child,
+    String,
+    String,
+    std::thread::JoinHandle<String>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    // NO-FILES HARNESS (#443 review): the broker runs with a scratch CWD and an isolated TMPDIR,
+    // both created empty, so the test can assert after the clean exit that the ephemeral broker
+    // created NO file anywhere it could plausibly write (a regression that starts touching disk,
+    // e.g. an unconditional data-dir prepare or a lock file leaking past the Filesystem trait,
+    // fails the emptiness assertion instead of passing silently).
+    let cwd_scratch = std::env::temp_dir().join(format!("ironbus-memcwd-{}", std::process::id()));
+    let tmp_scratch = std::env::temp_dir().join(format!("ironbus-memtmp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cwd_scratch);
+    let _ = std::fs::remove_dir_all(&tmp_scratch);
+    std::fs::create_dir_all(&cwd_scratch).expect("create scratch cwd");
+    std::fs::create_dir_all(&tmp_scratch).expect("create scratch tmpdir");
+    let mut child = Command::new(BIN)
+        .args([
+            "serve",
+            "--storage",
+            "memory",
+            "--ephemeral-loss-ack",
+            "--max-total-bytes",
+            "16777216",
+            "--addr",
+            "127.0.0.1:0",
+            "--checkpoint-interval",
+            "1",
+        ])
+        .current_dir(&cwd_scratch)
+        .env("TMPDIR", &tmp_scratch)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ironbus serve --storage memory");
+    // Accumulate the WHOLE stderr stream on a worker thread for the duration of the broker's
+    // life, so the pipe can never fill and block the broker, and the test can assert on the
+    // materialized-config line after the clean exit.
+    let stderr = child.stderr.take().expect("piped stderr");
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let mut reader = BufReader::new(stderr);
+        let _ = reader.read_to_string(&mut buf);
+        buf
+    });
+    // The startup-protocol contract on stdout: line 1 is the listening line, line 2 is the
+    // ephemeral banner (written immediately after, before any connection is accepted).
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut first = String::new();
+        let n = reader.read_line(&mut first).unwrap_or(0);
+        let mut second = String::new();
+        let m = if n > 0 {
+            reader.read_line(&mut second).unwrap_or(0)
+        } else {
+            0
+        };
+        let _ = tx.send((n.min(1) + m.min(1), first, second));
+    });
+    let (lines, first, second) = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("memory-mode serve did not print its startup lines within 10s: {e}");
+        }
+    };
+    if lines < 2 {
+        let _ = child.kill();
+        let _ = child.wait();
+        let err = stderr_handle.join().unwrap_or_default();
+        panic!("memory-mode serve exited before its startup lines: {err}");
+    }
+    let Some(addr) = first
+        .split("listening on ")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .map(str::trim)
+    else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("could not parse the memory-mode listening line: {first:?}");
+    };
+    assert!(
+        first.contains("storage memory (ephemeral)"),
+        "the listening line names the memory backend, never a path that does not exist: {first}"
+    );
+    (
+        child,
+        addr.to_string(),
+        second,
+        stderr_handle,
+        cwd_scratch,
+        tmp_scratch,
+    )
+}
+
+#[test]
+fn memory_mode_round_trips_on_the_real_wire_and_exits_clean() {
+    // #443: the OPT-IN ephemeral in-memory backend serves the SAME wire protocol end to end.
+    // Boot the real binary with `--storage memory` (consent + byte cap, NO --data-dir), produce
+    // over real loopback sockets, fan in with acks, then stop it cleanly with SIGTERM and assert
+    // exit 0 plus the machine-checkable `storage=memory` materialized-config echo. The default
+    // disk path is byte-for-byte unchanged; every other scenario in this suite proves that.
+    let (mut broker, addr, banner, stderr_handle, cwd_scratch, tmp_scratch) = start_memory_broker();
+
+    // The ephemeral-contract banner is the broker's second startup line on EVERY memory boot.
+    assert!(
+        banner.contains("EPHEMERAL") && banner.contains("NO power-loss or restart durability"),
+        "the startup banner states the loss contract: {banner}"
+    );
+
+    // Produce three messages; each ack carries the next durable-within-this-process offset.
+    for (i, payload) in ["m0", "m1", "m2"].iter().enumerate() {
+        let (out, code) = run(&["pub", "--addr", &addr, payload]);
+        assert_eq!(code, 0, "pub exit code in memory mode");
+        assert_eq!(out.trim(), i.to_string(), "pub returned the next offset");
+    }
+
+    // Consume the whole batch and ack every message: the wire surface, group semantics, and the
+    // ack path are the disk engine's, just over the in-memory filesystem.
+    let (out, code) = run(&["sub", "--addr", &addr, "--max", "10", "--ack"]);
+    assert_eq!(code, 0, "sub exit code in memory mode");
+    assert!(
+        out.contains("payload=m0") && out.contains("payload=m1") && out.contains("payload=m2"),
+        "all three delivered: {out}"
+    );
+    assert_eq!(
+        out.matches("ack committed").count(),
+        3,
+        "all three acked: {out}"
+    );
+
+    // Within the process lifetime an ack holds exactly as on disk: a re-fetch sees nothing.
+    let (out, code) = run(&["sub", "--addr", &addr, "--max", "10"]);
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("fetched 0 message(s)"),
+        "the acked messages do not redeliver within the process lifetime: {out}"
+    );
+
+    // A clean operator stop: SIGTERM exits 0 (the graceful drain runs over the in-memory fs).
+    send_sigterm(broker.id());
+    let code = wait_for_exit(&mut broker, Duration::from_secs(10));
+    assert_eq!(
+        code, 0,
+        "a SIGTERM graceful shutdown exits 0 in memory mode"
+    );
+
+    // The #443 machine-checkable echo on the stderr log stream: an operator (or a script) reads
+    // the backend straight off the startup materialized-config line.
+    let logs = stderr_handle.join().expect("join the stderr reader");
+    let config_line = logs
+        .lines()
+        .find(|l| l.contains("materialized-config"))
+        .unwrap_or_else(|| panic!("no materialized-config line on stderr: {logs}"));
+    assert!(
+        config_line.contains("storage=memory"),
+        "the materialized-config line says storage=memory: {config_line}"
+    );
+    assert!(
+        config_line.contains("data_dir=none"),
+        "no data dir exists in memory mode (the none sentinel): {config_line}"
+    );
+
+    // THE NO-FILES CONTRACT: across boot, produce, consume, ack, and the graceful drain, the
+    // ephemeral broker wrote NOTHING under its cwd and NOTHING under its TMPDIR. Any entry at
+    // all (a data dir, a lock, a checkpoint, a stray temp) is a regression of the whole point.
+    let leftovers = |dir: &std::path::Path| -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert!(
+        leftovers(&cwd_scratch).is_empty(),
+        "memory mode created files in its cwd: {:?}",
+        leftovers(&cwd_scratch)
+    );
+    assert!(
+        leftovers(&tmp_scratch).is_empty(),
+        "memory mode created files in its TMPDIR: {:?}",
+        leftovers(&tmp_scratch)
+    );
+    let _ = std::fs::remove_dir_all(&cwd_scratch);
+    let _ = std::fs::remove_dir_all(&tmp_scratch);
+}

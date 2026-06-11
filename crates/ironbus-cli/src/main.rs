@@ -121,10 +121,8 @@ use ironbus_server::server::serve;
 use ironbus_storage::dict_store::{CachingDictResolver, DictSidecarStore, DICTS_SUBDIR};
 #[cfg(unix)]
 use ironbus_storage::dlq::{read_dlq_entries, DlqEntry};
-#[cfg(all(unix, feature = "zstd"))]
-use ironbus_storage::fs::Filesystem;
 #[cfg(unix)]
-use ironbus_storage::fs::StdFs;
+use ironbus_storage::fs::{Filesystem, InMemoryFs, StdFs};
 #[cfg(unix)]
 use ironbus_storage::log::LogConfig;
 #[cfg(unix)]
@@ -226,6 +224,12 @@ const DEFAULT_DISK_FULL_POLICY: &str = "drop-new";
 /// lost on a power cut (ZERO acked loss). A zero-config broker stays power-loss safe; the relaxed
 /// levels (`interval`/`async`/`none`) are strictly opt-in and weaken I2 by a documented loss window.
 const DEFAULT_DURABILITY_LEVEL: &str = "sync";
+
+/// The default storage BACKEND for `serve` (#443): `disk`, the durable on-disk store, so a
+/// zero-config broker is byte-for-byte the historical durable broker. The `memory` backend runs the
+/// SAME engine over the in-memory filesystem (NO files, NO fsync, explicitly NO power-loss or
+/// restart durability) and is strictly opt-in behind the explicit `--ephemeral-loss-ack` consent.
+const DEFAULT_STORAGE: &str = "disk";
 
 /// The default compression codec for `serve` (#12, #387, wired by #430): `lz4`, the pure-Rust
 /// default codec per [ADR-0003](../../../docs/adr/0003-default-compression-lz4-zstd-opt-in.md).
@@ -434,6 +438,50 @@ impl CompressionArg {
         match self {
             CompressionArg::None => "none",
             CompressionArg::Lz4 => DEFAULT_COMPRESSION,
+        }
+    }
+}
+
+/// The storage BACKEND parsed from `serve --storage` (#443). A platform-neutral `Copy` enum, so it
+/// lives in the (non-Unix-gated) [`ServeConfig`] and is parsed/validated on EVERY platform; only the
+/// Unix serve path opens an engine over it. The default is [`StorageArg::Disk`], the durable on-disk
+/// store: a broker that passes no `--storage` is byte-for-byte the historical broker. `memory` runs
+/// the SAME engine and the SAME `EngineConfig` over [`ironbus_storage::fs::InMemoryFs`] (the
+/// deterministic in-memory filesystem every engine test and conformance suite already exercises):
+/// NO files, NO fsync, and explicitly NO power-loss or restart durability, for hot-path fan-out,
+/// spill-to-RAM buffering, and test rigs where flash wear or fsync latency is the binding
+/// constraint. It is gated behind the explicit `--ephemeral-loss-ack` consent and a non-zero
+/// `--max-total-bytes` (see `validate_storage`), so an ephemeral broker is never reachable by
+/// accident. An unknown value is a usage error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorageArg {
+    /// The DEFAULT durable on-disk store rooted at `--data-dir` (byte-for-byte unchanged behavior).
+    Disk,
+    /// OPT-IN ephemeral in-memory store: the same engine over `InMemoryFs`, no files, no fsync; a
+    /// clean stop or crash loses every acked message by contract. Gated behind
+    /// `--ephemeral-loss-ack` and an explicit `--max-total-bytes`.
+    Memory,
+}
+
+impl StorageArg {
+    /// Parses the `--storage` flag value, accepting `disk` or `memory`.
+    fn parse(value: &str) -> Option<StorageArg> {
+        match value {
+            "disk" => Some(StorageArg::Disk),
+            "memory" => Some(StorageArg::Memory),
+            _ => None,
+        }
+    }
+
+    /// The flag/log spelling of this backend, the inverse of [`StorageArg::parse`]. `Disk` returns
+    /// the [`DEFAULT_STORAGE`] string so the default constant stays the single source of truth for
+    /// that name; used as a resolvable default and in the materialized-config log (the #443
+    /// machine-checkable `storage=` echo: an operator cannot mistake a tmpfs mount for durable
+    /// storage, nor an ephemeral broker for a durable one).
+    fn as_str(self) -> &'static str {
+        match self {
+            StorageArg::Disk => DEFAULT_STORAGE,
+            StorageArg::Memory => "memory",
         }
     }
 }
@@ -666,8 +714,9 @@ const USAGE: &str = "\
 ironbus: a durable edge message queue.
 
 USAGE:
-    ironbus serve --data-dir <dir> [--config <path>] [--allow-unknown-config]
+    ironbus serve (--data-dir <dir> | --storage memory) [--config <path>] [--allow-unknown-config]
                   [--profile <edge-tiny|balanced|throughput>]
+                  [--storage <disk|memory>] [--ephemeral-loss-ack]
                   [--addr <host:port>] [--max-connections <n>]
                   [--checkpoint-interval <n>] [--max-deliver <n>] [--allow-unlimited-deliver]
                   [--backoff-ms <ms,ms,...>] [--max-in-flight <n>]
@@ -724,6 +773,17 @@ Notes:
     is byte-identical to passing no profile; edge-tiny is the small-RAM, flash-gentle edge preset;
     throughput widens every buffer for a multi-core hub. An unknown profile name is a usage error.
     The active profile and its schema version are logged in the startup materialized-config line.
+    --storage <disk|memory> (default disk) selects the storage backend (#443). disk is the durable
+    on-disk store rooted at --data-dir, byte-for-byte the historical broker. memory runs the SAME
+    engine over an in-memory filesystem: NO files, NO fsync, and explicitly NO power-loss or
+    restart durability (a clean stop or crash loses every acked message; a supervisor restart
+    revives an EMPTY broker), for hot-path fan-out, spill-to-RAM buffering, and test rigs where
+    flash wear or fsync latency is the binding constraint. memory REFUSES to boot without the
+    explicit --ephemeral-loss-ack consent (a dedicated flag; --async-loss-ack does not cover it)
+    and without an explicit --max-total-bytes above 0 (the RAM bound: the cap meters STORED,
+    post-compression bytes, and 0 = unlimited would OOM the device). With --storage memory,
+    --data-dir must be ABSENT (the broker keeps no on-disk state). The startup banner states the
+    ephemeral contract and the materialized-config line says storage=memory.
     --max-in-flight bounds the per-GROUP in-flight (max-ack-pending) window; --consumer-credit
     (default 64) bounds the per-CONNECTION un-acked set, so in a competing group one stuck
     consumer cannot consume a peer's budget. A fetch delivers min(requested, consumer credit,
@@ -1614,6 +1674,15 @@ struct ServeFlags {
     /// The explicit data-loss acknowledgement for `async`/`none` (#49, #379): the `--async-loss-ack`
     /// bare flag. `true` only if it appeared; without it, an `async`/`none` level refuses to boot.
     async_loss_ack: bool,
+    /// The storage BACKEND (#443) selected by `--storage` / `IRONBUS_STORAGE`. `None` resolves to
+    /// the default `disk` (the durable on-disk store, byte-for-byte unchanged). An unknown name is
+    /// a usage error.
+    storage: Option<String>,
+    /// The explicit EPHEMERAL data-loss consent for `--storage memory` (#443): the
+    /// `--ephemeral-loss-ack` bare flag. `true` only if it appeared; without it, `--storage memory`
+    /// refuses to boot. A DEDICATED flag (not `--async-loss-ack`) so consenting to a relaxed fsync
+    /// schedule is never conflated with consenting to a fully ephemeral broker.
+    ephemeral_loss_ack: bool,
     disk_full_policy: Option<String>,
     visibility_ms: Option<u64>,
     enable_admin: bool,
@@ -1787,6 +1856,16 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             // explicit data-loss acknowledgement that gates the unbounded-loss durability levels.
             "--async-loss-ack" => {
                 f.async_loss_ack = true;
+                i += 1;
+            }
+            // The storage BACKEND (#443): `disk` (the default) or the opt-in ephemeral `memory`.
+            "--storage" => {
+                f.storage = Some(take_value("--storage", args, &mut i)?);
+            }
+            // A bare boolean flag (no value): advance ONE token, not two, or the loop spins. The
+            // explicit EPHEMERAL data-loss consent that gates `--storage memory` (#443).
+            "--ephemeral-loss-ack" => {
+                f.ephemeral_loss_ack = true;
                 i += 1;
             }
             "--key-shared-group" => {
@@ -1991,6 +2070,23 @@ fn parse_serve_flags_with_env_and_reader(
              on this build), got `{compression_arg}`"
         ))
     })?;
+    // The storage BACKEND (#443) resolves like the disk-full policy: an enum string with
+    // flag > env (`IRONBUS_STORAGE`, the IRONBUS_<FLAG> grammar) > default (`disk`) precedence,
+    // parsed after resolution so a bad value names its source (the flag if explicit, else the env
+    // var). The default `disk` keeps the historical durable broker byte-for-byte; the ephemeral
+    // `memory` backend is strictly opt-in and further gated in `validate_storage`.
+    let storage_from_flag = f.storage.is_some();
+    let storage_arg = resolve_string("--storage", f.storage, env, DEFAULT_STORAGE);
+    let storage = StorageArg::parse(&storage_arg).ok_or_else(|| {
+        let source = if storage_from_flag {
+            "--storage".to_string()
+        } else {
+            env_var_name("--storage")
+        };
+        CliError::Usage(format!(
+            "`{source}` must be `disk` or `memory`, got `{storage_arg}`"
+        ))
+    })?;
     let mut parsed = ParsedServe {
         addr: resolve_string("--addr", f.addr, env, DEFAULT_ADDR),
         data_dir: resolve_opt_string("--data-dir", f.data_dir, env),
@@ -2138,6 +2234,11 @@ fn parse_serve_flags_with_env_and_reader(
                 DEFAULT_FLUSH_MAX_BYTES,
             )?,
             async_loss_ack: resolve_bool("--async-loss-ack", f.async_loss_ack, env)?,
+            // The storage backend (#443), resolved above (flag > env > default `disk`); the
+            // ephemeral consent resolves like the other bare safety flags. `memory` without the
+            // consent (or without a byte cap) is refused in `validate_storage`, never by accident.
+            storage,
+            ephemeral_loss_ack: resolve_bool("--ephemeral-loss-ack", f.ephemeral_loss_ack, env)?,
             // The backpressure controls (#68, #69). Every knob DEFAULTS to its disabling value, so a
             // zero-config broker behaves exactly as today; an operator opts in per knob. CoDel and the
             // retry budget and the fire-and-forget bucket default OFF; the egress limiter defaults to
@@ -2283,9 +2384,13 @@ fn resolved_view(
 /// holds: the resolved cross-key view plus the COLD keys (`docs/CONFIG.md` section 3) whose change a
 /// live reload must reject atomically. The COLD keys are the layout-affecting / open-time-immutable
 /// ones: the segment size and the data dir (both COLD, changing them live could strand segments).
+/// `data_dir` is `None` only under `--storage memory` (#443), where there is no data dir at all;
+/// the cold key then carries the same stable sentinel on the installed config and on every reload
+/// candidate ([`data_dir_cold_value`]), so a memory-mode re-read self-check is still a no-op
+/// `Applied` (nothing panics or misbehaves around the absent path).
 fn build_effective_config(
     config: &ServeConfig,
-    data_dir: &Path,
+    data_dir: Option<&Path>,
     retention_requested: bool,
 ) -> config_reload::EffectiveConfig {
     // The COLD-key values, keyed off the classified `config_reload::COLD_KEYS` set so the two
@@ -2295,7 +2400,7 @@ fn build_effective_config(
         .map(|(key, _class)| {
             let value = match *key {
                 "storage.segment_size" => config.max_segment_bytes.to_string(),
-                "storage.data_dir" => data_dir.display().to_string(),
+                "storage.data_dir" => data_dir_cold_value(data_dir),
                 // Unreachable: COLD_KEYS lists only the two above; a new cold key must add its arm.
                 other => {
                     debug_assert!(false, "unhandled cold key `{other}`");
@@ -2309,6 +2414,14 @@ fn build_effective_config(
         cold_keys,
         resolved: resolved_view(config, retention_requested),
     }
+}
+
+/// The `storage.data_dir` COLD-key value for the reload comparison: the path's display, or the
+/// stable `none` sentinel under `--storage memory` (#443, no data dir exists). One function so the
+/// installed config and every reload candidate render the SAME value and an unedited re-read stays
+/// a no-op `Applied`.
+fn data_dir_cold_value(data_dir: Option<&Path>) -> String {
+    data_dir.map_or_else(|| "none".to_string(), |d| d.display().to_string())
 }
 
 /// Re-reads the `--config` file and attempts an atomic RELOAD (#380, #382): it builds a candidate
@@ -2327,7 +2440,7 @@ fn reload_effective_config(
     path: &str,
     allow_unknown: bool,
     current: &ServeConfig,
-    data_dir: &Path,
+    data_dir: Option<&Path>,
     out: &mut impl Write,
 ) {
     let layer = match config_file::load_config_file(path, allow_unknown, &fs_config_reader) {
@@ -2349,7 +2462,7 @@ fn reload_effective_config(
     candidate.resolved.segment_bytes = candidate_segment;
     candidate.cold_keys = vec![
         ("storage.segment_size", candidate_segment.to_string()),
-        ("storage.data_dir", data_dir.display().to_string()),
+        ("storage.data_dir", data_dir_cold_value(data_dir)),
     ];
     let outcome = handle.reload_from(candidate);
     debug_assert!(
@@ -2398,12 +2511,32 @@ fn finish_serve(
     reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
-    let data_dir =
-        data_dir.ok_or_else(|| CliError::Usage("serve requires `--data-dir <dir>`".to_string()))?;
+    // The data dir is storage-conditional (#443). DISK (the default): REQUIRED, exactly the
+    // historical rule. MEMORY: it must be ABSENT (the broker stores nothing on disk, so a given
+    // `--data-dir` would silently mean nothing; a usage error keeps the semantics explicit), and
+    // the data-dir-required validation is bypassed. The full flag-interplay sweep is #444; this is
+    // the one interplay that cannot wait, because `--data-dir` is otherwise required.
+    let data_dir = match config.storage {
+        StorageArg::Disk => Some(
+            data_dir
+                .ok_or_else(|| CliError::Usage("serve requires `--data-dir <dir>`".to_string()))?,
+        ),
+        StorageArg::Memory => {
+            if let Some(dir) = data_dir {
+                return Err(CliError::Usage(format!(
+                    "`--storage memory` keeps NO on-disk state, so `--data-dir` must be absent, \
+                     got `{dir}`: remove `--data-dir` (or the `IRONBUS_DATA_DIR` env var / config \
+                     file key). An in-memory broker ignores the filesystem entirely; pointing it \
+                     at a directory would only LOOK durable."
+                )));
+            }
+            None
+        }
+    };
     validate_serve_config(config)?;
     cmd_serve(
         addr,
-        Path::new(data_dir),
+        data_dir.map(Path::new),
         config,
         key_shared_groups,
         broadcast_groups,
@@ -2463,7 +2596,66 @@ fn validate_serve_config(config: &ServeConfig) -> Result<(), CliError> {
         ));
     }
     validate_durability(config)?;
+    validate_storage(config)?;
     validate_ram_ceiling(config)?;
+    Ok(())
+}
+
+/// The FAIL-CLOSED ephemeral-storage safety gate (#443), BEFORE the broker opens. Both checks
+/// mirror the `--durability-level async/none` + `--async-loss-ack` precedent in
+/// [`validate_durability`]: a loss-bearing (or RAM-unbounded) configuration is never reachable by a
+/// bare flag, only by an operator who explicitly accepted the contract.
+///
+/// - **Resilient stays honest** (the #443 tenet): an ack in memory mode survives a connection drop
+///   and an engine hiccup, NEVER a process exit, so `--storage memory` REFUSES TO BOOT unless the
+///   operator passes the explicit `--ephemeral-loss-ack` consent. The consent is a DEDICATED flag
+///   (not the reused `--async-loss-ack`) so consenting to a relaxed fsync schedule on a durable
+///   store is never conflated with consenting to a fully ephemeral broker. The refusal states the
+///   loss contract: a clean stop or crash loses every acked message.
+/// - **RAM bounds become load-bearing** (the #443 tenet): on disk an unbounded log fills the SD
+///   card; in memory it OOMs the device. `--storage memory` REQUIRES an explicit non-zero
+///   `--max-total-bytes` (0 = unlimited is refused). The byte cap meters STORED
+///   (post-#430-compression) bytes, the same accounting the disk store uses. It COMPOSES with the
+///   #115 `--ram-ceiling-bytes` refuse-to-boot guard unchanged ([`validate_ram_ceiling`] still
+///   runs after this, whatever the backend).
+///
+/// # Errors
+/// [`CliError::Usage`] (exit 1, before any listener opens) for `memory` without the consent, or
+/// `memory` with an unlimited byte cap.
+fn validate_storage(config: &ServeConfig) -> Result<(), CliError> {
+    if config.storage != StorageArg::Memory {
+        return Ok(());
+    }
+    if !config.ephemeral_loss_ack {
+        // Fail closed: the ephemeral backend needs the explicit consent. The error states the loss
+        // contract (a clean stop or crash loses every acked message), what an ack still covers, and
+        // the flag to set, so the operator knows exactly what they are accepting.
+        return Err(CliError::Usage(
+            "refusing to start with `--storage memory`: the broker would hold every record in RAM \
+             with NO files, NO fsync, and NO power-loss or restart durability, so a clean stop or \
+             crash loses EVERY acknowledged message (an ack in memory mode survives a connection \
+             drop and an engine hiccup, never a process exit). This is contrary to IronBus's \
+             durable default (`--storage disk`). To enable it deliberately, pass \
+             `--ephemeral-loss-ack` to accept that loss contract (the startup banner then states \
+             the ephemeral contract on every boot). `--async-loss-ack` does NOT cover this: it \
+             consents to a relaxed fsync schedule on a durable store, a different loss contract."
+                .to_string(),
+        ));
+    }
+    if config.max_total_bytes == 0 {
+        // The RAM OOM protection: with the cap off (0 = unlimited) an in-memory log grows until
+        // the device OOMs instead of filling a disk, so memory mode requires the explicit bound.
+        return Err(CliError::Usage(
+            "`--storage memory` requires an explicit `--max-total-bytes` above 0: the in-memory \
+             queue is bounded by broker config, not by a disk or mount size, and 0 means UNLIMITED, \
+             which on a RAM-backed store grows until the device OOMs. The cap meters STORED \
+             (post-compression) bytes, the same accounting the disk store uses; once at or over it, \
+             a produce sheds via the existing `at capacity` error (or force-reaps under \
+             `--disk-full-policy drop-oldest`). It composes with `--ram-ceiling-bytes` (#115) \
+             unchanged."
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -2738,6 +2930,21 @@ struct ServeConfig {
     /// with the ack, the broker logs a LOUD startup warning that I2 is waived and the worst-case loss
     /// for the active level.
     async_loss_ack: bool,
+    /// The storage BACKEND (#443): [`StorageArg::Disk`] (the default, the durable on-disk store,
+    /// byte-for-byte unchanged behavior) or the opt-in ephemeral [`StorageArg::Memory`] (the SAME
+    /// engine and the SAME `EngineConfig` over `InMemoryFs`: no files, no fsync, NO power-loss or
+    /// restart durability; a clean stop or crash loses every acked message by contract).
+    /// Platform-neutral so it is parsed/validated on every platform; the Unix serve path dispatches
+    /// on it statically (one monomorphized run per backend, no dyn dispatch on the hot path).
+    storage: StorageArg,
+    /// The explicit EPHEMERAL data-loss consent for `--storage memory` (#443): the
+    /// `--ephemeral-loss-ack` bare flag. Memory mode REFUSES TO BOOT without it (the fail-closed
+    /// ephemeral safety gate, mirroring the `--async-loss-ack` none/async precedent): an ack in
+    /// memory mode survives a connection drop and an engine hiccup, never a process exit, so the
+    /// operator must explicitly accept that a clean stop or crash loses every acked message. A
+    /// DEDICATED flag (not `--async-loss-ack`) so the two distinct loss contracts are never
+    /// conflated. `disk` mode ignores it.
+    ephemeral_loss_ack: bool,
     /// The CoDel time-in-queue (sojourn) shedding TARGET in MILLISECONDS (#68): the acceptable
     /// standing produce-admission latency before the load-shed begins. `0` = DISABLED (the default),
     /// so a zero-config broker behaves exactly as today (byte-cap shed + consumer credit only). When
@@ -2829,6 +3036,9 @@ impl ServeConfig {
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
             async_loss_ack: false,
+            // The default storage backend (#443): the durable on-disk store, no ephemeral consent.
+            storage: StorageArg::Disk,
+            ephemeral_loss_ack: false,
             // Backpressure controls (#68, #69) default to inert in this config builder.
             codel_target_ms: 0,
             codel_interval_ms: DEFAULT_CODEL_INTERVAL_MS,
@@ -2967,7 +3177,12 @@ fn health_bind_decision(haddr: &str, allow_public: bool) -> Result<HealthBindDec
 /// and platform-independent (it touches no IO) so a unit test asserts its contents directly and on
 /// every platform; `cmd_serve` writes it once at startup. `data_dir` is included but NEVER any
 /// secret material (the broker carries none today; the redacting newtype is the #89/#109 residual).
-fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: &Path) -> String {
+/// `data_dir` is `None` only under `--storage memory` (#443), rendered as the `none` sentinel; the
+/// trailing `storage=` field is the #443 machine-checkable echo (ADDITIVE, appended last so every
+/// existing field keeps its order and an operator/script reading the historical fields is
+/// unaffected): an operator cannot mistake a tmpfs mount for durable storage, nor an ephemeral
+/// broker for a durable one.
+fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&Path>) -> String {
     let policy = config.disk_full_policy.as_str();
     // The durability level (#341, #379) and its loss exposure: an operator reads the active level,
     // whether it is power-loss safe (I2 holds only under `sync`), and the interval triggers straight
@@ -2980,6 +3195,9 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: &Path) -
     // compressible payload at or over the 64-byte threshold is stored compressed behind the
     // `COMPRESSED` record flag (sub-threshold and incompressible payloads store raw by design).
     let compression = config.compression.as_str();
+    // The storage backend echo (#443). Memory mode has no data dir, so the `data_dir=` field (kept
+    // in place for field-order stability) carries the `none` sentinel there.
+    let storage = config.storage.as_str();
     format!(
         "materialized-config profile={} profile_schema_version={} addr={addr} \
          data_dir={data_dir} max_connections={} max_segment_bytes={} max_total_bytes={} \
@@ -2989,7 +3207,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: &Path) -
          max_retained_bytes={} max_age_ms={} max_messages={} health_liveness_window_ms={} \
          enable_admin={} ram_ceiling_bytes={} durability_level={durability_level} \
          power_loss_safe={power_loss_safe} compression={compression} flush_interval_ms={} \
-         flush_max_bytes={} async_loss_ack={} wal_fsync_headroom_bytes={}",
+         flush_max_bytes={} async_loss_ack={} wal_fsync_headroom_bytes={} storage={storage}",
         config.profile.name(),
         config.profile_schema_version,
         config.max_connections,
@@ -3014,7 +3232,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: &Path) -
         config.flush_max_bytes,
         config.async_loss_ack,
         config.wal_fsync_headroom_bytes,
-        data_dir = data_dir.display(),
+        data_dir = data_dir.map_or_else(|| "none".to_string(), |d| d.display().to_string()),
     )
 }
 
@@ -3056,13 +3274,9 @@ fn durability_loss_description(config: &ServeConfig) -> String {
 // health addr, the config-file warnings, the reload source,
 // out) is a distinct concern; a bundling struct would only
 // move the noise.
-#[allow(clippy::too_many_lines)] // the serve setup is one linear startup sequence (bind, lock, open
-                                 // the engine, install the immutable-config handle + reload, the
-                                 // health server, the accept loop, the graceful drain); splitting it
-                                 // further would scatter a single concern across helpers.
 fn cmd_serve(
     addr: &str,
-    data_dir: &Path,
+    data_dir: Option<&Path>,
     config: &ServeConfig,
     key_shared_groups: &[String],
     broadcast_groups: &[String],
@@ -3102,14 +3316,94 @@ fn cmd_serve(
         None => None,
     };
 
-    // Data-dir lifecycle then the single-broker lock (#89), BEFORE the engine opens. `prepare`
-    // creates the dir (0700) if absent, rejects a non-directory path, and proves it writable; the
-    // lock makes a SECOND `serve` on the same data dir fail fast rather than corrupt the log with
-    // concurrent writers. The `DirLock` is held in `_dir_lock` for the whole serve lifetime and is
-    // released by the OS when it drops on return (and unconditionally on process exit).
-    dirlock::prepare_data_dir(data_dir).map_err(|e| map_dir_error(&e))?;
-    let _dir_lock = dirlock::DirLock::acquire(data_dir).map_err(|e| map_dir_error(&e))?;
-    let engine = open_disk_engine(data_dir, config, key_shared_groups, broadcast_groups)?;
+    // The storage-backend dispatch (#443): a TWO-ARMED STATIC match, each arm monomorphizing the
+    // generic [`run_broker`] over its concrete filesystem (`StdFs` / `InMemoryFs`). The whole serve
+    // stack (engine, append actor, sessions, health) is already generic over `Filesystem`, so the
+    // backend is decided ONCE here at startup and there is NO dyn dispatch on the hot path.
+    match config.storage {
+        StorageArg::Disk => {
+            // The DEFAULT durable broker, byte-for-byte the historical behavior (#443: `disk` is
+            // unchanged). `finish_serve` already required the data dir for disk mode; the defensive
+            // re-check keeps a direct caller from reaching the disk path without one.
+            let Some(data_dir) = data_dir else {
+                return Err(CliError::Usage(
+                    "serve requires `--data-dir <dir>`".to_string(),
+                ));
+            };
+            // Data-dir lifecycle then the single-broker lock (#89), BEFORE the engine opens. `prepare`
+            // creates the dir (0700) if absent, rejects a non-directory path, and proves it writable; the
+            // lock makes a SECOND `serve` on the same data dir fail fast rather than corrupt the log with
+            // concurrent writers. The `DirLock` is held in `_dir_lock` for the whole serve lifetime and is
+            // released by the OS when it drops on return (and unconditionally on process exit).
+            dirlock::prepare_data_dir(data_dir).map_err(|e| map_dir_error(&e))?;
+            let _dir_lock = dirlock::DirLock::acquire(data_dir).map_err(|e| map_dir_error(&e))?;
+            let engine = open_disk_engine(data_dir, config, key_shared_groups, broadcast_groups)?;
+            run_broker(
+                engine,
+                addr,
+                Some(data_dir),
+                config,
+                health_addr,
+                health_bind,
+                config_warnings,
+                reload,
+                out,
+            )
+        }
+        StorageArg::Memory => {
+            // The OPT-IN ephemeral in-memory broker (#443): the SAME engine and the SAME
+            // `EngineConfig` over `InMemoryFs::new()`. NO data dir is prepared and NO exclusive
+            // data-dir lock is taken: serve's lock exists to stop two brokers writing one
+            // directory, and each memory-mode process owns its own PRIVATE in-memory filesystem,
+            // so the lock is meaningless here and there is no path to lock (nothing on the lock
+            // path runs, so nothing can panic or misbehave around it). `validate_storage` already
+            // enforced the explicit `--ephemeral-loss-ack` consent and the non-zero
+            // `--max-total-bytes` RAM bound before any of this runs.
+            let engine = open_memory_engine(config, key_shared_groups, broadcast_groups)?;
+            run_broker(
+                engine,
+                addr,
+                None,
+                config,
+                health_addr,
+                health_bind,
+                config_warnings,
+                reload,
+                out,
+            )
+        }
+    }
+}
+
+/// Runs an ALREADY-OPENED engine as the broker: actor spawn, wire bind, startup logging, the
+/// immutable-config handle + the startup reload self-check, signals, the health server, the accept
+/// loop, and the graceful drain. GENERIC over the engine's `Filesystem` (#443): the `disk` and
+/// `memory` storage backends share this entire body, monomorphized once per backend by
+/// `cmd_serve`'s static two-armed dispatch (no dyn dispatch on the hot path). `data_dir` is `None`
+/// only in memory mode, where no path exists at all; the checkpoint machinery (the per-group
+/// committed cursors that drive redelivery semantics) runs against the in-memory fs unchanged, so
+/// within the process lifetime acks behave exactly as on disk.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+// each input (engine, addr, data dir, config, health addr,
+// the bind decision, the config-file warnings, the reload
+// source, out) is a distinct concern; a bundling struct
+// would only move the noise.
+#[allow(clippy::too_many_lines)] // the serve run is one linear startup sequence (bind, install the
+                                 // immutable-config handle + reload, the health server, the accept
+                                 // loop, the graceful drain); splitting it further would scatter a
+                                 // single concern across helpers.
+fn run_broker<F: Filesystem + 'static>(
+    engine: Engine<F, SystemClock>,
+    addr: &str,
+    data_dir: Option<&Path>,
+    config: &ServeConfig,
+    health_addr: Option<&str>,
+    health_bind: Option<HealthBindDecision>,
+    config_warnings: &[String],
+    reload: ReloadSource<'_>,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
     // The engine is owned by the append actor (#177); connection handlers and the health server reach
     // it only through the bounded-channel handle, so no handler holds a lock across an fsync. The
     // actor's join handle yields the engine back on its clean exit (a Shutdown drain), which is how
@@ -3120,11 +3414,33 @@ fn cmd_serve(
     let local = listener
         .local_addr()
         .map_err(|e| CliError::Internal(format!("cannot read local address: {e}")))?;
-    writeln!(
-        out,
-        "ironbus listening on {local}, data dir {}",
-        data_dir.display()
-    )?;
+    // The stdout startup-protocol line. Memory mode (#443) has no data dir, so the line names the
+    // backend instead: an operator (or supervisor) reading the first line is never shown a path
+    // that does not exist.
+    match data_dir {
+        Some(dir) => writeln!(
+            out,
+            "ironbus listening on {local}, data dir {}",
+            dir.display()
+        )?,
+        None => writeln!(
+            out,
+            "ironbus listening on {local}, storage memory (ephemeral)"
+        )?,
+    }
+    if config.storage == StorageArg::Memory {
+        // The #443 ephemeral-contract banner, on its OWN log line on EVERY memory-mode boot: the
+        // operator who opted in (the `--ephemeral-loss-ack` gate) always sees exactly what the
+        // ack still covers and what it does not. Mirrors the loud I2-waived durability warning.
+        writeln!(
+            out,
+            "WARN: --storage memory: this broker is EPHEMERAL. Records live only in this \
+             process's RAM: NO files, NO fsync, NO power-loss or restart durability. A clean stop \
+             or a crash loses EVERY acknowledged message, and a supervisor restart \
+             (Restart=on-failure) revives an EMPTY broker. An ack still survives a connection drop \
+             and an engine hiccup within this process's lifetime."
+        )?;
+    }
     // The materialized-config dump (#87): ONE structured line with the active profile, the profile
     // schema version, and every resolved knob, so an operator sees exactly the effective config the
     // broker is running. This is diagnostic startup LOGGING, so it goes to STDERR (the log stream),
@@ -3297,11 +3613,13 @@ fn cmd_serve(
 #[allow(clippy::too_many_arguments)] // the wiring inputs (config, bind, engine, shutdown, beacon,
                                      // clock, out) are each a distinct concern; bundling them into a
                                      // struct would only move the noise, not remove it.
-fn start_health_server(
+                                     // GENERIC over the engine's Filesystem (#443), like `run_broker`: the disk and memory storage
+                                     // backends share the one health-server wiring, monomorphized by the same static dispatch.
+fn start_health_server<F: Filesystem + 'static>(
     config: &ServeConfig,
     health_addr: Option<&str>,
     health_bind: Option<HealthBindDecision>,
-    shared: &ironbus_server::actor::EngineHandle<StdFs, SystemClock>,
+    shared: &ironbus_server::actor::EngineHandle<F, SystemClock>,
     shutdown: &Arc<AtomicBool>,
     progress: &Arc<ironbus_server::liveness::LivenessBeacon>,
     health_clock: &SystemClock,
@@ -3396,7 +3714,7 @@ fn install_signal_handler(shutdown: &Arc<AtomicBool>) -> Result<(), CliError> {
                                      // distinct inputs into a struct would only move the noise.
 fn cmd_serve(
     addr: &str,
-    data_dir: &Path,
+    data_dir: Option<&Path>,
     config: &ServeConfig,
     key_shared_groups: &[String],
     broadcast_groups: &[String],
@@ -3489,6 +3807,12 @@ fn cmd_serve(
         config.flush_interval_ms,
         config.flush_max_bytes,
         config.async_loss_ack,
+        // The #443 storage-backend knob and its ephemeral consent are read only on the Unix serve
+        // path (the static disk/memory dispatch and the ephemeral-contract banner), so the non-Unix
+        // stub must consume them too or the Windows `-D warnings` build trips field-never-read,
+        // invisible to a macOS reviewer (the recurring #288/#99 footgun).
+        config.storage,
+        config.ephemeral_loss_ack,
         // The #68/#69 backpressure knobs are read only on the Unix serve path (they wire the engine's
         // CoDel / retry-budget / fire-and-forget / egress controls), so the non-Unix stub must consume
         // them too or the Windows `-D warnings` build trips field-never-read, invisible to a macOS
@@ -3531,6 +3855,9 @@ fn cmd_serve(
 /// a consumer first subscribes; an empty slice leaves every group plain competing (the default).
 /// `broadcast_groups` (#288) are marked BROADCAST at open (a group-of-one that sees every record in
 /// order), so each accepts the cumulative-ack verb; an empty slice leaves every group competing.
+/// The engine construction itself is the fs-generic [`open_engine_with`] (#443), so the `disk` and
+/// `memory` backends build the IDENTICAL `EngineConfig`; this wrapper adds only the disk concerns
+/// (create the directory, root a `StdFs` at it).
 #[cfg(unix)]
 fn open_disk_engine(
     data_dir: &Path,
@@ -3541,6 +3868,51 @@ fn open_disk_engine(
     std::fs::create_dir_all(data_dir)
         .map_err(|e| CliError::Internal(format!("cannot create {}: {e}", data_dir.display())))?;
     let fs = StdFs::new(data_dir.to_path_buf());
+    open_engine_with(
+        fs,
+        config,
+        key_shared_groups,
+        broadcast_groups,
+        &format!("at {}", data_dir.display()),
+    )
+}
+
+/// Opens the OPT-IN ephemeral in-memory broker engine (#443): the SAME engine and, via the shared
+/// [`open_engine_with`], the SAME `EngineConfig` the disk path builds, over a fresh
+/// [`InMemoryFs::new()`] (the deterministic in-memory `Filesystem` every engine test and
+/// conformance suite already exercises). No file is created and no fsync is issued; the stored
+/// format, CRC-over-stored-bytes, retention, compression (#430), the produce gate (#438), and the
+/// checkpoint machinery (group cursors, which drive redelivery semantics WITHIN the process
+/// lifetime) all hold identically. The loss contract is enforced upstream by `validate_storage`:
+/// this is only reachable with `--ephemeral-loss-ack` and a non-zero `--max-total-bytes`.
+#[cfg(unix)]
+fn open_memory_engine(
+    config: &ServeConfig,
+    key_shared_groups: &[String],
+    broadcast_groups: &[String],
+) -> Result<Engine<InMemoryFs, SystemClock>, CliError> {
+    open_engine_with(
+        InMemoryFs::new(),
+        config,
+        key_shared_groups,
+        broadcast_groups,
+        "in memory",
+    )
+}
+
+/// Builds the broker engine over ANY [`Filesystem`] (#443): the ONE place the resolved
+/// [`ServeConfig`] becomes an `EngineConfig`, shared by [`open_disk_engine`] and
+/// [`open_memory_engine`] so the two storage backends can never drift apart in engine behavior
+/// (same caps, same retention, same durability mapping, same compression). `context` names the
+/// store in an open error (e.g. `at /var/lib/ironbus`, `in memory`).
+#[cfg(unix)]
+fn open_engine_with<F: Filesystem>(
+    fs: F,
+    config: &ServeConfig,
+    key_shared_groups: &[String],
+    broadcast_groups: &[String],
+    context: &str,
+) -> Result<Engine<F, SystemClock>, CliError> {
     // An explicit --backoff-ms wins; an empty schedule (the flag was not passed) uses the built-in
     // default. Each stage is milliseconds on the wire, nanoseconds in the engine; saturate rather
     // than overflow on an absurd value.
@@ -3665,7 +4037,7 @@ fn open_disk_engine(
             },
         },
     )
-    .map_err(|e| CliError::Internal(format!("opening broker at {}: {e}", data_dir.display())))?;
+    .map_err(|e| CliError::Internal(format!("opening broker {context}: {e}")))?;
     let mut engine = engine;
     // Enable OPT-IN key compaction (#337) when `--compact` was passed (OFF by default). It runs the
     // off-hot-path compactor after each produce-path reaper run; it never touches the active segment,
@@ -5729,6 +6101,9 @@ mod tests {
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
             async_loss_ack: false,
+            // The default storage backend (#443): the durable on-disk store, no ephemeral consent.
+            storage: StorageArg::Disk,
+            ephemeral_loss_ack: false,
             // Backpressure controls (#68, #69) default to inert in this config builder.
             codel_target_ms: 0,
             codel_interval_ms: DEFAULT_CODEL_INTERVAL_MS,
@@ -6138,8 +6513,11 @@ mod tests {
         ]))
         .unwrap()
         .config;
-        let line =
-            materialized_config_line(&config, "127.0.0.1:7777", Path::new("/var/lib/ironbus"));
+        let line = materialized_config_line(
+            &config,
+            "127.0.0.1:7777",
+            Some(Path::new("/var/lib/ironbus")),
+        );
         assert!(
             line.contains("materialized-config"),
             "is the dump line: {line}"
@@ -7846,6 +8224,9 @@ mod tests {
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
             async_loss_ack: false,
+            // The default storage backend (#443): the durable on-disk store, no ephemeral consent.
+            storage: StorageArg::Disk,
+            ephemeral_loss_ack: false,
             // Backpressure controls (#68, #69) default to inert in this config builder.
             codel_target_ms: 0,
             codel_interval_ms: DEFAULT_CODEL_INTERVAL_MS,
@@ -8051,7 +8432,7 @@ mod tests {
                 .unwrap()
                 .config,
             "127.0.0.1:7700",
-            Path::new("/tmp/d"),
+            Some(Path::new("/tmp/d")),
         );
         assert!(
             line.contains("compression=none"),
@@ -8154,7 +8535,8 @@ mod tests {
         // active level, whether it is power-loss safe, and the interval triggers, so an operator reads
         // the durability posture straight off the startup log.
         let safe = parse_serve_flags(&serve_args(&[])).unwrap().config;
-        let line = materialized_config_line(&safe, "127.0.0.1:7777", Path::new("/var/lib/ironbus"));
+        let line =
+            materialized_config_line(&safe, "127.0.0.1:7777", Some(Path::new("/var/lib/ironbus")));
         assert!(line.contains("durability_level=sync"), "{line}");
         assert!(line.contains("power_loss_safe=true"), "{line}");
 
@@ -8165,8 +8547,11 @@ mod tests {
         ]))
         .unwrap()
         .config;
-        let line2 =
-            materialized_config_line(&relaxed, "127.0.0.1:7777", Path::new("/var/lib/ironbus"));
+        let line2 = materialized_config_line(
+            &relaxed,
+            "127.0.0.1:7777",
+            Some(Path::new("/var/lib/ironbus")),
+        );
         assert!(line2.contains("durability_level=async"), "{line2}");
         assert!(line2.contains("power_loss_safe=false"), "{line2}");
         assert!(line2.contains("async_loss_ack=true"), "{line2}");
@@ -8205,6 +8590,262 @@ mod tests {
         assert!(
             durability_loss_description(&none).contains("largest loss window"),
             "none states the largest window"
+        );
+    }
+
+    // ---- #443 ephemeral in-memory storage backend ----
+
+    #[test]
+    fn memory_storage_refuses_to_boot_without_the_ephemeral_loss_acknowledgement() {
+        // THE EPHEMERAL SAFETY GATE (#443): `--storage memory` without the explicit consent is
+        // refused fail-closed (exit 1, before any listener opens), with a message that states the
+        // loss contract, what an ack still covers, and the flag to set. An ephemeral broker is
+        // never reachable by accident, mirroring the none/async durability gate.
+        let cfg = parse_serve_flags(&serve_args(&[
+            "--storage",
+            "memory",
+            "--max-total-bytes",
+            "1048576",
+        ]))
+        .unwrap()
+        .config;
+        match validate_serve_config(&cfg) {
+            Err(CliError::Usage(m)) => {
+                assert!(m.contains("`--storage memory`"), "names the backend: {m}");
+                assert!(
+                    m.contains("--ephemeral-loss-ack"),
+                    "names the consent flag: {m}"
+                );
+                assert!(
+                    m.contains("loses EVERY acknowledged message"),
+                    "states the loss contract: {m}"
+                );
+                assert!(
+                    m.contains("`--async-loss-ack` does NOT cover this"),
+                    "separates the two loss contracts: {m}"
+                );
+                assert_eq!(CliError::Usage(m).exit_code(), EXIT_USAGE);
+            }
+            other => panic!("memory without the consent must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_storage_refuses_an_unlimited_byte_cap() {
+        // THE RAM BOUND (#443): on disk an unbounded log fills the SD card; in memory it OOMs the
+        // device. `--storage memory` requires an explicit non-zero `--max-total-bytes`, whether
+        // the cap is left at its 0 default or set to 0 explicitly, and the refusal states that
+        // the cap meters STORED (post-compression) bytes.
+        for extra in [&[][..], &["--max-total-bytes", "0"][..]] {
+            let mut args = vec!["--storage", "memory", "--ephemeral-loss-ack"];
+            args.extend_from_slice(extra);
+            let cfg = parse_serve_flags(&serve_args(&args)).unwrap().config;
+            match validate_serve_config(&cfg) {
+                Err(CliError::Usage(m)) => {
+                    assert!(m.contains("--max-total-bytes"), "names the cap flag: {m}");
+                    assert!(
+                        m.contains("STORED") && m.contains("post-compression"),
+                        "states what the cap meters: {m}"
+                    );
+                    assert!(m.contains("OOMs"), "states the failure mode: {m}");
+                    assert_eq!(CliError::Usage(m).exit_code(), EXIT_USAGE);
+                }
+                other => panic!("memory with an unlimited cap must be refused, got {other:?}"),
+            }
+        }
+        // With BOTH the consent and an explicit cap, validation accepts the backend.
+        let ok = parse_serve_flags(&serve_args(&[
+            "--storage",
+            "memory",
+            "--ephemeral-loss-ack",
+            "--max-total-bytes",
+            "1048576",
+        ]))
+        .unwrap()
+        .config;
+        assert!(
+            validate_serve_config(&ok).is_ok(),
+            "memory with the consent and a byte cap must validate"
+        );
+        assert_eq!(ok.storage, StorageArg::Memory);
+    }
+
+    #[test]
+    fn memory_storage_refuses_an_explicit_data_dir() {
+        // `--storage memory` keeps no on-disk state, so a given `--data-dir` would silently mean
+        // nothing; the boot refuses it as a usage error (exit 1, before any listener opens)
+        // echoing the conflicting directory.
+        let mut buf = Vec::new();
+        let e = run(
+            &[
+                "serve".to_string(),
+                "--storage".to_string(),
+                "memory".to_string(),
+                "--ephemeral-loss-ack".to_string(),
+                "--max-total-bytes".to_string(),
+                "1048576".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/ironbus-memory-mode-never-served".to_string(),
+            ],
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => {
+                assert!(
+                    m.contains("`--data-dir` must be absent"),
+                    "states the rule: {m}"
+                );
+                assert!(
+                    m.contains("/tmp/ironbus-memory-mode-never-served"),
+                    "echoes the conflicting directory: {m}"
+                );
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_storage_backend_is_a_usage_error_naming_its_source() {
+        // A bad `--storage` value names the FLAG; the same bad value arriving via the
+        // `IRONBUS_STORAGE` env var names the ENV VAR, exactly like the other enum flags.
+        match parse_serve_flags(&serve_args(&["--storage", "floppy"])) {
+            Err(CliError::Usage(m)) => {
+                assert!(
+                    m.contains("`--storage` must be `disk` or `memory`, got `floppy`"),
+                    "names the flag and echoes the value: {m}"
+                );
+                assert_eq!(CliError::Usage(m).exit_code(), EXIT_USAGE);
+            }
+            other => panic!("a bad --storage value must be a usage error, got {other:?}"),
+        }
+        let env_map = |name: &str| -> Option<String> {
+            if name == "IRONBUS_STORAGE" {
+                Some("floppy".to_string())
+            } else {
+                None
+            }
+        };
+        match parse_serve_flags_with_env(&serve_args(&[]), &env_map) {
+            Err(CliError::Usage(m)) => assert!(
+                m.contains("`IRONBUS_STORAGE` must be `disk` or `memory`, got `floppy`"),
+                "names the env var: {m}"
+            ),
+            other => panic!("a bad IRONBUS_STORAGE value must be a usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn async_loss_ack_never_satisfies_the_ephemeral_consent() {
+        // The two loss contracts are DISTINCT (#443): `--async-loss-ack` consents to a relaxed
+        // fsync schedule on a DURABLE store and must never unlock the ephemeral broker. The
+        // message-content test above cannot catch a conflated gate (one that accepts either
+        // consent), so this case boots with ONLY the async consent and pins the refusal itself.
+        let cfg = parse_serve_flags(&serve_args(&[
+            "--storage",
+            "memory",
+            "--async-loss-ack",
+            "--max-total-bytes",
+            "1048576",
+        ]))
+        .unwrap()
+        .config;
+        match validate_serve_config(&cfg) {
+            Err(CliError::Usage(m)) => assert!(
+                m.contains("--ephemeral-loss-ack"),
+                "memory mode still demands its dedicated consent: {m}"
+            ),
+            other => panic!("--async-loss-ack must not unlock memory mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_ephemeral_consent_resolves_from_its_env_var() {
+        // `IRONBUS_EPHEMERAL_LOSS_ACK` follows the IRONBUS_<FLAG> grammar like every bool flag
+        // (the `--async-loss-ack` precedent): an env-ignoring regression would strand fleet
+        // configs that grant the consent through /etc/ironbus/ironbus.env.
+        let env_map = |name: &str| -> Option<String> {
+            if name == "IRONBUS_EPHEMERAL_LOSS_ACK" {
+                Some("true".to_string())
+            } else {
+                None
+            }
+        };
+        let cfg = parse_serve_flags_with_env(
+            &serve_args(&["--storage", "memory", "--max-total-bytes", "1048576"]),
+            &env_map,
+        )
+        .unwrap()
+        .config;
+        assert!(
+            validate_serve_config(&cfg).is_ok(),
+            "the env-granted consent boots memory mode"
+        );
+    }
+
+    #[test]
+    fn the_storage_backend_resolves_flag_over_env_over_default() {
+        // The standard precedence (#89): the default is disk; `IRONBUS_STORAGE=memory` selects the
+        // memory backend; an explicit `--storage disk` still beats the env var.
+        let none = parse_serve_flags(&serve_args(&[])).unwrap().config;
+        assert_eq!(none.storage, StorageArg::Disk, "the default is disk");
+        let env_map = |name: &str| -> Option<String> {
+            if name == "IRONBUS_STORAGE" {
+                Some("memory".to_string())
+            } else {
+                None
+            }
+        };
+        let from_env = parse_serve_flags_with_env(&serve_args(&[]), &env_map)
+            .unwrap()
+            .config;
+        assert_eq!(
+            from_env.storage,
+            StorageArg::Memory,
+            "env beats the default"
+        );
+        let flag_wins = parse_serve_flags_with_env(&serve_args(&["--storage", "disk"]), &env_map)
+            .unwrap()
+            .config;
+        assert_eq!(flag_wins.storage, StorageArg::Disk, "the flag beats env");
+    }
+
+    #[test]
+    fn the_materialized_config_line_carries_the_storage_backend() {
+        // The #443 machine-checkable echo: the default disk line says storage=disk (ADDITIVE, the
+        // historical fields keep their order); memory mode says storage=memory with the data_dir
+        // field carrying the `none` sentinel (no path exists).
+        let disk = parse_serve_flags(&serve_args(&[])).unwrap().config;
+        let line =
+            materialized_config_line(&disk, "127.0.0.1:7777", Some(Path::new("/var/lib/ironbus")));
+        assert!(line.contains("storage=disk"), "{line}");
+        assert!(line.contains("data_dir=/var/lib/ironbus"), "{line}");
+        let memory = parse_serve_flags(&serve_args(&[
+            "--storage",
+            "memory",
+            "--ephemeral-loss-ack",
+            "--max-total-bytes",
+            "1048576",
+        ]))
+        .unwrap()
+        .config;
+        let line2 = materialized_config_line(&memory, "127.0.0.1:7777", None);
+        assert!(line2.contains("storage=memory"), "{line2}");
+        assert!(line2.contains("data_dir=none"), "{line2}");
+    }
+
+    #[test]
+    fn usage_lists_the_storage_flag_and_the_ephemeral_consent() {
+        // Both #443 flags are documented in the USAGE string, so `ironbus help` surfaces the
+        // backend selector next to its consent gate.
+        assert!(
+            USAGE.contains("--storage <disk|memory>"),
+            "USAGE must document --storage"
+        );
+        assert!(
+            USAGE.contains("--ephemeral-loss-ack"),
+            "USAGE must document --ephemeral-loss-ack"
         );
     }
 
@@ -8882,7 +9523,7 @@ mod tests {
         let line = materialized_config_line(
             &from_flag.config,
             "127.0.0.1:7777",
-            Path::new("/var/lib/ironbus"),
+            Some(Path::new("/var/lib/ironbus")),
         );
         assert!(
             line.contains("wal_fsync_headroom_bytes=4096"),
