@@ -882,3 +882,4 @@ are NOT emitted by the current binary.
   `--disk-full-policy`, `--key-shared-group`, and `--broadcast-group`).
 - The on-disk and wire byte layouts referenced by the offline output shapes are specified
   in [`CONTRACTS.md`](CONTRACTS.md).
+| `--pubwindow <n>` | int | `1` | n/a | The pipelined publish window (#450): up to `n` un-acked PUBs in flight per produce call via the client's `produce_window`, so the broker's group commit covers the window with ONE `fdatasync` instead of `n`. Acks keep their unchanged fsynced-durable meaning; only WHEN the publisher awaits changes. `1` is the historical one-awaited-ack-per-publish path; `0` is a usage error. Reported additively as `pubwindow` in the `--json` output. |

@@ -490,6 +490,85 @@ impl Client {
         }
     }
 
+    /// Produces a WINDOW of messages PIPELINED (#450): every `Pub` frame is written before any
+    /// ack is awaited, so the broker's group commit covers the whole window with ONE `fdatasync`
+    /// instead of one per message (the session parks the pending acks and the append actor
+    /// drains the window as a single batch). The replies are FIFO in frame order, the
+    /// per-connection wire contract, so the Nth returned ack belongs to the Nth message. Every
+    /// ack keeps the unchanged at-least-once meaning: the record is fsynced-durable before the
+    /// ack exists. Pipelining changes WHEN the client awaits, never what an ack means.
+    ///
+    /// Per-message `dedup` blocks are honored exactly as in [`Client::produce_dedup`] (a dedup
+    /// hit returns `duplicate = true` for that slot). The `fire_and_forget` field is forced
+    /// clear on every message: a QoS-0 produce has no reply and would desynchronize the FIFO
+    /// window; use [`Client::produce_fire_and_forget`] for that path.
+    ///
+    /// On a server `Err` reply mid-window, the REMAINING replies are still drained (one reply
+    /// per message is the contract, so the connection stays usable for the next call, the same
+    /// discipline as the decompress drain) and the FIRST error returns; offsets acked before or
+    /// after the failing slot in the same window are durable on the broker but not returned. An
+    /// IO error or an unexpected frame type aborts immediately: the stream itself is broken and
+    /// the connection should be dropped.
+    ///
+    /// An empty window returns an empty vec without touching the wire.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, an over-large field, an unexpected frame, or
+    /// the first server error in the window.
+    pub fn produce_window(
+        &mut self,
+        messages: &[PubBody<'_>],
+    ) -> Result<Vec<ProduceAck>, ClientError> {
+        // Phase 1: write the WHOLE window before awaiting any reply. This is what puts all N
+        // produces in front of the actor's drain loop as one group-commit batch (#450).
+        for message in messages {
+            let mut body = Vec::new();
+            let at_least_once = PubBody {
+                fire_and_forget: false,
+                ..*message
+            };
+            encode_pub(&at_least_once, &mut body).map_err(ClientError::Body)?;
+            self.send(FrameType::Pub, &body)?;
+        }
+        // Phase 2: drain exactly one reply per message, FIFO. A server Err consumes its slot and
+        // is remembered; the drain continues so the connection is not desynchronized.
+        let mut acks = Vec::with_capacity(messages.len());
+        let mut first_err: Option<ClientError> = None;
+        for _ in 0..messages.len() {
+            match self.read_frame()? {
+                (FrameType::PubAck, body) => {
+                    let ack = decode_pub_ack(&body).map_err(|_| {
+                        ClientError::BadResponse("produce reply was not an eight-byte offset")
+                    })?;
+                    acks.push(ProduceAck {
+                        offset: ack.offset,
+                        duplicate: false,
+                    });
+                }
+                (FrameType::PubAckDuplicate, body) => {
+                    let ack = decode_pub_ack(&body).map_err(|_| {
+                        ClientError::BadResponse("dedup-hit reply was not an eight-byte offset")
+                    })?;
+                    acks.push(ProduceAck {
+                        offset: ack.offset,
+                        duplicate: true,
+                    });
+                }
+                (FrameType::Err, body) => {
+                    if first_err.is_none() {
+                        first_err =
+                            Some(ClientError::Server(String::from_utf8_lossy(&body).into()));
+                    }
+                }
+                (other, _) => return Err(ClientError::Unexpected(other)),
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(acks),
+        }
+    }
+
     /// Produces a message on the FIRE-AND-FORGET (QoS-0, #11, #402) fast path: it sets the additive
     /// `PUB_FLAG_FIRE_AND_FORGET` wire bit and does NOT wait for a `PubAck`, so it returns the moment
     /// the frame is written. The broker MAY drop the produce under load (gated by its fire-and-forget
@@ -1115,6 +1194,58 @@ mod tests {
             }
         });
         (addr, handle)
+    }
+
+    #[test]
+    fn a_pipelined_window_returns_fifo_offsets_and_round_trips_against_a_real_server() {
+        // The #450 pipelined window over the real wire: all PUB frames written before any ack
+        // is awaited, FIFO acks one per message with consecutive offsets, payloads consumable
+        // in order, and the connection healthy for a follow-up plain produce.
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+
+        let payloads: Vec<Vec<u8>> = (0..8u8).map(|i| vec![b'w', i]).collect();
+        let window: Vec<PubBody<'_>> = payloads
+            .iter()
+            .map(|p| PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"k",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: p,
+            })
+            .collect();
+        let acks = c.produce_window(&window).unwrap();
+        assert_eq!(acks.len(), 8, "one ack per message");
+        for (i, ack) in acks.iter().enumerate() {
+            assert_eq!(ack.offset, i as u64, "FIFO acks carry consecutive offsets");
+            assert!(!ack.duplicate);
+        }
+        // An empty window is a no-op that never touches the wire.
+        assert!(c.produce_window(&[]).unwrap().is_empty());
+        // The connection is fully usable afterwards: a plain produce gets the next offset.
+        let next = c
+            .produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"k",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"after-window",
+            })
+            .unwrap();
+        assert_eq!(next, 8);
+        let messages = c.fetch(16).unwrap().messages;
+        assert_eq!(messages.len(), 9, "the window and the follow-up all landed");
+        assert_eq!(messages[0].payload, payloads[0]);
+        assert_eq!(messages[7].payload, payloads[7]);
+
+        shutdown.store(true, Ordering::Relaxed);
+        drop(c);
+        let _ = handle.join();
     }
 
     #[test]

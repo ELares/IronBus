@@ -360,18 +360,70 @@ fn run_publish(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError> {
     let mut produced: u64 = 0;
     let mut fsync_samples: Vec<u64> = Vec::new();
     let started = Instant::now();
-    while !should_stop(&cfg.bound, produced, started) {
-        fill_payload(
-            &mut payload,
-            cfg.payload_shape,
-            produced,
-            ROUND_TRIP_TOKEN_LEN,
-        );
-        stamp_seq(&mut payload, produced);
-        let produce_ns = produce_one(&mut pub_client, addr, &mut payload, started)?;
-        fsync_samples.push(produce_ns);
-        produced += 1;
-        pace(cfg.target_rate_hz, produced, started);
+    if cfg.pub_window > 1 {
+        // The PIPELINED window (#450): fill W distinct payload buffers, write all W PUB frames
+        // before awaiting any ack (Client::produce_window), and attribute the window's elapsed
+        // time evenly across its messages, so the per-op fsync-cost sample reflects the
+        // group-commit amortization honestly (one fdatasync covers the whole window).
+        let mut buffers: Vec<Vec<u8>> = vec![vec![0u8; cfg.payload_bytes]; cfg.pub_window];
+        while !should_stop(&cfg.bound, produced, started) {
+            let want = match &cfg.bound {
+                Bound::Count(n) => {
+                    usize::try_from(n.saturating_sub(produced)).unwrap_or(usize::MAX)
+                }
+                Bound::Duration(_) => cfg.pub_window,
+            }
+            .min(cfg.pub_window);
+            if want == 0 {
+                break;
+            }
+            for (i, buf) in buffers.iter_mut().enumerate().take(want) {
+                let seq = produced + i as u64;
+                fill_payload(buf, cfg.payload_shape, seq, ROUND_TRIP_TOKEN_LEN);
+                stamp_seq(buf, seq);
+                stamp_send_time(buf, started);
+            }
+            let window: Vec<PubBody<'_>> = buffers
+                .iter()
+                .take(want)
+                .map(|buf| PubBody {
+                    flags: 0,
+                    timestamp_ms: 0,
+                    key: b"",
+                    headers: b"",
+                    dedup: None,
+                    fire_and_forget: false,
+                    payload: buf,
+                })
+                .collect();
+            let call_start = Instant::now();
+            match pub_client.produce_window(&window) {
+                Ok(_) => {}
+                Err(e) if is_shed(&e) => {}
+                Err(e) => return Err(classify(addr, "producing a window to", &e)),
+            }
+            let elapsed_ns = u64::try_from(call_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let per_msg = elapsed_ns / want as u64;
+            for _ in 0..want {
+                fsync_samples.push(per_msg);
+            }
+            produced += want as u64;
+            pace(cfg.target_rate_hz, produced, started);
+        }
+    } else {
+        while !should_stop(&cfg.bound, produced, started) {
+            fill_payload(
+                &mut payload,
+                cfg.payload_shape,
+                produced,
+                ROUND_TRIP_TOKEN_LEN,
+            );
+            stamp_seq(&mut payload, produced);
+            let produce_ns = produce_one(&mut pub_client, addr, &mut payload, started)?;
+            fsync_samples.push(produce_ns);
+            produced += 1;
+            pace(cfg.target_rate_hz, produced, started);
+        }
     }
     let elapsed = started.elapsed();
     // Publish has no read-back, so no end-to-end latency; but the per-produce durable cost IS
