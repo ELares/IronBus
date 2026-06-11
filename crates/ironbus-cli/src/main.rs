@@ -6509,8 +6509,11 @@ mod tests {
         ]))
         .unwrap()
         .config;
-        let line =
-            materialized_config_line(&config, "127.0.0.1:7777", Path::new("/var/lib/ironbus"));
+        let line = materialized_config_line(
+            &config,
+            "127.0.0.1:7777",
+            Some(Path::new("/var/lib/ironbus")),
+        );
         assert!(
             line.contains("materialized-config"),
             "is the dump line: {line}"
@@ -8425,7 +8428,7 @@ mod tests {
                 .unwrap()
                 .config,
             "127.0.0.1:7700",
-            Path::new("/tmp/d"),
+            Some(Path::new("/tmp/d")),
         );
         assert!(
             line.contains("compression=none"),
@@ -8528,7 +8531,11 @@ mod tests {
         // active level, whether it is power-loss safe, and the interval triggers, so an operator reads
         // the durability posture straight off the startup log.
         let safe = parse_serve_flags(&serve_args(&[])).unwrap().config;
-        let line = materialized_config_line(&safe, "127.0.0.1:7777", Path::new("/var/lib/ironbus"));
+        let line = materialized_config_line(
+            &safe,
+            "127.0.0.1:7777",
+            Some(Path::new("/var/lib/ironbus")),
+        );
         assert!(line.contains("durability_level=sync"), "{line}");
         assert!(line.contains("power_loss_safe=true"), "{line}");
 
@@ -8539,8 +8546,11 @@ mod tests {
         ]))
         .unwrap()
         .config;
-        let line2 =
-            materialized_config_line(&relaxed, "127.0.0.1:7777", Path::new("/var/lib/ironbus"));
+        let line2 = materialized_config_line(
+            &relaxed,
+            "127.0.0.1:7777",
+            Some(Path::new("/var/lib/ironbus")),
+        );
         assert!(line2.contains("durability_level=async"), "{line2}");
         assert!(line2.contains("power_loss_safe=false"), "{line2}");
         assert!(line2.contains("async_loss_ack=true"), "{line2}");
@@ -9256,7 +9266,7 @@ mod tests {
         let line = materialized_config_line(
             &from_flag.config,
             "127.0.0.1:7777",
-            Path::new("/var/lib/ironbus"),
+            Some(Path::new("/var/lib/ironbus")),
         );
         assert!(
             line.contains("wal_fsync_headroom_bytes=4096"),
