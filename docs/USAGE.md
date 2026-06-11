@@ -163,6 +163,52 @@ notice and resumes at the oldest record still present.
 The two relevant metrics on `/metrics` are `ironbus_produce_rejected_total` (produces shed
 by the byte cap) and `ironbus_segments_reaped_total` (segments reclaimed by retention).
 
+### Memory mode (`--storage memory`)
+
+The opt-in ephemeral backend (#443) runs the SAME engine entirely in RAM:
+
+```sh
+ironbus serve --storage memory --ephemeral-loss-ack --max-total-bytes 67108864
+```
+
+**When to use it.** Hot-path fan-out, spill-to-RAM buffering, and test rigs where flash wear
+or fsync latency is the binding constraint and the data is reconstructible from a live
+source. On the measured edge baseline (#443), an SD card costs 9.0 ms per fsync at about
+50 msg/s with roughly 70 KB of physical flash writes per 256 B message; RAM-backed storage
+runs about 0.5 ms per publish at 92 msg/s and writes nothing to flash at all. If the device
+must survive a reboot with its queue intact, memory mode is the wrong tool; consider the
+disk backend on a tmpfs mount instead (see [`EDGE_TUNING.md`](EDGE_TUNING.md), which also
+explains when plain tmpfs is the better trade).
+
+**The loss contract.** A clean stop or a crash loses EVERY acknowledged message; an ack
+survives a connection drop and an engine hiccup, never a process exit. That is why boot is
+fail-closed three ways: the dedicated `--ephemeral-loss-ack` consent is required
+(`--async-loss-ack` does NOT cover it; that flag consents to a relaxed fsync schedule on a
+DURABLE store, a different contract), `--max-total-bytes` must be set above 0 (the RAM
+bound; in RAM an unbounded log OOMs the device instead of filling a disk), and `--data-dir`
+must be absent (no on-disk state exists, so a path would only LOOK durable). The startup
+banner restates the contract on every boot and the materialized-config line says
+`storage=memory`.
+
+**Introspection is live-only.** A memory broker leaves NO data directory, so the offline
+verbs (`peek`, `dump`, `scrub`, `repair`, `admin consumer-reset`, `admin dlq-redrive`,
+`migrate`) have nothing to inspect after it exits, ever. While it runs, `/healthz`,
+`/readyz`, `/metrics`, `/admin` (with `--enable-admin`), and `ironbus top --addr` work
+unchanged; plan any debugging or alerting around those.
+
+**Restarts revive an EMPTY broker.** Under a supervisor (the packaged systemd unit's
+`Restart=on-failure`, a container orchestrator's restart policy), a crashed memory broker
+comes back with offset 0 and no records: consumers resume from a clean slate, not from
+where they left off. Pair memory mode with consumers that tolerate replay-from-live (they
+re-subscribe and continue from whatever is published next) and with producers that can
+re-publish or afford to lose the in-flight window. Within one process lifetime the normal
+semantics hold: group cursors, redelivery, `MaxDeliver`, and dead-lettering behave exactly
+as on disk.
+
+Retention, the byte cap, `--disk-full-policy`, and `--compact` all keep working in memory
+mode and are what hold the broker under its RAM budget; the full per-knob interplay table
+is in [`CLI.md`](CLI.md).
+
 ## Produce
 
 ```sh
@@ -254,6 +300,10 @@ total of deliveries plus advisories), so a consumer that polls a queue learns ex
 which offsets were dropped past `MaxDeliver`.
 
 ## Restart and resume
+
+Everything in this section describes the default disk backend. A `--storage memory`
+broker (#443) has NO restart-and-resume story by contract: a restart revives an EMPTY
+broker (see "Memory mode" above).
 
 The durable log always survives a restart, so a fresh publish after restarting on the
 same `--data-dir` continues at the next offset (the message bytes were fsynced at
@@ -393,6 +443,11 @@ Both mark, never hide, a torn or corrupt tail: a trailing note (a `{"loss":...}`
 `--json` mode) reports the dropped byte span and the reason, so the holes are shown rather
 than silently skipped. A clean directory prints no note. Both bound memory to one segment
 at a time. The offline verbs are Unix only in v1, like `serve`.
+
+The offline verbs only apply to the disk backend: a `--storage memory` broker (#443) keeps
+no data directory, so there is nothing to peek, dump, scrub, or repair after it exits; its
+only introspection is the live surface while it runs (see "Memory mode" above and the
+offline-verb notes in [`CLI.md`](CLI.md)).
 
 ## Health and metrics
 

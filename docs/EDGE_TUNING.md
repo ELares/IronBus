@@ -52,7 +52,8 @@ not a hard requirement.
 | | `--max-in-flight` | `1024`; min `1` | a few hundred or fewer | The per-GROUP max-ack-pending window. Lower it so the in-flight set across a group cannot pin many records' worth of lease state in memory at once. |
 | | `--max-groups` | `1024`; `0` = unlimited | `1024` (default) or lower | Caps live work-groups so a client cannot exhaust memory by naming endless groups (#240; see THREAT_MODEL.md "unbounded group names"). Keep the non-zero default; never `0` on the edge. |
 | | `--max-total-bytes` | `0` = unlimited | a disk-sized cap, e.g. `268435456` (256 MiB) | A hard durable-log byte cap. It bounds disk, not RSS directly, but a bounded log keeps the in-memory derived offset index (rebuilt from the log on startup) small, so it composes with the RAM bound. |
-| **Flash wear / slow storage** | `--checkpoint-interval` | `1024` (messages) | `1024` (default) or higher | The cursor is checkpointed after it advances this many offsets, so the checkpoint write rate stays far below one write per ack (edge flash endurance). A larger value writes the checkpoint less often (at the cost of redelivering more after an abrupt crash); do NOT lower it toward 1 on flash. |
+| **Flash wear / slow storage** | `--storage memory` (#443) | `disk` | `memory` ONLY when reboot loss is acceptable | Removes flash writes and fsync latency entirely by holding the log in RAM: no files, no fsync, and NO restart durability (a stop or crash loses every acked message). Gated behind `--ephemeral-loss-ack` and a non-zero `--max-total-bytes`. See "When memory mode is the right call" below, including the tmpfs alternative. |
+| | `--checkpoint-interval` | `1024` (messages) | `1024` (default) or higher | The cursor is checkpointed after it advances this many offsets, so the checkpoint write rate stays far below one write per ack (edge flash endurance). A larger value writes the checkpoint less often (at the cost of redelivering more after an abrupt crash); do NOT lower it toward 1 on flash. |
 | | `--max-total-bytes` | `0` = unlimited | a disk-sized cap (as above) | Bounds total durable bytes so the log does not grow until the device fills; the drop-new shed backstop. |
 | | `--max-retained-bytes` / `--max-age-ms` / `--max-messages` | `0` = off (each) | enable at least one, sized to the device | Retention reaps whole old, fully-consumed sealed segments (consumer-safe, never below the slowest consumer, never the active segment). Bounding the on-disk footprint bounds the rewrite/erase volume the flash sees over time (write amplification, #19). |
 | | `--disk-full-policy` | `drop-new` | `drop-new` (default) | When `--max-total-bytes` is hit, drop-new sheds the over-cap produce and preserves older accepted data, avoiding the extra force-reap writes (and the consumer truncation) that `drop-oldest` incurs. |
@@ -116,6 +117,53 @@ loss is bounded (at most one segment or 64 MiB per event, at most 1 percent of
 durable bytes per recovery) and reported as a number; exceeding either cap
 freezes the log read-only and alerts. See README and
 [INVARIANTS.md](INVARIANTS.md).
+
+## When memory mode is the right call (#443, #444)
+
+`serve --storage memory` is the deliberate answer for a flash-wear-bound deployment that can
+tolerate reboot loss: the broker holds the whole log in RAM, so flash sees zero writes and the
+produce path pays no durability barrier at all.
+
+The measured baseline (the deployed edge hive, 2026-06-10, 256 B messages; the #443 numbers):
+
+- SD card (the durable default): 9.0 ms per fsync, about 50 msg/s sustained, and roughly
+  70 KB of PHYSICAL flash writes per 256 B message once segment append, cursor checkpoint,
+  and filesystem journal amplification stack up. On a wear-rated SD part, that write
+  amplification, not CPU, is the budget that runs out first.
+- RAM-backed (tmpfs mount): 0.5 ms per publish, about 92 msg/s, with the ceiling moving to
+  CPU. Memory mode runs the same engine over RAM, so it sits in the same performance regime
+  while writing nothing to any filesystem.
+
+Take memory mode when ALL of these hold: the data is reconstructible from a live source (or
+the loss window is genuinely acceptable), consumers tolerate replay-from-live after a restart
+(a revived memory broker is EMPTY: offset 0, no records), and introspection can be live-only
+(`/healthz`, `/readyz`, `/metrics`, `/admin`, `top --addr`; there is no data dir for the
+offline verbs, ever). Size `--max-total-bytes` deliberately: in RAM it is the OOM guard, and
+stored records are resident memory ON TOP of the bounded buffers `--ram-ceiling-bytes` meters.
+
+### The honest tmpfs baseline
+
+Running the ordinary DISK backend with `--data-dir` on a tmpfs mount achieves most of the same
+result and works on EVERY shipped version today, with no new flags: flash sees zero writes,
+fsync is a RAM-speed no-op (the 0.5 ms / 92 msg/s row above IS a tmpfs measurement), and,
+unlike memory mode, the data dir SURVIVES a broker stop, crash, or upgrade as long as the
+machine stays up (broker-restart survival on tmpfs was verified as part of the #443 baseline:
+a message published before a broker kill was delivered after restart). The full operational
+surface keeps working too: `peek`/`dump`/`scrub`/`repair` and the offline admin verbs can
+inspect the stopped broker's tmpfs directory until the reboot wipes it.
+
+What tmpfs does NOT give you is the explicit contract: a tmpfs mount LOOKS like durable
+storage to every tool and every operator downstream (the materialized-config line says
+`storage=disk` and shows a real path), nothing forces a byte cap (an uncapped log fills the
+mount or the mount fills RAM), and the loss-on-reboot property lives in /etc/fstab rather
+than in the broker invocation. Memory mode is the same trade made fail-closed and
+self-describing: the dedicated `--ephemeral-loss-ack` consent, the mandatory
+`--max-total-bytes` RAM bound, the `storage=memory` echo, and no mount provisioning at all.
+
+Rule of thumb: tmpfs when you want restart survival within an uptime or offline
+inspection on a stopped broker; `--storage memory` when you want the ephemeral contract
+explicit, machine-checkable, and impossible to mistake for durability; the SD card (the
+default) when acked data must survive a reboot.
 
 ## Cross-references
 

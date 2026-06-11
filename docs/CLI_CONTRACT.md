@@ -433,6 +433,15 @@ for online verbs (loopback default, never exposed without an explicit `--addr`).
 selects the section-1 contract. `--log-level` (in the diagram legend) tunes diagnostic
 verbosity and never changes a command's output contract or exit code.
 
+> Memory-mode note (#443, #444): a broker run with `serve --storage memory` has NO offline
+> source of truth, ever: it keeps no data directory, so no offline or offline-capable verb
+> can target it after exit, and the LIVE surfaces are its only introspection while it runs.
+> This adds NO new exit codes and changes NO row above: the memory-mode boot refusals (a
+> missing `--ephemeral-loss-ack`, an unlimited `--max-total-bytes`, an explicit
+> `--data-dir`) are ordinary exit `1` usage errors under the existing scheme, and an offline
+> verb given the serve-only `--storage` flag is the ordinary unknown-flag exit `1` (pinned
+> by test). The shipped exit-code table in [`CLI.md`](CLI.md) is unchanged.
+
 ## 3. The exit-code-3 gate
 
 [`CLI.md`](CLI.md) freezes the SHIPPED exit-code scheme from the `EXIT_*` constants in
