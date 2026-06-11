@@ -85,8 +85,8 @@ flash wear is the concern; see [`EDGE_TUNING.md`](EDGE_TUNING.md)).
 `--storage` itself is a `serve`-only flag. Every offline verb's strict parser rejects it as an
 unknown flag (a usage error, exit 1, before touching the filesystem), so `peek --storage memory`
 can never be mistaken for a working invocation; this rejection is pinned by a test. The offline
-verbs also read no environment variables, so an `IRONBUS_STORAGE=memory` in a unit env file
-cannot leak into them. The residual confusion case is honest and unchanged: pointing an offline
+verbs also read no `IRONBUS_*` environment variables, so an `IRONBUS_STORAGE=memory` in a unit
+env file cannot leak into them. The residual confusion case is honest and unchanged: pointing an offline
 verb's `--data-dir` at a directory that does not exist (for example, because the broker that
 "owned" it was a memory broker and never created one) is the ordinary exit 2 not-found.
 
