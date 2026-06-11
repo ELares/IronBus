@@ -176,6 +176,27 @@ runtime reload trigger is tracked in #380, refs #88), and because the unit uses
 reload leaves the broker DOWN until `systemctl start ironbus`. To change configuration, edit
 `/etc/ironbus/ironbus.env` (or the `--config` TOML file) and run `systemctl restart ironbus`.
 
+### Memory mode under the unit: `Restart=` revives an EMPTY broker (#443, #444)
+
+A unit configured for the ephemeral backend (`IRONBUS_STORAGE=memory` plus
+`IRONBUS_EPHEMERAL_LOSS_ACK=true` and a non-zero `IRONBUS_MAX_TOTAL_BYTES` in
+`/etc/ironbus/ironbus.env`, or the equivalent flags) keeps NO state across process exits, by
+contract. Under `Restart=on-failure`, a crashed memory broker is revived EMPTY: offset 0, no
+records, no group cursors, every acknowledged message of the previous incarnation gone. The
+restart is a fresh broker that happens to share the unit name. Plan for that explicitly: pair
+the unit with consumers that tolerate replay-from-live (re-subscribe and continue from whatever
+arrives next) and producers that can re-publish or accept the loss; alert on the
+`storage=memory` materialized-config echo if a fleet must never run ephemeral by accident. The
+fall-back-after-N machinery above is unaffected (it tracks the BINARY, not the data), and the
+data-dir-related guidance elsewhere in this document simply does not apply: a memory broker
+needs no `StateDirectory=`, no writable data-dir mount, and leaves nothing for the offline
+verbs to inspect after it stops (live `/healthz`, `/readyz`, `/metrics`, `/admin`, and
+`ironbus top --addr` are the introspection surface; see `docs/CLI.md`).
+
+The same applies to the container image: a `--storage memory` container needs NO writable
+volume mount (the "Required writable volume" rule below is a disk-backend rule), and an
+orchestrator restart revives it empty.
+
 ## 3. The distroless container image
 
 `Dockerfile` builds a multi-stage image whose runtime stage is `gcr.io/distroless/static:nonroot`.
