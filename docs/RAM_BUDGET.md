@@ -393,7 +393,7 @@ configured caps imply provably exceeds the ceiling. The footprint is a CLOSED
 formula in the config (no live RSS), summing the FIRMLY-BOUNDED terms above:
 
 ```
-worst_case = term1 + term3 + term5
+worst_case = term1 + term3 + term4mem + term5
 
 term1 (per-connection in-flight payloads, the firm RAM bound)
      = max_connections * per_conn_inflight
@@ -401,10 +401,39 @@ term1 (per-connection in-flight payloads, the firm RAM bound)
                             consumer_credit * MAX_FRAME_LEN     if it is 0 (UNLIMITED)
 term3 (per-group cursor + lease state)
      = max_groups * max_in_flight * PER_LEASE_BYTES (~64 bytes)
+term4mem (the store, ONLY under --storage memory; 0 on disk)
+     = IN_MEMORY_STORE_IMAGES (2) * max_total_bytes
 term5 (fixed overhead + one OS-thread stack per connection)
      = FIXED_OVERHEAD_BYTES (~4 MiB)
      + max_connections * PER_CONNECTION_STACK_BYTES (~64 KiB resident)
 ```
+
+THE MEMORY-BACKEND STORE FOLD (#445, refs #443): on DISK the store is term 4 of
+the budget above, ~0 in RSS (written straight to file), so the guard does not
+charge it and the disk verdict is the historical one bit-for-bit. Under
+`--storage memory` the store ITSELF is RAM: the engine retains up to
+`--max-total-bytes` of stored bytes, and the in-memory filesystem keeps a SECOND
+byte image per file (the durable image each `sync_data` clones the live bytes
+into, the power-loss-simulation contract), so the guard charges
+`2 * max_total_bytes` and refuses a ceiling below the modeled floor. Memory mode
+already refuses an unlimited (`0`) byte cap at boot, so the store term is always
+finite there. Two honesty caveats on `term4mem`:
+
+- **The 2x is the steady-state RETAINED set, not an instantaneous bound.** The
+  durable image is refreshed by `clone_from` inside `sync_data`; when that clone
+  has to reallocate, the old durable allocation and the incoming bytes can
+  briefly coexist, so an instant mid-sync can exceed two images. Amortized and
+  at steady state, exactly two images are retained per file.
+- **The dead-letter sink (the DLQ) is DELIBERATELY excluded.** The DLQ's log is
+  byte-UNCAPPED by design (a poison record is the durable evidence of a dropped
+  message and must never itself be shed), and in memory mode it lives on the
+  SAME in-memory filesystem as the store, so `term4mem` bounds the MAIN log
+  only. The guard's proof therefore holds for ACK-PROGRESSING workloads; a
+  poison-heavy workload (consumers that never ack, so records dead-letter after
+  `--max-deliver` attempts, default 5) grows RSS OUTSIDE the modeled floor.
+  Capping the DLQ would shed poison evidence, a different design decision.
+  Operationally: pair memory mode with consumers that make ack progress,
+  monitor `ironbus_dlq_records_total`, and tune `--max-deliver`.
 
 WHY this is PROVABLE-FROM-CONFIG and not a boot RSS guess: every term is a
 CONFIGURED cap multiplied to its maximum, so the sum is the largest the bounded

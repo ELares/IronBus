@@ -13,12 +13,13 @@ use crate::bench::{
     fill_payload, percentiles_us, BenchConfig, BenchReport, Bound, Mode, BENCH_NAMESPACE_PREFIX,
     ROUND_TRIP_TOKEN_LEN,
 };
-use crate::{open_disk_engine, CliError, ServeConfig};
+use crate::{open_disk_engine, open_memory_engine, CliError, ServeConfig, StorageArg};
 use ironbus_client::{Client, ClientConfig, ClientError};
 use ironbus_core::clock::Clock; // the monotonic seam the serve loop's liveness beacon (#95) reads
 use ironbus_proto::message::PubBody;
 use ironbus_server::actor::{spawn_actor, DEFAULT_CHANNEL_BOUND};
 use ironbus_server::server::serve;
+use ironbus_storage::fs::{Filesystem, InMemoryFs, StdFs};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,9 +45,34 @@ pub fn execute(cfg: &BenchConfig) -> Result<BenchReport, CliError> {
     }
 }
 
-/// The isolated path: create a synthetic data dir, spawn an in-process broker over it, run the
-/// load, tear the broker down, then auto-delete the directory (reporting a cleanup failure).
+/// The isolated path, dispatched on the broker's storage backend (#445, mirroring `cmd_serve`'s
+/// static two-armed match): DISK spawns over a synthetic data dir with the auto-delete lifecycle;
+/// MEMORY spawns over a fresh in-memory filesystem, so there is NO directory to create, lock, or
+/// clean up (the whole #94 leftover-directory failure mode does not exist on this arm).
 fn execute_isolated(cfg: &BenchConfig) -> Result<BenchReport, CliError> {
+    let config = bench_serve_config(cfg);
+    // The spawned broker is the REAL serve engine, so its config passes the REAL serve boot gates
+    // (the #443 ephemeral consent + byte cap among them): if the serve rules tighten, bench
+    // follows automatically instead of quietly spawning a config `serve` itself would refuse.
+    crate::validate_serve_config(&config).map_err(|e| {
+        CliError::Internal(format!(
+            "bench: the spawned isolated broker's config failed the serve boot gates: {e}"
+        ))
+    })?;
+    match cfg.storage {
+        StorageArg::Disk => execute_isolated_disk(cfg, &config),
+        StorageArg::Memory => {
+            let broker = IsolatedBroker::spawn_memory(&config)?;
+            let result = drive_load(cfg, broker.addr());
+            broker.shutdown();
+            result
+        }
+    }
+}
+
+/// The DISK isolated path: create a synthetic data dir, spawn an in-process broker over it, run
+/// the load, tear the broker down, then auto-delete the directory (reporting a cleanup failure).
+fn execute_isolated_disk(cfg: &BenchConfig, config: &ServeConfig) -> Result<BenchReport, CliError> {
     let data_dir = synthetic_data_dir(&cfg.group);
     // Start from a clean directory so a stale leftover from a crashed prior run cannot skew bytes.
     let _ = std::fs::remove_dir_all(&data_dir);
@@ -57,7 +83,7 @@ fn execute_isolated(cfg: &BenchConfig) -> Result<BenchReport, CliError> {
     // disarms this guard, so the explicit cleanup stays authoritative for the exit code.
     let mut dir_guard = DataDirGuard::arm(data_dir.clone());
 
-    let broker = IsolatedBroker::spawn(&data_dir, cfg.no_fsync)?;
+    let broker = IsolatedBroker::spawn_disk(&data_dir, config)?;
     let run_result = drive_load(cfg, broker.addr());
     // Tear the broker down BEFORE deleting the directory, so no writer races the cleanup.
     broker.shutdown();
@@ -139,33 +165,51 @@ fn synthetic_data_dir(group: &str) -> PathBuf {
 /// An in-process isolated broker: the same `ironbus-server` engine + append actor + `serve` the
 /// `ironbus` binary ships, bound to an ephemeral loopback port, torn down on [`Self::shutdown`].
 /// No signal handler is installed (unlike `cmd_serve`): this is a child of the bench command, not
-/// the whole process, so it is stopped by flipping the shutdown flag.
-struct IsolatedBroker {
+/// the whole process, so it is stopped by flipping the shutdown flag. GENERIC over the engine's
+/// [`Filesystem`] (#445), exactly like `run_broker` in `main.rs`: the disk and memory bench
+/// brokers share this whole body, monomorphized once per backend by `execute_isolated`'s static
+/// dispatch, so the two backends can never drift in how bench hosts them.
+struct IsolatedBroker<F: Filesystem + 'static> {
     addr: String,
     shutdown: Arc<AtomicBool>,
     serve_thread: Option<std::thread::JoinHandle<()>>,
-    handle: ironbus_server::actor::EngineHandle<
-        ironbus_storage::fs::StdFs,
-        ironbus_server::clock::SystemClock,
-    >,
+    handle: ironbus_server::actor::EngineHandle<F, ironbus_server::clock::SystemClock>,
     actor: Option<
         std::thread::JoinHandle<
-            ironbus_server::engine::Engine<
-                ironbus_storage::fs::StdFs,
-                ironbus_server::clock::SystemClock,
-            >,
+            ironbus_server::engine::Engine<F, ironbus_server::clock::SystemClock>,
         >,
     >,
 }
 
-impl IsolatedBroker {
-    /// Spawns the broker over `data_dir` on a loopback ephemeral port. `no_fsync` batches cursor
-    /// checkpoints (a larger checkpoint interval) to spare flash on a dry run; otherwise every ack
-    /// drives a durable cursor write (`--checkpoint-interval 1`) so the round-trip fsync cost is
-    /// honest, mirroring the bench-crate harness.
-    fn spawn(data_dir: &Path, no_fsync: bool) -> Result<IsolatedBroker, CliError> {
-        let config = bench_serve_config(no_fsync);
-        let engine = open_disk_engine(data_dir, &config, &[], &[])?;
+impl IsolatedBroker<StdFs> {
+    /// Spawns the DISK broker over `data_dir` on a loopback ephemeral port, from the prebuilt,
+    /// already-validated bench `ServeConfig`.
+    fn spawn_disk(
+        data_dir: &Path,
+        config: &ServeConfig,
+    ) -> Result<IsolatedBroker<StdFs>, CliError> {
+        let engine = open_disk_engine(data_dir, config, &[], &[])?;
+        IsolatedBroker::from_engine(engine, config)
+    }
+}
+
+impl IsolatedBroker<InMemoryFs> {
+    /// Spawns the MEMORY broker (#445): the same engine over a fresh in-memory filesystem via the
+    /// shared `open_memory_engine`, so the bench broker is the REAL `serve --storage memory`
+    /// engine path. No file is created and nothing needs cleanup afterwards.
+    fn spawn_memory(config: &ServeConfig) -> Result<IsolatedBroker<InMemoryFs>, CliError> {
+        let engine = open_memory_engine(config, &[], &[])?;
+        IsolatedBroker::from_engine(engine, config)
+    }
+}
+
+impl<F: Filesystem + 'static> IsolatedBroker<F> {
+    /// Hosts an ALREADY-OPENED engine: actor spawn, ephemeral loopback bind, serve thread. The
+    /// shared backend-independent body behind both spawn constructors.
+    fn from_engine(
+        engine: ironbus_server::engine::Engine<F, ironbus_server::clock::SystemClock>,
+        config: &ServeConfig,
+    ) -> Result<IsolatedBroker<F>, CliError> {
         let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
         let listener = TcpListener::bind("127.0.0.1:0")
             .map_err(|e| CliError::Internal(format!("bench: cannot bind a loopback port: {e}")))?;
@@ -234,18 +278,35 @@ impl IsolatedBroker {
     }
 }
 
-impl Drop for IsolatedBroker {
+impl<F: Filesystem + 'static> Drop for IsolatedBroker<F> {
     fn drop(&mut self) {
         self.stop();
     }
 }
 
+/// The default `--max-total-bytes` cap bench gives its own MEMORY-backend broker (#445): the real
+/// serve path refuses an in-RAM store without a byte bound (0 = unlimited would grow until the
+/// host OOMs), and bench supplies a default rather than burdening the operator, because the
+/// synthetic broker's data is disposable BY DESIGN. 256 MiB holds ~1M default-256-byte messages,
+/// far beyond any sane bounded bench; a run that somehow fills it sheds at capacity (which
+/// `produce_one` already tolerates as the overload workload) instead of eating the host's RAM.
+const BENCH_MEMORY_CAP_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Builds the `ServeConfig` for the isolated bench broker: the compiled defaults, except the
 /// checkpoint interval, which is `1` (durable cursor write per ack, honest fsync) normally and a
-/// large batch under `--no-fsync` (spare flash, fsync cost not measured).
-fn bench_serve_config(no_fsync: bool) -> ServeConfig {
+/// large batch under `--no-fsync` (spare flash, fsync cost not measured). Under
+/// `--storage memory` (#445) it carries the memory backend plus the two boot-gate requirements
+/// the real serve path enforces: the explicit ephemeral consent (bench's synthetic broker and its
+/// data are disposable by design, so bench supplies the consent the way it already owns the
+/// auto-delete of its synthetic disk dir) and the default in-RAM byte cap above.
+fn bench_serve_config(cfg: &BenchConfig) -> ServeConfig {
     let mut config = ServeConfig::bench_default();
-    config.checkpoint_interval = if no_fsync { 1_000_000 } else { 1 };
+    config.checkpoint_interval = if cfg.no_fsync { 1_000_000 } else { 1 };
+    if cfg.storage == StorageArg::Memory {
+        config.storage = StorageArg::Memory;
+        config.ephemeral_loss_ack = true;
+        config.max_total_bytes = BENCH_MEMORY_CAP_BYTES;
+    }
     config
 }
 
@@ -323,7 +384,7 @@ fn run_publish(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError> {
         &[],
         &fsync_samples,
         elapsed,
-        !cfg.no_fsync,
+        cfg.fsync_is_measured(),
     ))
 }
 
@@ -358,7 +419,7 @@ fn run_subscribe(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError>
         &latencies,
         &fsync_samples,
         drain_start.elapsed(),
-        !cfg.no_fsync,
+        cfg.fsync_is_measured(),
     ))
 }
 
@@ -443,7 +504,7 @@ fn run_round_trip(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError
         &latencies,
         &fsync_samples,
         elapsed,
-        !cfg.no_fsync,
+        cfg.fsync_is_measured(),
     ))
 }
 

@@ -1246,13 +1246,35 @@ fn start_memory_broker() -> (
     std::path::PathBuf,
     std::path::PathBuf,
 ) {
+    start_memory_broker_with_cap(16_777_216)
+}
+
+/// [`start_memory_broker`] with a caller-chosen `--max-total-bytes` cap, so the #445 OOM-bound
+/// gate can boot a deliberately tiny store while the round-trip tests keep a roomy one.
+fn start_memory_broker_with_cap(
+    cap_bytes: u64,
+) -> (
+    Child,
+    String,
+    String,
+    std::thread::JoinHandle<String>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
     // NO-FILES HARNESS (#443 review): the broker runs with a scratch CWD and an isolated TMPDIR,
     // both created empty, so the test can assert after the clean exit that the ephemeral broker
     // created NO file anywhere it could plausibly write (a regression that starts touching disk,
     // e.g. an unconditional data-dir prepare or a lock file leaking past the Filesystem trait,
-    // fails the emptiness assertion instead of passing silently).
-    let cwd_scratch = std::env::temp_dir().join(format!("ironbus-memcwd-{}", std::process::id()));
-    let tmp_scratch = std::env::temp_dir().join(format!("ironbus-memtmp-{}", std::process::id()));
+    // fails the emptiness assertion instead of passing silently). The scratch names carry a
+    // process-wide counter ON TOP of the pid: every test in this binary shares one pid (cargo runs
+    // them as threads), so pid alone would let two concurrent memory-mode tests remove each
+    // other's scratch dirs (the #439 same-name collision, generalized).
+    static SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let cwd_scratch =
+        std::env::temp_dir().join(format!("ironbus-memcwd-{}-{seq}", std::process::id()));
+    let tmp_scratch =
+        std::env::temp_dir().join(format!("ironbus-memtmp-{}-{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&cwd_scratch);
     let _ = std::fs::remove_dir_all(&tmp_scratch);
     std::fs::create_dir_all(&cwd_scratch).expect("create scratch cwd");
@@ -1264,7 +1286,7 @@ fn start_memory_broker() -> (
             "memory",
             "--ephemeral-loss-ack",
             "--max-total-bytes",
-            "16777216",
+            &cap_bytes.to_string(),
             "--addr",
             "127.0.0.1:0",
             "--checkpoint-interval",
@@ -1432,4 +1454,301 @@ fn memory_mode_round_trips_on_the_real_wire_and_exits_clean() {
     );
     let _ = std::fs::remove_dir_all(&cwd_scratch);
     let _ = std::fs::remove_dir_all(&tmp_scratch);
+}
+
+#[test]
+fn memory_mode_restart_revives_an_empty_broker() {
+    // THE RESTART CONTRACT (#445), pinned LOUDLY: `--storage memory` has NO restart durability of
+    // any kind. This is the exact INVERSE of the disk path's recovery tests above (which prove a
+    // restart RESUMES past the acked prefix while the durable log continues): a memory broker
+    // stopped cleanly and booted again ON THE SAME FLAGS revives EMPTY. A fresh consumer fetches
+    // NOTHING (not the acked messages, not the unacked ones, nothing), and the durable-offset
+    // counter restarts at 0, because no state of any kind outlived the process. If this test ever
+    // starts seeing data across the restart, the ephemeral backend has silently grown persistence
+    // and the #443 loss contract (and its consent gate) no longer means what it says.
+
+    // LIFE 1: a normal working session, ending in a CLEAN stop (the strongest restart case: even
+    // a graceful SIGTERM drain, which on disk flushes cursors for resume, preserves nothing here).
+    let (mut broker, addr, banner, stderr_handle, cwd1, tmp1) = start_memory_broker();
+    assert!(
+        banner.contains("EPHEMERAL"),
+        "life 1 states the contract: {banner}"
+    );
+    for (i, payload) in ["r0", "r1", "r2"].iter().enumerate() {
+        let (out, code) = run(&["pub", "--addr", &addr, payload]);
+        assert_eq!(code, 0, "pub exit code in life 1");
+        assert_eq!(out.trim(), i.to_string(), "life 1 offsets march 0,1,2");
+    }
+    let (out, code) = run(&["sub", "--addr", &addr, "--max", "10", "--ack"]);
+    assert_eq!(code, 0, "sub exit code in life 1");
+    assert_eq!(
+        out.matches("ack committed").count(),
+        3,
+        "life 1 acked all three: {out}"
+    );
+    send_sigterm(broker.id());
+    assert_eq!(
+        wait_for_exit(&mut broker, Duration::from_secs(10)),
+        0,
+        "life 1 ends in a CLEAN exit 0 (the graceful drain ran; the loss is still total)"
+    );
+    drop(stderr_handle);
+
+    // LIFE 2: a fresh broker on the SAME flags (the supervisor-restart shape). EMPTY by contract.
+    let (mut broker2, addr2, banner2, stderr_handle2, cwd2, tmp2) = start_memory_broker();
+    assert!(
+        banner2.contains("EPHEMERAL"),
+        "life 2 states the contract on its own boot too: {banner2}"
+    );
+    // A consumer sees an EMPTY queue: no acked message, no unacked message, no cursor, nothing.
+    let (out, code) = run(&["sub", "--addr", &addr2, "--max", "10"]);
+    assert_eq!(code, 0, "sub exit code in life 2");
+    assert!(
+        out.contains("fetched 0 message(s)"),
+        "a restarted memory broker is EMPTY, life 1's messages are gone by contract: {out}"
+    );
+    // And the log restarts from scratch: the first produce is offset 0 again, not 3. The offset
+    // space itself did not survive, which is the unambiguous machine-checkable form of "empty".
+    let (out, code) = run(&["pub", "--addr", &addr2, "fresh"]);
+    assert_eq!(code, 0, "pub exit code in life 2");
+    assert_eq!(
+        out.trim(),
+        "0",
+        "the durable-offset counter restarts at 0 on a fresh memory broker: {out}"
+    );
+    send_sigterm(broker2.id());
+    assert_eq!(
+        wait_for_exit(&mut broker2, Duration::from_secs(10)),
+        0,
+        "life 2 also exits clean"
+    );
+    drop(stderr_handle2);
+    for dir in [cwd1, tmp1, cwd2, tmp2] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Reads a live process's resident set size in BYTES via `ps -o rss=` (KiB on both Linux and
+/// macOS), the #445 OOM-bound gate's external measurement: the broker cannot lie about its own
+/// footprint and the test does not depend on /proc existing (macOS lacks it).
+fn rss_bytes(pid: u32) -> u64 {
+    let out = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .expect("run ps -o rss=");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let kib: u64 = text
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("unparseable ps rss output: {text:?}"));
+    kib * 1024
+}
+
+#[test]
+fn memory_mode_sheds_past_the_byte_cap_and_rss_stays_bounded() {
+    // THE #445 OOM-BOUND GATE, the headline risk of an in-RAM store: produce FAR past
+    // `--max-total-bytes` with INCOMPRESSIBLE payloads (so the default lz4 write path cannot
+    // shrink the stored bytes and dodge the cap) and prove the three load-bearing facts at once:
+    //   1. the at-capacity drop-new shed reaches the PRODUCER as the existing typed `at capacity`
+    //      error (never a silent drop, never a hang);
+    //   2. the broker STAYS ALIVE and keeps serving on the same connection after every shed;
+    //   3. the broker's RSS stays bounded FOR THIS ACK-PROGRESSING-OR-IDLE WORKLOAD while ~96x
+    //      the cap is thrown at it (no consumer ever attaches here, so nothing dead-letters; the
+    //      DLQ sink is deliberately byte-uncapped, poison evidence is never shed, and sits
+    //      OUTSIDE the modeled floor, so a poison-heavy workload is NOT covered by this bound,
+    //      see docs/RAM_BUDGET.md). The bound is deliberately generous (both store images,
+    //      2 * cap, plus a fixed slack for the binary, buffers, and allocator overhead): the
+    //      assertion is "does not grow with the offered load", not a byte-exact budget. A
+    //      regression that retains shed payloads (or leaks per produce) blows through it by an
+    //      order of magnitude.
+    const CAP: u64 = 2 * 1024 * 1024; // --max-total-bytes: a tiny 2 MiB store
+    const PAYLOAD_LEN: usize = 64 * 1024; // 64 KiB of incompressible noise per message
+    const ATTEMPTS: usize = 3072; // 192 MiB offered, 96x the cap
+    const RSS_SLACK: u64 = 96 * 1024 * 1024; // binary + buffers + allocator, generously
+    let rss_bound = 2 * CAP + RSS_SLACK;
+
+    let (mut broker, addr, _banner, _stderr_handle, cwd_scratch, tmp_scratch) =
+        start_memory_broker_with_cap(CAP);
+    let mut client = Client::connect(&addr).expect("connect the wire producer");
+    let mut payload = vec![0u8; PAYLOAD_LEN];
+    let mut accepted: u64 = 0;
+    let mut shed: u64 = 0;
+    for i in 0..ATTEMPTS {
+        // An LCG noise fill, reseeded per message: incompressible, so stored bytes equal offered
+        // bytes and the cap (which meters STORED, post-compression bytes) engages honestly.
+        let mut state = (i as u64)
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        for b in &mut payload {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *b = u8::try_from((state >> 33) & 0xff).unwrap_or(0);
+        }
+        let result = client.produce(&PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: &payload,
+        });
+        match result {
+            Ok(offset) => {
+                assert_eq!(offset, accepted, "accepted offsets are gapless");
+                accepted += 1;
+            }
+            Err(ironbus_client::ClientError::Server(m)) if m.contains("at capacity") => {
+                // Fact 1: the shed is the EXISTING typed at-capacity error, delivered to the
+                // producer on a connection that stays open (this same client keeps producing).
+                shed += 1;
+            }
+            Err(e) => panic!(
+                "produce {i} failed with something other than the at-capacity shed \
+                 (accepted={accepted}, shed={shed}): {e}"
+            ),
+        }
+        // Fact 3, sampled DURING the flood (not only after): RSS never exceeds the bound while
+        // the offered bytes keep climbing past it.
+        if i % 256 == 255 {
+            let rss = rss_bytes(broker.id());
+            assert!(
+                rss <= rss_bound,
+                "broker RSS {rss} exceeded the bound {rss_bound} after {i} produces \
+                 (cap {CAP}, accepted {accepted}, shed {shed}): the in-memory store is not \
+                 honoring its byte cap"
+            );
+        }
+    }
+
+    // Non-vacuity: the cap ENGAGED (sheds dominate at 96x the cap) and something was accepted.
+    assert!(accepted >= 1, "at least one produce filled the store");
+    assert!(
+        shed > accepted,
+        "with 96x the cap offered, sheds must dominate: accepted={accepted} shed={shed}"
+    );
+    assert_eq!(
+        accepted + shed,
+        ATTEMPTS as u64,
+        "every produce either landed or shed, none lost track of"
+    );
+
+    // Fact 2: the broker is STILL ALIVE after thousands of sheds. The same connection takes one
+    // more produce (promptly shed again), and the process is still running.
+    match client.produce(&PubBody {
+        flags: 0,
+        timestamp_ms: 0,
+        key: b"",
+        headers: b"",
+        dedup: None,
+        fire_and_forget: false,
+        payload: &payload,
+    }) {
+        Err(ironbus_client::ClientError::Server(m)) if m.contains("at capacity") => {}
+        other => panic!("the post-flood produce must shed at capacity, got {other:?}"),
+    }
+    assert!(
+        broker.try_wait().expect("poll broker").is_none(),
+        "the broker process survived the whole flood"
+    );
+    let final_rss = rss_bytes(broker.id());
+    assert!(
+        final_rss <= rss_bound,
+        "final broker RSS {final_rss} exceeded the bound {rss_bound}"
+    );
+    // Diagnostic (visible under --nocapture): the measured footprint against the bound, so a CI
+    // run leaves evidence of how much headroom the generous bound actually had.
+    eprintln!(
+        "memory-mode OOM gate: offered {} bytes against a {CAP}-byte cap; accepted {accepted}, \
+         shed {shed}; final RSS {final_rss} bytes <= bound {rss_bound} bytes",
+        (ATTEMPTS * PAYLOAD_LEN)
+    );
+
+    drop(client);
+    send_sigterm(broker.id());
+    assert_eq!(
+        wait_for_exit(&mut broker, Duration::from_secs(10)),
+        0,
+        "a graceful stop still exits 0 after the at-capacity flood"
+    );
+    let _ = std::fs::remove_dir_all(&cwd_scratch);
+    let _ = std::fs::remove_dir_all(&tmp_scratch);
+}
+
+#[test]
+fn memory_mode_refuses_a_ram_ceiling_below_the_store_floor() {
+    // The #445 store fold at the REAL binary, arranged so the STORE TERM ALONE decides the
+    // verdict: the edge-tiny profile's connection terms (32 connections, 256 KiB credit bytes,
+    // 64 groups, 256 in-flight) sum to ~15 MiB, comfortably under the 64 MiB ceiling, so THIS
+    // EXACT invocation booted before the fold (the #115 guard modeled connections, credits,
+    // groups, and in-flight only; the store was honestly excluded as ~0 RSS, which is true only
+    // on disk). With the store folded in, the 1 GiB in-RAM cap is charged at two byte images
+    // (the live bytes plus the durable-image clone) and the same invocation must now refuse to
+    // boot (exit 1, usage, BEFORE any listener opens) with a message naming the store term and
+    // the knob to lower. The small connection terms are load-bearing: under the balanced
+    // defaults, term 1 alone (256 connections x 8 MiB credit bytes = 2 GiB) exceeds the ceiling
+    // and the guard refuses with or without the store fold, so a fold-less mutant would pass.
+    // Here a fold-less mutant BOOTS, and the bounded wait below turns that boot into a loud
+    // failure instead of a hung suite.
+    let child = Command::new(BIN)
+        .args([
+            "serve",
+            "--profile",
+            "edge-tiny",
+            "--storage",
+            "memory",
+            "--ephemeral-loss-ack",
+            "--max-total-bytes",
+            "1073741824",
+            "--ram-ceiling-bytes",
+            "67108864",
+            "--addr",
+            "127.0.0.1:0",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ironbus serve");
+    let mut guard = ChildGuard(child);
+    // A bounded poll, deliberately NOT `.output()`: if the store fold regresses, the broker
+    // BOOTS and never exits, and `.output()` would hang the test forever. The deadline converts
+    // "booted" into the failure it is (the guard kills the orphan on the way out).
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = guard.0.try_wait().expect("poll the refused serve") {
+            break status;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the broker BOOTED (still running 10s in): the memory-store fold is gone from the \
+             RAM-ceiling guard, so a 1 GiB in-RAM store was accepted under a 64 MiB ceiling"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a memory-mode ceiling below the store floor is a usage refusal (exit 1)"
+    );
+    let mut stderr = String::new();
+    guard
+        .0
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut stderr)
+        .expect("read the refusal message");
+    assert!(
+        stderr.contains("refuses to boot"),
+        "the refusal is the boot guard: {stderr}"
+    );
+    assert!(
+        stderr.contains("in-RAM store") && stderr.contains("--max-total-bytes"),
+        "the refusal names the store fold and the knob to lower: {stderr}"
+    );
+    assert!(
+        stderr.contains("durable-image clone"),
+        "the refusal states the 2x clone headroom: {stderr}"
+    );
 }

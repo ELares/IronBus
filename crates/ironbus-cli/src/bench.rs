@@ -42,7 +42,7 @@
 //! free SLO instrument stays in `ironbus-bench`; this is the operator-facing, safety-guarded tool
 //! the issue asks for.
 
-use crate::CliError;
+use crate::{CliError, StorageArg};
 use std::io::Write;
 use std::time::Duration;
 
@@ -178,6 +178,12 @@ pub struct BenchConfig {
     /// Dry-run: batch the bench broker's cursor checkpoints instead of one durable write per ack,
     /// to spare edge flash. In this mode the fsync cost is not measured.
     pub no_fsync: bool,
+    /// The storage BACKEND of bench's own ISOLATED synthetic broker (#445, refs #443): `disk` (the
+    /// default, the historical bench broker over an auto-deleted synthetic data dir) or `memory`
+    /// (the same engine over the in-memory filesystem, for honest RAM-path numbers next to the
+    /// disk numbers). The flag shapes ONLY the spawned broker, so it is refused alongside
+    /// `--addr` (a live broker's backend is already decided by that broker).
+    pub storage: StorageArg,
     /// Emit the versioned JSON object instead of (well, in addition to a suppressed) human view.
     pub json: bool,
 }
@@ -188,6 +194,15 @@ impl BenchConfig {
     #[must_use]
     pub fn is_isolated(&self) -> bool {
         self.live_addr.is_none()
+    }
+
+    /// Whether the run measures the HONEST per-op fsync cost (#445): only on the DISK backend
+    /// (the in-memory engine issues NO fsync at all, so there is no durable-write cost to
+    /// attribute; reporting one would be dishonest) and only outside the `--no-fsync` dry run
+    /// (which batches the cursor checkpoints, so the per-ack durable path is not exercised).
+    #[must_use]
+    pub fn fsync_is_measured(&self) -> bool {
+        !self.no_fsync && self.storage == StorageArg::Disk
     }
 }
 
@@ -248,6 +263,7 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
     let mut live_addr: Option<String> = None;
     let mut live_ack = false;
     let mut no_fsync = false;
+    let mut storage: Option<StorageArg> = None;
     let mut json = false;
     let mut i = 0;
     while i < args.len() {
@@ -331,6 +347,16 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
                 no_fsync = true;
                 i += 1;
             }
+            // The isolated broker's storage backend (#445): `disk` (default) or `memory`. Reuses
+            // the serve-side parser so bench and serve can never drift on the accepted names.
+            "--storage" => {
+                let raw = take(args, &mut i, "--storage")?;
+                storage = Some(StorageArg::parse(&raw).ok_or_else(|| {
+                    CliError::Usage(format!(
+                        "`--storage` must be `disk` or `memory`, got `{raw}`"
+                    ))
+                })?);
+            }
             "--json" => {
                 json = true;
                 i += 1;
@@ -380,6 +406,20 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         ));
     }
 
+    // `--storage` shapes ONLY the isolated synthetic broker bench spawns (#445). With `--addr`
+    // the target broker's backend was decided when THAT broker booted, so accepting the flag
+    // would silently mean nothing; refuse it instead (a no-op flag on a live run is a footgun).
+    if storage.is_some() && live_addr.is_some() {
+        return Err(CliError::Usage(
+            "`--storage` selects the backend of bench's own ISOLATED synthetic broker; with \
+             `--addr` (a live run) the target broker's backend is already decided by that broker \
+             and this flag would silently mean nothing. Drop `--storage`, or drop `--addr` to \
+             bench an isolated broker."
+                .to_string(),
+        ));
+    }
+    let storage = storage.unwrap_or(StorageArg::Disk);
+
     // PRODUCTION-SAFETY guard: a caller-named group that is not a bench namespace could be a real
     // consumer group; joining it would steal that group's messages, so it needs the ack too.
     let group = match group {
@@ -409,6 +449,7 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         group,
         live_addr,
         no_fsync,
+        storage,
         json,
     })
 }
@@ -487,7 +528,12 @@ pub fn write_human<W: Write + ?Sized>(
         out,
         "target:         {}",
         if cfg.is_isolated() {
-            "isolated synthetic broker (auto-created, auto-deleted)"
+            match cfg.storage {
+                StorageArg::Disk => "isolated synthetic broker (auto-created, auto-deleted)",
+                StorageArg::Memory => {
+                    "isolated synthetic IN-MEMORY broker (ephemeral: no files, no fsync)"
+                }
+            }
         } else {
             "LIVE broker (operator acknowledged)"
         }
@@ -511,6 +557,15 @@ pub fn write_human<W: Write + ?Sized>(
     }
     if report.fsync_measured {
         write_latency_line(out, "fsync cost", report.fsync_cost_us)?;
+    } else if cfg.storage == StorageArg::Memory {
+        // The HONEST memory-mode wording (#445): there is no fsync in the in-memory engine, so
+        // the cost is not "skipped", it does not exist. A reader comparing RAM-path numbers next
+        // to disk numbers must never mistake the absence for a dry-run shortcut.
+        writeln!(
+            out,
+            "fsync cost:     not measured (--storage memory: the in-memory engine issues no \
+             fsync, so there is no durable-write cost to attribute)"
+        )?;
     } else {
         writeln!(
             out,
@@ -536,7 +591,10 @@ fn write_latency_line<W: Write + ?Sized>(
 
 /// Renders a finished run as the single versioned JSON object (the `--json` contract). The
 /// latency-histogram fields are named EXPLICITLY (`latency_p50_us`, `latency_p99_us`,
-/// `latency_p999_us`, `latency_max_us`), null when the mode does not measure them. Written to `out`.
+/// `latency_p999_us`, `latency_max_us`), null when the mode does not measure them. The `storage`
+/// field (#445) is ADDITIVE (schema version unchanged, the #439 `payload_entropy` precedent), so
+/// a recorded run self-describes which backend it measured and a RAM-path number is never
+/// mistaken for a disk number. Written to `out`.
 ///
 /// # Errors
 /// Returns [`CliError`] if writing to `out` fails.
@@ -560,7 +618,7 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         s,
         "{{\"schema_version\":{},\"mode\":\"{}\",\"isolated\":{},\"group\":\"{}\",\
          \"bound\":{{{}}},\"target_rate_hz\":{},\"payload_bytes\":{},\"payload_shape\":\"{}\",\
-         \"fetch_batch\":{},\"no_fsync\":{},\"results\":{{\
+         \"fetch_batch\":{},\"no_fsync\":{},\"storage\":\"{}\",\"results\":{{\
          \"produced\":{},\"recorded\":{},\"elapsed_secs\":{},\"msgs_per_sec\":{},\
          \"mb_per_sec\":{},\"bytes_per_op\":{},\
          \"latency_p50_us\":{},\"latency_p99_us\":{},\"latency_p999_us\":{},\"latency_max_us\":{},\
@@ -575,6 +633,7 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         cfg.payload_shape.as_str(),
         cfg.fetch_batch,
         cfg.no_fsync,
+        cfg.storage.as_str(),
         report.produced,
         report.recorded,
         f64_json(report.elapsed_secs),
@@ -918,6 +977,99 @@ mod tests {
         let json = bench_json(&cfg, &report);
         assert!(json.contains("\"latency_p50_us\":null"), "json: {json}");
         assert!(json.contains("\"latency_p999_us\":null"), "json: {json}");
+    }
+
+    #[test]
+    fn default_storage_is_disk_and_measures_fsync() {
+        // The #445 default: a bench that names no backend runs the historical DISK broker and
+        // measures the honest fsync cost, byte-for-byte the pre-#445 behavior. The additive JSON
+        // field self-describes the backend.
+        let cfg = parse(&["--count", "1"]).unwrap();
+        assert_eq!(cfg.storage, StorageArg::Disk);
+        assert!(cfg.fsync_is_measured(), "disk + per-ack durable path");
+        let json = bench_json(&cfg, &BenchReport::default());
+        assert!(json.contains("\"storage\":\"disk\""), "json: {json}");
+    }
+
+    #[test]
+    fn memory_storage_parses_and_never_claims_an_fsync_cost() {
+        // #445: `--storage memory` selects the in-memory isolated broker, and the fsync cost is
+        // HONESTLY not measured (the in-memory engine issues no fsync at all, so there is no
+        // durable-write cost to attribute). This test FAILS if memory mode ever starts claiming
+        // a measured fsync number.
+        let cfg = parse(&["--count", "1", "--storage", "memory"]).unwrap();
+        assert_eq!(cfg.storage, StorageArg::Memory);
+        assert!(
+            !cfg.fsync_is_measured(),
+            "no fsync exists in memory mode, so none may be claimed"
+        );
+        let report = BenchReport {
+            fsync_measured: cfg.fsync_is_measured(),
+            ..BenchReport::default()
+        };
+        let json = bench_json(&cfg, &report);
+        assert!(json.contains("\"storage\":\"memory\""), "json: {json}");
+        assert!(json.contains("\"fsync_measured\":false"), "json: {json}");
+        assert!(json.contains("\"fsync_cost_us\":null"), "json: {json}");
+        // The human view states WHY, naming the backend rather than the dry run.
+        let mut human = Vec::new();
+        write_human(&cfg, &report, &mut human).unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert!(human.contains("IN-MEMORY"), "human: {human}");
+        assert!(
+            human.contains("issues no fsync"),
+            "the memory-mode fsync line states the reason: {human}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_storage_value_is_a_usage_error() {
+        let err = parse(&["--count", "1", "--storage", "tmpfs"]).unwrap_err();
+        assert!(matches!(err, CliError::Usage(_)));
+        assert!(err.to_string().contains("`disk` or `memory`"));
+    }
+
+    #[test]
+    fn storage_with_a_live_addr_is_refused() {
+        // The flag shapes only the ISOLATED spawned broker; on a live run it would silently mean
+        // nothing, so it is refused even WITH the live acknowledgement. This test FAILS if the
+        // no-op-flag guard is removed.
+        let err = parse(&[
+            "--count",
+            "1",
+            "--storage",
+            "memory",
+            "--addr",
+            "10.0.0.5:7777",
+            "--i-understand-this-is-live",
+        ])
+        .unwrap_err();
+        assert!(matches!(err, CliError::Usage(_)));
+        assert!(err.to_string().contains("ISOLATED"), "{err}");
+    }
+
+    #[test]
+    fn memory_storage_composes_with_the_entropy_modes() {
+        // #439's payload-entropy knob applies unchanged over the memory backend: the fill is
+        // payload-side and knows nothing about storage, so `--payload-shape random` (and the
+        // realistic default) parse and carry through with `--storage memory`.
+        let cfg = parse(&[
+            "--count",
+            "1",
+            "--storage",
+            "memory",
+            "--payload-shape",
+            "random",
+        ])
+        .unwrap();
+        assert_eq!(cfg.storage, StorageArg::Memory);
+        assert_eq!(cfg.payload_shape, PayloadShape::Random);
+        let json = bench_json(&cfg, &BenchReport::default());
+        assert!(
+            json.contains("\"payload_shape\":\"random\""),
+            "json: {json}"
+        );
+        assert!(json.contains("\"storage\":\"memory\""), "json: {json}");
     }
 
     #[test]
