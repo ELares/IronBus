@@ -208,6 +208,21 @@ are the MUTATING wire `CONFIG SET`/`SAVE` admin verbs, which need the #106 auth.
 | `data_dir` | `--data-dir` / `IRONBUS_DATA_DIR` | path | required (no default) | path | a writable directory; created 0700 if absent, probe-write verified (#89) | COLD |
 | `max_total_bytes` | `--max-total-bytes` / `IRONBUS_MAX_TOTAL_BYTES` | u64 | `0` = unlimited (`DEFAULT_MAX_TOTAL_BYTES`) | bytes | `0` (off) or any u64 | HOT |
 | `segment_roll` | SPECIFIED-NOT-YET-A-FIELD | duration | `0` = size-only (specified) | duration (`{ms,s,m,h,d}`) | `0` (off) or a positive duration | COLD (coupled with `segment_size`) |
+| (no file key: flag/env ONLY) | `--storage` / `IRONBUS_STORAGE` | enum | `disk` (`DEFAULT_STORAGE`) | -- | `disk \| memory` (#443) | COLD (the backend is an open-time decision) |
+| (no file key: flag/env ONLY) | `--ephemeral-loss-ack` / `IRONBUS_EPHEMERAL_LOSS_ACK` | bool | `false` | -- | `true` to permit `--storage memory` | COLD (coupled with the backend) |
+
+The storage BACKEND selector and its ephemeral-loss consent (#443) are deliberately
+flag/env ONLY, with no `[storage]` file key: the backend decides whether a data
+directory exists at all, and a consent that waives durability should be visible in
+the unit file or on the command line, not buried in a config file the unit merely
+points at (the same reasoning that keeps the repeatable group flags command-line
+only). Under `--storage memory` the `data_dir` row above INVERTS: the key (file,
+env, or flag form) must be ABSENT and is refused at boot as a usage error, because
+an in-memory broker keeps no on-disk state and a configured path would only LOOK
+durable. `memory` also requires `max_total_bytes` above `0` (in RAM the byte cap is
+the OOM guard, so `0` = unlimited is refused). Every other key in this document
+keeps its meaning under the memory backend; the per-knob interplay table is in
+[CLI.md](CLI.md).
 
 `segment_roll` is the co-equal TIME roll trigger flagged in the #139 coherence
 pass: the merged storage design (#4/#5/WAL.md) has a 1h time-based segment roll

@@ -216,6 +216,20 @@ encode/decode logic that enforces the rules is in `segment.rs` (segment header a
 and `codec.rs` (record frame). The byte tables are in [CONTRACTS.md](CONTRACTS.md) under
 "On-disk record models" and "On-disk segment models".
 
+### Memory mode leaves no on-disk artifacts: there is no downgrade story (#443, #444)
+
+A broker run with `serve --storage memory` writes NOTHING to disk: no segments, no cursor
+or attempts checkpoints, no `dlq/` sink, no `LOCK` file. Consequently there is NO on-disk
+upgrade, downgrade, or migration story for it, and this section says so explicitly rather
+than leaving the gap implied: nothing survives the process for a newer or older binary to
+read, `ironbus migrate` has nothing to gate (a memory broker never stamps a format version
+anywhere a later binary could find), and a binary downgrade after running a memory broker
+is indistinguishable from a fresh install. The in-RAM layout reuses the same format code
+paths and frozen-layout tests as the disk store, but it is a process-internal detail,
+never observable across versions. For a memory-mode broker the entire compatibility
+surface is the wire section above (the startup lines, including the `storage=` echo, are
+log output, not a stored format).
+
 ### Format identifiers (magic) and version fields
 
 - **Record frame magic** `RECORD_MAGIC` = `0x4942` (the bytes `b'B' b'I'`); the record header

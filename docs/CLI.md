@@ -31,7 +31,7 @@ flag and code does.
 
 | Subcommand | Mode | Platform | What it does |
 |------------|------|----------|--------------|
-| `serve` | online (runs the broker) | Unix only in v1 | Open the on-disk log under `--data-dir` and serve the wire protocol on `--addr`. |
+| `serve` | online (runs the broker) | Unix only in v1 | Open the on-disk log under `--data-dir` (or, with the opt-in `--storage memory`, an ephemeral in-memory log, #443) and serve the wire protocol on `--addr`. |
 | `pub` | online (connects) | any | Append one message and print its durable offset. |
 | `sub` | online (connects) | any | Fetch up to a credit of messages, print each, optionally dispose of the batch. |
 | `cumulative-ack` | online (connects) | any | Commit a BROADCAST group's cursor up to (exclusive) `--up-to` in one move (ack-all-up-to-offset, #288). |
@@ -70,6 +70,26 @@ anywhere.
   flag (`--addr`/`--health-addr` vs `--data-dir`), and a mandatory banner names the active mode so
   the two are never confused.
 
+### Memory-mode brokers and the offline verbs (#443, #444)
+
+A broker run with `serve --storage memory` keeps NO on-disk state: when it exits (cleanly or by
+crash), it leaves NO data directory behind, so there is nothing for `peek`, `dump`, `scrub`,
+`repair`, `admin consumer-reset`, `admin dlq-redrive`, `migrate`, or `top --data-dir` to inspect,
+ever. The LIVE surfaces are the ONLY introspection story for a memory-mode broker: `/healthz`,
+`/readyz`, `/metrics`, `/admin` (with `--enable-admin`), and `ironbus top --addr` all work
+unchanged while it runs, and nothing works after it stops. The offline mutating verbs have no
+memory-mode counterpart either: there is no stopped-broker state to reset or redrive (an
+operator who needs a post-mortem or an offline mutation needs the disk backend, on tmpfs if
+flash wear is the concern; see [`EDGE_TUNING.md`](EDGE_TUNING.md)).
+
+`--storage` itself is a `serve`-only flag. Every offline verb's strict parser rejects it as an
+unknown flag (a usage error, exit 1, before touching the filesystem), so `peek --storage memory`
+can never be mistaken for a working invocation; this rejection is pinned by a test. The offline
+verbs also read no `IRONBUS_*` environment variables, so an `IRONBUS_STORAGE=memory` in a unit
+env file cannot leak into them. The residual confusion case is honest and unchanged: pointing an offline
+verb's `--data-dir` at a directory that does not exist (for example, because the broker that
+"owned" it was a memory broker and never created one) is the ordinary exit 2 not-found.
+
 ## `serve` (online; Unix only in v1)
 
 Starts the broker: opens (creating if absent) the durable log under `--data-dir`, binds
@@ -82,9 +102,10 @@ trigger is tracked in #380, refs #88). Under a supervisor that restarts only on 
 (the packaged unit ships `Restart=on-failure`), a SIGHUP'd broker exits 0 cleanly and STAYS
 DOWN until it is started again.
 
-`--data-dir` is REQUIRED; omitting it is a usage error. `serve` takes no positional
-arguments. All numeric flags reject a non-numeric value as a usage error before the
-broker opens.
+`--data-dir` is REQUIRED under the default `--storage disk`; omitting it is a usage error.
+Under the opt-in `--storage memory` (#443) the rule inverts: `--data-dir` must be ABSENT
+(see the memory-mode notes below). `serve` takes no positional arguments. All numeric flags
+reject a non-numeric value as a usage error before the broker opens.
 
 | Flag | Value type | Default | Unit | Meaning |
 |------|-----------|---------|------|---------|
@@ -164,6 +185,61 @@ broker opens.
   (naming the address) is the default rather than an accidental public metrics endpoint (#95). The
   classification is on the resolved address. A `--health-addr` that resolves to nothing is also a
   usage error.
+- `--storage` must be `disk` or `memory`; an unknown value is a usage error naming its source (the
+  flag, or the `IRONBUS_STORAGE` env var). `--storage memory` (#443) REFUSES to boot without the
+  dedicated `--ephemeral-loss-ack` consent, with `--max-total-bytes` at `0` (unlimited), or with
+  an explicit `--data-dir` (from the flag, the `IRONBUS_DATA_DIR` env var, or the
+  `storage.data_dir` config-file key). All three refusals are fail-closed usage errors (exit 1)
+  before any listener opens; the interplay of every other knob with memory mode is below.
+
+### Memory mode (`--storage memory`): flag and config interplay (#443, #444)
+
+The memory backend runs the SAME engine over an in-memory filesystem, so almost every knob keeps
+its exact disk-mode meaning; the few that touch the filesystem boundary are decided explicitly
+here. Each row below is a pinned decision, not an accident:
+
+- `--data-dir` / `IRONBUS_DATA_DIR` / `storage.data_dir` (config file): REFUSED (usage error,
+  exit 1). The broker keeps no on-disk state, so a given path would only LOOK durable. The
+  config-file key flows through the same env mapping and is refused identically (pinned by a
+  test).
+- `--max-total-bytes`: REQUIRED above `0`. On disk an unbounded log fills the SD card; in RAM it
+  OOMs the device, so the cap (which meters STORED, post-compression bytes) is the RAM bound and
+  `0` = unlimited is refused.
+- `--max-segment-bytes` (`storage.segment_size`): LEGAL, identical semantics. Segments roll in
+  RAM exactly as they roll on disk; the active-segment working set it bounds is the same memory
+  either way.
+- `--max-retained-bytes` / `--max-age-ms` / `--max-messages` (retention): LEGAL, identical
+  semantics, and MORE load-bearing, not less: a reaped sealed segment frees RAM instead of disk,
+  which is what keeps a long-running memory broker under its byte cap.
+- `--disk-full-policy`: LEGAL, identical semantics despite the name: at the byte cap `drop-new`
+  sheds the produce and `drop-oldest` force-reaps the oldest sealed in-RAM segment to admit it.
+- `--checkpoint-interval` (and the per-group cursor checkpoints): LEGAL and MEANINGFUL. Group
+  cursors, attempts counts, and redelivery semantics hold within the process lifetime, and the
+  checkpoint machinery runs against the in-memory filesystem unchanged (deliberately NOT
+  special-cased: it is the same code path the engine tests exercise). What changes is the
+  payoff: a checkpoint write costs RAM bandwidth instead of flash wear, and no checkpoint
+  survives the process, so the flag tunes nothing an operator can observe across a restart.
+- `--compact` (#337): LEGAL, allowed and documented rather than refused. Compaction rewrites
+  sealed segments in RAM exactly as on disk; for a keyed changelog topic it genuinely RECLAIMS
+  RAM under the byte cap, so refusing it would remove a real tool. For a non-keyed workload it
+  is pointless (it only spends CPU), which is exactly as true on disk.
+- `--durability-level` / `--flush-interval-ms` / `--flush-max-bytes` / `--async-loss-ack`: LEGAL
+  but VACUOUS. There is no fsync on the in-memory filesystem, so every level yields the same
+  RAM-only loss contract; the gates are still enforced uniformly (`async`/`none` still demand
+  `--async-loss-ack`), because backend-conditional validation would let a script that flips
+  `--storage` silently change what it is consenting to. Leave the default `sync`.
+- `--ram-ceiling-bytes` (#115): COMPOSES UNCHANGED. The refuse-to-boot guard bounds the
+  bounded-buffer footprint; note it does NOT count stored records (that is `--max-total-bytes`,
+  which in memory mode is additional resident RAM, so size the two together).
+- Everything else (`--addr`, connection/credit/group caps, delivery, dedup, backpressure,
+  health/admin, `--compression`, `--profile`, `--config`): unchanged; none of it touches the
+  filesystem boundary.
+
+Memory mode skips the data-dir lifecycle below entirely: no directory is created, probed, or
+locked. The single-broker exclusive lock exists to stop two brokers writing one directory; each
+memory broker owns a private in-memory filesystem, so the only exclusivity that applies is the
+`--addr` bind itself. After exit there is nothing to inspect offline (see "Memory-mode brokers
+and the offline verbs" above).
 
 ### Environment-variable mapping and precedence (#89)
 
@@ -206,6 +282,8 @@ it). With no `--profile`, the default profile is `balanced`, whose values ARE th
 | `--flush-interval-ms` | `IRONBUS_FLUSH_INTERVAL_MS` |
 | `--flush-max-bytes` | `IRONBUS_FLUSH_MAX_BYTES` |
 | `--async-loss-ack` | `IRONBUS_ASYNC_LOSS_ACK` |
+| `--storage` | `IRONBUS_STORAGE` (`disk`/`memory`, #443) |
+| `--ephemeral-loss-ack` | `IRONBUS_EPHEMERAL_LOSS_ACK` (`true`/`1` or `false`/`0`) |
 | `--wal-fsync-headroom-bytes` | `IRONBUS_WAL_FSYNC_HEADROOM_BYTES` |
 | `--visibility-timeout-ms` | `IRONBUS_VISIBILITY_TIMEOUT_MS` |
 | `--health-addr` | `IRONBUS_HEALTH_ADDR` |
@@ -253,6 +331,19 @@ On a successful bind it prints (to stdout):
 ironbus listening on <addr>, data dir <dir>
 ```
 
+or, under `--storage memory` (#443), the backend instead of a path that does not exist:
+
+```
+ironbus listening on <addr>, storage memory (ephemeral)
+```
+
+followed on EVERY memory-mode boot by the ephemeral-contract banner (its own line, mirroring
+the loud I2-waived durability warning):
+
+```
+WARN: --storage memory: this broker is EPHEMERAL. Records live only in this process's RAM: NO files, NO fsync, NO power-loss or restart durability. ...
+```
+
 It then prints the MATERIALIZED-CONFIG line (#87): one structured `key=value` line carrying
 the active profile, the profile schema version, and every resolved tuning knob, so an
 operator can see exactly what the broker is running (and a profile content change is
@@ -261,6 +352,11 @@ auditable across an upgrade):
 ```
 materialized-config profile=<name> profile_schema_version=<n> addr=<addr> data_dir=<dir> max_connections=<n> max_segment_bytes=<n> ... enable_admin=<bool> ram_ceiling_bytes=<n>
 ```
+
+The line ends with an ADDITIVE trailing `storage=` field (#443): `storage=disk` on the default
+backend, `storage=memory` with `data_dir=none` in memory mode. A script detects an ephemeral
+broker by `storage=memory`, never by `data_dir=none` alone (a disk broker started with a literal
+relative directory named `none` emits the same `data_dir` token).
 
 If `--health-addr` is set, it also prints:
 

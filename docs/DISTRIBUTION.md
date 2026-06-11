@@ -176,6 +176,51 @@ runtime reload trigger is tracked in #380, refs #88), and because the unit uses
 reload leaves the broker DOWN until `systemctl start ironbus`. To change configuration, edit
 `/etc/ironbus/ironbus.env` (or the `--config` TOML file) and run `systemctl restart ironbus`.
 
+### Memory mode under the unit: `Restart=` revives an EMPTY broker (#443, #444)
+
+A unit configured for the ephemeral backend (`IRONBUS_STORAGE=memory` plus
+`IRONBUS_EPHEMERAL_LOSS_ACK=true` and a non-zero `IRONBUS_MAX_TOTAL_BYTES` in
+`/etc/ironbus/ironbus.env`, PLUS the `UnsetEnvironment=` drop-in below, or the equivalent
+flags) keeps NO state across process exits, by
+contract. Under `Restart=on-failure`, a crashed memory broker is revived EMPTY: offset 0, no
+records, no group cursors, every acknowledged message of the previous incarnation gone. The
+restart is a fresh broker that happens to share the unit name. Plan for that explicitly: pair
+the unit with consumers that tolerate replay-from-live (re-subscribe and continue from whatever
+arrives next) and producers that can re-publish or accept the loss; alert on the
+`storage=memory` materialized-config echo if a fleet must never run ephemeral by accident. The
+fall-back-after-N machinery above is unaffected (it tracks the BINARY, not the data), and the
+data-dir-related guidance elsewhere in this document simply does not apply: a memory broker
+needs no `StateDirectory=`, no writable data-dir mount, and leaves nothing for the offline
+verbs to inspect after it stops (live `/healthz`, `/readyz`, `/metrics`, `/admin`, and
+`ironbus top --addr` are the introspection surface; see `docs/CLI.md`).
+
+The env file alone is NOT a complete memory-mode recipe. The shipped unit hard-codes
+`Environment=IRONBUS_DATA_DIR=/var/lib/ironbus`, and an `EnvironmentFile=` can only override a
+variable, never UNSET it: an empty `IRONBUS_DATA_DIR=` line still reaches the broker as a SET
+(empty) value, which the memory-mode boot refuses exactly like a real path (memory mode requires
+`--data-dir`, and therefore `IRONBUS_DATA_DIR`, to be ABSENT; the usage error echoes the empty
+value). So a memory-mode unit also needs a drop-in that unsets the variable:
+
+```ini
+# /etc/systemd/system/ironbus.service.d/memory.conf
+[Service]
+UnsetEnvironment=IRONBUS_DATA_DIR
+```
+
+`UnsetEnvironment=` exists since systemd 235, the floor this unit already requires for
+`StateDirectory=`. Per `systemd.exec(5)`, its effect "is applied as final step when the
+environment list passed to executed processes is compiled", so "it may undo assignments from any
+configuration source, including assignments made through `Environment=` or `EnvironmentFile=`",
+which is exactly the capability the env file lacks. Omit the drop-in and every start exits 1 on
+the data-dir refusal, which under `Restart=on-failure` with the rate limiter disabled is a
+crashloop where `ExecStopPost` counts each exit as a failed start, so after N=3 the
+fall-back-after-N machinery performs a SPURIOUS binary rollback for what is only a configuration
+mistake.
+
+The same applies to the container image: a `--storage memory` container needs NO writable
+volume mount (the "Required writable volume" rule below is a disk-backend rule), and an
+orchestrator restart revives it empty.
+
 ## 3. The distroless container image
 
 `Dockerfile` builds a multi-stage image whose runtime stage is `gcr.io/distroless/static:nonroot`.

@@ -9029,6 +9029,170 @@ mod tests {
         );
     }
 
+    // ---- #444 memory-mode operational surface ----
+
+    #[test]
+    fn the_offline_verbs_reject_the_serve_only_storage_flag() {
+        // The #444 offline-verb decision, PINNED: `--storage` is parsed by `serve` only. Every
+        // offline verb operates on a STOPPED broker's `--data-dir`, and a memory-mode broker
+        // (#443) leaves NO directory behind, so the flag has nothing it could mean there. Each
+        // strict per-verb parser already rejects it as an unknown flag at USAGE level (exit 1),
+        // BEFORE touching the filesystem; that is the clear error path the issue asks for (never
+        // the confusing `data dir not found` exit 2). This test pins the rejection for all seven
+        // offline data-dir verbs PLUS `top` (dual-mode, but `top --data-dir` is in the docs'
+        // data-dir enumeration, so its strict parser is pinned with the rest), so a future
+        // shared-parser refactor cannot silently start accepting (and ignoring) the flag. The
+        // zstd-only `dict install` / `dict ls` are the feature-gated equivalents (strict per-verb
+        // parsers over `--data-dir` that reject the flag the same way); they are not in the array
+        // because this test must pass on a default (no-zstd) build. The offline verbs also read
+        // NO `IRONBUS_*` env vars, so an `IRONBUS_STORAGE=memory` in a unit env file cannot leak
+        // into them either.
+        let verbs: &[&[&str]] = &[
+            &["peek", "--storage", "memory"],
+            &["dump", "--storage", "memory"],
+            &["scrub", "--storage", "memory"],
+            &["repair", "--storage", "memory"],
+            &["admin", "consumer-reset", "--storage", "memory"],
+            &["admin", "dlq-redrive", "--storage", "memory"],
+            &["migrate", "--storage", "memory"],
+            &["top", "--storage", "memory"],
+        ];
+        for argv in verbs {
+            let owned: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+            let mut buf = Vec::new();
+            match run(&owned, &mut buf) {
+                Err(CliError::Usage(m)) => {
+                    assert!(
+                        m.contains("unknown flag `--storage`"),
+                        "{argv:?} must reject --storage as an unknown flag at usage level: {m}"
+                    );
+                    assert_eq!(CliError::Usage(m).exit_code(), EXIT_USAGE);
+                }
+                other => panic!("{argv:?} must be a usage error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn memory_storage_refuses_a_config_file_data_dir_key() {
+        // The #444 boot-interplay sweep: the `storage.data_dir` config-FILE key flows through the
+        // same `IRONBUS_DATA_DIR` env mapping as every file key (#382), so under `--storage
+        // memory` it is refused exactly like the flag form (#443 pinned that one): an in-memory
+        // broker keeps no on-disk state, and a configured directory would only LOOK durable.
+        //
+        // Asserted at the parse + `finish_serve` seam (the seam the other refusal unit tests
+        // assert through), deliberately NOT through `run`: through `run`, a regression of the
+        // guarded mapping would not refuse but boot a REAL memory broker and hang this test
+        // forever. Here a mapping regression fails the `parsed.data_dir` assert as an immediate
+        // panic, and the pre-verified Some(dir) + Memory inputs make `finish_serve` return the
+        // refusal before any broker side effect.
+        struct RemoveOnDrop(std::path::PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "ironbus-cli-444-memfilekey-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "[storage]\ndata_dir = \"/var/lib/ironbus\"\n").unwrap();
+        // The cleanup guard is armed BEFORE any assertion, so a panicking assert (or a failed
+        // parse) cannot leak the temp config.
+        let _cleanup = RemoveOnDrop(path.clone());
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--config",
+            path.to_str().unwrap(),
+            "--storage",
+            "memory",
+            "--ephemeral-loss-ack",
+            "--max-total-bytes",
+            "1048576",
+            // A belt-and-braces tripwire: TEST-NET-3 is never locally assigned, so even if the
+            // `finish_serve` refusal itself regressed, the bind would fail fast (EADDRNOTAVAIL)
+            // instead of serving forever.
+            "--addr",
+            "203.0.113.1:7777",
+        ]))
+        .unwrap();
+        // The guarded mapping itself: the file key must surface as the parsed data dir. A
+        // regression here fails as an immediate panic, never a booted broker.
+        assert_eq!(
+            parsed.data_dir.as_deref(),
+            Some("/var/lib/ironbus"),
+            "the storage.data_dir file key must flow through the IRONBUS_DATA_DIR mapping"
+        );
+        assert_eq!(parsed.config.storage, StorageArg::Memory);
+        let mut buf = Vec::new();
+        let e = finish_serve(
+            &parsed.addr,
+            parsed.data_dir.as_deref(),
+            &parsed.config,
+            &parsed.key_shared_groups,
+            &parsed.broadcast_groups,
+            parsed.health_addr.as_deref(),
+            &parsed.config_warnings,
+            ReloadSource {
+                config_path: parsed.config_path.as_deref(),
+                allow_unknown_config: parsed.allow_unknown_config,
+            },
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => {
+                assert!(
+                    m.contains("`--data-dir` must be absent"),
+                    "states the rule for the file key too: {m}"
+                );
+                assert!(
+                    m.contains("/var/lib/ironbus"),
+                    "echoes the file-configured directory: {m}"
+                );
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_storage_keeps_the_shared_engine_knobs_legal() {
+        // The #444 interplay decisions, PINNED as ALLOW: the segment size, the three retention
+        // bounds, the checkpoint interval, and the `--compact` opt-in (#337) all stay legal under
+        // `--storage memory`, because every one of them operates on the in-memory filesystem
+        // exactly as it operates on disk. Retention reaping and compaction RECLAIM RAM under the
+        // required `--max-total-bytes` cap (on a RAM-backed store the byte cap is the OOM guard,
+        // so the reclaim knobs are MORE load-bearing there, not less); the checkpoint machinery
+        // keeps the group cursors and redelivery semantics correct WITHIN the process lifetime.
+        // Refusing any of them would remove a real tool, so none is special-cased.
+        let cfg = parse_serve_flags(&serve_args(&[
+            "--storage",
+            "memory",
+            "--ephemeral-loss-ack",
+            "--max-total-bytes",
+            "1048576",
+            "--max-segment-bytes",
+            "65536",
+            "--max-retained-bytes",
+            "524288",
+            "--max-age-ms",
+            "60000",
+            "--max-messages",
+            "1000",
+            "--checkpoint-interval",
+            "64",
+            "--compact",
+        ]))
+        .unwrap()
+        .config;
+        assert!(cfg.compact, "--compact parsed");
+        assert_eq!(cfg.storage, StorageArg::Memory);
+        assert!(
+            validate_serve_config(&cfg).is_ok(),
+            "the shared engine knobs must stay legal in memory mode"
+        );
+    }
+
     #[test]
     fn serve_parses_the_ram_ceiling_bytes_flag() {
         // The flag takes a value and feeds the guard: a tiny ceiling with the (huge) balanced defaults
