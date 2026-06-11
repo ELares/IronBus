@@ -8899,27 +8899,66 @@ mod tests {
         // same `IRONBUS_DATA_DIR` env mapping as every file key (#382), so under `--storage
         // memory` it is refused exactly like the flag form (#443 pinned that one): an in-memory
         // broker keeps no on-disk state, and a configured directory would only LOOK durable.
+        //
+        // Asserted at the parse + `finish_serve` seam (the seam the other refusal unit tests
+        // assert through), deliberately NOT through `run`: through `run`, a regression of the
+        // guarded mapping would not refuse but boot a REAL memory broker and hang this test
+        // forever. Here a mapping regression fails the `parsed.data_dir` assert as an immediate
+        // panic, and the pre-verified Some(dir) + Memory inputs make `finish_serve` return the
+        // refusal before any broker side effect.
+        struct RemoveOnDrop(std::path::PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
         let path = std::env::temp_dir().join(format!(
             "ironbus-cli-444-memfilekey-{}.toml",
             std::process::id()
         ));
         std::fs::write(&path, "[storage]\ndata_dir = \"/var/lib/ironbus\"\n").unwrap();
+        // The cleanup guard is armed BEFORE any assertion, so a panicking assert (or a failed
+        // parse) cannot leak the temp config.
+        let _cleanup = RemoveOnDrop(path.clone());
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--config",
+            path.to_str().unwrap(),
+            "--storage",
+            "memory",
+            "--ephemeral-loss-ack",
+            "--max-total-bytes",
+            "1048576",
+            // A belt-and-braces tripwire: TEST-NET-3 is never locally assigned, so even if the
+            // `finish_serve` refusal itself regressed, the bind would fail fast (EADDRNOTAVAIL)
+            // instead of serving forever.
+            "--addr",
+            "203.0.113.1:7777",
+        ]))
+        .unwrap();
+        // The guarded mapping itself: the file key must surface as the parsed data dir. A
+        // regression here fails as an immediate panic, never a booted broker.
+        assert_eq!(
+            parsed.data_dir.as_deref(),
+            Some("/var/lib/ironbus"),
+            "the storage.data_dir file key must flow through the IRONBUS_DATA_DIR mapping"
+        );
+        assert_eq!(parsed.config.storage, StorageArg::Memory);
         let mut buf = Vec::new();
-        let e = run(
-            &[
-                "serve".to_string(),
-                "--config".to_string(),
-                path.to_str().unwrap().to_string(),
-                "--storage".to_string(),
-                "memory".to_string(),
-                "--ephemeral-loss-ack".to_string(),
-                "--max-total-bytes".to_string(),
-                "1048576".to_string(),
-            ],
+        let e = finish_serve(
+            &parsed.addr,
+            parsed.data_dir.as_deref(),
+            &parsed.config,
+            &parsed.key_shared_groups,
+            &parsed.broadcast_groups,
+            parsed.health_addr.as_deref(),
+            &parsed.config_warnings,
+            ReloadSource {
+                config_path: parsed.config_path.as_deref(),
+                allow_unknown_config: parsed.allow_unknown_config,
+            },
             &mut buf,
         )
         .unwrap_err();
-        let _ = std::fs::remove_file(&path);
         assert_eq!(e.exit_code(), EXIT_USAGE);
         match e {
             CliError::Usage(m) => {
