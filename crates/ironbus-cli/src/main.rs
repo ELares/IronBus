@@ -743,7 +743,7 @@ USAGE:
                   [--interval <secs>] [--once] [--json] [--no-color]
     ironbus bench (--duration <secs> | --count <n>) [--mode <publish|subscribe|round-trip>]
                   [--rate <msg/s>] [--payload-bytes <n>] [--payload-shape <realistic|random>]
-                  [--fetch-batch <n>] [--group <name>] [--no-fsync] [--json]
+                  [--fetch-batch <n>] [--group <name>] [--no-fsync] [--pubwindow <n>] [--json]
                   [--storage <disk|memory>]
                   [--addr <host:port> --i-understand-this-is-live]
     ironbus upgrade --new-binary <path> --dest <path> [--max-failed-starts <n>]
@@ -909,6 +909,10 @@ Notes:
     reported and exits 70). It REFUSES to target an existing broker (--addr) or join a non-bench
     consumer group (--group) unless --i-understand-this-is-live is passed, so it can never corrupt
     real data or steal a real group's messages. To protect edge flash, exactly one of --duration
+    --pubwindow <n> (default 1) pipelines the publisher: up to n un-acked PUBs are kept in
+    flight per produce call, so the broker's group commit covers the window with ONE fdatasync
+    instead of n (#450). Every ack keeps its fsynced-durable meaning; only WHEN the publisher
+    awaits changes. 1 is the historical one-awaited-ack-per-publish path.
     <secs> or --count <n> is REQUIRED (no unbounded default), and --no-fsync is a dry run that
     batches the bench broker's cursor checkpoints (the fsync cost is then reported as not measured).
     round-trip mode (the default) measures producer-to-consumer latency through the real durable

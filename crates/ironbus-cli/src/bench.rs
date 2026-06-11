@@ -178,6 +178,12 @@ pub struct BenchConfig {
     /// Dry-run: batch the bench broker's cursor checkpoints instead of one durable write per ack,
     /// to spare edge flash. In this mode the fsync cost is not measured.
     pub no_fsync: bool,
+    /// The pipelined publish window (#450): how many un-acked PUBs the publisher keeps in flight
+    /// per produce call. `1` (the default) is the historical one-awaited-ack-per-publish path;
+    /// `N > 1` uses [`ironbus_client::Client::produce_window`], so the broker's group commit
+    /// covers the window with one fdatasync instead of N. Acks keep their unchanged
+    /// fsynced-durable meaning; only WHEN the publisher awaits changes.
+    pub pub_window: usize,
     /// The storage BACKEND of bench's own ISOLATED synthetic broker (#445, refs #443): `disk` (the
     /// default, the historical bench broker over an auto-deleted synthetic data dir) or `memory`
     /// (the same engine over the in-memory filesystem, for honest RAM-path numbers next to the
@@ -267,6 +273,7 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
     let mut live_addr: Option<String> = None;
     let mut live_ack = false;
     let mut no_fsync = false;
+    let mut pub_window: usize = 1;
     let mut storage: Option<StorageArg> = None;
     let mut json = false;
     let mut i = 0;
@@ -349,6 +356,23 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
             }
             "--no-fsync" => {
                 no_fsync = true;
+                i += 1;
+            }
+            // The pipelined publish window (#450): 0 is meaningless (nothing would ever be
+            // published), so it is a usage error naming the bound.
+            "--pubwindow" => {
+                let raw = take(args, &mut i, "--pubwindow")?;
+                let parsed: usize = raw.parse().map_err(|_| {
+                    CliError::Usage(format!(
+                        "`--pubwindow` must be a positive integer, got `{raw}`"
+                    ))
+                })?;
+                if parsed == 0 {
+                    return Err(CliError::Usage(
+                        "`--pubwindow` must be at least 1 (1 = the unpipelined default)".into(),
+                    ));
+                }
+                pub_window = parsed;
                 i += 1;
             }
             // The isolated broker's storage backend (#445): `disk` (default) or `memory`. Reuses
@@ -453,6 +477,7 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         group,
         live_addr,
         no_fsync,
+        pub_window,
         storage,
         json,
     })
@@ -622,7 +647,7 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         s,
         "{{\"schema_version\":{},\"mode\":\"{}\",\"isolated\":{},\"group\":\"{}\",\
          \"bound\":{{{}}},\"target_rate_hz\":{},\"payload_bytes\":{},\"payload_shape\":\"{}\",\
-         \"fetch_batch\":{},\"no_fsync\":{},\"storage\":\"{}\",\"results\":{{\
+         \"fetch_batch\":{},\"no_fsync\":{},\"pubwindow\":{},\"storage\":\"{}\",\"results\":{{\
          \"produced\":{},\"recorded\":{},\"elapsed_secs\":{},\"msgs_per_sec\":{},\
          \"mb_per_sec\":{},\"bytes_per_op\":{},\
          \"latency_p50_us\":{},\"latency_p99_us\":{},\"latency_p999_us\":{},\"latency_max_us\":{},\
@@ -637,6 +662,7 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         cfg.payload_shape.as_str(),
         cfg.fetch_batch,
         cfg.no_fsync,
+        cfg.pub_window,
         cfg.storage.as_str(),
         report.produced,
         report.recorded,
@@ -1079,6 +1105,13 @@ mod tests {
     #[test]
     fn no_fsync_run_flags_the_cost_not_measured() {
         let cfg = parse(&["--count", "5", "--no-fsync"]).unwrap();
+        assert_eq!(cfg.pub_window, 1, "the unpipelined default");
+        let w = parse(&["--count", "5", "--pubwindow", "64"]).unwrap();
+        assert_eq!(w.pub_window, 64);
+        assert!(
+            parse(&["--count", "5", "--pubwindow", "0"]).is_err(),
+            "0 is refused"
+        );
         assert!(cfg.no_fsync);
         let report = BenchReport {
             fsync_measured: false,
