@@ -129,6 +129,16 @@ pub const PER_CONNECTION_STACK_BYTES: u64 = 64 * 1024;
 /// both with margin.
 pub const PER_LEASE_BYTES: u64 = 64;
 
+/// How many full byte IMAGES of the store the in-memory backend (#443) can hold at once, the
+/// multiplier the #445 footprint proof charges per stored byte under `--storage memory`. The
+/// in-memory `Filesystem` (`InMemoryFs` / `InMemoryFile` in `ironbus-storage`) keeps TWO byte
+/// images per file: the `live` bytes plus the `durable` image a `sync_data` clones them into (the
+/// power-loss simulation contract every conformance suite relies on). At steady state every stored
+/// byte therefore exists twice in RSS, so the worst-case in-memory store footprint is
+/// `2 * max_total_bytes`, not `max_total_bytes`. The directory-level `sync_dir` clone is only a
+/// map of `Arc` pointers (no third byte image), so 2 is the honest multiplier, not a guess.
+pub const IN_MEMORY_STORE_IMAGES: u64 = 2;
+
 /// The configuration the refuse-to-boot RAM guard ([`fits_under_ram_ceiling`]) reasons about: the
 /// bounded-buffer knobs from `docs/RAM_BUDGET.md` plus `max_connections` (a server-level cap that
 /// bounds the in-flight set, the read buffers, and the thread stacks). Every field is a CONFIGURED
@@ -151,6 +161,15 @@ pub struct RamFootprintConfig {
     pub max_groups: u64,
     /// `--max-in-flight`: the per-group delivery window. Bounds the per-group lease/cursor state.
     pub max_in_flight: u64,
+    /// The STORE's RAM bound (#445): `--max-total-bytes` when the storage backend is the in-memory
+    /// store (`--storage memory`, #443), and `0` when the store is on disk. On disk the store is
+    /// file-backed (the active segment is ~0 in RSS, `docs/RAM_BUDGET.md` term 4), so it is not a
+    /// RAM source and this stays `0`. In memory mode the store IS RAM: every stored byte lives in
+    /// the process, up to the byte cap, and is charged at [`IN_MEMORY_STORE_IMAGES`] images (the
+    /// live bytes plus the durable-image clone `sync_data` keeps). The caller passes the resolved
+    /// `max_total_bytes` here; memory mode refuses an unlimited (`0`) cap upstream, so a `0` always
+    /// means "the store is not in RAM", never "unbounded RAM store".
+    pub in_memory_store_bytes: u64,
 }
 
 /// The worst-case STEADY-STATE bounded-buffer footprint (in bytes) the configured caps imply,
@@ -188,8 +207,14 @@ pub struct RamFootprintConfig {
 ///   on-the-wire record-size cap and is tracked as the read-buffer follow-up. Charging it here would
 ///   refuse EVERY edge config, including the worked edge-tiny one the doc proves fits, so the guard
 ///   deliberately excludes it and asserts the firmly-bounded steady-state sum the doc itemizes.
-/// - **Term 4 (the active segment)** is ~0 in RSS (written straight to file), and **term 6 (dedup)**
-///   costs nothing until a producer opts in, so neither is charged.
+/// - **Term 4 (the store).** On DISK it is ~0 in RSS (the active segment is written straight to
+///   file) and is not charged. Under `--storage memory` (#443) the store ITSELF is RAM, so the
+///   #445 memory-backend fold charges it: `in_memory_store_bytes` (the resolved
+///   `--max-total-bytes` cap, the most stored bytes the engine ever retains) times
+///   [`IN_MEMORY_STORE_IMAGES`] (the live bytes PLUS the durable-image clone the in-memory
+///   filesystem keeps per file at every `sync_data`). Disk mode passes `0` here, so the disk
+///   verdict is bit-for-bit the historical one.
+/// - **Term 6 (dedup)** costs nothing until a producer opts in, so it is not charged.
 ///
 /// Every multiply and add SATURATES, so an unbounded (`0` = off) cap that would overflow instead
 /// saturates to [`u64::MAX`] and the config is correctly refused under any real ceiling.
@@ -214,6 +239,13 @@ pub fn worst_case_buffer_bytes(config: &RamFootprintConfig) -> u64 {
         .saturating_mul(config.max_in_flight)
         .saturating_mul(PER_LEASE_BYTES);
 
+    // Term 4, the IN-MEMORY store (#445): zero on disk (file-backed, ~0 RSS); under `--storage
+    // memory` the byte cap times the two byte images (live + the durable clone) the in-memory
+    // filesystem holds per file. See `IN_MEMORY_STORE_IMAGES` for why the multiplier is exactly 2.
+    let term4_memory_store = config
+        .in_memory_store_bytes
+        .saturating_mul(IN_MEMORY_STORE_IMAGES);
+
     // Term 5: fixed overhead + one OS thread stack per connection.
     let term5 = FIXED_OVERHEAD_BYTES.saturating_add(
         config
@@ -221,7 +253,10 @@ pub fn worst_case_buffer_bytes(config: &RamFootprintConfig) -> u64 {
             .saturating_mul(PER_CONNECTION_STACK_BYTES),
     );
 
-    term1.saturating_add(term3).saturating_add(term5)
+    term1
+        .saturating_add(term3)
+        .saturating_add(term4_memory_store)
+        .saturating_add(term5)
 }
 
 /// The verdict of the refuse-to-boot RAM guard for a configuration ([`fits_under_ram_ceiling`]).
@@ -294,6 +329,8 @@ mod tests {
             consumer_credit_bytes: 256 * 1024,
             max_groups: 64,
             max_in_flight: 256,
+            // The edge-tiny preset is the DISK backend: the store is file-backed, not charged.
+            in_memory_store_bytes: 0,
         }
     }
 
@@ -363,11 +400,67 @@ mod tests {
             consumer_credit_bytes: 0,
             max_groups: 64,
             max_in_flight: 256,
+            in_memory_store_bytes: 0,
         };
         assert!(matches!(
             fits_under_ram_ceiling(&cfg),
             RamCeilingVerdict::Exceeds { .. }
         ));
+    }
+
+    #[test]
+    fn the_in_memory_store_is_charged_at_two_byte_images() {
+        // THE #445 MEMORY-BACKEND FOLD: with the store in RAM, the worst case grows by EXACTLY
+        // `IN_MEMORY_STORE_IMAGES * in_memory_store_bytes` over the same config with a disk store
+        // (the live bytes plus the durable-image clone the in-memory filesystem keeps). This test
+        // FAILS if the store term is dropped from the proof or its clone headroom is forgotten.
+        let disk = edge_tiny_footprint();
+        let mem = RamFootprintConfig {
+            in_memory_store_bytes: 8 * 1024 * 1024,
+            ..disk
+        };
+        assert_eq!(
+            worst_case_buffer_bytes(&mem),
+            worst_case_buffer_bytes(&disk) + IN_MEMORY_STORE_IMAGES * 8 * 1024 * 1024,
+            "the in-memory store must be charged at live + durable-clone (2 images)"
+        );
+    }
+
+    #[test]
+    fn a_memory_store_past_the_ceiling_is_refused_where_the_disk_config_fits() {
+        // The issue-#445 headline: edge-tiny knobs FIT under 64 MiB on disk, but the SAME knobs
+        // with a 1 GiB in-RAM store provably cannot (2 GiB of store images alone), so the verdict
+        // flips from Fits to Exceeds purely on the store fold.
+        let disk = edge_tiny_footprint();
+        assert!(matches!(
+            fits_under_ram_ceiling(&disk),
+            RamCeilingVerdict::Fits { .. }
+        ));
+        let mem = RamFootprintConfig {
+            in_memory_store_bytes: 1024 * 1024 * 1024,
+            ..disk
+        };
+        match fits_under_ram_ceiling(&mem) {
+            RamCeilingVerdict::Exceeds {
+                worst_case_bytes, ..
+            } => assert!(
+                worst_case_bytes >= IN_MEMORY_STORE_IMAGES * 1024 * 1024 * 1024,
+                "the store images dominate the worst case, got {worst_case_bytes}"
+            ),
+            other => panic!("a 1 GiB in-RAM store under a 64 MiB ceiling must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_absurd_in_memory_store_saturates_rather_than_overflows() {
+        // Belt and braces: a u64::MAX byte cap times the image multiplier saturates (the config is
+        // then refused under any real ceiling), never wraps around to a small, spuriously-fitting
+        // worst case.
+        let cfg = RamFootprintConfig {
+            in_memory_store_bytes: u64::MAX,
+            ..edge_tiny_footprint()
+        };
+        assert_eq!(worst_case_buffer_bytes(&cfg), u64::MAX);
     }
 
     #[test]
@@ -391,6 +484,10 @@ mod tests {
             },
             RamFootprintConfig {
                 max_in_flight: base.max_in_flight + 1,
+                ..base
+            },
+            RamFootprintConfig {
+                in_memory_store_bytes: base.in_memory_store_bytes + 1,
                 ..base
             },
         ] {

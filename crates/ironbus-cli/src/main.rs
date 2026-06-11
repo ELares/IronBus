@@ -2719,6 +2719,22 @@ fn validate_durability(config: &ServeConfig) -> Result<(), CliError> {
 /// and the knobs that drive it, so an operator knows exactly which cap to lower. `0` (the default for
 /// `balanced`/`throughput`) disables the guard; `edge-tiny`'s 64 MiB ceiling fits (~15 MiB worst
 /// case) but a blown-up cap override (e.g. a server-sized `--max-connections`) is refused here.
+///
+/// THE #445 MEMORY-BACKEND FOLD. The footprint historically modeled connections, credits, groups,
+/// and in-flight state ONLY; the store was honestly excluded because on DISK it is file-backed (~0
+/// RSS, `docs/RAM_BUDGET.md` term 4). Under `--storage memory` (#443) that exclusion would be a
+/// hole an operator falls straight into: the store ITSELF is RAM, up to `--max-total-bytes` of
+/// stored bytes, and the in-memory filesystem keeps a SECOND byte image per file (the durable
+/// image each `sync_data` clones the live bytes into, the power-loss-simulation contract), so the
+/// store's worst case is `2 * max_total_bytes`
+/// ([`ironbus_server::rss::IN_MEMORY_STORE_IMAGES`]). The model here is therefore:
+///
+/// - DISK: `worst_case = buffers(conns, credits, groups, in-flight) + fixed` (unchanged, the
+///   historical verdict bit-for-bit; the store stays uncharged because it is not RAM).
+/// - MEMORY: `worst_case = buffers(...) + fixed + 2 * max_total_bytes` (the store fold). A
+///   `--ram-ceiling-bytes` below that floor REFUSES TO BOOT with a message naming the store term,
+///   so `--ram-ceiling-bytes 64MiB --max-total-bytes 1GiB --storage memory` (which booted before
+///   this fold) is now a provable refusal, never a silent OOM promise.
 fn validate_ram_ceiling(config: &ServeConfig) -> Result<(), CliError> {
     // `usize` -> `u64` is lossless on every supported (32/64-bit) target; the saturating fallback is
     // belt-and-braces so a hypothetical >u64 platform could only ever make the worst case LARGER (more
@@ -2730,6 +2746,13 @@ fn validate_ram_ceiling(config: &ServeConfig) -> Result<(), CliError> {
         consumer_credit_bytes: config.consumer_credit_bytes,
         max_groups: u64::try_from(config.max_groups).unwrap_or(u64::MAX),
         max_in_flight: u64::from(config.max_in_flight),
+        // The #445 store fold: in memory mode the store is RAM and is charged at its byte cap
+        // (times the durable-image clone, applied inside the model); on disk it is file-backed
+        // and stays uncharged, keeping the historical disk verdict bit-for-bit.
+        in_memory_store_bytes: match config.storage {
+            StorageArg::Memory => config.max_total_bytes,
+            StorageArg::Disk => 0,
+        },
     };
     match ironbus_server::rss::fits_under_ram_ceiling(&footprint) {
         ironbus_server::rss::RamCeilingVerdict::Disabled
@@ -2738,21 +2761,40 @@ fn validate_ram_ceiling(config: &ServeConfig) -> Result<(), CliError> {
             worst_case_bytes,
             ceiling_bytes,
             overage_bytes,
-        } => Err(CliError::Usage(format!(
-            "`--ram-ceiling-bytes` {ceiling_bytes} is below the worst-case bounded-buffer footprint \
-             {worst_case_bytes} the configured caps imply (over by {overage_bytes} bytes): the \
-             broker cannot prove it stays under the ceiling, so it refuses to boot. Lower \
-             `--max-connections` ({max_connections}), `--consumer-credit-bytes` \
-             ({consumer_credit_bytes}; 0 = unlimited, which cannot fit a small ceiling), \
-             `--consumer-credit` ({consumer_credit}), `--max-groups` ({max_groups}), or \
-             `--max-in-flight` ({max_in_flight}), or raise the ceiling. See docs/RAM_BUDGET.md for \
-             the worst-case formula.",
-            max_connections = config.max_connections,
-            consumer_credit_bytes = config.consumer_credit_bytes,
-            consumer_credit = config.consumer_credit,
-            max_groups = config.max_groups,
-            max_in_flight = config.max_in_flight,
-        ))),
+        } => {
+            // In memory mode the refusal NAMES the store term: the dominant new knob is almost
+            // always `--max-total-bytes`, and an operator who only ever read the disk-mode message
+            // would otherwise hunt the connection caps for an overage the store causes.
+            let store_note = match config.storage {
+                StorageArg::Memory => format!(
+                    " Under `--storage memory` the footprint INCLUDES the in-RAM store: \
+                     `--max-total-bytes` ({max_total_bytes}) is charged TWICE (the live bytes plus \
+                     the durable-image clone the in-memory filesystem keeps at each sync), so the \
+                     store alone accounts for {store_bytes} bytes of the worst case. Lower \
+                     `--max-total-bytes` or raise the ceiling to cover the store.",
+                    max_total_bytes = config.max_total_bytes,
+                    store_bytes = config
+                        .max_total_bytes
+                        .saturating_mul(ironbus_server::rss::IN_MEMORY_STORE_IMAGES),
+                ),
+                StorageArg::Disk => String::new(),
+            };
+            Err(CliError::Usage(format!(
+                "`--ram-ceiling-bytes` {ceiling_bytes} is below the worst-case bounded-buffer \
+                 footprint {worst_case_bytes} the configured caps imply (over by {overage_bytes} \
+                 bytes): the broker cannot prove it stays under the ceiling, so it refuses to boot. \
+                 Lower `--max-connections` ({max_connections}), `--consumer-credit-bytes` \
+                 ({consumer_credit_bytes}; 0 = unlimited, which cannot fit a small ceiling), \
+                 `--consumer-credit` ({consumer_credit}), `--max-groups` ({max_groups}), or \
+                 `--max-in-flight` ({max_in_flight}), or raise the ceiling. See docs/RAM_BUDGET.md \
+                 for the worst-case formula.{store_note}",
+                max_connections = config.max_connections,
+                consumer_credit_bytes = config.consumer_credit_bytes,
+                consumer_credit = config.consumer_credit,
+                max_groups = config.max_groups,
+                max_in_flight = config.max_in_flight,
+            )))
+        }
     }
 }
 
@@ -8352,6 +8394,86 @@ mod tests {
                 "an unlimited byte budget under a tiny ceiling must be refused, got {other:?}"
             ),
         }
+    }
+
+    /// The edge-tiny knob set used by the #445 memory-fold tests: small enough that the buffer
+    /// terms fit a 64 MiB ceiling with room to spare, so the verdict flips PURELY on the store.
+    fn edge_tiny_caps() -> ServeConfig {
+        ServeConfig {
+            max_connections: 32,
+            consumer_credit: 8,
+            consumer_credit_bytes: 256 * 1024,
+            max_groups: 64,
+            max_in_flight: 256,
+            ram_ceiling_bytes: EDGE_TINY_RAM_CEILING,
+            ..validation_config()
+        }
+    }
+
+    #[test]
+    fn memory_storage_folds_the_store_into_the_ram_ceiling_proof() {
+        // THE #445 MEMORY-BACKEND FOLD, the refusal direction. `--ram-ceiling-bytes 64MiB` plus
+        // `--max-total-bytes 1GiB` BOOTED before this fold (the #115 guard modeled connections,
+        // credits, groups, and in-flight only, never the store), which in memory mode is a silent
+        // OOM promise: the store itself is RAM. With the store folded in (charged at 2x for the
+        // in-memory durable-image clone) the same pair is now a provable refusal that NAMES the
+        // store term and the knob to lower. This test FAILS if the fold is removed.
+        let cfg = ServeConfig {
+            storage: StorageArg::Memory,
+            ephemeral_loss_ack: true,
+            max_total_bytes: 1024 * 1024 * 1024,
+            ..edge_tiny_caps()
+        };
+        match validate_serve_config(&cfg) {
+            Err(CliError::Usage(m)) => {
+                assert!(m.contains("--ram-ceiling-bytes"), "{m}");
+                assert!(m.contains("refuses to boot"), "{m}");
+                assert!(
+                    m.contains("`--storage memory`") && m.contains("in-RAM store"),
+                    "the refusal names the memory-mode store fold: {m}"
+                );
+                assert!(
+                    m.contains("--max-total-bytes"),
+                    "the refusal names the store knob to lower: {m}"
+                );
+                assert!(
+                    m.contains("durable-image clone"),
+                    "the refusal states the 2x clone headroom: {m}"
+                );
+                assert_eq!(CliError::Usage(m).exit_code(), EXIT_USAGE);
+            }
+            other => panic!(
+                "a 1 GiB in-RAM store under a 64 MiB ceiling must be refused, got {other:?}"
+            ),
+        }
+        // The SAME knobs on the DISK backend still validate: the disk store is file-backed (~0
+        // RSS), so it stays uncharged and the historical disk verdict is unchanged.
+        let disk = ServeConfig {
+            max_total_bytes: 1024 * 1024 * 1024,
+            ..edge_tiny_caps()
+        };
+        assert!(
+            validate_serve_config(&disk).is_ok(),
+            "the disk backend must not charge the file-backed store"
+        );
+    }
+
+    #[test]
+    fn memory_storage_boots_when_the_ceiling_covers_the_store_and_buffers() {
+        // The fold's accepting direction: a memory-mode config whose ceiling covers the buffer
+        // terms PLUS both store images (2 * max-total-bytes) validates and boots. 8 MiB of cap
+        // means 16 MiB of store images; with the ~15 MiB edge-tiny buffer worst case that sums
+        // well under the 64 MiB ceiling.
+        let cfg = ServeConfig {
+            storage: StorageArg::Memory,
+            ephemeral_loss_ack: true,
+            max_total_bytes: 8 * 1024 * 1024,
+            ..edge_tiny_caps()
+        };
+        assert!(
+            validate_serve_config(&cfg).is_ok(),
+            "a ceiling that covers store images + buffers must boot"
+        );
     }
 
     // ---- #341 / #379 relaxed durability levels: CLI gate, parsing, observability ----
