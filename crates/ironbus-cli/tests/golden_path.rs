@@ -1360,7 +1360,10 @@ fn memory_mode_round_trips_on_the_real_wire_and_exits_clean() {
     // A clean operator stop: SIGTERM exits 0 (the graceful drain runs over the in-memory fs).
     send_sigterm(broker.id());
     let code = wait_for_exit(&mut broker, Duration::from_secs(10));
-    assert_eq!(code, 0, "a SIGTERM graceful shutdown exits 0 in memory mode");
+    assert_eq!(
+        code, 0,
+        "a SIGTERM graceful shutdown exits 0 in memory mode"
+    );
 
     // The #443 machine-checkable echo on the stderr log stream: an operator (or a script) reads
     // the backend straight off the startup materialized-config line.

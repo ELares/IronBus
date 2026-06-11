@@ -2517,9 +2517,10 @@ fn finish_serve(
     // the data-dir-required validation is bypassed. The full flag-interplay sweep is #444; this is
     // the one interplay that cannot wait, because `--data-dir` is otherwise required.
     let data_dir = match config.storage {
-        StorageArg::Disk => Some(data_dir.ok_or_else(|| {
-            CliError::Usage("serve requires `--data-dir <dir>`".to_string())
-        })?),
+        StorageArg::Disk => Some(
+            data_dir
+                .ok_or_else(|| CliError::Usage("serve requires `--data-dir <dir>`".to_string()))?,
+        ),
         StorageArg::Memory => {
             if let Some(dir) = data_dir {
                 return Err(CliError::Usage(format!(
@@ -3422,7 +3423,10 @@ fn run_broker<F: Filesystem + 'static>(
             "ironbus listening on {local}, data dir {}",
             dir.display()
         )?,
-        None => writeln!(out, "ironbus listening on {local}, storage memory (ephemeral)")?,
+        None => writeln!(
+            out,
+            "ironbus listening on {local}, storage memory (ephemeral)"
+        )?,
     }
     if config.storage == StorageArg::Memory {
         // The #443 ephemeral-contract banner, on its OWN log line on EVERY memory-mode boot: the
@@ -3609,8 +3613,8 @@ fn run_broker<F: Filesystem + 'static>(
 #[allow(clippy::too_many_arguments)] // the wiring inputs (config, bind, engine, shutdown, beacon,
                                      // clock, out) are each a distinct concern; bundling them into a
                                      // struct would only move the noise, not remove it.
-// GENERIC over the engine's Filesystem (#443), like `run_broker`: the disk and memory storage
-// backends share the one health-server wiring, monomorphized by the same static dispatch.
+                                     // GENERIC over the engine's Filesystem (#443), like `run_broker`: the disk and memory storage
+                                     // backends share the one health-server wiring, monomorphized by the same static dispatch.
 fn start_health_server<F: Filesystem + 'static>(
     config: &ServeConfig,
     health_addr: Option<&str>,
@@ -8531,11 +8535,8 @@ mod tests {
         // active level, whether it is power-loss safe, and the interval triggers, so an operator reads
         // the durability posture straight off the startup log.
         let safe = parse_serve_flags(&serve_args(&[])).unwrap().config;
-        let line = materialized_config_line(
-            &safe,
-            "127.0.0.1:7777",
-            Some(Path::new("/var/lib/ironbus")),
-        );
+        let line =
+            materialized_config_line(&safe, "127.0.0.1:7777", Some(Path::new("/var/lib/ironbus")));
         assert!(line.contains("durability_level=sync"), "{line}");
         assert!(line.contains("power_loss_safe=true"), "{line}");
 
@@ -8751,7 +8752,11 @@ mod tests {
         let from_env = parse_serve_flags_with_env(&serve_args(&[]), &env_map)
             .unwrap()
             .config;
-        assert_eq!(from_env.storage, StorageArg::Memory, "env beats the default");
+        assert_eq!(
+            from_env.storage,
+            StorageArg::Memory,
+            "env beats the default"
+        );
         let flag_wins = parse_serve_flags_with_env(&serve_args(&["--storage", "disk"]), &env_map)
             .unwrap()
             .config;
@@ -8764,11 +8769,8 @@ mod tests {
         // historical fields keep their order); memory mode says storage=memory with the data_dir
         // field carrying the `none` sentinel (no path exists).
         let disk = parse_serve_flags(&serve_args(&[])).unwrap().config;
-        let line = materialized_config_line(
-            &disk,
-            "127.0.0.1:7777",
-            Some(Path::new("/var/lib/ironbus")),
-        );
+        let line =
+            materialized_config_line(&disk, "127.0.0.1:7777", Some(Path::new("/var/lib/ironbus")));
         assert!(line.contains("storage=disk"), "{line}");
         assert!(line.contains("data_dir=/var/lib/ironbus"), "{line}");
         let memory = parse_serve_flags(&serve_args(&[
