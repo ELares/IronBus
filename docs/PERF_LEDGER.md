@@ -48,3 +48,20 @@ and the session await one ack per publish.
   even the worst-case two-commits-per-window split leaves >= 32x headroom over the target).
 - **Status:** PENDING. The on-hive bench result lands here after merge
   (`ironbus bench --mode publish --pub-window 64` on the reference device).
+
+### Measured (hive 1000000088e76a84, 2026-06-11, pre-merge cross-compiled PR head, 256B, publish mode, disk + full fsync)
+
+| pubwindow | random | realistic |
+| --- | --- | --- |
+| 1 | 205/s (4.48ms/op fsync) | -- |
+| 8 | 637/s | -- |
+| 64 | 1,334/s | -- |
+| 256 | 1,684/s | -- |
+| 512 | 1,930/s | 1,643/s |
+| 1024 | 1,749/s | 1,956/s |
+
+Verdict: KEEP. 9.5x over the unpipelined baseline and over NATS sync-always pipelined (~203/s); the leg-2 target (>=2,030/s, 10x) is NOT yet met. The fsync is fully amortized (9ms/512 ~ 18us/op); the remaining ~450us/op floor is per-record server cost, NOT the client (coalescing the window into one client write() moved nothing) and NOT the wire/actor (the same window over --storage memory measures 4,882/s).
+
+### Round 2 hypothesis (queued)
+
+Batch the drained produce batch into ONE WAL write() per group commit (today Log::append issues one write per record): the memory-mode diagnostic bounds the non-storage floor at ~205us/op, predicting roughly 2,900-4,000/s durable at window 512 if the per-record write cost collapses. Sources: Kafka segment-batched appends; Redpanda's iobuf batch writes; the group-commit literature already cited.

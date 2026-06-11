@@ -519,17 +519,23 @@ impl Client {
         &mut self,
         messages: &[PubBody<'_>],
     ) -> Result<Vec<ProduceAck>, ClientError> {
-        // Phase 1: write the WHOLE window before awaiting any reply. This is what puts all N
-        // produces in front of the actor's drain loop as one group-commit batch (#450).
+        // Phase 1: encode the WHOLE window into ONE buffer and write it with ONE syscall. This
+        // is what puts all N produces in front of the actor's drain loop as one group-commit
+        // batch (#450), and the coalesced write keeps the per-message client overhead flat (a
+        // write() per frame measurably floors the window's throughput on small payloads: one
+        // syscall per message costs more than the amortized fsync at large windows).
+        let mut body = Vec::new();
+        let mut wire = Vec::with_capacity(messages.len() * 64);
         for message in messages {
-            let mut body = Vec::new();
+            body.clear();
             let at_least_once = PubBody {
                 fire_and_forget: false,
                 ..*message
             };
             encode_pub(&at_least_once, &mut body).map_err(ClientError::Body)?;
-            self.send(FrameType::Pub, &body)?;
+            encode_frame(FrameType::Pub, &body, &mut wire).map_err(ClientError::Frame)?;
         }
+        self.stream.write_all(&wire)?;
         // Phase 2: drain exactly one reply per message, FIFO. A server Err consumes its slot and
         // is remembered; the drain continues so the connection is not desynchronized.
         let mut acks = Vec::with_capacity(messages.len());
