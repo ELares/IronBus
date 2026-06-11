@@ -1143,6 +1143,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // `AtCapacity` routing is a forward refinement, not required for correctness).
         let _ = file.preallocate(self.config.max_segment_bytes);
         let writer = SegmentWriter::create(file, header)?;
+        let mut writer = writer;
         writer.sync()?; // the header is durable...
         self.fs.sync_dir()?; // ...and so is its directory entry.
                              // The segment header is physical write volume an SSD/eMMC wear model charges (#118): the
@@ -1513,7 +1514,14 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // A fatal sync (a failed durability barrier) freezes the writer read-only and is never
         // retried: drop the active segment so every later append and sync returns WriterFrozen,
         // and a health check sees the degraded state. Reads keep serving the durable prefix.
-        if self.active()?.sync().is_err() {
+        // The sync needs the writer mutably (#452: it flushes the pending buffered records to
+        // the file before its fdatasync, so durable keeps its meaning).
+        self.active()?;
+        let frozen = match self.active.as_mut() {
+            Some(w) => w.sync().is_err(),
+            None => true,
+        };
+        if frozen {
             self.active = None;
             return Err(StorageError::WriterFrozen);
         }
@@ -1549,9 +1557,20 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // A frozen writer has no active segment: surface the fatal state rather than silently
         // advancing the visible head over records the writer can no longer own.
         self.active()?;
-        // The page-cache writes are already done (each append wrote them); make them readable by
-        // raising the visible head, WITHOUT the fdatasync that `sync` issues. The records are NOT
-        // durable until a later `sync`, a roll's seal, or a clean shutdown flush.
+        // Flush the writer's pending buffered records to the page cache first (#452): raising
+        // the visible head promises readers the bytes are in the file. A flush failure is the
+        // fatal frozen-writer class, exactly like a failed sync barrier.
+        let flush_failed = match self.active.as_mut() {
+            Some(w) => w.flush_pending().is_err(),
+            None => true,
+        };
+        if flush_failed {
+            self.active = None;
+            return Err(StorageError::WriterFrozen);
+        }
+        // Make the flushed records readable by raising the visible head, WITHOUT the fdatasync
+        // that `sync` issues. The records are NOT durable until a later `sync`, a roll's seal,
+        // or a clean shutdown flush.
         self.flushed_offset = self.next_offset;
         Ok(())
     }
@@ -3035,7 +3054,7 @@ mod tests {
         w0.append(&view(1, b"b")).unwrap();
         w0.seal().unwrap();
         let f1 = fs.create_new(&segment_file_name(1)).unwrap();
-        let w1 = SegmentWriter::create(f1, header_at(1, 2)).unwrap();
+        let mut w1 = SegmentWriter::create(f1, header_at(1, 2)).unwrap();
         w1.sync().unwrap();
         drop(w1);
 

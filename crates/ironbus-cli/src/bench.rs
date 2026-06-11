@@ -373,7 +373,6 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
                     ));
                 }
                 pub_window = parsed;
-                i += 1;
             }
             // The isolated broker's storage backend (#445): `disk` (default) or `memory`. Reuses
             // the serve-side parser so bench and serve can never drift on the accepted names.
@@ -1108,6 +1107,14 @@ mod tests {
         assert_eq!(cfg.pub_window, 1, "the unpipelined default");
         let w = parse(&["--count", "5", "--pubwindow", "64"]).unwrap();
         assert_eq!(w.pub_window, 64);
+        // Regression (#452 round 2 found it): the arm must not double-advance past its value,
+        // or the NEXT flag is silently swallowed and its value becomes a positional error.
+        let after = parse(&["--count", "5", "--pubwindow", "64", "--no-fsync"]).unwrap();
+        assert_eq!(after.pub_window, 64);
+        assert!(
+            after.no_fsync,
+            "the flag after --pubwindow must still parse"
+        );
         assert!(
             parse(&["--count", "5", "--pubwindow", "0"]).is_err(),
             "0 is refused"
