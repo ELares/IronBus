@@ -714,7 +714,7 @@ const USAGE: &str = "\
 ironbus: a durable edge message queue.
 
 USAGE:
-    ironbus serve --data-dir <dir> [--config <path>] [--allow-unknown-config]
+    ironbus serve (--data-dir <dir> | --storage memory) [--config <path>] [--allow-unknown-config]
                   [--profile <edge-tiny|balanced|throughput>]
                   [--storage <disk|memory>] [--ephemeral-loss-ack]
                   [--addr <host:port>] [--max-connections <n>]
@@ -8734,6 +8734,54 @@ mod tests {
             ),
             other => panic!("a bad IRONBUS_STORAGE value must be a usage error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn async_loss_ack_never_satisfies_the_ephemeral_consent() {
+        // The two loss contracts are DISTINCT (#443): `--async-loss-ack` consents to a relaxed
+        // fsync schedule on a DURABLE store and must never unlock the ephemeral broker. The
+        // message-content test above cannot catch a conflated gate (one that accepts either
+        // consent), so this case boots with ONLY the async consent and pins the refusal itself.
+        let cfg = parse_serve_flags(&serve_args(&[
+            "--storage",
+            "memory",
+            "--async-loss-ack",
+            "--max-total-bytes",
+            "1048576",
+        ]))
+        .unwrap()
+        .config;
+        match validate_serve_config(&cfg) {
+            Err(CliError::Usage(m)) => assert!(
+                m.contains("--ephemeral-loss-ack"),
+                "memory mode still demands its dedicated consent: {m}"
+            ),
+            other => panic!("--async-loss-ack must not unlock memory mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_ephemeral_consent_resolves_from_its_env_var() {
+        // `IRONBUS_EPHEMERAL_LOSS_ACK` follows the IRONBUS_<FLAG> grammar like every bool flag
+        // (the `--async-loss-ack` precedent): an env-ignoring regression would strand fleet
+        // configs that grant the consent through /etc/ironbus/ironbus.env.
+        let env_map = |name: &str| -> Option<String> {
+            if name == "IRONBUS_EPHEMERAL_LOSS_ACK" {
+                Some("true".to_string())
+            } else {
+                None
+            }
+        };
+        let cfg = parse_serve_flags_with_env(
+            &serve_args(&["--storage", "memory", "--max-total-bytes", "1048576"]),
+            &env_map,
+        )
+        .unwrap()
+        .config;
+        assert!(
+            validate_serve_config(&cfg).is_ok(),
+            "the env-granted consent boots memory mode"
+        );
     }
 
     #[test]

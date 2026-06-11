@@ -1238,7 +1238,25 @@ fn graceful_shutdown_on_sigterm_checkpoints_the_cursor_and_does_not_redeliver() 
 /// returning the un-guarded `Child` (so the caller can SIGTERM it and read its exit status), the
 /// bound wire address, the second stdout line (the #443 ephemeral-contract banner), and a join
 /// handle yielding the broker's accumulated STDERR, where the materialized-config line lands.
-fn start_memory_broker() -> (Child, String, String, std::thread::JoinHandle<String>) {
+fn start_memory_broker() -> (
+    Child,
+    String,
+    String,
+    std::thread::JoinHandle<String>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    // NO-FILES HARNESS (#443 review): the broker runs with a scratch CWD and an isolated TMPDIR,
+    // both created empty, so the test can assert after the clean exit that the ephemeral broker
+    // created NO file anywhere it could plausibly write (a regression that starts touching disk,
+    // e.g. an unconditional data-dir prepare or a lock file leaking past the Filesystem trait,
+    // fails the emptiness assertion instead of passing silently).
+    let cwd_scratch = std::env::temp_dir().join(format!("ironbus-memcwd-{}", std::process::id()));
+    let tmp_scratch = std::env::temp_dir().join(format!("ironbus-memtmp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cwd_scratch);
+    let _ = std::fs::remove_dir_all(&tmp_scratch);
+    std::fs::create_dir_all(&cwd_scratch).expect("create scratch cwd");
+    std::fs::create_dir_all(&tmp_scratch).expect("create scratch tmpdir");
     let mut child = Command::new(BIN)
         .args([
             "serve",
@@ -1252,6 +1270,8 @@ fn start_memory_broker() -> (Child, String, String, std::thread::JoinHandle<Stri
             "--checkpoint-interval",
             "1",
         ])
+        .current_dir(&cwd_scratch)
+        .env("TMPDIR", &tmp_scratch)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1310,7 +1330,14 @@ fn start_memory_broker() -> (Child, String, String, std::thread::JoinHandle<Stri
         first.contains("storage memory (ephemeral)"),
         "the listening line names the memory backend, never a path that does not exist: {first}"
     );
-    (child, addr.to_string(), second, stderr_handle)
+    (
+        child,
+        addr.to_string(),
+        second,
+        stderr_handle,
+        cwd_scratch,
+        tmp_scratch,
+    )
 }
 
 #[test]
@@ -1320,7 +1347,7 @@ fn memory_mode_round_trips_on_the_real_wire_and_exits_clean() {
     // over real loopback sockets, fan in with acks, then stop it cleanly with SIGTERM and assert
     // exit 0 plus the machine-checkable `storage=memory` materialized-config echo. The default
     // disk path is byte-for-byte unchanged; every other scenario in this suite proves that.
-    let (mut broker, addr, banner, stderr_handle) = start_memory_broker();
+    let (mut broker, addr, banner, stderr_handle, cwd_scratch, tmp_scratch) = start_memory_broker();
 
     // The ephemeral-contract banner is the broker's second startup line on EVERY memory boot.
     assert!(
@@ -1380,4 +1407,29 @@ fn memory_mode_round_trips_on_the_real_wire_and_exits_clean() {
         config_line.contains("data_dir=none"),
         "no data dir exists in memory mode (the none sentinel): {config_line}"
     );
+
+    // THE NO-FILES CONTRACT: across boot, produce, consume, ack, and the graceful drain, the
+    // ephemeral broker wrote NOTHING under its cwd and NOTHING under its TMPDIR. Any entry at
+    // all (a data dir, a lock, a checkpoint, a stray temp) is a regression of the whole point.
+    let leftovers = |dir: &std::path::Path| -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert!(
+        leftovers(&cwd_scratch).is_empty(),
+        "memory mode created files in its cwd: {:?}",
+        leftovers(&cwd_scratch)
+    );
+    assert!(
+        leftovers(&tmp_scratch).is_empty(),
+        "memory mode created files in its TMPDIR: {:?}",
+        leftovers(&tmp_scratch)
+    );
+    let _ = std::fs::remove_dir_all(&cwd_scratch);
+    let _ = std::fs::remove_dir_all(&tmp_scratch);
 }
