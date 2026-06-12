@@ -218,3 +218,61 @@ allocations on the produce path (OwnedAppend payload Vec + per-produce reply syn
 reuse/arena them), the parked-ack reply encode path, clock_gettime64 batching (stamp once per
 drain batch), TCP_NODELAY + vectored reply writes. Re-profile AFTER the clone is gone; the 82
 percent memmove was masking everything downstream.
+
+## Round 5 (#458): the half-duplex window was the leg-4 gap; full-duplex produce_stream = 92.8k/s, ALL FIVE LEGS CLEARED
+
+Sources: the NATS bench tool's async JetStream publisher (the leg-4 baseline itself: a writer
+that never stops for acks); classic sliding-window pipelining (TCP, HTTP/2 streams); the round-4
+ledger's queued candidates (all parked: see below).
+
+### What the measurement showed
+
+Per-thread CPU on the hive during a memory w=1024 publish run at 16.2k msg/s: append-actor 25.4
+percent of one core, session 20.5, bench client 16.1, on a 4-core box. NOTHING saturated; the
+same code does 1.02M msg/s on an M-series laptop. Leg 4 was not CPU and not the engine: it was
+SYNCHRONIZATION BUBBLES. Client::produce_window writes a window then blocks draining all W acks
+(feeding nothing); the session's pass-scoped parked-ack drain serializes read -> actor round
+trip -> write. The two half-duplex loops interlock so every stage idles most of the time. The
+NATS async baseline never had this handicap. (Also measured and parked again as second-order:
+broker-side lz4 ~5 percent at this shape; clock_gettime64 syscalls; per-produce futex pair;
+TCP_NODELAY unset.)
+
+### Fix shipped
+
+Client::produce_stream(messages, window) (#458): FULL-DUPLEX sliding window. The caller's
+thread keeps encoding and writing coalesced PUB batches (32 KiB flush budget, never more than
+`window` unacked) while a scoped reader thread drains the FIFO acks concurrently from a
+try_clone'd read half; termination rides the wire's frame-order guarantee (a trailing Ping
+whose Pong proves every prior reply was consumed). Server Err replies COUNT in the returned
+tally instead of failing the call (the stream has fully drained by then; a drop-new shed no
+longer discards the run's counts). The reply classifier is shared with produce_window so the
+two paths cannot drift. `bench --stream` (requires --pubwindow >= 2) drives it. NO broker, wire,
+or engine changes: the server side already handled a saturated socket; no client could present
+one until now.
+
+### Measured (hive, 256B realistic, 15s runs, pre-merge cross-compiled, scratch broker)
+
+| leg | half-duplex window | full-duplex --stream |
+| --- | --- | --- |
+| memory w=512 | 9,012/s | 87,368/s |
+| memory w=1024 | 16,165/s | 92,801-93,097/s |
+| memory w=4096 | -- | 88,877/s (saturates ~90k) |
+| disk w=1024 (full fsync) | 9,346/s | 16,172/s |
+
+NATS fairness rerun SAME DAY, same box, matched batch 1024: JS memory async 28,337/s (28,337 vs
+yesterday's 27,250: consistent); JS memory sync 2,555/s. IronBus memory stream = 3.3x NATS
+async. Guardrails: binary 1.55 MB; bounded-cap RSS 6.1 MB peak under stream load at a 2 MiB
+store cap, with drop-new shedding exercised end to end (the bench reports acked-only goodput).
+
+### Win condition: ALL FIVE LEGS CLEARED
+
+1. Durable single-ack within 10 percent of NATS: 198-205 vs 191-203 (fsync physics parity).
+2. Durable pipelined >= 10x NATS sync-always (2,030): 16,172 = 80x.
+3. Memory per-ack >= NATS (2,491): 7,045 = 2.8x.
+4. Memory pipelined >= NATS (27,250; rerun 28,337): 92,801 = 3.3x.
+5. At least 2 legs led by >= 2x: legs 2 (80x), 3 (2.8x), 4 (3.3x).
+
+Verdict: KEEP. The goal's standing follow-ups: a final full NATS matrix rerun is recorded above
+for the contested legs; the consume-side legs (NATS ordered consume 43,877/s) were never part
+of the win condition and remain the natural next frontier, along with the parked second-order
+CPU items (clocks, futex pairs, NODELAY) if a future round needs them.

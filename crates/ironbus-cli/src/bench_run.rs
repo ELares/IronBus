@@ -352,6 +352,62 @@ fn pace(rate_hz: Option<f64>, seq: u64, started: Instant) {
     }
 }
 
+/// The FULL-DUPLEX publish leg (#458), split from [`run_publish`]: one `produce_stream` call
+/// pumps the whole run, writer and ack-reader overlapped, in-flight capped at the window.
+fn run_publish_stream(
+    cfg: &BenchConfig,
+    pub_client: &mut Client,
+    addr: &str,
+    started: Instant,
+) -> Result<BenchReport, CliError> {
+    // The FULL-DUPLEX sliding window (#458): one produce_stream call pumps the whole run,
+    // writer and ack-reader overlapped, in-flight capped at the window. Payloads come from a
+    // pool of `window` DISTINCT pre-filled buffers cycled by sequence: the pool slots cannot
+    // be re-stamped per message (they may still be borrowed by the in-flight encoder), and
+    // publish mode never reads payloads back, so the seq/send-time stamps the half-duplex
+    // path embeds would be dead bytes here anyway. Entropy honesty matches the windowed
+    // path's working set: `window` distinct realistic payloads in rotation.
+    let mut pool: Vec<Vec<u8>> = vec![vec![0u8; cfg.payload_bytes]; cfg.pub_window];
+    for (i, buf) in pool.iter_mut().enumerate() {
+        fill_payload(buf, cfg.payload_shape, i as u64, ROUND_TRIP_TOKEN_LEN);
+    }
+    let pool = &pool;
+    let bound = &cfg.bound;
+    let mut seq: u64 = 0;
+    let messages = std::iter::from_fn(move || {
+        if should_stop(bound, seq, started) {
+            return None;
+        }
+        let body = PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: &pool[usize::try_from(seq).unwrap_or(0) % pool.len()],
+        };
+        seq += 1;
+        Some(body)
+    });
+    let summary = pub_client
+        .produce_stream(messages, cfg.pub_window)
+        .map_err(|e| classify(addr, "streaming produces to", &e))?;
+    let produced = summary.acked;
+    let elapsed = started.elapsed();
+    // No per-produce fsync attribution: the overlap makes a per-message share dishonest, so
+    // the histogram stays empty and the report's fsync_measured flag is forced off.
+    Ok(finish_report(
+        cfg,
+        produced,
+        produced,
+        &[],
+        &[],
+        elapsed,
+        false,
+    ))
+}
+
 /// PUBLISH mode: append at the bound/rate, measuring produce-side throughput and bytes/op. Latency
 /// is not measured (no read-back), so the latency fields stay `None`.
 fn run_publish(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError> {
@@ -360,6 +416,9 @@ fn run_publish(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError> {
     let mut produced: u64 = 0;
     let mut fsync_samples: Vec<u64> = Vec::new();
     let started = Instant::now();
+    if cfg.stream && cfg.pub_window > 1 {
+        return run_publish_stream(cfg, &mut pub_client, addr, started);
+    }
     if cfg.pub_window > 1 {
         // The PIPELINED window (#450): fill W distinct payload buffers, write all W PUB frames
         // before awaiting any ack (Client::produce_window), and attribute the window's elapsed

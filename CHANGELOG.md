@@ -6,6 +6,9 @@ to follow Semantic Versioning once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Added
+- `Client::produce_stream(messages, window)` (#458): a FULL-DUPLEX sliding-window publish. The caller's thread keeps writing coalesced PUB batches while a scoped reader thread drains the FIFO acks concurrently from a cloned read half, with at most `window` produces un-acked; termination rides the wire's frame-order guarantee (a trailing Ping whose Pong proves the drain is complete). Reply semantics follow `produce_window` except that server Err replies are COUNTED in the returned summary (first one kept verbatim) instead of failing the call, since the stream has fully drained by then and the tally is the product (a shed under `drop-new` no longer discards the run's counts); `fire_and_forget` is forced clear; on success the connection stays fully usable. `bench --mode publish` gains `--stream` (requires `--pubwindow >= 2`) to drive it, with a `"stream"` field in the JSON object; per-produce fsync cost is not attributed in stream mode. No broker or wire-protocol changes.
+
 ### Changed
 - `InMemoryFile::sync_data` now copies only the byte ranges written since the last sync into the durable image instead of cloning the whole file (#456). An in-memory group commit costs O(bytes appended) like a real fdatasync, not O(file): under `--storage memory` this removes a whole-segment memcpy per commit (82 percent of append-actor CPU in a profiled pipelined publish run) and a quadratic per-message copy at window 1. The durable image is byte-for-byte unchanged (unsynced-truncation tail retention, zero-fill growth, power-loss reverts all preserved; the determinism, crash-recovery, and power-loss suites pass unchanged).
 

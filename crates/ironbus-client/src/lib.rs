@@ -288,6 +288,168 @@ pub enum ProgressOutcome {
     Fenced,
 }
 
+/// One produce reply, classified: the single decode point shared by the half-duplex
+/// [`Client::produce_window`] drain and the [`Client::produce_stream`] reader thread (#458), so
+/// the two paths can never drift on the reply contract.
+enum PubReply {
+    Acked(u64),
+    Duplicate(u64),
+    ServerErr(String),
+    Pong,
+}
+
+/// One coalesced write's byte budget for [`Client::produce_stream`] (#458): large enough to
+/// amortize the syscall, small enough that the first acks stream back while later frames are
+/// still being written.
+const STREAM_FLUSH_BYTES: usize = 32 * 1024;
+
+/// The shared tally between [`Client::produce_stream`]'s writer (the caller thread) and its
+/// reader thread, guarded by a mutex with a condvar the reader signals as window room opens.
+#[derive(Default)]
+struct StreamFlow {
+    /// Reply slots consumed so far (acks + duplicates + server errors).
+    done: u64,
+    acked: u64,
+    duplicates: u64,
+    server_errors: u64,
+    last_offset: Option<u64>,
+    first_server_err: Option<String>,
+    /// The reader hit a fatal error and exited; the writer must stop waiting on it.
+    reader_dead: bool,
+}
+
+/// The reader half of [`Client::produce_stream`] (#458): drains produce replies into `flow`
+/// (notifying `room` as slots free) until the terminal `Pong` or a fatal error. Runs on the
+/// scoped reader thread over the cloned read half.
+fn drain_stream_replies(
+    stream: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    flow: &std::sync::Mutex<StreamFlow>,
+    room: &std::sync::Condvar,
+) -> Result<(), ClientError> {
+    let outcome: Result<(), ClientError> = loop {
+        let (ty, body) = match read_frame_from(stream, buf) {
+            Ok(f) => f,
+            Err(e) => break Err(e),
+        };
+        let reply = match classify_pub_reply(ty, &body) {
+            Ok(r) => r,
+            Err(e) => break Err(e),
+        };
+        let mut f = flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match reply {
+            PubReply::Acked(offset) => {
+                f.done += 1;
+                f.acked += 1;
+                f.last_offset = Some(offset);
+            }
+            PubReply::Duplicate(offset) => {
+                f.done += 1;
+                f.acked += 1;
+                f.duplicates += 1;
+                f.last_offset = Some(offset);
+            }
+            PubReply::ServerErr(msg) => {
+                f.done += 1;
+                f.server_errors += 1;
+                if f.first_server_err.is_none() {
+                    f.first_server_err = Some(msg);
+                }
+            }
+            // The terminal marker: the server's FIFO frame order guarantees every prior
+            // produce's reply has already been consumed.
+            PubReply::Pong => break Ok(()),
+        }
+        room.notify_all();
+        drop(f);
+    };
+    if outcome.is_err() {
+        let mut f = flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f.reader_dead = true;
+        room.notify_all();
+    }
+    outcome
+}
+
+fn classify_pub_reply(ty: FrameType, body: &[u8]) -> Result<PubReply, ClientError> {
+    match ty {
+        FrameType::PubAck => {
+            let ack = decode_pub_ack(body).map_err(|_| {
+                ClientError::BadResponse("produce reply was not an eight-byte offset")
+            })?;
+            Ok(PubReply::Acked(ack.offset))
+        }
+        FrameType::PubAckDuplicate => {
+            let ack = decode_pub_ack(body).map_err(|_| {
+                ClientError::BadResponse("dedup-hit reply was not an eight-byte offset")
+            })?;
+            Ok(PubReply::Duplicate(ack.offset))
+        }
+        FrameType::Err => Ok(PubReply::ServerErr(String::from_utf8_lossy(body).into())),
+        FrameType::Pong => Ok(PubReply::Pong),
+        other => Err(ClientError::Unexpected(other)),
+    }
+}
+
+/// Reads one whole frame from `stream`, buffering partial bytes in `buf`. The free-function
+/// form of [`Client::read_frame`] so [`Client::produce_stream`]'s reader thread can drain a
+/// cloned read half with its own buffer (#458).
+fn read_frame_from(
+    stream: &mut TcpStream,
+    buf: &mut Vec<u8>,
+) -> Result<(FrameType, Vec<u8>), ClientError> {
+    let mut chunk = [0u8; 4096];
+    loop {
+        match decode_frame(buf).map_err(ClientError::Frame)? {
+            FrameDecode::Frame {
+                type_tag,
+                body,
+                consumed,
+            } => {
+                // An unknown tag (e.g. from a newer server) has no client handler; name
+                // the raw tag rather than pretending it was some known frame.
+                let ty =
+                    FrameType::from_u8(type_tag).ok_or(ClientError::UnknownFrameType(type_tag))?;
+                let body = body.to_vec();
+                buf.drain(..consumed);
+                return Ok((ty, body));
+            }
+            FrameDecode::Incomplete { .. } => {}
+        }
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Err(ClientError::Closed);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// The tally a fully-drained [`Client::produce_stream`] returns (#458). A stream is a TALLY,
+/// not a transcript: by the time a server `Err` could be surfaced the stream has already fully
+/// drained, and failing the call would discard the whole run's counts, so server-side rejections
+/// (a shed under `drop-new`, a malformed produce) are COUNTED here instead of returned as
+/// `Err` (the documented divergence from [`Client::produce_window`], which fails on the first
+/// server error). The call still fails for transport-level problems: IO errors, decode errors,
+/// an unexpected frame, or a reply-count mismatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamSummary {
+    /// Messages acknowledged (including dedup hits).
+    pub acked: u64,
+    /// How many of `acked` were `PubAckDuplicate` dedup hits.
+    pub duplicates: u64,
+    /// Produces the server rejected with an `Err` reply (each consumed its FIFO slot).
+    pub server_errors: u64,
+    /// The first server `Err` body, kept verbatim so a caller can distinguish a benign shed
+    /// (`at capacity` under `drop-new`) from a real rejection.
+    pub first_server_error: Option<String>,
+    /// The offset carried by the last ack observed, if any message was acked.
+    pub last_offset: Option<u64>,
+}
+
 /// A connected IronBus client over one TCP connection.
 #[derive(Debug)]
 pub struct Client {
@@ -541,38 +703,151 @@ impl Client {
         let mut acks = Vec::with_capacity(messages.len());
         let mut first_err: Option<ClientError> = None;
         for _ in 0..messages.len() {
-            match self.read_frame()? {
-                (FrameType::PubAck, body) => {
-                    let ack = decode_pub_ack(&body).map_err(|_| {
-                        ClientError::BadResponse("produce reply was not an eight-byte offset")
-                    })?;
-                    acks.push(ProduceAck {
-                        offset: ack.offset,
-                        duplicate: false,
-                    });
-                }
-                (FrameType::PubAckDuplicate, body) => {
-                    let ack = decode_pub_ack(&body).map_err(|_| {
-                        ClientError::BadResponse("dedup-hit reply was not an eight-byte offset")
-                    })?;
-                    acks.push(ProduceAck {
-                        offset: ack.offset,
-                        duplicate: true,
-                    });
-                }
-                (FrameType::Err, body) => {
+            let (ty, body) = self.read_frame()?;
+            match classify_pub_reply(ty, &body)? {
+                PubReply::Acked(offset) => acks.push(ProduceAck {
+                    offset,
+                    duplicate: false,
+                }),
+                PubReply::Duplicate(offset) => acks.push(ProduceAck {
+                    offset,
+                    duplicate: true,
+                }),
+                PubReply::ServerErr(msg) => {
                     if first_err.is_none() {
-                        first_err =
-                            Some(ClientError::Server(String::from_utf8_lossy(&body).into()));
+                        first_err = Some(ClientError::Server(msg));
                     }
                 }
-                (other, _) => return Err(ClientError::Unexpected(other)),
+                PubReply::Pong => return Err(ClientError::Unexpected(FrameType::Pong)),
             }
         }
         match first_err {
             Some(e) => Err(e),
             None => Ok(acks),
         }
+    }
+
+    /// Produces a stream of messages FULL-DUPLEX with a sliding in-flight window (#458): the
+    /// caller's thread keeps encoding and writing PUB frames (coalesced into batched writes)
+    /// while a scoped reader thread drains the FIFO acks concurrently from a cloned read half,
+    /// so neither side ever idles waiting for the other the way the half-duplex
+    /// [`produce_window`](Client::produce_window) round-trips do. At most `window` produces are
+    /// unacknowledged at any moment (a full window blocks the WRITER only, never the reader).
+    ///
+    /// The reply contract is `produce_window`'s, applied as a running tally instead of a
+    /// returned `Vec`: one reply per message FIFO, `PubAckDuplicate` counts as acked-and-
+    /// duplicate, a server `Err` consumes its slot and is COUNTED in the summary (the first
+    /// one kept verbatim) rather than failing the call, and `fire_and_forget` is forced
+    /// CLEAR on every message. See [`StreamSummary`] for why server errors tally instead of
+    /// erroring: the stream has fully drained by then, and the counts are the product. Termination uses the wire's frame-order guarantee: after the
+    /// last produce the writer sends a `Ping`, and the `Pong` (which the server emits only
+    /// after every prior reply) tells the reader the drain is complete, with no read timeout
+    /// and no protocol change.
+    ///
+    /// On success the connection is fully reusable (the reader's leftover bytes are restored
+    /// to this client's buffer). On any error the connection state is undefined, exactly like
+    /// an errored `produce_window`: drop the client.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO/encode error, an unexpected frame, or a reply-count
+    /// mismatch. Server `Err` replies do NOT fail the call; they are counted in the summary.
+    pub fn produce_stream<'a, I>(
+        &mut self,
+        messages: I,
+        window: usize,
+    ) -> Result<StreamSummary, ClientError>
+    where
+        I: IntoIterator<Item = PubBody<'a>>,
+    {
+        let window = window.max(1) as u64;
+        let mut reader_stream = self.stream.try_clone()?;
+        let mut reader_buf = std::mem::take(&mut self.buf);
+        let flow = std::sync::Mutex::new(StreamFlow::default());
+        let room = std::sync::Condvar::new();
+
+        let (writer_result, reader_outcome) = std::thread::scope(|s| {
+            let reader =
+                s.spawn(|| drain_stream_replies(&mut reader_stream, &mut reader_buf, &flow, &room));
+
+            let mut body = Vec::new();
+            let mut wire: Vec<u8> = Vec::with_capacity(STREAM_FLUSH_BYTES + 1024);
+            let mut sent: u64 = 0;
+            let mut buffered: u64 = 0;
+            let writer_result: Result<u64, ClientError> = (|| {
+                for message in messages {
+                    body.clear();
+                    let at_least_once = PubBody {
+                        fire_and_forget: false,
+                        ..message
+                    };
+                    encode_pub(&at_least_once, &mut body).map_err(ClientError::Body)?;
+                    encode_frame(FrameType::Pub, &body, &mut wire).map_err(ClientError::Frame)?;
+                    buffered += 1;
+                    if wire.len() >= STREAM_FLUSH_BYTES || buffered >= window {
+                        // Wait for window room for the WHOLE buffered batch, then one write.
+                        let mut f = flow
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        while !f.reader_dead && sent + buffered - f.done > window {
+                            f = room
+                                .wait(f)
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        }
+                        let dead = f.reader_dead;
+                        drop(f);
+                        if dead {
+                            // The reader's own error is the root cause; surface it after join.
+                            return Ok(sent);
+                        }
+                        self.stream.write_all(&wire)?;
+                        sent += buffered;
+                        buffered = 0;
+                        wire.clear();
+                    }
+                }
+                if buffered > 0 {
+                    self.stream.write_all(&wire)?;
+                    sent += buffered;
+                }
+                // The terminal Ping: its Pong arrives after every produce reply (FIFO), which
+                // is what releases the reader without a read timeout.
+                let mut ping = Vec::new();
+                encode_frame(FrameType::Ping, &[], &mut ping).map_err(ClientError::Frame)?;
+                self.stream.write_all(&ping)?;
+                Ok(sent)
+            })();
+            if writer_result.is_err() {
+                // The writer failed mid-stream (encode or write): the connection is undefined,
+                // so unblock a reader parked in read() by shutting the socket's read half.
+                let _ = self.stream.shutdown(std::net::Shutdown::Both);
+            }
+            (writer_result, reader.join())
+        });
+
+        let reader_result = match reader_outcome {
+            Ok(r) => r,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        let sent = writer_result?;
+        reader_result?;
+        // The reader exited cleanly on the Pong: restore its leftover bytes so this client
+        // stays usable, then settle the tallies.
+        self.buf = reader_buf;
+        let f = flow
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if f.done != sent {
+            return Err(ClientError::BadResponse(
+                "the produce stream's reply count did not match the messages sent",
+            ));
+        }
+        Ok(StreamSummary {
+            acked: f.acked,
+            duplicates: f.duplicates,
+            server_errors: f.server_errors,
+            first_server_error: f.first_server_err,
+            last_offset: f.last_offset,
+        })
     }
 
     /// Produces a message on the FIRE-AND-FORGET (QoS-0, #11, #402) fast path: it sets the additive
@@ -1006,30 +1281,7 @@ impl Client {
 
     /// Reads one complete frame, buffering leftover bytes for the next call.
     fn read_frame(&mut self) -> Result<(FrameType, Vec<u8>), ClientError> {
-        let mut chunk = [0u8; 4096];
-        loop {
-            match decode_frame(&self.buf).map_err(ClientError::Frame)? {
-                FrameDecode::Frame {
-                    type_tag,
-                    body,
-                    consumed,
-                } => {
-                    // An unknown tag (e.g. from a newer server) has no client handler; name
-                    // the raw tag rather than pretending it was some known frame.
-                    let ty = FrameType::from_u8(type_tag)
-                        .ok_or(ClientError::UnknownFrameType(type_tag))?;
-                    let body = body.to_vec();
-                    self.buf.drain(..consumed);
-                    return Ok((ty, body));
-                }
-                FrameDecode::Incomplete { .. } => {}
-            }
-            let n = self.stream.read(&mut chunk)?;
-            if n == 0 {
-                return Err(ClientError::Closed);
-            }
-            self.buf.extend_from_slice(&chunk[..n]);
-        }
+        read_frame_from(&mut self.stream, &mut self.buf)
     }
 }
 
@@ -1200,6 +1452,60 @@ mod tests {
             }
         });
         (addr, handle)
+    }
+
+    #[test]
+    fn a_produce_stream_slides_its_window_full_duplex_against_a_real_server() {
+        // The #458 full-duplex sliding window over the real wire: far more messages than the
+        // window, so the writer must interleave with the reader's ack drain; every message acked
+        // exactly once, the last offset is the final message's, and the connection is fully
+        // usable afterwards (the reader's leftover buffer is restored).
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+
+        let payloads: Vec<Vec<u8>> = (0..100u8).map(|i| vec![b's', i]).collect();
+        let summary = c
+            .produce_stream(
+                payloads.iter().map(|p| PubBody {
+                    flags: 0,
+                    timestamp_ms: 0,
+                    key: b"k",
+                    headers: b"",
+                    dedup: None,
+                    fire_and_forget: false,
+                    payload: p,
+                }),
+                8,
+            )
+            .unwrap();
+        assert_eq!(summary.acked, 100, "every streamed message acked");
+        assert_eq!(summary.duplicates, 0);
+        assert_eq!(summary.server_errors, 0);
+        assert_eq!(summary.first_server_error, None);
+        assert_eq!(
+            summary.last_offset,
+            Some(99),
+            "offsets assigned in send order"
+        );
+        // An empty stream is a clean no-op round trip (just the terminal ping/pong).
+        let empty = c.produce_stream(std::iter::empty(), 8).unwrap();
+        assert_eq!((empty.acked, empty.last_offset), (0, None));
+        // The connection stays healthy: a plain produce gets the next offset.
+        let next = c
+            .produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"k",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"after-stream",
+            })
+            .unwrap();
+        assert_eq!(next, 100);
+        shutdown.store(true, Ordering::Relaxed);
+        drop(c);
+        let _ = handle.join();
     }
 
     #[test]

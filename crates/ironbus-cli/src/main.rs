@@ -743,7 +743,7 @@ USAGE:
                   [--interval <secs>] [--once] [--json] [--no-color]
     ironbus bench (--duration <secs> | --count <n>) [--mode <publish|subscribe|round-trip>]
                   [--rate <msg/s>] [--payload-bytes <n>] [--payload-shape <realistic|random>]
-                  [--fetch-batch <n>] [--group <name>] [--no-fsync] [--pubwindow <n>] [--json]
+                  [--fetch-batch <n>] [--group <name>] [--no-fsync] [--pubwindow <n>] [--stream] [--json]
                   [--storage <disk|memory>]
                   [--addr <host:port> --i-understand-this-is-live]
     ironbus upgrade --new-binary <path> --dest <path> [--max-failed-starts <n>]
@@ -927,6 +927,9 @@ Notes:
     latency_p999_us, latency_max_us) and an additive storage field naming the backend.
     Every serve setting can also be supplied via an environment variable IRONBUS_<FLAG>, the flag
     name uppercased with dashes as underscores (--max-total-bytes -> IRONBUS_MAX_TOTAL_BYTES,
+    --stream (publish mode, needs --pubwindow >= 2) makes the publisher FULL-DUPLEX: writes
+        never stop for acks; a reader thread drains them concurrently with at most the
+        window un-acked. Per-produce fsync cost is not attributed in this mode.
     --data-dir -> IRONBUS_DATA_DIR, --addr -> IRONBUS_ADDR). Precedence is flag > env > default: an
     explicit flag overrides the env var, which overrides the compiled default. A bad env value (e.g.
     non-numeric where a number is expected) is a usage error naming the env var. See docs/CLI.md.
