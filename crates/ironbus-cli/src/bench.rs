@@ -184,6 +184,13 @@ pub struct BenchConfig {
     /// covers the window with one fdatasync instead of N. Acks keep their unchanged
     /// fsynced-durable meaning; only WHEN the publisher awaits changes.
     pub pub_window: usize,
+    /// FULL-DUPLEX streaming publish (#458): with `--stream`, the publisher uses
+    /// [`ironbus_client::Client::produce_stream`] (a writer that never stops for acks while a
+    /// reader thread drains them concurrently, in-flight capped at `pub_window`) instead of the
+    /// half-duplex write-window-then-drain `produce_window` round-trips. Requires
+    /// `--pubwindow >= 2`. Per-produce fsync cost is NOT attributed in this mode (the overlap
+    /// makes a per-message share dishonest), so the fsync histogram stays empty.
+    pub stream: bool,
     /// The storage BACKEND of bench's own ISOLATED synthetic broker (#445, refs #443): `disk` (the
     /// default, the historical bench broker over an auto-deleted synthetic data dir) or `memory`
     /// (the same engine over the in-memory filesystem, for honest RAM-path numbers next to the
@@ -273,6 +280,7 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
     let mut live_addr: Option<String> = None;
     let mut live_ack = false;
     let mut no_fsync = false;
+    let mut stream = false;
     let mut pub_window: usize = 1;
     let mut storage: Option<StorageArg> = None;
     let mut json = false;
@@ -356,6 +364,10 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
             }
             "--no-fsync" => {
                 no_fsync = true;
+                i += 1;
+            }
+            "--stream" => {
+                stream = true;
                 i += 1;
             }
             // The pipelined publish window (#450): 0 is meaningless (nothing would ever be
@@ -466,6 +478,14 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         None => format!("{BENCH_NAMESPACE_PREFIX}{random_suffix}"),
     };
 
+    if stream && pub_window < 2 {
+        return Err(CliError::Usage(
+            "`--stream` needs `--pubwindow` of at least 2 (the full-duplex slide is the point; \
+             window 1 is the plain awaited-ack path)"
+                .into(),
+        ));
+    }
+
     Ok(BenchConfig {
         mode,
         bound,
@@ -476,6 +496,7 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         group,
         live_addr,
         no_fsync,
+        stream,
         pub_window,
         storage,
         json,
@@ -646,7 +667,7 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         s,
         "{{\"schema_version\":{},\"mode\":\"{}\",\"isolated\":{},\"group\":\"{}\",\
          \"bound\":{{{}}},\"target_rate_hz\":{},\"payload_bytes\":{},\"payload_shape\":\"{}\",\
-         \"fetch_batch\":{},\"no_fsync\":{},\"pubwindow\":{},\"storage\":\"{}\",\"results\":{{\
+         \"fetch_batch\":{},\"no_fsync\":{},\"pubwindow\":{},\"stream\":{},\"storage\":\"{}\",\"results\":{{\
          \"produced\":{},\"recorded\":{},\"elapsed_secs\":{},\"msgs_per_sec\":{},\
          \"mb_per_sec\":{},\"bytes_per_op\":{},\
          \"latency_p50_us\":{},\"latency_p99_us\":{},\"latency_p999_us\":{},\"latency_max_us\":{},\
@@ -662,6 +683,7 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         cfg.fetch_batch,
         cfg.no_fsync,
         cfg.pub_window,
+        cfg.stream,
         cfg.storage.as_str(),
         report.produced,
         report.recorded,
@@ -1099,6 +1121,36 @@ mod tests {
             "json: {json}"
         );
         assert!(json.contains("\"storage\":\"memory\""), "json: {json}");
+    }
+
+    #[test]
+    fn the_stream_flag_parses_requires_a_window_and_lands_in_the_json() {
+        // The full-duplex publish flag (#458): default off; bare flag does not swallow the next
+        // flag; refused without a pipelining window (>= 2); echoed in the JSON object.
+        let off = parse(&["--count", "5", "--pubwindow", "64"]).unwrap();
+        assert!(!off.stream, "stream defaults off");
+        let on = parse(&[
+            "--count",
+            "5",
+            "--stream",
+            "--pubwindow",
+            "64",
+            "--no-fsync",
+        ])
+        .unwrap();
+        assert!(on.stream);
+        assert!(on.no_fsync, "the flag after --stream must still parse");
+        assert_eq!(on.pub_window, 64);
+        match parse(&["--count", "5", "--stream"]) {
+            Err(CliError::Usage(msg)) => assert!(msg.contains("--pubwindow"), "{msg}"),
+            other => panic!("--stream without a window must be a usage error, got {other:?}"),
+        }
+        match parse(&["--count", "5", "--stream", "--pubwindow", "1"]) {
+            Err(CliError::Usage(msg)) => assert!(msg.contains("at least 2"), "{msg}"),
+            other => panic!("--stream with window 1 must be a usage error, got {other:?}"),
+        }
+        let json = bench_json(&on, &BenchReport::default());
+        assert!(json.contains("\"stream\":true"), "{json}");
     }
 
     #[test]
