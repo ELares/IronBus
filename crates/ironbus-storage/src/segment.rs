@@ -280,7 +280,22 @@ pub struct SegmentWriter<F: RandomAccessFile> {
     /// deletes a sealed segment only when ALL its records are older than the bound, which the max
     /// answers. Maintained on each [`SegmentWriter::append`] so the running value is O(1).
     max_timestamp_ms: u64,
+    /// Encoded record bytes appended but NOT yet written to the file (#452): records are parked
+    /// here and written with ONE `write_all_at` at a flush point (a `sync`, the visible-head
+    /// raise via `flush_pending`, the seal, or the spill cap), so a group-commit window costs
+    /// one write syscall instead of one per record. Sound by construction: every reader is
+    /// gated on the log's `flushed_offset`, which only advances at those same flush points, so
+    /// parked bytes are unreadable until they are in the file. Durability is untouched: `sync`
+    /// writes the pending bytes BEFORE its `fdatasync`, so durable means exactly what it meant.
+    pending: Vec<u8>,
+    /// The file position where `pending` begins: everything below it is already in the file.
+    pending_base: u64,
 }
+
+/// The spill cap for the writer's pending buffer (#452): a relaxed durability level can run a
+/// long unsynced window, so the buffer flushes to the file (one write, NO fsync) whenever it
+/// reaches this size, bounding the writer's heap at a constant instead of the unsynced window.
+const PENDING_SPILL_BYTES: usize = 256 * 1024;
 
 impl<F: RandomAccessFile> SegmentWriter<F> {
     /// Creates a new segment, writing the header at offset 0. The file should be
@@ -297,6 +312,8 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
             record_count: 0,
             last_seq: header.base_seq,
             max_timestamp_ms: 0,
+            pending: Vec::new(),
+            pending_base: SEGMENT_HEADER_LEN as u64,
         })
     }
 
@@ -326,6 +343,8 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
             record_count,
             last_seq,
             max_timestamp_ms,
+            pending: Vec::new(),
+            pending_base: write_pos,
         }
     }
 
@@ -355,6 +374,8 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
             record_count: 0,
             last_seq: header.base_seq,
             max_timestamp_ms: 0,
+            pending: Vec::new(),
+            pending_base: SEGMENT_HEADER_LEN as u64,
         })
     }
 
@@ -375,6 +396,10 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         offset: Offset,
         record: &RecordView<'_>,
     ) -> Result<Offset, StorageError> {
+        // The compaction writer writes DIRECTLY at write_pos; flush any buffered tail first so
+        // direct and buffered bytes can never interleave out of order (#452). In practice a
+        // compacted-segment writer only ever uses this path, so this is a no-op.
+        self.flush_pending()?;
         if self.record_count == u32::MAX {
             return Err(StorageError::SegmentFull);
         }
@@ -474,15 +499,26 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
             .get()
             .checked_add(u64::from(self.record_count))
             .ok_or(StorageError::SegmentFull)?;
-        let mut buf = Vec::new();
-        codec::encode(record, &mut buf).map_err(|_| StorageError::SegmentFull)?;
-        let len = u64::try_from(buf.len()).map_err(|_| StorageError::SegmentFull)?;
+        // Encode DIRECTLY into the pending buffer (#452): no per-record write syscall and no
+        // intermediate copy. The bytes reach the file at the next flush point; on encode failure
+        // the buffer is truncated back so a rejected record leaves no partial frame behind.
+        let before = self.pending.len();
+        if codec::encode(record, &mut self.pending).is_err() {
+            self.pending.truncate(before);
+            return Err(StorageError::SegmentFull);
+        }
+        let len =
+            u64::try_from(self.pending.len() - before).map_err(|_| StorageError::SegmentFull)?;
         let end = self
             .write_pos
             .checked_add(len)
             .ok_or(StorageError::SegmentFull)?;
-        self.file.write_all_at(&buf, self.write_pos)?;
         self.write_pos = end;
+        // Spill: bound the buffer regardless of how long a relaxed durability level defers the
+        // sync. One write per spill still reduces syscalls by spill/record-size to one.
+        if self.pending.len() >= PENDING_SPILL_BYTES {
+            self.flush_pending()?;
+        }
         self.record_count += 1;
         self.last_seq = record.seq;
         // Track the MAX timestamp (not the last): producer timestamps are not monotonic, and the
@@ -498,8 +534,27 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
     /// # Errors
     /// Propagates the underlying IO error. A fatal sync error must be treated as
     /// terminal by the caller (the writer is frozen read-only).
-    pub fn sync(&self) -> Result<(), StorageError> {
+    pub fn sync(&mut self) -> Result<(), StorageError> {
+        // The pending bytes must be IN the file before the fdatasync, or durable would not mean
+        // what it says (#452). A flush failure is the same fatal class as a failed sync.
+        self.flush_pending()?;
         self.file.sync_data()?;
+        Ok(())
+    }
+
+    /// Writes the pending appended records to the file with ONE `write_all_at` (#452), making
+    /// them readable (page cache) but NOT durable (no fsync). Called from every flush point:
+    /// `sync` (before its fdatasync), the log's visible-head raise, the seal, and the spill cap.
+    ///
+    /// # Errors
+    /// Propagates the underlying IO error; the caller treats it as the fatal frozen-writer class.
+    pub fn flush_pending(&mut self) -> Result<(), StorageError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        self.file.write_all_at(&self.pending, self.pending_base)?;
+        self.pending_base = self.write_pos;
+        self.pending.clear();
         Ok(())
     }
 
@@ -508,7 +563,9 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
     ///
     /// # Errors
     /// Propagates the underlying IO error.
-    pub fn seal(self) -> Result<SegmentFooter, StorageError> {
+    pub fn seal(mut self) -> Result<SegmentFooter, StorageError> {
+        // The footer must FOLLOW the records in the file (#452): flush the pending tail first.
+        self.flush_pending()?;
         let footer = SegmentFooter {
             segment_id: self.header.segment_id,
             last_seq: self.last_seq,

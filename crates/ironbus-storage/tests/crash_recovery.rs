@@ -479,9 +479,13 @@ fn fatal_fsync_freeze_during_a_roll_loses_no_acked_record() {
 
 #[test]
 fn a_write_eio_during_append_recovers_the_acked_prefix() {
-    // A write that fails cleanly (no bytes persisted) leaves the record unacked and the
-    // writer consistent (a write fault, unlike a fatal fsync, does not freeze the writer).
-    // Recovery yields exactly the acked prefix.
+    // Since #452 the writer batches appends in a pending buffer, so a per-record write fault
+    // is unreachable: the append itself does no IO and succeeds, and the fault fires at the
+    // FLUSH point (the sync's pre-fdatasync write). A flush-time write fault is promoted to
+    // the fatal frozen-writer class, exactly like a failed fsync barrier: the flush covers a
+    // batch whose members were already submitted, so failing one fails all, and none of them
+    // was ever acked (an ack exists only after the covering sync returns). The acked-prefix
+    // guarantee is STRONGER than before: the failed batch leaves NO bytes in the file at all.
     let durable = 5u64;
     let (fs, control) = FaultFs::new(InMemoryFs::new());
     let mut log = Log::open(fs, ManualClock::new(), big_config()).unwrap();
@@ -492,25 +496,28 @@ fn a_write_eio_during_append_recovers_the_acked_prefix() {
 
     control.set_fail_write(true);
     let p = payload(durable);
-    let err = log.append(&Append {
+    let appended = log.append(&Append {
         timestamp_ms: durable,
         flags: RecordFlags::EMPTY,
         key: b"",
         headers: b"",
         payload: &p,
     });
-    assert!(matches!(
-        err,
-        Err(ironbus_storage::segment::StorageError::Io(_))
-    ));
-    assert_eq!(
-        log.next_offset(),
-        Offset::new(durable),
-        "a failed write does not advance the offset"
+    assert!(
+        appended.is_ok(),
+        "a buffered append does no IO, so the write fault cannot fire here"
+    );
+    let err = log.sync();
+    assert!(
+        matches!(
+            err,
+            Err(ironbus_storage::segment::StorageError::WriterFrozen)
+        ),
+        "the flush-time write fault is the fatal frozen-writer class: {err:?}"
     );
     assert!(
-        log.is_writable(),
-        "a write fault does not freeze the writer"
+        !log.is_writable(),
+        "a failed flush barrier freezes the writer, like a failed fsync"
     );
 
     control.set_fail_write(false);
@@ -534,24 +541,27 @@ fn a_torn_write_during_append_is_truncated_by_recovery() {
     }
     log.sync().unwrap();
 
-    // Tear the next record a few bytes in (a partial record header on disk).
+    // Tear the next flush a few bytes in (a partial record header on disk). Since #452 the
+    // append is buffered (no IO), so the torn write fires at the sync's pre-fdatasync flush;
+    // the record was never acked (no covering sync returned), and the torn bytes on disk are
+    // exactly what recovery's truncation exists to clean.
     control.arm_torn_write(4);
     let p = payload(durable);
-    let err = log.append(&Append {
+    log.append(&Append {
         timestamp_ms: durable,
         flags: RecordFlags::EMPTY,
         key: b"",
         headers: b"",
         payload: &p,
-    });
-    assert!(matches!(
-        err,
-        Err(ironbus_storage::segment::StorageError::Io(_))
-    ));
-    assert_eq!(
-        log.next_offset(),
-        Offset::new(durable),
-        "a torn write does not advance the offset"
+    })
+    .expect("the buffered append does no IO");
+    let err = log.sync();
+    assert!(
+        matches!(
+            err,
+            Err(ironbus_storage::segment::StorageError::WriterFrozen)
+        ),
+        "the torn flush is the fatal frozen-writer class: {err:?}"
     );
 
     let faultfs = log.into_filesystem();
@@ -812,10 +822,14 @@ proptest! {
             .unwrap()
             .len()
             .unwrap();
-        // The unsynced tail: append more WITHOUT syncing.
+        // The unsynced tail: append more WITHOUT syncing, then raise the visible head so the
+        // tail bytes are IN the file but not durable (since #452 a buffered append alone leaves
+        // nothing in the file; `flush_no_sync` is the relaxed-durability path that writes the
+        // tail without an fdatasync, exactly the unsynced-but-written state this gate models).
         for i in durable..(durable + unsynced) {
             append_at(&mut log, i);
         }
+        log.flush_no_sync().unwrap();
         let current_len = log
             .filesystem()
             .open(&segment_file_name(0))
