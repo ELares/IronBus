@@ -7,6 +7,12 @@ to follow Semantic Versioning once it reaches a tagged release.
 ## [Unreleased]
 
 ### Changed
+- The per-connection read chunk grew from a 4 KiB stack array to a 64 KiB zero-page heap buffer (#454). The pipelined produce window (#450) is pass-scoped, and a pass sees at most one read chunk, so 4 KiB silently capped the publisher pipeline at ~13 records per group commit on 256 B payloads (~40 fsyncs per 512-record window on the reference edge box). Untouched pages cost no resident memory, so idle connections are unaffected.
+
+### Added
+- `serve --commit-gather-us <us>` / `IRONBUS_COMMIT_GATHER_US` (#454): an opt-in bounded group-commit gather window. When a drain pass already holds at least two produces (evidence of a pipelining publisher; an unpipelined producer never pays the window), the append actor keeps collecting commands for up to the window before committing, so a pipelined publisher's whole in-flight window lands under one covering fsync instead of arrival-rate-sized slivers (measured on the reference edge box: a 512-record client window was committing as ~12 records per fsync). Default `0` keeps the actor byte-identical; acks keep their fsynced-durable meaning at any setting; validation caps the window at 1 second. The materialized-config line gains a `commit_gather_us=` field.
+
+### Changed
 - Renamed the published release binary assets to friendly CPU-arch names: `ironbus-linux-amd64`, `ironbus-linux-arm64`, `ironbus-linux-armv7` (dropping the `unknown`-vendored `musl` triple, which stays the internal cargo/cross build target). The installer (`detect_target` + download URL), its tests, both release workflows (staging, `SHA256SUMS`, attestation, release assets, notes table), and the install docs (README, DISTRIBUTION, RELEASING) are updated to match. The `.deb` packages were renamed to match (`ironbus-linux-amd64.deb`, `ironbus-linux-arm64.deb`, `ironbus-linux-armv7.deb`), so no published asset carries the `unknown` triple; it stays the cargo `--target` only. The binaries are still static `musl` with no runtime dependency.
 
 ### Fixed

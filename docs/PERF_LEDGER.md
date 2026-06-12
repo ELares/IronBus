@@ -102,3 +102,60 @@ times fsync latency; if the steady-state drain is far below the client window, e
 several fsyncs). If confirmed, add a bounded group-commit gather delay or min-batch (the MySQL
 binlog_group_commit_sync_delay precedent; PostgreSQL commit_delay) so a pipelined window commits
 in one or two batches. Leg 2 stands at median ~1,951/s vs the 2,030 target (9.6x of NATS's 203).
+
+## Round 3 (#454): the 4 KiB read chunk was the pipeline cap; 64 KiB chunk = 7,200-10,300/s durable
+
+Sources: MySQL binlog_group_commit_sync_delay and PostgreSQL commit_delay (bounded group-commit
+gather); DeWitt et al. 1984 (group commit); the round-2 ledger entry (batch-size hypothesis).
+
+### Hypothesis and what the instrumentation actually showed
+
+Hypothesis: the actor drain self-sizes to arrival rate x fsync latency, so a 512-record client
+window commits in many small batches; a bounded gather window would merge them. The zero-code
+measurement (delta ironbus_produced_total / delta fsync_duration_seconds_count on the hive)
+confirmed tiny batches: mean 12-13 records per fsync against a 512 window, ~40 fsyncs per window.
+
+The gather knob alone then DISPROVED the mechanism: with gather windows of 1/3/5/13 ms the batch
+stayed at 13-15 and throughput fell monotonically (2,384 -> 645/s at 13 ms). The batch was not
+arrival-sized; it was CAPPED. The session's pipelined window (#450) is pass-scoped, a pass sees
+at most one connection-loop read chunk, and the chunk was a 4 KiB stack array: ~13 frames of
+256 B realistic payloads, after which the session blocks awaiting its parked acks while the
+actor waits out the gather. The two waits compound; nothing feeds.
+
+### Fix shipped
+
+1. Read chunk 4 KiB -> 64 KiB zero-page heap buffer (the actual win). A pass now carries
+   hundreds of frames, so the pass-scoped window group-commits in a few fsyncs, not ~40.
+   Untouched pages cost no RSS; idle/ping-only connections still touch about a page.
+2. serve --commit-gather-us (default 0 = off, validation-capped at 1 s) kept as the OPT-IN
+   multi-producer lever: many connections each trickling singles can amortize one fsync. It
+   only engages when a drain pass already holds >= 2 produces (a single-produce pass never
+   gathers, so an unpipelined producer pays no window; the MySQL no-delay-count analogue).
+
+### Measured (hive, 256B realistic, 15s runs, pre-merge cross-compiled, scratch broker)
+
+| leg | round 2 | round 3 (64 KiB chunk) |
+| --- | --- | --- |
+| disk w=1 | 201/s | 198/s (fsync physics, unchanged) |
+| disk w=64 | 1,502/s | 5,215/s |
+| disk w=512 | ~1,951/s | 7,193/s (batch 90 rec/fsync) |
+| disk w=1024 | 1,956/s | 9,197-10,294/s (batch 104) |
+| memory w=1 | 980/s | 1,364/s |
+| memory w=512 | 4,882/s | 8,023/s |
+| memory w=1024 | -- | 11,171/s |
+
+Gather on a single pipelined connection now HURTS (6,839 vs 7,193 at w=512): default 0 stays.
+Guardrails: binary 1.53 MB (<= 3 MB), peak RSS under w=1024 load 2.1 MB (<= 8 MB), ack-after-
+fdatasync default untouched, all suites green.
+
+Verdict: KEEP. Win-condition leg 2 (durable pipelined >= 2,030/s = 10x NATS sync-always) is
+cleared at 35-50x (7,193-10,294 vs 203). Leg 1 holds (198-205 vs NATS 191-203). Legs 3 and 4
+(memory per-ack >= 2,491; memory pipelined >= 27,250) remain open: both are now CPU-floor bound
+(~125 us/op at w=512), not batching bound.
+
+### Round 4 hypothesis (queued)
+
+Profile the per-op CPU floor on the wire/session/engine path (memory w=1 is 733 us round-trip;
+NATS does 401 us). Candidates: per-record allocations in decode/dispatch (arena or reuse), the
+per-frame reply flush (vectored writes), checkpoint cadence in the hot loop. Target: memory
+w=1 >= 2,491/s (leg 3) and memory pipelined toward 27,250/s (leg 4).

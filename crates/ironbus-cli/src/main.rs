@@ -110,7 +110,7 @@ use ironbus_core::lease::LeaseConfig;
 #[cfg(unix)]
 use ironbus_core::types::RecordFlags;
 #[cfg(unix)]
-use ironbus_server::actor::{spawn_actor, DEFAULT_CHANNEL_BOUND};
+use ironbus_server::actor::{spawn_actor_with_gather, DEFAULT_CHANNEL_BOUND};
 #[cfg(unix)]
 use ironbus_server::engine::{DiskFullPolicy, DurabilityLevel, Engine, EngineConfig};
 #[cfg(unix)]
@@ -1679,6 +1679,9 @@ struct ServeFlags {
     compression: Option<String>,
     /// The `interval` level's TIME window in ms (#341); `None` falls back to the default.
     flush_interval_ms: Option<u64>,
+    /// The opt-in GROUP-COMMIT GATHER window in MICROSECONDS (#454); `None` resolves to 0 (off,
+    /// byte-identical actor behavior). See the `ServeConfig` field for the contract.
+    commit_gather_us: Option<u64>,
     /// The `interval` level's unsynced-byte budget (#341); `None` falls back to the default.
     flush_max_bytes: Option<u64>,
     /// The explicit data-loss acknowledgement for `async`/`none` (#49, #379): the `--async-loss-ack`
@@ -1823,6 +1826,9 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             }
             "--flush-interval-ms" => {
                 f.flush_interval_ms = Some(take_number("--flush-interval-ms", args, &mut i)?);
+            }
+            "--commit-gather-us" => {
+                f.commit_gather_us = Some(take_number("--commit-gather-us", args, &mut i)?);
             }
             "--flush-max-bytes" => {
                 f.flush_max_bytes = Some(take_number("--flush-max-bytes", args, &mut i)?);
@@ -2243,6 +2249,8 @@ fn parse_serve_flags_with_env_and_reader(
                 env,
                 DEFAULT_FLUSH_MAX_BYTES,
             )?,
+            // The group-commit gather (#454): default 0 = off, the byte-identical historical actor.
+            commit_gather_us: resolve_number("--commit-gather-us", f.commit_gather_us, env, 0)?,
             async_loss_ack: resolve_bool("--async-loss-ack", f.async_loss_ack, env)?,
             // The storage backend (#443), resolved above (flag > env > default `disk`); the
             // ephemeral consent resolves like the other bare safety flags. `memory` without the
@@ -2559,6 +2567,14 @@ fn finish_serve(
 
 /// Rejects an out-of-range `serve` tuning value with a usage error before the broker opens.
 fn validate_serve_config(config: &ServeConfig) -> Result<(), CliError> {
+    if config.commit_gather_us > 1_000_000 {
+        // The gather window delays every produce ack by up to its full length under load; a
+        // fat-fingered value (ms pasted as us, or an extra zero) must not silently turn into a
+        // multi-second ack stall. One second is already far past any useful group-commit window.
+        return Err(CliError::Usage(
+            "`--commit-gather-us` must be at most 1000000 (1 second)".to_string(),
+        ));
+    }
     if config.max_connections == 0 {
         // A zero cap binds and looks healthy but refuses every connection: reject it.
         return Err(CliError::Usage(
@@ -2994,6 +3010,16 @@ struct ServeConfig {
     /// (`DEFAULT_FLUSH_MAX_BYTES`); `0` disables the byte trigger (the time window alone forces the
     /// sync). The EFFECTIVE worst-case loss bound is the smaller of the time and byte triggers.
     flush_max_bytes: u64,
+    /// The opt-in GROUP-COMMIT GATHER window in MICROSECONDS (#454): when a drain pass already
+    /// holds at least TWO produces (evidence of a pipelining publisher; a single-produce pass
+    /// never gathers, so an unpipelined producer pays no window), the append actor keeps
+    /// collecting commands for up to this long before committing, so the publisher's whole
+    /// in-flight window lands under ONE covering fsync instead of arrival-rate-sized slivers. `0` (the default) disables the gather and the
+    /// actor is byte-identical to the historical drain. Durability is UNTOUCHED: acks still mean
+    /// fsynced-durable; the knob trades up to this much added commit latency under produce bursts
+    /// for fewer, larger sync barriers (the `MySQL` `binlog_group_commit_sync_delay` precedent).
+    /// Bounded at 1 second by validation so a typo cannot stall acks indefinitely.
+    commit_gather_us: u64,
     /// The explicit DATA-LOSS ACKNOWLEDGEMENT for the unbounded-loss levels (#49, #379): the
     /// `--async-loss-ack` (a.k.a. `i-accept-acknowledged-data-loss`) bare flag. `async` and `none`
     /// WAIVE I2 with an unbounded loss window, so they REFUSE TO BOOT unless this is set (the
@@ -3106,6 +3132,7 @@ impl ServeConfig {
             compression: CompressionArg::Lz4,
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
+            commit_gather_us: 0,
             async_loss_ack: false,
             // The default storage backend (#443): the durable on-disk store, no ephemeral consent.
             storage: StorageArg::Disk,
@@ -3278,7 +3305,8 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
          max_retained_bytes={} max_age_ms={} max_messages={} health_liveness_window_ms={} \
          enable_admin={} ram_ceiling_bytes={} durability_level={durability_level} \
          power_loss_safe={power_loss_safe} compression={compression} flush_interval_ms={} \
-         flush_max_bytes={} async_loss_ack={} wal_fsync_headroom_bytes={} storage={storage}",
+         flush_max_bytes={} async_loss_ack={} wal_fsync_headroom_bytes={} storage={storage} \
+         commit_gather_us={}",
         config.profile.name(),
         config.profile_schema_version,
         config.max_connections,
@@ -3303,6 +3331,7 @@ fn materialized_config_line(config: &ServeConfig, addr: &str, data_dir: Option<&
         config.flush_max_bytes,
         config.async_loss_ack,
         config.wal_fsync_headroom_bytes,
+        config.commit_gather_us,
         data_dir = data_dir.map_or_else(|| "none".to_string(), |d| d.display().to_string()),
     )
 }
@@ -3479,7 +3508,8 @@ fn run_broker<F: Filesystem + 'static>(
     // it only through the bounded-channel handle, so no handler holds a lock across an fsync. The
     // actor's join handle yields the engine back on its clean exit (a Shutdown drain), which is how
     // the graceful-shutdown cursor flush (#195) completes before the process exits 0.
-    let (shared, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+    let (shared, actor) =
+        spawn_actor_with_gather(engine, DEFAULT_CHANNEL_BOUND, config.commit_gather_us);
     let listener = TcpListener::bind(addr)
         .map_err(|e| CliError::Internal(format!("cannot bind {addr}: {e}")))?;
     let local = listener
@@ -6171,6 +6201,7 @@ mod tests {
             compression: CompressionArg::Lz4,
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
+            commit_gather_us: 0,
             async_loss_ack: false,
             // The default storage backend (#443): the durable on-disk store, no ephemeral consent.
             storage: StorageArg::Disk,
@@ -8294,6 +8325,7 @@ mod tests {
             compression: CompressionArg::Lz4,
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
+            commit_gather_us: 0,
             async_loss_ack: false,
             // The default storage backend (#443): the durable on-disk store, no ephemeral consent.
             storage: StorageArg::Disk,
@@ -8711,6 +8743,44 @@ mod tests {
             validate_serve_config(&ok).is_ok(),
             "interval with a positive trigger and no ack must boot"
         );
+    }
+
+    #[test]
+    fn the_commit_gather_flag_parses_defaults_off_echoes_and_caps_at_one_second() {
+        // The group-commit gather knob (#454). Default OFF: an untouched serve resolves to 0 and
+        // the actor stays byte-identical. The flag parses WITHOUT swallowing the next flag (the
+        // `--pubwindow` parse-cursor regression class), the materialized-config line echoes the
+        // resolved value, and validation refuses a window past one second (an ms-pasted-as-us typo
+        // must not become a silent multi-second ack stall).
+        let off = parse_serve_flags(&serve_args(&[])).unwrap().config;
+        assert_eq!(off.commit_gather_us, 0, "gather defaults off");
+        let on = parse_serve_flags(&serve_args(&[
+            "--commit-gather-us",
+            "3000",
+            "--max-connections",
+            "7",
+        ]))
+        .unwrap()
+        .config;
+        assert_eq!(on.commit_gather_us, 3000);
+        assert_eq!(
+            on.max_connections, 7,
+            "the flag after --commit-gather-us still parses (cursor not swallowed)"
+        );
+        assert!(validate_serve_config(&on).is_ok());
+        let line =
+            materialized_config_line(&on, "127.0.0.1:7777", Some(Path::new("/var/lib/ironbus")));
+        assert!(line.contains("commit_gather_us=3000"), "{line}");
+        let over = parse_serve_flags(&serve_args(&["--commit-gather-us", "1000001"]))
+            .unwrap()
+            .config;
+        match validate_serve_config(&over) {
+            Err(CliError::Usage(m)) => {
+                assert!(m.contains("--commit-gather-us"), "{m}");
+                assert!(m.contains("1000000"), "{m}");
+            }
+            other => panic!("an over-cap gather window must be a usage error, got {other:?}"),
+        }
     }
 
     #[test]

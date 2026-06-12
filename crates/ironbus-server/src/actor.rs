@@ -645,6 +645,33 @@ where
     F: Filesystem + 'static,
     C: Clock + Clone + 'static,
 {
+    spawn_actor_with_gather(engine, channel_bound, 0)
+}
+
+/// Like [`spawn_actor`] with an opt-in bounded GROUP-COMMIT GATHER (#454). With `gather_micros`
+/// of 0 (the default everywhere except an operator's explicit `--commit-gather-us`) the actor is
+/// byte-identical to the historical drain. With a window set, a drain pass that already holds at
+/// least TWO produces (evidence of a pipelining publisher; a single-produce pass never gathers,
+/// so an unpipelined producer pays no window) keeps collecting commands for up to the window
+/// before committing, so a pipelined publisher's whole in-flight window lands under ONE covering
+/// fsync instead of self-sizing slivers (measured on the reference edge box: a 512-record client window committed as ~12
+/// records per fsync, because the drain only sees what arrived during the PREVIOUS batch's
+/// fsync). Acks keep their fsynced-durable meaning; the knob trades up to the window in added
+/// commit latency under produce bursts for fewer, larger barriers (the `MySQL`
+/// `binlog_group_commit_sync_delay` / `PostgreSQL` `commit_delay` precedent).
+///
+/// # Panics
+/// Panics if the OS refuses to spawn the actor thread, exactly as [`spawn_actor`]: a STARTUP step,
+/// not a request path, so the no-panic bar for the library hot paths is untouched.
+pub fn spawn_actor_with_gather<F, C>(
+    engine: Engine<F, C>,
+    channel_bound: usize,
+    gather_micros: u64,
+) -> (EngineHandle<F, C>, std::thread::JoinHandle<Engine<F, C>>)
+where
+    F: Filesystem + 'static,
+    C: Clock + Clone + 'static,
+{
     let (tx, rx) = sync_channel::<Command<F, C>>(channel_bound.max(1));
     // Clone the engine's clock seam BEFORE the engine moves into the actor thread, so the handle can
     // stamp a produce's enqueue instant (the CoDel sojourn measurement, #68) with the SAME clock the
@@ -655,7 +682,7 @@ where
     let consumer_credit_caps = (engine.consumer_credit(), engine.consumer_credit_bytes());
     let join = std::thread::Builder::new()
         .name("ironbus-append-actor".to_string())
-        .spawn(move || run_actor(engine, &rx))
+        .spawn(move || run_actor(engine, &rx, gather_micros))
         // A thread-spawn failure at startup is unrecoverable for the server, but the no-panic bar is
         // for the LIBRARY hot paths; spawning the single actor at boot is a startup step. Surface it
         // by propagating the panic only here (boot), never on a request path.
@@ -670,12 +697,59 @@ where
     )
 }
 
+/// The bounded group-commit gather (#454): keeps collecting commands into `commands` for up to
+/// `gather_micros`, so the caller's batch covers a pipelined publisher's whole in-flight window
+/// under ONE fsync. Wall-clock (`std::time::Instant`) is correct here: the gather is a real-time
+/// IO batching decision on the actor thread, outside the engine's deterministic clock seam (the
+/// sim drives the `Engine` directly and never runs this loop). A `Shutdown` gathered mid-window is
+/// processed in order after the batch, exactly as if it had arrived in the same burst. A
+/// disconnect ends the gather early; the caller's batch then processes and the next outer `recv`
+/// observes the disconnect.
+///
+/// A pass holding FEWER THAN TWO produces never gathers: an unpipelined producer (one in-flight
+/// produce, awaiting each ack) would otherwise stall the full window on every send and gain
+/// nothing, since its next produce cannot arrive until this one is acked; and a produce-less
+/// control pass (acks, polls, subscribes) has no fsync to amortize.
+fn gather_commands<F, C>(
+    commands: &mut Vec<Command<F, C>>,
+    rx: &Receiver<Command<F, C>>,
+    gather_micros: u64,
+) where
+    F: Filesystem,
+    C: Clock + Clone,
+{
+    let produces = commands
+        .iter()
+        .filter(|c| matches!(c, Command::Produce { .. }))
+        .count();
+    if produces < 2 {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_micros(gather_micros);
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+        if left.is_zero() {
+            return;
+        }
+        let Ok(cmd) = rx.recv_timeout(left) else {
+            return;
+        };
+        commands.push(cmd);
+        while let Ok(c) = rx.try_recv() {
+            commands.push(c);
+        }
+    }
+}
+
 /// The actor's run loop. It blocks for one command, then DRAINS every command already queued
 /// (`try_recv`) into the same pass so a burst of produces group-commits together. Produces are
 /// appended (no sync) and their replies parked; a non-produce job or the end of the drain triggers
 /// the ONE `commit_batch` that covers the parked produces, after which their replies are released.
 /// Returns the engine on exit so a caller can recover it.
-fn run_actor<F, C>(mut engine: Engine<F, C>, rx: &Receiver<Command<F, C>>) -> Engine<F, C>
+fn run_actor<F, C>(
+    mut engine: Engine<F, C>,
+    rx: &Receiver<Command<F, C>>,
+    gather_micros: u64,
+) -> Engine<F, C>
 where
     F: Filesystem,
     C: Clock + Clone,
@@ -694,6 +768,11 @@ where
         // Drain everything immediately available so a concurrent burst of produces forms one group.
         while let Ok(cmd) = rx.try_recv() {
             commands.push(cmd);
+        }
+        // The opt-in bounded gather (#454); a no-op unless configured AND this pass already
+        // shows a pipelining publisher (two or more produces).
+        if gather_micros > 0 {
+            gather_commands(&mut commands, rx, gather_micros);
         }
         for cmd in commands {
             match cmd {
@@ -1311,6 +1390,81 @@ mod tests {
             1,
             "the record stayed durable"
         );
+    }
+
+    #[test]
+    fn a_commit_gather_window_collects_a_spaced_produce_into_the_pipelined_batch() {
+        // The opt-in group-commit gather (#454): a drain pass holding TWO OR MORE produces (a
+        // pipelining publisher) keeps gathering, so a produce that arrives WHILE the actor is
+        // gathering joins the in-progress batch instead of paying its own fsync. The sync gate
+        // gives a deterministic setup: a primer produce parks the actor on its covering fsync,
+        // TWO produces queue behind it (so the next drain pass proves pipelining), the gate
+        // opens, and a fourth produce sent mid-gather must land in the SAME batch: exactly TWO
+        // syncs total (the primer's, then ONE covering the gathered three).
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let engine = Engine::open(fs, ManualClock::new(), config()).unwrap();
+        let (handle, actor) = spawn_actor_with_gather(engine, DEFAULT_CHANNEL_BOUND, 800_000);
+        control.close_sync_gate();
+        let primer = handle.produce_async(append(b"primer")).unwrap();
+        control.wait_for_sync_gate_entered(1);
+        let queued_a = handle.produce_async(append(b"queued-a")).unwrap();
+        let queued_b = handle.produce_async(append(b"queued-b")).unwrap();
+        let before = control.sync_count();
+        control.open_sync_gate();
+        match primer.recv().unwrap() {
+            ProduceOutcome::Appended(o) => assert_eq!(o.get(), 0),
+            other => panic!("expected Appended primer, got {other:?}"),
+        }
+        // The primer is acked, so the actor is in its next pass: it drained the two queued
+        // produces (>= 2, the gather engages) and is now collecting. Real-time spacing is the
+        // point under test (the gather is a wall-clock IO batching decision, outside the
+        // ManualClock seam), with a 16x margin between the spacing and the window so a slow CI
+        // runner cannot expire the gather before the late produce lands.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let late = handle.produce_async(append(b"gathered-late")).unwrap();
+        let mut offsets = Vec::new();
+        for reply in [queued_a, queued_b, late] {
+            match reply.recv().unwrap() {
+                ProduceOutcome::Appended(o) => offsets.push(o.get()),
+                other => panic!("expected Appended, got {other:?}"),
+            }
+        }
+        assert_eq!(offsets, vec![1, 2, 3], "all three appended in send order");
+        // `sync_count` ticks when a sync ENTERS the gate, so the primer's (parked) sync is
+        // already inside `before`; the gathered batch of three adds exactly ONE more.
+        assert_eq!(
+            control.sync_count() - before,
+            1,
+            "ONE covering fsync for the gathered batch of three, none for the late produce"
+        );
+        drop(handle);
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn a_single_inflight_produce_never_pays_the_gather_window() {
+        // The no-tax rule (#454): a drain pass holding ONE produce never gathers, so an
+        // unpipelined producer (send, await ack, send) on a gather-enabled broker keeps the
+        // historical ack latency. With an 800 ms window, a gathered single produce could not ack
+        // in under 800 ms; the bound asserts the ack came back far sooner.
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let engine = Engine::open(fs, ManualClock::new(), config()).unwrap();
+        let (handle, actor) = spawn_actor_with_gather(engine, DEFAULT_CHANNEL_BOUND, 800_000);
+        let before = control.sync_count();
+        let started = std::time::Instant::now();
+        let reply = handle.produce_async(append(b"solo")).unwrap();
+        match reply.recv().unwrap() {
+            ProduceOutcome::Appended(o) => assert_eq!(o.get(), 0),
+            other => panic!("expected Appended, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(400),
+            "a single produce must ack without waiting out the 800 ms gather window, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(control.sync_count() - before, 1, "one produce, one fsync");
+        drop(handle);
+        actor.join().unwrap();
     }
 
     #[test]
