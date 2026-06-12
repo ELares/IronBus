@@ -173,13 +173,20 @@ where
     C: Clock + Clone + 'static,
 {
     let mut inbuf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 4096];
+    // The read chunk BOUNDS the pipelined-window pass (#450, #454): a `process` pass sees at most
+    // one chunk of new frames, and every pass ends by awaiting its parked produce acks, so the
+    // effective publisher pipeline depth is (chunk bytes / wire frame bytes). The old 4 KiB stack
+    // chunk capped a 512-produce window at ~13 records per group commit on 256 B payloads (hive
+    // measured), paying ~40 fsyncs per window. 64 KiB lets a pass carry hundreds of small frames.
+    // Heap-allocated and zero-initialized: `alloc_zeroed` pages stay untouched (no RSS) until the
+    // kernel actually fills them, so an idle or ping-only connection still costs about a page.
+    let mut chunk = vec![0u8; 64 * 1024];
     // The minimum buffer length before re-running `process` is worth it: `0` means run on any new
     // byte; a larger value is the trailing partial frame's `needed` hint, so a near-cap frame
     // trickled byte-by-byte is decoded once it is whole, not once per byte (#176).
     let mut needed: usize = 0;
     loop {
-        let n = stream.read(&mut chunk)?;
+        let n = stream.read(&mut chunk[..])?;
         if n == 0 {
             return Ok(()); // the client closed the connection
         }
