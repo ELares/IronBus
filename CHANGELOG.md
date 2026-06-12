@@ -7,6 +7,9 @@ to follow Semantic Versioning once it reaches a tagged release.
 ## [Unreleased]
 
 ### Changed
+- `InMemoryFile::sync_data` now copies only the byte ranges written since the last sync into the durable image instead of cloning the whole file (#456). An in-memory group commit costs O(bytes appended) like a real fdatasync, not O(file): under `--storage memory` this removes a whole-segment memcpy per commit (82 percent of append-actor CPU in a profiled pipelined publish run) and a quadratic per-message copy at window 1. The durable image is byte-for-byte unchanged (unsynced-truncation tail retention, zero-fill growth, power-loss reverts all preserved; the determinism, crash-recovery, and power-loss suites pass unchanged).
+
+### Changed
 - The per-connection read chunk grew from a 4 KiB stack array to a 64 KiB zero-page heap buffer (#454). The pipelined produce window (#450) is pass-scoped, and a pass sees at most one read chunk, so 4 KiB silently capped the publisher pipeline at ~13 records per group commit on 256 B payloads (~40 fsyncs per 512-record window on the reference edge box). Untouched pages cost no resident memory, so idle connections are unaffected.
 
 ### Added

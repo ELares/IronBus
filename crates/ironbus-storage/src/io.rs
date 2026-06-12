@@ -150,6 +150,52 @@ struct State {
     /// truncation (length is metadata): only `sync_all` (fsync) makes a truncation
     /// durable. See the sync methods below and [`InMemoryFile`] for the contract.
     durable: Vec<u8>,
+    /// The byte ranges of `live` written since the last sync: sorted, disjoint, half-open.
+    /// `sync_data` copies ONLY these into the durable image (#456) instead of cloning the whole
+    /// file, so an in-memory group commit costs O(bytes appended since the last sync) like a real
+    /// fdatasync, not O(file). Soundness invariant: every byte of `live` that differs from the
+    /// corresponding `durable` byte is inside a dirty range (every `live` mutation marks its
+    /// range, including a zero-fill growth gap; the power-loss models rewrite `live` from the
+    /// durable image and clear the list). For the append-only log writer this is almost always a
+    /// single coalesced range.
+    dirty: Vec<(usize, usize)>,
+}
+
+/// Records `[a, b)` as written-since-last-sync, keeping `dirty` sorted, disjoint, and coalesced.
+/// The fast path is the log writer's append pattern (the new range starts at or inside the last
+/// one); an arbitrary overlap falls back to a sort-and-merge pass.
+fn mark_dirty(dirty: &mut Vec<(usize, usize)>, a: usize, b: usize) {
+    if a >= b {
+        return;
+    }
+    match dirty.last_mut() {
+        None => dirty.push((a, b)),
+        // At or after the last range's start: earlier ranges all end before it, so the new range
+        // either merges with the last one or goes after it. O(1), the append fast path.
+        Some(last) if a >= last.0 => {
+            if a <= last.1 {
+                last.1 = last.1.max(b);
+            } else {
+                dirty.push((a, b));
+            }
+        }
+        // A write behind the frontier (a header patch, a compaction rewrite): general coalesce.
+        Some(_) => {
+            dirty.push((a, b));
+            dirty.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(dirty.len());
+            for &(x, y) in dirty.iter() {
+                if let Some(m) = merged.last_mut() {
+                    if x <= m.1 {
+                        m.1 = m.1.max(y);
+                        continue;
+                    }
+                }
+                merged.push((x, y));
+            }
+            *dirty = merged;
+        }
+    }
 }
 
 /// An in-memory [`RandomAccessFile`] for tests and the deterministic simulation.
@@ -198,6 +244,7 @@ impl InMemoryFile {
             state: Mutex::new(State {
                 live: bytes.clone(),
                 durable: bytes,
+                dirty: Vec::new(),
             }),
             syncs: AtomicU64::new(0),
             preallocated_to: AtomicU64::new(0),
@@ -246,6 +293,8 @@ impl InMemoryFile {
         let mut guard = self.lock();
         let s = &mut *guard;
         s.live.clone_from(&s.durable);
+        // The unsynced writes are gone with the live image: live == durable again.
+        s.dirty.clear();
     }
 
     /// Models a power loss with page-cache reorder/drop of the UNSYNCED tail (#164, #55).
@@ -300,6 +349,7 @@ impl InMemoryFile {
         // post-cut live image: a later `simulate_power_loss` then resurrects nothing, and the kept
         // unsynced prefix is now itself durable (the cut is the new ground truth).
         s.durable.clone_from(&s.live);
+        s.dirty.clear();
         kept as u64
     }
 }
@@ -321,11 +371,16 @@ impl RandomAccessFile for InMemoryFile {
         let end = off
             .checked_add(buf.len())
             .ok_or_else(|| invalid_input("write extends past the addressable range"))?;
-        let mut s = self.lock();
-        if s.live.len() < end {
+        let mut guard = self.lock();
+        let s = &mut *guard;
+        let old_len = s.live.len();
+        if old_len < end {
             s.live.resize(end, 0);
         }
         s.live[off..end].copy_from_slice(buf);
+        // The zero-fill gap of a past-EOF write is new data too: a real fdatasync persists the
+        // allocated zeros, so the dirty range starts at the old length when the write grew the file.
+        mark_dirty(&mut s.dirty, off.min(old_len), end);
         Ok(())
     }
 
@@ -337,14 +392,24 @@ impl RandomAccessFile for InMemoryFile {
         // writes that extend the file are data, so they DO become durable here.
         let mut guard = self.lock();
         let s = &mut *guard;
-        if s.live.len() >= s.durable.len() {
-            s.durable.clone_from(&s.live);
-        } else {
-            // An unsynced truncation: flush the surviving data in place, keep the old
-            // durable length, and retain the un-truncated tail so a power loss can still
-            // expose it (exactly until a `sync_all` persists the shorter length).
-            s.durable[..s.live.len()].copy_from_slice(&s.live);
+        if s.live.len() > s.durable.len() {
+            // Data grew the file: the durable length advances with it (the grown range is in a
+            // dirty range, so the zeros materialized here are overwritten just below).
+            s.durable.resize(s.live.len(), 0);
         }
+        // Copy ONLY the bytes written since the last sync (#456). Outside the dirty ranges, live
+        // and durable already agree (the soundness invariant on `State::dirty`), so this is
+        // byte-for-byte the old clone-the-whole-file image at O(written) cost. Under an unsynced
+        // truncation the ranges were clamped by `set_len`, the durable image keeps its old length,
+        // and the un-truncated durable tail survives so a power loss can still expose it (exactly
+        // until a `sync_all` persists the shorter length).
+        for &(a, b) in &s.dirty {
+            debug_assert!(b <= s.live.len(), "dirty range past live length");
+            let b = b.min(s.live.len());
+            let a = a.min(b);
+            s.durable[a..b].copy_from_slice(&s.live[a..b]);
+        }
+        s.dirty.clear();
         self.syncs.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -355,6 +420,7 @@ impl RandomAccessFile for InMemoryFile {
         let mut guard = self.lock();
         let s = &mut *guard;
         s.durable.clone_from(&s.live);
+        s.dirty.clear();
         self.syncs.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -365,7 +431,25 @@ impl RandomAccessFile for InMemoryFile {
 
     fn set_len(&self, len: u64) -> io::Result<()> {
         let len = usize::try_from(len).map_err(|_| invalid_input("length out of range"))?;
-        self.lock().live.resize(len, 0);
+        let mut guard = self.lock();
+        let s = &mut *guard;
+        let old_len = s.live.len();
+        s.live.resize(len, 0);
+        if len > old_len {
+            // Growth zero-fills: new live bytes that must reach the durable image at the next sync
+            // (matching the old clone-everything image, which carried the grown zeros and length).
+            mark_dirty(&mut s.dirty, old_len, len);
+        } else {
+            // Truncation: the dropped bytes no longer exist in `live`, so no range may reach past
+            // the new length (the durable image keeps its own longer tail until `sync_all`).
+            s.dirty.retain_mut(|r| {
+                if r.0 >= len {
+                    return false;
+                }
+                r.1 = r.1.min(len);
+                r.0 < r.1
+            });
+        }
         Ok(())
     }
 
@@ -383,6 +467,53 @@ impl RandomAccessFile for InMemoryFile {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn dirty_range_sync_matches_the_clone_everything_durable_image() {
+        // The incremental sync (#456) must be observationally identical to the old
+        // clone-the-whole-file `sync_data`. Each step mutates the live image, syncs, and asserts
+        // the durable snapshot is exactly what the old semantics produced, through the tricky
+        // cases: an in-place edit inside the synced prefix, an append, a past-EOF write with a
+        // zero-fill gap, an unsynced truncation (durable keeps its longer tail), a write after
+        // the truncation, the power-loss revert clearing pending writes, and the sync_all length
+        // barrier.
+        let f = InMemoryFile::new();
+        f.write_all_at(b"AAAAAAAAAA", 0).unwrap();
+        f.sync_data().unwrap();
+        assert_eq!(f.durable_snapshot(), b"AAAAAAAAAA");
+        // An in-place edit inside the already-synced prefix.
+        f.write_all_at(b"B", 2).unwrap();
+        f.sync_data().unwrap();
+        assert_eq!(f.durable_snapshot(), b"AABAAAAAAA");
+        // A past-EOF write: the zero-fill gap (10..12) is data and becomes durable with it.
+        f.write_all_at(b"CC", 12).unwrap();
+        f.sync_data().unwrap();
+        assert_eq!(f.durable_snapshot(), b"AABAAAAAAA\x00\x00CC");
+        // An unsynced truncation + fdatasync: durable keeps its OLD length and un-truncated tail
+        // (a shrink is metadata; only sync_all persists it), exactly the old prefix-copy image.
+        f.set_len(4).unwrap();
+        f.sync_data().unwrap();
+        assert_eq!(f.durable_snapshot(), b"AABAAAAAAA\x00\x00CC");
+        // A write after the truncation flushes in place under the longer durable tail.
+        f.write_all_at(b"D", 1).unwrap();
+        f.sync_data().unwrap();
+        assert_eq!(f.durable_snapshot(), b"ADBAAAAAAA\x00\x00CC");
+        assert_eq!(f.snapshot(), b"ADBA");
+        // sync_all is the full barrier: the truncation becomes durable.
+        f.sync_all().unwrap();
+        assert_eq!(f.durable_snapshot(), b"ADBA");
+        // Unsynced writes vanish at a power loss and must NOT resurface at the next sync.
+        f.write_all_at(b"EEEE", 4).unwrap();
+        f.simulate_power_loss();
+        assert_eq!(f.snapshot(), b"ADBA");
+        f.sync_data().unwrap();
+        assert_eq!(f.durable_snapshot(), b"ADBA");
+        // A behind-the-frontier write coalesces with an append (the slow merge path).
+        f.write_all_at(b"FF", 6).unwrap();
+        f.write_all_at(b"G", 0).unwrap();
+        f.sync_data().unwrap();
+        assert_eq!(f.durable_snapshot(), b"GDBA\x00\x00FF");
+    }
 
     #[test]
     fn write_then_read_roundtrip() {

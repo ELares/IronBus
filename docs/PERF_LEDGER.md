@@ -159,3 +159,62 @@ Profile the per-op CPU floor on the wire/session/engine path (memory w=1 is 733 
 NATS does 401 us). Candidates: per-record allocations in decode/dispatch (arena or reuse), the
 per-frame reply flush (vectored writes), checkpoint cadence in the hot loop. Target: memory
 w=1 >= 2,491/s (leg 3) and memory pipelined toward 27,250/s (leg 4).
+
+## Round 4 (#456): InMemoryFile::sync_data cloned the whole segment per commit; dirty ranges = leg 3 cleared
+
+Sources: the round-3 ledger entry (CPU-floor hypothesis); LMAX Disruptor (Thompson et al. 2011,
+mechanical sympathy: the hot path should never copy what it does not have to); the incremental
+checkpoint/shadow-paging tradition (copy only what changed since the last barrier).
+
+### What the profile showed
+
+Round 3 left legs 3 and 4 "CPU-floor bound". A symbolized macOS `sample` of the broker under a
+memory-mode w=512 publish run located the floor precisely: 82 percent of the append-actor
+thread was `actor::flush_pending -> Log::sync -> SegmentWriter::sync -> Vec::clone_from ->
+memmove`. `InMemoryFile::sync_data` maintained the power-loss-simulation durable image by
+CLONING THE ENTIRE LIVE FILE on every sync: every group commit memcpy'd the whole accumulated
+segment (64 MiB profile segments), and window-1 publishing re-copied everything per MESSAGE
+(quadratic in segment fill). Strace corroborated: mmap/munmap churn from the repeated large
+clones. The hive's earlier "memory barely beats disk" oddity (8,023 vs 7,193) was this copy.
+
+Also measured and parked for later rounds: clock_gettime64 is a REAL syscall on the 32-bit ARM
+musl static build (~3/msg pipelined, 6/msg at w=1; no time64 vDSO) ~ a few us/op; futex 4/msg at
+w=1 from the per-produce sync_channel rendezvous; TCP_NODELAY is never set. All second-order
+next to the clone.
+
+### Fix shipped
+
+`State` tracks the byte ranges written since the last sync (sorted, disjoint, coalesced; the
+append pattern is the O(1) fast path). `sync_data` copies only those ranges into the durable
+image and clears the list. Byte-for-byte identical durable semantics: zero-fill growth gaps are
+dirty, an unsynced truncation clamps ranges while the durable image keeps its longer tail until
+`sync_all`, and both power-loss models clear the list when they rewrite the live image. The
+determinism, crash-recovery, torn-write, and power-loss suites pass unchanged, plus a focused
+equivalence test walks the tricky interleavings against the old clone-everything image.
+
+### Measured (hive, 256B realistic, 15s runs, pre-merge cross-compiled, scratch broker)
+
+| leg | round 3 | round 4 (dirty ranges) |
+| --- | --- | --- |
+| memory w=1 | 1,364/s | 7,045/s (5.2x; the quadratic clone is gone) |
+| memory w=512 | 8,023/s | 9,012/s |
+| memory w=1024 | 11,171/s | 16,461-16,753/s |
+| disk w=512 | 7,193/s | 6,791/s (run noise; disk never cloned) |
+| disk w=1024 | 9,197-10,294/s | 9,346/s |
+
+Guardrails: binary 1.54 MB (<= 3 MB); bounded-cap memory RSS 6.2 MB peak under w=1024 load with
+a 2 MiB store cap (the #443 model, <= 8 MB); the big-cap RSS scales with STORED MESSAGES by
+memory-mode design (45 MB at a 512 MiB cap, the queue itself, not overhead).
+
+Verdict: KEEP. Win-condition leg 3 (memory per-ack >= 2,491 = NATS memory sync) CLEARED at
+7,045 = 2.8x NATS. Standing: leg 1 held (198-205 vs 191-203), leg 2 cleared (46x), leg 3
+cleared (2.8x), leg 5 cleared (two legs led by >= 2x). OPEN: leg 4 only (memory pipelined
+16,461 vs 27,250 = 60 percent).
+
+### Round 5 hypothesis (queued)
+
+Leg 4 is now genuinely wire/session/engine CPU. Candidates in measured order: per-record
+allocations on the produce path (OwnedAppend payload Vec + per-produce reply sync_channel:
+reuse/arena them), the parked-ack reply encode path, clock_gettime64 batching (stamp once per
+drain batch), TCP_NODELAY + vectored reply writes. Re-profile AFTER the clone is gone; the 82
+percent memmove was masking everything downstream.
