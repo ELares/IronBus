@@ -57,21 +57,28 @@ crc32c = "0.6"
 # grammar/validator is in `ironbus-core::config`; only the whole-read file IO lives here).
 toml = "0.5"
 
-# Signal handling for `serve`'s graceful shutdown (#195): catches SIGINT/SIGTERM/SIGHUP and flips
-# the serve loop's shutdown flag so the broker stops accepting, flushes the committed cursor, and
-# exits 0. The maintainer chose `ctrlc` over a hand-rolled `unsafe` sigaction (Miri cannot exercise
-# OS signal delivery, so the unsafe-justification ceremony is impractical here). It pulls `nix` +
-# `libc` transitively; both are permissive (MIT) and on the deny.toml allow-list. CLI-only: the
-# IO-free `ironbus-core` and the `ironbus-server` lib never see it. Unix-only because `serve` itself
-# is Unix-only in v1 (on-disk storage uses positioned IO the Windows path lacks), so the non-Unix
-# build neither installs a handler nor pulls the dependency.
+# Signal handling for `serve` (#195, #380): a dedicated signal thread distinguishes the signals so
+# SIGINT/SIGTERM perform the graceful stop (flush every committed cursor, exit 0) while SIGHUP
+# performs a live config RE-READ (the runtime reload trigger #380 names), the conventional daemon
+# split (nginx/sshd `kill -HUP` = reload). The previous `ctrlc` dependency could NOT tell the signals
+# apart — its `termination` feature bound SIGHUP to the same stop path (the #195/#431 residual) — so
+# it is replaced by `signal-hook`, which registers PER signal and delivers them to an ordinary thread
+# via a self-pipe. That keeps the reload's file IO out of an async-signal handler AND avoids a
+# hand-rolled `unsafe` sigaction (the maintainer's no-unsafe-signal stance, since Miri cannot exercise
+# OS signal delivery). It is pure Rust and pulls only `signal-hook-registry` + `libc`, both permissive
+# (MIT OR Apache-2.0) and on the deny.toml allow-list. We take ONLY the `iterator` feature (with
+# default-features off): signal-hook gates an OPTIONAL `cc` build-dependency (a tiny C `siginfo` shim)
+# behind its non-default `extended-siginfo-raw` feature, which we do NOT enable, so the shipped binary
+# compiles ZERO C (the cc dep stays dormant in the lock). That keeps the #102/#139 pure-Rust ban
+# clean; `signal-hook` is allowlisted in `deny.toml` and `scripts/ci/cffi-ban.sh` on exactly this
+# basis (the optional, unenabled cc), NOT because it can never carry C. CLI-only and Unix-only, like
+# `serve` itself (on-disk storage uses positioned IO the Windows path lacks), so the non-Unix build
+# neither spawns the signal thread nor pulls the dependency.
 [target.'cfg(unix)'.dependencies]
-# The `termination` feature makes the handler also catch SIGTERM and SIGHUP (not just SIGINT), which
-# the graceful-shutdown story needs for an operator's `systemctl stop` / `kill <pid>`.
-ctrlc = { version = "^3.4", features = ["termination"] }
+signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
 # The single-broker data-dir lock (#89) calls `flock(2)` directly for an exclusive advisory lock on
 # the data dir's `LOCK` file, so a second `serve` on one data dir fails fast instead of corrupting
-# the log with concurrent writers. `libc` is already in the tree (pulled by `ctrlc`) and on the
+# the log with concurrent writers. `libc` is already in the tree (pulled by `signal-hook`) and on the
 # `deny.toml` allow-list (MIT OR Apache-2.0); this makes it a direct, Unix-only dependency. It is
 # the libc binding only (not vendored C), so the #139 pure-Rust DATA-path policy is unchanged: the
 # lock is a CLI startup guard, off the record path.

@@ -23,8 +23,9 @@ profile the default stays `balanced` (exactly the compiled-in `DEFAULT_*` set,
 The TOML config FILE (`serve --config <path>`) is also SHIPPED (#382), on the
 precedence `flag > env > FILE > default`; the env-var layer (`IRONBUS_<FLAG>`)
 sits between flags and the file as before. The validate-whole-then-swap re-read
-RELOAD engine ships too, but it runs only as a startup self-check: no runtime
-trigger is wired yet (SIGHUP is graceful stop, not reload), see #431. The other
+RELOAD engine ships too, running as a startup self-check AND on a runtime trigger:
+SIGHUP re-reads `--config` at runtime and applies the live-reloadable subset (the
+retention bounds + the disk-full policy) to the running broker (#380). The other
 residual on that surface is the MUTATING wire `CONFIG SET`/`SAVE` admin verbs,
 which wait on the #106 connection-scoped auth (#380). The refuse-to-boot RAM guard (#115) is wired
 too: with `--ram-ceiling-bytes` set (which `edge-tiny` does, to 64 MiB), a
@@ -61,7 +62,7 @@ not a hard requirement.
 | | `--compression` | `lz4` (the #139 default; zstd opt-in behind a feature) | `lz4` (default) or `none` | Per the #139 decision, lz4_flex (cheap, pure Rust) is the default codec and zstd is opt-in only behind a feature, never on the default path. The write path is WIRED (#387 runtime, #430 wiring): a compressible payload of 64 bytes or more is stored compressed behind the `COMPRESSED` record flag (smaller or incompressible payloads store raw by design), the materialized-config `compression=` echo matches the bytes on disk, the offline reader prints the real stored codec, and the client decompresses transparently on deliver. `none` stores every record raw, byte-for-byte the historical layout. |
 | **Intermittent power** | `--durability-level` | `sync` | `sync` (default) | Every acknowledged durable write is `fdatasync`'d before the ack under the DEFAULT `sync` level, so a power loss never loses an acknowledged write. The relaxed levels (`interval` / `async` / `none`, #341 / #379) are strictly OPT-IN: `async` / `none` refuse to boot without the explicit `--async-loss-ack` acknowledgement, and any relaxed level logs a loud I2-waived startup WARN, so you cannot accidentally weaken durability from the command line. Keep `sync` on a device that can brown out. |
 | | `--disk-full-policy` | `drop-new` | `drop-new` (default) | On a device that may brown out mid-write, drop-new avoids the extra reaping writes of `drop-oldest`; the older accepted (and already-`fdatasync`'d) data is preserved. |
-| | graceful shutdown (always on, #195) | n/a | n/a | SIGINT / SIGTERM / SIGHUP stops accepting, flushes every work-group's committed cursor, and exits 0, so a clean shutdown does not redelivery-replay acked work. Un-acked in-flight messages still correctly redeliver (at-least-once). |
+| | graceful shutdown (always on, #195) | n/a | n/a | SIGINT / SIGTERM stops accepting, flushes every work-group's committed cursor, and exits 0, so a clean shutdown does not redelivery-replay acked work. Un-acked in-flight messages still correctly redeliver (at-least-once). SIGHUP does not stop; it re-reads `--config` to reload the live subset (#380). |
 | | `--checkpoint-interval` | `1024` | `1024` (default) | After an abrupt (non-graceful) power cut, at most this many messages redeliver. It bounds the post-crash replay; recovery itself always restores the longest valid prefix and bounds + reports any corruption-skip loss (see below). |
 
 ### How the RAM knobs compose to keep RSS under the ceiling
@@ -185,9 +186,10 @@ default) when acked data must survive a reboot.
   on the reference edge device.
 - **#380 / #106**: the MUTATING wire `CONFIG SET` / `SAVE` admin verbs (the
   runtime config-change surface) wait on connection-scoped auth. The
-  validate-whole-then-swap `--config` re-read engine ships (#382) but runs only
-  as a startup self-check; no runtime trigger is wired yet (SIGHUP is graceful
-  stop), see #431.
+  validate-whole-then-swap `--config` re-read engine ships (#382) and runs both
+  as a startup self-check and on a runtime trigger: SIGHUP re-reads `--config` at
+  runtime and applies the live-reloadable subset (the retention bounds + the
+  disk-full policy) to the running broker (#380).
 - **#12 write-path wiring**: DONE (#387 runtime, #430 wiring). `serve
   --compression lz4` (the default) compresses each compressible payload of 64
   bytes or more on the produce path; `dump` shows the real stored codec and

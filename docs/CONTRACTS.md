@@ -683,10 +683,12 @@ reject-unknown-key-with-a-did-you-mean rule, `--allow-unknown-config`, and the c
 validators live in `ironbus-core::config`; the immutable `Arc<EffectiveConfig>` plus the
 atomic re-read RELOAD (validate the whole config, reject a cold-key change atomically, swap
 only on success) are in `ironbus-cli`. The hot/cold/coupled reload classes are enforced by
-that re-read engine, but the engine runs at most once, as a startup self-check when `--config` is set: NO runtime
-trigger is wired yet (SIGHUP performs a graceful stop exactly like SIGTERM, not a reload,
-#431; the runtime trigger is the #380 admin surface, refs #88), so a config change today
-requires a broker restart. The MUTATING wire `CONFIG SET` admin verbs need the #106 auth and
+that re-read engine. The engine runs as a startup self-check when `--config` is set, and it
+ALSO has a runtime trigger now: SIGHUP re-reads the `--config` file and applies the
+LIVE-reloadable subset (the consumer-safe retention bounds and the disk-full policy) to the
+running engine without dropping connections, while a restart-required key change is reported
+on stderr but not applied live (#380, refs #88). A cold-key change (segment size, data dir) is
+rejected. SIGINT/SIGTERM remain the graceful stop (#195). The MUTATING wire `CONFIG SET` admin verbs need the #106 auth and
 are deferred (no unauthenticated remote config mutation). See the discrepancies section.
 
 ### EngineConfig (runtime config struct)
@@ -976,10 +978,11 @@ code; the code is canonical.
   `flag > env > FILE > default`). The repository carries the pure-Rust `toml` dependency. The
   DEFERRED residuals are the MUTATING wire `CONFIG SET`/`SAVE` admin verbs (they change runtime
   state and need the #106 connection-scoped auth, so there is no unauthenticated remote config
-  mutation surface) and the runtime reload trigger (#380, refs #88): the read of the
-  materialized config ships, and the validate-whole-then-swap re-read RELOAD engine ships as a
-  startup self-check only. No signal invokes it at runtime; SIGHUP performs a graceful stop
-  exactly like SIGTERM (#431), so a config change today requires a restart.
+  mutation surface). The read of the
+  materialized config ships, and the validate-whole-then-swap re-read RELOAD engine ships both as a
+  startup self-check and on a runtime trigger: SIGHUP invokes it at runtime (#380, refs #88),
+  re-reading `--config` and applying the live subset (the retention bounds + the disk-full policy)
+  to the running engine, with restart-required keys reported on stderr but not applied live.
 
 ---
 
@@ -1079,8 +1082,8 @@ code today. They are aspirational and MUST NOT be treated as a current byte cont
   is the shipped artifact (see the discrepancies).
 - **TOML Config document.** IMPLEMENTED (#382): the `--config` file, the literal grammar, the
   strict typed-key validation, the coupled-set validators, and the immutable-config atomic reload
-  engine ship (the engine runs once, as a startup self-check; SIGHUP is graceful stop, not
-  reload, #431). The deferred halves are the runtime reload trigger (#380, refs #88) and the
+  engine ship (the engine runs as a startup self-check, and SIGHUP now re-reads `--config` at
+  runtime to apply the live subset, #380, refs #88). The deferred half is the
   authed mutating wire `CONFIG SET`/`SAVE` verbs (#106). See the discrepancies section.
 - **Wire verbs from the draft with no implementation:** the auth handshake fields in
   `Connect` (`auth_method`, `auth_blob`, `stream_id`, `max_frame_size`), the `Info`

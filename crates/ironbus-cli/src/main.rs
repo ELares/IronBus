@@ -66,9 +66,9 @@ mod config_file;
 /// that needs it, and the re-read RELOAD that validates the whole candidate, rejects a cold-key
 /// change atomically, and swaps ONLY on full success (a broken reload keeps the old config). The
 /// MUTATING wire `CONFIG SET` verbs need the #106 auth and are NOT here (no unauthenticated remote
-/// mutation surface); this is the safe local re-read reload path only, and it runs at most once,
-/// as a startup self-check: no signal invokes it at runtime (SIGHUP is bound to graceful stop, the
-/// #195 residual, see #431; the runtime trigger is the #380 surface, refs #88).
+/// mutation surface); this is the safe local re-read reload path only. SIGHUP invokes it at runtime
+/// (the #380 trigger): the signal thread re-reads `--config` and applies the live-reloadable subset
+/// to the running engine. It also runs once at startup as a validate-whole self-check.
 mod config_reload;
 
 /// The OPT-IN `dict` subcommand group (#357, `docs/DICTIONARY_LIFECYCLE.md`): `dict train` (ZDICT
@@ -1551,6 +1551,28 @@ fn resolve_bool(flag: &str, cli_set: bool, env: &EnvFn<'_>) -> Result<bool, CliE
     }
 }
 
+/// Which LIVE-reloadable keys were PINNED by a higher-precedence layer (a CLI `--flag` or an
+/// `IRONBUS_*` env var) at startup (#380). A pinned key MUST NOT be overridden by a re-read config
+/// FILE on a SIGHUP reload: the documented precedence is `flag > env > FILE`, and flags/env are
+/// fixed for the process lifetime, so the file (the lowest of the three) cannot lower a flag/env-set
+/// retention bound out from under the operator. Computed once at resolution time (where the raw flag
+/// `Option`s and the env seam are in scope) and carried to the reload path; an unpinned reloadable
+/// key takes the re-read file value, matching "SIGHUP re-reads the file".
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(clippy::struct_excessive_bools)] // each bool is an INDEPENDENT per-key pin (which startup
+                                         // layer set that key), not a state machine; a flat set of
+                                         // flags is the right shape, mirroring ServeConfig's bools.
+struct ReloadPins {
+    /// `retention.max_retained_bytes` was set by `--max-retained-bytes` or `IRONBUS_MAX_RETAINED_BYTES`.
+    max_retained_bytes: bool,
+    /// `retention.max_age_ms` was set by `--max-age-ms` or `IRONBUS_MAX_AGE_MS`.
+    max_age_ms: bool,
+    /// `retention.max_messages` was set by `--max-messages` or `IRONBUS_MAX_MESSAGES`.
+    max_messages: bool,
+    /// `backpressure.disk_full_policy` was set by `--disk-full-policy` or `IRONBUS_DISK_FULL_POLICY`.
+    disk_full_policy: bool,
+}
+
 /// The fully-parsed `serve` invocation: the assembled tuning config plus the connection-level
 /// arguments (the bind address, the optional data dir and health address, the declared
 /// `key_shared` groups, and the declared broadcast groups) that are not part of [`ServeConfig`].
@@ -1579,6 +1601,9 @@ struct ParsedServe {
     /// The `--allow-unknown-config` flag (#86), threaded to `cmd_serve` so a re-read reload applies
     /// the SAME unknown-key policy as the startup load. False with no `--config`.
     allow_unknown_config: bool,
+    /// Which live-reloadable keys were pinned by a flag/env at startup (#380), so a SIGHUP file
+    /// re-read does not override them (the `flag > env > FILE` precedence). All false with no flag/env.
+    reload_pins: ReloadPins,
 }
 
 fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
@@ -1597,6 +1622,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         ReloadSource {
             config_path: parsed.config_path.as_deref(),
             allow_unknown_config: parsed.allow_unknown_config,
+            reload_pins: parsed.reload_pins,
         },
         out,
     )
@@ -1612,6 +1638,9 @@ struct ReloadSource<'a> {
     config_path: Option<&'a str>,
     /// The `--allow-unknown-config` policy to re-apply on a reload.
     allow_unknown_config: bool,
+    /// Which live-reloadable keys a startup flag/env pinned (#380): a SIGHUP file re-read must not
+    /// override these (the `flag > env > FILE` precedence holds at reload too).
+    reload_pins: ReloadPins,
 }
 
 /// Parses the `serve` flag list into a [`ParsedServe`]. Split out of [`run_serve`] so the
@@ -2002,6 +2031,20 @@ fn parse_serve_flags_with_env_and_reader(
         ),
         None => None,
     };
+    // The live-reload PINS (#380), computed NOW while `env` is still the RAW process/injected env,
+    // BEFORE it is shadowed by the file-combined closure below. A live-reloadable key is pinned only
+    // if a FLAG or the RAW env set it — NOT the file: the file is exactly what a SIGHUP reload
+    // re-reads, so a file-set key must remain reloadable (treating it as a pin would wrongly freeze
+    // it). This preserves the `flag > env > FILE` precedence at reload: the file may not override a
+    // flag/env-set retention bound, but it CAN change a key only the file set.
+    let reload_pins = ReloadPins {
+        max_retained_bytes: f.max_retained_bytes.is_some()
+            || env(&env_var_name("--max-retained-bytes")).is_some(),
+        max_age_ms: f.max_age_ms.is_some() || env(&env_var_name("--max-age-ms")).is_some(),
+        max_messages: f.max_messages.is_some() || env(&env_var_name("--max-messages")).is_some(),
+        disk_full_policy: f.disk_full_policy.is_some()
+            || env(&env_var_name("--disk-full-policy")).is_some(),
+    };
     // The combined env-then-file seam: env BEATS the file (env is the higher layer), so look env up
     // first and fall back to the file value. The existing `resolve_*` helpers consult THIS, so the
     // precedence becomes flag > env > FILE > default with no change to their internal logic.
@@ -2330,6 +2373,10 @@ fn parse_serve_flags_with_env_and_reader(
         retention_requested: false,
         config_path: f.config.clone(),
         allow_unknown_config: f.allow_unknown_config,
+        // The live-reloadable flag/env pins (#380), computed above from the RAW env BEFORE the
+        // file-combined seam shadowed `env`, so a key set ONLY by the file is correctly NOT pinned
+        // (the file remains reloadable; only a flag/env-set key is frozen against the file on reload).
+        reload_pins,
     };
     // Fold in the FILE layer's non-fatal warnings and its explicit-retention-request flag, then run
     // the WHOLE-config coupled-set validation as a UNIT (#86, #382, docs/CONFIG.md section 4): every
@@ -3568,13 +3615,14 @@ fn run_broker<F: Filesystem + 'static>(
     // The immutable effective-config + atomic reload handle (#380, #382): the resolved config is
     // installed into ONE immutable `Arc<EffectiveConfig>` behind a single safe swap point, read here
     // via one refcount bump (the single atomic pointer load on the path that needs it, never a
-    // per-message re-parse). `_config_handle` is held for the serve lifetime; a re-read RELOAD
+    // per-message re-parse). `config_handle` is held for the serve lifetime; a re-read RELOAD
     // (`reload_from`) validates a whole candidate, rejects a cold-key change atomically, and swaps
-    // ONLY on full success (a broken reload keeps this config). The SIGHUP wire is the #195
-    // disentanglement residual (SIGHUP is currently bound to graceful-stop via ctrlc's `termination`
-    // feature, so re-binding it to reload would silently change `kill -HUP` semantics); the engine
-    // and the safe re-read trigger ship here, the authed mutating wire CONFIG verbs are the #106
-    // residual (no unauthenticated remote mutation surface).
+    // ONLY on full success (a broken reload keeps this config). SIGHUP now drives a live re-read of
+    // this handle (the runtime trigger, #380): the signal thread re-reads `--config` and applies the
+    // live-reloadable subset (the consumer-safe retention bounds and the disk-full policy) to the
+    // running engine via the actor, rejecting a cold-key change and reporting any restart-required
+    // change it did NOT apply. The authed mutating wire CONFIG verbs remain the #106 residual (no
+    // unauthenticated remote mutation surface).
     // `retention_requested` is `false` here: the coupled-set "retention requested but all off" check
     // already ran (and passed) at parse time, so the installed snapshot needs no re-detection of the
     // request; a reload re-derives it from the re-read file.
@@ -3590,7 +3638,8 @@ fn run_broker<F: Filesystem + 'static>(
     // `Arc<EffectiveConfig>` in ONE store ONLY on success (a broken reload keeps the running config).
     // Run once at startup right after the engine opens, as a re-read self-check: it proves the
     // file still parses identically just after the broker took the data-dir lock (catching a
-    // mid-start operator edit, a TOCTOU window), and it is the exact path a future SIGHUP wire calls.
+    // mid-start operator edit, a TOCTOU window). The SIGHUP reload (`reload_running_config`) calls
+    // the same handle path at runtime, plus the live engine apply.
     // The reload mutates only the in-process config pointer on a LOCALLY-read file, never on an
     // unauthenticated remote request (the mutating wire CONFIG verbs are the #106 auth residual).
     if let Some(path) = reload.config_path {
@@ -3632,13 +3681,21 @@ fn run_broker<F: Filesystem + 'static>(
     }
     // The shared shutdown flag the serve loop polls. The wire serve uses a non-blocking accept that
     // re-checks this flag every ~50 ms (its ACCEPT_POLL), so flipping it breaks the accept loop
-    // within a bounded time rather than only after the next connection. A SIGINT/SIGTERM/SIGHUP
-    // handler flips it for a graceful stop (#195); the broker then stops accepting and, on exit
-    // below, flushes every group's committed cursor so a restart does not redeliver acked messages.
-    // Durability across an ABRUPT termination still holds (every ack is fsynced first); this handler
-    // additionally makes a CLEAN operator stop non-redelivering by flushing the lagging cursor.
+    // within a bounded time rather than only after the next connection. The SIGINT/SIGTERM signal
+    // path flips it for a graceful stop (#195); the broker then stops accepting and, on exit below,
+    // flushes every group's committed cursor so a restart does not redeliver acked messages.
+    // Durability across an ABRUPT termination still holds (every ack is fsynced first); the stop path
+    // additionally makes a CLEAN operator stop non-redelivering by flushing the lagging cursor. SIGHUP
+    // is handled by the SAME thread as a live config re-read (#380), never a stop.
     let shutdown = Arc::new(AtomicBool::new(false));
-    install_signal_handler(&shutdown)?;
+    let signal_thread = spawn_signal_thread(
+        &shutdown,
+        shared.clone(),
+        config_handle.clone(),
+        reload,
+        config,
+        data_dir,
+    )?;
 
     // The monotonic clock the liveness watchdog (#95) measures against. ONE clock instance is shared
     // (cloned, so every clone reports from the SAME monotonic origin) between the wire accept loop
@@ -3676,9 +3733,11 @@ fn run_broker<F: Filesystem + 'static>(
         &progress,
     )
     .map_err(|e| CliError::Internal(format!("serve loop failed: {e}")));
-    // The wire serve returns only when shutdown is set (a signal, or a fatal listener error that
-    // ends the loop), so flip it for the health thread too.
+    // The wire serve returns only when shutdown is set (a stop signal, or a fatal listener error that
+    // ends the loop), so flip it for the health thread too, then stop the signal thread (close its
+    // wait and join it) so no in-flight SIGHUP reload races the actor drain below.
     shutdown.store(true, Ordering::Release);
+    signal_thread.stop();
     if let Some(h) = health_handle {
         let _ = h.join();
     }
@@ -3793,24 +3852,416 @@ fn start_health_server<F: Filesystem + 'static>(
     })))
 }
 
-/// Installs the process-wide signal handler that flips `shutdown` on SIGINT, SIGTERM, or SIGHUP, so
-/// `serve` performs a graceful stop (#195): the serve loop's next poll observes the flag, stops
-/// accepting, and the broker flushes its cursors before exiting 0. The `ironbus` binary runs exactly
-/// one subcommand per process, so this is installed at most once per process. `try_set_handler` (not
-/// `set_handler`) is used so the install is fallible-not-panicking: a `MultipleHandlers` error (a
-/// handler already present, which the single-subcommand binary never produces but a future caller
-/// might) is surfaced as an internal error rather than a panic, keeping the no-panic library bar.
-/// `ctrlc` catches SIGINT; its `termination` feature (enabled in `Cargo.toml`) adds SIGTERM and
-/// SIGHUP, so the one handler covers all three signals an operator stop might deliver.
+/// The running signal thread's control handles (#195, #380): the `signal-hook` `Handle` that breaks
+/// the wait loop on a clean serve exit, and the thread's join handle. Returned by
+/// [`spawn_signal_thread`] so [`run_broker`] stops the thread deterministically on the way out
+/// (close the wait, then join) rather than detaching it.
 #[cfg(unix)]
-fn install_signal_handler(shutdown: &Arc<AtomicBool>) -> Result<(), CliError> {
-    let flag = Arc::clone(shutdown);
-    ctrlc::try_set_handler(move || {
-        // Async-signal context: a single atomic store, nothing else. The serve loop polls this flag
-        // on its next accept cycle and unwinds the accept-stop, cursor-flush, exit-0 path itself.
-        flag.store(true, Ordering::Release);
-    })
-    .map_err(|e| CliError::Internal(format!("cannot install the shutdown signal handler: {e}")))
+struct SignalThread {
+    handle: signal_hook::iterator::Handle,
+    join: std::thread::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl SignalThread {
+    /// Stops the signal thread: close the signal wait (so a thread still blocked on an unsignalled
+    /// `forever()` returns) and join it. Idempotent in effect — a thread that already exited on a
+    /// SIGINT/SIGTERM is joined immediately, and `close` on an already-closed handle is a no-op.
+    fn stop(self) {
+        self.handle.close();
+        let _ = self.join.join();
+    }
+}
+
+/// Spawns the broker's signal-handling thread (#195, #380). Unlike a single signal-agnostic handler,
+/// it DISTINGUISHES the signals so SIGHUP can mean RELOAD while the stop signals still mean STOP:
+///
+/// - **SIGINT / SIGTERM** (Ctrl-C, `systemctl stop`, `kill <pid>`): flip `shutdown` for a graceful
+///   stop. The serve loop's next accept poll observes the flag, stops accepting, and the broker
+///   flushes every group's committed cursor before exiting 0 — the #195 invariant, unchanged from the
+///   previous `ctrlc` handler (the observable behavior of a stop signal is identical; only the
+///   delivery mechanism moved from an async-signal handler to this thread).
+/// - **SIGHUP** (`kill -HUP`, `systemctl reload`): re-read the `--config` file and apply the
+///   LIVE-reloadable subset (the consumer-safe retention bounds and the disk-full policy) to the
+///   running engine — the conventional daemon reload. With no `--config` it is a logged no-op; it
+///   NEVER stops the broker. See [`reload_running_config`].
+///
+/// `signal-hook` delivers signals to THIS ordinary thread via a self-pipe, so the reload's file IO
+/// and parse run in a normal thread context, not an async-signal handler — none of the
+/// async-signal-safety constraints of a raw handler apply, and no `unsafe` sigaction is hand-rolled.
+/// This is what lets SIGHUP do real work (the `ctrlc` `termination` feature could not tell the
+/// signals apart and bound SIGHUP to the same stop path, the #195/#431 residual this resolves).
+///
+/// # Errors
+/// [`CliError::Internal`] if the signal set cannot be registered.
+#[cfg(unix)]
+fn spawn_signal_thread<F: Filesystem + 'static>(
+    shutdown: &Arc<AtomicBool>,
+    engine: ironbus_server::actor::EngineHandle<F, SystemClock>,
+    config_handle: config_reload::ConfigHandle,
+    reload: ReloadSource<'_>,
+    config: &ServeConfig,
+    data_dir: Option<&Path>,
+) -> Result<SignalThread, CliError> {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+
+    let shutdown = Arc::clone(shutdown);
+    // Own the reload inputs for the 'static thread: the config path, the unknown-key policy, the
+    // running config (the baseline a reload diffs cold/restart-required keys against), and the data
+    // dir. The handle and engine clones are cheap (an `Arc`/`SyncSender` bump).
+    let reload_path = reload.config_path.map(str::to_string);
+    let allow_unknown = reload.allow_unknown_config;
+    let reload_pins = reload.reload_pins;
+    let base_config = config.clone();
+    let data_dir = data_dir.map(Path::to_path_buf);
+
+    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])
+        .map_err(|e| CliError::Internal(format!("cannot install the signal handler: {e}")))?;
+    let handle = signals.handle();
+    let join = std::thread::spawn(move || {
+        // Reload reports go to STDERR, the log stream: stdout is the startup-protocol stream (the
+        // single "listening on" line a supervisor reads then stops reading, so further stdout writes
+        // risk SIGPIPE, per `run_broker`), AND `cmd_serve` holds the STDOUT lock for the whole serve
+        // lifetime, so a stdout write from this thread would deadlock. stderr is lock-free here and is
+        // where the materialized-config line and the config warnings already go.
+        let mut out = std::io::stderr();
+        for signal in signals.forever() {
+            match signal {
+                SIGINT | SIGTERM => {
+                    // The stop path, identical in effect to the old handler: the serve loop polls
+                    // this flag on its next accept cycle and unwinds the accept-stop / cursor-flush /
+                    // exit-0 sequence itself. Stop listening once a stop signal is seen.
+                    shutdown.store(true, Ordering::Release);
+                    break;
+                }
+                SIGHUP => match reload_path.as_deref() {
+                    Some(path) => {
+                        reload_running_config(
+                            &engine,
+                            &config_handle,
+                            path,
+                            allow_unknown,
+                            &base_config,
+                            data_dir.as_deref(),
+                            reload_pins,
+                            &mut out,
+                        );
+                    }
+                    None => {
+                        // No config file to re-read (config is the startup flags/env only). A SIGHUP
+                        // here changes nothing and must NOT stop the broker (the conventional reload
+                        // signal is a no-op when there is nothing to reload).
+                        let _ = writeln!(
+                            out,
+                            "SIGHUP: no --config file is set, so there is nothing to re-read; the \
+                             broker keeps running (use SIGINT or SIGTERM to stop it)"
+                        );
+                    }
+                },
+                _ => {}
+            }
+        }
+    });
+    Ok(SignalThread { handle, join })
+}
+
+/// Resolves ONE live-reloadable `u64` key on a SIGHUP reload, honoring `flag > env > FILE` (#380): a
+/// key a startup flag/env PINNED keeps `current_value` (the file may not override it), and a file
+/// value that differs from a pinned key is reported (the edit did not take); an UNPINNED key takes
+/// the re-read file value if the file sets it, else `current_value`. The config-file layer
+/// canonicalizes a byte-size/duration to a plain integer, so `parse::<u64>` is exact.
+#[cfg(unix)]
+fn reload_value_u64(
+    layer: &config_file::FileLayer,
+    pinned: bool,
+    env_name: &str,
+    label: &str,
+    current_value: u64,
+    out: &mut impl Write,
+) -> u64 {
+    let Some(file_value) = layer
+        .lookup_env_name(env_name)
+        .and_then(|v| v.parse::<u64>().ok())
+    else {
+        return current_value; // the file does not set the key; keep the running value
+    };
+    if pinned {
+        if file_value != current_value {
+            let _ = writeln!(
+                out,
+                "WARN: config reload: `{label}` is pinned by a startup flag or env var (running \
+                 value `{current_value}`); the config file's `{file_value}` is NOT applied on a \
+                 reload (the flag > env > file precedence holds)"
+            );
+        }
+        current_value
+    } else {
+        file_value
+    }
+}
+
+/// Re-reads the `--config` file on a SIGHUP and applies the LIVE-reloadable subset to the running
+/// engine (#380, #382): the consumer-safe retention bounds (size/age/count) and the disk-full policy,
+/// the only knobs read OFF the per-message hot path and therefore safe to change on a running broker.
+///
+/// It first runs the freshly re-read candidate through the immutable-config handle, which validates
+/// the whole config and rejects a COLD-key change (segment size, data dir) ATOMICALLY: on a rejection
+/// nothing is applied and the running config is kept exactly. On success it pushes the live subset
+/// into the engine via the actor ([`EngineHandle::with`], run between batches, so no lock and no
+/// hot-path cost), reports what it changed live, surfaces any coupled-set warnings, and warns about
+/// each RESTART-REQUIRED key the file changed (durability, flush, the per-consumer credits,
+/// max-in-flight, max-connections, max-deliver, the total cap) which the running broker does NOT pick
+/// up until a restart. Output goes to STDERR (the log stream), where the materialized-config line and
+/// the config warnings already land — never the stdout startup-protocol stream.
+///
+/// The live-reloadable values honor the `flag > env > FILE` precedence at reload too (`pins`): a key
+/// a startup flag or env var PINNED keeps its running value (the file may not lower a flag/env-set
+/// retention bound out from under the operator), while an UNPINNED key takes the re-read file value
+/// if the file sets it, else keeps the running value. A pinned key the file tries to change is
+/// reported (the edit did not take). Auth-free: it re-reads a LOCAL file and mutates only in-process
+/// state, never an unauthenticated remote request (the mutating wire CONFIG verbs are the #106 auth
+/// residual).
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+// each input (the engine handle, the config handle, the
+// --config path, the unknown-key policy, the running config,
+// the data dir, the flag/env pins, the output sink) is a
+// distinct reload input; a bundling struct would only move it.
+#[allow(clippy::too_many_lines)] // the reload is ONE linear sequence (re-read, resolve the live
+                                 // subset under the flag>env>file pin precedence, validate +
+                                 // cold-reject via the handle, push to the engine, report); splitting
+                                 // it would scatter a single concern across helpers.
+fn reload_running_config<F: Filesystem + 'static>(
+    engine: &ironbus_server::actor::EngineHandle<F, SystemClock>,
+    handle: &config_reload::ConfigHandle,
+    path: &str,
+    allow_unknown: bool,
+    current: &ServeConfig,
+    data_dir: Option<&Path>,
+    pins: ReloadPins,
+    out: &mut impl Write,
+) {
+    let layer = match config_file::load_config_file(path, allow_unknown, &fs_config_reader) {
+        Ok(layer) => layer,
+        Err(e) => {
+            // A broken/unreadable re-read keeps the running config; log and return (no swap, no apply).
+            let _ = writeln!(out, "WARN: config reload rejected (re-read failed): {e}");
+            return;
+        }
+    };
+    // The candidate's COLD segment value, for the handle's cold-key-change check: the re-read FILE
+    // value where the file sets it (the config-file layer canonicalizes a size/duration to a plain
+    // integer, so `parse::<u64>` is exact), else the running value. Segment is COLD (a change is
+    // rejected by the handle), not part of the live subset, so it needs no pin handling.
+    let file_u64 = |env: &str, current_value: u64| -> u64 {
+        layer
+            .lookup_env_name(env)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(current_value)
+    };
+    // The LIVE-reloadable retention bounds, honoring `flag > env > FILE`: a pinned key keeps its
+    // running value (the file may not override it), an unpinned key takes the re-read file value.
+    let new_max_retained = reload_value_u64(
+        &layer,
+        pins.max_retained_bytes,
+        "IRONBUS_MAX_RETAINED_BYTES",
+        "retention.max_retained_bytes",
+        current.max_retained_bytes,
+        out,
+    );
+    let new_max_age_ms = reload_value_u64(
+        &layer,
+        pins.max_age_ms,
+        "IRONBUS_MAX_AGE_MS",
+        "retention.max_age_ms",
+        current.max_age_ms,
+        out,
+    );
+    let new_max_messages = reload_value_u64(
+        &layer,
+        pins.max_messages,
+        "IRONBUS_MAX_MESSAGES",
+        "retention.max_messages",
+        current.max_messages,
+        out,
+    );
+    let new_policy = if let Some(s) = layer.lookup_env_name("IRONBUS_DISK_FULL_POLICY") {
+        if let Some(p) = DiskFullPolicyArg::parse(&s) {
+            if pins.disk_full_policy {
+                // Pinned by a startup flag/env: the file may not flip it on a reload.
+                if p.as_str() != current.disk_full_policy.as_str() {
+                    let _ = writeln!(
+                        out,
+                        "WARN: config reload: `backpressure.disk_full_policy` is pinned by a startup \
+                         flag or env var (`{}`); the config file's `{}` is NOT applied on a reload \
+                         (the flag > env > file precedence holds)",
+                        current.disk_full_policy.as_str(),
+                        p.as_str()
+                    );
+                }
+                current.disk_full_policy
+            } else {
+                p
+            }
+        } else {
+            let _ = writeln!(
+                out,
+                "WARN: config reload: ignoring invalid backpressure.disk_full_policy `{s}` \
+                 (expected `drop-new` or `drop-oldest`); keeping the running policy"
+            );
+            current.disk_full_policy
+        }
+    } else {
+        current.disk_full_policy
+    };
+
+    // Validate the WHOLE candidate and reject a cold-key change atomically via the immutable handle.
+    // The candidate's reloadable fields take the re-read file values (so the coupled-set validator
+    // checks the NEW config), its segment is the file-or-current segment (so a changed cold segment is
+    // caught), and its data dir is the fixed runtime value.
+    let candidate_segment = file_u64("IRONBUS_MAX_SEGMENT_BYTES", current.max_segment_bytes);
+    let mut candidate = build_effective_config(current, data_dir, layer.retention_requested());
+    candidate.resolved.segment_bytes = candidate_segment;
+    candidate.resolved.max_retained_bytes = new_max_retained;
+    candidate.resolved.max_age_ms = new_max_age_ms;
+    candidate.resolved.max_messages = new_max_messages;
+    candidate.resolved.disk_full_policy_drop_oldest =
+        matches!(new_policy, DiskFullPolicyArg::DropOldest);
+    candidate.cold_keys = vec![
+        ("storage.segment_size", candidate_segment.to_string()),
+        ("storage.data_dir", data_dir_cold_value(data_dir)),
+    ];
+    let warnings = match handle.reload_from(candidate) {
+        config_reload::ReloadOutcome::Rejected { reasons } => {
+            for r in reasons {
+                let _ = writeln!(out, "WARN: config reload rejected (config unchanged): {r}");
+            }
+            return;
+        }
+        config_reload::ReloadOutcome::Applied { warnings } => warnings,
+    };
+
+    // Push the live subset into the running engine. `with` runs the closure on the actor thread
+    // between batches, so it serializes with produces/acks under the engine's single owner — no lock,
+    // no per-message cost. The new retention bounds take effect on the next reap (the apply runs an
+    // immediate reap, still floored at the consumer protect offset); the policy on the next over-cap.
+    let retention = ironbus_storage::log::RetentionBounds {
+        max_bytes: new_max_retained,
+        max_age_ms: new_max_age_ms,
+        max_messages: new_max_messages,
+    };
+    let policy = match new_policy {
+        DiskFullPolicyArg::DropOldest => DiskFullPolicy::DropOldest,
+        DiskFullPolicyArg::DropNew => DiskFullPolicy::DropNew,
+    };
+    match engine.with(move |e| e.apply_reloadable_config(retention, policy)) {
+        Ok(Ok(())) => {
+            let _ = writeln!(
+                out,
+                "config reload applied (re-read {path}): live retention/disk-full updated \
+                 (max_retained_bytes={new_max_retained}, max_age_ms={new_max_age_ms}, \
+                 max_messages={new_max_messages}, disk_full_policy={})",
+                new_policy.as_str()
+            );
+        }
+        Ok(Err(e)) => {
+            // The new bounds and policy are installed; only the EAGER reclamation hit a storage
+            // error (it retries on the next produce). Honest: the config DID change.
+            let _ = writeln!(
+                out,
+                "config reload applied (re-read {path}): new bounds installed, but the immediate \
+                 retention reap hit a storage error (it retries on the next produce): {e}"
+            );
+        }
+        Err(_) => {
+            // The actor has exited (the broker is shutting down); the reload is moot.
+            let _ = writeln!(
+                out,
+                "WARN: config reload: the engine has stopped (the broker is shutting down); reload \
+                 skipped"
+            );
+        }
+    }
+    for w in warnings {
+        let _ = writeln!(out, "WARN: config reload: {w}");
+    }
+    warn_restart_required_changes(&layer, current, out);
+}
+
+/// Warns for each RESTART-REQUIRED key the re-read config file sets to a value DIFFERENT from the
+/// running one (#380): these knobs are contract- or layout-bound — a per-consumer credit is
+/// negotiated once at connect, `max_in_flight` bounds existing leases, durability/flush change the
+/// commit/fsync path, and the total cap and segment size are storage layout — so a live reload does
+/// NOT apply them; the change takes effect only on a restart. Stating exactly which key changed (and
+/// that it is not live) keeps the reload HONEST: an operator who edits one of these and `kill -HUP`s
+/// sees that it did not take effect, rather than silently believing it did. The comparison is against
+/// the file's NORMALIZED value (the layer canonicalizes a size/duration to a plain decimal integer),
+/// so it matches the running value's `to_string` form exactly.
+#[cfg(unix)]
+fn warn_restart_required_changes(
+    layer: &config_file::FileLayer,
+    current: &ServeConfig,
+    out: &mut impl Write,
+) {
+    let checks = [
+        (
+            "durability.level",
+            "IRONBUS_DURABILITY_LEVEL",
+            current.durability_level.as_str().to_string(),
+        ),
+        (
+            "durability.flush_interval_ms",
+            "IRONBUS_FLUSH_INTERVAL_MS",
+            current.flush_interval_ms.to_string(),
+        ),
+        (
+            "durability.flush_max_bytes",
+            "IRONBUS_FLUSH_MAX_BYTES",
+            current.flush_max_bytes.to_string(),
+        ),
+        (
+            "storage.max_total_bytes",
+            "IRONBUS_MAX_TOTAL_BYTES",
+            current.max_total_bytes.to_string(),
+        ),
+        (
+            "backpressure.max_connections",
+            "IRONBUS_MAX_CONNECTIONS",
+            current.max_connections.to_string(),
+        ),
+        (
+            "backpressure.consumer_credit",
+            "IRONBUS_CONSUMER_CREDIT",
+            current.consumer_credit.to_string(),
+        ),
+        (
+            "backpressure.consumer_credit_bytes",
+            "IRONBUS_CONSUMER_CREDIT_BYTES",
+            current.consumer_credit_bytes.to_string(),
+        ),
+        (
+            "backpressure.max_in_flight",
+            "IRONBUS_MAX_IN_FLIGHT",
+            current.max_in_flight.to_string(),
+        ),
+        (
+            "delivery.max_deliver",
+            "IRONBUS_MAX_DELIVER",
+            current.max_deliver.to_string(),
+        ),
+    ];
+    for (label, env, current_value) in checks {
+        if let Some(file_value) = layer.lookup_env_name(env) {
+            if file_value.trim() != current_value {
+                let _ = writeln!(
+                    out,
+                    "WARN: config reload: `{label}` changed to `{file_value}` in the file, but it is \
+                     a RESTART-REQUIRED key; the running broker keeps `{current_value}` until restart"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -3942,10 +4393,18 @@ fn cmd_serve(
         // stub must consume the param too or the Windows `-D warnings` build trips unused-variable,
         // invisible to a macOS reviewer (the recurring #288/#99 footgun).
         config_warnings,
-        // The reload source (#382, the `--config` path + unknown-key policy) is read only on the
-        // Unix serve path's re-read reload, so consume it here too for the same #288 reason.
+        // The reload source (#382, #380: the `--config` path + unknown-key policy + the live-reload
+        // flag/env pins) is read only on the Unix serve path's re-read reload, so consume every field
+        // here too or the Windows `-D warnings` build trips dead-code, invisible to a macOS reviewer
+        // (the recurring #288/#99 footgun).
         reload.config_path,
         reload.allow_unknown_config,
+        // Each ReloadPins field is read only by the Unix reload path, so read EVERY one here (not just
+        // `reload.reload_pins`, which would leave the inner fields dead on Windows -D warnings).
+        reload.reload_pins.max_retained_bytes,
+        reload.reload_pins.max_age_ms,
+        reload.reload_pins.max_messages,
+        reload.reload_pins.disk_full_policy,
         health_addr,
         out,
     );
@@ -9212,6 +9671,7 @@ mod tests {
             ReloadSource {
                 config_path: parsed.config_path.as_deref(),
                 allow_unknown_config: parsed.allow_unknown_config,
+                reload_pins: parsed.reload_pins,
             },
             &mut buf,
         )
@@ -10909,5 +11369,74 @@ mod tests {
         handle2.join().unwrap();
         drop(recover_engine(actor2));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #380: a SIGHUP reload honors `flag > env > FILE`. A live-reloadable key PINNED by a startup
+    /// flag/env keeps its running value (the re-read file may NOT lower it) and the ignored file
+    /// change is reported; an UNPINNED key takes the file value; a key the file does not set keeps
+    /// the running value either way, with no report.
+    #[cfg(unix)]
+    #[test]
+    fn reload_value_u64_honors_the_flag_env_pin_precedence() {
+        let read = |_: &str| -> Result<String, String> {
+            Ok("[retention]\nmax_messages = 1000\n".to_string())
+        };
+        let layer = config_file::load_config_file("/x.toml", false, &read).expect("parse config");
+
+        // UNPINNED: the re-read file value (1000) is taken, overriding the running 5000.
+        let mut out = Vec::new();
+        let v = reload_value_u64(
+            &layer,
+            false,
+            "IRONBUS_MAX_MESSAGES",
+            "retention.max_messages",
+            5000,
+            &mut out,
+        );
+        assert_eq!(v, 1000, "an unpinned key takes the re-read file value");
+        assert!(
+            out.is_empty(),
+            "no warning for an unpinned key: {}",
+            String::from_utf8_lossy(&out)
+        );
+
+        // PINNED: the running 5000 is KEPT (the file's 1000 is NOT applied), and it is reported.
+        let mut out = Vec::new();
+        let v = reload_value_u64(
+            &layer,
+            true,
+            "IRONBUS_MAX_MESSAGES",
+            "retention.max_messages",
+            5000,
+            &mut out,
+        );
+        assert_eq!(
+            v, 5000,
+            "a flag/env-pinned key keeps its running value on a reload"
+        );
+        let report = String::from_utf8_lossy(&out);
+        assert!(
+            report.contains("pinned") && report.contains("retention.max_messages"),
+            "the ignored file change on a pinned key is reported: {report}"
+        );
+
+        // A key the file does NOT set keeps the running value, pinned or not, with no report.
+        for pinned in [false, true] {
+            let mut out = Vec::new();
+            let v = reload_value_u64(
+                &layer,
+                pinned,
+                "IRONBUS_MAX_AGE_MS",
+                "retention.max_age_ms",
+                42,
+                &mut out,
+            );
+            assert_eq!(v, 42, "a key absent from the file keeps the running value");
+            assert!(
+                out.is_empty(),
+                "no report when the file does not set the key (pinned={pinned}): {}",
+                String::from_utf8_lossy(&out)
+            );
+        }
     }
 }

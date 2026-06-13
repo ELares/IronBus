@@ -2081,6 +2081,35 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.compaction
     }
 
+    /// Applies the LIVE-reloadable engine configuration (#380): the consumer-safe retention bounds
+    /// (size / age / count) and the disk-full overflow policy. These are the ONLY engine knobs a
+    /// runtime reload (a SIGHUP re-read of `--config`, see `crates/ironbus-cli`) changes on a running
+    /// broker, precisely because they are read only OFF the per-message hot path — the retention
+    /// reaper and the disk-full make-room path — so changing them between commits is sound: the next
+    /// reap uses the new bounds (still floored at the consumer protect offset by `reap_for_retention`,
+    /// so a tightened bound never reaps below a live group's cursor), and the next over-cap produce
+    /// uses the new policy. Every other engine knob (durability, flush, the per-consumer credits,
+    /// max-in-flight, the segment size, the data dir) is contract- or layout-bound and requires a
+    /// restart; the caller diffs those itself and refuses to apply a change here.
+    ///
+    /// Runs an immediate reap so a reload that TIGHTENS retention reclaims space at once rather than
+    /// waiting for the next produce (produce-path reaping is otherwise only triggered by a produce).
+    ///
+    /// # Errors
+    /// [`EngineError`] if the immediate retention reap hits a storage error. The new bounds and
+    /// policy are already installed before the reap runs (a failed reclamation never undoes a durable
+    /// record, mirroring [`Engine::reap_for_retention`]'s own contract), so a reap on the next
+    /// produce simply continues from the new bounds.
+    pub fn apply_reloadable_config(
+        &mut self,
+        retention: RetentionBounds,
+        disk_full_policy: DiskFullPolicy,
+    ) -> Result<(), EngineError> {
+        self.retention = retention;
+        self.disk_full_policy = disk_full_policy;
+        self.reap_for_retention()
+    }
+
     /// Seeds the metric registry from the recovered durable state (#97), so the per-consumer lag
     /// series is correct from the FIRST scrape after a restart, not zeroed. The durable head is the
     /// flushed offset (a record count), and each recovered group's commit floor is its committed

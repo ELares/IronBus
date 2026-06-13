@@ -189,7 +189,7 @@ the defending mechanism and a test cited to the source.
 - **Failure mode:** an operator stops the broker (SIGTERM) and the lagging
   in-memory cursor is lost, so acked messages redeliver to a still-connected
   consumer on restart.
-- **Mitigation:** SIGINT / SIGTERM / SIGHUP flip the serve loop's shutdown flag,
+- **Mitigation:** SIGINT / SIGTERM flip the serve loop's shutdown flag,
   stop accepting connections, flush EVERY work-group's committed cursor
   (`Engine::checkpoint_all_groups`), and exit 0, so a restart after a clean stop
   does not redeliver acked messages (#195). The handler (`ctrlc`) does a single
