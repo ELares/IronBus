@@ -20,8 +20,8 @@
 #      (*-sys bindings, ring, openssl, zstd, lz4-the-C-binding, etc.).
 #
 # An ALLOWLIST exempts crates that are pure-Rust bindings to OS SYSCALLS with no compiled C and no
-# build script that builds C (libc and nix are raw syscall/ABI bindings; they are already documented
-# on the deny.toml allow comment and are off the record path). deny.toml additionally bans the
+# build script that builds C (libc is a raw syscall/ABI binding; it is already documented on the
+# deny.toml allow comment and is off the record path). deny.toml additionally bans the
 # best-known C-FFI crates by name as a belt-and-suspenders layer; this script is the structural
 # forward guard that also catches an unknown `links`/C-builder crate deny.toml has no rule for.
 #
@@ -37,9 +37,17 @@ target="${1:-}"
 
 # Pure-Rust OS-syscall binding crates that are NOT vendored C and are allowed on the shipped graph.
 # Keep this list TIGHT: only crates proven to compile no C and run no C-building build script.
+#
+# `signal-hook` (the #195/#380 signal handler) declares an OPTIONAL `cc` build-dependency behind its
+# non-default `extended-siginfo-raw` feature (a tiny C siginfo shim). IronBus depends on it with
+# default-features OFF and only the `iterator` feature, so that feature is NEVER enabled and the
+# shipped binary compiles ZERO C (the cc dep is dormant in the lock). This heuristic flags the
+# DECLARED optional dep regardless of activation, so signal-hook is allowlisted on exactly that basis;
+# the Cargo.toml pin (no default features, iterator only) is what keeps the claim true. Do NOT enable
+# `extended-siginfo`/`extended-siginfo-raw`.
 allow_crate() {
 	case "$1" in
-	libc | nix) return 0 ;;
+	libc | signal-hook) return 0 ;;
 	*) return 1 ;;
 	esac
 }

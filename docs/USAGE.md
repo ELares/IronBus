@@ -318,7 +318,7 @@ never a loss), and `--checkpoint-interval` is exactly the knob that trades that 
 window against checkpoint write amplification; a lower value (even `1`) persists the
 cursor more eagerly.
 
-Signalling the broker is NOT an abrupt stop: `serve` installs a SIGINT/SIGTERM/SIGHUP
+Signalling the broker to stop is NOT an abrupt stop: `serve` installs a SIGINT/SIGTERM
 handler that does a graceful shutdown. It stops accepting connections, flushes every
 work-group's committed cursor, and exits 0, so a restart after a clean operator stop does
 not redeliver already-acked messages even from a long-lived consumer that was still
@@ -328,14 +328,15 @@ the restart, which is the correct at-least-once behavior. The everyday `pub`/`su
 also resumes cleanly because each short-lived `sub` connection closes and flushes its
 cursor on disconnect.
 
-All three signals mean STOP; none of them means reload. In particular, SIGHUP is NOT a
-config re-read (#431): it performs the same graceful stop as SIGTERM (flushes the cursors,
-exits 0). To change configuration, edit the file (or env vars or flags) and restart the
-broker: the validate-whole-then-swap re-read engine ships, but it runs only as a startup
-self-check, and the runtime trigger is tracked in #380 (refs #88). Mind the supervisor
-interaction: under the packaged systemd unit's `Restart=on-failure`, a clean stop is NOT
-restarted, so a `kill -HUP` sent in the expectation of a reload leaves the broker DOWN
-until it is started again.
+SIGINT and SIGTERM stop gracefully; SIGHUP no longer stops the broker. SIGHUP is now the
+runtime config-reload trigger (#380, refs #88): it re-reads the `--config` file and applies
+the live-reloadable subset (the consumer-safe retention bounds and the disk-full policy) to
+the running broker without dropping connections. A change to a restart-required key is
+reported on stderr but not applied live (it takes effect on the next restart); a cold-key
+change is rejected. With no `--config` set, SIGHUP is a logged no-op. To change a
+restart-required knob, edit the file (or env vars or flags) and restart the broker. Because
+SIGHUP no longer stops the broker, the packaged systemd unit's `Restart=on-failure` footgun
+no longer applies to it: a `kill -HUP` reloads config and leaves the broker UP.
 
 The per-message delivery-attempt count is ALSO durable, so `MaxDeliver` is a hard
 guarantee across an unclean restart, not best-effort. Each group's in-flight

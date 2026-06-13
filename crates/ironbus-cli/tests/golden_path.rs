@@ -1108,7 +1108,7 @@ fn start_broker_large_interval(data_dir: &str) -> (Child, String) {
 }
 
 /// Sends SIGTERM to `pid` via the `kill` binary (std-only; the test crate pulls no signal crate),
-/// modeling an operator's `systemctl stop` / `kill <pid>`. The broker's `ctrlc` handler flips the
+/// modeling an operator's `systemctl stop` / `kill <pid>`. The broker's signal thread flips the
 /// serve loop's shutdown flag, which its non-blocking accept observes within ~50 ms.
 fn send_sigterm(pid: u32) {
     let status = Command::new("kill")
@@ -1231,6 +1231,182 @@ fn graceful_shutdown_on_sigterm_checkpoints_the_cursor_and_does_not_redeliver() 
     drop(client2);
     let _ = broker2.kill();
     let _ = broker2.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Sends SIGHUP to `pid` via the `kill` binary (std-only; the test crate pulls no signal crate),
+/// modeling an operator's `kill -HUP` / `systemctl reload`. The broker's signal thread re-reads the
+/// `--config` file and applies the live-reloadable subset; unlike SIGINT/SIGTERM, SIGHUP NEVER stops
+/// the broker (#380).
+fn send_sighup(pid: u32) {
+    let status = Command::new("kill")
+        .args(["-HUP", &pid.to_string()])
+        .status()
+        .expect("run kill -HUP");
+    assert!(status.success(), "kill -HUP {pid} succeeded");
+}
+
+/// Boots `ironbus serve --config <path>` over `data_dir` on an ephemeral loopback port, capturing
+/// BOTH stdout and stderr into one shared buffer via reader threads, so a test can parse the first
+/// "listening on" line (stdout) AND watch for the SIGHUP reload report (stderr, the log stream where
+/// reload output lands, #380). Returns the raw `Child` (so the caller can signal it and read its exit
+/// status), the bound address, and the shared line buffer.
+fn start_broker_with_config(
+    data_dir: &str,
+    config_path: &str,
+) -> (Child, String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let mut child = Command::new(BIN)
+        .args([
+            "serve",
+            "--data-dir",
+            data_dir,
+            "--config",
+            config_path,
+            "--addr",
+            "127.0.0.1:0",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ironbus serve --config");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    for stream in [
+        Box::new(stdout) as Box<dyn Read + Send>,
+        Box::new(stderr) as Box<dyn Read + Send>,
+    ] {
+        let sink = std::sync::Arc::clone(&lines);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stream).lines() {
+                match line {
+                    Ok(l) => sink.lock().expect("captured lines lock").push(l),
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+    let Some(line) = wait_for_log(&lines, Duration::from_secs(10), |l| {
+        l.contains("listening on ")
+    }) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "ironbus serve did not print a listening line within 10s; captured output: {:?}",
+            lines.lock().expect("captured lines lock")
+        );
+    };
+    let addr = line
+        .split("listening on ")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .map(|s| s.trim().to_string())
+        .expect("parse the listening address");
+    (child, addr, lines)
+}
+
+/// Polls the captured output buffer (merged stdout + stderr) up to `deadline` for the FIRST line
+/// matching `pred`, returning a clone of it (or `None` on timeout). Lets a test wait for the broker's
+/// "listening on" banner (stdout) and the SIGHUP reload-report lines (stderr) without racing the
+/// reader threads.
+fn wait_for_log(
+    lines: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    deadline: Duration,
+    pred: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let start = Instant::now();
+    loop {
+        if let Some(found) = lines
+            .lock()
+            .expect("captured lines lock")
+            .iter()
+            .find(|l| pred(l))
+            .cloned()
+        {
+            return Some(found);
+        }
+        if start.elapsed() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn sighup_reloads_retention_live_reports_restart_required_and_does_not_stop_the_broker() {
+    // #380: SIGHUP is the RUNTIME config-reload trigger, not a stop. Re-reading the `--config` file
+    // applies the live-reloadable subset (the consumer-safe retention bounds and the disk-full
+    // policy) to the running engine and reports any RESTART-REQUIRED key the file changed; the broker
+    // keeps running. SIGINT/SIGTERM remain the graceful stop (#195). Drives the real binary end to
+    // end over the real signal path.
+    let dir = std::env::temp_dir().join(format!("ironbus-sighup-{}", std::process::id()));
+    let data_dir = dir.to_str().expect("utf8 temp path").to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create the data dir");
+    let config_path = dir.join("ironbus.toml");
+    let cfg = config_path.to_str().expect("utf8 config path").to_string();
+
+    // The initial config sets a LIVE retention bound (max_messages) and a RESTART-REQUIRED knob
+    // (max_connections), so the running baseline of each is known and a later edit is a real change.
+    std::fs::write(
+        &config_path,
+        "[retention]\nmax_messages = 1000\n[backpressure]\nmax_connections = 100\n",
+    )
+    .expect("write the initial config");
+
+    let (mut broker, _addr, log) = start_broker_with_config(&data_dir, &cfg);
+
+    // The "listening on" banner prints just BEFORE the signal thread is installed, so give the
+    // startup a brief, generous margin to finish registering signals before the first SIGHUP. The
+    // gap is microseconds of CPU plus one small config re-read; 500 ms is ample headroom even on a
+    // loaded CI runner (and an operator never reloads a broker microseconds after boot).
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Edit the file: bump the LIVE retention bound AND the RESTART-REQUIRED max_connections.
+    std::fs::write(
+        &config_path,
+        "[retention]\nmax_messages = 2000\n[backpressure]\nmax_connections = 200\n",
+    )
+    .expect("rewrite the config");
+
+    // SIGHUP: re-read and apply. This must NOT stop the broker.
+    send_sighup(broker.id());
+
+    // The live retention bound was applied to the running engine and reported on stdout.
+    let applied = wait_for_log(&log, Duration::from_secs(10), |l| {
+        l.contains("config reload applied") && l.contains("max_messages=2000")
+    });
+    assert!(
+        applied.is_some(),
+        "SIGHUP applied the live retention reload; captured output: {:?}",
+        log.lock().expect("lock")
+    );
+
+    // The restart-required max_connections change was reported as NOT applied to the running broker.
+    let restart_warn = wait_for_log(&log, Duration::from_secs(5), |l| {
+        l.contains("RESTART-REQUIRED") && l.contains("max_connections")
+    });
+    assert!(
+        restart_warn.is_some(),
+        "the restart-required max_connections change was reported; captured output: {:?}",
+        log.lock().expect("lock")
+    );
+
+    // The broker is STILL RUNNING after SIGHUP (the core behavior: SIGHUP is a reload, not a stop).
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        broker.try_wait().expect("poll the broker").is_none(),
+        "SIGHUP must NOT stop the broker (it is a config reload, not a stop signal)"
+    );
+
+    // SIGTERM still performs the graceful stop and exits 0 (no #195 regression after a reload).
+    send_sigterm(broker.id());
+    let code = wait_for_exit(&mut broker, Duration::from_secs(10));
+    assert_eq!(
+        code, 0,
+        "SIGTERM still does a graceful stop (exit 0) after a SIGHUP reload"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

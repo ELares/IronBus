@@ -55,9 +55,12 @@ wildcards = "deny"
 # C-FFI BAN (#102). The best-known vendored-C / native crates are name-banned below as a
 # belt-and-suspenders layer; the STRUCTURAL forward guard is `scripts/ci/cffi-ban.sh` (run by the
 # CI `sbom` job over the shipped musl graph), which also catches an UNKNOWN `links` / C-builder
-# crate this name list has no rule for. ALLOWLIST: `libc` and `nix` are pure-Rust bindings to OS
-# SYSCALLS (no compiled C, no C-building build script), are on the license allow-list above, and
-# are off the record path, so they are permitted (they are also exempted in cffi-ban.sh). The ONLY
+# crate this name list has no rule for. ALLOWLIST: `libc` is a pure-Rust binding to OS SYSCALLS (no
+# compiled C, no C-building build script), is on the license allow-list above, and is off the record
+# path, so it is permitted (it is also exempted in cffi-ban.sh). `signal-hook` (#195/#380) is
+# likewise exempted: it declares an OPTIONAL `cc` build-dep behind its non-default
+# `extended-siginfo-raw` feature, which IronBus does NOT enable (it pins default-features off + only
+# `iterator`), so the shipped binary compiles ZERO C and the cc dep stays dormant in the lock. The ONLY
 # vendored-C allowance is the opt-in `zstd-sys` above (feature-gated, off the default graph). Add a
 # crate here (and to that script's allowlist) ONLY if it is proven pure Rust; any further opt-in
 # vendored-C dependency must be added to BOTH the allowlist and a documented #12 C-FFI allowance,
@@ -101,13 +104,16 @@ name = "mimalloc" # vendored mimalloc C.
 # `serde` + `serde_json` (the provenance JSON). All are pure Rust (no vendored C), so the #139
 # pure-Rust policy holds for the harness too.
 #
-# Graceful shutdown (#195) adds `ctrlc` to `ironbus-cli` (the broker binary), the first non-trivial
-# runtime dependency of a shipped crate beyond `crc32c`. It catches SIGINT/SIGTERM/SIGHUP so `serve`
-# can flush the cursor and exit 0 on a clean stop. On Linux/musl (the CI target) it pulls `nix`,
-# `libc`, `bitflags`, `cfg-if`, and `cfg_aliases` transitively; all are permissive (MIT, or MIT OR
-# Apache-2.0) and the license allow-list above already covers them, so no extra allowance is needed.
-# `libc` is the only FFI binding (libc bindings, not vendored C), so the #139 pure-Rust policy for
-# the DEFAULT DATA path is unchanged: this is a signal-handling shim on the CLI, off the record path.
+# Graceful shutdown + config reload (#195, #380) add `signal-hook` to `ironbus-cli` (the broker
+# binary), a non-trivial runtime dependency of a shipped crate beyond `crc32c`. A dedicated signal
+# thread catches SIGINT/SIGTERM (graceful stop: flush every cursor, exit 0) and SIGHUP (a live
+# config re-read, #380), so the signals are told apart (the prior `ctrlc` dep's `termination` feature
+# could not, binding SIGHUP to the stop path). On Linux/musl (the CI target) it pulls
+# `signal-hook-registry` and `libc` transitively; both are permissive (MIT OR Apache-2.0), the
+# license allow-list above already covers them, and both are pure Rust (no vendored C, no C-building
+# build script), so no extra allowance is needed. `libc` is the only FFI binding (libc bindings, not
+# vendored C), so the #139 pure-Rust policy for the DEFAULT DATA path is unchanged: this is a
+# signal-handling shim on the CLI, off the record path.
 #
 # Structured tracing (#16, #99) adds `tracing` + `tracing-subscriber` (the `fmt` + `json` features
 # only, no `env-filter`/`ansi`) to `ironbus-server` for the JSON log layer compiled in by default.

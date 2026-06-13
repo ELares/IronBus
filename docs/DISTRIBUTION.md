@@ -169,11 +169,14 @@ fall-back-after-N logic, not the rate limiter, governs restarts. N is `--max-fai
 
 ### Signals and config changes (the unit)
 
-The broker treats SIGINT, SIGTERM, and SIGHUP identically as a graceful stop: it stops accepting,
-flushes every work-group's committed cursor, and exits 0. SIGHUP is NOT a config reload (#431; the
-runtime reload trigger is tracked in #380, refs #88), and because the unit uses
-`Restart=on-failure`, a clean stop is not restarted: a `kill -HUP` sent in the expectation of a
-reload leaves the broker DOWN until `systemctl start ironbus`. To change configuration, edit
+The broker treats SIGINT and SIGTERM as a graceful stop: it stops accepting,
+flushes every work-group's committed cursor, and exits 0. SIGHUP is the config-reload trigger
+(#380, refs #88), the conventional daemon reload: a `systemctl reload ironbus` (SIGHUP) re-reads
+`--config` and applies the live-reloadable subset (the consumer-safe retention bounds and the
+disk-full policy) to the running broker without dropping connections; a restart-required key
+change is reported on stderr but not applied live, and a cold-key change is rejected. SIGHUP
+never stops the broker, so the `Restart=on-failure` interaction no longer applies to it: a
+`kill -HUP` reloads config and leaves the broker UP. To change a restart-required knob, edit
 `/etc/ironbus/ironbus.env` (or the `--config` TOML file) and run `systemctl restart ironbus`.
 
 ### Memory mode under the unit: `Restart=` revives an EMPTY broker (#443, #444)

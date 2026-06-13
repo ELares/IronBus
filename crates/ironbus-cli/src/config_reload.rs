@@ -9,13 +9,13 @@
 //!
 //! This module implements that engine, AUTH-FREE: the [`ConfigHandle`] holds the immutable
 //! [`EffectiveConfig`] behind a single swap point, and [`ConfigHandle::reload_from`] is the
-//! safe re-read entry point (the reload path #380 names; no signal invokes it yet: SIGHUP is a
-//! graceful stop per #195, the runtime trigger is the #380/#88 residual, see #431, and today
-//! `cmd_serve` drives this at most once as the startup self-check when `--config` is set. The
-//! MUTATING wire `CONFIG SET`
-//! verbs that change runtime state need the connection-scoped AUTH of #106 and are NOT in
-//! scope here, so this module exposes only a READ of the current config and the file re-read
-//! reload, never an unauthenticated remote mutation).
+//! safe re-read entry point (the reload path #380 names). SIGHUP drives it at runtime (the #380
+//! trigger): `cmd_serve`'s signal thread re-reads `--config` on SIGHUP and applies the
+//! live-reloadable subset to the running engine; it also runs once at startup as a validate-whole
+//! self-check when `--config` is set. The MUTATING wire `CONFIG SET` verbs that change runtime
+//! state need the connection-scoped AUTH of #106 and are NOT in scope here, so this module exposes
+//! only a READ of the current config and the file re-read reload, never an unauthenticated remote
+//! mutation.
 //!
 //! The swap is a safe-Rust `RwLock<Arc<EffectiveConfig>>`: a READ takes a read lock and clones
 //! the `Arc` (a single refcount bump, no parse, no allocation of the config itself), so the
@@ -160,9 +160,9 @@ impl ConfigHandle {
     /// Attempts a RELOAD to `candidate`: re-validate the whole config as a unit, reject any COLD-key
     /// change, and swap the immutable snapshot in ONE store ONLY on full success. On ANY failure the
     /// running config is left EXACTLY unchanged ([`ReloadOutcome::Rejected`]). This is the safe,
-    /// auth-free reload (the local re-read path; no signal invokes it yet, SIGHUP is graceful stop,
-    /// see #431): it mutates only the in-process config pointer, on
-    /// a locally-read candidate, never on an unauthenticated remote request.
+    /// auth-free reload (the local re-read path SIGHUP invokes at runtime, #380): it mutates only
+    /// the in-process config pointer, on a locally-read candidate, never on an unauthenticated
+    /// remote request.
     ///
     /// The validation order is: (1) the coupled-set / range checks on the candidate (a broken
     /// candidate is rejected before anything is touched), then (2) the cold-key comparison against

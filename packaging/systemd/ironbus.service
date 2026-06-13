@@ -97,6 +97,15 @@ ExecStartPost=+/bin/sh -c 'sleep "${IRONBUS_STARTUP_GRACE_SEC:-10}"; /usr/bin/ir
 # bumps the counter by exactly one, so N consecutive genuine failures (and only those) fall back.
 ExecStopPost=+/bin/sh -c '[ "${SERVICE_RESULT}" = "success" ] || /usr/bin/ironbus record-start --dest "${IRONBUS_BIN}" --failed'
 
+# RELOAD (#380): `systemctl reload ironbus` sends SIGHUP to the broker, which re-reads its --config
+# file and applies the LIVE-reloadable subset (the consumer-safe retention bounds and the disk-full
+# policy) WITHOUT dropping connections or restarting. A change to a restart-required key (durability,
+# flush, the per-consumer credits, max-in-flight, max-connections, max-deliver, the total cap) is
+# logged on stderr but takes effect only on a restart; a cold-key change (segment size, data dir) is
+# rejected. SIGHUP never stops the broker, so it does not interact with Restart= below. No `+` prefix:
+# the broker signals its own MAINPID, which the sandboxed User=ironbus process may do.
+ExecReload=/bin/kill -HUP $MAINPID
+
 Restart=on-failure
 RestartSec=5
 

@@ -94,13 +94,13 @@ verb's `--data-dir` at a directory that does not exist (for example, because the
 
 Starts the broker: opens (creating if absent) the durable log under `--data-dir`, binds
 the wire protocol on `--addr`, optionally binds the health endpoints on `--health-addr`,
-and runs until signalled. SIGINT, SIGTERM, or SIGHUP triggers a graceful stop: the serve
+and runs until signalled. SIGINT or SIGTERM triggers a graceful stop: the serve
 loop stops accepting, flushes every work-group's committed cursor, and exits 0. SIGHUP is
-NOT a config reload (#431): all three signals stop the broker identically, and a config
-change requires a restart (the re-read engine runs only as a startup self-check; the runtime
-trigger is tracked in #380, refs #88). Under a supervisor that restarts only on failure
-(the packaged unit ships `Restart=on-failure`), a SIGHUP'd broker exits 0 cleanly and STAYS
-DOWN until it is started again.
+the runtime config-reload trigger (#380, refs #88): it re-reads the `--config` file and
+applies the live-reloadable subset (the consumer-safe retention bounds and the disk-full
+policy) to the running broker without dropping connections; a restart-required key change is
+reported on stderr but not applied live, and a cold-key change is rejected. With no `--config`
+set, SIGHUP is a logged no-op. SIGHUP keeps the broker running — it never stops it.
 
 `--data-dir` is REQUIRED under the default `--storage disk`; omitting it is a usage error.
 Under the opt-in `--storage memory` (#443) the rule inverts: `--data-dir` must be ABSENT
@@ -301,9 +301,10 @@ scalar). The compiled-in named PROFILES and the `--profile` selector are impleme
 (#87, see `--profile` above); the TOML config FILE (`--config`), its strict typed-key /
 literal-grammar / coupled-set validation, and the immutable-config atomic re-read RELOAD
 engine are implemented (#382, see `--config` above and `docs/CONFIG.md`). The reload engine
-runs at most once, as a startup self-check when `--config` is set; no runtime trigger is wired yet (SIGHUP is
-graceful stop, not reload, #431; the trigger is tracked in #380, refs #88), so applying a
-config change requires restarting the broker. The other remaining residual is the MUTATING
+runs as a startup self-check when `--config` is set, and SIGHUP is now the runtime trigger
+(#380, refs #88): it re-reads `--config` and applies the live-reloadable subset (the retention
+bounds + the disk-full policy) to the running broker, with restart-required keys reported but
+not applied live, so applying those requires restarting the broker. The other remaining residual is the MUTATING
 wire `CONFIG SET`/`SAVE` admin verbs, which need the #106 connection-scoped auth (there is
 no unauthenticated remote config mutation).
 

@@ -14,9 +14,10 @@ environment variables, and a `--config <path>` TOML FILE, on the precedence
 specified in [CLI.md](CLI.md)). The TOML config FILE, the named PROFILES, the
 strict typed-key + literal-grammar + coupled-set validation, and the
 immutable-config atomic re-read RELOAD engine are all now IMPLEMENTED (#87,
-#382); the reload engine runs as a validate-whole-then-swap startup self-check,
-with no runtime trigger wired yet (SIGHUP is graceful stop, not reload; the
-trigger is tracked in #431). The other remaining residual is the MUTATING wire
+#382); the reload engine runs as a validate-whole-then-swap startup self-check
+AND on a runtime trigger: SIGHUP re-reads the `--config` file and applies the
+live-reloadable subset (the retention bounds + the disk-full policy) to the
+running broker, restart-required keys reported but not applied live (#380). The other remaining residual is the MUTATING wire
 `CONFIG SET`/`SAVE` admin verbs, which need the #106 connection-scoped auth
 (there is no unauthenticated remote config mutation surface). Each layer is tagged with the issue that owns it, and the
 boundary between what ships and what is still specified is drawn explicitly
@@ -67,7 +68,7 @@ Read this first, because it frames every table below.
 | `data_dir` create-if-absent + probe-write + fatal-if-unwritable, single-broker lock | SHIPPED (#89) | [CLI.md](CLI.md) |
 | The TOML config FILE and its parser (`serve --config <path>`) | SHIPPED (#382) | [#85](https://github.com/ELares/IronBus/issues/85), `config_file.rs` |
 | The named PROFILES (`edge-tiny` / `balanced` / `throughput`), the `--profile` flag, and the materialized-config log | SHIPPED (#87) | [#87](https://github.com/ELares/IronBus/issues/87), `main.rs` |
-| The immutable `Arc<EffectiveConfig>` + the atomic validate-whole-then-swap re-read RELOAD engine | SHIPPED (#382) as a startup self-check; NO runtime trigger wired yet (SIGHUP is graceful stop, [#431](https://github.com/ELares/IronBus/issues/431)) | [#88](https://github.com/ELares/IronBus/issues/88), `config_reload.rs` |
+| The immutable `Arc<EffectiveConfig>` + the atomic validate-whole-then-swap re-read RELOAD engine | SHIPPED ([#382](https://github.com/ELares/IronBus/issues/382)/[#380](https://github.com/ELares/IronBus/issues/380)): startup self-check + SIGHUP runtime re-read applying the live subset (retention + disk-full); mutating wire verbs await #106 | [#88](https://github.com/ELares/IronBus/issues/88), `config_reload.rs` |
 | The MUTATING wire admin `CONFIG SET`/`SAVE` verbs (need auth) | **SPECIFIED here, NOT implemented** | [#380](https://github.com/ELares/IronBus/issues/380) (needs auth) |
 | Secret redaction in config dumps | **SPECIFIED, NOT implemented** (env mapping IS shipped) | [#89](https://github.com/ELares/IronBus/issues/89) |
 | The typed key table, the literal grammar parser, and coupled-set validation | SHIPPED (#382) | [#86](https://github.com/ELares/IronBus/issues/86), `ironbus-core::config` |
@@ -76,8 +77,10 @@ The honest one-line summary: the same knob surface is reachable via flags, env
 vars, AND a `--config` TOML FILE on the SHIPPED `flag > env > FILE > default`
 precedence; the strict typed-key validation, the shared literal grammar, the
 coupled-set validators, and the immutable-config + atomic re-read RELOAD engine are
-wired (#382), the reload engine running as a startup self-check only (no runtime
-trigger yet; SIGHUP is graceful stop, #431). The remaining residual is the MUTATING
+wired (#382), the reload engine running as a startup self-check AND on a runtime
+trigger (SIGHUP re-reads `--config` and applies the live subset — the retention bounds
++ the disk-full policy — restart-required keys reported but not applied live, #380).
+The remaining residual is the MUTATING
 wire `CONFIG SET`/`SAVE` admin verbs, which need the #106 connection-scoped auth
 (no unauthenticated remote config mutation). [CONTRACTS.md](CONTRACTS.md) records the same boundary from the
 byte-model side (the TOML config FILE is IMPLEMENTED, #382, and the mutating
@@ -195,10 +198,11 @@ Reload-class legend (the live-reload semantics owned by
 The reload engine ships (#382): the immutable `Arc<EffectiveConfig>` and the atomic
 re-read RELOAD enforce the COLD/HOT distinction in the class column below (a COLD-key
 change across a reload is rejected atomically, leaving the running config unchanged).
-The engine currently runs only as a validate-whole-then-swap startup self-check: no
-runtime trigger is wired yet (SIGHUP is graceful stop, not reload; the trigger is
-tracked in [#431](https://github.com/ELares/IronBus/issues/431)). Also still deferred
-are the MUTATING wire `CONFIG SET`/`SAVE` admin verbs, which need the #106 auth.
+The engine runs as a validate-whole-then-swap startup self-check AND on a runtime
+trigger: SIGHUP re-reads `--config` and applies the live-reloadable subset (the
+retention bounds + the disk-full policy) to the running broker, with restart-required
+keys reported but not applied live ([#380](https://github.com/ELares/IronBus/issues/380)).
+Also still deferred are the MUTATING wire `CONFIG SET`/`SAVE` admin verbs, which need the #106 auth.
 
 ### Storage (`[storage]`)
 
@@ -767,8 +771,9 @@ The implementation status and the issues that own each layer:
   pointer load), the cold/hot key classification, and the atomic re-read RELOAD
   (validate the whole config, reject a cold-key change atomically, swap only on
   success) ship in `config_reload.rs`; the engine runs as a startup self-check
-  only, with no runtime trigger wired yet (SIGHUP is graceful stop, not reload;
-  [#431](https://github.com/ELares/IronBus/issues/431)). The read-only
+  AND on a runtime trigger: SIGHUP re-reads `--config` and applies the live-reloadable
+  subset (the retention bounds + the disk-full policy) to the running broker, restart-required
+  keys reported but not applied live ([#380](https://github.com/ELares/IronBus/issues/380)). The read-only
   `/admin` introspection endpoint (`--enable-admin`) ships. The MUTATING
   `CONFIG SET/SAVE` verbs change runtime state and need the
   [#106](https://github.com/ELares/IronBus/issues/106) connection-scoped auth, so
