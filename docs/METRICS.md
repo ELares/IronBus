@@ -590,7 +590,7 @@ compiled in **only** with `otlp`.
 
 - **Transport: plaintext gRPC (tonic, no TLS).** This is the deliberate
   C-FFI-minimizing choice. OTLP to a co-located collector is plaintext
-  `http://host:4317`, so no TLS stack is linked: the otlp build pulls
+  `http://127.0.0.1:4317`, so no TLS stack is linked: the otlp build pulls
   **no** `rustls` / `ring` / `aws-lc` / `native-tls` / `openssl`, keeping even
   the feature build pure Rust (so the deny.toml `[bans]` C-FFI denylist, which
   `cargo deny check` evaluates over all features, stays green). The default graph
