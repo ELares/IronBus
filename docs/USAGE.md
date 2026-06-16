@@ -495,6 +495,10 @@ resilience event is ever silent. The full per-counter catalog, the
 shed-vs-drop-vs-skip-vs-dead-letter taxonomy, and the frozen-taxonomy contract
 are in [METRICS.md](METRICS.md).
 
+For a ready-made **Grafana dashboard**, **Prometheus alert rules**, a scrape config,
+and a row-by-row guide to what to watch (and what should stay flat zero), see
+[MONITORING.md](MONITORING.md) and [`packaging/grafana/`](../packaging/grafana/).
+
 ## A complete example
 
 ```sh
