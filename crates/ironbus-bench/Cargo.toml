@@ -22,6 +22,12 @@ path = "src/main.rs"
 name = "ironbus-regression-gate"
 path = "src/bin/regression_gate.rs"
 
+# Assembles the competitor benchmark corpus (#19/#114): ingests the corpus_bench.py
+# rows and builds a durability-lint-validated ComparisonReport + markdown. On demand.
+[[bin]]
+name = "assemble-corpus"
+path = "src/bin/assemble_corpus.rs"
+
 [dependencies]
 # The harness drives the broker through the REAL #11 client over a real socket, never a privileged
 # test path; it launches the shipping `ironbus` binary built by `ironbus-cli`.

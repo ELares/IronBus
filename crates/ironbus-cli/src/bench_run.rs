@@ -510,17 +510,43 @@ fn run_subscribe(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError>
     };
     let started = Instant::now();
     let mut producer = connect(addr)?;
-    let mut payload = vec![0u8; cfg.payload_bytes];
-    let mut fsync_samples: Vec<u64> = Vec::new();
-    for seq in 0..preload {
-        fill_payload(&mut payload, cfg.payload_shape, seq, ROUND_TRIP_TOKEN_LEN);
-        stamp_seq(&mut payload, seq);
-        fsync_samples.push(produce_one(&mut producer, addr, &mut payload, started)?);
+    // Pre-load via a PIPELINED produce window (group-committed), not a serial per-message produce:
+    // SUBSCRIBE measures the DRAIN rate, so the preload's write speed is irrelevant to the metric,
+    // and a serial fdatasync-per-message preload is otherwise fsync-bound (~SD speed), making a
+    // large preload take minutes for no measurement value. Each message still carries its `seq`
+    // stamp. Chunked so the in-flight window stays bounded.
+    let mut seq: u64 = 0;
+    while seq < preload {
+        let n = (preload - seq).min(PRELOAD_CHUNK);
+        let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let mut b = vec![0u8; cfg.payload_bytes];
+            fill_payload(&mut b, cfg.payload_shape, seq + i, ROUND_TRIP_TOKEN_LEN);
+            stamp_seq(&mut b, seq + i);
+            bufs.push(b);
+        }
+        let bodies: Vec<PubBody<'_>> = bufs
+            .iter()
+            .map(|b| PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b,
+            })
+            .collect();
+        producer
+            .produce_window(&bodies)
+            .map_err(|e| classify(addr, "preloading the subscribe queue on", &e))?;
+        seq += n;
     }
     drop(producer);
 
     // The measured drain phase: time it from here so the throughput reflects fetch/ack, not the
-    // preload. Latency is still measured against `started` (the real produce instant).
+    // preload. The preload fsync cost is not the SUBSCRIBE metric (drain throughput is), so the
+    // fsync histogram is empty for this mode.
     let drain_start = Instant::now();
     let (recorded, latencies) = drain(cfg, addr, preload, started)?;
     Ok(finish_report(
@@ -528,9 +554,9 @@ fn run_subscribe(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError>
         preload,
         recorded,
         &latencies,
-        &fsync_samples,
+        &[],
         drain_start.elapsed(),
-        cfg.fsync_is_measured(),
+        false,
     ))
 }
 
@@ -619,6 +645,33 @@ fn run_round_trip(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError
     ))
 }
 
+/// Consecutive empty fetches that mean a count-bound drain is truly drained even below `expected`.
+/// ~20ms at the 200us poll yield: long enough that the (already-finished) producer's records have
+/// all arrived, short enough not to stall a normal full drain.
+const DRAINED_GRACE_POLLS: u32 = 100;
+
+/// Whether [`drain`] should stop. Pure so the termination logic is unit-tested without a broker.
+///
+/// Count bound: stop once the queue is drained (`empty_streak > 0`, the last fetch was empty) AND
+/// either every expected record arrived (the normal full drain) OR the queue has stayed empty for
+/// [`DRAINED_GRACE_POLLS`] (the rest were SHED under the broker's byte cap and will never arrive --
+/// the producer already finished, so a sustained-empty queue cannot refill). Without the grace, a
+/// shed/lossy preload hangs the drain forever waiting for `recorded >= expected`.
+fn drain_should_stop(
+    bound: Bound,
+    recorded: u64,
+    expected: u64,
+    empty_streak: u32,
+    drain_started: Instant,
+) -> bool {
+    match bound {
+        Bound::Count(_) => {
+            empty_streak > 0 && (recorded >= expected || empty_streak >= DRAINED_GRACE_POLLS)
+        }
+        Bound::Duration(d) => drain_started.elapsed() >= d,
+    }
+}
+
 /// Drains all `expected` messages from the broker through the synthetic group, recording per-message
 /// read-back latency (against the producer's `produce_started`), until the queue is empty after the
 /// expected count is reached (count bound) or the drain duration elapses (duration bound).
@@ -632,6 +685,7 @@ fn drain(
     subscribe_group(&mut consumer, addr, &cfg.group)?;
     let mut latencies: Vec<u64> = Vec::new();
     let mut recorded: u64 = 0;
+    let mut empty_streak: u32 = 0;
     let drain_started = Instant::now();
     loop {
         let fetched = fetch_batch(&mut consumer, addr, cfg.fetch_batch)?;
@@ -643,23 +697,35 @@ fn drain(
                     .unwrap_or(u64::MAX);
                 latencies.push(latency_ns);
             }
+            // Per-message ack: the synthetic group is a COMPETING work-queue, where each lease is
+            // acked individually (cumulative ack is a broadcast-only primitive). This is the real
+            // work-queue consume path; its drain throughput is therefore ack-RPC-bound, which the
+            // corpus notes when comparing to peers whose clients batch their acks.
             ack_one(&mut consumer, addr, m.offset, m.generation)?;
             recorded += 1;
         }
-        let stop = match cfg.bound {
-            Bound::Count(_) => recorded >= expected && fetched.messages.is_empty(),
-            Bound::Duration(d) => drain_started.elapsed() >= d,
+        empty_streak = if fetched.messages.is_empty() {
+            empty_streak.saturating_add(1)
+        } else {
+            0
         };
-        if stop {
+        if drain_should_stop(cfg.bound, recorded, expected, empty_streak, drain_started) {
             break;
         }
         if fetched.messages.is_empty() {
-            // Caught up but not done (duration bound, or waiting on the count): a tiny yield.
+            // Caught up but not done: a tiny yield before the next poll.
             std::thread::sleep(Duration::from_micros(200));
-            if matches!(cfg.bound, Bound::Count(_)) && recorded >= expected {
-                break;
-            }
         }
+    }
+    if recorded < expected {
+        // The producer finished BEFORE the drain started, so a drained queue with fewer than
+        // `expected` records means the broker shed the rest under its byte cap (memory mode, or a
+        // disk drop policy) -- report it rather than hang waiting for records that will never come.
+        eprintln!(
+            "note: drained {recorded} of {expected} preloaded records; the broker shed \
+             {} under its cap (the consume rate is over the {recorded} that survived)",
+            expected - recorded
+        );
     }
     Ok((recorded, latencies))
 }
@@ -819,6 +885,9 @@ fn is_shed(err: &ClientError) -> bool {
 
 /// The number of messages a SUBSCRIBE run with a DURATION bound pre-loads before draining.
 const SUBSCRIBE_DURATION_PRELOAD: u64 = 10_000;
+/// Chunk size for the pipelined SUBSCRIBE preload (#19): a bounded in-flight window so a large
+/// preload group-commits in batches rather than one unbounded window.
+const PRELOAD_CHUNK: u64 = 1000;
 
 /// Writes the send-time (nanos since `started`, little-endian) into the token's time slot
 /// (bytes [0,8)). Called by `produce_one` at the real produce instant, so the recorded latency is
@@ -832,6 +901,27 @@ fn stamp_send_time(payload: &mut [u8], started: Instant) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn drain_stops_on_full_count_and_on_shed_but_not_before_caught_up() {
+        let t = Instant::now();
+        // Full drain: every expected record arrived and the queue is empty -> stop.
+        assert!(drain_should_stop(Bound::Count(500), 500, 500, 1, t));
+        // Still receiving (last fetch non-empty -> streak 0): keep going.
+        assert!(!drain_should_stop(Bound::Count(500), 200, 500, 0, t));
+        // Caught up but short of expected after only a brief empty: could be transient, keep waiting.
+        assert!(!drain_should_stop(Bound::Count(500), 200, 500, 1, t));
+        // Sustained-empty below expected (records were shed): stop instead of hanging forever.
+        assert!(drain_should_stop(
+            Bound::Count(500),
+            200,
+            500,
+            DRAINED_GRACE_POLLS,
+            t
+        ));
+    }
+
     use super::DataDirGuard;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
