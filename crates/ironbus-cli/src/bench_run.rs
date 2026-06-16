@@ -408,9 +408,66 @@ fn run_publish_stream(
     ))
 }
 
+/// The AT-MOST-ONCE publish leg (QoS-0, the #11 fast path), split from [`run_publish`]: drive
+/// [`Client::produce_fire_and_forget`] as fast as the bound/rate allow. No `PubAck` is awaited (the
+/// broker may even drop a send under its fire-and-forget token bucket by contract), so there is no
+/// durable-write cost to attribute and no read-back latency: the report's fsync cost is forced
+/// not-measured and the latency fields stay `None`, exactly like the memory backend. This is the
+/// matched analog to a core fire-and-forget pub on a routing broker (e.g. NATS core `nats bench
+/// pub`), which likewise writes without awaiting an ack.
+fn run_publish_faf(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError> {
+    let mut pub_client = connect(addr)?;
+    // ONE realistic-shaped payload, filled once and reused for every send. The realistic fill is
+    // independent of sequence (only the round-trip token region would vary by seq, and a
+    // fire-and-forget send is never read back, so that region is dead bytes here), so a single
+    // buffer is byte-equivalent to re-filling per message AND matches how a core-pub benchmark
+    // drives its broker (a fixed payload). Filling once keeps the loop measuring the PURE
+    // at-most-once send rate, not a per-message refill the peer does not pay either.
+    let mut payload = vec![0u8; cfg.payload_bytes];
+    fill_payload(&mut payload, cfg.payload_shape, 0, ROUND_TRIP_TOKEN_LEN);
+    let body = PubBody {
+        flags: 0,
+        timestamp_ms: 0,
+        key: b"",
+        headers: b"",
+        dedup: None,
+        // `produce_fire_and_forget` forces this true on the wire regardless; set it here too so the
+        // body and the call's contract never disagree.
+        fire_and_forget: true,
+        payload: &payload,
+    };
+    let mut produced: u64 = 0;
+    let started = Instant::now();
+    while !should_stop(&cfg.bound, produced, started) {
+        // No reply is read (the broker sends no PubAck for a fire-and-forget produce), so this
+        // returns as soon as the frame is written; TCP backpressure is the only pacing when the
+        // broker falls behind. An IO/encode error is still fatal and mapped to the frozen codes.
+        pub_client
+            .produce_fire_and_forget(&body)
+            .map_err(|e| classify(addr, "fire-and-forget producing to", &e))?;
+        produced += 1;
+        pace(cfg.target_rate_hz, produced, started);
+    }
+    let elapsed = started.elapsed();
+    // At-most-once: no ack and no read-back, so no latency and no durable-write cost to attribute
+    // (the broker may even have shed sends under its token bucket). fsync is forced not-measured.
+    Ok(finish_report(
+        cfg,
+        produced,
+        produced,
+        &[],
+        &[],
+        elapsed,
+        false,
+    ))
+}
+
 /// PUBLISH mode: append at the bound/rate, measuring produce-side throughput and bytes/op. Latency
 /// is not measured (no read-back), so the latency fields stay `None`.
 fn run_publish(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError> {
+    if cfg.fire_and_forget {
+        return run_publish_faf(cfg, addr);
+    }
     let mut pub_client = connect(addr)?;
     let mut payload = vec![0u8; cfg.payload_bytes];
     let mut produced: u64 = 0;

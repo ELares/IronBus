@@ -26,6 +26,14 @@ build is a hard error, not a footnote.
 | `group-commit-fsync` | yes | `--pubwindow 1024 --stream` (1 conn, batched fdatasync) | -- (no ack-after-fsync mode) | `appendfsync always`, **50 clients** (fsync coalesces across writers) |
 | `page-cache-async` | **no** | `--no-fsync` | async file store (default ~2 min sync) | `appendfsync everysec`, pipelined |
 | `memory` | no (ephemeral) | `--storage memory` | memory-storage stream | AOF disabled |
+| `at-most-once` | no (best-effort) | `--fire-and-forget` (QoS-0, no ack) | core `nats bench pub` (no JetStream)\* | -- |
+
+\* The `at-most-once` row's NATS column is the **CORE router** (`nats bench pub`, no JetStream, no
+persistence, no ack), NOT the durable JetStream of every other row. It is a separate,
+deliberately-unmatched send-rate probe (detailed in the findings below), added 2026-06-16, not part
+of the matched-durability comparison. The Redis cell is empty: Redis Streams has no at-most-once
+fire-and-forget publish. Reproduce this tier alone with `corpus_bench.py --faf-only` (needs
+natscli >= ~0.2.x for the `nats bench pub` subcommand form).
 
 Concurrency is part of durability fairness: `redis-benchmark` defaults to 50
 clients, so `appendfsync always` silently coalesces fsyncs across them -- that is
@@ -82,6 +90,23 @@ The committed `corpus-report.md` is the data; the read:
   ack-RPC-bound (~250 msg/s) vs the peers' batched/streamed consume (NATS ~20k, Redis ~11k); the
   reported `p99` for IronBus consume is closed-loop drain (queue-depth) latency, not service latency.
   A matched consume is tracked follow-up work.
+- **At-most-once (fire-and-forget / QoS-0): NATS core leads the raw SEND rate; IronBus pays for being
+  a log.** This is a SEPARATE, deliberately-unmatched experiment, NOT part of the matched-durability
+  comparison above: the NATS peer here is the CORE router (`nats bench pub`, no JetStream, no
+  persistence), not the JetStream column of the durable tiers (where IronBus leads the memory tier).
+  Both numbers are CLIENT SEND RATES into the socket -- no ack, no read-back, TCP backpressure is the
+  only pacing -- so they are upper bounds on what each broker accepted, NOT delivered throughput. On
+  that send rate NATS core leads IronBus QoS-0 (memory) at every size (256/1024/4096 B):
+  168,981 / 144,350 / 62,710 vs 82,477 / 36,607 / 22,022 msg/s (~2.0x / 3.9x / 2.8x; the ratio is
+  non-monotonic -- IronBus's absolute rate decays faster per byte). NATS core is a pure router (no
+  log, no offsets, no compression); the gap is consistent with IronBus QoS-0 still assigning an
+  offset, appending to an in-RAM log with a CRC, and lz4-compressing each message -- strictly more
+  per-message work even with acks off (the harness measures end-to-end send rate, it does not isolate
+  that cost). The flip side, which NATS core cannot do at all: IronBus QoS-0 on DISK does at-most-once
+  delivery that STILL durably appends (18,408 / 5,995 / 1,696 msg/s, the only column here paying real
+  fdatasync backpressure, so the closest cell to a true broker-accept rate). And in every tier that
+  actually persists or queues, NATS core does not compete -- it has no durability at all. Single-rig
+  RPi4 armv7 loopback, median-of-3; directional, not a universal constant.
 
 ## Bugs found and fixed (and findings) along the way
 

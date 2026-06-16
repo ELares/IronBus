@@ -43,6 +43,7 @@ fn sys(s: &str) -> Option<System> {
     match s {
         "ironbus" => Some(System::IronBus),
         "nats" => Some(System::Nats),
+        "nats-core" => Some(System::NatsCore),
         "redis" => Some(System::Redis),
         "mosquitto" => Some(System::Mosquitto),
         _ => None,
@@ -66,6 +67,10 @@ fn label(system: &str, tier: &str) -> Option<DurabilityLabel> {
         "page-cache-async" => Some(DurabilityLabel::PageCacheAsync),
         "memory" => Some(DurabilityLabel::Memory),
         "group-commit-fsync" => Some(DurabilityLabel::GroupCommitFsync),
+        // IronBus QoS-0 (`--fire-and-forget`) and a NATS core pub: both at-most-once, no ack, so
+        // they share AtMostOnce and the lint pairs them. The `-disk` variant is at-most-once
+        // delivery that STILL durably appends (context, appendix), same label.
+        "at-most-once" | "at-most-once-disk" => Some(DurabilityLabel::AtMostOnce),
         _ => None,
     }
 }
@@ -145,13 +150,29 @@ fn assemble(raws: &[Raw]) -> Result<ComparisonReport, ironbus_bench::comparison:
                 right: rd,
             });
         }
+        // AT-MOST-ONCE head-to-head: IronBus QoS-0 (fire-and-forget, memory backend) vs NATS CORE
+        // pub (no JetStream). Both at-most-once -- no ack awaited, may drop under load -- so they
+        // share the AtMostOnce label and pass the lint. This is the ONLY tier on which NATS core
+        // (a non-durable router) is a fair peer. The IronBus QoS-0 DISK variant is at-most-once
+        // delivery that STILL durably appends (which NATS core cannot do); it goes to the appendix.
+        if let (Some(ib), Some(nc)) = (
+            get("ironbus", "at-most-once", payload).and_then(|r| row(r, Placement::EdgeGate)),
+            get("nats-core", "at-most-once", payload).and_then(|r| row(r, Placement::EdgeGate)),
+        ) {
+            pairs.push(ComparisonPair {
+                left: ib,
+                right: nc,
+            });
+        }
     }
 
     // Appendix (informational, not head-to-head): MQTT publish rows, IronBus's
     // group-commit-fsync differentiator, and all consume-throughput rows.
     let mut appendix: Vec<ComparisonRow> = Vec::new();
     for r in raws {
-        let take = (r.mode == "publish" && r.system == "mosquitto") || r.mode == "consume";
+        let take = (r.mode == "publish"
+            && (r.system == "mosquitto" || r.tier == "at-most-once-disk"))
+            || r.mode == "consume";
         if take {
             // consume rows have no durability meaning; label them Memory (measured off a
             // memory pre-fill) purely so the appendix row is well-typed.
@@ -275,6 +296,51 @@ fn consume_str(raws: &[Raw], sysname: &str, p: usize) -> String {
         .map_or_else(|| "--".to_string(), |r| format!("{:.0}", r.throughput))
 }
 
+/// The at-most-once (fire-and-forget / QoS-0) table: IronBus QoS-0 vs NATS core, with the
+/// IronBus-disk and MQTT-QoS-0 context columns. Split out of `render_md` so that function stays
+/// under the line ceiling (the `pub_table` precedent).
+fn at_most_once_table(s: &mut String, raws: &[Raw], payloads: &[usize]) {
+    use std::fmt::Write as _;
+    s.push_str("## At-most-once (fire-and-forget / QoS-0): IronBus vs NATS core\n\n");
+    s.push_str(
+        "The ONLY tier where NATS core plays. At-most-once: no ack awaited, the broker may drop \
+         under load -- NOT power-loss-safe, not even guaranteed delivery. The pair is IronBus \
+         QoS-0 (`--fire-and-forget`, memory backend) vs a NATS CORE pub (`nats bench pub`, no \
+         JetStream, no persistence). IMPORTANT: NATS here is the CORE router, NOT the JetStream \
+         column of the durable tiers above (where NATS is a durable log and IronBus leads the \
+         memory tier); this is a separate, deliberately at-most-once experiment, not that matched \
+         comparison. Both figures are CLIENT SEND RATES into the socket -- no ack, no read-back, \
+         TCP backpressure is the only pacing -- so they are upper bounds on what each broker \
+         actually accepted, NOT delivered throughput. On that send rate NATS core leads: it is a \
+         pure router (logs nothing, assigns no offsets, compresses nothing). IronBus QoS-0 is a \
+         durable LOG with acks turned off; the gap is consistent with IronBus still assigning an \
+         offset, appending to the in-RAM log with a CRC, and lz4-compressing each message -- \
+         strictly more per-message work than a router (the harness measures end-to-end send rate, \
+         it does not isolate that cost). IronBus's absolute rate decays faster per byte than NATS's \
+         (the ratio is non-monotonic: 2.0x / 3.9x / 2.8x at 256 / 1024 / 4096 B). IronBus's QoS-0 \
+         DISK column is the thing NATS core cannot do at all -- at-most-once delivery that STILL \
+         durably appends -- and it alone pays real fdatasync backpressure, so it is the closest \
+         cell here to a true broker-accept rate. MQTT QoS 0 (its own at-most-once) is shown for \
+         reference. Single-rig RPi4 armv7 loopback, median-of-3; directional, not universal.\n\n",
+    );
+    let _ = writeln!(
+        s,
+        "| payload | IronBus QoS-0 (memory) | NATS core | IronBus QoS-0 (disk, still durable) | MQTT QoS 0 |"
+    );
+    let _ = writeln!(s, "| --- | --- | --- | --- | --- |");
+    for &p in payloads {
+        let _ = writeln!(
+            s,
+            "| {p} B | {} | {} | {} | {} |",
+            thr(raws, "ironbus", "at-most-once", p),
+            thr(raws, "nats-core", "at-most-once", p),
+            thr(raws, "ironbus", "at-most-once-disk", p),
+            thr(raws, "mosquitto", "page-cache-async", p)
+        );
+    }
+    s.push('\n');
+}
+
 fn render_md(raws: &[Raw], payloads: &[usize]) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
@@ -322,6 +388,7 @@ fn render_md(raws: &[Raw], payloads: &[usize]) -> String {
         );
     }
     s.push('\n');
+    at_most_once_table(&mut s, raws, payloads);
     s.push_str("## Consume throughput (drain rate, durability-independent)\n\n");
     let _ = writeln!(s, "| payload | IronBus | NATS | Redis | Mosquitto |");
     let _ = writeln!(s, "| --- | --- | --- | --- | --- |");
@@ -400,6 +467,51 @@ mod tests {
             label("mosquitto", "sync-per-message"),
             label("ironbus", "sync-per-message")
         );
+    }
+
+    #[test]
+    fn at_most_once_pairs_ironbus_qos0_with_nats_core() {
+        // IronBus QoS-0 and a NATS CORE pub share the AtMostOnce label, so the lint pairs them;
+        // the `-disk` variant maps to the same label (appendix context); `nats-core` maps to the
+        // NatsCore system. This is the only tier on which NATS core is a fair peer.
+        assert_eq!(
+            label("ironbus", "at-most-once"),
+            Some(DurabilityLabel::AtMostOnce)
+        );
+        assert_eq!(
+            label("nats-core", "at-most-once"),
+            Some(DurabilityLabel::AtMostOnce)
+        );
+        assert_eq!(
+            label("ironbus", "at-most-once-disk"),
+            Some(DurabilityLabel::AtMostOnce)
+        );
+        assert_eq!(sys("nats-core"), Some(System::NatsCore));
+        let mk = |system: &str, thr: f64| {
+            row(
+                &Raw {
+                    system: system.into(),
+                    tier: "at-most-once".into(),
+                    payload: 256,
+                    mode: "publish".into(),
+                    throughput: thr,
+                    p50: None,
+                    p99: None,
+                    p999: None,
+                },
+                Placement::EdgeGate,
+            )
+            .unwrap()
+        };
+        // A matched at-most-once pair builds (both AtMostOnce, same size, same device).
+        assert!(ComparisonReport::build(
+            vec![ComparisonPair {
+                left: mk("ironbus", 82_000.0),
+                right: mk("nats-core", 169_000.0),
+            }],
+            vec![]
+        )
+        .is_ok());
     }
 
     #[test]
