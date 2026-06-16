@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/ironbus-logo.png" alt="IronBus logo" width="360">
+</p>
+
 # IronBus
 
 **A single durable, crash-safe message queue for the edge, in one static Rust binary.**
