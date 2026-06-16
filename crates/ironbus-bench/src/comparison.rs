@@ -69,6 +69,15 @@ pub enum DurabilityLabel {
     /// number.
     #[serde(rename = "memory")]
     Memory,
+    /// AT-MOST-ONCE fire-and-forget: the producer awaits NO ack and the broker MAY drop the message
+    /// under load, so delivery is best-effort. NOT power-loss safe, and not even guaranteed delivery.
+    /// The honest shared label for IronBus's QoS-0 fast path (`produce_fire_and_forget`) and a NATS
+    /// CORE publish (no `JetStream`, no persistence, no ack): the only tier on which those two are
+    /// comparable, so the lint can pair them without setting a no-ack send next to a durable one.
+    /// (MQTT keeps its own `mqtt-qos0` label so it is never force-paired with a log system; this
+    /// label is specifically the IronBus/NATS-core at-most-once head-to-head.)
+    #[serde(rename = "at-most-once")]
+    AtMostOnce,
     /// NATS `JetStream` File-backed stream (default `FileStore` block sizes, `MaxAckPending`
     /// budgeted).
     #[serde(rename = "nats-jetstream-file")]
@@ -99,6 +108,7 @@ impl DurabilityLabel {
             DurabilityLabel::PageCacheAsync => "page-cache-async",
             DurabilityLabel::SyncPerMessage => "sync-per-message",
             DurabilityLabel::Memory => "memory",
+            DurabilityLabel::AtMostOnce => "at-most-once",
             DurabilityLabel::NatsJetstreamFile => "nats-jetstream-file",
             DurabilityLabel::RedisAofEverysec => "redis-aof-everysec",
             DurabilityLabel::RedisAofAlways => "redis-aof-always",
@@ -126,6 +136,7 @@ impl DurabilityLabel {
             DurabilityLabel::RedisAofEverysec
             | DurabilityLabel::PageCacheAsync
             | DurabilityLabel::Memory
+            | DurabilityLabel::AtMostOnce
             | DurabilityLabel::MqttQos0 => false,
         }
     }
@@ -143,6 +154,10 @@ pub enum System {
     /// NATS `JetStream` (File-backed).
     #[serde(rename = "nats-jetstream")]
     Nats,
+    /// NATS CORE (no `JetStream`): a pure at-most-once pub/sub router -- no persistence, no ack. The
+    /// peer for the `AtMostOnce` tier, distinct from `Nats` (which is the durable `JetStream`).
+    #[serde(rename = "nats-core")]
+    NatsCore,
     /// Redis Streams.
     #[serde(rename = "redis-streams")]
     Redis,
@@ -164,6 +179,7 @@ impl System {
         match self {
             System::IronBus => "ironbus",
             System::Nats => "nats-jetstream",
+            System::NatsCore => "nats-core",
             System::Redis => "redis-streams",
             System::Mosquitto => "mosquitto",
             System::Kafka => "kafka",

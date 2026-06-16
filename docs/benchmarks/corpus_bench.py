@@ -16,6 +16,8 @@ Durability tiers (assigned to BOTH sides of a pair by the assembler):
   sync-per-message  power-loss-safe, one fdatasync per ack   (IB window=1; NATS pub sync + sync_interval=always; Redis appendfsync=always; -P1)
   page-cache-async  NOT power-loss-safe (labeled)            (IB --no-fsync; NATS async default; Redis appendfsync=everysec pipelined)
   memory            ephemeral, no disk                       (IB --storage memory; NATS memory store; Redis no-AOF)
+  at-most-once      fire-and-forget: no ack, may drop, NOT    (IB --fire-and-forget [--storage memory]; NATS CORE pub, no JetStream)
+                    power-loss-safe (the only tier NATS core plays)
 
 Latency: reported only where the tool yields a natively-saturated percentile
 (NATS pub). Cross-system latency is NOT headlined: the load models differ
@@ -51,6 +53,15 @@ def wait_port(port, timeout=15):
             with socket.create_connection((HOST, port), timeout=0.5): return True
         except OSError: time.sleep(0.2)
     return False
+def median_rep(fn, k=3):
+    """Run fn k times and return the result whose throughput is the median, so a warmup or a
+    scheduler hiccup in one rep cannot set the headline number. None/failed reps are dropped;
+    returns None only if every rep failed. Used for the at-most-once headline pair, where the
+    send rate is high enough that a single short run is warmup-sensitive."""
+    got = [r for r in (fn() for _ in range(k)) if r and r.get("throughput") is not None]
+    if not got: return None
+    got.sort(key=lambda r: r["throughput"])
+    return got[len(got) // 2]
 
 # ---------- IronBus (native bench CLI, spawns its own broker) ----------
 def ironbus(binpath, tier, payload, mode):
@@ -74,6 +85,12 @@ def ironbus(binpath, tier, payload, mode):
     elif tier == "group-commit-fsync": args += ["--pubwindow", "1024", "--stream"]
     elif tier == "page-cache-async": args += ["--pubwindow", "1024", "--stream", "--no-fsync"]
     elif tier == "memory":           args += ["--pubwindow", "1024", "--stream", "--storage", "memory"]
+    # AT-MOST-ONCE (QoS-0): produce_fire_and_forget, no ack awaited. Cannot combine with the
+    # awaited-ack pipelining flags (--stream/--pubwindow), so it stands alone. The MEMORY variant
+    # is the truest peer for NATS core (both ephemeral); the DISK variant is at-most-once delivery
+    # that still durably appends -- extra context, not a matched-pair member.
+    elif tier == "at-most-once":     args += ["--fire-and-forget", "--storage", "memory"]
+    elif tier == "at-most-once-disk": args += ["--fire-and-forget"]
     else: return None
     try:
         out = subprocess.run(args, capture_output=True, text=True, timeout=600)
@@ -126,6 +143,33 @@ def nats(tier, payload, mode):
         try: srv.wait(5)
         except Exception: srv.kill()
         shutil.rmtree(sd, ignore_errors=True)
+        if os.path.exists(cfg): os.remove(cfg)
+
+# ---------- NATS Core (no JetStream: at-most-once fire-and-forget pub) ----------
+def nats_core(payload):
+    """NATS CORE pub: no JetStream, no persistence, no ack -- at-most-once fire-and-forget, the
+    only NATS mode that is the durability-matched peer for IronBus QoS-0. A core nats-server has
+    NO `jetstream {}` block, and `nats bench pub` (no `js` subcommand) drives the core publish
+    path: it sends as fast as it can and never awaits an ack, so the number is the pure publish
+    send rate (core drops a message with no subscriber, exactly the at-most-once contract)."""
+    port = free_port(); cfg = f"/tmp/nats-core-{port}.conf"
+    open(cfg, "w").write(f'host: "{HOST}"\nport: {port}\n')   # NO jetstream block == core only
+    srv = subprocess.Popen(["nats-server", "-c", cfg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        if not wait_port(port): log("  nats-core: no start"); return None
+        url = f"nats://{HOST}:{port}"; subj = f"core.{port}"; size = f"{payload}B"
+        cmd = ["nats", "-s", url, "bench", "pub", subj, "--msgs", "300000", "--size", size]
+        o = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        txt = o.stdout + o.stderr
+        m = re.search(r"([\d,]+(?:\.\d+)?)\s+msgs/sec", txt)
+        if not m: log(f"  nats-core {payload}: {txt[:200]}"); return None
+        return dict(throughput=float(m.group(1).replace(",", "")), p50=None, p99=None, p999=None)
+    except Exception as e:
+        log(f"  nats-core/{payload} FAILED: {e}"); return None
+    finally:
+        srv.send_signal(signal.SIGTERM)
+        try: srv.wait(5)
+        except Exception: srv.kill()
         if os.path.exists(cfg): os.remove(cfg)
 
 # ---------- Redis Streams ----------
@@ -239,6 +283,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ironbus", required=True); ap.add_argument("--out", required=True)
     ap.add_argument("--smoke", action="store_true")
+    ap.add_argument("--faf-only", action="store_true",
+                    help="run ONLY the at-most-once (fire-and-forget) tier: IronBus QoS-0 vs NATS core")
     a = ap.parse_args()
     payloads = [256] if a.smoke else [256, 1024, 4096]
     outf = open(a.out, "w"); rows = []
@@ -250,23 +296,37 @@ def main():
         log(f"OK  {system:9} {tier:18} {payload:5}B {mode:8} -> {res['throughput']:.0f} msg/s"
             + (f" p99={res['p99']:.0f}us" if res.get('p99') else ""))
     for payload in payloads:
-        # PUBLISH: matched durability tiers, head-to-head.
-        for tier in TIERS:
-            emit("ironbus", tier, payload, "publish", ironbus(a.ironbus, tier, payload, "publish"))
-            emit("nats", tier, payload, "publish", nats(tier, payload, "publish"))
-            emit("redis", tier, payload, "publish", redis(tier, payload, "publish"))
-            emit("mosquitto", tier, payload, "publish", mqtt(tier, payload, "publish"))
-        # Durable-at-throughput: IronBus group-commit-fsync (1 connection, pipelined) vs Redis
-        # appendfsync=always with 50 concurrent writers (its only path to durable throughput).
-        emit("ironbus", "group-commit-fsync", payload, "publish",
-             ironbus(a.ironbus, "group-commit-fsync", payload, "publish"))
-        emit("redis", "group-commit-fsync", payload, "publish",
-             redis("group-commit-fsync", payload, "publish"))
-        # CONSUME: drain rate is durability-independent, so measure ONCE per system
-        # with a fast (memory) pre-fill. tier label is "consume".
-        for sysname, fn in [("ironbus", ironbus), ("nats", nats), ("redis", redis), ("mosquitto", mqtt)]:
-            res = fn(a.ironbus, "memory", payload, "consume") if sysname == "ironbus" else fn("memory", payload, "consume")
-            emit(sysname, "consume", payload, "consume", res)
+        if not a.faf_only:
+            # PUBLISH: matched durability tiers, head-to-head.
+            for tier in TIERS:
+                emit("ironbus", tier, payload, "publish", ironbus(a.ironbus, tier, payload, "publish"))
+                emit("nats", tier, payload, "publish", nats(tier, payload, "publish"))
+                emit("redis", tier, payload, "publish", redis(tier, payload, "publish"))
+                emit("mosquitto", tier, payload, "publish", mqtt(tier, payload, "publish"))
+            # Durable-at-throughput: IronBus group-commit-fsync (1 connection, pipelined) vs Redis
+            # appendfsync=always with 50 concurrent writers (its only path to durable throughput).
+            emit("ironbus", "group-commit-fsync", payload, "publish",
+                 ironbus(a.ironbus, "group-commit-fsync", payload, "publish"))
+            emit("redis", "group-commit-fsync", payload, "publish",
+                 redis("group-commit-fsync", payload, "publish"))
+        # AT-MOST-ONCE (fire-and-forget / QoS-0): IronBus produce_fire_and_forget vs NATS CORE pub
+        # (no JetStream). Both at-most-once -- no ack awaited, the broker may drop under load, NOT
+        # power-loss-safe. The matched pair is IronBus QoS-0 MEMORY vs NATS core (both ephemeral,
+        # no persistence). IronBus QoS-0 DISK is reported too: at-most-once delivery that STILL
+        # durably appends, which NATS core cannot do -- honest extra context, not a matched member.
+        # Median of 3 reps for these high-rate cells so a warmup hiccup cannot set the number.
+        emit("ironbus", "at-most-once", payload, "publish",
+             median_rep(lambda: ironbus(a.ironbus, "at-most-once", payload, "publish")))
+        emit("ironbus", "at-most-once-disk", payload, "publish",
+             median_rep(lambda: ironbus(a.ironbus, "at-most-once-disk", payload, "publish")))
+        emit("nats-core", "at-most-once", payload, "publish",
+             median_rep(lambda: nats_core(payload)))
+        if not a.faf_only:
+            # CONSUME: drain rate is durability-independent, so measure ONCE per system
+            # with a fast (memory) pre-fill. tier label is "consume".
+            for sysname, fn in [("ironbus", ironbus), ("nats", nats), ("redis", redis), ("mosquitto", mqtt)]:
+                res = fn(a.ironbus, "memory", payload, "consume") if sysname == "ironbus" else fn("memory", payload, "consume")
+                emit(sysname, "consume", payload, "consume", res)
     outf.close()
     log(f"\nWROTE {len(rows)} rows to {a.out}")
 

@@ -155,6 +155,12 @@ pub enum Bound {
 }
 
 /// The fully-parsed, validated `bench` invocation.
+// Each bool here is an INDEPENDENT, orthogonal CLI flag (`--no-fsync`, `--stream`,
+// `--fire-and-forget`, `--json`), each mapping 1:1 to a documented option, not interdependent state
+// a state machine or two-variant enum would model more clearly. Collapsing them would obscure the
+// flag-to-field correspondence the parser and JSON output rely on, so the lint is allowed here with
+// this rationale, exactly as `parse_bench` carries a justified `too_many_lines`.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug)]
 pub struct BenchConfig {
     /// The workload mode.
@@ -191,6 +197,16 @@ pub struct BenchConfig {
     /// `--pubwindow >= 2`. Per-produce fsync cost is NOT attributed in this mode (the overlap
     /// makes a per-message share dishonest), so the fsync histogram stays empty.
     pub stream: bool,
+    /// AT-MOST-ONCE publish (QoS-0, the #11 fast path): with `--fire-and-forget`, publish mode
+    /// drives [`ironbus_client::Client::produce_fire_and_forget`], which writes the `Pub` frame and
+    /// returns WITHOUT awaiting a `PubAck` (the broker may even drop it under load by contract). It
+    /// trades the at-least-once guarantee for raw send throughput and no round-trip, and is the
+    /// matched analog to a core fire-and-forget pub on a routing broker (e.g. NATS core). Because no
+    /// ack is awaited, there is no durable-write cost to attribute, so the fsync cost is forced
+    /// not-measured (exactly like the memory backend). Publish-only, and mutually exclusive with the
+    /// ack-pipelining flags (`--stream`, `--pubwindow > 1`), which pipeline awaited acks this path
+    /// has none of.
+    pub fire_and_forget: bool,
     /// The storage BACKEND of bench's own ISOLATED synthetic broker (#445, refs #443): `disk` (the
     /// default, the historical bench broker over an auto-deleted synthetic data dir) or `memory`
     /// (the same engine over the in-memory filesystem, for honest RAM-path numbers next to the
@@ -281,6 +297,7 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
     let mut live_ack = false;
     let mut no_fsync = false;
     let mut stream = false;
+    let mut fire_and_forget = false;
     let mut pub_window: usize = 1;
     let mut storage: Option<StorageArg> = None;
     let mut json = false;
@@ -368,6 +385,12 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
             }
             "--stream" => {
                 stream = true;
+                i += 1;
+            }
+            // AT-MOST-ONCE publish (QoS-0): drive `produce_fire_and_forget` (no awaited ack). The
+            // `--faf` alias is accepted for brevity.
+            "--fire-and-forget" | "--faf" => {
+                fire_and_forget = true;
                 i += 1;
             }
             // The pipelined publish window (#450): 0 is meaningless (nothing would ever be
@@ -486,6 +509,34 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         ));
     }
 
+    // AT-MOST-ONCE guards. Fire-and-forget is a produce-only fast path that never awaits an ack,
+    // so it is meaningless in a mode that reads back (round-trip) or consumes (subscribe), and it
+    // cannot combine with the flags that pipeline AWAITED acks (`--stream`, `--pubwindow > 1`):
+    // there are no acks here to pipeline. Each is its own usage error naming the conflict.
+    if fire_and_forget && mode != Mode::Publish {
+        return Err(CliError::Usage(
+            "`--fire-and-forget` is a produce-only QoS-0 path (it awaits no ack): it requires \
+             `--mode publish`. subscribe and round-trip need an ack or a read-back, which a \
+             fire-and-forget produce never sends."
+                .into(),
+        ));
+    }
+    if fire_and_forget && stream {
+        return Err(CliError::Usage(
+            "`--fire-and-forget` and `--stream` are mutually exclusive: `--stream` pipelines \
+             AWAITED acks, while fire-and-forget awaits none. Pick one."
+                .into(),
+        ));
+    }
+    if fire_and_forget && pub_window > 1 {
+        return Err(CliError::Usage(
+            "`--fire-and-forget` cannot combine with `--pubwindow > 1`: the window pipelines \
+             AWAITED acks, while fire-and-forget awaits none. Drop `--pubwindow` (fire-and-forget \
+             is already maximally pipelined: it never stops for an ack)."
+                .into(),
+        ));
+    }
+
     Ok(BenchConfig {
         mode,
         bound,
@@ -497,6 +548,7 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         live_addr,
         no_fsync,
         stream,
+        fire_and_forget,
         pub_window,
         storage,
         json,
@@ -588,6 +640,13 @@ pub fn write_human<W: Write + ?Sized>(
         }
     )?;
     writeln!(out, "group:          {}", cfg.group)?;
+    if cfg.fire_and_forget {
+        writeln!(
+            out,
+            "delivery:       AT-MOST-ONCE (fire-and-forget QoS-0: no ack awaited; the broker may \
+             drop a send under load by contract)"
+        )?;
+    }
     writeln!(out, "produced:       {} messages", report.produced)?;
     if cfg.mode.measures_latency() {
         writeln!(out, "recorded:       {} messages", report.recorded)?;
@@ -667,7 +726,7 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         s,
         "{{\"schema_version\":{},\"mode\":\"{}\",\"isolated\":{},\"group\":\"{}\",\
          \"bound\":{{{}}},\"target_rate_hz\":{},\"payload_bytes\":{},\"payload_shape\":\"{}\",\
-         \"fetch_batch\":{},\"no_fsync\":{},\"pubwindow\":{},\"stream\":{},\"storage\":\"{}\",\"results\":{{\
+         \"fetch_batch\":{},\"no_fsync\":{},\"pubwindow\":{},\"stream\":{},\"fire_and_forget\":{},\"storage\":\"{}\",\"results\":{{\
          \"produced\":{},\"recorded\":{},\"elapsed_secs\":{},\"msgs_per_sec\":{},\
          \"mb_per_sec\":{},\"bytes_per_op\":{},\
          \"latency_p50_us\":{},\"latency_p99_us\":{},\"latency_p999_us\":{},\"latency_max_us\":{},\
@@ -684,6 +743,7 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         cfg.no_fsync,
         cfg.pub_window,
         cfg.stream,
+        cfg.fire_and_forget,
         cfg.storage.as_str(),
         report.produced,
         report.recorded,
@@ -1151,6 +1211,72 @@ mod tests {
         }
         let json = bench_json(&on, &BenchReport::default());
         assert!(json.contains("\"stream\":true"), "{json}");
+    }
+
+    #[test]
+    fn fire_and_forget_is_publish_only_excludes_ack_pipelining_and_lands_in_the_json() {
+        // AT-MOST-ONCE (QoS-0): default off; the bare flag (and its `--faf` alias) sets it; it is
+        // refused outside publish mode and alongside the AWAITED-ack pipelining flags; and it is
+        // echoed additively in the JSON object (schema version unchanged, the `--stream` precedent).
+        let off = parse(&["--count", "5", "--mode", "publish"]).unwrap();
+        assert!(!off.fire_and_forget, "fire-and-forget defaults off");
+        let on = parse(&["--count", "5", "--mode", "publish", "--fire-and-forget"]).unwrap();
+        assert!(on.fire_and_forget);
+        let aliased = parse(&["--count", "5", "--mode", "publish", "--faf"]).unwrap();
+        assert!(aliased.fire_and_forget, "`--faf` is the alias");
+        // Publish-only: round-trip (the default) and subscribe are refused (no ack / no read-back).
+        match parse(&["--count", "5", "--fire-and-forget"]) {
+            Err(CliError::Usage(m)) => assert!(m.contains("--mode publish"), "{m}"),
+            other => panic!("fire-and-forget outside publish must be a usage error, got {other:?}"),
+        }
+        match parse(&["--count", "5", "--mode", "subscribe", "--fire-and-forget"]) {
+            Err(CliError::Usage(m)) => assert!(m.contains("produce-only"), "{m}"),
+            other => panic!("fire-and-forget + subscribe must be a usage error, got {other:?}"),
+        }
+        // Mutually exclusive with the awaited-ack pipelining flags.
+        match parse(&[
+            "--count",
+            "5",
+            "--mode",
+            "publish",
+            "--fire-and-forget",
+            "--stream",
+            "--pubwindow",
+            "8",
+        ]) {
+            Err(CliError::Usage(m)) => assert!(m.contains("mutually exclusive"), "{m}"),
+            other => panic!("fire-and-forget + stream must be a usage error, got {other:?}"),
+        }
+        match parse(&[
+            "--count",
+            "5",
+            "--mode",
+            "publish",
+            "--fire-and-forget",
+            "--pubwindow",
+            "8",
+        ]) {
+            Err(CliError::Usage(m)) => assert!(m.contains("pubwindow"), "{m}"),
+            other => panic!("fire-and-forget + pubwindow>1 must be a usage error, got {other:?}"),
+        }
+        // Composes with the storage backend (memory here) and lands additively in the JSON.
+        let mem = parse(&[
+            "--count",
+            "5",
+            "--mode",
+            "publish",
+            "--fire-and-forget",
+            "--storage",
+            "memory",
+        ])
+        .unwrap();
+        assert!(mem.fire_and_forget && mem.storage == StorageArg::Memory);
+        let json = bench_json(&on, &BenchReport::default());
+        assert!(json.contains("\"fire_and_forget\":true"), "{json}");
+        assert!(
+            json.contains("\"schema_version\":1"),
+            "additive, version unchanged: {json}"
+        );
     }
 
     #[test]

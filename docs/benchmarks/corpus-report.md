@@ -38,6 +38,16 @@ Power-loss-safe AND fast: ack only after a (batched) fdatasync. IronBus reaches 
 | 1024 B | 5622 | 2507 |
 | 4096 B | 1488 | 1564 |
 
+## At-most-once (fire-and-forget / QoS-0): IronBus vs NATS core
+
+The ONLY tier where NATS core plays. At-most-once: no ack awaited, the broker may drop under load -- NOT power-loss-safe, not even guaranteed delivery. The pair is IronBus QoS-0 (`--fire-and-forget`, memory backend) vs a NATS CORE pub (`nats bench pub`, no JetStream, no persistence). IMPORTANT: NATS here is the CORE router, NOT the JetStream column of the durable tiers above (where NATS is a durable log and IronBus leads the memory tier); this is a separate, deliberately at-most-once experiment, not that matched comparison. Both figures are CLIENT SEND RATES into the socket -- no ack, no read-back, TCP backpressure is the only pacing -- so they are upper bounds on what each broker actually accepted, NOT delivered throughput. On that send rate NATS core leads: it is a pure router (logs nothing, assigns no offsets, compresses nothing). IronBus QoS-0 is a durable LOG with acks turned off; the gap is consistent with IronBus still assigning an offset, appending to the in-RAM log with a CRC, and lz4-compressing each message -- strictly more per-message work than a router (the harness measures end-to-end send rate, it does not isolate that cost). IronBus's absolute rate decays faster per byte than NATS's (the ratio is non-monotonic: 2.0x / 3.9x / 2.8x at 256 / 1024 / 4096 B). IronBus's QoS-0 DISK column is the thing NATS core cannot do at all -- at-most-once delivery that STILL durably appends -- and it alone pays real fdatasync backpressure, so it is the closest cell here to a true broker-accept rate. MQTT QoS 0 (its own at-most-once) is shown for reference. Single-rig RPi4 armv7 loopback, median-of-3; directional, not universal.
+
+| payload | IronBus QoS-0 (memory) | NATS core | IronBus QoS-0 (disk, still durable) | MQTT QoS 0 |
+| --- | --- | --- | --- | --- |
+| 256 B | 82477 | 168981 | 18408 | 13234 |
+| 1024 B | 36607 | 144350 | 5995 | 12984 |
+| 4096 B | 22022 | 62710 | 1696 | 11204 |
+
 ## Consume throughput (drain rate, durability-independent)
 
 | payload | IronBus | NATS | Redis | Mosquitto |
