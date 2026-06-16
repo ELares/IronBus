@@ -62,6 +62,13 @@ pub enum DurabilityLabel {
     /// One `fdatasync` per message, no group commit. Power-loss safe, throughput-bound by the device.
     #[serde(rename = "sync-per-message")]
     SyncPerMessage,
+    /// In-RAM only: no disk, no fsync. NOT power-loss safe and NOT crash-safe; an acked message is
+    /// lost on any process exit. The honest label for IronBus `--storage memory`, a NATS
+    /// `JetStream` memory-storage stream, and Redis with the `AOF` disabled, so the ephemeral
+    /// in-RAM throughput ceilings compare apples-to-apples and are never confused with a durable
+    /// number.
+    #[serde(rename = "memory")]
+    Memory,
     /// NATS `JetStream` File-backed stream (default `FileStore` block sizes, `MaxAckPending`
     /// budgeted).
     #[serde(rename = "nats-jetstream-file")]
@@ -91,6 +98,7 @@ impl DurabilityLabel {
             DurabilityLabel::GroupCommitFsync => "group-commit-fsync",
             DurabilityLabel::PageCacheAsync => "page-cache-async",
             DurabilityLabel::SyncPerMessage => "sync-per-message",
+            DurabilityLabel::Memory => "memory",
             DurabilityLabel::NatsJetstreamFile => "nats-jetstream-file",
             DurabilityLabel::RedisAofEverysec => "redis-aof-everysec",
             DurabilityLabel::RedisAofAlways => "redis-aof-always",
@@ -117,6 +125,7 @@ impl DurabilityLabel {
             | DurabilityLabel::MqttQos2 => true,
             DurabilityLabel::RedisAofEverysec
             | DurabilityLabel::PageCacheAsync
+            | DurabilityLabel::Memory
             | DurabilityLabel::MqttQos0 => false,
         }
     }

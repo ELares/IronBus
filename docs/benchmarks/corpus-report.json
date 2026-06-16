@@ -1,0 +1,868 @@
+{
+  "schema_version": 1,
+  "pairs": [
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "sync-per-message",
+        "message_size_bytes": 256,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 210.86409269560323,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "nats-jetstream",
+        "durability": "sync-per-message",
+        "message_size_bytes": 256,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 179.0,
+        "percentiles": {
+          "p50_us": 5144.79,
+          "p99_us": 9139.54,
+          "p999_us": 35990.85
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "sync-per-message",
+        "message_size_bytes": 256,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 210.86409269560323,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "redis-streams",
+        "durability": "sync-per-message",
+        "message_size_bytes": 256,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 181.49,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "page-cache-async",
+        "message_size_bytes": 256,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 15640.623728088483,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "nats-jetstream",
+        "durability": "page-cache-async",
+        "message_size_bytes": 256,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 13902.0,
+        "percentiles": {
+          "p50_us": 6774.06,
+          "p99_us": 13095.76,
+          "p999_us": 17344.02
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "page-cache-async",
+        "message_size_bytes": 256,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 15640.623728088483,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "redis-streams",
+        "durability": "page-cache-async",
+        "message_size_bytes": 256,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 34524.43,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "memory",
+        "message_size_bytes": 256,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 84282.10549039839,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "nats-jetstream",
+        "durability": "memory",
+        "message_size_bytes": 256,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 16931.0,
+        "percentiles": {
+          "p50_us": 4778.11,
+          "p99_us": 16729.75,
+          "p999_us": 25759.15
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "memory",
+        "message_size_bytes": 256,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 84282.10549039839,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "redis-streams",
+        "durability": "memory",
+        "message_size_bytes": 256,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 44023.77,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "group-commit-fsync",
+        "message_size_bytes": 256,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 17278.016307777423,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "redis-streams",
+        "durability": "group-commit-fsync",
+        "message_size_bytes": 256,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 3505.08,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "sync-per-message",
+        "message_size_bytes": 1024,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 192.4137842280065,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "nats-jetstream",
+        "durability": "sync-per-message",
+        "message_size_bytes": 1024,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 153.0,
+        "percentiles": {
+          "p50_us": 5465.58,
+          "p99_us": 23198.65,
+          "p999_us": 156891.52
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "sync-per-message",
+        "message_size_bytes": 1024,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 192.4137842280065,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "redis-streams",
+        "durability": "sync-per-message",
+        "message_size_bytes": 1024,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 178.22,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "page-cache-async",
+        "message_size_bytes": 1024,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 5513.075529558977,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "nats-jetstream",
+        "durability": "page-cache-async",
+        "message_size_bytes": 1024,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 10547.0,
+        "percentiles": {
+          "p50_us": 7872.19,
+          "p99_us": 15796.17,
+          "p999_us": 656672.08
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "page-cache-async",
+        "message_size_bytes": 1024,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 5513.075529558977,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "redis-streams",
+        "durability": "page-cache-async",
+        "message_size_bytes": 1024,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 18414.51,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "memory",
+        "message_size_bytes": 1024,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 61228.5371756329,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "nats-jetstream",
+        "durability": "memory",
+        "message_size_bytes": 1024,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 17941.0,
+        "percentiles": {
+          "p50_us": 5211.96,
+          "p99_us": 10684.69,
+          "p999_us": 17879.09
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "memory",
+        "message_size_bytes": 1024,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 61228.5371756329,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "redis-streams",
+        "durability": "memory",
+        "message_size_bytes": 1024,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 32211.3,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "group-commit-fsync",
+        "message_size_bytes": 1024,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 5621.515212162392,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "redis-streams",
+        "durability": "group-commit-fsync",
+        "message_size_bytes": 1024,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 2507.02,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "sync-per-message",
+        "message_size_bytes": 4096,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 181.71836843503849,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "nats-jetstream",
+        "durability": "sync-per-message",
+        "message_size_bytes": 4096,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 132.0,
+        "percentiles": {
+          "p50_us": 6494.36,
+          "p99_us": 28188.18,
+          "p999_us": 103554.48
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "sync-per-message",
+        "message_size_bytes": 4096,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 181.71836843503849,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "redis-streams",
+        "durability": "sync-per-message",
+        "message_size_bytes": 4096,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 149.54,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "page-cache-async",
+        "message_size_bytes": 4096,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 1359.1961604816863,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "nats-jetstream",
+        "durability": "page-cache-async",
+        "message_size_bytes": 4096,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 6128.0,
+        "percentiles": {
+          "p50_us": 12014.91,
+          "p99_us": 23435.6,
+          "p999_us": 1397491.89
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "page-cache-async",
+        "message_size_bytes": 4096,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 1359.1961604816863,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "redis-streams",
+        "durability": "page-cache-async",
+        "message_size_bytes": 4096,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 6375.72,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "memory",
+        "message_size_bytes": 4096,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 25884.16739001366,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "nats-jetstream",
+        "durability": "memory",
+        "message_size_bytes": 4096,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 12419.0,
+        "percentiles": {
+          "p50_us": 7668.62,
+          "p99_us": 16470.53,
+          "p999_us": 24488.55
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "memory",
+        "message_size_bytes": 4096,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 25884.16739001366,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "redis-streams",
+        "durability": "memory",
+        "message_size_bytes": 4096,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 15169.9,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "group-commit-fsync",
+        "message_size_bytes": 4096,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 1487.8204704178845,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      },
+      "right": {
+        "system": "redis-streams",
+        "durability": "group-commit-fsync",
+        "message_size_bytes": 4096,
+        "device": "edge-min-pi4-1000000088e76a84",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 1563.92,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      }
+    }
+  ],
+  "appendix": [
+    {
+      "system": "mosquitto",
+      "durability": "mqtt-qos1",
+      "message_size_bytes": 256,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 2255.9968510847175,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    },
+    {
+      "system": "mosquitto",
+      "durability": "mqtt-qos0",
+      "message_size_bytes": 256,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 13234.473449702013,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    },
+    {
+      "system": "mosquitto",
+      "durability": "mqtt-qos0",
+      "message_size_bytes": 256,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 13673.802641995358,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    },
+    {
+      "system": "ironbus",
+      "durability": "memory",
+      "message_size_bytes": 256,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 250.31411693251155,
+      "percentiles": {
+        "p50_us": 4354942.032,
+        "p99_us": 8148059.208,
+        "p999_us": 8220579.843
+      }
+    },
+    {
+      "system": "nats-jetstream",
+      "durability": "memory",
+      "message_size_bytes": 256,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 22334.0,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    },
+    {
+      "system": "redis-streams",
+      "durability": "memory",
+      "message_size_bytes": 256,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 11827.784819853672,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    },
+    {
+      "system": "mosquitto",
+      "durability": "memory",
+      "message_size_bytes": 256,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 4014.579825642927,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    },
+    {
+      "system": "mosquitto",
+      "durability": "mqtt-qos1",
+      "message_size_bytes": 1024,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 2249.2878709802458,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    },
+    {
+      "system": "mosquitto",
+      "durability": "mqtt-qos0",
+      "message_size_bytes": 1024,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 12983.72196393381,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    },
+    {
+      "system": "mosquitto",
+      "durability": "mqtt-qos0",
+      "message_size_bytes": 1024,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 12915.548993757968,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    },
+    {
+      "system": "ironbus",
+      "durability": "memory",
+      "message_size_bytes": 1024,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 249.8821296623803,
+      "percentiles": {
+        "p50_us": 4544938.369,
+        "p99_us": 8332454.729,
+        "p999_us": 8406359.038
+      }
+    },
+    {
+      "system": "nats-jetstream",
+      "durability": "memory",
+      "message_size_bytes": 1024,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 20416.0,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    },
+    {
+      "system": "redis-streams",
+      "durability": "memory",
+      "message_size_bytes": 1024,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 10716.349040478495,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    },
+    {
+      "system": "mosquitto",
+      "durability": "memory",
+      "message_size_bytes": 1024,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 3789.36751391028,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    },
+    {
+      "system": "mosquitto",
+      "durability": "mqtt-qos1",
+      "message_size_bytes": 4096,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 2190.357573979331,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    },
+    {
+      "system": "mosquitto",
+      "durability": "mqtt-qos0",
+      "message_size_bytes": 4096,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 11204.153517298932,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    },
+    {
+      "system": "mosquitto",
+      "durability": "mqtt-qos0",
+      "message_size_bytes": 4096,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 11188.009840787274,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    },
+    {
+      "system": "ironbus",
+      "durability": "memory",
+      "message_size_bytes": 4096,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 229.16964045547263,
+      "percentiles": {
+        "p50_us": 5537574.99,
+        "p99_us": 9705408.195,
+        "p999_us": 9783307.86
+      }
+    },
+    {
+      "system": "nats-jetstream",
+      "durability": "memory",
+      "message_size_bytes": 4096,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 16933.0,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    },
+    {
+      "system": "redis-streams",
+      "durability": "memory",
+      "message_size_bytes": 4096,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 8455.15003074194,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    },
+    {
+      "system": "mosquitto",
+      "durability": "memory",
+      "message_size_bytes": 4096,
+      "device": "edge-min-pi4-1000000088e76a84",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 3583.138157296736,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    }
+  ]
+}
