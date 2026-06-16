@@ -1,0 +1,202 @@
+# IronBus Prometheus alerting rules.
+#
+# Grounded in the frozen metric catalog (docs/METRICS.md) and the SLO targets
+# (docs/SLO.md): the marquee p99 fsync target is 6 ms and the flash write-
+# amplification gate is >= 4x. Load into Prometheus via `rule_files:` (or import
+# the same expressions into Grafana managed alerts).
+#
+# Thresholds marked "TUNE" are deployment-specific (lag, RAM, unsynced bytes):
+# the defaults are conservative starting points, not universal constants. Every
+# expression references only an emitted ironbus_* series, so each alert is backed
+# by a real, never-silent signal -- not a derived guess.
+#
+# Severity convention: critical = data integrity / availability at risk now;
+# warning = degrading or a relaxed-safety posture; info = a notable event that is
+# not itself an outage.
+groups:
+  # -------------------------------------------------------------------------
+  - name: ironbus.critical
+    rules:
+      - alert: IronbusDown
+        expr: up{job=~"ironbus.*"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "IronBus broker {{ $labels.instance }} is down (scrape failing)"
+          description: "Prometheus cannot scrape /metrics on {{ $labels.instance }} for 1m. The broker process or its health endpoint is unreachable."
+
+      - alert: IronbusWriterFrozen
+        expr: ironbus_writer_healthy == 0
+        for: 30s
+        labels: {severity: critical}
+        annotations:
+          summary: "IronBus writer FROZEN on {{ $labels.instance }} (integrity freeze)"
+          description: "ironbus_writer_healthy == 0: a fatal fsync froze the durable-log writer. Produces are refused (fail-closed). /readyz is 503. Investigate the disk and restart."
+
+      - alert: IronbusForceReapDataLoss
+        expr: increase(ironbus_segments_force_reaped_total[5m]) > 0
+        for: 0m
+        labels: {severity: critical}
+        annotations:
+          summary: "IronBus is force-reaping segments on {{ $labels.instance }} (drop-oldest data loss)"
+          description: "ironbus_segments_force_reaped_total increased: the disk-full drop-oldest policy deleted sealed segments to make room, ignoring consumer safety. A slow consumer may have lost data (it will see a one-time truncation). The disk is at its byte cap."
+
+      - alert: IronbusConsumerTruncation
+        expr: increase(ironbus_truncations_total[5m]) > 0
+        for: 0m
+        labels: {severity: critical}
+        annotations:
+          summary: "IronBus consumer truncation on {{ $labels.instance }} (a live consumer lost data)"
+          description: "ironbus_truncations_total increased: a consumer's cursor fell below the oldest retained record (force-reaped out from under it) and was reset forward. The span [old_cursor, earliest_retained) is lost for that consumer."
+
+      - alert: IronbusRecoveryDataLoss
+        expr: ironbus_recovery_data_loss_bytes > 0
+        for: 0m
+        labels: {severity: critical}
+        annotations:
+          summary: "IronBus lost {{ $value | humanize1024 }}B at the last recovery on {{ $labels.instance }}"
+          description: "ironbus_recovery_data_loss_bytes > 0: the last crash recovery dropped previously-durable data (torn tails excluded). Check ironbus_recovery_loss_records{reason} for the cause (corruption vs sequence gap vs scrubber-suspect)."
+
+  # -------------------------------------------------------------------------
+  - name: ironbus.warning
+    rules:
+      - alert: IronbusPowerLossUnsafe
+        expr: ironbus_durability_power_loss_unsafe == 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "IronBus on {{ $labels.instance }} is in a power-loss-UNSAFE durability level"
+          description: "ironbus_durability_power_loss_unsafe == 1: a relaxed durability level is active, so acknowledged data can be lost on a power cut. ironbus_durability_unsynced_bytes is the live bytes-at-risk. Intentional only if a relaxed level was deliberately configured."
+
+      - alert: IronbusFsyncP99High
+        # The 6 ms p99 fsync SLO (docs/SLO.md). Histogram quantile summed by le.
+        expr: histogram_quantile(0.99, sum by (job, instance, le) (rate(ironbus_fsync_duration_seconds_bucket[5m]))) > 0.006
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "IronBus fsync p99 {{ $value | humanizeDuration }} > 6ms SLO on {{ $labels.instance }}"
+          description: "The produce-time durability-barrier (fdatasync) p99 latency is above the 6 ms SLO for 10m. The storage device is under pressure or failing."
+
+      - alert: IronbusUnsyncedBytesHigh
+        # Only non-zero under a relaxed durability level; TUNE per loss-window tolerance.
+        expr: ironbus_durability_unsynced_bytes > 8388608
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "IronBus has {{ $value | humanize1024 }}B unsynced (at risk on power loss) on {{ $labels.instance }}"
+          description: "ironbus_durability_unsynced_bytes > 8 MiB (TUNE): acknowledged-but-not-fdatasync'd bytes are accumulating under a relaxed durability level. This is the power-loss window. 0 under the default sync level."
+
+      - alert: IronbusConsumerLagHigh
+        # TUNE: 100k records is a placeholder; set to your backlog tolerance.
+        expr: ironbus_consumer_lag > 100000
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "IronBus consumer lag {{ $value }} on {{ $labels.instance }}"
+          description: "ironbus_consumer_lag (flushed head - committed cursor) is above 100000 (TUNE) for 10m. Consumers are not keeping up; the backlog is growing. Check per-group lag and in-flight."
+
+      - alert: IronbusRedeliveryStorm
+        expr: |
+          rate(ironbus_redelivered_total[5m])
+            / clamp_min(rate(ironbus_delivered_total[5m]), 1) > 0.2
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "IronBus redelivering {{ $value | humanizePercentage }} of deliveries on {{ $labels.instance }}"
+          description: "More than 20% of deliveries are redeliveries for 10m: consumers are not acking within the lease (slow consumers or expired leases). Not loss (at-least-once), but a sign of consumer trouble that ends in dead-lettering at MaxDeliver."
+
+      - alert: IronbusDeadLettering
+        expr: increase(ironbus_dead_lettered_total[15m]) > 0
+        for: 0m
+        labels: {severity: warning}
+        annotations:
+          summary: "IronBus dead-lettered {{ $value }} message(s) on {{ $labels.instance }}"
+          description: "ironbus_dead_lettered_total increased: poison messages exceeded MaxDeliver and were parked in the DLQ. Inspect the dead-letter sink (ironbus_dlq_records_total is the durable depth)."
+
+      - alert: IronbusBackpressureShedding
+        # Sum of the producer-refusing shed counters (excludes fire-and-forget QoS-0,
+        # which sheds by contract, and retry-shed, which defers rather than drops).
+        expr: |
+          sum by (job, instance) (rate(ironbus_produce_rejected_total[5m]))
+          + sum by (job, instance) (rate(ironbus_codel_shed_total[5m]))
+          + sum by (job, instance) (rate(ironbus_codel_backstop_shed_total[5m]))
+          + sum by (job, instance) (rate(ironbus_egress_shed_total[5m]))
+          + sum by (job, instance) (rate(ironbus_wal_fsync_headroom_shed_total[5m]))
+          + sum by (job, instance) (rate(ironbus_daily_write_budget_sheds_total[5m])) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "IronBus is shedding produces on {{ $labels.instance }} (backpressure active)"
+          description: "One or more admission controls is refusing produces (disk-full drop-new, CoDel latency, CoDel backstop, egress AIMD, WAL fsync headroom, or the daily write budget). Open the Backpressure panel to see which control and why."
+
+      - alert: IronbusProduceSaturated
+        expr: ironbus_produce_saturated == 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "IronBus produce SATURATED on {{ $labels.instance }} (throughput collapse signal)"
+          description: "ironbus_produce_saturated == 1: the broker has shed at least one produce (admission exhaustion). The portable throughput-collapse signal #118 defines."
+
+      - alert: IronbusWriteAmplificationHigh
+        # The LIVE bound is ~20x, NOT the 4x figure. The 4x is the `--compression none`
+        # raw-bytes CI gate; the live ratio is defined over STORED (post-lz4) bytes, so a
+        # healthy compressible workload runs well above 4x (docs/EDGE_CONSTRAINTS.md L217:
+        # derived 20x, observed ~7x healthy). Alerting at 4x here would be a false positive.
+        expr: ironbus_write_amp_ratio >= 20
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "IronBus flash write amplification {{ $value }}x on {{ $labels.instance }}"
+          description: "ironbus_write_amp_ratio (physical / STORED bytes) is at or above the ~20x LIVE bound for 15m -- NOT the 4x `--compression none` CI gate (4x is normal under lz4). At 20x the per-record framing is dominating real flash wear; correlate with rate(ironbus_physical_bytes_written) and the daily-write-budget meter."
+
+      - alert: IronbusRamHeadroomLow
+        # -1 means no ceiling set / RSS unreadable -- excluded. TUNE the 16 MiB floor.
+        expr: ironbus_ram_headroom_bytes != -1 and ironbus_ram_headroom_bytes < 16777216
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "IronBus RAM headroom {{ $value | humanize1024 }}B on {{ $labels.instance }}"
+          description: "ironbus_ram_headroom_bytes (ram_ceiling - RSS) is below 16 MiB (TUNE) and approaching the OOM cliff. -1 (no ceiling configured) is excluded."
+
+      - alert: IronbusDailyWriteBudgetOver
+        expr: ironbus_daily_write_budget_over == 1
+        for: 0m
+        labels: {severity: warning}
+        annotations:
+          summary: "IronBus daily flash write budget exhausted on {{ $labels.instance }}"
+          description: "ironbus_daily_write_budget_over == 1: today's physical writes reached the configured daily budget, so the flash-wear governor is shedding produces until the UTC day boundary."
+
+  # -------------------------------------------------------------------------
+  - name: ironbus.info
+    rules:
+      - alert: IronbusHardCrashRecovered
+        expr: increase(ironbus_counter_checkpoint_repair_total[10m]) > 0
+        for: 0m
+        labels: {severity: info}
+        annotations:
+          summary: "IronBus reconciled recovery-loss counters after a hard crash on {{ $labels.instance }}"
+          description: "ironbus_counter_checkpoint_repair_total increased: a hard crash (kill -9 / power loss) lost post-snapshot recovery-loss increments and checkpoint-plus-replay reconciliation restored the lower bound on open. Expected after an unclean stop; not itself loss."
+
+      - alert: IronbusRestarted
+        expr: changes(ironbus_start_time_seconds[10m]) > 0
+        for: 0m
+        labels: {severity: info}
+        annotations:
+          summary: "IronBus restarted on {{ $labels.instance }}"
+          description: "ironbus_start_time_seconds changed: the broker restarted within the last 10m. Confirm it was intended and check ironbus_recovery_data_loss_bytes for any recovery loss."
+
+      - alert: IronbusConsumerOverflowSaturated
+        expr: ironbus_consumer_overflow_saturated == 1
+        for: 0m
+        labels: {severity: info}
+        annotations:
+          summary: "IronBus consumer-label cardinality cap saturated on {{ $labels.instance }}"
+          description: "ironbus_consumer_overflow_saturated == 1: more than the bounded over-cap ledger of distinct consumers have been seen, so ironbus_consumer_lag_records{consumer=\"__overflow__\"} is now a monotonic lower bound rather than exact. A very-high-cardinality consumer population."
+
+      - alert: IronbusConsumerLabelsDropped
+        expr: increase(ironbus_consumer_labels_dropped_total[1h]) > 0
+        for: 0m
+        labels: {severity: info}
+        annotations:
+          summary: "IronBus folded {{ $value }} over-cap consumer label(s) into __overflow__ on {{ $labels.instance }}"
+          description: "ironbus_consumer_labels_dropped_total increased: distinct consumers past the 1024-series cardinality cap had their lag folded into {consumer=\"__overflow__\"}. Total lag stays visible; per-consumer detail for those is not."

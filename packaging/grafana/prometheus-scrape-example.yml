@@ -1,0 +1,41 @@
+# Example Prometheus config snippet for scraping IronBus.
+#
+# IronBus exposes Prometheus text exposition on GET /metrics at the broker's
+# --health-addr (off by default; set it, e.g. `serve --health-addr 127.0.0.1:9090`).
+# The endpoint is UNAUTHENTICATED and serve REFUSES a non-loopback --health-addr
+# unless --health-allow-public is passed (see docs/METRICS.md, docs/THREAT_MODEL.md),
+# so scrape it over loopback or a trusted network only.
+#
+# The metric/label names are a stability contract (frozen by CI), so this scrape
+# config and the dashboard/alerts keep working across broker upgrades.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - ironbus-alerts.yml
+
+scrape_configs:
+  - job_name: ironbus            # keep the job name prefixed "ironbus" so IronbusDown matches
+    metrics_path: /metrics
+    scrape_interval: 15s
+    static_configs:
+      # The broker's --health-addr (NOT Prometheus's own 9090). One target per broker.
+      - targets:
+          - "127.0.0.1:9090"
+        labels:
+          service: ironbus
+
+    # Optional: also blackbox the liveness/readiness probes via relabeling or the
+    # blackbox_exporter. /healthz is liveness (accept-loop watchdog), /readyz is
+    # readiness (200 once the writer accepts writes; 503 while frozen or shutting
+    # down). They are plain HTTP 200/503, not metrics.
+
+# For a fleet, prefer service discovery over static_configs, e.g.:
+#   - job_name: ironbus
+#     file_sd_configs:
+#       - files: ['/etc/prometheus/ironbus_targets/*.yml']
+# so each target carries its own `instance` (and optional `region`/`site`) labels,
+# which the dashboard's $instance variable and the alerts' {{ $labels.instance }}
+# then key off.
