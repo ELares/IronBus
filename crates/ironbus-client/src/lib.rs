@@ -1072,6 +1072,79 @@ impl Client {
         }
     }
 
+    /// Acks MANY fetched messages in ONE pipelined round-trip: the consume-side counterpart to
+    /// [`produce_window`](Client::produce_window). Encodes every `(offset, generation)` ack into one
+    /// buffer, writes them with one syscall, then drains exactly one `AckStatus` reply per ack in
+    /// FIFO order. This removes the per-message round-trip that floors a competing work-group's drain
+    /// throughput (one [`ack`](Client::ack) RPC per record), so a consumer settles a whole fetched
+    /// batch at the broker's commit rate instead of stalling on ack latency.
+    ///
+    /// Returns one `bool` per ack IN INPUT ORDER: `true` = committed, `false` = fenced (a stale
+    /// token — the lease already expired and redelivered, or it was already settled; do not drop
+    /// local state). Each offset is committed INDIVIDUALLY by the broker, so this is correct for a
+    /// competing work-group, unlike [`cumulative_ack`](Client::cumulative_ack) (broadcast-only). An
+    /// empty slice is a no-op `Ok(vec![])`.
+    ///
+    /// Keep the batch BOUNDED (ack at most a fetched batch, i.e. within the consumer credit): the
+    /// write-all-then-drain shape can deadlock against the socket buffers for an unbounded batch,
+    /// exactly like an oversized `produce_window`. A server `Err` reply consumes its slot (the drain
+    /// continues so the connection stays framed) and is returned as the call's error.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO/encode error, a wrong-shape reply, an unexpected frame, or
+    /// a server `Err` reply (the first one kept).
+    pub fn ack_many(&mut self, acks: &[(u64, u64)]) -> Result<Vec<bool>, ClientError> {
+        if acks.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Phase 1: encode every Ack into ONE buffer and write it with ONE syscall (mirrors
+        // produce_window): all N acks land in front of the broker's loop back-to-back, so the
+        // per-ack client overhead stays flat instead of paying a write()+read() round-trip each.
+        let mut body = Vec::new();
+        let mut wire = Vec::with_capacity(acks.len() * 32);
+        for &(offset, generation) in acks {
+            body.clear();
+            encode_ack(
+                &AckBody {
+                    op: AckOp::Ack,
+                    offset,
+                    generation,
+                    delay_ms: 0,
+                },
+                &mut body,
+            );
+            encode_frame(FrameType::Ack, &body, &mut wire).map_err(ClientError::Frame)?;
+        }
+        self.stream.write_all(&wire)?;
+        // Phase 2: drain exactly one reply per ack, FIFO. A server Err consumes its slot and is
+        // remembered; the drain continues so the connection is not desynchronized.
+        let mut statuses = Vec::with_capacity(acks.len());
+        let mut first_err: Option<ClientError> = None;
+        for _ in 0..acks.len() {
+            match self.read_frame()? {
+                (FrameType::AckStatus, body) => match body.as_slice() {
+                    [status] => statuses.push(*status == 1),
+                    _ => {
+                        return Err(ClientError::BadResponse(
+                            "ack reply was not a one-byte status",
+                        ))
+                    }
+                },
+                (FrameType::Err, body) => {
+                    if first_err.is_none() {
+                        first_err =
+                            Some(ClientError::Server(String::from_utf8_lossy(&body).into()));
+                    }
+                }
+                (other, _) => return Err(ClientError::Unexpected(other)),
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(statuses),
+        }
+    }
+
     /// Nacks a fetched message by its offset and fencing generation, asking the broker to
     /// redeliver it. `delay_ms` is `Some(ms)` for an explicit delay (`Some(0)` = immediate) or
     /// `None` to let the broker apply its configured backoff schedule for the attempt. Returns
@@ -1587,6 +1660,52 @@ mod tests {
         assert!(c.ack(messages[0].offset, messages[0].generation).unwrap());
         // Nothing left to fetch.
         assert!(c.fetch(10).unwrap().messages.is_empty());
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn ack_many_batch_commits_every_message_in_one_round_trip() {
+        // The consume-side counterpart to produce_window: produce N records, fetch the batch, and
+        // settle them ALL with ONE ack_many call. Every offset comes back committed (true) in input
+        // order, and nothing remains to fetch -- a competing work-group drains at batch rate with no
+        // per-message ack RPC (the #464 consume-throughput fix).
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+        let n = 8usize;
+        let window: Vec<PubBody> = (0..n)
+            .map(|_| PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"k",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"batch",
+            })
+            .collect();
+        assert_eq!(c.produce_window(&window).unwrap().len(), n);
+
+        let messages = c.fetch(u32::try_from(n).unwrap()).unwrap().messages;
+        assert_eq!(messages.len(), n);
+        let acks: Vec<(u64, u64)> = messages.iter().map(|m| (m.offset, m.generation)).collect();
+
+        let statuses = c.ack_many(&acks).unwrap();
+        assert_eq!(statuses.len(), n, "one status per ack, in input order");
+        assert!(
+            statuses.iter().all(|&committed| committed),
+            "every offset committed"
+        );
+
+        // All settled: nothing left to fetch.
+        assert!(c
+            .fetch(u32::try_from(n).unwrap())
+            .unwrap()
+            .messages
+            .is_empty());
+        // An empty batch is a no-op.
+        assert!(c.ack_many(&[]).unwrap().is_empty());
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
