@@ -215,6 +215,19 @@ impl LeaseTable {
         self.leases.len()
     }
 
+    /// Releases every lease (and its carried attempt count) strictly below `up_to`, reclaiming
+    /// their in-flight slots in one move. This is the bulk counterpart to [`LeaseTable::ack`]:
+    /// a cumulative ack commits the cursor past a whole range at once, so those offsets are done
+    /// and their leases must be reclaimed immediately rather than left to expire through the
+    /// visibility timeout. A high-rate BROADCAST consumer that drains by fetch + cumulative ack
+    /// would otherwise pile leases up faster than they time out, fill its in-flight window, and
+    /// starve its own fetches. Offsets at or above `up_to` are untouched.
+    pub fn release_below(&mut self, up_to: Offset) {
+        let up = up_to.get();
+        self.leases.retain(|&offset, _| offset >= up);
+        self.carried.retain(|&offset, _| offset >= up);
+    }
+
     /// Claims `offset` for delivery at monotonic time `now`. A free offset, or one whose
     /// lease has expired, is granted (a redelivery resets the attempt start and bumps the
     /// generation, fencing the previous holder, and increments the delivery count). An
