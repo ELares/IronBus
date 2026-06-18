@@ -781,9 +781,17 @@ impl Session {
         };
         let group = group.to_string();
         let up_to = Offset::new(ack.up_to);
+        let up_to_exclusive = ack.up_to;
         match engine.with(move |e| e.cumulative_ack_in(&group, up_to))? {
             Ok(()) => {
                 // A committed (or idempotent no-op) cumulative ack: the generic body-less success.
+                // Release the per-connection leases this bulk commit covers (every offset strictly
+                // below the exclusive `up_to`), so a broadcast consumer that fetches-then-cumulative-
+                // acks gets its in-flight credit back. Per-message ack/nack/term remove from `leased`
+                // one offset at a time; #288 added this bulk commit path but omitted the bookkeeping,
+                // so `leased` only ever GREW and the consumer eventually starved its own fetches (its
+                // remaining message credit is `ceiling - leased.len()`).
+                self.leased.retain(|&offset, _| offset >= up_to_exclusive);
                 reply(out, FrameType::Ok, &[]);
                 Ok(())
             }
@@ -2534,6 +2542,65 @@ mod tests {
                 "group {group:?} independently sees the whole log"
             );
         }
+    }
+
+    #[test]
+    fn broadcast_cumulative_ack_releases_the_per_connection_leases_it_commits() {
+        // Regression for the credit leak in the #288 bulk-commit path: cumulative_ack committed the
+        // engine cursor but did NOT remove the committed offsets from the connection's `leased` set,
+        // the way per-message ack/nack/term do. A broadcast consumer that fetches-then-cumulative-acks
+        // therefore only ever GREW `leased`, and once leased.len() reached its credit ceiling its
+        // fetches starved (remaining message credit = ceiling - leased.len()). The ack must release them.
+        use ironbus_proto::message::{encode_cumulative_ack, CumulativeAckBody};
+        let e = DirectEngine::new(engine());
+        for p in [&b"a"[..], b"b", b"c", b"d"] {
+            produce(&e, p);
+        }
+        e.with(|eng| eng.set_broadcast_in("g", true))
+            .unwrap()
+            .unwrap();
+        let mut a = connect_and_sub(&e, MemberId::new(1), b"g");
+        let mut out = Vec::new();
+        // A fetch leases offsets 0, 1, 2 into the connection's `leased` set.
+        a.process(&e, &frame(FrameType::Flow, &3u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_payloads(&out),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "three records leased"
+        );
+        assert_eq!(
+            a.leased.len(),
+            3,
+            "three leases held before the cumulative ack"
+        );
+        // Cumulative ack up to 3 (exclusive) commits 0,1,2 AND must release their leases.
+        out.clear();
+        let mut body = Vec::new();
+        encode_cumulative_ack(
+            &CumulativeAckBody {
+                up_to: 3,
+                group: b"g",
+            },
+            &mut body,
+        );
+        a.process(&e, &frame(FrameType::CumulativeAck, &body), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "broadcast ack is Ok");
+        assert_eq!(
+            a.leased.len(),
+            0,
+            "the committed leases are released, restoring the connection's in-flight credit"
+        );
+        // Not starved: the consumer keeps fetching, and the uncommitted offset 3 is delivered.
+        out.clear();
+        a.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_payloads(&out),
+            vec![b"d".to_vec()],
+            "fetch still works after the bulk ack -- the credit was reclaimed"
+        );
     }
 
     #[test]
