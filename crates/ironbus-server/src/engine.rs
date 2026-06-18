@@ -4194,6 +4194,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.groups.get(group).map_or(0, |g| g.subscribers.len())
     }
 
+    /// The number of in-flight (delivered-but-not-yet-acked) leases for `group`, or 0 if the group
+    /// is unknown. Mirrors [`Engine::subscriber_count_in`] for tests and operability.
+    #[must_use]
+    pub fn in_flight_in(&self, group: &str) -> usize {
+        self.groups.get(group).map_or(0, |g| g.leases.in_flight())
+    }
+
     /// Whether `group` is a BROADCAST consumer (#288): a group-of-one that sees every record in
     /// order and therefore accepts a cumulative ack. `false` for an unknown group or a plain
     /// competing / `key_shared` work-group.
@@ -4587,14 +4594,21 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // Commit the single broadcast cursor up to `up_to`. `commit_up_to` is idempotent and
         // monotonic: an `up_to` at or below `committed` is a no-op success (the re-ack case) and the
         // watermark never regresses. The redelivery gate is the cursor (`poll_in` skips `is_acked`
-        // offsets), so committing past leases that were never per-message acked simply stops their
-        // redelivery; any such lease expires through the visibility timeout without re-serving.
+        // offsets), so committing past a lease stops its redelivery.
         if g.cursor.commit_up_to(up_to) {
             // Count each newly-committed offset as an ack (the same `acks` counter per-message acks
             // drive), so the resilience taxonomy is unchanged: no new counter is introduced.
             let advanced = g.cursor.committed().get().saturating_sub(before);
             self.counters.acks = self.counters.acks.saturating_add(advanced);
         }
+        // Reclaim the in-flight lease slots this commit covers (every offset below `up_to`). The
+        // cursor commit alone only STOPS redelivery; without this the leases linger in-flight until
+        // the visibility timeout. A BROADCAST consumer that drains by fetch + cumulative ack relies
+        // on this reclaim: otherwise leases pile up faster than they expire, the in-flight window
+        // fills, and the consumer starves its own fetches. Per-message ack reclaims one slot
+        // (`leases.ack`); this is the bulk equivalent, and idempotent on a re-ack (nothing remains
+        // leased below an already-committed `up_to`).
+        g.leases.release_below(up_to);
         Ok(())
     }
 
@@ -5970,6 +5984,46 @@ mod tests {
         assert_eq!(d.deliveries, 1, "the acked prefix is not redelivered");
         // Other groups are untouched: the default group still sees the whole log from zero.
         assert_eq!(e.committed_offset(), Offset::new(0));
+    }
+
+    #[test]
+    fn broadcast_cumulative_ack_reclaims_the_in_flight_leases_it_commits() {
+        // Regression for the broadcast-drain stall: a broadcast consumer leases a batch (poll/fetch)
+        // and commits it with cumulative_ack. The commit must RECLAIM those leases' in-flight slots
+        // at once, not leave them to expire through the visibility timeout -- otherwise a high-rate
+        // consumer piles leases up faster than they expire, fills its in-flight window, and starves
+        // its own fetches.
+        let mut e = open(config(10, 5));
+        for p in [&b"a"[..], b"b", b"c", b"d"] {
+            produce(&mut e, p);
+        }
+        e.set_broadcast_in("g", true).unwrap();
+        // Lease offsets 0, 1, 2 (three deliveries, none acked yet).
+        for expected in 0..3 {
+            let d = message(e.poll_in("g", 0).unwrap());
+            assert_eq!(d.offset, Offset::new(expected));
+        }
+        assert_eq!(
+            e.in_flight_in("g"),
+            3,
+            "three leases in flight before the cumulative ack"
+        );
+        // Cumulative ack up to 3 (exclusive): commits 0,1,2 AND reclaims their lease slots.
+        e.cumulative_ack_in("g", Offset::new(3)).unwrap();
+        assert_eq!(
+            e.committed_offset_in("g"),
+            Offset::new(3),
+            "cursor advanced"
+        );
+        assert_eq!(
+            e.in_flight_in("g"),
+            0,
+            "the committed leases were reclaimed -- the in-flight window is restored"
+        );
+        // Not starved: the next poll delivers offset 3, not a redelivery of the acked prefix.
+        let d = message(e.poll_in("g", 0).unwrap());
+        assert_eq!(d.offset, Offset::new(3));
+        assert_eq!(d.deliveries, 1, "the acked prefix is not redelivered");
     }
 
     #[test]
