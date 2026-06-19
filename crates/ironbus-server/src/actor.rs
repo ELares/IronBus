@@ -37,6 +37,7 @@ use ironbus_core::types::Offset;
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 
 /// The default bound on the actor command channel: the most produce/engine commands that may be
 /// in flight before a sender blocks (backpressure). Sized for the edge box's bounded connection
@@ -44,6 +45,60 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 /// the queued work rather than buffering without limit. It does not cap the GROUP size (the actor
 /// drains everything available each pass); it caps the un-drained backlog.
 pub const DEFAULT_CHANNEL_BOUND: usize = 1024;
+
+/// One recycled produce reply channel: a paired bounded `sync_channel(1)` (#475). The pool keeps the
+/// pair together so the SAME channel can carry one publish's outcome after another WITHOUT a fresh
+/// per-publish allocation. The `tx` half stays in the pool and is CLONED into each `Command::Produce`
+/// (a cheap `Arc` refcount bump, never a heap channel alloc); the `rx` half rides with the in-flight
+/// submission and recv's exactly one outcome before the pair returns to the pool. A capacity-1 channel
+/// keeps the I2 group-commit semantics byte-for-byte: the actor's send still cannot precede its
+/// covering `commit_batch`, and a `recv` still yields exactly one outcome.
+///
+/// `pub` only so it can ride inside the public [`ProduceSubmission::Pending`] variant; its fields stay
+/// private, so a caller can neither construct one nor reach into the channel — it is an opaque,
+/// pool-managed handle.
+#[derive(Debug)]
+pub struct ReplyChannel {
+    tx: SyncSender<ProduceOutcome>,
+    rx: Receiver<ProduceOutcome>,
+}
+
+/// A per-CONNECTION free-list of reusable produce reply channels (#475), so the produce hot path
+/// amortizes the `sync_channel(1)` allocation it used to pay PER publish. Each cloned [`EngineHandle`]
+/// (one per connection, see `server.rs`) gets its OWN fresh pool, so a recycled channel NEVER crosses
+/// between connections (no cross-delivery) and every in-flight publish on a connection still holds a
+/// DISTINCT channel for its whole lifetime — exactly the per-publish receiver identity the FIFO reply
+/// order and I2 already rely on. Only the owning connection thread ever locks this `Mutex` (it pops on
+/// submit and pushes back on `wait`; the actor thread only ever uses a CLONED `tx`, never the pool), so
+/// the lock is always uncontended — far cheaper than the heap channel alloc+drop it replaces. The
+/// `Arc` lets an in-flight [`ProduceSubmission`] hold a back-reference to return its pair on `wait`
+/// while keeping [`EngineHandle`] `Send` (an `Rc` would not cross the move into the connection thread).
+///
+/// `pub` only because the public [`ProduceSubmission::Pending`] variant holds one; it carries no
+/// reachable API surface of its own (the element type's fields are private).
+pub type ReplyPool = Arc<Mutex<Vec<ReplyChannel>>>;
+
+/// Pops a reusable reply channel from the pool, or makes a fresh one if the pool is empty (#475). The
+/// pool warms to the connection's in-flight window once, then recycles; the steady state pays no
+/// channel allocation. The lock is uncontended (only the connection thread touches the pool).
+fn pool_take(pool: &ReplyPool) -> ReplyChannel {
+    pool.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pop()
+        .unwrap_or_else(|| {
+            let (tx, rx) = sync_channel(1);
+            ReplyChannel { tx, rx }
+        })
+}
+
+/// Returns a drained reply channel to the pool for the next publish to reuse (#475). Called only after
+/// its single outcome has been `recv`'d, so the channel is empty and ready. A poisoned lock is
+/// recovered (the pool is plain data; a panic elsewhere never corrupts it), so recycling never panics.
+fn pool_return(pool: &ReplyPool, channel: ReplyChannel) {
+    pool.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(channel);
+}
 
 /// A produce request's payload, OWNED so it can cross the channel to the actor (the wire [`Append`]
 /// borrows the connection's input buffer, which the actor cannot hold). The actor borrows it back as
@@ -162,9 +217,19 @@ pub enum ProduceSubmission {
     /// trait's default `produce_submit` use this arm; it keeps the pipelined session logic exercised
     /// against a synchronous engine without a thread.
     Ready(ProduceOutcome),
-    /// The produce is in flight to the append actor; the receiver yields the outcome only after the
-    /// covering group-commit fsync (I2), exactly like [`EngineHandle::produce`]'s awaited reply.
-    Pending(Receiver<ProduceOutcome>),
+    /// The produce is in flight to the append actor; the channel yields the outcome only after the
+    /// covering group-commit fsync (I2), exactly like [`EngineHandle::produce`]'s awaited reply. The
+    /// channel is a RECYCLED pair from the connection's reply pool (#475): it is held intact for this
+    /// publish's whole lifetime (so its receiver identity, the FIFO reply order and I2 already depend
+    /// on, is unchanged) and returned to `pool` for the next publish to reuse once its single outcome
+    /// has been awaited.
+    Pending {
+        /// The recycled reply channel carrying THIS publish's outcome (its `tx` was cloned into the
+        /// `Command::Produce`; this `rx` recv's the one outcome the actor sends after the fsync).
+        channel: ReplyChannel,
+        /// The connection's reply-channel pool to return the drained channel to on `wait` (#475).
+        pool: ReplyPool,
+    },
 }
 
 impl ProduceSubmission {
@@ -178,7 +243,17 @@ impl ProduceSubmission {
     pub fn wait(self) -> Result<ProduceOutcome, ActorGone> {
         match self {
             ProduceSubmission::Ready(outcome) => Ok(outcome),
-            ProduceSubmission::Pending(rx) => rx.recv().map_err(|_| ActorGone),
+            ProduceSubmission::Pending { channel, pool } => {
+                // Recv the ONE outcome the actor sent after the covering fsync (I2); the original `tx`
+                // half still lives in `channel`, so a clean recv yields the value rather than seeing a
+                // spurious disconnect. ActorGone only if the actor dropped its cloned `tx` un-sent
+                // (it exited before replying), which closes the channel.
+                let outcome = channel.rx.recv().map_err(|_| ActorGone)?;
+                // The channel is now drained and ready: return the intact pair to the pool so the next
+                // publish reuses it instead of allocating a fresh one (#475).
+                pool_return(&pool, channel);
+                Ok(outcome)
+            }
         }
     }
 }
@@ -245,6 +320,13 @@ pub struct EngineHandle<F: Filesystem, C: Clock> {
     /// (invariant 4, #177). `.0` is the message-count cap (`consumer_credit`, floored to >= 1), `.1` is
     /// the byte-budget cap (`consumer_credit_bytes`, `0` = unlimited).
     consumer_credit_caps: (u32, u64),
+    /// The per-CONNECTION free-list of reusable produce reply channels (#475): `produce_submit` pops a
+    /// recycled `sync_channel(1)` from here instead of allocating one PER publish, removing the
+    /// per-publish channel alloc+drop from the produce hot path. [`Clone`] gives each new connection a
+    /// FRESH empty pool (a recycled channel never crosses connections, so no cross-delivery), and the
+    /// pool is only ever locked by the owning connection thread (uncontended). It carries no produce
+    /// state: it is purely an allocation cache, so it never affects reply ORDER or I2.
+    reply_pool: ReplyPool,
 }
 
 // Derived `Clone` would demand `F: Clone`; the handle clones the `SyncSender` and the clock (`C` is
@@ -255,6 +337,10 @@ impl<F: Filesystem, C: Clock + Clone> Clone for EngineHandle<F, C> {
             tx: self.tx.clone(),
             clock: self.clock.clone(),
             consumer_credit_caps: self.consumer_credit_caps,
+            // A FRESH pool per clone (#475): each connection gets its own handle (see `server.rs`), so
+            // recycled reply channels stay strictly per-connection and never cross-deliver. The pool
+            // warms lazily on that connection's first produces.
+            reply_pool: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -293,14 +379,26 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
     /// # Errors
     /// Returns [`ActorGone`] if the actor exited before the produce could be enqueued.
     pub fn produce_submit(&self, append: OwnedAppend) -> Result<ProduceSubmission, ActorGone> {
-        let (reply_tx, reply_rx) = sync_channel(1);
-        self.tx
-            .send(Command::Produce {
-                append,
-                reply: reply_tx,
-            })
-            .map_err(|_| ActorGone)?;
-        Ok(ProduceSubmission::Pending(reply_rx))
+        // Take a RECYCLED reply channel from this connection's pool (#475) instead of allocating a
+        // fresh `sync_channel(1)` per publish. Clone its `tx` into the command (a cheap `Arc` bump);
+        // the pair's `rx` rides with the submission and recycles on `wait`.
+        let channel = pool_take(&self.reply_pool);
+        let reply = channel.tx.clone();
+        if self
+            .tx
+            .send(Command::Produce { append, reply })
+            .map_err(|_| ActorGone)
+            .is_err()
+        {
+            // The actor is gone: return the unused channel to the pool (the cloned `tx` we just made is
+            // dropped with the failed command) so a later handle op can still reuse it, and report it.
+            pool_return(&self.reply_pool, channel);
+            return Err(ActorGone);
+        }
+        Ok(ProduceSubmission::Pending {
+            channel,
+            pool: Arc::clone(&self.reply_pool),
+        })
     }
 
     /// Runs `job` on the owned engine and AWAITS its result. Used for every engine operation that is
@@ -694,6 +792,9 @@ where
             tx,
             clock,
             consumer_credit_caps,
+            // The base handle's pool (#475); each per-connection `clone` gets its own fresh pool, so
+            // this one is only used if the base handle itself produces (e.g. in tests).
+            reply_pool: Arc::new(Mutex::new(Vec::new())),
         },
         join,
     )
@@ -1696,6 +1797,138 @@ mod tests {
             0,
             "a disabled bucket never drops a QoS-0 produce"
         );
+        let _ = recover(handle, actor);
+    }
+
+    // ---- The #475 pooled (recycled) per-publish reply channel ----
+
+    #[test]
+    fn two_in_flight_pooled_submissions_each_get_their_own_outcome_in_order() {
+        // THE TEETH for #475: the per-publish reply channel is now a RECYCLED pool channel, so this
+        // proves the reuse never lets two in-flight publishes cross-deliver and never reorders their
+        // outcomes. Two produces are submitted WITHOUT awaiting (the pipelined window, #450): each
+        // holds its OWN pooled channel. We stall the actor on a gated primer's fsync so BOTH land in
+        // the SAME drained batch (one group commit), then await them in SUBMISSION order. Each
+        // submission yields ITS OWN offset (0-based: primer=0, then 1 and 2 contiguously), proving the
+        // pooled channels are distinct per in-flight publish — no cross-delivery, FIFO preserved.
+        let (handle, actor, control) = rig();
+        control.close_sync_gate();
+        let primer = handle.produce_async(append(b"primer")).unwrap();
+        control.wait_for_sync_gate_entered(1);
+        // Both submissions are in flight at once, each on its own recycled pool channel.
+        let s1 = handle.produce_submit(append(b"first")).unwrap();
+        let s2 = handle.produce_submit(append(b"second")).unwrap();
+        control.open_sync_gate();
+        match primer.recv().unwrap() {
+            ProduceOutcome::Appended(o) => assert_eq!(o.get(), 0),
+            other => panic!("expected the primer Appended at 0, got {other:?}"),
+        }
+        // Awaited in submission order; each gets its OWN outcome (no cross-delivery).
+        match s1.wait().unwrap() {
+            ProduceOutcome::Appended(o) => {
+                assert_eq!(o.get(), 1, "the first submission's own offset");
+            }
+            other => panic!("expected Appended(1) for s1, got {other:?}"),
+        }
+        match s2.wait().unwrap() {
+            ProduceOutcome::Appended(o) => {
+                assert_eq!(o.get(), 2, "the second submission's own offset");
+            }
+            other => panic!("expected Appended(2) for s2, got {other:?}"),
+        }
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn a_pooled_channel_is_recycled_and_still_delivers_correctly_across_rounds() {
+        // The pool RECYCLES: a channel returns to the pool on `wait`, so the next publish reuses it
+        // instead of allocating. Over many sequential submit/await rounds the reused channel must keep
+        // delivering exactly the right outcome (a stale value from a prior round would corrupt this).
+        // Each round's offset is contiguous and matches the submission, proving the recycled channel is
+        // drained and correct every time. (Sequential rounds keep the SAME one channel hot in the pool,
+        // which is exactly the reuse the issue removes the per-publish alloc for.)
+        let (handle, actor, _control) = rig();
+        for i in 0..16u64 {
+            // One submit + one await per round: the channel is taken from the pool, used, and returned,
+            // so round i+1 reuses round i's channel.
+            let s = handle
+                .produce_submit(append(format!("r{i}").as_bytes()))
+                .unwrap();
+            match s.wait().unwrap() {
+                ProduceOutcome::Appended(o) => assert_eq!(
+                    o.get(),
+                    i,
+                    "round {i} reused a pooled channel and still got its own offset"
+                ),
+                other => panic!("round {i} expected Appended({i}), got {other:?}"),
+            }
+        }
+        assert_eq!(
+            handle.with(|e| e.flushed_offset().get()).unwrap(),
+            16,
+            "all 16 recycled-channel produces are durable and contiguous"
+        );
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn pooled_outcomes_do_not_cross_when_an_immediate_reply_interleaves_parked_ones() {
+        // THE REORDERING TEETH for #475: the actor sends a FENCE (an immediate reply) the instant it
+        // sees it, but sends the surrounding APPENDED outcomes only later, from `flush_pending` after
+        // the covering fsync. So within ONE batch the actor's send ORDER is NOT the submission order:
+        // it sends fence FIRST, then the two appended. With the OLD per-publish channel this was
+        // invisible (each publish had its own receiver). The pooled design must preserve that: each
+        // in-flight submission still holds its OWN channel, so awaiting them in SUBMISSION order yields
+        // append, fence, append correctly — a single shared FIFO channel would mis-deliver the fence
+        // where the first append belongs. We force all three into one batch behind a gated primer.
+        let (handle, actor, control) = rig();
+        // Establish epoch 5 so a later epoch-4 produce is a deterministic stale-epoch FENCE.
+        handle
+            .produce(append_dedup(b"e0", b"p1", 5, b"m0"))
+            .unwrap();
+        control.close_sync_gate();
+        let primer = handle.produce_async(append(b"primer")).unwrap();
+        control.wait_for_sync_gate_entered(1);
+        // The window, all queued behind the gated primer so they drain as ONE batch:
+        //   s_a: a fresh append at epoch 5 -> PARKS, replies Appended after the fsync.
+        //   s_fence: an epoch-4 produce -> FENCED, replied IMMEDIATELY (out of submission order).
+        //   s_b: another fresh append at epoch 5 -> PARKS, replies Appended after the fsync.
+        let s_a = handle
+            .produce_submit(append_dedup(b"a", b"p1", 5, b"m_a"))
+            .unwrap();
+        let s_fence = handle
+            .produce_submit(append_dedup(b"b", b"p1", 4, b"m_b"))
+            .unwrap();
+        let s_b = handle
+            .produce_submit(append_dedup(b"c", b"p1", 5, b"m_c"))
+            .unwrap();
+        control.open_sync_gate();
+        assert!(matches!(
+            primer.recv().unwrap(),
+            ProduceOutcome::Appended(_)
+        ));
+        // Awaited in SUBMISSION order; each gets its OWN, correct outcome despite the actor's send order
+        // (fence first, then the two appends) — the pooled channels never cross-deliver.
+        match s_a.wait().unwrap() {
+            ProduceOutcome::Appended(o) => {
+                assert_eq!(
+                    o.get(),
+                    2,
+                    "the first window append's own offset (after e0=0, primer=1)"
+                );
+            }
+            other => panic!("expected Appended for s_a, got {other:?}"),
+        }
+        assert!(
+            matches!(s_fence.wait().unwrap(), ProduceOutcome::Fenced),
+            "the fenced submission gets its OWN fence, not an append meant for a neighbor"
+        );
+        match s_b.wait().unwrap() {
+            ProduceOutcome::Appended(o) => {
+                assert_eq!(o.get(), 3, "the second window append's own offset");
+            }
+            other => panic!("expected Appended for s_b, got {other:?}"),
+        }
         let _ = recover(handle, actor);
     }
 }
