@@ -360,59 +360,60 @@ where
     C: Clock + Clone + 'static,
     E: EngineAccess<F, C>,
 {
-    let mut snapshot = engine.with(|g| MetricsSnapshot {
-        committed: g.committed_offset().get(),
-        flushed: g.flushed_offset().get(),
-        in_flight: g.in_flight(),
-        healthy: g.is_healthy(),
-        recovered_truncated: g.recovered_truncated_bytes(),
-        quarantined: g.quarantined_bytes(),
-        recovery_loss: {
-            let r = g.loss_report();
-            ReasonCode::ALL.map(|rc| r.bytes_skipped_for(rc))
-        },
-        recovery_loss_records: {
-            let r = g.loss_report();
-            ReasonCode::ALL.map(|rc| r.records_lost_for(rc))
-        },
-        recovery_data_loss: g.loss_report().data_loss_bytes(),
-        // -1 is the unambiguous "none yet" sentinel (offsets are never negative).
-        last_dead_lettered: g
-            .last_dead_lettered_offset()
-            .map_or(-1i64, |o| i64::try_from(o.get()).unwrap_or(i64::MAX)),
-        dlq_records: g.dlq_records(),
-        counters: g.counters(),
-        fsync: g.fsync_histogram(),
-        // The edge write-amplification + RAM-headroom + daily-write-budget inputs (#118), read here
-        // so they share the snapshot's single instant. The RSS is filled in below, off the lock.
-        edge: EdgeMetrics {
-            logical_bytes_written: g.logical_bytes_written(),
-            physical_bytes_written: g.physical_bytes_written(),
-            ram_ceiling_bytes: g.ram_ceiling_bytes(),
-            daily_physical_write_budget_bytes: g.daily_physical_write_budget_bytes(),
-            physical_bytes_written_today: g.physical_bytes_written_today(),
-            daily_budget_sheds: g.daily_budget_sheds(),
-            produce_rejected: g.counters().produce_rejected,
-        },
-        // The durability observability inputs (#341, #379), read under the same lock: the active
-        // level, whether it waives I2 (the sticky power-loss-unsafe signal), and the live unsynced
-        // bytes-at-risk. All three are derived from the engine's level + storage state.
-        durability: DurabilityMetrics {
-            level: g.durability_level().as_str(),
-            power_loss_unsafe: g.power_loss_unsafe(),
-            unsynced_bytes: g.unsynced_bytes(),
-        },
-        // The backpressure controllers' observable state (#68, #69), read under the same lock.
-        backpressure: g.backpressure_snapshot(),
-        // Filled in below, outside the engine lock; `None` is the not-yet-read placeholder.
-        rss: None,
-        groups: g.group_consumer_stats(),
-        // The bounded metric registry (#97) is rendered into a String inside the actor job (it walks
-        // only the bounded series set and the fixed histograms, so the work is O(number of series),
-        // independent of the record count or disk size), then the body is assembled outside with the
-        // rest. The uptime series reads the live monotonic clock seam here so it advances between
-        // scrapes.
-        registry: registry_body(g.registry(), g.now_monotonic()),
+    let mut snapshot = engine.with(|g| {
+        // Fold the loss report ONCE into its per-reason and grand totals (#504). The standalone
+        // accessors each rescan the whole event list, so reading every per-reason series the old
+        // way was O(reasons · events); `aggregate` makes the scrape O(events). The per-reason
+        // arrays are already in `ReasonCode::ALL` order, the order these metric series render in.
+        let loss = g.loss_report().aggregate();
+        MetricsSnapshot {
+            committed: g.committed_offset().get(),
+            flushed: g.flushed_offset().get(),
+            in_flight: g.in_flight(),
+            healthy: g.is_healthy(),
+            recovered_truncated: g.recovered_truncated_bytes(),
+            quarantined: g.quarantined_bytes(),
+            recovery_loss: loss.bytes_skipped,
+            recovery_loss_records: loss.records_lost,
+            recovery_data_loss: loss.data_loss_bytes,
+            // -1 is the unambiguous "none yet" sentinel (offsets are never negative).
+            last_dead_lettered: g
+                .last_dead_lettered_offset()
+                .map_or(-1i64, |o| i64::try_from(o.get()).unwrap_or(i64::MAX)),
+            dlq_records: g.dlq_records(),
+            counters: g.counters(),
+            fsync: g.fsync_histogram(),
+            // The edge write-amplification + RAM-headroom + daily-write-budget inputs (#118), read here
+            // so they share the snapshot's single instant. The RSS is filled in below, off the lock.
+            edge: EdgeMetrics {
+                logical_bytes_written: g.logical_bytes_written(),
+                physical_bytes_written: g.physical_bytes_written(),
+                ram_ceiling_bytes: g.ram_ceiling_bytes(),
+                daily_physical_write_budget_bytes: g.daily_physical_write_budget_bytes(),
+                physical_bytes_written_today: g.physical_bytes_written_today(),
+                daily_budget_sheds: g.daily_budget_sheds(),
+                produce_rejected: g.counters().produce_rejected,
+            },
+            // The durability observability inputs (#341, #379), read under the same lock: the active
+            // level, whether it waives I2 (the sticky power-loss-unsafe signal), and the live unsynced
+            // bytes-at-risk. All three are derived from the engine's level + storage state.
+            durability: DurabilityMetrics {
+                level: g.durability_level().as_str(),
+                power_loss_unsafe: g.power_loss_unsafe(),
+                unsynced_bytes: g.unsynced_bytes(),
+            },
+            // The backpressure controllers' observable state (#68, #69), read under the same lock.
+            backpressure: g.backpressure_snapshot(),
+            // Filled in below, outside the engine lock; `None` is the not-yet-read placeholder.
+            rss: None,
+            groups: g.group_consumer_stats(),
+            // The bounded metric registry (#97) is rendered into a String inside the actor job (it walks
+            // only the bounded series set and the fixed histograms, so the work is O(number of series),
+            // independent of the record count or disk size), then the body is assembled outside with the
+            // rest. The uptime series reads the live monotonic clock seam here so it advances between
+            // scrapes.
+            registry: registry_body(g.registry(), g.now_monotonic()),
+        }
     })?;
     // Read this process's RSS OUTSIDE the engine lock (#118): a best-effort, no-`unsafe`
     // cross-platform read (`/proc/self/status` on Linux, `ps` on macOS), `None` where unavailable so
