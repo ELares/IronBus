@@ -7484,6 +7484,7 @@ mod tests {
     /// so the redrive verb has poison to re-inject.
     #[cfg(unix)]
     fn seed_dlq(dir: &std::path::Path, poison: u64) {
+        use bytes::Bytes;
         use ironbus_core::types::{Offset, Seq};
         use ironbus_storage::dlq::DlqSink;
         use ironbus_storage::segment::OwnedRecord;
@@ -7495,9 +7496,10 @@ mod tests {
                 seq: Seq::new(500 + i),
                 timestamp_ms: 7000 + i,
                 flags: RecordFlags::EMPTY,
-                key: b"pk".to_vec(),
-                headers: b"".to_vec(),
-                payload: format!("poison-{i}").into_bytes(),
+                // `OwnedRecord`'s blobs are `Bytes` (#480); seed the test fixture with `Bytes`.
+                key: Bytes::from_static(b"pk"),
+                headers: Bytes::new(),
+                payload: Bytes::from(format!("poison-{i}").into_bytes()),
             };
             sink.append_poison("orders", &src, 6).unwrap();
         }

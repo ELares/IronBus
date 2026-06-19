@@ -5177,7 +5177,7 @@ mod tests {
 
         let d0 = message(e.poll(0).unwrap());
         assert_eq!(d0.offset, Offset::new(0));
-        assert_eq!(d0.record.payload, b"a");
+        assert_eq!(d0.record.payload.as_ref(), b"a");
         assert_eq!(d0.deliveries, 1);
         assert_eq!(e.ack(&d0.token), AckResult::Acked);
         assert_eq!(e.committed_offset(), Offset::new(1));
@@ -5237,7 +5237,7 @@ mod tests {
             match e.poll(0).unwrap() {
                 Poll::Message(d) => {
                     let off = d.offset.get();
-                    delivered.push((off, d.record.payload.clone()));
+                    delivered.push((off, d.record.payload.to_vec()));
                     assert_eq!(e.ack(&d.token), AckResult::Acked);
                 }
                 Poll::Compacted { from, to } => {
@@ -5436,7 +5436,7 @@ mod tests {
         match e.poll(40).unwrap() {
             Poll::Parked { offset, record } => {
                 assert_eq!(offset, Offset::new(0));
-                assert_eq!(record.payload, b"poison");
+                assert_eq!(record.payload.as_ref(), b"poison");
             }
             other => panic!("expected Parked, got {other:?}"),
         }
@@ -5559,7 +5559,7 @@ mod tests {
         // Drain the whole window: exactly offset 2 ("c") is deliverable.
         let mut delivered = Vec::new();
         while let Poll::Message(d) = e.poll(0).unwrap() {
-            delivered.push((d.offset.get(), d.record.payload.clone()));
+            delivered.push((d.offset.get(), d.record.payload.to_vec()));
         }
         assert_eq!(
             delivered,
@@ -5625,7 +5625,7 @@ mod tests {
         assert_eq!(e.committed_offset(), Offset::new(1));
         let mut delivered = Vec::new();
         while let Poll::Message(d) = e.poll(0).unwrap() {
-            delivered.push((d.offset.get(), d.record.payload.clone()));
+            delivered.push((d.offset.get(), d.record.payload.to_vec()));
         }
         assert_eq!(
             delivered,
@@ -5677,7 +5677,7 @@ mod tests {
         assert_eq!(e.committed_offset(), Offset::new(1));
         let d = message(e.poll(0).unwrap());
         assert_eq!(d.offset, Offset::new(1));
-        assert_eq!(d.record.payload, b"b");
+        assert_eq!(d.record.payload.as_ref(), b"b");
     }
 
     #[test]
@@ -5712,7 +5712,7 @@ mod tests {
         loop {
             match e.poll(0).unwrap() {
                 Poll::Message(d) => {
-                    delivered.push((d.offset.get(), d.record.payload.clone()));
+                    delivered.push((d.offset.get(), d.record.payload.to_vec()));
                     e.ack(&d.token);
                 }
                 Poll::Idle => break,
@@ -5904,7 +5904,7 @@ mod tests {
                 d.deliveries, 1,
                 "redelivery from zero is a fresh first delivery"
             );
-            delivered.push((d.offset.get(), d.record.payload.clone()));
+            delivered.push((d.offset.get(), d.record.payload.to_vec()));
             e.ack(&d.token);
         }
         assert_eq!(
@@ -6714,9 +6714,9 @@ mod tests {
         assert_eq!(e.committed_offset(), Offset::new(0));
         let d = message(e.poll(0).unwrap());
         assert_eq!(d.offset, Offset::new(0));
-        assert_eq!(d.record.payload, b"a");
+        assert_eq!(d.record.payload.as_ref(), b"a");
         let d_b = message(e.poll(0).unwrap());
-        assert_eq!(d_b.record.payload, b"b");
+        assert_eq!(d_b.record.payload.as_ref(), b"b");
     }
 
     #[cfg(unix)]
@@ -6750,7 +6750,7 @@ mod tests {
         assert_eq!(e.committed_offset(), Offset::new(1));
         let d = message(e.poll(0).unwrap());
         assert_eq!(d.offset, Offset::new(1));
-        assert_eq!(d.record.payload, b"b");
+        assert_eq!(d.record.payload.as_ref(), b"b");
     }
 
     #[cfg(unix)]
@@ -6785,7 +6785,7 @@ mod tests {
         assert_eq!(e.committed_offset_in(group), Offset::new(1));
         let d = message(e.poll_in(group, 0).unwrap());
         assert_eq!(d.offset, Offset::new(1));
-        assert_eq!(d.record.payload, b"b");
+        assert_eq!(d.record.payload.as_ref(), b"b");
         // The default group is unaffected on the same real directory.
         assert_eq!(e.committed_offset(), Offset::new(0));
     }
@@ -8196,7 +8196,7 @@ mod tests {
             Offset::new(1),
             "the resumed touched default group's unconsumed record survived retention"
         );
-        assert_eq!(d.record.payload, &[0xcd; 16]);
+        assert_eq!(d.record.payload.as_ref(), &[0xcd; 16]);
     }
 
     // ---- Count- and age-based retention end to end (refs #13, #80) ----
@@ -9437,7 +9437,7 @@ mod tests {
             // Poll as the owner until we get this key_a record (it may first serve "other").
             loop {
                 match e.poll_in_member("g", owner, 0).unwrap() {
-                    Poll::Message(d) if d.record.key == key_a => {
+                    Poll::Message(d) if d.record.key.as_ref() == key_a.as_slice() => {
                         assert_eq!(d.offset, expected_off, "per-key offset order preserved");
                         assert_eq!(e.ack_in("g", &d.token), AckResult::Acked);
                         break;
@@ -9867,7 +9867,7 @@ mod tests {
             Offset::new(2),
             "resumes at head; redelivers only the new record, nothing it had acked"
         );
-        assert_eq!(d.record.payload, b"c");
+        assert_eq!(d.record.payload.as_ref(), b"c");
     }
 
     #[test]
@@ -11420,7 +11420,8 @@ mod tests {
             d.record.flags
         );
         assert_ne!(
-            d.record.payload, original,
+            d.record.payload.as_ref(),
+            original.as_slice(),
             "the stored bytes are not the raw payload"
         );
         assert!(

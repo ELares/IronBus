@@ -84,6 +84,13 @@ signal-hook = { version = "0.3", default-features = false, features = ["iterator
 # lock is a CLI startup guard, off the record path.
 libc = "0.2"
 
+# TEST-ONLY (#480): a `#[cfg(test)]` redrive fixture seeds the DLQ with an `ironbus_storage`
+# `OwnedRecord`, whose key/headers/payload are now `bytes::Bytes` (refcounted read-buffer slices).
+# `bytes` is a DEV-dependency here, so it never enters the shipped CLI binary's dependency graph and
+# leaves the supply-chain / C-FFI gates untouched; it is pure Rust and already in the workspace tree.
+[dev-dependencies]
+bytes = { version = "1", default-features = false }
+
 [lints]
 workspace = true
 

@@ -401,7 +401,7 @@ mod tests {
         // The message is durable in the engine and deliverable.
         let mut engine = recover_engine(handle, actor);
         match engine.poll(0).unwrap() {
-            Poll::Message(d) => assert_eq!(d.record.payload, b"net"),
+            Poll::Message(d) => assert_eq!(d.record.payload.as_ref(), b"net"),
             other => panic!("expected the produced message, got {other:?}"),
         }
     }
