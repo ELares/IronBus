@@ -115,6 +115,32 @@ impl SealedSegment {
             .and_then(|i| self.anchors.get(i))
             .copied()
     }
+
+    /// The WINDOW-BOUNDED read-end (#664), the off-actor twin of [`SegmentIndex::window_read_end`]:
+    /// the byte position past which a read wanting `[from_offset, from_offset + want_records)` need
+    /// not look. Before #664 the off-actor sealed read passed the segment-wide `valid_end` as the
+    /// read-end, so a forward streaming drain over a large sealed segment read
+    /// `O(distance-to-segment-end)` bytes per fetch (`O(N^2)` overall). This bounds the read to the
+    /// FIRST sparse anchor STRICTLY ABOVE `from_offset + want_records`, clamped to the segment's
+    /// `valid_end`: every wanted frame lies below that anchor, so the read covers the window plus at
+    /// most one stride of slack — `O(want + stride)` bytes. `want_records == 0` (or an overflowing
+    /// `want`) falls back to `valid_end`; a conservative (larger) read-end only ever reads MORE
+    /// bytes, never wrong ones (the per-record `max`/`flushed` filters bound the returned run).
+    fn window_read_end(&self, from_offset: u64, want_records: usize) -> u64 {
+        let want = want_records as u64;
+        if want == 0 {
+            return self.valid_end;
+        }
+        let window_end = from_offset.saturating_add(want);
+        let idx = self
+            .anchors
+            .partition_point(|&(anchor_off, _)| anchor_off <= window_end);
+        let bound = self
+            .anchors
+            .get(idx)
+            .map_or(self.valid_end, |&(_, byte_pos)| byte_pos);
+        bound.min(self.valid_end)
+    }
 }
 
 /// An IMMUTABLE snapshot of the SEALED prefix the writer publishes via [`ArcSwap`] (#539). A reader
@@ -253,11 +279,13 @@ impl<F: crate::fs::Filesystem> SealedSnapshot<F> {
                 // segment's covered records): nothing more here; advance to the next slot.
                 continue;
             };
-            let read_end = slot.valid_end;
+            let remaining = max_records - out.len();
+            // #664: bound the read span to the WINDOW (`remaining` records from `seg_start`), not the
+            // whole sealed segment, so a forward off-actor drain reads O(window) bytes per fetch.
+            let read_end = slot.window_read_end(seg_start, remaining);
             let gap = usize::try_from(seg_start.saturating_sub(anchor_offset)).unwrap_or(0);
             let below_flushed =
                 usize::try_from(flushed.saturating_sub(anchor_offset)).unwrap_or(usize::MAX);
-            let remaining = max_records - out.len();
             let want = remaining.saturating_add(gap).min(below_flushed);
             let reader = SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?;
             let records = reader.scan_from(byte_pos, Offset::new(anchor_offset), read_end, want)?;
@@ -355,7 +383,11 @@ impl<F: crate::fs::Filesystem> SealedSnapshot<F> {
             // The snapshot's anchors do not cover `seg_start`: serve nothing raw, resume past here.
             return Ok(empty(Some(seg_start)));
         };
-        let read_end = slot.valid_end;
+        // #664: bound the read span to the WINDOW (`max_records` records from `seg_start`), not the
+        // whole sealed segment, so a forward off-actor Tier-S raw drain reads O(window) bytes per
+        // fetch (not O(distance-to-segment-end) => O(N^2) overall). The `want`/`max_records` clamp
+        // below still governs the frames returned.
+        let read_end = slot.window_read_end(seg_start, max_records);
         // Cap the raw read at the flushed frontier and the segment's covered end: never carry a frame
         // at or past `flushed`, and bound the want by how many frames lie below the frontier from the
         // anchor (the gap the anchor preceded `seg_start` by is dropped after the read).
@@ -677,6 +709,63 @@ mod tests {
                 sealed.records.len() <= actor.len(),
                 "off-actor served more than through-actor at {start}"
             );
+        }
+    }
+
+    /// #664: the off-actor WINDOW-BOUNDED read-end (`SealedSegment::window_read_end`) is correct over
+    /// a MULTI-SEGMENT sealed prefix for both the materialized (`read_range`) and raw
+    /// (`read_range_raw`) off-actor reads — byte-identical to the through-actor `read_from` for every
+    /// (start, window). Before #664 the off-actor read buffered the whole sealed segment per fetch
+    /// (O(distance-to-segment-end)); the window bound must not change WHICH records are served.
+    #[test]
+    fn window_bounded_sealed_read_is_byte_identical_across_starts_and_windows() {
+        // A tiny cap seals many segments, so a window read lands mid-sealed-segment (where the window
+        // bound and the whole-segment bound differ the most).
+        let mut log = small_log();
+        for i in 0..500u32 {
+            log.append(&rec(&i.to_le_bytes())).unwrap();
+            if i % 5 == 0 {
+                log.sync().unwrap();
+            }
+        }
+        log.sync().unwrap();
+        let plane = log.read_plane().unwrap();
+        let flushed = log.flushed_offset().get();
+        for start in 0..flushed {
+            for window in [1usize, 4, 33, 200] {
+                let oracle = log.read_from(Offset::new(start), window).unwrap();
+                // Materialized off-actor read: a PREFIX of the oracle (stops at the sealed end), every
+                // served record byte-identical to the through-actor read at the same position.
+                let sealed = plane.read_range(Offset::new(start), window, None).unwrap();
+                for (a, s) in oracle.iter().zip(sealed.records.iter()) {
+                    assert_eq!(
+                        a, s,
+                        "sealed read != oracle at start={start} window={window}"
+                    );
+                }
+                assert!(sealed.records.len() <= oracle.len());
+                // Raw off-actor read: its frames decode to the same records (positional offsets).
+                let raw = plane
+                    .read_range_raw(Offset::new(start), window, None)
+                    .unwrap();
+                let mut off = raw.run.first_offset.get();
+                let mut cursor = 0usize;
+                let mut i = 0usize;
+                while cursor < raw.run.bytes.len() {
+                    let (view, consumed) =
+                        ironbus_core::codec::decode(&raw.run.bytes[cursor..]).unwrap();
+                    assert_eq!(off, oracle[i].offset.get(), "raw off at start={start}");
+                    assert_eq!(
+                        view.payload,
+                        &oracle[i].payload[..],
+                        "raw payload at start={start}"
+                    );
+                    off += 1;
+                    cursor += consumed;
+                    i += 1;
+                }
+                assert_eq!(i as u64, raw.run.record_count);
+            }
         }
     }
 
