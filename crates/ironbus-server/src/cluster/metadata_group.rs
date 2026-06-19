@@ -8,27 +8,30 @@
 //! so it composes with IronBus's existing single-writer-actor cadence rather than an async
 //! runtime. There is no IO and no async here — the group is advanced by the caller.
 //!
-//! ## Scope (C1-I1 only)
+//! ## Scope (C1-I2: durable storage)
 //!
-//! This issue proves the vendored-codec raft-rs builds clean under every IronBus gate and
-//! that a metadata group is *constructible and self-consistent* in memory:
+//! As of C1-I2 (#580) the group's storage is the DURABLE
+//! [`MetadataLogStorage`](crate::cluster::metadata_storage::MetadataLogStorage) over an IronBus
+//! CRC-framed log, NOT the in-memory `MemStorage` C1-I1 (#578) used. The `Ready` persist step now
+//! writes raft entries + the `HardState`/`ConfState` checkpoint to that log and FSYNCS before the
+//! group advances (the metadata analogue of IronBus's I2 ack-after-fsync, the foundation for C3's
+//! quorum-fsync), and the metadata log inherits the storage crate's I1–I4 bounded/reported recovery.
 //!
-//! * storage is the in-memory `raft::storage::MemStorage` (the durable IronBus-log
-//!   `Storage` is **C1-I2**);
+//! Still deliberately deferred:
+//!
 //! * there is no peer transport, no membership change, no leader-epoch exposure, and no
 //!   wiring into the append actor (those are **C1-I3 / C1-I4** and later);
 //! * crucially, this module is NOT yet referenced by the running broker, so adding it does
 //!   not change the single-node binary's behavior or on-disk layout.
-//!
-//! What it does do: construct a group, drive a `tick`/`step`/`propose`/`ready` round-trip,
-//! and fold committed entries into the state machine — enough to prove the wiring end to
-//! end on `MemStorage`.
 
+use ironbus_core::clock::Clock;
+use ironbus_storage::fs::Filesystem;
+use ironbus_storage::log::LogConfig;
 use raft::eraftpb::{Entry, EntryType, Message};
-use raft::storage::MemStorage;
-use raft::{Config, RawNode, StateRole};
+use raft::{Config, RawNode, StateRole, Storage as _};
 use slog::{o, Discard, Logger};
 
+use crate::cluster::metadata_storage::{MetadataLogStorage, MetadataStorageError};
 use crate::cluster::state_machine::{DecodeError, MetadataCommand, MetadataStateMachine};
 
 /// Errors constructing or driving the metadata group.
@@ -42,6 +45,8 @@ pub enum GroupError {
     Raft(raft::Error),
     /// A committed entry's bytes did not decode to a metadata command.
     Decode(DecodeError),
+    /// The durable metadata storage (open / persist / fsync / recover) returned an error.
+    Storage(MetadataStorageError),
 }
 
 impl core::fmt::Display for GroupError {
@@ -58,6 +63,7 @@ impl core::fmt::Display for GroupError {
             }
             GroupError::Raft(e) => write!(f, "raft error: {e}"),
             GroupError::Decode(e) => write!(f, "metadata command decode error: {e}"),
+            GroupError::Storage(e) => write!(f, "metadata storage error: {e}"),
         }
     }
 }
@@ -76,32 +82,51 @@ impl From<DecodeError> for GroupError {
     }
 }
 
+impl From<MetadataStorageError> for GroupError {
+    fn from(e: MetadataStorageError) -> Self {
+        GroupError::Storage(e)
+    }
+}
+
 /// The supported metadata group sizes. Odd sizes only, so a single partition cannot split
 /// the vote; capped at 5 (the design's metadata group is small by construction — one group
 /// for the cluster, not per-asset).
 const SUPPORTED_VOTER_COUNTS: [usize; 3] = [1, 3, 5];
 
-/// An embedded metadata Raft group: a `RawNode` over `MemStorage` plus the applied
-/// [`MetadataStateMachine`]. Synchronous and caller-driven.
-pub struct MetadataRaftGroup {
-    node: RawNode<MemStorage>,
+/// An embedded metadata Raft group: a `RawNode` over the durable
+/// [`MetadataLogStorage`] plus the applied [`MetadataStateMachine`]. Synchronous and
+/// caller-driven. Generic over the storage [`Filesystem`] (`F`) and [`Clock`] (`C`) seams,
+/// exactly like the rest of the storage engine (`StdFs` in production, `InMemoryFs` in the
+/// deterministic simulation).
+pub struct MetadataRaftGroup<F: Filesystem, C: Clock> {
+    node: RawNode<MetadataLogStorage<F, C>>,
     state: MetadataStateMachine,
 }
 
-impl MetadataRaftGroup {
-    /// Construct a metadata group for `node_id` over the `voters` set.
+impl<F: Filesystem, C: Clock> MetadataRaftGroup<F, C> {
+    /// Construct a metadata group for `node_id` over the `voters` set, persisting to a durable
+    /// metadata log rooted in the `metaraft/` subdirectory of `parent_fs`.
     ///
-    /// `voters` must be one of the supported sizes (1, 3, or 5) and must contain
-    /// `node_id`. Storage is the in-memory `MemStorage` seeded with the voter `ConfState`
-    /// (the durable IronBus-log storage is C1-I2). No logger is attached (default-logger is
-    /// off): raft-rs logs are discarded for now; bridging `slog` to `tracing` is deferred.
+    /// `voters` must be one of the supported sizes (1, 3, or 5) and must contain `node_id`.
+    /// The storage is opened (recovering any prior durable state, or creating fresh and
+    /// seeding the voter `ConfState`); on a recovered group the persisted `HardState` +
+    /// `ConfState` win, so a restart resumes where it left off. No logger is attached
+    /// (default-logger is off): raft-rs logs are discarded for now; bridging `slog` to
+    /// `tracing` is deferred (C1-I3+).
     ///
     /// # Errors
     ///
     /// Returns [`GroupError::UnsupportedVoterCount`] for a bad size,
-    /// [`GroupError::SelfNotAVoter`] if `node_id` is not a voter, or [`GroupError::Raft`]
-    /// if the raft-rs config fails to validate.
-    pub fn new(node_id: u64, voters: &[u64]) -> Result<Self, GroupError> {
+    /// [`GroupError::SelfNotAVoter`] if `node_id` is not a voter, [`GroupError::Storage`] if
+    /// the durable metadata log cannot be opened or recovered, or [`GroupError::Raft`] if the
+    /// raft-rs config fails to validate.
+    pub fn open(
+        node_id: u64,
+        voters: &[u64],
+        parent_fs: &F,
+        clock: C,
+        config: LogConfig,
+    ) -> Result<Self, GroupError> {
         let n = voters.len();
         if !SUPPORTED_VOTER_COUNTS.contains(&n) {
             return Err(GroupError::UnsupportedVoterCount(n));
@@ -110,19 +135,21 @@ impl MetadataRaftGroup {
             return Err(GroupError::SelfNotAVoter { node_id });
         }
 
-        let config = Config {
+        let raft_config = Config {
             id: node_id,
             // Standard etcd-style ratio (heartbeat every tick window, election ~10x).
             election_tick: 10,
             heartbeat_tick: 3,
             ..Default::default()
         };
-        config.validate()?;
+        raft_config.validate()?;
 
-        let storage = MemStorage::new_with_conf_state((voters.to_vec(), vec![]));
-        // default-logger is disabled; discard raft-rs's own slog output for C1-I1.
+        // Open (or recover) the durable metadata log, seeding the voter ConfState for a fresh
+        // group; the persisted membership wins on a recovered one.
+        let storage = MetadataLogStorage::open(parent_fs, clock, config, voters)?;
+        // default-logger is disabled; discard raft-rs's own slog output.
         let logger = Logger::root(Discard, o!());
-        let node = RawNode::new(&config, storage, &logger)?;
+        let node = RawNode::new(&raft_config, storage, &logger)?;
 
         Ok(Self {
             node,
@@ -196,19 +223,24 @@ impl MetadataRaftGroup {
         Ok(())
     }
 
-    /// Run one full `ready` cycle: persist the `Ready` (entries, hard state, snapshot) into
-    /// `MemStorage`, hand outbound messages to the (currently absent) transport, then
-    /// `advance` and apply the committed entries into the state machine.
+    /// Run one full `ready` cycle: persist the `Ready` (entries, hard state, snapshot)
+    /// DURABLY to the IronBus metadata log and FSYNC it, hand outbound messages to the
+    /// (currently absent) transport, then `advance` and apply the committed entries into the
+    /// state machine.
     ///
     /// Returns the outbound messages the caller's transport should send (empty at n=1).
     ///
-    /// This is the persist-before-advance contract raft-rs requires; with the durable
-    /// IronBus-log storage (C1-I2) the persist step becomes the group-commit fsync barrier.
+    /// This is the persist-before-advance contract raft-rs requires, made DURABLE for C1-I2:
+    /// the persist step (entries + the `HardState` checkpoint) is written to the metadata log
+    /// and the log is `sync`ed (fdatasync) BEFORE the group `advance`s. So an entry/hard-state
+    /// the group acts on is durable first — the metadata analogue of IronBus's I2
+    /// ack-after-fsync, and the foundation for C3's quorum-fsync.
     ///
     /// # Errors
     ///
-    /// Returns [`GroupError::Raft`] on a storage append failure or [`GroupError::Decode`]
-    /// if a committed entry's bytes are not a valid metadata command.
+    /// Returns [`GroupError::Storage`] on a durable append / fsync failure, [`GroupError::Raft`]
+    /// on a core error, or [`GroupError::Decode`] if a committed entry's bytes are not a valid
+    /// metadata command.
     pub fn drive_ready(&mut self) -> Result<Vec<Message>, GroupError> {
         if !self.node.has_ready() {
             return Ok(Vec::new());
@@ -219,33 +251,49 @@ impl MetadataRaftGroup {
         // 1. Outbound messages to peers (none at n=1) — collected for the caller.
         let mut outbound = ready.take_messages();
 
-        // 2. Apply a snapshot if present (none in C1-I1's flows, but handle it for safety).
+        // 2. Apply a snapshot if present (handled for safety; not produced in the n=1 flows).
+        //    A snapshot replaces the durable log prefix; that is C1-I2's compaction follow-up,
+        //    so for now we surface it as an error rather than silently dropping it (the
+        //    metadata group's current flows never emit one).
         if !ready.snapshot().is_empty() {
-            let snap = ready.snapshot().clone();
-            self.node.store().wl().apply_snapshot(snap)?;
+            return Err(GroupError::Raft(raft::Error::Store(
+                raft::StorageError::SnapshotTemporarilyUnavailable,
+            )));
         }
 
         // 3. Apply committed entries that came with this Ready (after a snapshot, or once
         //    already-persisted entries commit).
         self.apply_committed(ready.take_committed_entries())?;
 
-        // 4. Persist newly-appended (uncommitted) entries to storage.
+        // 4. Persist newly-appended (uncommitted) entries DURABLY (no fsync yet — one barrier
+        //    per Ready below). A leader-change suffix rewrite is handled by the storage's
+        //    append: the conflicting tail is superseded and recovery replays the last writer.
         if !ready.entries().is_empty() {
-            self.node.store().wl().append(ready.entries())?;
+            self.node.mut_store().append(ready.entries())?;
         }
 
-        // 5. Persist the hard state (term / vote / commit) if it changed.
+        // 5. Persist the hard state (term / vote / commit) checkpoint if it changed.
         if let Some(hs) = ready.hs() {
-            self.node.store().wl().set_hardstate(hs.clone());
+            self.node.mut_store().set_hard_state(hs)?;
         }
 
-        // 6. Persisted messages (for async-append flows) — also handed to the transport.
+        // 6. THE DURABILITY BARRIER: fdatasync the metadata log so every record appended in
+        //    steps 4–5 is durable BEFORE the group advances/acks. Persist-before-advance.
+        self.node.mut_store().sync()?;
+
+        // 7. Persisted messages (for async-append flows) — also handed to the transport.
         outbound.extend(ready.take_persisted_messages());
 
-        // 7. Advance the core; the LightReady carries entries that committed as a result.
+        // 8. Advance the core; the LightReady carries entries that committed as a result, plus
+        //    a possibly-updated commit index. The new commit index is folded into the durable
+        //    hard state (and fsynced) so a recovered group never replays past a committed-and-
+        //    acted-on index.
         let mut light = self.node.advance(ready);
         if let Some(commit) = light.commit_index() {
-            self.node.store().wl().mut_hard_state().commit = commit;
+            let mut hs = self.node.store().initial_state()?.hard_state;
+            hs.commit = commit;
+            self.node.mut_store().set_hard_state(&hs)?;
+            self.node.mut_store().sync()?;
         }
         outbound.extend(light.take_messages());
         self.apply_committed(light.take_committed_entries())?;
@@ -278,11 +326,28 @@ impl MetadataRaftGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::state_machine::NodeRole;
+    use crate::cluster::state_machine::{NodeRole, Placement};
+    use ironbus_core::clock::ManualClock;
+    use ironbus_storage::fs::InMemoryFs;
+
+    /// The concrete group type the durable tests use: the in-memory filesystem + a manual
+    /// clock, exactly the seams the storage crate's own tests drive.
+    type TestGroup = MetadataRaftGroup<InMemoryFs, ManualClock>;
+
+    fn log_config() -> LogConfig {
+        LogConfig::new(64 * 1024).expect("valid segment cap")
+    }
+
+    /// Open a durable single-voter group over `fs` (so a test can reuse the same `fs` to
+    /// simulate a restart by dropping the group and re-opening over the SAME durable image).
+    fn open_on(fs: &InMemoryFs, node_id: u64, voters: &[u64]) -> TestGroup {
+        MetadataRaftGroup::open(node_id, voters, fs, ManualClock::new(), log_config())
+            .expect("open durable group")
+    }
 
     /// Drive the group until it has settled (no more pending Ready), bounded so a bug can't
     /// hang the test.
-    fn settle(group: &mut MetadataRaftGroup) {
+    fn settle(group: &mut TestGroup) {
         for _ in 0..256 {
             let _ = group.drive_ready().expect("drive ready");
             if !group.node.has_ready() {
@@ -293,37 +358,62 @@ mod tests {
 
     #[test]
     fn unsupported_voter_count_is_rejected() {
+        let fs = InMemoryFs::new();
         assert!(matches!(
-            MetadataRaftGroup::new(1, &[1, 2]),
+            MetadataRaftGroup::open(1, &[1, 2], &fs, ManualClock::new(), log_config()),
             Err(GroupError::UnsupportedVoterCount(2))
         ));
         assert!(matches!(
-            MetadataRaftGroup::new(1, &[]),
+            MetadataRaftGroup::open(1, &[], &fs, ManualClock::new(), log_config()),
             Err(GroupError::UnsupportedVoterCount(0))
         ));
     }
 
     #[test]
     fn self_must_be_a_voter() {
+        let fs = InMemoryFs::new();
         assert!(matches!(
-            MetadataRaftGroup::new(9, &[1, 2, 3]),
+            MetadataRaftGroup::open(9, &[1, 2, 3], &fs, ManualClock::new(), log_config()),
             Err(GroupError::SelfNotAVoter { node_id: 9 })
         ));
     }
 
     #[test]
     fn constructs_for_one_three_and_five_voters() {
-        assert!(MetadataRaftGroup::new(1, &[1]).is_ok());
-        assert!(MetadataRaftGroup::new(2, &[1, 2, 3]).is_ok());
-        assert!(MetadataRaftGroup::new(5, &[1, 2, 3, 4, 5]).is_ok());
+        // Each group gets its OWN data dir (separate fs) so the metaraft/ subdirs don't collide.
+        assert!(MetadataRaftGroup::open(
+            1,
+            &[1],
+            &InMemoryFs::new(),
+            ManualClock::new(),
+            log_config()
+        )
+        .is_ok());
+        assert!(MetadataRaftGroup::open(
+            2,
+            &[1, 2, 3],
+            &InMemoryFs::new(),
+            ManualClock::new(),
+            log_config()
+        )
+        .is_ok());
+        assert!(MetadataRaftGroup::open(
+            5,
+            &[1, 2, 3, 4, 5],
+            &InMemoryFs::new(),
+            ManualClock::new(),
+            log_config()
+        )
+        .is_ok());
     }
 
-    /// The C1-I1 acceptance test: a single-voter group constructs, elects itself via
-    /// tick/ready, and a proposed command round-trips through propose -> step/tick ->
-    /// ready -> apply into the state machine on `MemStorage`.
+    /// A single-voter group elects itself via tick/ready and a proposed command round-trips
+    /// through propose -> step/tick -> ready -> apply into the state machine — now on the
+    /// DURABLE `MetadataLogStorage`, not `MemStorage`.
     #[test]
-    fn single_node_group_propose_tick_ready_roundtrips_on_memstorage() {
-        let mut group = MetadataRaftGroup::new(1, &[1]).expect("construct");
+    fn single_node_group_propose_tick_ready_roundtrips_on_durable_log() {
+        let fs = InMemoryFs::new();
+        let mut group = open_on(&fs, 1, &[1]);
         assert!(!group.is_leader());
 
         // Elect via the campaign + ready cycle, then settle the no-op commit.
@@ -359,7 +449,7 @@ mod tests {
         settle(&mut group);
         assert_eq!(
             group.state().placement(7),
-            Some(crate::cluster::state_machine::Placement {
+            Some(Placement {
                 leader: 1,
                 epoch: group.term()
             })
@@ -369,7 +459,8 @@ mod tests {
 
     #[test]
     fn tick_drives_election_without_explicit_campaign() {
-        let mut group = MetadataRaftGroup::new(1, &[1]).expect("construct");
+        let fs = InMemoryFs::new();
+        let mut group = open_on(&fs, 1, &[1]);
         // Ticking past the election timeout makes the lone voter campaign on its own.
         for _ in 0..50 {
             group.tick();
@@ -379,5 +470,79 @@ mod tests {
             }
         }
         assert!(group.is_leader(), "tick alone should elect the lone voter");
+    }
+
+    /// The C1-I2 acceptance test: a committed metadata entry driven through the DURABLE
+    /// storage SURVIVES a simulated restart — reopening the group over the SAME durable image
+    /// recovers the committed placement and the term/commit, proving the metadata group
+    /// drives propose/commit through `MetadataLogStorage` (not `MemStorage`) and the committed
+    /// entry is durable across a reopen.
+    #[test]
+    fn committed_entry_survives_a_group_reopen() {
+        let fs = InMemoryFs::new();
+        let (term, last_index, applied_index) = {
+            let mut group = open_on(&fs, 1, &[1]);
+            group.campaign().expect("campaign");
+            settle(&mut group);
+            assert!(group.is_leader());
+
+            group
+                .propose(&MetadataCommand::AssignPartition {
+                    partition: 3,
+                    leader: 1,
+                    epoch: 1,
+                })
+                .expect("propose");
+            settle(&mut group);
+            assert_eq!(
+                group.state().placement(3),
+                Some(Placement {
+                    leader: 1,
+                    epoch: 1
+                })
+            );
+            (
+                group.term(),
+                group.node.store().last_index().expect("last index"),
+                group.state().applied_index(),
+            )
+        };
+        assert!(applied_index > 0);
+
+        // Reopen the group over the SAME durable fs image: this is a process restart. The
+        // recovered storage must report the same last index and the persisted hard state, and
+        // re-applying the durable entries must re-derive the committed placement.
+        let mut reopened = open_on(&fs, 1, &[1]);
+        let recovered_state = reopened
+            .node
+            .store()
+            .initial_state()
+            .expect("initial state");
+        assert_eq!(
+            recovered_state.hard_state.term, term,
+            "the persisted term must survive the restart"
+        );
+        assert!(
+            recovered_state.hard_state.commit >= applied_index,
+            "the persisted commit index must cover the committed entry"
+        );
+        assert_eq!(
+            reopened.node.store().last_index().expect("last index"),
+            last_index,
+            "the recovered log must have the same last index"
+        );
+
+        // Re-applying the committed (durable) entries reconstructs the state machine: campaign
+        // is unnecessary (the entries are already durable), so drive the recovered commit
+        // through the ready loop and confirm the placement comes back.
+        settle(&mut reopened);
+        assert_eq!(
+            reopened.state().placement(3),
+            Some(Placement {
+                leader: 1,
+                epoch: 1
+            }),
+            "the committed placement must survive a reopen of the durable group"
+        );
     }
 }
