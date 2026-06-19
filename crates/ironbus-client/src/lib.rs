@@ -30,7 +30,7 @@ use ironbus_proto::message::{
     decode_dead_letter, decode_deliver, decode_gap_marker, decode_info, decode_produce_confirm,
     decode_pub_ack, decode_truncated, encode_ack, encode_connect, encode_cumulative_ack,
     encode_fetch, encode_pub, encode_sub, produce_confirm_status, AckBody, AckLevel, AckOp,
-    BodyError, ConnectBody, CumulativeAckBody, FetchBody, PubBody, SubBody,
+    BodyError, ConnectBody, ConsumeTier, CumulativeAckBody, FetchBody, PubBody, SubBody,
     PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
 };
 use std::io::{self, Read, Write};
@@ -160,6 +160,22 @@ pub struct ClientConfig {
     /// the adopted default in `Info` once that path lands (#497); until then a `Some` request is sent
     /// and decoded by the server but not yet echoed back.
     pub default_ack_level: Option<AckLevel>,
+    /// Whether this client ADVERTISES that it understands the streaming consume tier (Tier-S, #543,
+    /// V2-M1): when `true`, the `Connect` sets the [`CONNECT_FLAG_UNDERSTANDS_STREAMING`] capability
+    /// bit, so the server may serve this connection at Tier-S and honor a Tier-S `default_consume_tier`.
+    /// When `false` (the default, backward-compatible) the client does not advertise it and is ALWAYS
+    /// served Tier-W — byte-for-byte today's behavior — and any Tier-S default it set is ignored. A
+    /// caller checks [`Client::streaming_enabled`] after connecting to learn whether the server
+    /// confirmed it.
+    pub understands_streaming: bool,
+    /// The connection-wide DEFAULT consume tier this client REQUESTS in its `Connect` handshake body
+    /// (#543, V2-M1), or `None` to defer to the server default (Tier-W). When `Some(tier)`,
+    /// `connect_with` sends the raw tier value (see [`ConsumeTier::as_u8`]) so a subscription that does
+    /// not pick its own tier adopts this default server-side. Only HONORED when `understands_streaming`
+    /// is also `true`; a Tier-S default without the capability is ignored. `None` (the default,
+    /// backward-compatible) sends no default tier, so the body carries no tier byte and the server
+    /// applies Tier-W.
+    pub default_consume_tier: Option<ConsumeTier>,
 }
 
 impl Default for ClientConfig {
@@ -181,6 +197,14 @@ impl Default for ClientConfig {
             // it sends a byte-for-byte pre-#494 `Connect` body and the server applies its own default
             // (#494, #496). A caller opts into a connection default by setting this.
             default_ack_level: None,
+            // Off by default: an unconfigured client does not advertise streaming support, so it is
+            // always served Tier-W exactly as before (#543). A caller that wants the streaming tier
+            // opts in by setting this (and typically a Tier-S `default_consume_tier`).
+            understands_streaming: false,
+            // None by default: an unconfigured client requests no connection-wide default consume tier,
+            // so it sends no tier byte and the server applies Tier-W (#543). A caller opts into a
+            // connection default by setting this AND `understands_streaming`.
+            default_consume_tier: None,
         }
     }
 }
@@ -569,6 +593,15 @@ pub struct Client {
     /// (an old server, or the client did not advertise), a skipped span arrives in
     /// [`Fetch::truncations`] as the legacy advisory.
     gap_marker_enabled: bool,
+    /// Whether the streaming consume tier (Tier-S) is ACTIVE on this connection (#543, V2-M1): `true`
+    /// only when this client advertised it ([`ClientConfig::understands_streaming`]) AND the server
+    /// confirmed it in `Info`. When `false` (an old server, or the client did not advertise), this
+    /// connection is only ever served Tier-W.
+    streaming_enabled: bool,
+    /// The connection-wide DEFAULT consume tier the SERVER adopted for this connection (#543, V2-M1),
+    /// echoed in `Info`, or `None` if the server did not echo one (an old server, or it defaulted to
+    /// Tier-W). A subscription that does not pick its own tier consumes at this default server-side.
+    negotiated_default_tier: Option<ConsumeTier>,
     /// Level-2 `ProduceConfirm`s (#497) that arrived for an offset OTHER than the one a
     /// [`Client::produce_confirmed`] call was awaiting, cached so a later call for that offset returns
     /// without re-waiting. Bounded in practice by the number of in-flight L2 produces a single
@@ -607,6 +640,8 @@ impl Client {
             negotiated_credit: None,
             negotiated_credit_bytes: None,
             gap_marker_enabled: false,
+            streaming_enabled: false,
+            negotiated_default_tier: None,
             confirm_cache: Vec::new(),
         };
         // The #292 handshake: send a versioned Connect body carrying any requested credit (an
@@ -624,6 +659,11 @@ impl Client {
                 // the body is byte-for-byte the pre-#494 `Connect`; `Some(level)` negotiates the
                 // connection default a level-less publish then adopts server-side.
                 default_ack_level: config.default_ack_level.map(AckLevel::as_u8),
+                // The streaming-tier capability bit and connection-wide default consume tier (#543).
+                // Off/None by default, so the body carries no tier byte and the connection stays Tier-W
+                // (byte-for-byte today's behavior); a caller opts in via the config.
+                understands_streaming: config.understands_streaming,
+                default_tier: config.default_consume_tier.map(ConsumeTier::as_u8),
             },
             &mut connect_body,
         );
@@ -640,6 +680,12 @@ impl Client {
                 // The gap-marker capability is active only when the server CONFIRMED it (it does so
                 // only when the client advertised it), so an old server's empty Info leaves it off.
                 client.gap_marker_enabled = info.gap_marker;
+                // The streaming tier is active only when the server CONFIRMED it (it does so only when
+                // the client advertised it understands streaming), so an old server's empty Info leaves
+                // it off and the connection stays Tier-W (#543). The echoed default tier is adopted as
+                // the connection default a tier-less subscription consumes at.
+                client.streaming_enabled = info.streaming;
+                client.negotiated_default_tier = info.default_tier.map(ConsumeTier::from_u8);
                 Ok(client)
             }
             (FrameType::Err, body) => {
@@ -673,6 +719,23 @@ impl Client {
     #[must_use]
     pub fn gap_marker_enabled(&self) -> bool {
         self.gap_marker_enabled
+    }
+
+    /// Whether the streaming consume tier (Tier-S) is ACTIVE on this connection (#543, V2-M1): `true`
+    /// only when this client advertised it ([`ClientConfig::understands_streaming`]) AND the server
+    /// confirmed it in `Info`. When `false` (an old server, or the client did not advertise), this
+    /// connection is only ever served Tier-W.
+    #[must_use]
+    pub fn streaming_enabled(&self) -> bool {
+        self.streaming_enabled
+    }
+
+    /// The connection-wide DEFAULT consume tier the server adopted for this connection (#543, V2-M1),
+    /// echoed in `Info`, or `None` if the server did not echo one (an old server, or it defaulted to
+    /// Tier-W). A subscription that does not pick its own tier consumes at this default server-side.
+    #[must_use]
+    pub fn negotiated_default_tier(&self) -> Option<ConsumeTier> {
+        self.negotiated_default_tier
     }
 
     /// Resolves `addr` and connects to the first address that accepts, honoring an optional
@@ -3416,6 +3479,8 @@ mod tests {
                 credit_bytes: None,
                 gap_marker: true,
                 default_ack_level: None,
+                streaming: false,
+                default_tier: None,
             },
             &mut body,
         );

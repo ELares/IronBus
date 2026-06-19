@@ -237,6 +237,52 @@ pub fn pub_ack_level(flags: u8) -> AckLevel {
     }
 }
 
+/// The consume TIER a consumer reads a log at (#543, V2-M1, the consume spine of #544). The storage
+/// log is identical for both tiers; only the per-CONSUMER consume bookkeeping differs, so the tier is
+/// a per-consumer choice the broker honors per subscription, never a per-stream property. It rides the
+/// `Connect`/`Info` handshake as a connection-wide DEFAULT (see [`ConnectBody::default_tier`]) which a
+/// subscription adopts unless it explicitly picks a tier (the #544 per-subscription selection still
+/// overrides). PROTO/CODEC + SELECTION metadata only: it changes no storage and no ack/durability path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ConsumeTier {
+    /// Tier-W (work-queue): the existing default — per-message lease + generation fence + visibility
+    /// timeout + per-message ack + DLQ + key-shared. This is today's behavior EXACTLY and the DEFAULT,
+    /// so a connection that negotiates nothing (and an old client) consumes at Tier-W, byte-for-byte
+    /// unchanged.
+    #[default]
+    Work,
+    /// Tier-S (streaming, #544): the CONSUMER manages its own offset; the broker serves a contiguous
+    /// batch with no per-record lease/fence/cursor write, and the ack is a periodic cumulative
+    /// `StreamCommit`. A connection reaches Tier-S only when it advertised it UNDERSTANDS streaming (the
+    /// [`CONNECT_FLAG_UNDERSTANDS_STREAMING`] capability bit), so a pre-streaming client never lands here.
+    Streaming,
+}
+
+impl ConsumeTier {
+    /// The raw `u8` this tier encodes into the appended `default_tier` byte of the handshake bodies
+    /// (`0` = Tier-W, `1` = Tier-S). Carried raw so a FUTURE tier the proto does not yet name still
+    /// round-trips the wire as an opaque byte.
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        match self {
+            ConsumeTier::Work => 0,
+            ConsumeTier::Streaming => 1,
+        }
+    }
+
+    /// Folds a raw handshake `default_tier` byte into a [`ConsumeTier`]: `1` is Tier-S; EVERYTHING else
+    /// — `0` (the explicit Tier-W / old-client encoding) and any RESERVED future value — folds to the
+    /// safe Tier-W default rather than erroring, so the field can grow without a wire break and a peer
+    /// that names a tier this build does not understand degrades to today's work-queue behavior.
+    #[must_use]
+    pub fn from_u8(raw: u8) -> ConsumeTier {
+        match raw {
+            1 => ConsumeTier::Streaming,
+            _ => ConsumeTier::Work,
+        }
+    }
+}
+
 /// The opt-in dedup metadata a producer attaches to a PUB to request effectively-once dedup
 /// (#33): a `producer_id` (the dedup identity; empty is the anonymous/session-scoped default),
 /// a monotonic `epoch` (the fencing token; a higher epoch fences an older zombie session), and
@@ -873,6 +919,28 @@ pub const CONNECT_FLAG_WANTS_GAP_MARKER: u8 = 0b0000_0100;
 /// compatible (an old body omits the byte and leaves this bit clear).
 pub const CONNECT_FLAG_HAS_DEFAULT_ACK_LEVEL: u8 = 0b0000_1000;
 
+/// The `Connect` CAPABILITY bit (#543, V2-M1) by which a consumer advertises that it UNDERSTANDS the
+/// streaming consume tier (Tier-S: the `StreamFetch`/`StreamCommit` consumer-managed-offset path, #544).
+/// When set, the server may serve this connection at Tier-S — including honoring a Tier-S
+/// [`ConnectBody::default_tier`] so an unmarked subscription streams. When CLEAR (an old client, or one
+/// that opts out) the connection ALWAYS consumes at Tier-W (the work-queue default), byte-for-byte
+/// today's behavior, and a Tier-S default it might have sent is ignored — a pre-streaming client can
+/// never be silently moved onto a tier it does not understand. Like [`CONNECT_FLAG_WANTS_GAP_MARKER`]
+/// it is a pure capability flag (no associated value), so it occupies no slot in the v1 field block
+/// beyond this `flags` bit.
+pub const CONNECT_FLAG_UNDERSTANDS_STREAMING: u8 = 0b0001_0000;
+
+/// The `Connect` presence-flag bit (#543, V2-M1) signalling that a `default_tier` (the connection-wide
+/// default consume tier a subscription adopts when it does not pick its own) is present and meaningful.
+/// When clear (an old client, or one that defers) the client requests NO default tier and the server
+/// applies Tier-W (the work-queue default). The tier VALUE is an APPENDED v1-block byte (see
+/// [`ConnectBody`], folded via [`ConsumeTier::from_u8`]); this presence bit governs only whether that
+/// byte is meaningful, mirroring [`CONNECT_FLAG_HAS_DEFAULT_ACK_LEVEL`], so the field is
+/// forward+backward compatible (an old body omits the byte and leaves this bit clear). The default is
+/// only HONORED when the streaming capability bit ([`CONNECT_FLAG_UNDERSTANDS_STREAMING`]) is also set;
+/// a default of Tier-S without the capability bit is ignored (the connection stays Tier-W).
+pub const CONNECT_FLAG_HAS_DEFAULT_TIER: u8 = 0b0010_0000;
+
 /// The `Info` presence-flag bit signalling that the server's advertised per-consumer message-credit
 /// fields (`negotiated` + `cap`) are present (#292). A server that does not advertise leaves it clear,
 /// and a client then keeps its own local credit (backward-compat).
@@ -897,6 +965,22 @@ pub const INFO_FLAG_GAP_MARKER: u8 = 0b0000_0100;
 /// only whether it is meaningful, so the field is forward+backward compatible.
 pub const INFO_FLAG_HAS_DEFAULT_ACK_LEVEL: u8 = 0b0000_1000;
 
+/// The `Info` CAPABILITY bit (#543, V2-M1) by which the server CONFIRMS this connection may consume at
+/// the streaming tier (Tier-S): `true` only when the client advertised
+/// [`CONNECT_FLAG_UNDERSTANDS_STREAMING`] AND the server supports the tier. When clear (an old server,
+/// or a client that did not advertise) the client knows it will only ever be served Tier-W and keeps
+/// using the work-queue path. The negotiation is AND, the server->client twin of
+/// [`CONNECT_FLAG_UNDERSTANDS_STREAMING`], mirroring the [`INFO_FLAG_GAP_MARKER`] confirmation.
+pub const INFO_FLAG_STREAMING: u8 = 0b0001_0000;
+
+/// The `Info` presence-flag bit (#543, V2-M1) by which the server ECHOES the connection-wide
+/// `default_tier` it adopted for this connection, the server->client twin of
+/// [`CONNECT_FLAG_HAS_DEFAULT_TIER`]. When clear (an old server, or one that defaulted to Tier-W) the
+/// client reads no default-tier echo. The tier VALUE is an APPENDED v1-block byte (see [`InfoBody`],
+/// folded via [`ConsumeTier::from_u8`]); this presence bit governs only whether it is meaningful,
+/// mirroring [`INFO_FLAG_HAS_DEFAULT_ACK_LEVEL`], so the field is forward+backward compatible.
+pub const INFO_FLAG_HAS_DEFAULT_TIER: u8 = 0b0010_0000;
+
 /// A client's handshake request (the `Connect` frame body, #292). The client MAY request a
 /// per-consumer message credit and/or byte budget; the server clamps each to its own cap and replies
 /// the negotiated value in [`InfoBody`]. A field is REQUESTED only when its presence bit is set in
@@ -907,11 +991,14 @@ pub const INFO_FLAG_HAS_DEFAULT_ACK_LEVEL: u8 = 0b0000_1000;
 /// Layout (version-prefixed, length-prefixed, forward-compatible): `body_version: u8`
 /// ([`HANDSHAKE_BODY_VERSION`]), `field_len: u16` (the length of the v1 known-field block that
 /// follows), then the v1 block: `flags: u8`, `requested_credit: u32 LE`, `requested_credit_bytes:
-/// u64 LE`, and then — ONLY when [`CONNECT_FLAG_HAS_DEFAULT_ACK_LEVEL`] is set — an APPENDED
-/// `default_ack_level: u8` (#494). The ack-level byte is OMITTED (and `field_len` is the historical
-/// length) when the field is absent, so a request without it is byte-for-byte the pre-#494 body. Any
-/// bytes past `field_len` (a FUTURE version's appended fields, e.g. the #71 `wire_protocol_version`)
-/// are TOLERATED and ignored by a v1 reader. An empty body is the all-absent default.
+/// u64 LE`, then — each ONLY when its presence bit is set, in this fixed order — an APPENDED
+/// `default_ack_level: u8` (#494, when [`CONNECT_FLAG_HAS_DEFAULT_ACK_LEVEL`]) and an APPENDED
+/// `default_tier: u8` (#543, when [`CONNECT_FLAG_HAS_DEFAULT_TIER`]). Each appended byte is OMITTED
+/// (and `field_len` shrinks by it) when its field is absent; the encoder and decoder walk them in the
+/// SAME conditional order, so an absent earlier byte never shifts a present later one. A request with
+/// neither appended byte is byte-for-byte the historical body. Any bytes past `field_len` (a FUTURE
+/// version's appended fields, e.g. the #71 `wire_protocol_version`) are TOLERATED and ignored by a v1
+/// reader. An empty body is the all-absent default.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConnectBody {
     /// The per-consumer message credit the client requests, or `None` to defer to the server default.
@@ -931,34 +1018,50 @@ pub struct ConnectBody {
     /// the pre-#494 body and an old client (which never sets the presence bit) decodes to `None`. The
     /// value is carried raw as a `u8` so a future level the proto does not yet name still round-trips.
     pub default_ack_level: Option<u8>,
+    /// Whether this consumer UNDERSTANDS the streaming consume tier (#543, V2-M1): the
+    /// [`CONNECT_FLAG_UNDERSTANDS_STREAMING`] capability bit. When `true`, the server may serve the
+    /// connection at Tier-S and may honor a Tier-S `default_tier`. When `false` (the default, and an
+    /// old client) the connection ALWAYS consumes at Tier-W — byte-for-byte today's behavior — and any
+    /// Tier-S `default_tier` is ignored, so a pre-streaming client is never moved onto a tier it cannot
+    /// follow. A pure capability flag, so it adds no block slot beyond its `flags` bit.
+    pub understands_streaming: bool,
+    /// The connection-wide DEFAULT consume tier the client requests (#543, V2-M1): the raw value folded
+    /// via [`ConsumeTier::from_u8`] (`0` = Tier-W, `1` = Tier-S) a SUBSCRIPTION adopts when it does not
+    /// pick its own tier. `None` (an old client, or one that defers) means the server applies Tier-W,
+    /// the work-queue default. APPENDED v1 field mirroring `default_ack_level`: emitted only when
+    /// `Some`, so a `None` request keeps the body byte-for-byte the layout without it, and an old client
+    /// decodes to `None`. The default is only HONORED when `understands_streaming` is also set; a
+    /// Tier-S default without the capability is ignored. The value is carried raw as a `u8` so a future
+    /// tier the proto does not yet name still round-trips.
+    pub default_tier: Option<u8>,
 }
 
-/// The number of bytes in the `Connect` v1 known-field block WITHOUT the appended `default_ack_level`
-/// byte (#494): `flags: u8` + `requested_credit: u32` + `requested_credit_bytes: u64`. This is the
-/// historical, pre-#494 block length, emitted whenever `default_ack_level` is `None` so the body is
-/// byte-for-byte the old one.
+/// The number of bytes in the `Connect` v1 known-field block with NO appended bytes (#494, #543):
+/// `flags: u8` + `requested_credit: u32` + `requested_credit_bytes: u64`. This is the historical,
+/// pre-appended-byte block length; each present appended byte (`default_ack_level`, then
+/// `default_tier`) adds exactly one to it, so an all-absent request is byte-for-byte the old body.
 const CONNECT_V1_FIELD_LEN: u16 = 1 + 4 + 8;
 
-/// The `Connect` v1 block length WITH the appended `default_ack_level` byte (#494): the historical
-/// block plus one byte, emitted only when the field is present.
-const CONNECT_V1_FIELD_LEN_WITH_ACK_LEVEL: u16 = CONNECT_V1_FIELD_LEN + 1;
-
-/// Encodes a `Connect` body onto the end of `out` (#292, #494). The result is the version byte, the v1
-/// field-block length, then the v1 block; an all-`None` request still encodes a well-formed
+/// Encodes a `Connect` body onto the end of `out` (#292, #494, #543). The result is the version byte,
+/// the v1 field-block length, then the v1 block; an all-`None` request still encodes a well-formed
 /// (non-empty) v1 body whose presence flags are clear, which the server reads as "use my defaults".
-/// The `default_ack_level` byte (#494) is APPENDED to the block ONLY when present, and `field_len`
-/// grows by exactly that byte; when absent the body is byte-for-byte the pre-#494 layout. To emit the
-/// historical EMPTY `Connect` body (the old-client case) the caller simply sends an empty body and
-/// does NOT call this; [`decode_connect`] accepts both.
+/// The appended `default_ack_level` (#494) and `default_tier` (#543) bytes are each APPENDED to the
+/// block ONLY when present, in that fixed order, and `field_len` grows by exactly the present bytes;
+/// when both are absent the body is byte-for-byte the historical layout. To emit the historical EMPTY
+/// `Connect` body (the old-client case) the caller simply sends an empty body and does NOT call this;
+/// [`decode_connect`] accepts both.
 pub fn encode_connect(req: &ConnectBody, out: &mut Vec<u8>) {
     out.push(HANDSHAKE_BODY_VERSION);
-    // The block length depends ONLY on whether the appended ack-level byte is present, so a request
-    // without it encodes the historical length and bytes (byte-identity, #494).
-    let field_len = if req.default_ack_level.is_some() {
-        CONNECT_V1_FIELD_LEN_WITH_ACK_LEVEL
-    } else {
-        CONNECT_V1_FIELD_LEN
-    };
+    // The block length is the historical fixed block plus ONE byte for each present appended field, in
+    // declared order (ack-level, then tier). An all-absent request encodes the historical length and
+    // bytes verbatim (byte-identity, #494/#543).
+    let mut field_len = CONNECT_V1_FIELD_LEN;
+    if req.default_ack_level.is_some() {
+        field_len += 1;
+    }
+    if req.default_tier.is_some() {
+        field_len += 1;
+    }
     out.extend_from_slice(&field_len.to_le_bytes());
     let mut flags = 0u8;
     if req.requested_credit.is_some() {
@@ -973,13 +1076,23 @@ pub fn encode_connect(req: &ConnectBody, out: &mut Vec<u8>) {
     if req.default_ack_level.is_some() {
         flags |= CONNECT_FLAG_HAS_DEFAULT_ACK_LEVEL;
     }
+    if req.understands_streaming {
+        flags |= CONNECT_FLAG_UNDERSTANDS_STREAMING;
+    }
+    if req.default_tier.is_some() {
+        flags |= CONNECT_FLAG_HAS_DEFAULT_TIER;
+    }
     out.push(flags);
     out.extend_from_slice(&req.requested_credit.unwrap_or(0).to_le_bytes());
     out.extend_from_slice(&req.requested_credit_bytes.unwrap_or(0).to_le_bytes());
-    // The appended ack-level byte is emitted LAST in the block and ONLY when present, so the historical
-    // fields keep their exact offsets and a `None` request omits the byte entirely (#494).
+    // The appended bytes follow the historical fixed fields, each ONLY when present, in declared order
+    // (ack-level, then tier). The decoder reads them in the SAME conditional order, so an absent earlier
+    // byte never shifts a present later one and the historical fields keep their exact offsets.
     if let Some(level) = req.default_ack_level {
         out.push(level);
+    }
+    if let Some(tier) = req.default_tier {
+        out.push(tier);
     }
 }
 
@@ -1028,15 +1141,22 @@ pub fn decode_connect(body: &[u8]) -> Result<ConnectBody, BodyError> {
     // set the bit but truncated the block.
     let default_ack_level =
         (flags & CONNECT_FLAG_HAS_DEFAULT_ACK_LEVEL != 0).then(|| fr.u8().unwrap_or(0));
+    // The appended tier byte (#543) follows the ack-level byte in the SAME conditional order the
+    // encoder wrote them, so a present tier byte is read from the right offset whether or not the
+    // ack-level byte preceded it. Read AFTER ack-level; a clear bit (or short block) reads no byte.
+    let default_tier = (flags & CONNECT_FLAG_HAS_DEFAULT_TIER != 0).then(|| fr.u8().unwrap_or(0));
     let requested_credit = (flags & CONNECT_FLAG_HAS_CREDIT != 0).then_some(credit);
     let requested_credit_bytes =
         (flags & CONNECT_FLAG_HAS_CREDIT_BYTES != 0).then_some(credit_bytes);
     let wants_gap_marker = flags & CONNECT_FLAG_WANTS_GAP_MARKER != 0;
+    let understands_streaming = flags & CONNECT_FLAG_UNDERSTANDS_STREAMING != 0;
     Ok(ConnectBody {
         requested_credit,
         requested_credit_bytes,
         wants_gap_marker,
         default_ack_level,
+        understands_streaming,
+        default_tier,
     })
 }
 
@@ -1061,11 +1181,12 @@ pub struct CreditAdvert<T> {
 ///
 /// Layout (the same version/length framing as [`ConnectBody`]): `body_version: u8`, `field_len: u16`,
 /// then the v1 block: `flags: u8`, `credit.negotiated: u32 LE`, `credit.cap: u32 LE`,
-/// `credit_bytes.negotiated: u64 LE`, `credit_bytes.cap: u64 LE`, and then — ONLY when
-/// [`INFO_FLAG_HAS_DEFAULT_ACK_LEVEL`] is set — an APPENDED `default_ack_level: u8` (#494). The
-/// ack-level byte is OMITTED (and `field_len` is the historical length) when absent, so an
-/// advertisement without it is byte-for-byte the pre-#494 body. Trailing bytes past the block are a
-/// future version's fields, tolerated and ignored. An empty body is the all-absent case.
+/// `credit_bytes.negotiated: u64 LE`, `credit_bytes.cap: u64 LE`, then — each ONLY when its presence
+/// bit is set, in this fixed order — an APPENDED `default_ack_level: u8` (#494, when
+/// [`INFO_FLAG_HAS_DEFAULT_ACK_LEVEL`]) and an APPENDED `default_tier: u8` (#543, when
+/// [`INFO_FLAG_HAS_DEFAULT_TIER`]). Each appended byte is OMITTED (and `field_len` shrinks by it) when
+/// absent; an advertisement with neither is byte-for-byte the historical body. Trailing bytes past the
+/// block are a future version's fields, tolerated and ignored. An empty body is the all-absent case.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InfoBody {
     /// The server's per-consumer message-credit advertisement, or `None` if the server does not
@@ -1086,31 +1207,43 @@ pub struct InfoBody {
     /// client keeps whatever default it requested. APPENDED v1 field: emitted only when `Some`, so a
     /// `None` advertisement is byte-for-byte the pre-#494 body and an old server decodes to `None`.
     pub default_ack_level: Option<u8>,
+    /// Whether the server CONFIRMS this connection may consume at the streaming tier (#543, V2-M1): the
+    /// [`INFO_FLAG_STREAMING`] capability echo, the server->client twin of
+    /// [`ConnectBody::understands_streaming`]. `true` only when the client advertised it understands
+    /// streaming AND the server supports the tier. `false` (an old server, or a client that did not
+    /// advertise) tells the client it will only ever be served Tier-W.
+    pub streaming: bool,
+    /// The connection-wide DEFAULT consume tier the server ECHOES for this connection (#543, V2-M1), the
+    /// server->client twin of [`ConnectBody::default_tier`]: the raw value folded via
+    /// [`ConsumeTier::from_u8`] (`0` = Tier-W, `1` = Tier-S). `None` (an old server, or one that
+    /// defaulted to Tier-W) means no echo. APPENDED v1 field mirroring `default_ack_level`: emitted only
+    /// when `Some`, so a `None` advertisement is byte-for-byte the body without it.
+    pub default_tier: Option<u8>,
 }
 
-/// The number of bytes in the `Info` v1 known-field block WITHOUT the appended `default_ack_level`
-/// byte (#494): `flags: u8` + `credit.negotiated: u32` + `credit.cap: u32` + `credit_bytes.negotiated:
-/// u64` + `credit_bytes.cap: u64`. This is the historical, pre-#494 block length.
+/// The number of bytes in the `Info` v1 known-field block with NO appended bytes (#494, #543):
+/// `flags: u8` + `credit.negotiated: u32` + `credit.cap: u32` + `credit_bytes.negotiated: u64` +
+/// `credit_bytes.cap: u64`. This is the historical, pre-appended-byte block length; each present
+/// appended byte (`default_ack_level`, then `default_tier`) adds exactly one to it.
 const INFO_V1_FIELD_LEN: u16 = 1 + 4 + 4 + 8 + 8;
 
-/// The `Info` v1 block length WITH the appended `default_ack_level` byte (#494): the historical block
-/// plus one byte, emitted only when the field is present.
-const INFO_V1_FIELD_LEN_WITH_ACK_LEVEL: u16 = INFO_V1_FIELD_LEN + 1;
-
-/// Encodes an `Info` body onto the end of `out` (#292, #494): the version byte, the v1 field-block
-/// length, then the v1 block. An all-`None` advertisement still encodes a well-formed (non-empty) v1
-/// body whose presence flags are clear, which a client reads as "no advertisement, keep my local
-/// credit". The `default_ack_level` byte (#494) is APPENDED to the block ONLY when present, and
-/// `field_len` grows by exactly that byte; when absent the body is byte-for-byte the pre-#494 layout.
-/// To emit the historical EMPTY `Info` body (the old-server case) the caller sends an empty body and
-/// does NOT call this; [`decode_info`] accepts both.
+/// Encodes an `Info` body onto the end of `out` (#292, #494, #543): the version byte, the v1
+/// field-block length, then the v1 block. An all-`None` advertisement still encodes a well-formed
+/// (non-empty) v1 body whose presence flags are clear, which a client reads as "no advertisement, keep
+/// my local credit". The appended `default_ack_level` (#494) and `default_tier` (#543) bytes are each
+/// APPENDED to the block ONLY when present, in that fixed order, and `field_len` grows by exactly the
+/// present bytes; when both are absent the body is byte-for-byte the historical layout. To emit the
+/// historical EMPTY `Info` body (the old-server case) the caller sends an empty body and does NOT call
+/// this; [`decode_info`] accepts both.
 pub fn encode_info(info: &InfoBody, out: &mut Vec<u8>) {
     out.push(HANDSHAKE_BODY_VERSION);
-    let field_len = if info.default_ack_level.is_some() {
-        INFO_V1_FIELD_LEN_WITH_ACK_LEVEL
-    } else {
-        INFO_V1_FIELD_LEN
-    };
+    let mut field_len = INFO_V1_FIELD_LEN;
+    if info.default_ack_level.is_some() {
+        field_len += 1;
+    }
+    if info.default_tier.is_some() {
+        field_len += 1;
+    }
     out.extend_from_slice(&field_len.to_le_bytes());
     let mut flags = 0u8;
     if info.credit.is_some() {
@@ -1125,6 +1258,12 @@ pub fn encode_info(info: &InfoBody, out: &mut Vec<u8>) {
     if info.default_ack_level.is_some() {
         flags |= INFO_FLAG_HAS_DEFAULT_ACK_LEVEL;
     }
+    if info.streaming {
+        flags |= INFO_FLAG_STREAMING;
+    }
+    if info.default_tier.is_some() {
+        flags |= INFO_FLAG_HAS_DEFAULT_TIER;
+    }
     out.push(flags);
     let credit = info.credit.unwrap_or(CreditAdvert {
         negotiated: 0,
@@ -1138,10 +1277,14 @@ pub fn encode_info(info: &InfoBody, out: &mut Vec<u8>) {
     });
     out.extend_from_slice(&credit_bytes.negotiated.to_le_bytes());
     out.extend_from_slice(&credit_bytes.cap.to_le_bytes());
-    // The appended ack-level byte is emitted LAST in the block and ONLY when present, so the historical
-    // fields keep their exact offsets and a `None` advertisement omits the byte entirely (#494).
+    // The appended bytes follow the historical fixed fields, each ONLY when present, in declared order
+    // (ack-level, then tier), exactly as the decoder reads them, so an absent earlier byte never shifts
+    // a present later one and the historical fields keep their exact offsets.
     if let Some(level) = info.default_ack_level {
         out.push(level);
+    }
+    if let Some(tier) = info.default_tier {
+        out.push(tier);
     }
 }
 
@@ -1182,6 +1325,9 @@ pub fn decode_info(body: &[u8]) -> Result<InfoBody, BodyError> {
     // byte and defaults to `None`.
     let default_ack_level =
         (flags & INFO_FLAG_HAS_DEFAULT_ACK_LEVEL != 0).then(|| fr.u8().unwrap_or(0));
+    // The appended tier byte (#543) follows the ack-level byte in the SAME conditional order the
+    // encoder wrote them, read AFTER ack-level; a clear bit (or short block) reads no byte.
+    let default_tier = (flags & INFO_FLAG_HAS_DEFAULT_TIER != 0).then(|| fr.u8().unwrap_or(0));
     let credit = (flags & INFO_FLAG_HAS_CREDIT != 0).then_some(CreditAdvert {
         negotiated: credit_negotiated,
         cap: credit_cap,
@@ -1191,11 +1337,14 @@ pub fn decode_info(body: &[u8]) -> Result<InfoBody, BodyError> {
         cap: credit_bytes_cap,
     });
     let gap_marker = flags & INFO_FLAG_GAP_MARKER != 0;
+    let streaming = flags & INFO_FLAG_STREAMING != 0;
     Ok(InfoBody {
         credit,
         credit_bytes,
         gap_marker,
         default_ack_level,
+        streaming,
+        default_tier,
     })
 }
 
@@ -1538,6 +1687,8 @@ mod tests {
             requested_credit_bytes: None,
             wants_gap_marker: true,
             default_ack_level: None,
+            understands_streaming: false,
+            default_tier: None,
         };
         let mut buf = Vec::new();
         encode_connect(&req, &mut buf);
@@ -1559,6 +1710,8 @@ mod tests {
             credit_bytes: None,
             gap_marker: true,
             default_ack_level: None,
+            streaming: false,
+            default_tier: None,
         };
         let mut buf = Vec::new();
         encode_info(&info, &mut buf);
@@ -2279,8 +2432,10 @@ mod tests {
             credit_bytes in proptest::option::of(any::<u64>()),
             wants_gap_marker in any::<bool>(),
             default_ack_level in proptest::option::of(any::<u8>()),
+            understands_streaming in any::<bool>(),
+            default_tier in proptest::option::of(any::<u8>()),
         ) {
-            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: credit_bytes, wants_gap_marker, default_ack_level };
+            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: credit_bytes, wants_gap_marker, default_ack_level, understands_streaming, default_tier };
             let mut buf = Vec::new();
             encode_connect(&req, &mut buf);
             prop_assert_eq!(buf[0], HANDSHAKE_BODY_VERSION, "the body leads with its version");
@@ -2288,20 +2443,25 @@ mod tests {
         }
 
         /// An Info body round-trips for any combination of present/absent advertised credit and byte
-        /// budget (#292), the gap-marker capability bit (#346), and the appended `default_ack_level`
-        /// (#494): each survives the round-trip.
+        /// budget (#292), the gap-marker capability bit (#346), the appended `default_ack_level`
+        /// (#494), the streaming capability bit and the appended `default_tier` (#543): each survives
+        /// the round-trip, including BOTH appended bytes present together at independent offsets.
         #[test]
         fn any_info_round_trips(
             credit in proptest::option::of((any::<u32>(), any::<u32>())),
             credit_bytes in proptest::option::of((any::<u64>(), any::<u64>())),
             gap_marker in any::<bool>(),
             default_ack_level in proptest::option::of(any::<u8>()),
+            streaming in any::<bool>(),
+            default_tier in proptest::option::of(any::<u8>()),
         ) {
             let info = InfoBody {
                 credit: credit.map(|(negotiated, cap)| CreditAdvert { negotiated, cap }),
                 credit_bytes: credit_bytes.map(|(negotiated, cap)| CreditAdvert { negotiated, cap }),
                 gap_marker,
                 default_ack_level,
+                streaming,
+                default_tier,
             };
             let mut buf = Vec::new();
             encode_info(&info, &mut buf);
@@ -2330,7 +2490,7 @@ mod tests {
             credit in proptest::option::of(any::<u32>()),
             trailing in prop::collection::vec(any::<u8>(), 0..64),
         ) {
-            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: None, wants_gap_marker: false, default_ack_level: None };
+            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: None, wants_gap_marker: false, default_ack_level: None, understands_streaming: false, default_tier: None };
             let mut buf = Vec::new();
             encode_connect(&req, &mut buf);
             let mut extended = buf.clone();
@@ -2342,6 +2502,8 @@ mod tests {
                 credit_bytes: None,
                 gap_marker: false,
                 default_ack_level: None,
+                streaming: false,
+                default_tier: None,
             };
             let mut ibuf = Vec::new();
             encode_info(&info, &mut ibuf);
@@ -2413,6 +2575,8 @@ mod tests {
                 requested_credit_bytes: None,
                 wants_gap_marker: false,
                 default_ack_level: None,
+                understands_streaming: false,
+                default_tier: None,
             }
         );
     }
@@ -2429,6 +2593,8 @@ mod tests {
                 credit_bytes: None,
                 gap_marker: false,
                 default_ack_level: None,
+                streaming: false,
+                default_tier: None,
             }
         );
     }
@@ -2440,6 +2606,8 @@ mod tests {
             requested_credit_bytes: Some(1024),
             wants_gap_marker: true,
             default_ack_level: None,
+            understands_streaming: false,
+            default_tier: None,
         };
         let mut buf = Vec::new();
         encode_connect(&req, &mut buf);
@@ -2464,6 +2632,8 @@ mod tests {
             }),
             gap_marker: true,
             default_ack_level: None,
+            streaming: false,
+            default_tier: None,
         };
         let mut buf = Vec::new();
         encode_info(&info, &mut buf);
@@ -2689,6 +2859,8 @@ mod tests {
             requested_credit_bytes: None,
             wants_gap_marker: false,
             default_ack_level: None,
+            understands_streaming: false,
+            default_tier: None,
         };
         let mut pre = Vec::new();
         encode_connect(&no_level, &mut pre);
@@ -2720,7 +2892,7 @@ mod tests {
         encode_connect(&with_level, &mut buf);
         assert_eq!(
             &buf[1..3],
-            &CONNECT_V1_FIELD_LEN_WITH_ACK_LEVEL.to_le_bytes(),
+            &(CONNECT_V1_FIELD_LEN + 1).to_le_bytes(),
             "a Some default grows field_len by one byte"
         );
         assert_eq!(
@@ -2739,6 +2911,8 @@ mod tests {
             credit_bytes: None,
             gap_marker: false,
             default_ack_level: None,
+            streaming: false,
+            default_tier: None,
         };
         let mut pre = Vec::new();
         encode_info(&no_level, &mut pre);
@@ -2753,7 +2927,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         encode_info(&with_level, &mut buf);
-        assert_eq!(&buf[1..3], &INFO_V1_FIELD_LEN_WITH_ACK_LEVEL.to_le_bytes());
+        assert_eq!(&buf[1..3], &(INFO_V1_FIELD_LEN + 1).to_le_bytes());
         assert_eq!(
             buf[3] & INFO_FLAG_HAS_DEFAULT_ACK_LEVEL,
             INFO_FLAG_HAS_DEFAULT_ACK_LEVEL
@@ -2761,6 +2935,166 @@ mod tests {
         assert_eq!(buf.len(), pre.len() + 1);
         assert_eq!(*buf.last().unwrap(), 2);
         assert_eq!(decode_info(&buf).unwrap(), with_level);
+    }
+
+    #[test]
+    fn connect_carries_the_streaming_capability_and_default_tier_and_old_client_is_byte_identical()
+    {
+        // #543: a streaming-capable consumer sets the capability bit (a pure flags bit, no block byte)
+        // and MAY append a connection-default tier byte. An old client (or one that defers both) leaves
+        // them clear/None, so the body is byte-for-byte the layout WITHOUT them.
+        let none = ConnectBody {
+            requested_credit: Some(7),
+            requested_credit_bytes: None,
+            wants_gap_marker: false,
+            default_ack_level: None,
+            understands_streaming: false,
+            default_tier: None,
+        };
+        let mut pre = Vec::new();
+        encode_connect(&none, &mut pre);
+        assert_eq!(
+            pre[3] & (CONNECT_FLAG_UNDERSTANDS_STREAMING | CONNECT_FLAG_HAS_DEFAULT_TIER),
+            0,
+            "neither the capability nor the default-tier bit is set"
+        );
+        assert_eq!(
+            pre.len(),
+            3 + usize::from(CONNECT_V1_FIELD_LEN),
+            "no appended tier byte"
+        );
+        assert_eq!(decode_connect(&pre).unwrap(), none);
+
+        // The capability bit is a PURE flags bit: setting it adds NO appended byte, so the body length
+        // is unchanged, only the flags bit flips.
+        let cap_only = ConnectBody {
+            understands_streaming: true,
+            ..none
+        };
+        let mut cap_buf = Vec::new();
+        encode_connect(&cap_only, &mut cap_buf);
+        assert_eq!(
+            cap_buf[3] & CONNECT_FLAG_UNDERSTANDS_STREAMING,
+            CONNECT_FLAG_UNDERSTANDS_STREAMING
+        );
+        assert_eq!(
+            cap_buf.len(),
+            pre.len(),
+            "the capability bit appends no byte"
+        );
+        assert_eq!(decode_connect(&cap_buf).unwrap(), cap_only);
+
+        // A streaming-capable client that ALSO requests a Tier-S default appends exactly one tier byte
+        // and sets the default-tier presence bit; the value round-trips via `ConsumeTier::from_u8`.
+        let with_tier = ConnectBody {
+            understands_streaming: true,
+            default_tier: Some(ConsumeTier::Streaming.as_u8()),
+            ..none
+        };
+        let mut buf = Vec::new();
+        encode_connect(&with_tier, &mut buf);
+        assert_eq!(
+            buf[3] & CONNECT_FLAG_HAS_DEFAULT_TIER,
+            CONNECT_FLAG_HAS_DEFAULT_TIER
+        );
+        assert_eq!(buf.len(), pre.len() + 1, "exactly one appended tier byte");
+        assert_eq!(*buf.last().unwrap(), ConsumeTier::Streaming.as_u8());
+        let decoded = decode_connect(&buf).unwrap();
+        assert_eq!(decoded, with_tier);
+        assert_eq!(
+            decoded.default_tier.map(ConsumeTier::from_u8),
+            Some(ConsumeTier::Streaming)
+        );
+    }
+
+    #[test]
+    fn info_echoes_the_streaming_capability_and_default_tier_and_old_server_is_byte_identical() {
+        // #543: the server->client twin. An old server (or one that confirms neither) is byte-for-byte
+        // the layout without the echo; a confirming server flips the capability bit and may append the
+        // echoed default-tier byte.
+        let none = InfoBody {
+            credit: None,
+            credit_bytes: None,
+            gap_marker: false,
+            default_ack_level: None,
+            streaming: false,
+            default_tier: None,
+        };
+        let mut pre = Vec::new();
+        encode_info(&none, &mut pre);
+        assert_eq!(
+            pre[3] & (INFO_FLAG_STREAMING | INFO_FLAG_HAS_DEFAULT_TIER),
+            0
+        );
+        assert_eq!(pre.len(), 3 + usize::from(INFO_V1_FIELD_LEN));
+        assert_eq!(decode_info(&pre).unwrap(), none);
+
+        let with_tier = InfoBody {
+            streaming: true,
+            default_tier: Some(ConsumeTier::Streaming.as_u8()),
+            ..none
+        };
+        let mut buf = Vec::new();
+        encode_info(&with_tier, &mut buf);
+        assert_eq!(buf[3] & INFO_FLAG_STREAMING, INFO_FLAG_STREAMING);
+        assert_eq!(
+            buf[3] & INFO_FLAG_HAS_DEFAULT_TIER,
+            INFO_FLAG_HAS_DEFAULT_TIER
+        );
+        assert_eq!(buf.len(), pre.len() + 1, "exactly one appended tier byte");
+        assert_eq!(*buf.last().unwrap(), ConsumeTier::Streaming.as_u8());
+        assert_eq!(decode_info(&buf).unwrap(), with_tier);
+    }
+
+    #[test]
+    fn connect_with_both_appended_bytes_keeps_them_at_independent_offsets() {
+        // #494 + #543 together: BOTH appended bytes present. They are written in declared order
+        // (ack-level, then tier) and read in the SAME order, so each lands at its own offset and both
+        // round-trip — the appended-byte discipline composes.
+        let both = ConnectBody {
+            requested_credit: None,
+            requested_credit_bytes: None,
+            wants_gap_marker: false,
+            default_ack_level: Some(AckLevel::ServerAndClientAck.as_u8()),
+            understands_streaming: true,
+            default_tier: Some(ConsumeTier::Streaming.as_u8()),
+        };
+        let mut buf = Vec::new();
+        encode_connect(&both, &mut buf);
+        // field_len = historical + 2 appended bytes; the last two block bytes are ack-level then tier.
+        assert_eq!(&buf[1..3], &(CONNECT_V1_FIELD_LEN + 2).to_le_bytes());
+        assert_eq!(buf[buf.len() - 2], AckLevel::ServerAndClientAck.as_u8());
+        assert_eq!(buf[buf.len() - 1], ConsumeTier::Streaming.as_u8());
+        assert_eq!(decode_connect(&buf).unwrap(), both);
+
+        // FORWARD-COMPAT: a future version appends MORE fields past the declared block; a v1 reader
+        // tolerates the trailing bytes and still recovers every v1 field (including both appended bytes).
+        let mut extended = buf.clone();
+        extended.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        assert_eq!(
+            decode_connect(&extended).unwrap(),
+            both,
+            "trailing future bytes are ignored, the appended bytes still decode"
+        );
+    }
+
+    #[test]
+    fn consume_tier_folds_unknown_values_to_work() {
+        // A future tier value the proto does not yet name folds to the safe Tier-W default rather than
+        // erroring, so the field can grow without a wire break (mirrors `pub_ack_level`'s reserved-value
+        // handling). Only the exact value 1 is Tier-S.
+        assert_eq!(ConsumeTier::from_u8(0), ConsumeTier::Work);
+        assert_eq!(ConsumeTier::from_u8(1), ConsumeTier::Streaming);
+        for raw in 2u8..=255 {
+            assert_eq!(
+                ConsumeTier::from_u8(raw),
+                ConsumeTier::Work,
+                "an unknown future tier {raw} degrades to Tier-W"
+            );
+        }
+        assert_eq!(ConsumeTier::Work.as_u8(), 0);
+        assert_eq!(ConsumeTier::Streaming.as_u8(), 1);
+        assert_eq!(ConsumeTier::default(), ConsumeTier::Work);
     }
 
     #[test]
@@ -2781,6 +3115,8 @@ mod tests {
                 requested_credit_bytes: None,
                 wants_gap_marker: false,
                 default_ack_level: None,
+                understands_streaming: false,
+                default_tier: None,
             }
         );
 
@@ -2798,6 +3134,8 @@ mod tests {
                 credit_bytes: None,
                 gap_marker: false,
                 default_ack_level: None,
+                streaming: false,
+                default_tier: None,
             }
         );
     }
