@@ -122,7 +122,7 @@ use ironbus_storage::dict_store::{CachingDictResolver, DictSidecarStore, DICTS_S
 #[cfg(unix)]
 use ironbus_storage::dlq::{read_dlq_entries, DlqEntry};
 #[cfg(unix)]
-use ironbus_storage::fs::{Filesystem, InMemoryFs, StdFs};
+use ironbus_storage::fs::{EphemeralFs, Filesystem, StdFs};
 #[cfg(unix)]
 use ironbus_storage::log::LogConfig;
 #[cfg(unix)]
@@ -471,8 +471,8 @@ impl CompressionArg {
 /// lives in the (non-Unix-gated) [`ServeConfig`] and is parsed/validated on EVERY platform; only the
 /// Unix serve path opens an engine over it. The default is [`StorageArg::Disk`], the durable on-disk
 /// store: a broker that passes no `--storage` is byte-for-byte the historical broker. `memory` runs
-/// the SAME engine and the SAME `EngineConfig` over [`ironbus_storage::fs::InMemoryFs`] (the
-/// deterministic in-memory filesystem every engine test and conformance suite already exercises):
+/// the SAME engine and the SAME `EngineConfig` over [`ironbus_storage::fs::EphemeralFs`] (the
+/// single-image in-RAM filesystem, #492 — no `durable` shadow, so RSS is ~1x the cap, not ~2x):
 /// NO files, NO fsync, and explicitly NO power-loss or restart durability, for hot-path fan-out,
 /// spill-to-RAM buffering, and test rigs where flash wear or fsync latency is the binding
 /// constraint. It is gated behind the explicit `--ephemeral-loss-ack` consent and a non-zero
@@ -482,8 +482,8 @@ impl CompressionArg {
 enum StorageArg {
     /// The DEFAULT durable on-disk store rooted at `--data-dir` (byte-for-byte unchanged behavior).
     Disk,
-    /// OPT-IN ephemeral in-memory store: the same engine over `InMemoryFs`, no files, no fsync; a
-    /// clean stop or crash loses every acked message by contract. Gated behind
+    /// OPT-IN ephemeral in-memory store: the same engine over `EphemeralFs` (#492), no files, no
+    /// fsync; a clean stop or crash loses every acked message by contract. Gated behind
     /// `--ephemeral-loss-ack` and an explicit `--max-total-bytes`.
     Memory,
 }
@@ -3115,8 +3115,8 @@ struct ServeConfig {
     async_loss_ack: bool,
     /// The storage BACKEND (#443): [`StorageArg::Disk`] (the default, the durable on-disk store,
     /// byte-for-byte unchanged behavior) or the opt-in ephemeral [`StorageArg::Memory`] (the SAME
-    /// engine and the SAME `EngineConfig` over `InMemoryFs`: no files, no fsync, NO power-loss or
-    /// restart durability; a clean stop or crash loses every acked message by contract).
+    /// engine and the SAME `EngineConfig` over `EphemeralFs` (#492): no files, no fsync, NO power-loss
+    /// or restart durability; a clean stop or crash loses every acked message by contract).
     /// Platform-neutral so it is parsed/validated on every platform; the Unix serve path dispatches
     /// on it statically (one monomorphized run per backend, no dyn dispatch on the hot path).
     storage: StorageArg,
@@ -3505,7 +3505,7 @@ fn cmd_serve(
     };
 
     // The storage-backend dispatch (#443): a TWO-ARMED STATIC match, each arm monomorphizing the
-    // generic [`run_broker`] over its concrete filesystem (`StdFs` / `InMemoryFs`). The whole serve
+    // generic [`run_broker`] over its concrete filesystem (`StdFs` / `EphemeralFs`). The whole serve
     // stack (engine, append actor, sessions, health) is already generic over `Filesystem`, so the
     // backend is decided ONCE here at startup and there is NO dyn dispatch on the hot path.
     match config.storage {
@@ -3540,7 +3540,7 @@ fn cmd_serve(
         }
         StorageArg::Memory => {
             // The OPT-IN ephemeral in-memory broker (#443): the SAME engine and the SAME
-            // `EngineConfig` over `InMemoryFs::new()`. NO data dir is prepared and NO exclusive
+            // `EngineConfig` over `EphemeralFs::new()` (#492). NO data dir is prepared and NO exclusive
             // data-dir lock is taken: serve's lock exists to stop two brokers writing one
             // directory, and each memory-mode process owns its own PRIVATE in-memory filesystem,
             // so the lock is meaningless here and there is no path to lock (nothing on the lock
@@ -4480,20 +4480,26 @@ fn open_disk_engine(
 
 /// Opens the OPT-IN ephemeral in-memory broker engine (#443): the SAME engine and, via the shared
 /// [`open_engine_with`], the SAME `EngineConfig` the disk path builds, over a fresh
-/// [`InMemoryFs::new()`] (the deterministic in-memory `Filesystem` every engine test and
-/// conformance suite already exercises). No file is created and no fsync is issued; the stored
-/// format, CRC-over-stored-bytes, retention, compression (#430), the produce gate (#438), and the
+/// [`EphemeralFs::new()`]. No file is created and no fsync is issued; the stored format,
+/// CRC-over-stored-bytes, retention, compression (#430), the produce gate (#438), and the
 /// checkpoint machinery (group cursors, which drive redelivery semantics WITHIN the process
 /// lifetime) all hold identically. The loss contract is enforced upstream by `validate_storage`:
 /// this is only reachable with `--ephemeral-loss-ack` and a non-zero `--max-total-bytes`.
+///
+/// The backend is [`EphemeralFs`], NOT the simulation's `InMemoryFs` (#492): an ephemeral broker
+/// models no power loss, so the `durable` second copy `InMemoryFs`/`InMemoryFile` keep solely for
+/// the crash-recovery simulation is pure waste here — it doubled RSS to ~2x the `--max-total-bytes`
+/// cap (the production memory blowup) and made every `sync_*` clone the whole file/map. `EphemeralFs`
+/// holds a single image, so RSS is ~1x the cap and `sync_*` is O(1). The crash-recovery simulation
+/// keeps using `InMemoryFs` (which still carries the durable copy `simulate_power_loss` reverts to).
 #[cfg(unix)]
 fn open_memory_engine(
     config: &ServeConfig,
     key_shared_groups: &[String],
     broadcast_groups: &[String],
-) -> Result<Engine<InMemoryFs, SystemClock>, CliError> {
+) -> Result<Engine<EphemeralFs, SystemClock>, CliError> {
     open_engine_with(
-        InMemoryFs::new(),
+        EphemeralFs::new(),
         config,
         key_shared_groups,
         broadcast_groups,

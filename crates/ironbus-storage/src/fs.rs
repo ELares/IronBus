@@ -7,7 +7,7 @@
 //! fully controls, including directory-entry durability across a simulated power loss
 //! (a created-but-not-dir-synced segment vanishes; a not-yet-durable removal is undone).
 
-use crate::io::{InMemoryFile, RandomAccessFile};
+use crate::io::{EphemeralFile, InMemoryFile, RandomAccessFile};
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -284,6 +284,139 @@ impl Filesystem for InMemoryFs {
         // for the DLQ probe).
         let dir_prefix = format!("{}{name}/", self.prefix);
         Ok(self.lock().live.keys().any(|k| k.starts_with(&dir_prefix)))
+    }
+}
+
+/// An EPHEMERAL in-memory [`Filesystem`] for the real `--storage memory` broker (#492).
+///
+/// It is the directory-level companion to [`EphemeralFile`]: a flat namespace of named ephemeral
+/// files with NO `durable` directory shadow and a no-op `sync_dir`. [`InMemoryFs`] keeps a second
+/// `durable` `BTreeMap` (and each file keeps its own `durable` byte image) ONLY so the deterministic
+/// crash-recovery simulation can revert created/removed entries and unsynced bytes at a modelled
+/// power loss. The real `--storage memory` path models no power loss — it is ephemeral, a crash
+/// loses everything — so that second map is pure overhead, the directory half of the ~2x RSS blowup
+/// (#492). This backend drops it, so directory state is ~1x and `sync_dir` is O(1).
+///
+/// It is deliberately MISSING `simulate_power_loss` / `simulate_power_loss_reorder`: the crash
+/// simulation must keep using [`InMemoryFs`], which still carries the durable images those models
+/// revert to. Like [`InMemoryFs`], a clone aliases the SAME backing store (an `Arc`) and a
+/// [`subdir`](Filesystem::subdir) is a key-prefix view over it (the DLQ sink lives there), so the
+/// engine's subdirectory and multi-handle behavior is unchanged.
+///
+/// [`EphemeralFile`]: crate::io::EphemeralFile
+#[derive(Clone, Debug, Default)]
+pub struct EphemeralFs {
+    /// The single live directory image, shared behind an `Arc` so a clone aliases the same store.
+    /// There is no `durable` companion map: an ephemeral directory has no power loss to model.
+    files: Arc<Mutex<BTreeMap<String, Arc<EphemeralFile>>>>,
+    /// The key prefix this handle operates under, so a [`subdir`](Filesystem::subdir) view shares
+    /// the SAME backing store while seeing only the keys under its prefix. The root handle's prefix
+    /// is empty; the flat store models a subdirectory as a `"<name>/"` key prefix, exactly as
+    /// [`InMemoryFs`] does.
+    prefix: String,
+}
+
+impl EphemeralFs {
+    /// Creates an empty ephemeral in-memory directory.
+    #[must_use]
+    pub fn new() -> EphemeralFs {
+        EphemeralFs::default()
+    }
+
+    // As in [`InMemoryFs::lock`]: recovering a poisoned guard keeps the broker process alive, and
+    // the only mutations are map and `Arc` operations that never leave the state structurally torn.
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<String, Arc<EphemeralFile>>> {
+        self.files.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Maps a caller-visible name to its backing-store key by prepending this handle's prefix.
+    fn key(&self, name: &str) -> String {
+        format!("{}{}", self.prefix, name)
+    }
+}
+
+impl Filesystem for EphemeralFs {
+    type File = Arc<EphemeralFile>;
+
+    fn open(&self, name: &str) -> io::Result<Self::File> {
+        self.lock()
+            .get(&self.key(name))
+            .map(Arc::clone)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))
+    }
+
+    fn create_new(&self, name: &str) -> io::Result<Self::File> {
+        let key = self.key(name);
+        let mut g = self.lock();
+        if g.contains_key(&key) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "file already exists",
+            ));
+        }
+        let file = Arc::new(EphemeralFile::new());
+        g.insert(key, Arc::clone(&file));
+        Ok(file)
+    }
+
+    fn remove(&self, name: &str) -> io::Result<()> {
+        if self.lock().remove(&self.key(name)).is_some() {
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::NotFound, "no such file"))
+        }
+    }
+
+    fn list(&self) -> io::Result<Vec<String>> {
+        // Only the entries directly under this handle's prefix (not a deeper subdirectory's), with
+        // the prefix stripped — exactly the InMemoryFs flat-listing rule.
+        Ok(self
+            .lock()
+            .keys()
+            .filter_map(|k| k.strip_prefix(&self.prefix))
+            .filter(|rest| !rest.is_empty() && !rest.contains('/'))
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        Ok(self.lock().contains_key(&self.key(name)))
+    }
+
+    // No durable directory image to advance and no device to flush: directory durability is not a
+    // concept for an ephemeral store, so this is a faithful O(1) no-op (cf. InMemoryFs::sync_dir,
+    // which clones the whole live map into a durable shadow purely for the power-loss simulation).
+    fn sync_dir(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn subdir(&self, name: &str) -> io::Result<EphemeralFs> {
+        if !is_plain_component(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "subdirectory name must be a single path component",
+            ));
+        }
+        // A subdirectory is a deeper key prefix over the SAME shared store, so the subdir's files
+        // share the parent's image (the DLQ sink, #63). The flat store materializes a directory
+        // lazily as its files appear, so nothing is created here.
+        Ok(EphemeralFs {
+            files: Arc::clone(&self.files),
+            prefix: format!("{}{name}/", self.prefix),
+        })
+    }
+
+    fn subdir_exists(&self, name: &str) -> io::Result<bool> {
+        if !is_plain_component(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "subdirectory name must be a single path component",
+            ));
+        }
+        // The flat store has no standalone directory entries: a subdirectory "exists" iff at least
+        // one key under its `<prefix><name>/` namespace is present.
+        let dir_prefix = format!("{}{name}/", self.prefix);
+        Ok(self.lock().keys().any(|k| k.starts_with(&dir_prefix)))
     }
 }
 
@@ -607,6 +740,115 @@ mod tests {
         g.read_exact_at(&mut buf, 0).unwrap();
         assert_eq!(&buf, b"ORIGINAL");
         assert_eq!(g.len().unwrap(), 8);
+    }
+}
+
+#[cfg(test)]
+mod ephemeral_fs_tests {
+    use super::*;
+
+    fn write_all(f: &Arc<EphemeralFile>, bytes: &[u8]) {
+        f.write_all_at(bytes, 0).unwrap();
+    }
+
+    #[test]
+    fn create_open_list_remove_roundtrip() {
+        let fs = EphemeralFs::new();
+        let a = fs.create_new("a.log").unwrap();
+        write_all(&a, b"alpha");
+        fs.create_new("b.log").unwrap();
+        let mut names = fs.list().unwrap();
+        names.sort();
+        assert_eq!(names, vec!["a.log".to_owned(), "b.log".to_owned()]);
+        // Opening returns a handle to the same bytes (the same Arc-backed file).
+        let again = fs.open("a.log").unwrap();
+        let mut buf = [0u8; 5];
+        again.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"alpha");
+        // Remove drops it; create_new refuses an existing name; open of a missing name errors.
+        fs.remove("a.log").unwrap();
+        assert!(!fs.exists("a.log").unwrap());
+        assert_eq!(
+            fs.create_new("b.log").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            fs.open("a.log").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            fs.remove("a.log").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn a_clone_aliases_the_same_disk_with_no_durable_revert() {
+        // A clone shares the one backing store. The whole point of #492: there is NO durable shadow,
+        // so syncs are no-ops and nothing is ever reverted — the live bytes are the only truth.
+        let fs = EphemeralFs::new();
+        let probe = fs.clone();
+        let f = fs.create_new("seg").unwrap();
+        write_all(&f, b"hello");
+        f.sync_all().unwrap();
+        fs.sync_dir().unwrap();
+        assert!(probe.exists("seg").unwrap());
+        // An overwrite is immediately visible on the clone; a sync changes nothing (no revert).
+        f.write_all_at(b"WORLD", 0).unwrap();
+        let mut buf = [0u8; 5];
+        probe
+            .open("seg")
+            .unwrap()
+            .read_exact_at(&mut buf, 0)
+            .unwrap();
+        assert_eq!(&buf, b"WORLD");
+    }
+
+    #[test]
+    fn a_subdir_is_isolated_and_shares_the_store() {
+        let fs = EphemeralFs::new();
+        fs.create_new("seg-0.log").unwrap();
+        assert!(!fs.subdir_exists("dlq").unwrap());
+        let dlq = fs.subdir("dlq").unwrap();
+        dlq.create_new("seg-0.log").unwrap();
+        dlq.create_new("seg-1.log").unwrap();
+        assert!(fs.subdir_exists("dlq").unwrap());
+        // The subdir sees only its own files; the parent's flat list never surfaces the deeper keys.
+        let mut sub = dlq.list().unwrap();
+        sub.sort();
+        assert_eq!(sub, vec!["seg-0.log".to_owned(), "seg-1.log".to_owned()]);
+        assert_eq!(fs.list().unwrap(), vec!["seg-0.log".to_owned()]);
+        // Same-named files in the parent and the subdir are distinct objects.
+        dlq.open("seg-0.log")
+            .unwrap()
+            .write_all_at(b"sub", 0)
+            .unwrap();
+        fs.open("seg-0.log")
+            .unwrap()
+            .write_all_at(b"PARENT", 0)
+            .unwrap();
+        let mut buf = [0u8; 3];
+        dlq.open("seg-0.log")
+            .unwrap()
+            .read_exact_at(&mut buf, 0)
+            .unwrap();
+        assert_eq!(&buf, b"sub");
+    }
+
+    #[test]
+    fn subdir_rejects_an_unsafe_name() {
+        let fs = EphemeralFs::new();
+        for bad in ["", ".", "..", "a/b", "with\0nul"] {
+            assert_eq!(
+                fs.subdir(bad).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "subdir name {bad:?} should be rejected"
+            );
+            assert_eq!(
+                fs.subdir_exists(bad).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+            );
+        }
     }
 }
 

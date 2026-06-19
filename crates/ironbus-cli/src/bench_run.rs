@@ -19,7 +19,7 @@ use ironbus_core::clock::Clock; // the monotonic seam the serve loop's liveness 
 use ironbus_proto::message::PubBody;
 use ironbus_server::actor::{spawn_actor_with_gather, DEFAULT_CHANNEL_BOUND};
 use ironbus_server::server::serve;
-use ironbus_storage::fs::{Filesystem, InMemoryFs, StdFs};
+use ironbus_storage::fs::{EphemeralFs, Filesystem, StdFs};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -193,11 +193,13 @@ impl IsolatedBroker<StdFs> {
     }
 }
 
-impl IsolatedBroker<InMemoryFs> {
-    /// Spawns the MEMORY broker (#445): the same engine over a fresh in-memory filesystem via the
+impl IsolatedBroker<EphemeralFs> {
+    /// Spawns the MEMORY broker (#445): the same engine over a fresh ephemeral filesystem via the
     /// shared `open_memory_engine`, so the bench broker is the REAL `serve --storage memory`
-    /// engine path. No file is created and nothing needs cleanup afterwards.
-    fn spawn_memory(config: &ServeConfig) -> Result<IsolatedBroker<InMemoryFs>, CliError> {
+    /// engine path — including the #492 single-image `EphemeralFs` (no durable shadow), so the
+    /// bench measures the production in-RAM backend, not the simulation one. No file is created and
+    /// nothing needs cleanup afterwards.
+    fn spawn_memory(config: &ServeConfig) -> Result<IsolatedBroker<EphemeralFs>, CliError> {
         let engine = open_memory_engine(config, &[], &[])?;
         IsolatedBroker::from_engine(engine, config)
     }
