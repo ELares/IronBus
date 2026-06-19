@@ -49,6 +49,18 @@ pub struct LogConfig {
     /// `max_segment_bytes`), so the log may exceed the cap by at most the last record. A record
     /// on an EMPTY log is always written, so an oversized first record is not wedged out.
     ///
+    /// HONEST-ACCOUNTING NOTE (#493): this cap counts ONLY the framed record region. It does NOT
+    /// count the per-segment headers (64 B) and footers (32 B), the per-segment index cache, the
+    /// in-memory image, or a disk backend's per-active-segment preallocation (`max_segment_bytes`,
+    /// 64 MiB by default). So the log's true RESIDENT/disk footprint runs ABOVE this cap — up to
+    /// ~`1.85x` on small records (where the fixed 44-byte record framing dominates) and higher
+    /// still with preallocation. The basis is INTENTIONALLY left at the record region: it is the
+    /// only term that retention/reap decrements in O(1), and the parallel resident terms (the
+    /// in-memory 2x image is dropping to 1x in #492; disk preallocation is backend-specific) would
+    /// poison a single basis. To size a real memory or disk budget, read the HONEST live resident
+    /// estimate [`Log::resident_bytes_estimate`] and the per-backend multiplier table in
+    /// `docs/CONFIG.md`; do NOT assume `bytes_on_disk == max_total_bytes`.
+    ///
     /// `0` means UNLIMITED (the cap is off), which is the default and preserves the historical
     /// spill-by-default behavior: an operator opts in to the cap. The rejection is non-fatal
     /// and does not freeze the writer (see [`StorageError::AtCapacity`]); once retention frees
@@ -144,7 +156,9 @@ impl LogConfig {
     /// Sets the hard durable-log byte cap (`max_total_bytes`) and returns the updated config.
     /// `0` is accepted and means UNLIMITED (the cap is off). Any non-zero value opts in to the
     /// drop-new shed: an at-or-over-cap produce is rejected with [`StorageError::AtCapacity`].
-    /// See [`LogConfig::max_total_bytes`] for the exact accounting and at-or-over semantics.
+    /// See [`LogConfig::max_total_bytes`] for the exact accounting and at-or-over semantics, and
+    /// note (#493) that the cap counts only the framed record region — to size a real disk/RAM
+    /// budget use [`Log::resident_bytes_estimate`] and the `docs/CONFIG.md` multiplier.
     #[must_use]
     pub fn with_max_total_bytes(mut self, max_total_bytes: u64) -> LogConfig {
         self.max_total_bytes = max_total_bytes;
@@ -1301,6 +1315,44 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     #[must_use]
     pub fn physical_bytes_written(&self) -> u64 {
         self.physical_bytes_written
+    }
+
+    /// An HONEST estimate of the log's LIVE on-disk RESIDENT framed bytes (#493): the durable
+    /// RECORD bytes the byte cap is measured against PLUS the per-segment framing the cap basis
+    /// omits — every live segment's 64-byte header and every SEALED segment's 32-byte footer (the
+    /// active segment has no footer until it is sealed). This is the quantity an operator should
+    /// compare against a disk budget, since [`LogConfig::max_total_bytes`] caps only the record
+    /// region and so reads ~`1.85x` low on small records where framing dominates.
+    ///
+    /// It is LIVE (reap-tracking): it is built from [`Log::durable_record_bytes`] and the current
+    /// [`Log::segment_count`], both of which fall as retention reclaims segments — UNLIKE
+    /// [`Log::physical_bytes_written`], which is a write-AMPLIFICATION counter that never decreases.
+    /// That is exactly why the cap cannot simply switch its basis to `physical_bytes_written`: a
+    /// monotonic meter would tighten the cap after every reap and eventually wedge the writer.
+    ///
+    /// What this estimate DELIBERATELY excludes, because both are backend- and config-dependent
+    /// (an honest single number cannot fold them in):
+    /// - DISK PREALLOCATION: a disk-backed broker preallocates the active segment to
+    ///   `max_segment_bytes` (default 64 MiB), so its true disk footprint is up to one
+    ///   `max_segment_bytes` higher than this estimate; the in-memory backend reserves nothing.
+    /// - the in-memory backend's IMAGE multiplier (the historical 2x copy, being reduced to 1x in
+    ///   #492), and the per-segment index cache.
+    ///
+    /// `docs/CONFIG.md` documents the full per-backend multiplier (record region → resident → disk)
+    /// so an operator can size a memory or disk budget without overshooting. Cheap (O(1)).
+    #[must_use]
+    pub fn resident_bytes_estimate(&self) -> u64 {
+        let segments = self.segments.len() as u64;
+        // Every live segment carries a 64-byte header; every SEALED segment also carries a 32-byte
+        // footer. The active segment (the last slot) has no durable footer yet, so the footer count
+        // is `segments - 1` (saturating to 0 when the log somehow holds no segments).
+        let header_overhead = segments.saturating_mul(SEGMENT_HEADER_LEN as u64);
+        let footer_overhead = segments
+            .saturating_sub(1)
+            .saturating_mul(SEGMENT_FOOTER_LEN as u64);
+        self.durable_record_bytes()
+            .saturating_add(header_overhead)
+            .saturating_add(footer_overhead)
     }
 
     /// The physical bytes written so far on the current UTC day (#118): the daily-write-budget meter,
@@ -2763,6 +2815,83 @@ mod tests {
             "physical {} should exceed logical {} (amplification > 1)",
             log.physical_bytes_written(),
             log.logical_bytes_written()
+        );
+    }
+
+    #[test]
+    fn resident_estimate_adds_segment_framing_to_the_record_region_and_tracks_reaps() {
+        // The honest resident estimate (#493): record region + every live segment's 64-byte header
+        // + every SEALED segment's 32-byte footer (the active segment has no footer yet). Unlike
+        // the byte cap (record region only) it counts the framing an operator's disk budget pays
+        // for, and unlike `physical_bytes_written` (monotonic write-amp) it FALLS as retention
+        // reaps segments — which is exactly why the cap basis stays the reap-tracked record region.
+
+        // One segment, three records, no roll: estimate = record region + ONE header, no footer
+        // (the lone segment is the active one).
+        let payload = b"payload-xyz";
+        let frame = record_bytes(payload);
+        let mut log = open_mem(LogConfig::default());
+        for _ in 0..3 {
+            log.append(&rec(payload)).unwrap();
+        }
+        assert_eq!(
+            log.segment_count(),
+            1,
+            "no roll under the default segment cap"
+        );
+        assert_eq!(
+            log.resident_bytes_estimate(),
+            log.durable_record_bytes() + SEGMENT_HEADER_LEN as u64,
+            "single active segment: record region + one header, no footer"
+        );
+        assert_eq!(
+            log.resident_bytes_estimate(),
+            3 * frame + SEGMENT_HEADER_LEN as u64,
+            "exact framed value"
+        );
+        // The estimate is strictly above the cap basis: that gap is the honesty fix.
+        assert!(log.resident_bytes_estimate() > log.durable_record_bytes());
+
+        // Roll several segments, then confirm the per-segment overhead is exactly
+        // segments*header + (segments-1)*footer on top of the live record region.
+        let mut log = open_mem(small_config());
+        for i in 0..12u8 {
+            log.append(&rec(&[i; 11])).unwrap();
+        }
+        let segs = log.segment_count() as u64;
+        assert!(segs >= 2, "should have rolled to multiple segments");
+        let expected = log.durable_record_bytes()
+            + segs * SEGMENT_HEADER_LEN as u64
+            + (segs - 1) * SEGMENT_FOOTER_LEN as u64;
+        assert_eq!(
+            log.resident_bytes_estimate(),
+            expected,
+            "estimate = record region + per-segment header/footer framing"
+        );
+
+        // After a size reap deletes old sealed segments, the estimate DROPS (record region AND
+        // segment-framing terms both fall), proving it is live/reap-tracking, not monotonic.
+        let before = log.resident_bytes_estimate();
+        let before_segs = log.segment_count();
+        // Protect nothing (all consumers past the head): the reaper is free to drop sealed segments
+        // down to the byte bound. A tiny bound forces several reaps.
+        let outcome = log.reap_to_size(frame, u64::MAX).unwrap();
+        assert!(outcome.segments_reaped > 0, "the reap dropped segments");
+        assert!(
+            log.segment_count() < before_segs,
+            "segment count fell after the reap"
+        );
+        assert!(
+            log.resident_bytes_estimate() < before,
+            "the resident estimate FELL after the reap (it is live, not a monotonic write-amp meter)"
+        );
+        // The estimate stays exactly the record region plus the surviving segments' framing.
+        let segs_after = log.segment_count() as u64;
+        assert_eq!(
+            log.resident_bytes_estimate(),
+            log.durable_record_bytes()
+                + segs_after * SEGMENT_HEADER_LEN as u64
+                + segs_after.saturating_sub(1) * SEGMENT_FOOTER_LEN as u64,
         );
     }
 
