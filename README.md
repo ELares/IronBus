@@ -7,14 +7,16 @@
 **A single durable, crash-safe message queue for the edge, in one static Rust binary.**
 
 > Status: early implementation. The architecture is vetted in the GitHub issues; the code is now being built one small, reviewed, CI-gated PR at a time. Start at the [vision EPIC (#1)](https://github.com/ELares/IronBus/issues/1).
+>
+> **Where this is going:** the v2 mission is for IronBus to be feature-rich and decisively better than NATS on every front, **single node or clustered**, with clustering a first-class goal (not post-1.0). Read **[docs/MISSION.md](docs/MISSION.md)** — it is scrupulously explicit about what is achieved and measured today versus what is v2 target, not yet built.
 
-IronBus is one durable, ordered queue (think a single AWS SQS queue) that lives on the device, survives power loss and corrupt files on its own, and fans out to many consumers. It ships as a single static binary you can drop onto a Raspberry Pi. It takes the best small, composable ideas from MQTT, NATS, Kafka, Pulsar, Redpanda, RocksDB, Redis Streams, and SQS, and leaves behind the operational weight and the silent durability footguns that do not survive a battery-less edge node.
+IronBus is one durable, ordered queue (think a single AWS SQS queue) that lives on the device, survives power loss and corrupt files on its own, and fans out to many consumers. It ships as a single static binary you can drop onto a Raspberry Pi. It takes the best small, composable ideas from MQTT, NATS, Kafka, Pulsar, Redpanda, RocksDB, Redis Streams, and SQS, and leaves behind the operational weight and the silent durability footguns that do not survive a battery-less edge node. The single-node durable broker is what runs today; multi-stream, subjects, KV, an object store, and a real multi-node cluster are the v2 roadmap (see [docs/MISSION.md](docs/MISSION.md)).
 
 ---
 
 ## Why IronBus exists
 
-Every existing broker is wrong for a resilient single-topic edge workload in a different way, and each wrongness maps to one of our tenets:
+Every existing broker is wrong for a resilient durable-log edge workload in a different way, and each wrongness maps to one of our tenets:
 
 - **Kafka** defaults to NOT calling `fsync` per write and leans on replication for durability. On an edge box that loses power, the page-cache loss window is real, and replicas usually share the same power rail, so the independent-failure assumption is false. It also drags in a JVM.
 - **NATS Core** is beautifully simple but has no persistence. JetStream adds durability but a heavier surface.
@@ -50,10 +52,25 @@ We rank the tenets, and when two conflict we resolve in this order: **Resilient 
 - Self-healing: it detects corruption, skips poison records and quarantines unreadable segments, resynchronizes to the next valid record, and reports exactly what was lost.
 - A single static binary that is both the broker and the CLI.
 
-**IronBus v1 is explicitly NOT (these are committed non-goals):**
+**What ships today is a single node; the rest is the v2 roadmap, not a permanent identity.** The v2
+mission is for IronBus to be feature-rich and decisively better than NATS on every front, single node
+**or clustered** — see [docs/MISSION.md](docs/MISSION.md). Single node is the zero-config default the
+cluster degrades to, not the ceiling:
 
-- Not multi-topic, not partitions, not subjects, and not a routing fabric. Multiple independent queues are achieved by running multiple instances. Multi-topic-in-one-log is deferred to a later version.
-- Not replicated. v1 is single-node durable. No quorum, no leader election. Replication is reserved for a post-1.0 milestone and the version scheme leaves room for it.
+- **One log today; multi-stream, subjects, and a routing fabric are the v2 roadmap.** The shipped binary
+  is one durable ordered log. Multiple streams, subject routing, wildcards, a KV store, and an object
+  store are planned (v2 single-node milestones), not a non-goal. Until they land, multiple independent
+  queues can be run as separate instances.
+- **Single node today; a real cluster is the v2 roadmap, and clustering is first-class.** The shipped
+  binary is single-node durable (`fdatasync` before ack). Replication is **not** a non-goal and **not**
+  deferred to post-1.0: real multi-node clustering — leader/follower replication with NATS-cluster parity
+  and better — is a first-class v2 goal that **preserves** every durability/recovery/edge/flash-wear
+  guarantee below. The cluster ack default is `fsync`'d-on-a-quorum, and the cluster recovery invariants
+  (CI1–CI4) extend the single-node bounded-and-reported-loss discipline across replicas
+  ([docs/MISSION.md](docs/MISSION.md)).
+
+**IronBus is explicitly NOT (these are durable non-goals):**
+
 - Not exactly-once. At-least-once is the contract, with an optional fire-and-forget fast path. No exactly-once handshake.
 - Not a Kafka wire-protocol clone, and not a Windows product in v1 (Windows fsync and path semantics differ enough to threaten the durability guarantee).
 
@@ -254,7 +271,7 @@ A fresh-eyes second pass over every issue resolved over one hundred design quest
 
 | Question | Decision |
 | --- | --- |
-| Logical scope | One durable ordered queue per instance. No partitions or subjects in v1. |
+| Logical scope | One durable ordered queue per instance today. Multi-stream, subjects, partitions, KV, and an object store are the v2 roadmap (see [docs/MISSION.md](docs/MISSION.md)), not a permanent non-goal. |
 | Delivery contract | At-least-once, pull-based in v1. SQS-style visibility-timeout leases (default 30s, hard cap 5 minutes), persisted redelivery count, default max-deliver 5, then dead-letter queue. |
 | Ordering | Total durable order of the log. Per-group at-least-once, not per-group strict in-order delivery. Exactly-once is a non-goal. |
 | Storage model | Log-is-WAL: a publish is one framed, checksummed, record-aligned append to the active segment, and that append is the durable record. No separate WAL file. The offset index is derived and rebuildable. |
@@ -266,7 +283,7 @@ A fresh-eyes second pass over every issue resolved over one hundred design quest
 | Bounded loss report | After any skip, report (records_lost, bytes_lost, segments_affected) plus the offset range and a reason enum, via a log line, a recovery report file, and a Prometheus counter. Loss is capped at one segment or 64 MiB per event and 1 percent of durable bytes per recovery; exceeding either freezes the log read-only and alerts. |
 | Runtime | tokio (multi-threaded), with the durability commit on a dedicated thread. io_uring is a deferred, feature-flagged, Linux 5.10 and newer optimization, never the foundation, to protect the Cross Platform tenet. |
 | Targets | First-class: aarch64, x86_64, armv7 musl static binaries, kernel floor Linux 4.19. Best-effort, CI-built: macOS. Windows is a non-goal for v1. |
-| Replication | Out of scope for v1. Single-node durable only. |
+| Replication | Single-node durable today; a real multi-node cluster (leader/follower replication, NATS-cluster parity and better, `fsync`'d-on-a-quorum ack default) is a first-class v2 goal, not a non-goal — see [docs/MISSION.md](docs/MISSION.md). It preserves the single-node durability/recovery/edge guarantees. |
 | License | Dual `MIT OR Apache-2.0` across the whole workspace. |
 | MSRV | Rust 1.78, may rise only in a minor release, new floor always at least 6 months old. |
 
@@ -322,11 +339,13 @@ Performance ([#19](https://github.com/ELares/IronBus/issues/19)) is measured, no
 
 ## Roadmap
 
-Work is grouped into three milestones. The design issues come first because no code is written until the design is vetted.
+The v1 design work was grouped into three milestones, and the single-node broker is now being built from them. The design issues come first because no code is written until the design is vetted.
 
-- **M0: Vision and Scope.** The problem, the tenets, the committed scope and non-goals, the prior-art evidence base, the invariants, and the ADR index.
+- **M0: Vision and Scope.** The problem, the tenets, the committed scope, the prior-art evidence base, the invariants, and the ADR index.
 - **M1: Architecture Specification.** Vetted specs for every core subsystem: semantics, storage, record format, durability, recovery, corruption skip, consumers, backpressure, protocol, compression, retention, configuration, and the CLI.
 - **M2: Prototype-Ready Design.** The cross-cutting concerns that gate coding: observability, build and distribution, security, performance, edge constraints, verification, governance, and the end-to-end golden-path acceptance scenario.
+
+**Beyond the single node — the v2 mission.** IronBus's goal is to be feature-rich and decisively better than NATS on every front, single node **or clustered**, with clustering a first-class goal rather than a post-1.0 afterthought. The v2 single-node milestones (consume-beats-NATS, multi-stream + subjects, KV, object store, routing richness) and the first-class clustering milestones (metadata consensus, per-partition pull replication, `fsync`'d-on-a-quorum cluster acks, bounded self-healing divergence) are laid out — with an explicit achieved-vs-target honesty split — in **[docs/MISSION.md](docs/MISSION.md)**.
 
 ---
 
