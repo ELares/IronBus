@@ -48,3 +48,15 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Vendor the raft-rs codec (V2-C1, #578). The `raft` crate (tikv/raft-rs, Apache-2.0, the
+# production TiKV Raft core) depends on `raft-proto`, whose `build.rs` regenerates the
+# `eraftpb` protobuf codec at build time via `protobuf-build` -> `protoc`/`prost-build`.
+# IronBus has NO build-time codegen anywhere and must keep the reproducible static-musl
+# build, the MSRV-1.78 floor, and the zero-build-script posture intact. So `raft-proto` is
+# redirected to a vendored, build-script-free drop-in (the generated `eraftpb` committed as
+# source; see crates/ironbus-server/vendor/raft-proto): the build links the real raft-rs
+# core while running NO `protoc` and NO build script. raft-rs is wired ONLY into
+# ironbus-server (never ironbus-core, which stays IO-free/async-free).
+[patch.crates-io]
+raft-proto = { path = "crates/ironbus-server/vendor/raft-proto" }
