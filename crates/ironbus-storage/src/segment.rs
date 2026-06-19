@@ -674,6 +674,20 @@ pub struct CompactedScan {
     pub max_timestamp_ms: u64,
 }
 
+/// The result of a frame-position walk (#483): see [`SegmentReader::walk_positions`]. Carries the
+/// per-record frame START positions delimiting the valid prefix, plus the bytes consumed and the
+/// clean/torn flag the seal check needs, without materializing record payloads.
+struct PositionWalk {
+    /// Each valid record's frame START byte position, in offset order.
+    positions: Vec<u64>,
+    /// The last valid record's sequence (`None` if the region held no record), for the seal check.
+    last_seq: Option<Seq>,
+    /// Bytes consumed relative to the walk's start offset (the valid prefix length).
+    cursor: u64,
+    /// `true` if the region decoded cleanly with no torn or corrupt tail.
+    clean: bool,
+}
+
 /// The running result of a streaming body walk: see [`SegmentReader::scan_body_streaming`].
 struct BodyWalk {
     /// Valid records seen before the first torn or corrupt frame.
@@ -832,6 +846,142 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             cursor += consumed;
         }
         Ok((records, cursor as u64, clean))
+    }
+
+    /// Walks the DENSE (v1) record region front to back and returns, for each valid record, the
+    /// byte position at which its frame starts (#483). The Nth returned position is the file
+    /// offset of the record whose log offset is `base_offset + N`, so the caller can build a
+    /// resident `offset -> byte position` seek index. The walk decodes one frame at a time exactly
+    /// as [`SegmentReader::scan`] does (same torn/corrupt-tail stop), so the positions delimit the
+    /// SAME valid prefix `scan` would materialize; it stops at the first frame that does not decode.
+    /// It validates each frame's HEADER CRC (the length field a position step depends on is inside
+    /// that CRC-protected header), but it does NOT materialize or body-CRC the records — that full
+    /// validation happens when [`SegmentReader::scan_from`] later reads the records the index points
+    /// at. Returns the positions and the byte offset at which the valid prefix ends (`valid_end`),
+    /// which equals what `scan` reports.
+    ///
+    /// The active (unsealed) segment is walked over the whole file; a sealed segment's trailing
+    /// 32-byte footer is excluded first (a body-consistent seal), so a coincidental or torn footer
+    /// is treated as record data exactly as in `scan`, keeping the index's valid prefix identical.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::FooterSegmentMismatch`] if a body-consistent footer names a
+    /// different segment (the same recycled/mixed-file guard `scan` applies), or an IO error.
+    pub fn record_byte_positions(&self) -> Result<(Vec<u64>, u64), StorageError> {
+        let header_end = SEGMENT_HEADER_LEN as u64;
+        let footer_len = SEGMENT_FOOTER_LEN as u64;
+
+        // Mirror `scan`'s seal handling so the walked region is byte-identical: a trailing footer is
+        // trusted (and excluded) only when it is consistent with the body. To decide that without a
+        // second full materialization, walk the body once and reuse the result for both the seal
+        // check and the position list.
+        let candidate = if self.file_len >= header_end + footer_len {
+            let mut fbuf = [0u8; SEGMENT_FOOTER_LEN];
+            self.file
+                .read_exact_at(&mut fbuf, self.file_len - footer_len)?;
+            SegmentFooter::decode(&fbuf).ok()
+        } else {
+            None
+        };
+
+        if let Some(footer) = candidate {
+            let body_end = self.file_len - footer_len;
+            let walk = self.walk_positions(header_end, body_end)?;
+            let ends_at_footer = walk.clean && header_end + walk.cursor == body_end;
+            let expected_last_seq = walk.last_seq.unwrap_or(self.header.base_seq);
+            let body_matches = u64::from(footer.record_count) == walk.positions.len() as u64
+                && footer.last_seq == expected_last_seq;
+            if ends_at_footer && body_matches {
+                if footer.segment_id != self.header.segment_id {
+                    return Err(StorageError::FooterSegmentMismatch {
+                        header: self.header.segment_id,
+                        footer: footer.segment_id,
+                    });
+                }
+                return Ok((walk.positions, body_end));
+            }
+            // The candidate does not describe the body: treat the segment as unsealed and walk the
+            // valid prefix from the full file, exactly as `scan` does.
+        }
+
+        let walk = self.walk_positions(header_end, self.file_len)?;
+        Ok((walk.positions, header_end + walk.cursor))
+    }
+
+    /// Walks `[start, end)` decoding one frame at a time and collecting each frame's START position,
+    /// stopping at the first torn or corrupt frame. The decode is the SAME CRC-gated step
+    /// `scan_body` uses, so the prefix it accepts is identical.
+    fn walk_positions(&self, start: u64, end: u64) -> Result<PositionWalk, StorageError> {
+        let body_len =
+            usize::try_from(end.saturating_sub(start)).map_err(|_| StorageError::SegmentFull)?;
+        let mut body = vec![0u8; body_len];
+        if body_len > 0 {
+            self.file.read_exact_at(&mut body, start)?;
+        }
+        let mut positions = Vec::new();
+        let mut cursor = 0usize;
+        let mut clean = true;
+        let mut last_seq = None;
+        while cursor < body.len() {
+            let Ok((view, consumed)) = codec::decode(&body[cursor..]) else {
+                clean = false;
+                break;
+            };
+            positions.push(start + cursor as u64);
+            last_seq = Some(view.seq);
+            cursor += consumed;
+        }
+        Ok(PositionWalk {
+            positions,
+            last_seq,
+            cursor: cursor as u64,
+            clean,
+        })
+    }
+
+    /// Reads up to `max` DENSE (v1) records starting at the file byte position `start_byte`,
+    /// FULLY validating each materialized record (header AND body CRC, via the same
+    /// `codec::decode` the scan uses) and stopping at the first torn or corrupt frame or after
+    /// `max` records (#483). The record at `start_byte` is assigned log offset `start_offset` and
+    /// each subsequent record the next consecutive offset, so the caller seeks an index-resolved
+    /// byte position and reads forward WITHOUT rescanning the segment from its base. `start_byte`
+    /// MUST be a real frame boundary (an index entry); reading mid-frame would fail the CRC and
+    /// stop, never returning a bogus record.
+    ///
+    /// `read_end` bounds the read: no frame whose body would extend at or past it is materialized
+    /// (the caller passes the segment's `valid_end` so a torn tail beyond the durable prefix is
+    /// never read). Returns the records in offset order.
+    ///
+    /// # Errors
+    /// Returns an IO error from reading the region. A torn or corrupt frame is NOT an error: it
+    /// ends the returned prefix, exactly as `scan` stops at the first bad frame.
+    pub fn scan_from(
+        &self,
+        start_byte: u64,
+        start_offset: Offset,
+        read_end: u64,
+        max: usize,
+    ) -> Result<Vec<OwnedRecord>, StorageError> {
+        if max == 0 || start_byte >= read_end {
+            return Ok(Vec::new());
+        }
+        let len = usize::try_from(read_end.saturating_sub(start_byte))
+            .map_err(|_| StorageError::SegmentFull)?;
+        let mut body = vec![0u8; len];
+        self.file.read_exact_at(&mut body, start_byte)?;
+        let mut records = Vec::with_capacity(max.min(64));
+        let mut cursor = 0usize;
+        let mut next_offset = start_offset.get();
+        while cursor < body.len() && records.len() < max {
+            // The SAME CRC-gated decode `scan_body` uses: a torn or corrupt frame ends the prefix.
+            let Ok((view, consumed)) = codec::decode(&body[cursor..]) else {
+                break;
+            };
+            records.push(OwnedRecord::from_view(Offset::new(next_offset), &view));
+            next_offset = next_offset.saturating_add(1);
+            cursor += consumed;
+        }
+        Ok(records)
     }
 
     /// Scans a COMPACTED (`version` = 2) segment (#337): validates the v2 header (the caller's
@@ -1198,6 +1348,153 @@ mod tests {
         assert_eq!(scan.records.len(), 1);
         assert_eq!(scan.records[0].payload, b"good1");
         assert_eq!(scan.valid_end, after_first);
+    }
+
+    // ---- #483 seek-index primitives: record_byte_positions + scan_from ----
+
+    /// `record_byte_positions` must delimit the SAME valid prefix `scan` does, and seeking to each
+    /// returned position with `scan_from` must reproduce the exact record `scan` materialized — for
+    /// both an UNSEALED and a SEALED dense segment.
+    fn assert_positions_and_scan_from_match_scan(file: &Arc<InMemoryFile>, base_offset: u64) {
+        let reader = SegmentReader::open(Arc::clone(file)).unwrap();
+        let scan = reader.scan().unwrap();
+        let reader2 = SegmentReader::open(Arc::clone(file)).unwrap();
+        let (positions, valid_end) = reader2.record_byte_positions().unwrap();
+        assert_eq!(
+            positions.len(),
+            scan.records.len(),
+            "one position per scanned record"
+        );
+        assert_eq!(valid_end, scan.valid_end, "valid_end matches scan");
+        // Seek to EACH position and read forward one record: it must equal the scanned record at the
+        // same index, with the right offset assigned.
+        let reader3 = SegmentReader::open(Arc::clone(file)).unwrap();
+        for (i, &pos) in positions.iter().enumerate() {
+            let off = Offset::new(base_offset + i as u64);
+            let got = reader3.scan_from(pos, off, valid_end, 1).unwrap();
+            assert_eq!(got.len(), 1, "one record from a single-record seek");
+            assert_eq!(got[0], scan.records[i], "seeked record matches scan at {i}");
+            assert_eq!(got[0].offset, off, "offset assigned from the seek base");
+        }
+        // A seek from the FIRST position with a large max reads the whole valid prefix, byte-identical.
+        if let Some(&first) = positions.first() {
+            let all = reader3
+                .scan_from(first, Offset::new(base_offset), valid_end, usize::MAX)
+                .unwrap();
+            assert_eq!(all, scan.records, "full forward read equals scan");
+        }
+    }
+
+    #[test]
+    fn record_byte_positions_and_scan_from_match_scan_unsealed_and_sealed() {
+        // Unsealed (active) dense segment.
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        for i in 0..7u64 {
+            w.append(&rec(i, &[u8::try_from(i).unwrap(); 9])).unwrap();
+        }
+        w.sync().unwrap();
+        assert_positions_and_scan_from_match_scan(&file, 0);
+
+        // Sealed dense segment (the trailing footer is excluded by `record_byte_positions`).
+        let sealed = Arc::new(InMemoryFile::new());
+        let mut ws = SegmentWriter::create(Arc::clone(&sealed), header()).unwrap();
+        for i in 0..5u64 {
+            ws.append(&rec(i, &[u8::try_from(i + 1).unwrap(); 13]))
+                .unwrap();
+        }
+        ws.seal().unwrap();
+        assert_positions_and_scan_from_match_scan(&sealed, 0);
+    }
+
+    #[test]
+    fn record_byte_positions_stops_at_a_torn_tail_exactly_like_scan() {
+        // Corrupt the second record's body: the position list and `scan` must both stop after the
+        // first record, and a seek to the first position reads only that one record.
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        w.append(&rec(0, b"good1")).unwrap();
+        let after_first = w.write_pos();
+        w.append(&rec(1, b"good2")).unwrap();
+        w.sync().unwrap();
+        let mut bytes = file.snapshot();
+        let body_byte = usize::try_from(after_first + RECORD_HEADER_LEN as u64 + 1).unwrap();
+        bytes[body_byte] ^= 0x01;
+        file.set_len(0).unwrap();
+        file.write_all_at(&bytes, 0).unwrap();
+
+        let reader = SegmentReader::open(Arc::clone(&file)).unwrap();
+        let (positions, valid_end) = reader.record_byte_positions().unwrap();
+        assert_eq!(
+            positions.len(),
+            1,
+            "the torn tail ends the prefix at one record"
+        );
+        assert_eq!(
+            valid_end, after_first,
+            "valid_end stops at the first record's end"
+        );
+        // A seek bounded by valid_end reads only the good record; it never materializes the torn one.
+        let reader2 = SegmentReader::open(Arc::clone(&file)).unwrap();
+        let got = reader2
+            .scan_from(positions[0], Offset::new(0), valid_end, 10)
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].payload, b"good1");
+    }
+
+    #[test]
+    fn scan_from_full_crc_rejects_a_corrupt_seeked_frame() {
+        // A position that lands on a record whose BODY is corrupt must yield NO record (the body CRC
+        // fails in `codec::decode`), proving `scan_from` fully validates what it materializes rather
+        // than trusting the index blindly.
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        w.append(&rec(0, b"first")).unwrap();
+        let second_pos = w.write_pos();
+        w.append(&rec(1, b"second")).unwrap();
+        let valid_end = w.write_pos();
+        w.sync().unwrap();
+        // Corrupt the SECOND record's body in place; its index position is still `second_pos`.
+        let mut bytes = file.snapshot();
+        let body_byte = usize::try_from(second_pos + RECORD_HEADER_LEN as u64 + 1).unwrap();
+        bytes[body_byte] ^= 0x01;
+        file.set_len(0).unwrap();
+        file.write_all_at(&bytes, 0).unwrap();
+        let reader = SegmentReader::open(Arc::clone(&file)).unwrap();
+        // Seeking directly to the corrupt frame returns nothing: the CRC stops materialization.
+        let got = reader
+            .scan_from(second_pos, Offset::new(1), valid_end, 10)
+            .unwrap();
+        assert!(got.is_empty(), "a corrupt seeked frame is never returned");
+    }
+
+    #[test]
+    fn scan_from_respects_max_and_empty_bounds() {
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        for i in 0..6u64 {
+            w.append(&rec(i, &[u8::try_from(i).unwrap(); 7])).unwrap();
+        }
+        w.sync().unwrap();
+        let reader = SegmentReader::open(Arc::clone(&file)).unwrap();
+        let (positions, valid_end) = reader.record_byte_positions().unwrap();
+        // max == 0 yields nothing; start_byte >= read_end yields nothing.
+        assert!(reader
+            .scan_from(positions[0], Offset::new(0), valid_end, 0)
+            .unwrap()
+            .is_empty());
+        assert!(reader
+            .scan_from(valid_end, Offset::new(6), valid_end, 10)
+            .unwrap()
+            .is_empty());
+        // max caps the count read forward from a mid-segment position.
+        let two = reader
+            .scan_from(positions[2], Offset::new(2), valid_end, 2)
+            .unwrap();
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].offset, Offset::new(2));
+        assert_eq!(two[1].offset, Offset::new(3));
     }
 
     #[test]

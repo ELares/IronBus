@@ -375,6 +375,56 @@ struct RecoveredChain {
     highest: RecoveryScan,
 }
 
+/// The RESIDENT, in-memory `offset -> byte position` seek index for ONE open DENSE (v1) segment
+/// (#483). It lets [`Log::read_from`] SEEK to a record's frame in O(1) instead of rescanning the
+/// segment from its base on every delivery (the consume hot path reads `read_from(off, 1)` per
+/// record, so the old scan made each delivery O(records-per-segment)).
+///
+/// `positions[i]` is the file byte offset of the frame for the record at log offset
+/// `base_offset + i`. The index is DENSE: it holds exactly one entry per record in a v1 segment,
+/// whose offsets are contiguous from `base_offset`. `valid_end` is the byte offset at which the
+/// durable record region ends (a sealed segment's footer start, or the active segment's torn-free
+/// prefix end), so a seek-and-read-forward never reads past the valid prefix into a torn tail.
+///
+/// RESIDENT-ONLY by design: it is built once when a segment is first consulted on the read path
+/// (or seeded from the active segment as it appends), kept while the segment is open, and DROPPED
+/// the instant the segment is retired (reaped, force-reaped, or superseded by compaction) so a
+/// recycled slot can never seek with a stale index, and so RAM is bounded to the working set of
+/// segments actually being read rather than a permanent dense vector for every cold sealed
+/// segment. It is NEVER persisted: a reopen rebuilds it from the durable frames.
+///
+/// COMPACTED (v2, sparse) segments are NOT indexed here: their survivors are sparse and the read
+/// path already routes them through the v2 scan, which this change leaves untouched.
+#[derive(Clone, Debug)]
+struct SegmentIndex {
+    /// The lowest log offset this segment holds (the segment's `base_offset`). `positions[0]` is
+    /// this offset's frame.
+    base_offset: u64,
+    /// The frame START byte position of each record, in offset order: `positions[i]` locates the
+    /// record at `base_offset + i`. `positions.len()` is the indexed record count.
+    positions: Vec<u64>,
+    /// The byte offset at which the valid record region ends: the read-forward upper bound, so a
+    /// seek never materializes a frame from beyond the durable prefix (a torn tail or a footer).
+    valid_end: u64,
+}
+
+impl SegmentIndex {
+    /// The byte position of the frame for log offset `offset`, if this index covers it. `None`
+    /// when `offset` is below the base or at/above the last indexed record (the caller then has no
+    /// in-range entry to seek to).
+    fn byte_position(&self, offset: u64) -> Option<u64> {
+        let idx = offset.checked_sub(self.base_offset)?;
+        let idx = usize::try_from(idx).ok()?;
+        self.positions.get(idx).copied()
+    }
+
+    /// The next log offset this index does NOT yet cover (`base_offset + len`): the offset the next
+    /// appended record to the active segment will carry, used to EXTEND the active segment's index.
+    fn next_offset(&self) -> u64 {
+        self.base_offset.saturating_add(self.positions.len() as u64)
+    }
+}
+
 /// A single durable, ordered log backed by one data directory of segment files.
 ///
 /// One active segment receives appends; sealed predecessors hold the older records.
@@ -479,6 +529,23 @@ pub struct Log<F: Filesystem, C: Clock> {
     /// loss-exposure gauge. Saturating; a `flush_no_sync` does NOT reset it (those records are visible
     /// but not yet durable). Exposed by [`Log::unsynced_bytes`].
     unsynced_record_bytes: u64,
+    /// The RESIDENT, per-OPEN-segment `offset -> byte position` seek index keyed by segment id
+    /// (#483): the cache that turns [`Log::read_from`] from an O(records-per-segment) base rescan
+    /// into an O(1) seek-and-read-forward on the consume hot path. A DENSE (v1) segment's entry is
+    /// built lazily the first time the read path consults it (or seeded for the active segment),
+    /// EXTENDED in lockstep as the active segment appends, and EVICTED the instant the segment is
+    /// retired (reap, force-reap, compaction install) so a recycled segment id never seeks with a
+    /// stale index. Resident-only: never persisted (a reopen rebuilds it) and bounded to the
+    /// working set of open segments, not a permanent dense vector for every cold sealed segment.
+    /// COMPACTED (v2, sparse) segments are absent here (they keep the v2 scan read path).
+    ///
+    /// Interior mutability: a `read_from(&self)` lazily builds and caches an entry, so the cache
+    /// sits behind a `RefCell`. The log is single-writer with no shared reader yet (the doc on
+    /// [`Log`] notes the lock-free readers are layered later), so the cell is never aliased across
+    /// threads; when the concurrent read path lands it replaces this with the appropriate shared
+    /// structure. The cell holds only derived data: dropping or rebuilding it changes nothing a
+    /// reader observes (same records, same CRC validation), it only re-pays the build cost.
+    segment_indexes: std::cell::RefCell<std::collections::HashMap<u64, SegmentIndex>>,
 }
 
 impl<F: Filesystem, C: Clock> Log<F, C> {
@@ -527,6 +594,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     physical_bytes_written_today: 0,
                     physical_write_today_day: 0,
                     daily_budget_sheds: 0,
+                    // A fresh log has no segment to index yet; `start_segment` below seeds the
+                    // active segment's (empty) entry.
+                    segment_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
                 };
                 log.start_segment(FIRST_SEGMENT_ID, Seq::new(0), Offset::ZERO)?;
                 Ok(log)
@@ -691,6 +761,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             physical_bytes_written_today: 0,
             physical_write_today_day: 0,
             daily_budget_sheds: 0,
+            // Resident seek indexes (#483) are built lazily on the read path and EXTENDED as the
+            // active segment appends, so recovery starts them empty: nothing is read yet, and a
+            // reopen always rebuilds from the durable frames (the index is never persisted).
+            segment_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
 
         if scan.footer.is_some() {
@@ -1052,6 +1126,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             physical_bytes_written_today: 0,
             physical_write_today_day: 0,
             daily_budget_sheds: 0,
+            // Resident seek indexes (#483) are built lazily on the read path; recovery (including
+            // the compaction-aware path) starts them empty. Compacted (v2, sparse) segments are
+            // never indexed here — they keep the v2 scan read path.
+            segment_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
 
         match active {
@@ -1177,6 +1255,18 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             // off-hot-path cleaner ever writes a compacted segment, and it never becomes active.
             compacted_covered: None,
         });
+        // Seed an EMPTY resident seek index (#483) for the new active segment: appends EXTEND it in
+        // lockstep (so the consume hot path hits the cache without ever rebuilding), and its
+        // `valid_end` tracks the writer's flushed prefix. A fresh segment holds no records yet, so
+        // `valid_end` is the header end. The id is fresh (ADR 0002), so no stale entry can exist.
+        self.segment_indexes.borrow_mut().insert(
+            id,
+            SegmentIndex {
+                base_offset: base_offset.get(),
+                positions: Vec::new(),
+                valid_end: SEGMENT_HEADER_LEN as u64,
+            },
+        );
         Ok(())
     }
 
@@ -1523,6 +1613,28 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // The ids advance only after the write returns Ok.
         self.next_seq = next_seq;
         self.next_offset = next_offset;
+        // EXTEND the active segment's resident seek index (#483) in lockstep with the append: the
+        // record's frame starts at `pos_before` (the writer's `write_pos` before this append, the
+        // exact file byte offset it will occupy once flushed) and ends at `pos_before + frame_len`,
+        // which becomes the new readable `valid_end`. Reads are clamped to `flushed_offset`, which
+        // never runs ahead of the file, so an index entry is only ever USED once its bytes are in
+        // the file. Keeping the index current here is what lets the consume hot path seek O(1)
+        // without ever rebuilding the active segment's index. If the active segment's entry was
+        // evicted (it never is on this path, but be defensive), skip silently: a later read rebuilds.
+        {
+            let mut indexes = self.segment_indexes.borrow_mut();
+            if let Some(idx) = indexes.get_mut(&self.active_id) {
+                // The append must be contiguous with the index (dense, in-order). If it somehow is
+                // not (an inconsistency that cannot occur on the single-writer path), drop the entry
+                // rather than record a wrong position, so a later read rebuilds from disk.
+                if idx.next_offset() == offset.get() {
+                    idx.positions.push(pos_before);
+                    idx.valid_end = pos_before.saturating_add(frame_len);
+                } else {
+                    indexes.remove(&self.active_id);
+                }
+            }
+        }
         // Write-amplification accounting (#118), charged only after the append returned Ok (a failed
         // append wrote nothing). Logical = the STORED payload this append carries (key + headers +
         // payload, no framing); under the #430 write path the engine compresses BEFORE this append,
@@ -1763,13 +1875,16 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 // This segment, and every later one, begins beyond the durable end.
                 break;
             }
+            if out.len() >= max {
+                return Ok(out);
+            }
             // A COMPACTED segment is SPARSE: read its survivors via the v2 scan and push each at its
             // ORIGINAL offset. A read that lands on a compacted-away offset naturally ADVANCES to the
             // next present survivor (the absent offsets simply have no record), so the read path skips
-            // the gap rather than stalling, and never reports MissingRecord for a compacted hole. An
-            // ordinary segment uses the dense v1 scan exactly as before.
-            let records = if slot.compacted_covered.is_some() {
-                match SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?
+            // the gap rather than stalling, and never reports MissingRecord for a compacted hole. The
+            // SPARSE path is left UNCHANGED by the #483 seek index (which is dense-only).
+            if slot.compacted_covered.is_some() {
+                let records = match SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?
                     .scan_compacted()?
                 {
                     Some(scan) => scan.records,
@@ -1777,21 +1892,60 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     // structural inconsistency the recovery reconciliation should have prevented;
                     // surface it rather than silently serving nothing.
                     None => return Err(StorageError::WriterFrozen),
+                };
+                for record in records {
+                    let offset = record.offset.get();
+                    if offset < start_v {
+                        continue; // before the requested start (only in the first segment)
+                    }
+                    if offset >= flushed || out.len() >= max {
+                        return Ok(out);
+                    }
+                    out.push(record);
                 }
+                continue;
+            }
+            // ORDINARY (dense, v1) segment: SEEK via the resident #483 index to the start offset's
+            // frame and read FORWARD, materializing (and FULL-CRC validating) up to the remaining
+            // `max`, instead of rescanning the whole segment from its base on every call. The
+            // per-segment start offset is `max(start_v, base)`: the FIRST segment seeks to the
+            // requested `start_v` (mid-segment), each later one to its base. The records come back
+            // already at-or-above the start, so no skip-before-start filter is needed.
+            let seg_start = start_v.max(slot.base_offset);
+            let remaining = max - out.len();
+            // The seek read-end is the flushed-clamped readable end of THIS segment (see
+            // `seek_in_segment`): for a sealed predecessor it is the segment's whole `valid_end`; for
+            // the active segment it is `flushed`'s byte position, so a record at or beyond `flushed`
+            // (or still in the writer's pending buffer) is never materialized. A defensive count cap
+            // to the records below `flushed` belt-and-suspenders the byte bound.
+            if let Some((byte_pos, read_end)) = self.seek_in_segment(slot, seg_start, flushed)? {
+                let below_flushed =
+                    usize::try_from(flushed.saturating_sub(seg_start)).unwrap_or(usize::MAX);
+                let want = remaining.min(below_flushed);
+                let reader = SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?;
+                let records = reader.scan_from(byte_pos, Offset::new(seg_start), read_end, want)?;
+                out.extend(records);
+                // If the seek-and-read returned fewer than the per-segment budget, the segment is
+                // exhausted (its durable prefix ended); the loop advances to the next segment, which
+                // begins at the contiguous next offset.
             } else {
-                SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?
+                // The index does not cover `seg_start` (it targets the as-yet-unflushed tail of the
+                // active segment, or a not-yet-extended boundary). Fall back to the full scan for
+                // this segment: correct, only (rarely) slower, and the same records the index path
+                // would have produced. This keeps the read total even on a cache miss.
+                let records = SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?
                     .scan()?
-                    .records
-            };
-            for record in records {
-                let offset = record.offset.get();
-                if offset < start_v {
-                    continue; // before the requested start (only in the first segment)
+                    .records;
+                for record in records {
+                    let offset = record.offset.get();
+                    if offset < start_v {
+                        continue;
+                    }
+                    if offset >= flushed || out.len() >= max {
+                        return Ok(out);
+                    }
+                    out.push(record);
                 }
-                if offset >= flushed || out.len() >= max {
-                    return Ok(out);
-                }
-                out.push(record);
             }
         }
         Ok(out)
@@ -1910,6 +2064,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             self.fs.remove(&name)?;
             self.fs.sync_dir()?;
             self.segments.remove(0);
+            // EVICT this retired segment's resident seek index (#483) the moment its slot leaves
+            // memory: the id is now free to be... never reused (ADR 0002), but evicting here keeps
+            // the resident set bounded to live segments and guarantees no stale entry can survive a
+            // segment's retirement. Done after the slot is removed so memory and the index agree.
+            self.evict_segment_index(oldest.id);
             self.sealed_record_bytes = self
                 .sealed_record_bytes
                 .saturating_sub(segment_record_bytes);
@@ -1990,6 +2149,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         self.fs.remove(&name)?;
         self.fs.sync_dir()?;
         self.segments.remove(0);
+        // EVICT the force-reaped segment's resident seek index (#483) as its slot leaves memory, so
+        // no stale index can outlive the segment it described (the same retirement guarantee `reap`
+        // makes).
+        self.evict_segment_index(oldest.id);
         self.sealed_record_bytes = self
             .sealed_record_bytes
             .saturating_sub(segment_record_bytes);
@@ -2088,6 +2251,14 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // Drop the covered ordinary slots, then insert the compacted slot, then re-sort by covered
         // base offset so the slot vector stays offset-ordered for the binary search.
         self.segments.retain(|s| !source_set.contains(&s.id));
+        // EVICT each superseded source segment's resident seek index (#483): those ordinary slots
+        // are gone, so their dense indexes must go too. The freshly installed compacted segment is
+        // SPARSE and is never indexed here — the read path routes it through the v2 scan — so there
+        // is nothing to add, only the source entries to drop. This is the compaction-retirement leg
+        // of the evict-on-every-retirement guarantee.
+        for id in source_set {
+            self.evict_segment_index(*id);
+        }
         self.segments.push(SegmentSlot {
             id: compacted_id,
             base_offset: scan.header.base_offset.get(),
@@ -2161,6 +2332,79 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         }
     }
 
+    /// Ensures a RESIDENT seek index (#483) exists for the DENSE (v1) segment `slot`, building it
+    /// from a one-time frame walk of the durable record region if it is not already cached, and
+    /// returns the byte position of `start_offset`'s frame together with the byte READ-END for a
+    /// seek-and-read-forward bounded by `flushed`. The frame walk validates each frame's header CRC
+    /// and delimits the SAME valid prefix a full scan would (it stops at the first torn or corrupt
+    /// frame); the FULL body-CRC validation of the records actually returned happens in
+    /// [`SegmentReader::scan_from`].
+    ///
+    /// The read-end is the byte position of the FIRST non-visible offset (`flushed`) within this
+    /// segment when the index covers it, otherwise the segment's `valid_end`. This is CRITICAL: a
+    /// record's index entry is written on append (`valid_end` extends immediately), but the bytes
+    /// may still sit in the writer's pending buffer until a flush; reads are clamped to `flushed`,
+    /// and every record BELOW `flushed` is guaranteed to be IN the file (a flush precedes raising
+    /// the visible head), so bounding the read at `flushed`'s byte position never reads a pending
+    /// (not-yet-in-file) frame.
+    ///
+    /// Returns `Ok(None)` only when `start_offset` is NOT covered by the built index (it is at or
+    /// past the segment's last indexed record — e.g. the read targets the as-yet-unflushed tail);
+    /// the caller falls back to its existing scan for that segment, so a miss is never wrong, only
+    /// (rarely) slower. The active segment's index is seeded/extended by the append path, so the
+    /// common consume case hits the cache without a rebuild.
+    fn seek_in_segment(
+        &self,
+        slot: &SegmentSlot,
+        start_offset: u64,
+        flushed: u64,
+    ) -> Result<Option<(u64, u64)>, StorageError> {
+        // A compacted (v2, sparse) segment is never indexed here; the caller routes it to the v2
+        // scan. This guard keeps the resident index strictly to the dense case.
+        debug_assert!(slot.compacted_covered.is_none());
+        if let Some(idx) = self.segment_indexes.borrow().get(&slot.id) {
+            return Ok(Self::seek_with(idx, start_offset, flushed));
+        }
+        // Build once from the durable frames: the positions delimit exactly the valid prefix a
+        // scan would, so seeking into the index can never point past a torn tail.
+        let reader = SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?;
+        let (positions, valid_end) = reader.record_byte_positions()?;
+        let index = SegmentIndex {
+            base_offset: slot.base_offset,
+            positions,
+            valid_end,
+        };
+        let result = Self::seek_with(&index, start_offset, flushed);
+        self.segment_indexes.borrow_mut().insert(slot.id, index);
+        Ok(result)
+    }
+
+    /// Resolves `start_offset` to its frame byte position and the flushed-bounded read-end against a
+    /// built `index`. The read-end is `index`'s byte position for `flushed` (the first non-visible
+    /// offset) when the index covers it — so a partly-visible active segment reads only the frames
+    /// below `flushed`, never a pending one — and otherwise the index's `valid_end` (the whole
+    /// durable record region, for a sealed predecessor that lies entirely below `flushed`). `None`
+    /// when `start_offset` is not covered (the caller falls back to a full scan).
+    fn seek_with(index: &SegmentIndex, start_offset: u64, flushed: u64) -> Option<(u64, u64)> {
+        let byte_pos = index.byte_position(start_offset)?;
+        // `flushed`'s frame position if it falls inside this index (the active segment's visible
+        // boundary), else the full durable region end (a sealed segment entirely below `flushed`).
+        let read_end = index
+            .byte_position(flushed)
+            .unwrap_or(index.valid_end)
+            .min(index.valid_end);
+        Some((byte_pos, read_end))
+    }
+
+    /// EVICTS the resident seek index (#483) for segment `id`, called on EVERY segment retirement
+    /// (reap, force-reap, compaction install) so a recycled or compacted-away segment id can never
+    /// be seeked with a stale index. A no-op if no index was cached for `id`. Resident-only: the
+    /// dropped index is rebuilt on demand if the (different) segment that later takes a higher id is
+    /// read — ids are never reused (ADR 0002), so this only ever drops a now-gone segment's data.
+    fn evict_segment_index(&mut self, id: u64) {
+        self.segment_indexes.borrow_mut().remove(&id);
+    }
+
     fn segment_index_for(&self, offset: u64) -> usize {
         // Search by the segment's COVERED base offset, not the survivor base: for a compacted
         // segment the covered base can be BELOW the lowest survivor, and a target offset in that
@@ -2175,6 +2419,44 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             Err(0) => 0,
             Err(index) => index - 1,
         }
+    }
+}
+
+#[cfg(test)]
+impl<F: Filesystem, C: Clock> Log<F, C> {
+    /// Whether a resident seek index (#483) is currently cached for segment `id`. Lets a test assert
+    /// the evict-on-retirement contract directly.
+    fn has_segment_index(&self, id: u64) -> bool {
+        self.segment_indexes.borrow().contains_key(&id)
+    }
+
+    /// The number of resident seek indexes currently cached, so a test can assert the resident set
+    /// stays bounded to the working set (no permanent dense vector per cold sealed segment).
+    fn segment_index_count(&self) -> usize {
+        self.segment_indexes.borrow().len()
+    }
+
+    /// Drops EVERY cached seek index, forcing the next read to rebuild from the durable frames. A
+    /// test uses this to prove the freshly-BUILT index path (not just the append-seeded one) is
+    /// byte-identical to a full scan.
+    fn clear_segment_indexes(&self) {
+        self.segment_indexes.borrow_mut().clear();
+    }
+
+    /// Installs a deliberately CORRUPT seek index for segment `id` whose every entry points at the
+    /// FIRST record's byte position, so a seek that consulted it would return the WRONG record. A
+    /// test installs this, confirms the retirement path EVICTS it, and then confirms the rebuilt
+    /// index serves the right data — proving a stale index can never outlive its segment.
+    fn poison_segment_index(&self, id: u64, base_offset: u64, len: usize, valid_end: u64) {
+        let first = SEGMENT_HEADER_LEN as u64;
+        self.segment_indexes.borrow_mut().insert(
+            id,
+            SegmentIndex {
+                base_offset,
+                positions: vec![first; len],
+                valid_end,
+            },
+        );
     }
 }
 
@@ -3354,6 +3636,322 @@ mod tests {
         assert_eq!(from5.len(), 4);
         assert_eq!(from5[0].offset, Offset::new(5));
         assert_eq!(from5[3].offset, Offset::new(8));
+    }
+
+    // ---- #483 resident seek index: equivalence + eviction correctness ----
+
+    /// A REFERENCE read that bypasses the resident #483 seek index entirely: it reads each
+    /// ORDINARY segment with a full `SegmentReader::scan()` (the pre-#483 behavior) and applies the
+    /// exact same bounds/start/flushed/max filter `read_from` does, so any divergence between this
+    /// and `read_from` is a seek-index bug. A compacted (sparse) segment routes through the v2 scan
+    /// exactly as the production path does (the index never touches it).
+    fn read_from_by_full_scan<G: Filesystem, K: Clock>(
+        log: &Log<G, K>,
+        start: u64,
+        max: usize,
+    ) -> Vec<OwnedRecord> {
+        let flushed = log.flushed_offset().get();
+        if max == 0 || start >= flushed {
+            return Vec::new();
+        }
+        let oldest = log
+            .segments
+            .first()
+            .map_or(0, SegmentSlot::covered_base_offset);
+        assert!(start >= oldest, "test only covers in-range starts");
+        let mut out = Vec::new();
+        for slot in &log.segments[log.segment_index_for(start)..] {
+            if slot.covered_base_offset() >= flushed {
+                break;
+            }
+            let reader =
+                SegmentReader::open(log.fs.open(&segment_file_name(slot.id)).unwrap()).unwrap();
+            let records = if slot.compacted_covered.is_some() {
+                reader.scan_compacted().unwrap().unwrap().records
+            } else {
+                reader.scan().unwrap().records
+            };
+            for record in records {
+                let offset = record.offset.get();
+                if offset < start {
+                    continue;
+                }
+                if offset >= flushed || out.len() >= max {
+                    return out;
+                }
+                out.push(record);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn read_from_via_the_index_is_byte_identical_to_a_full_scan_over_every_window() {
+        // A multi-segment dense log (the tiny cap forces several rolls), then a final UNSYNCED tail
+        // so `flushed` sits mid-active-segment (exercising the flushed-clamped read end). Sweep every
+        // (start, max) window and require the index-driven `read_from` to equal the full-scan
+        // reference EXACTLY (offset, seq, payload — full `OwnedRecord` equality).
+        let mut log = open_mem(small_config());
+        let n: u64 = 25;
+        for i in 0..n {
+            log.append(&rec(&[u8::try_from(i % 256).unwrap(); 16]))
+                .unwrap();
+        }
+        log.sync().unwrap();
+        // Append a few MORE without syncing so the active segment has visible (rolled) + invisible
+        // (unsynced) records, putting `flushed` strictly inside the active segment's range.
+        for i in n..n + 3 {
+            log.append(&rec(&[u8::try_from(i % 256).unwrap(); 16]))
+                .unwrap();
+        }
+        assert!(
+            log.active_segment_id() >= 2,
+            "should have rolled several times"
+        );
+        let flushed = log.flushed_offset().get();
+
+        let sweep = |log: &Log<InMemoryFs, ManualClock>| {
+            for start in 0..=flushed + 2 {
+                for max in [0usize, 1, 2, 3, 7, 1000] {
+                    let via_index = log.read_from(Offset::new(start), max).unwrap();
+                    let via_scan = read_from_by_full_scan(log, start, max);
+                    assert_eq!(
+                        via_index, via_scan,
+                        "index vs scan mismatch at start={start} max={max}"
+                    );
+                }
+            }
+        };
+
+        // First with the append-SEEDED active index and lazily-built sealed indexes in place...
+        sweep(&log);
+        // ...then after DROPPING every index, so the next reads rebuild from the durable frames and
+        // the freshly-BUILT index path is proven byte-identical too.
+        log.clear_segment_indexes();
+        sweep(&log);
+    }
+
+    #[test]
+    fn the_seeded_active_index_matches_a_rebuild_after_a_reopen() {
+        // The append-seeded active index (extended record-by-record) must agree with the index a
+        // fresh reopen rebuilds from the durable frames: same records for every window.
+        let mut log = open_mem(small_config());
+        for i in 0..14u8 {
+            log.append(&rec(&[i; 16])).unwrap();
+        }
+        log.sync().unwrap();
+        let seeded: Vec<_> = (0..14)
+            .map(|s| log.read_from(Offset::new(s), 100).unwrap())
+            .collect();
+        let fs = log.into_filesystem();
+        let reopened = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        for (s, expected) in seeded.iter().enumerate() {
+            let got = reopened.read_from(Offset::new(s as u64), 100).unwrap();
+            assert_eq!(&got, expected, "rebuilt index diverged at start={s}");
+        }
+    }
+
+    #[test]
+    fn a_reap_evicts_the_seek_index_so_no_stale_entry_survives_retirement() {
+        // Build several sealed segments, POISON the oldest sealed segment's resident index (every
+        // entry points at the first record — a wrong-data index), then reap it. The eviction on
+        // retirement must drop the poisoned entry; a subsequent read of the surviving log is correct.
+        let mut log = open_mem(small_config());
+        for i in 0..18u8 {
+            log.append(&rec(&[i; 16])).unwrap();
+        }
+        log.sync().unwrap();
+        assert!(log.segments.len() >= 3, "need several sealed segments");
+
+        let oldest = log.segments[0];
+        // Build the real index first (a read), then overwrite it with a poisoned one bound to the
+        // SAME id, proving that without eviction a seek would serve wrong data.
+        let _ = log.read_from(Offset::new(oldest.base_offset), 1).unwrap();
+        log.poison_segment_index(
+            oldest.id,
+            oldest.base_offset,
+            usize::try_from(oldest.record_count.max(1)).unwrap(),
+            // A large valid_end is fine; the poisoned positions are what would mislead a seek.
+            u64::MAX,
+        );
+        assert!(log.has_segment_index(oldest.id));
+
+        // Reap the oldest segment: the protect floor is above its whole range (fully consumed), and a
+        // tiny byte bound makes it eligible.
+        let next_base = log.segments[1].base_offset;
+        let outcome = log
+            .reap(
+                RetentionBounds {
+                    max_bytes: 1,
+                    ..RetentionBounds::default()
+                },
+                next_base,
+            )
+            .unwrap();
+        assert!(
+            outcome.segments_reaped >= 1,
+            "the oldest should have reaped"
+        );
+        // The retirement EVICTED the poisoned index: it is gone, not serving stale data.
+        assert!(
+            !log.has_segment_index(oldest.id),
+            "the reaped segment's index must be evicted"
+        );
+
+        // The surviving log still reads correctly across every window (a fresh, correct index is
+        // rebuilt for the new oldest segment on demand).
+        let flushed = log.flushed_offset().get();
+        for start in next_base..flushed {
+            let via_index = log.read_from(Offset::new(start), 100).unwrap();
+            let via_scan = read_from_by_full_scan(&log, start, 100);
+            assert_eq!(
+                via_index, via_scan,
+                "post-reap read diverged at start={start}"
+            );
+        }
+    }
+
+    #[test]
+    fn forced_reap_evicts_the_seek_index() {
+        let mut log = open_mem(small_config());
+        for i in 0..16u8 {
+            log.append(&rec(&[i; 16])).unwrap();
+        }
+        log.sync().unwrap();
+        assert!(log.segments.len() >= 2);
+        let oldest = log.segments[0];
+        let _ = log.read_from(Offset::new(oldest.base_offset), 1).unwrap();
+        log.poison_segment_index(
+            oldest.id,
+            oldest.base_offset,
+            usize::try_from(oldest.record_count.max(1)).unwrap(),
+            u64::MAX,
+        );
+        assert!(log.has_segment_index(oldest.id));
+        let out = log.reap_oldest_forced().unwrap();
+        assert!(out.is_some(), "a force-reap should remove the oldest");
+        assert!(
+            !log.has_segment_index(oldest.id),
+            "the force-reaped segment's index must be evicted"
+        );
+    }
+
+    #[test]
+    fn compaction_install_evicts_the_source_segment_seek_indexes() {
+        use crate::compaction::CompactionConfig;
+        // A keyed, multi-version log across several sealed segments, so a compaction pass retires a
+        // run of ORDINARY source segments and replaces them with one compacted segment. The source
+        // indexes (poisoned to prove the point) must be evicted on install; the post-compaction read
+        // serves the correct sparse survivors at their original offsets.
+        let mut log = open_mem(small_config());
+        for v in 0..6u8 {
+            for (k, base) in [(&b"alpha"[..], 0u8), (&b"beta"[..], 100u8)] {
+                log.append(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: k,
+                    headers: b"",
+                    payload: &[v + base; 12],
+                })
+                .unwrap();
+                log.sync().unwrap();
+            }
+        }
+        // A keyless carry-through and a one-shot key so survivors include verbatim records.
+        log.append(&rec(b"keyless")).unwrap();
+        log.sync().unwrap();
+        let active = log.active_segment_id();
+        let source_ids: Vec<u64> = (0..active).collect();
+        assert!(
+            source_ids.len() >= 2,
+            "need adjacent sealed sources to compact"
+        );
+
+        // Build + poison each source segment's resident index, so a surviving entry would mislead.
+        let before = read_from_by_full_scan(&log, 0, 10_000);
+        for &id in &source_ids {
+            let slot = *log.segments.iter().find(|s| s.id == id).unwrap();
+            let _ = log.read_from(Offset::new(slot.base_offset), 1).unwrap();
+            log.poison_segment_index(
+                id,
+                slot.base_offset,
+                usize::try_from(slot.record_count.max(1)).unwrap(),
+                u64::MAX,
+            );
+        }
+
+        let out = log.maybe_compact(&CompactionConfig::enabled()).unwrap();
+        assert!(
+            out.compacted_segment_id.is_some(),
+            "a dirty keyed log should compact"
+        );
+        // EVERY retired source index is evicted; the new compacted (sparse) segment is never indexed.
+        for &id in &source_ids {
+            assert!(
+                !log.has_segment_index(id),
+                "compaction must evict source segment {id}'s seek index"
+            );
+        }
+        assert!(
+            !log.has_segment_index(out.compacted_segment_id.unwrap()),
+            "a compacted (sparse) segment is not seek-indexed"
+        );
+
+        // The post-compaction read (sparse survivors at original offsets) is correct and matches a
+        // full scan; the surviving latest-per-key set is a subset of the pre-compaction records.
+        let after_index = {
+            let head = log.flushed_offset().get();
+            log.read_from(Offset::ZERO, usize::try_from(head).unwrap())
+                .unwrap()
+        };
+        let after_scan = read_from_by_full_scan(&log, 0, 10_000);
+        assert_eq!(
+            after_index, after_scan,
+            "post-compaction index vs scan mismatch"
+        );
+        assert!(
+            after_index.len() < before.len(),
+            "compaction dropped superseded versions"
+        );
+    }
+
+    #[test]
+    fn the_resident_index_set_stays_bounded_to_open_segments() {
+        // After reaping old segments, the resident index map holds no entry for a gone segment, so
+        // RAM is bounded to the working set, not a permanent dense vector per cold sealed segment.
+        let mut log = open_mem(small_config());
+        for i in 0..20u8 {
+            log.append(&rec(&[i; 16])).unwrap();
+        }
+        log.sync().unwrap();
+        // Touch every segment so each gets a resident index built.
+        let flushed = log.flushed_offset().get();
+        for s in 0..flushed {
+            let _ = log.read_from(Offset::new(s), 1).unwrap();
+        }
+        let segs_before = log.segments.len();
+        assert_eq!(
+            log.segment_index_count(),
+            segs_before,
+            "one resident index per open segment after reads"
+        );
+        // Reap as much as retention allows (everything consumed), then assert the index count fell to
+        // exactly the surviving segment count — no orphaned entries for reaped ids.
+        let protect = log.flushed_offset().get();
+        log.reap(
+            RetentionBounds {
+                max_bytes: 1,
+                ..RetentionBounds::default()
+            },
+            protect,
+        )
+        .unwrap();
+        assert!(log.segments.len() < segs_before, "some segments reaped");
+        assert_eq!(
+            log.segment_index_count(),
+            log.segments.len(),
+            "no stale index entry survives a reap"
+        );
     }
 
     #[test]
