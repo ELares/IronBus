@@ -1859,8 +1859,8 @@ fn memory_mode_refuses_a_ram_ceiling_below_the_store_floor() {
     // 64 groups, 256 in-flight) sum to ~15 MiB, comfortably under the 64 MiB ceiling, so THIS
     // EXACT invocation booted before the fold (the #115 guard modeled connections, credits,
     // groups, and in-flight only; the store was honestly excluded as ~0 RSS, which is true only
-    // on disk). With the store folded in, the 1 GiB in-RAM cap is charged at two byte images
-    // (the live bytes plus the durable-image clone) and the same invocation must now refuse to
+    // on disk). With the store folded in, the 1 GiB in-RAM cap is charged at a single live byte
+    // image (post-#492; EphemeralFile keeps no durable clone) and the same invocation must now refuse to
     // boot (exit 1, usage, BEFORE any listener opens) with a message naming the store term and
     // the knob to lower. The small connection terms are load-bearing: under the balanced
     // defaults, term 1 alone (256 connections x 8 MiB credit bytes = 2 GiB) exceeds the ceiling
@@ -1924,7 +1924,7 @@ fn memory_mode_refuses_a_ram_ceiling_below_the_store_floor() {
         "the refusal names the store fold and the knob to lower: {stderr}"
     );
     assert!(
-        stderr.contains("durable-image clone"),
-        "the refusal states the 2x clone headroom: {stderr}"
+        stderr.contains("charged ONCE") && stderr.contains("no durable clone"),
+        "the refusal states the 1x single-image charge: {stderr}"
     );
 }
