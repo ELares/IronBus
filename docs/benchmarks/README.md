@@ -95,10 +95,14 @@ The committed `corpus-report.md` is the data; the read:
   `ack_many` per fetched batch), so the IronBus consume number now reflects the broker's real fetch +
   batch-ack throughput, matched to the peers' batched/streamed consume (NATS ~20k, Redis ~11k). A
   same-config dev A/B (loopback, 256 B, `--fetch-batch 256`, `--no-fsync`) shows batched beating
-  per-message at every backend (disk 2,382 -> 2,955 msg/s; memory 2,710 -> 3,734 msg/s avg-of-3); the
-  amortization is bounded on fast loopback by the 64-record consumer credit (so each round-trip still
-  carries only ~64 acks) and grows on a box where the per-RPC syscall cost dominates (the RPi4/edge
-  case, where 63 of every 64 ack round-trips are removed). The reported `p99` for IronBus consume is
+  per-message at every backend (disk 2,382 -> 2,955 msg/s; memory 2,710 -> 3,734 msg/s avg-of-3, on a
+  build that predates the #552 credit auto-tune); the amortization was bounded on fast loopback by the
+  then-fixed 64-record consumer credit (so each round-trip carried only ~64 acks) and grows on a box
+  where the per-RPC syscall cost dominates (the RPi4/edge case, where 63 of every 64 ack round-trips
+  are removed). Post-#552 the per-connection count credit no longer pins the loopback window at 64: it
+  auto-tunes from the 64 floor up toward the 2048 ceiling as the consumer keeps draining (RAM-bounded
+  by the byte budget), so more acks amortize per round-trip on loopback than the figures above show --
+  re-run to refresh. The reported `p99` for IronBus consume is
   closed-loop drain (queue-depth) latency, not service latency. The consume ROW in `corpus-report.md`
   is still the old per-message data; re-run the consume rows on the device (default `subscribe`) to
   refresh it -- the harness now drives the fair path with no flag change.

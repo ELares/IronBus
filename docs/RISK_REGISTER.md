@@ -55,12 +55,20 @@ the defending mechanism and a test cited to the source.
   and pins unbounded in-flight messages, blowing the broker's RAM ceiling and
   starving peers in the same competing group.
 - **Mitigation:** two composed per-connection budgets. The message-count credit
-  (`EngineConfig.consumer_credit`, default 64, `serve --consumer-credit`) caps the
-  un-acked message count per connection (#65). The byte budget
+  (`EngineConfig.consumer_credit`, `serve --consumer-credit`) AUTO-TUNES the
+  un-acked message-count window from a 64 floor toward a 2048 ceiling
+  (`DEFAULT_CREDIT_CEILING`, the default) as the consumer keeps draining, halving
+  toward the floor under backpressure (#65, #552). The byte budget
   (`EngineConfig.consumer_credit_bytes`, default 8 MiB, `serve
-  --consumer-credit-bytes`) caps the un-acked payload bytes, so the effective
+  --consumer-credit-bytes`) caps the un-acked payload bytes and is the FIRM RAM
+  bound the count window grows strictly UNDER, so the effective
   per-Flow credit is `min(message credits, byte credits)` with a hard floor of one
-  message so a single over-budget record never wedges the consumer (#275). Both
+  message so a single over-budget record never wedges the consumer (#275). The
+  byte budget is what makes the higher count ceiling RAM-safe: with it OFF (`0` =
+  unlimited) the refuse-to-boot RAM guard charges the full count ceiling
+  (`consumer_credit * MAX_FRAME_LEN`), so a no-byte-budget config is honestly
+  refused under a small RAM ceiling rather than waved through (see RR-01). An
+  explicit `--consumer-credit <= 64` pins the historical fixed window. Both
   are derived from the connection-scoped `leased` set, so the accounting cannot
   drift. Tested at every layer (engine passthrough, session credit-cap /
   restore-on-ack/nack/term / isolation / redelivery accounting, end-to-end over a

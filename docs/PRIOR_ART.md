@@ -89,8 +89,10 @@ Numbers carry a bracketed claim id (for example `[kafka-acks-default]`) into
   the credit-based flow-control SHAPE (a bounded number of in-flight messages the
   consumer must drain) and the idea that a fast fire-and-forget path can coexist
   with a reliable acked path. IronBus's wire credit is the FLOW frame
-  (`consumer_credit` default 64 messages or 8 MiB; see
-  [FLOW_CONTROL.md](FLOW_CONTROL.md)), and its fire-and-forget tier is the
+  (the per-connection message-count window auto-tunes from a 64 floor toward a
+  2048 ceiling as the consumer keeps draining, bounded by the firm 8 MiB
+  `consumer_credit_bytes` budget; see [FLOW_CONTROL.md](FLOW_CONTROL.md)), and
+  its fire-and-forget tier is the
   optional producer fast path (README, "What IronBus is").
 - **LEAVE: QoS 0 exempt from flow control, and a protocol-not-a-log.** IronBus
   rejects an UNCREDITED tier that can flood a small device (the fire-and-forget

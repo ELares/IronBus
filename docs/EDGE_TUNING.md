@@ -48,7 +48,7 @@ not a hard requirement.
 | Hardware constraint | Knob(s) | Default | Recommended edge value | Why |
 |---|---|---|---|---|
 | **Limited RAM** (e.g. the 64 MiB ceiling, #115) | `--max-segment-bytes` | `67108864` (64 MiB); min `4096` | `8388608` (8 MiB) | The active segment is buffered/served from memory; an 8 MiB roll size (the `EDGE_SEGMENT_BYTES` value, which `--profile edge-tiny` sets for you) keeps the working set small and bounds the largest single in-memory region. |
-| | `--consumer-credit` | `64`; min `1` | `64` (default, or lower) | Caps the per-CONNECTION un-acked message count. The default is already small and memory-justified; keep it or lower it on a very tight box. |
+| | `--consumer-credit` | `2048` (the auto-tune CEILING); min `1` | a small explicit value (e.g. `8`, the `edge-tiny` preset, or up to `64`) | Caps the per-CONNECTION un-acked message count. The default AUTO-TUNES from a 64 floor toward the 2048 ceiling as the consumer keeps draining (RAM-bounded by `--consumer-credit-bytes`); on a very tight box set an explicit value of 64 or less to PIN a small fixed window so a single connection can never grow past it. |
 | | `--consumer-credit-bytes` | `8388608` (8 MiB); `0` = unlimited | `8388608` (8 MiB) | The per-CONNECTION un-acked BYTE budget. This is the firm RAM-side bound: a large-payload consumer cannot blow the ceiling despite a small message count, since a fetch stops once in-flight bytes reach the budget (hard floor of one message so it never wedges). Do NOT set `0` on the edge. |
 | | `--max-in-flight` | `1024`; min `1` | a few hundred or fewer | The per-GROUP max-ack-pending window. Lower it so the in-flight set across a group cannot pin many records' worth of lease state in memory at once. |
 | | `--max-groups` | `1024`; `0` = unlimited | `1024` (default) or lower | Caps live work-groups so a client cannot exhaust memory by naming endless groups (#240; see THREAT_MODEL.md "unbounded group names"). Keep the non-zero default; never `0` on the edge. |
@@ -74,9 +74,13 @@ The four RAM-side knobs bound different buffers, and they compose:
 - `--consumer-credit-bytes 8388608` bounds the un-acked PAYLOAD bytes held PER
   CONNECTION to 8 MiB, with a hard floor of one message so it never wedges. This
   is the per-consumer RAM ceiling.
-- `--consumer-credit 64` bounds the un-acked MESSAGE count per connection; the
-  effective per-fetch credit is `min(message credit, byte budget, group
-  window)`, so whichever binds first stops the fetch.
+- `--consumer-credit` bounds the un-acked MESSAGE count per connection. The
+  default auto-tunes from a 64 floor toward the 2048 ceiling as the consumer keeps
+  draining, but the byte budget above is the FIRM RAM bound the count grows
+  strictly under, so on a tight box you set an explicit small value (`8` on
+  `edge-tiny`, or up to `64`) to pin a fixed window. The effective per-fetch credit
+  is `min(message credit, byte budget, group window)`, so whichever binds first
+  stops the fetch.
 - `--max-in-flight` bounds the per-GROUP lease state.
 - `--max-groups 1024` bounds how many groups (each with its own cursor + lease
   state) can exist, so total consumer-state memory is `O(max_groups *

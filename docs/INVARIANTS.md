@@ -517,7 +517,11 @@ defined as the code uses it.
   un-acked work. The in-flight WINDOW is per-GROUP: at most `max_in_flight`
   offsets above the committed cursor (the max-ack-pending bound). CREDIT is
   per-CONSUMER (per-connection): at most `consumer_credit` un-acked messages a
-  single connection may hold (default 64). A Flow delivers
+  single connection may hold. The message-count window auto-tunes from a 64 floor
+  toward a 2048 ceiling (`DEFAULT_CREDIT_CEILING`, the default) as the consumer
+  keeps draining, halving under backpressure and RAM-bounded by the firm
+  `consumer_credit_bytes` budget; an explicit `--consumer-credit <= 64` pins the
+  historical fixed window. A Flow delivers
   `min(requested, ceiling - already_held, group window)`, so the effective bound
   is the min of the two. `EngineConfig` (`max_in_flight`, `consumer_credit`) in
   `crates/ironbus-server/src/engine.rs`.
