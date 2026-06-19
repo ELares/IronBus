@@ -806,6 +806,7 @@ dependencies = [
 name = "ironbus-server"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "ironbus-core",
  "ironbus-proto",
  "ironbus-storage",

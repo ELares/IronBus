@@ -35,6 +35,14 @@ ironbus-core = { path = "../ironbus-core", version = "0.0.0" }
 ironbus-proto = { path = "../ironbus-proto", version = "0.0.0" }
 ironbus-storage = { path = "../ironbus-storage", version = "0.0.0" }
 
+# Refcounted byte buffer for the produce hot path (#474). `OwnedAppend` carries the publish payload
+# (and key/headers/dedup ids) as `bytes::Bytes` so moving a produce across the append-actor channel is
+# a refcount bump, not a per-publish `Vec` deep copy. `bytes` is pure Rust (no `links`, no C build
+# script, no vendored crypto), MIT-licensed (already on the deny.toml allow-list via the otlp tree),
+# with an MSRV well below the workspace 1.78 floor. It is already resolved in the lockfile (1.11.x) by
+# the all-features otlp/tonic tree, so making it a first-class default dependency adds no new crate.
+bytes = { version = "1", default-features = false }
+
 # Structured tracing (#16, #99). `tracing` is the instrumentation facade; `tracing-subscriber` (the
 # `fmt` + `json` features only, no `env-filter`/`ansi`, to keep the transitive surface minimal)
 # provides the JSON log layer compiled in BY DEFAULT. Both, and their whole transitive tree

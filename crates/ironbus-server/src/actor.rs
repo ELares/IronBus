@@ -32,6 +32,7 @@
 //!   [`ActorGone`], never a panic, so neither side hangs forever if the other dies.
 
 use crate::engine::{Engine, EngineError};
+use bytes::Bytes;
 use ironbus_core::clock::Clock;
 use ironbus_core::types::Offset;
 use ironbus_storage::fs::Filesystem;
@@ -103,6 +104,13 @@ fn pool_return(pool: &ReplyPool, channel: ReplyChannel) {
 /// A produce request's payload, OWNED so it can cross the channel to the actor (the wire [`Append`]
 /// borrows the connection's input buffer, which the actor cannot hold). The actor borrows it back as
 /// an [`Append`] to append it. Fields mirror [`Append`], plus the opt-in dedup identity (#33).
+///
+/// The byte fields are [`bytes::Bytes`] (refcounted) rather than `Vec<u8>` (#474): moving an
+/// `OwnedAppend` across the append-actor channel is already a move, but carrying the bytes as `Bytes`
+/// makes a CLONE (the `#[derive(Clone)]` used by the test/replay paths) and any future slice-of-the-
+/// read-buffer handoff a refcount bump instead of a deep copy. The storage encode still copies the
+/// payload into the segment buffer when it appends (the `Bytes` is consumed by the borrow there,
+/// exactly as the `Vec` was), so durability and the on-disk image are byte-identical.
 #[derive(Clone, Debug)]
 pub struct OwnedAppend {
     /// Producer timestamp, milliseconds since the Unix epoch.
@@ -111,11 +119,11 @@ pub struct OwnedAppend {
     /// wire-only dedup bit is masked OFF by the session before this crosses the channel.
     pub flags: u8,
     /// The routing or ordering key (empty if none).
-    pub key: Vec<u8>,
+    pub key: Bytes,
     /// The record headers blob (empty if none).
-    pub headers: Vec<u8>,
+    pub headers: Bytes,
     /// The record payload.
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     /// The OPT-IN dedup identity (#3, #33): `Some` iff the publish carried a `msg_id` (the dedup
     /// opt-in), owned so it can cross the channel. `None` is the default no-dedup produce.
     pub dedup: Option<OwnedDedup>,
@@ -141,11 +149,11 @@ pub struct OwnedAppend {
 #[derive(Clone, Debug)]
 pub struct OwnedDedup {
     /// The stable producer identity for dedup keying and epoch fencing (empty = anonymous).
-    pub producer_id: Vec<u8>,
+    pub producer_id: Bytes,
     /// The producer's monotonic epoch (the fencing token).
     pub epoch: u64,
     /// The idempotency key the broker deduplicates on (never the body).
-    pub msg_id: Vec<u8>,
+    pub msg_id: Bytes,
 }
 
 /// The outcome of a produce, mapped to the wire reply by the session. It carries enough to
@@ -1169,9 +1177,9 @@ mod tests {
         OwnedAppend {
             timestamp_ms: 0,
             flags: 0,
-            key: Vec::new(),
-            headers: Vec::new(),
-            payload: payload.to_vec(),
+            key: Bytes::new(),
+            headers: Bytes::new(),
+            payload: Bytes::copy_from_slice(payload),
             dedup: None,
             enqueue_monotonic_nanos: 0,
             fire_and_forget: false,
@@ -1192,13 +1200,13 @@ mod tests {
         OwnedAppend {
             timestamp_ms: 0,
             flags: 0,
-            key: Vec::new(),
-            headers: Vec::new(),
-            payload: payload.to_vec(),
+            key: Bytes::new(),
+            headers: Bytes::new(),
+            payload: Bytes::copy_from_slice(payload),
             dedup: Some(OwnedDedup {
-                producer_id: producer_id.to_vec(),
+                producer_id: Bytes::copy_from_slice(producer_id),
                 epoch,
-                msg_id: msg_id.to_vec(),
+                msg_id: Bytes::copy_from_slice(msg_id),
             }),
             enqueue_monotonic_nanos: 0,
             fire_and_forget: false,
