@@ -10,6 +10,14 @@ authors.workspace = true
 
 [dev-dependencies]
 proptest = "1"
+criterion = "0.5"
 
 [lints]
 workspace = true
+
+# Informational micro-bench (#541): the framing + write overhead a DeliverBatch removes versus N
+# per-record Deliver frames over a contiguous run. Run on demand (`cargo bench -p ironbus-proto`), NOT
+# in per-PR CI; the full consume-vs-NATS leg is #554.
+[[bench]]
+name = "deliver_batch_framing"
+harness = false

@@ -296,7 +296,7 @@ pub struct OwnedRecord {
 /// today — the zero-copy path moves the body-CRC check to the only place that still touches the
 /// bytes (the client), it never silently drops integrity. (Verify-once-while-resident is the
 /// separate #540.)
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RawByteRun {
     /// The raw, contiguous on-disk frame bytes for `[first_offset, next_offset)`, one frame after
     /// another in the frozen on-disk layout. A refcounted [`Bytes`] slice of the shared read buffer

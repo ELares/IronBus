@@ -41,7 +41,7 @@ use ironbus_storage::dlq::{DlqSink, DLQ_SUBDIR};
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::{Append, Log, LogConfig, RetentionBounds};
 use ironbus_storage::loss::LossReport;
-use ironbus_storage::segment::{OwnedRecord, StorageError};
+use ironbus_storage::segment::{OwnedRecord, RawByteRun, StorageError};
 use std::collections::BTreeMap;
 
 /// What the engine does with a produce that would exceed the durable-log byte cap
@@ -761,6 +761,33 @@ pub struct StreamBatch {
     /// (or `start_offset` itself when the batch is empty). It never exceeds the flushed head. A
     /// reconnecting consumer that has not committed simply re-passes its last committed offset, not
     /// this value, and the uncommitted span redelivers.
+    pub next_offset: Offset,
+}
+
+/// A Tier-S STREAMING fetch result served as RAW on-disk frame bytes (#541, M1-I5): the zero-copy twin
+/// of [`StreamBatch`] used to deliver a contiguous run as ONE `DeliverBatch` frame. The contiguous
+/// SEALED prefix of the run comes back as `raw` — the on-disk frame bytes VERBATIM (a refcounted slice
+/// of one segment's resident bytes, the #542 zero-copy primitive), never re-encoded — so a later disk
+/// `sendfile(2)` path (#658) can splice them straight into the socket. Any remainder past the sealed
+/// segment's end (the active tail, which the off-actor raw plane does not serve) is materialized into
+/// `tail` and delivered as ordinary per-record `Deliver` frames; the consumer sees one continuous,
+/// contiguous run regardless of where the sealed/active boundary falls.
+#[derive(Clone, Debug, Default)]
+pub struct StreamRawBatch {
+    /// The contiguous run of records from the SEALED, flushed prefix as raw on-disk frame bytes (#542):
+    /// `raw.bytes` is `raw.record_count` complete on-disk frames in offset order, `raw.first_offset` is
+    /// the first record's log offset, and the i-th frame's offset is `first_offset + i`. Empty
+    /// (`record_count == 0`) when `start_offset` is already in the active tail or at/past the durable
+    /// head. The body CRC of every frame ships verbatim for end-to-end client verification.
+    pub raw: RawByteRun,
+    /// The remainder of the run that fell in the ACTIVE tail (or otherwise could not be served raw),
+    /// materialized as ordinary records and delivered per-record. Contiguous with and immediately
+    /// following `raw` (its first offset is `raw.next_offset`). Empty when the whole run was served raw
+    /// or nothing remained below the flushed head.
+    pub tail: Vec<OwnedRecord>,
+    /// The offset the consumer resumes from on its NEXT fetch: one past the last record served across
+    /// BOTH `raw` and `tail` (or `start_offset` when the whole batch is empty). Never exceeds the
+    /// flushed head.
     pub next_offset: Offset,
 }
 
@@ -4989,6 +5016,89 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         max_bytes: Option<usize>,
     ) -> Result<StreamBatch, EngineError> {
         self.stream_fetch_in(DEFAULT_GROUP, member, start_offset, max_records, max_bytes)
+    }
+
+    /// Serves a Tier-S STREAMING fetch as RAW on-disk frame bytes (#541, M1-I5): the zero-copy twin of
+    /// [`Engine::stream_fetch_in`] used to deliver a contiguous run as ONE `DeliverBatch` frame. It runs
+    /// the IDENTICAL group-mode guard, activity refresh, and `delivered`-counter accounting as
+    /// `stream_fetch_in` (so the two are interchangeable on the wire from the engine's view), but sources
+    /// the contiguous SEALED prefix as the on-disk frame bytes VERBATIM ([`Log::read_range_raw`], the
+    /// #542 zero-copy primitive) instead of materializing every record. Any remainder in the ACTIVE tail
+    /// (which the raw read does not serve) is materialized via the SAME `Log::read_range` the per-record
+    /// path uses, so the consumer always receives one continuous contiguous run.
+    ///
+    /// The records the client reconstructs from `raw` (offset POSITIONALLY as `first_offset + i`) and the
+    /// records in `tail` together are EXACTLY the records `stream_fetch_in` would return for the same
+    /// `[start_offset, ...)` window — the differential test in `engine.rs` pins this. NO lease is
+    /// granted, NO generation is fenced, NO cursor is written, exactly like `stream_fetch_in`.
+    ///
+    /// # Errors
+    /// [`EngineError::CumulativeAckOnWorkGroup`] if `group` is not a streaming group (the same wrong-mode
+    /// guard as `stream_fetch_in`), or a storage error reading the durable prefix.
+    pub fn stream_fetch_raw_in(
+        &mut self,
+        group: &str,
+        _member: MemberId,
+        start_offset: Offset,
+        max_records: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<StreamRawBatch, EngineError> {
+        // The wrong-mode guard and activity refresh are IDENTICAL to `stream_fetch_in`: a raw fetch is
+        // the same Tier-S streaming fetch, only the delivery encoding differs.
+        if !self.is_streaming_in(group) {
+            return Err(EngineError::CumulativeAckOnWorkGroup);
+        }
+        let now = self.log.now_monotonic();
+        if let Some(g) = self.groups.get_mut(group) {
+            g.last_activity = now;
+            g.touched = true;
+        }
+        // The contiguous SEALED prefix as raw on-disk frame bytes (zero-copy, no body decode), plus the
+        // resume point for anything this single-segment raw read did not serve.
+        let (raw, tail_from) = self
+            .log
+            .read_range_raw(start_offset, max_records, max_bytes)?;
+        // Materialize the ACTIVE-tail remainder (if any), bounded by the records the raw run did NOT
+        // already serve and the residual byte budget, so the raw + tail run never exceeds the request.
+        let raw_count = usize::try_from(raw.record_count).unwrap_or(usize::MAX);
+        let tail = match tail_from {
+            Some(from) if raw_count < max_records => {
+                let remaining = max_records - raw_count;
+                // The byte budget the raw run already consumed cannot be cheaply known here; pass the
+                // ORIGINAL `max_bytes` so the tail is bounded by the same cap (the first-frame-always
+                // rule keeps a single over-cap tail record from stalling). The record-count remainder is
+                // the hard bound that keeps raw + tail within the request.
+                self.log.read_range(from, remaining, max_bytes)?
+            }
+            _ => Vec::new(),
+        };
+        // The resume offset is one past the last record across raw and tail (or `start_offset` when
+        // both are empty), mirroring `stream_fetch_in`'s `next_offset`.
+        let next_offset = tail.last().map_or(raw.next_offset, |r| {
+            r.offset.checked_next().unwrap_or(r.offset)
+        });
+        let total = raw.record_count.saturating_add(tail.len() as u64);
+        self.counters.delivered = self.counters.delivered.saturating_add(total);
+        Ok(StreamRawBatch {
+            raw,
+            tail,
+            next_offset,
+        })
+    }
+
+    /// Serves a Tier-S streaming RAW fetch in the default work-group (#541): delegates to
+    /// [`Engine::stream_fetch_raw_in`] with the default group name (which must have been marked streaming).
+    ///
+    /// # Errors
+    /// As [`Engine::stream_fetch_raw_in`].
+    pub fn stream_fetch_raw(
+        &mut self,
+        member: MemberId,
+        start_offset: Offset,
+        max_records: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<StreamRawBatch, EngineError> {
+        self.stream_fetch_raw_in(DEFAULT_GROUP, member, start_offset, max_records, max_bytes)
     }
 
     /// Commits a Tier-S STREAMING group's cursor up to the EXCLUSIVE offset `up_to` (#544, M1-I7): the
@@ -12193,6 +12303,73 @@ mod tests {
         assert_eq!(again.records[0].offset, Offset::ZERO);
         assert_eq!(e.in_flight_in("s"), 0);
         assert_eq!(e.committed_offset_in("s"), Offset::ZERO);
+    }
+
+    #[test]
+    fn stream_fetch_raw_decodes_to_the_same_records_as_stream_fetch() {
+        // #541 DIFFERENTIAL: the RAW batch source (`stream_fetch_raw_in`) decodes — `raw` (positional
+        // offsets) plus the materialized `tail` — to EXACTLY the records `stream_fetch_in` returns for
+        // the same window, with the same offsets, in the same order. This is the core correctness proof
+        // that a DeliverBatch carries the same delivery a per-record Deliver run would.
+        let mut e = open(config(100, 5));
+        for i in 0..40u8 {
+            produce(&mut e, &[i, i.wrapping_add(1)]);
+        }
+        e.set_streaming_in("s", true).unwrap();
+        for start in 0..40u64 {
+            for max in [1usize, 3, 8, 64] {
+                let materialized = e
+                    .stream_fetch_in("s", member(1), Offset::new(start), max, None)
+                    .unwrap();
+                let raw = e
+                    .stream_fetch_raw_in("s", member(1), Offset::new(start), max, None)
+                    .unwrap();
+                // Decode `raw` (positional offsets) then append the materialized tail, the way the
+                // session ships them (DeliverBatch then per-record Deliver).
+                let mut got: Vec<(u64, Vec<u8>)> = Vec::new();
+                let mut cursor = 0usize;
+                let mut off = raw.raw.first_offset.get();
+                while cursor < raw.raw.bytes.len() {
+                    let (view, consumed) =
+                        ironbus_core::codec::decode(&raw.raw.bytes[cursor..]).unwrap();
+                    got.push((off, view.payload.to_vec()));
+                    off += 1;
+                    cursor += consumed;
+                }
+                for r in &raw.tail {
+                    got.push((r.offset.get(), r.payload.to_vec()));
+                }
+                let want: Vec<(u64, Vec<u8>)> = materialized
+                    .records
+                    .iter()
+                    .map(|r| (r.offset.get(), r.payload.to_vec()))
+                    .collect();
+                assert_eq!(
+                    got, want,
+                    "raw batch != materialized at start={start} max={max}"
+                );
+                assert_eq!(
+                    raw.next_offset, materialized.next_offset,
+                    "resume offset mismatch at start={start} max={max}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stream_fetch_raw_is_rejected_on_a_non_streaming_group_like_stream_fetch() {
+        // The raw path applies the IDENTICAL wrong-mode guard as `stream_fetch_in`, so a client cannot
+        // get a lease-free batch off a Tier-W group by asking for the raw frame.
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"a");
+        assert!(matches!(
+            e.stream_fetch_raw_in("w", member(1), Offset::ZERO, 4, None),
+            Err(EngineError::CumulativeAckOnWorkGroup)
+        ));
+        assert!(matches!(
+            e.stream_fetch_raw(member(1), Offset::ZERO, 4, None),
+            Err(EngineError::CumulativeAckOnWorkGroup)
+        ));
     }
 
     #[test]

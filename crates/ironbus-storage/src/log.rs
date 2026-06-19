@@ -14,7 +14,10 @@ use crate::io::RandomAccessFile;
 use crate::loss::{LossEvent, LossReport, ReasonCode};
 use crate::naming::{segment_file_name, segment_ids};
 use crate::read_plane::{ReadPlane, SealedSegment};
-use crate::segment::{OwnedRecord, RecoveryScan, SegmentReader, SegmentWriter, StorageError};
+use crate::segment::{
+    OwnedRecord, RawByteRun, RecoveryScan, SegmentReader, SegmentWriter, StorageError,
+};
+use bytes::Bytes;
 use ironbus_core::clock::Clock;
 use ironbus_core::codec::RecordView;
 use ironbus_core::format::{
@@ -2270,6 +2273,111 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         false
     }
 
+    /// Reads a CONTIGUOUS RAW byte run starting at `start`, returning the records' ON-DISK frame bytes
+    /// VERBATIM as one [`RawByteRun`] (the zero-copy read primitive, #542) — the raw, through-actor twin
+    /// of [`Log::read_range`] used by the Tier-S `DeliverBatch` delivery path (#541, M1-I5). Where
+    /// `read_range` decodes every frame into an [`OwnedRecord`], this seeks to the same anchor and hands
+    /// back the contiguous on-disk frame bytes with NO body decode and NO per-record allocation, so a
+    /// later disk `sendfile(2)` path (#658) can splice the segment's bytes straight from page cache.
+    ///
+    /// Bounded to a SINGLE DENSE (v1) segment: a contiguous BYTE range is one slice of one segment file,
+    /// so a run that reaches a segment boundary (or a compacted/active-but-unindexed start) stops there
+    /// and the returned `tail_from` is `Some(off)` — the next offset the caller serves through the
+    /// ordinary materialize path ([`Log::read_range`]). `None` when the read is complete (it hit
+    /// `max_records`, the byte cap, or the flushed frontier within this segment). The seek/clamp logic
+    /// MIRRORS `read_range` exactly, so the run decodes to byte-identical records.
+    ///
+    /// Bounds are identical to `read_range`: `max_records`, the optional `max_bytes` (whole-read cap,
+    /// first-frame always admitted), and the flushed frontier (no record at/past it is served).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::OffsetOutOfRange`] if `start` is older than the oldest retained record,
+    /// or an IO error reading a segment.
+    pub fn read_range_raw(
+        &self,
+        start: Offset,
+        max_records: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<(RawByteRun, Option<Offset>), StorageError> {
+        let start_v = start.get();
+        let flushed = self.flushed_offset.get();
+        let empty = RawByteRun {
+            bytes: Bytes::new(),
+            first_offset: start,
+            record_count: 0,
+            next_offset: start,
+        };
+        if max_records == 0 || start_v >= flushed {
+            // Nothing to serve raw, and nothing remains below the flushed head from `start`.
+            return Ok((empty, None));
+        }
+        let oldest = self
+            .segments
+            .first()
+            .map_or(0, SegmentSlot::covered_base_offset);
+        if start_v < oldest {
+            return Err(StorageError::OffsetOutOfRange {
+                requested: start_v,
+                oldest,
+            });
+        }
+        let slot = &self.segments[self.segment_index_for(start_v)];
+        // A COMPACTED (sparse, v2) slot is NOT served raw (its byte run is non-contiguous): hand the
+        // whole remainder to the materialize path from this segment's covered base (clamped to start).
+        if slot.compacted_covered.is_some() {
+            let tail = start_v.max(slot.covered_base_offset());
+            return Ok((empty, Some(Offset::new(tail))));
+        }
+        let seg_start = start_v.max(slot.base_offset);
+        let Some((anchor_offset, byte_pos, read_end)) = self.seek_in_segment(slot, seg_start)?
+        else {
+            // The dense index does not cover `seg_start` (a not-yet-indexed active tail): serve it
+            // through the materialize path, exactly as `read_slot_into`'s full-scan fallback would.
+            return Ok((empty, Some(start)));
+        };
+        // The anchor may sit a BOUNDED run before `seg_start`; `raw_byte_range` returns frames from the
+        // anchor forward, so trim the leading `gap` records below `seg_start` after the read. We read
+        // `gap + max_records` frames so the wanted count survives the trim, clamped to records below
+        // `flushed` (the per-frame visibility bound the raw read cannot apply itself).
+        let gap = usize::try_from(seg_start.saturating_sub(anchor_offset)).unwrap_or(0);
+        let below_flushed =
+            usize::try_from(flushed.saturating_sub(anchor_offset)).unwrap_or(usize::MAX);
+        let want = max_records.saturating_add(gap).min(below_flushed);
+        let reader = SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?;
+        // No byte cap on the raw read when there is a leading gap: the trimmed frames would mis-charge
+        // it. When there is NO gap (`gap == 0`, the common case where the anchor lands exactly on
+        // `seg_start`) the byte cap binds the read directly, identical to `read_range`.
+        let raw_max_bytes = if gap == 0 { max_bytes } else { None };
+        let run = reader.raw_byte_range(
+            byte_pos,
+            Offset::new(anchor_offset),
+            read_end,
+            want,
+            raw_max_bytes,
+        )?;
+        // Trim the leading `gap` frames (the bounded run the anchor preceded `seg_start` by) and apply
+        // the record-count and byte caps to the surviving frames, so the result is byte-identical to the
+        // prefix `read_range` would return over the same single segment.
+        let trimmed = trim_and_bound_raw_run(&run, seg_start, max_records, max_bytes);
+        // Where does the caller resume? If the trimmed run stopped strictly below the flushed head with
+        // records still available in this segment or beyond, the caller continues from `next_offset`
+        // through the materialize path (the next segment, or the active tail). If it reached the flushed
+        // head, the read is complete (`None`).
+        let next = trimmed.next_offset.get();
+        let tail_from = if next < flushed && trimmed.record_count >= max_records as u64 {
+            // Stopped because the record/byte cap bound within this segment: complete (the cap, not the
+            // data, ended it), exactly as `read_range` stops without a fallback.
+            None
+        } else if next < flushed {
+            // More flushed offsets remain past this single-segment raw run (a segment boundary, or a
+            // byte-cap stop with offsets still below flushed): serve the remainder via materialize.
+            Some(Offset::new(next))
+        } else {
+            None
+        };
+        Ok((trimmed, tail_from))
+    }
+
     /// Reclaims disk by deleting whole OLD SEALED segments under any of three composable retention
     /// [`RetentionBounds`] (size, age, count), but NEVER a segment any consumer still needs (the
     /// consumer-safe segment reaper, refs #13, #80). This is the drain side of the overflow policy
@@ -2976,6 +3084,62 @@ impl<F: Filesystem + Clone, C: Clock> Log<F, C> {
         );
         *self.read_plane.borrow_mut() = Some(plane.clone());
         Ok(plane)
+    }
+}
+
+/// Trims a [`RawByteRun`] to begin at `seg_start` (dropping the leading frames a sparse anchor preceded
+/// it by) and re-bounds it to `max_records` / `max_bytes` over the trimmed run — a HEADER-ONLY walk (no
+/// body decode), so it preserves the zero-copy property (the result is a refcount RE-SLICE of the input's
+/// `bytes`, never a copy). The through-actor twin of the read-plane's `trim_raw_run`, used by
+/// [`Log::read_range_raw`] (#541) to make a raw run byte-identical to the prefix [`Log::read_range`] would
+/// return over the same single segment.
+fn trim_and_bound_raw_run(
+    run: &RawByteRun,
+    seg_start: u64,
+    max_records: usize,
+    max_bytes: Option<usize>,
+) -> RawByteRun {
+    let mut cursor = 0usize;
+    let mut offset = run.first_offset.get();
+    let bytes = &run.bytes;
+    // Drop the leading frames below `seg_start` by walking their header lengths.
+    while offset < seg_start && cursor < bytes.len() {
+        let Ok(consumed) = ironbus_core::codec::decoded_len(&bytes[cursor..]) else {
+            break;
+        };
+        if cursor.saturating_add(consumed) > bytes.len() {
+            break;
+        }
+        cursor += consumed;
+        offset = offset.saturating_add(1);
+    }
+    let run_start_byte = cursor;
+    let first_offset = offset;
+    // Admit up to `max_records` / `max_bytes` frames from `seg_start`, "at least one" honored.
+    let mut count = 0usize;
+    let mut byte_total = 0usize;
+    while cursor < bytes.len() && count < max_records {
+        let Ok(consumed) = ironbus_core::codec::decoded_len(&bytes[cursor..]) else {
+            break;
+        };
+        if cursor.saturating_add(consumed) > bytes.len() {
+            break;
+        }
+        if let Some(cap) = max_bytes {
+            if count != 0 && byte_total.saturating_add(consumed) > cap {
+                break;
+            }
+        }
+        byte_total = byte_total.saturating_add(consumed);
+        count += 1;
+        offset = offset.saturating_add(1);
+        cursor += consumed;
+    }
+    RawByteRun {
+        bytes: bytes.slice(run_start_byte..run_start_byte + byte_total),
+        first_offset: Offset::new(first_offset),
+        record_count: count as u64,
+        next_offset: Offset::new(offset),
     }
 }
 
@@ -4384,6 +4548,140 @@ mod tests {
         differential(&log);
         log.clear_segment_indexes();
         differential(&log);
+    }
+
+    /// Decodes a [`RawByteRun`]'s bytes front-to-back into `(RecordView, offset)` pairs the way a
+    /// `DeliverBatch` client does: positional offset reconstruction (`first_offset + i`), each frame
+    /// fully CRC-validated by `codec::decode`. Asserts the run is EXACTLY `record_count` whole frames.
+    fn decode_raw_run(run: &RawByteRun) -> Vec<(RecordView<'_>, u64)> {
+        let mut out = Vec::new();
+        let mut cursor = 0usize;
+        let mut offset = run.first_offset.get();
+        while cursor < run.bytes.len() {
+            let (view, consumed) =
+                ironbus_core::codec::decode(&run.bytes[cursor..]).expect("raw run frame decodes");
+            out.push((view, offset));
+            offset = offset.saturating_add(1);
+            cursor += consumed;
+        }
+        assert_eq!(cursor, run.bytes.len(), "raw run is exactly whole frames");
+        assert_eq!(
+            out.len() as u64,
+            run.record_count,
+            "count matches the frames"
+        );
+        out
+    }
+
+    #[test]
+    fn read_range_raw_is_byte_identical_to_read_range_and_chains_the_whole_prefix() {
+        // #541: the through-actor raw read (the DeliverBatch source) decodes to the SAME records as the
+        // materialize path, with offsets reconstructed POSITIONALLY, and chaining each raw run's
+        // `tail_from` through `read_range` reconstructs the WHOLE flushed prefix with no gaps/overlaps —
+        // across the anchor stride, segment boundaries, and the sealed/active boundary.
+        let n: u64 = 25;
+        let log = rolled_log_unsynced_tail(n);
+        let flushed = log.flushed_offset().get();
+        assert!(log.active_segment_id() >= 2, "must span several segments");
+
+        let differential = |log: &Log<InMemoryFs, ManualClock>| {
+            // Per-window: a single raw run is byte-identical to the prefix `read_range` returns over the
+            // same single segment, and its records start exactly at `start`.
+            for start in 0..flushed {
+                for max in [1usize, 2, 3, 7, 1000] {
+                    let (run, _tail) = log.read_range_raw(Offset::new(start), max, None).unwrap();
+                    let materialized = log.read_range(Offset::new(start), max, None).unwrap();
+                    let decoded = decode_raw_run(&run);
+                    for ((view, off), owned) in decoded.iter().zip(materialized.iter()) {
+                        assert_eq!(*off, owned.offset.get(), "offset at start={start}");
+                        assert_eq!(view.seq, owned.seq, "seq at start={start}");
+                        assert_eq!(view.timestamp_ms, owned.timestamp_ms);
+                        assert_eq!(view.flags, owned.flags);
+                        assert_eq!(view.key, &owned.key[..]);
+                        assert_eq!(view.headers, &owned.headers[..]);
+                        assert_eq!(view.payload, &owned.payload[..]);
+                    }
+                    if let Some((_, off)) = decoded.first() {
+                        assert_eq!(*off, start, "raw run starts at the requested offset");
+                    }
+                }
+            }
+            // Chaining: follow each run's `tail_from` (serving it raw when possible, else materialized)
+            // to walk the whole flushed prefix exactly once, in order.
+            let mut next = 0u64;
+            let mut seen: Vec<u64> = Vec::new();
+            let mut guard = 0u32;
+            while next < flushed {
+                guard += 1;
+                assert!(guard < 10_000, "raw-read chain did not terminate");
+                let (run, tail_from) = log.read_range_raw(Offset::new(next), 1_000, None).unwrap();
+                for (_, off) in decode_raw_run(&run) {
+                    seen.push(off);
+                }
+                match tail_from {
+                    // A raw-served-then-resume boundary (segment edge): continue from the run's end. When
+                    // the raw run was EMPTY (the start landed on the active tail the raw path doesn't
+                    // serve), drain that remainder via the materialize path so the chain advances.
+                    Some(off) => {
+                        if run.record_count == 0 {
+                            for record in log.read_range(off, 1_000, None).unwrap() {
+                                seen.push(record.offset.get());
+                            }
+                            // The active tail is the last region below flushed; the chain ends here.
+                            break;
+                        }
+                        next = off.get();
+                    }
+                    None => break,
+                }
+            }
+            let expected: Vec<u64> = (0..flushed).collect();
+            assert_eq!(
+                seen, expected,
+                "raw chain covers the whole prefix once, in order"
+            );
+        };
+
+        differential(&log);
+        log.clear_segment_indexes();
+        differential(&log);
+    }
+
+    #[test]
+    fn read_range_raw_honors_max_records_and_max_bytes_like_read_range() {
+        // The raw read applies the SAME record-count and byte caps (first-frame-always rule) as
+        // read_range, so a capped raw run decodes to the same records the capped materialize path does.
+        let mut log = open_mem(LogConfig::default());
+        for i in 0..50u32 {
+            log.append(&rec(&i.to_le_bytes())).unwrap();
+        }
+        log.sync().unwrap();
+        let one_frame = log.read_range(Offset::ZERO, 1, None).unwrap()[0].encoded_len();
+        for k in 1..=8usize {
+            let cap = k * one_frame;
+            let (run, _) = log
+                .read_range_raw(Offset::ZERO, usize::MAX, Some(cap))
+                .unwrap();
+            let materialized = log.read_range(Offset::ZERO, usize::MAX, Some(cap)).unwrap();
+            let decoded = decode_raw_run(&run);
+            assert_eq!(
+                decoded.len(),
+                materialized.len(),
+                "raw byte-capped count matches materialize at cap={cap}"
+            );
+            for ((_, off), owned) in decoded.iter().zip(materialized.iter()) {
+                assert_eq!(*off, owned.offset.get());
+            }
+        }
+        // max_records == 0 serves nothing; a start at/past the flushed head serves nothing and resumes
+        // nowhere.
+        let (empty, tail) = log.read_range_raw(Offset::ZERO, 0, None).unwrap();
+        assert_eq!(empty.record_count, 0);
+        assert_eq!(tail, None);
+        let head = log.flushed_offset();
+        let (caught_up, tail) = log.read_range_raw(head, 100, None).unwrap();
+        assert_eq!(caught_up.record_count, 0);
+        assert_eq!(tail, None);
     }
 
     #[test]

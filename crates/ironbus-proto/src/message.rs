@@ -575,6 +575,119 @@ pub fn decode_deliver(body: &[u8]) -> Result<DeliverBody<'_>, BodyError> {
     })
 }
 
+/// The version of the [`crate::frame::FrameType::DeliverBatch`] (raw-framed batch delivery, tag 26)
+/// HEADER framing (#541, M1-I5). Version `1` is the first (and only) layout. Carried as a leading byte
+/// so a future version can extend the header without a wire break: a reader rejects a version it does
+/// not understand rather than mis-parsing it, exactly like [`STREAM_FETCH_BODY_VERSION`].
+pub const DELIVER_BATCH_HEADER_VERSION: u8 = 1;
+
+/// The FIXED header of a [`crate::frame::FrameType::DeliverBatch`] frame (#541, M1-I5): the small,
+/// length-framed prefix that precedes the contiguous ON-DISK record-frame bytes in the frame body. It
+/// is the RAW-FRAMED batch delivery's only re-encoded part — the records themselves ship as their
+/// stored bytes VERBATIM (the broker never re-encodes per record), so a later disk `sendfile(2)` path
+/// (#658) can splice the segment's page-cache bytes straight in after this header.
+///
+/// ## Why an on-disk body, and how the client reconstructs offsets
+///
+/// The on-disk record frame carries `seq` (its in-segment sequence), NOT the log `offset` the on-wire
+/// [`DeliverBody`] carries. A contiguous run is DENSE and offset-ordered, so the client reconstructs
+/// each record's offset POSITIONALLY: the i-th frame in the body has offset `first_offset + i`. The
+/// header therefore carries only `first_offset` (the run's base) — the client never needs the per-record
+/// seq->offset mapping, it just increments. `generation` is the lease fencing token to carry on an ack;
+/// for the Tier-S streaming path (#544, the first user of this frame) it is `0`, exactly as the
+/// per-record `Deliver` on that path. `record_count` lets the client size its work and validate it
+/// decoded exactly the frames the broker counted.
+///
+/// ## CRC integrity end-to-end
+///
+/// Each on-disk record frame in the body still carries its own header CRC32C and body CRC32C (and the
+/// optional xxh3-64 for a large body). The broker copies the bytes without touching them, so the
+/// consumer verifies every record exactly as it verifies a per-record `Deliver` — integrity is moved to
+/// the only place that still decodes the bytes (the client), never silently dropped.
+///
+/// Layout (version+length framed, forward-compatible, mirroring [`StreamFetchBody`]): `header_version:
+/// u8` ([`DELIVER_BATCH_HEADER_VERSION`]), `field_len: u16` (the length of the v1 known-field block that
+/// follows), then the v1 block: `first_offset: u64 LE`, `generation: u64 LE`, `record_count: u32 LE`.
+/// Bytes past `field_len` (a future version's appended header fields) are TOLERATED and ignored by a v1
+/// reader; everything AFTER the declared block is the contiguous on-disk record-frame bytes (the batch
+/// body), returned to the caller as a borrowed slice so it can be decoded (or spliced) without a copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeliverBatchHeader {
+    /// The log offset of the FIRST record in the batch body. The i-th on-disk frame in the body has
+    /// offset `first_offset + i` (the run is dense and contiguous), which is how the client reconstructs
+    /// per-record offsets without reading each frame's stored `seq`.
+    pub first_offset: u64,
+    /// The lease generation to carry on the ack for these records (the fencing token). `0` on the
+    /// lease-free Tier-S streaming path (#544), matching the per-record `Deliver`'s `generation` there.
+    pub generation: u64,
+    /// How many complete on-disk record frames the batch body carries. The client asserts it decodes
+    /// exactly this many whole frames with no partial tail.
+    pub record_count: u32,
+}
+
+/// The number of bytes in the `DeliverBatch` header v1 known-field block: `first_offset: u64` +
+/// `generation: u64` + `record_count: u32`.
+const DELIVER_BATCH_V1_FIELD_LEN: u16 = 8 + 8 + 4;
+
+/// Encodes a `DeliverBatch` frame body onto the end of `out` (#541): the header version byte, the v1
+/// field-block length, the v1 block, then the contiguous on-disk record-frame bytes VERBATIM. `record_bytes`
+/// is the concatenation of `header.record_count` complete on-disk frames (e.g. an `ironbus-storage`
+/// `RawByteRun`'s bytes), copied through UNCHANGED so each record's CRC ships end-to-end. The fixed header
+/// precedes the variable body, so a future `sendfile(2)` path writes this header then splices the stored
+/// bytes.
+pub fn encode_deliver_batch(header: &DeliverBatchHeader, record_bytes: &[u8], out: &mut Vec<u8>) {
+    out.push(DELIVER_BATCH_HEADER_VERSION);
+    out.extend_from_slice(&DELIVER_BATCH_V1_FIELD_LEN.to_le_bytes());
+    out.extend_from_slice(&header.first_offset.to_le_bytes());
+    out.extend_from_slice(&header.generation.to_le_bytes());
+    out.extend_from_slice(&header.record_count.to_le_bytes());
+    out.extend_from_slice(record_bytes);
+}
+
+/// Decodes a `DeliverBatch` frame body (#541) into its fixed [`DeliverBatchHeader`] and a BORROWED slice
+/// of the contiguous on-disk record-frame bytes that follow it, cap-before-alloc and panic-free.
+///
+/// The body MUST carry the version byte and the `u16` field-length; the v1 known fields are read from the
+/// front of the declared block and any trailing bytes WITHIN the block (a future version's appended header
+/// fields) are tolerated and ignored. Everything AFTER the declared block is the record-bytes slice,
+/// returned by reference so the caller decodes (or splices) it with no copy. A body too short to hold the
+/// `field_len` it declares is a typed [`BodyError`], never a panic or an over-read (the `field_len` is
+/// bounded against the actual body by [`Reader::take`] BEFORE any read). An EMPTY body is NOT a valid
+/// `DeliverBatch` (the frame type is new, with no historical empty case), so it is a typed
+/// [`BodyError::Truncated`].
+///
+/// This decodes ONLY the wire framing; the per-record on-disk frames in `record_bytes` are decoded by the
+/// storage/record codec (`ironbus_core::codec::decode`), kept out of this dependency-light proto crate.
+///
+/// # Errors
+/// Returns [`BodyError::Truncated`] if the body is too short for the version/length header or the declared
+/// field block, or [`BodyError::BadHandshakeVersion`] for an unknown header version.
+pub fn decode_deliver_batch(body: &[u8]) -> Result<(DeliverBatchHeader, &[u8]), BodyError> {
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != DELIVER_BATCH_HEADER_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    // Everything after the declared header block is the contiguous on-disk record-frame bytes.
+    let record_bytes = r.rest();
+    let mut fr = Reader::new(block);
+    // Every v1 slot occupies a fixed position and is always consumed in order; a short block (a sender
+    // that declared fewer bytes) reads what is present and defaults the rest, never panicking.
+    let first_offset = fr.u64().unwrap_or(0);
+    let generation = fr.u64().unwrap_or(0);
+    let record_count = fr.u32().unwrap_or(0);
+    Ok((
+        DeliverBatchHeader {
+            first_offset,
+            generation,
+            record_count,
+        },
+        record_bytes,
+    ))
+}
+
 /// A consumer's subscription request (the SUB frame body): the work-group name the consumer
 /// joins for subsequent FLOW fetches and ACKs. The entire body is the name; an empty name
 /// selects the default group (the same one an unsubscribed consumer reads). The server
@@ -941,6 +1054,17 @@ pub const CONNECT_FLAG_UNDERSTANDS_STREAMING: u8 = 0b0001_0000;
 /// a default of Tier-S without the capability bit is ignored (the connection stays Tier-W).
 pub const CONNECT_FLAG_HAS_DEFAULT_TIER: u8 = 0b0010_0000;
 
+/// The `Connect` CAPABILITY bit (#541, M1-I5) by which a consumer advertises that it UNDERSTANDS the
+/// raw-framed [`crate::frame::FrameType::DeliverBatch`] frame (tag 26): when set, the server MAY ship a
+/// contiguous delivery run as ONE `DeliverBatch` whose body carries the records' on-disk frame bytes
+/// verbatim, instead of N per-record [`crate::frame::FrameType::Deliver`] frames. When CLEAR (an old
+/// client, or one that opts out) the server keeps sending the per-record `Deliver` run, byte-for-byte
+/// unchanged, and NEVER sends the new tag — so a consumer that would error on an unknown frame, or that
+/// cannot decode the on-disk record layout, is never broken. It is a pure capability flag (no associated
+/// value), so it occupies no slot in the v1 field block beyond this `flags` bit, exactly like
+/// [`CONNECT_FLAG_WANTS_GAP_MARKER`] / [`CONNECT_FLAG_UNDERSTANDS_STREAMING`].
+pub const CONNECT_FLAG_UNDERSTANDS_DELIVER_BATCH: u8 = 0b0100_0000;
+
 /// The `Info` presence-flag bit signalling that the server's advertised per-consumer message-credit
 /// fields (`negotiated` + `cap`) are present (#292). A server that does not advertise leaves it clear,
 /// and a client then keeps its own local credit (backward-compat).
@@ -980,6 +1104,15 @@ pub const INFO_FLAG_STREAMING: u8 = 0b0001_0000;
 /// folded via [`ConsumeTier::from_u8`]); this presence bit governs only whether it is meaningful,
 /// mirroring [`INFO_FLAG_HAS_DEFAULT_ACK_LEVEL`], so the field is forward+backward compatible.
 pub const INFO_FLAG_HAS_DEFAULT_TIER: u8 = 0b0010_0000;
+
+/// The `Info` CAPABILITY bit (#541, M1-I5) by which the server CONFIRMS it will deliver contiguous runs
+/// as raw-framed [`crate::frame::FrameType::DeliverBatch`] frames for this connection: `true` only when
+/// the client advertised [`CONNECT_FLAG_UNDERSTANDS_DELIVER_BATCH`] AND the server supports the frame.
+/// When clear (an old server, or a client that did not advertise) the client knows it will only ever see
+/// per-record `Deliver` runs and keeps handling them. The negotiation is AND, the server->client twin of
+/// [`CONNECT_FLAG_UNDERSTANDS_DELIVER_BATCH`], mirroring the [`INFO_FLAG_GAP_MARKER`] /
+/// [`INFO_FLAG_STREAMING`] confirmations.
+pub const INFO_FLAG_DELIVER_BATCH: u8 = 0b0100_0000;
 
 /// A client's handshake request (the `Connect` frame body, #292). The client MAY request a
 /// per-consumer message credit and/or byte budget; the server clamps each to its own cap and replies
@@ -1034,6 +1167,14 @@ pub struct ConnectBody {
     /// Tier-S default without the capability is ignored. The value is carried raw as a `u8` so a future
     /// tier the proto does not yet name still round-trips.
     pub default_tier: Option<u8>,
+    /// Whether this consumer UNDERSTANDS the raw-framed `DeliverBatch` frame (tag 26, #541, M1-I5): the
+    /// [`CONNECT_FLAG_UNDERSTANDS_DELIVER_BATCH`] capability bit. When `true`, the server may deliver a
+    /// contiguous run as ONE `DeliverBatch` (the records' on-disk frame bytes, decoded client-side) in
+    /// place of N per-record `Deliver` frames. When `false` (the default, and an old client) the server
+    /// ALWAYS sends per-record `Deliver` frames — byte-for-byte today's behavior — and never sends the
+    /// new tag, so a pre-batch client is never sent a frame it cannot decode. A pure capability flag, so
+    /// it adds no block slot beyond its `flags` bit.
+    pub understands_deliver_batch: bool,
 }
 
 /// The number of bytes in the `Connect` v1 known-field block with NO appended bytes (#494, #543):
@@ -1081,6 +1222,9 @@ pub fn encode_connect(req: &ConnectBody, out: &mut Vec<u8>) {
     }
     if req.default_tier.is_some() {
         flags |= CONNECT_FLAG_HAS_DEFAULT_TIER;
+    }
+    if req.understands_deliver_batch {
+        flags |= CONNECT_FLAG_UNDERSTANDS_DELIVER_BATCH;
     }
     out.push(flags);
     out.extend_from_slice(&req.requested_credit.unwrap_or(0).to_le_bytes());
@@ -1150,6 +1294,7 @@ pub fn decode_connect(body: &[u8]) -> Result<ConnectBody, BodyError> {
         (flags & CONNECT_FLAG_HAS_CREDIT_BYTES != 0).then_some(credit_bytes);
     let wants_gap_marker = flags & CONNECT_FLAG_WANTS_GAP_MARKER != 0;
     let understands_streaming = flags & CONNECT_FLAG_UNDERSTANDS_STREAMING != 0;
+    let understands_deliver_batch = flags & CONNECT_FLAG_UNDERSTANDS_DELIVER_BATCH != 0;
     Ok(ConnectBody {
         requested_credit,
         requested_credit_bytes,
@@ -1157,6 +1302,7 @@ pub fn decode_connect(body: &[u8]) -> Result<ConnectBody, BodyError> {
         default_ack_level,
         understands_streaming,
         default_tier,
+        understands_deliver_batch,
     })
 }
 
@@ -1219,6 +1365,12 @@ pub struct InfoBody {
     /// defaulted to Tier-W) means no echo. APPENDED v1 field mirroring `default_ack_level`: emitted only
     /// when `Some`, so a `None` advertisement is byte-for-byte the body without it.
     pub default_tier: Option<u8>,
+    /// Whether the server CONFIRMS it will deliver contiguous runs as raw-framed `DeliverBatch` frames
+    /// (tag 26) for this connection (#541, M1-I5): the [`INFO_FLAG_DELIVER_BATCH`] capability echo, the
+    /// server->client twin of [`ConnectBody::understands_deliver_batch`]. `true` only when the client
+    /// advertised it understands the frame AND the server supports it. `false` (an old server, or a
+    /// client that did not advertise) tells the client it will only ever see per-record `Deliver` runs.
+    pub deliver_batch: bool,
 }
 
 /// The number of bytes in the `Info` v1 known-field block with NO appended bytes (#494, #543):
@@ -1263,6 +1415,9 @@ pub fn encode_info(info: &InfoBody, out: &mut Vec<u8>) {
     }
     if info.default_tier.is_some() {
         flags |= INFO_FLAG_HAS_DEFAULT_TIER;
+    }
+    if info.deliver_batch {
+        flags |= INFO_FLAG_DELIVER_BATCH;
     }
     out.push(flags);
     let credit = info.credit.unwrap_or(CreditAdvert {
@@ -1338,6 +1493,7 @@ pub fn decode_info(body: &[u8]) -> Result<InfoBody, BodyError> {
     });
     let gap_marker = flags & INFO_FLAG_GAP_MARKER != 0;
     let streaming = flags & INFO_FLAG_STREAMING != 0;
+    let deliver_batch = flags & INFO_FLAG_DELIVER_BATCH != 0;
     Ok(InfoBody {
         credit,
         credit_bytes,
@@ -1345,6 +1501,7 @@ pub fn decode_info(body: &[u8]) -> Result<InfoBody, BodyError> {
         default_ack_level,
         streaming,
         default_tier,
+        deliver_batch,
     })
 }
 
@@ -1689,6 +1846,7 @@ mod tests {
             default_ack_level: None,
             understands_streaming: false,
             default_tier: None,
+            understands_deliver_batch: false,
         };
         let mut buf = Vec::new();
         encode_connect(&req, &mut buf);
@@ -1712,6 +1870,7 @@ mod tests {
             default_ack_level: None,
             streaming: false,
             default_tier: None,
+            deliver_batch: false,
         };
         let mut buf = Vec::new();
         encode_info(&info, &mut buf);
@@ -2239,6 +2398,129 @@ mod tests {
     }
 
     #[test]
+    fn deliver_batch_header_round_trips_with_the_record_bytes_carried_verbatim() {
+        // #541: the DeliverBatch frame body is the fixed header (first_offset / generation /
+        // record_count) followed by the contiguous on-disk record-frame bytes carried VERBATIM. The
+        // header round-trips and the record bytes are returned by reference, byte-for-byte unchanged.
+        let header = DeliverBatchHeader {
+            first_offset: 0x0102_0304_0506_0708,
+            generation: 0,
+            record_count: 3,
+        };
+        let record_bytes = b"on-disk-frame-bytes-here";
+        let mut buf = Vec::new();
+        encode_deliver_batch(&header, record_bytes, &mut buf);
+        let (decoded, decoded_bytes) = decode_deliver_batch(&buf).unwrap();
+        assert_eq!(decoded, header);
+        assert_eq!(decoded_bytes, record_bytes, "record bytes ship verbatim");
+        // An EMPTY record body is valid (a zero-record batch): the header still frames.
+        let empty_header = DeliverBatchHeader {
+            first_offset: 7,
+            generation: 0,
+            record_count: 0,
+        };
+        let mut ebuf = Vec::new();
+        encode_deliver_batch(&empty_header, &[], &mut ebuf);
+        let (eh, eb) = decode_deliver_batch(&ebuf).unwrap();
+        assert_eq!(eh, empty_header);
+        assert!(eb.is_empty());
+    }
+
+    #[test]
+    fn deliver_batch_rejects_an_empty_or_short_body_and_an_unknown_version() {
+        // The frame type is new: an empty body is not a valid frame (no historical empty case).
+        assert_eq!(decode_deliver_batch(&[]), Err(BodyError::Truncated));
+        // A declared field_len longer than the body is a typed length error, never an over-read.
+        let mut bad = vec![DELIVER_BATCH_HEADER_VERSION];
+        bad.extend_from_slice(&99u16.to_le_bytes()); // declares 99 header bytes but supplies none
+        assert!(matches!(
+            decode_deliver_batch(&bad),
+            Err(BodyError::Truncated | BodyError::BadLength)
+        ));
+        // An unknown header version is rejected, not best-effort parsed (so a future layout is never
+        // mis-decoded as v1).
+        let mut wrong = Vec::new();
+        encode_deliver_batch(
+            &DeliverBatchHeader {
+                first_offset: 1,
+                generation: 0,
+                record_count: 0,
+            },
+            &[],
+            &mut wrong,
+        );
+        wrong[0] = DELIVER_BATCH_HEADER_VERSION + 1;
+        assert_eq!(
+            decode_deliver_batch(&wrong),
+            Err(BodyError::BadHandshakeVersion {
+                version: DELIVER_BATCH_HEADER_VERSION + 1
+            })
+        );
+    }
+
+    #[test]
+    fn deliver_batch_tolerates_a_future_appended_header_field() {
+        // FORWARD-COMPAT: a future version may APPEND fields inside the declared header block; a v1
+        // reader reads its known fields and the record bytes still begin right after the declared block,
+        // so a present future header field never bleeds into the record bytes. Hand-build a body whose
+        // header block is one byte longer than v1 (a future field), then a record-bytes tail.
+        let mut buf = vec![DELIVER_BATCH_HEADER_VERSION];
+        let extended_len = DELIVER_BATCH_V1_FIELD_LEN + 1;
+        buf.extend_from_slice(&extended_len.to_le_bytes());
+        buf.extend_from_slice(&123u64.to_le_bytes()); // first_offset
+        buf.extend_from_slice(&0u64.to_le_bytes()); // generation
+        buf.extend_from_slice(&5u32.to_le_bytes()); // record_count
+        buf.push(0xAB); // a FUTURE appended header byte, inside the declared block
+        buf.extend_from_slice(b"record-bytes"); // the body proper begins AFTER the declared block
+        let (header, record_bytes) = decode_deliver_batch(&buf).unwrap();
+        assert_eq!(header.first_offset, 123);
+        assert_eq!(header.record_count, 5);
+        assert_eq!(
+            record_bytes, b"record-bytes",
+            "record bytes begin after the declared header block, not after the v1 fields"
+        );
+    }
+
+    #[test]
+    fn connect_and_info_carry_the_deliver_batch_capability_bit() {
+        // #541: a batch-capable consumer sets the capability bit (a pure flags bit, no block byte); the
+        // bit round-trips and an EMPTY (old-client) Connect never advertises it. The Info echo mirrors it.
+        let req = ConnectBody {
+            understands_deliver_batch: true,
+            ..ConnectBody::default()
+        };
+        let mut buf = Vec::new();
+        encode_connect(&req, &mut buf);
+        assert_eq!(
+            buf[3] & CONNECT_FLAG_UNDERSTANDS_DELIVER_BATCH,
+            CONNECT_FLAG_UNDERSTANDS_DELIVER_BATCH,
+            "the capability bit is set in the flags byte"
+        );
+        // The capability is a PURE flags bit: setting it appends NO byte to the v1 block.
+        let mut plain = Vec::new();
+        encode_connect(&ConnectBody::default(), &mut plain);
+        assert_eq!(buf.len(), plain.len(), "the capability bit appends no byte");
+        assert_eq!(decode_connect(&buf).unwrap(), req);
+        // An EMPTY (old-client) Connect body never advertises the capability.
+        assert!(!decode_connect(&[]).unwrap().understands_deliver_batch);
+
+        let info = InfoBody {
+            deliver_batch: true,
+            ..InfoBody::default()
+        };
+        let mut ibuf = Vec::new();
+        encode_info(&info, &mut ibuf);
+        assert_eq!(
+            ibuf[3] & INFO_FLAG_DELIVER_BATCH,
+            INFO_FLAG_DELIVER_BATCH,
+            "the capability confirmation bit is set in the flags byte"
+        );
+        assert_eq!(decode_info(&ibuf).unwrap(), info);
+        // An EMPTY (old-server) Info body never confirms the capability.
+        assert!(!decode_info(&[]).unwrap().deliver_batch);
+    }
+
+    #[test]
     fn stream_commit_round_trips_and_shares_the_cumulative_ack_shape() {
         // #544: StreamCommit carries the same (u64 up_to, group name) shape as CumulativeAck — a shared
         // byte layout, a DISTINCT frame type. The server dispatches on the frame type to pick the
@@ -2434,8 +2716,9 @@ mod tests {
             default_ack_level in proptest::option::of(any::<u8>()),
             understands_streaming in any::<bool>(),
             default_tier in proptest::option::of(any::<u8>()),
+            understands_deliver_batch in any::<bool>(),
         ) {
-            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: credit_bytes, wants_gap_marker, default_ack_level, understands_streaming, default_tier };
+            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: credit_bytes, wants_gap_marker, default_ack_level, understands_streaming, default_tier, understands_deliver_batch };
             let mut buf = Vec::new();
             encode_connect(&req, &mut buf);
             prop_assert_eq!(buf[0], HANDSHAKE_BODY_VERSION, "the body leads with its version");
@@ -2454,6 +2737,7 @@ mod tests {
             default_ack_level in proptest::option::of(any::<u8>()),
             streaming in any::<bool>(),
             default_tier in proptest::option::of(any::<u8>()),
+            deliver_batch in any::<bool>(),
         ) {
             let info = InfoBody {
                 credit: credit.map(|(negotiated, cap)| CreditAdvert { negotiated, cap }),
@@ -2462,6 +2746,7 @@ mod tests {
                 default_ack_level,
                 streaming,
                 default_tier,
+                deliver_batch,
             };
             let mut buf = Vec::new();
             encode_info(&info, &mut buf);
@@ -2490,7 +2775,7 @@ mod tests {
             credit in proptest::option::of(any::<u32>()),
             trailing in prop::collection::vec(any::<u8>(), 0..64),
         ) {
-            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: None, wants_gap_marker: false, default_ack_level: None, understands_streaming: false, default_tier: None };
+            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: None, wants_gap_marker: false, default_ack_level: None, understands_streaming: false, default_tier: None, understands_deliver_batch: false };
             let mut buf = Vec::new();
             encode_connect(&req, &mut buf);
             let mut extended = buf.clone();
@@ -2504,6 +2789,7 @@ mod tests {
                 default_ack_level: None,
                 streaming: false,
                 default_tier: None,
+                deliver_batch: false,
             };
             let mut ibuf = Vec::new();
             encode_info(&info, &mut ibuf);
@@ -2577,6 +2863,7 @@ mod tests {
                 default_ack_level: None,
                 understands_streaming: false,
                 default_tier: None,
+                understands_deliver_batch: false,
             }
         );
     }
@@ -2595,6 +2882,7 @@ mod tests {
                 default_ack_level: None,
                 streaming: false,
                 default_tier: None,
+                deliver_batch: false,
             }
         );
     }
@@ -2608,6 +2896,7 @@ mod tests {
             default_ack_level: None,
             understands_streaming: false,
             default_tier: None,
+            understands_deliver_batch: false,
         };
         let mut buf = Vec::new();
         encode_connect(&req, &mut buf);
@@ -2634,6 +2923,7 @@ mod tests {
             default_ack_level: None,
             streaming: false,
             default_tier: None,
+            deliver_batch: false,
         };
         let mut buf = Vec::new();
         encode_info(&info, &mut buf);
@@ -2861,6 +3151,7 @@ mod tests {
             default_ack_level: None,
             understands_streaming: false,
             default_tier: None,
+            understands_deliver_batch: false,
         };
         let mut pre = Vec::new();
         encode_connect(&no_level, &mut pre);
@@ -2913,6 +3204,7 @@ mod tests {
             default_ack_level: None,
             streaming: false,
             default_tier: None,
+            deliver_batch: false,
         };
         let mut pre = Vec::new();
         encode_info(&no_level, &mut pre);
@@ -2950,6 +3242,7 @@ mod tests {
             default_ack_level: None,
             understands_streaming: false,
             default_tier: None,
+            understands_deliver_batch: false,
         };
         let mut pre = Vec::new();
         encode_connect(&none, &mut pre);
@@ -3019,6 +3312,7 @@ mod tests {
             default_ack_level: None,
             streaming: false,
             default_tier: None,
+            deliver_batch: false,
         };
         let mut pre = Vec::new();
         encode_info(&none, &mut pre);
@@ -3058,6 +3352,7 @@ mod tests {
             default_ack_level: Some(AckLevel::ServerAndClientAck.as_u8()),
             understands_streaming: true,
             default_tier: Some(ConsumeTier::Streaming.as_u8()),
+            understands_deliver_batch: false,
         };
         let mut buf = Vec::new();
         encode_connect(&both, &mut buf);
@@ -3117,6 +3412,7 @@ mod tests {
                 default_ack_level: None,
                 understands_streaming: false,
                 default_tier: None,
+                understands_deliver_batch: false,
             }
         );
 
@@ -3136,6 +3432,7 @@ mod tests {
                 default_ack_level: None,
                 streaming: false,
                 default_tier: None,
+                deliver_batch: false,
             }
         );
     }
