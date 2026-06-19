@@ -12,7 +12,8 @@ use crate::loss::{CapViolation, ReasonCode};
 use bytes::{Bytes, BytesMut};
 use ironbus_core::codec::{self, DecodeError, RecordView};
 use ironbus_core::format::{
-    COMPACTION_META_LEN, RECORD_HEADER_LEN, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN,
+    COMPACTION_META_LEN, RECORD_HEADER_LEN, RECORD_TRAILER_LEN, RECORD_XXH3_LEN,
+    SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN, XXH3_PAYLOAD_THRESHOLD,
 };
 use ironbus_core::segment::{CompactionMeta, SegmentError, SegmentFooter, SegmentHeader};
 use ironbus_core::types::{Offset, RecordFlags, Seq};
@@ -281,6 +282,23 @@ impl OwnedRecord {
             headers: buf.slice_ref(v.headers),
             payload: buf.slice_ref(v.payload),
         }
+    }
+
+    /// The total ENCODED on-disk frame length of this record in bytes: the fixed header, the stored
+    /// body (key + headers + payload), the optional xxh3-64 field (present iff the stored body is at
+    /// or above [`XXH3_PAYLOAD_THRESHOLD`]), and the fixed trailer. This is the SAME formula
+    /// `codec::encode` lays down, so it is the authoritative per-record frame size the `max_bytes`
+    /// budget of [`crate::log::Log::read_range`] (#538) accounts against — kept as one derivation so
+    /// the budget can never drift from the bytes actually written.
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        let body_len = self.key.len() + self.headers.len() + self.payload.len();
+        let xxh3_field = if body_len >= XXH3_PAYLOAD_THRESHOLD as usize {
+            RECORD_XXH3_LEN
+        } else {
+            0
+        };
+        RECORD_HEADER_LEN + body_len + xxh3_field + RECORD_TRAILER_LEN
     }
 }
 
@@ -1170,6 +1188,46 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         read_end: u64,
         max: usize,
     ) -> Result<Vec<OwnedRecord>, StorageError> {
+        // No byte cap: `scan_range` with `max_bytes = None` IS the historical `scan_from`.
+        self.scan_range(start_byte, start_offset, read_end, max, None)
+    }
+
+    /// Reads a CONTIGUOUS run of up to `max` DENSE (v1) records starting at the file byte position
+    /// `start_byte` in ONE linear forward pass — the byte-capped sibling of [`SegmentReader::
+    /// scan_from`] and the single-pass batch-read primitive of the consume read plane (#538, the
+    /// I1 #537 seek-index spine). One `read_exact_at` fills a shared `Bytes` buffer, then the
+    /// records refcount-slice it (#480): a seek-and-read-forward of N records is ONE syscall + ONE
+    /// allocation + N refcounted slices, NOT N opens/seeks/decodes — `O(N)` over the run, not
+    /// `O(N * records-per-segment)`. Each materialized record is FULLY CRC-validated (header AND
+    /// body, via the same `codec::decode` the scan uses); the seek index is a LOCATOR, never a CRC
+    /// bypass (verify-once CRC-skip is the separate #540). Zero-copy / `sendfile` is the separate
+    /// #542; this returns materialized [`OwnedRecord`]s.
+    ///
+    /// Bounds, all honored in the single pass:
+    /// - `max`: stop after `max` records. `max == 0` returns empty (matching `scan_from`).
+    /// - `read_end`: no frame whose body would extend at or past it is materialized (the caller
+    ///   passes the segment's flushed `valid_end`, so a torn/unflushed tail is never read).
+    /// - `max_bytes`: stop once the accumulated ENCODED frame bytes (each frame's `consumed` span)
+    ///   would EXCEED the cap. `None` means no byte cap. To avoid a stall on a record larger than
+    ///   the cap, the FIRST record is ALWAYS taken even if it alone exceeds `max_bytes` (the
+    ///   standard "at least one" fetch rule); the cap then bounds every record AFTER the first.
+    ///
+    /// The record at `start_byte` is assigned log offset `start_offset` and each subsequent record
+    /// the next consecutive offset. `start_byte` MUST be a real frame boundary (an index entry);
+    /// reading mid-frame fails the CRC and stops, never returning a bogus record. Returns the
+    /// records in offset order.
+    ///
+    /// # Errors
+    /// Returns an IO error from reading the region. A torn or corrupt frame is NOT an error: it
+    /// ends the returned prefix, exactly as `scan` stops at the first bad frame.
+    pub fn scan_range(
+        &self,
+        start_byte: u64,
+        start_offset: Offset,
+        read_end: u64,
+        max: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<Vec<OwnedRecord>, StorageError> {
         if max == 0 || start_byte >= read_end {
             return Ok(Vec::new());
         }
@@ -1183,12 +1241,22 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         let body = buf.freeze();
         let mut records = Vec::with_capacity(max.min(64));
         let mut cursor = 0usize;
+        let mut byte_total = 0usize;
         let mut next_offset = start_offset.get();
         while cursor < body.len() && records.len() < max {
             // The SAME CRC-gated decode `scan_body` uses: a torn or corrupt frame ends the prefix.
             let Ok((view, consumed)) = codec::decode(&body[cursor..]) else {
                 break;
             };
+            // Byte cap: stop BEFORE a record that would push the accumulated encoded frame bytes
+            // past `max_bytes`, but ALWAYS admit the first record (records non-empty would not yet
+            // be true) so a single record larger than the cap never stalls the read.
+            if let Some(cap) = max_bytes {
+                if !records.is_empty() && byte_total.saturating_add(consumed) > cap {
+                    break;
+                }
+            }
+            byte_total = byte_total.saturating_add(consumed);
             // Frame CRC-validated by the decode above before the slice is taken.
             records.push(OwnedRecord::from_view(
                 Offset::new(next_offset),
@@ -1440,6 +1508,31 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         read_end: u64,
         max: usize,
     ) -> Result<Vec<OwnedRecord>, StorageError> {
+        // No byte cap: the historical `scan_compacted_from` is `scan_compacted_range` with `None`.
+        self.scan_compacted_range(start_byte, base_off, base_seq, read_end, max, None)
+    }
+
+    /// The byte-capped sibling of [`SegmentReader::scan_compacted_from`]: reads a CONTIGUOUS run of
+    /// up to `max` SPARSE survivors from a COMPACTED (v2) segment in ONE linear forward pass, with
+    /// the same single-read + refcounted-slice (#480) machinery, honoring an optional `max_bytes`
+    /// cap on the accumulated ENCODED frame bytes (#538). This is the compacted half of the
+    /// single-pass batch-read primitive `Log::read_range` threads its byte budget through. `None`
+    /// means no byte cap; the FIRST survivor is ALWAYS taken even if it alone exceeds the cap (the
+    /// "at least one" rule), so a single large survivor never stalls the read. CRC validation per
+    /// frame is unchanged (the seek index is a locator, not a trust bypass).
+    ///
+    /// # Errors
+    /// Returns an IO error from reading the region. A torn or corrupt frame is NOT an error: it
+    /// ends the returned prefix, exactly as the dense `scan_range` stops at the first bad frame.
+    pub fn scan_compacted_range(
+        &self,
+        start_byte: u64,
+        base_off: u64,
+        base_seq: u64,
+        read_end: u64,
+        max: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<Vec<OwnedRecord>, StorageError> {
         if max == 0 || start_byte >= read_end {
             return Ok(Vec::new());
         }
@@ -1452,11 +1545,20 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         let body = buf.freeze();
         let mut records = Vec::with_capacity(max.min(64));
         let mut cursor = 0usize;
+        let mut byte_total = 0usize;
         while cursor < body.len() && records.len() < max {
             // The SAME CRC-gated decode `scan_compacted` uses: a torn or corrupt frame ends the read.
             let Ok((view, consumed)) = codec::decode(&body[cursor..]) else {
                 break;
             };
+            // Byte cap: stop BEFORE a survivor that would exceed `max_bytes`, but always admit the
+            // first (so one large survivor never stalls the read), mirroring the dense `scan_range`.
+            if let Some(cap) = max_bytes {
+                if !records.is_empty() && byte_total.saturating_add(consumed) > cap {
+                    break;
+                }
+            }
+            byte_total = byte_total.saturating_add(consumed);
             // Reconstruct the original sparse offset from the constant offset-minus-seq delta, the
             // identical reconstruction `scan_compacted` applies.
             let seq = view.seq.get();
@@ -1949,6 +2051,68 @@ mod tests {
         assert_eq!(two.len(), 2);
         assert_eq!(two[0].offset, Offset::new(2));
         assert_eq!(two[1].offset, Offset::new(3));
+    }
+
+    #[test]
+    fn scan_range_honors_max_bytes_with_at_least_one() {
+        // Uniform 7-byte-payload records => uniform frame lengths, so a byte budget admits a
+        // predictable count, and a budget below one frame still returns exactly one record (#538).
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        for i in 0..6u64 {
+            w.append(&rec(i, &[u8::try_from(i).unwrap(); 7])).unwrap();
+        }
+        w.sync().unwrap();
+        let reader = SegmentReader::open(Arc::clone(&file)).unwrap();
+        let (positions, valid_end) = reader.record_byte_positions().unwrap();
+        let one_frame = reader
+            .scan_range(positions[0], Offset::new(0), valid_end, 1, None)
+            .unwrap()[0]
+            .encoded_len();
+
+        // A budget of exactly K frames yields K records (the K+1th frame would exceed it).
+        for k in 1..=4usize {
+            let got = reader
+                .scan_range(
+                    positions[0],
+                    Offset::new(0),
+                    valid_end,
+                    usize::MAX,
+                    Some(k * one_frame),
+                )
+                .unwrap();
+            assert_eq!(
+                got.len(),
+                k,
+                "byte budget for {k} frames yields {k} records"
+            );
+        }
+        // A sub-frame budget (even zero) still returns exactly one record (the "at least one" rule).
+        for cap in [0usize, 1, one_frame - 1] {
+            let got = reader
+                .scan_range(
+                    positions[0],
+                    Offset::new(0),
+                    valid_end,
+                    usize::MAX,
+                    Some(cap),
+                )
+                .unwrap();
+            assert_eq!(
+                got.len(),
+                1,
+                "a sub-frame cap of {cap} still returns one record"
+            );
+        }
+        // scan_range(.., None) is byte-identical to scan_from (the unbounded historical path).
+        assert_eq!(
+            reader
+                .scan_range(positions[0], Offset::new(0), valid_end, usize::MAX, None)
+                .unwrap(),
+            reader
+                .scan_from(positions[0], Offset::new(0), valid_end, usize::MAX)
+                .unwrap()
+        );
     }
 
     #[test]

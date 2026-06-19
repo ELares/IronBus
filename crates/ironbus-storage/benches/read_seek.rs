@@ -80,6 +80,60 @@ fn locate_by_full_scan(log: &Log<InMemoryFs, ManualClock>, offset: u64) -> usize
         .map_or(0, |r| r.payload.len())
 }
 
+/// How many CONTIGUOUS records a single consume batch delivers (#538). The BEFORE path issues this
+/// many separate single-record `read_from(off, 1)` locates; the AFTER path issues ONE `read_range`.
+const RANGE_BATCH: usize = 256;
+
+fn bench_read_range(c: &mut Criterion) {
+    // The #538 batch read: delivering a CONTIGUOUS run of N records.
+    //
+    // - BEFORE (the consume engine's per-record path): N separate `read_from(off, 1)` calls, each
+    //   re-paying a `SegmentReader::open` + anchor seek + bounded forward scan to locate ONE record
+    //   (the #537 locate is a small constant PER record, but the per-call open/seek overhead is paid
+    //   N times). Delivering a batch of N is then N separate locates.
+    // - AFTER (this issue, #538): ONE `read_range(start, N, _)` — one seek to the anchor at or before
+    //   `start`, one bounded forward scan to `start`, then one linear pass materializing N contiguous
+    //   records over the segment bytes. `O(N)` over the run, the open/seek paid ONCE.
+    //
+    // CRC validation per record is identical on both paths (the index is a locator, not a bypass);
+    // this measures the per-record re-seek/open overhead the single pass removes, NOT a CRC change.
+    let mut group = c.benchmark_group("consume_batch_read");
+    for &count in &RECORD_COUNTS {
+        let log = packed_log(count);
+        let batch = RANGE_BATCH.min(usize::try_from(count).unwrap());
+
+        group.bench_with_input(
+            BenchmarkId::new("before_per_record_read_from", count),
+            &batch,
+            |b, &batch| {
+                b.iter(|| {
+                    let mut total = 0usize;
+                    for off in 0..batch as u64 {
+                        let recs = log.read_from(Offset::new(black_box(off)), 1).unwrap();
+                        total += recs.first().map_or(0, |r| r.payload.len());
+                    }
+                    black_box(total);
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("after_single_pass_read_range", count),
+            &batch,
+            |b, &batch| {
+                b.iter(|| {
+                    let recs = log
+                        .read_range(Offset::new(black_box(0)), black_box(batch), None)
+                        .unwrap();
+                    let total: usize = recs.iter().map(|r| r.payload.len()).sum();
+                    black_box(total);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn bench_read_seek(c: &mut Criterion) {
     let mut group = c.benchmark_group("consume_locate");
     for &count in &RECORD_COUNTS {
@@ -120,5 +174,5 @@ fn bench_read_seek(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_read_seek);
+criterion_group!(benches, bench_read_seek, bench_read_range);
 criterion_main!(benches);
