@@ -486,6 +486,44 @@ impl SegmentIndex {
     fn covered_end(&self) -> u64 {
         self.base_offset.saturating_add(self.record_count)
     }
+
+    /// The WINDOW-BOUNDED read-end (#664): the byte position past which a read that wants the
+    /// records in `[from_offset, from_offset + want_records)` need not look. A seek-and-scan-forward
+    /// reads `[anchor_byte, read_end)` into one buffer up front; before #664 `read_end` was the
+    /// SEGMENT-WIDE `flushed_end`, so a forward streaming drain read `O(distance-to-segment-end)`
+    /// bytes per fetch and was `O(N^2)` overall. This bounds the read to the FIRST sparse anchor
+    /// STRICTLY ABOVE the last wanted offset (`from_offset + want_records`): every wanted record lies
+    /// below that anchor's byte position, so the read covers the window plus at most one extra stride
+    /// of slack — `O(want + stride)` bytes, INDEPENDENT of how far `from_offset` sits from the
+    /// segment end. When no anchor lies above the window (the window reaches the indexed tail) the
+    /// bound is the full `flushed_end`, exactly the pre-#664 behavior for that (final) window.
+    ///
+    /// `want_records == 0` (or a `want` that overflows) falls back to `flushed_end`: the caller
+    /// returns nothing anyway, and a conservative (larger) read-end is always correct — it only ever
+    /// reads MORE bytes, never wrong ones (the per-record `max`/`flushed` filters still bound the
+    /// returned run). The result is clamped to `flushed_end`, so a window-bounded read never reaches
+    /// past the durable, in-file prefix.
+    fn window_read_end(&self, from_offset: u64, want_records: usize, flushed_end: u64) -> u64 {
+        let want = want_records as u64;
+        if want == 0 {
+            return flushed_end;
+        }
+        // The first offset PAST the window. Saturating: an enormous `want` (e.g. `usize::MAX`)
+        // resolves to `u64::MAX`, for which no anchor is strictly above => the bound is `flushed_end`
+        // (the whole prefix), correctly degrading to "read to the end" for an unbounded fetch.
+        let window_end = from_offset.saturating_add(want);
+        // The first anchor whose OFFSET is strictly greater than `window_end`. Its byte position is a
+        // safe upper bound: every record with offset `< window_end` has its frame entirely below it
+        // (anchors mark frame STARTS, ascending). `partition_point` is O(log anchors).
+        let idx = self
+            .anchors
+            .partition_point(|&(anchor_off, _)| anchor_off <= window_end);
+        let bound = self
+            .anchors
+            .get(idx)
+            .map_or(flushed_end, |&(_, byte_pos)| byte_pos);
+        bound.min(flushed_end)
+    }
 }
 
 /// The RESIDENT, in-memory SPARSE seek index for ONE open COMPACTED (v2) segment (#481). It is the
@@ -2207,7 +2245,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // The anchor may sit a BOUNDED run (<= `stride` bytes) BEFORE `seg_start`; those records come
         // back and are skipped below. The per-segment start is `max(start_v, base)`.
         let seg_start = bounds.start_v.max(slot.base_offset);
-        let Some((anchor_offset, byte_pos, read_end)) = self.seek_in_segment(slot, seg_start)?
+        // #664: bound the seek's read span to the WINDOW (`remaining` records from `seg_start`), not
+        // the whole segment, so a forward streaming drain reads O(window) bytes per fetch (not
+        // O(distance-to-segment-end)). The `want`/gap clamp below still governs the records returned.
+        let Some((anchor_offset, byte_pos, read_end)) =
+            self.seek_in_segment(slot, seg_start, remaining)?
         else {
             // The index does not cover `seg_start` (the as-yet-unflushed active tail): fall back to a
             // full scan for this segment — correct, only (rarely) slower, the same records.
@@ -2329,7 +2371,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             return Ok((empty, Some(Offset::new(tail))));
         }
         let seg_start = start_v.max(slot.base_offset);
-        let Some((anchor_offset, byte_pos, read_end)) = self.seek_in_segment(slot, seg_start)?
+        // #664: bound the seek's read span to the WINDOW (`max_records` records from `seg_start`), not
+        // the whole segment, so a forward Tier-S streaming drain reads O(window) bytes per fetch (not
+        // O(distance-to-segment-end) => O(N^2) overall). The `want`/`max_records` clamp below still
+        // governs the frames returned; `read_end` only bounds how many bytes are read into the buffer.
+        let Some((anchor_offset, byte_pos, read_end)) =
+            self.seek_in_segment(slot, seg_start, max_records)?
         else {
             // The dense index does not cover `seg_start` (a not-yet-indexed active tail): serve it
             // through the materialize path, exactly as `read_slot_into`'s full-scan fallback would.
@@ -2803,12 +2850,13 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         &self,
         slot: &SegmentSlot,
         start_offset: u64,
+        want_records: usize,
     ) -> Result<Option<(u64, u64, u64)>, StorageError> {
         // A compacted (v2, sparse) segment is never indexed here; the caller routes it to the v2
         // scan. This guard keeps the resident index strictly to the dense case.
         debug_assert!(slot.compacted_covered.is_none());
         if let Some(idx) = self.segment_indexes.borrow().get(&slot.id) {
-            return Ok(Self::seek_with(idx, start_offset));
+            return Ok(Self::seek_with(idx, start_offset, want_records));
         }
         // Build once from the durable frames: the SPARSE anchors delimit exactly the valid prefix a
         // scan would (the streaming walk stops at the same torn tail), so seeking into the index can
@@ -2834,29 +2882,39 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             valid_end,
             flushed_end: valid_end,
         };
-        let result = Self::seek_with(&index, start_offset);
+        let result = Self::seek_with(&index, start_offset, want_records);
         self.segment_indexes.borrow_mut().insert(slot.id, index);
         Ok(result)
     }
 
     /// Resolves `start_offset` to its SEEK anchor (the nearest indexed `(anchor offset, anchor byte
-    /// position)` at or before it) and the flushed-bounded read-end against a built `index` (#537).
-    /// The caller seeks to the anchor byte position, reads forward, and skips the bounded run of
-    /// records below `start_offset`. The read-end is the index's `flushed_end` (the in-file prefix
-    /// end): for the active segment that is where pending bytes were last flushed to the file, so a
-    /// seek never reads an appended-but-not-yet-flushed frame; for a sealed predecessor it is the
-    /// whole durable record region (`flushed_end == valid_end`). `None` when `start_offset` is not
-    /// covered (the caller falls back to a full scan).
-    fn seek_with(index: &SegmentIndex, start_offset: u64) -> Option<(u64, u64, u64)> {
+    /// position)` at or before it) and the WINDOW-BOUNDED read-end against a built `index` (#537,
+    /// window bound #664). The caller seeks to the anchor byte position, reads forward, and skips the
+    /// bounded run of records below `start_offset`. `None` when `start_offset` is not covered (the
+    /// caller falls back to a full scan).
+    ///
+    /// The read-end is bounded BOTH by the index's `flushed_end` (the in-file prefix end — for the
+    /// active segment the byte position up to which pending bytes were last flushed, so a seek never
+    /// reads an appended-but-not-yet-flushed frame; for a sealed predecessor the whole durable record
+    /// region, `flushed_end == valid_end`) AND by the WINDOW (#664): `want_records` records starting
+    /// at `start_offset` span at most up to the first sparse anchor above `start_offset +
+    /// want_records`, so a seek-and-read-forward reads `O(want + stride)` bytes, NOT
+    /// `O(distance-to-segment-end)`. Before #664 the read-end was the segment-wide `flushed_end`,
+    /// making a forward streaming drain `O(N^2)`. The per-record `>= flushed` / `max` filters in the
+    /// scan then enforce the exact visibility and count boundary among the frames the read returns.
+    fn seek_with(
+        index: &SegmentIndex,
+        start_offset: u64,
+        want_records: usize,
+    ) -> Option<(u64, u64, u64)> {
         let covered_end = index.covered_end();
         let (anchor_offset, byte_pos) = index.seek_anchor(start_offset, covered_end)?;
-        // The read-end is the FLUSHED (in-file) prefix end: for a sealed predecessor this is the
-        // whole durable record region (`flushed_end == valid_end`); for the active segment it is the
-        // byte position up to which pending bytes were last flushed to the file, so a seek never
-        // reads an appended-but-not-yet-flushed (not-in-file) frame. The per-record `>= flushed`
-        // offset filter in `read_from` then enforces the exact visibility boundary among the in-file
-        // frames the read returns.
-        let read_end = index.flushed_end.min(index.valid_end);
+        let flushed_end = index.flushed_end.min(index.valid_end);
+        // #664: bound the read to the WINDOW (anchor -> first anchor above `start + want`), clamped to
+        // the flushed prefix end. The anchor may sit BELOW `start_offset` (sparse, one-per-stride), so
+        // the window is measured from `start_offset` (where the caller's wanted records begin); the
+        // gap below it is at most one stride and is contained by the same first-anchor-above bound.
+        let read_end = index.window_read_end(start_offset, want_records, flushed_end);
         Some((anchor_offset, byte_pos, read_end))
     }
 
@@ -6584,5 +6642,228 @@ mod tests {
         assert_eq!(outcome, ReapOutcome::default());
         assert_eq!(log.durable_record_count(), before);
         assert!(log.filesystem().exists(&segment_file_name(0)).unwrap());
+    }
+
+    /// #664: the WINDOW-BOUNDED read-end (the fix) returns BYTE-IDENTICAL records to a read whose
+    /// read-end was the whole segment, for EVERY (start, window) over a multi-segment log — the
+    /// differential that proves bounding the read span never drops, duplicates, or corrupts a record.
+    /// Covers BOTH `read_range` (materialized) and `read_range_raw` (zero-copy), and a non-sequential
+    /// SEEK (a start that jumps backward/forward) re-locates exactly.
+    #[test]
+    fn window_bounded_read_is_byte_identical_to_an_unbounded_read_everywhere() {
+        // Several segments (small cap) so the seek crosses segment boundaries, plus enough records
+        // per segment that windows land mid-segment (where the old whole-segment read-end and the new
+        // window read-end differ the most).
+        let mut log = open_mem(LogConfig {
+            max_segment_bytes: 4096,
+            max_total_bytes: 0,
+            ..LogConfig::default()
+        });
+        let total = 2_000u32;
+        for i in 0..total {
+            log.append(&rec(&i.to_le_bytes())).unwrap();
+            if i % 13 == 0 {
+                log.sync().unwrap();
+            }
+        }
+        log.sync().unwrap();
+        let flushed = log.flushed_offset().get();
+        // The single shared read primitive `read_from` (max-records, no window subtlety) is the oracle:
+        // window-bounding only changes HOW MANY BYTES are buffered, never WHICH records decode.
+        for start in 0..flushed {
+            for window in [1usize, 3, 17, 64, 257] {
+                let oracle = log.read_from(Offset::new(start), window).unwrap();
+                let ranged = log.read_range(Offset::new(start), window, None).unwrap();
+                assert_eq!(
+                    ranged, oracle,
+                    "read_range differs from oracle at start={start} window={window}"
+                );
+                // The raw twin: reconstruct its records (raw frames + the materialized active tail)
+                // and compare field-by-field against the oracle.
+                let (raw, tail_from) = log
+                    .read_range_raw(Offset::new(start), window, None)
+                    .unwrap();
+                let decoded = decode_raw_run(&raw);
+                for ((view, off), owned) in decoded.iter().zip(oracle.iter()) {
+                    assert_eq!(*off, owned.offset.get(), "raw offset at start={start}");
+                    assert_eq!(
+                        view.payload,
+                        &owned.payload[..],
+                        "raw payload at start={start}"
+                    );
+                }
+                let mut chained = decoded.len();
+                if let Some(from) = tail_from {
+                    let remaining = window - chained;
+                    if remaining > 0 {
+                        let tail = log.read_range(from, remaining, None).unwrap();
+                        for (i, owned) in tail.iter().enumerate() {
+                            assert_eq!(
+                                owned,
+                                &oracle[chained + i],
+                                "raw tail record at start={start} window={window}"
+                            );
+                        }
+                        chained += tail.len();
+                    }
+                }
+                assert_eq!(
+                    chained,
+                    oracle.len(),
+                    "raw run + tail count != oracle at start={start} window={window}"
+                );
+            }
+        }
+    }
+
+    /// #664: a non-sequential SEEK (jumping the start offset around, not draining forward) re-locates
+    /// via the binary-search anchor seek and returns the exact records, with the window read-end
+    /// bounded fresh each time — there is no stale forward cursor to mislead a seek.
+    #[test]
+    fn window_bounded_read_handles_a_non_sequential_seek() {
+        let mut log = open_mem(LogConfig {
+            max_segment_bytes: 4096,
+            max_total_bytes: 0,
+            ..LogConfig::default()
+        });
+        for i in 0..1_500u32 {
+            log.append(&rec(&i.to_le_bytes())).unwrap();
+        }
+        log.sync().unwrap();
+        let flushed = log.flushed_offset().get();
+        // A scattered, deliberately non-monotonic sequence of starts (forward, backward, repeated).
+        for &start in &[900u64, 12, 1_400, 1, 700, 0, 1_499, 256, 257, 13] {
+            if start >= flushed {
+                continue;
+            }
+            let oracle = log.read_from(Offset::new(start), 50).unwrap();
+            let ranged = log.read_range(Offset::new(start), 50, None).unwrap();
+            assert_eq!(ranged, oracle, "seek to {start} mis-located");
+            assert_eq!(
+                ranged.first().unwrap().offset.get(),
+                start,
+                "first offset != start"
+            );
+        }
+    }
+
+    /// #664: the window read-end bound makes `read_range_raw`'s buffered span INDEPENDENT of how far
+    /// the start sits from the segment end. Asserted structurally: the returned run's byte length for
+    /// a fixed window is ~the same near the segment start as near its end (it would GROW with
+    /// distance-to-end before the fix). One large active segment holds the whole log.
+    #[test]
+    fn window_bounded_raw_read_span_does_not_grow_with_start() {
+        let mut log = open_mem(LogConfig::default());
+        let payload = [7u8; 64];
+        for _ in 0..50_000u32 {
+            log.append(&rec(&payload)).unwrap();
+        }
+        log.sync().unwrap();
+        let flushed = log.flushed_offset().get();
+        assert_eq!(log.active_segment_id(), 0, "single segment");
+        let window = 128usize;
+        let (near_start, _) = log.read_range_raw(Offset::new(10), window, None).unwrap();
+        let (near_end, _) = log
+            .read_range_raw(Offset::new(flushed - 200), window, None)
+            .unwrap();
+        // Both serve `window` whole frames; their byte runs must be the same size (same frame size),
+        // NOT proportional to the distance from the segment end. Allow exact equality here: the
+        // payload is fixed-size, so two equal-count runs are byte-equal in length.
+        assert_eq!(near_start.record_count, window as u64);
+        assert_eq!(
+            near_start.bytes.len(),
+            near_end.bytes.len(),
+            "raw run byte length grew with start offset (window bound not applied)"
+        );
+    }
+
+    /// #664 MICRO-BENCH (ignored; run with `--ignored --nocapture`). Times a FIXED-window
+    /// `read_range_raw` at increasing `start_offset` over ONE large active segment (the bench's
+    /// shape: all records in one un-sealed 64 MiB segment). BEFORE the fix the per-fetch cost GROWS
+    /// with `start` (each fetch reads anchor->segment-end bytes => O(distance-to-end)); AFTER the
+    /// window-bounded read it is FLAT (each fetch reads ~one window). Prints the curve so the PR can
+    /// show O(start)->O(1).
+    #[test]
+    #[ignore = "perf micro-bench, run explicitly with --ignored --nocapture"]
+    fn micro_bench_664_read_range_raw_fixed_window_vs_start() {
+        let total: u64 = 200_000;
+        let window = 256usize;
+        let payload = [0u8; 100];
+        let mut log = open_mem(LogConfig::default());
+        for _ in 0..total {
+            log.append(&rec(&payload)).unwrap();
+        }
+        log.sync().unwrap();
+        let flushed = log.flushed_offset().get();
+        assert!(flushed >= total, "all records flushed in one segment");
+        assert_eq!(log.active_segment_id(), 0, "single un-sealed segment");
+
+        eprintln!("#664 read_range_raw fixed-window={window} cost vs start_offset:");
+        for frac in [1u64, 4, 8, 16, 32, 64, 128, 256, 512] {
+            let start = (flushed / 1024) * frac;
+            if start >= flushed {
+                continue;
+            }
+            // Warm the seek index, then time a batch of identical fixed-window fetches.
+            let _ = log
+                .read_range_raw(Offset::new(start), window, None)
+                .unwrap();
+            let iters = 200u32;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let (run, _) = log
+                    .read_range_raw(Offset::new(start), window, None)
+                    .unwrap();
+                std::hint::black_box(&run);
+            }
+            let per = t0.elapsed().as_nanos() / u128::from(iters);
+            eprintln!("  start={start:>8}  per_fetch={per:>9} ns");
+        }
+    }
+
+    /// #664 STREAMING-DRAIN micro-bench (ignored). Drains the WHOLE log forward in fixed windows
+    /// via the same sequential `read_range_raw(next_offset)` a Tier-S consumer issues, and reports
+    /// records/sec at several record counts. BEFORE the fix throughput HALVES per record-count
+    /// doubling (the O(N^2) drain); AFTER it is FLAT.
+    #[test]
+    #[ignore = "perf micro-bench, run explicitly with --ignored --nocapture"]
+    // The record counts here are <= 200k, far below f64's 2^52 exact-integer range, so the
+    // records/sec ratio loses no precision; the cast is purely for the printed throughput.
+    #[allow(clippy::cast_precision_loss)]
+    fn micro_bench_664_sequential_drain_throughput() {
+        let window = 256usize;
+        let payload = [0u8; 100];
+        eprintln!("#664 sequential drain throughput (window={window}):");
+        for total in [20_000u64, 50_000, 100_000, 200_000] {
+            let mut log = open_mem(LogConfig::default());
+            for _ in 0..total {
+                log.append(&rec(&payload)).unwrap();
+            }
+            log.sync().unwrap();
+            let flushed = log.flushed_offset().get();
+            let t0 = std::time::Instant::now();
+            let mut next = 0u64;
+            let mut drained = 0u64;
+            while next < flushed {
+                let (run, tail_from) = log.read_range_raw(Offset::new(next), window, None).unwrap();
+                if run.record_count == 0 {
+                    // Active-tail remainder: materialize forward (mirrors the engine's tail read).
+                    let recs = log.read_range(Offset::new(next), window, None).unwrap();
+                    if recs.is_empty() {
+                        break;
+                    }
+                    drained += recs.len() as u64;
+                    next = recs.last().unwrap().offset.get() + 1;
+                    continue;
+                }
+                drained += run.record_count;
+                next = run.next_offset.get();
+                let _ = tail_from;
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            let rps = drained as f64 / secs;
+            eprintln!("  total={total:>7}  drained={drained:>7}  {rps:>12.0} rec/s");
+            assert_eq!(drained, flushed, "drained the whole log");
+        }
     }
 }
