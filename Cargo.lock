@@ -836,6 +836,7 @@ dependencies = [
 name = "ironbus-storage"
 version = "0.0.0"
 dependencies = [
+ "arc-swap",
  "bytes",
  "crc32c",
  "criterion",

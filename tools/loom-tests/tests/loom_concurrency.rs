@@ -538,3 +538,137 @@ fn refcount_slot_release_is_balanced_under_concurrent_handlers() {
         );
     });
 }
+
+// ---------------------------------------------------------------------------------------------
+// MODEL 4: the off-actor READ-PLANE frontier/snapshot publish/observe (#539).
+//
+// Real symbol cross-reference: `ironbus_storage::read_plane::ReadPlane`. The single append actor
+// (the writer) publishes a SEALED snapshot and then the read-visible FLUSHED frontier; any number
+// of reader threads observe them with NO lock and NO actor round-trip. The correctness hinge is the
+// publish/observe ORDER and the Acquire/Release pairing:
+//
+//   writer: store SNAPSHOT (sealed_end)  THEN  store FRONTIER (Release)
+//   reader: load  FRONTIER (Acquire)     THEN  load  SNAPSHOT
+//
+// so a reader that observes a frontier F is GUARANTEED to observe a snapshot whose coverage
+// (sealed_end) is at least F — it can never see a frontier that admits a sealed offset the snapshot
+// lacks. This is the read-plane analogue of MODEL 1: `sealed_end` plays the role of the covered
+// `data`, the `frontier` plays the role of the published `index`. `ArcSwap::store`/`load` provide
+// the same Release/Acquire pairing the production type relies on; this model uses the two atomics
+// directly so the ordering is the thing under test (a faithful replica per the file's preamble).
+// Weakening the frontier store to Relaxed (or loading the frontier AFTER the snapshot) lets a reader
+// see a bumped frontier with a stale, too-small `sealed_end` in some interleaving — the teeth.
+// ---------------------------------------------------------------------------------------------
+
+/// The two shared atomics of the read plane: the snapshot coverage (`sealed_end`) and the published
+/// read-visible `frontier`. The writer stores the snapshot BEFORE the frontier; the reader loads the
+/// frontier BEFORE the snapshot.
+struct ReadPlaneCell {
+    /// How far the published SEALED snapshot covers (the active base = sealed end). Stands in for the
+    /// arc-swapped `SealedSnapshot`. Written BEFORE the frontier; read AFTER it.
+    sealed_end: AtomicUsize,
+    /// The read-visible FLUSHED frontier: the hard bound a reader clamps a read to. Published
+    /// Release, observed Acquire.
+    frontier: AtomicUsize,
+}
+
+impl ReadPlaneCell {
+    fn new() -> ReadPlaneCell {
+        ReadPlaneCell {
+            sealed_end: AtomicUsize::new(0),
+            frontier: AtomicUsize::new(0),
+        }
+    }
+
+    /// Writer side: publish the snapshot coverage, THEN the frontier with Release so the snapshot
+    /// store cannot be reordered after the frontier becomes visible. Mirrors `Log::republish_read_plane`
+    /// storing the `ArcSwap` snapshot then `publish_flushed` (the Release frontier store).
+    fn publish(&self, sealed_end: usize, frontier: usize) {
+        self.sealed_end.store(sealed_end, Ordering::Relaxed);
+        self.frontier.store(frontier, Ordering::Release);
+    }
+
+    /// Reader side: observe the frontier with Acquire FIRST, then the snapshot. Mirrors
+    /// `ReadPlane::read_range` loading `flushed` (Acquire) then the `ArcSwap` snapshot.
+    fn observe(&self) -> (usize, usize) {
+        let frontier = self.frontier.load(Ordering::Acquire);
+        let sealed_end = self.sealed_end.load(Ordering::Relaxed);
+        (frontier, sealed_end)
+    }
+}
+
+#[test]
+fn read_plane_observe_never_sees_a_frontier_beyond_its_snapshot() {
+    // 2 threads: a writer publishes (sealed_end=1, frontier=1), a reader observes once. The
+    // invariant: an observed frontier of 1 IMPLIES the snapshot covering it (sealed_end >= 1) is
+    // visible, so a reader can never be handed a read-visible offset the sealed snapshot lacks.
+    // Under the real snapshot-then-frontier-Release / frontier-Acquire-then-snapshot pairing this
+    // holds in every interleaving; weakening it lets the reader see frontier=1 with sealed_end=0.
+    model_counted("read_plane_publish_observe", || {
+        let cell = Arc::new(ReadPlaneCell::new());
+        let writer = {
+            let cell = Arc::clone(&cell);
+            thread::spawn(move || {
+                cell.publish(1, 1);
+            })
+        };
+        let (frontier, sealed_end) = cell.observe();
+        assert!(
+            frontier <= 1,
+            "frontier must never exceed the only published value"
+        );
+        if frontier == 1 {
+            assert!(
+                sealed_end >= 1,
+                "observing frontier 1 must imply the snapshot covering it (sealed_end >= 1) is \
+                 visible — a reader is never handed an offset the snapshot lacks (#539 I2/coverage)"
+            );
+        }
+        writer.join().expect("writer thread");
+        let (frontier, sealed_end) = cell.observe();
+        assert_eq!(
+            (frontier, sealed_end),
+            (1, 1),
+            "the published read-plane state is final after join"
+        );
+    });
+}
+
+#[test]
+fn read_plane_frontier_is_monotone_and_always_covered_under_two_seals() {
+    // A single writer advances across TWO seals: (sealed_end=1, frontier=1) then (sealed_end=2,
+    // frontier=2) — two rolls each republishing the snapshot then bumping the frontier — while a
+    // reader observes once. The reader must never see a regressed frontier, and any frontier it sees
+    // must be covered by the snapshot (sealed_end >= frontier). <= 4 shared ops on the writer, 2 on
+    // the reader, 2 threads.
+    model_counted("read_plane_two_seals_covered", || {
+        let cell = Arc::new(ReadPlaneCell::new());
+        let writer = {
+            let cell = Arc::clone(&cell);
+            thread::spawn(move || {
+                cell.publish(1, 1);
+                cell.publish(2, 2);
+            })
+        };
+        let (frontier, sealed_end) = cell.observe();
+        assert!(
+            frontier <= 2,
+            "frontier must be one of the published values"
+        );
+        // Every observed frontier is covered by the snapshot it implies (Acquire pairs with the
+        // snapshot-then-frontier Release): a frontier F is only ever published AFTER a snapshot with
+        // sealed_end >= F, so a reader can never read past the snapshot's coverage.
+        assert!(
+            sealed_end >= frontier,
+            "frontier {frontier} exceeds snapshot coverage {sealed_end}: a reader would be handed \
+             an offset the sealed snapshot does not cover"
+        );
+        writer.join().expect("writer thread");
+        let (frontier, sealed_end) = cell.observe();
+        assert_eq!(
+            (frontier, sealed_end),
+            (2, 2),
+            "the final read-plane state after two seals is fully published"
+        );
+    });
+}

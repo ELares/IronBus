@@ -19,5 +19,11 @@ pub mod loss;
 pub mod naming;
 pub mod offline;
 pub mod quarantine;
+/// The lock-free, off-actor consume READ plane (#539): an atomic flushed frontier plus an
+/// arc-swapped immutable snapshot of the sealed segments + their seek indexes, so a consumer read
+/// takes a wait-free snapshot and reads the durable prefix with NO lock and NO append-actor
+/// round-trip. The single append actor remains the only writer (it publishes the frontier + swaps
+/// the snapshot after each commit/seal).
+pub mod read_plane;
 pub mod segment;
 pub mod sim;

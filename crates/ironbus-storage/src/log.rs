@@ -13,6 +13,7 @@ use crate::fs::Filesystem;
 use crate::io::RandomAccessFile;
 use crate::loss::{LossEvent, LossReport, ReasonCode};
 use crate::naming::{segment_file_name, segment_ids};
+use crate::read_plane::{ReadPlane, SealedSegment};
 use crate::segment::{OwnedRecord, RecoveryScan, SegmentReader, SegmentWriter, StorageError};
 use ironbus_core::clock::Clock;
 use ironbus_core::codec::RecordView;
@@ -663,6 +664,21 @@ pub struct Log<F: Filesystem, C: Clock> {
     /// and caches an entry behind a `RefCell`, holding only derived data (dropping or rebuilding it
     /// changes nothing a reader observes — same survivors, same CRC validation).
     compacted_indexes: std::cell::RefCell<std::collections::HashMap<u64, CompactedIndex>>,
+    /// The lock-free, off-actor consume READ plane (#539): the shared atomic flushed frontier plus
+    /// the arc-swapped immutable snapshot of the SEALED segments + their seek anchors, which any
+    /// number of reader threads observe with NO lock and NO append-actor round-trip. The single
+    /// writer (this `Log`, owned by the append actor) PUBLISHES to it: the new flushed frontier
+    /// after every `sync`/`flush_no_sync`/`roll`, and a fresh sealed snapshot when a roll seals a
+    /// segment or a reap retires one.
+    ///
+    /// Built LAZILY on the first [`Log::read_plane`] (which needs `F: Clone` to put the filesystem
+    /// handle behind an `Arc` for cross-thread readers), and cached behind a `RefCell` so the
+    /// `&self` build and the `&mut self` publish hooks can both reach it. `None` until a consumer
+    /// first asks for the plane — a single-writer log that is never read off-actor (e.g. the
+    /// `FaultFs`-backed durability tests, whose `F` is not `Clone`) never builds it and pays
+    /// nothing. The cell holds only derived state: the snapshot is rebuilt from `self.segments`, so
+    /// dropping or rebuilding it changes nothing a reader observes.
+    read_plane: std::cell::RefCell<Option<ReadPlane<F>>>,
 }
 
 /// The bounds of a single [`Log::read_range`] pass, threaded to the per-segment read helpers so
@@ -730,6 +746,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     // A fresh log has no compacted segment, so the sparse index map (#481) starts
                     // empty; it is filled lazily the first time a compacted slot is read.
                     compacted_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
+                    // The off-actor read plane (#539) is built lazily on the first consumer
+                    // `read_plane()` call; a never-read log pays nothing.
+                    read_plane: std::cell::RefCell::new(None),
                 };
                 log.start_segment(FIRST_SEGMENT_ID, Seq::new(0), Offset::ZERO)?;
                 Ok(log)
@@ -901,6 +920,8 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             // The compacted (sparse) seek index map (#481) is likewise resident-only: a reopen
             // rebuilds it lazily from the durable frames the first time a compacted slot is read.
             compacted_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
+            // The off-actor read plane (#539) is built lazily on the first consumer `read_plane()`.
+            read_plane: std::cell::RefCell::new(None),
         };
 
         if scan.footer.is_some() {
@@ -1269,6 +1290,8 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             // The compacted (sparse) seek index map (#481) starts empty and is filled lazily on the
             // read path; the recovered chain may include compacted segments, indexed on first read.
             compacted_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
+            // The off-actor read plane (#539) is built lazily on the first consumer `read_plane()`.
+            read_plane: std::cell::RefCell::new(None),
         };
 
         match active {
@@ -1482,6 +1505,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // so the at-risk exposure resets to zero: this is what bounds the relaxed levels' loss to at
         // most one open segment's worth of records (#341, #379).
         self.unsynced_record_bytes = 0;
+        // A roll SEALED a segment: the sealed set changed, so REPUBLISH the whole off-actor read
+        // plane (#539) — the new immutable sealed snapshot FIRST (Release), then the new frontier
+        // (Release). After this the just-sealed segment is served lock-free off-actor; before it the
+        // active-tail fallback served those same records, so consume behavior is identical across the
+        // seal. A no-op if no consumer has built the plane.
+        self.republish_read_plane();
         Ok(())
     }
 
@@ -1860,6 +1889,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // The covering fsync just made every unsynced record durable, so the at-risk exposure is now
         // zero (#341): the next relaxed-level window measures from here.
         self.unsynced_record_bytes = 0;
+        // Publish the new flushed frontier to the off-actor read plane (#539): the sealed set is
+        // unchanged by a plain sync (no roll), so only the atomic frontier (a Release store) is
+        // republished. A no-op if no consumer has built the plane yet.
+        self.publish_flushed_frontier();
         Ok(())
     }
 
@@ -1903,6 +1936,11 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // flushed (in-file) prefix now reaches its full appended prefix (#537), exactly as after a
         // `sync` — the records are visible (and in-file) even though not yet durable.
         self.raise_active_index_flushed_end();
+        // Publish the new (relaxed-level) flushed frontier to the off-actor read plane (#539): like
+        // `sync`, no roll, so only the atomic frontier is republished. The plane's hard read bound is
+        // exactly this flushed frontier, so a reader under a relaxed level still only ever observes
+        // the visible prefix, never the not-yet-flushed tail.
+        self.publish_flushed_frontier();
         Ok(())
     }
 
@@ -2357,6 +2395,15 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             outcome.segments_reaped = outcome.segments_reaped.saturating_add(1);
             outcome.bytes_reaped = outcome.bytes_reaped.saturating_add(segment_record_bytes);
         }
+        // A reap RETIRED sealed segments (raising `oldest` and deleting their files), so REPUBLISH
+        // the off-actor read plane (#539) — the new sealed snapshot no longer references the
+        // now-deleted files, so a concurrent reader can never seek into a reaped segment. The flushed
+        // frontier is unchanged by a reap (the head only ever loses a PREFIX), but republishing it is
+        // harmless and keeps the publish path uniform. A no-op if nothing was reaped or no plane is
+        // built. A consumer below the new `oldest` already gets the through-actor truncation signal.
+        if outcome.segments_reaped > 0 {
+            self.republish_read_plane();
+        }
         Ok(outcome)
     }
 
@@ -2438,6 +2485,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             .sealed_record_bytes
             .saturating_sub(segment_record_bytes);
         self.total_record_count = self.total_record_count.saturating_sub(segment_record_count);
+        // The force-reap RETIRED a sealed segment (raising `oldest`, deleting its file): REPUBLISH
+        // the off-actor read plane (#539) so its snapshot drops the now-deleted segment and no
+        // concurrent reader can seek into it. A no-op if no plane is built.
+        self.republish_read_plane();
         Ok(Some(ReapOutcome {
             segments_reaped: 1,
             bytes_reaped: segment_record_bytes,
@@ -2562,6 +2613,12 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             .total_record_count
             .saturating_sub(source_count)
             .saturating_add(survivor_count);
+        // Compaction RETIRED the source ordinary segments (their files are gone) and installed a
+        // SPARSE compacted slot in their place: REPUBLISH the off-actor read plane (#539) so its
+        // snapshot drops the now-deleted source files. The compacted slot is recorded as a fallback
+        // marker in the snapshot (the off-actor plane does not serve the sparse v2 scan), so a read
+        // of its covered range routes through the actor — identical to today's compacted read path.
+        self.republish_read_plane();
         Ok(())
     }
 
@@ -2772,6 +2829,153 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             Err(0) => 0,
             Err(index) => index - 1,
         }
+    }
+
+    // ---- The off-actor lock-free READ plane publish hooks (#539) ----
+
+    /// Builds the immutable SEALED-prefix descriptor the read plane snapshot is published from
+    /// (#539): one [`SealedSegment`] per sealed predecessor (every slot EXCEPT the active one, which
+    /// is the last) carrying its covered range, its sparse seek anchors, and its durable `valid_end`,
+    /// plus the `(oldest, sealed_end)` covered bounds. The active (un-sealed) segment is deliberately
+    /// EXCLUDED: it is still being appended to (its index is mutated on every append), so it is never
+    /// in the snapshot and a reader can never observe its in-flight bytes off-actor.
+    ///
+    /// Anchors are taken from the resident seek index when cached (a sealed segment's `flushed_end`
+    /// equals its `valid_end`, so the cached anchors are complete), and built once from the durable
+    /// frames otherwise — exactly the same `sparse_record_byte_positions` walk `seek_in_segment`
+    /// uses, so the snapshot's anchors are byte-identical to the through-actor read's. A COMPACTED
+    /// (v2, sparse) sealed segment is recorded as a fallback marker (no anchors): the off-actor plane
+    /// hands its reads back to the through-actor v2 scan.
+    fn build_sealed_descriptor(&self) -> Result<(Vec<SealedSegment>, u64, u64), StorageError> {
+        let oldest = self
+            .segments
+            .first()
+            .map_or(0, SegmentSlot::covered_base_offset);
+        // The active segment is the LAST slot; the sealed prefix is everything before it. The active
+        // base is the first offset NOT in the sealed prefix (the sealed end). With no sealed
+        // predecessor (only the active segment, or none) the sealed prefix is empty and ends at the
+        // oldest offset.
+        let sealed_count = self.segments.len().saturating_sub(1);
+        let sealed_slots = &self.segments[..sealed_count];
+        let sealed_end = self
+            .segments
+            .last()
+            .map_or(oldest, SegmentSlot::covered_base_offset);
+        let mut sealed = Vec::with_capacity(sealed_count);
+        for slot in sealed_slots {
+            if slot.compacted_covered.is_some() {
+                // A compacted sealed segment: the off-actor plane does not serve it (the through-
+                // actor v2 scan does). Record it as a fallback marker so the snapshot's offset-to-
+                // segment search stays exact across its covered range.
+                sealed.push(SealedSegment {
+                    id: slot.id,
+                    base_offset: slot.covered_base_offset(),
+                    record_count: slot.compacted_covered.map_or(slot.record_count, |c| {
+                        c.covered_end_offset.saturating_sub(c.covered_base_offset)
+                    }),
+                    compacted: true,
+                    anchors: Vec::new(),
+                    valid_end: 0,
+                });
+                continue;
+            }
+            // Prefer the resident index (a sealed segment's anchors are complete: flushed_end ==
+            // valid_end), else build once from the durable frames — the SAME sparse walk the read
+            // path uses, so the snapshot's anchors match the through-actor read byte-for-byte.
+            let (anchors, valid_end) =
+                if let Some(idx) = self.segment_indexes.borrow().get(&slot.id) {
+                    (idx.anchors.clone(), idx.valid_end)
+                } else {
+                    let reader = SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?;
+                    reader.sparse_record_byte_positions(SEGMENT_INDEX_STRIDE_BYTES)?
+                };
+            sealed.push(SealedSegment {
+                id: slot.id,
+                base_offset: slot.base_offset,
+                record_count: slot.record_count,
+                compacted: false,
+                anchors,
+                valid_end,
+            });
+        }
+        Ok((sealed, oldest, sealed_end))
+    }
+
+    /// PUBLISHES the new flushed frontier to the read plane after every commit/flush (#539), IF the
+    /// plane has been built (a consumer asked for it). The sealed set is UNCHANGED by a plain
+    /// `sync`/`flush_no_sync` (no roll), so only the atomic frontier is republished — the cheap, hot
+    /// path. A RELEASE store: it is the LAST thing the writer publishes and the FIRST thing a reader
+    /// observes, so a reader that sees this frontier also sees every prior `publish_sealed` (the
+    /// module-level ordering argument). A no-op when no plane is built.
+    fn publish_flushed_frontier(&self) {
+        if let Some(plane) = self.read_plane.borrow().as_ref() {
+            plane.publish_flushed(self.flushed_offset.get());
+        }
+    }
+
+    /// REPUBLISHES the whole read plane after the SEALED SET changed (a roll sealed a segment, or a
+    /// reap retired one) (#539), IF the plane is built. Rebuilds the immutable sealed snapshot from
+    /// the current `self.segments` and stores it FIRST (a Release `ArcSwap::store`), THEN stores the
+    /// frontier (a Release store). This publish ORDER is load-bearing: a reader observes the frontier
+    /// FIRST (Acquire) and the snapshot SECOND, so a frontier it sees never admits an offset the
+    /// snapshot lacks. A no-op when no plane is built. Best-effort on the snapshot build: a transient
+    /// read error leaves the previous snapshot in place (still valid, covering fewer offsets), and
+    /// the frontier is still published, so the through-actor fallback serves any gap correctly.
+    fn republish_read_plane(&self) {
+        let needs_publish = self.read_plane.borrow().is_some();
+        if !needs_publish {
+            return;
+        }
+        // Build the new sealed descriptor OUTSIDE the plane borrow (the build borrows
+        // `segment_indexes`). On a build error keep the old snapshot and still bump the frontier.
+        match self.build_sealed_descriptor() {
+            Ok((sealed, oldest, sealed_end)) => {
+                if let Some(plane) = self.read_plane.borrow().as_ref() {
+                    // The Arc<F> the plane already holds is reused for the new snapshot (the
+                    // filesystem handle is the same directory); rebuild only the segment view.
+                    plane.republish_sealed(sealed, oldest, sealed_end);
+                    plane.publish_flushed(self.flushed_offset.get());
+                }
+            }
+            Err(_) => self.publish_flushed_frontier(),
+        }
+    }
+}
+
+impl<F: Filesystem + Clone, C: Clock> Log<F, C> {
+    /// Returns a clone of the lock-free, off-actor consume READ plane (#539), BUILDING it on the
+    /// first call. A consumer thread holds this handle to read the SEALED, flushed prefix with NO
+    /// lock and NO append-actor round-trip; the single append actor (this `Log`) keeps PUBLISHING to
+    /// it after every commit/seal. Cloning the returned handle is two `Arc` bumps, so every consumer
+    /// shares the SAME published frontier and snapshot.
+    ///
+    /// Built lazily so a single-writer log that is never read off-actor pays nothing, and so the
+    /// `F: Clone` bound (needed to put the filesystem handle behind an `Arc` for cross-thread
+    /// readers) is required only HERE, not on `Log::open` (which stays generic over any
+    /// `F: Filesystem`, including the non-`Clone` fault filesystems the durability tests use). The
+    /// build is idempotent: the first caller seeds the plane from the current durable state (the
+    /// recovered/​live flushed frontier + the current sealed snapshot), every later caller clones it.
+    ///
+    /// # Errors
+    /// Propagates an IO error from building the initial sealed snapshot (reading the sealed segments'
+    /// sparse seek anchors). After it returns Ok the plane is cached and never rebuilt.
+    pub fn read_plane(&self) -> Result<ReadPlane<F>, StorageError> {
+        if let Some(plane) = self.read_plane.borrow().as_ref() {
+            return Ok(plane.clone());
+        }
+        // Seed from the current durable state. The filesystem handle is CLONED behind an `Arc` so
+        // any number of reader threads can open the immutable sealed files concurrently with the
+        // writer (a clone aliases the SAME directory; `Filesystem` is `Send + Sync`).
+        let (sealed, oldest, sealed_end) = self.build_sealed_descriptor()?;
+        let plane = ReadPlane::new(
+            std::sync::Arc::new(self.fs.clone()),
+            self.flushed_offset.get(),
+            sealed,
+            oldest,
+            sealed_end,
+        );
+        *self.read_plane.borrow_mut() = Some(plane.clone());
+        Ok(plane)
     }
 }
 

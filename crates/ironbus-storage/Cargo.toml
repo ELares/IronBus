@@ -18,6 +18,13 @@ default = []
 zstd = ["ironbus-core/zstd"]
 
 [dependencies]
+# `arc-swap` backs the lock-free off-actor consume READ plane (#539): the writer swaps in an
+# immutable sealed-prefix snapshot (a Release store) and any number of reader threads `load` it
+# wait-free (Acquire), so a consume read takes the snapshot with NO lock and NO append-actor
+# round-trip. Same crate and publish pattern as the #651 routing trie in `ironbus-core`
+# (`ArcSwap<Sublist>`). Pure Rust, no build script, `default-features = false` to keep the static
+# edge binary lean; already in the workspace lock as a direct dependency of `ironbus-core`.
+arc-swap = { version = "1.7", default-features = false }
 crc32c = "0.6"
 # `bytes::Bytes` lets an `OwnedRecord` carry REFCOUNTED slices of the segment read buffer instead of
 # three per-record `Vec` deep copies (#480): a `read_from` reads the region into ONE buffer and each
@@ -69,4 +76,13 @@ harness = false
 # leg is #554.
 [[bench]]
 name = "read_seek"
+harness = false
+
+# Informational micro-bench for the off-actor consume read plane's multi-consumer SCALING (#539):
+# N concurrent consumers' aggregate sealed-prefix read throughput OFF-ACTOR (lock-free `ReadPlane`
+# snapshot) vs THROUGH-ACTOR (a single `Mutex<Log>`, the serialized append actor). Off-actor scales
+# with the consumer count; through-actor stays flat (the #491 ceiling). Run on demand
+# (`cargo bench -p ironbus-storage`), not in per-PR CI; the full consumer-vs-NATS leg is #554.
+[[bench]]
+name = "consume_scaling"
 harness = false
