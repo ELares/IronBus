@@ -1308,6 +1308,134 @@ pub fn decode_fetch(body: &[u8]) -> Result<FetchBody, BodyError> {
     })
 }
 
+/// The version of the Tier-S `StreamFetch` (streaming consumer-managed-offset) body framing (#544,
+/// M1-I7). Version `1` is the first (and only) layout. Carried as a leading byte so a future version
+/// can extend the body without a wire break: a reader rejects a version it does not understand rather
+/// than mis-parsing it, exactly like [`FETCH_BODY_VERSION`].
+pub const STREAM_FETCH_BODY_VERSION: u8 = 1;
+
+/// A consumer Tier-S STREAMING fetch request (the `StreamFetch` frame body, #544 / M1-I7): the
+/// consumer-managed-offset twin of [`FetchBody`]. The consumer names its OWN `start_offset` and the
+/// broker serves a CONTIGUOUS batch of records `[start_offset, ...)` bounded by `max_records` /
+/// `max_bytes` — with NO lease, NO generation fence, and NO per-record cursor write. At-least-once
+/// holds BY CONSTRUCTION: a crash or reconnect re-reads from the consumer's last committed offset
+/// (advanced via a periodic [`crate::frame::FrameType::StreamCommit`]), so at most the uncommitted
+/// records redeliver — the Kafka / NATS-pull contract. Where [`FetchBody`] drives the per-record
+/// lease/cursor poll (Tier-W, the work-queue), this drives a contiguous read off the durable prefix,
+/// which removes exactly the per-record cost that makes single-consumer durable consume lose to NATS.
+///
+/// Layout (version+length framed, forward-compatible, mirroring [`FetchBody`]): `body_version: u8`
+/// ([`STREAM_FETCH_BODY_VERSION`]), `field_len: u16` (the length of the v1 known-field block that
+/// follows), then the v1 block: `start_offset: u64 LE`, `max_records: u32 LE`, `max_bytes: u64 LE`.
+/// Bytes past `field_len` (a future version's appended fields) are TOLERATED and ignored by a v1
+/// reader.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamFetchBody {
+    /// The consumer-managed offset to begin the contiguous read at (inclusive). The consumer owns this
+    /// position: it is normally the consumer's last committed offset, so a reconnect resumes exactly
+    /// where it left off. The broker reads forward from here off the durable prefix, bounded by the
+    /// flushed frontier (no un-flushed record is ever served).
+    pub start_offset: u64,
+    /// The maximum number of records to deliver in this batch. The server delivers at most this many
+    /// (the durable prefix's available records and the byte cap also bind). A value of `0` requests
+    /// nothing.
+    pub max_records: u32,
+    /// The maximum total ENCODED record bytes to deliver in this batch. `0` means UNBOUNDED by bytes
+    /// (only the record count and the available durable prefix bind). The server stops once delivering
+    /// the next record would exceed this, EXCEPT the floor-of-one (a batch always delivers at least one
+    /// ready record so a single over-cap record never wedges the consumer).
+    pub max_bytes: u64,
+}
+
+/// The number of bytes in the `StreamFetch` v1 known-field block: `start_offset: u64` +
+/// `max_records: u32` + `max_bytes: u64`.
+const STREAM_FETCH_V1_FIELD_LEN: u16 = 8 + 4 + 8;
+
+/// Encodes a `StreamFetch` body onto the end of `out` (#544): the version byte, the v1 field-block
+/// length, then the v1 block.
+pub fn encode_stream_fetch(req: &StreamFetchBody, out: &mut Vec<u8>) {
+    out.push(STREAM_FETCH_BODY_VERSION);
+    out.extend_from_slice(&STREAM_FETCH_V1_FIELD_LEN.to_le_bytes());
+    out.extend_from_slice(&req.start_offset.to_le_bytes());
+    out.extend_from_slice(&req.max_records.to_le_bytes());
+    out.extend_from_slice(&req.max_bytes.to_le_bytes());
+}
+
+/// Decodes a `StreamFetch` body (#544), cap-before-alloc and panic-free.
+///
+/// The body MUST carry the version byte and the `u16` field-length; the v1 known fields are read from
+/// the front of the declared block and any trailing bytes (a future version's appended fields) are
+/// tolerated and ignored. A body too short to hold the `field_len` it declares is a typed
+/// [`BodyError`], never a panic or an over-read (the `field_len` is bounded against the actual body by
+/// [`Reader::take`] BEFORE any read). An EMPTY body is NOT a valid `StreamFetch` (the frame type is
+/// new, with no historical empty case), so it is a typed [`BodyError::Truncated`].
+///
+/// # Errors
+/// Returns [`BodyError::Truncated`] if the body is too short for the version/length header or the
+/// declared field block, or [`BodyError::BadHandshakeVersion`] for an unknown body version.
+pub fn decode_stream_fetch(body: &[u8]) -> Result<StreamFetchBody, BodyError> {
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != STREAM_FETCH_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    let mut fr = Reader::new(block);
+    // Every v1 slot occupies a fixed position and is always consumed in order; a short block (a sender
+    // that declared fewer bytes) reads what is present and defaults the rest, never panicking.
+    let start_offset = fr.u64().unwrap_or(0);
+    let max_records = fr.u32().unwrap_or(0);
+    let max_bytes = fr.u64().unwrap_or(0);
+    Ok(StreamFetchBody {
+        start_offset,
+        max_records,
+        max_bytes,
+    })
+}
+
+/// A consumer Tier-S periodic CUMULATIVE COMMIT (the `StreamCommit` frame body, #544 / M1-I7): the
+/// consumer-managed-offset durability point. It advances the STREAMING group's committed watermark up
+/// to an exclusive `up_to` offset, the consumer's periodic "everything below `up_to` is durably
+/// processed" checkpoint. It REUSES the same cursor primitive
+/// (`AckCursor::commit_up_to` in `ironbus-core`) the broadcast [`CumulativeAckBody`] rides on —
+/// no new durable structure is invented — but targets a STREAMING group rather than a BROADCAST one,
+/// so the two never collide. The server validates `up_to` against the durable head and the
+/// earliest-retained offset, is idempotent / monotonic on a re-commit, and HARD-REJECTS the verb on a
+/// group that is not streaming.
+///
+/// Layout: `up_to: u64` (the exclusive commit offset, little-endian), then `group` (the work-group
+/// name as the remainder of the body; empty selects the default group). This is BYTE-IDENTICAL to
+/// [`CumulativeAckBody`]'s layout (a shared shape, distinct frame type); the server dispatches on the
+/// FRAME TYPE (Tier-S streaming vs Tier-W broadcast) to pick the right group-mode guard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamCommitBody<'a> {
+    /// The exclusive offset to commit the streaming cursor up to (every offset strictly below it is
+    /// committed).
+    pub up_to: u64,
+    /// The work-group name (empty selects the default group). Validated server-side.
+    pub group: &'a [u8],
+}
+
+/// Encodes a `StreamCommit` body onto the end of `out`: the 8-byte LE `up_to` offset, then the group
+/// name as the remainder (the same shape as [`encode_cumulative_ack`]).
+pub fn encode_stream_commit(commit: &StreamCommitBody<'_>, out: &mut Vec<u8>) {
+    out.extend_from_slice(&commit.up_to.to_le_bytes());
+    out.extend_from_slice(commit.group);
+}
+
+/// Decodes a `StreamCommit` body: the leading 8-byte LE `up_to` offset, then the remainder is the group
+/// name (the same shape as [`decode_cumulative_ack`]).
+///
+/// # Errors
+/// Returns [`BodyError::Truncated`] if the body is shorter than the 8-byte `up_to` field.
+pub fn decode_stream_commit(body: &[u8]) -> Result<StreamCommitBody<'_>, BodyError> {
+    let mut r = Reader::new(body);
+    let up_to = r.u64()?;
+    let group = r.rest();
+    Ok(StreamCommitBody { up_to, group })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1897,6 +2025,111 @@ mod tests {
         encode_fetch(&req, &mut buf);
         buf.extend_from_slice(b"future-fields"); // appended past field_len
         assert_eq!(decode_fetch(&buf).unwrap(), req);
+    }
+
+    #[test]
+    fn stream_fetch_round_trips() {
+        // #544: the Tier-S streaming fetch carries the consumer-managed start_offset + the batch caps.
+        let req = StreamFetchBody {
+            start_offset: 0x0102_0304_0506_0708,
+            max_records: 256,
+            max_bytes: 1 << 20,
+        };
+        let mut buf = Vec::new();
+        encode_stream_fetch(&req, &mut buf);
+        assert_eq!(decode_stream_fetch(&buf).unwrap(), req);
+    }
+
+    #[test]
+    fn stream_fetch_rejects_an_empty_or_short_body_and_an_unknown_version() {
+        // The frame type is new: an empty body is not a valid request (no historical empty case).
+        assert_eq!(decode_stream_fetch(&[]), Err(BodyError::Truncated));
+        // A declared field_len longer than the body is a typed length error, never an over-read.
+        let mut bad = vec![STREAM_FETCH_BODY_VERSION];
+        bad.extend_from_slice(&99u16.to_le_bytes()); // declares 99 bytes but supplies none
+        assert!(matches!(
+            decode_stream_fetch(&bad),
+            Err(BodyError::Truncated | BodyError::BadLength)
+        ));
+        // An unknown body version is rejected, not best-effort parsed.
+        let mut wrong = Vec::new();
+        encode_stream_fetch(
+            &StreamFetchBody {
+                start_offset: 1,
+                max_records: 1,
+                max_bytes: 0,
+            },
+            &mut wrong,
+        );
+        wrong[0] = STREAM_FETCH_BODY_VERSION + 1;
+        assert_eq!(
+            decode_stream_fetch(&wrong),
+            Err(BodyError::BadHandshakeVersion {
+                version: STREAM_FETCH_BODY_VERSION + 1
+            })
+        );
+    }
+
+    #[test]
+    fn stream_fetch_tolerates_a_future_appended_field() {
+        // A newer client may append fields past the declared v1 block; a v1 reader decodes its known
+        // fields and ignores the tail (forward-compat), exactly like FetchBody.
+        let req = StreamFetchBody {
+            start_offset: 42,
+            max_records: 7,
+            max_bytes: 4096,
+        };
+        let mut buf = Vec::new();
+        encode_stream_fetch(&req, &mut buf);
+        buf.extend_from_slice(b"future-fields");
+        assert_eq!(decode_stream_fetch(&buf).unwrap(), req);
+    }
+
+    #[test]
+    fn stream_commit_round_trips_and_shares_the_cumulative_ack_shape() {
+        // #544: StreamCommit carries the same (u64 up_to, group name) shape as CumulativeAck — a shared
+        // byte layout, a DISTINCT frame type. The server dispatches on the frame type to pick the
+        // group-mode guard (streaming vs broadcast).
+        let commit = StreamCommitBody {
+            up_to: 0x1122_3344_5566_7788,
+            group: b"stream-group",
+        };
+        let mut buf = Vec::new();
+        encode_stream_commit(&commit, &mut buf);
+        assert_eq!(decode_stream_commit(&buf).unwrap(), commit);
+        // The bytes are identical to a CumulativeAck body with the same fields.
+        let mut ca = Vec::new();
+        encode_cumulative_ack(
+            &CumulativeAckBody {
+                up_to: commit.up_to,
+                group: commit.group,
+            },
+            &mut ca,
+        );
+        assert_eq!(
+            buf, ca,
+            "StreamCommit and CumulativeAck share the wire shape"
+        );
+        // An empty group selects the default group.
+        let default_group = StreamCommitBody {
+            up_to: 5,
+            group: b"",
+        };
+        let mut db = Vec::new();
+        encode_stream_commit(&default_group, &mut db);
+        assert_eq!(decode_stream_commit(&db).unwrap(), default_group);
+    }
+
+    #[test]
+    fn stream_commit_rejects_a_short_body() {
+        // Anything shorter than the 8-byte up_to cannot carry the commit offset.
+        for len in 0..8usize {
+            assert_eq!(
+                decode_stream_commit(&vec![0u8; len]),
+                Err(BodyError::Truncated),
+                "a {len}-byte body must be Truncated"
+            );
+        }
     }
 
     proptest! {

@@ -134,6 +134,40 @@ pub enum FrameType {
     /// (`max_records: u32`, `max_bytes: u64`, `expires_ms: u64` relative deadline budget, and a
     /// `no_wait` flag), versioned and forward-compatible.
     Fetch,
+    /// Consumer Tier-S STREAMING fetch request (the consumer-managed-offset consume mode, M1-I7 /
+    /// #544): the consumer names its OWN `start_offset` and the broker serves a CONTIGUOUS batch of
+    /// records `[start_offset, ...)` bounded by `max_records` / `max_bytes` — with NO lease grant, NO
+    /// generation fence, and NO per-record cursor write. This is the Kafka / NATS-pull
+    /// consumer-managed-offset contract: at-least-once holds BY CONSTRUCTION because a crash or
+    /// reconnect simply re-reads from the consumer's last committed offset, so at most the uncommitted
+    /// records redeliver. It is the STREAMING (Tier-S) twin of [`FrameType::Fetch`] (tag 23, the
+    /// work-queue Tier-W batch pull): where `Fetch` runs the per-record lease/cursor poll, this serves
+    /// a contiguous read off the durable prefix and leaves all offset bookkeeping to the consumer,
+    /// which removes exactly the per-record lease + generation + cursor cost that makes single-consumer
+    /// durable consume lose to NATS. The RESPONSE reuses the existing delivery frames verbatim — a run
+    /// of [`FrameType::Deliver`] (with any interleaved [`FrameType::Truncated`] /
+    /// [`FrameType::GapMarker`] advisory), terminated by exactly one [`FrameType::FlowEnd`] carrying
+    /// the delivered count — so no new response frame is introduced. It is a NEW append-only request
+    /// tag: an old client never sends it and the existing `Fetch` (tag 23) and `Flow` (tag 10) wires
+    /// are byte-for-byte unchanged. Body: a [`crate::message::StreamFetchBody`] (`start_offset: u64`,
+    /// `max_records: u32`, `max_bytes: u64`), versioned and forward-compatible.
+    StreamFetch,
+    /// Consumer Tier-S periodic CUMULATIVE COMMIT (the consumer-managed-offset durability point, M1-I7
+    /// / #544): advances the streaming group's committed watermark up to an exclusive `up_to` offset,
+    /// the consumer's PERIODIC "I have durably processed everything below `up_to`" checkpoint. It
+    /// REUSES the same cumulative-ack cursor primitive (`AckCursor::commit_up_to` in `ironbus-core`)
+    /// the broadcast [`FrameType::CumulativeAck`] (tag 19) rides on — no new durable structure is
+    /// invented — but it targets a STREAMING group (where `CumulativeAck` targets a BROADCAST group),
+    /// so the two never collide and `CumulativeAck`'s broadcast-only guard stays unchanged. Because
+    /// tier-S grants no leases, this commit only advances the watermark (it frees retention and stops
+    /// any redeliver below it); there is no per-record lease to reclaim. It is idempotent and monotonic
+    /// (a re-commit at or below the watermark is a no-op success), exactly like `commit_up_to`. The
+    /// SUCCESS response is a body-less [`FrameType::Ok`] (matching the `CumulativeAck` reply shape); an
+    /// out-of-range or wrong-mode commit is an [`FrameType::Err`]. A NEW append-only request tag: an old
+    /// client never sends it. Body: the exclusive `up_to` offset as a little-endian `u64` (8 bytes)
+    /// followed by the work-group name as the remainder (empty selects the default group) — identical
+    /// in shape to the [`crate::message::CumulativeAckBody`].
+    StreamCommit,
 }
 
 impl FrameType {
@@ -164,6 +198,8 @@ impl FrameType {
             FrameType::GapMarker => 21,
             FrameType::ProduceConfirm => 22,
             FrameType::Fetch => 23,
+            FrameType::StreamFetch => 24,
+            FrameType::StreamCommit => 25,
         }
     }
 
@@ -195,6 +231,8 @@ impl FrameType {
             21 => FrameType::GapMarker,
             22 => FrameType::ProduceConfirm,
             23 => FrameType::Fetch,
+            24 => FrameType::StreamFetch,
+            25 => FrameType::StreamCommit,
             _ => return None,
         })
     }
@@ -327,7 +365,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 23] = [
+    const ALL_TYPES: [FrameType; 25] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -351,6 +389,8 @@ mod tests {
         FrameType::GapMarker,
         FrameType::ProduceConfirm,
         FrameType::Fetch,
+        FrameType::StreamFetch,
+        FrameType::StreamCommit,
     ];
 
     #[test]
@@ -392,6 +432,8 @@ mod tests {
         assert_eq!(FrameType::GapMarker.as_u8(), 21);
         assert_eq!(FrameType::ProduceConfirm.as_u8(), 22);
         assert_eq!(FrameType::Fetch.as_u8(), 23);
+        assert_eq!(FrameType::StreamFetch.as_u8(), 24);
+        assert_eq!(FrameType::StreamCommit.as_u8(), 25);
     }
 
     #[test]
@@ -423,8 +465,6 @@ mod tests {
         assert_eq!(FrameType::from_u8(23), Some(FrameType::Fetch));
         // The existing Flow tag is untouched (the batch fetch is additive, not a replacement).
         assert_eq!(FrameType::Flow.as_u8(), 10);
-        // 24 is the new next-free tag (still unknown), so it frames but is not a known type.
-        assert_eq!(FrameType::from_u8(24), None);
         let mut buf = Vec::new();
         encode_frame(FrameType::Fetch, b"\x03\x04", &mut buf).unwrap();
         match decode_frame(&buf).unwrap() {
@@ -433,6 +473,34 @@ mod tests {
                 assert_eq!(body, b"\x03\x04");
             }
             FrameDecode::Incomplete { .. } => panic!("complete"),
+        }
+    }
+
+    #[test]
+    fn stream_tier_tags_are_the_next_free_tags_and_frame() {
+        // #544 (M1-I7): StreamFetch (24) and StreamCommit (25) take the next FREE tags after Fetch
+        // (23). They were previously UNKNOWN tags; pin them as known now and confirm they frame at the
+        // envelope level. The existing Flow (10) and Fetch (23) wires are byte-for-byte unchanged: the
+        // Tier-S streaming mode is ADDITIVE, not a replacement of the Tier-W work-queue verbs.
+        assert_eq!(FrameType::StreamFetch.as_u8(), 24);
+        assert_eq!(FrameType::StreamCommit.as_u8(), 25);
+        assert_eq!(FrameType::from_u8(24), Some(FrameType::StreamFetch));
+        assert_eq!(FrameType::from_u8(25), Some(FrameType::StreamCommit));
+        // The Tier-W verbs are untouched.
+        assert_eq!(FrameType::Flow.as_u8(), 10);
+        assert_eq!(FrameType::Fetch.as_u8(), 23);
+        // 26 is the new next-free tag (still unknown), so it frames but is not a known type.
+        assert_eq!(FrameType::from_u8(26), None);
+        for ty in [FrameType::StreamFetch, FrameType::StreamCommit] {
+            let mut buf = Vec::new();
+            encode_frame(ty, b"\x07\x08", &mut buf).unwrap();
+            match decode_frame(&buf).unwrap() {
+                FrameDecode::Frame { type_tag, body, .. } => {
+                    assert_eq!(FrameType::from_u8(type_tag), Some(ty));
+                    assert_eq!(body, b"\x07\x08");
+                }
+                FrameDecode::Incomplete { .. } => panic!("complete"),
+            }
         }
     }
 
@@ -619,7 +687,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 24u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 26u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);
