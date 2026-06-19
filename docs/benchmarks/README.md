@@ -56,15 +56,17 @@ as context (QoS 1 / QoS 0 publish throughput), never as a durable head-to-head.
   comparable number.
 - **consume throughput** (drain a pre-filled store) -- closes the previously-unbenched
   consume side, measured once per system with a fast pre-fill (drain rate is
-  durability-independent). NOT a matched head-to-head like publish: each system
-  drains via its NATIVE default consume path, and those differ fundamentally.
-  IronBus's synthetic group is a COMPETING work-queue, which acks each lease
-  individually and checkpoints the cursor (cumulative ack is a broadcast-only
-  primitive), so its drain is ack-RPC-bound; NATS `js consume`, Redis
-  `XREADGROUP`, and MQTT live delivery batch or stream their acks. So the consume
-  row shows each system's real default consume behavior, not a like-for-like
-  durability comparison -- a fair matched consume (e.g. an IronBus broadcast group,
-  or a batched/multi-ack work-queue drain) is follow-up work.
+  durability-independent). As of #464 the IronBus consume row is now a FAIR
+  head-to-head: the `bench --mode subscribe` drain settles each fetched batch with
+  one pipelined `ack_many` round-trip BY DEFAULT (the consume-side twin of the
+  publish window), so it measures the broker's real fetch + batch-ack throughput,
+  matched to how the peers consume -- NATS `js consume`, Redis `XREADGROUP`, and
+  MQTT live delivery all batch or stream their acks. The synthetic group is still a
+  COMPETING work-queue (each lease committed INDIVIDUALLY by the broker; cumulative
+  ack stays broadcast-only), so the at-least-once contract is unchanged -- only the
+  client's ack FLUSH is amortized. The previous per-message-ack drain (one
+  synchronous `ack` RPC per message) is kept available behind `--per-message-ack`
+  as a legitimate ack-RPC-LATENCY probe, NOT a throughput head-to-head.
 - **latency** is reported only where a tool yields a natively-saturated percentile
   (NATS publish). The load models differ across systems (IronBus/Redis closed-loop
   vs NATS open-loop), so cross-system latency is NOT headlined; throughput is the
@@ -86,10 +88,20 @@ The committed `corpus-report.md` is the data; the read:
   payload byte, so on this small ARM core throughput at the relaxed tier becomes per-byte-CPU-bound
   while the peers (no default compression) do not pay it. It is an honest cost of a real feature
   (less disk/uplink); `--compression none` would close the gap at the cost of that feature.
-- **Consume: NOT a fair head-to-head (see Metrics).** IronBus's work-queue per-message-ack drain is
-  ack-RPC-bound (~250 msg/s) vs the peers' batched/streamed consume (NATS ~20k, Redis ~11k); the
-  reported `p99` for IronBus consume is closed-loop drain (queue-depth) latency, not service latency.
-  A matched consume is tracked follow-up work.
+- **Consume: now a FAIR head-to-head (#464).** The 2026-06-16 RPi4 consume row (~250 msg/s) was the
+  OLD per-message-ack drain: ack-RPC-bound (one synchronous `ack` RPC per message), not fetch-bound,
+  which the RPi4 sweep proved by staying flat across `--fetch-batch` sizes -- the ack round-trip, not
+  the fetch, was the ceiling. As of #464 the drain batches the acks BY DEFAULT (one pipelined
+  `ack_many` per fetched batch), so the IronBus consume number now reflects the broker's real fetch +
+  batch-ack throughput, matched to the peers' batched/streamed consume (NATS ~20k, Redis ~11k). A
+  same-config dev A/B (loopback, 256 B, `--fetch-batch 256`, `--no-fsync`) shows batched beating
+  per-message at every backend (disk 2,382 -> 2,955 msg/s; memory 2,710 -> 3,734 msg/s avg-of-3); the
+  amortization is bounded on fast loopback by the 64-record consumer credit (so each round-trip still
+  carries only ~64 acks) and grows on a box where the per-RPC syscall cost dominates (the RPi4/edge
+  case, where 63 of every 64 ack round-trips are removed). The reported `p99` for IronBus consume is
+  closed-loop drain (queue-depth) latency, not service latency. The consume ROW in `corpus-report.md`
+  is still the old per-message data; re-run the consume rows on the device (default `subscribe`) to
+  refresh it -- the harness now drives the fair path with no flag change.
 - **At-most-once (fire-and-forget / QoS-0): NATS core leads the raw SEND rate; IronBus pays for being
   a log.** This is a SEPARATE, deliberately-unmatched experiment, NOT part of the matched-durability
   comparison above: the NATS peer here is the CORE router (`nats bench pub`, no JetStream, no
@@ -121,12 +133,16 @@ issues (all in the `bench` harness / rig, none in the broker's data path):
   (one fdatasync per message, ~SD speed), making a large preload take minutes for
   a metric (drain rate) that does not depend on write speed. Now pipelined
   (group-committed) per chunk.
-- **Finding (not a bug) -- work-queue consume acks per message.** A competing
-  work-queue acks each lease individually; cumulative ack is correctly rejected on
-  a work-queue ("broadcast consumers only"). So IronBus's work-queue drain is
-  ack-RPC-bound; the corpus reports it with that caveat rather than papering over
-  it. A faster fair consume path (broadcast group / batched ack) is a tracked
-  follow-up.
+- **FIXED (#464) -- work-queue consume was ack-RPC-bound (one ack RPC per message).**
+  A competing work-queue commits each lease individually (cumulative ack is correctly
+  rejected on a work-queue, "broadcast consumers only"), and the old drain issued one
+  SYNCHRONOUS `ack` round-trip per message, so its throughput measured the per-message
+  ack RPC, not the broker's fetch/consume rate -- an unfair self-handicap vs peers whose
+  clients batch their acks. The drain now settles each fetched batch with one pipelined
+  `ack_many` round-trip BY DEFAULT (the consume-side twin of `--pubwindow`); every lease
+  is still committed individually by the broker, so the at-least-once contract is
+  unchanged -- only the client's ack flush is amortized. The old behavior is kept behind
+  `--per-message-ack` as a legitimate ack-RPC-LATENCY probe.
 - **Finding to investigate -- `--storage memory` produce can block at capacity.**
   A produce that the memory broker sheds under its cap appeared to leave the
   blocking client waiting (the preload did not return). The corpus avoids it

@@ -769,7 +769,7 @@ USAGE:
     ironbus bench (--duration <secs> | --count <n>) [--mode <publish|subscribe|round-trip>]
                   [--rate <msg/s>] [--payload-bytes <n>] [--payload-shape <realistic|random>]
                   [--fetch-batch <n>] [--group <name>] [--no-fsync] [--pubwindow <n>] [--stream] [--json]
-                  [--storage <disk|memory>]
+                  [--storage <disk|memory>] [--per-message-ack]
                   [--addr <host:port> --i-understand-this-is-live]
     ironbus upgrade --new-binary <path> --dest <path> [--max-failed-starts <n>]
     ironbus rollback --dest <path>
@@ -955,6 +955,15 @@ Notes:
     --stream (publish mode, needs --pubwindow >= 2) makes the publisher FULL-DUPLEX: writes
         never stop for acks; a reader thread drains them concurrently with at most the
         window un-acked. Per-produce fsync cost is not attributed in this mode.
+    subscribe mode drains the work-queue with BATCHED acks by DEFAULT (#464): each fetched batch
+        is settled with one pipelined ack_many round-trip (the consume-side twin of --pubwindow),
+        so the throughput reflects the broker's real fetch + batch-ack rate, comparable to a NATS
+        pull consumer or Redis XREADGROUP whose clients batch their acks. --per-message-ack opts
+        back into the legacy one-synchronous-ack-per-message drain, a legitimate ack-RPC-LATENCY
+        measurement (it is ack-RPC-bound, not fetch-bound), NOT a fair throughput head-to-head.
+        EITHER way every fetched message is acked (each lease individually, the competing-work-queue
+        contract); only WHEN the acks are flushed differs. subscribe-only (publish never consumes,
+        round-trip uses a separate concurrent consumer).
     --data-dir -> IRONBUS_DATA_DIR, --addr -> IRONBUS_ADDR). Precedence is flag > env > default: an
     explicit flag overrides the env var, which overrides the compiled default. A bad env value (e.g.
     non-numeric where a number is expected) is a usage error naming the env var. See docs/CLI.md.
