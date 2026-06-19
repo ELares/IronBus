@@ -393,6 +393,137 @@ impl AimdLimiter {
     }
 }
 
+/// The default per-consumer in-flight CREDIT FLOOR (#552): the window an auto-tuning consumer starts
+/// at and never drops below. Held at the historical static default (64) so a never-keeping-up consumer
+/// behaves exactly as the pre-#552 fixed window did; a consumer that DRAINS its window grows past this
+/// toward [`DEFAULT_CREDIT_CEILING`].
+pub const DEFAULT_CREDIT_FLOOR: u32 = 64;
+
+/// The default per-consumer in-flight CREDIT CEILING (#552): the high, Kafka-class window a
+/// keeping-up consumer's auto-tune grows TOWARD, so single-consumer throughput on a fast/loopback link
+/// is no longer pinned at the old 64/RTT (the #464/#532 co-floor). It is the WORST-CASE in-flight
+/// message count the refuse-to-boot RAM guard must charge (`crate`-external: `ironbus_server::rss`),
+/// so it is a bounded, defensible number rather than the protocol max: 2048 messages, well past 64 yet
+/// firmly capped, and ALWAYS dominated by the per-consumer BYTE budget when one is set (the byte budget
+/// remains the firm RAM bound; the count merely auto-tunes UNDER it).
+pub const DEFAULT_CREDIT_CEILING: u32 = 2048;
+
+/// The additive-increase STEP the credit auto-tune adds to the window after a clean keep-up window
+/// (#552). Larger than the AIMD's `+1` so a keeping-up consumer reaches the ceiling in a handful of
+/// drained batches rather than thousands of acks (the window must FILL THE PIPE quickly to remove the
+/// loopback floor, where a `+1`-per-ack climb from 64 to 2048 would itself be a throughput drag). The
+/// decrease stays multiplicative (halve), preserving the AIMD asymmetry: grow steadily, back off fast.
+pub const CREDIT_AUTOTUNE_STEP: u32 = 64;
+
+/// The auto-tuning per-consumer byte+count CREDIT flow-control window (#552, V2-M1).
+///
+/// First-principles: a STATIC small credit window caps a consumer's in-flight to far below the
+/// bandwidth-delay product, so on a fast/loopback link throughput is pinned at `window/RTT` — the
+/// 64/RTT loopback floor the #464 fair-consume bench and the #532 follow-up surfaced. A SELF-GROWING
+/// window fills the pipe: it climbs toward a high ceiling while the consumer keeps up and backs off
+/// under backpressure, exactly the TCP-congestion intuition the egress [`AimdLimiter`] already
+/// encodes. This reuses that limiter rather than inventing a second controller; it differs only in
+/// (a) the domain — the per-CONSUMER in-flight credit window, not the downstream-sink concurrency —
+/// and (b) a brisker additive step ([`CREDIT_AUTOTUNE_STEP`]) so the climb itself is not a drag.
+///
+/// The growth is BOUNDED two ways, so it can never blow RAM: the window never exceeds `ceiling`
+/// (default [`DEFAULT_CREDIT_CEILING`]), and — the FIRM bound — the caller intersects the window with
+/// the per-consumer BYTE budget on every Flow, so the worst-case in-flight BYTES stay
+/// `min(window, byte_budget/avg_record)` worth, capped by the byte budget. The refuse-to-boot RAM
+/// guard charges the `ceiling` (the worst-case count) against `MAX_FRAME_LEN` when the byte budget is
+/// OFF, so the guard stays TRUTHFUL: a config with no byte budget and a high ceiling is honestly
+/// refused under a small RAM ceiling rather than waved through.
+///
+/// At-least-once is untouched: a larger window only means MORE messages may be in flight at once, each
+/// still leased and committed exactly as before. The window is purely a delivery-pacing bound; it
+/// never changes which records are leased, acked, or redelivered.
+#[derive(Clone, Copy, Debug)]
+pub struct CreditAutotuner {
+    /// The underlying AIMD state machine (#69 reuse): `limit` is the current credit window, bounded to
+    /// `[floor, ceiling]`. The auto-tune drives it through [`AimdLimiter::on_failure`] (halve) and a
+    /// stepped additive increase (see [`CreditAutotuner::keep_up`]).
+    aimd: AimdLimiter,
+    /// The additive-increase step applied on a keep-up window (cached so the increase is a single add).
+    step: u32,
+}
+
+impl CreditAutotuner {
+    /// Builds a credit auto-tuner that starts at `floor`, grows by `step` toward `ceiling` on each
+    /// keep-up window, and halves toward `floor` on backpressure. A degenerate `floor > ceiling` is
+    /// normalized by [`AimdLimiter::new`] (the window pins to the ceiling), and a `0` step is floored
+    /// to one, so the controller can never be constructed into a non-growing state.
+    #[must_use]
+    pub fn new(floor: u32, ceiling: u32, step: u32) -> CreditAutotuner {
+        CreditAutotuner {
+            // Start AT the floor: a consumer that never keeps up behaves as the historical fixed window.
+            aimd: AimdLimiter::new(floor, floor, ceiling),
+            step: step.max(1),
+        }
+    }
+
+    /// The default credit auto-tuner (#552): floor [`DEFAULT_CREDIT_FLOOR`] (64, the historical static
+    /// window), ceiling [`DEFAULT_CREDIT_CEILING`] (2048), step [`CREDIT_AUTOTUNE_STEP`] (64). A
+    /// keeping-up consumer grows from 64 to 2048 in a handful of drained windows; a slow one stays at
+    /// 64.
+    #[must_use]
+    pub fn default_credit() -> CreditAutotuner {
+        CreditAutotuner::new(
+            DEFAULT_CREDIT_FLOOR,
+            DEFAULT_CREDIT_CEILING,
+            CREDIT_AUTOTUNE_STEP,
+        )
+    }
+
+    /// Builds a credit auto-tuner whose ceiling is `ceiling` (the negotiated per-consumer window cap)
+    /// and whose floor is `min(DEFAULT_CREDIT_FLOOR, ceiling)`, so a consumer whose negotiated ceiling
+    /// is BELOW the default floor (a tightly-bounded edge consumer, or a `--consumer-credit` set under
+    /// 64) is never started above its own cap. The step is [`CREDIT_AUTOTUNE_STEP`]. This is the
+    /// session-facing constructor: the ceiling is the negotiated `credit_ceiling`, the firm bound the
+    /// RAM guard also charges.
+    #[must_use]
+    pub fn with_ceiling(ceiling: u32) -> CreditAutotuner {
+        CreditAutotuner::new(
+            DEFAULT_CREDIT_FLOOR.min(ceiling.max(1)),
+            ceiling,
+            CREDIT_AUTOTUNE_STEP,
+        )
+    }
+
+    /// The current credit window: the most un-acked messages the consumer may hold in flight right
+    /// now, BEFORE the byte budget intersects it (the caller still bounds by the byte budget on every
+    /// Flow, the firm RAM bound). Always within `[floor, ceiling]`.
+    #[must_use]
+    pub fn window(&self) -> u32 {
+        self.aimd.limit()
+    }
+
+    /// The auto-tune CEILING: the highest the window can ever grow to, the worst-case in-flight COUNT
+    /// the RAM guard charges. Exposed so the guard's term and the gauge read the SAME number the
+    /// controller is bounded by (no drift).
+    #[must_use]
+    pub fn ceiling(&self) -> u32 {
+        self.aimd.max
+    }
+
+    /// KEEP-UP signal (#552): the consumer drained its window without stalling (a clean batch with no
+    /// would-block), so GROW the window by [`CreditAutotuner::step`] toward the ceiling. Stepped (not
+    /// `+1`) so the climb fills the pipe quickly. Idempotent at the ceiling.
+    pub fn keep_up(&mut self) {
+        // Reuse the AIMD ceiling clamp: add the step, then pin to the ceiling. `min` is the floor here,
+        // so the add can only ever raise the window (the floor is the start, never re-imposed on grow).
+        self.aimd.limit = self.aimd.limit.saturating_add(self.step).min(self.aimd.max);
+    }
+
+    /// BACK-OFF signal (#552): the consumer is not draining (a would-block at the window with a
+    /// near-full in-flight set, or a nack), so multiplicatively DECREASE the window (halve, floored at
+    /// the floor). The AIMD asymmetry — grow steadily, back off fast — sheds a slow consumer's window
+    /// smoothly instead of oscillating, and the floor guarantees forward progress (it never collapses
+    /// below the historical static window).
+    pub fn back_off(&mut self) {
+        self.aimd.on_failure();
+    }
+}
+
 /// A token bucket rate limiter for the fire-and-forget (un-credited) admission tier (#69).
 ///
 /// The QoS-0-equivalent path is never credited, so it cannot be braked by the consumer-credit
@@ -1005,6 +1136,86 @@ mod tests {
             "start is clamped into the normalized bounds"
         );
         assert!(a.limit() >= 1);
+    }
+
+    // ---- credit auto-tune (#552) ----
+
+    #[test]
+    fn credit_autotune_starts_at_the_floor() {
+        let a = CreditAutotuner::default_credit();
+        assert_eq!(
+            a.window(),
+            DEFAULT_CREDIT_FLOOR,
+            "a fresh consumer starts at the historical static window (64)"
+        );
+        assert_eq!(a.ceiling(), DEFAULT_CREDIT_CEILING);
+    }
+
+    #[test]
+    fn credit_autotune_grows_past_64_toward_the_ceiling_for_a_keeping_up_consumer() {
+        // The CORE #552 claim: a consumer that keeps draining its window grows the window WELL past the
+        // old 64 floor (so throughput is no longer pinned at 64/RTT), reaching the high ceiling.
+        let mut a = CreditAutotuner::default_credit();
+        assert_eq!(a.window(), 64);
+        a.keep_up();
+        assert!(
+            a.window() > 64,
+            "one keep-up window must grow the credit past the old 64 floor, got {}",
+            a.window()
+        );
+        for _ in 0..1000 {
+            a.keep_up();
+        }
+        assert_eq!(
+            a.window(),
+            DEFAULT_CREDIT_CEILING,
+            "a perpetually-keeping-up consumer climbs to the ceiling, not pinned at 64"
+        );
+    }
+
+    #[test]
+    fn credit_autotune_never_exceeds_the_ceiling() {
+        let mut a = CreditAutotuner::new(64, 300, 64);
+        for _ in 0..100 {
+            a.keep_up();
+        }
+        assert_eq!(a.window(), 300, "growth is capped at the ceiling");
+        assert_eq!(a.ceiling(), 300);
+    }
+
+    #[test]
+    fn credit_autotune_backs_off_multiplicatively_under_backpressure() {
+        // A non-draining consumer's window halves toward the floor (grow steadily, back off fast), but
+        // never below the floor, so forward progress is guaranteed.
+        let mut a = CreditAutotuner::default_credit();
+        for _ in 0..1000 {
+            a.keep_up();
+        }
+        assert_eq!(a.window(), 2048);
+        a.back_off();
+        assert_eq!(a.window(), 1024, "back-off halves the window");
+        a.back_off();
+        assert_eq!(a.window(), 512);
+        for _ in 0..20 {
+            a.back_off();
+        }
+        assert_eq!(
+            a.window(),
+            DEFAULT_CREDIT_FLOOR,
+            "back-off never collapses below the floor (forward progress guaranteed)"
+        );
+    }
+
+    #[test]
+    fn credit_autotune_floor_never_exceeds_a_low_negotiated_ceiling() {
+        // A consumer whose negotiated ceiling is BELOW the default floor (a tightly-bounded edge
+        // consumer) is never started above its own cap, and never grows past it.
+        let mut a = CreditAutotuner::with_ceiling(8);
+        assert_eq!(a.window(), 8, "the start is clamped to the low ceiling");
+        for _ in 0..100 {
+            a.keep_up();
+        }
+        assert_eq!(a.window(), 8, "growth is capped at the negotiated ceiling");
     }
 
     // ---- token bucket ----

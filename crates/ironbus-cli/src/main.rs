@@ -811,9 +811,12 @@ Notes:
     --data-dir must be ABSENT (the broker keeps no on-disk state). The startup banner states the
     ephemeral contract and the materialized-config line says storage=memory.
     --max-in-flight bounds the per-GROUP in-flight (max-ack-pending) window; --consumer-credit
-    (default 64) bounds the per-CONNECTION un-acked set, so in a competing group one stuck
-    consumer cannot consume a peer's budget. A fetch delivers min(requested, consumer credit,
-    group window). --consumer-credit-bytes (default 8388608, 8 MiB; 0 = unlimited) is the parallel
+    (default 2048) is the per-CONNECTION un-acked CEILING the auto-tuning credit window grows
+    toward (#552): the window starts at a 64-message floor and grows toward this ceiling as the
+    consumer keeps draining, so a fast/loopback consumer is not pinned at 64/RTT, while a stuck
+    consumer cannot consume a peer's budget. A fetch delivers min(requested, current credit window,
+    byte budget, group window). --consumer-credit-bytes (default 8388608, 8 MiB; 0 = unlimited) is
+    the FIRM RAM bound the count window grows UNDER, the parallel
     per-CONNECTION un-acked BYTE budget, so a large-payload consumer cannot blow the RAM ceiling
     despite a small message count: a fetch also stops once a connection's in-flight bytes reach the
     budget, with a hard floor of one message (a single over-budget message is still delivered so it
@@ -2968,10 +2971,12 @@ struct ServeConfig {
     /// soon as the visibility timeout allows).
     backoff_ms: Vec<u64>,
     max_in_flight: u32,
-    /// Per-CONSUMER (per-connection) standing in-flight credit (#65): the most un-acked messages one
-    /// connection may hold at once, the consumer-side half of credit-based flow control. The
-    /// effective Flow bound is min(this, the per-group `max_in_flight` window). Default 64 (NOT
-    /// 65535), floored to 1 by the engine.
+    /// Per-CONSUMER (per-connection) standing in-flight credit CEILING (#65, #552): the most un-acked
+    /// messages one connection may EVER hold at once — the ceiling the auto-tuning credit window grows
+    /// toward (from a 64 floor) as the consumer keeps draining, so a fast consumer is not pinned at
+    /// 64/RTT. The effective Flow bound is min(the current auto-tuned window, the byte budget, the
+    /// per-group `max_in_flight` window). Default 2048 (NOT 65535), floored to 1 by the engine; this is
+    /// also the worst-case in-flight count the refuse-to-boot RAM guard charges.
     consumer_credit: u32,
     /// Per-CONSUMER (per-connection) standing in-flight BYTE budget (#275): the most un-acked
     /// payload bytes one connection may hold at once, the RAM-side companion to `consumer_credit`.
@@ -4560,10 +4565,11 @@ fn open_engine_with<F: Filesystem>(
             lease: LeaseConfig::from_millis(visibility_ms, visibility_ms.max(DEFAULT_HARD_CAP_MS)),
             delivery,
             max_in_flight: config.max_in_flight,
-            // The per-CONSUMER (per-connection) standing in-flight credit (#65): the most un-acked
-            // messages one connection may hold, the consumer-side half of credit-based flow control.
-            // The effective Flow bound is min(this, the per-group max_in_flight window). Floored to
-            // 1 by the engine. Default 64 (NOT 65535), memory-justified by Little's Law (#19).
+            // The per-CONSUMER (per-connection) standing in-flight credit CEILING (#65, #552): the most
+            // un-acked messages one connection may EVER hold — the ceiling the auto-tuning credit window
+            // grows toward from a 64 floor as the consumer keeps draining. The effective Flow bound is
+            // min(the current auto-tuned window, the byte budget, the per-group max_in_flight window).
+            // Floored to 1 by the engine. Default 2048 (NOT 65535), the Kafka-class auto-tune ceiling.
             consumer_credit: config.consumer_credit,
             // The per-CONSUMER (per-connection) in-flight BYTE budget (#275): the RAM-side companion
             // to the message-count credit. The effective Flow bound is min(message credit, byte

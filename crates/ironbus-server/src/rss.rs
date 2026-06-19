@@ -198,6 +198,17 @@ pub struct RamFootprintConfig {
 ///   fit a small ceiling and is correctly refused. This is exactly the term the task names
 ///   (`max_connections * consumer_credit_bytes` worst case) and the firm RAM-side bound
 ///   `docs/EDGE_CONSTRAINTS.md` lists for the RAM-ceiling row.
+///
+///   The #552 credit AUTO-TUNE does NOT loosen this term and keeps the guard TRUTHFUL: the per-consumer
+///   count window auto-tunes UPWARD toward `consumer_credit` (its ceiling), but `consumer_credit` IS
+///   the worst-case in-flight count this term already charges, so the auto-tune can never push a
+///   connection's in-flight past the value the guard assumes. With the byte budget SET, term 1 is
+///   byte-bound (`consumer_credit_bytes`) regardless of how high the count auto-tunes — the count grows
+///   strictly UNDER the firm byte cap. With the byte budget OFF, the term charges the full ceiling
+///   (`consumer_credit * MAX_FRAME_LEN`), so raising the ceiling to a Kafka-class default makes a
+///   no-byte-budget config HONESTLY refuse under a small ceiling rather than silently grow its
+///   worst-case RAM. Either way the guard's term remains an upper bound on the true in-flight RAM (it
+///   is drift-tested below: `the_worst_case_is_monotonic_in_the_caps` and the byte-budget-off refusal).
 /// - **Term 3, per-group cursor + lease state.** `max_groups * max_in_flight * PER_LEASE_BYTES`.
 /// - **Term 5, fixed overhead + thread stacks.** [`FIXED_OVERHEAD_BYTES`] plus
 ///   `max_connections * PER_CONNECTION_STACK_BYTES` (one OS thread per connection).
@@ -422,6 +433,64 @@ mod tests {
             fits_under_ram_ceiling(&cfg),
             RamCeilingVerdict::Exceeds { .. }
         ));
+    }
+
+    #[test]
+    fn the_count_term_charges_the_full_autotune_ceiling_when_the_byte_budget_is_off() {
+        // #552 GUARD-TRUTHFULNESS DRIFT TEST. The per-consumer count window auto-tunes UPWARD toward
+        // `consumer_credit` (its ceiling), so with the byte budget OFF the worst-case in-flight count IS
+        // that ceiling — the guard MUST charge `consumer_credit * MAX_FRAME_LEN` per connection, not the
+        // old fixed 64. This pins term 1 to the auto-tune ceiling so a future change that grows the
+        // ceiling without growing the guard's charge (a silent RAM-bound regression) FAILS here.
+        let max_record = u64::from(ironbus_proto::frame::MAX_FRAME_LEN);
+        let ceiling = u64::from(ironbus_core::backpressure::DEFAULT_CREDIT_CEILING);
+        let cfg = RamFootprintConfig {
+            ram_ceiling_bytes: 0, // not testing the verdict, only the worst-case term
+            max_connections: 4,
+            consumer_credit: ceiling,
+            consumer_credit_bytes: 0, // byte budget OFF -> the COUNT ceiling binds term 1
+            max_groups: 0,
+            max_in_flight: 0,
+            in_memory_store_bytes: 0,
+        };
+        let worst = worst_case_buffer_bytes(&cfg);
+        // Term 1 alone is `max_connections * consumer_credit * MAX_FRAME_LEN`; the whole worst case is
+        // at least that (the other terms are non-negative). The lower bound is a HARD product of the
+        // ceiling, so it follows the constant rather than being computed from the function under test.
+        let term1 = 4u64.saturating_mul(ceiling).saturating_mul(max_record);
+        assert!(
+            worst >= term1,
+            "the count-bound worst case must charge the full auto-tune ceiling \
+             ({ceiling} msgs/conn * {max_record}B), got worst={worst} < term1={term1}"
+        );
+    }
+
+    #[test]
+    fn the_byte_budget_binds_term_one_independent_of_the_autotune_ceiling() {
+        // #552 FIRM-BYTE-BOUND DRIFT TEST. With the byte budget SET, term 1 is `consumer_credit_bytes`
+        // per connection NO MATTER how high the count auto-tunes: two configs that differ ONLY in the
+        // count ceiling (low fixed 64 vs the high auto-tune ceiling) but share the same byte budget have
+        // the IDENTICAL worst case. This is the guarantee that the count auto-tunes UNDER the firm byte
+        // cap and can never blow RAM by growing the count.
+        let low_count = RamFootprintConfig {
+            ram_ceiling_bytes: 0,
+            max_connections: 8,
+            consumer_credit: 64,
+            consumer_credit_bytes: 8 * 1024 * 1024, // byte budget SET -> the firm bound binds term 1
+            max_groups: 16,
+            max_in_flight: 256,
+            in_memory_store_bytes: 0,
+        };
+        let high_count = RamFootprintConfig {
+            consumer_credit: u64::from(ironbus_core::backpressure::DEFAULT_CREDIT_CEILING),
+            ..low_count
+        };
+        assert_eq!(
+            worst_case_buffer_bytes(&low_count),
+            worst_case_buffer_bytes(&high_count),
+            "with a byte budget set, the count ceiling must not change the worst case (byte budget is \
+             the firm RAM bound; the count auto-tunes UNDER it)"
+        );
     }
 
     #[test]
