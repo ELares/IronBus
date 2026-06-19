@@ -98,3 +98,11 @@ harness = false
 [[bench]]
 name = "sublist"
 harness = false
+
+# Per-connection resolve cache (#569): the steady-state publish hot path — a cache HIT (a hash
+# lookup + generation-compare, NO trie walk) vs a direct trie walk — and the bind-change cost
+# (a single generation-compare + lazy re-resolve, NOT NATS's per-subject global-cache flush).
+# Backs the "beats NATS results-cache" claim. Run via `cargo bench -p ironbus-core --bench resolve_cache`.
+[[bench]]
+name = "resolve_cache"
+harness = false

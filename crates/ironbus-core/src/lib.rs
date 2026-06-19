@@ -27,6 +27,7 @@ pub mod dict;
 pub mod format;
 pub mod keyshared;
 pub mod lease;
+pub mod resolve_cache;
 pub mod segment;
 pub mod subject;
 pub mod sublist;
