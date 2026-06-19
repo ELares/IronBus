@@ -28,6 +28,7 @@ pub mod format;
 pub mod keyshared;
 pub mod leader_lease;
 pub mod lease;
+pub mod resolve_cache;
 pub mod segment;
 pub mod subject;
 pub mod sublist;
