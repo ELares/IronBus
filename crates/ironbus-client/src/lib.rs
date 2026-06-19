@@ -304,6 +304,17 @@ enum PubReply {
 /// still being written.
 const STREAM_FLUSH_BYTES: usize = 32 * 1024;
 
+/// The default in-flight window for [`Client::pipelined_producer`] (#508): how many publishes the
+/// auto-pipelining handle buffers and sends before awaiting acks, so a SINGLE producer keeps that
+/// many produces in flight and the broker's group commit collapses them under one `fdatasync`
+/// instead of one per publish. Chosen small enough that the buffered (not-yet-flushed) tail a
+/// [`PipelinedProducer::flush`] / [`PipelinedProducer::finish`] makes durable is bounded and the
+/// per-flush memory is modest, yet large enough to lift a tight single-producer durable loop well
+/// past the one-fsync-per-publish floor of the awaited [`Client::produce`]. The handle's window is
+/// configurable via [`Client::pipelined_producer_with_window`] for a caller that wants a different
+/// latency/throughput trade.
+pub const DEFAULT_PIPELINE_WINDOW: usize = 64;
+
 /// The shared tally between [`Client::produce_stream`]'s writer (the caller thread) and its
 /// reader thread, guarded by a mutex with a condvar the reader signals as window room opens.
 #[derive(Default)]
@@ -601,6 +612,25 @@ impl Client {
     /// [`Client::produce_dedup`]. (A `PubAckDuplicate` reply is still parsed here defensively and
     /// its offset returned, so an old caller never errors on a dedup-capable broker.)
     ///
+    /// This is the FULLY SYNCHRONOUS path: it writes the `Pub` frame and BLOCKS until the
+    /// covering group-commit `fdatasync` has made the record durable and the broker's `PubAck`
+    /// has arrived, so on return the message is durable (the ack-implies-durable contract). One
+    /// publish is in flight at a time, so a SINGLE producer using this path pays one fsync per
+    /// publish: the broker's group commit can only amortize an fsync across produces that are
+    /// concurrently in flight, and an awaited `produce` never has a second one pending. That is
+    /// the right default for a producer that needs each publish durable before it does anything
+    /// else, but it caps a tight single-producer durable loop at roughly one publish per fsync.
+    ///
+    /// To LIFT a single producer's durable throughput without giving up the ack-implies-durable
+    /// guarantee, keep several publishes in flight so the broker's group commit covers them with
+    /// ONE fsync: use [`Client::pipelined_producer`] (the ergonomic auto-pipelining handle, which
+    /// buffers a small window and flushes it as one group-committed batch) or, for an
+    /// already-batched caller, [`Client::produce_window`] / [`Client::produce_stream`] directly.
+    /// All three keep every ack's meaning unchanged (durable before the ack exists); they change
+    /// only HOW MANY publishes are in flight when the fsync runs. This method's synchronous
+    /// one-in-flight contract is deliberately left UNCHANGED so an existing caller's durability and
+    /// blocking behavior are byte-for-byte identical.
+    ///
     /// # Errors
     /// Returns a [`ClientError`] on an IO error, an over-large field, or a server error.
     pub fn produce(&mut self, message: &PubBody<'_>) -> Result<u64, ClientError> {
@@ -883,6 +913,42 @@ impl Client {
         // Fire and forget: do NOT read a reply. The broker sends no PubAck for a fire-and-forget
         // produce (whether it appended it or dropped it under load), so awaiting one would hang.
         Ok(())
+    }
+
+    /// Opens an AUTO-PIPELINING durable producer (#508) over this client with the default in-flight
+    /// window ([`DEFAULT_PIPELINE_WINDOW`]): the ergonomic high-throughput companion to the awaited
+    /// [`Client::produce`], for a SINGLE producer that wants its publishes durable (at-least-once,
+    /// ack-implies-durable) but does not want to pay one `fdatasync` per publish.
+    ///
+    /// A [`PipelinedProducer`] buffers each [`PipelinedProducer::produce`] into an in-flight window
+    /// and writes the window as ONE pipelined batch (the proven [`Client::produce_window`] wire
+    /// discipline), so the broker's group commit covers the whole window with a single fsync. The
+    /// caller drains the resulting acks at flush points ([`PipelinedProducer::flush`]) or at the end
+    /// ([`PipelinedProducer::finish`]). Every ack still means the record is fsynced-durable (I2 is
+    /// untouched); only WHEN a publish's ack is observed moves, never what it means.
+    ///
+    /// This is ADDITIVE: it does not change [`Client::produce`], whose fully-synchronous,
+    /// one-in-flight, durable-on-return contract is unchanged. Reach for the handle when a single
+    /// producer's durable THROUGHPUT matters; reach for `produce` when each publish must be durable
+    /// before the next line of caller code runs.
+    pub fn pipelined_producer(&mut self) -> PipelinedProducer<'_> {
+        self.pipelined_producer_with_window(DEFAULT_PIPELINE_WINDOW)
+    }
+
+    /// Opens an auto-pipelining durable producer (#508) with an explicit in-flight `window`: the
+    /// number of publishes buffered before the handle flushes them as one group-committed batch. A
+    /// `window` of `0` is treated as `1` (no pipelining: each publish flushes and awaits on its own,
+    /// matching the awaited [`Client::produce`] throughput). A larger window keeps more publishes in
+    /// flight per fsync (higher durable throughput) at the cost of a larger not-yet-flushed tail and
+    /// more buffered memory. See [`Client::pipelined_producer`] for the default-window entry point
+    /// and the full contract.
+    pub fn pipelined_producer_with_window(&mut self, window: usize) -> PipelinedProducer<'_> {
+        PipelinedProducer {
+            client: self,
+            window: window.max(1),
+            buffered: 0,
+            wire: Vec::new(),
+        }
     }
 
     /// Fetches up to `max` messages. Returns the delivered messages (possibly fewer, or
@@ -1434,6 +1500,192 @@ impl Client {
     }
 }
 
+/// An auto-pipelining DURABLE producer (#508): the ergonomic high-throughput companion to the
+/// awaited [`Client::produce`], opened by [`Client::pipelined_producer`].
+///
+/// # Why this exists
+///
+/// The broker group-commits produces: one `fdatasync` covers every produce a drain pass holds, so a
+/// PIPELINED publisher (several produces in flight) pays one fsync for the whole window. But the
+/// fully-synchronous [`Client::produce`] awaits each `PubAck` before sending the next frame, so a
+/// SINGLE producer never has more than one produce in flight and the group commit has nothing to
+/// amortize across: it pays one fsync PER publish, the single-producer durable-throughput floor.
+///
+/// This handle removes that floor without changing `produce`'s contract: it BUFFERS up to `window`
+/// publishes (serializing each into an owned wire frame so the caller's input buffers are free
+/// again the instant [`PipelinedProducer::produce`] returns), then writes the whole window as ONE
+/// pipelined batch — the exact wire discipline of [`Client::produce_window`] — so the broker's
+/// group commit collapses the window under a single fsync. On a tight single-producer durable loop
+/// this lifts throughput from roughly one-publish-per-fsync to the group-commit rate.
+///
+/// # Durability contract (I2 preserved)
+///
+/// Every publish is at-least-once and ack-implies-durable, exactly like [`Client::produce`]: the
+/// broker fsyncs the record before the `PubAck` exists. What changes is only WHEN this client
+/// OBSERVES the ack. [`PipelinedProducer::produce`] returns as soon as the publish is buffered
+/// (and possibly flushed-and-drained if it filled the window), which is BEFORE its ack is guaranteed
+/// observed. To learn that a span of publishes is durably acked, call [`PipelinedProducer::flush`]
+/// (drains the in-flight window's acks) or [`PipelinedProducer::finish`] (flushes and drains the
+/// rest, returning the run's tally). A buffered-but-not-yet-flushed publish has been HANDED to this
+/// handle but NOT yet written to the broker, so — as with any producer — a process crash before the
+/// covering flush loses only those un-flushed publishes; nothing that has been acked is ever lost.
+/// This is the standard pipelined-producer trade and is why the handle is a distinct, explicitly
+/// chosen API rather than a silent change to [`Client::produce`].
+///
+/// # Errors and connection state
+///
+/// A flush drains exactly one reply per buffered publish, FIFO, the per-connection wire contract,
+/// so the Nth ack belongs to the Nth publish. A server `Err` reply mid-window is drained (the
+/// connection stays framed) and the FIRST one is returned by the flush; offsets acked before or
+/// after it in the same window are durable on the broker. An IO error, an over-large field, or an
+/// unexpected frame leaves the connection state undefined: drop the underlying [`Client`], exactly
+/// like an errored [`Client::produce_window`].
+#[derive(Debug)]
+pub struct PipelinedProducer<'a> {
+    client: &'a mut Client,
+    /// The in-flight window: how many publishes are buffered before an automatic flush.
+    window: usize,
+    /// How many publishes are buffered (framed into `wire`) but not yet flushed. One reply is owed
+    /// per buffered publish; the FIFO drain reads exactly this many replies. The replies are keyed
+    /// by FRAME TYPE (`PubAck` vs `PubAckDuplicate`), the per-connection wire contract, so the drain
+    /// needs only the COUNT, not per-publish state — exactly like [`Client::produce_window`], which
+    /// drains `messages.len()` replies.
+    buffered: usize,
+    /// The coalesced wire bytes for every buffered publish, written with one syscall on flush. The
+    /// publishes are already framed (`encode_frame`), so a flush is a single `write_all`.
+    wire: Vec<u8>,
+}
+
+impl PipelinedProducer<'_> {
+    /// The configured in-flight window: how many publishes are buffered before an automatic flush.
+    #[must_use]
+    pub fn window(&self) -> usize {
+        self.window
+    }
+
+    /// How many publishes are buffered but not yet flushed to the broker.
+    #[must_use]
+    pub fn buffered(&self) -> usize {
+        self.buffered
+    }
+
+    /// Buffers one DURABLE (at-least-once) publish into the in-flight window. Returns immediately
+    /// once the publish is serialized and buffered (its input buffers are free to reuse); when the
+    /// buffer reaches the window it is AUTOMATICALLY flushed (written and its acks drained), so this
+    /// call returns the flush's tally in that case and an empty tally otherwise.
+    ///
+    /// The publish's `fire_and_forget` field is forced CLEAR: a QoS-0 publish has no reply and would
+    /// desynchronize the FIFO window. Per-publish `dedup` is honored exactly as in
+    /// [`Client::produce_dedup`].
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an over-large field (the encode), or — when this publish
+    /// triggered an automatic flush — on an IO error, an unexpected frame, or the first server error
+    /// in the flushed window.
+    pub fn produce(&mut self, message: &PubBody<'_>) -> Result<FlushSummary, ClientError> {
+        let mut body = Vec::new();
+        // Force at-least-once: a fire-and-forget publish gets no reply and would break the FIFO
+        // one-reply-per-publish drain this window depends on, exactly as `produce_window` forces it.
+        let at_least_once = PubBody {
+            fire_and_forget: false,
+            ..*message
+        };
+        encode_pub(&at_least_once, &mut body).map_err(ClientError::Body)?;
+        // Frame and APPEND to the coalesced wire buffer now, so the caller's `message` borrows are
+        // not retained past this call (the producer owns the bytes it will flush).
+        encode_frame(FrameType::Pub, &body, &mut self.wire).map_err(ClientError::Frame)?;
+        self.buffered += 1;
+        if self.buffered >= self.window {
+            self.flush()
+        } else {
+            Ok(FlushSummary::default())
+        }
+    }
+
+    /// Flushes the buffered window: writes every buffered publish in ONE syscall (so the broker's
+    /// group commit covers them with one fsync) and drains exactly one reply per publish, FIFO,
+    /// returning the flushed window's tally. After a clean flush nothing is buffered and the
+    /// underlying [`Client`] is fully usable for any other call. An empty buffer is a no-op that
+    /// never touches the wire.
+    ///
+    /// Every returned ack means the record is fsynced-durable (I2). A server `Err` reply is drained
+    /// and the FIRST one returned as the call's error, after the whole window has been drained so
+    /// the connection stays framed (the [`Client::produce_window`] discipline).
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, an unexpected frame, or the first server error in
+    /// the flushed window. On any error the connection state is undefined: drop the [`Client`].
+    pub fn flush(&mut self) -> Result<FlushSummary, ClientError> {
+        let count = self.buffered;
+        if count == 0 {
+            return Ok(FlushSummary::default());
+        }
+        // Phase 1: one coalesced write of the whole buffered window. This is what puts all N
+        // produces in front of the actor's drain loop as one group-commit batch.
+        self.client.stream.write_all(&self.wire)?;
+        self.wire.clear();
+        // Phase 2: drain exactly one reply per buffered publish, FIFO. A server `Err` consumes its
+        // slot and is remembered; the drain continues so the connection is not desynchronized,
+        // exactly like `produce_window`.
+        let mut summary = FlushSummary::default();
+        let mut first_err: Option<ClientError> = None;
+        for _ in 0..count {
+            let (ty, body) = self.client.read_frame()?;
+            match classify_pub_reply(ty, &body)? {
+                PubReply::Acked(offset) => {
+                    summary.acked += 1;
+                    summary.last_offset = Some(offset);
+                }
+                PubReply::Duplicate(offset) => {
+                    summary.acked += 1;
+                    summary.duplicates += 1;
+                    summary.last_offset = Some(offset);
+                }
+                PubReply::ServerErr(msg) => {
+                    if first_err.is_none() {
+                        first_err = Some(ClientError::Server(msg));
+                    }
+                }
+                PubReply::Pong => return Err(ClientError::Unexpected(FrameType::Pong)),
+            }
+        }
+        self.buffered = 0;
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(summary),
+        }
+    }
+
+    /// Flushes any remaining buffered publishes and returns the FINAL flush's tally (empty if
+    /// nothing was buffered). Consumes the handle; after it returns the borrowed [`Client`] is free
+    /// for any other call. Call this (or [`PipelinedProducer::flush`]) before relying on the tail
+    /// of a producing run being durably acked, since a publish that was buffered but never flushed
+    /// has not yet reached the broker.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, an unexpected frame, or the first server error in
+    /// the final flushed window.
+    pub fn finish(mut self) -> Result<FlushSummary, ClientError> {
+        self.flush()
+    }
+}
+
+/// The tally a [`PipelinedProducer`] flush returns (#508): the acks observed for the publishes the
+/// flush drained. A flush drains one reply per buffered publish, so `acked` plus the server errors
+/// the flush's `Err` surfaces account for every publish in that window. This is the pipelined
+/// analog of the per-call `Vec<ProduceAck>` [`Client::produce_window`] returns, summarized because
+/// the handle's value is the throughput, not a per-message offset transcript (a caller that needs
+/// every offset should drive [`Client::produce_window`] directly).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FlushSummary {
+    /// Publishes acknowledged in this flush (including dedup hits).
+    pub acked: u64,
+    /// How many of `acked` were `PubAckDuplicate` dedup hits.
+    pub duplicates: u64,
+    /// The offset carried by the last ack observed in this flush, if any.
+    pub last_offset: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1704,6 +1956,170 @@ mod tests {
         assert_eq!(messages[0].payload, payloads[0]);
         assert_eq!(messages[7].payload, payloads[7]);
 
+        shutdown.store(true, Ordering::Relaxed);
+        drop(c);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn a_pipelined_producer_auto_flushes_the_window_and_every_publish_is_durable() {
+        // The #508 auto-pipelining durable producer over the real wire: a single producer buffers
+        // publishes into a small window that auto-flushes when it fills, plus a partial tail that
+        // `finish` flushes. Every publish must be acked exactly once, in order, and durably
+        // readable back — the single-producer durable-throughput lever, with I2 intact.
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+
+        let total = 10u8; // window of 4 => two full auto-flushes (8) + a 2-message tail at finish.
+        let payloads: Vec<Vec<u8>> = (0..total).map(|i| vec![b'p', i]).collect();
+        let mut total_acked = 0u64;
+        let mut last_offset = None;
+        {
+            let mut producer = c.pipelined_producer_with_window(4);
+            assert_eq!(producer.window(), 4);
+            for (i, p) in payloads.iter().enumerate() {
+                // The caller's buffer is borrowed only for the duration of THIS call: the producer
+                // serializes it into its own owned wire frame, so a `Vec` we drop right after would
+                // be fine. Here we just confirm the buffered count tracks the un-flushed tail.
+                let summary = producer
+                    .produce(&PubBody {
+                        flags: 0,
+                        timestamp_ms: 0,
+                        key: b"k",
+                        headers: b"",
+                        dedup: None,
+                        fire_and_forget: false,
+                        payload: p,
+                    })
+                    .unwrap();
+                total_acked += summary.acked;
+                if summary.last_offset.is_some() {
+                    last_offset = summary.last_offset;
+                }
+                // After the 4th and 8th publish the window auto-flushed (buffered resets to 0).
+                let expect_buffered = (i + 1) % 4;
+                assert_eq!(producer.buffered(), expect_buffered);
+            }
+            // Two windows of 4 auto-flushed during the loop; the 2-message tail flushes at finish.
+            assert_eq!(total_acked, 8, "the two full windows acked during the loop");
+            let tail = producer.finish().unwrap();
+            total_acked += tail.acked;
+            if tail.last_offset.is_some() {
+                last_offset = tail.last_offset;
+            }
+        }
+        assert_eq!(
+            total_acked,
+            u64::from(total),
+            "every publish acked exactly once"
+        );
+        assert_eq!(
+            last_offset,
+            Some(u64::from(total) - 1),
+            "FIFO offsets in send order"
+        );
+
+        // Durability (I2): every publish is readable back in order — the acks meant durable.
+        let messages = c.fetch(32).unwrap().messages;
+        assert_eq!(messages.len(), usize::from(total));
+        for (i, m) in messages.iter().enumerate() {
+            assert_eq!(m.payload, payloads[i]);
+        }
+        // The connection is fully usable afterwards: a plain produce gets the next offset.
+        let next = c
+            .produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"k",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"after-pipeline",
+            })
+            .unwrap();
+        assert_eq!(next, u64::from(total));
+
+        shutdown.store(true, Ordering::Relaxed);
+        drop(c);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn a_pipelined_producer_finish_with_no_buffered_publishes_is_a_clean_no_op() {
+        // An immediate finish (nothing produced) never touches the wire and leaves the connection
+        // pristine, and a window of 0 is treated as 1 (no panic, no pipelining).
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+        {
+            let producer = c.pipelined_producer_with_window(0);
+            assert_eq!(producer.window(), 1, "a zero window clamps to 1");
+            assert_eq!(producer.finish().unwrap(), FlushSummary::default());
+        }
+        // The default-window handle also no-ops on an immediate finish.
+        {
+            let producer = c.pipelined_producer();
+            assert_eq!(producer.window(), DEFAULT_PIPELINE_WINDOW);
+            assert_eq!(producer.finish().unwrap(), FlushSummary::default());
+        }
+        // The connection is untouched: a plain produce still gets offset 0.
+        let off = c
+            .produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"k",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"first",
+            })
+            .unwrap();
+        assert_eq!(off, 0);
+        shutdown.store(true, Ordering::Relaxed);
+        drop(c);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn a_pipelined_producer_honors_per_publish_dedup() {
+        // A dedup-keyed publish through the handle is deduplicated exactly as `produce_dedup`: the
+        // second publish of the same msg_id is a benign duplicate hit counted in the flush tally,
+        // and the original record is the only one stored. Window of 1 so each publish flushes on
+        // its own and the duplicate is observed deterministically.
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+        let dedup = PubDedup {
+            producer_id: b"prod-1",
+            epoch: 1,
+            msg_id: b"id-A",
+        };
+        let body = PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"k",
+            headers: b"",
+            dedup: Some(dedup),
+            fire_and_forget: false,
+            payload: b"dedup-payload",
+        };
+        let mut producer = c.pipelined_producer_with_window(1);
+        let first = producer.produce(&body).unwrap();
+        assert_eq!(first.acked, 1);
+        assert_eq!(first.duplicates, 0, "the first publish is fresh");
+        let second = producer.produce(&body).unwrap();
+        assert_eq!(second.acked, 1);
+        assert_eq!(second.duplicates, 1, "the repeat msg_id is a dedup hit");
+        assert_eq!(
+            second.last_offset, first.last_offset,
+            "a dedup hit returns the original offset"
+        );
+        let _ = producer.finish().unwrap();
+        // Only ONE record is stored despite two publishes.
+        let messages = c.fetch(16).unwrap().messages;
+        assert_eq!(
+            messages.len(),
+            1,
+            "the duplicate was not stored a second time"
+        );
         shutdown.store(true, Ordering::Relaxed);
         drop(c);
         let _ = handle.join();
