@@ -31,7 +31,8 @@
 //! - No lost replies / no deadlock: every command gets exactly one reply; a closed channel is a typed
 //!   [`ActorGone`], never a panic, so neither side hangs forever if the other dies.
 
-use crate::engine::{Engine, EngineError};
+use crate::engine::{DiskFullPolicy, Engine, EngineError};
+use crate::produce_gate::ProduceCapGate;
 use bytes::Bytes;
 use ironbus_core::clock::Clock;
 use ironbus_core::types::Offset;
@@ -335,6 +336,15 @@ pub struct EngineHandle<F: Filesystem, C: Clock> {
     /// pool is only ever locked by the owning connection thread (uncontended). It carries no produce
     /// state: it is purely an allocation cache, so it never affects reply ORDER or I2.
     reply_pool: ReplyPool,
+    /// The connection-thread byte-cap fast-reject gate (#476, fixes #465): a relaxed-atomic snapshot
+    /// of the durable-log byte-cap shed state the connection thread reads BEFORE the blocking
+    /// `tx.send`, so an at-or-over-cap produce is replied `AtCapacity` immediately WITHOUT enqueuing
+    /// onto a possibly-full (blocking) actor channel. SHARED across every connection (one gate per
+    /// actor), so a `clone` keeps the SAME `Arc` (unlike `reply_pool`): the actor publishes the one
+    /// authoritative byte total here and every connection reads it. The gate is a fast-reject FILTER
+    /// only; the actor's own byte-cap check stays authoritative (I2 / ordering), and the gate is
+    /// engineered to NEVER false-reject (see [`crate::produce_gate`]).
+    cap_gate: Arc<ProduceCapGate>,
 }
 
 // Derived `Clone` would demand `F: Clone`; the handle clones the `SyncSender` and the clock (`C` is
@@ -349,6 +359,9 @@ impl<F: Filesystem, C: Clock + Clone> Clone for EngineHandle<F, C> {
             // recycled reply channels stay strictly per-connection and never cross-deliver. The pool
             // warms lazily on that connection's first produces.
             reply_pool: Arc::new(Mutex::new(Vec::new())),
+            // The SAME shared gate (#476): every connection reads the one byte-cap snapshot the actor
+            // publishes, so the `Arc` is shared on clone (NOT freshened like `reply_pool`).
+            cap_gate: Arc::clone(&self.cap_gate),
         }
     }
 }
@@ -387,6 +400,26 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
     /// # Errors
     /// Returns [`ActorGone`] if the actor exited before the produce could be enqueued.
     pub fn produce_submit(&self, append: OwnedAppend) -> Result<ProduceSubmission, ActorGone> {
+        // CONNECTION-THREAD FAST-REJECT (#476, fixes #465): an O(1) relaxed-atomic read of the
+        // byte-cap shed state BEFORE the blocking `tx.send`. When the gate is SURE the actor would
+        // shed this produce with `AtCapacity` (the log is at or over its drop-new byte cap), reply
+        // `AtCapacity` IMMEDIATELY without enqueuing — so a saturated channel can no longer make a
+        // client BLOCK on `send` ahead of a shed it was always going to get (the #465 symptom).
+        //
+        // It is a fast-reject FILTER, never the source of truth: the actor's own byte-cap check
+        // (`Engine::append_no_sync` -> `Log::append`) is UNCHANGED and still authoritative for I2 and
+        // the single total order. The gate is engineered to NEVER false-reject (it only fires when the
+        // snapshot is provably still over cap at the actor, and disengages under drop-oldest); when it
+        // is not sure it returns `false` and the produce takes the normal, fully-authoritative path.
+        // The `Ready` arm short-circuits the whole channel round-trip, exactly like the direct-engine
+        // submission, so the session maps it through the identical `AtCapacity` reply seam.
+        if self.cap_gate.would_shed() {
+            // Count the fast-reject so it is NOT a silent shed (#476): the actor folds this into the
+            // engine's authoritative `produce_rejected` on its next batch, so a fast-reject is counted
+            // exactly like an in-actor `AtCapacity` shed. Then reply `AtCapacity` immediately.
+            self.cap_gate.record_fast_reject();
+            return Ok(ProduceSubmission::Ready(ProduceOutcome::AtCapacity));
+        }
         // Take a RECYCLED reply channel from this connection's pool (#475) instead of allocating a
         // fresh `sync_channel(1)` per publish. Clone its `tx` into the command (a cheap `Arc` bump);
         // the pair's `rx` rides with the submission and recycles on `wait`.
@@ -788,9 +821,24 @@ where
     // Snapshot the static per-consumer credit caps (#292) BEFORE the engine moves into the actor, so
     // the Connect handshake can negotiate them off the actor's hot path (no round-trip, #177).
     let consumer_credit_caps = (engine.consumer_credit(), engine.consumer_credit_bytes());
+    // Build the connection-thread byte-cap fast-reject gate (#476) BEFORE the engine moves into the
+    // actor. The cap is fixed for the engine's life (not live-reloadable), so it is snapshotted once
+    // here; the live byte total and the policy sentinel are published by the actor as it runs. The
+    // gate is shared (one `Arc` for every connection), and the SAME `Arc` is seeded into the actor so
+    // the actor's publishes and the connections' reads see one value.
+    let cap_gate = Arc::new(ProduceCapGate::new(engine.max_total_bytes()));
+    // Seed the gate to the engine's CURRENT durable bytes and policy, so a broker recovered ALREADY
+    // over its cap (a restart on a full log) fast-rejects from the very first produce rather than
+    // waiting for the first commit to publish a reading. Publish-only (no reconcile): nothing has run
+    // yet, so there are no fast-rejects to fold, and `&engine` is still borrowed before the move.
+    match engine.disk_full_policy() {
+        DiskFullPolicy::DropNew => cap_gate.publish_drop_new(engine.durable_record_bytes()),
+        _ => cap_gate.disengage(),
+    }
+    let actor_gate = Arc::clone(&cap_gate);
     let join = std::thread::Builder::new()
         .name("ironbus-append-actor".to_string())
-        .spawn(move || run_actor(engine, &rx, gather_micros))
+        .spawn(move || run_actor(engine, &rx, gather_micros, &actor_gate))
         // A thread-spawn failure at startup is unrecoverable for the server, but the no-panic bar is
         // for the LIBRARY hot paths; spawning the single actor at boot is a startup step. Surface it
         // by propagating the panic only here (boot), never on a request path.
@@ -803,9 +851,43 @@ where
             // The base handle's pool (#475); each per-connection `clone` gets its own fresh pool, so
             // this one is only used if the base handle itself produces (e.g. in tests).
             reply_pool: Arc::new(Mutex::new(Vec::new())),
+            // The shared fast-reject gate (#476); every connection `clone` shares this same `Arc`.
+            cap_gate,
         },
         join,
     )
+}
+
+/// Refreshes the connection-thread fast-reject gate (#476) AND reconciles its fast-reject count into
+/// the engine's authoritative shed counters. Called by the actor thread ONLY — after each
+/// `commit_batch` (the one place the durable bytes change) and after a config reload that can flip the
+/// policy — so it runs once per batch, amortized with the fsync, never per message.
+///
+/// Two jobs, both on the actor:
+/// 1. RECONCILE: fold any fast-rejects the connection threads performed since the last call into the
+///    engine's `produce_rejected` (and the backstop / retry-budget shed signals), so a connection-
+///    thread fast-reject is counted EXACTLY like an in-actor `AtCapacity` shed (never a silent shed).
+/// 2. PUBLISH the gate's next snapshot. Under [`DiskFullPolicy::DropNew`] it publishes the live
+///    `durable_record_bytes` (the gate may then fast-reject an at-or-over-cap produce); under
+///    [`DiskFullPolicy::DropOldest`] it DISENGAGES the gate (the under-cap sentinel), because that
+///    policy ACCEPTS an over-cap produce after a force-reap, so a connection-thread fast-reject would
+///    be a false reject. See [`crate::produce_gate`] for the full no-false-reject argument.
+fn refresh_cap_gate<F, C>(gate: &ProduceCapGate, engine: &mut Engine<F, C>)
+where
+    F: Filesystem,
+    C: Clock + Clone,
+{
+    // 1. Count the fast-rejects performed off the actor since last time (a fast-reject is never
+    //    silent). The delta is exact (monotonic total minus the actor's high-water mark).
+    engine.record_fast_reject_sheds(gate.take_unreconciled_fast_rejects());
+    // 2. Publish the gate's next snapshot from the now-current byte total and overflow policy.
+    match engine.disk_full_policy() {
+        DiskFullPolicy::DropNew => gate.publish_drop_new(engine.durable_record_bytes()),
+        // Drop-oldest accepts over-cap produces (force-reap then append), so the gate must not fire.
+        // `#[non_exhaustive]` enum: any future non-drop-new policy also disengages, which is the
+        // conservative default (fall through to the authoritative actor path).
+        _ => gate.disengage(),
+    }
 }
 
 /// The bounded group-commit gather (#454): keeps collecting commands into `commands` for up to
@@ -860,6 +942,7 @@ fn run_actor<F, C>(
     mut engine: Engine<F, C>,
     rx: &Receiver<Command<F, C>>,
     gather_micros: u64,
+    cap_gate: &ProduceCapGate,
 ) -> Engine<F, C>
 where
     F: Filesystem,
@@ -1013,7 +1096,18 @@ where
                 // order, so flush the parked produces (one fsync) BEFORE it runs.
                 Command::Run(job) => {
                     flush_pending(&mut engine, &mut pending);
+                    // Reconcile any off-actor fast-rejects into the engine's shed counters BEFORE the
+                    // job runs (#476), so a job that READS those counters — e.g. the `/metrics`
+                    // snapshot — observes the fast-rejects already folded in. Without this ordering a
+                    // scrape could under-report `produce_rejected` by the fast-rejects not yet folded.
+                    engine.record_fast_reject_sheds(cap_gate.take_unreconciled_fast_rejects());
                     job(&mut engine);
+                    // A `Run` job can move BOTH the byte total (a job that reaps) AND the overflow
+                    // policy (the live config reload, the only mutator of `disk_full_policy`), so
+                    // refresh the gate's published snapshot from the engine's now-current state (#476).
+                    // Doing it AFTER the job keeps the gate's policy view in lock-step with a reload
+                    // before any later produce reads it (a flip to drop-oldest never false-rejects).
+                    refresh_cap_gate(cap_gate, &mut engine);
                 }
                 // Graceful drain (#195): flush the pending batch, checkpoint every group, reply the
                 // result, and exit. The flush happens first so a produce acked-by-being-in-the-batch
@@ -1029,6 +1123,14 @@ where
         // The drain is exhausted: commit the parked produces with the ONE covering fsync, then release
         // their replies. This is the steady-state group commit boundary.
         flush_pending(&mut engine, &mut pending);
+        // The batch just changed the durable byte total (an append grows it; a post-commit retention
+        // reap can shrink it), so refresh the connection-thread fast-reject gate with the now-current
+        // reading (#476). This is the ONE refresh that matters for steady-state load: a produce that
+        // pushed the log at/over its drop-new cap is now visible to every connection's pre-check, so
+        // the NEXT saturating produce fast-rejects instead of blocking on a full channel (the #465
+        // fix). It runs once per drained batch (amortized with the fsync), never per message. It also
+        // reconciles any fast-rejects performed off the actor into the engine's shed counters (#476).
+        refresh_cap_gate(cap_gate, &mut engine);
         // The admission queue drained to empty: tell CoDel so the controlled-delay window closes and
         // a bursty-but-healthy queue never lingers in the dropping state (#68). A no-op when CoDel is
         // disabled (the default), so the steady-state loop is unchanged for a broker that has not
@@ -1254,6 +1356,203 @@ mod tests {
         .unwrap();
         let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
         (handle, actor, control)
+    }
+
+    /// The actor test config with a hard durable-log byte cap and the overflow policy overridden
+    /// (#476), sharing the default test knobs. Lets the connection-thread fast-reject tests drive the
+    /// real append-actor byte-cap shed path under a chosen policy.
+    fn config_capped(cap: u64, policy: DiskFullPolicy) -> EngineConfig {
+        EngineConfig {
+            log: LogConfig::default().with_max_total_bytes(cap),
+            disk_full_policy: policy,
+            ..config()
+        }
+    }
+
+    /// Builds a fault-fs + `ManualClock` rig over `config_capped(cap, policy)` and spawns the append
+    /// actor, returning the handle, the actor join handle, and the fault control (#476).
+    #[allow(clippy::type_complexity)]
+    fn rig_capped(
+        cap: u64,
+        policy: DiskFullPolicy,
+    ) -> (
+        EngineHandle<FaultFs<InMemoryFs>, ManualClock>,
+        std::thread::JoinHandle<Engine<FaultFs<InMemoryFs>, ManualClock>>,
+        FaultControl,
+    ) {
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let engine = Engine::open(fs, ManualClock::new(), config_capped(cap, policy)).unwrap();
+        let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        (handle, actor, control)
+    }
+
+    /// Produces `payload` (awaiting each, so the actor commits and refreshes the fast-reject gate)
+    /// until the engine's durable byte total has reached `cap`, i.e. until the next produce is a
+    /// byte-cap shed. Returns how many records were accepted. Used to drive the log to its cap
+    /// deterministically without hard-coding the per-record framed byte size.
+    fn fill_to_cap(
+        handle: &EngineHandle<FaultFs<InMemoryFs>, ManualClock>,
+        payload: &[u8],
+        cap: u64,
+    ) -> u64 {
+        let mut accepted = 0u64;
+        loop {
+            match handle.produce(append(payload)).unwrap() {
+                ProduceOutcome::Appended(_) => accepted += 1,
+                // The cap was reached by a prior record (the authoritative actor shed this one); the
+                // log is now at/over cap, which is exactly the state we wanted to reach.
+                ProduceOutcome::AtCapacity => break,
+                other => panic!("unexpected fill outcome: {other:?}"),
+            }
+            if handle.with(|e| e.durable_record_bytes()).unwrap() >= cap {
+                break;
+            }
+        }
+        accepted
+    }
+
+    #[test]
+    fn an_over_cap_produce_fast_rejects_on_the_connection_thread_without_blocking() {
+        // THE #465 FIX over the REAL append actor (#476): once the durable log is at/over its drop-new
+        // byte cap, a produce must get a PROMPT `AtCapacity` on the CONNECTION thread, WITHOUT
+        // enqueuing onto (and blocking on) the bounded actor channel. We prove "without enqueuing /
+        // without blocking" by the SUBMISSION SHAPE: `produce_submit` returns `Ready(AtCapacity)`,
+        // which ONLY the connection-thread fast-reject path produces — the channel path always returns
+        // `Pending`. So a `Ready` is proof the produce never touched `tx.send` (and so could never
+        // block on a full channel, the #465 symptom).
+        const FAST_REJECTS: u64 = 8;
+        let cap = 512;
+        let (handle, actor, _control) = rig_capped(cap, DiskFullPolicy::DropNew);
+        // Drive the log to its cap; the actor publishes the over-cap byte total to the gate on its
+        // post-commit refresh.
+        let accepted = fill_to_cap(&handle, &[0x5a_u8; 64], cap);
+        assert!(accepted > 0, "some records were accepted before the cap");
+        let bytes = handle.with(|e| e.durable_record_bytes()).unwrap();
+        assert!(bytes >= cap, "the log is at/over its cap: {bytes}/{cap}");
+
+        // The `produce_rejected` counter the broker has observed SO FAR (a `with` is a `Run` job, so
+        // this also reconciles any pending fast-rejects first — here there are none yet). Some of
+        // `fill_to_cap`'s tail produces may have been shed by the authoritative actor, so capture the
+        // baseline rather than assuming zero.
+        let rejected_before = handle.with(|e| e.counters().produce_rejected).unwrap();
+
+        // The over-cap produce returns a fast `Ready(AtCapacity)` — no enqueue, no block. Repeated, to
+        // show the gate stays engaged while the log stays over cap (every saturating produce gets the
+        // prompt shed rather than stalling behind a full channel).
+        for attempt in 0..FAST_REJECTS {
+            match handle.produce_submit(append(b"over-cap")).unwrap() {
+                ProduceSubmission::Ready(ProduceOutcome::AtCapacity) => {}
+                ProduceSubmission::Ready(other) => {
+                    panic!("attempt {attempt}: expected a Ready(AtCapacity) fast-reject, got Ready({other:?})")
+                }
+                ProduceSubmission::Pending { .. } => panic!(
+                    "attempt {attempt}: the over-cap produce was ENQUEUED (Pending) instead of \
+                     fast-rejected: it would have blocked on a saturated channel — the #465 bug"
+                ),
+            }
+        }
+
+        // A FAST-REJECT IS NEVER SILENT (#476): the actor reconciles the 8 connection-thread
+        // fast-rejects into the engine's authoritative `produce_rejected`, so the counter the broker
+        // exports matches the rejections the producer actually saw — exactly the equality the CLI
+        // acceptance test asserts against `/metrics`. The `with` runs as a `Run` job, which folds the
+        // pending fast-rejects in BEFORE the counter read.
+        let rejected_after = handle.with(|e| e.counters().produce_rejected).unwrap();
+        assert_eq!(
+            rejected_after - rejected_before,
+            FAST_REJECTS,
+            "every connection-thread fast-reject is counted in produce_rejected (never a silent shed)"
+        );
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn a_near_cap_but_admissible_produce_is_not_falsely_rejected() {
+        // NO FALSE REJECTS (the conservatism property, #476): a produce that the authoritative actor
+        // WOULD accept must never be fast-rejected. We sit the log JUST UNDER the cap (under-cap byte
+        // total) and assert the next produce is genuinely `Appended`, going through the normal actor
+        // path — the gate falls through, never short-circuits.
+        let cap = 4_096;
+        let (handle, actor, _control) = rig_capped(cap, DiskFullPolicy::DropNew);
+        // One small record: the log is now far under the cap, so the gate must NOT fire.
+        let first = handle.produce(append(b"small")).unwrap();
+        assert!(
+            matches!(first, ProduceOutcome::Appended(_)),
+            "the first record is accepted: {first:?}"
+        );
+        // Confirm we are genuinely near-but-under the cap, then the next produce must be admitted (the
+        // submission goes through the channel — `Pending`/`Appended` — never a fast `AtCapacity`).
+        let bytes = handle.with(|e| e.durable_record_bytes()).unwrap();
+        assert!(
+            bytes > 0 && bytes < cap,
+            "near cap but under it: {bytes}/{cap}"
+        );
+        let submission = handle.produce_submit(append(b"also-small")).unwrap();
+        match submission {
+            // The expected path: the produce was enqueued (NOT fast-rejected) and the actor accepts it.
+            ProduceSubmission::Pending { .. } => {
+                let outcome = submission_for_test_wait(submission);
+                assert!(
+                    matches!(outcome, ProduceOutcome::Appended(_)),
+                    "an under-cap produce is accepted, never falsely rejected: {outcome:?}"
+                );
+            }
+            ProduceSubmission::Ready(ProduceOutcome::AtCapacity) => {
+                panic!("FALSE REJECT: an under-cap produce was fast-rejected as AtCapacity")
+            }
+            ProduceSubmission::Ready(other) => panic!("unexpected Ready outcome: {other:?}"),
+        }
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn drop_oldest_never_fast_rejects_even_when_over_cap() {
+        // CONSERVATISM UNDER POLICY (#476): under drop-oldest the connection-thread fast-reject must
+        // NEVER fire, because that policy ACCEPTS an over-cap produce after a force-reap (a fast
+        // `AtCapacity` would be a false reject). The actor publishes the under-cap sentinel while the
+        // policy is drop-oldest, so the gate stays DISENGAGED no matter how full the log gets. The
+        // authoritative actor may still legitimately return `AtCapacity` through the CHANNEL in its
+        // documented wedge-guard fall-back (only the active segment left to reap) — that is correct
+        // and is NOT a gate decision; the property under test is strictly that no produce is short-
+        // circuited as a `Ready(AtCapacity)` fast-reject on the connection thread.
+        let cap = 512;
+        let (handle, actor, _control) = rig_capped(cap, DiskFullPolicy::DropOldest);
+        // Drive well past the cap. Every submission must go through the channel (`Pending`) — the gate
+        // is disengaged under drop-oldest, so it never produces a `Ready(AtCapacity)`. The actor's own
+        // outcome (Appended when it can reap, or the wedge-guard AtCapacity) is whatever it authorit-
+        // atively decides; what matters here is that it was NEVER fast-rejected before the channel.
+        let mut fast_reject_seen = false;
+        let mut appended = 0u64;
+        for _ in 0..64u64 {
+            match handle.produce_submit(append(&[0x5a_u8; 64])).unwrap() {
+                ProduceSubmission::Ready(ProduceOutcome::AtCapacity) => fast_reject_seen = true,
+                ProduceSubmission::Ready(other) => panic!("unexpected Ready outcome: {other:?}"),
+                // The normal, authoritative path: drain the outcome so its reply channel recycles.
+                ProduceSubmission::Pending { channel, pool } => {
+                    if matches!(channel.rx.recv(), Ok(ProduceOutcome::Appended(_))) {
+                        appended += 1;
+                    }
+                    drop(pool);
+                }
+            }
+        }
+        assert!(
+            !fast_reject_seen,
+            "FALSE REJECT under drop-oldest: the connection-thread gate fired (it must stay \
+             disengaged under a policy that accepts over-cap produces)"
+        );
+        assert!(
+            appended > 0,
+            "drop-oldest admitted produces via the authoritative path (the gate never blocked them)"
+        );
+        let _ = recover(handle, actor);
+    }
+
+    /// Awaits a `Pending` submission's outcome in a test, recycling its channel like the real `wait`.
+    /// A tiny helper so a test can assert on the SHAPE of the submission first (Pending vs Ready) and
+    /// then collect its outcome without re-implementing the recv/return dance inline.
+    fn submission_for_test_wait(submission: ProduceSubmission) -> ProduceOutcome {
+        submission.wait().unwrap()
     }
 
     #[test]

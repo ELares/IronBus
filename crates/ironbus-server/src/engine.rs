@@ -2937,6 +2937,33 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.backpressure.wal_headroom_shed = self.backpressure.wal_headroom_shed.saturating_add(1);
     }
 
+    /// Accounts `n` byte-cap sheds that the CONNECTION-THREAD fast-reject already performed off the
+    /// actor (#476, fixes #465), so a fast-reject is counted EXACTLY like the authoritative actor-side
+    /// byte-cap shed — never silent. The connection thread replies `AtCapacity` without enqueuing, so
+    /// it cannot touch these actor-owned counters itself; the actor folds the accumulated fast-reject
+    /// delta in here once per batch (the reconcile in `actor::run_actor`). It bumps the SAME three
+    /// signals an in-actor `AtCapacity` shed does — `produce_rejected` (the drop-new shed counter),
+    /// the unified sojourn-independent backstop shed, and the per-client retry-budget shed — so
+    /// `ironbus_produce_rejected_total` stays equal to the rejections the producers actually saw,
+    /// whether they were shed on the actor or fast-rejected on the connection thread. A no-op for
+    /// `n == 0`. All bumps saturate. Idempotent only in the sense that the caller passes a DELTA it
+    /// has not folded before (the gate hands out each fast-reject exactly once).
+    pub fn record_fast_reject_sheds(&mut self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.counters.produce_rejected = self.counters.produce_rejected.saturating_add(n);
+        let now = self.log.now_monotonic();
+        for _ in 0..n {
+            // Mirror the per-shed accounting of the in-actor byte-cap path exactly (one backstop shed
+            // and one retry-budget shed per rejected produce), so the two paths are observationally
+            // identical. Both are saturating no-ops when their controller is disabled (the default).
+            self.backpressure.codel_backstop_shed =
+                self.backpressure.codel_backstop_shed.saturating_add(1);
+            self.backpressure.retry_budget.record_shed(now);
+        }
+    }
+
     /// The broker-side per-client retry-budget re-check (#69): records one ORIGINAL request the
     /// broker ACCEPTED at the current monotonic instant, feeding the accept-based throttle so the
     /// observed retry ratio stays meaningful. Called when a produce (or other request) is admitted.
@@ -4761,6 +4788,25 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     #[must_use]
     pub fn durable_record_bytes(&self) -> u64 {
         self.log.durable_record_bytes()
+    }
+
+    /// The configured durable-log byte cap (`LogConfig::max_total_bytes`, the quantity
+    /// [`Engine::durable_record_bytes`] is shed against). `0` means UNLIMITED (the cap is off). Fixed
+    /// for the engine's life: the cap is layout/contract-bound and NOT live-reloadable (a change
+    /// requires a restart), so a one-time snapshot of it (e.g. for the #476 connection-thread
+    /// fast-reject gate) never drifts.
+    #[must_use]
+    pub fn max_total_bytes(&self) -> u64 {
+        self.log.config().max_total_bytes
+    }
+
+    /// The CURRENT durable-log overflow policy ([`EngineConfig::disk_full_policy`]). Unlike the cap,
+    /// this IS live-reloadable ([`Engine::apply_reloadable_config`]), but only between batches on the
+    /// append-actor thread, so reading it on that thread (e.g. to refresh the #476 fast-reject gate
+    /// after a commit or a reload) observes a stable value for the current pass.
+    #[must_use]
+    pub fn disk_full_policy(&self) -> DiskFullPolicy {
+        self.disk_full_policy
     }
 
     /// The log's total durable RECORD COUNT (the quantity the count-retention bound,
