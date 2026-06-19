@@ -28,4 +28,5 @@ pub mod format;
 pub mod keyshared;
 pub mod lease;
 pub mod segment;
+pub mod subject;
 pub mod types;
