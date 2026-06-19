@@ -396,22 +396,37 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         offset: Offset,
         record: &RecordView<'_>,
     ) -> Result<Offset, StorageError> {
-        // The compaction writer writes DIRECTLY at write_pos; flush any buffered tail first so
-        // direct and buffered bytes can never interleave out of order (#452). In practice a
-        // compacted-segment writer only ever uses this path, so this is a no-op.
-        self.flush_pending()?;
         if self.record_count == u32::MAX {
             return Err(StorageError::SegmentFull);
         }
-        let mut buf = Vec::new();
-        codec::encode(record, &mut buf).map_err(|_| StorageError::SegmentFull)?;
-        let len = u64::try_from(buf.len()).map_err(|_| StorageError::SegmentFull)?;
-        let end = self
-            .write_pos
-            .checked_add(len)
-            .ok_or(StorageError::SegmentFull)?;
-        self.file.write_all_at(&buf, self.write_pos)?;
+        // Encode survivors into the SHARED pending buffer and group-commit, exactly like the
+        // ordinary `append` (#452, #503): the cold compaction path previously allocated a fresh
+        // `Vec` and issued one `write_all_at` PER survivor (O(survivors) allocations + write
+        // syscalls). Encoding directly into `pending` and flushing once per spill window collapses
+        // that to one write per spill. The on-disk bytes are unchanged: the same encoded frames
+        // land contiguously at the same byte positions; only the syscall grouping differs. The
+        // spill cap bounds the buffer's heap regardless of how many survivors a compaction keeps.
+        // `seal_compacted` flushes the pending tail before the footer, so the records are durably
+        // in the file ahead of the commit (the footer/meta ordering is preserved).
+        let before = self.pending.len();
+        if codec::encode(record, &mut self.pending).is_err() {
+            self.pending.truncate(before);
+            return Err(StorageError::SegmentFull);
+        }
+        // On a length-overflow or byte-position overflow, truncate the buffer back so a rejected
+        // survivor leaves no partial frame behind (the same contract `append` upholds).
+        let Some(end) = u64::try_from(self.pending.len() - before)
+            .ok()
+            .and_then(|len| self.write_pos.checked_add(len))
+        else {
+            self.pending.truncate(before);
+            return Err(StorageError::SegmentFull);
+        };
         self.write_pos = end;
+        // Spill: bound the buffer regardless of the survivor count, one write per spill window.
+        if self.pending.len() >= PENDING_SPILL_BYTES {
+            self.flush_pending()?;
+        }
         self.record_count += 1;
         self.last_seq = record.seq;
         self.max_timestamp_ms = self.max_timestamp_ms.max(record.timestamp_ms);
@@ -432,10 +447,16 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
     /// # Errors
     /// Propagates the underlying IO error writing or syncing the trailing bytes.
     pub fn seal_compacted(
-        self,
+        mut self,
         footer: &SegmentFooter,
         meta: &CompactionMeta,
     ) -> Result<(), StorageError> {
+        // The survivor records must be IN the file before the footer+meta trailing write, exactly
+        // as `seal` flushes before its footer (#452, #503): `append_at` now group-commits survivors
+        // through the shared `pending` buffer, so flush the tail here so the footer follows the
+        // records on disk. The byte layout is unchanged — the same encoded frames precede the
+        // footer at the same positions — and the footer/meta commit ordering is preserved.
+        self.flush_pending()?;
         // One contiguous trailing write: the 32-byte v2 footer then the 44-byte metadata block,
         // so footer + block are durable at the same instant after the single `sync_all`.
         let mut trailer = [0u8; SEGMENT_FOOTER_LEN + COMPACTION_META_LEN];
