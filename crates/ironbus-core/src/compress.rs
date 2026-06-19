@@ -370,19 +370,56 @@ pub fn compress_payload(
         });
     }
 
-    let stream = match config.codec {
+    // SINGLE BUFFER: build the descriptor header, then compress the payload DIRECTLY after it
+    // into the same allocation (#477). The lz4 path writes the codec stream into this buffer's
+    // tail with `compress_into`, so there is one allocation and one pass instead of compressing
+    // into a separate `stream` Vec and copying it again behind the header. The descriptor bytes
+    // are byte-identical to before: codec_id (u8), dict_id (u32 LE), uncompressed_len (u32 LE),
+    // then the codec stream, so an existing record still decodes unchanged.
+    let descriptor = match config.codec {
         // Unreachable: handled by the early-return above. Kept exhaustive without a panic.
         Codec::None => return Ok(store_raw(payload)),
-        Codec::Lz4 => lz4_flex::block::compress(payload),
+        Codec::Lz4 => {
+            // One buffer sized to the descriptor plus lz4's worst-case bound, so the compressed
+            // stream can be written in place after the header in a single pass.
+            let bound = lz4_flex::block::get_maximum_output_size(payload.len());
+            let mut buf = Vec::with_capacity(DESCRIPTOR_LEN + bound);
+            write_descriptor_header(
+                &mut buf,
+                config.codec.id(),
+                config.dict_id,
+                uncompressed_len,
+            );
+            // Grow the buffer so `compress_into` has the full worst-case slice to write into AFTER
+            // the header; the header bytes already written are left untouched.
+            buf.resize(DESCRIPTOR_LEN + bound, 0);
+            match lz4_flex::block::compress_into(payload, &mut buf[DESCRIPTOR_LEN..]) {
+                // Trim to exactly the bytes the encoder wrote, leaving the header intact.
+                Ok(written) => {
+                    buf.truncate(DESCRIPTOR_LEN + written);
+                    buf
+                }
+                // The buffer is sized to lz4's own worst-case bound, so this is unreachable; fall
+                // back to a raw store rather than panic, which is always safe and never expands.
+                Err(_) => return Ok(store_raw(payload)),
+            }
+        }
         #[cfg(feature = "zstd")]
-        Codec::Zstd => zstd_compress(payload, config)?,
+        Codec::Zstd => {
+            // The vendored-C zstd codec returns an owned stream, so this path still builds the
+            // header then appends the stream (one copy); the lz4 default carries no second copy.
+            let stream = zstd_compress(payload, config)?;
+            let mut buf = Vec::with_capacity(DESCRIPTOR_LEN + stream.len());
+            write_descriptor_header(
+                &mut buf,
+                config.codec.id(),
+                config.dict_id,
+                uncompressed_len,
+            );
+            buf.extend_from_slice(&stream);
+            buf
+        }
     };
-
-    let mut descriptor = Vec::with_capacity(DESCRIPTOR_LEN + stream.len());
-    descriptor.push(config.codec.id());
-    descriptor.extend_from_slice(&config.dict_id.to_le_bytes());
-    descriptor.extend_from_slice(&uncompressed_len.to_le_bytes());
-    descriptor.extend_from_slice(&stream);
 
     // Never-expand guard: only keep the compressed form if it is STRICTLY smaller than the
     // raw payload (descriptor included). Otherwise store raw, so compression never expands.
@@ -394,6 +431,15 @@ pub fn compress_payload(
     } else {
         Ok(store_raw(payload))
     }
+}
+
+/// Writes the fixed [`DESCRIPTOR_LEN`]-byte descriptor header to the front of `buf`: the
+/// `codec_id (u8)`, then `dict_id (u32 LE)`, then `uncompressed_len (u32 LE)`. The byte layout
+/// is frozen (`docs/compat/versions.md`); the codec stream is written immediately after.
+fn write_descriptor_header(buf: &mut Vec<u8>, codec_id: u8, dict_id: u32, uncompressed_len: u32) {
+    buf.push(codec_id);
+    buf.extend_from_slice(&dict_id.to_le_bytes());
+    buf.extend_from_slice(&uncompressed_len.to_le_bytes());
 }
 
 /// Stores a payload raw (no descriptor, flag clear).
@@ -752,6 +798,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(back, payload, "decompress(compress(x)) == x");
+    }
+
+    #[test]
+    fn single_buffer_descriptor_bytes_are_on_wire_identical() {
+        // PINS the #477 single-buffer encode against the frozen on-wire descriptor: the header
+        // bytes the in-place lz4 encode writes must be byte-for-byte the documented layout
+        // (codec_id, dict_id LE, uncompressed_len LE), and the stream that follows the header
+        // must be a standalone-decodable lz4 block of exactly the claimed length. If the
+        // single-buffer rewrite ever shifted a field or corrupted the header/stream boundary,
+        // this fails even when the full round-trip happens to still pass.
+        let payload = compressible(4096);
+        let out = compress_payload(&payload, &lz4_config()).unwrap();
+        assert!(out.compressed, "a compressible 4 KiB payload compresses");
+
+        // The descriptor header is the exact frozen layout: 1-byte codec id, 4-byte dict_id LE,
+        // 4-byte uncompressed_len LE.
+        assert_eq!(out.stored[0], CODEC_ID_LZ4, "codec id byte");
+        assert_eq!(
+            u32::from_le_bytes([out.stored[1], out.stored[2], out.stored[3], out.stored[4]]),
+            DICT_ID_NONE,
+            "dict_id is the no-dictionary sentinel on the lz4 path"
+        );
+        assert_eq!(
+            u32::from_le_bytes([out.stored[5], out.stored[6], out.stored[7], out.stored[8]]),
+            u32::try_from(payload.len()).unwrap(),
+            "uncompressed_len claims the raw payload length"
+        );
+
+        // `read_descriptor` frames the same header, and the stream after it is a self-contained
+        // lz4 block that decodes to the claimed length on its own (the header and the stream were
+        // written into one buffer without overlapping or truncating either).
+        let (codec_id, dict_id, claimed, stream) = read_descriptor(&out.stored).unwrap();
+        assert_eq!(codec_id, CODEC_ID_LZ4);
+        assert_eq!(dict_id, DICT_ID_NONE);
+        assert_eq!(claimed as usize, payload.len());
+        let mut decoded = vec![0u8; claimed as usize];
+        let written = lz4_flex::block::decompress_into(stream, &mut decoded).unwrap();
+        assert_eq!(written, payload.len());
+        assert_eq!(
+            decoded, payload,
+            "the in-place stream decodes to the payload"
+        );
     }
 
     #[test]
