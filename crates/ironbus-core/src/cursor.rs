@@ -264,18 +264,32 @@ impl AckCursor {
     }
 
     fn contains_ahead(&self, offset: u64) -> bool {
-        self.ahead.iter().any(|&(s, e)| offset >= s && offset < e)
+        // The ahead ranges are sorted, disjoint, and non-adjacent, so at most one can contain
+        // `offset` and binary search locates it in O(log R) rather than scanning all R runs.
+        // A range `[s, e)` compares Less when it lies wholly below `offset` (`e <= offset`),
+        // Greater when wholly above (`s > offset`), and Equal exactly when it contains `offset`.
+        self.ahead
+            .binary_search_by(|&(s, e)| {
+                if e <= offset {
+                    core::cmp::Ordering::Less
+                } else if s > offset {
+                    core::cmp::Ordering::Greater
+                } else {
+                    core::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
     }
 
     /// Inserts `[offset, next)` (where `next == offset + 1`) into the ahead set, merging
     /// with adjacent ranges so the set stays disjoint and non-adjacent. `offset` is known
     /// not to be present and to be at or above `committed`.
     fn insert(&mut self, offset: u64, next: u64) {
-        let i = self
-            .ahead
-            .iter()
-            .position(|&(s, _)| s > offset)
-            .unwrap_or(self.ahead.len());
+        // The ranges are sorted by start, so the insertion point is the first index whose start
+        // exceeds `offset`. `offset` is known absent (the caller guards on `contains_ahead`), so a
+        // binary search on the start key always misses and yields exactly that index in O(log R),
+        // replacing the linear `position` scan. `partition_point` returns the same index directly.
+        let i = self.ahead.partition_point(|&(s, _)| s <= offset);
         let merge_left = i > 0 && self.ahead[i - 1].1 == offset;
         let merge_right = i < self.ahead.len() && self.ahead[i].0 == next;
         match (merge_left, merge_right) {
@@ -553,6 +567,31 @@ mod tests {
         assert!(!fresh.ack(off(u64::MAX)));
         assert_eq!(fresh.committed(), off(0));
         assert_eq!(fresh.ahead_len(), 0);
+    }
+
+    #[test]
+    fn is_acked_probes_every_boundary_of_many_ranges() {
+        // Exercise the binary-search comparator in `contains_ahead` across many disjoint,
+        // non-adjacent runs: each range start is inclusive, each end exclusive, and the gaps
+        // between runs (and the offsets bracketing the whole set) must read as unacked. A
+        // comparator that mishandled the half-open boundary would fail exactly here.
+        let mut c = AckCursor::new();
+        // Acks leave runs 2..4, 6..7, 10..13, 20..21 with gaps at 0,1,4,5,7,8,9,13..20.
+        for o in [2u64, 3, 6, 10, 11, 12, 20] {
+            c.ack(off(o));
+        }
+        assert_eq!(c.ahead_ranges(), &[(2, 4), (6, 7), (10, 13), (20, 21)]);
+        // Below the watermark (0) is the empty gap before the first run.
+        assert!(!c.is_acked(off(0)) && !c.is_acked(off(1)));
+        for &(s, e) in c.ahead_ranges() {
+            assert!(c.is_acked(off(s)), "range start {s} is inclusive");
+            assert!(c.is_acked(off(e - 1)), "last offset {} is acked", e - 1);
+            assert!(!c.is_acked(off(e)), "range end {e} is exclusive");
+        }
+        // Interior gaps between runs and an offset far past the last run all read unacked.
+        for gap in [4u64, 5, 7, 8, 9, 13, 14, 19, 21, 1_000] {
+            assert!(!c.is_acked(off(gap)), "gap offset {gap} must be unacked");
+        }
     }
 
     #[test]
