@@ -3794,7 +3794,7 @@ mod tests {
         // The message is durable in the engine and deliverable.
         let polled = e.engine_mut().poll(0).unwrap();
         match polled {
-            Poll::Message(d) => assert_eq!(d.record.payload, b"hello"),
+            Poll::Message(d) => assert_eq!(d.record.payload.as_ref(), b"hello"),
             other => panic!("expected the produced message, got {other:?}"),
         }
     }

@@ -17,6 +17,7 @@
 //!   on the surviving offsets, and the offset monotonic / never-reuse invariant (I5) and I1 to I4
 //!   hold across the compaction + crash.
 
+use bytes::Bytes;
 use ironbus_core::clock::ManualClock;
 use ironbus_core::segment::SegmentHeader;
 use ironbus_core::types::Offset;
@@ -70,7 +71,7 @@ fn build_dirty_log(fs: InMemoryFs) -> (InMemoryFs, Vec<OwnedRecord>, Offset) {
 /// keep, with each survivor at its ORIGINAL offset.
 fn expected_survivors(records: &[OwnedRecord]) -> Vec<OwnedRecord> {
     use std::collections::HashMap;
-    let mut latest: HashMap<Vec<u8>, u64> = HashMap::new();
+    let mut latest: HashMap<Bytes, u64> = HashMap::new();
     for r in records {
         if !r.key.is_empty() {
             latest.insert(r.key.clone(), r.offset.get());

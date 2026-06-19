@@ -754,7 +754,7 @@ proptest! {
             prop_assert_eq!(record.offset, Offset::new(i));
             prop_assert_eq!(record.seq, Seq::new(i));
             let expected = payload(i);
-            prop_assert_eq!(record.payload.as_slice(), expected.as_slice());
+            prop_assert_eq!(record.payload.as_ref(), expected.as_slice());
         }
     }
 
@@ -791,7 +791,7 @@ proptest! {
                 // that was dropped, or in the segment header), so a checksum that wrongly
                 // accepted a corrupt record would surface here as a mismatched payload.
                 let expected = payload(i);
-                prop_assert_eq!(record.payload.as_slice(), expected.as_slice());
+                prop_assert_eq!(record.payload.as_ref(), expected.as_slice());
             }
         }
     }
@@ -872,7 +872,7 @@ proptest! {
             prop_assert_eq!(record.offset, Offset::new(i));
             prop_assert_eq!(record.seq, Seq::new(i));
             let expected = payload(i);
-            prop_assert_eq!(record.payload.as_slice(), expected.as_slice());
+            prop_assert_eq!(record.payload.as_ref(), expected.as_slice());
         }
     }
 }
@@ -966,7 +966,7 @@ proptest! {
             prop_assert_eq!(record.offset, Offset::new(i));
             prop_assert_eq!(record.seq, Seq::new(i));
             let expected = payload(i);
-            prop_assert_eq!(record.payload.as_slice(), expected.as_slice());
+            prop_assert_eq!(record.payload.as_ref(), expected.as_slice());
         }
     }
 }

@@ -19,6 +19,7 @@
 //! - The negative fixtures (`negative_fixtures`) feed each checker a deliberately-broken input and
 //!   assert it FAILS, so a checker that wrongly always passes would fail the gate here.
 
+use bytes::Bytes;
 use ironbus_core::clock::ManualClock;
 use ironbus_core::format::{RECORD_HEADER_LEN, RECORD_TRAILER_LEN};
 use ironbus_core::types::{Offset, RecordFlags, Seq};
@@ -301,9 +302,9 @@ fn negative_fixtures() {
             seq: Seq::new(seq),
             timestamp_ms: 0,
             flags: RecordFlags::EMPTY,
-            key: Vec::new(),
-            headers: Vec::new(),
-            payload: payload(offset),
+            key: Bytes::new(),
+            headers: Bytes::new(),
+            payload: Bytes::from(payload(offset)),
         }
     }
     let prefix: Vec<OwnedRecord> = (0..4).map(|i| rec(i, i)).collect();
@@ -360,7 +361,7 @@ fn negative_fixtures() {
 
     // I4: two recoveries that diverge (different payload at index 1) must be rejected.
     let mut diverged = prefix.clone();
-    diverged[1].payload = vec![0xff];
+    diverged[1].payload = Bytes::from_static(&[0xff]);
     assert_eq!(
         check_pure_recovery(&prefix, &diverged),
         Err(InvariantViolation::Nondeterministic { index: 1 }),

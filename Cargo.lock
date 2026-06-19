@@ -761,6 +761,7 @@ dependencies = [
 name = "ironbus-cli"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "crc32c",
  "ironbus-client",
  "ironbus-core",
@@ -825,6 +826,7 @@ dependencies = [
 name = "ironbus-storage"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "crc32c",
  "criterion",
  "ironbus-core",
