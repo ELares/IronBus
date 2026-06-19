@@ -714,6 +714,38 @@ struct PositionWalk {
     clean: bool,
 }
 
+/// The SPARSE anchor list a [`SegmentReader::sparse_record_byte_positions`] walk produces (#537):
+/// each entry is `(log offset of the anchored record, that record's frame START byte position)`,
+/// ascending by offset. It is SPARSE — Kafka's `.index` design — holding ONE anchor per `stride`
+/// bytes of frame data rather than one per record, so a resident index built from it costs
+/// `O(region_bytes / stride)` regardless of how many (small) records the segment packs, bounding
+/// the per-segment RAM independent of the record count. A read SEEKS to the nearest anchor at or
+/// before the target offset and scans FORWARD at most `stride` bytes (a bounded number of frames)
+/// to reach the exact record, so the consume locate stays O(stride) — a small constant — instead
+/// of the pre-#483 O(records-per-segment) full rescan, with a fraction of the dense index's RAM.
+///
+/// The first record (offset `base_offset`) is ALWAYS anchored, so any in-range offset has an anchor
+/// at or before it to seek from. `region_end` is the byte offset at which the valid record region
+/// ends (a sealed segment's footer start, or the active segment's torn-free prefix end), the
+/// read-forward upper bound so a seek never reads past the durable prefix into a torn tail/footer.
+struct SparseWalk {
+    /// The sparse `(offset, frame START byte position)` anchors, ascending by offset (#537).
+    anchors: Vec<(u64, u64)>,
+    /// The last valid record's sequence (`None` if the region held no record), for the seal check.
+    last_seq: Option<Seq>,
+    /// How many valid records the walk decoded (the seal check cross-checks the footer's count).
+    count: u64,
+    /// Bytes consumed relative to the walk's start offset (the valid prefix length).
+    cursor: u64,
+    /// `true` if the region decoded cleanly with no torn or corrupt tail.
+    clean: bool,
+}
+
+/// The result of [`SegmentReader::sparse_record_byte_positions`] (#537): the SPARSE `(offset, frame
+/// START byte position)` anchor list (see [`SparseWalk`]) paired with the byte offset at which the
+/// valid record region ends (`valid_end`), the read-forward upper bound.
+pub type SparsePositions = (Vec<(u64, u64)>, u64);
+
 /// The running result of a streaming body walk: see [`SegmentReader::scan_body_streaming`].
 struct BodyWalk {
     /// Valid records seen before the first torn or corrupt frame.
@@ -968,6 +1000,149 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             positions,
             last_seq,
             cursor: cursor as u64,
+            clean,
+        })
+    }
+
+    /// Walks the DENSE (v1) record region and returns SPARSE anchors — one `(log offset, frame
+    /// START byte position)` per `stride` bytes of frame data, Kafka `.index` style (#537) — so the
+    /// caller can build a resident seek index whose RAM is `O(region_bytes / stride)` REGARDLESS of
+    /// how many small records the segment packs (the dense [`SegmentReader::record_byte_positions`]
+    /// costs `O(records)`, ~1.86 MiB for a fully-packed 8 MiB edge segment of 36-byte frames; the
+    /// sparse list is a small constant). The first record is always anchored, so any in-range offset
+    /// has an anchor at or before it; a read seeks to that anchor and scans forward at most `stride`
+    /// bytes (a bounded frame count) to the exact record, the bounded scan between index points.
+    ///
+    /// It steps frame-by-frame, reading each whole frame and FULL-CRC-validating it with the SAME
+    /// `codec::decode` [`SegmentReader::scan`] uses (header AND body CRC), so it delimits the EXACT
+    /// SAME valid prefix `scan` does — it stops at the first torn OR body-corrupt frame, never
+    /// stepping past a frame whose body fails its CRC (a header-only step would, which would let an
+    /// anchor point past `scan`'s prefix). The walk's own memory is one reusable per-frame scratch
+    /// buffer (no whole-region buffering), so the build is bounded to the largest single record.
+    /// The active segment is walked over the whole file; a sealed segment's body-consistent footer
+    /// is excluded first, exactly as [`SegmentReader::scan`] and [`SegmentReader::record_byte_positions`]
+    /// do, keeping the valid prefix byte-identical.
+    ///
+    /// `stride` is clamped up to one byte so a degenerate `0` cannot anchor every record.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::FooterSegmentMismatch`] if a body-consistent footer names a different
+    /// segment (the same recycled/mixed-file guard `scan` applies), or an IO error.
+    pub fn sparse_record_byte_positions(
+        &self,
+        stride: u64,
+    ) -> Result<SparsePositions, StorageError> {
+        let header_end = SEGMENT_HEADER_LEN as u64;
+        let footer_len = SEGMENT_FOOTER_LEN as u64;
+        let stride = stride.max(1);
+
+        // Mirror `record_byte_positions`/`scan` seal handling so the walked region is byte-identical:
+        // a trailing footer is trusted (and excluded) only when it is consistent with the body.
+        let candidate = if self.file_len >= header_end + footer_len {
+            let mut fbuf = [0u8; SEGMENT_FOOTER_LEN];
+            self.file
+                .read_exact_at(&mut fbuf, self.file_len - footer_len)?;
+            SegmentFooter::decode(&fbuf).ok()
+        } else {
+            None
+        };
+
+        if let Some(footer) = candidate {
+            let body_end = self.file_len - footer_len;
+            let walk = self.walk_sparse_positions(header_end, body_end, stride)?;
+            let ends_at_footer = walk.clean && header_end + walk.cursor == body_end;
+            let expected_last_seq = walk.last_seq.unwrap_or(self.header.base_seq);
+            let body_matches = u64::from(footer.record_count) == walk.count
+                && footer.last_seq == expected_last_seq;
+            if ends_at_footer && body_matches {
+                if footer.segment_id != self.header.segment_id {
+                    return Err(StorageError::FooterSegmentMismatch {
+                        header: self.header.segment_id,
+                        footer: footer.segment_id,
+                    });
+                }
+                return Ok((walk.anchors, body_end));
+            }
+            // The candidate does not describe the body: treat the segment as unsealed and walk the
+            // valid prefix from the full file, exactly as `scan` does.
+        }
+
+        let walk = self.walk_sparse_positions(header_end, self.file_len, stride)?;
+        Ok((walk.anchors, header_end + walk.cursor))
+    }
+
+    /// Streams `[start, end)` frame-by-frame, FULL-CRC-validating each frame (the SAME `codec::decode`
+    /// `scan`/`walk_positions` use), and collects a SPARSE anchor every `stride` bytes of frame data,
+    /// stopping at the first torn OR body-corrupt frame (#537), so the prefix it accepts is IDENTICAL
+    /// to the buffered `walk_positions`. A header-only step would walk PAST a body-corrupt frame
+    /// (the header CRC alone cannot see a bad body), letting an anchor point past `scan`'s prefix, so
+    /// the body CRC is validated here even though only the position is kept. The FIRST record is
+    /// always anchored (`next_anchor_at` starts at the region start), and after each anchor the next
+    /// boundary advances by `stride`, so anchors are at most `stride` bytes apart — the bound a read
+    /// forward-scans between. Memory is one reusable per-frame scratch buffer (the largest record),
+    /// never the whole region.
+    fn walk_sparse_positions(
+        &self,
+        start: u64,
+        end: u64,
+        stride: u64,
+    ) -> Result<SparseWalk, StorageError> {
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut pos = start;
+        let mut count = 0u64;
+        let mut last_seq = None;
+        let mut clean = true;
+        let mut anchors: Vec<(u64, u64)> = Vec::new();
+        // The next frame START at or past this boundary is anchored; it starts at `start`, so the
+        // first record is always anchored, then advances by `stride` after each anchor taken.
+        let mut next_anchor_at = start;
+        while pos < end {
+            let remaining = end - pos;
+            if remaining < RECORD_HEADER_LEN as u64 {
+                // Fewer bytes than a record header: a torn tail, not a whole frame.
+                clean = false;
+                break;
+            }
+            // Learn the frame length from the (header-CRC-validated) header, then read the WHOLE
+            // frame and full-CRC-validate it, exactly as the streaming recovery scan does.
+            scratch.resize(RECORD_HEADER_LEN, 0);
+            self.file.read_exact_at(&mut scratch, pos)?;
+            let Ok(total) = codec::decoded_len(&scratch) else {
+                clean = false;
+                break;
+            };
+            if total as u64 > remaining {
+                // The header is intact but the frame would run past the region: a torn tail.
+                clean = false;
+                break;
+            }
+            scratch.resize(total, 0);
+            self.file.read_exact_at(
+                &mut scratch[RECORD_HEADER_LEN..],
+                pos + RECORD_HEADER_LEN as u64,
+            )?;
+            let Ok((view, consumed)) = codec::decode(&scratch) else {
+                // A corrupt body (or trailer): ends the valid prefix, exactly as `scan` stops.
+                clean = false;
+                break;
+            };
+            // Anchor this frame if it is the first frame at or past the pending boundary. Because
+            // frames vary in length, advance the boundary to `pos + stride` (relative to THIS
+            // anchor) so consecutive anchors are at least `stride` apart, never less, bounding the
+            // forward scan a read does from an anchor to the next at `stride` bytes.
+            if pos >= next_anchor_at {
+                anchors.push((self.header.base_offset.get().saturating_add(count), pos));
+                next_anchor_at = pos.saturating_add(stride);
+            }
+            last_seq = Some(view.seq);
+            count += 1;
+            pos += consumed as u64;
+        }
+        Ok(SparseWalk {
+            anchors,
+            last_seq,
+            count,
+            cursor: pos - start,
             clean,
         })
     }
@@ -1639,6 +1814,87 @@ mod tests {
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].payload.as_ref(), b"good1");
+    }
+
+    /// Every sparse anchor (#537) locates the CORRECT record's frame: seeking to an anchor and
+    /// reading one record yields exactly the record `scan` reports at that anchor's offset, for both
+    /// an unsealed and a sealed segment, and the anchor list is genuinely SPARSE (far fewer than one
+    /// per record at a small stride).
+    #[test]
+    fn sparse_record_byte_positions_anchors_locate_the_right_records() {
+        for sealed in [false, true] {
+            let file = Arc::new(InMemoryFile::new());
+            let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+            for i in 0..40u64 {
+                w.append(&rec(i, &[u8::try_from(i % 256).unwrap(); 11]))
+                    .unwrap();
+            }
+            if sealed {
+                w.seal().unwrap();
+            } else {
+                w.sync().unwrap();
+            }
+            let reader = SegmentReader::open(Arc::clone(&file)).unwrap();
+            let scan = reader.scan().unwrap();
+            // A small stride relative to the frame size forces several anchors but far fewer than the
+            // 40 records — the sparse property.
+            let stride = 128u64;
+            let (anchors, valid_end) = reader.sparse_record_byte_positions(stride).unwrap();
+            assert_eq!(valid_end, scan.valid_end, "valid_end matches scan");
+            assert!(!anchors.is_empty(), "at least the first record is anchored");
+            assert_eq!(anchors[0].0, 0, "the first record is always anchored");
+            assert!(
+                anchors.len() < scan.records.len(),
+                "sparse: fewer anchors ({}) than records ({})",
+                anchors.len(),
+                scan.records.len()
+            );
+            // Each anchor's byte position locates exactly its claimed offset's record.
+            for &(offset, pos) in &anchors {
+                let got = reader
+                    .scan_from(pos, Offset::new(offset), valid_end, 1)
+                    .unwrap();
+                assert_eq!(got.len(), 1, "one record from the anchor");
+                assert_eq!(
+                    got[0],
+                    scan.records[usize::try_from(offset).unwrap()],
+                    "anchor at offset {offset} locates the right record"
+                );
+            }
+            // Consecutive anchors are at least `stride` bytes apart (the forward-scan bound).
+            for w in anchors.windows(2) {
+                assert!(
+                    w[1].1 - w[0].1 >= stride,
+                    "anchors are at least a stride apart"
+                );
+            }
+        }
+    }
+
+    /// The sparse walk (#537) stops at a torn tail at the SAME prefix boundary `scan` does: anchors
+    /// never point past the valid prefix.
+    #[test]
+    fn sparse_record_byte_positions_stops_at_a_torn_tail_exactly_like_scan() {
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        w.append(&rec(0, b"good1")).unwrap();
+        let after_first = w.write_pos();
+        w.append(&rec(1, b"good2")).unwrap();
+        w.sync().unwrap();
+        let mut bytes = file.snapshot();
+        let body_byte = usize::try_from(after_first + RECORD_HEADER_LEN as u64 + 1).unwrap();
+        bytes[body_byte] ^= 0x01;
+        file.set_len(0).unwrap();
+        file.write_all_at(&bytes, 0).unwrap();
+
+        let reader = SegmentReader::open(Arc::clone(&file)).unwrap();
+        let (anchors, valid_end) = reader.sparse_record_byte_positions(1).unwrap();
+        assert_eq!(
+            valid_end, after_first,
+            "valid_end stops at the first record"
+        );
+        assert_eq!(anchors.len(), 1, "only the good record is anchored");
+        assert_eq!(anchors[0], (0, SEGMENT_HEADER_LEN as u64));
     }
 
     #[test]

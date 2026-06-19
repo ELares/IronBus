@@ -375,53 +375,112 @@ struct RecoveredChain {
     highest: RecoveryScan,
 }
 
+/// The byte stride between [`SegmentIndex`] anchors (#537): one sparse anchor per this many bytes of
+/// frame data, Kafka's `.index` default interval. It bounds a resident dense-segment index's RAM to
+/// `O(region_bytes / stride)` (independent of the record count) and the per-read forward scan from
+/// an anchor to `stride` bytes. 4 KiB on an 8 MiB edge segment is ~2048 anchors ≈ 32 KiB resident
+/// (vs ~1.86 MiB for a dense one-entry-per-36-byte-record index), well inside the tiny-profile RAM
+/// budget while keeping the bounded scan tiny (~114 minimum-size frames). NOT an on-disk constant:
+/// the index is in-memory only, rebuilt from the durable frames on reopen, so changing it is a pure
+/// memory/latency trade with no format or recovery impact.
+const SEGMENT_INDEX_STRIDE_BYTES: u64 = 4096;
+
 /// The RESIDENT, in-memory `offset -> byte position` seek index for ONE open DENSE (v1) segment
-/// (#483). It lets [`Log::read_from`] SEEK to a record's frame in O(1) instead of rescanning the
-/// segment from its base on every delivery (the consume hot path reads `read_from(off, 1)` per
-/// record, so the old scan made each delivery O(records-per-segment)).
+/// (#483, sparsified by #537). It lets [`Log::read_from`] SEEK to a record's frame in near-O(1)
+/// (an anchor lookup plus a bounded forward scan) instead of rescanning the segment from its base on
+/// every delivery (the consume hot path reads `read_from(off, 1)` per record, so the old scan made
+/// each delivery O(records-per-segment)).
 ///
-/// `positions[i]` is the file byte offset of the frame for the record at log offset
-/// `base_offset + i`. The index is DENSE: it holds exactly one entry per record in a v1 segment,
-/// whose offsets are contiguous from `base_offset`. `valid_end` is the byte offset at which the
-/// durable record region ends (a sealed segment's footer start, or the active segment's torn-free
-/// prefix end), so a seek-and-read-forward never reads past the valid prefix into a torn tail.
+/// `anchors[i] = (offset_i, byte_pos_i)` is a SPARSE anchor: the frame START byte position of the
+/// record at log offset `offset_i`, ascending by offset. The index is SPARSE — Kafka's `.index`
+/// design (#537) — holding ONE anchor per [`SEGMENT_INDEX_STRIDE_BYTES`] bytes of frame data rather
+/// than one per record, so its RAM is `O(region_bytes / stride)` REGARDLESS of how many small
+/// records the segment packs. The pre-#537 DENSE index held one `u64` per record: a fully-packed
+/// 8 MiB edge segment of 36-byte frames is ~233k records = ~1.86 MiB of index, UNACCOUNTED in the
+/// RAM budget and scaling with the record count and the read working set (replay/follower reads pin
+/// many sealed segments resident). The sparse index is a small bounded constant (~32 KiB for that
+/// same 8 MiB segment at a 4 KiB stride), so a slow/replaying consumer's resident footprint stays
+/// inside the tiny-profile budget (see `docs/RAM_BUDGET.md`).
 ///
-/// RESIDENT-ONLY by design: it is built once when a segment is first consulted on the read path
-/// (or seeded from the active segment as it appends), kept while the segment is open, and DROPPED
-/// the instant the segment is retired (reaped, force-reaped, or superseded by compaction) so a
-/// recycled slot can never seek with a stale index, and so RAM is bounded to the working set of
-/// segments actually being read rather than a permanent dense vector for every cold sealed
-/// segment. It is NEVER persisted: a reopen rebuilds it from the durable frames.
+/// A read SEEKS to [`SegmentIndex::seek_anchor`]'s anchor at or before the target offset and scans
+/// FORWARD at most `stride` bytes (a bounded frame count) to reach the exact record, so the consume
+/// locate is O(stride) — a small constant — instead of the pre-#483 O(records-per-segment) full
+/// rescan. `base_offset` is the segment's lowest offset (always anchored, so any in-range offset has
+/// an anchor at or before it). `valid_end` is the byte offset at which the durable record region
+/// ends (a sealed segment's footer start, or the active segment's torn-free prefix end), so a
+/// seek-and-read-forward never reads past the valid prefix into a torn tail.
+///
+/// RESIDENT-ONLY by design: built once when a segment is first consulted on the read path (or seeded
+/// from the active segment as it appends), kept while the segment is open, and DROPPED the instant
+/// the segment is retired (reaped, force-reaped, or superseded by compaction) so a recycled slot can
+/// never seek with a stale index, and so RAM is bounded to the working set of segments actually
+/// being read. It is NEVER persisted: a reopen rebuilds it from the durable frames.
 ///
 /// COMPACTED (v2, sparse) segments are NOT indexed here: their survivors are sparse and the read
 /// path already routes them through the v2 scan, which this change leaves untouched.
 #[derive(Clone, Debug)]
 struct SegmentIndex {
-    /// The lowest log offset this segment holds (the segment's `base_offset`). `positions[0]` is
-    /// this offset's frame.
+    /// The lowest log offset this segment holds (the segment's `base_offset`): always the first
+    /// anchor's offset, so any in-range offset resolves to an anchor at or before it.
     base_offset: u64,
-    /// The frame START byte position of each record, in offset order: `positions[i]` locates the
-    /// record at `base_offset + i`. `positions.len()` is the indexed record count.
-    positions: Vec<u64>,
+    /// The SPARSE `(offset, frame START byte position)` anchors, ascending by offset: one per
+    /// `stride` bytes of frame data, NOT one per record (#537).
+    anchors: Vec<(u64, u64)>,
+    /// How many records this index covers: the covered offset range is `[base_offset, base_offset +
+    /// record_count)`. Tracked separately from `anchors.len()` because the index is SPARSE (far
+    /// fewer anchors than records). A read targeting an offset at or past `base_offset +
+    /// record_count` is in the not-yet-indexed tail, so the seek returns `None`.
+    record_count: u64,
+    /// The frame byte stride between anchors: at most this many bytes separate consecutive anchors,
+    /// so a read forward-scans at most this far from an anchor to the target. Echoed from
+    /// [`SEGMENT_INDEX_STRIDE_BYTES`] (or set per-test); kept on the index so the append-extend path
+    /// uses the SAME stride the build used.
+    stride: u64,
+    /// The next byte position at or past which the next appended frame is anchored (the active
+    /// segment's running anchor boundary): advances by `stride` each time an anchor is taken, so the
+    /// append-seeded index stays byte-identical to a rebuild.
+    next_anchor_at: u64,
     /// The byte offset at which the valid record region ends: the read-forward upper bound, so a
-    /// seek never materializes a frame from beyond the durable prefix (a torn tail or a footer).
+    /// seek never materializes a frame from beyond the durable prefix (a torn tail or a footer). For
+    /// the active segment this tracks the appended prefix (`write_pos`), which may include the
+    /// writer's not-yet-flushed PENDING bytes; reads are bounded by `flushed_end` (below), never this.
     valid_end: u64,
+    /// The byte offset at which the FLUSHED (in-file) prefix ends: the safe read-forward upper bound
+    /// for the ACTIVE segment, since appended-but-pending bytes are not yet in the file (#452, #537).
+    /// Set to `valid_end` whenever the log raises the visible head (`sync`/`flush_no_sync`, which
+    /// flush pending to the file first), so every record below `flushed_offset` is guaranteed in the
+    /// file up to here. For a SEALED segment this equals `valid_end` (the whole region is durable).
+    flushed_end: u64,
 }
 
 impl SegmentIndex {
-    /// The byte position of the frame for log offset `offset`, if this index covers it. `None`
-    /// when `offset` is below the base or at/above the last indexed record (the caller then has no
-    /// in-range entry to seek to).
-    fn byte_position(&self, offset: u64) -> Option<u64> {
-        let idx = offset.checked_sub(self.base_offset)?;
-        let idx = usize::try_from(idx).ok()?;
-        self.positions.get(idx).copied()
+    /// The SEEK target for log offset `offset`: the `(anchor offset, anchor byte position)` of the
+    /// nearest anchor AT OR BEFORE `offset`, so the caller seeks to the anchor byte position, reads
+    /// forward, and skips the (at most `stride`-bytes' worth of) records before `offset`. `None`
+    /// when `offset` is below the base or at/past the last covered offset (the caller then has no
+    /// in-range anchor to seek to and falls back to a full scan).
+    ///
+    /// `covered_end` is the first offset this index does NOT cover (the active segment's not-yet-
+    /// indexed tail begins here), so a target at or beyond it returns `None` rather than seeking to
+    /// the last anchor and reading a partially-indexed region.
+    fn seek_anchor(&self, offset: u64, covered_end: u64) -> Option<(u64, u64)> {
+        if offset < self.base_offset || offset >= covered_end {
+            return None;
+        }
+        // The anchors ascend by offset; find the last one whose offset is <= `offset`.
+        let idx = self
+            .anchors
+            .partition_point(|&(anchor_off, _)| anchor_off <= offset);
+        idx.checked_sub(1)
+            .and_then(|i| self.anchors.get(i))
+            .copied()
     }
 
-    /// The next log offset this index does NOT yet cover (`base_offset + len`): the offset the next
-    /// appended record to the active segment will carry, used to EXTEND the active segment's index.
-    fn next_offset(&self) -> u64 {
-        self.base_offset.saturating_add(self.positions.len() as u64)
+    /// The first log offset this index does NOT yet cover (`base_offset + record_count`): the offset
+    /// the next appended record to the active segment will carry, used to EXTEND the active
+    /// segment's index and to bound [`SegmentIndex::seek_anchor`]'s covered range.
+    fn covered_end(&self) -> u64 {
+        self.base_offset.saturating_add(self.record_count)
     }
 }
 
@@ -1322,16 +1381,22 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             // off-hot-path cleaner ever writes a compacted segment, and it never becomes active.
             compacted_covered: None,
         });
-        // Seed an EMPTY resident seek index (#483) for the new active segment: appends EXTEND it in
-        // lockstep (so the consume hot path hits the cache without ever rebuilding), and its
-        // `valid_end` tracks the writer's flushed prefix. A fresh segment holds no records yet, so
-        // `valid_end` is the header end. The id is fresh (ADR 0002), so no stale entry can exist.
+        // Seed an EMPTY resident seek index (#483, sparse #537) for the new active segment: appends
+        // EXTEND it in lockstep (so the consume hot path hits the cache without ever rebuilding), and
+        // its `valid_end` tracks the writer's flushed prefix. A fresh segment holds no records yet, so
+        // `valid_end` is the header end and the first appended frame (which starts AT the header end)
+        // is the first anchor (`next_anchor_at` = header end). The id is fresh (ADR 0002), so no stale
+        // entry can exist.
         self.segment_indexes.borrow_mut().insert(
             id,
             SegmentIndex {
                 base_offset: base_offset.get(),
-                positions: Vec::new(),
+                anchors: Vec::new(),
+                record_count: 0,
+                stride: SEGMENT_INDEX_STRIDE_BYTES,
+                next_anchor_at: SEGMENT_HEADER_LEN as u64,
                 valid_end: SEGMENT_HEADER_LEN as u64,
+                flushed_end: SEGMENT_HEADER_LEN as u64,
             },
         );
         Ok(())
@@ -1380,6 +1445,13 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             slot.max_timestamp_ms = old_max_timestamp_ms;
         }
         old.seal().map_err(|_| StorageError::WriterFrozen)?;
+        // The seal flushed and fsynced every pending byte, so the just-sealed segment's whole record
+        // region is now in the file: raise ITS resident seek index `flushed_end` to its full
+        // `valid_end` so a read of this now-sealed predecessor seeks over its entire prefix (#537).
+        // Done by the OLD active id, BEFORE `start_segment` repoints `active_id` to the new segment.
+        if let Some(idx) = self.segment_indexes.borrow_mut().get_mut(&self.active_id) {
+            idx.flushed_end = idx.valid_end;
+        }
         // The segment footer is durable physical write volume (#118): `seal` wrote and fsynced the
         // 32-byte footer, so charge it to the wear total here (the per-record frames and this
         // segment's header were charged on append and `start_segment`).
@@ -1680,22 +1752,29 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // The ids advance only after the write returns Ok.
         self.next_seq = next_seq;
         self.next_offset = next_offset;
-        // EXTEND the active segment's resident seek index (#483) in lockstep with the append: the
-        // record's frame starts at `pos_before` (the writer's `write_pos` before this append, the
-        // exact file byte offset it will occupy once flushed) and ends at `pos_before + frame_len`,
-        // which becomes the new readable `valid_end`. Reads are clamped to `flushed_offset`, which
-        // never runs ahead of the file, so an index entry is only ever USED once its bytes are in
-        // the file. Keeping the index current here is what lets the consume hot path seek O(1)
-        // without ever rebuilding the active segment's index. If the active segment's entry was
-        // evicted (it never is on this path, but be defensive), skip silently: a later read rebuilds.
+        // EXTEND the active segment's resident seek index (#483, sparse #537) in lockstep with the
+        // append: the record's frame starts at `pos_before` (the writer's `write_pos` before this
+        // append, the exact file byte offset it will occupy once flushed) and ends at `pos_before +
+        // frame_len`, which becomes the new readable `valid_end`. The frame is ANCHORED only when it
+        // is the first frame at or past the running `next_anchor_at` boundary (so anchors stay
+        // `stride` bytes apart, byte-identical to a rebuild's sparse walk); `record_count` still
+        // advances for EVERY record so the covered offset range is exact. Reads are clamped to
+        // `flushed_offset`, which never runs ahead of the file, so an index entry is only ever USED
+        // once its bytes are in the file. Keeping the index current here lets the consume hot path
+        // seek without rebuilding. If the active entry was evicted (it never is on this path, but be
+        // defensive), skip silently: a later read rebuilds.
         {
             let mut indexes = self.segment_indexes.borrow_mut();
             if let Some(idx) = indexes.get_mut(&self.active_id) {
                 // The append must be contiguous with the index (dense, in-order). If it somehow is
                 // not (an inconsistency that cannot occur on the single-writer path), drop the entry
                 // rather than record a wrong position, so a later read rebuilds from disk.
-                if idx.next_offset() == offset.get() {
-                    idx.positions.push(pos_before);
+                if idx.covered_end() == offset.get() {
+                    if pos_before >= idx.next_anchor_at {
+                        idx.anchors.push((offset.get(), pos_before));
+                        idx.next_anchor_at = pos_before.saturating_add(idx.stride);
+                    }
+                    idx.record_count = idx.record_count.saturating_add(1);
                     idx.valid_end = pos_before.saturating_add(frame_len);
                 } else {
                     indexes.remove(&self.active_id);
@@ -1761,6 +1840,10 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // relaxed levels' `synced_offset` catches up to the visible head, #341).
         self.flushed_offset = self.next_offset;
         self.synced_offset = self.next_offset;
+        // The pending bytes were just written to the file (the `sync` flushed them before its
+        // fdatasync), so the active seek index's flushed (in-file) prefix now reaches its full
+        // appended prefix: reads may safely seek up to here (#537).
+        self.raise_active_index_flushed_end();
         // The covering fsync just made every unsynced record durable, so the at-risk exposure is now
         // zero (#341): the next relaxed-level window measures from here.
         self.unsynced_record_bytes = 0;
@@ -1803,7 +1886,23 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // that `sync` issues. The records are NOT durable until a later `sync`, a roll's seal,
         // or a clean shutdown flush.
         self.flushed_offset = self.next_offset;
+        // The `flush_pending` above put every appended byte in the file, so the active seek index's
+        // flushed (in-file) prefix now reaches its full appended prefix (#537), exactly as after a
+        // `sync` — the records are visible (and in-file) even though not yet durable.
+        self.raise_active_index_flushed_end();
         Ok(())
+    }
+
+    /// Advances the ACTIVE segment's resident seek index `flushed_end` to its current `valid_end`
+    /// (#537): called after a `sync`/`flush_no_sync` flushes the writer's pending bytes to the file
+    /// and raises the visible head, so the index's flushed (in-file) read bound now reaches the whole
+    /// appended prefix. Every record below `flushed_offset` is thereby guaranteed in the file up to
+    /// `flushed_end`, so a seek-and-read never touches a not-yet-flushed (not-in-file) frame. A no-op
+    /// if the active index was evicted (it never is on this path, but be defensive).
+    fn raise_active_index_flushed_end(&self) {
+        if let Some(idx) = self.segment_indexes.borrow_mut().get_mut(&self.active_id) {
+            idx.flushed_end = idx.valid_end;
+        }
     }
 
     /// The first offset NOT yet covered by a returned `fdatasync` (the DURABLE head): under the
@@ -1981,26 +2080,47 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                 // nothing — the recovery reconciliation should have prevented it.
                 continue;
             }
-            // ORDINARY (dense, v1) segment: SEEK via the resident #483 index to the start offset's
-            // frame and read FORWARD, materializing (and FULL-CRC validating) up to the remaining
-            // `max`, instead of rescanning the whole segment from its base on every call. The
-            // per-segment start offset is `max(start_v, base)`: the FIRST segment seeks to the
-            // requested `start_v` (mid-segment), each later one to its base. The records come back
-            // already at-or-above the start, so no skip-before-start filter is needed.
+            // ORDINARY (dense, v1) segment: SEEK via the resident #483/#537 SPARSE index to the
+            // nearest ANCHOR at or before the start offset's frame and read FORWARD, materializing
+            // (and FULL-CRC validating) up to the remaining `max`, instead of rescanning the whole
+            // segment from its base on every call. The per-segment start offset is `max(start_v,
+            // base)`: the FIRST segment seeks to the requested `start_v` (mid-segment), each later one
+            // to its base. The sparse anchor may sit a BOUNDED number of records BEFORE `seg_start`
+            // (at most `stride` bytes), so the records come back at-or-above the ANCHOR offset and
+            // the few below `seg_start` are skipped here — the bounded forward scan between index
+            // points.
             let seg_start = start_v.max(slot.base_offset);
             let remaining = max - out.len();
-            // The seek read-end is the flushed-clamped readable end of THIS segment (see
-            // `seek_in_segment`): for a sealed predecessor it is the segment's whole `valid_end`; for
-            // the active segment it is `flushed`'s byte position, so a record at or beyond `flushed`
-            // (or still in the writer's pending buffer) is never materialized. A defensive count cap
-            // to the records below `flushed` belt-and-suspenders the byte bound.
-            if let Some((byte_pos, read_end)) = self.seek_in_segment(slot, seg_start, flushed)? {
+            // The seek read-end (see `seek_with`) is the FLUSHED (in-file) prefix end of THIS
+            // segment: for a sealed predecessor the whole `valid_end`; for the active segment the
+            // byte position up to which pending bytes were last flushed (which is exactly the
+            // `flushed_offset` boundary, raised in lockstep with it), so the byte bound alone keeps a
+            // frame at or beyond `flushed` — or still in the writer's pending buffer — from ever
+            // being materialized. The `below_flushed` count cap belt-and-suspenders that byte bound.
+            if let Some((anchor_offset, byte_pos, read_end)) =
+                self.seek_in_segment(slot, seg_start)?
+            {
+                // The pre-`seg_start` records the anchor sits before are read then dropped, so the
+                // read budget must cover them: `want` = the gap (`seg_start - anchor_offset`, bounded
+                // by `stride` bytes) plus the records actually wanted, clamped to the records below
+                // `flushed`. The gap is a small constant, so this never reads the whole segment.
+                let gap = usize::try_from(seg_start.saturating_sub(anchor_offset)).unwrap_or(0);
                 let below_flushed =
-                    usize::try_from(flushed.saturating_sub(seg_start)).unwrap_or(usize::MAX);
-                let want = remaining.min(below_flushed);
+                    usize::try_from(flushed.saturating_sub(anchor_offset)).unwrap_or(usize::MAX);
+                let want = remaining.saturating_add(gap).min(below_flushed);
                 let reader = SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?;
-                let records = reader.scan_from(byte_pos, Offset::new(seg_start), read_end, want)?;
-                out.extend(records);
+                let records =
+                    reader.scan_from(byte_pos, Offset::new(anchor_offset), read_end, want)?;
+                for record in records {
+                    // Skip the bounded run of records the anchor preceded `seg_start` by.
+                    if record.offset.get() < seg_start {
+                        continue;
+                    }
+                    if out.len() >= max {
+                        return Ok(out);
+                    }
+                    out.push(record);
+                }
                 // If the seek-and-read returned fewer than the per-segment budget, the segment is
                 // exhausted (its durable prefix ended); the loop advances to the next segment, which
                 // begins at the contiguous next offset.
@@ -2433,43 +2553,61 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         &self,
         slot: &SegmentSlot,
         start_offset: u64,
-        flushed: u64,
-    ) -> Result<Option<(u64, u64)>, StorageError> {
+    ) -> Result<Option<(u64, u64, u64)>, StorageError> {
         // A compacted (v2, sparse) segment is never indexed here; the caller routes it to the v2
         // scan. This guard keeps the resident index strictly to the dense case.
         debug_assert!(slot.compacted_covered.is_none());
         if let Some(idx) = self.segment_indexes.borrow().get(&slot.id) {
-            return Ok(Self::seek_with(idx, start_offset, flushed));
+            return Ok(Self::seek_with(idx, start_offset));
         }
-        // Build once from the durable frames: the positions delimit exactly the valid prefix a
-        // scan would, so seeking into the index can never point past a torn tail.
+        // Build once from the durable frames: the SPARSE anchors delimit exactly the valid prefix a
+        // scan would (the streaming walk stops at the same torn tail), so seeking into the index can
+        // never point past a torn tail. The build is `O(records)` ONCE (header-only stepping, no body
+        // materialization) and the resident result is `O(region_bytes / stride)`. This build path is
+        // for SEALED predecessors (the active segment's index is always append-seeded), whose whole
+        // record region is durable and in the file, so `flushed_end == valid_end`.
         let reader = SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?;
-        let (positions, valid_end) = reader.record_byte_positions()?;
+        let (anchors, valid_end) =
+            reader.sparse_record_byte_positions(SEGMENT_INDEX_STRIDE_BYTES)?;
+        // The covered record count is the dense record count of the valid prefix. Recover it from the
+        // segment's own recovery scan (the authoritative count of the valid prefix), falling back to
+        // the slot's running count if that scan somehow fails.
+        let record_count = reader
+            .scan_recovery()
+            .map_or(slot.record_count, |r| r.record_count);
         let index = SegmentIndex {
             base_offset: slot.base_offset,
-            positions,
+            anchors,
+            record_count,
+            stride: SEGMENT_INDEX_STRIDE_BYTES,
+            next_anchor_at: valid_end,
             valid_end,
+            flushed_end: valid_end,
         };
-        let result = Self::seek_with(&index, start_offset, flushed);
+        let result = Self::seek_with(&index, start_offset);
         self.segment_indexes.borrow_mut().insert(slot.id, index);
         Ok(result)
     }
 
-    /// Resolves `start_offset` to its frame byte position and the flushed-bounded read-end against a
-    /// built `index`. The read-end is `index`'s byte position for `flushed` (the first non-visible
-    /// offset) when the index covers it — so a partly-visible active segment reads only the frames
-    /// below `flushed`, never a pending one — and otherwise the index's `valid_end` (the whole
-    /// durable record region, for a sealed predecessor that lies entirely below `flushed`). `None`
-    /// when `start_offset` is not covered (the caller falls back to a full scan).
-    fn seek_with(index: &SegmentIndex, start_offset: u64, flushed: u64) -> Option<(u64, u64)> {
-        let byte_pos = index.byte_position(start_offset)?;
-        // `flushed`'s frame position if it falls inside this index (the active segment's visible
-        // boundary), else the full durable region end (a sealed segment entirely below `flushed`).
-        let read_end = index
-            .byte_position(flushed)
-            .unwrap_or(index.valid_end)
-            .min(index.valid_end);
-        Some((byte_pos, read_end))
+    /// Resolves `start_offset` to its SEEK anchor (the nearest indexed `(anchor offset, anchor byte
+    /// position)` at or before it) and the flushed-bounded read-end against a built `index` (#537).
+    /// The caller seeks to the anchor byte position, reads forward, and skips the bounded run of
+    /// records below `start_offset`. The read-end is the index's `flushed_end` (the in-file prefix
+    /// end): for the active segment that is where pending bytes were last flushed to the file, so a
+    /// seek never reads an appended-but-not-yet-flushed frame; for a sealed predecessor it is the
+    /// whole durable record region (`flushed_end == valid_end`). `None` when `start_offset` is not
+    /// covered (the caller falls back to a full scan).
+    fn seek_with(index: &SegmentIndex, start_offset: u64) -> Option<(u64, u64, u64)> {
+        let covered_end = index.covered_end();
+        let (anchor_offset, byte_pos) = index.seek_anchor(start_offset, covered_end)?;
+        // The read-end is the FLUSHED (in-file) prefix end: for a sealed predecessor this is the
+        // whole durable record region (`flushed_end == valid_end`); for the active segment it is the
+        // byte position up to which pending bytes were last flushed to the file, so a seek never
+        // reads an appended-but-not-yet-flushed (not-in-file) frame. The per-record `>= flushed`
+        // offset filter in `read_from` then enforces the exact visibility boundary among the in-file
+        // frames the read returns.
+        let read_end = index.flushed_end.min(index.valid_end);
+        Some((anchor_offset, byte_pos, read_end))
     }
 
     /// Ensures a RESIDENT sparse seek index (#481) exists for the COMPACTED (v2) segment `slot`,
@@ -2573,18 +2711,25 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         self.segment_indexes.borrow_mut().clear();
     }
 
-    /// Installs a deliberately CORRUPT seek index for segment `id` whose every entry points at the
-    /// FIRST record's byte position, so a seek that consulted it would return the WRONG record. A
-    /// test installs this, confirms the retirement path EVICTS it, and then confirms the rebuilt
-    /// index serves the right data — proving a stale index can never outlive its segment.
+    /// Installs a deliberately CORRUPT seek index for segment `id` with ONE anchor pointing at a
+    /// byte position WELL PAST the segment's records (`valid_end`), so a seek that consulted it would
+    /// read nothing (the wrong, empty result) for every covered offset. A test installs this,
+    /// confirms the retirement path EVICTS it, and then confirms the rebuilt index serves the right
+    /// data — proving a stale index can never outlive its segment.
     fn poison_segment_index(&self, id: u64, base_offset: u64, len: usize, valid_end: u64) {
-        let first = SEGMENT_HEADER_LEN as u64;
         self.segment_indexes.borrow_mut().insert(
             id,
             SegmentIndex {
                 base_offset,
-                positions: vec![first; len],
+                // A single anchor at the END of the region: `seek_anchor` resolves every covered
+                // offset to it, so a read would seek past the records and return the wrong (empty)
+                // slice — clear evidence the poisoned index was consulted instead of being evicted.
+                anchors: vec![(base_offset, valid_end)],
+                record_count: len as u64,
+                stride: SEGMENT_INDEX_STRIDE_BYTES,
+                next_anchor_at: valid_end,
                 valid_end,
+                flushed_end: valid_end,
             },
         );
     }
@@ -4267,6 +4412,86 @@ mod tests {
             log.segments.len(),
             "no stale index entry survives a reap"
         );
+    }
+
+    /// #537 BOUNDED MEMORY: a single segment packed with MANY small records has a resident SPARSE
+    /// index whose anchor count is `O(region_bytes / stride)` — far below one-per-record — so the
+    /// per-segment index RAM does not scale with the record count. This is the property that keeps a
+    /// slow/replaying consumer's resident footprint inside the tiny-profile RAM budget; a dense index
+    /// would hold one entry per record here.
+    #[test]
+    fn the_sparse_index_holds_far_fewer_anchors_than_records() {
+        // One big segment (no rolling) packed with many tiny records, so the dense count is large.
+        let mut log = open_mem(LogConfig::new(8 * 1024 * 1024).unwrap());
+        let n: u64 = 4000;
+        for i in 0..n {
+            log.append(&rec(&[u8::try_from(i % 256).unwrap(); 4]))
+                .unwrap();
+        }
+        log.sync().unwrap();
+        assert_eq!(log.segment_count(), 1, "all records in one segment");
+        // A read builds/extends the resident index; read everything so it is fully populated.
+        let all = log.read_from(Offset::ZERO, usize::MAX).unwrap();
+        assert_eq!(all.len() as u64, n, "all records read back");
+        // The 4 KiB-stride anchor count is bounded by region_bytes / stride. A 4-byte-payload frame
+        // is 48 bytes, so n records ≈ 192 KiB of frames ≈ ~48 anchors at a 4 KiB stride — far below
+        // the n records a dense index would hold.
+        let anchors = log
+            .segment_indexes
+            .borrow()
+            .get(&log.active_segment_id())
+            .map(|idx| idx.anchors.len())
+            .unwrap();
+        let frame_bytes = log.durable_record_bytes();
+        let bound = (frame_bytes / SEGMENT_INDEX_STRIDE_BYTES) as usize + 2;
+        assert!(
+            anchors <= bound,
+            "anchors {anchors} exceed the stride bound {bound}"
+        );
+        assert!(
+            (anchors as u64) * 8 < n,
+            "the sparse index ({anchors} anchors) is far smaller than a dense one ({n} records)"
+        );
+    }
+
+    /// #537 LOCATE CORRECTNESS through a BUILT (not append-seeded) sparse index: a reopen rebuilds
+    /// the index from the durable frames, and a read of EVERY offset in a many-record segment returns
+    /// exactly the record at that offset — proving the anchor-then-bounded-forward-scan locates the
+    /// right byte range across the sparse gaps.
+    #[test]
+    fn the_built_sparse_index_locates_every_offset_in_a_packed_segment() {
+        let mut log = open_mem(LogConfig::new(8 * 1024 * 1024).unwrap());
+        let n: u64 = 500;
+        for i in 0..n {
+            log.append(&rec(&[u8::try_from(i % 256).unwrap(); 7]))
+                .unwrap();
+        }
+        log.sync().unwrap();
+        // Reopen so the index is BUILT from disk (the sparse walk), not the append-seeded one.
+        let fs = log.into_filesystem();
+        let log = Log::open(
+            fs,
+            ManualClock::new(),
+            LogConfig::new(8 * 1024 * 1024).unwrap(),
+        )
+        .unwrap();
+        for start in 0..n {
+            let got = log.read_from(Offset::new(start), 3).unwrap();
+            let want_len = 3.min(usize::try_from(n - start).unwrap());
+            assert_eq!(got.len(), want_len, "count at start={start}");
+            for (k, r) in got.iter().enumerate() {
+                assert_eq!(
+                    r.offset,
+                    Offset::new(start + k as u64),
+                    "offset at start={start} k={k}"
+                );
+                assert_eq!(
+                    r.payload.as_ref(),
+                    &[u8::try_from((start + k as u64) % 256).unwrap(); 7],
+                    "payload at start={start} k={k}"
+                );
+            }
+        }
     }
 
     #[test]

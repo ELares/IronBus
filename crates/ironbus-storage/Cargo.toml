@@ -62,3 +62,11 @@ workspace = true
 [[bench]]
 name = "wal_append"
 harness = false
+
+# Informational micro-bench for the consume read LOCATE (#537): full-scan-per-delivery (the
+# pre-#483 behavior) vs the resident sparse-byte-index seek, over a single many-record segment.
+# Run on demand (`cargo bench -p ironbus-storage`), not wired into per-PR CI; the full consume-vs-NATS
+# leg is #554.
+[[bench]]
+name = "read_seek"
+harness = false

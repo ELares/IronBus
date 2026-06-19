@@ -61,8 +61,8 @@ Throughout, MiB = 1024 * 1024 bytes and KiB = 1024 bytes.
 
 ## The RAM sources and their bounding knobs
 
-There are six process-RSS sources plus a fixed overhead. Each is bounded by a
-specific knob, cited to the code.
+There are seven process-RSS sources (one of which is the fixed overhead). Each is
+bounded by a specific knob or a per-segment constant, cited to the code.
 
 ### 1. Per-connection in-flight messages (the dominant term)
 
@@ -300,6 +300,43 @@ a few thousand) AND `--dedup-max-producers` (e.g. to a few hundred) when enablin
 dedup, sizing the count bound to the realistic in-flight retry depth and the
 producer fan-in rather than the shipped defaults; the 2-minute time bound then
 caps how long any id lingers regardless.
+
+### 7. Resident per-segment seek index (the consume read plane)
+
+The consume read path keeps a small RESIDENT, in-memory seek index per OPEN segment
+so `Log::read_from` can SEEK to a record's frame instead of re-scanning the whole
+segment on every delivery
+([#483](https://github.com/ELares/IronBus/issues/483),
+[#537](https://github.com/ELares/IronBus/issues/537);
+`crates/ironbus-storage/src/log.rs`, `SegmentIndex` / `CompactedIndex`). It is
+SPARSE — Kafka's `.index` design — holding ONE `(offset, byte position)` anchor per
+`SEGMENT_INDEX_STRIDE_BYTES` (**4 KiB**) of frame data, NOT one per record, so its
+RAM is `O(region_bytes / stride)` **independent of the record count**:
+
+```
+per_segment_index = (max_segment_bytes / 4096) anchors x 16 bytes/anchor
+edge-tiny (max_segment_bytes = 8 MiB):
+                  = (8 MiB / 4 KiB) x 16 B = 2048 x 16 B = 32 KiB per resident segment
+```
+
+This matters because the index is built per OPEN segment and held while it is read,
+so a slow or replaying consumer (or a follower read) can pin SEVERAL sealed segments
+resident at once. A DENSE one-entry-per-record index — the pre-#537 shape — would
+have cost one `u64` per record: a fully-packed 8 MiB edge segment of 36-byte frames
+is ~233k records ~= **1.86 MiB** of index PER segment, scaling with the record count
+and the read working set, and was UNACCOUNTED here. The sparse index replaces that
+with a flat ~32 KiB/segment that does not grow as small records pack in; the read
+seeks to the nearest anchor and forward-scans at most one stride (~114 minimum-size
+frames), a bounded constant. Even pinning, say, 16 resident segments is ~512 KiB —
+under 1% of the 64 MiB ceiling.
+
+It is RESIDENT-ONLY and never persisted: built on first read (or seeded as the
+active segment appends), EVICTED the instant a segment is retired (reap, force-reap,
+compaction install), and rebuilt from the durable frames on reopen, so it adds no
+on-disk format and no recovery surface. The refuse-to-boot guard does not model this
+term (it is small, bounded, and not a configured buffer cap), but the per-segment
+bound above lets an operator add it to a hand sizing when many segments are pinned by
+a replaying consumer.
 
 ## A worked tiny-profile configuration that fits under 64 MiB
 
