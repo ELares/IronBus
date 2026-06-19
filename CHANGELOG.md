@@ -6,6 +6,12 @@ to follow Semantic Versioning once it reaches a tagged release.
 
 ## [Unreleased]
 
+### Added
+- `Client::pipelined_producer()` / `pipelined_producer_with_window(window)` (#508): an auto-pipelining DURABLE single-producer handle, the client-side complement to the server group-commit gather (#454/#472/#507). It buffers a window of at-least-once publishes (default `DEFAULT_PIPELINE_WINDOW` = 64), serializing each into an owned wire frame so the caller's input buffers are free immediately, then writes the window as ONE pipelined batch (the `produce_window` wire discipline) so the broker collapses it under a single fdatasync. The caller drains acks at `flush()`/`finish()` (a `FlushSummary` tally). This LIFTS a single producer's durable throughput from ~one-publish-per-fsync to the group-commit rate (a measured isolated-disk `bench --mode publish` rose from ~240 msg/s to ~13.5k msg/s, ~55x, with per-op fsync cost dropping ~4004 us to ~63 us) while keeping the ack-implies-durable guarantee intact (every ack still means fsynced-durable; only WHEN the ack is observed moves). `bench --mode publish` gains `--autopipe` (sized by `--pubwindow`, default window when omitted) to drive it, with an additive `"auto_pipeline"` JSON field (schema version unchanged); publish-only, mutually exclusive with `--stream` and `--fire-and-forget`. ADDITIVE and NON-BREAKING: `Client::produce`'s fully-synchronous, one-publish-in-flight, durable-on-return contract is UNCHANGED. No broker or wire-protocol changes.
+
+### Changed
+- `Client::produce`'s doc now points a producer that needs higher SINGLE-producer durable throughput at the pipelined paths (`pipelined_producer`, `produce_window`, `produce_stream`) and states explicitly that its own synchronous one-in-flight contract is deliberately left unchanged (#508). Guidance only; no behavior change.
+
 ### Fixed
 - `bench --mode subscribe` no longer HANGS when the broker retains fewer records than the preload count (#19 corpus work). The drain loop's count-bound stop required `recorded >= expected`, so if any preloaded record was shed under a byte cap (memory mode, or a disk drop policy) the drain looped forever waiting for records that would never arrive. It now also terminates once the queue has stayed empty for a grace window (the producer finishes before the drain starts, so a sustained-empty queue cannot refill), and reports how many records were shed. The termination predicate is extracted as a pure, unit-tested `drain_should_stop`.
 
