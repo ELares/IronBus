@@ -1199,6 +1199,115 @@ pub fn decode_info(body: &[u8]) -> Result<InfoBody, BodyError> {
     })
 }
 
+/// The version of the `Fetch` (batch-pull) body framing (#489). Version `1` is the first (and only)
+/// layout. Carried as a leading byte so a future version can extend the body without a wire break: a
+/// reader rejects a version it does not understand rather than mis-parsing it.
+pub const FETCH_BODY_VERSION: u8 = 1;
+
+/// The `Fetch` flag bit (#489) marking the request NO-WAIT: the server returns IMMEDIATELY with
+/// whatever records are ready, draining a single pass and never waiting out the `expires` deadline for
+/// more to arrive. When clear, the server may drain up to the `expires` deadline. The bit is the
+/// direct analogue of a NATS pull consumer's `no_wait`.
+pub const FETCH_FLAG_NO_WAIT: u8 = 0b0000_0001;
+
+/// A consumer batch-pull FETCH request (the `Fetch` frame body, #489): a NATS pull-consumer-style
+/// request to drain up to `max_records` / `max_bytes` of deliverable records in ONE round-trip,
+/// amortizing the per-poll actor hop and read cost across the whole batch. It is the BATCH twin of the
+/// per-record `Flow` request; the server runs the SAME per-record poll (preserving the lease/credit,
+/// at-least-once, and broadcast/`key_shared`/competing semantics exactly), so a batch fetch delivers
+/// EXACTLY the records N successive per-record polls would, just in one request. The effective batch is
+/// further bounded server-side by the negotiated per-consumer credit and byte budget (#292/#275) and
+/// the group's `max_in_flight` window, so a generous `max_records` / `max_bytes` never over-delivers.
+///
+/// Layout (version+length framed, forward-compatible, mirroring [`ConnectBody`]): `body_version: u8`
+/// ([`FETCH_BODY_VERSION`]), `field_len: u16` (the length of the v1 known-field block that follows),
+/// then the v1 block: `flags: u8`, `max_records: u32 LE`, `max_bytes: u64 LE`, `expires_ms: u64 LE`.
+/// Bytes past `field_len` (a future version's appended fields) are TOLERATED and ignored by a v1
+/// reader.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FetchBody {
+    /// The maximum number of records to deliver in this batch. The server delivers at most this many
+    /// (and possibly fewer: the negotiated credit, the byte budget, the group's available records, the
+    /// byte cap, and the deadline all bind first). A value of `0` requests nothing.
+    pub max_records: u32,
+    /// The maximum total payload-equivalent bytes to deliver in this batch (key + headers + payload per
+    /// record, matching the per-consumer byte-budget accounting). `0` means UNBOUNDED by bytes (only the
+    /// record count, credit, and deadline bind). The server stops once delivering the next record would
+    /// exceed this, EXCEPT the floor-of-one (a batch always delivers at least one ready record so a
+    /// single over-cap record never wedges the consumer), exactly the existing per-consumer byte-budget
+    /// floor.
+    pub max_bytes: u64,
+    /// The batch's deadline budget in milliseconds: the maximum wall-clock time the server spends
+    /// draining this batch before terminating it with whatever it has gathered. `0` means NO deadline
+    /// (drain until a bound binds). Measured on the server's monotonic clock; it bounds server WORK and
+    /// never changes WHICH records are delivered (the engine poll is non-blocking, so the deadline only
+    /// caps how long a large drain may run). Ignored when `no_wait` is set (a no-wait fetch is a single
+    /// immediate pass).
+    pub expires_ms: u64,
+    /// Whether this fetch is NO-WAIT (#489): when `true`, the server drains a single pass and returns
+    /// immediately with whatever is ready, never waiting out `expires_ms`. When `false`, the server may
+    /// drain up to the `expires_ms` deadline. The direct analogue of a NATS pull consumer's `no_wait`.
+    /// Carried in the [`FETCH_FLAG_NO_WAIT`] bit of the body's `flags`.
+    pub no_wait: bool,
+}
+
+/// The number of bytes in the `Fetch` v1 known-field block: `flags: u8` + `max_records: u32` +
+/// `max_bytes: u64` + `expires_ms: u64`.
+const FETCH_V1_FIELD_LEN: u16 = 1 + 4 + 8 + 8;
+
+/// Encodes a `Fetch` body onto the end of `out` (#489): the version byte, the v1 field-block length,
+/// then the v1 block. The `no_wait` field is derived into the [`FETCH_FLAG_NO_WAIT`] bit of the written
+/// `flags`, so the flag and the field can never disagree.
+pub fn encode_fetch(req: &FetchBody, out: &mut Vec<u8>) {
+    out.push(FETCH_BODY_VERSION);
+    out.extend_from_slice(&FETCH_V1_FIELD_LEN.to_le_bytes());
+    let mut flags = 0u8;
+    if req.no_wait {
+        flags |= FETCH_FLAG_NO_WAIT;
+    }
+    out.push(flags);
+    out.extend_from_slice(&req.max_records.to_le_bytes());
+    out.extend_from_slice(&req.max_bytes.to_le_bytes());
+    out.extend_from_slice(&req.expires_ms.to_le_bytes());
+}
+
+/// Decodes a `Fetch` body (#489), cap-before-alloc and panic-free.
+///
+/// The body MUST carry the version byte and the `u16` field-length; the v1 known fields are read from
+/// the front of the declared block and any trailing bytes (a future version's appended fields) are
+/// tolerated and ignored, so a newer client's longer body still decodes its v1 fields here. A body too
+/// short to hold the `field_len` it declares is a typed [`BodyError`], never a panic or an over-read
+/// (the `field_len` is bounded against the actual body by [`Reader::take`] BEFORE any read). Unlike the
+/// handshake bodies an EMPTY body is NOT a valid `Fetch` (there is no historical empty-`Fetch` case: the
+/// frame type itself is new), so it is a typed [`BodyError::Truncated`].
+///
+/// # Errors
+/// Returns [`BodyError::Truncated`] if the body is too short for the version/length header or the
+/// declared field block, or [`BodyError::BadHandshakeVersion`] for an unknown body version.
+pub fn decode_fetch(body: &[u8]) -> Result<FetchBody, BodyError> {
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != FETCH_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    let mut fr = Reader::new(block);
+    // Every v1 slot occupies a fixed position and is always consumed in order; a short block (a sender
+    // that declared fewer bytes) reads what is present and defaults the rest, never panicking.
+    let flags = fr.u8().unwrap_or(0);
+    let max_records = fr.u32().unwrap_or(0);
+    let max_bytes = fr.u64().unwrap_or(0);
+    let expires_ms = fr.u64().unwrap_or(0);
+    let no_wait = flags & FETCH_FLAG_NO_WAIT != 0;
+    Ok(FetchBody {
+        max_records,
+        max_bytes,
+        expires_ms,
+        no_wait,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1726,6 +1835,70 @@ mod tests {
         assert_eq!(decode_ack(&[0u8; 26]), Err(BodyError::TrailingBytes));
     }
 
+    #[test]
+    fn fetch_round_trips_and_derives_the_no_wait_bit() {
+        // #489: every field round-trips, and `no_wait` is carried in the FETCH_FLAG_NO_WAIT bit.
+        let req = FetchBody {
+            max_records: 0x0102_0304,
+            max_bytes: 0x0506_0708_090a_0b0c,
+            expires_ms: 5_000,
+            no_wait: true,
+        };
+        let mut buf = Vec::new();
+        encode_fetch(&req, &mut buf);
+        // version(1) + field_len(2) + flags(1) + max_records(4) + max_bytes(8) + expires_ms(8) = 24.
+        assert_eq!(buf.len(), 1 + 2 + 1 + 4 + 8 + 8);
+        // The no_wait field set the flag bit on the wire (the flags byte is the first block byte).
+        assert_eq!(buf[3] & FETCH_FLAG_NO_WAIT, FETCH_FLAG_NO_WAIT);
+        assert_eq!(decode_fetch(&buf).unwrap(), req);
+
+        // A waiting (no_wait = false) fetch clears the bit.
+        let waiting = FetchBody {
+            no_wait: false,
+            ..req
+        };
+        let mut buf2 = Vec::new();
+        encode_fetch(&waiting, &mut buf2);
+        assert_eq!(buf2[3] & FETCH_FLAG_NO_WAIT, 0);
+        assert_eq!(decode_fetch(&buf2).unwrap(), waiting);
+    }
+
+    #[test]
+    fn fetch_rejects_an_empty_or_short_body_and_an_unknown_version() {
+        // The Fetch frame type is new, so there is NO historical empty-body case: an empty body is a
+        // typed Truncated, never a default request.
+        assert_eq!(decode_fetch(&[]), Err(BodyError::Truncated));
+        // A non-empty body too short to hold the version+length header is Truncated, not a panic.
+        assert_eq!(
+            decode_fetch(&[FETCH_BODY_VERSION]),
+            Err(BodyError::Truncated)
+        );
+        // An unknown body version is a typed reject (a future layout this build cannot interpret).
+        let mut bad = Vec::new();
+        encode_fetch(&FetchBody::default(), &mut bad);
+        bad[0] = 2; // bump the version byte past what this build knows
+        assert_eq!(
+            decode_fetch(&bad),
+            Err(BodyError::BadHandshakeVersion { version: 2 })
+        );
+    }
+
+    #[test]
+    fn fetch_tolerates_a_future_appended_field() {
+        // A newer client may append fields past the declared v1 block; a v1 reader decodes its known
+        // fields and ignores the tail (forward-compat), exactly like the handshake bodies.
+        let req = FetchBody {
+            max_records: 7,
+            max_bytes: 4096,
+            expires_ms: 250,
+            no_wait: false,
+        };
+        let mut buf = Vec::new();
+        encode_fetch(&req, &mut buf);
+        buf.extend_from_slice(b"future-fields"); // appended past field_len
+        assert_eq!(decode_fetch(&buf).unwrap(), req);
+    }
+
     proptest! {
         #[test]
         fn any_pub_round_trips(
@@ -1968,6 +2141,30 @@ mod tests {
             } else {
                 prop_assert!(c.is_ok() && i.is_ok());
             }
+        }
+
+        /// A Fetch body round-trips every field for any inputs (#489): the encoder is the exact inverse
+        /// of the decoder, and the `no_wait` flag bit and the field agree.
+        #[test]
+        fn any_fetch_round_trips(
+            max_records in any::<u32>(),
+            max_bytes in any::<u64>(),
+            expires_ms in any::<u64>(),
+            no_wait in any::<bool>(),
+        ) {
+            let req = FetchBody { max_records, max_bytes, expires_ms, no_wait };
+            let mut buf = Vec::new();
+            encode_fetch(&req, &mut buf);
+            prop_assert_eq!(decode_fetch(&buf).unwrap(), req);
+        }
+
+        /// Decoding ARBITRARY bytes as a Fetch body never panics and never over-allocates: a hostile
+        /// version/length is always a typed Result, mirroring the handshake-body fuzz property.
+        #[test]
+        fn decode_fetch_on_arbitrary_bytes_never_panics(
+            bytes in prop::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let _ = decode_fetch(&bytes);
         }
     }
 

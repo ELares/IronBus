@@ -9,6 +9,7 @@
 
 use crate::io::RandomAccessFile;
 use crate::loss::{CapViolation, ReasonCode};
+use bytes::{Bytes, BytesMut};
 use ironbus_core::codec::{self, DecodeError, RecordView};
 use ironbus_core::format::{
     COMPACTION_META_LEN, RECORD_HEADER_LEN, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN,
@@ -231,8 +232,19 @@ impl StorageError {
     }
 }
 
-/// An owned copy of a decoded record (the codec yields a borrowed view; a scan owns
-/// its bytes).
+/// A materialized decoded record: the codec yields a borrowed [`RecordView`] over the read buffer;
+/// this owns the record so a scan can return it after the read.
+///
+/// The `key`, `headers`, and `payload` are [`Bytes`] handles (#480, the storage F2 finding): when a
+/// read materializes N records, the segment region is read into ONE buffer and each record's three
+/// blobs are REFCOUNTED slices of that shared buffer ([`Bytes::slice_ref`]) rather than three
+/// per-record `Vec` deep copies. A `read_from` is then one buffer allocation plus refcounted slices
+/// (a refcount bump per blob), not O(N) allocations and O(total bytes) copied, on the consume hot
+/// path. The materialized bytes are BYTE-IDENTICAL to a `to_vec` copy (a `Bytes` slice exposes the
+/// same bytes), and the frame's full CRC is validated by the codec BEFORE any slice is taken, so a
+/// handle is never a window into an unvalidated frame. `Bytes` derefs to `&[u8]`, so every reader
+/// that took `&[u8]` (the engine, compaction, the DLQ codec) is unchanged; a clone is a refcount
+/// bump, which is exactly the zero-copy fan-out the borrowed codec view was designed to enable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnedRecord {
     /// The log offset assigned to this record.
@@ -243,24 +255,31 @@ pub struct OwnedRecord {
     pub timestamp_ms: u64,
     /// Record flags as stored.
     pub flags: RecordFlags,
-    /// The routing or ordering key (empty if none).
-    pub key: Vec<u8>,
-    /// The record headers blob (empty if none).
-    pub headers: Vec<u8>,
-    /// The record payload.
-    pub payload: Vec<u8>,
+    /// The routing or ordering key (empty if none). A refcounted slice of the shared read buffer.
+    pub key: Bytes,
+    /// The record headers blob (empty if none). A refcounted slice of the shared read buffer.
+    pub headers: Bytes,
+    /// The record payload. A refcounted slice of the shared read buffer.
+    pub payload: Bytes,
 }
 
 impl OwnedRecord {
-    fn from_view(offset: Offset, v: &RecordView<'_>) -> OwnedRecord {
+    /// Materializes a record from a CRC-VALIDATED [`RecordView`] by taking refcounted slices of the
+    /// shared read `buf` the view borrows (#480). `buf` MUST be the exact buffer the `view` was
+    /// decoded from: [`Bytes::slice_ref`] resolves each blob's sub-range by its address WITHIN `buf`,
+    /// so the returned handles alias `buf` (one refcount bump each, no copy) and `buf` outlives every
+    /// record built from it (its bytes are freed when the last slice drops). The view's slices were
+    /// produced by `codec::decode`, which validates the whole frame's header and body CRC first, so a
+    /// slice is only ever taken over an already-validated frame — never a window into a torn frame.
+    fn from_view(offset: Offset, buf: &Bytes, v: &RecordView<'_>) -> OwnedRecord {
         OwnedRecord {
             offset,
             seq: v.seq,
             timestamp_ms: v.timestamp_ms,
             flags: v.flags,
-            key: v.key.to_vec(),
-            headers: v.headers.to_vec(),
-            payload: v.payload.to_vec(),
+            key: buf.slice_ref(v.key),
+            headers: buf.slice_ref(v.headers),
+            payload: buf.slice_ref(v.payload),
         }
     }
 }
@@ -829,10 +848,15 @@ impl<F: RandomAccessFile> SegmentReader<F> {
     ) -> Result<(Vec<OwnedRecord>, u64, bool), StorageError> {
         let body_len =
             usize::try_from(end.saturating_sub(start)).map_err(|_| StorageError::SegmentFull)?;
-        let mut body = vec![0u8; body_len];
+        // Read the region into ONE buffer and freeze it to a shared `Bytes` (#480): every record this
+        // walk materializes takes refcounted slices of `body` instead of three per-record `Vec`
+        // copies, so the whole scan is one allocation + refcount bumps. The frozen buffer outlives the
+        // returned records (each holds a ref), so it is freed only when the last record drops.
+        let mut buf = BytesMut::zeroed(body_len);
         if body_len > 0 {
-            self.file.read_exact_at(&mut body, start)?;
+            self.file.read_exact_at(&mut buf, start)?;
         }
+        let body = buf.freeze();
         let mut records = Vec::new();
         let mut cursor = 0usize;
         let mut clean = true;
@@ -849,7 +873,9 @@ impl<F: RandomAccessFile> SegmentReader<F> {
                     .get()
                     .saturating_add(records.len() as u64),
             );
-            records.push(OwnedRecord::from_view(offset, &view));
+            // The decode above validated the whole frame's CRC, so the view's slices are over an
+            // already-validated frame; `from_view` then refcount-slices them out of `body`.
+            records.push(OwnedRecord::from_view(offset, &body, &view));
             cursor += consumed;
         }
         Ok((records, cursor as u64, clean))
@@ -974,8 +1000,12 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         }
         let len = usize::try_from(read_end.saturating_sub(start_byte))
             .map_err(|_| StorageError::SegmentFull)?;
-        let mut body = vec![0u8; len];
-        self.file.read_exact_at(&mut body, start_byte)?;
+        // ONE read into a shared `Bytes` buffer; each materialized record refcount-slices it (#480),
+        // so a seek-and-read-forward is one allocation + refcounted slices on the consume hot path,
+        // not O(records) allocations + O(bytes) copied. The buffer outlives the returned records.
+        let mut buf = BytesMut::zeroed(len);
+        self.file.read_exact_at(&mut buf, start_byte)?;
+        let body = buf.freeze();
         let mut records = Vec::with_capacity(max.min(64));
         let mut cursor = 0usize;
         let mut next_offset = start_offset.get();
@@ -984,7 +1014,12 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             let Ok((view, consumed)) = codec::decode(&body[cursor..]) else {
                 break;
             };
-            records.push(OwnedRecord::from_view(Offset::new(next_offset), &view));
+            // Frame CRC-validated by the decode above before the slice is taken.
+            records.push(OwnedRecord::from_view(
+                Offset::new(next_offset),
+                &body,
+                &view,
+            ));
             next_offset = next_offset.saturating_add(1);
             cursor += consumed;
         }
@@ -1047,10 +1082,14 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         let base_seq = self.header.base_seq.get();
         let body_len = usize::try_from(footer_start.saturating_sub(header_end))
             .map_err(|_| StorageError::SegmentFull)?;
-        let mut body = vec![0u8; body_len];
+        // The survivor region is read into ONE shared `Bytes` buffer and each survivor refcount-slices
+        // it (#480), the same one-alloc + refcounted-slices win as the dense path. The buffer outlives
+        // the returned survivors.
+        let mut bbuf = BytesMut::zeroed(body_len);
         if body_len > 0 {
-            self.file.read_exact_at(&mut body, header_end)?;
+            self.file.read_exact_at(&mut bbuf, header_end)?;
         }
+        let body = bbuf.freeze();
         let mut records: Vec<OwnedRecord> = Vec::new();
         let mut cursor = 0usize;
         let mut max_timestamp_ms = 0u64;
@@ -1075,7 +1114,8 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             // Reconstruct the original offset from the constant offset-minus-seq delta.
             let offset = Offset::new(base_off.wrapping_add(seq.wrapping_sub(base_seq)));
             max_timestamp_ms = max_timestamp_ms.max(view.timestamp_ms);
-            records.push(OwnedRecord::from_view(offset, &view));
+            // Frame CRC-validated by the decode above before the slice is taken.
+            records.push(OwnedRecord::from_view(offset, &body, &view));
             cursor += consumed;
         }
         // The footer must describe THIS body and bind to THIS segment id.
@@ -1230,8 +1270,11 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         }
         let len = usize::try_from(read_end.saturating_sub(start_byte))
             .map_err(|_| StorageError::SegmentFull)?;
-        let mut body = vec![0u8; len];
-        self.file.read_exact_at(&mut body, start_byte)?;
+        // ONE read into a shared `Bytes` buffer; each survivor refcount-slices it (#480), the same
+        // one-alloc + refcounted-slices win as the dense `scan_from`. The buffer outlives the records.
+        let mut buf = BytesMut::zeroed(len);
+        self.file.read_exact_at(&mut buf, start_byte)?;
+        let body = buf.freeze();
         let mut records = Vec::with_capacity(max.min(64));
         let mut cursor = 0usize;
         while cursor < body.len() && records.len() < max {
@@ -1243,7 +1286,8 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             // identical reconstruction `scan_compacted` applies.
             let seq = view.seq.get();
             let offset = Offset::new(base_off.wrapping_add(seq.wrapping_sub(base_seq)));
-            records.push(OwnedRecord::from_view(offset, &view));
+            // Frame CRC-validated by the decode above before the slice is taken.
+            records.push(OwnedRecord::from_view(offset, &body, &view));
             cursor += consumed;
         }
         Ok(records)
@@ -1440,9 +1484,9 @@ mod tests {
         assert!(scan.footer.is_none());
         assert_eq!(scan.records.len(), 3);
         assert_eq!(scan.records[0].offset, Offset::new(0));
-        assert_eq!(scan.records[0].payload, b"one");
+        assert_eq!(scan.records[0].payload.as_ref(), b"one");
         assert_eq!(scan.records[2].seq, Seq::new(2));
-        assert_eq!(scan.records[2].payload, b"three");
+        assert_eq!(scan.records[2].payload.as_ref(), b"three");
     }
 
     #[test]
@@ -1500,7 +1544,7 @@ mod tests {
             .unwrap();
         assert!(!scan.clean);
         assert_eq!(scan.records.len(), 1);
-        assert_eq!(scan.records[0].payload, b"good1");
+        assert_eq!(scan.records[0].payload.as_ref(), b"good1");
         assert_eq!(scan.valid_end, after_first);
     }
 
@@ -1594,7 +1638,7 @@ mod tests {
             .scan_from(positions[0], Offset::new(0), valid_end, 10)
             .unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].payload, b"good1");
+        assert_eq!(got[0].payload.as_ref(), b"good1");
     }
 
     #[test]
@@ -1665,7 +1709,7 @@ mod tests {
             .scan()
             .unwrap();
         assert_eq!(scan.records.len(), 1);
-        assert_eq!(scan.records[0].payload, b"durable");
+        assert_eq!(scan.records[0].payload.as_ref(), b"durable");
     }
 
     #[test]
@@ -1723,8 +1767,8 @@ mod tests {
         assert!(scan.footer.is_none());
         assert!(!scan.clean);
         assert_eq!(scan.records.len(), 2);
-        assert_eq!(scan.records[0].payload, b"a");
-        assert_eq!(scan.records[1].payload, b"b");
+        assert_eq!(scan.records[0].payload.as_ref(), b"a");
+        assert_eq!(scan.records[1].payload.as_ref(), b"b");
     }
 
     #[test]
@@ -1755,7 +1799,7 @@ mod tests {
         // Not falsely sealed; the un-corrupted prefix (the first record) survives.
         assert!(scan.footer.is_none());
         assert!(!scan.clean);
-        assert_eq!(scan.records[0].payload, b"small");
+        assert_eq!(scan.records[0].payload.as_ref(), b"small");
     }
 
     #[test]
@@ -1780,8 +1824,8 @@ mod tests {
             .unwrap();
         assert!(scan.footer.is_none());
         assert_eq!(scan.records.len(), 2);
-        assert_eq!(scan.records[0].payload, b"keep1");
-        assert_eq!(scan.records[1].payload, b"keep2");
+        assert_eq!(scan.records[0].payload.as_ref(), b"keep1");
+        assert_eq!(scan.records[1].payload.as_ref(), b"keep2");
     }
 
     #[test]
@@ -1957,7 +2001,7 @@ mod tests {
         assert_eq!(scan.records.len(), 3);
         assert_eq!(scan.records[1].seq, Seq::new(1));
         assert_eq!(scan.records[1].payload, big.as_slice());
-        assert_eq!(scan.records[2].payload, b"after");
+        assert_eq!(scan.records[2].payload.as_ref(), b"after");
 
         let streamed = SegmentReader::open(Arc::clone(&file))
             .unwrap()

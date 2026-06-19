@@ -29,10 +29,11 @@ use ironbus_core::lease::LeaseToken;
 use ironbus_core::types::{Offset, RecordFlags};
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
-    decode_ack, decode_connect, decode_cumulative_ack, decode_pub, decode_sub, encode_dead_letter,
-    encode_deliver, encode_gap_marker, encode_info, encode_pub_ack, encode_truncated, gap_reason,
-    pub_ack_level, AckLevel, AckOp, CreditAdvert, DeadLetterBody, DeliverBody, GapMarkerBody,
-    InfoBody, PubAckBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
+    decode_ack, decode_connect, decode_cumulative_ack, decode_fetch, decode_pub, decode_sub,
+    encode_dead_letter, encode_deliver, encode_gap_marker, encode_info, encode_pub_ack,
+    encode_truncated, gap_reason, pub_ack_level, AckLevel, AckOp, CreditAdvert, DeadLetterBody,
+    DeliverBody, GapMarkerBody, InfoBody, PubAckBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER,
+    PUB_WIRE_ONLY_FLAGS,
 };
 use ironbus_storage::fs::Filesystem;
 use std::collections::HashMap;
@@ -451,6 +452,10 @@ impl Session {
                 self.handle_cumulative_ack(engine, body, out).map(|()| true)
             }
             Some(FrameType::Flow) => self.handle_flow(engine, body, out).map(|()| true),
+            // The batch-pull FETCH (#489): the amortized twin of Flow. It runs the SAME per-record poll
+            // loop bounded by max_records/max_bytes/expires/no_wait, so it returns `true` to run the
+            // interval checkpoint exactly like Flow (it commits cursor progress the same way).
+            Some(FrameType::Fetch) => self.handle_fetch(engine, body, out).map(|()| true),
             Some(FrameType::Sub) => self.handle_sub(engine, body, out).map(|()| false),
             Some(FrameType::Unsub) => self.handle_unsub(engine, out).map(|()| true),
             // The standalone Nack frame type (a client sends a nack as an Ack frame with the
@@ -1199,6 +1204,196 @@ impl Session {
         Ok(())
     }
 
+    /// Handles a batch-pull `Fetch` (#489): the AMORTIZED twin of [`Session::handle_flow`]. It drains up
+    /// to `max_records` / `max_bytes` of deliverable records in ONE round-trip by running the SAME
+    /// per-record poll the `Flow` path runs, so it delivers EXACTLY the records that many successive
+    /// per-record `Flow`/poll calls would, leasing each one identically. The whole at-least-once,
+    /// lease/credit, and broadcast/`key_shared`/competing contract is preserved verbatim because every
+    /// delivery goes through the same [`Engine::poll_now_in_member`] + `leased` insert as `handle_flow`;
+    /// the batch only changes HOW MANY polls one request performs, never WHAT a poll does.
+    ///
+    /// The bounds compose as the MIN of: `max_records`, the per-consumer remaining credit
+    /// (`ceiling - leased.len()`, #65), the egress AIMD grant (#69), the group's `max_in_flight` window
+    /// (the engine returns `Poll::Idle` when it is full, ending the batch early, so the server never
+    /// over-delivers), `max_bytes` (the per-consumer byte budget, #275, with the same floor-of-one), and
+    /// the `expires` deadline. A `no_wait` fetch makes a SINGLE drain pass and returns whatever is ready
+    /// immediately, never waiting out the deadline. Because the engine poll is non-blocking (no record
+    /// arrives mid-call), `expires` bounds only the WORK a large drain may do; it never changes which
+    /// records are delivered. The response reuses the existing delivery frames (`Deliver` /`DeadLetter`/
+    /// `Truncated`/`GapMarker`) terminated by a single `FlowEnd`, byte-for-byte the `Flow` response, so a
+    /// fetch and an equivalent flow are indistinguishable on the wire past the request frame.
+    // The fetch drain is one cohesive loop (deadline, byte cap, claim, disposition, advisories), the
+    // batch analogue of `handle_flow` plus the #489 bounds; splitting it would scatter the single
+    // in-flight-window walk across helpers and obscure the order the bounds must bind in. Mirrors the
+    // `Engine::poll_in` allowance for the same reason.
+    #[allow(clippy::too_many_lines)]
+    fn handle_fetch<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        let Ok(req) = decode_fetch(body) else {
+            reply_err(out, "malformed fetch body");
+            return Ok(());
+        };
+        // Redelivery accounting (#65): free the slots of any leases this connection no longer holds
+        // (expired-and-redelivered, or committed) BEFORE computing remaining credit, exactly as the
+        // per-record Flow path does, so a stuck consumer's expired leases stop counting against it.
+        self.release_stale_leases(engine)?;
+        // The per-consumer remaining message credit: the ceiling minus what this connection already
+        // holds un-acked (identical to `handle_flow`). The batch is bounded by the MIN of the requested
+        // `max_records`, this remaining credit, and the egress AIMD grant, so a generous `max_records`
+        // can NEVER over-deliver past the negotiated ceiling — the same guard the per-record path uses.
+        let ceiling = self.credit_ceiling(engine)?;
+        let held = u32::try_from(self.leased.len()).unwrap_or(u32::MAX);
+        let remaining = ceiling.saturating_sub(held);
+        // The requested record cap, clamped to the per-consumer remaining credit (the negotiated #292
+        // ceiling binds before the engine ever leases an offset this connection cannot deliver).
+        let want = req.max_records.min(remaining);
+        // EGRESS AIMD (#69, #402), identical to `handle_flow`: keep the effective egress credit within
+        // the negotiated ceiling, and count a real would-block (the consumer wants more than the limiter
+        // grants while already holding near a grant's worth un-acked) as a falling-behind signal.
+        let aimd_grant = engine.with(move |e| e.egress_grant_within(ceiling))?;
+        let credits = want.min(aimd_grant);
+        if aimd_grant < want && held >= aimd_grant {
+            engine.with(crate::engine::Engine::egress_falling_behind)?;
+        }
+        // The per-consumer BYTE budget (#275): `0` is unlimited. The fetch also carries its OWN
+        // `max_bytes` cap; the effective byte ceiling is the MIN of the two (each treated as unlimited
+        // when `0`). The floor-of-one is preserved: a connection holding nothing in-flight always gets at
+        // least one record even if it alone exceeds the budget, so a single over-budget record never
+        // wedges the consumer — exactly the per-record semantics.
+        let ceiling_bytes = self.credit_ceiling_bytes(engine)?;
+        let byte_cap = min_budget(ceiling_bytes, req.max_bytes);
+        // The deadline (#489): `expires_ms == 0` means no deadline. Read the monotonic clock ONCE at the
+        // start; a `no_wait` fetch ignores it entirely (a single immediate pass). The engine poll never
+        // blocks, so the deadline only bounds the WORK of a large drain, never which records are
+        // delivered (no record appears mid-call to be missed). `started` is `None` when there is no
+        // deadline to check, so the common path reads the clock zero extra times. `deadline` is `None`
+        // when there is no deadline to check (no_wait or a zero budget).
+        let deadline = if req.no_wait || req.expires_ms == 0 {
+            None
+        } else {
+            let now = engine.with(|e| e.now_monotonic())?;
+            // ms -> ns, saturating so a huge `expires_ms` cannot overflow into a too-early deadline.
+            let budget_nanos = req.expires_ms.saturating_mul(1_000_000);
+            Some(now.saturating_add(budget_nanos))
+        };
+        let mut delivered = 0u32;
+        for _ in 0..credits {
+            // The deadline binds (#489): once the monotonic clock has reached it, end the batch with
+            // whatever was gathered. Skipped for a no-wait / no-deadline fetch (`deadline` is `None`).
+            if let Some(deadline) = deadline {
+                if engine.with(|e| e.now_monotonic())? >= deadline {
+                    break;
+                }
+            }
+            // The byte cap binds (#275/#489): stop once delivering would exceed the cap, unless this
+            // connection holds nothing in-flight AND this batch has delivered nothing (the floor-of-one).
+            // A cap of 0 is unlimited, so it never binds. Mirrors the per-record byte-budget check, with
+            // the in-flight total taken as the connection's standing in-flight bytes (the budget is
+            // per-connection, so a fetch's own running total is already included once it leases).
+            if byte_cap != 0
+                && !(self.leased.is_empty() && delivered == 0)
+                && self.in_flight_bytes() >= byte_cap
+            {
+                break;
+            }
+            // Member-aware poll (#64): IDENTICAL to the per-record Flow path — one poll = one actor
+            // round-trip, routing by the connection's member for a key_shared group and behaving as a
+            // plain competing poll otherwise. This is THE shared primitive that makes a batch fetch
+            // deliver the same records, in the same order, leased the same way, as N per-record polls.
+            let group = self.subscription.clone();
+            let member = self.member_id;
+            match engine.with(move |e| e.poll_now_in_member(&group, member))? {
+                Ok(Poll::Message(d)) => {
+                    let msg = DeliverBody {
+                        offset: d.offset.get(),
+                        generation: d.token.generation,
+                        flags: d.record.flags.bits(),
+                        timestamp_ms: d.record.timestamp_ms,
+                        key: &d.record.key,
+                        headers: &d.record.headers,
+                        payload: &d.record.payload,
+                    };
+                    let mut frame_body = Vec::new();
+                    if encode_deliver(&msg, &mut frame_body).is_err() {
+                        break;
+                    }
+                    reply(out, FrameType::Deliver, &frame_body);
+                    // Lease ownership and byte accounting are IDENTICAL to `handle_flow`: only this
+                    // session can later act on the lease (#175), and the byte size feeds the byte budget
+                    // (#275). At-least-once holds because the record stays leased until acked.
+                    let bytes = lease_bytes(&d.record);
+                    self.leased.insert(
+                        d.offset.get(),
+                        Lease {
+                            generation: d.token.generation,
+                            bytes,
+                        },
+                    );
+                    delivered += 1;
+                }
+                // A parked (poison) message: the same in-band dead-letter advisory as `handle_flow`. It
+                // consumes a credit slot (it ran a poll) but does not count toward `delivered`.
+                Ok(Poll::Parked { offset, .. }) => {
+                    let mut frame_body = Vec::new();
+                    encode_dead_letter(
+                        &DeadLetterBody {
+                            offset: offset.get(),
+                            reason: DEAD_LETTER_MAX_DELIVER,
+                        },
+                        &mut frame_body,
+                    );
+                    reply(out, FrameType::DeadLetter, &frame_body);
+                }
+                // A below-earliest truncation: identical handling to `handle_flow` — drop the now-meaningless
+                // leases below the reset and emit the in-band advisory (GapMarker or Truncated per the
+                // negotiated capability), then keep draining.
+                Ok(Poll::Truncated {
+                    earliest_retained,
+                    skipped,
+                }) => {
+                    self.leased
+                        .retain(|&offset, _| offset >= earliest_retained.get());
+                    self.emit_truncation(out, earliest_retained.get(), skipped);
+                }
+                // A key-compaction hole: identical to `handle_flow` — a gap-marker-capable consumer gets
+                // the COMPACTED marker, a non-capable one silently advances. Keep draining.
+                Ok(Poll::Compacted { from, to }) => {
+                    if self.gap_marker_enabled {
+                        Self::emit_compaction(out, from.get(), to.get());
+                    }
+                }
+                // Nothing more deliverable right now: end the batch early (the no_wait / ready-now case).
+                Ok(Poll::Idle) => break,
+                Err(e) if e.is_fatal() => {
+                    reply_err(out, "fatal storage error");
+                    return Err(SessionError::EngineFatal(e));
+                }
+                Err(_) => {
+                    // The Err is this batch's terminator; do NOT also send a FlowEnd (that would desync
+                    // the client, which expects exactly one terminator per fetch), matching `handle_flow`.
+                    reply_err(out, "fetch failed");
+                    return Ok(());
+                }
+            }
+        }
+        // Drop ownership of any offset now committed, keeping `leased` bounded — identical to `handle_flow`.
+        let group = self.subscription.clone();
+        let committed = engine.with(move |e| e.committed_offset_in(&group).get())?;
+        self.leased.retain(|&offset, _| offset >= committed);
+        // The batch terminates with the SAME FlowEnd the Flow path uses (its body the delivered count),
+        // so the response is byte-for-byte a Flow response past the request frame.
+        reply(out, FrameType::FlowEnd, &delivered.to_le_bytes());
+        Ok(())
+    }
+
     /// Emits the in-band advisory for a `Poll::Truncated` skip: a consumer that negotiated the
     /// gap-marker capability (#346) gets the richer, consumer-visible `GapMarker` (tag 21) for the
     /// skipped span `[from, to)` where `to == earliest_retained` (delivery resumes at the oldest
@@ -1438,6 +1633,17 @@ fn lease_bytes(record: &ironbus_storage::segment::OwnedRecord) -> u64 {
         .saturating_add(record.headers.len())
         .saturating_add(record.payload.len());
     u64::try_from(len).unwrap_or(u64::MAX)
+}
+
+/// Combines two byte budgets into the EFFECTIVE one, where `0` means UNLIMITED on EITHER side (#489,
+/// #275): the per-consumer byte budget and a fetch's own `max_bytes`. When both are non-zero the tighter
+/// (`min`) binds; when one is `0` (unlimited) the other binds; when both are `0` the result is `0`
+/// (unlimited). So a fetch can only ever TIGHTEN the negotiated byte budget, never loosen it.
+fn min_budget(a: u64, b: u64) -> u64 {
+    match (a, b) {
+        (0, x) | (x, 0) => x,
+        (a, b) => a.min(b),
+    }
 }
 
 /// The #292 per-consumer MESSAGE-credit negotiation. A finite request tightens via `min(request,
@@ -3826,7 +4032,7 @@ mod tests {
         // The message is durable in the engine and deliverable.
         let polled = e.engine_mut().poll(0).unwrap();
         match polled {
-            Poll::Message(d) => assert_eq!(d.record.payload, b"hello"),
+            Poll::Message(d) => assert_eq!(d.record.payload.as_ref(), b"hello"),
             other => panic!("expected the produced message, got {other:?}"),
         }
     }
@@ -5875,5 +6081,334 @@ mod tests {
             1,
             "the L2-as-L1 record is durable before the ack (I2)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #489 batch-pull FETCH: the amortized twin of the per-record Flow path.
+    // -----------------------------------------------------------------------
+
+    /// Builds a Fetch request frame body from its fields (the wire a client's `fetch_batch` sends).
+    fn fetch_frame(max_records: u32, max_bytes: u64, expires_ms: u64, no_wait: bool) -> Vec<u8> {
+        let mut body = Vec::new();
+        ironbus_proto::message::encode_fetch(
+            &ironbus_proto::message::FetchBody {
+                max_records,
+                max_bytes,
+                expires_ms,
+                no_wait,
+            },
+            &mut body,
+        );
+        frame(FrameType::Fetch, &body)
+    }
+
+    #[test]
+    fn batch_fetch_delivers_the_same_records_and_leases_as_n_per_record_polls() {
+        // THE core #489 contract: a single batch fetch delivers EXACTLY the records (offsets AND lease
+        // generations) that N successive per-record Flow(1) polls would, leasing each one the same way.
+        // Two identical engines, two fresh sessions: one drained by a batch fetch, the other by N
+        // per-record polls. The delivered (offset, generation) sequences must be byte-for-byte equal.
+        const N: u8 = 6;
+
+        // The batch path.
+        let e_batch = DirectEngine::new(engine());
+        for i in 0..N {
+            produce(&e_batch, &[i; 8]);
+        }
+        let mut s_batch = connected_session(&e_batch);
+        let mut out_batch = Vec::new();
+        s_batch
+            .process(
+                &e_batch,
+                &fetch_frame(u32::from(N), 0, 0, false),
+                &mut out_batch,
+            )
+            .unwrap();
+        let batch_tokens = delivered_tokens(&out_batch);
+
+        // The per-record path: N successive Flow(1) calls on an identical fresh engine/session.
+        let e_poll = DirectEngine::new(engine());
+        for i in 0..N {
+            produce(&e_poll, &[i; 8]);
+        }
+        let mut s_poll = connected_session(&e_poll);
+        let mut poll_tokens = Vec::new();
+        for _ in 0..N {
+            let mut out = Vec::new();
+            s_poll
+                .process(
+                    &e_poll,
+                    &frame(FrameType::Flow, &1u32.to_le_bytes()),
+                    &mut out,
+                )
+                .unwrap();
+            poll_tokens.extend(delivered_tokens(&out));
+        }
+
+        assert_eq!(
+            batch_tokens, poll_tokens,
+            "the batch fetch delivers the same (offset, generation) sequence as N per-record polls"
+        );
+        assert_eq!(
+            batch_tokens.len(),
+            usize::from(N),
+            "all {N} records delivered"
+        );
+        // The batch terminates with exactly one FlowEnd whose count equals the deliveries (same wire
+        // terminator as the Flow path).
+        let frames = decode_all(&out_batch);
+        let flow_ends: Vec<_> = frames
+            .iter()
+            .filter(|(ty, _)| *ty == FrameType::FlowEnd)
+            .collect();
+        assert_eq!(flow_ends.len(), 1, "exactly one FlowEnd terminator");
+        assert_eq!(
+            u32::from_le_bytes(flow_ends[0].1.as_slice().try_into().unwrap()),
+            u32::from(N),
+            "the FlowEnd count equals the delivered records"
+        );
+    }
+
+    #[test]
+    fn batch_fetch_preserves_at_least_once_an_unacked_batch_redelivers() {
+        // At-least-once: a fetched-but-unacked record stays leased and REDELIVERS after the lease
+        // expires, exactly as a per-record poll does. The batch is an amortization, not a fire-and-forget.
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 5));
+        produce(&e, b"x");
+        let mut s = connected_session(&e);
+        let mut out = Vec::new();
+        s.process(&e, &fetch_frame(10, 0, 0, false), &mut out)
+            .unwrap();
+        let first = delivered_tokens(&out);
+        assert_eq!(first.len(), 1, "the one record is delivered");
+        assert_eq!(
+            e.engine_mut().committed_offset().get(),
+            0,
+            "an unacked fetched record does NOT advance the committed cursor"
+        );
+
+        // Expire the lease (visibility + hard cap are tiny in engine_with), then re-fetch: the unacked
+        // record redelivers (at-least-once), with a FRESH lease generation.
+        clock.advance_monotonic_nanos(10_000);
+        let mut out2 = Vec::new();
+        s.process(&e, &fetch_frame(10, 0, 0, false), &mut out2)
+            .unwrap();
+        let redelivered = delivered_tokens(&out2);
+        assert_eq!(redelivered.len(), 1, "the unacked record redelivers");
+        assert_eq!(redelivered[0].0, first[0].0, "same offset redelivers");
+    }
+
+    #[test]
+    fn batch_fetch_acking_a_delivered_record_commits_it_like_a_poll() {
+        // A record delivered by a batch fetch is leased identically: acking it (with the lease
+        // generation the fetch carried) commits it, proving the lease the batch hands out is the SAME
+        // fencing lease the per-record poll hands out.
+        let e = DirectEngine::new(engine());
+        produce(&e, b"a");
+        produce(&e, b"b");
+        let mut s = connected_session(&e);
+        let mut out = Vec::new();
+        s.process(&e, &fetch_frame(10, 0, 0, false), &mut out)
+            .unwrap();
+        let tokens = delivered_tokens(&out);
+        assert_eq!(tokens.len(), 2);
+        // Ack the first delivered record with the generation the FETCH carried.
+        let ack = AckBody {
+            offset: tokens[0].0,
+            generation: tokens[0].1,
+            op: AckOp::Ack,
+            delay_ms: 0,
+        };
+        let mut body = Vec::new();
+        encode_ack(&ack, &mut body);
+        out.clear();
+        s.process(&e, &frame(FrameType::Ack, &body), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out),
+            (FrameType::AckStatus, vec![1]),
+            "the fetch-leased record commits on ack"
+        );
+        assert_eq!(e.engine_mut().committed_offset().get(), 1);
+    }
+
+    #[test]
+    fn batch_fetch_max_records_bounds_the_batch() {
+        // max_records caps the batch below what is available: 10 records present, max_records = 3.
+        let e = DirectEngine::new(engine());
+        for i in 0..10u8 {
+            produce(&e, &[i; 4]);
+        }
+        let mut s = connected_session(&e);
+        let mut out = Vec::new();
+        s.process(&e, &fetch_frame(3, 0, 0, false), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_tokens(&out).len(),
+            3,
+            "max_records bounds the batch to 3 of the 10 available"
+        );
+    }
+
+    #[test]
+    fn batch_fetch_max_bytes_bounds_the_batch_with_a_floor_of_one() {
+        // max_bytes caps the batch with EXACTLY the per-record byte-budget semantics (#275): the check
+        // is BEFORE each poll, so the in-flight total may overshoot the cap by at most one record (the
+        // standard credit semantics the per-record Flow path also uses). Each record's lease size is
+        // key+headers+payload (here just the 4-byte payload). With max_bytes = 4, after the first record
+        // in-flight bytes reach 4 (>= the cap), so the batch stops at exactly 1.
+        let e = DirectEngine::new(engine());
+        for i in 0..5u8 {
+            produce(&e, &[i; 4]);
+        }
+        let mut s = connected_session(&e);
+        let mut out = Vec::new();
+        s.process(&e, &fetch_frame(10, 4, 0, false), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_tokens(&out).len(),
+            1,
+            "max_bytes (with the floor-of-one and the at-most-one overshoot) bounds the batch to one record"
+        );
+
+        // A single record larger than the whole budget is STILL delivered (the floor-of-one prevents a
+        // wedge), exactly the per-consumer byte-budget floor.
+        let e2 = DirectEngine::new(engine());
+        produce(&e2, &[0xff; 64]);
+        let mut s2 = connected_session(&e2);
+        let mut out2 = Vec::new();
+        s2.process(&e2, &fetch_frame(10, 8, 0, false), &mut out2)
+            .unwrap();
+        assert_eq!(
+            delivered_tokens(&out2).len(),
+            1,
+            "the floor-of-one delivers a single over-budget record"
+        );
+    }
+
+    #[test]
+    fn batch_fetch_no_wait_returns_immediately_with_whatever_is_ready() {
+        // no_wait returns what is ready right now (a single drain pass): with 2 records available and a
+        // generous max_records, all ready records come back, and an empty queue returns an empty batch
+        // (just the FlowEnd terminator) without waiting.
+        let e = DirectEngine::new(engine());
+        produce(&e, b"a");
+        produce(&e, b"b");
+        let mut s = connected_session(&e);
+        let mut out = Vec::new();
+        s.process(&e, &fetch_frame(10, 0, 1_000, true), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_tokens(&out).len(),
+            2,
+            "no_wait returns the 2 ready records immediately"
+        );
+
+        // A second no_wait fetch on the now-empty (all leased) queue returns nothing but the terminator.
+        let mut out2 = Vec::new();
+        s.process(&e, &fetch_frame(10, 0, 1_000, true), &mut out2)
+            .unwrap();
+        let frames = decode_all(&out2);
+        assert!(
+            !frames.iter().any(|(ty, _)| *ty == FrameType::Deliver),
+            "no_wait on a drained queue delivers nothing: {frames:?}"
+        );
+        assert_eq!(
+            frames.last().map(|(ty, _)| *ty),
+            Some(FrameType::FlowEnd),
+            "no_wait still terminates with FlowEnd"
+        );
+    }
+
+    #[test]
+    fn batch_fetch_expires_bounds_work_not_which_records_are_delivered() {
+        // The `expires` deadline bounds the WORK a drain may do, never WHICH records a ready queue yields:
+        // the engine poll is non-blocking, so no record arrives mid-call to be missed, and under the
+        // deterministic ManualClock the clock does not tick mid-call, so a generous deadline delivers the
+        // whole ready batch. (This is the property #489 relies on for the same-records-as-poll argument:
+        // the deadline is a work cap, not a selection filter.)
+        let e = DirectEngine::new(engine());
+        for i in 0..4u8 {
+            produce(&e, &[i; 4]);
+        }
+        let mut s = connected_session(&e);
+        let mut out = Vec::new();
+        s.process(&e, &fetch_frame(10, 0, 60_000, false), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_tokens(&out).len(),
+            4,
+            "a generous deadline does not cut a ready batch short"
+        );
+    }
+
+    #[test]
+    fn batch_fetch_respects_the_per_consumer_credit_ceiling() {
+        // The negotiated per-consumer credit ceiling binds the batch even past max_records: an undersized
+        // ceiling caps the batch, and held (unacked) leases reduce the remaining credit, so a batch never
+        // over-delivers past the ceiling (the same guard the per-record Flow path enforces).
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 5));
+        for i in 0..20u8 {
+            produce(&e, &[i; 4]);
+        }
+        // Connect requesting a small credit of 3 (the negotiation clamps to min(request, cap)).
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        let mut connect_body = Vec::new();
+        ironbus_proto::message::encode_connect(
+            &ironbus_proto::message::ConnectBody {
+                requested_credit: Some(3),
+                requested_credit_bytes: None,
+                wants_gap_marker: false,
+                default_ack_level: None,
+            },
+            &mut connect_body,
+        );
+        s.process(&e, &frame(FrameType::Connect, &connect_body), &mut out)
+            .unwrap();
+        out.clear();
+        // A generous max_records still cannot exceed the negotiated ceiling of 3.
+        s.process(&e, &fetch_frame(100, 0, 0, false), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_tokens(&out).len(),
+            3,
+            "the per-consumer credit ceiling of 3 bounds the batch, not max_records=100"
+        );
+        // Those 3 are held unacked, so remaining credit is 0: a second fetch (before any ack/expiry)
+        // delivers nothing, proving the ceiling is enforced across the in-flight set, never over-delivered.
+        out.clear();
+        s.process(&e, &fetch_frame(100, 0, 0, false), &mut out)
+            .unwrap();
+        assert_eq!(
+            delivered_tokens(&out).len(),
+            0,
+            "a saturated consumer (3/3 held) gets an empty batch"
+        );
+    }
+
+    #[test]
+    fn batch_fetch_rejects_a_malformed_body_without_dropping_the_connection() {
+        // A malformed Fetch body is a typed Err reply, never a panic, and the session stays open.
+        let e = DirectEngine::new(engine());
+        let mut s = connected_session(&e);
+        let mut out = Vec::new();
+        // A 1-byte body with a bogus version cannot decode.
+        s.process(&e, &frame(FrameType::Fetch, &[9u8]), &mut out)
+            .expect("the session stays open after a malformed fetch");
+        assert_eq!(one_response(&out).0, FrameType::Err);
+    }
+
+    #[test]
+    fn batch_fetch_before_connect_is_rejected() {
+        // A Fetch before Connect is rejected (the same guard as Flow), and the session stays open.
+        let e = DirectEngine::new(engine());
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &fetch_frame(10, 0, 0, false), &mut out)
+            .expect("the session stays open");
+        assert_eq!(one_response(&out).0, FrameType::Err);
     }
 }

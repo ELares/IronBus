@@ -447,6 +447,7 @@ mod tests {
     use crate::fs::InMemoryFs;
     use crate::naming::segment_file_name;
     use crate::segment::{OwnedRecord, SegmentReader};
+    use bytes::Bytes;
     use ironbus_core::clock::ManualClock;
     use ironbus_core::types::Seq;
 
@@ -487,9 +488,9 @@ mod tests {
             seq: Seq::new(offset),
             timestamp_ms: 1000 + offset,
             flags: RecordFlags::EMPTY,
-            key: key.to_vec(),
-            headers: headers.to_vec(),
-            payload: payload.to_vec(),
+            key: Bytes::copy_from_slice(key),
+            headers: Bytes::copy_from_slice(headers),
+            payload: Bytes::copy_from_slice(payload),
         }
     }
 
@@ -629,7 +630,7 @@ mod tests {
         assert_eq!(after.len() as u64, before + 4);
         let tail: Vec<Vec<u8>> = after[after.len() - 4..]
             .iter()
-            .map(|r| r.payload.clone())
+            .map(|r| r.payload.to_vec())
             .collect();
         assert_eq!(
             tail,
@@ -654,9 +655,9 @@ mod tests {
             seq: Seq::new(100),
             timestamp_ms: 1100,
             flags: RecordFlags::COMPRESSED.with(RecordFlags::HAS_KEY),
-            key: b"k".to_vec(),
-            headers: b"hdr".to_vec(),
-            payload: compressed_payload.clone(),
+            key: Bytes::from_static(b"k"),
+            headers: Bytes::from_static(b"hdr"),
+            payload: Bytes::from(compressed_payload.clone()),
         };
         sink.append_poison("orders", &src, 6).unwrap();
 

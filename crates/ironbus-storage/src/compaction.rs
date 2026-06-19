@@ -27,6 +27,7 @@
 use crate::fs::Filesystem;
 use crate::naming::{parse_segment_file_name, segment_file_name, segment_ids};
 use crate::segment::{OwnedRecord, SegmentReader, SegmentWriter, StorageError};
+use bytes::Bytes;
 use ironbus_core::clock::Clock;
 use ironbus_core::codec::RecordView;
 use ironbus_core::segment::{CompactionMeta, SegmentFooter, SegmentHeader};
@@ -195,7 +196,10 @@ fn select_survivors(sources: &[SourceSegment], now_ms: u64, tombstone_ttl_ms: u6
 
     // First pass: record, per key, the HIGHEST offset seen (the latest value for the key). This is
     // streamed in offset order; the map is the cost line that bounds N on an edge core.
-    let mut latest_for_key: HashMap<Vec<u8>, u64> = HashMap::new();
+    // Keyed on the survivor's `Bytes` key (#480): `OwnedRecord::key` is now a refcounted slice, so
+    // `rec.key.clone()` is a refcount bump rather than a `Vec` deep copy, and `get(&rec.key)` borrows
+    // the `Bytes` directly. `Bytes` is `Hash + Eq` over its bytes, so the per-key dedup is unchanged.
+    let mut latest_for_key: HashMap<Bytes, u64> = HashMap::new();
     for src in sources {
         for rec in &src.records {
             if !rec.key.is_empty() {
@@ -299,6 +303,7 @@ where
             seq: rec.seq,
             timestamp_ms: rec.timestamp_ms,
             flags: rec.flags,
+            // `OwnedRecord`'s blobs are `Bytes` (#480); deref to the `&[u8]` the borrowing view takes.
             key: &rec.key,
             headers: &rec.headers,
             payload: &rec.payload,
@@ -627,13 +632,13 @@ mod tests {
         let before = all_records(&log);
         let latest_alpha = before
             .iter()
-            .filter(|r| r.key == b"alpha")
+            .filter(|r| r.key.as_ref() == b"alpha")
             .map(|r| r.offset.get())
             .max()
             .unwrap();
         let latest_beta = before
             .iter()
-            .filter(|r| r.key == b"beta")
+            .filter(|r| r.key.as_ref() == b"beta")
             .map(|r| r.offset.get())
             .max()
             .unwrap();
@@ -645,7 +650,7 @@ mod tests {
             .get();
         let gamma_off = before
             .iter()
-            .find(|r| r.key == b"gamma")
+            .find(|r| r.key.as_ref() == b"gamma")
             .unwrap()
             .offset
             .get();
@@ -660,8 +665,11 @@ mod tests {
 
         // After compaction, the read path yields the SURVIVORS at their ORIGINAL offsets, sparse.
         let after = all_records(&log);
-        let alpha_records: Vec<_> = after.iter().filter(|r| r.key == b"alpha").collect();
-        let beta_records: Vec<_> = after.iter().filter(|r| r.key == b"beta").collect();
+        let alpha_records: Vec<_> = after
+            .iter()
+            .filter(|r| r.key.as_ref() == b"alpha")
+            .collect();
+        let beta_records: Vec<_> = after.iter().filter(|r| r.key.as_ref() == b"beta").collect();
         // Exactly one survivor per key (the latest), at its original offset, with its latest value.
         assert_eq!(alpha_records.len(), 1, "only the latest alpha survives");
         assert_eq!(
@@ -678,7 +686,7 @@ mod tests {
             .any(|r| r.key.is_empty() && r.offset.get() == keyless_off));
         assert!(after
             .iter()
-            .any(|r| r.key == b"gamma" && r.offset.get() == gamma_off));
+            .any(|r| r.key.as_ref() == b"gamma" && r.offset.get() == gamma_off));
         // Offsets never decreased and never repeated: I5 holds (monotonic, never reused).
         let offs: Vec<u64> = after.iter().map(|r| r.offset.get()).collect();
         let mut sorted = offs.clone();
@@ -718,7 +726,11 @@ mod tests {
             sources_loaded.push(read_source_segment(log.filesystem(), id).unwrap());
         }
         let within = select_survivors(&sources_loaded, 5_000, cfg.tombstone_ttl_ms);
-        let k_survivors: Vec<_> = within.keep.iter().filter(|r| r.key == b"k").collect();
+        let k_survivors: Vec<_> = within
+            .keep
+            .iter()
+            .filter(|r| r.key.as_ref() == b"k")
+            .collect();
         assert_eq!(k_survivors.len(), 1, "the tombstone is retained within TTL");
         assert!(
             k_survivors[0].payload.is_empty(),
@@ -729,7 +741,7 @@ mod tests {
         // reclaiming the key (no record for k at all).
         let aged = select_survivors(&sources_loaded, 1_000_000, cfg.tombstone_ttl_ms);
         assert!(
-            aged.keep.iter().all(|r| r.key != b"k"),
+            aged.keep.iter().all(|r| r.key.as_ref() != b"k"),
             "aged-out tombstone reclaims the key"
         );
     }

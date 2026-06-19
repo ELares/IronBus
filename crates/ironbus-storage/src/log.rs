@@ -2904,8 +2904,8 @@ mod tests {
         log.sync().unwrap();
         let records = read_back(log.filesystem(), 0);
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].payload, b"durable");
-        assert_eq!(records[1].payload, b"after");
+        assert_eq!(records[0].payload.as_ref(), b"durable");
+        assert_eq!(records[1].payload.as_ref(), b"after");
     }
 
     #[test]
@@ -2977,7 +2977,7 @@ mod tests {
         // The recovered log is fully appendable: the first record lands at offset 0.
         assert_eq!(log.append(&rec(b"first")).unwrap(), Offset::ZERO);
         log.sync().unwrap();
-        assert_eq!(read_back(log.filesystem(), 0)[0].payload, b"first");
+        assert_eq!(read_back(log.filesystem(), 0)[0].payload.as_ref(), b"first");
     }
 
     #[test]
@@ -3133,7 +3133,7 @@ mod tests {
             "a rolled-to segment re-attempted (and swallowed) the failing preallocate"
         );
         assert_eq!(
-            read_back(log.filesystem(), 0)[0].payload,
+            read_back(log.filesystem(), 0)[0].payload.as_ref(),
             b"payload-payload"
         );
     }
@@ -3721,8 +3721,8 @@ mod tests {
         let records = log.read_from(Offset::ZERO, 10).unwrap();
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].offset, Offset::new(0));
-        assert_eq!(records[0].payload, b"a");
-        assert_eq!(records[2].payload, b"c");
+        assert_eq!(records[0].payload.as_ref(), b"a");
+        assert_eq!(records[2].payload.as_ref(), b"c");
     }
 
     #[test]
@@ -3734,7 +3734,7 @@ mod tests {
         assert_eq!(log.flushed_offset(), Offset::new(1));
         let records = log.read_from(Offset::ZERO, 10).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].payload, b"durable");
+        assert_eq!(records[0].payload.as_ref(), b"durable");
         // After sync the pending record becomes visible.
         log.sync().unwrap();
         assert_eq!(log.read_from(Offset::ZERO, 10).unwrap().len(), 2);
@@ -4341,7 +4341,7 @@ mod tests {
                                          // ...not yet: only a and b are durable.
         let records = log.read_from(Offset::ZERO, 100).unwrap();
         assert_eq!(records.len(), 2);
-        assert_eq!(records[1].payload, b"b");
+        assert_eq!(records[1].payload.as_ref(), b"b");
     }
 
     #[test]

@@ -188,6 +188,7 @@ pub fn check_pure_recovery(
 mod tests {
     use super::*;
     use crate::loss::{LossEvent, ReasonCode};
+    use bytes::Bytes;
     use ironbus_core::types::{Offset, RecordFlags, Seq};
 
     fn rec(offset: u64, seq: u64) -> OwnedRecord {
@@ -196,9 +197,9 @@ mod tests {
             seq: Seq::new(seq),
             timestamp_ms: 0,
             flags: RecordFlags::EMPTY,
-            key: Vec::new(),
-            headers: Vec::new(),
-            payload: vec![u8::try_from(offset & 0xff).unwrap()],
+            key: Bytes::new(),
+            headers: Bytes::new(),
+            payload: Bytes::from(vec![u8::try_from(offset & 0xff).unwrap()]),
         }
     }
 
@@ -297,7 +298,7 @@ mod tests {
     fn i4_negative_fixture_diverging_payloads() {
         let a = prefix(3);
         let mut b = prefix(3);
-        b[1].payload = vec![0xff]; // a different payload at index 1
+        b[1].payload = Bytes::from_static(&[0xff]); // a different payload at index 1
         assert_eq!(
             check_pure_recovery(&a, &b),
             Err(InvariantViolation::Nondeterministic { index: 1 })

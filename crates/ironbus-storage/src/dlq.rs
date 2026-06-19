@@ -184,9 +184,13 @@ pub fn decode_entry(record: &OwnedRecord) -> Option<DlqEntry> {
         source_offset: meta.source_offset,
         attempt: meta.attempt,
         timestamp_ms: record.timestamp_ms,
-        key: record.key.clone(),
+        // `DlqEntry` is the cold operator-facing dead-letter view (not the consume hot read path), so
+        // its key/payload stay owned `Vec`s: the `record` blobs are now `Bytes` (#480), so make the
+        // owning copy LOCALLY here rather than widen `DlqEntry`. This keeps the per-record-read win on
+        // the hot path while the DLQ decode keeps its existing owned-`Vec` contract.
+        key: record.key.to_vec(),
         headers: meta.original_headers,
-        payload: record.payload.clone(),
+        payload: record.payload.to_vec(),
         original_flags: record.flags,
     })
 }
@@ -393,6 +397,7 @@ pub fn read_dlq_entries<F: Filesystem>(parent_fs: &F) -> Result<Vec<DlqEntry>, S
 mod tests {
     use super::*;
     use crate::fs::InMemoryFs;
+    use bytes::Bytes;
     use ironbus_core::clock::ManualClock;
     use ironbus_core::types::Seq;
 
@@ -406,9 +411,9 @@ mod tests {
             seq: Seq::new(offset),
             timestamp_ms: 1234 + offset,
             flags: RecordFlags::EMPTY,
-            key: key.to_vec(),
-            headers: headers.to_vec(),
-            payload: payload.to_vec(),
+            key: Bytes::copy_from_slice(key),
+            headers: Bytes::copy_from_slice(headers),
+            payload: Bytes::copy_from_slice(payload),
         }
     }
 
