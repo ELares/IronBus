@@ -3043,6 +3043,21 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         true
     }
 
+    /// Accounts `n` LEVEL-0 (no-ack / fire-and-forget) byte-cap sheds that the CONNECTION-THREAD
+    /// fast-reject already performed off the actor (#495, generalizing #476). An over-cap L0 produce is
+    /// shed at the connection thread BEFORE it enqueues (the client accepted loss by contract, so it
+    /// gets no ack and never blocks), which is a fire-and-forget DROP — so it is folded into
+    /// `ironbus_fire_and_forget_shed_total`, the SAME counter the fire-and-forget TOKEN-BUCKET drop
+    /// bumps ([`Engine::fire_and_forget_admit`]), NOT `produce_rejected` (the Level-1 at-least-once
+    /// rejection counter). The actor folds the accumulated L0-shed delta in here once per batch (the
+    /// reconcile in `actor::run_actor`), so an L0 cap-shed is never silent. A no-op for `n == 0`;
+    /// saturating. Idempotent in the sense that the caller passes a DELTA it has not folded before (the
+    /// gate hands out each L0 shed exactly once).
+    pub fn record_fire_and_forget_sheds(&mut self, n: u64) {
+        self.backpressure.fire_and_forget_shed =
+            self.backpressure.fire_and_forget_shed.saturating_add(n);
+    }
+
     /// The fire-and-forget (un-credited) admission decision (#69): tries to admit one fire-and-forget
     /// message of `payload_bytes` at the current monotonic instant through the per-connection token
     /// bucket. `true` admits; `false` SHEDS the message (the bucket is empty), incrementing

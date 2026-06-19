@@ -299,6 +299,23 @@ enum Command<F: Filesystem, C: Clock> {
         /// The one-shot reply channel for the produce outcome (sent only after the covering fsync).
         reply: SyncSender<ProduceOutcome>,
     },
+    /// A LEVEL-0 (no-ack / fire-and-forget) produce to batch into the next group commit with NO reply
+    /// channel (#495, design option (b)). The actor still does the append on its single-writer storage
+    /// (so the single total order and I2 for OTHER records hold) and covers it in the SAME
+    /// `commit_batch` as the rest of the batch, but it NEVER parks a reply and sends NOTHING back: the
+    /// L0 producer fired and forgot, so it allocated no reply channel and does not wait for the fsync.
+    /// This GENERALIZES the historical `PUB_FLAG_FIRE_AND_FORGET` path (an old faf publish IS a Level-0
+    /// publish): the append's `fire_and_forget` marker still gates it on the fire-and-forget token
+    /// bucket (#336) and a bucket/CoDel/headroom shed simply drops it with no frame, exactly as the
+    /// reply-bearing faf path did — only now without the wasted reply-channel allocation, park, and
+    /// fsync-wait. The connection-thread byte-cap pre-check (#476) sheds an over-cap L0 BEFORE this is
+    /// ever sent (counted in `fire_and_forget_shed`), so this command is only ever reached for an L0
+    /// produce the gate did not fast-reject.
+    ProduceNoReply {
+        /// The owned Level-0 produce payload (its `fire_and_forget` marker is set, so the actor's
+        /// fire-and-forget admission and the no-ack disposition apply).
+        append: OwnedAppend,
+    },
     /// Run an engine job (an ack, a flow/poll batch, a subscribe, a checkpoint), then it replies itself.
     Run(Job<F, C>),
     /// Graceful shutdown: flush the pending batch, checkpoint every group, then exit the actor loop.
@@ -442,6 +459,46 @@ impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
         })
     }
 
+    /// Submits a LEVEL-0 (no-ack / fire-and-forget) produce with NO reply channel (#495): the
+    /// NATS-Core-speed path. Unlike [`EngineHandle::produce_submit`] it allocates NO reply channel,
+    /// parks NOTHING, and does not wait for the covering fsync — the L0 producer fired and forgot. The
+    /// actor still does the append on its single-writer storage (the single total order and I2 for
+    /// OTHER records are untouched; this is NOT the phase-5 actor bypass), but sends nothing back.
+    ///
+    /// It generalizes the historical fire-and-forget path: `append.fire_and_forget` must be set, so the
+    /// actor gates the produce on the fire-and-forget token bucket (#336) and a bucket/CoDel/headroom
+    /// shed simply drops it with no frame — exactly the old faf disposition, only without the wasted
+    /// reply-channel allocation + park + fsync-wait.
+    ///
+    /// The connection-thread byte-cap fast-reject (#476) runs FIRST, identically to `produce_submit`,
+    /// so an at-or-over-cap L0 produce is shed at the connection thread WITHOUT enqueuing (droppable
+    /// under overload; the QoS-0 producer accepts loss). That shed is COUNTED — but on the L0 counter,
+    /// which the actor folds into `ironbus_fire_and_forget_shed_total` (a fire-and-forget drop, not a
+    /// Level-1 `produce_rejected`), so it is never a silent drop.
+    ///
+    /// # Errors
+    /// Returns [`ActorGone`] if the actor exited before the produce could be enqueued. (A SHED — the
+    /// cap pre-check firing — is NOT an error: the L0 produce is simply dropped, counted, and `Ok`.)
+    pub fn produce_no_reply(&self, append: OwnedAppend) -> Result<(), ActorGone> {
+        // CONNECTION-THREAD FAST-REJECT (#476, generalized for L0 by #495): the SAME O(1) relaxed read
+        // of the byte-cap shed state `produce_submit` does, BEFORE the blocking `tx.send`. When the
+        // gate is SURE the actor would shed this produce, DROP it here without enqueuing — the L0
+        // producer accepts loss by contract, so there is no ack to send and no client to block. Count
+        // it on the L0 shed counter (the actor folds it into `fire_and_forget_shed`, NOT
+        // `produce_rejected`), so a dropped L0 is never silent. The gate never false-rejects (see
+        // [`crate::produce_gate`]), so a produce it lets through is one the actor would have accepted.
+        if self.cap_gate.would_shed() {
+            self.cap_gate.record_l0_shed();
+            return Ok(());
+        }
+        // Send the no-reply produce: NO reply channel allocated, NOTHING parked. The send still blocks
+        // on a FULL actor channel (backpressure is shared with the at-least-once tier), but the caller
+        // does not wait for the reply — there is none.
+        self.tx
+            .send(Command::ProduceNoReply { append })
+            .map_err(|_| ActorGone)
+    }
+
     /// Runs `job` on the owned engine and AWAITS its result. Used for every engine operation that is
     /// not a group-committed produce: acks, the flow/poll fetch, subscribe/unsubscribe, the
     /// interval/close-path checkpoint. The actor flushes any pending produce batch (one fsync) BEFORE
@@ -532,6 +589,23 @@ pub trait EngineAccess<F: Filesystem, C: Clock> {
         Ok(ProduceSubmission::Ready(self.produce(append)?))
     }
 
+    /// Submits a LEVEL-0 (no-ack / fire-and-forget) produce with NO reply channel (#495): the session
+    /// routes a Level-0 publish here instead of [`EngineAccess::produce_submit`], so no reply channel
+    /// is allocated, nothing is parked, and the connection does not wait for the covering fsync. The
+    /// default implementation performs the produce synchronously and DISCARDS the outcome, which is
+    /// exact for the direct (same-thread) test engines: there is no actor to bypass the reply for, the
+    /// append still happens on the one engine, and an L0 produce never gets a wire frame anyway, so
+    /// dropping the outcome reproduces the no-ack contract. [`EngineHandle`] overrides this with the
+    /// real no-reply channel send (the cap pre-check + `Command::ProduceNoReply`).
+    ///
+    /// # Errors
+    /// Returns [`ActorGone`] if the engine is no longer reachable. A cap-shed of the L0 produce is NOT
+    /// an error (it is a counted fire-and-forget drop), so a shed still returns `Ok`.
+    fn produce_no_reply(&self, append: OwnedAppend) -> Result<(), ActorGone> {
+        let _ = self.produce(append)?;
+        Ok(())
+    }
+
     /// Runs `job` on the engine and returns its result.
     ///
     /// # Errors
@@ -565,6 +639,12 @@ impl<F: Filesystem + 'static, C: Clock + Clone + 'static> EngineAccess<F, C>
         // The REAL non-awaiting submit (#450): the produce crosses to the actor now, the covering
         // fsync is awaited later, so a session window group-commits under one `commit_batch`.
         EngineHandle::produce_submit(self, append)
+    }
+
+    fn produce_no_reply(&self, append: OwnedAppend) -> Result<(), ActorGone> {
+        // The REAL no-reply L0 submit (#495): the cap pre-check, then a `Command::ProduceNoReply` send
+        // with NO reply channel, NO park, NO fsync-wait — the NATS-Core-speed path.
+        EngineHandle::produce_no_reply(self, append)
     }
 
     fn with<R, J>(&self, job: J) -> Result<R, ActorGone>
@@ -878,8 +958,12 @@ where
     C: Clock + Clone,
 {
     // 1. Count the fast-rejects performed off the actor since last time (a fast-reject is never
-    //    silent). The delta is exact (monotonic total minus the actor's high-water mark).
+    //    silent). The delta is exact (monotonic total minus the actor's high-water mark). The Level-1
+    //    at-least-once fast-reject folds into `produce_rejected`; the Level-0 (no-ack) cap-shed folds
+    //    into `fire_and_forget_shed` (#495), because an over-cap L0 drop is a fire-and-forget drop, not
+    //    a Level-1 rejection. Two separate exact deltas, each reconciled to its own counter.
     engine.record_fast_reject_sheds(gate.take_unreconciled_fast_rejects());
+    engine.record_fire_and_forget_sheds(gate.take_unreconciled_l0_sheds());
     // 2. Publish the gate's next snapshot from the now-current byte total and overflow policy.
     match engine.disk_full_policy() {
         DiskFullPolicy::DropNew => gate.publish_drop_new(engine.durable_record_bytes()),
@@ -913,7 +997,7 @@ fn gather_commands<F, C>(
 {
     let produces = commands
         .iter()
-        .filter(|c| matches!(c, Command::Produce { .. }))
+        .filter(|c| matches!(c, Command::Produce { .. } | Command::ProduceNoReply { .. }))
         .count();
     if produces < 2 {
         return;
@@ -970,127 +1054,21 @@ where
         }
         for cmd in commands {
             match cmd {
+                // An at-least-once (Level-1, or Level-2 falling back to Level-1) produce: do the
+                // admission + append and PARK its reply behind the covering fsync (I2). The reply is
+                // `Some`, so every disposition sends exactly the frame it always did — this arm is
+                // byte-for-byte the historical produce path (the shared helper is a pure extraction).
                 Command::Produce { append, reply } => {
-                    // FIRE-AND-FORGET (QoS-0, #11, #402) admission, decided FIRST and only for a
-                    // produce the client marked fire-and-forget. The per-connection token bucket
-                    // (#336) caps this un-credited tier: an exhausted bucket DROPS the produce
-                    // (without acking and without appending), because the QoS-0 producer accepts
-                    // loss by contract. The bucket governs ONLY this tier, so it NEVER touches the
-                    // at-least-once path; a non-fire-and-forget produce skips this entirely. When
-                    // disabled (the default rate of 0), the bucket always admits, so a QoS-0 produce
-                    // under an unconfigured broker is appended-but-not-acked, never dropped.
-                    if append.fire_and_forget {
-                        let payload_bytes = u64::try_from(append.payload.len()).unwrap_or(u64::MAX);
-                        if !engine.fire_and_forget_admit(payload_bytes) {
-                            // Dropped by the bucket (counted in `ironbus_fire_and_forget_shed_total`):
-                            // the producer fired and forgot, so send NO frame and keep the session.
-                            let _ = reply.send(ProduceOutcome::FireAndForgetDropped);
-                            continue;
-                        }
-                    }
-                    // CoDel controlled-delay shed (#68), decided BEFORE the append so it rejects only
-                    // NEW work and never drops an already-accepted record (I2 holds). The sojourn is
-                    // `now - enqueue` on the monotonic clock seam; a sustained admission delay above
-                    // TARGET sheds this produce. When CoDel is disabled (the default) this is always
-                    // false, so the append path is byte-for-byte unchanged. A fire-and-forget produce
-                    // shed by CoDel also gets no ack (the session maps the Shed outcome to no frame
-                    // for a fire-and-forget pub), so the contract holds either way.
-                    if engine.codel_admit(append.enqueue_monotonic_nanos) {
-                        // The shed counts as a request the broker shed (the retry-budget signal), then
-                        // replies a stable "shed under load" outcome; the connection stays open.
-                        engine.retry_budget_record_shed();
-                        let _ = reply.send(ProduceOutcome::Shed);
-                        continue;
-                    }
-                    // fsync-HEADROOM admission (#378), decided BEFORE the append so it rejects only
-                    // NEW work and never drops an already-accepted record (I2 / no-data-loss hold). It
-                    // bounds the un-fsynced (buffered-but-not-durable) write frontier to the configured
-                    // headroom, reusing the engine's `unsynced_bytes()` frontier (the #341 tracking).
-                    // A no-op when the headroom is disabled (the default), so the append path is
-                    // byte-for-byte unchanged for a broker that has not opted in.
-                    if engine.wal_headroom_enabled() {
-                        // The new record's LOGICAL bytes (key + headers + payload), the same units the
-                        // un-fsynced frontier is measured in.
-                        let record_bytes = u64::try_from(
-                            append.key.len() + append.headers.len() + append.payload.len(),
-                        )
-                        .unwrap_or(u64::MAX);
-                        if !engine.wal_headroom_admit(record_bytes) {
-                            // The headroom is exhausted: DRAIN first. `flush_pending` issues the ONE
-                            // group-commit barrier for the parked batch. Under the default `sync` level
-                            // (and a DUE `interval` window) that is a real `fdatasync`, so it resets the
-                            // un-fsynced frontier to `0` and the record is then admitted by the no-wedge
-                            // floor: the headroom THROTTLES (drain-then-admit), never sheds, never loses.
-                            // Under a relaxed `async`/`none` level a commit DEFERS the fsync, so the
-                            // frontier does NOT drain; the re-check still fails and the new produce is
-                            // SHED to keep the loss window within the headroom. The already-buffered
-                            // records are untouched (they stay durable-pending and are made durable by
-                            // their level's barrier), so only this NEW produce is rejected.
-                            flush_pending(&mut engine, &mut pending);
-                            if !engine.wal_headroom_admit(record_bytes) {
-                                // The drain could not free the headroom (a relaxed level deferring the
-                                // fsync): shed this NEW produce with the typed, self-announcing signal,
-                                // count it (a shed is never silent), and keep the session open.
-                                engine.record_wal_headroom_shed();
-                                engine.retry_budget_record_shed();
-                                let _ = reply.send(ProduceOutcome::WalHeadroomShed);
-                                continue;
-                            }
-                        }
-                    }
-                    // Append (write, NO fsync) and park the reply; the covering fsync is issued once
-                    // for the whole batch by `flush_pending` below.
-                    let view = Append {
-                        timestamp_ms: append.timestamp_ms,
-                        flags: ironbus_core::types::RecordFlags::from_bits(append.flags),
-                        key: &append.key,
-                        headers: &append.headers,
-                        payload: &append.payload,
-                    };
-                    match engine.append_no_sync_dedup(&view, dedup_request(&append)) {
-                        Ok(crate::engine::AppendOutcome::Appended(offset)) => {
-                            // An accepted produce feeds the broker-side retry-budget accept count
-                            // (#69), so the observed retry ratio stays meaningful under load.
-                            engine.retry_budget_record_accept();
-                            // A fire-and-forget (QoS-0) produce is appended durably exactly like a
-                            // normal produce (covering group-commit fsync) but gets NO `PubAck`, so
-                            // park it as the no-ack outcome; a normal produce parks as `Appended`.
-                            let outcome = if append.fire_and_forget {
-                                PendingOutcome::FireAndForgetAppended(offset)
-                            } else {
-                                PendingOutcome::Appended(offset)
-                            };
-                            pending.push(PendingProduce { outcome, reply });
-                        }
-                        // A BENIGN dedup hit (#33): nothing was appended, but its original offset may
-                        // be an id recorded earlier in THIS uncommitted batch, so PARK the reply behind
-                        // the covering fsync too (I2). On a sync failure the batch is non-durable and
-                        // every parked reply, hit or fresh, becomes Fatal, exactly as for a fresh append.
-                        Ok(crate::engine::AppendOutcome::Duplicate(offset)) => {
-                            pending.push(PendingProduce {
-                                outcome: PendingOutcome::Duplicate(offset),
-                                reply,
-                            });
-                        }
-                        // A stale-epoch fence (#33): nothing was written, so reply immediately; it does
-                        // not join the durable batch.
-                        Ok(crate::engine::AppendOutcome::Fenced { .. }) => {
-                            let _ = reply.send(ProduceOutcome::Fenced);
-                        }
-                        // A shed or a hard error is known WITHOUT the sync (nothing was written), so
-                        // reply immediately; it does not join the durable batch.
-                        Err(e) if e.is_at_capacity() => {
-                            // A byte-cap shed is a request the broker shed (the retry-budget signal).
-                            engine.retry_budget_record_shed();
-                            let _ = reply.send(ProduceOutcome::AtCapacity);
-                        }
-                        Err(e) if e.is_fatal() => {
-                            let _ = reply.send(ProduceOutcome::Fatal(e));
-                        }
-                        Err(e) => {
-                            let _ = reply.send(ProduceOutcome::Failed(e));
-                        }
-                    }
+                    process_produce(&mut engine, &mut pending, &append, Some(reply));
+                }
+                // A LEVEL-0 (no-ack / fire-and-forget) produce (#495): the SAME admission + append, but
+                // with NO reply channel (`None`), so every disposition — a bucket/CoDel/headroom shed,
+                // a dedup hit, a fence, an append, even a fatal freeze — drops silently with no frame,
+                // exactly the fire-and-forget contract. An appended L0 still joins the batch and is
+                // covered by the one `commit_batch` (single-writer storage / single total order), it
+                // just parks `None` so `flush_pending` sends nothing for it.
+                Command::ProduceNoReply { append } => {
+                    process_produce(&mut engine, &mut pending, &append, None);
                 }
                 // A non-produce job must observe a consistent durable head and keep the total durable
                 // order, so flush the parked produces (one fsync) BEFORE it runs.
@@ -1100,7 +1078,10 @@ where
                     // job runs (#476), so a job that READS those counters — e.g. the `/metrics`
                     // snapshot — observes the fast-rejects already folded in. Without this ordering a
                     // scrape could under-report `produce_rejected` by the fast-rejects not yet folded.
+                    // The L0 (no-ack) cap-sheds fold into `fire_and_forget_shed` (#495) on the same
+                    // pre-job boundary, so a scrape never under-reports either counter.
                     engine.record_fast_reject_sheds(cap_gate.take_unreconciled_fast_rejects());
+                    engine.record_fire_and_forget_sheds(cap_gate.take_unreconciled_l0_sheds());
                     job(&mut engine);
                     // A `Run` job can move BOTH the byte total (a job that reaps) AND the overflow
                     // policy (the live config reload, the only mutator of `disk_full_policy`), so
@@ -1143,7 +1124,13 @@ where
 /// covering `commit_batch` has made it durable.
 struct PendingProduce {
     outcome: PendingOutcome,
-    reply: SyncSender<ProduceOutcome>,
+    /// The reply channel for the produce outcome, or `None` for a LEVEL-0 (no-ack / fire-and-forget)
+    /// produce (#495). A Level-0 produce is appended into the SAME batch and covered by the same fsync
+    /// (single-writer storage / single total order), but it carries no reply channel: `flush_pending`
+    /// sends nothing for it whether the commit succeeds or freezes — the producer fired and forgot. The
+    /// at-least-once (Level-1 / Level-2-as-Level-1) path always carries `Some`, so its reply behavior
+    /// is byte-for-byte unchanged.
+    reply: Option<SyncSender<ProduceOutcome>>,
 }
 
 /// The pre-sync outcome of a parked produce. A fresh append OR a dedup hit reaches here (a shed,
@@ -1161,6 +1148,155 @@ enum PendingOutcome {
     /// (the producer fired and forgot). On a sync FAILURE it becomes `Fatal` like any parked produce,
     /// so a frozen writer still ends the session rather than silently losing a record it appended.
     FireAndForgetAppended(Offset),
+}
+
+/// Runs one produce's admission + append on the actor, parking its reply behind the covering fsync or
+/// replying/dropping it immediately on a non-appended disposition.
+///
+/// `reply` is `Some` for an at-least-once produce (Level 1, and Level 2 falling back to Level 1) and
+/// `None` for a LEVEL-0 (no-ack / fire-and-forget) produce (#495). When `Some`, this is byte-for-byte
+/// the historical produce path: every disposition sends exactly the frame it always did. When `None`,
+/// every disposition is a SILENT drop with no frame (the L0 producer fired and forgot), but the
+/// admission and append are IDENTICAL — an appended L0 still joins the batch and is covered by the one
+/// `commit_batch` (single-writer storage / single total order), it just parks `None`.
+///
+/// A `None` (Level-0) produce always has `append.fire_and_forget == true` (the session sets it for the
+/// canonical fire-and-forget bit AND the level-bit Level-0 encoding), so the fire-and-forget token
+/// bucket governs it exactly as it governed the historical faf path — this is that path generalized.
+fn process_produce<F, C>(
+    engine: &mut Engine<F, C>,
+    pending: &mut Vec<PendingProduce>,
+    append: &OwnedAppend,
+    reply: Option<SyncSender<ProduceOutcome>>,
+) where
+    F: Filesystem,
+    C: Clock + Clone,
+{
+    // Reply only if a channel was provided: a Level-0 produce (`None`) drops silently on every
+    // disposition (the fire-and-forget no-frame contract), so each `send_outcome` below is a no-op for
+    // it and the wire stays byte-identical to the historical faf path.
+    let send_outcome = |reply: &Option<SyncSender<ProduceOutcome>>, outcome: ProduceOutcome| {
+        if let Some(tx) = reply {
+            let _ = tx.send(outcome);
+        }
+    };
+    // FIRE-AND-FORGET (QoS-0, #11, #402) admission, decided FIRST and only for a produce the client
+    // marked fire-and-forget (every Level-0 produce, #495). The per-connection token bucket (#336)
+    // caps this un-credited tier: an exhausted bucket DROPS the produce (without acking and without
+    // appending), because the QoS-0 producer accepts loss by contract. The bucket governs ONLY this
+    // tier, so it NEVER touches the at-least-once path; a non-fire-and-forget produce skips this
+    // entirely. When disabled (the default rate of 0), the bucket always admits, so a QoS-0 produce
+    // under an unconfigured broker is appended-but-not-acked, never dropped.
+    if append.fire_and_forget {
+        let payload_bytes = u64::try_from(append.payload.len()).unwrap_or(u64::MAX);
+        if !engine.fire_and_forget_admit(payload_bytes) {
+            // Dropped by the bucket (counted in `ironbus_fire_and_forget_shed_total`): the producer
+            // fired and forgot, so send NO frame and keep the session.
+            send_outcome(&reply, ProduceOutcome::FireAndForgetDropped);
+            return;
+        }
+    }
+    // CoDel controlled-delay shed (#68), decided BEFORE the append so it rejects only NEW work and
+    // never drops an already-accepted record (I2 holds). The sojourn is `now - enqueue` on the
+    // monotonic clock seam; a sustained admission delay above TARGET sheds this produce. When CoDel is
+    // disabled (the default) this is always false, so the append path is byte-for-byte unchanged. A
+    // fire-and-forget produce shed by CoDel also gets no ack (the session maps the Shed outcome to no
+    // frame for a fire-and-forget pub), so the contract holds either way.
+    if engine.codel_admit(append.enqueue_monotonic_nanos) {
+        // The shed counts as a request the broker shed (the retry-budget signal), then replies a
+        // stable "shed under load" outcome; the connection stays open.
+        engine.retry_budget_record_shed();
+        send_outcome(&reply, ProduceOutcome::Shed);
+        return;
+    }
+    // fsync-HEADROOM admission (#378), decided BEFORE the append so it rejects only NEW work and never
+    // drops an already-accepted record (I2 / no-data-loss hold). It bounds the un-fsynced
+    // (buffered-but-not-durable) write frontier to the configured headroom, reusing the engine's
+    // `unsynced_bytes()` frontier (the #341 tracking). A no-op when the headroom is disabled (the
+    // default), so the append path is byte-for-byte unchanged for a broker that has not opted in.
+    if engine.wal_headroom_enabled() {
+        // The new record's LOGICAL bytes (key + headers + payload), the same units the un-fsynced
+        // frontier is measured in.
+        let record_bytes =
+            u64::try_from(append.key.len() + append.headers.len() + append.payload.len())
+                .unwrap_or(u64::MAX);
+        if !engine.wal_headroom_admit(record_bytes) {
+            // The headroom is exhausted: DRAIN first. `flush_pending` issues the ONE group-commit
+            // barrier for the parked batch. Under the default `sync` level (and a DUE `interval`
+            // window) that is a real `fdatasync`, so it resets the un-fsynced frontier to `0` and the
+            // record is then admitted by the no-wedge floor: the headroom THROTTLES (drain-then-admit),
+            // never sheds, never loses. Under a relaxed `async`/`none` level a commit DEFERS the fsync,
+            // so the frontier does NOT drain; the re-check still fails and the new produce is SHED to
+            // keep the loss window within the headroom. The already-buffered records are untouched (they
+            // stay durable-pending and are made durable by their level's barrier), so only this NEW
+            // produce is rejected.
+            flush_pending(engine, pending);
+            if !engine.wal_headroom_admit(record_bytes) {
+                // The drain could not free the headroom (a relaxed level deferring the fsync): shed
+                // this NEW produce with the typed, self-announcing signal, count it (a shed is never
+                // silent), and keep the session open.
+                engine.record_wal_headroom_shed();
+                engine.retry_budget_record_shed();
+                send_outcome(&reply, ProduceOutcome::WalHeadroomShed);
+                return;
+            }
+        }
+    }
+    // Append (write, NO fsync) and park the reply; the covering fsync is issued once for the whole
+    // batch by `flush_pending` below.
+    let view = Append {
+        timestamp_ms: append.timestamp_ms,
+        flags: ironbus_core::types::RecordFlags::from_bits(append.flags),
+        key: &append.key,
+        headers: &append.headers,
+        payload: &append.payload,
+    };
+    match engine.append_no_sync_dedup(&view, dedup_request(append)) {
+        Ok(crate::engine::AppendOutcome::Appended(offset)) => {
+            // An accepted produce feeds the broker-side retry-budget accept count (#69), so the
+            // observed retry ratio stays meaningful under load.
+            engine.retry_budget_record_accept();
+            // A fire-and-forget (QoS-0) produce is appended durably exactly like a normal produce
+            // (covering group-commit fsync) but gets NO `PubAck`, so park it as the no-ack outcome; a
+            // normal produce parks as `Appended`. (A Level-0 produce carries `reply: None`, so even
+            // its `FireAndForgetAppended` parked outcome sends nothing on flush — `None` is the
+            // generalized faf disposition.)
+            let outcome = if append.fire_and_forget {
+                PendingOutcome::FireAndForgetAppended(offset)
+            } else {
+                PendingOutcome::Appended(offset)
+            };
+            pending.push(PendingProduce { outcome, reply });
+        }
+        // A BENIGN dedup hit (#33): nothing was appended, but its original offset may be an id recorded
+        // earlier in THIS uncommitted batch, so PARK the reply behind the covering fsync too (I2). On a
+        // sync failure the batch is non-durable and every parked reply, hit or fresh, becomes Fatal,
+        // exactly as for a fresh append.
+        Ok(crate::engine::AppendOutcome::Duplicate(offset)) => {
+            pending.push(PendingProduce {
+                outcome: PendingOutcome::Duplicate(offset),
+                reply,
+            });
+        }
+        // A stale-epoch fence (#33): nothing was written, so reply immediately; it does not join the
+        // durable batch.
+        Ok(crate::engine::AppendOutcome::Fenced { .. }) => {
+            send_outcome(&reply, ProduceOutcome::Fenced);
+        }
+        // A shed or a hard error is known WITHOUT the sync (nothing was written), so reply immediately;
+        // it does not join the durable batch.
+        Err(e) if e.is_at_capacity() => {
+            // A byte-cap shed is a request the broker shed (the retry-budget signal).
+            engine.retry_budget_record_shed();
+            send_outcome(&reply, ProduceOutcome::AtCapacity);
+        }
+        Err(e) if e.is_fatal() => {
+            send_outcome(&reply, ProduceOutcome::Fatal(e));
+        }
+        Err(e) => {
+            send_outcome(&reply, ProduceOutcome::Failed(e));
+        }
+    }
 }
 
 /// Issues the SINGLE `commit_batch` fsync that covers every parked produce, then releases each parked
@@ -1182,6 +1318,11 @@ where
     match engine.commit_batch() {
         Ok(()) => {
             for p in pending.drain(..) {
+                // A LEVEL-0 (no-ack) parked produce carries no reply channel (#495): it is durable now
+                // (covered by the same fsync), but the producer fired and forgot, so send nothing.
+                let Some(reply) = p.reply else {
+                    continue;
+                };
                 let outcome = match p.outcome {
                     PendingOutcome::Appended(offset) => ProduceOutcome::Appended(offset),
                     // A dedup hit replies PubAckDuplicate now that the covering batch is durable (#33).
@@ -1191,7 +1332,7 @@ where
                         ProduceOutcome::FireAndForgetAppended(offset)
                     }
                 };
-                let _ = p.reply.send(outcome);
+                let _ = reply.send(outcome);
             }
         }
         Err(e) => {
@@ -1199,12 +1340,18 @@ where
             // fatal storage error so each ends its session, exactly as the pre-actor per-produce path
             // did when its `log.sync()?` surfaced `WriterFrozen`. The first member carries the real
             // error; the rest carry an equivalent frozen-writer error (the freeze is the same event).
+            // A LEVEL-0 (no-ack) parked produce has no reply channel (#495), so it is SKIPPED WITHOUT
+            // consuming the real error — the fired-and-forgotten producer is not listening, and the
+            // first at-least-once member must still receive the true error.
             let mut first = Some(e);
             for p in pending.drain(..) {
+                let Some(reply) = p.reply else {
+                    continue;
+                };
                 let err = first.take().unwrap_or(EngineError::Storage(
                     ironbus_storage::segment::StorageError::WriterFrozen,
                 ));
-                let _ = p.reply.send(ProduceOutcome::Fatal(err));
+                let _ = reply.send(ProduceOutcome::Fatal(err));
             }
         }
     }
@@ -1553,6 +1700,115 @@ mod tests {
     /// then collect its outcome without re-implementing the recv/return dance inline.
     fn submission_for_test_wait(submission: ProduceSubmission) -> ProduceOutcome {
         submission.wait().unwrap()
+    }
+
+    /// A LEVEL-0 (no-ack) owned produce: it is `append_faf` (the fire-and-forget marker), since the
+    /// session sets `fire_and_forget` for every Level-0 publish — an L0 produce IS the generalized
+    /// fire-and-forget produce (#495).
+    fn append_l0(payload: &[u8]) -> OwnedAppend {
+        append_faf(payload)
+    }
+
+    #[test]
+    fn a_level0_produce_appends_durably_with_no_reply() {
+        // THE L0 FAST PATH (#495): a Level-0 produce is appended on the actor's single-writer storage
+        // (single total order / I2 for other records untouched), covered by the group-commit fsync,
+        // but the session sent NO reply channel — `produce_no_reply` returns `Ok(())` WITHOUT waiting
+        // for the fsync and never blocks on a reply that will never come. We prove the record landed by
+        // reading the durable head AFTER a following at-least-once produce flushes the batch.
+        let (handle, actor, _control) = rig();
+        handle.produce_no_reply(append_l0(b"qos0-record")).unwrap();
+        // A following Level-1 produce shares the batch, so its ack proves the L0 record was committed
+        // ahead of it in the same single total order (offset 0 is the L0 record, offset 1 the L1 one).
+        let l1 = handle.produce(append(b"ack-me")).unwrap();
+        assert!(
+            matches!(l1, ProduceOutcome::Appended(o) if o.get() == 1),
+            "the L1 produce after the no-reply L0 acks at offset 1 (the L0 took offset 0): {l1:?}"
+        );
+        let head = handle.with(|e| e.durable_record_bytes()).unwrap();
+        assert!(head > 0, "both records are durable: {head} bytes");
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn an_over_cap_level0_produce_is_shed_at_the_connection_thread_into_fire_and_forget_shed() {
+        // THE L0 CAP PRE-CHECK (#495 over #476): once the durable log is at/over its drop-new byte cap,
+        // a Level-0 produce is shed at the CONNECTION THREAD by the same byte-cap gate — but counted in
+        // `fire_and_forget_shed` (an over-cap L0 drop is a fire-and-forget drop), NOT `produce_rejected`
+        // (the Level-1 rejection counter). `produce_no_reply` returns `Ok(())` either way (a shed L0 is
+        // not an error; the producer accepted loss), so the only observable is the COUNTER delta.
+        const L0_SHEDS: u64 = 6;
+        let cap = 512;
+        let (handle, actor, _control) = rig_capped(cap, DiskFullPolicy::DropNew);
+        let accepted = fill_to_cap(&handle, &[0x5a_u8; 64], cap);
+        assert!(accepted > 0, "some records were accepted before the cap");
+        // Baselines AFTER a `with` (a Run job, which reconciles any pending fast-rejects first).
+        let faf_before = handle
+            .with(|e| e.backpressure_snapshot().fire_and_forget_shed)
+            .unwrap();
+        let rejected_before = handle.with(|e| e.counters().produce_rejected).unwrap();
+
+        // Each over-cap L0 is dropped at the connection thread (no enqueue, no error).
+        for _ in 0..L0_SHEDS {
+            handle.produce_no_reply(append_l0(b"over-cap-l0")).unwrap();
+        }
+
+        // The actor folds the L0 sheds into `fire_and_forget_shed` (never a silent drop), and leaves
+        // `produce_rejected` (the Level-1 rejection counter) untouched. The `with` runs as a Run job,
+        // which reconciles the pending L0 sheds BEFORE the counter read.
+        let faf_after = handle
+            .with(|e| e.backpressure_snapshot().fire_and_forget_shed)
+            .unwrap();
+        let rejected_after = handle.with(|e| e.counters().produce_rejected).unwrap();
+        assert_eq!(
+            faf_after - faf_before,
+            L0_SHEDS,
+            "every over-cap L0 cap-shed is counted in fire_and_forget_shed (never silent)"
+        );
+        assert_eq!(
+            rejected_after, rejected_before,
+            "an L0 cap-shed must NOT touch produce_rejected (that is the Level-1 rejection counter)"
+        );
+        let _ = recover(handle, actor);
+    }
+
+    #[test]
+    fn a_level0_produce_dropped_by_the_fire_and_forget_bucket_sends_no_reply() {
+        // THE GENERALIZED FAF BUCKET (#495): a Level-0 produce is still governed by the fire-and-forget
+        // token bucket (#336). The `rig_faf` bucket ceiling is exactly 1 (10 msg/s * 100 ms), and the
+        // ManualClock never advances (no refill), so the FIRST L0 is admitted-no-ack and every later L0
+        // is DROPPED (no append, no reply) and counted in `fire_and_forget_shed` — exactly the
+        // historical faf disposition, only now without a reply channel to suppress.
+        let (handle, actor, _control) = rig_faf();
+        // Five no-reply L0 produces: the bucket admits 1 and sheds 4. None blocks or errors (there is
+        // no reply channel), so the only observable is the shed counter.
+        for _ in 0..5u64 {
+            handle.produce_no_reply(append_l0(b"bucket")).unwrap();
+        }
+        // A trailing at-least-once produce forces the batch to commit and lets us read the head; it is
+        // never governed by the faf bucket (the bucket touches the QoS-0 tier only).
+        let alo = handle.produce(append(b"alo")).unwrap();
+        assert!(
+            matches!(alo, ProduceOutcome::Appended(_)),
+            "an at-least-once produce is never shed by the faf bucket: {alo:?}"
+        );
+        let (head, faf_shed) = handle
+            .with(|e| {
+                (
+                    e.flushed_offset().get(),
+                    e.backpressure_snapshot().fire_and_forget_shed,
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            faf_shed, 4,
+            "4 of the 5 L0 produces shed by the bucket (counted, never silent)"
+        );
+        assert_eq!(
+            head, 2,
+            "exactly the 1 admitted L0 (offset 0) and the at-least-once produce (offset 1) are durable"
+        );
+        let _ = recover(handle, actor);
     }
 
     #[test]
