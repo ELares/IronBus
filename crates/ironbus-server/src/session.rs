@@ -35,6 +35,7 @@ use ironbus_proto::message::{
 };
 use ironbus_storage::fs::Filesystem;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// A session error that ends the connection.
 #[derive(Debug)]
@@ -162,6 +163,33 @@ struct Lease {
 // Each bool is an INDEPENDENT piece of per-connection protocol state (handshake done, key_shared
 // membership, broadcast registration, gap-marker capability), not a set of related options that
 // would read better as one enum/bitset, so the four-bool count is intentional rather than a smell.
+/// A work-group name held cheaply for per-op hand-off to the engine actor (#487). Wraps an
+/// `Arc<str>` so each clone is an atomic refcount bump (no per-op heap allocation) and derefs to
+/// `str`, so the engine's `BTreeMap<String, _>` lookup still receives a plain `&str`. The manual
+/// `Default` (an empty name selects the default group) keeps the broker's 1.78 MSRV, since
+/// `Arc<str>: Default` only exists from Rust 1.80.
+#[derive(Debug, Clone)]
+struct GroupName(Arc<str>);
+
+impl Default for GroupName {
+    fn default() -> Self {
+        GroupName(Arc::from(""))
+    }
+}
+
+impl std::ops::Deref for GroupName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for GroupName {
+    fn from(s: &str) -> Self {
+        GroupName(Arc::from(s))
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default)]
 pub struct Session {
@@ -169,7 +197,16 @@ pub struct Session {
     /// The work-group this connection is subscribed to, set by SUB and cleared by UNSUB.
     /// Empty selects the default group (#9), so an unsubscribed consumer behaves exactly as
     /// before. FLOW fetches and ACKs route to this group.
-    subscription: String,
+    ///
+    /// Held as `Arc<str>` (#487): every consume op (ack/poll/cumulative-ack) hands the group name
+    /// to the engine actor by VALUE because the job closure is `'static` (it crosses the actor
+    /// channel), so the name must be owned, not borrowed. Cloning an `Arc<str>` is an atomic
+    /// refcount bump with NO heap allocation, where cloning a `String` would allocate a fresh
+    /// buffer per op — one allocation per delivered message on the FLOW hot path. The engine still
+    /// receives a plain `&str` (the `Arc<str>` derefs), so its `BTreeMap<String, _>` lookup is
+    /// unchanged. Empty (`Arc::default()`) selects the default group, exactly as the empty `String`
+    /// did.
+    subscription: GroupName,
     /// The leases this session was delivered via Flow and may still act on, keyed by offset to the
     /// granted generation AND the message's byte size (#65, #275). Acks are scoped to this map
     /// (#175), so one connection cannot ack a message delivered to another. Keying by offset bounds
@@ -1224,7 +1261,7 @@ impl Session {
         // tears down a working subscription.
         let old_group = self.subscription.clone();
         self.leave_current_key_shared(engine)?;
-        if self.registered_subscription && old_group != new_group {
+        if self.registered_subscription && *old_group != *new_group {
             engine.with(move |e| {
                 e.unsubscribe_in(&old_group, member);
             })?;
@@ -1233,7 +1270,7 @@ impl Session {
         // previous group (they redeliver there after the visibility timeout), so the new
         // subscription starts with no outstanding leases. The name's shape and the group
         // cap are validated by the engine on the first FLOW (#240), surfaced as an Err.
-        group.clone_into(&mut self.subscription);
+        self.subscription = GroupName::from(group);
         self.registered_subscription = !new_group.is_empty();
         self.leased.clear();
         // If the new group is configured key_shared (#64), put it into that mode and join as a
