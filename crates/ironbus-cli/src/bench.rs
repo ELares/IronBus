@@ -237,6 +237,17 @@ pub struct BenchConfig {
     /// ack-pipelining flags (`--stream`, `--pubwindow > 1`), which pipeline awaited acks this path
     /// has none of.
     pub fire_and_forget: bool,
+    /// AUTO-PIPELINING durable producer (#508): with `--autopipe`, publish mode drives
+    /// [`ironbus_client::Client::pipelined_producer_with_window`] (sized by `--pubwindow`, default
+    /// [`ironbus_client::DEFAULT_PIPELINE_WINDOW`]) instead of the awaited per-publish
+    /// [`ironbus_client::Client::produce`]. The handle buffers a window of durable publishes and
+    /// flushes them as one group-committed batch, so a SINGLE producer keeps the window in flight
+    /// and the broker collapses it under one fsync — the single-producer durable-throughput lever
+    /// that the awaited path cannot reach (it has one publish in flight at a time). Every publish
+    /// stays at-least-once and ack-implies-durable; only WHEN the ack is observed moves. Publish
+    /// mode only, and mutually exclusive with `--stream` and `--fire-and-forget` (each is its own
+    /// distinct publish path).
+    pub auto_pipeline: bool,
     /// The storage BACKEND of bench's own ISOLATED synthetic broker (#445, refs #443): `disk` (the
     /// default, the historical bench broker over an auto-deleted synthetic data dir) or `memory`
     /// (the same engine over the in-memory filesystem, for honest RAM-path numbers next to the
@@ -334,6 +345,7 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
     let mut no_fsync = false;
     let mut stream = false;
     let mut fire_and_forget = false;
+    let mut auto_pipeline = false;
     let mut pub_window: usize = 1;
     let mut storage: Option<StorageArg> = None;
     let mut per_message_ack = false;
@@ -428,6 +440,12 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
             // `--faf` alias is accepted for brevity.
             "--fire-and-forget" | "--faf" => {
                 fire_and_forget = true;
+                i += 1;
+            }
+            // AUTO-PIPELINING durable producer (#508): drive `pipelined_producer_with_window`
+            // (the default single-producer durable-throughput lever). Sized by `--pubwindow`.
+            "--autopipe" => {
+                auto_pipeline = true;
                 i += 1;
             }
             // The pipelined publish window (#450): 0 is meaningless (nothing would ever be
@@ -600,6 +618,34 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         AckMode::Batched
     };
 
+    // AUTO-PIPELINE guards (#508). The auto-pipelining durable producer is a produce-side path that
+    // awaits acks at flush points (so it is meaningful only in publish mode), and it is its own
+    // distinct in-flight-window mechanism, so it does not stack with `--stream` (the full-duplex
+    // window) or `--fire-and-forget` (no acks at all). Each is its own usage error naming the clash.
+    if auto_pipeline && mode != Mode::Publish {
+        return Err(CliError::Usage(
+            "`--autopipe` is a produce-only durable-throughput path: it requires `--mode publish`. \
+             subscribe and round-trip drive the consumer / read-back paths, which the \
+             auto-pipelining producer does not exercise."
+                .into(),
+        ));
+    }
+    if auto_pipeline && stream {
+        return Err(CliError::Usage(
+            "`--autopipe` and `--stream` are mutually exclusive: both keep a window of awaited acks \
+             in flight, by different mechanisms (the auto-pipelining handle vs the full-duplex \
+             slide). Pick one."
+                .into(),
+        ));
+    }
+    if auto_pipeline && fire_and_forget {
+        return Err(CliError::Usage(
+            "`--autopipe` and `--fire-and-forget` are mutually exclusive: auto-pipelining keeps a \
+             window of DURABLE awaited acks in flight, while fire-and-forget awaits none. Pick one."
+                .into(),
+        ));
+    }
+
     Ok(BenchConfig {
         mode,
         bound,
@@ -612,6 +658,7 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         no_fsync,
         stream,
         fire_and_forget,
+        auto_pipeline,
         pub_window,
         storage,
         consume_ack,
@@ -802,7 +849,7 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         s,
         "{{\"schema_version\":{},\"mode\":\"{}\",\"isolated\":{},\"group\":\"{}\",\
          \"bound\":{{{}}},\"target_rate_hz\":{},\"payload_bytes\":{},\"payload_shape\":\"{}\",\
-         \"fetch_batch\":{},\"no_fsync\":{},\"pubwindow\":{},\"stream\":{},\"fire_and_forget\":{},\"storage\":\"{}\",\"consume_ack\":\"{}\",\"results\":{{\
+         \"fetch_batch\":{},\"no_fsync\":{},\"pubwindow\":{},\"stream\":{},\"fire_and_forget\":{},\"auto_pipeline\":{},\"storage\":\"{}\",\"consume_ack\":\"{}\",\"results\":{{\
          \"produced\":{},\"recorded\":{},\"elapsed_secs\":{},\"msgs_per_sec\":{},\
          \"mb_per_sec\":{},\"bytes_per_op\":{},\
          \"latency_p50_us\":{},\"latency_p99_us\":{},\"latency_p999_us\":{},\"latency_max_us\":{},\
@@ -820,6 +867,7 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         cfg.pub_window,
         cfg.stream,
         cfg.fire_and_forget,
+        cfg.auto_pipeline,
         cfg.storage.as_str(),
         cfg.consume_ack.as_str(),
         report.produced,
@@ -1411,6 +1459,74 @@ mod tests {
         assert!(
             json_per_msg.contains("\"consume_ack\":\"per-message\""),
             "{json_per_msg}"
+        );
+        assert!(
+            json_per_msg.contains("\"schema_version\":1"),
+            "additive, version unchanged: {json_per_msg}"
+        );
+    }
+
+    #[test]
+    fn auto_pipeline_is_publish_only_excludes_the_other_paths_and_lands_in_the_json() {
+        // The #508 auto-pipelining durable producer: default off; the bare `--autopipe` flag sets
+        // it; it is refused outside publish mode and alongside `--stream` / `--fire-and-forget`;
+        // and it is echoed additively in the JSON object (schema version unchanged).
+        let off = parse(&["--count", "5", "--mode", "publish"]).unwrap();
+        assert!(!off.auto_pipeline, "auto-pipeline defaults off");
+        let on = parse(&["--count", "5", "--mode", "publish", "--autopipe"]).unwrap();
+        assert!(on.auto_pipeline);
+        // Bare flag does not swallow the next flag.
+        let with_window = parse(&[
+            "--count",
+            "5",
+            "--mode",
+            "publish",
+            "--autopipe",
+            "--pubwindow",
+            "32",
+        ])
+        .unwrap();
+        assert!(with_window.auto_pipeline && with_window.pub_window == 32);
+        // Publish-only: round-trip (the default) and subscribe are refused.
+        match parse(&["--count", "5", "--autopipe"]) {
+            Err(CliError::Usage(m)) => assert!(m.contains("--mode publish"), "{m}"),
+            other => panic!("autopipe outside publish must be a usage error, got {other:?}"),
+        }
+        match parse(&["--count", "5", "--mode", "subscribe", "--autopipe"]) {
+            Err(CliError::Usage(m)) => assert!(m.contains("produce-only"), "{m}"),
+            other => panic!("autopipe + subscribe must be a usage error, got {other:?}"),
+        }
+        // Mutually exclusive with the other publish paths.
+        match parse(&[
+            "--count",
+            "5",
+            "--mode",
+            "publish",
+            "--autopipe",
+            "--stream",
+            "--pubwindow",
+            "8",
+        ]) {
+            Err(CliError::Usage(m)) => assert!(m.contains("mutually exclusive"), "{m}"),
+            other => panic!("autopipe + stream must be a usage error, got {other:?}"),
+        }
+        match parse(&[
+            "--count",
+            "5",
+            "--mode",
+            "publish",
+            "--autopipe",
+            "--fire-and-forget",
+        ]) {
+            Err(CliError::Usage(m)) => assert!(m.contains("mutually exclusive"), "{m}"),
+            other => panic!("autopipe + fire-and-forget must be a usage error, got {other:?}"),
+        }
+        // Lands additively in the JSON, schema version unchanged.
+        let json = bench_json(&on, &BenchReport::default());
+        assert!(json.contains("\"auto_pipeline\":true"), "{json}");
+        assert!(
+            json.contains("\"schema_version\":1"),
+            "additive, version unchanged: {json}"
         );
     }
 

@@ -359,6 +359,107 @@ fn pace(rate_hz: Option<f64>, seq: u64, started: Instant) {
     }
 }
 
+/// The AUTO-PIPELINING DURABLE publish leg (#508), split from [`run_publish`]: drive
+/// [`Client::pipelined_producer_with_window`], the default single-producer durable-throughput lever.
+/// The handle buffers a window of at-least-once publishes and flushes them as ONE group-committed
+/// batch, so a SINGLE producer keeps the window in flight and the broker collapses it under one
+/// fsync — the gap the awaited per-publish [`Client::produce`] cannot close (it has one publish in
+/// flight at a time). Every publish stays durable (ack-implies-durable); only WHEN the ack is
+/// observed moves. The window is sized by `--pubwindow` (or [`DEFAULT_PIPELINE_WINDOW`] when it is
+/// the unpipelined default of 1, so a bare `--autopipe` still pipelines).
+///
+/// Per-op time is attributed across each flushed window evenly (one fdatasync covers the window), so
+/// the reported fsync cost honestly reflects the group-commit amortization, exactly as the
+/// half-duplex `--pubwindow` path does.
+fn run_publish_autopipe(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError> {
+    let mut pub_client = connect(addr)?;
+    // A bare `--autopipe` (pubwindow left at its unpipelined default of 1) still pipelines: use the
+    // client's default window so the throughput lever actually engages.
+    let window = if cfg.pub_window > 1 {
+        cfg.pub_window
+    } else {
+        ironbus_client::DEFAULT_PIPELINE_WINDOW
+    };
+    let mut payload = vec![0u8; cfg.payload_bytes];
+    let mut produced: u64 = 0;
+    let mut fsync_samples: Vec<u64> = Vec::new();
+    let started = Instant::now();
+    let mut pipe = pub_client.pipelined_producer_with_window(window);
+    // Time each flush across the publishes it made durable: a flush issues ONE write whose covering
+    // group commit is one fdatasync, so dividing the flush's wall time across its publishes gives an
+    // honest per-op durable cost (the same attribution the `--pubwindow` half-duplex path uses).
+    let mut window_start = Instant::now();
+    let mut window_count: u64 = 0;
+    while !should_stop(&cfg.bound, produced, started) {
+        fill_payload(
+            &mut payload,
+            cfg.payload_shape,
+            produced,
+            ROUND_TRIP_TOKEN_LEN,
+        );
+        stamp_seq(&mut payload, produced);
+        let body = PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: &payload,
+        };
+        window_count += 1;
+        match pipe.produce(&body) {
+            // A non-empty summary means this publish filled the window and triggered a flush: the
+            // window's publishes are now durable. Attribute the flush's elapsed time across them.
+            Ok(summary) if summary.acked > 0 => {
+                attribute_window(&mut fsync_samples, &mut window_start, &mut window_count);
+            }
+            Ok(_) => {} // buffered only; its flush is timed when the window fills (or at finish).
+            Err(e) if is_shed(&e) => {
+                attribute_window(&mut fsync_samples, &mut window_start, &mut window_count);
+            }
+            Err(e) => return Err(classify(addr, "auto-pipelining a produce to", &e)),
+        }
+        produced += 1;
+        pace(cfg.target_rate_hz, produced, started);
+    }
+    // Drain the buffered tail: its flush makes the remaining publishes durable.
+    match pipe.finish() {
+        Ok(_) => attribute_window(&mut fsync_samples, &mut window_start, &mut window_count),
+        Err(e) if is_shed(&e) => {
+            attribute_window(&mut fsync_samples, &mut window_start, &mut window_count);
+        }
+        Err(e) => return Err(classify(addr, "flushing the auto-pipelined tail to", &e)),
+    }
+    let elapsed = started.elapsed();
+    Ok(finish_report(
+        cfg,
+        produced,
+        produced,
+        &[],
+        &fsync_samples,
+        elapsed,
+        cfg.fsync_is_measured(),
+    ))
+}
+
+/// Attributes one flushed window's elapsed wall time evenly across the publishes it covered, pushing
+/// one per-op sample per publish, then resets the window timer/counter for the next window. A
+/// no-op when the window covered nothing (an empty flush).
+fn attribute_window(samples: &mut Vec<u64>, window_start: &mut Instant, window_count: &mut u64) {
+    if *window_count == 0 {
+        *window_start = Instant::now();
+        return;
+    }
+    let elapsed_ns = u64::try_from(window_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let per_msg = elapsed_ns / *window_count;
+    for _ in 0..*window_count {
+        samples.push(per_msg);
+    }
+    *window_count = 0;
+    *window_start = Instant::now();
+}
+
 /// The FULL-DUPLEX publish leg (#458), split from [`run_publish`]: one `produce_stream` call
 /// pumps the whole run, writer and ack-reader overlapped, in-flight capped at the window.
 fn run_publish_stream(
@@ -474,6 +575,9 @@ fn run_publish_faf(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliErro
 fn run_publish(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError> {
     if cfg.fire_and_forget {
         return run_publish_faf(cfg, addr);
+    }
+    if cfg.auto_pipeline {
+        return run_publish_autopipe(cfg, addr);
     }
     let mut pub_client = connect(addr)?;
     let mut payload = vec![0u8; cfg.payload_bytes];
