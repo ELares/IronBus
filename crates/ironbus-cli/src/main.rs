@@ -255,6 +255,31 @@ const DEFAULT_FLUSH_INTERVAL_MS: u64 = 1_000;
 /// is the smaller of the time and byte triggers.
 const DEFAULT_FLUSH_MAX_BYTES: u64 = 1024 * 1024;
 
+/// The default `--commit-gather-us`: the bounded group-commit GATHER window (#454, #472) in
+/// MICROSECONDS the append actor keeps collecting commands once a drain pass already holds TWO OR
+/// MORE produces (evidence of a pipelining / concurrent publisher), so that publisher's whole
+/// in-flight set lands under ONE covering `fdatasync` instead of self-sizing slivers (the default
+/// drain only sees what arrived during the PREVIOUS batch's fsync, so a concurrent producer was
+/// committing only a few records per fsync — the bulk of the ~186x durable-produce gap, #472).
+///
+/// The default is `200` (microseconds), NOT `0`, so out-of-the-box durable produce batches fsyncs.
+/// It is deliberately CONSERVATIVE and cannot weaken durability or change the synchronous `produce`
+/// contract:
+/// - I2 (ack-implies-durable) is untouched: an ack is still released only AFTER the covering
+///   `commit_batch` `fdatasync` (the gather only changes which commands share that one fsync, never
+///   the order of ack-vs-fsync).
+/// - A SINGLE in-flight producer (send, await each ack) NEVER engages the gather: a drain pass
+///   holding fewer than two produces returns immediately, so the unpipelined `produce` path keeps
+///   its exact historical ack latency and its one-fsync-per-message accounting.
+/// - It is far smaller than one edge-device `fdatasync` (hundreds of microseconds to low
+///   milliseconds), so the window closes well before a lone fsync would have completed; it adds at
+///   most ~200 us of commit latency to a BURST of concurrent produces in exchange for collapsing
+///   their many fsyncs into one. This mirrors the `MySQL` `binlog_group_commit_sync_delay` /
+///   `PostgreSQL` `commit_delay` precedent (tens to a few hundred microseconds). An operator may set
+///   `0` to restore the byte-identical historical actor, or raise it (bounded to 1 s) for fewer,
+///   larger barriers.
+const DEFAULT_COMMIT_GATHER_US: u64 = 200;
+
 /// The default CoDel TARGET (ms) for `serve` (#68), aliased to the engine's default so the CLI and
 /// engine stay one source of truth. `0` = DISABLED (CoDel off, the default), so a zero-config broker
 /// is unchanged; an operator opts in by setting a non-zero target.
@@ -2295,8 +2320,17 @@ fn parse_serve_flags_with_env_and_reader(
                 env,
                 DEFAULT_FLUSH_MAX_BYTES,
             )?,
-            // The group-commit gather (#454): default 0 = off, the byte-identical historical actor.
-            commit_gather_us: resolve_number("--commit-gather-us", f.commit_gather_us, env, 0)?,
+            // The group-commit gather (#454, #472): default [`DEFAULT_COMMIT_GATHER_US`] (a small,
+            // conservative window) so out-of-the-box durable produce batches fsyncs under a
+            // concurrent publisher. `0` restores the byte-identical historical actor; a single
+            // in-flight producer never engages the window (it only triggers on a pass holding >= 2
+            // produces), so the synchronous `produce` contract and I2 are unchanged.
+            commit_gather_us: resolve_number(
+                "--commit-gather-us",
+                f.commit_gather_us,
+                env,
+                DEFAULT_COMMIT_GATHER_US,
+            )?,
             async_loss_ack: resolve_bool("--async-loss-ack", f.async_loss_ack, env)?,
             // The storage backend (#443), resolved above (flag > env > default `disk`); the
             // ephemeral consent resolves like the other bare safety flags. `memory` without the
@@ -3060,15 +3094,17 @@ struct ServeConfig {
     /// (`DEFAULT_FLUSH_MAX_BYTES`); `0` disables the byte trigger (the time window alone forces the
     /// sync). The EFFECTIVE worst-case loss bound is the smaller of the time and byte triggers.
     flush_max_bytes: u64,
-    /// The opt-in GROUP-COMMIT GATHER window in MICROSECONDS (#454): when a drain pass already
-    /// holds at least TWO produces (evidence of a pipelining publisher; a single-produce pass
-    /// never gathers, so an unpipelined producer pays no window), the append actor keeps
-    /// collecting commands for up to this long before committing, so the publisher's whole
-    /// in-flight window lands under ONE covering fsync instead of arrival-rate-sized slivers. `0` (the default) disables the gather and the
-    /// actor is byte-identical to the historical drain. Durability is UNTOUCHED: acks still mean
-    /// fsynced-durable; the knob trades up to this much added commit latency under produce bursts
-    /// for fewer, larger sync barriers (the `MySQL` `binlog_group_commit_sync_delay` precedent).
-    /// Bounded at 1 second by validation so a typo cannot stall acks indefinitely.
+    /// The GROUP-COMMIT GATHER window in MICROSECONDS (#454, #472): when a drain pass already
+    /// holds at least TWO produces (evidence of a pipelining / concurrent publisher; a
+    /// single-produce pass never gathers, so an unpipelined producer pays no window), the append
+    /// actor keeps collecting commands for up to this long before committing, so the publisher's
+    /// whole in-flight window lands under ONE covering fsync instead of arrival-rate-sized slivers.
+    /// Defaults to [`DEFAULT_COMMIT_GATHER_US`] (a small, conservative window, #472) so out-of-the-
+    /// box durable produce batches fsyncs; `0` disables the gather and the actor is byte-identical
+    /// to the historical drain. Durability is UNTOUCHED: acks still mean fsynced-durable (I2); the
+    /// knob trades up to this much added commit latency under produce bursts for fewer, larger sync
+    /// barriers (the `MySQL` `binlog_group_commit_sync_delay` precedent). Bounded at 1 second by
+    /// validation so a typo cannot stall acks indefinitely.
     commit_gather_us: u64,
     /// The explicit DATA-LOSS ACKNOWLEDGEMENT for the unbounded-loss levels (#49, #379): the
     /// `--async-loss-ack` (a.k.a. `i-accept-acknowledged-data-loss`) bare flag. `async` and `none`
@@ -3182,7 +3218,9 @@ impl ServeConfig {
             compression: CompressionArg::Lz4,
             flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
-            commit_gather_us: 0,
+            // The shipped default group-commit gather (#454, #472): the bench broker must match the
+            // `serve` default so its measured durable produce reflects what operators actually run.
+            commit_gather_us: DEFAULT_COMMIT_GATHER_US,
             async_loss_ack: false,
             // The default storage backend (#443): the durable on-disk store, no ephemeral consent.
             storage: StorageArg::Disk,
@@ -9208,14 +9246,27 @@ mod tests {
     }
 
     #[test]
-    fn the_commit_gather_flag_parses_defaults_off_echoes_and_caps_at_one_second() {
-        // The group-commit gather knob (#454). Default OFF: an untouched serve resolves to 0 and
-        // the actor stays byte-identical. The flag parses WITHOUT swallowing the next flag (the
+    fn the_commit_gather_flag_resolves_the_default_window_echoes_and_caps_at_one_second() {
+        // The group-commit gather knob (#454, #472). DEFAULT: an untouched serve resolves to the
+        // shipped small conservative window (`DEFAULT_COMMIT_GATHER_US`), so out-of-the-box durable
+        // produce batches fsyncs under a concurrent publisher. An EXPLICIT `0` still restores the
+        // byte-identical historical actor. The flag parses WITHOUT swallowing the next flag (the
         // `--pubwindow` parse-cursor regression class), the materialized-config line echoes the
         // resolved value, and validation refuses a window past one second (an ms-pasted-as-us typo
         // must not become a silent multi-second ack stall).
-        let off = parse_serve_flags(&serve_args(&[])).unwrap().config;
-        assert_eq!(off.commit_gather_us, 0, "gather defaults off");
+        let defaulted = parse_serve_flags(&serve_args(&[])).unwrap().config;
+        assert_eq!(
+            defaulted.commit_gather_us, DEFAULT_COMMIT_GATHER_US,
+            "gather resolves the shipped default window when unset"
+        );
+        // An operator can still opt fully OUT, restoring the historical gather-off actor.
+        let disabled = parse_serve_flags(&serve_args(&["--commit-gather-us", "0"]))
+            .unwrap()
+            .config;
+        assert_eq!(
+            disabled.commit_gather_us, 0,
+            "an explicit 0 disables the gather (historical byte-identical actor)"
+        );
         let on = parse_serve_flags(&serve_args(&[
             "--commit-gather-us",
             "3000",

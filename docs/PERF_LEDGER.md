@@ -127,10 +127,13 @@ actor waits out the gather. The two waits compound; nothing feeds.
 1. Read chunk 4 KiB -> 64 KiB zero-page heap buffer (the actual win). A pass now carries
    hundreds of frames, so the pass-scoped window group-commits in a few fsyncs, not ~40.
    Untouched pages cost no RSS; idle/ping-only connections still touch about a page.
-2. serve --commit-gather-us (default 0 = off, validation-capped at 1 s) kept as the OPT-IN
-   multi-producer lever: many connections each trickling singles can amortize one fsync. It
-   only engages when a drain pass already holds >= 2 produces (a single-produce pass never
-   gathers, so an unpipelined producer pays no window; the MySQL no-delay-count analogue).
+2. serve --commit-gather-us (validation-capped at 1 s) as the multi-producer lever: many
+   connections each trickling singles can amortize one fsync. It only engages when a drain
+   pass already holds >= 2 produces (a single-produce pass never gathers, so an unpipelined
+   producer pays no window; the MySQL no-delay-count analogue). Originally shipped default-OFF
+   (`0`); #472 changed the SHIPPED DEFAULT to a small conservative window (200 us,
+   `DEFAULT_COMMIT_GATHER_US`) so out-of-the-box durable produce batches fsyncs under a
+   concurrent publisher. `0` still restores the byte-identical historical actor.
 
 ### Measured (hive, 256B realistic, 15s runs, pre-merge cross-compiled, scratch broker)
 
