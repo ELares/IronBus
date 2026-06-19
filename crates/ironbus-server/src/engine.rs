@@ -743,6 +743,27 @@ pub enum NackResult {
     Fenced,
 }
 
+/// A Tier-S STREAMING fetch result (#544, M1-I7): the CONTIGUOUS batch of records the broker served
+/// off the durable prefix starting at the consumer-managed `start_offset`, with NO lease granted and
+/// NO per-record cursor write. The consumer owns the offset: it advances its own position past
+/// `next_offset` and periodically durably-commits via [`Engine::stream_commit_in`]. At-least-once holds
+/// by construction — a crash/reconnect re-reads from the last committed offset, redelivering at most
+/// the uncommitted records.
+#[derive(Clone, Debug, Default)]
+pub struct StreamBatch {
+    /// The contiguous run of records read from the durable, flushed prefix `[start_offset, ...)`, in
+    /// offset order, bounded by `max_records` / `max_bytes` / the flushed frontier. May be empty (the
+    /// consumer is already caught up to the durable head, or `start_offset` is at/past it). These are
+    /// the SAME materialized, CRC-validated records the Tier-W poll path returns — only the
+    /// lease/cursor bookkeeping is skipped.
+    pub records: Vec<OwnedRecord>,
+    /// The offset the consumer should resume from on its NEXT fetch: one past the last record served
+    /// (or `start_offset` itself when the batch is empty). It never exceeds the flushed head. A
+    /// reconnecting consumer that has not committed simply re-passes its last committed offset, not
+    /// this value, and the uncommitted span redelivers.
+    pub next_offset: Offset,
+}
+
 /// The outcome of [`Engine::progress`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProgressResult {
@@ -1633,6 +1654,24 @@ struct WorkGroup {
     /// a cursor with nothing to record, so a consumer that polled but never committed resumes
     /// untouched even after a graceful stop.
     touched: bool,
+    /// Whether this group is a TIER-S STREAMING consumer (#544, M1-I7): a consumer-managed-offset
+    /// mode where the broker serves a CONTIGUOUS batch off the durable prefix with NO lease, NO
+    /// generation fence, and NO per-record cursor write, and durability comes from a PERIODIC
+    /// cumulative [`Engine::stream_commit_in`] that advances this group's committed cursor via
+    /// `commit_up_to`. It is the streaming twin of the default TIER-W work-queue mode (`broadcast` /
+    /// `router` above): where Tier-W grants a per-record lease and writes the cursor on every ack,
+    /// Tier-S removes exactly that per-record cost, which is what makes single-consumer durable
+    /// consume lose to NATS. At-least-once holds BY CONSTRUCTION — a crash or reconnect re-reads from
+    /// the last committed offset (the consumer passes its own `start_offset` to
+    /// [`Engine::stream_fetch_in`]), so at most the uncommitted records redeliver (the Kafka /
+    /// NATS-pull contract). The streaming cursor still pins the retention floor exactly like any
+    /// other group (it is read by [`Engine::min_committed_offset`] once `touched`), so a committed
+    /// streaming consumer frees retention correctly. `false` (Tier-W work-queue) by default, so an
+    /// unconfigured group is byte-for-byte unchanged and the Tier-W lease path is untouched. A
+    /// streaming group never grants leases, so it never carries the broadcast group-of-one hazard:
+    /// it is orthogonal to `broadcast` and `router` and does NOT clear them (a future Connect-default
+    /// tier negotiation, M1-I9, may layer policy on top; this flag is the per-group selector only).
+    streaming: bool,
 }
 
 /// What happens to an evicted group's `group_last_checkpointed` entry (#432): `Keep` leaves it
@@ -1667,6 +1706,11 @@ impl WorkGroup {
             // pinning. The single exception, the boot-created default group with no durable
             // state, is flipped to untouched right after open inserts it.
             touched: true,
+            // Tier-W (work-queue lease mode) by default (#544): a resumed/new group is byte-for-byte
+            // the existing lease path. Tier-S streaming is opted into server-side via
+            // `set_streaming_in` after open, never restored from disk here (the mode is re-applied,
+            // exactly like `broadcast` / `router`).
+            streaming: false,
         }
     }
 }
@@ -4810,6 +4854,221 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// As [`Engine::cumulative_ack_in`].
     pub fn cumulative_ack(&mut self, up_to: Offset) -> Result<(), EngineError> {
         self.cumulative_ack_in(DEFAULT_GROUP, up_to)
+    }
+
+    /// Marks `group` a TIER-S STREAMING consumer (#544, M1-I7), or clears the mode. A streaming group
+    /// is consumer-managed-offset: [`Engine::stream_fetch_in`] serves a contiguous batch off the
+    /// durable prefix with NO lease and NO per-record cursor write, and durability comes from a
+    /// periodic cumulative [`Engine::stream_commit_in`]. This is the serve-time declaration that opts a
+    /// named group into the streaming tier, mirroring [`Engine::set_broadcast_in`] /
+    /// [`Engine::set_key_ordering_in`] (the existing per-group mode setters). The Connect-level tier
+    /// DEFAULT negotiation is a SEPARATE issue (M1-I9); this is the explicit per-group selector only,
+    /// and it does NOT change any default — an unconfigured group stays Tier-W.
+    ///
+    /// Creates the group if absent (validating the name and the group cap, exactly like
+    /// `set_broadcast_in`). Unlike `set_broadcast_in` there is no group-of-one cap to guard: a
+    /// streaming group grants no leases, so there is no in-flight state a later commit could silently
+    /// drop. The flip is therefore always safe and does not clear `broadcast` / `router` (a streaming
+    /// consumer simply reads contiguously; the lease-mode flags are inert on the streaming path).
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidGroupName`] for a malformed name, or [`EngineError::TooManyGroups`] if a
+    /// new group would exceed the per-engine cap.
+    pub fn set_streaming_in(&mut self, group: &str, streaming: bool) -> Result<(), EngineError> {
+        if !self.groups.contains_key(group) {
+            validate_group_name(group)?;
+            if self.max_groups != 0 && self.groups.len() >= self.max_groups {
+                return Err(EngineError::TooManyGroups {
+                    max: self.max_groups,
+                });
+            }
+        }
+        let now = self.log.now_monotonic();
+        let lease_config = self.lease_config;
+        let g = self
+            .groups
+            .entry(group.to_string())
+            .or_insert_with(|| WorkGroup::new(lease_config, now));
+        g.streaming = streaming;
+        Ok(())
+    }
+
+    /// Whether `group` is a TIER-S STREAMING consumer (#544): a consumer-managed-offset group served
+    /// by [`Engine::stream_fetch_in`] / [`Engine::stream_commit_in`]. `false` for an unknown group or a
+    /// default Tier-W work-queue group.
+    #[must_use]
+    pub fn is_streaming_in(&self, group: &str) -> bool {
+        self.groups.get(group).is_some_and(|g| g.streaming)
+    }
+
+    /// Serves a Tier-S STREAMING fetch (#544, M1-I7): a CONTIGUOUS batch of records starting at the
+    /// consumer-managed `start_offset`, bounded by `max_records` / `max_bytes` and the flushed
+    /// frontier — with NO lease grant, NO generation fence, and NO per-record cursor write. This is the
+    /// headline single-consumer consume win: it removes exactly the per-record lease `BTreeMap` insert,
+    /// generation bump, and RLE cursor mutate that the Tier-W [`Engine::poll`] path pays on every
+    /// record, replacing N per-record actor round-trips with ONE contiguous read.
+    ///
+    /// At-least-once holds BY CONSTRUCTION: the consumer owns its offset and re-reads from its last
+    /// committed position on a crash/reconnect (it passes that offset as `start_offset`), so the broker
+    /// keeps no per-delivery state and at most the uncommitted records redeliver — the Kafka /
+    /// NATS-pull contract. The records returned are the SAME materialized, CRC-validated
+    /// [`OwnedRecord`]s the Tier-W path delivers (via the shared `Log::read_range`); only the
+    /// bookkeeping differs.
+    ///
+    /// The group must be in streaming mode (declared via [`Engine::set_streaming_in`]); a fetch on a
+    /// non-streaming group is rejected so a client cannot bypass the Tier-W lease path by accident.
+    /// `member` is accepted for symmetry with the Tier-W member-aware poll and future per-member
+    /// streaming policy, but a streaming fetch is not member-routed (the consumer manages its own
+    /// offset), so it is currently unused beyond marking the group active.
+    ///
+    /// A streaming fetch NEVER advances the group cursor and NEVER touches the lease table: retention
+    /// is pinned only by the periodic [`Engine::stream_commit_in`], so a consumer that fetches but
+    /// never commits pins the floor at its committed offset (not its read offset), exactly the
+    /// consumer-managed contract.
+    ///
+    /// # Errors
+    /// [`EngineError::CumulativeAckOnWorkGroup`] if `group` is not a streaming group (reusing the
+    /// wrong-mode error; the verb belongs to a streaming consumer only), or a storage error reading the
+    /// durable prefix.
+    pub fn stream_fetch_in(
+        &mut self,
+        group: &str,
+        _member: MemberId,
+        start_offset: Offset,
+        max_records: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<StreamBatch, EngineError> {
+        // A streaming fetch belongs to a streaming group ONLY. A Tier-W (lease) group must keep using
+        // the poll/Fetch path; serving it a contiguous lease-free batch would bypass its lease/cursor
+        // semantics. Reject with the wrong-mode error rather than silently degrade the work-queue.
+        if !self.is_streaming_in(group) {
+            return Err(EngineError::CumulativeAckOnWorkGroup);
+        }
+        let now = self.log.now_monotonic();
+        // A fetch IS activity: refresh the idle stamp and mark the group touched so its committed
+        // cursor pins the retention floor (#277 / #424), exactly like a Tier-W poll.
+        if let Some(g) = self.groups.get_mut(group) {
+            g.last_activity = now;
+            g.touched = true;
+        }
+        // The contiguous read off the durable, flushed prefix. `Log::read_range` bounds the read by the
+        // flushed frontier (no un-flushed record is served), `max_records`, and `max_bytes`, and
+        // returns the SAME CRC-validated records the Tier-W poll's `read_from` does — the single shared
+        // read primitive. NO lease is claimed, NO cursor is written: this is the whole point.
+        let records = self.log.read_range(start_offset, max_records, max_bytes)?;
+        // The consumer resumes from one past the last record served (or `start_offset` when empty). The
+        // records are contiguous and offset-ordered, so the last one's offset + 1 is the resume point;
+        // it never exceeds the flushed head (read_range clamps to it). `checked_next` only returns
+        // `None` at the `u64::MAX` boundary a real deployment never reaches; fall back to the record's
+        // own offset there rather than wrap, mirroring `AckCursor::ack`'s exhausted-boundary handling.
+        let next_offset = records.last().map_or(start_offset, |r| {
+            r.offset.checked_next().unwrap_or(r.offset)
+        });
+        // Count the streaming deliveries on the SAME `delivered` counter the Tier-W poll drives, so the
+        // observability taxonomy is unchanged (no new counter). A streaming delivery is never a
+        // redelivery from the broker's view (the broker keeps no per-delivery state); a consumer-driven
+        // re-read after an uncommitted crash is invisible here, exactly as the at-least-once contract
+        // intends.
+        self.counters.delivered = self.counters.delivered.saturating_add(records.len() as u64);
+        Ok(StreamBatch {
+            records,
+            next_offset,
+        })
+    }
+
+    /// Serves a Tier-S streaming fetch in the default work-group (#544): delegates to
+    /// [`Engine::stream_fetch_in`] with the default group name (which must have been marked streaming).
+    ///
+    /// # Errors
+    /// As [`Engine::stream_fetch_in`].
+    pub fn stream_fetch(
+        &mut self,
+        member: MemberId,
+        start_offset: Offset,
+        max_records: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<StreamBatch, EngineError> {
+        self.stream_fetch_in(DEFAULT_GROUP, member, start_offset, max_records, max_bytes)
+    }
+
+    /// Commits a Tier-S STREAMING group's cursor up to the EXCLUSIVE offset `up_to` (#544, M1-I7): the
+    /// consumer's PERIODIC, cumulative "everything below `up_to` is durably processed" checkpoint. It
+    /// REUSES the broadcast cumulative-ack cursor primitive ([`AckCursor::commit_up_to`]) — no new
+    /// durable structure is invented — and advances the SAME committed watermark
+    /// [`Engine::min_committed_offset`] reads, so a committed streaming consumer frees retention exactly
+    /// like a Tier-W ack or a broadcast cumulative ack.
+    ///
+    /// It is the streaming twin of [`Engine::cumulative_ack_in`] and deliberately distinct from it: this
+    /// targets a STREAMING group (where `cumulative_ack_in` targets a BROADCAST group), so the two never
+    /// collide and the broadcast-only guard on `cumulative_ack_in` is unchanged. Because a streaming
+    /// group grants NO leases, this commit does NOT call `release_below` (there is nothing in-flight to
+    /// reclaim); it ONLY advances the watermark. It is idempotent and monotonic — an `up_to` at or below
+    /// the committed offset is a no-op success — exactly like `commit_up_to`.
+    ///
+    /// `up_to` is validated against the durable, retained window `[earliest_retained, durable_head]`
+    /// BEFORE the cursor is touched, so a bad offset leaves the committed position unchanged.
+    ///
+    /// # Errors
+    /// [`EngineError::CumulativeAckOnWorkGroup`] if `group` is not a streaming group, or
+    /// [`EngineError::CumulativeAckOutOfRange`] if `up_to` is past the durable head or below the
+    /// earliest retained offset.
+    pub fn stream_commit_in(&mut self, group: &str, up_to: Offset) -> Result<(), EngineError> {
+        // Streaming groups only: the verb belongs to a consumer-managed-offset group. A Tier-W or
+        // broadcast group is rejected (a broadcast group uses `cumulative_ack_in` instead), so the two
+        // commit verbs never cross modes.
+        if !self.is_streaming_in(group) {
+            return Err(EngineError::CumulativeAckOnWorkGroup);
+        }
+        // Validate `up_to` against the durable, retained window BEFORE touching the cursor — identical
+        // to `cumulative_ack_in`. Committing past the head names records that do not exist; committing
+        // below the earliest retained offset names reaped (or replayed-stale) records. Either leaves the
+        // committed position exactly as it was.
+        let durable_head = self.log.flushed_offset().get();
+        let earliest_retained = self.log.earliest_offset().get();
+        let up_to_raw = up_to.get();
+        if up_to_raw > durable_head || up_to_raw < earliest_retained {
+            return Err(EngineError::CumulativeAckOutOfRange {
+                up_to: up_to_raw,
+                earliest_retained,
+                durable_head,
+            });
+        }
+        let now = self.log.now_monotonic();
+        let Some(g) = self.groups.get_mut(group) else {
+            return Err(EngineError::CumulativeAckOnWorkGroup);
+        };
+        // A commit IS activity: refresh the stamp so the idle sweep does not reclaim a group that
+        // commits via streaming rather than poll.
+        g.last_activity = now;
+        g.touched = true;
+        let before = g.cursor.committed().get();
+        // Advance the single streaming cursor up to `up_to`. `commit_up_to` is idempotent and monotonic
+        // (an `up_to` at or below `committed` is a no-op success; the watermark never regresses), so a
+        // re-commit after a redeliver cannot move the floor backwards. NO `release_below`: a streaming
+        // group holds no leases, so there is nothing in-flight to reclaim (the cardinal difference from
+        // the broadcast cumulative-ack path).
+        if g.cursor.commit_up_to(up_to) {
+            // Count each newly-committed offset as an ack on the SAME counter per-message acks drive, so
+            // the resilience taxonomy is unchanged (no new counter), exactly like `cumulative_ack_in`.
+            let advanced = g.cursor.committed().get().saturating_sub(before);
+            self.counters.acks = self.counters.acks.saturating_add(advanced);
+        }
+        // Fire the Level-2 cursor-commit hook (#497) once `g` is released: a streaming group can be the
+        // designated confirm group, so a cumulative streaming commit confirms every pending L2 produce
+        // below the new watermark in one move. ADDITIVE: a no-op unless this is the designated group
+        // with confirms pending.
+        let committed = g.cursor.committed().get();
+        self.confirm_designated_commit(group, committed);
+        Ok(())
+    }
+
+    /// Commits a Tier-S streaming cursor in the default work-group (#544): delegates to
+    /// [`Engine::stream_commit_in`] with the default group name (which must have been marked streaming).
+    ///
+    /// # Errors
+    /// As [`Engine::stream_commit_in`].
+    pub fn stream_commit(&mut self, up_to: Offset) -> Result<(), EngineError> {
+        self.stream_commit_in(DEFAULT_GROUP, up_to)
     }
 
     /// Nacks the message named by `token`, requeueing it for redelivery and fencing the
@@ -11881,6 +12140,277 @@ mod tests {
             lz4.durable_record_bytes() < 2048,
             "eight compressed 1 KiB produces hold fewer stored bytes than two raw ones: {}",
             lz4.durable_record_bytes()
+        );
+    }
+
+    // ----- Tier-S streaming consumer-managed-offset consume mode (#544, M1-I7) -----
+
+    fn member(id: u64) -> MemberId {
+        MemberId::new(id)
+    }
+
+    #[test]
+    fn stream_fetch_serves_a_contiguous_batch_with_no_lease_and_no_cursor_write() {
+        // THE core property (#544): a Tier-S streaming fetch serves a contiguous run off the durable
+        // prefix WITHOUT granting any lease or writing any per-record cursor state. This is what removes
+        // the per-record cost that makes single-consumer durable consume lose to NATS.
+        let mut e = open(config(10, 5));
+        for i in 0..6u8 {
+            produce(&mut e, &[i]);
+        }
+        e.set_streaming_in("s", true).unwrap();
+
+        let batch = e
+            .stream_fetch_in("s", member(1), Offset::ZERO, 4, None)
+            .unwrap();
+        // A contiguous prefix [0, 4) of records in offset order.
+        assert_eq!(batch.records.len(), 4);
+        for (i, r) in batch.records.iter().enumerate() {
+            assert_eq!(r.offset.get(), i as u64);
+            assert_eq!(&r.payload[..], &[u8::try_from(i).unwrap()]);
+        }
+        // The resume point is one past the last record served.
+        assert_eq!(batch.next_offset, Offset::new(4));
+        // NO lease was granted: the in-flight set is empty.
+        assert_eq!(
+            e.in_flight_in("s"),
+            0,
+            "a streaming fetch grants no lease (the headline Tier-S property)"
+        );
+        // NO cursor was written: the committed offset stays exactly where it was (0).
+        assert_eq!(
+            e.committed_offset_in("s"),
+            Offset::ZERO,
+            "a streaming fetch writes no per-record cursor state"
+        );
+
+        // Fetching AGAIN from the same start re-reads the SAME records (idempotent, consumer-managed):
+        // the broker keeps no per-delivery state, so there is nothing to advance.
+        let again = e
+            .stream_fetch_in("s", member(1), Offset::ZERO, 4, None)
+            .unwrap();
+        assert_eq!(again.records.len(), 4);
+        assert_eq!(again.records[0].offset, Offset::ZERO);
+        assert_eq!(e.in_flight_in("s"), 0);
+        assert_eq!(e.committed_offset_in("s"), Offset::ZERO);
+    }
+
+    #[test]
+    fn stream_fetch_is_rejected_on_a_non_streaming_group() {
+        // A streaming fetch must not bypass the Tier-W lease path: a group that was never declared
+        // streaming rejects the verb, so a client cannot accidentally turn a work-queue into a stream.
+        let mut e = open(config(10, 5));
+        produce(&mut e, b"a");
+        // The default Tier-W group (never marked streaming) rejects it.
+        assert!(matches!(
+            e.stream_fetch_in("w", member(1), Offset::ZERO, 4, None),
+            Err(EngineError::CumulativeAckOnWorkGroup)
+        ));
+        // The default group likewise.
+        assert!(matches!(
+            e.stream_fetch(member(1), Offset::ZERO, 4, None),
+            Err(EngineError::CumulativeAckOnWorkGroup)
+        ));
+    }
+
+    #[test]
+    fn stream_commit_advances_the_watermark_via_the_cumulative_cursor() {
+        // A periodic cumulative StreamCommit advances the streaming group's committed watermark via the
+        // REUSED `commit_up_to` primitive (no new durable structure), and is idempotent / monotonic.
+        let mut e = open(config(10, 5));
+        for _ in 0..10 {
+            produce(&mut e, b"x");
+        }
+        e.set_streaming_in("s", true).unwrap();
+        e.stream_fetch_in("s", member(1), Offset::ZERO, 10, None)
+            .unwrap();
+        assert_eq!(e.committed_offset_in("s"), Offset::ZERO);
+
+        // Commit up to 5 (exclusive): the watermark jumps to 5.
+        e.stream_commit_in("s", Offset::new(5)).unwrap();
+        assert_eq!(e.committed_offset_in("s"), Offset::new(5));
+        // Idempotent: a re-commit at or below the watermark is a no-op success, never a regression.
+        e.stream_commit_in("s", Offset::new(5)).unwrap();
+        e.stream_commit_in("s", Offset::new(3)).unwrap();
+        assert_eq!(e.committed_offset_in("s"), Offset::new(5));
+        // Advance further.
+        e.stream_commit_in("s", Offset::new(10)).unwrap();
+        assert_eq!(e.committed_offset_in("s"), Offset::new(10));
+        // Still no lease was ever taken (commit reclaims nothing because there is nothing in-flight).
+        assert_eq!(e.in_flight_in("s"), 0);
+    }
+
+    #[test]
+    fn stream_commit_rejects_a_non_streaming_group_and_an_out_of_range_offset() {
+        let mut e = open(config(10, 5));
+        for _ in 0..4 {
+            produce(&mut e, b"x");
+        }
+        // A non-streaming group rejects the commit (a broadcast group uses cumulative_ack_in instead).
+        assert!(matches!(
+            e.stream_commit_in("w", Offset::new(2)),
+            Err(EngineError::CumulativeAckOnWorkGroup)
+        ));
+        e.set_streaming_in("s", true).unwrap();
+        // Past the durable head: rejected, watermark unchanged.
+        assert!(matches!(
+            e.stream_commit_in("s", Offset::new(99)),
+            Err(EngineError::CumulativeAckOutOfRange { .. })
+        ));
+        assert_eq!(e.committed_offset_in("s"), Offset::ZERO);
+    }
+
+    #[test]
+    fn stream_at_least_once_survives_a_crash_reconnect_redelivering_only_uncommitted() {
+        // THE at-least-once correctness test (#544): a consumer fetches a batch, commits a PREFIX, then
+        // "crashes" (reconnects with no broker-side delivery state) and resumes from its LAST COMMITTED
+        // offset. The committed offset survives; every uncommitted record is re-delivered; nothing is
+        // lost and the contiguous order is preserved across the reconnect.
+        let mut e = open(config(10, 5));
+        let n = 8u8;
+        for i in 0..n {
+            produce(&mut e, &[i]);
+        }
+        e.set_streaming_in("s", true).unwrap();
+
+        // Fetch all 8, then durably commit only up to 5 (the consumer processed [0,5) and crashed
+        // before committing 5,6,7).
+        let first = e
+            .stream_fetch_in("s", member(1), Offset::ZERO, 8, None)
+            .unwrap();
+        assert_eq!(first.records.len(), 8);
+        e.stream_commit_in("s", Offset::new(5)).unwrap();
+        assert_eq!(e.committed_offset_in("s"), Offset::new(5));
+
+        // CRASH + RECONNECT: the broker kept no per-delivery state (no lease). The reconnecting consumer
+        // resumes from its last committed offset (5) — the consumer-managed contract. It re-reads
+        // [5, 8): exactly the uncommitted records, in order, none lost, at most re-delivered.
+        let resumed = e
+            .stream_fetch_in("s", member(1), e.committed_offset_in("s"), 8, None)
+            .unwrap();
+        let resumed_offsets: Vec<u64> = resumed.records.iter().map(|r| r.offset.get()).collect();
+        assert_eq!(
+            resumed_offsets,
+            vec![5, 6, 7],
+            "exactly the uncommitted records re-deliver, in contiguous order"
+        );
+        // The full delivered set across the crash (committed [0,5) once + redelivered [5,8)) covers
+        // every produced offset at least once: no message loss.
+        let mut seen: std::collections::BTreeSet<u64> =
+            first.records.iter().map(|r| r.offset.get()).collect();
+        seen.extend(resumed.records.iter().map(|r| r.offset.get()));
+        assert_eq!(
+            seen,
+            (0..u64::from(n)).collect(),
+            "every produced offset is delivered at least once (at-least-once)"
+        );
+
+        // The consumer finishes and commits the rest: the watermark reaches the head.
+        e.stream_commit_in("s", Offset::new(u64::from(n))).unwrap();
+        assert_eq!(e.committed_offset_in("s"), Offset::new(u64::from(n)));
+    }
+
+    #[test]
+    fn stream_commit_frees_retention_like_any_other_group() {
+        // A streaming group's committed cursor pins/frees the retention floor exactly like a Tier-W ack
+        // or a broadcast cumulative ack: it is read by `min_committed_offset` once touched. A streaming
+        // consumer that fetches-but-never-commits pins the floor at its committed (0); once it commits,
+        // the now-consumed old segments become reapable.
+        let mut e = open(config_with_retention(0));
+        produce(&mut e, &[0xab; 16]);
+        let one = e.durable_record_bytes();
+        let mut e = open(config_with_retention(2 * one));
+
+        e.set_streaming_in("s", true).unwrap();
+        // Produce well past the bound; the streaming consumer FETCHES everything but does NOT commit, so
+        // its cursor stays at 0 and pins the floor: nothing below 0 may be reaped.
+        for _ in 0..30 {
+            produce(&mut e, &[0xab; 16]);
+        }
+        let head = e.flushed_offset();
+        e.stream_fetch_in("s", member(1), Offset::ZERO, 1024, None)
+            .unwrap();
+        assert_eq!(e.committed_offset_in("s"), Offset::ZERO);
+        // Produce one more to drive the retention pass: the floor is pinned at 0, so nothing reaps.
+        produce(&mut e, &[0xab; 16]);
+        assert_eq!(
+            e.counters().segments_reaped,
+            0,
+            "an uncommitted streaming consumer pins the floor at its committed offset (0)"
+        );
+
+        // Now the consumer durably COMMITS up to the head it read: the floor rises and the next produce
+        // reaps the now-consumed old segments back toward the bound.
+        e.stream_commit_in("s", head).unwrap();
+        assert_eq!(e.committed_offset_in("s"), head);
+        produce(&mut e, &[0xab; 16]);
+        assert!(
+            e.counters().segments_reaped >= 1,
+            "once the streaming consumer commits, old consumed segments reap (retention freed)"
+        );
+        assert!(
+            e.durable_record_bytes() <= 4 * one,
+            "the live durable bytes dropped toward the bound after the streaming commit"
+        );
+    }
+
+    #[test]
+    fn tier_w_lease_path_is_unchanged_when_tier_s_is_available() {
+        // PRESERVE (#544): adding Tier-S leaves Tier-W (the lease/poll/ack work-queue) byte-identical.
+        // A default-group poll still grants a lease, an ack still advances the cursor, and the streaming
+        // verbs are simply unavailable on a Tier-W group. This is the regression guard that the
+        // work-queue differentiator stays intact.
+        let mut e = open(config(10, 5));
+        for i in 0..3u8 {
+            produce(&mut e, &[i]);
+        }
+        // The Tier-W poll path is exactly as before: a lease is granted, the cursor advances on ack.
+        let d = message(e.poll(0).unwrap());
+        assert_eq!(d.offset, Offset::ZERO);
+        assert_eq!(e.in_flight_in(""), 1, "Tier-W still grants a lease");
+        assert_eq!(e.ack(&d.token), AckResult::Acked);
+        assert_eq!(
+            e.committed_offset_in(""),
+            Offset::new(1),
+            "Tier-W ack still advances the cursor"
+        );
+        // The streaming verbs are rejected on this Tier-W group (it was never marked streaming).
+        assert!(matches!(
+            e.stream_fetch(member(1), Offset::ZERO, 4, None),
+            Err(EngineError::CumulativeAckOnWorkGroup)
+        ));
+        assert!(matches!(
+            e.stream_commit(Offset::new(1)),
+            Err(EngineError::CumulativeAckOnWorkGroup)
+        ));
+    }
+
+    #[test]
+    fn stream_fetch_respects_max_records_max_bytes_and_the_flushed_bound() {
+        let mut e = open(config(64, 5));
+        for _ in 0..10 {
+            produce(&mut e, &[0xcd; 32]);
+        }
+        e.set_streaming_in("s", true).unwrap();
+        // max_records bounds the batch.
+        let b = e
+            .stream_fetch_in("s", member(1), Offset::ZERO, 3, None)
+            .unwrap();
+        assert_eq!(b.records.len(), 3);
+        assert_eq!(b.next_offset, Offset::new(3));
+        // A start at the head serves nothing and resumes at the head (caught up).
+        let head = e.flushed_offset();
+        let caught_up = e.stream_fetch_in("s", member(1), head, 100, None).unwrap();
+        assert!(caught_up.records.is_empty());
+        assert_eq!(caught_up.next_offset, head);
+        // A tiny byte cap still serves at least one record (the floor-of-one), never zero.
+        let one_byte = e
+            .stream_fetch_in("s", member(1), Offset::ZERO, 100, Some(1))
+            .unwrap();
+        assert_eq!(
+            one_byte.records.len(),
+            1,
+            "the byte cap floors at one record so a stream never wedges"
         );
     }
 }

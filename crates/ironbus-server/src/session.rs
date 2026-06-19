@@ -19,7 +19,7 @@
 use crate::actor::{
     ActorGone, EngineAccess, OwnedAppend, OwnedDedup, ProduceOutcome, ProduceSubmission,
 };
-use crate::engine::{AckResult, EngineError, NackResult, Poll, ProgressResult};
+use crate::engine::{AckResult, EngineError, NackResult, Poll, ProgressResult, StreamBatch};
 use bytes::Bytes;
 use ironbus_core::clock::Clock;
 use ironbus_core::compress::{validate_descriptor_shape, DEFAULT_MAX_DECOMPRESSED_BYTES};
@@ -30,11 +30,12 @@ use ironbus_core::lease::LeaseToken;
 use ironbus_core::types::{Offset, RecordFlags};
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
-    decode_ack, decode_connect, decode_cumulative_ack, decode_fetch, decode_pub, decode_sub,
-    encode_dead_letter, encode_deliver, encode_gap_marker, encode_info, encode_produce_confirm,
-    encode_pub_ack, encode_truncated, gap_reason, produce_confirm_status, pub_ack_level, AckLevel,
-    AckOp, CreditAdvert, DeadLetterBody, DeliverBody, GapMarkerBody, InfoBody, ProduceConfirmBody,
-    PubAckBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
+    decode_ack, decode_connect, decode_cumulative_ack, decode_fetch, decode_pub,
+    decode_stream_commit, decode_stream_fetch, decode_sub, encode_dead_letter, encode_deliver,
+    encode_gap_marker, encode_info, encode_produce_confirm, encode_pub_ack, encode_truncated,
+    gap_reason, produce_confirm_status, pub_ack_level, AckLevel, AckOp, CreditAdvert,
+    DeadLetterBody, DeliverBody, GapMarkerBody, InfoBody, ProduceConfirmBody, PubAckBody,
+    TruncatedBody, DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
 };
 use ironbus_storage::fs::Filesystem;
 use std::collections::HashMap;
@@ -499,6 +500,19 @@ impl Session {
             // loop bounded by max_records/max_bytes/expires/no_wait, so it returns `true` to run the
             // interval checkpoint exactly like Flow (it commits cursor progress the same way).
             Some(FrameType::Fetch) => self.handle_fetch(engine, body, out).map(|()| true),
+            // The Tier-S STREAMING fetch (#544): a consumer-managed-offset contiguous read. It grants
+            // NO lease and writes NO cursor, so it never commits progress and there is nothing for the
+            // interval checkpoint to flush — it returns `false`. Durability is the separate periodic
+            // StreamCommit below.
+            Some(FrameType::StreamFetch) => {
+                self.handle_stream_fetch(engine, body, out).map(|()| false)
+            }
+            // The Tier-S periodic CUMULATIVE COMMIT (#544): advances the streaming group's committed
+            // cursor (when accepted), so it returns `true` to run the interval checkpoint, exactly like
+            // the broadcast CumulativeAck.
+            Some(FrameType::StreamCommit) => {
+                self.handle_stream_commit(engine, body, out).map(|()| true)
+            }
             Some(FrameType::Sub) => self.handle_sub(engine, body, out).map(|()| false),
             Some(FrameType::Unsub) => self.handle_unsub(engine, out).map(|()| true),
             // The standalone Nack frame type (a client sends a nack as an Ack frame with the
@@ -1450,6 +1464,164 @@ impl Session {
         // so the response is byte-for-byte a Flow response past the request frame.
         reply(out, FrameType::FlowEnd, &delivered.to_le_bytes());
         Ok(())
+    }
+
+    /// Handles a Tier-S STREAMING fetch (the tag-24 `StreamFetch` frame, #544 / M1-I7): the
+    /// consumer-managed-offset consume mode. The body carries the consumer's OWN `start_offset` plus
+    /// the batch caps; the broker serves a CONTIGUOUS run of records `[start_offset, ...)` off the
+    /// durable, flushed prefix with NO lease grant and NO per-record cursor write — exactly the
+    /// per-record cost the Tier-W `Fetch`/`Flow` path pays and Tier-S removes. The records ride the
+    /// SAME `Deliver` frames the Tier-W path uses, terminated by one `FlowEnd` carrying the delivered
+    /// count, so the response is byte-for-byte a Flow/Fetch response past the request frame — but
+    /// `self.leased` is NEVER touched (there is no lease to track; the consumer acks by offset via the
+    /// periodic `StreamCommit`).
+    ///
+    /// At-least-once holds BY CONSTRUCTION: the consumer drives the offset, so a crash/reconnect simply
+    /// re-fetches from its last committed offset and the uncommitted span redelivers. The engine
+    /// rejects a streaming fetch on a non-streaming group (the group must be declared streaming via
+    /// `set_streaming_in`), which surfaces here as a recoverable `Err`. The `Deliver` frame's
+    /// `generation` field is sent as `0` because there is no lease/fence on this path; a streaming
+    /// consumer commits by offset, not by fencing token.
+    #[allow(clippy::too_many_lines)]
+    fn handle_stream_fetch<
+        F: Filesystem + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        let Ok(req) = decode_stream_fetch(body) else {
+            reply_err(out, "malformed stream-fetch body");
+            return Ok(());
+        };
+        // Bound the batch by the negotiated per-consumer credit and byte budget, exactly as the Tier-W
+        // Fetch does (#292/#275), so a generous max_records/max_bytes never lets one fetch run away.
+        // Tier-S holds no leases, so the ceiling is the standing per-fetch cap, not a window minus
+        // in-flight: a streaming consumer's "in-flight" is whatever it has read-but-not-committed, which
+        // it tracks itself.
+        let ceiling = self.credit_ceiling(engine)?;
+        let ceiling_bytes = self.credit_ceiling_bytes(engine)?;
+        // The number of records to serve: the client's request clamped to the per-consumer credit
+        // ceiling. A request of 0 (or a 0 ceiling) serves nothing and replies an empty batch.
+        let want = req.max_records.min(ceiling) as usize;
+        // The byte cap: the smaller of the negotiated per-consumer byte budget and the client's
+        // requested max_bytes (each `0` meaning unbounded), passed to the engine read as the contiguous
+        // read's byte bound. `None` means unbounded (only the record count binds).
+        let max_bytes = match min_budget(ceiling_bytes, req.max_bytes) {
+            0 => None,
+            cap => Some(usize::try_from(cap).unwrap_or(usize::MAX)),
+        };
+        let start = Offset::new(req.start_offset);
+        let group = self.subscription.clone();
+        let member = self.member_id;
+        // ONE actor round-trip serves the whole contiguous batch — the heart of the Tier-S win versus
+        // the N per-record round-trips the Tier-W poll loop makes. The engine reads off the shared
+        // durable read path, claims no lease, and writes no cursor.
+        match engine.with(move |e| e.stream_fetch_in(&group, member, start, want, max_bytes))? {
+            Ok(StreamBatch { records, .. }) => {
+                let mut delivered = 0u32;
+                for record in &records {
+                    let msg = DeliverBody {
+                        offset: record.offset.get(),
+                        // No lease, no fence: a streaming delivery carries generation 0. The consumer
+                        // commits by offset (StreamCommit), never by a per-record fencing token.
+                        generation: 0,
+                        flags: record.flags.bits(),
+                        timestamp_ms: record.timestamp_ms,
+                        key: &record.key,
+                        headers: &record.headers,
+                        payload: &record.payload,
+                    };
+                    let mut frame_body = Vec::new();
+                    if encode_deliver(&msg, &mut frame_body).is_err() {
+                        break;
+                    }
+                    reply(out, FrameType::Deliver, &frame_body);
+                    // CRITICAL: NO `self.leased.insert` here. Tier-S grants no lease, so the consumer's
+                    // in-flight set is its own concern. This is what removes the per-record bookkeeping.
+                    delivered += 1;
+                }
+                // Terminate with the SAME FlowEnd the Tier-W batch uses (its body the delivered count),
+                // so a client frames the streaming batch exactly like a Fetch batch.
+                reply(out, FrameType::FlowEnd, &delivered.to_le_bytes());
+                Ok(())
+            }
+            // A fatal engine error wedges every future op: end the session rather than masquerade it as
+            // a transient rejection (matching the Fetch/cumulative-ack paths).
+            Err(e) if e.is_fatal() => {
+                reply_err(out, "fatal storage error");
+                Err(SessionError::EngineFatal(e))
+            }
+            // The wrong-mode reject (a non-streaming group) and an out-of-range start are client-visible,
+            // recoverable rejections: surface the engine's typed reason and keep the connection open. Do
+            // NOT also send a FlowEnd (the Err is the terminator), matching the Fetch error path.
+            Err(e) => {
+                reply_err(out, &e.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    /// Handles a Tier-S periodic CUMULATIVE COMMIT (the tag-25 `StreamCommit` frame, #544 / M1-I7):
+    /// advances the named streaming group's committed cursor up to the body's exclusive `up_to` offset,
+    /// the consumer's durability checkpoint. The body carries its own group name (like `CumulativeAck`),
+    /// so a streaming consumer drives it on any group it owns. The engine enforces the contract: only a
+    /// group MARKED streaming accepts the verb (a Tier-W or broadcast group is rejected with the
+    /// work-group error), `up_to` is validated against the durable head and the earliest-retained
+    /// offset, and a re-commit is an idempotent no-op success. Because Tier-S holds no leases, the
+    /// commit only advances the watermark (it frees retention and stops any redeliver below it); there
+    /// is no `self.leased` to prune. A success replies the generic body-less `Ok` (matching
+    /// `CumulativeAck`); a rejection replies a typed `Err`; a fatal engine error ends the session.
+    fn handle_stream_commit<
+        F: Filesystem + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        let Ok(commit) = decode_stream_commit(body) else {
+            reply_err(out, "malformed stream-commit body");
+            return Ok(());
+        };
+        let Ok(group) = core::str::from_utf8(commit.group) else {
+            reply_err(out, "stream-commit group name must be valid UTF-8");
+            return Ok(());
+        };
+        let group = group.to_string();
+        let up_to = Offset::new(commit.up_to);
+        match engine.with(move |e| e.stream_commit_in(&group, up_to))? {
+            // A committed (or idempotent no-op) streaming commit: the generic body-less success. There
+            // is no per-connection lease to release (Tier-S grants none), so unlike the broadcast
+            // cumulative-ack path there is no `self.leased` bookkeeping here.
+            Ok(()) => {
+                reply(out, FrameType::Ok, &[]);
+                Ok(())
+            }
+            Err(e) if e.is_fatal() => {
+                reply_err(out, "fatal storage error");
+                Err(SessionError::EngineFatal(e))
+            }
+            // The wrong-mode reject and the out-of-range reject are client-visible, recoverable
+            // rejections: surface the engine's typed reason and keep the connection open.
+            Err(e) => {
+                reply_err(out, &e.to_string());
+                Ok(())
+            }
+        }
     }
 
     /// Emits the in-band advisory for a `Poll::Truncated` skip: a consumer that negotiated the
