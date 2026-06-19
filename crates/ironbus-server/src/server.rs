@@ -148,6 +148,15 @@ where
     // cleanup directly above; there is no panic source in those lib paths today, so it is not a
     // live bug, but a future panic-prone refactor of the loop must keep this on every exit path.
     let _ = session.leave_current_subscription(engine);
+    // Drop this connection's Level-2 produce-confirm entries (#497): a producer that opened L2
+    // produces then disconnected has nobody awaiting its `ProduceConfirm`s, so the engine's bounded
+    // registry drops every pending AND ready entry for this member rather than letting them sit until
+    // the TTL. Best-effort like the cleanups above: a gone actor is a no-op. This is the "producer
+    // disconnect" failure mode of the bounded registry. GATED on `produced_l2` so an L0/L1-only or
+    // pure-consumer connection never routes this through the actor (it has nothing to drop).
+    if session.produced_l2() {
+        let _ = engine.with(move |e| e.drop_l2_confirms(member_id));
+    }
     let group = session.subscription().to_string();
     let _ = engine.with(move |e| {
         let _ = e.checkpoint_group(&group);

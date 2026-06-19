@@ -23,6 +23,7 @@ use crate::engine::{AckResult, EngineError, NackResult, Poll, ProgressResult};
 use bytes::Bytes;
 use ironbus_core::clock::Clock;
 use ironbus_core::compress::{validate_descriptor_shape, DEFAULT_MAX_DECOMPRESSED_BYTES};
+use ironbus_core::confirm::{ConfirmStatus, ReadyConfirm};
 use ironbus_core::dedup::{MAX_MSG_ID_LEN, MAX_PRODUCER_ID_LEN};
 use ironbus_core::keyshared::{KeyOrdering, MemberId};
 use ironbus_core::lease::LeaseToken;
@@ -30,10 +31,10 @@ use ironbus_core::types::{Offset, RecordFlags};
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
     decode_ack, decode_connect, decode_cumulative_ack, decode_fetch, decode_pub, decode_sub,
-    encode_dead_letter, encode_deliver, encode_gap_marker, encode_info, encode_pub_ack,
-    encode_truncated, gap_reason, pub_ack_level, AckLevel, AckOp, CreditAdvert, DeadLetterBody,
-    DeliverBody, GapMarkerBody, InfoBody, PubAckBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER,
-    PUB_WIRE_ONLY_FLAGS,
+    encode_dead_letter, encode_deliver, encode_gap_marker, encode_info, encode_produce_confirm,
+    encode_pub_ack, encode_truncated, gap_reason, produce_confirm_status, pub_ack_level, AckLevel,
+    AckOp, CreditAdvert, DeadLetterBody, DeliverBody, GapMarkerBody, InfoBody, ProduceConfirmBody,
+    PubAckBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
 };
 use ironbus_storage::fs::Filesystem;
 use std::collections::HashMap;
@@ -268,6 +269,17 @@ pub struct Session {
     /// double-signal and an old consumer that would error on an unknown frame is never sent the new
     /// tag. Default `false` (backward-compatible).
     gap_marker_enabled: bool,
+    /// Whether this connection has EVER published a Level-2 (server+client-ack) produce (#497): set
+    /// when an L2 publish is registered for confirmation, and NEVER cleared. It is the gate that keeps
+    /// the per-pass `ProduceConfirm` drain off the actor for a connection that never opted into Level 2
+    /// — CRITICALLY a ping-only or pure-consumer connection, which must answer a `Ping` WITHOUT touching
+    /// the actor so a stalled produce fsync on another connection cannot head-of-line-block it (#177,
+    /// invariant 4). Only a connection that actually produced an L2 publish ever routes the confirm
+    /// drain through the actor, and such a connection opted into the L2 protocol (its
+    /// `produce_confirmed` already tolerates the wait), so the head-of-line property holds for every
+    /// connection that did not. `false` by default, so an L0/L1-only connection is byte-for-byte
+    /// unchanged.
+    produced_l2: bool,
 }
 
 impl Session {
@@ -295,6 +307,14 @@ impl Session {
     #[must_use]
     pub fn subscription(&self) -> &str {
         &self.subscription
+    }
+
+    /// Whether this connection ever published a Level-2 (server+client-ack) produce (#497). The
+    /// connection-cleanup path consults it so only an L2 producer routes the confirm-registry cleanup
+    /// through the actor; an L0/L1-only or pure-consumer connection skips it entirely.
+    #[must_use]
+    pub fn produced_l2(&self) -> bool {
+        self.produced_l2
     }
 
     /// Processes the complete frames at the front of `input`, dispatching each to the engine (via
@@ -337,6 +357,10 @@ impl Session {
     ) -> Result<Progress, SessionError> {
         let mut consumed = 0;
         let mut committed_progress = false;
+        // This connection's stable id (#64), captured up front (it is `Copy`) so the parked-window
+        // drain can register a Level-2 produce's confirm (#497) against this producer without
+        // re-borrowing `self` while `handle_pub`/`dispatch` hold it.
+        let member_id = self.member_id;
         // The pass-scoped pipelined window (#450): produces submitted to the actor but not yet
         // awaited. Scoped to ONE pass so the caller's flush boundary is unchanged: every parked ack
         // is released into `out` before this method returns.
@@ -377,7 +401,7 @@ impl Session {
                         // starts; the cap matches the actor channel's default bound, so a capped
                         // window still group-commits in at most a couple of batches.
                         if parked.len() >= MAX_PARKED_PRODUCES {
-                            if let Err(e) = drain_parked(&mut parked, out) {
+                            if let Err(e) = drain_parked(engine, member_id, &mut parked, out) {
                                 break Err(e);
                             }
                         }
@@ -387,7 +411,7 @@ impl Session {
                         // actor-side ordering is also preserved: the actor flushes its pending
                         // produce batch before running any job, so an ack/flow/sub still observes
                         // every prior produce durable.
-                        if let Err(e) = drain_parked(&mut parked, out) {
+                        if let Err(e) = drain_parked(engine, member_id, &mut parked, out) {
                             break Err(e);
                         }
                         match self.dispatch(engine, type_tag, body, out) {
@@ -404,7 +428,25 @@ impl Session {
         // runs (those produces already reached the actor and their acks belong on the wire before
         // the close), but the FIRST error wins: a drain error after a loop error is the same fatal
         // engine event and is subsumed by it.
-        let drained = drain_parked(&mut parked, out);
+        let drained = drain_parked(engine, member_id, &mut parked, out);
+        // Drain any READY Level-2 `ProduceConfirm`s for THIS producer connection onto the wire (#497),
+        // so a producer awaiting a confirm receives it on its next pass. A confirm becomes ready when a
+        // consumer in the designated group acks the record (or it dead-letters / force-reaps / times
+        // out). The client's `produce_confirmed` drives these passes (it interleaves Pings while it
+        // waits), so a confirm is delivered without any out-of-band server push (the thread-per-
+        // connection server only writes a connection's socket from that connection's own pass). A no-op
+        // for a connection with no outstanding L2 confirms, so L0/L1 producers and consumers are
+        // byte-for-byte unchanged. Drained even on an error exit: the confirms belong on the wire before
+        // the connection closes, exactly like the parked acks above.
+        //
+        // GATED on `produced_l2`: a connection that has NEVER published a Level-2 produce never routes
+        // the drain through the actor, so a ping-only or pure-consumer connection answers a `Ping`
+        // WITHOUT touching the actor and a stalled produce fsync elsewhere cannot head-of-line-block it
+        // (#177, invariant 4). A connection that DID produce L2 opted into the protocol and its
+        // `produce_confirmed` tolerates the wait, so the head-of-line property holds for everyone else.
+        if self.produced_l2 {
+            drain_produce_confirms(engine, member_id, out);
+        }
         match result {
             Err(e) => Err(e),
             Ok(progress) => drained.map(|()| progress),
@@ -441,9 +483,10 @@ impl Session {
             // intercepts Pub frames before dispatch so it can park them across the pass, #450): a
             // one-entry window, submitted and immediately drained, byte-identical replies.
             Some(FrameType::Pub) => {
+                let member_id = self.member_id;
                 let mut parked = Vec::new();
                 self.handle_pub(engine, body, &mut parked, out)?;
-                drain_parked(&mut parked, out).map(|()| false)
+                drain_parked(engine, member_id, &mut parked, out).map(|()| false)
             }
             Some(FrameType::Ack) => self.handle_ack(engine, body, out).map(|()| true),
             // A cumulative ack commits the broadcast cursor (when accepted), so it returns `true` to
@@ -565,13 +608,16 @@ impl Session {
         parked: &mut Vec<ParkedPub>,
         out: &mut Vec<u8>,
     ) -> Result<(), SessionError> {
+        // Captured up front (it is `Copy`) so the pre-submit error-path drains can register a parked
+        // Level-2 produce's confirm (#497) without re-borrowing `self`.
+        let member_id = self.member_id;
         if !self.connected {
-            drain_parked(parked, out)?;
+            drain_parked(engine, member_id, parked, out)?;
             reply_err(out, "not connected");
             return Ok(());
         }
         let Ok(msg) = decode_pub(body) else {
-            drain_parked(parked, out)?;
+            drain_parked(engine, member_id, parked, out)?;
             reply_err(out, "malformed pub body");
             return Ok(());
         };
@@ -586,10 +632,21 @@ impl Session {
         //   generalization of the historical `PUB_FLAG_FIRE_AND_FORGET` path (an old faf publish IS a
         //   Level-0 publish): it gets NO PubAck, allocates NO reply channel, parks NOTHING, and does not
         //   wait for the fsync. Routed to `produce_no_reply` below.
-        // - LEVEL 2 (`AckLevel::ServerAndClientAck`) FALLS BACK to Level 1 for THIS phase (#495): the
-        //   producer-notify ProduceConfirm is phase 4 (#497), not yet end-to-end. So an L2 publish is
-        //   accepted and acked exactly like L1; the consumer-ack notify is simply not delivered yet.
+        // - LEVEL 2 (`AckLevel::ServerAndClientAck`, #497): accepted and made DURABLE exactly like
+        //   Level 1 (the `PubAck` stays the DURABILITY ack, I2), AND the durable offset is registered
+        //   in the engine's bounded confirm registry so that, when a CONSUMER in the designated group
+        //   later acks it, a server->producer `ProduceConfirm{status = consumed}` fires. The Level-1
+        //   `PubAck` and the Level-2 confirm are TWO acks: durable-then-consumed.
         let ack_level = pub_ack_level(msg.flags);
+        // Whether this publish wants a Level-2 consumer-ack confirmation in addition to its durability
+        // `PubAck` (#497). Only the at-least-once L2 level does; L0 (no reply) and L1 do not.
+        let wants_confirm = matches!(ack_level, AckLevel::ServerAndClientAck);
+        // Mark the connection as having opted into Level 2 (#497) so its passes drain confirms. Set at
+        // parse time, BEFORE the produce is even submitted: it never clears, and it is what keeps the
+        // per-pass confirm drain OFF the actor for an L0/L1-only or ping-only connection (#177).
+        if wants_confirm {
+            self.produced_l2 = true;
+        }
         // A LEVEL-0 publish is the generalized fire-and-forget: it gets no ack and is governed by the
         // fire-and-forget token bucket, REGARDLESS of which Level-0 encoding the producer used (the
         // canonical faf bit, where `msg.fire_and_forget` is already true, OR the level-bit value 1,
@@ -607,14 +664,14 @@ impl Session {
         if let Some(d) = msg.dedup.as_ref() {
             if d.producer_id.len() > MAX_PRODUCER_ID_LEN {
                 if !fire_and_forget {
-                    drain_parked(parked, out)?;
+                    drain_parked(engine, member_id, parked, out)?;
                     reply_err(out, "producer_id too long");
                 }
                 return Ok(());
             }
             if d.msg_id.len() > MAX_MSG_ID_LEN {
                 if !fire_and_forget {
-                    drain_parked(parked, out)?;
+                    drain_parked(engine, member_id, parked, out)?;
                     reply_err(out, "msg_id too long");
                 }
                 return Ok(());
@@ -644,7 +701,7 @@ impl Session {
         if RecordFlags::from_bits(msg.flags).contains(RecordFlags::COMPRESSED) {
             if let Err(e) = validate_descriptor_shape(msg.payload, DEFAULT_MAX_DECOMPRESSED_BYTES) {
                 if !fire_and_forget {
-                    drain_parked(parked, out)?;
+                    drain_parked(engine, member_id, parked, out)?;
                     reply_err(out, &format!("malformed compressed descriptor: {e}"));
                 }
                 return Ok(());
@@ -715,6 +772,7 @@ impl Session {
         parked.push(ParkedPub {
             submission,
             fire_and_forget,
+            wants_confirm,
         });
         Ok(())
     }
@@ -1704,6 +1762,56 @@ fn reply_pub_ack(out: &mut Vec<u8>, frame_type: FrameType, offset: Offset) {
     reply(out, frame_type, &body);
 }
 
+/// Writes one Level-2 `ProduceConfirm` frame (#497) for a ready terminal: the durable offset plus the
+/// terminal status byte, via the shared [`encode_produce_confirm`] codec so the wire body cannot drift
+/// from the proto definition. Maps the core [`ConfirmStatus`] to its wire
+/// [`produce_confirm_status`] byte: `Consumed` -> `CONSUMED`, `TimedOut` -> `TIMED_OUT`, and BOTH
+/// `DeadLettered` and the bounded-registry `Dropped` shed -> `DEAD_LETTERED` (a dropped confirm is a
+/// non-success terminal whose record stayed durable but is no longer tracked, indistinguishable on the
+/// wire from a dead-letter, which is the honest signal: the consumed confirmation will never arrive).
+fn write_produce_confirm(confirm: &ReadyConfirm, out: &mut Vec<u8>) {
+    let status = match confirm.status {
+        ConfirmStatus::Consumed => produce_confirm_status::CONSUMED,
+        ConfirmStatus::TimedOut => produce_confirm_status::TIMED_OUT,
+        ConfirmStatus::DeadLettered | ConfirmStatus::Dropped => {
+            produce_confirm_status::DEAD_LETTERED
+        }
+    };
+    let mut body = Vec::with_capacity(9);
+    encode_produce_confirm(
+        &ProduceConfirmBody {
+            offset: confirm.offset,
+            status,
+        },
+        &mut body,
+    );
+    reply(out, FrameType::ProduceConfirm, &body);
+}
+
+/// Drains every READY Level-2 `ProduceConfirm` for the producer connection `member_id` (#497) and
+/// writes one `ProduceConfirm` frame per terminal onto `out`, FIFO. The terminals are produced
+/// out-of-band by CONSUMER acks (and the dead-letter / force-reap / TTL-timeout failure paths) on
+/// OTHER connection threads, recorded in the engine's bounded registry keyed by this connection's
+/// `member_id`, and drained HERE on this producer's own pass — the only place the blocking
+/// thread-per-connection server may write this socket. A gone actor is a no-op. ADDITIVE: empty for
+/// any connection with no outstanding L2 confirm.
+fn drain_produce_confirms<
+    F: Filesystem + 'static,
+    C: Clock + Clone + 'static,
+    E: EngineAccess<F, C>,
+>(
+    engine: &E,
+    member_id: MemberId,
+    out: &mut Vec<u8>,
+) {
+    let Ok(ready) = engine.with(move |e| e.drain_l2_confirms(member_id)) else {
+        return; // a gone actor: the connection is ending, nothing to deliver
+    };
+    for confirm in ready {
+        write_produce_confirm(&confirm, out);
+    }
+}
+
 /// The safety cap on a single pass's pipelined produce window (#450): how many produces a session
 /// may PARK (submitted to the actor, ack not yet awaited) before it must release the window. It
 /// bounds the parked-reply memory for a buffer packed with tiny PUB frames and matches the actor
@@ -1722,6 +1830,10 @@ struct ParkedPub {
     /// Whether the producer marked this publish fire-and-forget (QoS-0, #11): suppresses every
     /// reply frame for this produce, exactly like the awaited path.
     fire_and_forget: bool,
+    /// Whether this publish is Level 2 (server+client ack, #497): in addition to its durability
+    /// `PubAck`, register the durable offset in the engine's bounded confirm registry so a later
+    /// consumer ack fires a `ProduceConfirm`. `false` for L0/L1, so their paths are unchanged.
+    wants_confirm: bool,
 }
 
 /// Releases a parked produce window (#450): awaits each submission IN SUBMISSION ORDER and appends
@@ -1730,10 +1842,38 @@ struct ParkedPub {
 /// entries are dropped un-replied, which is safe because a batch-covering fsync failure marks EVERY
 /// member of the batch fatal (the actor's `flush_pending`) and the session is closing anyway (the
 /// actor tolerates a dropped reply receiver). After this returns, `parked` is empty.
-fn drain_parked(parked: &mut Vec<ParkedPub>, out: &mut Vec<u8>) -> Result<(), SessionError> {
+///
+/// For a Level-2 publish (#497), AFTER its durability `PubAck` is written (the record is durable
+/// first, I2), the durable offset is REGISTERED in the engine's bounded confirm registry against this
+/// connection's `member_id`, so a later consumer ack in the designated group fires a `ProduceConfirm`
+/// back to this producer. The registration is layered ON TOP of the unchanged Level-1 reply; L0/L1
+/// (`wants_confirm == false`) skip it entirely.
+fn drain_parked<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
+    engine: &E,
+    member_id: MemberId,
+    parked: &mut Vec<ParkedPub>,
+    out: &mut Vec<u8>,
+) -> Result<(), SessionError> {
     for p in parked.drain(..) {
         let outcome = p.submission.wait()?;
+        // A Level-2 publish whose record became durable registers its offset for the consumer-ack
+        // confirmation, AFTER the durability ack is written below. Only a fresh `Appended` is a new
+        // durable offset to confirm; a dedup hit (`AppendedDuplicate`) returns an ALREADY-confirmed-or-
+        // pending earlier offset, a shed/fence/fatal never became durable, and a fire-and-forget L2 is
+        // not a thing (L2 is at-least-once). So capture the offset to register only on `Appended`.
+        let confirm_offset = match &outcome {
+            ProduceOutcome::Appended(offset) if p.wants_confirm => Some(*offset),
+            _ => None,
+        };
         write_pub_reply(outcome, p.fire_and_forget, out)?;
+        if let Some(offset) = confirm_offset {
+            // Register AFTER the `PubAck` was written: the record is durable (the covering fsync ran
+            // before the actor reported `Appended`) and its durability ack is already on the wire, so
+            // the Level-2 confirm wait is strictly layered on top of the Level-1 durability guarantee.
+            // A gone actor here is a no-op (the connection is ending anyway); the registry is bounded,
+            // so this can never grow without bound.
+            let _ = engine.with(move |e| e.register_l2_confirm(offset, member_id));
+        }
     }
     Ok(())
 }
@@ -6410,5 +6550,239 @@ mod tests {
         s.process(&e, &fetch_frame(10, 0, 0, false), &mut out)
             .expect("the session stays open");
         assert_eq!(one_response(&out).0, FrameType::Err);
+    }
+
+    // -------- Level-2 produce-confirm (#497) --------
+
+    /// Produces ONE message at the given ack level through `s` and returns the `PubAck` offset (`None`
+    /// for a non-acking level). The ack-level field is stamped into the PUB flags exactly as the wire
+    /// carries it, so the server routes it by `pub_ack_level`.
+    fn pub_at_level<C: Clock + Clone + 'static>(
+        s: &mut Session,
+        e: &DirectEngine<InMemoryFs, C>,
+        level: AckLevel,
+        payload: &[u8],
+    ) -> Option<u64> {
+        let flags = match level {
+            AckLevel::NoAck => PUB_FLAG_FIRE_AND_FORGET,
+            AckLevel::ServerAck => 0,
+            AckLevel::ServerAndClientAck => 2 << PUB_FLAG_ACK_LEVEL_SHIFT,
+        };
+        let mut body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload,
+            },
+            &mut body,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        s.process(e, &frame(FrameType::Pub, &body), &mut out)
+            .unwrap();
+        decode_all(&out)
+            .into_iter()
+            .find(|(ty, _)| *ty == FrameType::PubAck)
+            .map(|(_, b)| decode_pub_ack(&b).unwrap().offset)
+    }
+
+    /// Drives one producer pass on `s` (a Ping) and returns every `ProduceConfirm` (offset, status)
+    /// flushed onto the wire for that connection.
+    fn drain_confirms<C: Clock + Clone + 'static>(
+        s: &mut Session,
+        e: &DirectEngine<InMemoryFs, C>,
+    ) -> Vec<(u64, u8)> {
+        let mut out = Vec::new();
+        s.process(e, &frame(FrameType::Ping, b""), &mut out)
+            .unwrap();
+        decode_all(&out)
+            .into_iter()
+            .filter(|(ty, _)| *ty == FrameType::ProduceConfirm)
+            .map(|(_, b)| {
+                let c = ironbus_proto::message::decode_produce_confirm(&b)
+                    .expect("9-byte confirm body");
+                (c.offset, c.status)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_l2_produce_is_confirmed_when_a_consumer_acks_it() {
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 5));
+        // Producer and consumer are two sessions over the same engine (distinct member ids).
+        let mut producer = Session::with_member_id(MemberId::new(1));
+        let mut consumer = Session::with_member_id(MemberId::new(2));
+        let mut out = Vec::new();
+        producer
+            .process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        consumer
+            .process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+
+        // L2 produce: the durability PubAck returns the offset.
+        let offset = pub_at_level(&mut producer, &e, AckLevel::ServerAndClientAck, b"l2").unwrap();
+        // No confirm yet (no consumer has acked).
+        assert!(drain_confirms(&mut producer, &e).is_empty());
+
+        // The consumer flows and acks the record in the DESIGNATED (default) group.
+        out.clear();
+        consumer
+            .process(&e, &frame(FrameType::Flow, &4u32.to_le_bytes()), &mut out)
+            .unwrap();
+        let toks = delivered_tokens(&out);
+        let (off, generation) = *toks.iter().find(|(o, _)| *o == offset).expect("delivered");
+        assert_eq!(
+            ack_reply(&mut consumer, &e, AckOp::Ack, off, generation),
+            vec![1]
+        );
+
+        // The producer's next pass carries the CONSUMED ProduceConfirm for the offset.
+        let confirms = drain_confirms(&mut producer, &e);
+        assert_eq!(
+            confirms,
+            vec![(offset, produce_confirm_status::CONSUMED)],
+            "the L2 confirm fires on the consumer ack"
+        );
+        // Drained: a second pass yields nothing.
+        assert!(drain_confirms(&mut producer, &e).is_empty());
+    }
+
+    #[test]
+    fn an_l1_produce_registers_no_confirm() {
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 5));
+        let mut producer = Session::with_member_id(MemberId::new(1));
+        let mut consumer = Session::with_member_id(MemberId::new(2));
+        let mut out = Vec::new();
+        producer
+            .process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        consumer
+            .process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        // A Level-1 produce: the unchanged at-least-once PubAck path, NO confirm registered.
+        let offset = pub_at_level(&mut producer, &e, AckLevel::ServerAck, b"l1").unwrap();
+        out.clear();
+        consumer
+            .process(&e, &frame(FrameType::Flow, &4u32.to_le_bytes()), &mut out)
+            .unwrap();
+        let (off, generation) = *delivered_tokens(&out)
+            .iter()
+            .find(|(o, _)| *o == offset)
+            .expect("delivered");
+        ack_reply(&mut consumer, &e, AckOp::Ack, off, generation);
+        // No ProduceConfirm is ever produced for an L1 publish (L0/L1 byte-for-byte unchanged).
+        assert!(
+            drain_confirms(&mut producer, &e).is_empty(),
+            "L1 never registers an L2 confirm"
+        );
+        assert_eq!(
+            e.engine_mut().confirm_group(),
+            "",
+            "the designated confirm group defaults to the unnamed group"
+        );
+    }
+
+    #[test]
+    fn an_unacked_l2_produce_times_out() {
+        let clock = Arc::new(ManualClock::new());
+        // The default confirm TTL is large; drive a short one directly on the registry semantics by
+        // advancing the clock past the configured TTL. The registry uses DEFAULT_CONFIRM_TTL_NANOS.
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 5));
+        let mut producer = Session::with_member_id(MemberId::new(1));
+        let mut out = Vec::new();
+        producer
+            .process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        let offset = pub_at_level(&mut producer, &e, AckLevel::ServerAndClientAck, b"l2").unwrap();
+        // Advance well past the default TTL, then drive the produce/commit tick (a fresh L1 produce
+        // by another path) so the timeout sweep runs.
+        clock.advance_monotonic_nanos(ironbus_core::confirm::DEFAULT_CONFIRM_TTL_NANOS + 1);
+        produce(&e, b"tick"); // a commit_batch runs the L2 timeout sweep
+        let confirms = drain_confirms(&mut producer, &e);
+        assert_eq!(
+            confirms,
+            vec![(offset, produce_confirm_status::TIMED_OUT)],
+            "an L2 confirm no consumer acks within the TTL times out"
+        );
+    }
+
+    #[test]
+    fn an_l2_produce_dead_lettered_before_any_ack_is_terminated() {
+        let clock = Arc::new(ManualClock::new());
+        // max_deliver = 1: the first redelivery dead-letters the poison record.
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 1));
+        let mut producer = Session::with_member_id(MemberId::new(1));
+        let mut consumer = Session::with_member_id(MemberId::new(2));
+        let mut out = Vec::new();
+        producer
+            .process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        consumer
+            .process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        let offset =
+            pub_at_level(&mut producer, &e, AckLevel::ServerAndClientAck, b"poison").unwrap();
+
+        // Deliver once (attempt 1), let the lease expire, then re-poll: attempt 2 > max_deliver(1)
+        // dead-letters it WITHOUT any ack.
+        out.clear();
+        consumer
+            .process(&e, &frame(FrameType::Flow, &4u32.to_le_bytes()), &mut out)
+            .unwrap();
+        assert!(delivered_tokens(&out).iter().any(|(o, _)| *o == offset));
+        clock.advance_monotonic_nanos(1_000); // past the visibility window + hard cap
+        out.clear();
+        consumer
+            .process(&e, &frame(FrameType::Flow, &4u32.to_le_bytes()), &mut out)
+            .unwrap();
+        // The dead-letter terminal fires a DEAD_LETTERED confirm to the producer.
+        let confirms = drain_confirms(&mut producer, &e);
+        assert_eq!(
+            confirms,
+            vec![(offset, produce_confirm_status::DEAD_LETTERED)],
+            "a dead-letter before any ack terminates the L2 confirm"
+        );
+    }
+
+    #[test]
+    fn a_producer_disconnect_drops_its_pending_l2_confirms() {
+        let clock = Arc::new(ManualClock::new());
+        let e = DirectEngine::new(engine_with(Arc::clone(&clock), 5));
+        let mut producer = Session::with_member_id(MemberId::new(7));
+        let mut out = Vec::new();
+        producer
+            .process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        let offset = pub_at_level(&mut producer, &e, AckLevel::ServerAndClientAck, b"l2").unwrap();
+        assert_eq!(
+            e.engine_mut().drain_l2_confirms(MemberId::new(7)).len(),
+            0,
+            "nothing ready yet (no consumer acked)"
+        );
+        // The producer disconnects: the connection cleanup drops its registry entries.
+        e.engine_mut().drop_l2_confirms(MemberId::new(7));
+        // Even committing past the offset now fires nothing for the gone producer.
+        produce(&e, b"x");
+        e.engine_mut().ack_in(
+            "",
+            &ironbus_core::lease::LeaseToken {
+                offset: Offset::new(offset),
+                generation: 0,
+            },
+        );
+        assert!(
+            e.engine_mut()
+                .drain_l2_confirms(MemberId::new(7))
+                .is_empty(),
+            "a disconnected producer's confirms are dropped, never delivered"
+        );
     }
 }
