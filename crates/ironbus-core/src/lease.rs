@@ -24,7 +24,8 @@
 //! claim/max-deliver so orphaned leases are eventually evicted.
 
 use crate::types::Offset;
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap};
 
 /// Visibility-timeout and hard-cap tunables, in nanoseconds of monotonic time.
 ///
@@ -162,6 +163,34 @@ pub struct LeaseTable {
     /// cursor gates them), so a stale carried entry is simply never consumed; the snapshot is
     /// rebuilt from the live leases each checkpoint, so such an entry never persists.
     carried: BTreeMap<u64, u32>,
+    /// A deadline-ordered INDEX over `leases`, so [`LeaseTable::expired`] finds the soonest
+    /// expiry without the O(W) full scan it used to do (#485). `leases` is the SOURCE OF TRUTH;
+    /// this heap is only an accelerator, and is reconstructible from `leases` alone (it is not
+    /// part of the table's logical state). Each entry is `Reverse((deadline, offset))`, so the
+    /// min `peek` is the lease with the soonest deadline (offset breaks ties), in O(1); pushing on
+    /// a new/changed deadline is O(log W).
+    ///
+    /// LAZY DELETION. A deadline is set or changed by `claim` (first delivery and redelivery),
+    /// `extend`, `nack`, and `defer_redelivery`; each pushes a FRESH `(deadline, offset)` entry but
+    /// never rewrites or removes the prior one, and `ack` / `release_below` drop a lease without
+    /// touching the heap. So an entry is STALE once its `(deadline, offset)` no longer equals the
+    /// live lease's current deadline at that offset (the lease was acked, released, redelivered,
+    /// extended, nacked, or deferred since). Stale entries are discarded the next time they surface
+    /// at the top of the heap (see `expired`). The match key is the DEADLINE alone, deliberately,
+    /// not the generation: `expired` decides reclaimability purely from the live lease's current
+    /// deadline versus `now`, so an entry is "valid" exactly when a live lease at that offset still
+    /// carries that deadline — whichever heap entry happens to carry it. A deadline value that is
+    /// coincidentally reused by a later attempt at the same offset is therefore harmless: it names a
+    /// deadline the live lease really does hold, and the per-offset de-duplication in `expired`
+    /// keeps any such alias from emitting an offset twice.
+    ///
+    /// INDEX INVARIANT: for every live lease `L`, the heap contains at least one entry
+    /// `(L.deadline, L.offset)` — the one pushed when that deadline was last set. (Every deadline
+    /// write pushes; nothing rewrites a live entry in place.) Hence the soonest VALID entry is the
+    /// soonest live deadline, so no expiry is ever missed. Bounded by the same `max_in_flight`
+    /// window as `leases` plus the stale entries not yet reaped; stale entries are bounded by the
+    /// number of deadline changes between sweeps and are drained lazily, so the heap stays O(W).
+    deadlines: BinaryHeap<Reverse<(u64, u64)>>,
 }
 
 impl LeaseTable {
@@ -173,6 +202,7 @@ impl LeaseTable {
             leases: BTreeMap::new(),
             next_generation: 0,
             carried: BTreeMap::new(),
+            deadlines: BinaryHeap::new(),
         }
     }
 
@@ -251,6 +281,9 @@ impl LeaseTable {
         let deadline = now
             .saturating_add(self.config.visibility_nanos)
             .min(now.saturating_add(self.config.hard_cap_nanos));
+        // Index this deadline for O(log W) expiry. Both branches below store exactly this value,
+        // so one push covers the first-claim insert and the redelivery overwrite (#485).
+        self.deadlines.push(Reverse((deadline, off)));
         let deliveries = if let Some(lease) = self.leases.get_mut(&off) {
             // Redelivery: a new attempt under a fresh generation, fencing the prior holder.
             lease.generation = generation;
@@ -331,6 +364,8 @@ impl LeaseTable {
                 } else {
                     let deadline = now.saturating_add(visibility).min(cap);
                     lease.deadline = deadline;
+                    // Re-index the moved deadline; the prior entry is left to lazy deletion (#485).
+                    self.deadlines.push(Reverse((deadline, off)));
                     ExtendOutcome::Extended(deadline)
                 }
             }
@@ -391,6 +426,8 @@ impl LeaseTable {
         if let Some(lease) = self.leases.get_mut(&off) {
             lease.generation = generation;
             lease.deadline = deadline;
+            // Re-index the requeue deadline; the prior entry is left to lazy deletion (#485).
+            self.deadlines.push(Reverse((deadline, off)));
         }
         NackOutcome::Requeued { deadline }
     }
@@ -427,9 +464,13 @@ impl LeaseTable {
     ///
     /// [`nack`]: LeaseTable::nack
     pub fn defer_redelivery(&mut self, offset: Offset, now: u64, delay_nanos: u64) -> bool {
-        match self.leases.get_mut(&offset.get()) {
+        let off = offset.get();
+        match self.leases.get_mut(&off) {
             Some(lease) if now >= lease.deadline => {
-                lease.deadline = now.saturating_add(delay_nanos);
+                let deadline = now.saturating_add(delay_nanos);
+                lease.deadline = deadline;
+                // Re-index the deferred deadline; the prior entry is left to lazy deletion (#485).
+                self.deadlines.push(Reverse((deadline, off)));
                 true
             }
             _ => false,
@@ -439,13 +480,76 @@ impl LeaseTable {
     /// The offsets whose visibility has expired at `now` (deadline at or before `now`),
     /// in ascending order. These are reclaimable: the janitor redelivers them by
     /// claiming them again.
+    ///
+    /// Driven by the `deadlines` min-heap (#485) instead of the old O(W) scan of every in-flight
+    /// lease. It takes `&mut self` because it reaps stale heap entries (lazy deletion) as it goes;
+    /// the table's LOGICAL state — the set of live leases and their deadlines — is unchanged, so
+    /// the call is pure with respect to what it reports and is REPEATABLE: calling it again with the
+    /// same `now` and no intervening mutation returns the same set (no expiry is consumed here; only
+    /// `claim`/`ack` change a lease).
+    ///
+    /// Cost: the common "nothing is due" sweep is O(1) after lazily reaping any dead entries that
+    /// have surfaced at the top; when `k` leases are actually due it is O(k log W) to drain and
+    /// re-index them. It never scans the full window.
     #[must_use]
-    pub fn expired(&self, now: u64) -> Vec<Offset> {
+    pub fn expired(&mut self, now: u64) -> Vec<Offset> {
+        // 1. Reap provably-dead entries off the top: an entry is dead once no live lease at its
+        //    offset still carries its deadline (acked, released, redelivered, extended, nacked, or
+        //    deferred since it was pushed). Dropping a dead entry can never lose an expiry, because
+        //    the INDEX INVARIANT guarantees every live lease still has its CURRENT deadline indexed
+        //    by some entry; a dead entry is, by definition, not that one. This also makes the
+        //    frontier peek below see the soonest LIVE deadline.
+        while let Some(&Reverse((deadline, off))) = self.deadlines.peek() {
+            if self.is_live_deadline(off, deadline) {
+                break;
+            }
+            self.deadlines.pop();
+        }
+        // 2. Frontier: with the top now valid, if even the soonest live deadline is in the future,
+        //    nothing is due — return empty in O(1). This is the hot path for a quiet janitor sweep.
+        match self.deadlines.peek() {
+            Some(&Reverse((deadline, _))) if deadline <= now => {}
+            _ => return Vec::new(),
+        }
+        // 3. Something is due. Drain every entry with `deadline <= now`, keeping each VALID, due
+        //    offset once; then RE-PUSH the valid-and-due entries so the heap is restored and the
+        //    call stays repeatable (popped dead entries are simply not restored — that is the GC).
+        let mut due: Vec<u64> = Vec::new();
+        let mut restore: Vec<Reverse<(u64, u64)>> = Vec::new();
+        while let Some(Reverse((deadline, off))) = self.deadlines.pop() {
+            if deadline > now {
+                // Past the due frontier: this entry is valid-but-not-due. Restore it and stop —
+                // every remaining entry has an even later deadline.
+                self.deadlines.push(Reverse((deadline, off)));
+                break;
+            }
+            if self.is_live_deadline(off, deadline) {
+                // Valid and due: this offset is reclaimable. De-duplicate aliased entries (a reused
+                // deadline value may leave more than one entry naming the same live deadline).
+                if !due.contains(&off) {
+                    due.push(off);
+                }
+                restore.push(Reverse((deadline, off)));
+            }
+            // else: a stale (dead) due entry — drop it permanently (lazy deletion).
+        }
+        for entry in restore {
+            self.deadlines.push(entry);
+        }
+        // Ascending-offset order is the contract; the drain order is by (deadline, offset), so sort.
+        due.sort_unstable();
+        due.into_iter().map(Offset::new).collect()
+    }
+
+    /// Whether a live lease at `off` currently carries exactly `deadline` — the validity predicate
+    /// for a `deadlines` heap entry (#485). The deadline alone is the key: `expired` reports
+    /// reclaimability purely from the live lease's current deadline versus `now`, so an entry is
+    /// meaningful exactly when some live lease still holds that deadline. A `None` lease (acked or
+    /// released) or a moved deadline (redelivered, extended, nacked, deferred) makes the entry dead.
+    fn is_live_deadline(&self, off: u64, deadline: u64) -> bool {
         self.leases
-            .iter()
-            .filter(|(_, lease)| now >= lease.deadline)
-            .map(|(&off, _)| Offset::new(off))
-            .collect()
+            .get(&off)
+            .is_some_and(|lease| lease.deadline == deadline)
     }
 }
 
@@ -881,6 +985,94 @@ mod tests {
         }
     }
 
+    #[test]
+    fn expired_is_repeatable_and_handles_non_monotonic_now() {
+        // The heap drives `expired` (#485), but the call must stay REPEATABLE: it reaps only DEAD
+        // index entries, never a live lease's expiry, so the same `now` returns the same set, and
+        // `now` may move backward between calls (the janitor is not monotonic across sweeps).
+        let mut t = LeaseTable::new(cfg());
+        t.claim(off(1), 0); // deadline 30
+        t.claim(off(3), 0); // deadline 30
+        t.claim(off(2), 100); // deadline 130
+        assert_eq!(t.expired(50), vec![off(1), off(3)]);
+        // Same `now` again: identical answer, nothing was consumed.
+        assert_eq!(t.expired(50), vec![off(1), off(3)]);
+        // `now` moves BACKWARD: nothing is due, O(1) frontier says empty.
+        assert_eq!(t.expired(0), Vec::<Offset>::new());
+        // Forward again, far past every deadline: all three are due.
+        assert_eq!(t.expired(1000), vec![off(1), off(2), off(3)]);
+        // And still repeatable after the backward excursion.
+        assert_eq!(t.expired(50), vec![off(1), off(3)]);
+    }
+
+    #[test]
+    fn expired_reaps_stale_heap_entries_left_by_ack_extend_nack_and_defer() {
+        // Every deadline change leaves a stale (deadline, offset) entry behind; `expired` must
+        // ignore them and report only what the LIVE lease's current deadline says (#485).
+        let mut t = LeaseTable::new(cfg());
+        // ack: a heap entry for offset 0 at deadline 30 is left behind, but the lease is gone.
+        let tok = token(t.claim(off(0), 0));
+        assert_eq!(t.ack(&tok), AckOutcome::Acked);
+        assert_eq!(
+            t.expired(1000),
+            Vec::<Offset>::new(),
+            "acked lease never expires"
+        );
+        // extend: the old deadline-30 entry is stale; the live deadline is 50.
+        let tok = token(t.claim(off(1), 0)); // deadline 30
+        assert_eq!(t.extend(&tok, 20), ExtendOutcome::Extended(50));
+        assert_eq!(
+            t.expired(30),
+            Vec::<Offset>::new(),
+            "the stale 30 entry does not fire"
+        );
+        assert_eq!(t.expired(49), Vec::<Offset>::new());
+        assert_eq!(
+            t.expired(50),
+            vec![off(1)],
+            "fires only at the live deadline"
+        );
+        // nack: requeues offset 2 to a later deadline, stale-ing the original deadline-30 entry.
+        let tok = token(t.claim(off(2), 0)); // deadline 30
+        assert_eq!(
+            t.nack(&tok, 0, 200),
+            NackOutcome::Requeued { deadline: 200 }
+        );
+        // At now=50 only offset 1 is due (live deadline 50); offset 2's nack pushed it out to 200,
+        // so its stale deadline-30 entry must NOT fire.
+        assert_eq!(
+            t.expired(50),
+            vec![off(1)],
+            "the nacked offset is not yet due"
+        );
+        assert_eq!(t.expired(200), vec![off(1), off(2)]);
+        // defer_redelivery: pushes an expired lease's deadline out, stale-ing the prior entry.
+        assert!(t.defer_redelivery(off(1), 50, 1000)); // 1 now due at 1050
+        assert_eq!(
+            t.expired(200),
+            vec![off(2)],
+            "deferred offset 1 drops out until 1050"
+        );
+        assert_eq!(t.expired(1050), vec![off(1), off(2)]);
+    }
+
+    #[test]
+    fn release_below_stale_entries_do_not_resurrect_expiries() {
+        // release_below drops leases without touching the heap, leaving stale entries; they must be
+        // reaped, never reported as expired (#485).
+        let mut t = LeaseTable::new(cfg());
+        t.claim(off(1), 0);
+        t.claim(off(2), 0);
+        t.claim(off(3), 0);
+        t.release_below(off(3)); // leases 1 and 2 gone; only 3 remains
+        assert_eq!(t.in_flight(), 1);
+        assert_eq!(
+            t.expired(1000),
+            vec![off(3)],
+            "released offsets never expire again"
+        );
+    }
+
     proptest! {
         /// However many times a message is redelivered, only the most recently issued
         /// token can ack: every earlier token is fenced. This is the no-double-ack
@@ -907,6 +1099,73 @@ mod tests {
             prop_assert_eq!(t.ack(last), AckOutcome::Acked);
             prop_assert_eq!(t.ack(last), AckOutcome::Fenced);
             prop_assert_eq!(t.in_flight(), 0);
+        }
+
+        /// The heap-driven `expired` (#485) must equal a brute-force O(W) scan of the live leases
+        /// at every probed `now`, under an arbitrary interleaving of claim/ack/extend/nack/defer/
+        /// release. This is the missed-or-duplicated-expiry guard: the index can never disagree
+        /// with the source of truth. `now` is probed both forward and backward to stress
+        /// repeatability and the non-monotonic frontier.
+        #[test]
+        fn expired_matches_a_brute_force_scan_under_random_ops(
+            ops in prop::collection::vec(
+                (0u64..6, 0u64..8, 0u64..200u64, 0u64..120u64),
+                0..60,
+            ),
+            probes in prop::collection::vec(0u64..400u64, 1..12),
+        ) {
+            let mut t = LeaseTable::new(cfg());
+            // Track the live token per offset so ack/extend/nack target the current generation.
+            let mut live: BTreeMap<u64, LeaseToken> = BTreeMap::new();
+            for (kind, raw_off, now, delay) in ops {
+                let o = off(raw_off);
+                match kind {
+                    0 => {
+                        if let Claim::Granted { token, .. } = t.claim(o, now) {
+                            live.insert(raw_off, token);
+                        }
+                    }
+                    1 => {
+                        if let Some(tok) = live.get(&raw_off).copied() {
+                            if t.ack(&tok) == AckOutcome::Acked {
+                                live.remove(&raw_off);
+                            }
+                        }
+                    }
+                    2 => {
+                        if let Some(tok) = live.get(&raw_off).copied() {
+                            let _ = t.extend(&tok, now);
+                        }
+                    }
+                    3 => {
+                        if let Some(tok) = live.get(&raw_off).copied() {
+                            if let NackOutcome::Requeued { .. } = t.nack(&tok, now, delay) {
+                                // The nack fenced the old token; re-fetching the live one is not
+                                // needed for this model (we only re-claim to learn a new token).
+                                live.remove(&raw_off);
+                            }
+                        }
+                    }
+                    4 => {
+                        let _ = t.defer_redelivery(o, now, delay);
+                    }
+                    _ => {
+                        t.release_below(o);
+                        live.retain(|&k, _| k >= raw_off);
+                    }
+                }
+                // After every op, the heap-driven answer matches the brute-force scan at each probe.
+                for &p in &probes {
+                    let mut brute: Vec<Offset> = t
+                        .leases
+                        .iter()
+                        .filter(|(_, lease)| p >= lease.deadline)
+                        .map(|(&k, _)| off(k))
+                        .collect();
+                    brute.sort_unstable();
+                    prop_assert_eq!(t.expired(p), brute);
+                }
+            }
         }
     }
 }
