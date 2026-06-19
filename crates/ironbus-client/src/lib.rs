@@ -513,6 +513,10 @@ impl Client {
                 requested_credit: config.requested_consumer_credit,
                 requested_credit_bytes: config.requested_consumer_credit_bytes,
                 wants_gap_marker: config.request_gap_marker,
+                // #494 is PROTO/CODEC only: the client does not request a connection-wide default ack
+                // level yet (that is phase #496), so this stays `None` and the body is byte-for-byte
+                // the pre-#494 Connect.
+                default_ack_level: None,
             },
             &mut connect_body,
         );
@@ -2157,6 +2161,7 @@ mod tests {
                 credit: None,
                 credit_bytes: None,
                 gap_marker: true,
+                default_ack_level: None,
             },
             &mut body,
         );

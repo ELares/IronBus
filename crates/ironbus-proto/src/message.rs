@@ -137,11 +137,105 @@ pub const PUB_FLAG_HAS_DEDUP: u8 = 0b1000_0000;
 /// opt-in). Adds NO new frame tag (the `FrameType` vocabulary is unchanged); only this additive flag.
 pub const PUB_FLAG_FIRE_AND_FORGET: u8 = 0b0100_0000;
 
-/// The MASK of WIRE-ONLY PUB-body flag bits (the dedup-block bit and the fire-and-forget bit) that
-/// the server MUST clear before the `flags` byte becomes a stored [`ironbus_core::types::RecordFlags`]
-/// (#33, #11): neither is record state, so neither may pollute the stored flags or collide with a
-/// future record-flag bit. Both sit well above `RecordFlags::KNOWN` (`0b111`).
-pub const PUB_WIRE_ONLY_FLAGS: u8 = PUB_FLAG_HAS_DEDUP | PUB_FLAG_FIRE_AND_FORGET;
+/// The 2-bit WIRE-ONLY PUB-body field that carries the per-publish produce ACK LEVEL (#494, part of
+/// the Cassandra-consistency-style ack spectrum #499). It occupies the two currently-FREE PUB flag
+/// bits 3 and 4 (`0b0001_1000`), which sit between the stored record flags (`RecordFlags::KNOWN` =
+/// bits 0..=2) and the existing wire-only bits (fire-and-forget bit 6, dedup bit 7), so it collides
+/// with neither. The encoded values are:
+///
+/// - `0` = Level 1 (server ack, today's `PubAck` behavior). A `flags` byte with NEITHER the
+///   fire-and-forget bit NOR an ack-level bit set therefore means Level 1, which is EXACTLY how every
+///   pre-feature client encodes a default at-least-once publish — so an old client is Level 1 by
+///   construction and its body is byte-for-byte unchanged.
+/// - `1` (`0b0000_1000`, bit 3) = Level 0 (no-ack, fire-and-forget). This is the level-bit ALIAS for
+///   Level 0; the canonical Level-0 encoding remains [`PUB_FLAG_FIRE_AND_FORGET`] (an old faf publish
+///   IS a Level-0 publish), and [`pub_ack_level`] reports Level 0 when EITHER the fire-and-forget bit
+///   OR this level value is set.
+/// - `2` (`0b0001_0000`, bit 4) = Level 2 (server+client ack): the producer confirmation waits for a
+///   CONSUMER ack, delivered out-of-band by the new [`crate::frame::FrameType::ProduceConfirm`] frame.
+/// - `3` (`0b0001_1000`, both bits) = RESERVED for a future level; it decodes to Level 1 (the safe
+///   default) today, never an error, so the field can grow without a wire break.
+///
+/// Like the other wire-only bits this field is masked OUT of the stored record flags
+/// ([`PUB_WIRE_ONLY_FLAGS`]) by the server, so it never becomes record state. PROTO/CODEC ONLY in this
+/// phase: the bits are defined and round-trip here, but NO server accept-path, client API, or ack
+/// behavior reads them yet (phases #495/#496/#497).
+pub const PUB_FLAG_ACK_LEVEL_MASK: u8 = 0b0001_1000;
+
+/// The bit shift from the low edge of the `flags` byte to the [`PUB_FLAG_ACK_LEVEL_MASK`] field, so
+/// `(flags & PUB_FLAG_ACK_LEVEL_MASK) >> PUB_FLAG_ACK_LEVEL_SHIFT` yields the raw 0..=3 level value.
+pub const PUB_FLAG_ACK_LEVEL_SHIFT: u8 = 3;
+
+/// The MASK of WIRE-ONLY PUB-body flag bits that the server MUST clear before the `flags` byte
+/// becomes a stored [`ironbus_core::types::RecordFlags`] (#33, #11, #494): the dedup-block bit, the
+/// fire-and-forget bit, and the 2-bit ack-level field. NONE is record state, so none may pollute the
+/// stored flags or collide with a future record-flag bit. All sit well above `RecordFlags::KNOWN`
+/// (`0b111`), so masking them off leaves the stored record byte-for-byte what a pre-feature publish
+/// produced (the conformance byte-identity gate is unaffected).
+pub const PUB_WIRE_ONLY_FLAGS: u8 =
+    PUB_FLAG_HAS_DEDUP | PUB_FLAG_FIRE_AND_FORGET | PUB_FLAG_ACK_LEVEL_MASK;
+
+/// The per-publish produce ACK LEVEL a [`PubBody`] requests (#494, part of #499): the
+/// Cassandra-consistency-style spectrum from no-ack to server+client-ack. Carried on the wire in the
+/// [`PUB_FLAG_ACK_LEVEL_MASK`] bits (with [`PUB_FLAG_FIRE_AND_FORGET`] as the canonical Level-0
+/// encoding), masked off the stored record. PROTO/CODEC ONLY in this phase: no path acts on it yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AckLevel {
+    /// Level 0: no-ack / fire-and-forget. The producer never waits and accepts loss by contract; the
+    /// broker MAY drop the publish under load. Generalizes [`PUB_FLAG_FIRE_AND_FORGET`] (an old faf
+    /// publish is a Level-0 publish). The fastest path.
+    NoAck,
+    /// Level 1: server ack. A `PubAck` once the record is accepted into the log at the configured
+    /// durability level. This is today's behavior and the DEFAULT, so an old client (which encodes
+    /// neither the faf bit nor a level bit) is Level 1.
+    #[default]
+    ServerAck,
+    /// Level 2: server+client ack. The producer's confirmation completes only after a CONSUMER acks
+    /// the record, signalled out-of-band by the new [`crate::frame::FrameType::ProduceConfirm`] frame.
+    ServerAndClientAck,
+}
+
+impl AckLevel {
+    /// The raw 0..=2 value this level encodes into the [`PUB_FLAG_ACK_LEVEL_MASK`] bits. (Level 0 is
+    /// ALSO representable as [`PUB_FLAG_FIRE_AND_FORGET`] with a clear level field; the encoder writes
+    /// the canonical fire-and-forget bit for Level 0 and leaves the level bits clear, see
+    /// [`encode_pub`].)
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        match self {
+            AckLevel::NoAck => 0,
+            AckLevel::ServerAck => 1,
+            AckLevel::ServerAndClientAck => 2,
+        }
+    }
+}
+
+/// Reads the produce ACK LEVEL a PUB `flags` byte requests (#494), folding BOTH the canonical
+/// fire-and-forget Level-0 encoding ([`PUB_FLAG_FIRE_AND_FORGET`]) and the 2-bit
+/// [`PUB_FLAG_ACK_LEVEL_MASK`] field into a single [`AckLevel`]:
+///
+/// - the fire-and-forget bit OR a raw level value of `1` => [`AckLevel::NoAck`] (Level 0),
+/// - a raw level value of `2` => [`AckLevel::ServerAndClientAck`] (Level 2),
+/// - a raw level value of `0` (the old-client default) OR the RESERVED value `3` => the safe default
+///   [`AckLevel::ServerAck`] (Level 1).
+///
+/// So an old client whose `flags` set NEITHER the faf bit nor a level bit is reported as Level 1,
+/// preserving today's behavior, and an old fire-and-forget publish is reported as Level 0.
+#[must_use]
+pub fn pub_ack_level(flags: u8) -> AckLevel {
+    if flags & PUB_FLAG_FIRE_AND_FORGET != 0 {
+        return AckLevel::NoAck;
+    }
+    match (flags & PUB_FLAG_ACK_LEVEL_MASK) >> PUB_FLAG_ACK_LEVEL_SHIFT {
+        1 => AckLevel::NoAck,
+        2 => AckLevel::ServerAndClientAck,
+        // Everything else is the safe Level-1 default: value 0 is the old-client / explicit Level-1
+        // encoding (a pre-feature publish stays Level 1), and value 3 is RESERVED and decodes to
+        // Level 1 rather than erroring, so the field can grow without a wire break. (The mask is 2
+        // bits, so the only other value reaching here is 0 or 3.)
+        _ => AckLevel::ServerAck,
+    }
+}
 
 /// The opt-in dedup metadata a producer attaches to a PUB to request effectively-once dedup
 /// (#33): a `producer_id` (the dedup identity; empty is the anonymous/session-scoped default),
@@ -170,13 +264,18 @@ pub struct PubDedup<'a> {
 /// `payload` (the remainder of the body). With the dedup bit clear the layout is byte-for-byte
 /// the historical one (#33, additive). The [`PUB_FLAG_FIRE_AND_FORGET`] bit (bit 6) is an additive
 /// boolean signal carried in the SAME `flags` byte (no extra block, so it never changes the layout);
-/// it marks a QoS-0 publish (#11, #402).
+/// it marks a QoS-0 publish (#11, #402). The produce ACK LEVEL (#494) likewise rides the 2-bit
+/// [`PUB_FLAG_ACK_LEVEL_MASK`] field of the SAME `flags` byte (bits 3..=4); it too adds no block, so
+/// the layout is unchanged. The ack level is carried IN `flags` (not a separate struct field, so the
+/// `PubBody` shape is unchanged) and read with [`pub_ack_level`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PubBody<'a> {
     /// Producer record flags (the codec/server derives storage flags such as `HAS_KEY`). The
-    /// wire-only [`PUB_FLAG_HAS_DEDUP`] bit (bit 7) signals the dedup block and the
-    /// [`PUB_FLAG_FIRE_AND_FORGET`] bit (bit 6) marks a QoS-0 publish; BOTH are masked off
-    /// ([`PUB_WIRE_ONLY_FLAGS`]) by the server before this becomes a stored record flag.
+    /// wire-only [`PUB_FLAG_HAS_DEDUP`] bit (bit 7) signals the dedup block, the
+    /// [`PUB_FLAG_FIRE_AND_FORGET`] bit (bit 6) marks a QoS-0 publish, and the
+    /// [`PUB_FLAG_ACK_LEVEL_MASK`] bits (bits 3..=4) carry the produce ack level (#494, read via
+    /// [`pub_ack_level`]); ALL are masked off ([`PUB_WIRE_ONLY_FLAGS`]) by the server before this
+    /// becomes a stored record flag.
     pub flags: u8,
     /// Producer timestamp, milliseconds since the Unix epoch.
     pub timestamp_ms: u64,
@@ -203,16 +302,22 @@ pub struct PubBody<'a> {
 /// emitted after the headers; when `None`, the bit is forced clear, so the encoded body cannot
 /// claim a dedup block it does not carry (or omit one it does). The [`PUB_FLAG_FIRE_AND_FORGET`]
 /// bit is set iff `msg.fire_and_forget` (the QoS-0 marker, #11), derived from the field so it and
-/// the caller's intent can never disagree.
+/// the caller's intent can never disagree. The 2-bit [`PUB_FLAG_ACK_LEVEL_MASK`] ack-level field
+/// (#494) is carried IN `msg.flags` and PRESERVED here (set it with the level bits, or use the
+/// canonical [`PUB_FLAG_FIRE_AND_FORGET`] bit for Level 0); only the dedup and fire-and-forget bits
+/// are re-derived from the fields. The default produce (no faf, no ack-level bit) is therefore
+/// byte-for-byte the historical layout and decodes as Level 1 via [`pub_ack_level`].
 ///
 /// # Errors
 /// Returns [`BodyError::FieldTooLarge`] if the key, headers, `producer_id`, or `msg_id` exceed
 /// `u16::MAX`.
 pub fn encode_pub(msg: &PubBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
-    // Derive the on-wire dedup and fire-and-forget bits from the fields, not from the caller's
-    // flags, so the bits and the body/intent can never disagree. Start by clearing both wire-only
-    // bits the caller may have set, then OR in exactly what the fields say.
-    let mut flags = msg.flags & !PUB_WIRE_ONLY_FLAGS;
+    // Derive the on-wire dedup and fire-and-forget bits from the fields, not from the caller's flags,
+    // so those bits and the body/intent can never disagree. The ack-level field (#494) is the
+    // EXCEPTION: it has no dedicated `PubBody` field, so it is carried IN `flags` and must be
+    // PRESERVED. Clear ONLY the two field-derived bits (dedup, faf), keeping the caller's ack-level
+    // bits, then OR in exactly what the dedup/faf fields say.
+    let mut flags = msg.flags & !(PUB_FLAG_HAS_DEDUP | PUB_FLAG_FIRE_AND_FORGET);
     if msg.dedup.is_some() {
         flags |= PUB_FLAG_HAS_DEDUP;
     }
@@ -260,7 +365,9 @@ pub fn decode_pub(body: &[u8]) -> Result<PubBody<'_>, BodyError> {
         None
     };
     // The fire-and-forget (QoS-0) marker is a boolean read directly off the SAME flags byte (#11):
-    // it adds no block, so it never changes the layout or the payload boundary.
+    // it adds no block, so it never changes the layout or the payload boundary. The produce ACK LEVEL
+    // (#494) likewise rides this flags byte and is read on demand with `pub_ack_level(flags)`; it adds
+    // no field here so the `PubBody` shape (and every caller) is unchanged.
     let fire_and_forget = flags & PUB_FLAG_FIRE_AND_FORGET != 0;
     let payload = r.rest();
     Ok(PubBody {
@@ -672,6 +779,65 @@ pub fn decode_gap_marker(body: &[u8]) -> Result<GapMarkerBody, BodyError> {
     })
 }
 
+/// The terminal status of an ack-level-2 produce, carried in the one-byte `status` field of a
+/// [`ProduceConfirmBody`] (#494): the producer's confirmation completes when the broker reports one of
+/// these. The values are append-only; an unknown value a FUTURE server might send is tolerated by the
+/// codec (decoded verbatim, never an error), so the status field can grow without a new frame.
+pub mod produce_confirm_status {
+    /// The record was CONSUMED: a consumer acked it, so the Level-2 produce is confirmed (the success
+    /// terminal, the analogue of a `JetStream` consumer ack flowing back to the producer).
+    pub const CONSUMED: u8 = 0;
+    /// The Level-2 confirmation TIMED OUT: no consumer acked the record within the broker's confirm
+    /// window, so the producer is told the confirmation will never arrive (a non-success terminal).
+    pub const TIMED_OUT: u8 = 1;
+    /// The record was DEAD-LETTERED (poison / force-reaped) before any consumer acked it, so the
+    /// Level-2 confirmation can never be satisfied (a non-success terminal).
+    pub const DEAD_LETTERED: u8 = 2;
+}
+
+/// A server->producer Level-2 produce confirmation (the `ProduceConfirm` frame body, #494, part of
+/// #499): the broker tells a producer that an ack-level-2 (server+client-ack) publish has reached its
+/// terminal outcome — a consumer acked it, the confirm window timed out, or it was dead-lettered. It
+/// keys the confirmation by the record's durable `offset` (the same offset the matching `PubAck`
+/// returned) so the producer can match it to the publish it is awaiting.
+///
+/// Layout: `offset: u64` (the record's durable offset, little-endian), then a one-byte `status` (a
+/// [`produce_confirm_status`] value; a fixed 9-byte layout). PROTO/CODEC ONLY in this phase: the codec
+/// is defined and round-trips here, but NO path emits or consumes the frame yet (the server emit path
+/// is phase #497, the client wait path is phase #496).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProduceConfirmBody {
+    /// The durable log offset of the record the Level-2 produce was confirmed (or failed) for, matching
+    /// the offset the publish's `PubAck` returned.
+    pub offset: u64,
+    /// The terminal status of the Level-2 confirmation (a [`produce_confirm_status`] value: consumed /
+    /// timed-out / dead-lettered). An unknown future value is tolerated by the reader, never an error.
+    pub status: u8,
+}
+
+/// Encodes a `ProduceConfirm` body onto the end of `out` (a fixed 9-byte layout): the 8-byte LE offset
+/// then the one-byte status.
+pub fn encode_produce_confirm(confirm: &ProduceConfirmBody, out: &mut Vec<u8>) {
+    out.extend_from_slice(&confirm.offset.to_le_bytes());
+    out.push(confirm.status);
+}
+
+/// Decodes a `ProduceConfirm` body (a fixed 9-byte layout; a short or overlong body is rejected). The
+/// `status` byte is NOT validated here (an unknown future status is a valid, tolerated confirmation,
+/// decoded verbatim), only the length is, so the codec stays cap-before-alloc and panic-free.
+///
+/// # Errors
+/// Returns a [`BodyError`] on a short body or trailing bytes.
+pub fn decode_produce_confirm(body: &[u8]) -> Result<ProduceConfirmBody, BodyError> {
+    let mut r = Reader::new(body);
+    let offset = r.u64()?;
+    let status = r.u8()?;
+    if !r.at_end() {
+        return Err(BodyError::TrailingBytes);
+    }
+    Ok(ProduceConfirmBody { offset, status })
+}
+
 /// The version of the `Connect`/`Info` handshake body framing (#292, refs #275, #65, #11). The
 /// handshake bodies were EMPTY before this; version `1` is the first non-empty layout. It is the
 /// handshake-BODY version, distinct from the (still un-wired) `wire_protocol_version` integer #71/#11
@@ -699,6 +865,14 @@ pub const CONNECT_FLAG_HAS_CREDIT_BYTES: u8 = 0b0000_0010;
 /// associated value), so it occupies no slot in the v1 field block beyond this `flags` bit.
 pub const CONNECT_FLAG_WANTS_GAP_MARKER: u8 = 0b0000_0100;
 
+/// The `Connect` presence-flag bit signalling that a `default_ack_level` (the connection-wide default
+/// produce ack level a client adopts when a publish does not name its own, #494) is present and
+/// meaningful. When clear (an old client, or one that defers) the client requests NO default and the
+/// server applies its own. The level VALUE is an appended v1-block byte (see [`ConnectBody`]); this
+/// presence bit governs only whether that byte is meaningful, so the field is forward+backward
+/// compatible (an old body omits the byte and leaves this bit clear).
+pub const CONNECT_FLAG_HAS_DEFAULT_ACK_LEVEL: u8 = 0b0000_1000;
+
 /// The `Info` presence-flag bit signalling that the server's advertised per-consumer message-credit
 /// fields (`negotiated` + `cap`) are present (#292). A server that does not advertise leaves it clear,
 /// and a client then keeps its own local credit (backward-compat).
@@ -716,6 +890,13 @@ pub const INFO_FLAG_HAS_CREDIT_BYTES: u8 = 0b0000_0010;
 /// out falls back to the legacy advisory.
 pub const INFO_FLAG_GAP_MARKER: u8 = 0b0000_0100;
 
+/// The `Info` presence-flag bit by which the server ECHOES the connection-wide `default_ack_level` it
+/// adopted for this connection (#494), the server->client twin of [`CONNECT_FLAG_HAS_DEFAULT_ACK_LEVEL`].
+/// When clear (an old server, or one that does not echo) the client keeps whatever default it asked
+/// for. The level VALUE is an appended v1-block byte (see [`InfoBody`]); this presence bit governs
+/// only whether it is meaningful, so the field is forward+backward compatible.
+pub const INFO_FLAG_HAS_DEFAULT_ACK_LEVEL: u8 = 0b0000_1000;
+
 /// A client's handshake request (the `Connect` frame body, #292). The client MAY request a
 /// per-consumer message credit and/or byte budget; the server clamps each to its own cap and replies
 /// the negotiated value in [`InfoBody`]. A field is REQUESTED only when its presence bit is set in
@@ -726,9 +907,11 @@ pub const INFO_FLAG_GAP_MARKER: u8 = 0b0000_0100;
 /// Layout (version-prefixed, length-prefixed, forward-compatible): `body_version: u8`
 /// ([`HANDSHAKE_BODY_VERSION`]), `field_len: u16` (the length of the v1 known-field block that
 /// follows), then the v1 block: `flags: u8`, `requested_credit: u32 LE`, `requested_credit_bytes:
-/// u64 LE`. Any bytes past `field_len` (a FUTURE version's appended fields, e.g. the #71
-/// `wire_protocol_version`) are TOLERATED and ignored by a v1 reader. An empty body is the
-/// all-absent default.
+/// u64 LE`, and then — ONLY when [`CONNECT_FLAG_HAS_DEFAULT_ACK_LEVEL`] is set — an APPENDED
+/// `default_ack_level: u8` (#494). The ack-level byte is OMITTED (and `field_len` is the historical
+/// length) when the field is absent, so a request without it is byte-for-byte the pre-#494 body. Any
+/// bytes past `field_len` (a FUTURE version's appended fields, e.g. the #71 `wire_protocol_version`)
+/// are TOLERATED and ignored by a v1 reader. An empty body is the all-absent default.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConnectBody {
     /// The per-consumer message credit the client requests, or `None` to defer to the server default.
@@ -741,20 +924,42 @@ pub struct ConnectBody {
     /// legacy `Truncated` advisory across a skipped span (#346). `false` (the default, and an old
     /// client) means the server keeps sending `Truncated` and never sends the new tag.
     pub wants_gap_marker: bool,
+    /// The connection-wide DEFAULT produce ack level the client requests (#494, part of #499): the raw
+    /// 0/1/2 value (matching [`AckLevel::as_u8`]; `3` is reserved) a publish adopts when it does not
+    /// name its own. `None` (an old client, or one that defers) means the server applies its own
+    /// default. APPENDED v1 field: it is emitted only when `Some`, so a `None` request is byte-for-byte
+    /// the pre-#494 body and an old client (which never sets the presence bit) decodes to `None`. The
+    /// value is carried raw as a `u8` so a future level the proto does not yet name still round-trips.
+    pub default_ack_level: Option<u8>,
 }
 
-/// The number of bytes in the `Connect` v1 known-field block: `flags: u8` + `requested_credit: u32` +
-/// `requested_credit_bytes: u64`.
+/// The number of bytes in the `Connect` v1 known-field block WITHOUT the appended `default_ack_level`
+/// byte (#494): `flags: u8` + `requested_credit: u32` + `requested_credit_bytes: u64`. This is the
+/// historical, pre-#494 block length, emitted whenever `default_ack_level` is `None` so the body is
+/// byte-for-byte the old one.
 const CONNECT_V1_FIELD_LEN: u16 = 1 + 4 + 8;
 
-/// Encodes a `Connect` body onto the end of `out` (#292). The result is the version byte, the v1
+/// The `Connect` v1 block length WITH the appended `default_ack_level` byte (#494): the historical
+/// block plus one byte, emitted only when the field is present.
+const CONNECT_V1_FIELD_LEN_WITH_ACK_LEVEL: u16 = CONNECT_V1_FIELD_LEN + 1;
+
+/// Encodes a `Connect` body onto the end of `out` (#292, #494). The result is the version byte, the v1
 /// field-block length, then the v1 block; an all-`None` request still encodes a well-formed
 /// (non-empty) v1 body whose presence flags are clear, which the server reads as "use my defaults".
-/// To emit the historical EMPTY `Connect` body (the old-client case) the caller simply sends an empty
-/// body and does NOT call this; [`decode_connect`] accepts both.
+/// The `default_ack_level` byte (#494) is APPENDED to the block ONLY when present, and `field_len`
+/// grows by exactly that byte; when absent the body is byte-for-byte the pre-#494 layout. To emit the
+/// historical EMPTY `Connect` body (the old-client case) the caller simply sends an empty body and
+/// does NOT call this; [`decode_connect`] accepts both.
 pub fn encode_connect(req: &ConnectBody, out: &mut Vec<u8>) {
     out.push(HANDSHAKE_BODY_VERSION);
-    out.extend_from_slice(&CONNECT_V1_FIELD_LEN.to_le_bytes());
+    // The block length depends ONLY on whether the appended ack-level byte is present, so a request
+    // without it encodes the historical length and bytes (byte-identity, #494).
+    let field_len = if req.default_ack_level.is_some() {
+        CONNECT_V1_FIELD_LEN_WITH_ACK_LEVEL
+    } else {
+        CONNECT_V1_FIELD_LEN
+    };
+    out.extend_from_slice(&field_len.to_le_bytes());
     let mut flags = 0u8;
     if req.requested_credit.is_some() {
         flags |= CONNECT_FLAG_HAS_CREDIT;
@@ -765,9 +970,17 @@ pub fn encode_connect(req: &ConnectBody, out: &mut Vec<u8>) {
     if req.wants_gap_marker {
         flags |= CONNECT_FLAG_WANTS_GAP_MARKER;
     }
+    if req.default_ack_level.is_some() {
+        flags |= CONNECT_FLAG_HAS_DEFAULT_ACK_LEVEL;
+    }
     out.push(flags);
     out.extend_from_slice(&req.requested_credit.unwrap_or(0).to_le_bytes());
     out.extend_from_slice(&req.requested_credit_bytes.unwrap_or(0).to_le_bytes());
+    // The appended ack-level byte is emitted LAST in the block and ONLY when present, so the historical
+    // fields keep their exact offsets and a `None` request omits the byte entirely (#494).
+    if let Some(level) = req.default_ack_level {
+        out.push(level);
+    }
 }
 
 /// Decodes a `Connect` body (#292), cap-before-alloc and panic-free.
@@ -809,6 +1022,12 @@ pub fn decode_connect(body: &[u8]) -> Result<ConnectBody, BodyError> {
     let flags = fr.u8().unwrap_or(0);
     let credit = fr.u32().unwrap_or(0);
     let credit_bytes = fr.u64().unwrap_or(0);
+    // The appended ack-level byte (#494) follows the historical fixed fields and is present in the
+    // block ONLY when the presence bit is set; a clear bit (an old client, or a short block) reads no
+    // byte and defaults to `None`. The `unwrap_or` keeps the read panic-free even if a malformed sender
+    // set the bit but truncated the block.
+    let default_ack_level =
+        (flags & CONNECT_FLAG_HAS_DEFAULT_ACK_LEVEL != 0).then(|| fr.u8().unwrap_or(0));
     let requested_credit = (flags & CONNECT_FLAG_HAS_CREDIT != 0).then_some(credit);
     let requested_credit_bytes =
         (flags & CONNECT_FLAG_HAS_CREDIT_BYTES != 0).then_some(credit_bytes);
@@ -817,6 +1036,7 @@ pub fn decode_connect(body: &[u8]) -> Result<ConnectBody, BodyError> {
         requested_credit,
         requested_credit_bytes,
         wants_gap_marker,
+        default_ack_level,
     })
 }
 
@@ -841,7 +1061,10 @@ pub struct CreditAdvert<T> {
 ///
 /// Layout (the same version/length framing as [`ConnectBody`]): `body_version: u8`, `field_len: u16`,
 /// then the v1 block: `flags: u8`, `credit.negotiated: u32 LE`, `credit.cap: u32 LE`,
-/// `credit_bytes.negotiated: u64 LE`, `credit_bytes.cap: u64 LE`. Trailing bytes past the block are a
+/// `credit_bytes.negotiated: u64 LE`, `credit_bytes.cap: u64 LE`, and then — ONLY when
+/// [`INFO_FLAG_HAS_DEFAULT_ACK_LEVEL`] is set — an APPENDED `default_ack_level: u8` (#494). The
+/// ack-level byte is OMITTED (and `field_len` is the historical length) when absent, so an
+/// advertisement without it is byte-for-byte the pre-#494 body. Trailing bytes past the block are a
 /// future version's fields, tolerated and ignored. An empty body is the all-absent case.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InfoBody {
@@ -857,20 +1080,38 @@ pub struct InfoBody {
     /// server supports it. `false` (an old server, or the marker disabled) tells the client it will
     /// still see the legacy `Truncated` advisory.
     pub gap_marker: bool,
+    /// The connection-wide DEFAULT produce ack level the server ECHOES for this connection (#494), the
+    /// server->client twin of [`ConnectBody::default_ack_level`]: the raw 0/1/2 value (matching
+    /// [`AckLevel::as_u8`]; `3` reserved). `None` (an old server, or one that does not echo) means the
+    /// client keeps whatever default it requested. APPENDED v1 field: emitted only when `Some`, so a
+    /// `None` advertisement is byte-for-byte the pre-#494 body and an old server decodes to `None`.
+    pub default_ack_level: Option<u8>,
 }
 
-/// The number of bytes in the `Info` v1 known-field block: `flags: u8` + `credit.negotiated: u32` +
-/// `credit.cap: u32` + `credit_bytes.negotiated: u64` + `credit_bytes.cap: u64`.
+/// The number of bytes in the `Info` v1 known-field block WITHOUT the appended `default_ack_level`
+/// byte (#494): `flags: u8` + `credit.negotiated: u32` + `credit.cap: u32` + `credit_bytes.negotiated:
+/// u64` + `credit_bytes.cap: u64`. This is the historical, pre-#494 block length.
 const INFO_V1_FIELD_LEN: u16 = 1 + 4 + 4 + 8 + 8;
 
-/// Encodes an `Info` body onto the end of `out` (#292): the version byte, the v1 field-block length,
-/// then the v1 block. An all-`None` advertisement still encodes a well-formed (non-empty) v1 body whose
-/// presence flags are clear, which a client reads as "no advertisement, keep my local credit". To emit
-/// the historical EMPTY `Info` body (the old-server case) the caller sends an empty body and does NOT
-/// call this; [`decode_info`] accepts both.
+/// The `Info` v1 block length WITH the appended `default_ack_level` byte (#494): the historical block
+/// plus one byte, emitted only when the field is present.
+const INFO_V1_FIELD_LEN_WITH_ACK_LEVEL: u16 = INFO_V1_FIELD_LEN + 1;
+
+/// Encodes an `Info` body onto the end of `out` (#292, #494): the version byte, the v1 field-block
+/// length, then the v1 block. An all-`None` advertisement still encodes a well-formed (non-empty) v1
+/// body whose presence flags are clear, which a client reads as "no advertisement, keep my local
+/// credit". The `default_ack_level` byte (#494) is APPENDED to the block ONLY when present, and
+/// `field_len` grows by exactly that byte; when absent the body is byte-for-byte the pre-#494 layout.
+/// To emit the historical EMPTY `Info` body (the old-server case) the caller sends an empty body and
+/// does NOT call this; [`decode_info`] accepts both.
 pub fn encode_info(info: &InfoBody, out: &mut Vec<u8>) {
     out.push(HANDSHAKE_BODY_VERSION);
-    out.extend_from_slice(&INFO_V1_FIELD_LEN.to_le_bytes());
+    let field_len = if info.default_ack_level.is_some() {
+        INFO_V1_FIELD_LEN_WITH_ACK_LEVEL
+    } else {
+        INFO_V1_FIELD_LEN
+    };
+    out.extend_from_slice(&field_len.to_le_bytes());
     let mut flags = 0u8;
     if info.credit.is_some() {
         flags |= INFO_FLAG_HAS_CREDIT;
@@ -880,6 +1121,9 @@ pub fn encode_info(info: &InfoBody, out: &mut Vec<u8>) {
     }
     if info.gap_marker {
         flags |= INFO_FLAG_GAP_MARKER;
+    }
+    if info.default_ack_level.is_some() {
+        flags |= INFO_FLAG_HAS_DEFAULT_ACK_LEVEL;
     }
     out.push(flags);
     let credit = info.credit.unwrap_or(CreditAdvert {
@@ -894,6 +1138,11 @@ pub fn encode_info(info: &InfoBody, out: &mut Vec<u8>) {
     });
     out.extend_from_slice(&credit_bytes.negotiated.to_le_bytes());
     out.extend_from_slice(&credit_bytes.cap.to_le_bytes());
+    // The appended ack-level byte is emitted LAST in the block and ONLY when present, so the historical
+    // fields keep their exact offsets and a `None` advertisement omits the byte entirely (#494).
+    if let Some(level) = info.default_ack_level {
+        out.push(level);
+    }
 }
 
 /// Decodes an `Info` body (#292), cap-before-alloc and panic-free.
@@ -928,6 +1177,11 @@ pub fn decode_info(body: &[u8]) -> Result<InfoBody, BodyError> {
     let credit_cap = fr.u32().unwrap_or(0);
     let credit_bytes_negotiated = fr.u64().unwrap_or(0);
     let credit_bytes_cap = fr.u64().unwrap_or(0);
+    // The appended ack-level byte (#494) follows the historical fixed fields and is present in the
+    // block ONLY when the presence bit is set; a clear bit (an old server, or a short block) reads no
+    // byte and defaults to `None`.
+    let default_ack_level =
+        (flags & INFO_FLAG_HAS_DEFAULT_ACK_LEVEL != 0).then(|| fr.u8().unwrap_or(0));
     let credit = (flags & INFO_FLAG_HAS_CREDIT != 0).then_some(CreditAdvert {
         negotiated: credit_negotiated,
         cap: credit_cap,
@@ -941,6 +1195,7 @@ pub fn decode_info(body: &[u8]) -> Result<InfoBody, BodyError> {
         credit,
         credit_bytes,
         gap_marker,
+        default_ack_level,
     })
 }
 
@@ -1045,6 +1300,7 @@ mod tests {
             requested_credit: None,
             requested_credit_bytes: None,
             wants_gap_marker: true,
+            default_ack_level: None,
         };
         let mut buf = Vec::new();
         encode_connect(&req, &mut buf);
@@ -1065,6 +1321,7 @@ mod tests {
             credit: None,
             credit_bytes: None,
             gap_marker: true,
+            default_ack_level: None,
         };
         let mut buf = Vec::new();
         encode_info(&info, &mut buf);
@@ -1607,15 +1864,17 @@ mod tests {
         }
 
         /// A Connect body round-trips for any combination of present/absent requested credit and
-        /// byte budget (#292): the version/length framing is recovered and each optional field comes
-        /// back exactly as sent (present -> Some(value), absent -> None).
+        /// byte budget (#292) and the appended `default_ack_level` (#494): the version/length framing
+        /// is recovered and each optional field comes back exactly as sent (present -> Some(value),
+        /// absent -> None), including the raw ack-level byte for every 0..=255 value.
         #[test]
         fn any_connect_round_trips(
             credit in proptest::option::of(any::<u32>()),
             credit_bytes in proptest::option::of(any::<u64>()),
             wants_gap_marker in any::<bool>(),
+            default_ack_level in proptest::option::of(any::<u8>()),
         ) {
-            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: credit_bytes, wants_gap_marker };
+            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: credit_bytes, wants_gap_marker, default_ack_level };
             let mut buf = Vec::new();
             encode_connect(&req, &mut buf);
             prop_assert_eq!(buf[0], HANDSHAKE_BODY_VERSION, "the body leads with its version");
@@ -1623,17 +1882,20 @@ mod tests {
         }
 
         /// An Info body round-trips for any combination of present/absent advertised credit and byte
-        /// budget (#292) and the gap-marker capability bit (#346): each survives the round-trip.
+        /// budget (#292), the gap-marker capability bit (#346), and the appended `default_ack_level`
+        /// (#494): each survives the round-trip.
         #[test]
         fn any_info_round_trips(
             credit in proptest::option::of((any::<u32>(), any::<u32>())),
             credit_bytes in proptest::option::of((any::<u64>(), any::<u64>())),
             gap_marker in any::<bool>(),
+            default_ack_level in proptest::option::of(any::<u8>()),
         ) {
             let info = InfoBody {
                 credit: credit.map(|(negotiated, cap)| CreditAdvert { negotiated, cap }),
                 credit_bytes: credit_bytes.map(|(negotiated, cap)| CreditAdvert { negotiated, cap }),
                 gap_marker,
+                default_ack_level,
             };
             let mut buf = Vec::new();
             encode_info(&info, &mut buf);
@@ -1662,7 +1924,7 @@ mod tests {
             credit in proptest::option::of(any::<u32>()),
             trailing in prop::collection::vec(any::<u8>(), 0..64),
         ) {
-            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: None, wants_gap_marker: false };
+            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: None, wants_gap_marker: false, default_ack_level: None };
             let mut buf = Vec::new();
             encode_connect(&req, &mut buf);
             let mut extended = buf.clone();
@@ -1673,6 +1935,7 @@ mod tests {
                 credit: credit.map(|c| CreditAdvert { negotiated: c, cap: c }),
                 credit_bytes: None,
                 gap_marker: false,
+                default_ack_level: None,
             };
             let mut ibuf = Vec::new();
             encode_info(&info, &mut ibuf);
@@ -1719,6 +1982,7 @@ mod tests {
                 requested_credit: None,
                 requested_credit_bytes: None,
                 wants_gap_marker: false,
+                default_ack_level: None,
             }
         );
     }
@@ -1734,6 +1998,7 @@ mod tests {
                 credit: None,
                 credit_bytes: None,
                 gap_marker: false,
+                default_ack_level: None,
             }
         );
     }
@@ -1744,11 +2009,13 @@ mod tests {
             requested_credit: Some(32),
             requested_credit_bytes: Some(1024),
             wants_gap_marker: true,
+            default_ack_level: None,
         };
         let mut buf = Vec::new();
         encode_connect(&req, &mut buf);
         // version(1) + field_len(2) + flags(1) + credit(4) + credit_bytes(8) = 16 bytes. The gap-marker
-        // capability is a pure flags bit, so it adds NO bytes to the v1 field block.
+        // capability is a pure flags bit, so it adds NO bytes to the v1 field block, and a `None`
+        // default_ack_level (#494) appends NO byte, so a full request is still the historical length.
         assert_eq!(buf.len(), 3 + usize::from(CONNECT_V1_FIELD_LEN));
         assert_eq!(buf[0], HANDSHAKE_BODY_VERSION);
         assert_eq!(decode_connect(&buf).unwrap(), req);
@@ -1766,10 +2033,12 @@ mod tests {
                 cap: 8 * 1024 * 1024,
             }),
             gap_marker: true,
+            default_ack_level: None,
         };
         let mut buf = Vec::new();
         encode_info(&info, &mut buf);
-        // The gap-marker confirmation is a pure flags bit, so it adds NO bytes to the v1 field block.
+        // The gap-marker confirmation is a pure flags bit, so it adds NO bytes to the v1 field block,
+        // and a `None` default_ack_level (#494) appends NO byte, so a full advert is the historical len.
         assert_eq!(buf.len(), 3 + usize::from(INFO_V1_FIELD_LEN));
         assert_eq!(buf[0], HANDSHAKE_BODY_VERSION);
         assert_eq!(decode_info(&buf).unwrap(), info);
@@ -1808,6 +2077,298 @@ mod tests {
         assert_eq!(
             decode_info(&[HANDSHAKE_BODY_VERSION]),
             Err(BodyError::Truncated)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #494 — produce ack-level wire encoding (part of #499). PROTO/CODEC ONLY.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ack_level_bits_are_genuinely_free_and_distinct() {
+        // The 2 ack-level bits (3 and 4) sit ABOVE the stored record flags (RecordFlags::KNOWN = bits
+        // 0..=2) and BELOW the existing wire-only bits (faf bit 6, dedup bit 7), colliding with
+        // neither. This pins the chosen free bits so a future flag steals a different bit, not these.
+        assert_eq!(PUB_FLAG_ACK_LEVEL_MASK, 0b0001_1000);
+        assert_eq!(PUB_FLAG_ACK_LEVEL_SHIFT, 3);
+        // No overlap with the other wire-only bits.
+        assert_eq!(PUB_FLAG_ACK_LEVEL_MASK & PUB_FLAG_FIRE_AND_FORGET, 0);
+        assert_eq!(PUB_FLAG_ACK_LEVEL_MASK & PUB_FLAG_HAS_DEDUP, 0);
+        // No overlap with the stored record flags (the low 3 bits, RecordFlags::KNOWN = 0b111).
+        assert_eq!(PUB_FLAG_ACK_LEVEL_MASK & 0b0000_0111, 0);
+        // And the full wire-only mask is exactly the union of the three.
+        assert_eq!(
+            PUB_WIRE_ONLY_FLAGS,
+            PUB_FLAG_HAS_DEDUP | PUB_FLAG_FIRE_AND_FORGET | PUB_FLAG_ACK_LEVEL_MASK
+        );
+        assert_eq!(PUB_WIRE_ONLY_FLAGS, 0b1101_1000);
+    }
+
+    #[test]
+    fn pub_ack_level_default_and_faf_and_levels() {
+        // flags == 0 (neither faf nor a level bit): an OLD client, which MUST mean Level 1.
+        assert_eq!(pub_ack_level(0), AckLevel::ServerAck);
+        // The canonical Level-0 encoding is the fire-and-forget bit (an old faf publish IS Level 0).
+        assert_eq!(pub_ack_level(PUB_FLAG_FIRE_AND_FORGET), AckLevel::NoAck);
+        // The level-bit ALIAS for Level 0 (raw value 1, bit 3) also reads as Level 0.
+        assert_eq!(pub_ack_level(0b0000_1000), AckLevel::NoAck);
+        // Raw value 2 (bit 4) is Level 2.
+        assert_eq!(pub_ack_level(0b0001_0000), AckLevel::ServerAndClientAck);
+        // The RESERVED raw value 3 (both bits) decodes to the safe Level-1 default, never an error.
+        assert_eq!(pub_ack_level(0b0001_1000), AckLevel::ServerAck);
+        // The faf bit DOMINATES any level bits (Level 0 wins).
+        assert_eq!(
+            pub_ack_level(PUB_FLAG_FIRE_AND_FORGET | 0b0001_0000),
+            AckLevel::NoAck
+        );
+        // Stored record flags (low bits) and the other wire bits never perturb the read level.
+        assert_eq!(pub_ack_level(0b1000_0111), AckLevel::ServerAck);
+        // The enum's raw values are the frozen wire numbers.
+        assert_eq!(AckLevel::NoAck.as_u8(), 0);
+        assert_eq!(AckLevel::ServerAck.as_u8(), 1);
+        assert_eq!(AckLevel::ServerAndClientAck.as_u8(), 2);
+        // The default level is Level 1 (server ack), matching the old-client default.
+        assert_eq!(AckLevel::default(), AckLevel::ServerAck);
+    }
+
+    #[test]
+    fn pub_preserves_caller_ack_level_bits_and_masks_them_off_the_stored_record() {
+        // A producer sets the Level-2 bits in `flags`; encode PRESERVES them (only dedup/faf are
+        // re-derived), so a decode reports Level 2. The server's `flags & !PUB_WIRE_ONLY_FLAGS` then
+        // strips them so the stored record flag is byte-for-byte unchanged. `HAS_KEY` (bit 1) mirrors
+        // `ironbus_core::types::RecordFlags::HAS_KEY`, a genuine stored record flag, asserted here
+        // WITHOUT an ironbus-core dependency so this stays a pure proto-crate test.
+        const HAS_KEY: u8 = 0b0000_0010;
+        let level2 = (AckLevel::ServerAndClientAck.as_u8() << PUB_FLAG_ACK_LEVEL_SHIFT)
+            & PUB_FLAG_ACK_LEVEL_MASK;
+        let msg = PubBody {
+            flags: HAS_KEY | level2,
+            timestamp_ms: 7,
+            key: b"k",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: b"p",
+        };
+        let mut buf = Vec::new();
+        encode_pub(&msg, &mut buf).unwrap();
+        // The ack-level bits survive the encode (carried in flags, not stripped).
+        assert_eq!(buf[0] & PUB_FLAG_ACK_LEVEL_MASK, level2);
+        let got = decode_pub(&buf).unwrap();
+        assert_eq!(pub_ack_level(got.flags), AckLevel::ServerAndClientAck);
+        // The stored record flags (what the server keeps) drop every wire-only bit, leaving only the
+        // genuine record flag the caller set (HAS_KEY, bit 1).
+        assert_eq!(
+            got.flags & !PUB_WIRE_ONLY_FLAGS,
+            HAS_KEY,
+            "ack-level bits are masked OUT of the stored record flags"
+        );
+    }
+
+    #[test]
+    fn a_pre_feature_pub_round_trips_byte_identical() {
+        // OLD-CLIENT BYTE-IDENTITY: a publish a pre-#494 client built (no faf, no ack-level bit, only
+        // a genuine stored record flag) must encode to EXACTLY the frozen historical bytes, decode as
+        // Level 1 (today's behavior), and have its stored-record flag unchanged. Build the expected
+        // historical body by hand and compare byte-for-byte.
+        let msg = PubBody {
+            flags: 0b0000_0010, // HAS_KEY, a genuine stored record flag — no wire-only bits
+            timestamp_ms: 0x0102_0304_0506_0708,
+            key: b"key",
+            headers: b"hd",
+            dedup: None,
+            fire_and_forget: false,
+            payload: b"payload",
+        };
+        let mut buf = Vec::new();
+        encode_pub(&msg, &mut buf).unwrap();
+        let mut expected = Vec::new();
+        expected.push(0b0000_0010);
+        expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        expected.extend_from_slice(&3u16.to_le_bytes());
+        expected.extend_from_slice(b"key");
+        expected.extend_from_slice(&2u16.to_le_bytes());
+        expected.extend_from_slice(b"hd");
+        expected.extend_from_slice(b"payload");
+        assert_eq!(
+            buf, expected,
+            "a pre-#494 PUB is byte-for-byte the frozen historical layout"
+        );
+        // It decodes as Level 1 (the old-client default) and its stored flag is unchanged.
+        let got = decode_pub(&buf).unwrap();
+        assert_eq!(pub_ack_level(got.flags), AckLevel::ServerAck);
+        assert_eq!(got.flags & !PUB_WIRE_ONLY_FLAGS, 0b0000_0010);
+    }
+
+    #[test]
+    fn produce_confirm_round_trips_every_status() {
+        for status in [
+            produce_confirm_status::CONSUMED,
+            produce_confirm_status::TIMED_OUT,
+            produce_confirm_status::DEAD_LETTERED,
+        ] {
+            let confirm = ProduceConfirmBody {
+                offset: 0x0102_0304_0506_0708,
+                status,
+            };
+            let mut buf = Vec::new();
+            encode_produce_confirm(&confirm, &mut buf);
+            assert_eq!(buf.len(), 9, "fixed 9-byte body: u64 offset + u8 status");
+            assert_eq!(&buf[..8], &confirm.offset.to_le_bytes(), "offset leads, LE");
+            assert_eq!(buf[8], status);
+            assert_eq!(decode_produce_confirm(&buf).unwrap(), confirm);
+        }
+    }
+
+    #[test]
+    fn produce_confirm_tolerates_an_unknown_status() {
+        // An unknown future status byte (e.g. 200) is a VALID, tolerated confirmation decoded
+        // verbatim, never an error: the status field can grow without a new frame.
+        let confirm = ProduceConfirmBody {
+            offset: 42,
+            status: 200,
+        };
+        let mut buf = Vec::new();
+        encode_produce_confirm(&confirm, &mut buf);
+        assert_eq!(decode_produce_confirm(&buf).unwrap(), confirm);
+    }
+
+    #[test]
+    fn produce_confirm_rejects_a_short_or_overlong_body() {
+        assert_eq!(decode_produce_confirm(&[0u8; 8]), Err(BodyError::Truncated));
+        assert_eq!(
+            decode_produce_confirm(&[0u8; 10]),
+            Err(BodyError::TrailingBytes)
+        );
+    }
+
+    #[test]
+    fn produce_confirm_status_tags_have_their_frozen_wire_values() {
+        assert_eq!(produce_confirm_status::CONSUMED, 0);
+        assert_eq!(produce_confirm_status::TIMED_OUT, 1);
+        assert_eq!(produce_confirm_status::DEAD_LETTERED, 2);
+    }
+
+    #[test]
+    fn connect_carries_the_default_ack_level_and_old_client_is_byte_identical() {
+        // An OLD client (or one that defers) leaves `default_ack_level` None: the encoded body is
+        // byte-for-byte the pre-#494 Connect (no appended byte, the historical field_len). Compare the
+        // two encodings directly.
+        let no_level = ConnectBody {
+            requested_credit: Some(7),
+            requested_credit_bytes: None,
+            wants_gap_marker: false,
+            default_ack_level: None,
+        };
+        let mut pre = Vec::new();
+        encode_connect(&no_level, &mut pre);
+        // The historical body: version + field_len(=CONNECT_V1_FIELD_LEN) + the v1 fixed fields, with
+        // the HAS_DEFAULT_ACK_LEVEL bit CLEAR and no appended byte.
+        assert_eq!(
+            &pre[1..3],
+            &CONNECT_V1_FIELD_LEN.to_le_bytes(),
+            "a None default keeps the historical field_len"
+        );
+        assert_eq!(
+            pre[3] & CONNECT_FLAG_HAS_DEFAULT_ACK_LEVEL,
+            0,
+            "the presence bit is clear for a None default"
+        );
+        assert_eq!(
+            pre.len(),
+            3 + usize::from(CONNECT_V1_FIELD_LEN),
+            "no appended byte"
+        );
+        assert_eq!(decode_connect(&pre).unwrap(), no_level);
+
+        // A NEW client that DOES request a default appends exactly one byte and sets the presence bit.
+        let with_level = ConnectBody {
+            default_ack_level: Some(AckLevel::ServerAndClientAck.as_u8()),
+            ..no_level
+        };
+        let mut buf = Vec::new();
+        encode_connect(&with_level, &mut buf);
+        assert_eq!(
+            &buf[1..3],
+            &CONNECT_V1_FIELD_LEN_WITH_ACK_LEVEL.to_le_bytes(),
+            "a Some default grows field_len by one byte"
+        );
+        assert_eq!(
+            buf[3] & CONNECT_FLAG_HAS_DEFAULT_ACK_LEVEL,
+            CONNECT_FLAG_HAS_DEFAULT_ACK_LEVEL
+        );
+        assert_eq!(buf.len(), pre.len() + 1, "exactly one appended byte");
+        assert_eq!(*buf.last().unwrap(), AckLevel::ServerAndClientAck.as_u8());
+        assert_eq!(decode_connect(&buf).unwrap(), with_level);
+    }
+
+    #[test]
+    fn info_carries_the_default_ack_level_and_old_server_is_byte_identical() {
+        let no_level = InfoBody {
+            credit: None,
+            credit_bytes: None,
+            gap_marker: false,
+            default_ack_level: None,
+        };
+        let mut pre = Vec::new();
+        encode_info(&no_level, &mut pre);
+        assert_eq!(&pre[1..3], &INFO_V1_FIELD_LEN.to_le_bytes());
+        assert_eq!(pre[3] & INFO_FLAG_HAS_DEFAULT_ACK_LEVEL, 0);
+        assert_eq!(pre.len(), 3 + usize::from(INFO_V1_FIELD_LEN));
+        assert_eq!(decode_info(&pre).unwrap(), no_level);
+
+        let with_level = InfoBody {
+            default_ack_level: Some(2),
+            ..no_level
+        };
+        let mut buf = Vec::new();
+        encode_info(&with_level, &mut buf);
+        assert_eq!(&buf[1..3], &INFO_V1_FIELD_LEN_WITH_ACK_LEVEL.to_le_bytes());
+        assert_eq!(
+            buf[3] & INFO_FLAG_HAS_DEFAULT_ACK_LEVEL,
+            INFO_FLAG_HAS_DEFAULT_ACK_LEVEL
+        );
+        assert_eq!(buf.len(), pre.len() + 1);
+        assert_eq!(*buf.last().unwrap(), 2);
+        assert_eq!(decode_info(&buf).unwrap(), with_level);
+    }
+
+    #[test]
+    fn old_connect_info_decode_under_new_reader_yields_none_default_ack_level() {
+        // FORWARD/BACKWARD COMPAT: a body the OLD (pre-#494) encoder produced — the historical fixed
+        // v1 block with NO appended ack-level byte and the presence bit clear — decodes under the new
+        // reader with `default_ack_level: None`, every other field intact. Build the historical bodies
+        // by hand (independent of the new encoder) and decode them.
+        let mut connect = vec![HANDSHAKE_BODY_VERSION];
+        connect.extend_from_slice(&CONNECT_V1_FIELD_LEN.to_le_bytes());
+        connect.push(CONNECT_FLAG_HAS_CREDIT); // only the credit presence bit
+        connect.extend_from_slice(&9u32.to_le_bytes()); // requested_credit = 9
+        connect.extend_from_slice(&0u64.to_le_bytes()); // requested_credit_bytes
+        assert_eq!(
+            decode_connect(&connect).unwrap(),
+            ConnectBody {
+                requested_credit: Some(9),
+                requested_credit_bytes: None,
+                wants_gap_marker: false,
+                default_ack_level: None,
+            }
+        );
+
+        let mut info = vec![HANDSHAKE_BODY_VERSION];
+        info.extend_from_slice(&INFO_V1_FIELD_LEN.to_le_bytes());
+        info.push(0); // no presence bits
+        info.extend_from_slice(&0u32.to_le_bytes()); // credit.negotiated
+        info.extend_from_slice(&0u32.to_le_bytes()); // credit.cap
+        info.extend_from_slice(&0u64.to_le_bytes()); // credit_bytes.negotiated
+        info.extend_from_slice(&0u64.to_le_bytes()); // credit_bytes.cap
+        assert_eq!(
+            decode_info(&info).unwrap(),
+            InfoBody {
+                credit: None,
+                credit_bytes: None,
+                gap_marker: false,
+                default_ack_level: None,
+            }
         );
     }
 }
