@@ -3,6 +3,7 @@
 
 pub mod actor;
 pub mod clock;
+pub mod cluster;
 pub mod codes;
 pub mod engine;
 pub mod health;

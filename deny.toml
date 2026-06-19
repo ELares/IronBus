@@ -9,6 +9,15 @@ all-features = true
 # gRPC tree is `MIT` / `Apache-2.0` / `BSD-2-Clause` / `BSD-3-Clause` (a few `Unicode-3.0`), all already
 # present below, so the otlp tree adds NO new license (the entries below ARE the opentelemetry tree's
 # license set; see the `[bans]` comment for the full per-crate review).
+#
+# The embedded metadata Raft group (V2-C1, #578) adds the `raft` (tikv/raft-rs) tree: `raft` and the
+# vendored `raft-proto` are `Apache-2.0`; the rest (`protobuf`, `fxhash`, `getset`, `erased-serde`,
+# `slog`, `rand`/`rand_chacha`/`rand_core`, `getrandom`, `ppv-lite86`, `zerocopy`, `byteorder`,
+# `cfg-if`, `bytes`, `thiserror`) is `MIT` or `MIT OR Apache-2.0`, with `zerocopy` adding the
+# already-allowed `BSD-2-Clause` arm and `slog` resolving to its `MIT OR Apache-2.0` arm (its license
+# is `MPL-2.0 OR MIT OR Apache-2.0`; cargo-deny accepts the allowed arm). So the raft tree adds NO new
+# license -- every arm is already on the list below. (RUSTSEC advisories for the raft tree --
+# protobuf-2.x and the unmaintained fxhash -- are scoped + justified in `[advisories].ignore`.)
 allow = [
   "MIT",
   "Apache-2.0",
@@ -152,6 +161,22 @@ name = "mimalloc" # vendored mimalloc C.
 # `links` key or C build script (cargo-deny `bans` + scripts/ci/cffi-ban.sh verify this over the
 # shipped musl graph), so the #102 C-FFI ban and the #139 pure-Rust DATA-path policy hold: config
 # parsing is a CLI startup concern, off the record path.
+#
+# The embedded metadata Raft group (V2-C1, #578) adds the `raft` (tikv/raft-rs) tree to
+# `ironbus-server` (and so to the shipped `ironbus-cli` graph). The WHOLE tree is PURE RUST: no crate
+# declares a `links` key and none has a C/asm-builder build-dependency (the only build-dep anywhere in
+# it is `slog -> rustversion`, a pure-Rust proc-macro), so the #102 C-FFI ban and the
+# scripts/ci/cffi-ban.sh structural guard stay clean -- NO new allowlist entry is needed and NO
+# `*-sys` / vendored-C crate enters the graph. CRUCIALLY, raft-rs's `protobuf-codec` would normally
+# run a BUILD-TIME protobuf codegen step (`raft-proto`'s `build.rs` -> `protobuf-build` ->
+# `protoc`/`prost-build`); IronBus has NO build-time codegen anywhere, so `raft-proto` is redirected
+# via `[patch.crates-io]` (workspace root) to a VENDORED, build-script-free drop-in
+# (crates/ironbus-server/vendor/raft-proto) that ships the generated `eraftpb` codec as committed
+# source and depends only on the PURE-RUST `protobuf` 2 RUNTIME crate. So the build runs NO `protoc`
+# and NO build script, the reproducible static-musl build and the zero-build-script posture are
+# preserved, and `getrandom` (via `rand`) stays on its pure `getrandom(2)` syscall path on Linux/musl
+# (no vendored C, no `cc`), exactly like `libc`. raft-rs is OFF the produce/consume DATA path (it is
+# metadata-only, O(quorum) not O(assets)), and in #578 it is not yet wired into the running broker.
 
 [advisories]
 yanked = "deny"
@@ -180,6 +205,36 @@ ignore = [
   #     information leak and no panic are reachable.
   # Drop this ignore when the MSRV reaches 1.81 and `lz4_flex` is bumped to >= 0.11.6 (#387).
   "RUSTSEC-2026-0041",
+  # RUSTSEC-2024-0437 (protobuf < 3.7.2): the rust-protobuf 2.x decoder does not bound recursion
+  # when parsing UNKNOWN fields, so a hostile, deeply-nested message can overflow the stack. It is
+  # pulled transitively by `raft` (tikv/raft-rs) via the vendored, build-script-free `raft-proto`
+  # codec (V2-C1, #578); raft 0.7's `protobuf-codec` is bound to the protobuf 2.x RUNTIME, and the
+  # fixed 3.7.2 lives on the protobuf 3.x line that the protobuf-codec path cannot use (the
+  # alternative `prost-codec` drags an edition2024 / rustc >= 1.85 cascade that breaks the
+  # `msrv (1.78)` gate). IronBus is NOT exposed in this issue:
+  #   * The ONLY thing that decodes `eraftpb` protobuf is the metadata Raft group, and in C1-I1
+  #     there is NO peer transport (that is C1-I3): the group runs on an in-memory `MemStorage` and
+  #     decodes ONLY entries it itself proposed and committed locally. No attacker-controlled bytes
+  #     reach the protobuf parser, so the untrusted-input precondition of the advisory is not met.
+  #   * raft-rs is confined to `ironbus-server`'s `cluster` module and is NOT yet wired into the
+  #     running broker (the n=1 data path never constructs the group), so the default binary decodes
+  #     zero protobuf at runtime.
+  #   * IronBus's own wire/record codecs are the hand-rolled, zero-dep `ironbus-proto` /
+  #     `ironbus-core` parsers (already 32-bit-overflow and recursion hardened, fuzzed); the
+  #     protobuf parser is NOT on the produce/consume or storage path.
+  # Before C1-I3 exposes the metadata group to peer bytes over the wire, this must be revisited:
+  # received Raft messages will be attacker-reachable and MUST be bounded (a size/recursion cap in
+  # the transport/step seam, or a raft-rs codec that is no longer on protobuf 2.x). Re-review then;
+  # drop this ignore once raft-rs can ride a fixed protobuf (>= 3.7.2) under the IronBus MSRV.
+  "RUSTSEC-2024-0437",
+  # RUSTSEC-2025-0057 (fxhash unmaintained): `fxhash` is no longer maintained (the advisory points to
+  # `rustc-hash`). It is pulled transitively by `raft` (tikv/raft-rs) purely as the internal HashMap
+  # HASHER for raft-rs's progress/tracker maps; it is NOT a parser, NOT crypto, and NOT on any
+  # security boundary or untrusted-input path. It carries no open vulnerability (this is an
+  # unmaintained-only advisory, surfaced because `unmaintained = "all"` above). Removing it would mean
+  # forking raft-rs's internals, which is not warranted for an internal hasher. Drop this ignore when
+  # a raft-rs release replaces `fxhash` (upstream tracks the same migration to `rustc-hash`).
+  "RUSTSEC-2025-0057",
 ]
 
 [sources]

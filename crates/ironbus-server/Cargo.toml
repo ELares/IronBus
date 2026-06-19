@@ -35,6 +35,40 @@ ironbus-core = { path = "../ironbus-core", version = "0.0.0" }
 ironbus-proto = { path = "../ironbus-proto", version = "0.0.0" }
 ironbus-storage = { path = "../ironbus-storage", version = "0.0.0" }
 
+# Embedded metadata Raft group (V2-C1, #578). `raft` is tikv/raft-rs, the production TiKV
+# Raft CORE (Apache-2.0): storage- and transport-agnostic, SYNCHRONOUS and caller-driven
+# (`RawNode` + tick/step/ready/advance), with first-class joint-consensus membership and
+# learners. It is wired ONLY here (ironbus-server), NEVER ironbus-core, so the IO-free /
+# async-free core invariant is untouched; raft-rs pulls no async runtime (no tokio/mio/
+# async-std/smol), so the `cargo tree -p ironbus-core` async-runtime guard stays green.
+#
+# Pinned `=0.7.0` (raft-rs is pre-1.0; a `=` pin + `--locked` localizes any churn behind the
+# `cluster` module). `default-features = false` drops the `default-logger` (slog-term /
+# slog-envlogger / slog-stdlog) and the failpoints surface; we keep ONLY `protobuf-codec`.
+#
+# THE CODEC IS VENDORED, NOT GENERATED. `protobuf-codec` makes `raft` use `raft-proto`'s
+# rust-protobuf `eraftpb` types -- whose upstream `build.rs` would regenerate them via
+# `protoc`/`prost-build` at build time. IronBus runs NO build-time codegen, so the workspace
+# root redirects `raft-proto` to a vendored, build-script-free drop-in via `[patch.crates-io]`
+# (the generated `eraftpb` committed as source under `vendor/raft-proto`). Net effect: the real
+# raft-rs core is linked, but the build runs NO `protoc` and NO build script, and the only new
+# protobuf dependency is the PURE-RUST `protobuf` 2 RUNTIME crate. The whole new tree (`raft`,
+# the vendored `raft-proto`, `protobuf`, `slog`, `fxhash`, `getset`, `erased-serde`, `rand`/
+# `getrandom`, ...) is permissive (Apache-2.0 / MIT, on the deny.toml allow-list) and carries
+# NO `links` key and NO C-builder build-dep, so the C-FFI ban and the pure-Rust posture hold.
+# MSRV: the whole tree builds on stable 1.78 with the committed lock (validated by the
+# `msrv (1.78)` gate). For THIS issue the metadata group is a new, NOT-YET-WIRED module, so the
+# default single-node binary's behavior and on-disk layout are byte-for-byte unchanged.
+raft = { version = "=0.7.0", default-features = false, features = ["protobuf-codec"] }
+
+# raft-rs's `RawNode::new` takes a `&slog::Logger` and does not re-export `slog`, so it is a
+# direct dependency here. We pass a `Discard` drain (default-logger is off), so no log output
+# is produced; bridging raft-rs's slog to IronBus's `tracing` is deferred (C1-I3+). `slog` is
+# already in the tree via `raft`, is pure Rust (no `links`, no C build script), and is
+# permissive (its `MPL-2.0 OR MIT OR Apache-2.0` license resolves to the allowed MIT/Apache
+# arm, so cargo-deny accepts it). No new crate enters the graph.
+slog = { version = "2", default-features = false }
+
 # Refcounted byte buffer for the produce hot path (#474). `OwnedAppend` carries the publish payload
 # (and key/headers/dedup ids) as `bytes::Bytes` so moving a produce across the append-actor channel is
 # a refcount bump, not a per-publish `Vec` deep copy. `bytes` is pure Rust (no `links`, no C build
