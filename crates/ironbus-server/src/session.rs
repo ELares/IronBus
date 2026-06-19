@@ -20,6 +20,7 @@ use crate::actor::{
     ActorGone, EngineAccess, OwnedAppend, OwnedDedup, ProduceOutcome, ProduceSubmission,
 };
 use crate::engine::{AckResult, EngineError, NackResult, Poll, ProgressResult};
+use bytes::Bytes;
 use ironbus_core::clock::Clock;
 use ironbus_core::compress::{validate_descriptor_shape, DEFAULT_MAX_DECOMPRESSED_BYTES};
 use ironbus_core::dedup::{MAX_MSG_ID_LEN, MAX_PRODUCER_ID_LEN};
@@ -633,19 +634,26 @@ impl Session {
         // epoch / msg_id to the engine's dedup window. Mask the WIRE-only dedup bit OUT of the stored
         // record flags so it never becomes a record flag (it is a wire signal, not stored state).
         let dedup = msg.dedup.map(|d| OwnedDedup {
-            producer_id: d.producer_id.to_vec(),
+            producer_id: Bytes::copy_from_slice(d.producer_id),
             epoch: d.epoch,
-            msg_id: d.msg_id.to_vec(),
+            msg_id: Bytes::copy_from_slice(d.msg_id),
         });
+        // Carry the produce's bytes as refcounted `Bytes` (#474) so moving/cloning the `OwnedAppend`
+        // across the append-actor channel is a refcount bump, not a `Vec` deep copy. The wire body
+        // still borrows the connection's input buffer (which the actor cannot hold), so this fill
+        // copies the slice ONCE here at the boundary; the FULL zero-copy (a `Bytes` slice OF the read
+        // buffer, retired by refcount) is the follow-on read-buffer rework flagged on #474. The
+        // storage encode copies the payload into the segment buffer when it appends regardless, so
+        // durability and the on-disk image are unchanged.
         let append = OwnedAppend {
             timestamp_ms: msg.timestamp_ms,
             // Mask BOTH wire-only PUB flag bits (dedup bit 7, fire-and-forget bit 6) out of the
             // stored record flags (#33, #11): neither is record state. The fire-and-forget marker is
             // carried in its own field below, not in the stored flags.
             flags: msg.flags & !PUB_WIRE_ONLY_FLAGS,
-            key: msg.key.to_vec(),
-            headers: msg.headers.to_vec(),
-            payload: msg.payload.to_vec(),
+            key: Bytes::copy_from_slice(msg.key),
+            headers: Bytes::copy_from_slice(msg.headers),
+            payload: Bytes::copy_from_slice(msg.payload),
             dedup,
             // Stamp the ENQUEUE instant from the engine's clock seam (a LOCAL read, no actor
             // round-trip), so the engine can measure the admission SOJOURN for the CoDel shed (#68).
@@ -5639,9 +5647,9 @@ mod tests {
             .produce_submit(crate::actor::OwnedAppend {
                 timestamp_ms: 0,
                 flags: 0,
-                key: Vec::new(),
-                headers: Vec::new(),
-                payload: b"primer".to_vec(),
+                key: Bytes::new(),
+                headers: Bytes::new(),
+                payload: Bytes::from_static(b"primer"),
                 dedup: None,
                 enqueue_monotonic_nanos: 0,
                 fire_and_forget: false,
