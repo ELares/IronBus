@@ -10,8 +10,8 @@
 //! [`crate::bench`] and are unit-tested on every target.
 
 use crate::bench::{
-    fill_payload, percentiles_us, BenchConfig, BenchReport, Bound, Mode, BENCH_NAMESPACE_PREFIX,
-    ROUND_TRIP_TOKEN_LEN,
+    fill_payload, percentiles_us, AckMode, BenchConfig, BenchReport, Bound, Mode,
+    BENCH_NAMESPACE_PREFIX, ROUND_TRIP_TOKEN_LEN,
 };
 use crate::{open_disk_engine, open_memory_engine, CliError, ServeConfig, StorageArg};
 use ironbus_client::{Client, ClientConfig, ClientError};
@@ -843,6 +843,15 @@ fn drain_should_stop(
 /// Drains all `expected` messages from the broker through the synthetic group, recording per-message
 /// read-back latency (against the producer's `produce_started`), until the queue is empty after the
 /// expected count is reached (count bound) or the drain duration elapses (duration bound).
+///
+/// The synthetic group is a COMPETING work-queue, so each lease is committed individually (cumulative
+/// ack is broadcast-only). How those individual acks are ISSUED is the #464 fair-consume knob
+/// ([`AckMode`]): by DEFAULT the drain settles each fetched batch with ONE pipelined `ack_many`
+/// round-trip (the consume-side twin of the publish window), so the measured throughput reflects the
+/// broker's real fetch + batch-ack rate — comparable to a NATS pull consumer or Redis `XREADGROUP`
+/// whose clients batch their acks. Under `--per-message-ack` it falls back to one synchronous `ack`
+/// per message (the historical drain), which is ack-RPC-LATENCY-bound, NOT fetch-bound. EITHER WAY
+/// every fetched message is acked: the batched path settles the exact same leases, just amortized.
 fn drain(
     cfg: &BenchConfig,
     addr: &str,
@@ -854,10 +863,17 @@ fn drain(
     let mut latencies: Vec<u64> = Vec::new();
     let mut recorded: u64 = 0;
     let mut empty_streak: u32 = 0;
+    // Reused across iterations so the batched-ack path does not reallocate the ack vector per batch.
+    let mut acks: Vec<(u64, u64)> = Vec::with_capacity(cfg.fetch_batch as usize);
     let drain_started = Instant::now();
     loop {
-        let fetched = fetch_batch(&mut consumer, addr, cfg.fetch_batch)?;
+        // FAIR consume pull (#489): batch-pull the whole credit window in ONE round-trip (the NATS
+        // pull-consumer twin), instead of one Flow round-trip per `fetch`, so the measured drain
+        // reflects the broker's fetch throughput, not a per-fetch RPC. `no_wait` returns immediately
+        // with whatever is ready (a single drain pass), exactly the closed-loop drain shape.
+        let fetched = fetch_batch_pull(&mut consumer, addr, cfg.fetch_batch)?;
         let now = Instant::now();
+        acks.clear();
         for m in &fetched.messages {
             if let Some(sent) = read_round_trip_time(&m.payload, produce_started) {
                 // The read-back latency: time from the message's produce instant to its delivery.
@@ -865,12 +881,25 @@ fn drain(
                     .unwrap_or(u64::MAX);
                 latencies.push(latency_ns);
             }
-            // Per-message ack: the synthetic group is a COMPETING work-queue, where each lease is
-            // acked individually (cumulative ack is a broadcast-only primitive). This is the real
-            // work-queue consume path; its drain throughput is therefore ack-RPC-bound, which the
-            // corpus notes when comparing to peers whose clients batch their acks.
-            ack_one(&mut consumer, addr, m.offset, m.generation)?;
             recorded += 1;
+            match cfg.consume_ack {
+                // FAIR (#464): collect this batch's leases and settle them ALL in one pipelined
+                // `ack_many` round-trip below, so the drain measures fetch + batch-ack throughput
+                // (comparable to a NATS pull consumer / Redis XREADGROUP whose clients batch acks),
+                // not the per-message ack RPC. Each lease is still acked individually by the broker
+                // (correct for a COMPETING work-queue, where cumulative ack is broadcast-only).
+                AckMode::Batched => acks.push((m.offset, m.generation)),
+                // LEGACY per-message ack: one synchronous ack round-trip per delivered lease, the
+                // historical ack-RPC-bound path kept available as an ack-LATENCY measurement.
+                AckMode::PerMessage => ack_one(&mut consumer, addr, m.offset, m.generation)?,
+            }
+        }
+        // Settle the whole batch with ONE pipelined round-trip (write all acks, then drain all
+        // statuses). Bounded by the fetch credit, so the write-all-then-drain shape cannot deadlock
+        // against the socket buffers. EVERY fetched message is acked: the batched path settles the
+        // exact same leases the per-message path does, just amortized.
+        if matches!(cfg.consume_ack, AckMode::Batched) && !acks.is_empty() {
+            ack_many(&mut consumer, addr, &acks)?;
         }
         empty_streak = if fetched.messages.is_empty() {
             empty_streak.saturating_add(1)
@@ -1016,7 +1045,9 @@ fn subscribe_group(client: &mut Client, addr: &str, group: &str) -> Result<(), C
         .map_err(|e| classify(addr, "subscribing to", &e))
 }
 
-/// Fetches up to `credit` messages, mapping a client error to the frozen exit codes.
+/// Fetches up to `credit` messages, mapping a client error to the frozen exit codes. The per-fetch
+/// (one Flow round-trip) pull used by the round-trip consumer, where the producer and consumer are
+/// concurrent so a per-fetch poll is the natural shape.
 fn fetch_batch(
     client: &mut Client,
     addr: &str,
@@ -1027,12 +1058,41 @@ fn fetch_batch(
         .map_err(|e| classify(addr, "fetching from", &e))
 }
 
+/// Batch-pull up to `credit` records in ONE round-trip (#489), mapping a client error to the frozen
+/// exit codes. Used by the SUBSCRIBE drain so the pull cost is amortized across the whole credit
+/// window (the NATS pull-consumer twin) instead of one Flow round-trip per `fetch`. `no_wait` returns
+/// immediately with whatever is ready — a single drain pass, the closed-loop drain shape — so the
+/// drain's empty-queue termination logic is unchanged. No byte budget (`0`) and no deadline: the
+/// record credit alone bounds the batch, exactly as the per-record `fetch` path is bounded.
+fn fetch_batch_pull(
+    client: &mut Client,
+    addr: &str,
+    credit: u32,
+) -> Result<ironbus_client::Fetch, CliError> {
+    client
+        .fetch_batch(credit, 0, Duration::ZERO, true)
+        .map_err(|e| classify(addr, "batch-fetching from", &e))
+}
+
 /// Acks one delivered message, mapping a client error to the frozen exit codes.
 fn ack_one(client: &mut Client, addr: &str, offset: u64, generation: u64) -> Result<(), CliError> {
     client
         .ack(offset, generation)
         .map(|_| ())
         .map_err(|e| classify(addr, "acking to", &e))
+}
+
+/// Acks a whole fetched batch in ONE pipelined round-trip (#469), mapping a client error to the
+/// frozen exit codes. The consume-side twin of `produce_window`: write every `(offset, generation)`
+/// ack with one syscall, then drain one status per ack. Each lease is committed INDIVIDUALLY by the
+/// broker, so this is correct for the COMPETING work-queue the bench drains (where cumulative ack is
+/// broadcast-only). Caller keeps the batch bounded by the fetch credit so the write-all-then-drain
+/// shape cannot deadlock against the socket buffers.
+fn ack_many(client: &mut Client, addr: &str, acks: &[(u64, u64)]) -> Result<(), CliError> {
+    client
+        .ack_many(acks)
+        .map(|_| ())
+        .map_err(|e| classify(addr, "batch-acking to", &e))
 }
 
 /// Classifies a client error against the frozen exit-code scheme: a transport-level failure is

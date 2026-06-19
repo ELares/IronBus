@@ -113,6 +113,36 @@ impl Mode {
     }
 }
 
+/// How the SUBSCRIBE drain settles the messages it consumes (#464). Both modes consume AND ack every
+/// fetched message (no record is left un-acked); they differ ONLY in whether the acks for a fetched
+/// batch are issued as one pipelined round-trip or one synchronous round-trip per message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AckMode {
+    /// FAIR consume (the default): settle each fetched batch with ONE pipelined
+    /// [`ironbus_client::Client::ack_many`] round-trip (#469), the consume-side twin of the publish
+    /// window. This measures the broker's real fetch + batch-ack throughput, comparable to a NATS
+    /// pull consumer or Redis `XREADGROUP` whose clients batch their acks, instead of self-handicapping
+    /// the work-queue drain to one ack RPC per message.
+    Batched,
+    /// LEGACY per-message ack: settle each delivered message with one synchronous
+    /// [`ironbus_client::Client::ack`] round-trip before the next, the historical drain. This is a
+    /// legitimate measurement of the per-message ack-RPC LATENCY ceiling (it is ack-RPC-bound, NOT
+    /// fetch-bound), kept available behind `--per-message-ack`; it is NOT a fair throughput head-to-head
+    /// with peers whose clients batch their acks.
+    PerMessage,
+}
+
+impl AckMode {
+    /// The stable string used in JSON and the reproduce line.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AckMode::Batched => "batched",
+            AckMode::PerMessage => "per-message",
+        }
+    }
+}
+
 /// The payload shape generated for each message. Default is `realistic`: a repetitive,
 /// codec-friendly byte pattern that compresses like real edge telemetry, so the bytes/op and any
 /// compression ratio are measured on REAL-shaped payloads, not incompressible noise (#94, #12).
@@ -224,6 +254,12 @@ pub struct BenchConfig {
     /// disk numbers). The flag shapes ONLY the spawned broker, so it is refused alongside
     /// `--addr` (a live broker's backend is already decided by that broker).
     pub storage: StorageArg,
+    /// How the SUBSCRIBE drain settles each fetched batch (#464): [`AckMode::Batched`] (the default,
+    /// one pipelined `ack_many` per batch — the FAIR consume number) or [`AckMode::PerMessage`] (the
+    /// legacy one synchronous `ack` per message — the ack-RPC-LATENCY ceiling, behind
+    /// `--per-message-ack`). SUBSCRIBE-only: round-trip's overlapped consumer is unchanged, and
+    /// publish never consumes.
+    pub consume_ack: AckMode,
     /// Emit the versioned JSON object instead of (well, in addition to a suppressed) human view.
     pub json: bool,
 }
@@ -312,6 +348,7 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
     let mut auto_pipeline = false;
     let mut pub_window: usize = 1;
     let mut storage: Option<StorageArg> = None;
+    let mut per_message_ack = false;
     let mut json = false;
     let mut i = 0;
     while i < args.len() {
@@ -437,6 +474,13 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
                     ))
                 })?);
             }
+            // FAIR-CONSUME opt-out (#464): drain the subscribe queue with one SYNCHRONOUS ack per
+            // message (the legacy ack-RPC-bound path) instead of the default batched `ack_many` per
+            // fetched batch. A legitimate ack-RPC-LATENCY measurement; NOT a fair throughput compare.
+            "--per-message-ack" => {
+                per_message_ack = true;
+                i += 1;
+            }
             "--json" => {
                 json = true;
                 i += 1;
@@ -555,6 +599,25 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         ));
     }
 
+    // FAIR-CONSUME guard (#464): the ack strategy only shapes the SUBSCRIBE drain. Publish never
+    // consumes, and round-trip's consumer is the separate concurrent latency loop (left unchanged),
+    // so accepting `--per-message-ack` there would silently mean nothing. Refuse it (a no-op flag is
+    // a footgun), exactly as `--storage` is refused alongside `--addr`.
+    if per_message_ack && mode != Mode::Subscribe {
+        return Err(CliError::Usage(
+            "`--per-message-ack` shapes the `--mode subscribe` consume drain (its ack strategy): \
+             publish never consumes and round-trip uses a separate concurrent consumer, so the flag \
+             would mean nothing there. Pass `--mode subscribe`, or drop `--per-message-ack` to keep \
+             the default batched-ack consume."
+                .into(),
+        ));
+    }
+    let consume_ack = if per_message_ack {
+        AckMode::PerMessage
+    } else {
+        AckMode::Batched
+    };
+
     // AUTO-PIPELINE guards (#508). The auto-pipelining durable producer is a produce-side path that
     // awaits acks at flush points (so it is meaningful only in publish mode), and it is its own
     // distinct in-flight-window mechanism, so it does not stack with `--stream` (the full-duplex
@@ -598,6 +661,7 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         auto_pipeline,
         pub_window,
         storage,
+        consume_ack,
         json,
     })
 }
@@ -687,6 +751,18 @@ pub fn write_human<W: Write + ?Sized>(
         }
     )?;
     writeln!(out, "group:          {}", cfg.group)?;
+    if cfg.mode == Mode::Subscribe {
+        writeln!(
+            out,
+            "consume ack:    {}",
+            match cfg.consume_ack {
+                AckMode::Batched =>
+                    "BATCHED (ack_many per fetched batch — the fair fetch+batch-ack throughput)",
+                AckMode::PerMessage =>
+                    "per-message (one synchronous ack per message — the ack-RPC-LATENCY ceiling)",
+            }
+        )?;
+    }
     if cfg.fire_and_forget {
         writeln!(
             out,
@@ -773,7 +849,7 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         s,
         "{{\"schema_version\":{},\"mode\":\"{}\",\"isolated\":{},\"group\":\"{}\",\
          \"bound\":{{{}}},\"target_rate_hz\":{},\"payload_bytes\":{},\"payload_shape\":\"{}\",\
-         \"fetch_batch\":{},\"no_fsync\":{},\"pubwindow\":{},\"stream\":{},\"fire_and_forget\":{},\"auto_pipeline\":{},\"storage\":\"{}\",\"results\":{{\
+         \"fetch_batch\":{},\"no_fsync\":{},\"pubwindow\":{},\"stream\":{},\"fire_and_forget\":{},\"auto_pipeline\":{},\"storage\":\"{}\",\"consume_ack\":\"{}\",\"results\":{{\
          \"produced\":{},\"recorded\":{},\"elapsed_secs\":{},\"msgs_per_sec\":{},\
          \"mb_per_sec\":{},\"bytes_per_op\":{},\
          \"latency_p50_us\":{},\"latency_p99_us\":{},\"latency_p999_us\":{},\"latency_max_us\":{},\
@@ -793,6 +869,7 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         cfg.fire_and_forget,
         cfg.auto_pipeline,
         cfg.storage.as_str(),
+        cfg.consume_ack.as_str(),
         report.produced,
         report.recorded,
         f64_json(report.elapsed_secs),
@@ -1324,6 +1401,68 @@ mod tests {
         assert!(
             json.contains("\"schema_version\":1"),
             "additive, version unchanged: {json}"
+        );
+    }
+
+    #[test]
+    fn consume_ack_defaults_to_batched_per_message_is_subscribe_only_and_lands_in_the_json() {
+        // FAIR consume (#464): the SUBSCRIBE drain settles each fetched batch with one pipelined
+        // `ack_many` by DEFAULT (the fair fetch+batch-ack throughput); `--per-message-ack` opts back
+        // into the legacy one-ack-RPC-per-message drain (the ack-LATENCY ceiling). The flag is
+        // subscribe-only (publish never consumes, round-trip uses a separate concurrent consumer) and
+        // is echoed additively in the JSON object (schema version unchanged, the `--stream` precedent).
+        let default_sub = parse(&["--count", "5", "--mode", "subscribe"]).unwrap();
+        assert_eq!(
+            default_sub.consume_ack,
+            AckMode::Batched,
+            "the fair batched-ack drain is the default"
+        );
+        let per_msg = parse(&["--count", "5", "--mode", "subscribe", "--per-message-ack"]).unwrap();
+        assert_eq!(per_msg.consume_ack, AckMode::PerMessage);
+        // The bare flag does not swallow the next flag.
+        let trailing = parse(&[
+            "--count",
+            "5",
+            "--mode",
+            "subscribe",
+            "--per-message-ack",
+            "--no-fsync",
+        ])
+        .unwrap();
+        assert!(
+            trailing.no_fsync,
+            "the flag after --per-message-ack must still parse"
+        );
+        // Subscribe-only: round-trip (the default) and publish are refused (the flag would mean
+        // nothing — no consume drain there).
+        match parse(&["--count", "5", "--per-message-ack"]) {
+            Err(CliError::Usage(m)) => assert!(m.contains("--mode subscribe"), "{m}"),
+            other => {
+                panic!("--per-message-ack outside subscribe must be a usage error, got {other:?}")
+            }
+        }
+        match parse(&["--count", "5", "--mode", "publish", "--per-message-ack"]) {
+            Err(CliError::Usage(m)) => assert!(m.contains("consume"), "{m}"),
+            other => panic!("--per-message-ack + publish must be a usage error, got {other:?}"),
+        }
+        // Both ack strategies land additively in the JSON; the schema version is unchanged.
+        let json_default = bench_json(&default_sub, &BenchReport::default());
+        assert!(
+            json_default.contains("\"consume_ack\":\"batched\""),
+            "{json_default}"
+        );
+        assert!(
+            json_default.contains("\"schema_version\":1"),
+            "additive, version unchanged: {json_default}"
+        );
+        let json_per_msg = bench_json(&per_msg, &BenchReport::default());
+        assert!(
+            json_per_msg.contains("\"consume_ack\":\"per-message\""),
+            "{json_per_msg}"
+        );
+        assert!(
+            json_per_msg.contains("\"schema_version\":1"),
+            "additive, version unchanged: {json_per_msg}"
         );
     }
 
