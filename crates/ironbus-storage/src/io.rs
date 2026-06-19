@@ -799,6 +799,181 @@ mod tests {
         f.read_exact_at(&mut buf, 0).unwrap();
         assert_eq!(&buf, b"ok");
     }
+
+    #[test]
+    fn ephemeral_read_write_set_len_match_the_in_memory_file() {
+        // The ephemeral backend's read/write/set_len/len contract is byte-for-byte the in-memory
+        // file's, only without the durable bookkeeping. Mirror the core round-trips so a regression
+        // that diverged the production in-RAM path from the simulation one is caught.
+        let f = EphemeralFile::new();
+        assert!(f.is_empty().unwrap());
+        f.write_all_at(b"hello", 0).unwrap();
+        let mut buf = [0u8; 5];
+        assert_eq!(f.read_at(&mut buf, 0).unwrap(), 5);
+        assert_eq!(&buf, b"hello");
+        assert_eq!(f.len().unwrap(), 5);
+        assert_eq!(f.snapshot(), b"hello");
+        // A past-EOF write zero-fills the gap, exactly like InMemoryFile.
+        f.write_all_at(b"ab", 7).unwrap();
+        assert_eq!(f.snapshot(), b"hello\x00\x00ab");
+        // read past end is 0; a partial read near the end returns the remainder.
+        let mut tail = [0u8; 8];
+        assert_eq!(f.read_at(&mut tail, 9).unwrap(), 0);
+        let n = f.read_at(&mut tail, 7).unwrap();
+        assert_eq!(&tail[..n], b"ab");
+        // set_len truncates then zero-fill-extends.
+        f.set_len(3).unwrap();
+        assert_eq!(f.snapshot(), b"hel");
+        f.set_len(5).unwrap();
+        assert_eq!(f.snapshot(), b"hel\x00\x00");
+        // read_exact_at fills exactly or errors UnexpectedEof.
+        let mut three = [0u8; 3];
+        f.read_exact_at(&mut three, 0).unwrap();
+        assert_eq!(&three, b"hel");
+        assert_eq!(
+            f.read_exact_at(&mut [0u8; 6], 0).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn ephemeral_sync_is_a_noop_and_never_loses_live_bytes() {
+        // The whole point of #492: sync_data/sync_all do nothing (no durable copy to refresh, no
+        // device to flush) and are O(1). After a sync the bytes are simply still the bytes — there
+        // is no power loss to model, so nothing is ever reverted.
+        let f = EphemeralFile::new();
+        f.write_all_at(b"durable-by-process-lifetime", 0).unwrap();
+        f.sync_data().unwrap();
+        f.sync_all().unwrap();
+        assert_eq!(f.snapshot(), b"durable-by-process-lifetime");
+        // A write after a sync is immediately visible; there is no "unsynced tail" concept.
+        f.write_all_at(b"!", 27).unwrap();
+        f.sync_all().unwrap();
+        assert_eq!(f.snapshot(), b"durable-by-process-lifetime!");
+    }
+
+    #[test]
+    fn ephemeral_default_preallocate_is_a_noop_and_changes_nothing() {
+        // EphemeralFile does not override preallocate: the trait default no-op applies, reserving
+        // nothing and leaving the bytes and length untouched (a Vec has no up-front reservation a
+        // reader could observe).
+        let f = EphemeralFile::new();
+        f.write_all_at(b"ok", 0).unwrap();
+        f.preallocate(1 << 20).unwrap();
+        assert_eq!(f.len().unwrap(), 2);
+        assert_eq!(f.snapshot(), b"ok");
+    }
+
+    #[test]
+    fn ephemeral_shared_across_threads_as_trait_object() {
+        let f: Arc<dyn RandomAccessFile> = Arc::new(EphemeralFile::new());
+        let f2 = Arc::clone(&f);
+        std::thread::scope(|s| {
+            s.spawn(move || f2.write_all_at(b"data", 0).unwrap());
+        });
+        let mut buf = [0u8; 4];
+        assert_eq!(f.read_at(&mut buf, 0).unwrap(), 4);
+        assert_eq!(&buf, b"data");
+    }
+}
+
+/// An EPHEMERAL in-memory [`RandomAccessFile`] for the real `--storage memory` broker: a single
+/// `Vec` of bytes, NO durable second copy, and `sync_data`/`sync_all` no-ops.
+///
+/// This is the production in-RAM backend (#492). The deterministic simulation backend
+/// [`InMemoryFile`] keeps TWO images — `live` plus a `durable` copy taken at each sync — purely so
+/// [`simulate_power_loss`](InMemoryFile::simulate_power_loss) can model a crash by reverting the
+/// unsynced tail. The real `--storage memory` path models no power loss (it is ephemeral: a crash
+/// loses everything, there is no restart durability to simulate), so that `durable` copy is pure
+/// overhead: it doubles RSS to ~2x the configured cap and makes every `sync_all` clone the whole
+/// file (O(file)). This backend drops it. RSS is ~1x the cap and a sync is O(1).
+///
+/// Durability semantics: there are none, by design. `sync_data`/`sync_all` succeed without doing
+/// anything — there is no device, so there is nothing to flush. Within the process the bytes are
+/// always the live bytes; the [`RandomAccessFile`] read/write/`set_len`/`len` contract is identical
+/// to [`InMemoryFile`]'s, only WITHOUT the durable-image bookkeeping, so the engine, recovery scan,
+/// CRC checks, retention, and compression all behave exactly the same while the process is alive.
+/// There is deliberately NO `simulate_power_loss` on this type: the crash-recovery simulation must
+/// stay on [`InMemoryFile`], which retains the `durable` copy it depends on.
+#[derive(Debug, Default)]
+pub struct EphemeralFile {
+    /// The one and only image: the current bytes. No `durable` shadow, no `dirty` ledger — an
+    /// ephemeral file has no power loss to model and no sync barrier to honor.
+    bytes: Mutex<Vec<u8>>,
+}
+
+impl EphemeralFile {
+    /// Creates an empty ephemeral file.
+    #[must_use]
+    pub fn new() -> EphemeralFile {
+        EphemeralFile::default()
+    }
+
+    // As in [`InMemoryFile::lock`]: the only mutations are `Vec` slice copies and resizes, none of
+    // which unwind partway through a structurally invalid state, so recovering a poisoned guard
+    // keeps the broker process alive rather than cascading a panic.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
+        self.bytes.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Returns a copy of the current bytes (the only image there is).
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.lock().clone()
+    }
+}
+
+impl RandomAccessFile for EphemeralFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        let off = usize::try_from(offset).map_err(|_| invalid_input("offset out of range"))?;
+        let bytes = self.lock();
+        if off >= bytes.len() {
+            return Ok(0);
+        }
+        let n = (bytes.len() - off).min(buf.len());
+        buf[..n].copy_from_slice(&bytes[off..off + n]);
+        Ok(n)
+    }
+
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        let off = usize::try_from(offset).map_err(|_| invalid_input("offset out of range"))?;
+        let end = off
+            .checked_add(buf.len())
+            .ok_or_else(|| invalid_input("write extends past the addressable range"))?;
+        let mut bytes = self.lock();
+        if bytes.len() < end {
+            bytes.resize(end, 0);
+        }
+        bytes[off..end].copy_from_slice(buf);
+        Ok(())
+    }
+
+    // No device, nothing to flush: the bytes are already the live bytes and there is no durable
+    // image to advance. O(1), unlike [`InMemoryFile`]'s dirty-range copy. There is no power loss to
+    // survive, so this is a faithful no-op, not a weakened barrier.
+    fn sync_data(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn sync_all(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.lock().len() as u64)
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        let len = usize::try_from(len).map_err(|_| invalid_input("length out of range"))?;
+        // Truncation drops the tail, extension zero-fills, exactly like [`InMemoryFile::set_len`]
+        // and [`StdFile::set_len`] — minus the durable-image truncation-is-metadata bookkeeping,
+        // which is meaningless without a durable image.
+        self.lock().resize(len, 0);
+        Ok(())
+    }
+
+    // `preallocate` keeps the trait default (a no-op): an in-RAM `Vec` reserves nothing up front and
+    // a reservation that changed no bytes would be invisible anyway, exactly the default's contract.
 }
 
 /// A production [`RandomAccessFile`] backed by an OS file, using cursor-free
