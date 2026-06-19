@@ -27,14 +27,24 @@
 //! and `SIGSTOP`s it. It is solid on a stable host but flaky on shared CI runners, so it stays
 //! `#[ignore]`d (run with `cargo test -p ironbus-bench -- --ignored`). It does NOT gate CI.
 //!
-//! # Self-tuning to the host
+//! # Self-tuning to the MEASURED host speed (not just the unloaded probe)
 //!
 //! The broker fsyncs every produce, so its per-message latency floor is the fsync cost (sub-ms on a
 //! fast SSD; effectively the in-process round trip for the in-memory `FaultFs`). A fixed arrival rate
 //! could overload a slow host (the healthy baseline tail would then exceed the freeze and the proof
-//! would be vacuous). So each test CALIBRATES first: it probes the broker's unloaded single-op
-//! latency, picks an arrival rate at a low utilization (so the healthy tail stays near the floor),
-//! and a freeze that is a large multiple of the floor (never below the issue's ~300 ms target).
+//! would be vacuous). So each test CALIBRATES in two stages. First it probes the broker's unloaded
+//! single-op latency and picks an arrival rate at a low utilization (so the healthy tail stays near
+//! the floor). Then it runs the healthy baseline and sizes the freeze from the MEASURED baseline
+//! p99.9 — a large multiple of it, floored at the issue's ~300 ms target and capped at [`MAX_STALL`].
+//!
+//! Sizing the freeze from the OBSERVED baseline (which already reflects whatever contention the
+//! runner is under), rather than only from the unloaded probe (which by definition cannot see
+//! contention), is what makes the test robust on a shared runner. A contended runner inflates the
+//! baseline; the freeze grows with it; and the adaptive separation (half the freeze) keeps its
+//! headroom above the baseline. The earlier flake (#666) was an effectively-ABSOLUTE backstop: the
+//! freeze, hence the sanity bound, was derived from the unloaded probe and was a near-fixed ~240 ms,
+//! so a merely-contended runner whose baseline p99.9 spiked past it tripped the precondition before
+//! the real check ran — a brittle absolute-latency gate on a shared host.
 //!
 //! # The separation is ADAPTIVE, not a fixed floor
 //!
@@ -46,10 +56,12 @@
 //! flaked here: a loaded runner lifted the baseline above the absolute floor even though the freeze
 //! was fine. Both sides of the relative check scale with the host, so it cannot be defeated by a
 //! slow/noisy runner, yet it still FAILS on a coordinated-omission regression (which would leave the
-//! stalled tail at the baseline) and on a freeze too small to clear the baseline plus the margin. A
-//! generous sanity backstop (baseline p99.9 below most of the freeze) still catches a pathologically
-//! slow host. A harness committing coordinated omission records the same low tail with and without
-//! the freeze and fails the relative separation.
+//! stalled tail at the baseline) and on a freeze too small to clear the baseline plus the margin. The
+//! sanity backstop is now tied to [`MAX_STALL`] (the real runtime ceiling), not to a near-fixed
+//! probe-derived freeze, so it fires only on a genuinely pathological host (baseline p99.9 above half
+//! the maximum possible freeze, where no freeze that fits the cap could clear the separation) and not
+//! on mere contention. A harness committing coordinated omission records the same low tail with and
+//! without the freeze and fails the relative separation.
 //!
 //! Unix only: the in-process broker (and the `SIGSTOP` path) are Unix-only, matching the shipped
 //! broker.
@@ -67,9 +79,19 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// The minimum freeze: above the issue's ~200 ms target, with extra absolute headroom (300 ms) so
-/// the adaptive separation below clears a noisy baseline by a wide margin. A slow host (low rate)
-/// uses a longer freeze so it still spans many inter-arrivals, but never shorter than this.
+/// the adaptive separation below clears a noisy baseline by a wide margin. A slow host (low rate, or
+/// a high MEASURED baseline) uses a longer freeze so it still spans many inter-arrivals and keeps the
+/// adaptive separation above the baseline, but the freeze is never shorter than this.
 const MIN_STALL: Duration = Duration::from_millis(300);
+/// The freeze is at least this multiple of the MEASURED healthy baseline p99.9. Sizing it from the
+/// OBSERVED baseline (which already reflects the runner's contention), not only from the unloaded
+/// op-latency probe (which cannot see contention), is what keeps the adaptive separation above the
+/// baseline on a contended shared runner. At 6x, with the separation set to half the freeze, the
+/// stalled tail must clear `baseline + 3*baseline = 4*baseline`, so a contended baseline that rose
+/// with the host still leaves wide headroom. This is the #666 fix: the old freeze (hence the sanity
+/// bound) came only from the unloaded probe and was a near-fixed ~240 ms, which a contended baseline
+/// could exceed, tripping the precondition before the real check ran.
+const FREEZE_OVER_BASELINE: f64 = 6.0;
 /// The freeze spans at least this many inter-arrival gaps (`STALL_OVER_INTERARRIVAL / rate`). It
 /// must be SEVERAL inter-arrivals, not one, so that even at a low arrival rate the freeze reliably
 /// brackets multiple scheduled sends: the earliest one lands within ~one gap of the freeze start and
@@ -96,12 +118,16 @@ const MAX_RATE_HZ: f64 = 50.0;
 /// amount, and the separation still holds; a coordinated-omission regression leaves the stalled tail
 /// at the baseline and fails it. Half the freeze is a substantial, freeze-tied margin.
 const STALL_SEPARATION_FRACTION: f64 = 0.5;
-/// The sanity bound on the healthy baseline, as a fraction of the freeze: the baseline p99.9 must
-/// stay below this fraction of the injected stall. This catches a pathologically slow host (where
-/// the baseline alone approaches the freeze, leaving no room for the adaptive separation), but a
-/// merely-loaded host (baseline p99.9 well under the stall) is NOT failed. The PRIMARY robustness is
-/// the adaptive (baseline + separation) check above; this is only a generous backstop.
-const BASELINE_SANITY_FRACTION: f64 = 0.8;
+/// The sanity bound on the healthy baseline, as a fraction of [`MAX_STALL`] (the real runtime
+/// ceiling on the freeze), NOT of the chosen freeze. The baseline p99.9 must stay below this fraction
+/// of the largest freeze the test could ever inject. This catches a genuinely PATHOLOGICAL host:
+/// when the baseline already exceeds half the maximum possible freeze, no freeze that fits the cap
+/// can clear the adaptive separation, so the calibration must be revisited. A merely-contended host
+/// (baseline well under half of `MAX_STALL`) is NOT failed — that was the #666 flake, where the bound
+/// was tied to a near-fixed probe-derived freeze instead. The PRIMARY robustness is the adaptive
+/// (baseline + separation) check; this is only a backstop, now pinned to the absolute runtime ceiling
+/// so it cannot trip on ordinary contention. At 0.5, the bound is `0.5 * MAX_STALL`.
+const BASELINE_SANITY_OF_MAX_STALL: f64 = 0.5;
 /// How many messages each run aims to record. The run duration is `TARGET_SAMPLES / rate`, so a
 /// slow host (low rate) still gathers enough samples for a meaningful upper tail, bounded by
 /// [`MAX_RUN`] so the test stays fast.
@@ -124,10 +150,12 @@ fn ironbus_bin() -> PathBuf {
     )
 }
 
-/// Builds the calibrated run config from the measured unloaded op latency (microseconds): a low
-/// utilization arrival rate so the healthy tail stays near the fsync floor, and a duration scaled to
-/// gather [`TARGET_SAMPLES`] at that rate (so a slow host still collects a meaningful upper tail).
-fn calibrated_config(op_latency_us: f64) -> RunConfig {
+/// Stage one of calibration: builds the run config from the measured UNLOADED op latency
+/// (microseconds) — a low-utilization arrival rate so the healthy tail stays near the fsync floor,
+/// and a duration scaled to gather [`TARGET_SAMPLES`] at that rate (so a slow host still collects a
+/// meaningful upper tail). Taken before the baseline run; the freeze is finalized afterward from the
+/// MEASURED baseline (see [`finalize_calibration`]).
+fn calibrate_config(op_latency_us: f64) -> RunConfig {
     // rate (per second) = utilization / op_latency(seconds). Clamp into a sane band so a tiny or
     // huge measurement cannot produce an absurd rate.
     let latency_seconds = (op_latency_us / 1e6).max(1e-6);
@@ -146,19 +174,30 @@ fn calibrated_config(op_latency_us: f64) -> RunConfig {
     }
 }
 
-/// The freeze for a given arrival `rate` (msg/s): several inter-arrival gaps, clamped to
-/// [`MIN_STALL`, `MAX_STALL`]. Sizing it from the rate (not the op latency) guarantees the freeze
-/// spans MANY scheduled sends, so the earliest affected message accumulates nearly the whole freeze
-/// as latency and the stalled tail lands well above the adaptive separation threshold on any host.
-fn calibrated_stall(rate_hz: f64) -> Duration {
-    let want_secs = (STALL_OVER_INTERARRIVAL / rate_hz.max(f64::MIN_POSITIVE)).max(0.0);
+/// The freeze, sized to be large versus BOTH the inter-arrival gap AND the MEASURED healthy baseline
+/// p99.9, then clamped to [`MIN_STALL`, `MAX_STALL`].
+///
+/// Two lower bounds, whichever is larger:
+/// - several inter-arrival gaps (`STALL_OVER_INTERARRIVAL / rate`), so the freeze brackets MANY
+///   scheduled sends and the earliest affected message accumulates nearly the whole freeze as
+///   latency; and
+/// - a multiple of the OBSERVED baseline (`FREEZE_OVER_BASELINE * baseline_p999`), so on a contended
+///   runner — where the baseline p99.9 has risen with the host — the freeze rises with it and the
+///   adaptive separation (half the freeze) keeps its headroom above the baseline. Sizing from the
+///   measured baseline rather than only the unloaded probe is the #666 fix: the probe cannot see
+///   contention, so a probe-only freeze was a near-fixed ~240 ms that a contended baseline could
+///   exceed, tripping the old precondition before the real check ran.
+fn calibrated_stall(rate_hz: f64, baseline_p999_us: f64) -> Duration {
+    let by_interarrival_secs = (STALL_OVER_INTERARRIVAL / rate_hz.max(f64::MIN_POSITIVE)).max(0.0);
+    let by_baseline_secs = (FREEZE_OVER_BASELINE * baseline_p999_us / 1e6).max(0.0);
+    let want_secs = by_interarrival_secs.max(by_baseline_secs);
     // `from_secs_f64` does the float-to-Duration conversion without a manual, lint-flagged cast.
     Duration::from_secs_f64(want_secs).clamp(MIN_STALL, MAX_STALL)
 }
 
-/// The calibration a run derives from a probed op latency: the config, the freeze, the ADAPTIVE
-/// separation margin, and the baseline sanity backstop (all microseconds), so both the deterministic
-/// and the live tests share one recipe.
+/// The calibration a run derives from a probed op latency AND the measured healthy baseline: the
+/// config, the freeze, the ADAPTIVE separation margin, and the baseline sanity backstop (all
+/// microseconds), so both the deterministic and the live tests share one recipe.
 struct Calibration {
     config: RunConfig,
     stall: Duration,
@@ -166,18 +205,23 @@ struct Calibration {
     /// The adaptive separation margin: the stalled tail must exceed the MEASURED healthy baseline
     /// p99.9 by at least this. A fraction of the freeze, so it scales with the host.
     separation_us: f64,
-    /// The generous backstop: the healthy baseline p99.9 must stay below this fraction of the freeze.
+    /// The backstop: the healthy baseline p99.9 must stay below this. Tied to [`MAX_STALL`] (the
+    /// runtime ceiling on the freeze), not to the chosen freeze, so mere contention cannot trip it.
     baseline_sanity_us: f64,
 }
 
-fn calibrate(op_latency_us: f64) -> Calibration {
-    let config = calibrated_config(op_latency_us);
-    let stall = calibrated_stall(config.target_rate_hz);
+/// Stage two of calibration: with the config fixed and the healthy baseline now MEASURED, size the
+/// freeze (and the separation/sanity it implies) so the test scales to the observed host speed. The
+/// freeze is a multiple of the measured baseline p99.9 (floored at [`MIN_STALL`], capped at
+/// [`MAX_STALL`]); the separation is half of it; the sanity backstop is tied to [`MAX_STALL`].
+fn finalize_calibration(config: RunConfig, baseline_p999_us: f64) -> Calibration {
+    let stall = calibrated_stall(config.target_rate_hz, baseline_p999_us);
     let stall_us = stall.as_secs_f64() * 1e6;
     let separation_us = stall_us * STALL_SEPARATION_FRACTION;
-    let baseline_sanity_us = stall_us * BASELINE_SANITY_FRACTION;
+    let max_stall_us = MAX_STALL.as_secs_f64() * 1e6;
+    let baseline_sanity_us = max_stall_us * BASELINE_SANITY_OF_MAX_STALL;
     eprintln!(
-        "calibrated: op_latency={op_latency_us:.0} us, rate={:.0} msg/s, stall={:.0} us, \
+        "calibrated: rate={:.0} msg/s, baseline_p999={baseline_p999_us:.0} us, stall={:.0} us, \
          separation={separation_us:.0} us, baseline_sanity={baseline_sanity_us:.0} us",
         config.target_rate_hz, stall_us,
     );
@@ -223,23 +267,28 @@ fn assert_stall_is_measured(
     let baseline_us = healthy.percentiles.p999_us;
     let threshold_us = baseline_us + cal.separation_us;
 
-    // SANITY backstop FIRST: the healthy baseline must stay well below the freeze itself, so a
-    // pathologically slow host (where the baseline alone approaches the stall, leaving no room for
-    // the adaptive separation) is still caught. A merely-loaded host (baseline p99.9 well under the
-    // stall) passes. This is a GENEROUS backstop, not the old fixed-floor non-vacuity guard; the
-    // primary robustness is the adaptive `baseline + separation` check below.
+    // SANITY backstop FIRST, now tied to MAX_STALL (the runtime ceiling on the freeze), NOT to the
+    // chosen freeze. A genuinely pathological host is one whose baseline p99.9 already exceeds half
+    // the largest freeze the test could ever inject: at that point no freeze that fits the cap could
+    // clear the adaptive separation, so the calibration must be revisited. A merely-CONTENDED host
+    // (baseline well under half of MAX_STALL) passes — the freeze and the separation scaled up with
+    // it. This is the #666 fix: the bound was previously a near-fixed fraction of a probe-derived
+    // freeze (~240 ms), which a contended baseline could exceed even though the relative separation
+    // was fine. The PRIMARY robustness remains the adaptive `baseline + separation` check below.
     assert!(
         baseline_us < cal.baseline_sanity_us,
         "the healthy baseline p99.9 ({:.0} us) is at or above the baseline sanity bound ({:.0} us, \
-         {:.0}% of the {:.0} ms freeze); the host is pathologically slow (op_latency was {:.0} us, \
-         rate {:.0} msg/s), so the calibration must be revisited for the test to keep headroom for \
-         the adaptive separation",
+         {:.0}% of the {:.0} ms MAX_STALL ceiling); the host is pathologically slow (op_latency was \
+         {:.0} us, rate {:.0} msg/s, chosen freeze {:.0} ms), so even the largest freeze that fits \
+         the cap cannot keep headroom for the adaptive separation and the calibration must be \
+         revisited",
         baseline_us,
         cal.baseline_sanity_us,
-        BASELINE_SANITY_FRACTION * 100.0,
-        cal.stall_us / 1e3,
+        BASELINE_SANITY_OF_MAX_STALL * 100.0,
+        MAX_STALL.as_secs_f64() * 1e3,
         op_latency_us,
         cal.config.target_rate_hz,
+        cal.stall_us / 1e3,
     );
 
     // THE load-bearing assertion: the freeze appears in p99.9, the issue's headline tail, ABOVE the
@@ -286,22 +335,27 @@ fn assert_stall_is_measured(
 /// freeze is absent from p99.9. Non-flaky across runs (the #284 acceptance criterion).
 #[test]
 fn an_injected_stall_shows_up_in_the_recorded_tail() {
-    // 0. Calibrate against a fresh in-process broker: probe the unloaded single-op latency, then
-    //    derive the arrival rate and the freeze, so the test self-tunes to a fast or slow host.
+    // 0. Stage-one calibration against a fresh in-process broker: probe the unloaded single-op
+    //    latency and derive the arrival rate + duration, so the run self-tunes to a fast or slow host.
     let op_latency_us = {
         let broker = InProcBroker::start().expect("start the in-process broker for calibration");
         probe_op_latency_us(broker.addr()).expect("probe the in-process broker's op latency")
     };
-    let cal = calibrate(op_latency_us);
+    let config = calibrate_config(op_latency_us);
 
     // 1. The healthy baseline against a fresh in-process broker: the calibrated config with NO
     //    freeze. Its tail is the broker's fsync floor plus light queueing, kept well below the floor.
     let healthy = {
         let broker = InProcBroker::start().expect("start the in-process broker for the baseline");
         let probe_dir = std::env::temp_dir();
-        ironbus_bench::run_open_loop(broker.addr(), &probe_dir, std::process::id(), &cal.config)
+        ironbus_bench::run_open_loop(broker.addr(), &probe_dir, std::process::id(), &config)
             .expect("the healthy in-process baseline run completed")
     };
+
+    // 1b. Stage-two calibration: now that the baseline is MEASURED (under whatever contention the
+    //     runner is under), size the freeze from it so the adaptive separation keeps headroom on a
+    //     contended shared host. This is the #666 fix.
+    let cal = finalize_calibration(config, healthy.percentiles.p999_us);
 
     // 2. The stalled run: the same config WITH the calibrated freeze injected mid-run via the sync
     //    gate, so a warm steady state precedes it and the receiver records the post-thaw backlog
@@ -326,8 +380,8 @@ fn an_injected_stall_shows_up_in_the_recorded_tail() {
 fn an_injected_sigstop_shows_up_in_the_recorded_tail() {
     let bin = ironbus_bin();
 
-    // 0. Calibrate: probe the broker's unloaded single-op latency, then derive the arrival rate and
-    //    the freeze from it, so the test self-tunes to a fast SSD or a slow CI disk alike.
+    // 0. Stage-one calibration: probe the broker's unloaded single-op latency and derive the arrival
+    //    rate + duration, so the run self-tunes to a fast SSD or a slow CI disk alike.
     let op_latency_us = {
         let data_dir = fresh_data_dir("calib");
         let broker =
@@ -337,11 +391,15 @@ fn an_injected_sigstop_shows_up_in_the_recorded_tail() {
         cleanup(&data_dir);
         lat
     };
-    let cal = calibrate(op_latency_us);
+    let config = calibrate_config(op_latency_us);
 
     // 1. The healthy baseline: the calibrated config with NO freeze. Its tail is the broker's fsync
     //    floor plus light queueing; the adaptive separation is measured relative to it.
-    let healthy = healthy_baseline(&bin, &cal.config);
+    let healthy = healthy_baseline(&bin, &config);
+
+    // 1b. Stage-two calibration: size the freeze from the MEASURED baseline p99.9 so the adaptive
+    //     separation keeps headroom on a contended host (the #666 fix).
+    let cal = finalize_calibration(config, healthy.percentiles.p999_us);
 
     // 2. The stalled run: the same config WITH the calibrated freeze injected mid-run, so a warm
     //    steady state precedes it and the receiver records the post-thaw backlog with its old
