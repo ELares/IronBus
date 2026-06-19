@@ -35,6 +35,15 @@ path = "src/bin/assemble_corpus.rs"
 name = "stream-consume-bench"
 path = "src/bin/stream_consume_bench.rs"
 
+# Assembles the SINGLE-CONSUMER CONSUME corpus (#554, V2-M1): ingests the consume_bench.py rows and
+# builds a durability-lint-validated ComparisonReport pairing IronBus Tier-S streaming consume against
+# a NATS JetStream durable pull consumer at the matched `durable-consume` label (the headline V2-M1
+# consume proof), with the Tier-W work-queue + NATS core sub as appendix context. The consume-side
+# twin of `assemble-corpus`; its unit tests are the CI-checkable fairness gate. On demand.
+[[bin]]
+name = "consume-corpus"
+path = "src/bin/consume_corpus.rs"
+
 [dependencies]
 # The harness drives the broker through the REAL #11 client over a real socket, never a privileged
 # test path; it launches the shipping `ironbus` binary built by `ironbus-cli`.

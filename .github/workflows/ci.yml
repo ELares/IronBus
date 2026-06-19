@@ -125,6 +125,40 @@ jobs:
           fi
           echo "ok: regression gate no-ops gracefully with no baseline history (exit 0)"
 
+  consume-corpus-gate:
+    name: consume corpus fairness gate (#554)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: consume-corpus-gate
+      # The V2-M1 consume scoreboard gate (#554): the committed single-consumer consume corpus
+      # (`docs/benchmarks/consume-rows.jsonl`, the t4g head-to-head) must still ASSEMBLE under the
+      # durability-label fairness lint — i.e. IronBus Tier-S streaming and NATS JS pull stay matched
+      # at the `durable-consume` label, and the non-durable NATS core sub is never force-paired
+      # against a durable consumer. `consume-corpus` exits non-zero if any pair is mislabeled, so a
+      # silent regression of the matched scoreboard (a marketing comparison creeping in) fails CI.
+      # This is the consume twin of the produce corpus's `assemble-corpus` lint, run on the COMMITTED
+      # rows the milestone asserts against (the live t4g numbers themselves are a documented device
+      # residual, not a CI run; this gate validates the SCOREBOARD's fairness, not the run). The
+      # `consume_corpus.rs` + `comparison.rs` unit tests (run by the workspace `test` job) cover the
+      # pairing/lint logic; this job additionally proves the END-TO-END wiring on the real rows.
+      - name: assert the committed consume corpus passes the fairness lint
+        run: |
+          set -euo pipefail
+          cargo run --locked -p ironbus-bench --bin consume-corpus -- \
+            --rows docs/benchmarks/consume-rows.jsonl \
+            --json-out "${RUNNER_TEMP}/consume-report.json" \
+            --md-out "${RUNNER_TEMP}/consume-report.md" 2>&1 | tee "${RUNNER_TEMP}/consume-gate.txt"
+          if ! grep -q 'all lints passed' "${RUNNER_TEMP}/consume-gate.txt"; then
+            echo "::error::the committed consume corpus did not pass the durability-label fairness lint"
+            exit 1
+          fi
+          echo "ok: committed consume corpus assembles under the fairness lint (#554)"
+
   msrv:
     name: msrv (1.78)
     runs-on: ubuntu-latest

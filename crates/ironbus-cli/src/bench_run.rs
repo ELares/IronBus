@@ -10,13 +10,13 @@
 //! [`crate::bench`] and are unit-tested on every target.
 
 use crate::bench::{
-    fill_payload, percentiles_us, AckMode, BenchConfig, BenchReport, Bound, Mode,
+    fill_payload, percentiles_us, AckMode, BenchConfig, BenchReport, Bound, ConsumeTier, Mode,
     BENCH_NAMESPACE_PREFIX, ROUND_TRIP_TOKEN_LEN,
 };
 use crate::{open_disk_engine, open_memory_engine, CliError, ServeConfig, StorageArg};
-use ironbus_client::{Client, ClientConfig, ClientError};
+use ironbus_client::{Client, ClientConfig, ClientError, StreamConsumerConfig};
 use ironbus_core::clock::Clock; // the monotonic seam the serve loop's liveness beacon (#95) reads
-use ironbus_proto::message::PubBody;
+use ironbus_proto::message::{ConsumeTier as ProtoConsumeTier, PubBody};
 use ironbus_server::actor::{spawn_actor_with_gather, DEFAULT_CHANNEL_BOUND};
 use ironbus_server::server::serve;
 use ironbus_storage::fs::{EphemeralFs, Filesystem, StdFs};
@@ -333,6 +333,25 @@ fn connect(addr: &str) -> Result<Client, CliError> {
     let client_cfg = ClientConfig::default();
     Client::connect_with(addr, &client_cfg)
         .map_err(|e| CliError::Unreachable(format!("bench: connecting to broker at {addr}: {e}")))
+}
+
+/// Connects a STREAMING (Tier-S) client to `addr` (#554): advertises Tier-S + `DeliverBatch` and a
+/// streaming connection default in the `Connect` handshake, so the server may serve this connection
+/// at Tier-S and a subscription marks its group streaming server-side. The `--consume-tier streaming`
+/// drain rides this connection; if the server does not negotiate Tier-S the streaming fetch path
+/// returns a server error the caller surfaces, so the bench cannot silently fall back to Tier-W.
+fn connect_streaming(addr: &str) -> Result<Client, CliError> {
+    let client_cfg = ClientConfig {
+        understands_streaming: true,
+        default_consume_tier: Some(ProtoConsumeTier::Streaming),
+        understands_deliver_batch: true,
+        ..ClientConfig::default()
+    };
+    Client::connect_with(addr, &client_cfg).map_err(|e| {
+        CliError::Unreachable(format!(
+            "bench: connecting streaming client to broker at {addr}: {e}"
+        ))
+    })
 }
 
 /// Whether the run should stop given how many ops are done and when it started.
@@ -716,7 +735,12 @@ fn run_subscribe(cfg: &BenchConfig, addr: &str) -> Result<BenchReport, CliError>
     // preload. The preload fsync cost is not the SUBSCRIBE metric (drain throughput is), so the
     // fsync histogram is empty for this mode.
     let drain_start = Instant::now();
-    let (recorded, latencies) = drain(cfg, addr, preload, started)?;
+    // TIER selector (#554): Tier-W is the per-message-lease work queue; Tier-S is the streaming
+    // consumer-managed-offset path (the durable single-consumer streaming-consume head-to-head).
+    let (recorded, latencies) = match cfg.consume_tier {
+        ConsumeTier::Work => drain(cfg, addr, preload, started)?,
+        ConsumeTier::Streaming => drain_streaming(cfg, addr, preload, started)?,
+    };
     Ok(finish_report(
         cfg,
         preload,
@@ -920,6 +944,77 @@ fn drain(
         // disk drop policy) -- report it rather than hang waiting for records that will never come.
         eprintln!(
             "note: drained {recorded} of {expected} preloaded records; the broker shed \
+             {} under its cap (the consume rate is over the {recorded} that survived)",
+            expected - recorded
+        );
+    }
+    Ok((recorded, latencies))
+}
+
+/// Drains the preloaded prefix via the TIER-S STREAMING consumer (#554): the batched-fetch +
+/// bounded-read-ahead + periodic-cumulative-commit [`ironbus_client::StreamingConsumer`] default
+/// (#662). This is the durable single-consumer streaming-consume path — the head-to-head with a NATS
+/// `JetStream` pull consumer's batched-ack drain — NOT the per-message-lease work queue [`drain`]
+/// measures. It returns the same `(recorded, latencies)` pair so the two tiers share the reporting
+/// path; the consumer's `next_batch` does the windowed `StreamFetch` and commits the cursor
+/// cumulatively every `commit_every_batches`, so the bench drives no per-message ack here (a
+/// streaming consumer commits an offset, it does not settle leases).
+fn drain_streaming(
+    cfg: &BenchConfig,
+    addr: &str,
+    expected: u64,
+    produce_started: Instant,
+) -> Result<(u64, Vec<u64>), CliError> {
+    let mut consumer_conn = connect_streaming(addr)?;
+    subscribe_group(&mut consumer_conn, addr, &cfg.group)?;
+    // The streaming window mirrors the Tier-W fetch credit (`--fetch-batch`), so the two tiers fetch
+    // the same window size and the comparison is the TIER, not the window. Read-ahead ON is the #662
+    // ergonomic default (the next window's StreamFetch is hidden behind processing the current one),
+    // and the commit cadence is the client default (commit the cursor once every N windows).
+    let stream_cfg = StreamConsumerConfig {
+        max_records: cfg.fetch_batch,
+        max_bytes: 0,
+        read_ahead: true,
+        ..StreamConsumerConfig::default()
+    };
+    let mut latencies: Vec<u64> = Vec::new();
+    let mut recorded: u64 = 0;
+    let mut consumer = consumer_conn.streaming_consumer_with(&cfg.group, &stream_cfg);
+    let drain_started = Instant::now();
+    let mut empty_streak: u32 = 0;
+    loop {
+        let batch = consumer
+            .next_batch()
+            .map_err(|e| classify(addr, "streaming-fetching from", &e))?;
+        let now = Instant::now();
+        for m in &batch.messages {
+            if let Some(sent) = read_round_trip_time(&m.payload, produce_started) {
+                let latency_ns = u64::try_from(now.saturating_duration_since(sent).as_nanos())
+                    .unwrap_or(u64::MAX);
+                latencies.push(latency_ns);
+            }
+            recorded += 1;
+        }
+        empty_streak = if batch.messages.is_empty() {
+            empty_streak.saturating_add(1)
+        } else {
+            0
+        };
+        if drain_should_stop(cfg.bound, recorded, expected, empty_streak, drain_started) {
+            break;
+        }
+        if batch.messages.is_empty() {
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+    // Flush the final cumulative commit (any window since the last periodic commit), so the consumed
+    // span is durably checkpointed exactly as a real streaming consumer would leave it on shutdown.
+    let _committed = consumer
+        .finish()
+        .map_err(|e| classify(addr, "committing the streaming cursor to", &e))?;
+    if recorded < expected {
+        eprintln!(
+            "note: streaming-drained {recorded} of {expected} preloaded records; the broker shed \
              {} under its cap (the consume rate is over the {recorded} that survived)",
             expected - recorded
         );

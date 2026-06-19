@@ -279,3 +279,116 @@ Verdict: KEEP. The goal's standing follow-ups: a final full NATS matrix rerun is
 for the contested legs; the consume-side legs (NATS ordered consume 43,877/s) were never part
 of the win condition and remain the natural next frontier, along with the parked second-order
 CPU items (clocks, futex pairs, NODELAY) if a future round needs them.
+
+---
+
+# Consume scoreboard: single-consumer durable consume vs NATS (#554, V2-M1)
+
+The produce scoreboard above closed the PRODUCE axis. This is the CONSUME axis — the V2-M1
+headline: that the streaming-tier consume rearchitecture (Tier-S #655, tier negotiation #656, #661
+`DeliverBatch`, #662 the batched-fetch + bounded-read-ahead + periodic-cumulative-commit client
+default) makes a single durable consumer beat a NATS JetStream durable PULL consumer, the axis on
+which the old per-message-lease work-queue consume LOST to NATS by ~3-20x. Driven by
+`docs/benchmarks/consume_bench.py` and assembled by `cargo run -p ironbus-bench --bin
+consume-corpus` (the consume-side twin of the produce `assemble-corpus`, same durability-label
+fairness lint). The legs:
+
+- **IronBus Tier-S streaming** (`bench --mode subscribe --consume-tier streaming`): the merged
+  streaming consumer — a windowed `StreamFetch` with bounded read-ahead and a periodic cumulative
+  `StreamCommit` (the #662 default), durable file-backed, cursor persisted.
+- **NATS JetStream durable PULL** (`nats bench <subj> --js --sub 1 --pull --consumerbatch 256`): one
+  durable pull consumer, explicit batched ack against a file-backed stream. The matched durable peer.
+- Context (appendix, NOT a durable head-to-head): **IronBus Tier-W work-queue** (the
+  per-message-lease path IronBus used to lose on) and **NATS CORE sub** (`nats bench <subj> --pub 1
+  --sub 1`, no JetStream — non-durable at-most-once live delivery, a reference ceiling).
+
+Matched durability label `durable-consume` on the head-to-head pair (both persist a consume cursor;
+a crash redelivers only the uncommitted span); the non-durable core sub carries `at-most-once`, so
+the lint can never force-pair it against a durable consumer. The label match is the CI gate
+(`consume_corpus.rs` unit tests + `comparison.rs`), exactly as the produce legs are gated.
+
+## The rig
+
+AWS Graviton2 `t4g.large` (2× Cortex-A72-class, 8 GiB), Ubuntu 24.04 aarch64, `us-west-2` dev,
+all loopback; `nats-server` v2.10.22, `natscli` 0.1.6; IronBus release `aarch64` built on-box.
+Each broker runs on a scratch dir/port and is stopped after (the EC2 instance was STOPPED at the
+end of the run). Both durable sides drain a pre-filled durable prefix with a 256-record consumer
+window (`--fetch-batch 256` / `StreamConsumerConfig.max_records 256` / `--consumerbatch 256`), so
+the TIER, not the window, is what differs. The IronBus pre-fill is `--no-fsync` (page-cache): the
+DRAIN rate is the metric and is write-durability-independent, exactly as the produce corpus's
+consume row. NOTE on rig discipline: this is a single-run, 2-core box; the
+[EDGE_RUN_DISCIPLINE.md](EDGE_RUN_DISCIPLINE.md) cpuset-pinning / steady-state-CoV / thermal
+instrumentation is NOT yet wired into this harness (the same documented residual the produce
+ledger ran under), so these are directional single-rig numbers, not ratified edge SLO numbers. The
+2-core box means broker and harness contend; the absolute IronBus numbers would rise with the
+broker pinned to its own core — but the head-to-head holds the contention equal on both sides.
+
+## The headline (the committed corpus point, 20k records): IronBus Tier-S WINS at both sizes
+
+`docs/benchmarks/consume-rows.jsonl`, the lint-validated head-to-head the `consume-corpus`
+assembler pairs at the matched 20,000-record prefill (the realistic small/moderate prefill a real
+edge consumer keeps caught-up against):
+
+| payload | IronBus Tier-S streaming | NATS JS pull | IronBus / NATS |
+| --- | --- | --- | --- |
+| 256 B | 114,984 /s | 99,861 /s | **1.15x (IronBus wins)** |
+| 4096 B | 81,410 /s | 57,774 /s | **1.41x (IronBus wins)** |
+
+Both clear the #554 single-consumer criterion at 4096 B (1.41x ≥ 1.25x) and IronBus leads at 256 B
+(1.15x; an independent same-config sweep run measured 1.40x at this point — run-to-run variance is
+high on the contended 2-core box, see the sweep below, but IronBus led in BOTH runs).
+
+## But it DEPENDS on the pre-filled prefix length (the honest caveat)
+
+256 B, IronBus Tier-S streaming vs NATS JS pull, record-count sweep
+(`docs/benchmarks/consume-sweep.jsonl`, the full curve, not one cherry-picked point):
+
+| pre-filled records | IronBus Tier-S streaming | NATS JS pull | IronBus / NATS |
+| --- | --- | --- | --- |
+| 20,000 | 148,038 /s | 105,552 /s | **1.40x (IronBus wins)** |
+| 50,000 | 83,618 /s | 108,106 /s | 0.77x (NATS wins) |
+| 100,000 | 46,045 /s | 106,565 /s | 0.44x (NATS wins) |
+| 200,000 | 22,610 /s | 104,819 /s | 0.22x (NATS wins) |
+
+The read, stated honestly: **IronBus Tier-S beats NATS JS pull at the small/moderate prefill (the
+headline above) but the IronBus number DEGRADES super-linearly as the pre-filled prefix grows while
+NATS stays flat at ~105k/s**, so the two cross near ~30k records and NATS leads beyond it. IronBus
+throughput roughly halves each time the prefix doubles (148k → 83k → 46k → 23k across 20k → 200k),
+the signature of a super-linear total cost: the server `StreamFetch(start_offset, …)` path's cost
+grows with `start_offset` (an O(start) locate per fetch ⇒ ~O(N²) over the whole drain), whereas a
+NATS pull consumer carries an O(1) server-side position. (The growing p99 — 1.1 s at 20k to 18.4 s
+at 200k — is the preloaded-drain queue-wait, i.e. records sat in the prefix before the timed drain
+began, NOT a per-record service latency; it is reported but is not the throughput signal.) At
+4096 B and 50,000 records (past the 256 B crossover) the two are near parity (56,545 vs 58,519,
+0.97x): the larger payload is more per-byte-bound, so the offset-scan penalty is proportionally
+smaller at the same record count.
+
+## Context (appendix, not a durable head-to-head)
+
+20,000 records: IronBus Tier-W work-queue **3,326 /s** (256 B) / **2,795 /s** (4096 B) — the
+per-message-lease drain the V2-M1 rearchitecture replaced; Tier-S at the SAME workload is **~35x**
+(256 B: 114,984 vs 3,326) and **~29x** (4096 B) the work-queue, the in-family streaming win. NATS
+CORE sub **620,220 /s** (256 B) / **125,800 /s** (4096 B): non-durable, no JetStream, no replay — a
+different durability tier, a reference ceiling, never paired against a durable consumer.
+
+## Verdict (honest)
+
+The V2-M1 headline holds AT THE REALISTIC SMALL/MODERATE PREFILL and NOT YET universally:
+
+- **WON, #554 single-consumer criterion (Tier-S ≥1.25x NATS pull):** 1.41x at 20k records, 4096 B
+  (and 1.15-1.40x at 256 B across two runs). The streaming-tier rearchitecture turned the old
+  ~3-20x consume LOSS into a win where the consume cursor isn't dominated by the offset-scan: Tier-S
+  is ~29-35x the old Tier-W work-queue at the same 20k workload, and beats NATS JS pull at the
+  prefill a real edge consumer keeps caught-up against.
+- **NOT YET won at large prefills:** past ~30k pre-filled records IronBus's `StreamFetch`-by-offset
+  cost goes super-linear and NATS's flat O(1) pull position wins (0.22x at 200k). This is recorded,
+  not hidden.
+- **The remaining lever:** an O(1) offset SEEK/index on the server streaming-fetch path so
+  `StreamFetch(start, …)` no longer pays O(start) to locate the run (the produce side's analog was
+  the #454 read-chunk fix that removed a pipeline cap). The `#552` consumer-credit and `#658`
+  `sendfile` zero-copy levers are downstream of that locate cost and would compound it. Until the
+  seek is O(1), the win is prefix-bounded, and the ledger says so.
+
+The multi-consumer aggregate criterion (≥1.5x at M≥4) and the Tier-W-batched-≥10x-baseline
+criterion from #554 are separate legs not measured in this single-consumer round; they are the
+natural next consume frontier alongside the offset-seek lever above.
