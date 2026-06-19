@@ -31,8 +31,8 @@ use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, 
 use ironbus_proto::message::{
     decode_ack, decode_connect, decode_cumulative_ack, decode_pub, decode_sub, encode_dead_letter,
     encode_deliver, encode_gap_marker, encode_info, encode_pub_ack, encode_truncated, gap_reason,
-    AckOp, CreditAdvert, DeadLetterBody, DeliverBody, GapMarkerBody, InfoBody, PubAckBody,
-    TruncatedBody, DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
+    pub_ack_level, AckLevel, AckOp, CreditAdvert, DeadLetterBody, DeliverBody, GapMarkerBody,
+    InfoBody, PubAckBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
 };
 use ironbus_storage::fs::Filesystem;
 use std::collections::HashMap;
@@ -570,12 +570,30 @@ impl Session {
             reply_err(out, "malformed pub body");
             return Ok(());
         };
-        // The QoS-0 no-frame contract (#11): a fire-and-forget producer NEVER reads a reply, so the
-        // session must send NO frame for a flagged produce on ANY disposition (append, drop, shed,
-        // capacity, fence, failure), or the one unexpected frame would permanently desync the
-        // client's reply stream (its next produce would consume the stale frame). Captured here and
-        // consulted on every reply site below.
-        let fire_and_forget = msg.fire_and_forget;
+        // The per-publish produce ACK LEVEL (#494/#495): the server reads it from the decoded PUB
+        // flags and routes the produce accordingly. `pub_ack_level` folds BOTH the canonical
+        // fire-and-forget bit and the 2-bit ack-level field into one [`AckLevel`]:
+        //
+        // - LEVEL 1 (`AckLevel::ServerAck`) is TODAY's behavior EXACTLY: a `PubAck` after the covering
+        //   group-commit fsync (I2). A pre-feature client sets NEITHER the faf bit NOR a level bit, so
+        //   it decodes as Level 1 and its path below is byte-for-byte unchanged.
+        // - LEVEL 0 (`AckLevel::NoAck`) is the no-ack fire-and-forget fast path (#495), the
+        //   generalization of the historical `PUB_FLAG_FIRE_AND_FORGET` path (an old faf publish IS a
+        //   Level-0 publish): it gets NO PubAck, allocates NO reply channel, parks NOTHING, and does not
+        //   wait for the fsync. Routed to `produce_no_reply` below.
+        // - LEVEL 2 (`AckLevel::ServerAndClientAck`) FALLS BACK to Level 1 for THIS phase (#495): the
+        //   producer-notify ProduceConfirm is phase 4 (#497), not yet end-to-end. So an L2 publish is
+        //   accepted and acked exactly like L1; the consumer-ack notify is simply not delivered yet.
+        let ack_level = pub_ack_level(msg.flags);
+        // A LEVEL-0 publish is the generalized fire-and-forget: it gets no ack and is governed by the
+        // fire-and-forget token bucket, REGARDLESS of which Level-0 encoding the producer used (the
+        // canonical faf bit, where `msg.fire_and_forget` is already true, OR the level-bit value 1,
+        // where it is not). Deriving the faf marker from the ack level here makes the level-bit and the
+        // faf-bit Level-0 encodings behave identically downstream (one no-ack path). Level 1 and the
+        // Level-2-as-Level-1 fallback are at-least-once, so `fire_and_forget` is false for them and the
+        // existing parked-ack path is unchanged.
+        let level0 = matches!(ack_level, AckLevel::NoAck);
+        let fire_and_forget = level0;
         // Enforce the dedup id length caps (#33) at the wire boundary, BEFORE the bytes cross into
         // owned storage. The `producer_id` keys the per-producer window map and the `msg_id` keys the
         // per-window ring; both are wire-supplied and attacker-chosen (up to the 64 KiB wire field
@@ -664,16 +682,30 @@ impl Session {
             // Read just before the produce crosses the channel, so the sojourn captures the queue
             // wait. CoDel-off (the default) ignores this entirely.
             enqueue_monotonic_nanos: engine.now_monotonic_nanos(),
-            // The QoS-0 fire-and-forget marker (#11, #402), from the additive PUB flag bit. When set,
-            // the broker may drop the produce under the fire-and-forget bucket WITHOUT acking, and
-            // otherwise appends it durably but sends NO PubAck (handled in the match below).
-            fire_and_forget: msg.fire_and_forget,
+            // The QoS-0 / Level-0 fire-and-forget marker (#11, #402, #495): set for every Level-0
+            // publish (derived from the ack level above, so the canonical faf bit and the level-bit
+            // Level-0 encoding are equivalent). When set, the broker may drop the produce under the
+            // fire-and-forget bucket WITHOUT acking, and otherwise appends it durably but sends NO
+            // PubAck. Level 1 (and the Level-2-as-Level-1 fallback) leave it clear.
+            fire_and_forget,
         };
-        // SUBMIT the produce to the actor WITHOUT awaiting (#450) and PARK the pending ack: the
-        // caller releases parked acks in FIFO submission order, so the reply this produce eventually
-        // gets is byte-identical to the awaited path's, only written later in the same pass. The
-        // submission still blocks on a FULL actor channel (backpressure), and the actor still
-        // releases the reply only after the covering group-commit fsync (I2).
+        // LEVEL 0 (no-ack fast path, #495): submit the produce with NO reply channel and return
+        // immediately — do NOT park. The producer fired and forgot, so there is no PubAck to write, no
+        // reply-channel allocation, and no fsync to wait for. The connection-thread byte-cap pre-check
+        // (#476) inside `produce_no_reply` sheds an over-cap L0 here (counted in the fire-and-forget
+        // shed metric), droppable under overload; an admitted L0 is appended into the actor's batch
+        // (single-writer storage / single total order) but never acked. An old fire-and-forget publish
+        // takes exactly this path (it decodes as Level 0).
+        if level0 {
+            engine.produce_no_reply(append)?;
+            return Ok(());
+        }
+        // LEVEL 1 / LEVEL 2 (at-least-once; L2 falls back to L1 this phase): SUBMIT the produce to the
+        // actor WITHOUT awaiting (#450) and PARK the pending ack. The caller releases parked acks in
+        // FIFO submission order, so the reply this produce eventually gets is byte-identical to the
+        // awaited path's, only written later in the same pass. The submission still blocks on a FULL
+        // actor channel (backpressure), and the actor still releases the reply only after the covering
+        // group-commit fsync (I2). This path is unchanged from before the ack-level feature.
         let submission = engine.produce_submit(append)?;
         parked.push(ParkedPub {
             submission,
@@ -1604,7 +1636,7 @@ mod tests {
     use ironbus_core::types::RecordFlags;
     use ironbus_proto::message::{
         decode_deliver, decode_pub_ack, encode_ack, encode_pub, AckBody, PubBody, PubDedup,
-        PUB_FLAG_FIRE_AND_FORGET,
+        PUB_FLAG_ACK_LEVEL_SHIFT, PUB_FLAG_FIRE_AND_FORGET,
     };
     use ironbus_storage::fs::InMemoryFs;
     use ironbus_storage::log::{Append, LogConfig};
@@ -5715,5 +5747,133 @@ mod tests {
         let _ = handle.shutdown();
         drop(handle);
         let _ = actor.join().unwrap();
+    }
+
+    // --- Ack-level server accept-path (#495) ------------------------------------------------------
+
+    /// Builds a PUB body with an EXPLICIT raw flags byte, so a test can set the ack-level field
+    /// (#494/#495) that the safe `encode_pub` does not emit (it derives only the dedup + faf bits).
+    /// Hand-rolls the historical PUB layout: `flags(u8) + timestamp_ms(u64 LE) + key(u16len) +
+    /// headers(u16len) + payload`, with no dedup block (so the layout is byte-for-byte a default
+    /// publish, only the `flags` byte carries the level bits).
+    fn pub_body_with_flags(flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(flags);
+        body.extend_from_slice(&0u64.to_le_bytes()); // timestamp_ms
+        body.extend_from_slice(&0u16.to_le_bytes()); // key len 0
+        body.extend_from_slice(&0u16.to_le_bytes()); // headers len 0
+        body.extend_from_slice(payload);
+        body
+    }
+
+    /// Connects a session over a `DirectEngine` and returns the (session, engine, out) tuple ready for
+    /// a PUB, so the ack-level routing tests share the handshake boilerplate.
+    fn connected_direct() -> (Session, DirectEngine<InMemoryFs, ManualClock>, Vec<u8>) {
+        let e = DirectEngine::new(engine());
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        (s, e, out)
+    }
+
+    #[test]
+    fn level1_is_unchanged_acks_after_the_fsync_with_the_record_durable() {
+        // LEVEL 1 (#495) is TODAY's behavior EXACTLY: a default publish (no faf bit, no level bit)
+        // decodes as Level 1 and is answered by a `PubAck` carrying the assigned offset, AFTER the
+        // covering group-commit fsync made the record durable (I2). This is the byte-identical path.
+        let (mut s, e, mut out) = connected_direct();
+        s.process(
+            &e,
+            &frame(FrameType::Pub, &pub_body_with_flags(0, b"l1")),
+            &mut out,
+        )
+        .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::PubAck, "Level 1 acks with a PubAck");
+        assert_eq!(body, 0u64.to_le_bytes(), "the PubAck carries offset 0");
+        assert_eq!(
+            e.engine_mut().flushed_offset().get(),
+            1,
+            "the L1 record is durable before the ack (I2)"
+        );
+    }
+
+    #[test]
+    fn level0_via_the_fire_and_forget_bit_gets_no_frame_and_appends() {
+        // LEVEL 0 (#495) via the CANONICAL fire-and-forget encoding (an old faf publish IS a Level-0
+        // publish): NO PubAck (no frame at all), and the record is still appended durably (the no-reply
+        // path appends on the single-writer storage, it just never acks).
+        let (mut s, e, mut out) = connected_direct();
+        let body = pub_body_with_flags(PUB_FLAG_FIRE_AND_FORGET, b"l0-faf");
+        s.process(&e, &frame(FrameType::Pub, &body), &mut out)
+            .unwrap();
+        assert!(
+            out.is_empty(),
+            "a Level-0 (faf) publish gets NO frame: {out:?}"
+        );
+        assert_eq!(
+            e.engine_mut().flushed_offset().get(),
+            1,
+            "the L0 record is appended durably even though it is never acked"
+        );
+    }
+
+    #[test]
+    fn level0_via_the_level_bit_gets_no_frame_and_appends() {
+        // LEVEL 0 (#495) via the LEVEL-BIT encoding (raw ack-level value 1, distinct from the faf bit):
+        // it must behave IDENTICALLY to the faf encoding — no frame, record appended. This proves the
+        // server derives Level-0-ness from `pub_ack_level` (which folds both encodings), not just the
+        // faf bit, so a level-bit Level-0 client is the generalized fire-and-forget path.
+        let (mut s, e, mut out) = connected_direct();
+        // Raw level value 1 in the ack-level field (the level-bit Level-0 alias), faf bit CLEAR.
+        let flags = 1u8 << PUB_FLAG_ACK_LEVEL_SHIFT;
+        assert_eq!(
+            flags & PUB_FLAG_FIRE_AND_FORGET,
+            0,
+            "this encoding does NOT set the faf bit"
+        );
+        let body = pub_body_with_flags(flags, b"l0-levelbit");
+        s.process(&e, &frame(FrameType::Pub, &body), &mut out)
+            .unwrap();
+        assert!(
+            out.is_empty(),
+            "a Level-0 (level-bit) publish gets NO frame, exactly like the faf encoding: {out:?}"
+        );
+        assert_eq!(
+            e.engine_mut().flushed_offset().get(),
+            1,
+            "the level-bit L0 record is appended durably even though it is never acked"
+        );
+    }
+
+    #[test]
+    fn level2_falls_back_to_level1_and_acks() {
+        // LEVEL 2 (#495) for THIS phase FALLS BACK to Level 1: the consumer-ack producer-notify is
+        // phase 4 (#497), not yet end-to-end, so an L2 publish is accepted and acked EXACTLY like L1
+        // (a `PubAck` after the fsync, record durable). No ProduceConfirm is emitted here.
+        let (mut s, e, mut out) = connected_direct();
+        // Raw level value 2 in the ack-level field (the Level-2 encoding).
+        let flags = 2u8 << PUB_FLAG_ACK_LEVEL_SHIFT;
+        let body = pub_body_with_flags(flags, b"l2");
+        s.process(&e, &frame(FrameType::Pub, &body), &mut out)
+            .unwrap();
+        let (ty, ack_body) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::PubAck,
+            "Level 2 falls back to a Level-1 PubAck this phase (the L2 notify is #497)"
+        );
+        assert_eq!(
+            ack_body,
+            0u64.to_le_bytes(),
+            "the fallback PubAck carries offset 0"
+        );
+        assert_eq!(
+            e.engine_mut().flushed_offset().get(),
+            1,
+            "the L2-as-L1 record is durable before the ack (I2)"
+        );
     }
 }

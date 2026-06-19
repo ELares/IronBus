@@ -98,6 +98,21 @@ pub struct ProduceCapGate {
     /// then advances `reconciled` to the value it just observed. An `AtomicU64` (not a plain field)
     /// only because the gate is shared behind an `Arc`.
     reconciled: AtomicU64,
+    /// A MONOTONIC running total of LEVEL-0 (no-ack / fire-and-forget) produces fast-rejected at the
+    /// connection thread by the SAME byte-cap pre-check (#495, generalizing #476). Kept SEPARATE from
+    /// `fast_rejects` because an over-cap L0 shed is a fire-and-forget DROP (the client accepted loss,
+    /// no ack), so the actor folds this delta into `ironbus_fire_and_forget_shed_total` (NOT
+    /// `produce_rejected`, which counts the Level-1 at-least-once rejections the producers actually
+    /// saw). The connection thread bumps it (relaxed `fetch_add`) every time
+    /// [`ProduceCapGate::would_shed`] short-circuits an L0 produce; the actor reads the delta once per
+    /// batch and folds it, so an L0 cap-shed is never a silent drop. Monotonic + delta-reconciled, so
+    /// the count is exact under any number of concurrent connection threads with no lock.
+    l0_shed: AtomicU64,
+    /// The L0-shed high-water mark the ACTOR has already folded into
+    /// `ironbus_fire_and_forget_shed_total` (#495). Touched ONLY by the actor thread (in
+    /// [`ProduceCapGate::take_unreconciled_l0_sheds`]), so it needs no compare-and-swap, exactly like
+    /// `reconciled` does for `fast_rejects`.
+    l0_reconciled: AtomicU64,
 }
 
 impl ProduceCapGate {
@@ -111,6 +126,8 @@ impl ProduceCapGate {
             bytes: AtomicU64::new(0),
             fast_rejects: AtomicU64::new(0),
             reconciled: AtomicU64::new(0),
+            l0_shed: AtomicU64::new(0),
+            l0_reconciled: AtomicU64::new(0),
         }
     }
 
@@ -192,6 +209,42 @@ impl ProduceCapGate {
         let delta = total.saturating_sub(already);
         if delta != 0 {
             self.reconciled.store(total, Ordering::Relaxed);
+        }
+        delta
+    }
+
+    /// Records that the connection thread just fast-rejected a LEVEL-0 (no-ack / fire-and-forget)
+    /// produce by the byte-cap pre-check (#495): bumps the monotonic L0-shed total so the actor can
+    /// later fold it into `ironbus_fire_and_forget_shed_total` (an over-cap L0 shed is a fire-and-forget
+    /// drop, never silent). A single relaxed `fetch_add` on the L0 fast path; the caller invokes it
+    /// exactly once per [`ProduceCapGate::would_shed`] that fired for an L0 produce. SEPARATE from
+    /// [`ProduceCapGate::record_fast_reject`] so an L0 shed is counted as a fire-and-forget drop, not a
+    /// Level-1 `produce_rejected` rejection.
+    pub fn record_l0_shed(&self) {
+        self.l0_shed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The MONOTONIC running total of Level-0 produces fast-rejected on the connection thread (#495). A
+    /// single relaxed load. Exposed for tests/observability; the actor uses
+    /// [`ProduceCapGate::take_unreconciled_l0_sheds`] to fold the delta into the engine counter.
+    #[must_use]
+    pub fn l0_shed_total(&self) -> u64 {
+        self.l0_shed.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of Level-0 cap-sheds performed since the LAST call and advances the
+    /// L0-reconciled high-water mark (#495). Called ONLY by the actor thread, once per batch, so it
+    /// needs no CAS: it reads the connection threads' monotonic L0 total, subtracts what it has already
+    /// folded, and records the new high-water mark. The returned delta is folded into
+    /// `ironbus_fire_and_forget_shed_total` (`Engine::record_fire_and_forget_sheds`), so an L0 cap-shed
+    /// is counted exactly once and never silent. `saturating_sub` guards the
+    /// (impossible-under-the-single-actor-invariant) reordered read, reporting `0` rather than wrapping.
+    pub fn take_unreconciled_l0_sheds(&self) -> u64 {
+        let total = self.l0_shed.load(Ordering::Relaxed);
+        let already = self.l0_reconciled.load(Ordering::Relaxed);
+        let delta = total.saturating_sub(already);
+        if delta != 0 {
+            self.l0_reconciled.store(total, Ordering::Relaxed);
         }
         delta
     }
@@ -303,6 +356,38 @@ mod tests {
             "only the 2 new ones"
         );
         assert_eq!(gate.take_unreconciled_fast_rejects(), 0);
+    }
+
+    #[test]
+    fn l0_sheds_are_counted_and_reconciled_separately_from_l1_fast_rejects() {
+        // A LEVEL-0 (no-ack) cap-shed is a fire-and-forget DROP, so it is tallied on its OWN counter
+        // and folded into `fire_and_forget_shed`, NEVER mixed into the Level-1 `produce_rejected`
+        // fast-reject total (#495). The two counters move independently and reconcile as exact deltas.
+        let gate = ProduceCapGate::new(1_000);
+        assert_eq!(gate.l0_shed_total(), 0);
+        assert_eq!(gate.fast_reject_total(), 0);
+
+        // Two L0 sheds and one L1 fast-reject: each lands on its own counter.
+        gate.record_l0_shed();
+        gate.record_l0_shed();
+        gate.record_fast_reject();
+        assert_eq!(gate.l0_shed_total(), 2, "L0 sheds on the L0 counter only");
+        assert_eq!(
+            gate.fast_reject_total(),
+            1,
+            "L1 fast-rejects unaffected by L0"
+        );
+
+        // Each reconciles its own delta; folding one never consumes the other.
+        assert_eq!(gate.take_unreconciled_l0_sheds(), 2);
+        assert_eq!(gate.take_unreconciled_fast_rejects(), 1);
+        assert_eq!(gate.take_unreconciled_l0_sheds(), 0, "no double-count");
+        assert_eq!(gate.take_unreconciled_fast_rejects(), 0, "no double-count");
+
+        // Only the NEW L0 sheds fold next time.
+        gate.record_l0_shed();
+        assert_eq!(gate.take_unreconciled_l0_sheds(), 1, "only the new L0 shed");
+        assert_eq!(gate.take_unreconciled_l0_sheds(), 0);
     }
 
     #[test]
