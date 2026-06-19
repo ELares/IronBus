@@ -27,10 +27,11 @@ use ironbus_core::compress::{
 use ironbus_core::types::RecordFlags;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
-    decode_dead_letter, decode_deliver, decode_gap_marker, decode_info, decode_pub_ack,
-    decode_truncated, encode_ack, encode_connect, encode_cumulative_ack, encode_fetch, encode_pub,
-    encode_sub, AckBody, AckLevel, AckOp, BodyError, ConnectBody, CumulativeAckBody, FetchBody,
-    PubBody, SubBody, PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
+    decode_dead_letter, decode_deliver, decode_gap_marker, decode_info, decode_produce_confirm,
+    decode_pub_ack, decode_truncated, encode_ack, encode_connect, encode_cumulative_ack,
+    encode_fetch, encode_pub, encode_sub, produce_confirm_status, AckBody, AckLevel, AckOp,
+    BodyError, ConnectBody, CumulativeAckBody, FetchBody, PubBody, SubBody,
+    PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -290,6 +291,43 @@ pub struct ProduceAck {
     pub duplicate: bool,
 }
 
+/// The terminal outcome of a Level-2 (server+client-ack) produce confirmation (#497), returned by
+/// [`Client::produce_confirmed`]. The record was ALREADY made durable (the durability `PubAck` arrived
+/// before the wait began, I2); this is the SECOND ack, reporting what became of it CONSUMER-side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmOutcome {
+    /// A consumer in the broker's designated group ACKED the record: the Level-2 produce is fully
+    /// confirmed (durable AND consumed), the success terminal.
+    Consumed,
+    /// No consumer acked the record within the broker's confirm window, so the broker timed the
+    /// confirmation out: it will never arrive. The record stayed durable (its `PubAck` was returned),
+    /// but its consumption is unconfirmed.
+    TimedOut,
+    /// The record was dead-lettered (poison / force-reaped) or the broker's bounded confirm registry
+    /// dropped the pending confirmation before any consumer acked it: the consumed confirmation can
+    /// never be satisfied. The record stayed durable; only its consumed-confirmation is lost.
+    DeadLettered,
+    /// The CLIENT-side wait elapsed before any terminal `ProduceConfirm` arrived (distinct from the
+    /// BROKER-side `TimedOut`: this is the local deadline the caller passed expiring). The record is
+    /// durable; the caller may keep using the connection and a later confirmation, if any, will arrive
+    /// on a subsequent pass. Carries the durable offset so the caller can correlate or re-await.
+    LocalTimeout,
+    /// The broker sent a confirmation `status` byte this client build does not recognize (a forward-
+    /// compatible future status). The record is durable; the specific consumer-side outcome is unknown
+    /// to this build. Carries the raw status byte.
+    Unknown(u8),
+}
+
+/// A Level-2 produce confirmation (#497): the durable `offset` (the same one the durability `PubAck`
+/// returned) plus its terminal [`ConfirmOutcome`]. Returned by [`Client::produce_confirmed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProduceConfirmation {
+    /// The durable offset the confirmation is keyed to.
+    pub offset: u64,
+    /// What became of the record consumer-side (consumed / timed-out / dead-lettered / local-timeout).
+    pub outcome: ConfirmOutcome,
+}
+
 /// The outcome of a [`Client::progress`] call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProgressOutcome {
@@ -423,6 +461,18 @@ fn with_ack_level_bits(flags: u8, level: AckLevel) -> u8 {
     (flags & !PUB_FLAG_ACK_LEVEL_MASK) | bits
 }
 
+/// Maps a wire `ProduceConfirm` status byte (#497) to a client [`ConfirmOutcome`]. An unknown future
+/// status decodes to [`ConfirmOutcome::Unknown`] (forward-compatible: the codec already tolerated it),
+/// never an error.
+fn confirm_outcome(status: u8) -> ConfirmOutcome {
+    match status {
+        produce_confirm_status::CONSUMED => ConfirmOutcome::Consumed,
+        produce_confirm_status::TIMED_OUT => ConfirmOutcome::TimedOut,
+        produce_confirm_status::DEAD_LETTERED => ConfirmOutcome::DeadLettered,
+        other => ConfirmOutcome::Unknown(other),
+    }
+}
+
 fn classify_pub_reply(ty: FrameType, body: &[u8]) -> Result<PubReply, ClientError> {
     match ty {
         FrameType::PubAck => {
@@ -519,6 +569,13 @@ pub struct Client {
     /// (an old server, or the client did not advertise), a skipped span arrives in
     /// [`Fetch::truncations`] as the legacy advisory.
     gap_marker_enabled: bool,
+    /// Level-2 `ProduceConfirm`s (#497) that arrived for an offset OTHER than the one a
+    /// [`Client::produce_confirmed`] call was awaiting, cached so a later call for that offset returns
+    /// without re-waiting. Bounded in practice by the number of in-flight L2 produces a single
+    /// half-duplex producer can have outstanding (it awaits each before issuing the next), so this
+    /// stays tiny; entries are removed on the matching call. Empty for any connection that never uses
+    /// `produce_confirmed`.
+    confirm_cache: Vec<(u64, ConfirmOutcome)>,
 }
 
 impl Client {
@@ -550,6 +607,7 @@ impl Client {
             negotiated_credit: None,
             negotiated_credit_bytes: None,
             gap_marker_enabled: false,
+            confirm_cache: Vec::new(),
         };
         // The #292 handshake: send a versioned Connect body carrying any requested credit (an
         // all-absent body when the caller requested nothing, which the server reads as "use my
@@ -791,6 +849,143 @@ impl Client {
                 self.produce(&leveled).map(Some)
             }
         }
+    }
+
+    /// Produces a message at Level 2 (server+client ack, #497, part of #499) and AWAITS its
+    /// `ProduceConfirm`: the publish is confirmed only after a CONSUMER acks it, so this returns once
+    /// the record is BOTH durable AND consumed (or a terminal failure / the `timeout` elapses).
+    ///
+    /// TWO acks, in order:
+    /// 1. The DURABILITY ack: the publish goes out at Level 2 and this first awaits the `PubAck` after
+    ///    the covering group-commit fsync (I2), exactly like [`Client::produce`]. If this fails (a
+    ///    server `Err`, a transport error) the call returns that error and never reaches the wait.
+    /// 2. The CONSUMED ack: the broker registered the durable offset in its bounded confirm registry;
+    ///    when a consumer in the broker's designated group acks the record, the broker sends a
+    ///    server->producer `ProduceConfirm{offset, status}` frame, which this awaits (keyed by the
+    ///    offset the `PubAck` returned) up to `timeout`.
+    ///
+    /// ## How the wait works (and why it polls)
+    ///
+    /// The broker is a blocking, thread-per-connection, request-response server: it only writes a
+    /// connection's socket from THAT connection's own pass, so it cannot push a confirm to a producer
+    /// blocked in `read`. This call therefore DRIVES the broker to flush by interleaving lightweight
+    /// `Ping`s while it waits: each round sends a `Ping` and reads the frames the broker returns
+    /// (`Pong` plus any ready `ProduceConfirm`s for this connection), until the matching confirm
+    /// arrives or `timeout` elapses. A confirm for a DIFFERENT offset (an earlier L2 publish on the
+    /// same connection) is matched and CACHED so a later `produce_confirmed` for that offset returns it
+    /// without re-waiting. The poll keeps the await fully within the existing wire/threading contract:
+    /// no out-of-band push, no second socket, no new race.
+    ///
+    /// Returns a [`ProduceConfirmation`] carrying the durable `offset` and the terminal
+    /// [`ConfirmOutcome`] (`Consumed` / `TimedOut` / `DeadLettered` / `LocalTimeout` / `Unknown`). A
+    /// `LocalTimeout` means the local deadline elapsed first; the record is durable regardless, and the
+    /// connection stays usable.
+    ///
+    /// This is ADDITIVE and SEPARATE from [`Client::produce_with_ack_level`]: that method records the
+    /// Level-2 intent on the wire but returns at the durability ack (it does NOT await the consumer-ack
+    /// confirmation); this method is the one that awaits the `ProduceConfirm`.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on a transport error, an over-large field, an unexpected frame, or a
+    /// server `Err` for the durability ack. A broker-side timeout / dead-letter is NOT an error: it is
+    /// reported as the corresponding [`ConfirmOutcome`].
+    pub fn produce_confirmed(
+        &mut self,
+        message: &PubBody<'_>,
+        timeout: Duration,
+    ) -> Result<ProduceConfirmation, ClientError> {
+        // Step 1 — the durability ack. Send at Level 2 (the ack-level field on the wire) and await the
+        // PubAck, exactly like `produce`. `produce` forces the faf bit clear, so this is at-least-once.
+        let leveled = PubBody {
+            flags: with_ack_level_bits(message.flags, AckLevel::ServerAndClientAck),
+            ..*message
+        };
+        let offset = self.produce(&leveled)?;
+        // A confirm for THIS offset may already be cached from an earlier round (a prior
+        // `produce_confirmed` drained it while waiting on a different offset). Serve it without waiting.
+        if let Some(outcome) = self.take_cached_confirm(offset) {
+            return Ok(ProduceConfirmation { offset, outcome });
+        }
+        // Step 2 — the consumed ack. Poll for the matching `ProduceConfirm` within the deadline,
+        // driving broker passes with Pings.
+        let outcome = self.await_produce_confirm(offset, timeout)?;
+        Ok(ProduceConfirmation { offset, outcome })
+    }
+
+    /// Awaits the `ProduceConfirm` for `offset` up to `timeout` (#497), driving broker passes with
+    /// `Ping`s (see [`Client::produce_confirmed`]). Returns the terminal [`ConfirmOutcome`], or
+    /// `LocalTimeout` if the deadline elapses first. A `ProduceConfirm` for a DIFFERENT offset is
+    /// cached for a later `produce_confirmed`. A read that times out (the connection read timeout) is
+    /// treated as "no confirm this round" while the deadline has not passed.
+    fn await_produce_confirm(
+        &mut self,
+        offset: u64,
+        timeout: Duration,
+    ) -> Result<ConfirmOutcome, ClientError> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            // Drive a broker pass: a Ping makes the connection do a `process` pass, which flushes any
+            // ready ProduceConfirms for this connection alongside the Pong.
+            self.send(FrameType::Ping, &[])?;
+            // Read frames until this round yields the Pong boundary (every ready confirm precedes or
+            // accompanies it in the same flush), the matching confirm arrives, or the read times out.
+            loop {
+                match self.read_frame_or_timeout()? {
+                    Some((FrameType::ProduceConfirm, body)) => {
+                        let confirm = decode_produce_confirm(&body).map_err(|_| {
+                            ClientError::BadResponse("produce-confirm body was not nine bytes")
+                        })?;
+                        let outcome = confirm_outcome(confirm.status);
+                        if confirm.offset == offset {
+                            return Ok(outcome);
+                        }
+                        // A confirm for an earlier L2 publish on this connection: cache it so a later
+                        // `produce_confirmed` for that offset returns without re-waiting.
+                        self.confirm_cache.push((confirm.offset, outcome));
+                    }
+                    // Two round-ending cases, same action (stop reading, re-check the deadline,
+                    // re-Ping): `None` is a read timeout with no frame, and `Pong` is this round's
+                    // flush boundary (every ready confirm precedes or accompanies it in the same flush).
+                    None | Some((FrameType::Pong, _)) => break,
+                    // An Err for a Ping is not expected; surface it. Any other frame (e.g. a stray
+                    // Deliver on a mixed producer/consumer connection) is not what this wait is for.
+                    Some((FrameType::Err, body)) => {
+                        return Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+                    }
+                    Some((other, _)) => return Err(ClientError::Unexpected(other)),
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(ConfirmOutcome::LocalTimeout);
+            }
+        }
+    }
+
+    /// Reads one frame, returning `Ok(None)` if the connection read TIMED OUT (the OS read timeout
+    /// elapsed) rather than propagating it as an error (#497): the confirm-await poll treats a timed-out
+    /// read as "no confirm yet this round". A genuine close or malformed frame still errors.
+    fn read_frame_or_timeout(&mut self) -> Result<Option<(FrameType, Vec<u8>)>, ClientError> {
+        match self.read_frame() {
+            Ok(frame) => Ok(Some(frame)),
+            // A read timeout surfaces as a `WouldBlock`/`TimedOut` IO error on a blocking socket with a
+            // read timeout set; that is "no data yet", not a fatal error, during the bounded poll.
+            Err(ClientError::Io(e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Removes and returns a cached `ProduceConfirm` outcome for `offset` if one arrived on an earlier
+    /// round (#497), else `None`.
+    fn take_cached_confirm(&mut self, offset: u64) -> Option<ConfirmOutcome> {
+        let pos = self.confirm_cache.iter().position(|&(o, _)| o == offset)?;
+        Some(self.confirm_cache.swap_remove(pos).1)
     }
 
     /// Produces a WINDOW of messages PIPELINED (#450): every `Pub` frame is written before any
@@ -2157,6 +2352,91 @@ mod tests {
         assert_eq!(messages[0].payload, b"l0");
         assert_eq!(messages[1].payload, b"l1");
         assert_eq!(messages[2].payload, b"l2");
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn produce_confirmed_returns_consumed_once_a_consumer_acks_against_a_real_server() {
+        // #497 end-to-end against the REAL wire server: a producer calls `produce_confirmed` (send L2,
+        // await the durability PubAck, then poll for the ProduceConfirm). A SEPARATE consumer thread
+        // fetches the record and acks it, which fires the server->producer Consumed confirm. The
+        // producer's call returns `Consumed` keyed to the produced offset.
+        let (addr, shutdown, handle) = start_server();
+        let mut producer = Client::connect(addr).unwrap();
+
+        // The consumer runs on its own thread: it fetches the one record and acks it (in the default
+        // group, the broker's designated confirm group), which is what fires the producer's confirm.
+        let consumer = std::thread::spawn({
+            move || {
+                let mut c = Client::connect(addr).unwrap();
+                // Retry the fetch until the record is visible (the producer's L2 publish lands first).
+                loop {
+                    let messages = c.fetch(10).unwrap().messages;
+                    if let Some(m) = messages.first() {
+                        assert!(c.ack(m.offset, m.generation).unwrap());
+                        return m.offset;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        });
+
+        let body = PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: b"l2-confirmed",
+        };
+        let confirmation = producer
+            .produce_confirmed(&body, Duration::from_secs(5))
+            .unwrap();
+        let acked_offset = consumer.join().unwrap();
+        assert_eq!(
+            confirmation.offset, acked_offset,
+            "the confirm is keyed to the produced offset"
+        );
+        assert_eq!(
+            confirmation.outcome,
+            ConfirmOutcome::Consumed,
+            "a consumer ack confirms the L2 produce as consumed"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn produce_confirmed_reports_local_timeout_when_no_consumer_acks() {
+        // #497: with no consumer ever acking, `produce_confirmed` returns `LocalTimeout` once the
+        // caller's deadline elapses (the record stayed durable; only its consumed-confirmation is
+        // pending). The broker-side TTL is far longer than this local deadline, so the LOCAL deadline
+        // is what fires here, exactly as documented.
+        let (addr, shutdown, handle) = start_server();
+        let mut producer = Client::connect(addr).unwrap();
+        let body = PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: b"unconfirmed",
+        };
+        let confirmation = producer
+            .produce_confirmed(&body, Duration::from_millis(150))
+            .unwrap();
+        assert_eq!(
+            confirmation.outcome,
+            ConfirmOutcome::LocalTimeout,
+            "no consumer acked within the local deadline"
+        );
+        // The record is durable regardless: a fetch sees it.
+        assert_eq!(producer.fetch(10).unwrap().messages.len(), 1);
 
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();

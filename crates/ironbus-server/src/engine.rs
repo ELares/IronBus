@@ -26,6 +26,7 @@ use ironbus_core::clock::Clock;
 use ironbus_core::compress::{
     compress_payload, Codec, CompressConfig, DEFAULT_MAX_DECOMPRESSED_BYTES,
 };
+use ironbus_core::confirm::{ConfirmConfig, ConfirmRegistry, ConfirmStatus, ReadyConfirm};
 use ironbus_core::cursor::AckCursor;
 use ironbus_core::delivery::{DeliveryConfig, Disposition};
 use ironbus_core::keyshared::{KeyOrdering, KeyRouter, MemberId, RouteDecision};
@@ -1833,6 +1834,26 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// ([`Engine::append_no_sync`]); a `Codec::None` codec makes the seam a pass-through, so the
     /// historical broker is byte-for-byte unchanged.
     compress: CompressConfig<'static>,
+    /// The bounded Level-2 produce-confirm registry (#497, part of #499): the per-offset map keying a
+    /// producer's awaited `ProduceConfirm` to the durable offset and the producer connection. EMPTY
+    /// until a producer publishes at Level 2 (`AckLevel::ServerAndClientAck`), so a broker no producer
+    /// uses Level 2 on pays nothing here. A Level-2 produce registers its durable offset
+    /// ([`Engine::register_l2_confirm`]) AFTER its Level-1 `PubAck` (the record is durable first, I2);
+    /// when the DESIGNATED group's committed cursor advances past that offset (the cursor-commit hook
+    /// in [`Engine::ack_in`] / [`Engine::cumulative_ack_in`]) a `Consumed` confirm fires; a
+    /// dead-letter / force-reap before any ack fires a `DeadLettered` confirm; the idle/retention tick
+    /// sweeps a confirm no consumer acks within the TTL to `TimedOut`; a producer disconnect drops its
+    /// entries. HARD-bounded (a max pending count AND a TTL), so a slow or absent consumer can never
+    /// grow it without bound (the same threat class as the dedup window cap).
+    confirm_registry: ConfirmRegistry,
+    /// The name of the ONE designated consumer group whose ack confirms a Level-2 produce (#497).
+    /// "Consumed" is ambiguous across the many groups a record is delivered to, so the confirm is
+    /// keyed to a SINGLE group: the default group (`""`, the wire's unnamed group) unless an operator
+    /// names another, exactly the group whose cursor-commit the engine hooks. Keyed to ONE group (not
+    /// "any group", which is non-deterministic, nor "all groups", which is unbounded). The engine
+    /// fires `Consumed` only when THIS group's cursor advances; an ack in any other group is ignored
+    /// by the confirm path (its own delivery and acking are unaffected).
+    confirm_group: String,
 }
 
 /// The file name of the work-group's durable committed-cursor checkpoint.
@@ -2059,6 +2080,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // The #430 write-path compression seam; `Codec::None` makes it a pass-through,
             // so the disk image is byte-for-byte historical.
             compress: compress_config(config.compression),
+            // The bounded Level-2 produce-confirm registry (#497), at its default cap + TTL. Empty
+            // until a producer publishes at Level 2, so a no-L2 broker pays nothing. NOT a new
+            // `EngineConfig` field (the registry is self-bounded by internal defaults); a knob can be
+            // threaded later without touching every config construction site.
+            confirm_registry: ConfirmRegistry::new(ConfirmConfig::default()),
+            // The designated group whose ack confirms a Level-2 produce (#497): the default/unnamed
+            // group, which every plain producer/consumer uses. An operator can redesignate it via
+            // `set_confirm_group` server-side (NOT on the wire).
+            confirm_group: DEFAULT_GROUP.to_string(),
         };
         engine.seed_registry_from_recovered_state(flushed);
         Ok(engine)
@@ -3224,6 +3254,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // here therefore reclaims only groups that were already idle AND caught up before this batch.
         let now = self.log.now_monotonic();
         self.sweep_idle_groups(now)?;
+        // The Level-2 confirm-timeout sweep (#497): on the SAME produce/group-commit tick, time out
+        // any pending L2 confirm no consumer has acked within the registry TTL, so a slow or absent
+        // consumer cannot pin a confirm (or grow the registry) forever. A no-op unless the TTL is set
+        // AND an L2 confirm is outstanding, so a no-L2 broker is unaffected. It rides this existing
+        // tick rather than a new timer, and runs regardless of the idle-eviction window so the TTL
+        // bound holds even when group idle-eviction is disabled.
+        self.sweep_l2_confirm_timeouts();
         Ok(())
     }
 
@@ -3419,6 +3456,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                         self.counters.segments_force_reaped =
                             self.counters.segments_force_reaped.saturating_add(1);
                         forced_this_pass = true;
+                        // The Level-2 force-reap terminal (#497): the forced drop-oldest just deleted
+                        // the oldest sealed segment out from under any slow consumer, so a record
+                        // below the NEW earliest-retained offset can never be consumed (acked) by the
+                        // designated group. Fire a `DeadLettered` `ProduceConfirm` for every pending
+                        // L2 confirm now below that floor, so the producer is not left awaiting a
+                        // confirm the broker has made impossible. A no-op unless an L2 confirm was
+                        // pending in the reaped span. Same threat class as the dead-letter terminal.
+                        let earliest = self.log.earliest_offset().get();
+                        self.terminate_confirms_below(earliest, ConfirmStatus::DeadLettered);
                     }
                     // Only the active segment remains: nothing left to free, so the wedge guard
                     // returns the rejection and `produce` sheds (drop-new fall-back).
@@ -3972,6 +4018,18 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.sync_consumer_lag(group, committed);
         self.counters.dead_lettered += 1;
         self.last_dead_lettered = Some(off);
+        // The Level-2 dead-letter terminal (#497): if the DESIGNATED confirm group dead-lettered this
+        // offset, its record can never be consumed (acked) by that group, so fire a `DeadLettered`
+        // `ProduceConfirm` instead of leaving the producer to wait out the whole TTL. A no-op unless
+        // an L2 confirm was actually pending for this offset in the designated group. The cursor
+        // commit above ALSO ran the per-offset `confirm_up_to` via no hook here on purpose: a
+        // dead-letter is NOT a consume, so it must surface a NON-success terminal, which `terminate`
+        // does. `terminate` removes the pending entry, so the later `confirm_designated_commit` paths
+        // can never double-fire it.
+        if group == self.confirm_group {
+            self.confirm_registry
+                .terminate(off, ConfirmStatus::DeadLettered);
+        }
         Ok(Poll::Parked {
             offset: off,
             record,
@@ -4522,6 +4580,82 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.poll_in_member(group, member, now)
     }
 
+    /// The name of the ONE designated group whose ack confirms a Level-2 produce (#497). Defaults to
+    /// the default/unnamed group; see [`Engine::set_confirm_group`].
+    #[must_use]
+    pub fn confirm_group(&self) -> &str {
+        &self.confirm_group
+    }
+
+    /// Redesignates the group whose ack confirms a Level-2 produce (#497), server-side (NOT on the
+    /// wire). The default is the default/unnamed group. Changing it does not retroactively re-key
+    /// already-pending confirms (they fire on the newly-designated group's commit going forward);
+    /// pending entries that the old group would have confirmed eventually time out, so the registry
+    /// stays bounded. Intended to be set once at serve time, like `set_broadcast_in`.
+    pub fn set_confirm_group(&mut self, group: &str) {
+        self.confirm_group = group.to_string();
+    }
+
+    /// Registers a Level-2 (server+client-ack) produce's DURABLE offset against the producer
+    /// connection awaiting its `ProduceConfirm` (#497). The caller (the session) invokes this AFTER
+    /// the record's Level-1 `PubAck` is determined, so the record is durable first (I2) and the
+    /// confirm wait is layered ON TOP of, never instead of, the durability ack. BOUNDED: a register at
+    /// the registry cap drop-oldests the eldest pending confirm (queued as a `Dropped` terminal for
+    /// its producer), so a slow or absent consumer can never grow the registry. `member` is the
+    /// producer connection's stable id (its `MemberId`).
+    pub fn register_l2_confirm(&mut self, offset: Offset, member: MemberId) {
+        let now = self.log.now_monotonic();
+        self.confirm_registry.register(offset, member.get(), now);
+    }
+
+    /// Drains every READY `ProduceConfirm` terminal for the producer connection `member` (#497), in
+    /// FIFO order, so the session can write them to that producer on its own pass. Other producers'
+    /// ready terminals are left in place. Returns the drained terminals (possibly empty); the common
+    /// no-L2 case returns an empty `Vec` without touching the registry's internals.
+    pub fn drain_l2_confirms(&mut self, member: MemberId) -> Vec<ReadyConfirm> {
+        self.confirm_registry.drain_ready_for(member.get())
+    }
+
+    /// Drops every Level-2 confirm entry (pending AND ready) for a producer connection that has
+    /// disconnected (#497): nobody is waiting, so no terminal is produced and the registry is bounded
+    /// against a producer that opens L2 produces then vanishes. Called from the connection cleanup
+    /// path on every exit, like the `key_shared` leave and the subscription deregister.
+    pub fn drop_l2_confirms(&mut self, member: MemberId) {
+        self.confirm_registry.drop_member(member.get());
+    }
+
+    /// Fires a `Consumed` `ProduceConfirm` for every pending Level-2 confirm below `committed`, but
+    /// ONLY when `group` is the designated confirm group (#497). This is the cursor-commit hook: every
+    /// site that advances a group's `AckCursor` (an ack, a cumulative ack) calls it AFTER the advance,
+    /// passing the group's fresh committed watermark, so a confirm fires exactly when the record it
+    /// keys becomes consumed by the designated group. An ack in any OTHER group is ignored here (its
+    /// own delivery/acking is unaffected), keeping "consumed" well-defined and the hook a pure,
+    /// additive overlay on the unchanged consume/ack path.
+    fn confirm_designated_commit(&mut self, group: &str, committed: u64) {
+        if group == self.confirm_group {
+            self.confirm_registry.confirm_up_to(Offset::new(committed));
+        }
+    }
+
+    /// Terminates every pending Level-2 confirm below `floor` with `status` (#497): the disk-full
+    /// force-reap path uses it to surface a `DeadLettered` terminal for every confirm whose record was
+    /// force-reaped out from under every consumer. Group-agnostic on purpose: a force-reap deletes the
+    /// record for ALL groups, so a confirm keyed to the designated group below the new floor is
+    /// unsatisfiable regardless. A no-op unless a confirm is pending in the reaped span.
+    fn terminate_confirms_below(&mut self, floor: u64, status: ConfirmStatus) {
+        self.confirm_registry
+            .terminate_below(Offset::new(floor), status);
+    }
+
+    /// Sweeps every pending Level-2 confirm older than the registry TTL to a `TimedOut` terminal
+    /// (#497), the "no consumer ever acks" failure mode. Driven from the existing idle/retention tick
+    /// ([`Engine::sweep_idle_groups`]), so it adds no new timer; a no-op when the TTL is disabled or no
+    /// L2 confirm is outstanding. Reads the clock seam for `now`.
+    fn sweep_l2_confirm_timeouts(&mut self) {
+        let now = self.log.now_monotonic();
+        self.confirm_registry.sweep_timed_out(now);
+    }
+
     /// Pushes `group`'s current committed offset (a record count) to the metric registry's
     /// per-consumer lag series (#97), so the scrape reads `head - committed` without ever walking
     /// the log. Called at EVERY committed-advancing site (ack, dead-letter commit, below-earliest
@@ -4568,6 +4702,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 // without ever walking the log. Read it before the borrow ends.
                 let committed = g.cursor.committed().get();
                 self.sync_consumer_lag(group, committed);
+                // The Level-2 cursor-commit hook (#497): if THIS is the designated confirm group and
+                // its watermark just advanced past a pending L2 produce, fire its `Consumed`
+                // `ProduceConfirm`. ADDITIVE — a no-op unless `group` is the designated group AND a
+                // confirm is pending below the new watermark, so the consume/ack path is otherwise
+                // byte-for-byte unchanged. The `g` borrow has ended (`sync_consumer_lag` above took
+                // `&mut self`), so this re-borrows `self` safely.
+                self.confirm_designated_commit(group, committed);
                 AckResult::Acked
             }
             AckOutcome::Fenced => AckResult::Fenced,
@@ -4651,6 +4792,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // (`leases.ack`); this is the bulk equivalent, and idempotent on a re-ack (nothing remains
         // leased below an already-committed `up_to`).
         g.leases.release_below(up_to);
+        // Capture the watermark before the borrow ends, then fire the Level-2 cursor-commit hook
+        // (#497) once `g` is released. A broadcast group can be the designated confirm group, so a
+        // bulk cumulative ack confirms every pending L2 produce below the new watermark in one move,
+        // exactly as a sequence of per-message acks would. ADDITIVE: a no-op unless this is the
+        // designated group with confirms pending.
+        let committed = g.cursor.committed().get();
+        self.confirm_designated_commit(group, committed);
         Ok(())
     }
 
@@ -8465,6 +8613,47 @@ mod tests {
             e.durable_record_bytes(),
             5 * one
         );
+    }
+
+    #[test]
+    fn force_reaping_an_l2_records_segment_dead_letters_its_pending_confirm() {
+        // #497: an L2 produce at offset 0 registers a pending confirm. If the disk-full drop-oldest
+        // policy FORCE-reaps the oldest segment (deleting offset 0 out from under every consumer)
+        // before any consumer acked it, the pending confirm can never be satisfied, so a DEAD_LETTERED
+        // terminal fires to the producer instead of leaving it waiting out the whole TTL.
+        let one = one_record_bytes();
+        let mut e = open(config_disk_full(4 * one, DiskFullPolicy::DropOldest));
+        let producer = MemberId::new(42);
+
+        // The first record (offset 0) is an L2 produce: register its pending confirm.
+        produce(&mut e, &[0xab; 16]);
+        e.register_l2_confirm(Offset::new(0), producer);
+        assert_eq!(
+            e.drain_l2_confirms(producer).len(),
+            0,
+            "no terminal yet (nothing reaped)"
+        );
+
+        // A fast producer fills past the cap; drop-oldest force-reaps segment 0 (offset 0 is gone).
+        for _ in 0..20 {
+            e.produce(&Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: &[0xab; 16],
+            })
+            .expect("drop-oldest accepts the produce");
+        }
+        assert!(
+            e.earliest_retained_offset().get() > 0,
+            "offset 0 was force-reaped"
+        );
+        // The producer's pending confirm for the reaped offset became a DEAD_LETTERED terminal.
+        let ready = e.drain_l2_confirms(producer);
+        assert_eq!(ready.len(), 1, "exactly one terminal for the reaped offset");
+        assert_eq!(ready[0].offset, 0);
+        assert_eq!(ready[0].status, ConfirmStatus::DeadLettered);
     }
 
     #[test]
