@@ -20,13 +20,15 @@ use std::collections::BTreeSet;
 use ironbus_core::subject::{Subject, SubjectPattern, MAX_SUBJECT_DEPTH};
 use ironbus_core::sublist::{Sublist, SublistBuilder, SublistSnapshot};
 
-/// Build a trie at generation 0 from `(pattern, target)` pairs.
+/// Build a trie at generation 0 from `(pattern, target)` pairs. The differential test sets
+/// are small/shallow, so their worst-case fork frontier is far under [`MAX_FORK_FRONTIER`]
+/// and the fail-closed build always succeeds here.
 fn build(entries: &[(&str, u32)]) -> Sublist<u32> {
     let mut b = SublistBuilder::new();
     for (p, t) in entries {
         b.insert(p, *t).expect("valid test pattern");
     }
-    b.build(0)
+    b.build(0).expect("differential test set within fork bound")
 }
 
 /// The authoritative reference: every target whose #567 pattern matches `subject`, as a

@@ -40,7 +40,10 @@ fn table(n: usize) -> Sublist<u32> {
     }
     // One global catch-all so every subject has at least one match.
     b.insert(">", u32::MAX).expect("valid catch-all");
-    b.build(0)
+    // Distinct `t<i>` prefixes are mutually exclusive at the root, so the worst-case fork
+    // frontier stays tiny (a single prefix's `*` fork) regardless of `n`; the fail-closed
+    // build is always within MAX_FORK_FRONTIER here.
+    b.build(0).expect("bench table within fork bound")
 }
 
 /// `match()` throughput as the routing table grows: a literal hit, a `*` hit, and a `>`

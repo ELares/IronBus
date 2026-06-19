@@ -66,13 +66,14 @@
 //! `std::{io,fs,net,os,process}` and async runtimes, none of which appear here, and the
 //! `cargo tree` half forbids async-runtime crates, which `arc-swap` is not).
 
+use core::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::subject::{Subject, SubjectPattern};
+use crate::subject::{Subject, SubjectError, SubjectPattern};
 
 /// An index into the arena's node vector. `u32` keeps a node compact and the whole arena
 /// addressable up to `u32::MAX` nodes, far beyond any real routing table.
@@ -87,17 +88,83 @@ const ROOT: NodeId = 0;
 /// This is the bound that replaces NATS's exponential pwc recursion. At each subject
 /// token the frontier can branch (a literal child *and* the `*` child both match), so an
 /// unbounded frontier could in principle grow like `2^depth`. We deduplicate the frontier
-/// (a node is visited at most once per level) and cap it at this constant, which makes the
-/// per-match work provably `O(depth × MAX_FORK_FRONTIER × log F)` where `depth` is at most
+/// (a node is visited at most once per level) so its size is provably
+/// `O(MAX_FORK_FRONTIER)`, which makes the per-match work
+/// `O(depth × MAX_FORK_FRONTIER × log F)` where `depth` is at most
 /// [`MAX_SUBJECT_DEPTH`](crate::subject::MAX_SUBJECT_DEPTH) and `F` is a node's literal
 /// fan-out searched by binary search.
+///
+/// # Why the cap is enforced at BUILD time, not at match time (#568 fail-closed)
+///
+/// This cap is **fail-closed at ingest**: [`SublistBuilder::build`] computes the exact
+/// worst-case simultaneously-live frontier the registered pattern *set* can ever produce
+/// (see [`worst_case_frontier`]) and REJECTS the whole table with
+/// [`SublistError::ForkLimitExceeded`] if it could exceed this cap. A built [`Sublist`]
+/// therefore can NEVER need to drop a node at match time, so [`Sublist::match_into`] is
+/// **provably complete**: it returns *every* matching target, always. Were the cap merely
+/// applied at match time it would have to silently omit a matching subscriber under a
+/// pathological pattern set — a silent message loss that violates IronBus's
+/// never-silently-drop tenet (I3), the very property IronBus cites against NATS. We make
+/// the bound a typed rejection of the offending *subscription set* instead, the same
+/// fail-closed-at-ingest posture as the #567 subject grammar.
 ///
 /// The cap is generous: a frontier only grows when *distinct* trie nodes are
 /// simultaneously live, which requires that many genuinely overlapping registered
 /// patterns at the same depth. `1024` mirrors NATS's own `slCacheMax` so the comparison is
-/// like-for-like — but here it is a fork bound on a wait-free walk, not a shared cache
-/// that a wildcard unsub must linear-scan under a write lock.
+/// like-for-like — but here it is a build-time admission bound on a wait-free,
+/// provably-complete walk, not a shared cache that a wildcard unsub must linear-scan under
+/// a write lock (and not a match-time truncation that could silently drop a match).
 pub const MAX_FORK_FRONTIER: usize = 1024;
+
+/// Why a [`SublistBuilder::build`] was rejected.
+///
+/// The trie is fail-closed at ingest, mirroring the #567 subject grammar: a pattern set
+/// that cannot be served with a *provably complete* `match()` is refused at build time
+/// rather than admitted and silently truncated at match time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SublistError {
+    /// A registered pattern was not a valid #567 subject pattern. Carries the underlying
+    /// [`SubjectError`]. (Surfaced by [`SublistBuilder::build`] only if a stored pattern
+    /// fails to re-parse; [`SublistBuilder::insert`] already rejects an invalid pattern
+    /// at insert time with the same typed reason.)
+    InvalidPattern(SubjectError),
+    /// The accepted pattern *set* would make the worst-case simultaneously-live wildcard
+    /// match frontier exceed [`MAX_FORK_FRONTIER`]. Accepting it would force
+    /// [`Sublist::match_into`] to drop a live node — and therefore silently omit a
+    /// matching target — under some published subject. To preserve the never-silently-drop
+    /// tenet (I3) and keep `match()` provably complete, the whole table is rejected here
+    /// instead. `worst_case` is the computed worst-case frontier; `limit` is the cap it
+    /// exceeded.
+    ForkLimitExceeded {
+        /// The computed worst-case simultaneously-live frontier of the pattern set.
+        worst_case: usize,
+        /// The cap it exceeded ([`MAX_FORK_FRONTIER`]).
+        limit: usize,
+    },
+}
+
+impl fmt::Display for SublistError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SublistError::InvalidPattern(e) => write!(f, "invalid subject pattern: {e}"),
+            SublistError::ForkLimitExceeded { worst_case, limit } => write!(
+                f,
+                "pattern set's worst-case wildcard fork frontier is {worst_case}, exceeding \
+                 the cap of {limit}; the set is rejected so match() can never silently drop \
+                 a matching target"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SublistError {}
+
+impl From<SubjectError> for SublistError {
+    fn from(e: SubjectError) -> SublistError {
+        SublistError::InvalidPattern(e)
+    }
+}
 
 /// One arena node: a position in the token-trie reached by some token prefix.
 ///
@@ -181,14 +248,30 @@ impl<T: Clone> SublistBuilder<T> {
     /// creating arena nodes on demand and appending its target to the matched terminal.
     /// The per-node literal lists are sorted once at the end so reads can binary-search.
     ///
+    /// # Fail-closed fork bound (#568)
+    ///
+    /// Before returning, `build` computes the exact worst-case simultaneously-live wildcard
+    /// match frontier the accepted pattern *set* can ever produce (see
+    /// [`worst_case_frontier`]). If that worst case could exceed [`MAX_FORK_FRONTIER`], the
+    /// whole table is REJECTED with [`SublistError::ForkLimitExceeded`] rather than admitted
+    /// and silently truncated at match time. A successfully built [`Sublist`] therefore can
+    /// never need to drop a frontier node, so [`Sublist::match_into`] is *provably
+    /// complete* — it preserves the never-silently-drop tenet (I3). This is the same
+    /// fail-closed-at-ingest posture as the #567 grammar.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SublistError::ForkLimitExceeded`] if the pattern set's worst-case fork
+    /// frontier would exceed [`MAX_FORK_FRONTIER`], or [`SublistError::InvalidPattern`] in
+    /// the (API-internal) case that a stored, previously-validated pattern fails to
+    /// re-parse.
+    ///
     /// # Panics
     ///
     /// Panics only on internal-invariant violations that cannot occur for a builder used
-    /// through its public API: if a stored pattern (already validated by [`Self::insert`])
-    /// fails to re-parse, or if the arena/target table would exceed `u32::MAX` entries
+    /// through its public API: if the arena/target table would exceed `u32::MAX` entries
     /// (far beyond any real routing table).
-    #[must_use]
-    pub fn build(&self, generation: u64) -> Sublist<T> {
+    pub fn build(&self, generation: u64) -> Result<Sublist<T>, SublistError> {
         // The arena starts with the root. Literal children are accumulated unsorted (as a
         // scratch map keyed by hash) then frozen sorted.
         let mut nodes: Vec<NodeScratch> = vec![NodeScratch::new()];
@@ -198,10 +281,11 @@ impl<T: Clone> SublistBuilder<T> {
         let mut gt_terminals: Vec<Vec<T>> = vec![Vec::new()];
 
         for (pattern, target) in &self.entries {
-            // Re-parse the stored (already-validated) pattern; `expect` is sound because
-            // `insert` only ever stored strings that parsed.
-            let pat = SubjectPattern::parse(pattern)
-                .expect("a registered pattern was validated by insert()");
+            // Re-parse the stored (already-validated) pattern. `insert` only ever stored
+            // strings that parsed, so this cannot fail through the public API; if it
+            // somehow did, surface it as a typed error rather than ever building a trie
+            // that silently disagrees with the grammar.
+            let pat = SubjectPattern::parse(pattern)?;
 
             let mut cur: NodeId = ROOT;
             let mut placed_gt = false;
@@ -251,12 +335,100 @@ impl<T: Clone> SublistBuilder<T> {
             });
         }
 
-        Sublist {
+        // Fail-closed fork bound: if the accepted pattern SET could ever drive the
+        // simultaneously-live match frontier past the cap, refuse the whole table now so
+        // match() can never silently drop a matching target (I3). A successful build
+        // guarantees `match_into` is provably complete.
+        let worst_case = worst_case_frontier(&final_nodes);
+        if worst_case > MAX_FORK_FRONTIER {
+            return Err(SublistError::ForkLimitExceeded {
+                worst_case,
+                limit: MAX_FORK_FRONTIER,
+            });
+        }
+
+        Ok(Sublist {
             nodes: final_nodes,
             targets,
             generation,
-        }
+        })
     }
+}
+
+/// Computes the exact worst-case simultaneously-live match frontier of a built arena: the
+/// maximum number of distinct trie nodes [`Sublist::match_into`] can hold live at any one
+/// subject depth, over *every* possible published subject.
+///
+/// # Why this is a sound (never-under-counting) bound, and why it is tight
+///
+/// `match_into` advances a frontier one subject token at a time; at each step *all* live
+/// nodes consume the **same** token. A live node `v` contributes to the next frontier:
+///
+/// * its `*` child (`star_child`), which always matches the token, AND
+/// * at most ONE literal child — the one whose token-hash equals the (single, shared)
+///   token's hash.
+///
+/// Two crucial structural facts follow:
+///
+/// 1. **Distinct literal children of the same node are mutually exclusive.** Reaching one
+///    requires the shared token to equal *its* token; a different literal sibling needs a
+///    different token. So they can never be co-live — we take the `max` over a node's
+///    literal children, never their sum. This is what keeps a wide, distinct-prefix table
+///    (e.g. `t0.…`, `t1.…`, … thousands of disjoint prefixes) at a frontier of ~1, exactly
+///    as it behaves at run time, rather than over-rejecting it.
+/// 2. **The only way two differently-keyed nodes become co-live is a `*`/literal fork:** a
+///    parent with both a `*` child and a literal child puts *both* on the frontier for the
+///    one token that hits that literal. So a node's worst-case live count is the live count
+///    of its `*` subtree PLUS the live count of its best literal subtree (added because both
+///    survive that single token); for a node with only a `*` child, or only literal
+///    children, the branches are mutually exclusive and we take the larger.
+///
+/// `wcf(v)` below is exactly that recurrence: the maximum, over all depths at-or-below
+/// `v`, of the number of nodes co-live in a walk whose frontier is exactly `{v}` at `v`'s
+/// depth. At `v`'s own depth that count is 1; deeper, when `v` forks on `*`+literal, the
+/// peak is the `*` subtree's peak PLUS the best literal subtree's peak (both survive the one
+/// shared token), otherwise the larger of the two mutually-exclusive branches. It
+/// over-approximates only by assuming the `*` subtree and the chosen literal subtree peak at
+/// the *same* relative depth (it adds their independent maxima), which can only make the
+/// bound LARGER than any real frontier — never smaller. Hence
+/// `wcf(root) >= max over subjects of |frontier|`, so a build that passes
+/// (`wcf(root) <= MAX_FORK_FRONTIER`) guarantees the run-time frontier never reaches the cap
+/// and [`push_unique_capped`] can never drop a node: `match()` is provably complete.
+///
+/// It is `O(nodes)`: a single bottom-up pass. A child is allocated by `new_node` only after
+/// its parent already exists, so every child has a strictly larger [`NodeId`] than its
+/// parent; iterating ids in DESCENDING order therefore computes every child before its
+/// parent without recursion. `gt_terminal`s do not branch the frontier (they are harvested
+/// in place, never pushed), so they do not enter this count.
+fn worst_case_frontier(nodes: &[Node]) -> usize {
+    let mut wcf = vec![0usize; nodes.len()];
+    for id in (0..nodes.len()).rev() {
+        let node = &nodes[id];
+        // Best (largest) peak among the mutually-exclusive literal children: a single shared
+        // token can descend into at most ONE of them, so they never co-exist — take the max,
+        // never the sum.
+        let best_literal = node
+            .literals
+            .iter()
+            .map(|&(_, child)| wcf[child as usize])
+            .max()
+            .unwrap_or(0);
+        // The `*` subtree's peak (0 if there is no `*` child).
+        let star = node.star_child.map_or(0, |c| wcf[c as usize]);
+        // The peak contributed by descending past `v`: when `v` forks on `*` AND a literal,
+        // the one token that hits that literal keeps BOTH branches live, so their peaks add;
+        // otherwise the branches are mutually exclusive and only the larger survives. The
+        // node itself is one live node (the `max(1, …)` floor covers a leaf with no
+        // children, and `star + best_literal >= 2` already dominates 1 when both fork).
+        let deeper = if star > 0 && best_literal > 0 {
+            star + best_literal
+        } else {
+            star.max(best_literal)
+        };
+        wcf[id] = deeper.max(1);
+    }
+    // The frontier starts at the root alone; `wcf[ROOT]` is the whole table's worst case.
+    wcf.first().copied().unwrap_or(1)
 }
 
 /// A mutable scratch node used only while building (literal children as a plain `Vec` of
@@ -445,15 +617,27 @@ impl<T: Clone> Sublist<T> {
     }
 }
 
-/// Pushes `id` onto `frontier` iff it is not already present and the frontier is below
-/// [`MAX_FORK_FRONTIER`]. The dedup keeps a node visited at most once per level (so the
-/// frontier can never exceed the live node count) and the cap makes the bound explicit
-/// even for a pathologically overlapping pattern set.
+/// Pushes `id` onto `frontier` iff it is not already present. The dedup keeps a node
+/// visited at most once per level, so the frontier never exceeds the live node count.
+///
+/// # The cap is a build-time guarantee, not a match-time truncation
+///
+/// [`SublistBuilder::build`] has already proven (via [`worst_case_frontier`]) that this
+/// trie's worst-case simultaneously-live frontier is `<= MAX_FORK_FRONTIER`, REJECTING any
+/// pattern set that could exceed it. So at match time the frontier can NEVER reach the cap,
+/// and this function never needs to drop a node: `match()` is provably complete and never
+/// silently omits a matching target (I3). The `debug_assert!` pins that invariant — if a
+/// future change ever lets the frontier reach the cap, a debug/test build fails LOUDLY here
+/// rather than silently dropping a match. (In release the dedup alone keeps the push
+/// correct and bounded; it simply never fires because the build guarantee holds.)
 #[inline]
 fn push_unique_capped(frontier: &mut Vec<NodeId>, id: NodeId) {
-    if frontier.len() >= MAX_FORK_FRONTIER {
-        return;
-    }
+    debug_assert!(
+        frontier.len() < MAX_FORK_FRONTIER,
+        "match frontier reached MAX_FORK_FRONTIER ({MAX_FORK_FRONTIER}); \
+         SublistBuilder::build was supposed to have rejected this pattern set — \
+         a silent match-drop was about to happen"
+    );
     if !frontier.contains(&id) {
         frontier.push(id);
     }
@@ -487,9 +671,22 @@ impl<T: Clone> SublistSnapshot<T> {
 
     /// Creates a snapshot holding an EMPTY routing table (generation 0): matches nothing
     /// until a table is stored.
+    ///
+    /// # Panics
+    ///
+    /// Never panics in practice: an empty builder registers no patterns, so its worst-case
+    /// fork frontier is 1 (the root alone) — far under [`MAX_FORK_FRONTIER`] — and the
+    /// fail-closed build cannot reject it. The `expect` guards only an impossible
+    /// internal-invariant violation.
     #[must_use]
     pub fn empty() -> SublistSnapshot<T> {
-        SublistSnapshot::new(SublistBuilder::<T>::new().build(0))
+        // An empty builder has no patterns, so its worst-case frontier is 1 (the root
+        // alone); the build cannot fail the fork bound.
+        SublistSnapshot::new(
+            SublistBuilder::<T>::new()
+                .build(0)
+                .expect("an empty routing table is always within the fork bound"),
+        )
     }
 
     /// Loads the current immutable trie. This is a wait-free `Arc` load; the returned guard
@@ -543,13 +740,14 @@ mod tests {
     use super::*;
     use crate::subject::{SubjectError, MAX_SUBJECT_DEPTH};
 
-    /// Build a trie from `(pattern, target)` pairs at generation 0.
+    /// Build a trie from `(pattern, target)` pairs at generation 0. Expects the set to be
+    /// within the fork bound (every set used by these unit tests is).
     fn build<T: Clone>(entries: &[(&str, T)]) -> Sublist<T> {
         let mut b = SublistBuilder::new();
         for (p, t) in entries {
             b.insert(p, t.clone()).expect("valid test pattern");
         }
-        b.build(0)
+        b.build(0).expect("test pattern set within fork bound")
     }
 
     /// Match a literal subject and return a sorted target vec for order-independent
@@ -774,7 +972,12 @@ mod tests {
         }
         // A pure-wildcard pattern that matches everything of depth >= 1.
         b.insert(">", 999_999u32).unwrap();
-        let trie = b.build(0);
+        // The 8 distinct literal prefixes are mutually exclusive at the root, so the
+        // worst-case frontier is tiny (one prefix subtree + the shared `*.*` path); the
+        // build is well within the fork bound.
+        let trie = b
+            .build(0)
+            .expect("8 disjoint-prefix patterns stay far under the fork bound");
 
         let s = Subject::parse_literal("t0.a.b.c.d").unwrap();
         let mut out = Vec::new();
@@ -805,5 +1008,103 @@ mod tests {
         let deep = vec!["a"; MAX_SUBJECT_DEPTH].join(".");
         let s = Subject::parse_literal(&deep).unwrap();
         assert_eq!(matches(&trie, s.as_str()), vec![1]);
+    }
+
+    // ---- fail-closed fork bound: never silently drop a match (#568) ----
+
+    /// Generates every pattern over the alphabet {`a`, `*`} of length `depth`, i.e. all
+    /// `2^depth` combinations. Against the literal subject `a.a.….a` (`depth` tokens) EVERY
+    /// one of these patterns matches, and at trie depth `k` each reachable node has BOTH an
+    /// `a` literal child and a `*` child — so the live match frontier doubles at every level
+    /// and reaches `2^depth`. This is the pathological frontier-blowup shape.
+    fn all_star_literal_combos(depth: usize) -> Vec<String> {
+        (0..(1usize << depth))
+            .map(|mask| {
+                (0..depth)
+                    .map(|k| if mask & (1 << k) == 0 { "a" } else { "*" })
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_rejects_pattern_set_exceeding_fork_bound() {
+        // depth 11 => 2048 patterns => worst-case frontier 2^11 = 2048 > MAX_FORK_FRONTIER
+        // (1024). The build MUST fail-closed with the typed error rather than admit a trie
+        // whose match() would have to silently drop a frontier node (and thus a matching
+        // target) under the subject `a.a.….a`.
+        let combos = all_star_literal_combos(11);
+        let mut b = SublistBuilder::new();
+        for (i, p) in combos.iter().enumerate() {
+            // Inserts SUCCEED — each pattern is individually valid #567 grammar; the bound
+            // is a property of the SET and is enforced at build time.
+            b.insert(p, u32::try_from(i).unwrap())
+                .expect("each combo is a valid pattern");
+        }
+        match b.build(0) {
+            Err(SublistError::ForkLimitExceeded { worst_case, limit }) => {
+                assert_eq!(limit, MAX_FORK_FRONTIER);
+                assert!(
+                    worst_case > MAX_FORK_FRONTIER,
+                    "reported worst_case {worst_case} must exceed the cap {MAX_FORK_FRONTIER}",
+                );
+                // The all-combos shape forces a frontier of exactly 2^11.
+                assert_eq!(worst_case, 1usize << 11);
+            }
+            other => panic!("expected ForkLimitExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_accepts_set_at_fork_bound_and_matches_completely() {
+        // depth 10 => 1024 patterns => worst-case frontier 2^10 = 1024 == MAX_FORK_FRONTIER.
+        // Exactly AT the cap must be ACCEPTED, and — the crux of fail-closed — the accepted
+        // trie must match COMPLETELY: against `a.a.….a` (10 tokens) every one of the 1024
+        // patterns matches, and match() must return ALL of them with NOTHING dropped.
+        let depth = 10;
+        let combos = all_star_literal_combos(depth);
+        assert_eq!(combos.len(), MAX_FORK_FRONTIER);
+
+        let mut b = SublistBuilder::new();
+        for (i, p) in combos.iter().enumerate() {
+            b.insert(p, u32::try_from(i).unwrap())
+                .expect("valid pattern");
+        }
+        let trie = b
+            .build(0)
+            .expect("a set whose worst-case frontier == the cap is accepted");
+
+        // Every combo pattern matches the all-`a` subject of the same depth, so the complete
+        // result is ALL 1024 targets — proving no silent drop at the boundary.
+        let subject = vec!["a"; depth].join(".");
+        let got = matches(&trie, &subject);
+        let expected: Vec<u32> = (0..u32::try_from(MAX_FORK_FRONTIER).unwrap()).collect();
+        assert_eq!(
+            got.len(),
+            MAX_FORK_FRONTIER,
+            "match() must return every one of the {MAX_FORK_FRONTIER} matching targets",
+        );
+        assert_eq!(got, expected, "match() at the fork bound is COMPLETE");
+    }
+
+    #[test]
+    fn worst_case_frontier_does_not_over_reject_wide_disjoint_prefixes() {
+        // A WIDE table of mutually-exclusive prefixes (no two co-live) must NOT be rejected:
+        // its run-time frontier is ~1 regardless of width. This guards the `max`-not-`sum`
+        // treatment of literal siblings (the property that keeps the bound tight, so a
+        // legitimate large routing table is admitted).
+        let mut b = SublistBuilder::new();
+        for i in 0..5000u32 {
+            // Each distinct first token is a disjoint root subtree; plus a `*` fork deeper.
+            b.insert(&format!("t{i}.svc.*.metric"), i)
+                .expect("valid pattern");
+        }
+        let trie = b
+            .build(0)
+            .expect("5000 disjoint-prefix patterns are within the fork bound");
+        // A subject under one prefix matches exactly that prefix's pattern — complete.
+        let got = matches(&trie, "t42.svc.anything.metric");
+        assert_eq!(got, vec![42u32]);
     }
 }
