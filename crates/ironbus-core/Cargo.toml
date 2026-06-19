@@ -21,6 +21,16 @@ default = []
 zstd = ["dep:zstd", "dep:blake3"]
 
 [dependencies]
+# Wait-free atomic `Arc` swap for the subject-routing trie snapshot (#568). `SublistSnapshot`
+# wraps the immutable built trie in an `ArcSwap` so a publish-side `match()` is a wait-free
+# `Arc` load + walk (no lock) and a bind change atomically swaps in a freshly-built trie. It is
+# pure Rust (no `links`, no C build script, no vendored crypto), `MIT OR Apache-2.0` (both already
+# on the deny.toml allow-list), and is NOT an async runtime, so it passes BOTH halves of the
+# ironbus-core IO-free gate (the `tools/io-free-check` AST walk forbids `std::{io,fs,net,os,process}`
+# and tokio/mio/async-std/smol — `arc-swap` and the `std::sync::{Arc,atomic}` it builds on are
+# none of those; the `cargo tree -e normal,build` half forbids only those async runtimes). Its MSRV
+# is well below the workspace 1.78 floor and its only optional dep (`serde`) is left disabled.
+arc-swap = { version = "1.7", default-features = false }
 crc32c = "0.6"
 xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
 # Pure-Rust LZ4, the default compression codec per ADR-0003 (#12, #139). The `safe-encode` +
@@ -80,4 +90,11 @@ harness = false
 # equivalent Arc<[u8]> freeze + refcounted slice handoff IronBus actually uses, vs a copy.
 [[bench]]
 name = "zero_copy_handoff"
+harness = false
+
+# Subject-routing trie (#568): match() throughput + scaling with pattern count, the wait-free
+# snapshot read, and the bind-change (rebuild + atomic swap) cost. Backs the "beats NATS Sublist"
+# claim. Run on demand via `cargo bench -p ironbus-core --bench sublist`.
+[[bench]]
+name = "sublist"
 harness = false
