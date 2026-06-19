@@ -249,6 +249,20 @@ pub struct Session {
     /// The per-consumer byte budget the client requested in its `Connect` body (#292), the byte-side
     /// companion to `requested_credit`. Same lazy-clamp fallback.
     requested_credit_bytes: Option<u64>,
+    /// The per-consumer AUTO-TUNING credit window (#552): the message-count flow-control window that
+    /// GROWS from the historical floor (64) toward the negotiated `credit_ceiling` as this consumer
+    /// keeps draining, and BACKS OFF under backpressure (a would-block at a near-full in-flight set, or
+    /// a nack). It reuses the egress [`ironbus_core::backpressure::CreditAutotuner`] (AIMD) so a
+    /// fast/loopback consumer fills the pipe instead of being pinned at 64/RTT (the #464/#532 floor),
+    /// while the byte budget (`credit_ceiling_bytes`) stays the FIRM RAM bound the count grows UNDER.
+    ///
+    /// `None` until the first Flow/Fetch fixes it (it needs the negotiated `credit_ceiling`, which is
+    /// the auto-tune's ceiling); once set its CEILING never changes for the life of the connection,
+    /// though its current window moves with keep-up / back-off. A consumer whose negotiated ceiling is
+    /// at or below the floor never grows past its own cap (so an explicit small `--consumer-credit` is
+    /// byte-for-byte the historical fixed window). At-least-once is untouched: the window only paces how
+    /// many records may be in flight, never which are leased / acked / redelivered.
+    credit_autotune: Option<ironbus_core::backpressure::CreditAutotuner>,
     /// This connection's stable `key_shared` member identity (#64): the rendezvous-hash seed the
     /// engine routes a key's records to. Minted once per connection by the server from an atomic
     /// counter, so two concurrently-live connections never collide. Only consulted for a group
@@ -919,6 +933,13 @@ impl Session {
                         // (a no-op when the AIMD is inert). Repeated nacks throttle the egress credit
                         // smoothly, the failure half of the AIMD asymmetry.
                         engine.with(crate::engine::Engine::egress_falling_behind)?;
+                        // CREDIT AUTO-TUNE back-off (#552): a nack is the consumer signalling it could
+                        // NOT process the message — it is not draining what it already holds — so halve
+                        // the per-consumer credit window toward the floor (never below it, so forward
+                        // progress is guaranteed). This is the back-pressure half of the auto-tune: a
+                        // window grown for a keeping-up consumer is shed promptly once it stops draining,
+                        // so a non-draining consumer does not sit on a large in-flight set.
+                        self.credit_back_off();
                         self.leased.remove(&ack.offset);
                         reply(out, FrameType::AckStatus, &[1]);
                         Ok(())
@@ -1086,6 +1107,55 @@ impl Session {
         Ok(c)
     }
 
+    /// The CURRENT auto-tuned per-consumer message window (#552): the most un-acked messages this
+    /// connection may hold in flight right now, BEFORE the byte budget intersects it. Lazily builds the
+    /// [`ironbus_core::backpressure::CreditAutotuner`] from the negotiated `credit_ceiling` on the first
+    /// call (the auto-tune's ceiling is the negotiated #292 cap, the same value the RAM guard charges),
+    /// then returns its current window, which grows toward the ceiling as the consumer keeps up and
+    /// halves under backpressure. A consumer that never keeps up sits at the floor (64, or its lower
+    /// negotiated ceiling), so it is byte-for-byte the historical fixed window.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::ActorGone`] if the actor exited before the ceiling read.
+    fn credit_window<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
+        &mut self,
+        engine: &E,
+    ) -> Result<u32, SessionError> {
+        if self.credit_autotune.is_none() {
+            let ceiling = self.credit_ceiling(engine)?;
+            self.credit_autotune = Some(ironbus_core::backpressure::CreditAutotuner::with_ceiling(
+                ceiling,
+            ));
+        }
+        // Just-set above, so the unwrap is infallible; `expect` documents the invariant.
+        Ok(self
+            .credit_autotune
+            .as_ref()
+            .expect("credit_autotune set above")
+            .window())
+    }
+
+    /// KEEP-UP signal to the credit auto-tune (#552): the consumer DRAINED its window without stalling
+    /// (it took a full requested batch and never hit a would-block), so GROW the window toward the
+    /// ceiling. A no-op before the auto-tuner is built (no Flow has run yet) or once the window is at
+    /// the ceiling. This is the additive-increase half of the AIMD asymmetry; the back-off is on the
+    /// would-block / nack paths.
+    fn credit_keep_up(&mut self) {
+        if let Some(a) = self.credit_autotune.as_mut() {
+            a.keep_up();
+        }
+    }
+
+    /// BACK-OFF signal to the credit auto-tune (#552): the consumer is not draining (a would-block at
+    /// the window with a near-full in-flight set, or a nack), so multiplicatively DECREASE the window
+    /// (halve, floored at the floor). A no-op before the auto-tuner is built. Forward progress is
+    /// guaranteed: the window never collapses below the historical static floor.
+    fn credit_back_off(&mut self) {
+        if let Some(a) = self.credit_autotune.as_mut() {
+            a.back_off();
+        }
+    }
+
     /// The total in-flight PAYLOAD bytes this connection currently holds un-acked (#275): the sum of
     /// every leased message's byte size. The byte budget is DERIVED from this, never a separate
     /// counter, so it cannot drift from true ownership. Saturating so it can never wrap.
@@ -1165,6 +1235,10 @@ impl Session {
     /// budget (per-consumer isolation). The advisory frames (dead-letter, truncation) still count
     /// against the REQUESTED credit (they bound the total frames a batch streams) but do NOT occupy
     /// an in-flight slot or any bytes, since they commit past or reset rather than lease.
+    // One cohesive credit/byte-budget/AIMD/auto-tune-bounded drain loop (the #65/#275/#402/#552 bounds
+    // must bind in order in one place), the per-record analogue of `handle_fetch`; splitting it would
+    // scatter the single in-flight-window walk across helpers and obscure the order the bounds compose.
+    #[allow(clippy::too_many_lines)]
     fn handle_flow<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
         &mut self,
         engine: &E,
@@ -1184,27 +1258,40 @@ impl Session {
         // (expired-and-redelivered, or committed) BEFORE computing remaining credit, so a stuck
         // consumer's expired leases stop counting against it and its peers stay isolated.
         self.release_stale_leases(engine)?;
-        // The per-consumer remaining credit: the ceiling minus what this connection already holds
-        // un-acked. The effective batch bound is min(requested, remaining); the per-group
+        // The per-consumer remaining credit: the AUTO-TUNED window (#552) minus what this connection
+        // already holds un-acked. The effective batch bound is min(requested, remaining); the per-group
         // `max_in_flight` window further caps it inside the engine's poll (a full window returns
         // Poll::Idle, ending the batch early), so the delivered total is the MIN of the requested
         // credit, this consumer's remaining credit, and whatever the group makes available. Bounding
         // the WHOLE loop by `credits` (not `requested`) is what stops the engine from leasing an
         // offset this connection has no credit to deliver: at zero remaining credit the loop body
         // never runs, so a saturated consumer gets an empty batch even with messages available.
-        let ceiling = self.credit_ceiling(engine)?;
+        //
+        // The window AUTO-TUNES (#552): it starts at the historical floor (64) and grows toward the
+        // negotiated `credit_ceiling` as the consumer keeps draining, so a fast/loopback consumer is no
+        // longer pinned at 64/RTT (the #464/#532 floor). The ceiling is the negotiated #292 cap and the
+        // RAM-guard's worst-case count; the byte budget below stays the firm RAM bound (the count grows
+        // UNDER it).
+        let window = self.credit_window(engine)?;
         let held = u32::try_from(self.leased.len()).unwrap_or(u32::MAX);
-        let remaining = ceiling.saturating_sub(held);
-        // The negotiated per-consumer credit bound, before the egress AIMD.
+        let remaining = window.saturating_sub(held);
+        // The per-consumer credit bound, before the egress AIMD. The consumer is COUNT-BOUND by its own
+        // window when it asked for at least the whole window's worth and the window (not the requested
+        // credit) is what capped `want`: that is the auto-tune keep-up signal once it actually drains.
         let want = requested.min(remaining);
+        let window_was_binding = requested >= remaining && remaining > 0;
         // EGRESS AIMD (#69, #402): adjust the EFFECTIVE per-consumer egress credit WITHIN the
-        // negotiated #292 ceiling. `egress_grant_within(ceiling)` is `min(ceiling, AIMD limit)`, so the
-        // limiter never exceeds the negotiated cap; when the AIMD is inert (the default) it returns the
-        // ceiling unchanged, so `credits` is exactly `want` and the path is byte-for-byte historical.
-        // A real, observable WOULD-BLOCK is when the consumer wanted MORE than the limiter grants while
-        // ALREADY holding a near-full in-flight set (it is not keeping up): that is the falling-behind
-        // signal, so the AIMD multiplicatively decreases (and counts the throttled grant). A clean
-        // keep-up (prompt acks) drives the additive increase on the ack path.
+        // negotiated #292 ceiling. This is the SEPARATE (default-inert) downstream-sink limiter, kept
+        // distinct from the #552 credit auto-tune: it bounds the per-Flow grant by the broker-wide
+        // downstream health, the auto-tune bounds it by THIS consumer's keep-up. `egress_grant_within`
+        // is `min(ceiling, AIMD limit)`, so the limiter never exceeds the negotiated cap; when the AIMD
+        // is inert (the default) it returns the ceiling unchanged, so `credits` is exactly `want` and
+        // the egress path is byte-for-byte historical. A real, observable WOULD-BLOCK is when the
+        // consumer wanted MORE than the limiter grants while ALREADY holding a near-full in-flight set
+        // (it is not keeping up): that is the falling-behind signal, so the AIMD multiplicatively
+        // decreases (and counts the throttled grant). A clean keep-up (prompt acks) drives its additive
+        // increase on the ack path.
+        let ceiling = self.credit_ceiling(engine)?;
         let aimd_grant = engine.with(move |e| e.egress_grant_within(ceiling))?;
         let credits = want.min(aimd_grant);
         if aimd_grant < want && held >= aimd_grant {
@@ -1336,6 +1423,17 @@ impl Session {
         let group = self.subscription.clone();
         let committed = engine.with(move |e| e.committed_offset_in(&group).get())?;
         self.leased.retain(|&offset, _| offset >= committed);
+        // CREDIT AUTO-TUNE keep-up (#552): the consumer was COUNT-BOUND by its own window (it asked for
+        // at least the whole remaining window) AND drained the full grant it was given (`delivered ==
+        // credits`, every credit became a real delivery, not an early Idle / advisory). That is the
+        // window FILLING THE PIPE — the consumer could use more in-flight than the window allowed, so
+        // GROW it toward the ceiling. Bounding the keep-up on a window-binding, fully-drained batch (not
+        // merely a non-empty one) is what removes the 64/RTT floor for a fast consumer without growing a
+        // service-bound or starved consumer that never saturates its window. The byte budget still caps
+        // the in-flight bytes, so the grown count can only ever deliver byte-budget-worth of RAM.
+        if window_was_binding && delivered == credits && credits > 0 {
+            self.credit_keep_up();
+        }
         reply(out, FrameType::FlowEnd, &delivered.to_le_bytes());
         Ok(())
     }
@@ -1381,19 +1479,26 @@ impl Session {
         // (expired-and-redelivered, or committed) BEFORE computing remaining credit, exactly as the
         // per-record Flow path does, so a stuck consumer's expired leases stop counting against it.
         self.release_stale_leases(engine)?;
-        // The per-consumer remaining message credit: the ceiling minus what this connection already
-        // holds un-acked (identical to `handle_flow`). The batch is bounded by the MIN of the requested
-        // `max_records`, this remaining credit, and the egress AIMD grant, so a generous `max_records`
-        // can NEVER over-deliver past the negotiated ceiling — the same guard the per-record path uses.
-        let ceiling = self.credit_ceiling(engine)?;
+        // The per-consumer remaining message credit: the AUTO-TUNED window (#552) minus what this
+        // connection already holds un-acked (identical to `handle_flow`). The batch is bounded by the
+        // MIN of the requested `max_records`, this remaining credit, and the egress AIMD grant, so a
+        // generous `max_records` can NEVER over-deliver past the window — the same guard the per-record
+        // path uses. The window auto-tunes from 64 toward the negotiated ceiling as this consumer keeps
+        // up (so a batched/streaming consumer is not pinned at 64/RTT, the #464/#532 floor), bounded by
+        // the byte budget (the firm RAM bound the count grows UNDER).
+        let window = self.credit_window(engine)?;
         let held = u32::try_from(self.leased.len()).unwrap_or(u32::MAX);
-        let remaining = ceiling.saturating_sub(held);
-        // The requested record cap, clamped to the per-consumer remaining credit (the negotiated #292
-        // ceiling binds before the engine ever leases an offset this connection cannot deliver).
+        let remaining = window.saturating_sub(held);
+        // The requested record cap, clamped to the per-consumer remaining credit (the window binds
+        // before the engine ever leases an offset this connection cannot deliver).
         let want = req.max_records.min(remaining);
+        // COUNT-BOUND keep-up signal: the consumer asked for at least the whole remaining window, so the
+        // window (not `max_records`) is what capped it — the auto-tune grows once it actually drains.
+        let window_was_binding = req.max_records >= remaining && remaining > 0;
         // EGRESS AIMD (#69, #402), identical to `handle_flow`: keep the effective egress credit within
         // the negotiated ceiling, and count a real would-block (the consumer wants more than the limiter
         // grants while already holding near a grant's worth un-acked) as a falling-behind signal.
+        let ceiling = self.credit_ceiling(engine)?;
         let aimd_grant = engine.with(move |e| e.egress_grant_within(ceiling))?;
         let credits = want.min(aimd_grant);
         if aimd_grant < want && held >= aimd_grant {
@@ -1524,6 +1629,12 @@ impl Session {
         let group = self.subscription.clone();
         let committed = engine.with(move |e| e.committed_offset_in(&group).get())?;
         self.leased.retain(|&offset, _| offset >= committed);
+        // CREDIT AUTO-TUNE keep-up (#552), identical to `handle_flow`: the consumer was window-bound and
+        // drained the full grant, so grow the window toward the ceiling. A deadline-cut batch leaves
+        // `delivered < credits`, so it correctly does NOT register as keep-up.
+        if window_was_binding && delivered == credits && credits > 0 {
+            self.credit_keep_up();
+        }
         // The batch terminates with the SAME FlowEnd the Flow path uses (its body the delivered count),
         // so the response is byte-for-byte a Flow response past the request frame.
         reply(out, FrameType::FlowEnd, &delivered.to_le_bytes());
@@ -1565,16 +1676,23 @@ impl Session {
             reply_err(out, "malformed stream-fetch body");
             return Ok(());
         };
-        // Bound the batch by the negotiated per-consumer credit and byte budget, exactly as the Tier-W
-        // Fetch does (#292/#275), so a generous max_records/max_bytes never lets one fetch run away.
-        // Tier-S holds no leases, so the ceiling is the standing per-fetch cap, not a window minus
-        // in-flight: a streaming consumer's "in-flight" is whatever it has read-but-not-committed, which
-        // it tracks itself.
-        let ceiling = self.credit_ceiling(engine)?;
+        // Bound the batch by the negotiated per-consumer AUTO-TUNED credit WINDOW and byte budget,
+        // exactly as the Tier-W Fetch does (#292/#275/#552), so a generous max_records/max_bytes never
+        // lets one fetch run away. Tier-S holds no leases, so the window is the standing PER-FETCH cap
+        // (a streaming consumer's "in-flight" is whatever it has read-but-not-committed, which it tracks
+        // itself) — but it is ALSO the loopback floor: with a fixed 64-record per-fetch cap, a fast/
+        // loopback streaming consumer is pinned at 64/RTT (the #464/#532 floor). The window AUTO-TUNES:
+        // a streaming consumer that keeps pulling full window-bound batches grows it toward the ceiling,
+        // filling the pipe. The byte budget (`max_bytes` below) stays the firm bound on bytes-per-fetch.
+        let window = self.credit_window(engine)?;
         let ceiling_bytes = self.credit_ceiling_bytes(engine)?;
         // The number of records to serve: the client's request clamped to the per-consumer credit
-        // ceiling. A request of 0 (or a 0 ceiling) serves nothing and replies an empty batch.
-        let want = req.max_records.min(ceiling) as usize;
+        // window. A request of 0 (or a 0 window) serves nothing and replies an empty batch.
+        let want = req.max_records.min(window) as usize;
+        // COUNT-BOUND keep-up: the consumer asked for at least the whole window, so the window (not
+        // `max_records`) capped this fetch. If it then returns a FULL window's worth, the consumer is
+        // keeping up and could pull more per RTT, so the auto-tune grows toward the ceiling.
+        let window_was_binding = req.max_records >= window && window > 0;
         // The byte cap: the smaller of the negotiated per-consumer byte budget and the client's
         // requested max_bytes (each `0` meaning unbounded), passed to the engine read as the contiguous
         // read's byte bound. `None` means unbounded (only the record count binds).
@@ -1589,11 +1707,54 @@ impl Session {
         // a contiguous run ships as ONE `DeliverBatch` (the on-disk frame bytes verbatim, sendfile-ready
         // for #658) instead of N per-record `Deliver` frames, with no broker re-encode of the sealed run.
         // A consumer that did NOT advertise it takes the byte-for-byte-unchanged per-record path below.
-        if self.deliver_batch_enabled {
-            return Self::serve_stream_fetch_batch(
+        // Serve the batch (raw-framed if the consumer advertised DeliverBatch, else per-record), getting
+        // back how many records were delivered (`None` = a recoverable reject already replied as an Err,
+        // which is the response terminator, so there is no keep-up and no FlowEnd to add).
+        let delivered = if self.deliver_batch_enabled {
+            Self::serve_stream_fetch_batch(engine, &group, member, start, want, max_bytes, out)?
+        } else {
+            Self::serve_stream_fetch_per_record(
                 engine, &group, member, start, want, max_bytes, out,
-            );
+            )?
+        };
+        let Some(delivered) = delivered else {
+            // A recoverable engine reject already wrote its Err terminator; nothing more to send.
+            return Ok(());
+        };
+        // CREDIT AUTO-TUNE keep-up (#552) on the lease-FREE Tier-S path: the consumer was window-bound
+        // and the broker returned a FULL window's worth of records, so the consumer can pull more per
+        // RTT — grow the window toward the ceiling. This is THE removal of the 64/RTT loopback floor for
+        // the streaming default: each successive full fetch grows the per-fetch window, so a fast
+        // consumer's steady-state per-fetch size climbs from 64 toward the ceiling. A short batch (the
+        // log ran dry) leaves `delivered < window`, so a caught-up consumer does not over-grow.
+        if window_was_binding && u64::from(delivered) >= u64::from(window) {
+            self.credit_keep_up();
         }
+        // Terminate with the SAME FlowEnd the Tier-W batch uses (its body the delivered count), so a
+        // client frames the streaming batch exactly like a Fetch batch.
+        reply(out, FrameType::FlowEnd, &delivered.to_le_bytes());
+        Ok(())
+    }
+
+    /// The per-record half of [`Session::handle_stream_fetch`] (the consumer did NOT advertise
+    /// `DeliverBatch`): serves the contiguous run as N per-record `Deliver` frames. Returns the number
+    /// of records delivered (`Some(n)`), or `None` when a recoverable engine reject was surfaced as an
+    /// `Err` terminator (so the caller adds no `FlowEnd`). Does NOT write the `FlowEnd`; the caller
+    /// does, after the shared #552 keep-up check, so both batch halves terminate identically.
+    fn serve_stream_fetch_per_record<
+        F: Filesystem + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        engine: &E,
+        group: &GroupName,
+        member: MemberId,
+        start: Offset,
+        want: usize,
+        max_bytes: Option<usize>,
+        out: &mut Vec<u8>,
+    ) -> Result<Option<u32>, SessionError> {
+        let group = group.clone();
         // ONE actor round-trip serves the whole contiguous batch — the heart of the Tier-S win versus
         // the N per-record round-trips the Tier-W poll loop makes. The engine reads off the shared
         // durable read path, claims no lease, and writes no cursor.
@@ -1621,10 +1782,7 @@ impl Session {
                     // in-flight set is its own concern. This is what removes the per-record bookkeeping.
                     delivered += 1;
                 }
-                // Terminate with the SAME FlowEnd the Tier-W batch uses (its body the delivered count),
-                // so a client frames the streaming batch exactly like a Fetch batch.
-                reply(out, FrameType::FlowEnd, &delivered.to_le_bytes());
-                Ok(())
+                Ok(Some(delivered))
             }
             // A fatal engine error wedges every future op: end the session rather than masquerade it as
             // a transient rejection (matching the Fetch/cumulative-ack paths).
@@ -1637,7 +1795,7 @@ impl Session {
             // NOT also send a FlowEnd (the Err is the terminator), matching the Fetch error path.
             Err(e) => {
                 reply_err(out, &e.to_string());
-                Ok(())
+                Ok(None)
             }
         }
     }
@@ -1646,9 +1804,12 @@ impl Session {
     /// half of [`Session::handle_stream_fetch`]. The contiguous SEALED prefix of the run ships as ONE
     /// `DeliverBatch` frame whose body is the records' on-disk frame bytes VERBATIM (never re-encoded, so
     /// #658's disk `sendfile(2)` can splice them); any ACTIVE-tail remainder follows as ordinary
-    /// per-record `Deliver` frames, so the consumer always receives one continuous contiguous run. The
-    /// batch is terminated by exactly one `FlowEnd` carrying the TOTAL delivered count, identical to the
-    /// per-record path, so the client frames the response the same way either way.
+    /// per-record `Deliver` frames, so the consumer always receives one continuous contiguous run.
+    ///
+    /// Returns the TOTAL records delivered (`Some(n)`), or `None` when a recoverable engine reject was
+    /// surfaced as an `Err` terminator. It does NOT write the `FlowEnd`; the caller writes it after the
+    /// shared #552 keep-up check, so the batch and per-record halves terminate identically (one `FlowEnd`
+    /// carrying the total delivered count), and the client frames the response the same way either way.
     ///
     /// CRC integrity end-to-end: the broker copies the stored bytes UNTOUCHED into the batch body, so
     /// each record's header/body CRC ships verbatim for the client to verify exactly as it does a
@@ -1667,7 +1828,7 @@ impl Session {
         want: usize,
         max_bytes: Option<usize>,
         out: &mut Vec<u8>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<Option<u32>, SessionError> {
         let group = group.clone();
         match engine.with(move |e| e.stream_fetch_raw_in(&group, member, start, want, max_bytes))? {
             Ok(StreamRawBatch { raw, tail, .. }) => {
@@ -1709,8 +1870,7 @@ impl Session {
                     reply(out, FrameType::Deliver, &frame_body);
                     delivered = delivered.saturating_add(1);
                 }
-                reply(out, FrameType::FlowEnd, &delivered.to_le_bytes());
-                Ok(())
+                Ok(Some(delivered))
             }
             Err(e) if e.is_fatal() => {
                 reply_err(out, "fatal storage error");
@@ -1718,7 +1878,7 @@ impl Session {
             }
             Err(e) => {
                 reply_err(out, &e.to_string());
-                Ok(())
+                Ok(None)
             }
         }
     }
@@ -3293,6 +3453,226 @@ mod tests {
             .filter(|(t, _)| *t == FrameType::Deliver)
             .map(|(_, b)| decode_deliver(b).unwrap().payload.to_vec())
             .collect()
+    }
+
+    // ---- credit auto-tune over the wire (#552) ----
+
+    /// An engine whose per-GROUP window and per-consumer credit CEILING are both high, so the #552
+    /// auto-tune (which grows the per-consumer count window from the 64 floor toward the ceiling) is
+    /// the binding constraint a test can observe — `max_in_flight` is generous so the per-group window
+    /// never masks the per-consumer window, and `consumer_credit` (the ceiling) is well above 64 so the
+    /// window has room to grow. `consumer_credit_bytes` is the caller's choice (0 = byte budget off).
+    fn autotune_engine(consumer_credit_bytes: u64) -> Engine<InMemoryFs, ManualClock> {
+        Engine::open(
+            InMemoryFs::new(),
+            ManualClock::new(),
+            EngineConfig {
+                max_in_flight: 100_000,
+                consumer_credit: 2048,
+                consumer_credit_bytes,
+                ..test_config()
+            },
+        )
+        .unwrap()
+    }
+
+    /// Connects + drives one Flow asking for `requested` credit, ACKING every delivered message (so the
+    /// next Flow has a fully-drained window). Returns the count delivered in this batch. Repeated calls
+    /// are the "keeping-up consumer": each one drains its whole window, which is the #552 keep-up signal
+    /// that grows the window.
+    fn flow_and_ack_all<C: Clock + Clone + 'static>(
+        s: &mut Session,
+        e: &DirectEngine<InMemoryFs, C>,
+        requested: u32,
+    ) -> usize {
+        let mut out = Vec::new();
+        s.process(
+            e,
+            &frame(FrameType::Flow, &requested.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let toks = delivered_tokens(&out);
+        for (offset, generation) in &toks {
+            ack_reply(s, e, AckOp::Ack, *offset, *generation);
+        }
+        toks.len()
+    }
+
+    #[test]
+    fn a_keeping_up_consumers_window_grows_past_64_toward_the_ceiling() {
+        // THE CORE #552 CLAIM over the wire: a consumer that keeps draining its whole window grows the
+        // per-consumer count window WELL past the old fixed 64, so a single Flow can eventually deliver
+        // more than 64 records — throughput is no longer pinned at 64/RTT. With a static 64 ceiling this
+        // would be impossible (a Flow could never exceed 64 in one batch).
+        let e = DirectEngine::new(autotune_engine(0));
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        // Seed plenty so the window, not the log, is the binding constraint every round.
+        for i in 0..5000u32 {
+            produce(&e, &i.to_le_bytes());
+        }
+        // Round 0 is capped at the floor (64): ask for a huge credit; only the window binds.
+        let first = flow_and_ack_all(&mut s, &e, 100_000);
+        assert_eq!(first, 64, "the first batch is bounded by the 64 floor");
+        // Keep draining full windows; the window grows by the step each round.
+        let mut last = first;
+        for _ in 0..10 {
+            last = flow_and_ack_all(&mut s, &e, 100_000);
+        }
+        assert!(
+            last > 64,
+            "a keeping-up consumer's window must grow past the old 64 floor, got a {last}-record batch"
+        );
+    }
+
+    #[test]
+    fn the_byte_budget_stays_a_hard_cap_as_the_window_grows() {
+        // #552 RAM-BOUND: even as the COUNT window auto-tunes upward, the per-consumer BYTE budget is a
+        // firm cap on in-flight bytes. With a budget of 10 * payload bytes, a Flow never leases more than
+        // ~10 unacked messages regardless of how high the count window grows, so in-flight RAM stays
+        // bounded by the byte budget, NOT the (growing) count.
+        let payload = [0u8; 100];
+        let budget = 10 * 100; // 10 messages' worth of payload bytes
+        let e = DirectEngine::new(autotune_engine(budget));
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        for _ in 0..5000u32 {
+            produce(&e, &payload);
+        }
+        // Drain many full windows WITHOUT acking on the LAST one, so we can read the in-flight set the
+        // byte budget actually allowed. First grow the window over several acked rounds.
+        for _ in 0..20 {
+            flow_and_ack_all(&mut s, &e, 100_000);
+        }
+        // Now a Flow that does NOT ack: the delivered (and thus leased) count is bounded by the byte
+        // budget's floor-of-one semantics (at-or-below-budget delivery overshoots by at most one), so
+        // even with a window grown far past 64 the batch is ~the byte-budget's worth, not the window's.
+        out.clear();
+        s.process(
+            &e,
+            &frame(FrameType::Flow, &100_000u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        let delivered = delivered_payloads(&out).len();
+        assert!(
+            delivered <= 11,
+            "the byte budget (10 msgs) must cap in-flight regardless of the grown count window, got {delivered}"
+        );
+        assert!(delivered >= 1, "the floor-of-one always makes progress");
+    }
+
+    #[test]
+    fn a_non_draining_consumer_backs_the_window_off() {
+        // #552 BACK-OFF: a consumer that NACKs (cannot process) sheds its grown window back toward the
+        // floor. After growing the window, a burst of nacks must shrink the per-batch size a later
+        // fully-acked Flow can reach — the window halved.
+        let e = DirectEngine::new(autotune_engine(0));
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        for _ in 0..5000u32 {
+            produce(&e, b"p");
+        }
+        // Grow the window well past 64.
+        let mut grown = 0;
+        for _ in 0..12 {
+            grown = flow_and_ack_all(&mut s, &e, 100_000);
+        }
+        assert!(
+            grown > 64,
+            "precondition: the window grew past 64, got {grown}"
+        );
+        // A non-draining round: Flow then NACK every delivered message (the consumer could not process).
+        out.clear();
+        s.process(
+            &e,
+            &frame(FrameType::Flow, &100_000u32.to_le_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        for (offset, generation) in delivered_tokens(&out) {
+            ack_reply(&mut s, &e, AckOp::Nack, offset, generation);
+        }
+        // The window backed off (each nack halves it), so a subsequent fully-acked Flow delivers FEWER
+        // than the grown peak — backpressure shed the window.
+        let after = flow_and_ack_all(&mut s, &e, 100_000);
+        assert!(
+            after < grown,
+            "a non-draining (nacking) consumer must back the window off below its grown peak: \
+             grown={grown}, after-backoff={after}"
+        );
+    }
+
+    #[test]
+    fn the_autotune_preserves_at_least_once_no_message_is_lost() {
+        // #552 AT-LEAST-ONCE: a larger auto-tuned window only means more in-flight at once; every record
+        // is still leased and acked exactly once. Drain the WHOLE log through the auto-tuning path and
+        // assert every produced offset arrives exactly once, in order, with none lost or duplicated.
+        let total = 1000u32;
+        let e = DirectEngine::new(autotune_engine(0));
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        for i in 0..total {
+            produce(&e, &i.to_le_bytes());
+        }
+        let mut seen: Vec<u32> = Vec::new();
+        // Drain until the log is empty, acking every record (the keeping-up path that also grows the
+        // window). The growing window changes batch sizes but never which records are delivered.
+        loop {
+            out.clear();
+            s.process(
+                &e,
+                &frame(FrameType::Flow, &100_000u32.to_le_bytes()),
+                &mut out,
+            )
+            .unwrap();
+            let toks = delivered_tokens(&out);
+            if toks.is_empty() {
+                break;
+            }
+            for (offset, generation) in &toks {
+                seen.push(u32::try_from(*offset).unwrap());
+                ack_reply(&mut s, &e, AckOp::Ack, *offset, *generation);
+            }
+        }
+        let expected: Vec<u32> = (0..total).collect();
+        assert_eq!(
+            seen, expected,
+            "every produced record must arrive exactly once, in order (at-least-once preserved)"
+        );
+    }
+
+    #[test]
+    fn an_explicit_low_consumer_credit_is_byte_for_byte_the_historical_fixed_window() {
+        // A consumer whose negotiated ceiling is the historical 64 (the `test_config` default) never
+        // grows past 64: the auto-tune floor == ceiling == 64, so its behavior is byte-for-byte the
+        // pre-#552 fixed window. This pins that the auto-tune NEVER over-delivers past a configured cap.
+        let e = DirectEngine::new(engine()); // test_config(): consumer_credit 64, max_in_flight 10
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        for _ in 0..500u32 {
+            produce(&e, b"p");
+        }
+        // Even after many fully-drained rounds, a Flow never delivers more than the per-group window (10
+        // here) and never exceeds the 64 ceiling — there is no room above 64 to grow into.
+        for _ in 0..20 {
+            let n = flow_and_ack_all(&mut s, &e, 100_000);
+            assert!(
+                n <= 64,
+                "a 64-ceiling consumer must never exceed 64 in a batch, got {n}"
+            );
+        }
     }
 
     #[test]

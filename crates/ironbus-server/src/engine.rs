@@ -250,25 +250,35 @@ pub struct EngineConfig {
     /// The max-ack-pending window: at most this many offsets above the committed cursor
     /// may be in flight at once. Bounds in-flight work and the poll scan.
     pub max_in_flight: u32,
-    /// The per-CONSUMER (per-connection) standing in-flight credit (refs #65, #9, #10): the most
-    /// un-acked messages a single connection may hold at once, independent of the per-GROUP
-    /// `max_in_flight` window. It is the consumer-side half of credit-based flow control (MQTT
+    /// The per-CONSUMER (per-connection) standing in-flight credit CEILING (refs #65, #9, #10, #552):
+    /// the most un-acked messages a single connection may EVER hold at once, independent of the
+    /// per-GROUP `max_in_flight` window. It is the consumer-side half of credit-based flow control (MQTT
     /// Receive Maximum / `JetStream` `MaxAckPending`): a Flow fetch delivers at most
-    /// `min(requested_credit, ceiling - already_held, whatever the group makes available)`, so the
-    /// EFFECTIVE bound is the min of the producer-side group window and this consumer ceiling.
+    /// `min(requested_credit, AUTO-TUNED window - already_held, byte budget remaining, whatever the
+    /// group makes available)`, so the EFFECTIVE bound is the min of the producer-side group window, the
+    /// per-consumer byte budget, and the consumer's CURRENT auto-tuned window (which itself never
+    /// exceeds this ceiling).
+    ///
+    /// Post-#552 the per-consumer count window AUTO-TUNES rather than being pinned at a fixed value: it
+    /// starts at the historical floor of 64 and grows toward THIS ceiling as the consumer keeps draining
+    /// (the [`ironbus_core::backpressure::CreditAutotuner`] reuse of the egress AIMD), so a fast/loopback
+    /// consumer fills the bandwidth-delay product instead of stalling at 64/RTT (the #464/#532 floor),
+    /// while a service-bound consumer never grows what it does not drain. This field is the CEILING the
+    /// auto-tune is bounded by AND the worst-case in-flight count the RAM guard charges, so the byte
+    /// budget remains the firm RAM bound (the count auto-tunes UNDER it).
     ///
     /// Enforced per session (one connection), not per group, so in a competing group one slow
-    /// consumer that fills its own ceiling and stops acking pins ONLY its own credit and cannot
+    /// consumer that fills its own window and stops acking pins ONLY its own credit and cannot
     /// reduce a peer's available deliveries (the per-consumer isolation from #10). A consumer at
     /// zero remaining credit gets zero deliveries from a Flow until it acks, nacks, terms, or one
     /// of its leases expires and is redelivered elsewhere, freeing the slot.
     ///
-    /// The default is a small, memory-justified number ([`DEFAULT_CONSUMER_CREDIT`] = 64), NOT the
-    /// MQTT absent-value 65535: at the #19 working point (10k msg/s x 5 ms service = 50 in-flight by
-    /// Little's Law) 64 gives ~28% headroom. A value of `0` is treated as 1 (a hard floor of one, so
-    /// a consumer always makes progress) by [`Engine::open`]. The parallel per-consumer BYTE budget
-    /// is [`EngineConfig::consumer_credit_bytes`]; the `max_deliver`-to-DLQ poison cap lives in
-    /// [`DeliveryConfig`].
+    /// The default is [`DEFAULT_CONSUMER_CREDIT`] (the Kafka-class auto-tune ceiling, 2048), NOT the
+    /// MQTT absent-value 65535. A value of `0` is treated as 1 (a hard floor of one, so a consumer
+    /// always makes progress) by [`Engine::open`]; a value BELOW 64 caps the auto-tune below the floor
+    /// (a tightly-bounded consumer never grows past its own negotiated ceiling). The parallel
+    /// per-consumer BYTE budget is [`EngineConfig::consumer_credit_bytes`]; the `max_deliver`-to-DLQ
+    /// poison cap lives in [`DeliveryConfig`].
     pub consumer_credit: u32,
     /// The per-CONSUMER (per-connection) standing in-flight BYTE budget (refs #65, #275, #10, #20):
     /// the most un-acked PAYLOAD bytes a single connection may hold at once, the RAM-side companion
@@ -1250,20 +1260,39 @@ fn crate_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// The default per-consumer in-flight credit (refs #65, #10): the most un-acked messages one
-/// connection may hold at once before a Flow stops delivering to it. A small, memory-justified
-/// number (NOT the MQTT absent-value 65535): by Little's Law at the #19 working point (10k msg/s
-/// x 5 ms service = 50 concurrent) 64 leaves ~28% headroom for variance. See
-/// [`EngineConfig::consumer_credit`].
-pub const DEFAULT_CONSUMER_CREDIT: u32 = 64;
+/// The default per-consumer in-flight credit CEILING (refs #65, #10, #552): the most un-acked
+/// messages one connection may EVER hold at once — the high, Kafka-class window the per-consumer
+/// auto-tune ([`ironbus_core::backpressure::CreditAutotuner`], #552) grows TOWARD as the consumer
+/// keeps up, NOT the window every consumer is pinned at.
+///
+/// Pre-#552 this was a FIXED 64, which (Little's Law at the #19 working point, 10k msg/s x 5 ms =
+/// 50 concurrent) had ~28% headroom for a SERVICE-bound consumer but pinned a fast/loopback consumer
+/// to 64/RTT — the bandwidth-delay product floor the #464 fair-consume bench and the #532 follow-up
+/// surfaced. The window now AUTO-TUNES: it starts at the historical floor of 64
+/// ([`ironbus_core::backpressure::DEFAULT_CREDIT_FLOOR`]) and grows to this ceiling
+/// ([`ironbus_core::backpressure::DEFAULT_CREDIT_CEILING`] = 2048) while the consumer drains, so a
+/// keeping-up consumer fills the pipe instead of stalling at 64/RTT, while a service-bound consumer
+/// stays near 64 (it never grows what it does not drain).
+///
+/// This value is also the WORST-CASE in-flight message count the refuse-to-boot RAM guard charges
+/// (`crate::rss`): with the byte budget OFF it is `consumer_credit * MAX_FRAME_LEN` per connection, so
+/// raising the ceiling makes a no-byte-budget config HONESTLY refuse under a small RAM ceiling rather
+/// than silently grow. With the byte budget SET (the 8 MiB default), the byte budget binds term 1 and
+/// the count ceiling is irrelevant to RAM — the count auto-tunes UNDER the firm byte cap. NOT the
+/// MQTT absent-value 65535. See [`EngineConfig::consumer_credit`].
+pub const DEFAULT_CONSUMER_CREDIT: u32 = ironbus_core::backpressure::DEFAULT_CREDIT_CEILING;
 
-/// The default per-consumer in-flight BYTE budget (refs #65, #275, #10, #20): the most un-acked
+/// The default per-consumer in-flight BYTE budget (refs #65, #275, #10, #20, #552): the most un-acked
 /// PAYLOAD bytes one connection may hold at once before a Flow stops delivering to it, the RAM-side
-/// companion to [`DEFAULT_CONSUMER_CREDIT`]. 8 MiB: at the 64-message default that is a 128 KiB
-/// average message before the byte budget binds before the message count, generous for the small
-/// records an edge broker carries yet a firm RAM ceiling for a large-payload consumer. A single
-/// message larger than this is still delivered (the hard floor of one), so the budget never wedges a
-/// consumer. `0` means UNLIMITED (the byte budget is off). See [`EngineConfig::consumer_credit_bytes`].
+/// companion to [`DEFAULT_CONSUMER_CREDIT`] and — post-#552 — the FIRM RAM bound the auto-tuning count
+/// window grows UNDER. 8 MiB: large enough that the small records an edge broker carries grow the count
+/// window well past 64 toward the ceiling (a keeping-up loopback consumer fills the pipe) before the
+/// byte budget binds, yet a firm RAM ceiling that a large-payload consumer cannot exceed regardless of
+/// how high the count auto-tunes (e.g. at 2048 the count is byte-bound at any record over ~4 KiB). A
+/// single message larger than this is still delivered (the hard floor of one), so the budget never
+/// wedges a consumer. `0` means UNLIMITED (the byte budget is off — then ONLY the count ceiling binds
+/// in-flight RAM, which is why a no-byte-budget config is charged the full count ceiling by the RAM
+/// guard). See [`EngineConfig::consumer_credit_bytes`].
 pub const DEFAULT_CONSUMER_CREDIT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The default cap on the number of live work-groups per engine, INCLUDING the durable default

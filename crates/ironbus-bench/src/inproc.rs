@@ -53,14 +53,26 @@ use std::thread::JoinHandle;
 type FaultEngine = Engine<FaultFs<InMemoryFs>, ManualClock>;
 
 fn engine_config() -> EngineConfig {
+    // The self-test default: a 1024 per-consumer credit AND a 1024 per-group window, unchanged from
+    // pre-#552 (the injected-stall self-test measures fsync-gated latency, not credit flow control).
+    engine_config_with_credit(1024, 1024)
+}
+
+/// The in-process engine config with a CONFIGURABLE per-consumer credit CEILING and per-group window
+/// (#552), so a bench can stand a broker at the OLD fixed window (`consumer_credit == 64`: the
+/// auto-tune floor equals the ceiling, byte-for-byte the pre-#552 fixed 64) vs the AUTO-TUNED window (a
+/// high ceiling the window grows from 64 toward), over the SAME data and link, to demonstrate the
+/// removed loopback floor. The group window is raised alongside so the per-CONSUMER window (the #552
+/// subject), not the per-group window, is the binding constraint the bench measures.
+fn engine_config_with_credit(consumer_credit: u32, max_in_flight: u32) -> EngineConfig {
     EngineConfig {
         log: LogConfig::default(),
         lease: LeaseConfig::default(),
         // `unwrap` is fine in this bench/test-only path (not a lib hot path): the literal args are
         // valid by construction, so this never errors.
         delivery: DeliveryConfig::new(5, false, vec![]).expect("valid delivery config"),
-        max_in_flight: 1024,
-        consumer_credit: 1024,
+        max_in_flight,
+        consumer_credit,
         consumer_credit_bytes: 0,
         checkpoint_interval: 1,
         max_retained_bytes: 0,
@@ -113,8 +125,32 @@ impl InProcBroker {
     /// # Errors
     /// Returns a string if the engine cannot open or the loopback listener cannot bind.
     pub fn start() -> Result<InProcBroker, String> {
+        Self::start_with_config(engine_config())
+    }
+
+    /// Like [`InProcBroker::start`] but with a CONFIGURABLE per-consumer credit CEILING (#552), so a
+    /// bench can stand one broker at the OLD fixed 64 window (`consumer_credit == 64`: the auto-tune
+    /// floor equals the ceiling) and another at a high AUTO-TUNED ceiling, over the SAME data and
+    /// loopback link, to measure the removed 64/RTT floor. The per-group window is raised to match so
+    /// the per-CONSUMER window is the binding constraint.
+    ///
+    /// # Errors
+    /// Returns a string if the engine cannot open or the loopback listener cannot bind.
+    pub fn start_with_credit(consumer_credit: u32) -> Result<InProcBroker, String> {
+        Self::start_with_config(engine_config_with_credit(
+            consumer_credit,
+            consumer_credit.max(1024),
+        ))
+    }
+
+    /// Opens an in-process broker over the given engine config (the shared body of [`Self::start`] and
+    /// [`Self::start_with_credit`]).
+    ///
+    /// # Errors
+    /// Returns a string if the engine cannot open or the loopback listener cannot bind.
+    fn start_with_config(config: EngineConfig) -> Result<InProcBroker, String> {
         let (fs, control) = FaultFs::new(InMemoryFs::new());
-        let engine = Engine::open(fs, ManualClock::new(), engine_config())
+        let engine = Engine::open(fs, ManualClock::new(), config)
             .map_err(|e| format!("opening in-process engine: {e}"))?;
         let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
 

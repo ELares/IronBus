@@ -18,6 +18,12 @@
 //! reported delta is the throughput multiple. This is the consume-side setup for the #554 NATS
 //! comparison; it is NOT that comparison, and it is OFF the per-PR CI path (run on demand):
 //!   cargo run -p ironbus-bench --bin stream-consume-bench --release -- --records 50000 --window 256
+//!
+//! It ALSO reports the #552 leg: the OLD fixed-64 per-consumer credit window vs the AUTO-TUNED window,
+//! over the SAME data and loopback link, with a client window far above 64 so the SERVER credit window
+//! binds. At the fixed 64 each fetch is capped at 64 records (the 64/RTT loopback floor #464/#532
+//! found); with the auto-tune the per-consumer window grows from 64 toward the ceiling, so the
+//! steady-state per-fetch size climbs and the floor lifts. The reported `floor lift` is that multiple.
 
 // The in-process broker (`ironbus_bench::inproc`) is Unix-only, matching the shipped broker, so the
 // whole bench body is `cfg(unix)`. On a non-Unix target the binary compiles to a no-op `main` that
@@ -43,6 +49,50 @@ fn streaming_config() -> ClientConfig {
         understands_deliver_batch: true,
         ..ClientConfig::default()
     }
+}
+
+#[cfg(unix)]
+/// Drains `records` via the batched streaming consumer with a LARGE client window (so the SERVER-side
+/// per-consumer credit window — fixed 64 vs auto-tuned — is the binding constraint, not the client's
+/// own batch cap). Returns the wall-clock elapsed. This is the #552 measurement: at a fixed 64 server
+/// credit each fetch is capped at 64 records (64/RTT loopback floor); with the auto-tune the window
+/// grows from 64 toward the ceiling, so the steady-state per-fetch size climbs and the floor lifts.
+fn drain_streaming_window(
+    addr: &str,
+    records: u64,
+    client_window: u32,
+) -> Result<Duration, String> {
+    let mut c = Client::connect_with(addr, &streaming_config())
+        .map_err(|e| format!("window consumer connect: {e}"))?;
+    c.subscribe("s").map_err(|e| format!("window sub: {e}"))?;
+    let cfg = StreamConsumerConfig {
+        // A client window far above 64, so the SERVER credit window is what bounds each fetch: at the
+        // old fixed 64 the server caps every fetch at 64; with the auto-tune it grows past 64.
+        max_records: client_window,
+        max_bytes: 0,
+        commit_every_batches: 8,
+        start_offset: 0,
+        read_ahead: true,
+    };
+    let start = Instant::now();
+    let mut consumer = c.streaming_consumer_with("s", &cfg);
+    let mut drained = 0u64;
+    loop {
+        let batch = consumer
+            .next_batch()
+            .map_err(|e| format!("window next_batch: {e}"))?;
+        if batch.is_empty() {
+            break;
+        }
+        drained += batch.messages.len() as u64;
+        if drained >= records {
+            break;
+        }
+    }
+    consumer
+        .finish()
+        .map_err(|e| format!("window finish: {e}"))?;
+    Ok(start.elapsed())
 }
 
 #[cfg(unix)]
@@ -194,6 +244,42 @@ fn run() -> Result<(), String> {
         batched.as_secs_f64()
     );
     println!("  speedup (batched / per-message)     : {speedup:>12.2}x");
+
+    // #552 PROOF: the OLD fixed-64 credit window vs the AUTO-TUNED window, over the SAME data and a
+    // real loopback link, with a client window far above 64 so the SERVER credit window is the binding
+    // constraint. At the fixed 64 each fetch is capped at 64 records (the 64/RTT loopback floor the
+    // #464/#532 bench found); with the auto-tune the per-consumer window grows from 64 toward the
+    // ceiling, so the steady-state per-fetch size climbs and the floor lifts. The two brokers are
+    // separate in-process instances so neither's credit state leaks into the other.
+    let client_window: u32 = 1024; // far above 64, so the SERVER credit (64 vs auto-tune) binds
+    let old_broker = InProcBroker::start_with_credit(64)?;
+    let old_addr = old_broker.addr().to_string();
+    seed(&old_addr, records, payload)?;
+    let old_64 = drain_streaming_window(&old_addr, records, client_window)?;
+
+    // The auto-tune ceiling (2048, the production default): the window grows from the 64 floor toward
+    // this, so the per-fetch size climbs well past 64.
+    let auto_broker = InProcBroker::start_with_credit(2048)?;
+    let auto_addr = auto_broker.addr().to_string();
+    seed(&auto_addr, records, payload)?;
+    let auto = drain_streaming_window(&auto_addr, records, client_window)?;
+
+    let old_tput = throughput(records, old_64);
+    let auto_tput = throughput(records, auto);
+    let floor_lift = auto_tput / old_tput;
+    println!();
+    println!(
+        "  #552 credit flow-control: single-consumer streaming throughput, client window {client_window}"
+    );
+    println!(
+        "  OLD fixed-64 credit window           : {old_tput:>12.0} msg/s  ({:.3}s)  [64/RTT floor]",
+        old_64.as_secs_f64()
+    );
+    println!(
+        "  AUTO-TUNED window (grows 64 -> ceil) : {auto_tput:>12.0} msg/s  ({:.3}s)",
+        auto.as_secs_f64()
+    );
+    println!("  floor lift (auto-tune / fixed-64)    : {floor_lift:>12.2}x");
     Ok(())
 }
 
