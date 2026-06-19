@@ -28,8 +28,9 @@ use ironbus_core::types::RecordFlags;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
     decode_dead_letter, decode_deliver, decode_gap_marker, decode_info, decode_pub_ack,
-    decode_truncated, encode_ack, encode_connect, encode_cumulative_ack, encode_pub, encode_sub,
-    AckBody, AckOp, BodyError, ConnectBody, CumulativeAckBody, PubBody, SubBody,
+    decode_truncated, encode_ack, encode_connect, encode_cumulative_ack, encode_fetch, encode_pub,
+    encode_sub, AckBody, AckOp, BodyError, ConnectBody, CumulativeAckBody, FetchBody, PubBody,
+    SubBody,
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -908,6 +909,21 @@ impl Client {
         // slot yields at most one delivery OR one dead-letter advisory OR one truncation advisory,
         // so a buggy or hostile server cannot stream any of them without bound.
         let limit = usize::try_from(max).unwrap_or(usize::MAX);
+        self.read_fetch_response(limit)
+    }
+
+    /// Reads and decodes a batch delivery response (the shared tail of [`Client::fetch`] and
+    /// [`Client::fetch_batch`]): a run of `Deliver` frames (transparently decompressed, #430), with any
+    /// interleaved `DeadLetter` / `Truncated` / `GapMarker` advisories, terminated by exactly one
+    /// `FlowEnd` (or an `Err`). `limit` bounds the TOTAL advisory + delivery frames the server may stream
+    /// before the terminator, so a buggy or hostile server cannot stream without bound. The batch-pull
+    /// fetch (#489) reuses this verbatim because its wire response is byte-for-byte a `Flow` response past
+    /// the request frame.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, a server error, a decode failure, or a server that
+    /// streams more frames than `limit`.
+    fn read_fetch_response(&mut self, limit: usize) -> Result<Fetch, ClientError> {
         let mut messages = Vec::new();
         let mut dead_letters = Vec::new();
         let mut truncations = Vec::new();
@@ -1038,6 +1054,62 @@ impl Client {
                 (other, _) => return Err(ClientError::Unexpected(other)),
             }
         }
+    }
+
+    /// Batch-pull FETCH (#489): drains up to `max_records` records (and at most `max_bytes` total
+    /// payload-equivalent bytes) in ONE round-trip, the amortized twin of [`Client::fetch`]. The server
+    /// runs the SAME per-record poll the per-record path runs, so a batch fetch delivers EXACTLY the
+    /// records that many successive [`Client::fetch`] calls would, leasing each one identically and
+    /// preserving the at-least-once contract and the broadcast/`key_shared`/competing semantics — it only
+    /// amortizes the actor hop and per-poll read cost across the batch.
+    ///
+    /// - `max_records`: the most records to return. As with [`Client::fetch`], it is capped at the
+    ///   NEGOTIATED per-consumer credit (#292) when the server advertised one, so the client honors what
+    ///   it agreed to (the server enforces the same ceiling independently).
+    /// - `max_bytes`: the byte budget for the batch (`0` = unbounded by bytes; the record count, credit,
+    ///   and deadline still bind). The server applies the floor-of-one, so a single over-budget record is
+    ///   never wedged.
+    /// - `expires`: a deadline budget; the server returns whatever it has gathered by the deadline. `0`
+    ///   means no deadline. Ignored when `no_wait` is set.
+    /// - `no_wait`: when `true`, the server returns IMMEDIATELY with whatever is ready (a single drain
+    ///   pass), never waiting out `expires` — the NATS pull-consumer `no_wait` behavior.
+    ///
+    /// The response is byte-for-byte a [`Client::fetch`] response past the request frame (a run of
+    /// deliveries plus any advisories, terminated by `FlowEnd`), so the returned [`Fetch`] is shaped
+    /// identically.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, a server error, or a server that delivers more frames
+    /// than the requested record cap.
+    pub fn fetch_batch(
+        &mut self,
+        max_records: u32,
+        max_bytes: u64,
+        expires: Duration,
+        no_wait: bool,
+    ) -> Result<Fetch, ClientError> {
+        // Cap the record request at the negotiated credit (when known): the negotiated value governs the
+        // pull, exactly as `fetch` does, so the client never over-requests past what it agreed to.
+        let max_records = match self.negotiated_credit {
+            Some(credit) => max_records.min(credit),
+            None => max_records,
+        };
+        // The deadline budget in milliseconds, saturated to u64 so an absurd Duration cannot overflow.
+        let expires_ms = u64::try_from(expires.as_millis()).unwrap_or(u64::MAX);
+        let req = FetchBody {
+            max_records,
+            max_bytes,
+            expires_ms,
+            no_wait,
+        };
+        let mut body = Vec::new();
+        encode_fetch(&req, &mut body);
+        self.send(FrameType::Fetch, &body)?;
+        // The record cap bounds the TOTAL delivery + advisory frames the server may stream before
+        // FlowEnd, exactly as the per-record credit does for `fetch`: each granted slot yields at most one
+        // such frame, so a buggy or hostile server cannot stream without bound.
+        let limit = usize::try_from(max_records).unwrap_or(usize::MAX);
+        self.read_fetch_response(limit)
     }
 
     /// Acknowledges a fetched message by its offset and fencing generation. Returns `true`
@@ -1665,6 +1737,107 @@ mod tests {
         // Nothing left to fetch.
         assert!(c.fetch(10).unwrap().messages.is_empty());
 
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_batch_round_trips_against_a_real_server() {
+        // #489: a batch-pull fetch_batch drains the produced records in ONE round-trip, identically to
+        // the per-record fetch path, and each delivered record can be acked with the lease generation it
+        // carried (the lease the batch hands out is the same fencing lease the per-record poll hands out).
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+        let n = 5u8;
+        for i in 0..n {
+            c.produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: &[i; 8],
+            })
+            .unwrap();
+        }
+
+        // One batch fetch drains all n records.
+        let fetched = c
+            .fetch_batch(u32::from(n), 0, std::time::Duration::from_secs(1), false)
+            .unwrap();
+        assert_eq!(
+            fetched.messages.len(),
+            usize::from(n),
+            "all records in one round-trip"
+        );
+        for (i, m) in fetched.messages.iter().enumerate() {
+            assert_eq!(
+                m.offset,
+                u64::try_from(i).unwrap(),
+                "offsets are in log order"
+            );
+        }
+        // Ack them all with the generations the batch carried, proving the leases are the real fencing
+        // leases (at-least-once / lease semantics preserved).
+        for m in &fetched.messages {
+            assert!(
+                c.ack(m.offset, m.generation).unwrap(),
+                "the fetch-leased record commits"
+            );
+        }
+        // Nothing left.
+        assert!(c
+            .fetch_batch(u32::from(n), 0, std::time::Duration::ZERO, true)
+            .unwrap()
+            .messages
+            .is_empty());
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_batch_no_wait_on_an_empty_queue_returns_immediately() {
+        // #489 no_wait: a fetch against an empty queue returns an empty batch immediately, never hanging.
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+        let fetched = c
+            .fetch_batch(10, 0, std::time::Duration::ZERO, true)
+            .unwrap();
+        assert!(
+            fetched.messages.is_empty(),
+            "no_wait on an empty queue returns nothing"
+        );
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_batch_max_records_bounds_the_batch_against_a_real_server() {
+        // #489: max_records caps the batch below what is available, end-to-end over the wire.
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+        for i in 0..10u8 {
+            c.produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: &[i; 4],
+            })
+            .unwrap();
+        }
+        let fetched = c
+            .fetch_batch(3, 0, std::time::Duration::from_secs(1), false)
+            .unwrap();
+        assert_eq!(
+            fetched.messages.len(),
+            3,
+            "max_records bounds the batch to 3 of 10"
+        );
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
