@@ -127,10 +127,12 @@ when deciding where to deploy the broker.
   (`crates/ironbus-proto/src/frame.rs`). A zero-length prefix is a malformed
   envelope that closes the connection (`EmptyFrame`).
 - **Resource exhaustion via in-flight set (one consumer starving peers).**
-  *Mitigated.* Per-consumer credit (#65): each connection holds at most
-  `consumer_credit` un-acked messages (default 64), derived from the
-  connection-scoped `leased` set, so a stuck consumer pins only its own slots and
-  cannot consume a peer's budget in a competing group
+  *Mitigated.* Per-consumer credit (#65, #552): each connection holds at most
+  `consumer_credit` un-acked messages — a window that auto-tunes from a 64 floor
+  toward a 2048 ceiling (the default) and is RAM-bounded by the firm
+  `consumer_credit_bytes` byte budget — derived from the connection-scoped
+  `leased` set, so a stuck consumer pins only its own slots and cannot consume a
+  peer's budget in a competing group
   (`crates/ironbus-server/src/session.rs`, the `Session::credit_ceiling` /
   `leased` accounting).
 - **Resource exhaustion via disk.**
@@ -187,7 +189,7 @@ contains controls that actually run.
 | Frame length validated before allocation, hard 16 MiB + 64 KiB cap | `decode_frame_with_cap`, `frame.rs` | T7 (oversized-frame DoS) |
 | Named-group cap (default 1024) + name validation (1 to 128 graphic-ASCII) | `validate_group_name` / `poll_in`, `engine.rs` | T7 (group-name memory exhaustion, #240) |
 | Dedup producer-window cap (default 4096) with LRU eviction + 256-byte `producer_id`/`msg_id` caps | `DedupRegistry::make_room_for`, `dedup.rs`; `Session::handle_pub`, `session.rs` | T7 (distinct-`producer_id` dedup memory exhaustion, #33) |
-| Per-consumer credit (default 64) bounds one connection's in-flight set | `Session` credit / `leased`, `session.rs` | T7 (one consumer starving peers, #65) |
+| Per-consumer credit (message count auto-tunes 64 floor -> 2048 ceiling, RAM-bounded by the firm 8 MiB byte budget) bounds one connection's in-flight set | `Session` credit / `leased`, `session.rs` | T7 (one consumer starving peers, #65, #552) |
 | Durable-log byte cap + drop-new shed; consumer-safe retention reaper | `Log` byte cap / `Log::reap`, `engine.rs` | T7 (disk exhaustion, #10 / #13) |
 | Record body CRC32C (+ xxh3-64 for large records); CRC'd dual-slot checkpoint | `codec` / `checkpoint.rs` | T-file (bit-rot / torn write integrity) |
 | Bounded-loss fail-closed recovery (refuse to exceed the loss cap) | `check_caps`, `log.rs` | T-file (unbounded silent loss, I3 / #120) |

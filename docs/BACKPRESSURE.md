@@ -103,9 +103,14 @@ the specs below extend, but do not replace, them.
   `crates/ironbus-server/src/engine.rs`, `crates/ironbus-storage/src/log.rs`. See
   [WAL.md](WAL.md) and RR-03 in [RISK_REGISTER.md](RISK_REGISTER.md).
 - **Per-connection consumer credit.** Each connection holds at most
-  `consumer_credit` un-acked messages (default 64) and `consumer_credit_bytes`
-  un-acked bytes (default 8 MiB), derived from the connection-scoped `leased` set,
-  so one stuck consumer pins only its own slots and never starves a peer. Source:
+  `consumer_credit` un-acked messages and `consumer_credit_bytes` un-acked bytes
+  (default 8 MiB), derived from the connection-scoped `leased` set, so one stuck
+  consumer pins only its own slots and never starves a peer. The message-count
+  window AUTO-TUNES (#552): it starts at a 64 floor and grows toward the 2048
+  ceiling (`DEFAULT_CREDIT_CEILING`, the default) while the consumer keeps
+  draining, halving toward the floor under backpressure (reusing the egress AIMD);
+  the 8 MiB byte budget is the firm RAM bound the count grows strictly under, and
+  an explicit `--consumer-credit <= 64` pins the historical fixed window. Source:
   `crates/ironbus-server/src/session.rs` (#65, #275). See RR-01 in
   [RISK_REGISTER.md](RISK_REGISTER.md).
 

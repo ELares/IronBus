@@ -699,7 +699,7 @@ are deferred (no unauthenticated remote config mutation). See the discrepancies 
 | `lease`              | `LeaseConfig`   | -       | visibility timeout and hard cap |
 | `delivery`           | `DeliveryConfig`| -       | max-deliver and backoff |
 | `max_in_flight`      | u32             | -       | max-ack-pending window per group; `0` is rejected at open (`ZeroMaxInFlight`) |
-| `consumer_credit`    | u32             | `DEFAULT_CONSUMER_CREDIT` = 64 | per-connection standing in-flight credit; `0` is floored to 1 at open |
+| `consumer_credit`    | u32             | `DEFAULT_CONSUMER_CREDIT` = 2048 (the auto-tune CEILING) | per-connection in-flight credit; the message-count window auto-tunes from a 64 floor toward this ceiling, RAM-bounded by `consumer_credit_bytes`; `0` is floored to 1 at open, a value `<= 64` pins the historical fixed window |
 | `checkpoint_interval`| u64             | -       | checkpoint after the committed cursor advances this many offsets; `0` treated as 1 |
 | `max_retained_bytes` | u64             | 0 (unlimited) | consumer-safe size retention bound |
 | `max_age_ms`         | u64             | 0 (off) | consumer-safe age retention bound, in milliseconds |

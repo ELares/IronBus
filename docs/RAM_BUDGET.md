@@ -71,10 +71,16 @@ Every delivered-but-not-yet-acked message is held in RAM in the session's
 (`crates/ironbus-server/src/session.rs`). Two per-connection knobs bound this,
 and the effective bound is the smaller of the two:
 
-- `consumer_credit` (`--consumer-credit`, default **64**,
-  `DEFAULT_CONSUMER_CREDIT` in `crates/ironbus-server/src/engine.rs`): the max
-  count of un-acked messages a connection may hold
-  ([#65](https://github.com/ELares/IronBus/issues/65)).
+- `consumer_credit` (`--consumer-credit`, default **2048** = the auto-tune
+  CEILING, `DEFAULT_CONSUMER_CREDIT` in `crates/ironbus-server/src/engine.rs`):
+  the max count of un-acked messages a connection may hold. The window AUTO-TUNES
+  from a 64 floor toward this 2048 ceiling as the consumer keeps draining, halving
+  under backpressure (#552); the ceiling is the WORST-CASE count this budget must
+  charge. The firm `consumer_credit_bytes` budget below is what keeps the higher
+  ceiling RAM-safe — the count grows strictly UNDER it. An explicit
+  `--consumer-credit <= 64` pins the historical fixed window
+  ([#65](https://github.com/ELares/IronBus/issues/65),
+  [#552](https://github.com/ELares/IronBus/issues/552)).
 - `consumer_credit_bytes` (`--consumer-credit-bytes`, default **8 MiB**,
   `DEFAULT_CONSUMER_CREDIT_BYTES` in `engine.rs`; `0` = unlimited): the max
   un-acked PAYLOAD bytes (key + headers + payload) a connection may hold
@@ -100,8 +106,9 @@ count (the accept loop refuses past it, `serve` / `ConnectionSlot` in
 `crates/ironbus-server/src/server.rs`).
 
 **KEY FINDING: the defaults are not edge-safe.** With the shipped defaults and
-the 8 MiB byte budget binding (it binds long before 64 messages * a 16 MiB
-record):
+the 8 MiB byte budget binding (it binds long before the 2048-message count
+ceiling * a 16 MiB record — the byte budget is the firm RAM bound the count
+auto-tunes under):
 
 ```
 per_conn worst case  = consumer_credit_bytes = 8 MiB

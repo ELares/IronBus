@@ -68,10 +68,13 @@ Two flow-control facts are implemented and verified in the source.
   reply to a `Flow` is a stream of `Deliver` frames (tag 13) terminated by a
   `FlowEnd` (tag 16) whose body is the delivered count as a four-byte LE `u32`.
 - **Per-connection consumer credit binds every fetch.** A connection holds at most
-  `consumer_credit` un-acked messages (`DEFAULT_CONSUMER_CREDIT` = 64, NOT 65535)
-  and at most `consumer_credit_bytes` un-acked payload bytes
-  (`DEFAULT_CONSUMER_CREDIT_BYTES` = 8 MiB; `0` = unlimited), derived from the
-  connection-scoped `leased` set. A `Flow` fetch delivers at most
+  `consumer_credit` un-acked messages (`DEFAULT_CONSUMER_CREDIT` = 2048, the
+  auto-tune CEILING, NOT 65535) and at most `consumer_credit_bytes` un-acked
+  payload bytes (`DEFAULT_CONSUMER_CREDIT_BYTES` = 8 MiB; `0` = unlimited),
+  derived from the connection-scoped `leased` set. The message-count window
+  auto-tunes from a 64 floor toward the ceiling as the consumer keeps draining,
+  halving under backpressure, and is RAM-bounded by the firm byte budget; an
+  explicit `--consumer-credit <= 64` pins the historical fixed window. A `Flow` fetch delivers at most
   `min(requested_credit, message ceiling - already held, byte budget remaining,
   whatever the group makes available)`, with a hard floor of one message so a
   single over-budget message never wedges the consumer. Source:
@@ -176,7 +179,9 @@ per ack. The accounting is exactly the implemented per-connection model
 (`crates/ironbus-server/src/session.rs`), stated here as the normative rule:
 
 - **The ceiling is per connection, and NEGOTIATED (#292).** Each connection has a
-  standing message ceiling `consumer_credit` (default 64) and a byte budget
+  standing message ceiling `consumer_credit` (default 2048, the auto-tune ceiling:
+  the count window auto-tunes from a 64 floor toward it, halving under
+  backpressure, RAM-bounded by the byte budget) and a byte budget
   `consumer_credit_bytes` (default 8 MiB; `0` = unlimited). The effective ceiling for a
   connection is the NEGOTIATED value `min(client request, server cap)`: the client MAY
   request a credit in its `Connect` body, the server clamps it to its cap (or substitutes
@@ -521,8 +526,9 @@ deliverable); the **bytes on the wire and the broker/producer logic are the #11 
 - `crates/ironbus-server/src/session.rs`: `Session::handle_flow` (the implemented
   consumer-credit accounting), the per-connection `leased` set, and
   `release_stale_leases` (#65 redelivery accounting).
-- `crates/ironbus-server/src/engine.rs`: `DEFAULT_CONSUMER_CREDIT` (64) and
-  `DEFAULT_CONSUMER_CREDIT_BYTES` (8 MiB), the standing per-connection ceilings.
+- `crates/ironbus-server/src/engine.rs`: `DEFAULT_CONSUMER_CREDIT` (2048, the
+  auto-tune ceiling) and `DEFAULT_CONSUMER_CREDIT_BYTES` (8 MiB), the standing
+  per-connection ceilings.
 - `crates/ironbus-proto/src/frame.rs`: the frozen `FrameType` tags
   (`Flow` = 10, `FlowEnd` = 16) and the `type_tags_have_their_exact_frozen_wire_values`
   test that pins them.

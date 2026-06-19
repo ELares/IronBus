@@ -390,7 +390,7 @@ bounded only by `max_total_bytes` and `disk_full_policy`.
 | Knob (file key) | Flag / env | Type | Default | Units | Valid range | Reload |
 | --- | --- | --- | --- | --- | --- | --- |
 | `disk_full_policy` | `--disk-full-policy` / `IRONBUS_DISK_FULL_POLICY` | enum | `drop-new` (`DEFAULT_DISK_FULL_POLICY`) | -- | `drop-new \| drop-oldest` | HOT |
-| `consumer_credit` | `--consumer-credit` / `IRONBUS_CONSUMER_CREDIT` | u32 | `64` (`DEFAULT_CONSUMER_CREDIT`) | messages | `>= 1` (`0` floored to 1 at open) | HOT |
+| `consumer_credit` | `--consumer-credit` / `IRONBUS_CONSUMER_CREDIT` | u32 | `2048` (`DEFAULT_CONSUMER_CREDIT`, the auto-tune CEILING) | messages | `>= 1` (`0` floored to 1 at open; the count window auto-tunes from a 64 floor toward this ceiling, RAM-bounded by `consumer_credit_bytes`; `<= 64` pins the historical fixed window) | HOT |
 | `consumer_credit_bytes` | `--consumer-credit-bytes` / `IRONBUS_CONSUMER_CREDIT_BYTES` | u64 | `8388608` (8 MiB, `DEFAULT_CONSUMER_CREDIT_BYTES`) | bytes | `0` = unlimited or any u64 | HOT |
 | `max_in_flight` | `--max-in-flight` / `IRONBUS_MAX_IN_FLIGHT` | u32 | `1024` (`DEFAULT_MAX_IN_FLIGHT`) | messages | `>= 1` (`0` rejected: `ZeroMaxInFlight`) | COLD |
 | `max_connections` | `--max-connections` / `IRONBUS_MAX_CONNECTIONS` | usize | `256` (`DEFAULT_MAX_CONNECTIONS`) | count | `>= 1` | COLD |
@@ -668,8 +668,8 @@ max_total_bytes = "0B"             # 0 = unlimited (a plain integer 0 is also ac
 
 [backpressure]
 disk_full_policy = "drop-new"      # drop-new | drop-oldest (block is opt-in-only, not shipped)
-consumer_credit = 64               # per-connection message credit
-consumer_credit_bytes = "8MiB"     # 8 MiB per-connection byte budget (0 = unlimited)
+consumer_credit = 2048             # per-connection message-credit CEILING (auto-tunes from a 64 floor; <=64 pins a fixed window)
+consumer_credit_bytes = "8MiB"     # 8 MiB per-connection byte budget, the firm RAM bound (0 = unlimited)
 max_in_flight = 1024               # per-group window
 max_connections = 256
 max_groups = 1024                  # 0 = unlimited
@@ -736,7 +736,7 @@ column is cross-referenced byte-for-byte against the `tiny` profile table in
 | Knob (flag) | `edge-tiny` | `balanced` (the default) | `throughput` |
 | --- | --- | --- | --- |
 | `segment_size` (`--max-segment-bytes`) | `8388608` (8 MiB) | `67108864` (64 MiB) | `268435456` (256 MiB) |
-| `consumer_credit` (`--consumer-credit`) | `8` | `64` | `512` |
+| `consumer_credit` (`--consumer-credit`) | `8` | `2048` (the auto-tune ceiling) | `512` |
 | `consumer_credit_bytes` (`--consumer-credit-bytes`) | `262144` (256 KiB) | `8388608` (8 MiB) | `67108864` (64 MiB) |
 | `max_connections` (`--max-connections`) | `32` | `256` | `1024` |
 | `max_groups` (`--max-groups`) | `64` | `1024` | `4096` |
@@ -764,9 +764,10 @@ One-line rationale each:
   bounded-buffer footprint is well under 64 MiB), so it boots, but a blown-up cap
   override (e.g. a server-sized `--max-connections`) is provably refused.
 - **`balanced`** is THE default, and is exactly the set of compiled-in
-  `DEFAULT_*` constants in `main.rs` (64 MiB segments, 64 / 8 MiB consumer
-  credits, 256 connections, 1024 groups, 1024 in-flight, `drop-new`, 1024
-  checkpoint, 30 s visibility, 5 max-deliver). This is what `ironbus serve` with
+  `DEFAULT_*` constants in `main.rs` (64 MiB segments, 2048-message / 8 MiB
+  consumer credits — the count is the auto-tune ceiling, the 8 MiB byte budget the
+  firm RAM bound it tunes under — 256 connections, 1024 groups, 1024 in-flight,
+  `drop-new`, 1024 checkpoint, 30 s visibility, 5 max-deliver). This is what `ironbus serve` with
   no profile, no file, no env var, and no flag runs, which is the
   zero-config-starts-on-`balanced` acceptance guarantee. (RAM_BUDGET.md notes
   these server-sized defaults are NOT edge-safe: 256 conns x 8 MiB is ~2 GiB
