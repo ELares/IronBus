@@ -235,6 +235,49 @@ in addition to the size cap, but the locked `[storage]` table and the shipped
 here (COLD, COUPLED with `segment_size`) so the time roll is representable; the
 field and flag are the #4/#87 implementation residual.
 
+#### `max_total_bytes` is a RECORD-region cap, not a disk/RAM budget (#493)
+
+`max_total_bytes` caps ONLY the framed **record region** — the sum, across every
+segment, of `valid_end - SEGMENT_HEADER_LEN` (the same quantity recovery sums as
+`durable_bytes` and retention reaps against). It deliberately does NOT count the
+per-segment framing, the in-memory image, or a disk backend's preallocation, so the
+**true resident footprint is always larger than the configured cap**. An operator
+sizing a memory or disk budget MUST apply the multiplier below rather than assume
+`bytes_resident == max_total_bytes`.
+
+Why the cap basis stays the record region (and is not switched to a physical meter):
+retention/reap decrement the record-region total in O(1), so it is the one basis a
+reap can relieve. `ironbus_physical_bytes_written` is a write-AMPLIFICATION counter
+that **never decreases on a reap**, so capping on it would tighten after every reap
+and eventually wedge the writer; and the resident terms below are backend- and
+config-specific (the in-memory image is dropping from 2x to 1x in #492; disk
+preallocation depends on `segment_size`), so no single basis can honestly fold them
+in. The cap basis is therefore left untouched and the overhead is published here.
+
+Per-backend multiplier (record region → resident bytes):
+
+| Term | Adds | Worst case (tiny records) |
+| --- | --- | --- |
+| Per-record framing | 44 B/record (36 B header + 8 B trailer) already INSIDE the record region | dominates at small payloads: a 1 B record frames to ~45 B → ~`1.85x` of payload |
+| Per-segment header/footer | 64 B/segment + 32 B/sealed segment | small unless `segment_size` is tiny (many segments) |
+| In-memory image (`--storage memory`) | historically **2x** the record region (the in-RAM copy); dropping to **1x** in #492 | up to 2x of resident until #492 lands |
+| Per-segment index cache (memory + disk) | a few entries per segment | small |
+| Disk preallocation (`--storage disk`) | the ACTIVE segment is preallocated to `segment_size` (default 64 MiB) | up to one `segment_size` of apparent disk use beyond the resident framed bytes |
+
+**Honest live estimate.** The framed resident bytes (record region + every live
+segment's header + every sealed segment's footer, reap-tracked) are exposed
+programmatically by `Log::resident_bytes_estimate()`. It excludes the in-memory
+image multiplier and disk preallocation on purpose (both are backend/config
+specific — add them from the table above). Practical sizing:
+
+- **Disk budget** ≈ `resident_bytes_estimate()` + `segment_size` (the active
+  segment's preallocation). To hold `max_total_bytes` of record bytes, provision at
+  least `max_total_bytes + (segment_count × 96 B framing) + segment_size`.
+- **Memory budget** (`--storage memory`) ≈ `resident_bytes_estimate()` × the image
+  multiplier (2x today, 1x after #492). `max_total_bytes` is REQUIRED above `0` for
+  the memory backend precisely because it is the OOM guard — size it as
+  `desired_RAM / image_multiplier`, then subtract the segment-framing overhead.
+
 ### Durability (`[durability]`)
 
 | Knob (file key) | Flag / env | Type | Default | Units | Valid range | Reload |
