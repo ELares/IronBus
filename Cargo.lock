@@ -853,6 +853,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "protobuf",
  "raft",
  "serde",
  "serde_json",

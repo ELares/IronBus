@@ -69,6 +69,16 @@ raft = { version = "=0.7.0", default-features = false, features = ["protobuf-cod
 # arm, so cargo-deny accepts it). No new crate enters the graph.
 slog = { version = "2", default-features = false }
 
+# Durable metadata Raft log codec (V2-C1, #580). The metadata `Storage` (C1-I2) persists each raft
+# `Entry` / `HardState` / `ConfState` to the IronBus CRC-framed log as its `protobuf` wire bytes —
+# the SAME encoding raft-rs uses internally via the vendored `eraftpb` types — so an entry round-trips
+# byte-for-byte across a restart. `protobuf` is the PURE-RUST runtime crate (no `protoc`, no `links`,
+# no C build script) ALREADY resolved in the lockfile (`=2.28.0`) by `raft`'s `protobuf-codec` feature
+# and the vendored `raft-proto`, so making it a first-class dependency here adds NO new crate to the
+# graph and does not change `Cargo.lock`. Permissive (MIT / Apache-2.0), on the deny.toml allow-list,
+# MSRV well below the workspace 1.78 floor. `default-features = false` keeps the lean runtime surface.
+protobuf = { version = "2", default-features = false }
+
 # Refcounted byte buffer for the produce hot path (#474). `OwnedAppend` carries the publish payload
 # (and key/headers/dedup ids) as `bytes::Bytes` so moving a produce across the append-actor channel is
 # a refcount bump, not a per-publish `Vec` deep copy. `bytes` is pure Rust (no `links`, no C build
