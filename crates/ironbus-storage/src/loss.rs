@@ -83,6 +83,19 @@ impl ReasonCode {
         ReasonCode::UnresolvedDictId,
     ];
 
+    /// This reason's index into [`ReasonCode::ALL`] (and so into the per-reason arrays
+    /// [`LossAggregate`] produces). It is `code() - 1` today, but deriving it from the position in
+    /// `ALL` keeps the two in lockstep so a future reason that is appended (or, hypothetically,
+    /// given a non-contiguous code) cannot silently desync the array index from the metric order.
+    #[must_use]
+    fn all_index(self) -> usize {
+        // `ALL` is the frozen, append-only enumeration, so every variant is present exactly once.
+        ReasonCode::ALL
+            .iter()
+            .position(|&rc| rc == self)
+            .expect("every ReasonCode is in ReasonCode::ALL")
+    }
+
     /// A stable, lower-snake-case label for this reason, for a metric series or a log field.
     /// Frozen alongside [`ReasonCode::code`].
     #[must_use]
@@ -203,6 +216,34 @@ pub struct LossReport {
     pub events: Vec<LossEvent>,
 }
 
+/// Every per-reason and grand total a metrics scrape reads from a [`LossReport`], folded in a
+/// SINGLE pass by [`LossReport::aggregate`] instead of one whole-event-list rescan per accessor
+/// per reason (#504).
+///
+/// The per-reason arrays are indexed in [`ReasonCode::ALL`] order: `bytes_skipped[i]` and
+/// `records_lost[i]` are the totals for `ReasonCode::ALL[i]`, matching the order the metrics
+/// endpoint emits its series in. This is a derived, in-memory view of an existing report (not a
+/// persisted schema), so it carries no `serde` derive and adding to it never touches the frozen
+/// `ironbus.loss-report.v1` wire format.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LossAggregate {
+    /// Bytes dropped per reason, indexed in [`ReasonCode::ALL`] order. Equals
+    /// [`LossReport::bytes_skipped_for`] for each reason.
+    pub bytes_skipped: [u64; ReasonCode::ALL.len()],
+    /// Estimated records dropped per reason, indexed in [`ReasonCode::ALL`] order. Equals
+    /// [`LossReport::records_lost_for`] for each reason.
+    pub records_lost: [u64; ReasonCode::ALL.len()],
+    /// The grand total of dropped bytes across all reasons. Equals
+    /// [`LossReport::total_bytes_skipped`].
+    pub total_bytes_skipped: u64,
+    /// The grand total of estimated records dropped across all reasons. Equals
+    /// [`LossReport::total_records_lost_estimate`].
+    pub total_records_lost_estimate: u64,
+    /// The bytes of real DATA loss (with [`ReasonCode::TornTail`] excluded). Equals
+    /// [`LossReport::data_loss_bytes`].
+    pub data_loss_bytes: u64,
+}
+
 impl LossReport {
     /// The current loss-report schema version. Bumped only on an incompatible change to the
     /// fields or their meaning; new [`ReasonCode`] variants do not bump it (readers ignore an
@@ -298,6 +339,39 @@ impl LossReport {
             .iter()
             .filter(|e| e.reason_code == reason)
             .fold(0u64, |acc, e| acc.saturating_add(e.records_lost_estimate))
+    }
+
+    /// Every per-reason and grand total a metrics scrape needs, computed in a SINGLE pass over the
+    /// events.
+    ///
+    /// The individual accessors ([`total_bytes_skipped`](LossReport::total_bytes_skipped),
+    /// [`data_loss_bytes`](LossReport::data_loss_bytes),
+    /// [`bytes_skipped_for`](LossReport::bytes_skipped_for),
+    /// [`records_lost_for`](LossReport::records_lost_for), …) each walk the whole event list, so a
+    /// scrape that asks for every per-reason series calls them once per reason: O(reasons · events).
+    /// This folds the same arithmetic ONCE into [`LossAggregate`]'s small fixed-size per-reason
+    /// arrays, so the scrape is O(events) regardless of how many reasons or series it renders (#504).
+    ///
+    /// The per-reason arrays are indexed in [`ReasonCode::ALL`] order (so `bytes_skipped[i]` is the
+    /// byte total for `ReasonCode::ALL[i]`), and every field matches its standalone accessor
+    /// exactly, saturating add for saturating add and `is_data_loss` filter for `is_data_loss`
+    /// filter, so this is purely the same answer computed once rather than rescanned per reason.
+    #[must_use]
+    pub fn aggregate(&self) -> LossAggregate {
+        let mut agg = LossAggregate::default();
+        for e in &self.events {
+            let i = e.reason_code.all_index();
+            agg.bytes_skipped[i] = agg.bytes_skipped[i].saturating_add(e.bytes_skipped);
+            agg.records_lost[i] = agg.records_lost[i].saturating_add(e.records_lost_estimate);
+            agg.total_bytes_skipped = agg.total_bytes_skipped.saturating_add(e.bytes_skipped);
+            agg.total_records_lost_estimate = agg
+                .total_records_lost_estimate
+                .saturating_add(e.records_lost_estimate);
+            if e.reason_code.is_data_loss() {
+                agg.data_loss_bytes = agg.data_loss_bytes.saturating_add(e.bytes_skipped);
+            }
+        }
+        agg
     }
 
     /// The global loss cap in bytes for a log holding `durable_bytes` of durable data, using
@@ -755,6 +829,89 @@ mod tests {
             ReasonCode::UnresolvedDictId
         ));
         assert!(ReasonCode::UnresolvedDictId.is_data_loss());
+    }
+
+    #[test]
+    fn aggregate_matches_the_per_reason_accessors_in_one_pass() {
+        // A report with several reasons (including repeats and a saturating-prone span) so the
+        // single-pass aggregate is exercised against every standalone accessor it replaces (#504).
+        let mut r = LossReport::new();
+        r.push(LossEvent::span(0, 0, 10, 2, ReasonCode::TornTail));
+        r.push(LossEvent::span(1, 0, 30, 7, ReasonCode::CorruptRecordBody));
+        r.push(LossEvent::span(2, 0, 5, 3, ReasonCode::TornTail));
+        r.push(LossEvent::span(3, 0, 40, 1, ReasonCode::ScrubberSuspect));
+        r.push(LossEvent::span(4, 0, 55, 4, ReasonCode::UnresolvedDictId));
+
+        let agg = r.aggregate();
+        // The grand totals match their accessors exactly.
+        assert_eq!(agg.total_bytes_skipped, r.total_bytes_skipped());
+        assert_eq!(
+            agg.total_records_lost_estimate,
+            r.total_records_lost_estimate()
+        );
+        assert_eq!(agg.data_loss_bytes, r.data_loss_bytes());
+        // The per-reason arrays match the per-reason accessors, in ReasonCode::ALL order.
+        for (i, &rc) in ReasonCode::ALL.iter().enumerate() {
+            assert_eq!(
+                agg.bytes_skipped[i],
+                r.bytes_skipped_for(rc),
+                "bytes for {rc:?}"
+            );
+            assert_eq!(
+                agg.records_lost[i],
+                r.records_lost_for(rc),
+                "records for {rc:?}"
+            );
+        }
+        // The per-reason arrays sum back to the grand totals (no event was dropped or double-counted).
+        assert_eq!(
+            agg.bytes_skipped.iter().sum::<u64>(),
+            agg.total_bytes_skipped
+        );
+        assert_eq!(
+            agg.records_lost.iter().sum::<u64>(),
+            agg.total_records_lost_estimate
+        );
+
+        // An empty report aggregates to all zeros.
+        assert_eq!(LossReport::new().aggregate(), LossAggregate::default());
+
+        // Saturation in the single pass matches the saturating accessors: two near-MAX torn tails
+        // saturate the total, and a non-torn near-MAX span saturates the data-loss total too.
+        let mut big = LossReport::new();
+        big.push(LossEvent::span(
+            0,
+            0,
+            u64::MAX,
+            u64::MAX,
+            ReasonCode::TornTail,
+        ));
+        big.push(LossEvent::span(
+            1,
+            0,
+            u64::MAX,
+            u64::MAX,
+            ReasonCode::TornTail,
+        ));
+        big.push(LossEvent::span(
+            2,
+            0,
+            u64::MAX,
+            u64::MAX,
+            ReasonCode::CorruptRecordBody,
+        ));
+        let bagg = big.aggregate();
+        assert_eq!(bagg.total_bytes_skipped, big.total_bytes_skipped());
+        assert_eq!(bagg.total_bytes_skipped, u64::MAX);
+        assert_eq!(
+            bagg.total_records_lost_estimate,
+            big.total_records_lost_estimate()
+        );
+        assert_eq!(bagg.data_loss_bytes, big.data_loss_bytes());
+        for (i, &rc) in ReasonCode::ALL.iter().enumerate() {
+            assert_eq!(bagg.bytes_skipped[i], big.bytes_skipped_for(rc));
+            assert_eq!(bagg.records_lost[i], big.records_lost_for(rc));
+        }
     }
 
     #[test]
