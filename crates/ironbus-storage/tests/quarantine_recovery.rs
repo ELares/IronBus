@@ -141,9 +141,18 @@ fn a_corrupt_segment_is_copied_to_quarantine_while_recovery_recovers_the_prefix(
         "live segment truncated to the prefix"
     );
 
-    // Recovery never scanned the quarantine blob as a live segment: the live directory lists only
-    // the segment file, never the blob.
-    assert_eq!(fs.list().unwrap(), vec![segment_file_name(0)]);
+    // Recovery never scanned the quarantine blob as a live segment: the live directory contains the
+    // segment file (and the data-dir layout marker `layout.meta`, #562) but NEVER the blob, which
+    // lives only in the quarantine/ subdir.
+    let root = fs.list().unwrap();
+    assert!(
+        root.contains(&segment_file_name(0)),
+        "the live segment is present in the root: {root:?}"
+    );
+    assert!(
+        !root.contains(&blob_name),
+        "the quarantine blob is never in the live root listing: {root:?}"
+    );
 }
 
 #[test]

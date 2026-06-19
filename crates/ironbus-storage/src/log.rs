@@ -747,6 +747,13 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
     /// # Errors
     /// Returns [`StorageError`] on an IO error or a structurally invalid segment.
     pub fn open(fs: F, clock: C, config: LogConfig) -> Result<Log<F, C>, StorageError> {
+        // Check (and, on a pre-marker dir, durably write) the data-directory LAYOUT version marker
+        // BEFORE any recovery, so a FUTURE layout is refused fail-closed before its unknown-shaped
+        // contents are interpreted (#562). An absent or torn/corrupt marker recovers as layout v1
+        // and is (re)written idempotently; an existing single-log deployment is byte-for-byte layout
+        // v1, so this records a fact and reinterprets no segment, cursor, or DLQ byte. Recovery below
+        // is unchanged. Reserves the `streams/` subtree for per-stream logs (M2-I2); does not create it.
+        crate::layout::open_or_upgrade(&fs)?;
         let ids = segment_ids(&fs)?;
         match ids.last().copied() {
             None => {
