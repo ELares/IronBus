@@ -96,6 +96,19 @@ pub trait Filesystem: Send + Sync {
     /// # Errors
     /// Returns [`io::ErrorKind::InvalidInput`] for an unsafe `name`, or an IO error.
     fn subdir_exists(&self, name: &str) -> io::Result<bool>;
+
+    /// Lists the names of the immediate SUBDIRECTORIES of this directory, in sorted order, WITHOUT
+    /// creating any. This is the directory-level complement to [`Filesystem::list`] (which reports
+    /// only regular files): it is what lets a multi-store layer enumerate its children, e.g. the
+    /// `StreamSet` enumerating each `streams/<name>/` per-stream log at open (M2-I2), the same way
+    /// segment recovery enumerates `seg-<id>.log` files. Each returned name is a single, safe path
+    /// component that can be passed to [`Filesystem::subdir`]. The order is deterministic across
+    /// backends so recovery never depends on raw directory order. A directory with no
+    /// subdirectories yields an empty list, never an error.
+    ///
+    /// # Errors
+    /// Propagates the underlying IO error.
+    fn list_subdirs(&self) -> io::Result<Vec<String>>;
 }
 
 /// Validates that `name` is a single, safe path component (no separator, no `.`/`..`, no NUL),
@@ -285,6 +298,27 @@ impl Filesystem for InMemoryFs {
         let dir_prefix = format!("{}{name}/", self.prefix);
         Ok(self.lock().live.keys().any(|k| k.starts_with(&dir_prefix)))
     }
+
+    fn list_subdirs(&self) -> io::Result<Vec<String>> {
+        // The flat store models a subdirectory as a deeper key prefix, so an immediate subdirectory
+        // is the FIRST path component of any key under this handle's prefix whose remainder still
+        // contains a `/` (i.e. the key lives in a child directory, not directly here). A `BTreeSet`
+        // dedupes the many keys that share one subdir and yields the names in sorted order, matching
+        // `list`'s deterministic ordering. A subdir "exists" iff it holds at least one live key,
+        // consistent with `subdir_exists`.
+        let g = self.lock();
+        let mut dirs = std::collections::BTreeSet::new();
+        for k in g.live.keys() {
+            if let Some(rest) = k.strip_prefix(&self.prefix) {
+                if let Some((head, _)) = rest.split_once('/') {
+                    if !head.is_empty() {
+                        dirs.insert(head.to_owned());
+                    }
+                }
+            }
+        }
+        Ok(dirs.into_iter().collect())
+    }
 }
 
 /// An EPHEMERAL in-memory [`Filesystem`] for the real `--storage memory` broker (#492).
@@ -418,6 +452,24 @@ impl Filesystem for EphemeralFs {
         let dir_prefix = format!("{}{name}/", self.prefix);
         Ok(self.lock().keys().any(|k| k.starts_with(&dir_prefix)))
     }
+
+    fn list_subdirs(&self) -> io::Result<Vec<String>> {
+        // Same flat-store rule as `InMemoryFs::list_subdirs`: the immediate subdirectories are the
+        // first path components of the keys under this handle's prefix whose remainder still holds a
+        // `/`, deduped and sorted.
+        let g = self.lock();
+        let mut dirs = std::collections::BTreeSet::new();
+        for k in g.keys() {
+            if let Some(rest) = k.strip_prefix(&self.prefix) {
+                if let Some((head, _)) = rest.split_once('/') {
+                    if !head.is_empty() {
+                        dirs.insert(head.to_owned());
+                    }
+                }
+            }
+        }
+        Ok(dirs.into_iter().collect())
+    }
 }
 
 /// A production [`Filesystem`] rooted at a real data directory, using positioned IO
@@ -522,6 +574,29 @@ impl Filesystem for StdFs {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    fn list_subdirs(&self) -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            // Only real directories (the segment file `list` reports only files; this is its mirror
+            // for directories). A symlink to a directory is NOT followed: `file_type` reports the
+            // link itself, so a planted symlink cannot make enumeration escape the data dir.
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            // A non-UTF-8 name cannot be an IronBus subdir (stream subdir names are ASCII hex), so
+            // skip it rather than failing the whole listing on one foreign entry — exactly as `list`
+            // does for files.
+            if let Ok(name) = entry.file_name().into_string() {
+                names.push(name);
+            }
+        }
+        // Sorted, so `list_subdirs` is deterministic across backends; recovery must not depend on
+        // raw `read_dir` order.
+        names.sort();
+        Ok(names)
     }
 }
 
@@ -685,6 +760,31 @@ mod tests {
     }
 
     #[test]
+    fn list_subdirs_enumerates_immediate_children_only_sorted() {
+        let fs = InMemoryFs::new();
+        // A flat file at the root is not a subdir.
+        fs.create_new("seg-0.log").unwrap();
+        // Two immediate subdirs (materialized lazily as a file appears in each), each with a deeper
+        // child that must NOT be reported as a top-level subdir of the root.
+        let beta = fs.subdir("beta").unwrap();
+        beta.create_new("seg-0.log").unwrap();
+        let alpha = fs.subdir("alpha").unwrap();
+        alpha.create_new("seg-0.log").unwrap();
+        alpha.subdir("nested").unwrap().create_new("x").unwrap();
+        // Sorted, deduped, immediate children only (not "nested", which is alpha's child).
+        assert_eq!(
+            fs.list_subdirs().unwrap(),
+            vec!["alpha".to_owned(), "beta".to_owned()]
+        );
+        // From inside alpha, only its own immediate child is reported.
+        assert_eq!(alpha.list_subdirs().unwrap(), vec!["nested".to_owned()]);
+        // A leaf subdir with no children reports none.
+        assert!(beta.list_subdirs().unwrap().is_empty());
+        // A subdir with only files (no child dirs) is itself listed by its parent but lists nothing.
+        assert_eq!(fs.list().unwrap(), vec!["seg-0.log".to_owned()]);
+    }
+
+    #[test]
     fn a_subdir_shares_the_power_loss_image_with_the_parent() {
         let fs = InMemoryFs::new();
         let dlq = fs.subdir("dlq").unwrap();
@@ -780,6 +880,23 @@ mod ephemeral_fs_tests {
             fs.remove("a.log").unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn list_subdirs_enumerates_immediate_children_only() {
+        // The ephemeral backend uses the same flat-store subdir rule as InMemoryFs, so list_subdirs
+        // must report immediate children only, sorted, deduped.
+        let fs = EphemeralFs::new();
+        fs.create_new("seg-0.log").unwrap();
+        let alpha = fs.subdir("alpha").unwrap();
+        alpha.create_new("seg-0.log").unwrap();
+        fs.subdir("beta").unwrap().create_new("seg-0.log").unwrap();
+        alpha.subdir("nested").unwrap().create_new("x").unwrap();
+        assert_eq!(
+            fs.list_subdirs().unwrap(),
+            vec!["alpha".to_owned(), "beta".to_owned()]
+        );
+        assert_eq!(alpha.list_subdirs().unwrap(), vec!["nested".to_owned()]);
     }
 
     #[test]
@@ -932,6 +1049,31 @@ mod std_tests {
         // and sees the file written before.
         let dlq_again = fs.subdir("dlq").unwrap();
         assert_eq!(dlq_again.list().unwrap(), vec!["seg.log".to_owned()]);
+    }
+
+    #[test]
+    fn list_subdirs_reports_directories_not_files_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = StdFs::new(dir.path().to_path_buf());
+        // Files at the root are never reported as subdirs.
+        fs.create_new("a.log").unwrap();
+        fs.create_new("layout.meta").unwrap();
+        // Real subdirectories, created out of lexicographic order.
+        let streams = fs.subdir("streams").unwrap();
+        fs.subdir("dlq").unwrap();
+        // Children of `streams/` are not top-level subdirs of the root.
+        streams.subdir("6f7264657273").unwrap(); // streams/<hex("orders")>
+                                                 // The root reports exactly its two immediate subdirs, sorted, never the files or grandchildren.
+        assert_eq!(
+            fs.list_subdirs().unwrap(),
+            vec!["dlq".to_owned(), "streams".to_owned()]
+        );
+        assert_eq!(
+            streams.list_subdirs().unwrap(),
+            vec!["6f7264657273".to_owned()]
+        );
+        // A leaf subdir with no child directories reports none, and matches the in-memory backend.
+        assert!(fs.subdir("dlq").unwrap().list_subdirs().unwrap().is_empty());
     }
 
     #[test]

@@ -3753,6 +3753,9 @@ mod tests {
         fn subdir_exists(&self, name: &str) -> std::io::Result<bool> {
             self.inner.subdir_exists(name)
         }
+        fn list_subdirs(&self) -> std::io::Result<Vec<String>> {
+            self.inner.list_subdirs()
+        }
     }
 
     #[test]

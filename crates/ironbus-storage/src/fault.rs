@@ -464,6 +464,10 @@ impl<F: Filesystem> Filesystem for FaultFs<F> {
     fn subdir_exists(&self, name: &str) -> io::Result<bool> {
         self.inner.subdir_exists(name)
     }
+
+    fn list_subdirs(&self) -> io::Result<Vec<String>> {
+        self.inner.list_subdirs()
+    }
 }
 
 /// A [`RandomAccessFile`] that wraps another and injects faults while the shared

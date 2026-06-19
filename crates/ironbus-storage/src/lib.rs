@@ -32,3 +32,10 @@ pub mod quarantine;
 pub mod read_plane;
 pub mod segment;
 pub mod sim;
+/// A [`StreamSet`](streamset::StreamSet): N independently-opened, independently-recovered IronBus
+/// logs over one filesystem (#563, V2-M2). The DEFAULT stream `""` is today's root log (byte
+/// identical), and each named stream is an independent [`log::Log`] under `streams/<name>/`
+/// (generalizing the `dlq/` subdir pattern). Each stream recovers independently — a torn stream
+/// recovers to its own valid prefix + loss report without touching a sibling — and per-record cost
+/// stays flat as streams grow (no per-record structure is added).
+pub mod streamset;

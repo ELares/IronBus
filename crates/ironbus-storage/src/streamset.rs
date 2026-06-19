@@ -1,0 +1,807 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! A `StreamSet`: N independently-opened, independently-recovered IronBus logs over one filesystem
+//! (#563, V2-M2 the multiple-streams core).
+//!
+//! The single-log broker is, in v2 terms, a broker with exactly ONE stream: the DEFAULT stream `""`,
+//! which IS today's root log (the `seg-<hex>.log` segments at the data-dir root). This module
+//! generalizes that to N streams without touching the default stream's bytes: the default stream
+//! stays the root log, byte for byte, and each NAMED stream is its own independent [`Log`] under
+//! `streams/<hex(name)>/`. A deployment that declares no named stream is therefore unchanged on disk
+//! and in behavior — `streams/` is never even created.
+//!
+//! ## The DLQ-subdir pattern, generalized
+//!
+//! [`crate::dlq::DlqSink`] proved the pattern this module generalizes: a fully independent
+//! [`Log`] rooted at a subdirectory of the same [`Filesystem`] (`Log::open(parent_fs.subdir("dlq"),
+//! …)`), using the exact same framed, CRC32C'd, recoverable segment format and the same recovery
+//! path as the main log, with no second format to maintain. The DLQ is ONE such subdir-log; a
+//! `StreamSet` is N of them, one per named stream under the reserved `streams/` subtree (whose name
+//! #670 reserved and versioned via the layout marker), keyed by a validated [`StreamId`].
+//!
+//! ## Per-stream resilience isolation (the headline property)
+//!
+//! Because each stream is an independent [`Log`] over its OWN segment set, each stream recovers
+//! independently: it gets the existing longest-valid-prefix recovery, per-record CRC, and a bounded,
+//! reported [`LossReport`] over ITS OWN durable bytes (recovery is a pure function of a stream's
+//! durable bytes — I1-I4). A torn or corrupt segment in stream X recovers X to X's own valid prefix
+//! and X's own loss report, and CANNOT shorten or corrupt a sibling stream's recovery or the default
+//! stream's: a single bad segment contains its blast radius to one stream rather than poisoning all
+//! traffic. This is the resilience win the shared-WAL fallback (M2-I13) deliberately trades away for
+//! density, and the property [`StreamSet::open`]'s test suite asserts directly.
+//!
+//! ## Per-record cost stays FLAT as streams grow
+//!
+//! A `StreamSet` adds NO per-record structure: the resident index is per-stream and O(Σ segments) of
+//! that stream (the same resident index a single [`Log`] already keeps), so total resident index is
+//! O(Σ segments across all streams) — never O(Σ records). Opening stream X touches only X's
+//! directory; it never reads or rebuilds stream Y. Appending to X is exactly a single-`Log` append on
+//! X. Adding a stream therefore costs one directory + its segments, never a per-record tax on the
+//! others.
+//!
+//! ## Scope boundary (what this module is NOT)
+//!
+//! This is the StreamSet storage primitive ONLY: multi-`Log` open / recover / declare / route-by-id.
+//! It deliberately does NOT do:
+//! - the cross-stream group-commit `CommitCoordinator` (one `fdatasync` batched across streams) —
+//!   that is M2-I3 (#564). Here each stream syncs INDEPENDENTLY ([`StreamSet::sync_stream`] /
+//!   [`StreamSet::sync_all`]); correctness first, the fsync-batching optimization is I3's job.
+//! - the `max_open_streams` hot-set / fd LRU bound — M2-I4 (#565). Here every declared stream's
+//!   [`Log`] is kept resident.
+//! - per-stream retention/compaction — M2-I5.
+//! - the WIRE frames (`StreamDeclare`/`PubTo`/`SubTo`) — M2-I10. A `StreamSet` is a storage/engine
+//!   internal API; the wire protocol is untouched.
+//! - partitions — M2-I11.
+
+use crate::fs::Filesystem;
+use crate::layout::STREAMS_SUBDIR;
+use crate::log::{Append, Log, LogConfig};
+use crate::loss::LossReport;
+use crate::naming::{
+    is_valid_stream_name, parse_stream_subdir_name, stream_subdir_name, MAX_STREAM_NAME_LEN,
+};
+use crate::segment::{OwnedRecord, StorageError};
+use ironbus_core::clock::Clock;
+use ironbus_core::types::Offset;
+use std::collections::BTreeMap;
+
+/// A validated stream identifier: either the DEFAULT stream (the empty name `""`, today's root log)
+/// or a NAMED stream (1 to [`MAX_STREAM_NAME_LEN`] graphic-ASCII bytes). The newtype makes an invalid
+/// name unrepresentable past construction, so every API that takes a `StreamId` is already validated
+/// — the routing layer (and the later wire wiring, M2-I10) cannot smuggle a path-unsafe or
+/// over-length name into the filesystem.
+///
+/// Construct via [`StreamId::default_stream`] (the root log) or [`StreamId::named`] (validated).
+/// Equality and ordering are by the underlying name, so a `StreamId` keys the [`StreamSet`]'s
+/// `BTreeMap` directly (deterministic iteration, default stream first since `"" < any non-empty`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StreamId(String);
+
+impl StreamId {
+    /// The DEFAULT stream: the empty name `""`, which addresses today's ROOT log (the data-dir's
+    /// `seg-<hex>.log` segments), NOT a `streams/` child. Routing the default stream preserves the
+    /// single-log broker's behavior exactly.
+    #[must_use]
+    pub fn default_stream() -> StreamId {
+        StreamId(String::new())
+    }
+
+    /// Constructs a NAMED stream id, validating the name against [`is_valid_stream_name`] (1 to
+    /// [`MAX_STREAM_NAME_LEN`] graphic-ASCII bytes — the SAME rule a work-group name obeys). The
+    /// empty name is rejected here: the default stream is constructed via [`StreamId::default_stream`],
+    /// never by passing `""` to a "named" constructor, so the two are never confused.
+    ///
+    /// # Errors
+    /// Returns [`StreamError::InvalidName`] (carrying the rejected name) for an empty, over-length,
+    /// or non-graphic-ASCII name, so a bad name fails closed at the boundary rather than reaching the
+    /// filesystem.
+    pub fn named(name: &str) -> Result<StreamId, StreamError> {
+        if is_valid_stream_name(name) {
+            Ok(StreamId(name.to_string()))
+        } else {
+            Err(StreamError::InvalidName {
+                name: name.to_string(),
+            })
+        }
+    }
+
+    /// The stream's name: `""` for the default stream, else the validated named-stream name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether this is the DEFAULT stream (the root log).
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// An error from a [`StreamSet`] operation that is not itself a lower-level [`StorageError`]: today,
+/// only an invalid stream name (the validation boundary). A storage/IO failure from opening,
+/// recovering, appending, reading, or syncing a stream's [`Log`] surfaces as [`StorageError`]
+/// directly via the `From` impl below, so callers handle the two with one `?`.
+#[derive(Debug)]
+pub enum StreamError {
+    /// A named stream's name was empty, longer than [`MAX_STREAM_NAME_LEN`], or contained a
+    /// non-graphic-ASCII byte (the same rule a work-group name obeys). Carries the rejected name.
+    InvalidName {
+        /// The rejected stream name.
+        name: String,
+    },
+    /// A lower-level storage or IO error from a stream's [`Log`] (open, recover, append, read, sync,
+    /// or the `streams/` subdir creation/enumeration).
+    Storage(StorageError),
+}
+
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamError::InvalidName { name } => write!(
+                f,
+                "invalid stream name {name:?} (the default stream is \"\", otherwise 1 to {MAX_STREAM_NAME_LEN} graphic-ASCII bytes)"
+            ),
+            StreamError::Storage(e) => write!(f, "stream storage error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for StreamError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            StreamError::Storage(e) => Some(e),
+            StreamError::InvalidName { .. } => None,
+        }
+    }
+}
+
+impl From<StorageError> for StreamError {
+    fn from(e: StorageError) -> Self {
+        StreamError::Storage(e)
+    }
+}
+
+/// The result of [`StreamSet::open`]: the opened set, paired with each stream's INDEPENDENT recovery
+/// summary (keyed by id, default stream included). Named so the two-element tuple does not trip the
+/// `type_complexity` lint and reads as one value at the call site.
+pub type OpenedStreamSet<F, C> = (StreamSet<F, C>, BTreeMap<StreamId, StreamRecovery>);
+
+/// A per-stream recovery summary: how the stream recovered (its bounded, reported loss), produced by
+/// [`StreamSet::open`] for every stream it opened. Because each stream recovers independently, every
+/// stream has its OWN summary; a torn stream's non-empty loss never appears under a sibling's id.
+#[derive(Clone, Debug)]
+pub struct StreamRecovery {
+    /// The bytes recovery truncated from this stream's torn/unsynced active-segment tail (the silent
+    /// loss, made explicit). Zero for a clean recovery.
+    pub recovered_truncated_bytes: u64,
+    /// The structured, versioned loss report from THIS stream's recovery: every byte span recovery
+    /// skipped (torn tail or corrupt body), bounded and reported. Empty for a clean recovery. A
+    /// torn/corrupt sibling's events are NEVER in this stream's report (the isolation property).
+    pub loss_report: LossReport,
+}
+
+/// N independently-opened, independently-recovered IronBus [`Log`]s over one [`Filesystem`], keyed by
+/// [`StreamId`]: the DEFAULT stream `""` is today's ROOT log (byte-identical), and each NAMED stream
+/// is an independent [`Log`] under `streams/<hex(name)>/` (the DLQ subdir pattern, generalized). See
+/// the module docs for the design and the scope boundary.
+///
+/// `F` is the backing filesystem and `C` the clock seam, exactly as for a single [`Log`]; the
+/// default stream and every named stream share the SAME `F` instance's directory tree and the same
+/// `C`, so they observe one consistent power-loss image.
+pub struct StreamSet<F: Filesystem, C: Clock> {
+    /// Every open stream's log, keyed by id. The default stream `""` is ALWAYS present (it is the
+    /// root log, opened at construction); named streams are added by [`StreamSet::declare`] and
+    /// rediscovered at [`StreamSet::open`]. A `BTreeMap` keeps iteration deterministic (default
+    /// first) and the per-stream lookup O(log streams) — never O(records).
+    streams: BTreeMap<StreamId, Log<F, C>>,
+    /// The clock seam, cloned into each newly-declared stream's [`Log`] so a stream opened later in
+    /// the process's life shares the same time source as the rest. Held so [`StreamSet::declare`] can
+    /// open a fresh stream without the caller re-supplying it.
+    clock: C,
+    /// The log configuration applied to EVERY stream's [`Log`] (segment cap, byte caps, quarantine
+    /// budget, daily write budget). Per-stream config overrides are a future concern (per-stream
+    /// retention is M2-I5); here one config governs all streams, matching the single-log broker.
+    config: LogConfig,
+}
+
+impl<F: Filesystem, C: Clock> std::fmt::Debug for StreamSet<F, C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamSet")
+            .field("stream_count", &self.streams.len())
+            .field(
+                "stream_ids",
+                &self.streams.keys().map(StreamId::name).collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F: Filesystem + Clone, C: Clock + Clone> StreamSet<F, C> {
+    /// Opens (recovering, or creating fresh) the whole stream set rooted at `fs`: the DEFAULT stream
+    /// `""` (the root log) plus every NAMED stream already present under `streams/`. Each stream is
+    /// opened as an INDEPENDENT [`Log`] (the default at the data-dir root, each named one at
+    /// `streams/<hex(name)>/`), so each gets its own longest-valid-prefix recovery, per-record CRC,
+    /// bounded/reported [`LossReport`], and the #670 layout-marker check (the default stream's
+    /// `Log::open` performs the marker check at the root, exactly as today).
+    ///
+    /// Recovery is INDEPENDENT per stream: the returned map carries each stream's own
+    /// [`StreamRecovery`], and a torn/corrupt stream recovers to ITS OWN valid prefix without
+    /// shortening or corrupting any sibling's recovery (the resilience-isolation property). A foreign
+    /// directory under `streams/` (one whose name is not a canonical hex-encoded stream name) is
+    /// SKIPPED, never opened as a stream, exactly as a foreign file is skipped by segment recovery.
+    ///
+    /// Total recovery work is O(Σ records across all streams) — each stream's recovery is its
+    /// existing single-log recovery, run once. It could be parallelized later (each stream is fully
+    /// independent), but is sequential here; parallel recovery is not needed for correctness.
+    ///
+    /// A data dir with no `streams/` subtree (the common single-log deployment) opens with ONLY the
+    /// default stream and never materializes `streams/`, so its on-disk shape is unchanged.
+    ///
+    /// # Errors
+    /// Propagates a [`StorageError`] from opening/recovering any stream (including the
+    /// fail-closed `IncompatibleLayoutVersion` from the default stream's #670 marker check) or from
+    /// enumerating `streams/`.
+    pub fn open(
+        fs: &F,
+        clock: C,
+        config: LogConfig,
+    ) -> Result<OpenedStreamSet<F, C>, StorageError> {
+        let mut streams = BTreeMap::new();
+        let mut recoveries = BTreeMap::new();
+
+        // 1) The DEFAULT stream "" = today's ROOT log, opened at the data-dir root. This is the
+        //    EXISTING single-log open: it performs the #670 layout-marker check and the
+        //    longest-valid-prefix recovery over the root segments, byte for byte as before. The
+        //    StreamSet adds NOTHING to this path, so a deployment with no named stream is unchanged.
+        let root = Log::open(fs.clone(), clock.clone(), config)?;
+        recoveries.insert(StreamId::default_stream(), recovery_of(&root));
+        streams.insert(StreamId::default_stream(), root);
+
+        // 2) Each NAMED stream already on disk under `streams/`. Probe WITHOUT creating the subtree
+        //    (so a single-log dir never grows a `streams/`): only if `streams/` exists do we
+        //    enumerate it. Each child directory whose name is a canonical hex-encoded stream name is
+        //    opened as an INDEPENDENT Log at `streams/<dir>/`; a foreign directory is skipped.
+        if fs.subdir_exists(STREAMS_SUBDIR).map_err(StorageError::Io)? {
+            let streams_fs = fs.subdir(STREAMS_SUBDIR).map_err(StorageError::Io)?;
+            for dir in streams_fs.list_subdirs().map_err(StorageError::Io)? {
+                let Some(name) = parse_stream_subdir_name(&dir) else {
+                    // A stray/foreign directory under streams/ (not a canonical hex stream name):
+                    // skip it, exactly as segment recovery skips a foreign file. It never opens as a
+                    // stream and never shadows a real one.
+                    continue;
+                };
+                let id = StreamId(name);
+                // Open the named stream's INDEPENDENT log at streams/<dir>/. Its recovery is over its
+                // own durable bytes alone: a torn segment here cannot touch the root log or a sibling.
+                let log = Log::open(
+                    streams_fs.subdir(&dir).map_err(StorageError::Io)?,
+                    clock.clone(),
+                    config,
+                )?;
+                recoveries.insert(id.clone(), recovery_of(&log));
+                streams.insert(id, log);
+            }
+        }
+
+        Ok((
+            StreamSet {
+                streams,
+                clock,
+                config,
+            },
+            recoveries,
+        ))
+    }
+
+    /// Declares (creating its `streams/<hex(name)>/` directory + a fresh [`Log`] on first use, or
+    /// returning the already-open one) the NAMED stream `id`, so it can be appended to and read. The
+    /// default stream is always already open (it is the root log), so declaring it is a no-op that
+    /// simply confirms it is present.
+    ///
+    /// On first declaration of a named stream this materializes `streams/` (and `streams/<hex>/`) on
+    /// disk via [`Filesystem::subdir`] and opens a fresh independent [`Log`] there. Re-declaring an
+    /// open stream is idempotent: it does not reopen or disturb the existing log. Returns whether the
+    /// stream was NEWLY created (`true`) versus already open (`false`).
+    ///
+    /// # Errors
+    /// Propagates a [`StorageError`] from creating the subdir or opening the stream's log.
+    pub fn declare(&mut self, id: &StreamId) -> Result<bool, StorageError> {
+        if self.streams.contains_key(id) {
+            return Ok(false);
+        }
+        // The default stream is inserted at open and can never be missing here, so any id not present
+        // is a named stream: create streams/<hex(name)>/ and open a fresh independent log there.
+        debug_assert!(!id.is_default(), "the default stream is always open");
+        let root = self.root_fs();
+        let subtree = root.subdir(STREAMS_SUBDIR).map_err(StorageError::Io)?;
+        let this_stream_dir = subtree
+            .subdir(&stream_subdir_name(id.name()))
+            .map_err(StorageError::Io)?;
+        let log = Log::open(this_stream_dir, self.clock.clone(), self.config)?;
+        self.streams.insert(id.clone(), log);
+        Ok(true)
+    }
+
+    /// Borrows the root filesystem (the default stream's), the parent of the `streams/` subtree, so a
+    /// newly-declared named stream is rooted under the same data directory as every other stream. The
+    /// default stream is always present, so this never panics.
+    fn root_fs(&self) -> &F {
+        self.streams
+            .get(&StreamId::default_stream())
+            .expect("the default stream is always open")
+            .filesystem()
+    }
+}
+
+impl<F: Filesystem, C: Clock> StreamSet<F, C> {
+    /// Borrows a stream's log by id for reads/inspection, or `None` if the stream is not open (a
+    /// named stream that was never [`declare`](StreamSet::declare)d). The default stream is always
+    /// open. This is the route-by-id read path: a consume targeting a specific stream resolves its
+    /// log here.
+    #[must_use]
+    pub fn get(&self, id: &StreamId) -> Option<&Log<F, C>> {
+        self.streams.get(id)
+    }
+
+    /// Mutably borrows a stream's log by id for appends, or `None` if the stream is not open. The
+    /// default stream is always open. This is the route-by-id WRITE path: a publish targeting a
+    /// specific stream resolves its log here and appends to it. The append is exactly a single-`Log`
+    /// append — appending to stream X never touches stream Y, so per-record cost stays flat as
+    /// streams grow.
+    pub fn get_mut(&mut self, id: &StreamId) -> Option<&mut Log<F, C>> {
+        self.streams.get_mut(id)
+    }
+
+    /// Routes one append to stream `id`, returning the assigned [`Offset`], or
+    /// [`StreamError::InvalidName`]-free `Err` of [`StorageError`]/unopened. A convenience over
+    /// [`get_mut`](StreamSet::get_mut) + [`Log::append`] that names the routing intent: a publish to
+    /// a specific stream. The record is durable only after a subsequent [`sync_stream`](StreamSet::sync_stream).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Io`] wrapping a `NotFound` if `id` is not an open stream (declare it
+    /// first), else propagates the underlying [`Log::append`] [`StorageError`] (capacity sheds,
+    /// writer-frozen, etc.) unchanged.
+    pub fn append_to(
+        &mut self,
+        id: &StreamId,
+        record: &Append<'_>,
+    ) -> Result<Offset, StorageError> {
+        match self.streams.get_mut(id) {
+            Some(log) => log.append(record),
+            None => Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("stream {:?} is not open (declare it first)", id.name()),
+            ))),
+        }
+    }
+
+    /// Reads up to `max_records` records (and at most `max_bytes` encoded frame bytes, if set) from
+    /// stream `id` starting at `start`, routing the read to that stream's log. Returns an empty vec
+    /// for an unopened stream is NOT done — an unopened stream is an error, so a typo'd id is not
+    /// silently an empty read.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Io`] wrapping `NotFound` if `id` is not an open stream, else
+    /// propagates the underlying [`Log::read_range`] error.
+    pub fn read_range(
+        &self,
+        id: &StreamId,
+        start: Offset,
+        max_records: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<Vec<OwnedRecord>, StorageError> {
+        match self.streams.get(id) {
+            Some(log) => log.read_range(start, max_records, max_bytes),
+            None => Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("stream {:?} is not open (declare it first)", id.name()),
+            ))),
+        }
+    }
+
+    /// Makes stream `id`'s appended records durable (fsync), independently of every other stream.
+    ///
+    /// NOTE the scope boundary: this syncs ONE stream's log on its own. The cross-stream group-commit
+    /// that batches a single `fdatasync` across many streams is M2-I3 (#564); until then each stream
+    /// syncs independently, which is CORRECT (every acked record is durable) but not yet
+    /// fsync-optimal. Correctness first.
+    ///
+    /// # Errors
+    /// Returns `NotFound` for an unopened stream, else propagates [`Log::sync`].
+    pub fn sync_stream(&mut self, id: &StreamId) -> Result<(), StorageError> {
+        match self.streams.get_mut(id) {
+            Some(log) => log.sync(),
+            None => Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("stream {:?} is not open (declare it first)", id.name()),
+            ))),
+        }
+    }
+
+    /// Syncs EVERY open stream's log, each independently (see [`sync_stream`](StreamSet::sync_stream)
+    /// for the M2-I3 group-commit boundary). Stops and returns on the first stream's sync error, so a
+    /// failure is surfaced rather than swallowed; streams already synced stay durable.
+    ///
+    /// # Errors
+    /// Propagates the first stream's [`Log::sync`] error.
+    pub fn sync_all(&mut self) -> Result<(), StorageError> {
+        for log in self.streams.values_mut() {
+            log.sync()?;
+        }
+        Ok(())
+    }
+
+    /// The ids of every open stream, in deterministic (default-first) order. The default stream `""`
+    /// is always included.
+    #[must_use]
+    pub fn stream_ids(&self) -> Vec<StreamId> {
+        self.streams.keys().cloned().collect()
+    }
+
+    /// The number of open streams, including the always-present default stream (so this is `>= 1`).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// Whether the set has no streams. Always `false` (the default stream is always open); provided
+    /// so a `len`-bearing type carries the conventional companion and clippy is satisfied.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
+
+    /// Whether stream `id` is currently open.
+    #[must_use]
+    pub fn is_open(&self, id: &StreamId) -> bool {
+        self.streams.contains_key(id)
+    }
+}
+
+/// Captures a freshly-opened log's recovery outcome (the truncated-tail bytes and the structured loss
+/// report) into an owned [`StreamRecovery`], so the per-stream recovery summary outlives the borrow
+/// of the log it came from.
+fn recovery_of<F: Filesystem, C: Clock>(log: &Log<F, C>) -> StreamRecovery {
+    StreamRecovery {
+        recovered_truncated_bytes: log.recovered_truncated_bytes(),
+        loss_report: log.loss_report().clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::InMemoryFs;
+    use crate::io::RandomAccessFile;
+    use crate::naming::{segment_file_name, segment_ids, stream_subdir_name};
+    use ironbus_core::clock::ManualClock;
+    use ironbus_core::types::RecordFlags;
+
+    fn cfg() -> LogConfig {
+        LogConfig::default()
+    }
+
+    fn rec(payload: &[u8]) -> Append<'_> {
+        Append {
+            timestamp_ms: 7,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload,
+        }
+    }
+
+    fn open(fs: &InMemoryFs) -> OpenedStreamSet<InMemoryFs, ManualClock> {
+        StreamSet::open(fs, ManualClock::new(), cfg()).unwrap()
+    }
+
+    /// A fresh data dir opens with ONLY the default stream "", and produces the EXACT same on-disk
+    /// image (the root `seg-*.log`, no `streams/`) as today's single-log path — byte for byte.
+    #[test]
+    fn fresh_dir_has_only_the_default_stream_byte_identical_to_a_single_log() {
+        // The single-log baseline: a bare Log over a fresh fs, a couple of records, synced.
+        let baseline_fs = InMemoryFs::new();
+        {
+            let mut log = Log::open(baseline_fs.clone(), ManualClock::new(), cfg()).unwrap();
+            log.append(&rec(b"a")).unwrap();
+            log.append(&rec(b"b")).unwrap();
+            log.sync().unwrap();
+        }
+
+        // The StreamSet path: same fresh fs, declare NO named stream, write the same records to the
+        // DEFAULT stream, sync.
+        let set_fs = InMemoryFs::new();
+        {
+            let (mut set, recoveries) = open(&set_fs);
+            // Exactly one stream — the default — and it recovered clean.
+            assert_eq!(set.stream_ids(), vec![StreamId::default_stream()]);
+            assert_eq!(set.len(), 1);
+            assert!(recoveries[&StreamId::default_stream()]
+                .loss_report
+                .is_empty());
+            let def = StreamId::default_stream();
+            set.append_to(&def, &rec(b"a")).unwrap();
+            set.append_to(&def, &rec(b"b")).unwrap();
+            set.sync_stream(&def).unwrap();
+        }
+
+        // No `streams/` subtree was ever materialized: the on-disk shape is unchanged.
+        assert!(!set_fs.subdir_exists(STREAMS_SUBDIR).unwrap());
+        // The root segment files are byte-for-byte identical between the two paths.
+        let baseline_ids = segment_ids(&baseline_fs).unwrap();
+        let set_ids = segment_ids(&set_fs).unwrap();
+        assert_eq!(baseline_ids, set_ids);
+        for id in set_ids {
+            let b = baseline_fs.open(&segment_file_name(id)).unwrap().snapshot();
+            let s = set_fs.open(&segment_file_name(id)).unwrap().snapshot();
+            assert_eq!(
+                b, s,
+                "segment {id} differs between single-log and StreamSet"
+            );
+        }
+        // And the layout marker is the same single byte image the single-log path writes (#670).
+        assert!(baseline_fs.exists("layout.meta").unwrap());
+        assert!(set_fs.exists("layout.meta").unwrap());
+    }
+
+    /// Declaring a named stream creates `streams/<hex(name)>/` and the stream is independently
+    /// appendable and readable; the default stream keeps its own data.
+    #[test]
+    fn declare_named_stream_creates_subdir_and_is_independently_usable() {
+        let fs = InMemoryFs::new();
+        let (mut set, _) = open(&fs);
+        let def = StreamId::default_stream();
+        let orders = StreamId::named("orders").unwrap();
+
+        // First declaration creates it; a second is idempotent.
+        assert!(set.declare(&orders).unwrap());
+        assert!(!set.declare(&orders).unwrap());
+        // The on-disk directory is streams/<hex("orders")>/.
+        assert!(fs.subdir_exists(STREAMS_SUBDIR).unwrap());
+        let streams_fs = fs.subdir(STREAMS_SUBDIR).unwrap();
+        assert_eq!(
+            streams_fs.list_subdirs().unwrap(),
+            vec![stream_subdir_name("orders")]
+        );
+
+        // Independent data: write different records to each stream.
+        set.append_to(&def, &rec(b"default-0")).unwrap();
+        set.append_to(&orders, &rec(b"orders-0")).unwrap();
+        set.append_to(&orders, &rec(b"orders-1")).unwrap();
+        set.sync_all().unwrap();
+
+        // Each stream reads back its OWN records, at its own offsets (both start at 0).
+        let d = set.read_range(&def, Offset::ZERO, 100, None).unwrap();
+        assert_eq!(d.len(), 1);
+        assert_eq!(&*d[0].payload, b"default-0");
+        let o = set.read_range(&orders, Offset::ZERO, 100, None).unwrap();
+        assert_eq!(o.len(), 2);
+        assert_eq!(&*o[0].payload, b"orders-0");
+        assert_eq!(&*o[1].payload, b"orders-1");
+    }
+
+    /// Reopening recovers EVERY stream independently with its own durable data.
+    #[test]
+    fn reopen_recovers_all_streams_independently_with_their_own_data() {
+        let fs = InMemoryFs::new();
+        let def = StreamId::default_stream();
+        let a = StreamId::named("alpha").unwrap();
+        let b = StreamId::named("beta").unwrap();
+        {
+            let (mut set, _) = open(&fs);
+            set.declare(&a).unwrap();
+            set.declare(&b).unwrap();
+            set.append_to(&def, &rec(b"d0")).unwrap();
+            set.append_to(&a, &rec(b"a0")).unwrap();
+            set.append_to(&a, &rec(b"a1")).unwrap();
+            set.append_to(&b, &rec(b"b0")).unwrap();
+            set.sync_all().unwrap();
+        }
+
+        // Reopen: all three streams are rediscovered (the two named from streams/, the default at the
+        // root), each recovers clean, and each holds exactly its own records.
+        let (set, recoveries) = open(&fs);
+        assert_eq!(set.stream_ids(), vec![def.clone(), a.clone(), b.clone()]);
+        for id in [&def, &a, &b] {
+            assert!(
+                recoveries[id].loss_report.is_empty(),
+                "{} recovered clean",
+                id.name()
+            );
+        }
+        assert_eq!(
+            set.read_range(&def, Offset::ZERO, 100, None).unwrap().len(),
+            1
+        );
+        let ar = set.read_range(&a, Offset::ZERO, 100, None).unwrap();
+        assert_eq!(ar.len(), 2);
+        assert_eq!(&*ar[0].payload, b"a0");
+        assert_eq!(
+            set.read_range(&b, Offset::ZERO, 100, None).unwrap().len(),
+            1
+        );
+    }
+
+    /// THE HEADLINE TEST — resilience isolation: corrupting a named stream's segment recovers THAT
+    /// stream bounded/reported to its valid prefix, and leaves the default stream AND a sibling
+    /// stream completely UNAFFECTED.
+    #[test]
+    fn corrupt_one_named_stream_is_isolated_from_the_default_and_siblings() {
+        let fs = InMemoryFs::new();
+        let def = StreamId::default_stream();
+        let victim = StreamId::named("victim").unwrap();
+        let sibling = StreamId::named("sibling").unwrap();
+        {
+            let (mut set, _) = open(&fs);
+            set.declare(&victim).unwrap();
+            set.declare(&sibling).unwrap();
+            // The default + the sibling each get clean, durable data.
+            set.append_to(&def, &rec(b"default-keep")).unwrap();
+            set.append_to(&sibling, &rec(b"sibling-keep-0")).unwrap();
+            set.append_to(&sibling, &rec(b"sibling-keep-1")).unwrap();
+            // The victim gets several records; we will tear its tail.
+            for i in 0..4u8 {
+                set.append_to(&victim, &rec(&[b'v', i])).unwrap();
+            }
+            set.sync_all().unwrap();
+        }
+
+        // Tear three bytes off the END of the VICTIM stream's segment 0 only (its independent log
+        // lives at streams/<hex("victim")>/seg-...0.log). This is the same torn-tail idiom the
+        // single-log recovery tests use, applied to one stream's directory.
+        let victim_fs = fs
+            .subdir(STREAMS_SUBDIR)
+            .unwrap()
+            .subdir(&stream_subdir_name("victim"))
+            .unwrap();
+        let seg = victim_fs.open(&segment_file_name(0)).unwrap();
+        let torn_len = seg.len().unwrap() - 3;
+        seg.set_len(torn_len).unwrap();
+        seg.sync_data().unwrap();
+
+        // Reopen the whole set. The victim recovers to its OWN valid prefix and reports its OWN loss;
+        // the default and the sibling are byte-clean and fully present.
+        let (set, recoveries) = open(&fs);
+
+        // VICTIM: bounded + reported loss, recovered to its valid prefix (3 of its 4 records survive).
+        let vrec = &recoveries[&victim];
+        assert!(
+            vrec.recovered_truncated_bytes > 0,
+            "the victim's torn tail was truncated"
+        );
+        assert!(
+            !vrec.loss_report.is_empty(),
+            "the victim's loss is reported"
+        );
+        assert_eq!(vrec.loss_report.events.len(), 1);
+        assert_eq!(
+            vrec.loss_report.events[0].reason_code,
+            crate::loss::ReasonCode::TornTail
+        );
+        let vread = set.read_range(&victim, Offset::ZERO, 100, None).unwrap();
+        assert_eq!(vread.len(), 3, "the victim recovered its 3 intact records");
+
+        // DEFAULT: completely unaffected — clean recovery, all data present.
+        let drec = &recoveries[&def];
+        assert_eq!(
+            drec.recovered_truncated_bytes, 0,
+            "the default stream lost nothing"
+        );
+        assert!(
+            drec.loss_report.is_empty(),
+            "the default stream reports no loss"
+        );
+        let dread = set.read_range(&def, Offset::ZERO, 100, None).unwrap();
+        assert_eq!(dread.len(), 1);
+        assert_eq!(&*dread[0].payload, b"default-keep");
+
+        // SIBLING: completely unaffected — clean recovery, both records present. The victim's
+        // corruption could NOT shorten or corrupt the sibling's recovery.
+        let srec = &recoveries[&sibling];
+        assert_eq!(
+            srec.recovered_truncated_bytes, 0,
+            "the sibling stream lost nothing"
+        );
+        assert!(
+            srec.loss_report.is_empty(),
+            "the sibling stream reports no loss"
+        );
+        let sread = set.read_range(&sibling, Offset::ZERO, 100, None).unwrap();
+        assert_eq!(sread.len(), 2);
+        assert_eq!(&*sread[0].payload, b"sibling-keep-0");
+        assert_eq!(&*sread[1].payload, b"sibling-keep-1");
+    }
+
+    /// A foreign directory under `streams/` (not a canonical hex-encoded stream name) is SKIPPED at
+    /// open, never opened as a stream — exactly as a foreign file is skipped by segment recovery.
+    #[test]
+    fn a_foreign_streams_subdir_is_skipped_not_opened() {
+        let fs = InMemoryFs::new();
+        // Materialize streams/ with one real stream and one foreign directory (a non-hex name).
+        {
+            let (mut set, _) = open(&fs);
+            let real = StreamId::named("real").unwrap();
+            set.declare(&real).unwrap();
+            set.append_to(&real, &rec(b"x")).unwrap();
+            set.sync_all().unwrap();
+        }
+        // Plant a foreign directory under streams/ by creating a file inside it (the flat in-mem fs
+        // materializes a dir lazily as a key appears). "NOT-HEX" is not a canonical hex name.
+        let streams_fs = fs.subdir(STREAMS_SUBDIR).unwrap();
+        let foreign = streams_fs.subdir("NOT-HEX").unwrap();
+        foreign.create_new("junk.txt").unwrap();
+        foreign.sync_dir().unwrap();
+
+        // Reopen: only the real stream is opened; the foreign dir is skipped.
+        let (set, _) = open(&fs);
+        assert_eq!(
+            set.stream_ids(),
+            vec![StreamId::default_stream(), StreamId::named("real").unwrap()]
+        );
+    }
+
+    /// Opening N streams adds NO per-record structure: per-record cost stays flat. We assert the
+    /// structural invariant directly — the resident index is per-stream (each stream is a plain
+    /// `Log`), so the only thing that grows with N is the number of logs, not any per-record table.
+    #[test]
+    fn per_record_cost_is_flat_as_streams_grow() {
+        let fs = InMemoryFs::new();
+        let (mut set, _) = open(&fs);
+        // Declare many streams; append one record to each. The set is a BTreeMap of independent Logs;
+        // there is no shared per-record structure to grow. The proof is structural (the type holds
+        // only `BTreeMap<StreamId, Log>` + the clock + the config), reinforced here by showing each
+        // stream's append is independent and self-contained.
+        for i in 0..50u32 {
+            let id = StreamId::named(&format!("s{i}")).unwrap();
+            set.declare(&id).unwrap();
+            set.append_to(&id, &rec(b"one")).unwrap();
+        }
+        set.sync_all().unwrap();
+        // 50 named + 1 default. Each holds exactly its own single record; opening stream X never
+        // touched stream Y's data.
+        assert_eq!(set.len(), 51);
+        for i in 0..50u32 {
+            let id = StreamId::named(&format!("s{i}")).unwrap();
+            assert_eq!(
+                set.read_range(&id, Offset::ZERO, 100, None).unwrap().len(),
+                1
+            );
+        }
+    }
+
+    /// Naming validation rejects bad stream names at the `StreamId` boundary, so a path-unsafe or
+    /// over-length name can never reach the filesystem.
+    #[test]
+    fn naming_validation_rejects_bad_stream_names() {
+        // The empty name is the DEFAULT stream, not a named one: `named("")` is rejected.
+        assert!(matches!(
+            StreamId::named(""),
+            Err(StreamError::InvalidName { .. })
+        ));
+        // Over-length and non-graphic-ASCII are rejected.
+        assert!(StreamId::named(&"x".repeat(MAX_STREAM_NAME_LEN + 1)).is_err());
+        assert!(StreamId::named("has space").is_err());
+        assert!(StreamId::named("café").is_err());
+        // Valid names construct.
+        assert!(StreamId::named("orders").is_ok());
+        assert!(StreamId::named("a/b").is_ok()); // graphic ASCII; hex-encoded on disk
+        assert!(StreamId::named(&"x".repeat(MAX_STREAM_NAME_LEN)).is_ok());
+        assert_eq!(StreamId::default_stream().name(), "");
+        assert!(StreamId::default_stream().is_default());
+    }
+
+    /// Routing to an unopened named stream is a typed `NotFound` error, not a silent empty read/write,
+    /// so a typo'd id fails closed.
+    #[test]
+    fn routing_to_an_unopened_stream_is_an_error_not_a_silent_noop() {
+        let fs = InMemoryFs::new();
+        let (mut set, _) = open(&fs);
+        let ghost = StreamId::named("never-declared").unwrap();
+        assert!(!set.is_open(&ghost));
+        assert!(set.append_to(&ghost, &rec(b"x")).is_err());
+        assert!(set.read_range(&ghost, Offset::ZERO, 1, None).is_err());
+        assert!(set.sync_stream(&ghost).is_err());
+        // The default stream is always open and routable.
+        assert!(set.is_open(&StreamId::default_stream()));
+    }
+}
