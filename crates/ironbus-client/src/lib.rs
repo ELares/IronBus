@@ -29,8 +29,8 @@ use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, 
 use ironbus_proto::message::{
     decode_dead_letter, decode_deliver, decode_gap_marker, decode_info, decode_pub_ack,
     decode_truncated, encode_ack, encode_connect, encode_cumulative_ack, encode_fetch, encode_pub,
-    encode_sub, AckBody, AckOp, BodyError, ConnectBody, CumulativeAckBody, FetchBody, PubBody,
-    SubBody,
+    encode_sub, AckBody, AckLevel, AckOp, BodyError, ConnectBody, CumulativeAckBody, FetchBody,
+    PubBody, SubBody, PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -150,6 +150,15 @@ pub struct ClientConfig {
     /// receiving the legacy `Truncation` advisory. A caller checks [`Client::gap_marker_enabled`]
     /// after connecting to learn whether the server confirmed it.
     pub request_gap_marker: bool,
+    /// The connection-wide DEFAULT produce ack level this client REQUESTS in its `Connect` handshake
+    /// body (#494, #496), or `None` to defer to the server default. When `Some(level)`, `connect_with`
+    /// sends the raw level value (see [`AckLevel::as_u8`]) in the `Connect` body so the connection's
+    /// default is negotiated; a publish that does not name its own level then adopts this default
+    /// server-side. `None` (the default, backward-compatible) sends no default, so the body is
+    /// byte-for-byte the pre-#494 `Connect` and the server applies its own default. The server echoes
+    /// the adopted default in `Info` once that path lands (#497); until then a `Some` request is sent
+    /// and decoded by the server but not yet echoed back.
+    pub default_ack_level: Option<AckLevel>,
 }
 
 impl Default for ClientConfig {
@@ -167,6 +176,10 @@ impl Default for ClientConfig {
             // keeps receiving the legacy `Truncation` advisory exactly as before (#346). A caller
             // that tracks contiguity opts in by setting this.
             request_gap_marker: false,
+            // None by default: an unconfigured client requests no connection-wide default ack level, so
+            // it sends a byte-for-byte pre-#494 `Connect` body and the server applies its own default
+            // (#494, #496). A caller opts into a connection default by setting this.
+            default_ack_level: None,
         }
     }
 }
@@ -387,6 +400,29 @@ fn drain_stream_replies(
     outcome
 }
 
+/// Writes the CANONICAL [`PUB_FLAG_ACK_LEVEL_MASK`] field value for an AT-LEAST-ONCE `level` (Level 1
+/// or Level 2) into `flags`, clearing any ack-level bits the caller already set, and returns the
+/// result (#494, #496). Only the 2-bit ack-level field is touched; every other flag bit (the real
+/// record flags, the dedup bit, the faf bit) is left exactly as the caller set it.
+///
+/// The written field value is NOT [`AckLevel::as_u8`] for Level 1: [`pub_ack_level`](ironbus_proto::message::pub_ack_level)
+/// decodes the raw field value `1` as Level 0 (it is the level-bit ALIAS for fire-and-forget), so the
+/// CANONICAL Level-1 encoding is the field value `0` (which is also exactly how a pre-feature client
+/// encodes a default produce, so `flags == 0` is Level 1). Level 2 writes the field value `2`. Level 0
+/// is NOT encoded here at all (it rides the canonical fire-and-forget bit via `produce_fire_and_forget`);
+/// passing it is a logic error this never receives, so it is treated as the safe Level-1 default
+/// (field `0`).
+fn with_ack_level_bits(flags: u8, level: AckLevel) -> u8 {
+    let field = match level {
+        // The canonical Level-1 encoding is field 0 (a raw `1` would decode as Level 0), matching how a
+        // pre-feature default produce encodes; Level 0 should never reach here, default it to Level 1.
+        AckLevel::ServerAck | AckLevel::NoAck => 0,
+        AckLevel::ServerAndClientAck => 2,
+    };
+    let bits = (field << PUB_FLAG_ACK_LEVEL_SHIFT) & PUB_FLAG_ACK_LEVEL_MASK;
+    (flags & !PUB_FLAG_ACK_LEVEL_MASK) | bits
+}
+
 fn classify_pub_reply(ty: FrameType, body: &[u8]) -> Result<PubReply, ClientError> {
     match ty {
         FrameType::PubAck => {
@@ -525,10 +561,11 @@ impl Client {
                 requested_credit: config.requested_consumer_credit,
                 requested_credit_bytes: config.requested_consumer_credit_bytes,
                 wants_gap_marker: config.request_gap_marker,
-                // #494 is PROTO/CODEC only: the client does not request a connection-wide default ack
-                // level yet (that is phase #496), so this stays `None` and the body is byte-for-byte
-                // the pre-#494 Connect.
-                default_ack_level: None,
+                // The connection-wide DEFAULT produce ack level the client requests (#494, #496),
+                // carried as the raw 0/1/2 level value. `None` (the default) sends no default byte, so
+                // the body is byte-for-byte the pre-#494 `Connect`; `Some(level)` negotiates the
+                // connection default a level-less publish then adopts server-side.
+                default_ack_level: config.default_ack_level.map(AckLevel::as_u8),
             },
             &mut connect_body,
         );
@@ -684,6 +721,75 @@ impl Client {
                 Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
             }
             (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Produces a message at an EXPLICIT per-publish produce ACK LEVEL (#494, #496, part of the
+    /// Cassandra-consistency-style spectrum #499), selecting the durability/round-trip trade per call.
+    /// The level is carried in the PUB body's flags exactly as [`pub_ack_level`](ironbus_proto::message::pub_ack_level)
+    /// decodes it, so the server routes the produce by the same rule a connection default or an old
+    /// faf publish does. The caller's own [`PubBody::flags`] ack-level / fire-and-forget bits are
+    /// REPLACED by the chosen level, so the method and the wire can never disagree; any `dedup` block
+    /// the caller set is preserved (a publish at any level may also opt into dedup).
+    ///
+    /// The levels map to:
+    ///
+    /// - [`AckLevel::NoAck`] (Level 0): the FIRE-AND-FORGET / no-ack fast path. It sets
+    ///   [`PUB_FLAG_FIRE_AND_FORGET`](ironbus_proto::message::PUB_FLAG_FIRE_AND_FORGET) (the canonical
+    ///   Level-0 encoding) and returns the moment the frame is written WITHOUT awaiting a reply, so the
+    ///   broker may drop the publish under load without acking and the producer accepts loss by
+    ///   contract. Returns `Ok(None)` (no offset, by the QoS-0 no-reply contract). This is exactly
+    ///   [`Client::produce_fire_and_forget`]'s wire behavior.
+    /// - [`AckLevel::ServerAck`] (Level 1, the DEFAULT): today's at-least-once produce. It awaits the
+    ///   `PubAck` after the covering group-commit fsync (I2: durable-on-return) and returns
+    ///   `Ok(Some(offset))`. Wire-identical to [`Client::produce`].
+    /// - [`AckLevel::ServerAndClientAck`] (Level 2): sets the ack-level field to 2 in the PUB flags and
+    ///   awaits the `PubAck`, returning `Ok(Some(offset))`. The server FALLS BACK to the Level-1
+    ///   await for THIS phase (#495): the record is accepted and acked exactly like Level 1, and the
+    ///   out-of-band consumer-ack notification (the `ProduceConfirm` frame, #497) is NOT delivered yet,
+    ///   so the returned offset reflects server-durability, not consumer-ack. When #497 lands this
+    ///   method's Level-2 path is where the producer-side confirmation wait is added; until then it is
+    ///   a Level-1-equivalent await with the Level-2 intent recorded on the wire.
+    ///
+    /// This is ADDITIVE: [`Client::produce`], [`Client::produce_window`], and
+    /// [`Client::produce_fire_and_forget`] are unchanged. A `flags` with no ack-level / faf bit is
+    /// Level 1, matching those paths; this method only lets a caller pick the level per publish.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, an over-large field, or (Levels 1 and 2) a server
+    /// error. Level 0 has no reply to surface, so a broker-side drop is not reported (the QoS-0
+    /// contract).
+    pub fn produce_with_ack_level(
+        &mut self,
+        message: &PubBody<'_>,
+        level: AckLevel,
+    ) -> Result<Option<u64>, ClientError> {
+        match level {
+            // Level 0: the no-ack fire-and-forget fast path. `produce_fire_and_forget` forces the
+            // canonical faf bit and reads no reply, so the wire behavior is identical; there is no
+            // offset to return by the QoS-0 contract.
+            AckLevel::NoAck => self.produce_fire_and_forget(message).map(|()| None),
+            // Level 1: today's at-least-once produce. Clear any caller-set ack-level bits so the wire
+            // carries the canonical Level-1 encoding (field 0), then take the normal awaited PubAck
+            // path (durable-on-return, I2). `produce` forces the faf bit clear, so a faf bit the caller
+            // left set does not leak into this at-least-once path.
+            AckLevel::ServerAck => {
+                let leveled = PubBody {
+                    flags: with_ack_level_bits(message.flags, AckLevel::ServerAck),
+                    ..*message
+                };
+                self.produce(&leveled).map(Some)
+            }
+            // Level 2: set the ack-level field to 2 on the wire and await the PubAck. The server accepts
+            // and acks it like Level 1 for THIS phase (#495); the producer-notify ProduceConfirm wait is
+            // #497. `produce` forces the faf bit clear, so the level-2 publish is at-least-once.
+            AckLevel::ServerAndClientAck => {
+                let leveled = PubBody {
+                    flags: with_ack_level_bits(message.flags, AckLevel::ServerAndClientAck),
+                    ..*message
+                };
+                self.produce(&leveled).map(Some)
+            }
         }
     }
 
@@ -1693,8 +1799,9 @@ mod tests {
     use ironbus_core::delivery::DeliveryConfig;
     use ironbus_core::lease::LeaseConfig;
     use ironbus_proto::message::{
-        encode_dead_letter, encode_deliver, DeadLetterBody, DeliverBody, PubDedup,
-        DEAD_LETTER_MAX_DELIVER,
+        decode_connect, decode_pub, encode_dead_letter, encode_deliver, encode_info,
+        encode_pub_ack, pub_ack_level, DeadLetterBody, DeliverBody, InfoBody, PubAckBody, PubDedup,
+        DEAD_LETTER_MAX_DELIVER, PUB_FLAG_FIRE_AND_FORGET,
     };
     use ironbus_server::actor::{spawn_actor, DEFAULT_CHANNEL_BOUND};
     use ironbus_server::clock::SystemClock;
@@ -1853,6 +1960,284 @@ mod tests {
             }
         });
         (addr, handle)
+    }
+
+    /// A one-shot listener like [`raw_server`] that ALSO captures every byte the client sends: it
+    /// writes `script` up front (the handshake `Info` and any `PubAck` replies the client will read
+    /// off its own buffer), then drains the client's request bytes into a buffer the returned join
+    /// handle yields after the client closes. Lets a test assert the exact WIRE the client produced
+    /// (e.g. the `Connect` body or the `Pub` flags it stamped), which a real server would consume
+    /// internally. The caller decodes the captured frames with [`decode_frame`].
+    fn capturing_server(
+        script: Vec<u8>,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<u8>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.write_all(&script).unwrap();
+            let mut captured = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while let Ok(n) = sock.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                captured.extend_from_slice(&chunk[..n]);
+            }
+            captured
+        });
+        (addr, handle)
+    }
+
+    /// Decodes every whole frame in `bytes` into `(type, body)` pairs (the captured-request decoder
+    /// for the wire-assertion tests). Panics on a malformed or incomplete trailing frame, which in a
+    /// test means the client wrote something unexpected.
+    fn decode_all_frames(bytes: &[u8]) -> Vec<(FrameType, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            match decode_frame(&bytes[pos..]).unwrap() {
+                FrameDecode::Frame {
+                    type_tag,
+                    body,
+                    consumed,
+                } => {
+                    out.push((FrameType::from_u8(type_tag).unwrap(), body.to_vec()));
+                    pos += consumed;
+                }
+                FrameDecode::Incomplete { .. } => panic!("incomplete trailing frame in capture"),
+            }
+        }
+        out
+    }
+
+    /// The framed `Info` reply a `capturing_server` script needs so [`Client::connect_with`] completes
+    /// its handshake: an empty advertisement (the client keeps its local defaults), which is all these
+    /// wire-assertion tests need past the handshake.
+    fn empty_info_frame() -> Vec<u8> {
+        let mut info_body = Vec::new();
+        encode_info(&InfoBody::default(), &mut info_body);
+        frame(FrameType::Info, &info_body)
+    }
+
+    #[test]
+    fn produce_with_ack_level_stamps_the_level_into_the_pub_flags_on_the_wire() {
+        // #496: produce_with_ack_level encodes each level into the PUB body flags exactly as the
+        // server's `pub_ack_level` decodes it. We capture the bytes the client sends and decode the
+        // PUB bodies: Level 0 sets the canonical fire-and-forget bit (no reply read), Level 1 sets the
+        // canonical Level-1 encoding (no faf bit, ack-level field 0), Level 2 sets the ack-level field
+        // to 2. A pre-set ack-level bit on the caller's flags is REPLACED, never OR-ed.
+        let mut script = empty_info_frame();
+        // The L1 and L2 produces each await one PubAck; L0 reads no reply. Two acks scripted (FIFO).
+        let mut ack0 = Vec::new();
+        encode_pub_ack(&PubAckBody { offset: 0 }, &mut ack0);
+        let mut ack1 = Vec::new();
+        encode_pub_ack(&PubAckBody { offset: 1 }, &mut ack1);
+        script.extend(frame(FrameType::PubAck, &ack0));
+        script.extend(frame(FrameType::PubAck, &ack1));
+        let (addr, handle) = capturing_server(script);
+
+        let mut c = Client::connect(addr).unwrap();
+        // A caller who set a stray ack-level bit (value 2 here): the method must REPLACE it with the
+        // chosen level, never combine, so the L1 publish below still decodes as Level 1.
+        let stray = 2u8 << PUB_FLAG_ACK_LEVEL_SHIFT;
+        let base = PubBody {
+            flags: stray,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: b"p",
+        };
+        // Level 0: returns no offset (QoS-0), sets the faf bit.
+        assert_eq!(
+            c.produce_with_ack_level(&base, AckLevel::NoAck).unwrap(),
+            None
+        );
+        // Level 1: returns the assigned offset.
+        assert_eq!(
+            c.produce_with_ack_level(&base, AckLevel::ServerAck)
+                .unwrap(),
+            Some(0)
+        );
+        // Level 2: returns the assigned offset (server falls back to L1-await this phase, #495).
+        assert_eq!(
+            c.produce_with_ack_level(&base, AckLevel::ServerAndClientAck)
+                .unwrap(),
+            Some(1)
+        );
+        drop(c);
+
+        let captured = handle.join().unwrap();
+        let frames = decode_all_frames(&captured);
+        // Connect, then three Pub frames in order (no reply was read for L0, so its frame was still
+        // sent first).
+        assert_eq!(frames[0].0, FrameType::Connect, "the handshake Connect");
+        let pubs: Vec<&(FrameType, Vec<u8>)> = frames
+            .iter()
+            .filter(|(t, _)| *t == FrameType::Pub)
+            .collect();
+        assert_eq!(pubs.len(), 3, "one Pub frame per produce");
+
+        // Level 0: the canonical fire-and-forget bit, and `pub_ack_level` reads it as NoAck.
+        let l0 = decode_pub(&pubs[0].1).unwrap();
+        assert_ne!(
+            l0.flags & PUB_FLAG_FIRE_AND_FORGET,
+            0,
+            "Level 0 sets the canonical fire-and-forget bit"
+        );
+        assert_eq!(pub_ack_level(l0.flags), AckLevel::NoAck);
+
+        // Level 1: no faf bit, ack-level field cleared (the stray bit was replaced), decodes as ServerAck.
+        let l1 = decode_pub(&pubs[1].1).unwrap();
+        assert_eq!(
+            l1.flags & PUB_FLAG_FIRE_AND_FORGET,
+            0,
+            "Level 1 is not fire-and-forget"
+        );
+        assert_eq!(
+            l1.flags & PUB_FLAG_ACK_LEVEL_MASK,
+            0,
+            "Level 1 is the canonical zero ack-level encoding (the stray bit was replaced)"
+        );
+        assert_eq!(pub_ack_level(l1.flags), AckLevel::ServerAck);
+
+        // Level 2: the ack-level field is exactly 2, decodes as ServerAndClientAck.
+        let l2 = decode_pub(&pubs[2].1).unwrap();
+        assert_eq!(
+            (l2.flags & PUB_FLAG_ACK_LEVEL_MASK) >> PUB_FLAG_ACK_LEVEL_SHIFT,
+            2,
+            "Level 2 stamps the ack-level field to 2"
+        );
+        assert_eq!(pub_ack_level(l2.flags), AckLevel::ServerAndClientAck);
+    }
+
+    #[test]
+    fn produce_with_ack_level_routes_each_level_against_a_real_server() {
+        // #496/#495 end-to-end: against the REAL server, Level 0 gets NO reply yet lands durably, and
+        // Levels 1 and 2 each return their assigned offset (the server acks L2 like L1 this phase). A
+        // following fetch sees all three records in log order, proving every level appended.
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+        let body = |p: &'static [u8]| PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: p,
+        };
+        // Level 0: no reply, no offset (the default fire-and-forget bucket is off, so it appends).
+        assert_eq!(
+            c.produce_with_ack_level(&body(b"l0"), AckLevel::NoAck)
+                .unwrap(),
+            None,
+            "Level 0 returns no offset (QoS-0 no-reply)"
+        );
+        // Level 1: the at-least-once PubAck at offset 1.
+        assert_eq!(
+            c.produce_with_ack_level(&body(b"l1"), AckLevel::ServerAck)
+                .unwrap(),
+            Some(1),
+            "Level 1 returns the assigned offset, durable-on-return"
+        );
+        // Level 2: the server falls back to a Level-1 await this phase (#495), so a PubAck at offset 2.
+        assert_eq!(
+            c.produce_with_ack_level(&body(b"l2"), AckLevel::ServerAndClientAck)
+                .unwrap(),
+            Some(2),
+            "Level 2 falls back to a Level-1 PubAck this phase (#495); ProduceConfirm is #497"
+        );
+        // All three records are durable in log order, proving the L0 no-reply produce also landed and
+        // did not desynchronize the stream for the L1/L2 awaits that followed it.
+        let messages = c.fetch(10).unwrap().messages;
+        assert_eq!(messages.len(), 3, "all three levels appended");
+        assert_eq!(messages[0].payload, b"l0");
+        assert_eq!(messages[1].payload, b"l1");
+        assert_eq!(messages[2].payload, b"l2");
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn connect_with_sends_the_configured_default_ack_level_in_the_connect_body() {
+        // #496: a ClientConfig default_ack_level is carried in the Connect handshake body. We capture
+        // the Connect frame and decode it, asserting the raw level value the client sent matches the
+        // configured AckLevel. (The server echo in Info is #497; here we prove the CLIENT puts it on
+        // the wire, the in-scope half of this phase.)
+        for level in [
+            AckLevel::NoAck,
+            AckLevel::ServerAck,
+            AckLevel::ServerAndClientAck,
+        ] {
+            let (addr, handle) = capturing_server(empty_info_frame());
+            let config = ClientConfig {
+                default_ack_level: Some(level),
+                ..ClientConfig::default()
+            };
+            let c = Client::connect_with(addr, &config).unwrap();
+            drop(c);
+            let captured = handle.join().unwrap();
+            let frames = decode_all_frames(&captured);
+            assert_eq!(frames[0].0, FrameType::Connect);
+            let connect = decode_connect(&frames[0].1).unwrap();
+            assert_eq!(
+                connect.default_ack_level,
+                Some(level.as_u8()),
+                "the Connect body carries the configured default ack level"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_with_omits_the_default_ack_level_when_unset() {
+        // #496 backward-compat: the default config (default_ack_level = None) sends NO default in the
+        // Connect body, so the body is byte-for-byte the pre-#494 layout and the server applies its own
+        // default. We capture and decode the Connect frame and assert the field is absent.
+        let (addr, handle) = capturing_server(empty_info_frame());
+        let c = Client::connect_with(addr, &ClientConfig::default()).unwrap();
+        drop(c);
+        let captured = handle.join().unwrap();
+        let frames = decode_all_frames(&captured);
+        assert_eq!(frames[0].0, FrameType::Connect);
+        let connect = decode_connect(&frames[0].1).unwrap();
+        assert_eq!(
+            connect.default_ack_level, None,
+            "an unconfigured client sends no connection default ack level"
+        );
+    }
+
+    #[test]
+    fn connect_with_a_default_ack_level_handshakes_against_a_real_server() {
+        // #496: a connection configured with a default ack level still completes the handshake against
+        // the REAL server (which decodes the field; the server-side honor + Info echo is #497) and the
+        // connection is usable for a normal produce afterwards.
+        let (addr, shutdown, handle) = start_server();
+        let config = ClientConfig {
+            default_ack_level: Some(AckLevel::ServerAck),
+            ..ClientConfig::default()
+        };
+        let mut c = Client::connect_with(addr, &config).unwrap();
+        let offset = c
+            .produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"after-default-handshake",
+            })
+            .unwrap();
+        assert_eq!(
+            offset, 0,
+            "the connection works after the default handshake"
+        );
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
     }
 
     #[test]
