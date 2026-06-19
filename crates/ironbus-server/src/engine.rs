@@ -4935,6 +4935,28 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.log.synced_offset().get()
     }
 
+    /// The lock-free, off-actor consume READ plane (#539): the shared handle a consumer thread reads
+    /// the SEALED, flushed prefix through with NO append-actor round-trip. The engine (on the single
+    /// actor thread) keeps PUBLISHING to it — the new flushed frontier after every commit, a fresh
+    /// sealed snapshot on every seal/reap — so a handed-out handle always observes the current
+    /// durable prefix. The off-actor plane carries multi-consumer replay/fan-out load (the durable
+    /// prefix, the #491 ceiling) with zero actor contention; a read whose range reaches the active
+    /// tail or a compacted segment reports a fallback so the caller serves that small remainder
+    /// through the actor (the through-actor `poll`), keeping consume behavior identical.
+    ///
+    /// Cloning the returned handle is two `Arc` bumps; every consumer shares the same published
+    /// frontier and snapshot. Built lazily on first call.
+    ///
+    /// # Errors
+    /// Propagates an IO error building the initial sealed snapshot (reading the sealed segments'
+    /// sparse seek anchors). After it returns Ok the plane is cached.
+    pub fn read_plane(&self) -> Result<ironbus_storage::read_plane::ReadPlane<F>, EngineError>
+    where
+        F: Clone,
+    {
+        Ok(self.log.read_plane()?)
+    }
+
     /// The OLDEST retained log offset: the oldest segment's base offset, the first offset still
     /// present in the durable log (#82, #84). `0` for a log that has never been reaped. It rises
     /// above 0 only once the disk-full drop-oldest policy or consumer-safe retention has reclaimed
