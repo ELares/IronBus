@@ -425,6 +425,50 @@ impl SegmentIndex {
     }
 }
 
+/// The RESIDENT, in-memory SPARSE seek index for ONE open COMPACTED (v2) segment (#481). It is the
+/// compacted analogue of [`SegmentIndex`]: where the dense index keys a contiguous offset run by
+/// array position, a compacted segment's survivors are SPARSE (compaction leaves holes: an offset
+/// may be absent, #337), so this index holds an explicit `(offset, byte position)` entry per
+/// survivor, sorted ascending by offset. It lets [`Log::read_from`] SEEK to the first survivor at or
+/// above a requested `start` via a binary search and read forward up to `max` records, instead of
+/// re-reading the WHOLE survivor region into a `Vec` and decoding EVERY survivor on every poll (the
+/// pre-#481 behavior, which made a slow/replaying consumer — the one that reads compacted segments
+/// most — pay O(survivors) + a whole-region alloc per delivery).
+///
+/// `entries[i] = (offset_i, byte_pos_i)` where `byte_pos_i` is the file byte offset of survivor
+/// `offset_i`'s frame; `valid_end` is the byte offset at which the survivor region ends (the footer
+/// start), the read-forward upper bound so a seek never decodes the trailing footer/compaction
+/// block as a record. A requested offset that falls in a compaction HOLE resolves (by the binary
+/// search) to the NEXT present survivor, so the read advances over the gap exactly as the full scan
+/// did — absent offsets simply have no entry.
+///
+/// RESIDENT-ONLY, identical lifecycle to the dense index: built once when the compacted segment is
+/// first consulted on the read path, kept while it is open, and DROPPED the instant the segment is
+/// retired (reaped, force-reaped, or — never, for a compacted segment, since it is itself the
+/// compaction product — superseded) by the SAME [`Log::evict_segment_index`] that drops a dense
+/// index, so a recycled slot can never seek with a stale index and RAM stays bounded to the working
+/// set. NEVER persisted: a reopen rebuilds it from the durable frames.
+#[derive(Clone, Debug)]
+struct CompactedIndex {
+    /// Each survivor's `(original sparse log offset, frame START byte position)`, ascending by
+    /// offset. Sparse: there is NO entry for a compacted-away (hole) offset.
+    entries: Vec<(u64, u64)>,
+    /// The byte offset at which the survivor record region ends (the footer start): the
+    /// read-forward upper bound, so a seek never materializes the trailing footer/compaction block.
+    valid_end: u64,
+}
+
+impl CompactedIndex {
+    /// The frame byte position of the FIRST survivor whose offset is at or above `start`, if any.
+    /// A `start` that lands on a present survivor returns that survivor; a `start` in a compaction
+    /// HOLE (or below the lowest survivor) returns the next present survivor, so the read advances
+    /// over the gap; a `start` past the last survivor returns `None` (nothing left to seek to).
+    fn seek_at_or_after(&self, start: u64) -> Option<u64> {
+        let idx = self.entries.partition_point(|&(offset, _)| offset < start);
+        self.entries.get(idx).map(|&(_, byte_pos)| byte_pos)
+    }
+}
+
 /// A single durable, ordered log backed by one data directory of segment files.
 ///
 /// One active segment receives appends; sealed predecessors hold the older records.
@@ -546,6 +590,20 @@ pub struct Log<F: Filesystem, C: Clock> {
     /// structure. The cell holds only derived data: dropping or rebuilding it changes nothing a
     /// reader observes (same records, same CRC validation), it only re-pays the build cost.
     segment_indexes: std::cell::RefCell<std::collections::HashMap<u64, SegmentIndex>>,
+    /// The RESIDENT, per-OPEN-COMPACTED-segment SPARSE seek index keyed by segment id (#481): the
+    /// compacted analogue of `segment_indexes`. It turns [`Log::read_from`]'s compacted branch from
+    /// an O(survivors) whole-region re-read-and-decode on every poll into a binary-search SEEK to the
+    /// first survivor at or above `start` plus an O(`max`) read-forward. Built lazily the first time
+    /// the read path reads a compacted slot, and EVICTED by the SAME [`Log::evict_segment_index`]
+    /// retirement path (reap, force-reap, compaction install) that drops a dense index, so a stale
+    /// sparse index can never outlive its segment. Resident-only: never persisted (a reopen rebuilds
+    /// it) and bounded to the working set of open compacted segments. DENSE (v1) segments are absent
+    /// here (they use `segment_indexes`); the two maps never hold the same id.
+    ///
+    /// Same interior-mutability rationale as `segment_indexes`: a `read_from(&self)` lazily builds
+    /// and caches an entry behind a `RefCell`, holding only derived data (dropping or rebuilding it
+    /// changes nothing a reader observes — same survivors, same CRC validation).
+    compacted_indexes: std::cell::RefCell<std::collections::HashMap<u64, CompactedIndex>>,
 }
 
 impl<F: Filesystem, C: Clock> Log<F, C> {
@@ -597,6 +655,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
                     // A fresh log has no segment to index yet; `start_segment` below seeds the
                     // active segment's (empty) entry.
                     segment_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
+                    // A fresh log has no compacted segment, so the sparse index map (#481) starts
+                    // empty; it is filled lazily the first time a compacted slot is read.
+                    compacted_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
                 };
                 log.start_segment(FIRST_SEGMENT_ID, Seq::new(0), Offset::ZERO)?;
                 Ok(log)
@@ -765,6 +826,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             // active segment appends, so recovery starts them empty: nothing is read yet, and a
             // reopen always rebuilds from the durable frames (the index is never persisted).
             segment_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
+            // The compacted (sparse) seek index map (#481) is likewise resident-only: a reopen
+            // rebuilds it lazily from the durable frames the first time a compacted slot is read.
+            compacted_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
 
         if scan.footer.is_some() {
@@ -1130,6 +1194,9 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             // the compaction-aware path) starts them empty. Compacted (v2, sparse) segments are
             // never indexed here — they keep the v2 scan read path.
             segment_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
+            // The compacted (sparse) seek index map (#481) starts empty and is filled lazily on the
+            // read path; the recovered chain may include compacted segments, indexed on first read.
+            compacted_indexes: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
 
         match active {
@@ -1878,31 +1945,40 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             if out.len() >= max {
                 return Ok(out);
             }
-            // A COMPACTED segment is SPARSE: read its survivors via the v2 scan and push each at its
-            // ORIGINAL offset. A read that lands on a compacted-away offset naturally ADVANCES to the
-            // next present survivor (the absent offsets simply have no record), so the read path skips
-            // the gap rather than stalling, and never reports MissingRecord for a compacted hole. The
-            // SPARSE path is left UNCHANGED by the #483 seek index (which is dense-only).
+            // A COMPACTED segment is SPARSE: read its survivors at their ORIGINAL offsets. SEEK via
+            // the resident #481 sparse index to the FIRST survivor at or above the per-segment start
+            // offset, then read FORWARD up to the remaining `max`, instead of re-reading the WHOLE
+            // survivor region and decoding EVERY survivor on every poll (the pre-#481 behavior). A
+            // read that lands on a compacted-away (hole) offset naturally ADVANCES to the next present
+            // survivor — the binary search resolves a hole to the next entry — so the read skips the
+            // gap rather than stalling, and never reports MissingRecord for a compacted hole. The
+            // records come back already at-or-above the start, so no skip-before-start filter is
+            // needed; the per-segment start offset is `max(start_v, covered_base)` (the FIRST segment
+            // seeks to the requested `start_v`, each later one to its covered base).
             if slot.compacted_covered.is_some() {
-                let records = match SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?
-                    .scan_compacted()?
+                let seg_start = start_v.max(slot.covered_base_offset());
+                let remaining = max - out.len();
+                let reader = SegmentReader::open(self.fs.open(&segment_file_name(slot.id))?)?;
+                if let Some((byte_pos, base_off, base_seq, read_end)) =
+                    self.seek_in_compacted(slot, seg_start, &reader)?
                 {
-                    Some(scan) => scan.records,
-                    // A compacted slot that no longer scans as a valid compacted segment is a
-                    // structural inconsistency the recovery reconciliation should have prevented;
-                    // surface it rather than silently serving nothing.
-                    None => return Err(StorageError::WriterFrozen),
-                };
-                for record in records {
-                    let offset = record.offset.get();
-                    if offset < start_v {
-                        continue; // before the requested start (only in the first segment)
+                    let records = reader
+                        .scan_compacted_from(byte_pos, base_off, base_seq, read_end, remaining)?;
+                    // The survivors are sparse, so an individual offset may still land at or beyond
+                    // `flushed`; clamp the same way the dense path's flushed bound does. (For a sealed
+                    // compacted predecessor, every survivor is below `flushed` and this is a no-op.)
+                    for record in records {
+                        if record.offset.get() >= flushed || out.len() >= max {
+                            return Ok(out);
+                        }
+                        out.push(record);
                     }
-                    if offset >= flushed || out.len() >= max {
-                        return Ok(out);
-                    }
-                    out.push(record);
                 }
+                // A `None` seek means no survivor is at or above `seg_start` (the segment is exhausted
+                // for this read); the loop advances to the next slot, which begins at the contiguous
+                // next covered offset. A compacted slot that no longer indexes as a valid compacted
+                // segment surfaces an error from `seek_in_compacted` rather than silently serving
+                // nothing — the recovery reconciliation should have prevented it.
                 continue;
             }
             // ORDINARY (dense, v1) segment: SEEK via the resident #483 index to the start offset's
@@ -2396,13 +2472,67 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         Some((byte_pos, read_end))
     }
 
-    /// EVICTS the resident seek index (#483) for segment `id`, called on EVERY segment retirement
-    /// (reap, force-reap, compaction install) so a recycled or compacted-away segment id can never
-    /// be seeked with a stale index. A no-op if no index was cached for `id`. Resident-only: the
-    /// dropped index is rebuilt on demand if the (different) segment that later takes a higher id is
-    /// read — ids are never reused (ADR 0002), so this only ever drops a now-gone segment's data.
+    /// Ensures a RESIDENT sparse seek index (#481) exists for the COMPACTED (v2) segment `slot`,
+    /// building it from a one-time validating walk of the survivor region ([`SegmentReader::
+    /// compacted_byte_positions`]) if it is not already cached, and returns the SEEK target for a
+    /// read starting at `start_offset`: the byte position of the first survivor at or above
+    /// `start_offset`, the segment's offset/sequence base (for the original-offset reconstruction),
+    /// and the survivor-region byte READ-END.
+    ///
+    /// The build applies the SAME structural validation `scan_compacted` does, so a slot that no
+    /// longer indexes as a valid compacted segment surfaces [`StorageError::WriterFrozen`] (the
+    /// recovery reconciliation should have prevented it) rather than silently serving nothing —
+    /// preserving the pre-#481 behavior where the read path errored on an invalid compacted slot.
+    ///
+    /// Returns `Ok(None)` when no survivor is at or above `start_offset` (the segment is exhausted
+    /// for this read): the caller advances to the next slot. A `start_offset` that lands in a
+    /// compaction HOLE resolves to the next present survivor, so the read advances over the gap. The
+    /// survivor region lies entirely below `flushed` for a sealed compacted segment (compaction only
+    /// ever produces sealed segments, never the active one), so unlike the dense path there is no
+    /// flushed-byte clamp here; the per-record `>= flushed` filter in `read_from` is the (no-op for a
+    /// compacted slot, belt-and-suspenders) visibility bound.
+    fn seek_in_compacted<R: RandomAccessFile>(
+        &self,
+        slot: &SegmentSlot,
+        start_offset: u64,
+        reader: &SegmentReader<R>,
+    ) -> Result<Option<(u64, u64, u64, u64)>, StorageError> {
+        debug_assert!(slot.compacted_covered.is_some());
+        let base_off = reader.header().base_offset.get();
+        let base_seq = reader.header().base_seq.get();
+        if let Some(idx) = self.compacted_indexes.borrow().get(&slot.id) {
+            return Ok(idx
+                .seek_at_or_after(start_offset)
+                .map(|byte_pos| (byte_pos, base_off, base_seq, idx.valid_end)));
+        }
+        // Build once from the durable survivor frames: the walk validates the footer/block and the
+        // whole-set sequence run exactly as `scan_compacted` does, so a seek into the index can never
+        // point past the survivor region or serve an unvalidated set.
+        let Some((entries, valid_end)) = reader.compacted_byte_positions()? else {
+            // A compacted slot that no longer scans as a valid compacted segment is a structural
+            // inconsistency the recovery reconciliation should have prevented; surface it rather than
+            // silently serving nothing (the same verdict the pre-#481 read path reached).
+            return Err(StorageError::WriterFrozen);
+        };
+        let index = CompactedIndex { entries, valid_end };
+        let result = index
+            .seek_at_or_after(start_offset)
+            .map(|byte_pos| (byte_pos, base_off, base_seq, index.valid_end));
+        self.compacted_indexes.borrow_mut().insert(slot.id, index);
+        Ok(result)
+    }
+
+    /// EVICTS the resident seek index for segment `id`, called on EVERY segment retirement (reap,
+    /// force-reap, compaction install) so a recycled or compacted-away segment id can never be
+    /// seeked with a stale index. Drops the entry from BOTH the dense (#483) and the compacted
+    /// sparse (#481) index maps — a given id is in at most one, and a retiring segment may be of
+    /// either kind — so the evict-on-retirement guarantee covers compacted segments too. A no-op if
+    /// no index was cached for `id`. Resident-only: the dropped index is rebuilt on demand if a
+    /// (different) higher-id segment is later read — ids are never reused (ADR 0002), so this only
+    /// ever drops a now-gone segment's data.
     fn evict_segment_index(&mut self, id: u64) {
         self.segment_indexes.borrow_mut().remove(&id);
+        self.compacted_indexes.borrow_mut().remove(&id);
     }
 
     fn segment_index_for(&self, offset: u64) -> usize {
@@ -2454,6 +2584,35 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             SegmentIndex {
                 base_offset,
                 positions: vec![first; len],
+                valid_end,
+            },
+        );
+    }
+
+    /// Whether a resident COMPACTED (sparse, #481) seek index is currently cached for segment `id`.
+    /// Lets a test assert the compacted-segment evict-on-retirement contract directly.
+    fn has_compacted_index(&self, id: u64) -> bool {
+        self.compacted_indexes.borrow().contains_key(&id)
+    }
+
+    /// Drops EVERY cached compacted (sparse) seek index, forcing the next compacted read to rebuild
+    /// from the durable survivor frames. A test uses this to prove the freshly-BUILT seek path (not
+    /// just the lazily-cached one) is byte-identical to the full v2 scan.
+    fn clear_compacted_indexes(&self) {
+        self.compacted_indexes.borrow_mut().clear();
+    }
+
+    /// Installs a deliberately CORRUPT compacted seek index for segment `id` whose every survivor
+    /// entry points at the survivor region's FIRST frame byte position, so a seek that consulted it
+    /// would return the WRONG (lowest) survivor for every requested offset. A test installs this,
+    /// confirms the retirement path EVICTS it, and then confirms the rebuilt index serves the right
+    /// sparse survivors — proving a stale compacted index can never outlive its segment.
+    fn poison_compacted_index(&self, id: u64, offsets: &[u64], valid_end: u64) {
+        let first = SEGMENT_HEADER_LEN as u64;
+        self.compacted_indexes.borrow_mut().insert(
+            id,
+            CompactedIndex {
+                entries: offsets.iter().map(|&o| (o, first)).collect(),
                 valid_end,
             },
         );
@@ -3913,6 +4072,162 @@ mod tests {
             after_index.len() < before.len(),
             "compaction dropped superseded versions"
         );
+    }
+
+    // ---- #481 compacted (sparse) seek index: equivalence over windows + holes + eviction ----
+
+    /// Builds a keyed, multi-version log, runs a compaction pass so a real COMPACTED (v2, sparse)
+    /// segment with COMPACTION HOLES exists, and returns the log. The survivors are the
+    /// latest-per-key set, so their offsets are sparse: the superseded earlier versions leave
+    /// absent (hole) offsets between the survivors. Used by the seek-equivalence tests below.
+    fn log_with_a_sparse_compacted_segment() -> Log<InMemoryFs, ManualClock> {
+        use crate::compaction::CompactionConfig;
+        let mut log = open_mem(small_config());
+        // Several versions of each of a few keys, each synced so they land in sealed segments a
+        // compaction pass can pick up. Interleaving keys + versions makes the survivor offsets
+        // genuinely sparse (the latest of each key sits at a scattered original offset).
+        for v in 0..6u8 {
+            for (k, base) in [
+                (&b"alpha"[..], 0u8),
+                (&b"beta"[..], 50u8),
+                (&b"gamma"[..], 100u8),
+            ] {
+                log.append(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: k,
+                    headers: b"",
+                    payload: &[v + base; 12],
+                })
+                .unwrap();
+                log.sync().unwrap();
+            }
+        }
+        let out = log.maybe_compact(&CompactionConfig::enabled()).unwrap();
+        assert!(
+            out.compacted_segment_id.is_some(),
+            "the keyed log must compact into a v2 segment"
+        );
+        assert!(
+            log.segments.iter().any(|s| s.compacted_covered.is_some()),
+            "a compacted (sparse) slot must be present"
+        );
+        log
+    }
+
+    #[test]
+    fn compacted_read_via_the_seek_is_byte_identical_to_the_full_scan_over_every_window() {
+        // The #481 contract: reading a COMPACTED segment by SEEKING to `start` and materializing
+        // <= `max` survivors must equal the pre-#481 whole-region full scan for EVERY (start, max)
+        // window — including starts that land on a compaction HOLE (an absent offset, which must
+        // advance to the next present survivor) and starts below/above the survivor range.
+        let log = log_with_a_sparse_compacted_segment();
+        let flushed = log.flushed_offset().get();
+
+        // Confirm the segment really is sparse (has holes): the survivor count is below the covered
+        // span, so some offsets in `[0, flushed)` are absent — the case this test must cover.
+        let all = read_from_by_full_scan(&log, 0, 10_000);
+        assert!(
+            (all.len() as u64) < flushed,
+            "the compacted segment must have holes for this test to mean anything"
+        );
+        // And there is at least one genuine hole offset to start a read ON.
+        let present: std::collections::HashSet<u64> = all.iter().map(|r| r.offset.get()).collect();
+        assert!(
+            (0..flushed).any(|o| !present.contains(&o)),
+            "expected at least one compaction-hole offset"
+        );
+
+        let sweep = |log: &Log<InMemoryFs, ManualClock>| {
+            // `..=flushed + 2` so starts AT and PAST the durable end are exercised too.
+            for start in 0..=flushed + 2 {
+                for max in [0usize, 1, 2, 3, 5, 1000] {
+                    let via_seek = log.read_from(Offset::new(start), max).unwrap();
+                    let via_scan = read_from_by_full_scan(log, start, max);
+                    assert_eq!(
+                        via_seek, via_scan,
+                        "compacted seek vs full-scan mismatch at start={start} max={max}"
+                    );
+                }
+            }
+        };
+
+        // First with the lazily-built compacted index in place...
+        sweep(&log);
+        // ...then after DROPPING it, so the next reads rebuild the sparse index from the durable
+        // survivor frames and the freshly-BUILT seek path is proven byte-identical too.
+        log.clear_compacted_indexes();
+        sweep(&log);
+    }
+
+    #[test]
+    fn a_reap_evicts_the_compacted_seek_index_so_no_stale_entry_survives_retirement() {
+        // The compacted-segment leg of the evict-on-retirement guarantee (#481, mirroring #483's
+        // dense leg). Build a sparse compacted segment, POISON its resident sparse index (every
+        // survivor entry points at the FIRST survivor — a wrong-data index that would serve the
+        // lowest survivor for every offset), then reap it. The eviction on retirement must drop the
+        // poisoned entry, and a read of the surviving log is correct (a fresh index is rebuilt).
+        let mut log = log_with_a_sparse_compacted_segment();
+        // The compacted slot is the oldest (it covers the lowest range). Append + roll a couple more
+        // ORDINARY records so a later segment exists and the compacted one is reapable (never the
+        // active segment).
+        for i in 0..6u8 {
+            log.append(&rec(&[200 + i; 16])).unwrap();
+            log.sync().unwrap();
+        }
+        let compacted = *log
+            .segments
+            .iter()
+            .find(|s| s.compacted_covered.is_some())
+            .expect("a compacted slot");
+        assert_eq!(
+            compacted.id, log.segments[0].id,
+            "the compacted slot is the oldest, hence reapable"
+        );
+
+        // Build the real sparse index (a read touches it), then overwrite it with a poisoned one
+        // bound to the SAME id, proving that without eviction a seek would serve wrong data.
+        let _ = log
+            .read_from(Offset::new(compacted.covered_base_offset()), 1)
+            .unwrap();
+        assert!(log.has_compacted_index(compacted.id));
+        let survivor_offsets: Vec<u64> = read_from_by_full_scan(&log, 0, 10_000)
+            .iter()
+            .map(|r| r.offset.get())
+            .filter(|&o| o < log.segments[1].covered_base_offset())
+            .collect();
+        log.poison_compacted_index(compacted.id, &survivor_offsets, u64::MAX);
+        assert!(log.has_compacted_index(compacted.id));
+
+        // Reap the oldest (compacted) segment: the protect floor is above its whole covered range
+        // (fully consumed) and a tiny byte bound makes it eligible.
+        let next_base = log.segments[1].covered_base_offset();
+        let outcome = log
+            .reap(
+                RetentionBounds {
+                    max_bytes: 1,
+                    ..RetentionBounds::default()
+                },
+                next_base,
+            )
+            .unwrap();
+        assert!(outcome.segments_reaped >= 1, "the compacted oldest reaped");
+        // The retirement EVICTED the poisoned compacted index: it is gone, not serving stale data.
+        assert!(
+            !log.has_compacted_index(compacted.id),
+            "the reaped compacted segment's sparse index must be evicted"
+        );
+
+        // The surviving log still reads correctly across every window.
+        let flushed = log.flushed_offset().get();
+        for start in next_base..flushed {
+            let via_seek = log.read_from(Offset::new(start), 100).unwrap();
+            let via_scan = read_from_by_full_scan(&log, start, 100);
+            assert_eq!(
+                via_seek, via_scan,
+                "post-reap read diverged at start={start}"
+            );
+        }
     }
 
     #[test]

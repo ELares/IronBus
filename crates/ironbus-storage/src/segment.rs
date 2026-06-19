@@ -674,6 +674,13 @@ pub struct CompactedScan {
     pub max_timestamp_ms: u64,
 }
 
+/// The result of [`SegmentReader::compacted_byte_positions`] (#481): each SPARSE survivor's
+/// `(original log offset, frame START byte position)` in ascending offset order, paired with the
+/// byte offset at which the survivor region ends (the footer start, the read-forward upper bound).
+/// `None` (wrapped by the method's `Result<Option<_>, _>`) when the segment is not a valid compacted
+/// segment, exactly as [`SegmentReader::scan_compacted`] returns `None`.
+pub type CompactedPositions = (Vec<(u64, u64)>, u64);
+
 /// The result of a frame-position walk (#483): see [`SegmentReader::walk_positions`]. Carries the
 /// per-record frame START positions delimiting the valid prefix, plus the bytes consumed and the
 /// clean/torn flag the seal check needs, without materializing record payloads.
@@ -1093,6 +1100,153 @@ impl<F: RandomAccessFile> SegmentReader<F> {
             valid_end: footer_start,
             max_timestamp_ms,
         }))
+    }
+
+    // ---- #481 compacted seek-index primitives: compacted_byte_positions + scan_compacted_from ----
+
+    /// Walks a COMPACTED (`version` = 2) segment ONCE and returns, for each SPARSE survivor, its
+    /// reconstructed original log offset paired with its frame START byte position, plus the byte
+    /// offset at which the record region ends (the footer start) (#481). This is the build half of
+    /// the resident compacted seek index: it applies EXACTLY the same structural validation
+    /// [`SegmentReader::scan_compacted`] does (the trailing footer + 44-byte compaction block must be
+    /// present and CRC-valid, every frame must decode, each survivor sequence must be strictly
+    /// increasing and within the covered span, the footer must bind to this segment and agree with
+    /// the body), so it returns `Ok(None)` in precisely the cases `scan_compacted` returns `None`
+    /// (not a committed compacted segment / structurally inconsistent) and the SAME hard errors
+    /// otherwise. It differs only in WHAT it materializes: `(offset, byte_pos)` pairs in ascending
+    /// offset order instead of the decoded records, so the caller can later SEEK to any survivor's
+    /// frame and read forward via [`SegmentReader::scan_compacted_from`] instead of re-reading and
+    /// re-decoding the whole survivor region on every poll.
+    ///
+    /// The returned positions delimit the SAME validated survivor set `scan_compacted` materializes,
+    /// so a seek to any returned position with `scan_compacted_from` reproduces the exact records
+    /// `scan_compacted` would have, and the FULL body-CRC validation of the records actually
+    /// returned happens there (this walk decodes each frame, so it is already CRC-gated, but the
+    /// authoritative per-record validation on the read path is `scan_compacted_from`'s decode).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::FooterSegmentMismatch`] if the footer names a different segment,
+    /// [`StorageError::RecoveredSequenceMismatch`] if a survivor's sequence is out of order or out
+    /// of the covered span (identical to `scan_compacted`), or an IO error.
+    pub fn compacted_byte_positions(&self) -> Result<Option<CompactedPositions>, StorageError> {
+        if !self.header.is_compacted() {
+            return Ok(None);
+        }
+        let header_end = SEGMENT_HEADER_LEN as u64;
+        let footer_len = SEGMENT_FOOTER_LEN as u64;
+        let block_len = COMPACTION_META_LEN as u64;
+        if self.file_len < header_end + footer_len + block_len {
+            return Ok(None);
+        }
+        let block_start = self.file_len - block_len;
+        let footer_start = block_start - footer_len;
+        let mut mbuf = [0u8; COMPACTION_META_LEN];
+        self.file.read_exact_at(&mut mbuf, block_start)?;
+        let Ok(meta) = CompactionMeta::decode(&mbuf) else {
+            return Ok(None);
+        };
+        let mut fbuf = [0u8; SEGMENT_FOOTER_LEN];
+        self.file.read_exact_at(&mut fbuf, footer_start)?;
+        let Ok(footer) = SegmentFooter::decode(&fbuf) else {
+            return Ok(None);
+        };
+
+        let base_off = self.header.base_offset.get();
+        let base_seq = self.header.base_seq.get();
+        let body_len = usize::try_from(footer_start.saturating_sub(header_end))
+            .map_err(|_| StorageError::SegmentFull)?;
+        let mut body = vec![0u8; body_len];
+        if body_len > 0 {
+            self.file.read_exact_at(&mut body, header_end)?;
+        }
+        // `(offset, frame-start byte position)` per survivor, in ascending offset order. The byte
+        // position is `header_end + cursor` (the frame's absolute start in the file), the same
+        // anchor `scan_compacted_from` seeks to.
+        let mut positions: Vec<(u64, u64)> = Vec::new();
+        let mut cursor = 0usize;
+        let mut prev_seq: Option<u64> = None;
+        while cursor < body.len() {
+            let Ok((view, consumed)) = codec::decode(&body[cursor..]) else {
+                // The same structural-inconsistency verdict `scan_compacted` reaches: a committed
+                // compacted segment (footer + block present and CRC-valid) with a torn/corrupt frame
+                // is refused wholesale rather than half-indexed.
+                return Ok(None);
+            };
+            let seq = view.seq.get();
+            if seq < base_seq || seq >= meta.covered_end_seq || prev_seq.is_some_and(|p| seq <= p) {
+                return Err(StorageError::RecoveredSequenceMismatch {
+                    index: positions.len(),
+                    expected: prev_seq.map_or(base_seq, |p| p + 1),
+                    found: seq,
+                });
+            }
+            prev_seq = Some(seq);
+            let offset = base_off.wrapping_add(seq.wrapping_sub(base_seq));
+            positions.push((offset, header_end + cursor as u64));
+            cursor += consumed;
+        }
+        if footer.segment_id != self.header.segment_id {
+            return Err(StorageError::FooterSegmentMismatch {
+                header: self.header.segment_id,
+                footer: footer.segment_id,
+            });
+        }
+        if u64::from(footer.record_count) != positions.len() as u64
+            || cursor as u64 != footer_start - header_end
+        {
+            return Ok(None);
+        }
+        Ok(Some((positions, footer_start)))
+    }
+
+    /// Reads up to `max` SPARSE survivor records from a COMPACTED (`version` = 2) segment starting at
+    /// the file byte position `start_byte`, FULLY validating each materialized record (header AND
+    /// body CRC, via the same `codec::decode` the v2 scan uses) and stopping at the first torn or
+    /// corrupt frame, after `max` records, or at `read_end` (#481). Each survivor's ORIGINAL log
+    /// offset is reconstructed from its decoded sequence and the constant offset-minus-sequence delta
+    /// (`base_off - base_seq`), EXACTLY as [`SegmentReader::scan_compacted`] does, so the records come
+    /// back at their true sparse offsets. `start_byte` MUST be a survivor frame boundary (an index
+    /// entry from [`SegmentReader::compacted_byte_positions`]); the structural validation
+    /// (footer/block presence, whole-set sequence monotonicity) was already done when that index was
+    /// built, so this forward read needs only the per-frame CRC the decode performs.
+    ///
+    /// `read_end` bounds the read at the survivor region end (the footer start the index reports), so
+    /// the footer and trailing compaction block are never decoded as a record. Returns the survivors
+    /// in ascending offset order; the caller applies the `start`/`flushed`/`max` log-level filter.
+    ///
+    /// # Errors
+    /// Returns an IO error from reading the region. A torn or corrupt frame is NOT an error here: it
+    /// ends the returned prefix, exactly as the dense `scan_from` stops at the first bad frame.
+    pub fn scan_compacted_from(
+        &self,
+        start_byte: u64,
+        base_off: u64,
+        base_seq: u64,
+        read_end: u64,
+        max: usize,
+    ) -> Result<Vec<OwnedRecord>, StorageError> {
+        if max == 0 || start_byte >= read_end {
+            return Ok(Vec::new());
+        }
+        let len = usize::try_from(read_end.saturating_sub(start_byte))
+            .map_err(|_| StorageError::SegmentFull)?;
+        let mut body = vec![0u8; len];
+        self.file.read_exact_at(&mut body, start_byte)?;
+        let mut records = Vec::with_capacity(max.min(64));
+        let mut cursor = 0usize;
+        while cursor < body.len() && records.len() < max {
+            // The SAME CRC-gated decode `scan_compacted` uses: a torn or corrupt frame ends the read.
+            let Ok((view, consumed)) = codec::decode(&body[cursor..]) else {
+                break;
+            };
+            // Reconstruct the original sparse offset from the constant offset-minus-seq delta, the
+            // identical reconstruction `scan_compacted` applies.
+            let seq = view.seq.get();
+            let offset = Offset::new(base_off.wrapping_add(seq.wrapping_sub(base_seq)));
+            records.push(OwnedRecord::from_view(offset, &view));
+            cursor += consumed;
+        }
+        Ok(records)
     }
 
     /// Like [`SegmentReader::scan`], but returns only the metadata [`Log::recover`] needs
