@@ -2574,8 +2574,7 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         // the slot's running count if that scan somehow fails.
         let record_count = reader
             .scan_recovery()
-            .map(|r| r.record_count)
-            .unwrap_or(slot.record_count);
+            .map_or(slot.record_count, |r| r.record_count);
         let index = SegmentIndex {
             base_offset: slot.base_offset,
             anchors,
