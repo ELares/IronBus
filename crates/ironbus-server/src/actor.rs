@@ -648,9 +648,11 @@ where
     spawn_actor_with_gather(engine, channel_bound, 0)
 }
 
-/// Like [`spawn_actor`] with an opt-in bounded GROUP-COMMIT GATHER (#454). With `gather_micros`
-/// of 0 (the default everywhere except an operator's explicit `--commit-gather-us`) the actor is
-/// byte-identical to the historical drain. With a window set, a drain pass that already holds at
+/// Like [`spawn_actor`] with a bounded GROUP-COMMIT GATHER (#454, #472). With `gather_micros`
+/// of 0 the actor is byte-identical to the historical drain (this is what [`spawn_actor`] passes,
+/// and what an operator gets from `--commit-gather-us 0`; the shipped CLI default is a small
+/// non-zero window so out-of-the-box durable produce batches fsyncs, #472). With a window set, a
+/// drain pass that already holds at
 /// least TWO produces (evidence of a pipelining publisher; a single-produce pass never gathers,
 /// so an unpipelined producer pays no window) keeps collecting commands for up to the window
 /// before committing, so a pipelined publisher's whole in-flight window lands under ONE covering
@@ -1463,6 +1465,65 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(control.sync_count() - before, 1, "one produce, one fsync");
+        drop(handle);
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn a_gather_enabled_concurrent_batch_acks_only_after_one_covering_fsync() {
+        // The SHIPPED-DEFAULT guarantee (#472): turning the gather ON (the CLI now defaults to a
+        // small non-zero window) must NOT weaken I2 (ack-implies-durable) or split a concurrent
+        // batch across fsyncs. The sync gate makes it deterministic and clock-independent (no
+        // dependence on the real window length, so it is not racy): close the gate so the actor
+        // parks on the FIRST covering fsync, queue several more produces behind it, then assert (a)
+        // no ack has been released while the fsync is still parked (I2: an ack never precedes its
+        // covering fsync), and (b) once the gate opens the whole queued batch is covered by exactly
+        // ONE additional fsync. Run with a non-trivial gather window to exercise the on path.
+        let (fs, control) = FaultFs::new(InMemoryFs::new());
+        let engine = Engine::open(fs, ManualClock::new(), config()).unwrap();
+        let (handle, actor) = spawn_actor_with_gather(engine, DEFAULT_CHANNEL_BOUND, 50_000);
+        control.close_sync_gate();
+        // The primer parks the actor inside its covering fsync (the gate holds it there).
+        let primer = handle.produce_async(append(b"primer")).unwrap();
+        control.wait_for_sync_gate_entered(1);
+        // Queue a concurrent batch behind the parked fsync; these all land in ONE drain pass (>= 2
+        // produces, so the gather engages) and must share a single covering fsync.
+        let queued: Vec<_> = (0..4)
+            .map(|i| {
+                handle
+                    .produce_async(append(format!("queued-{i}").as_bytes()))
+                    .unwrap()
+            })
+            .collect();
+        let before = control.sync_count();
+        // I2 PROOF: while the covering fsync is still parked, NOT ONE reply may have been released.
+        for reply in &queued {
+            assert!(
+                matches!(reply.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+                "a queued produce was acked BEFORE its covering fsync returned (I2 violated)"
+            );
+        }
+        control.open_sync_gate();
+        // The primer acks at offset 0; the gate is open so its parked fsync now returns.
+        match primer.recv().unwrap() {
+            ProduceOutcome::Appended(o) => assert_eq!(o.get(), 0),
+            other => panic!("expected Appended primer, got {other:?}"),
+        }
+        let mut offsets = Vec::new();
+        for reply in queued {
+            match reply.recv().unwrap() {
+                ProduceOutcome::Appended(o) => offsets.push(o.get()),
+                other => panic!("expected Appended, got {other:?}"),
+            }
+        }
+        assert_eq!(offsets, vec![1, 2, 3, 4], "all four appended in send order");
+        // ONE-FSYNC PROOF: the four queued produces are covered by exactly ONE fsync (the gather
+        // collapses the concurrent batch), not one per produce.
+        assert_eq!(
+            control.sync_count() - before,
+            1,
+            "the concurrent batch of four is covered by exactly ONE fsync"
+        );
         drop(handle);
         actor.join().unwrap();
     }

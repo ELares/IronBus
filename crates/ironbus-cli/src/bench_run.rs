@@ -17,7 +17,7 @@ use crate::{open_disk_engine, open_memory_engine, CliError, ServeConfig, Storage
 use ironbus_client::{Client, ClientConfig, ClientError};
 use ironbus_core::clock::Clock; // the monotonic seam the serve loop's liveness beacon (#95) reads
 use ironbus_proto::message::PubBody;
-use ironbus_server::actor::{spawn_actor, DEFAULT_CHANNEL_BOUND};
+use ironbus_server::actor::{spawn_actor_with_gather, DEFAULT_CHANNEL_BOUND};
 use ironbus_server::server::serve;
 use ironbus_storage::fs::{Filesystem, InMemoryFs, StdFs};
 use std::net::TcpListener;
@@ -210,7 +210,12 @@ impl<F: Filesystem + 'static> IsolatedBroker<F> {
         engine: ironbus_server::engine::Engine<F, ironbus_server::clock::SystemClock>,
         config: &ServeConfig,
     ) -> Result<IsolatedBroker<F>, CliError> {
-        let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        // Honor the resolved group-commit gather (#454, #472), so the bench broker reflects the
+        // SAME default as the real `serve` path (`run_broker` wires `config.commit_gather_us` the
+        // same way). Without this the bench would always run the gather-off actor and never measure
+        // the shipped default's effect on a concurrent publisher.
+        let (handle, actor) =
+            spawn_actor_with_gather(engine, DEFAULT_CHANNEL_BOUND, config.commit_gather_us);
         let listener = TcpListener::bind("127.0.0.1:0")
             .map_err(|e| CliError::Internal(format!("bench: cannot bind a loopback port: {e}")))?;
         let addr = listener
