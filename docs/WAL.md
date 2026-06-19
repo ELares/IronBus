@@ -160,6 +160,32 @@ directory of self-describing files is the authority, no manifest required").
   evidence and must not be shed). It is not on the produce-path retention loop, so in
   the shipped code the DLQ is not auto-reaped.
 
+### 6. The `layout.meta` data-dir layout marker (#562)
+
+- A small, durable, CRC32C-protected file at the data-dir root (`layout.rs`) that
+  declares the on-disk **directory layout version** — where streams, cursors, and the
+  DLQ live — *distinct* from the per-segment/record `FORMAT_VERSION`, which versions the
+  frame ENCODING. The two version axes are orthogonal: one names the shape of the
+  directory, the other the shape of a frame.
+- Format: the same two-slot, CRC32C'd, alternating-write `Checkpoint` file the cursors
+  use (`checkpoint.rs`). Its payload is a 4-byte magic (`IBDD`) plus a little-endian
+  `u32` layout version. A torn slot fails its CRC and is ignored, exactly like a torn
+  cursor.
+- **Layout version 1** is today's layout, described in items 1–5 above: the root log is
+  the default stream `""`, with `cursor*.ckpt`, `counters.ckpt`, the `quarantine/`
+  forensic subdir, and the `dlq/` subdir. The marker also **reserves** a future
+  `streams/` subtree for per-stream logs (M2-I2); that subtree is NOT created here.
+- Created/checked: `Log::open` reads the marker before any recovery. **Absent** (a
+  pre-marker data dir from before #562) is treated as layout v1 and the marker is
+  written — a safe, idempotent upgrade, because an existing single-log deployment is
+  byte-for-byte layout v1 (no segment, cursor, or DLQ byte changes). A **present v1**
+  marker opens unchanged. A **present, fully-valid marker declaring a FUTURE version**
+  fails closed with `StorageError::IncompatibleLayoutVersion` — a newer layout is never
+  silently reinterpreted by an older binary, the same refuse-and-report discipline as an
+  unknown `FORMAT_VERSION`. A **torn or corrupt** marker recovers as absent and is
+  re-upgraded to v1, bounded to a single marker rewrite, so a bad marker never bricks an
+  otherwise-valid data dir and never fabricates a future version.
+
 There is no other on-disk state. In particular there is no index sidecar, no time
 index, no `current` pointer file, and no manifest (all verified absent; see
 [below](#specified-but-not-yet-implemented)).

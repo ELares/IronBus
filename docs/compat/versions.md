@@ -29,6 +29,7 @@ or breaking (a new value means a new layout that an old reader fail-closed refus
 | Id-space | Current value(s) | Defined in (code symbol) | Bump rule | Owner |
 |----------|------------------|--------------------------|-----------|-------|
 | Storage `FORMAT_VERSION` | `1` | `ironbus_core::format::FORMAT_VERSION` | Breaking. A new layout takes a new integer; a v1 reader refuses any other value. | #126, #5 |
+| Data-dir layout version | `1` | `ironbus_storage::layout::LAYOUT_VERSION` (the `layout.meta` marker, CRC32C two-slot checkpoint) | Breaking. Versions the on-disk DIRECTORY structure (where streams/cursors/DLQ live), SEPARATELY from `FORMAT_VERSION` (which versions the frame ENCODING). v1 = today's root-log + `dlq/` layout and reserves a future `streams/` subtree (M2-I2). A v1 reader refuses any higher value; an absent marker auto-upgrades to v1 (an existing single-log dir is byte-for-byte v1); a torn/corrupt marker recovers as v1 and never bricks the dir. | #562, #500 |
 | Record header version | `1` (= `FORMAT_VERSION`) | `format::header_offsets::VERSION` (offset 2), checked in `ironbus_core::codec::decode` | Breaking. Same integer as `FORMAT_VERSION`; stamped per record. | #5 |
 | Segment header version | `1` (= `FORMAT_VERSION`) | `format::segment_header_offsets::VERSION` (offset 8), checked in `ironbus_core::segment::SegmentHeader::decode` | Breaking. Same integer as `FORMAT_VERSION`; stamped per segment. | #4, #5 |
 | Segment footer version | `1` (= `FORMAT_VERSION`) | `format::segment_footer_offsets::VERSION` (offset 2), checked in `ironbus_core::segment::SegmentFooter::decode` | Breaking. Same integer as `FORMAT_VERSION`; stamped per sealed segment. | #4, #5 |
@@ -79,6 +80,7 @@ unknown value. The three actions, consistent with [COMPATIBILITY.md](../COMPATIB
 | Id-space | Action on unknown | Append-only | Owner | Enforcing symbol / status |
 |----------|-------------------|-------------|-------|---------------------------|
 | Storage `FORMAT_VERSION` (record/segment/footer version bytes) | REFUSE | no (breaking) | #126, #5 | `DecodeError::UnsupportedVersion`, `SegmentError::UnsupportedVersion` |
+| Data-dir layout version (`layout.meta` marker) | REFUSE a higher version (fail closed); a torn/corrupt or ABSENT marker recovers as v1 (idempotent upgrade), never refused | no (breaking) | #562, #500 | `StorageError::IncompatibleLayoutVersion`; `ironbus_storage::layout::open_or_upgrade` checked at the top of `Log::open` |
 | Cursor checkpoint snapshot version | REFUSE | no (breaking) | #7 | `SnapshotError::UnsupportedVersion` |
 | `checksum_algo` | REFUSE | yes | #5 | `SegmentError::UnsupportedChecksumAlgo` |
 | `RecordFlags` unknown bits (within a known version) | TOLERATE + PRESERVE | yes | #5, #12 | `RecordFlags::unknown_bits` (kept verbatim, never interpreted) |

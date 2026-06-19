@@ -14,6 +14,11 @@ pub mod fault;
 pub mod fs;
 pub mod invariants;
 pub mod io;
+/// The data-directory LAYOUT version marker (#562): a small, durable, CRC32C'd `layout.meta` at the
+/// data-dir root that versions the on-disk DIRECTORY structure (where streams/cursors/DLQ live),
+/// distinct from the per-segment `FORMAT_VERSION`. Version 1 is today's layout (root log = default
+/// stream, `dlq/` subdir), and it reserves the `streams/` subtree for per-stream logs (M2-I2).
+pub mod layout;
 pub mod log;
 pub mod loss;
 pub mod naming;

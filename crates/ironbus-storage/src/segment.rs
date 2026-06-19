@@ -113,6 +113,20 @@ pub enum StorageError {
         /// The configured daily physical write budget the meter met or exceeded.
         budget: u64,
     },
+    /// The data directory's on-disk LAYOUT version (the DIRECTORY structure version in `layout.meta`,
+    /// `crate::layout`) is NEWER than this build understands, so `Log::open` fails CLOSED rather than
+    /// silently reinterpreting a layout it does not know (the same exact-match, refuse-and-report
+    /// discipline as an unknown `FORMAT_VERSION`, #562). DISTINCT from a record/segment version
+    /// mismatch ([`StorageError::Segment`] / [`StorageError::Record`]): this versions where streams,
+    /// cursors, and the DLQ live, not how a frame is encoded. A corrupt or absent marker never
+    /// produces this error (it recovers as layout v1); only a fully-valid, CRC-checked future marker
+    /// does.
+    IncompatibleLayoutVersion {
+        /// The layout version found in the marker.
+        found: u32,
+        /// The highest layout version this build supports ([`crate::layout::LAYOUT_VERSION`]).
+        supported: u32,
+    },
 }
 
 impl core::fmt::Display for StorageError {
@@ -175,6 +189,11 @@ impl core::fmt::Display for StorageError {
                 f,
                 "daily physical write budget reached ({bytes_today} of {budget} bytes today); \
                  produce rejected"
+            ),
+            StorageError::IncompatibleLayoutVersion { found, supported } => write!(
+                f,
+                "data-dir layout version {found} is newer than this build supports ({supported}); \
+                 refusing to open"
             ),
         }
     }
