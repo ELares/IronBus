@@ -28,6 +28,13 @@ path = "src/bin/regression_gate.rs"
 name = "assemble-corpus"
 path = "src/bin/assemble_corpus.rs"
 
+# Single-consumer streaming-consume throughput: the batched + read-ahead DEFAULT vs the
+# per-message-fetch + per-message-commit path (#550, M1-I10). The consume-side proof that sets up the
+# #554 NATS comparison; off the per-PR CI path, run on demand. Unix-only (uses the in-process broker).
+[[bin]]
+name = "stream-consume-bench"
+path = "src/bin/stream_consume_bench.rs"
+
 [dependencies]
 # The harness drives the broker through the REAL #11 client over a real socket, never a privileged
 # test path; it launches the shipping `ironbus` binary built by `ironbus-cli`.
