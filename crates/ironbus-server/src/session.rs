@@ -537,6 +537,10 @@ impl Session {
             // Confirm the gap-marker capability the server activated for this connection, so the
             // client knows whether to expect `GapMarker` (tag 21) or the legacy `Truncated` (#346).
             gap_marker: self.gap_marker_enabled,
+            // #494 is PROTO/CODEC only: the server does not echo a connection-wide default ack level
+            // yet (that is phase #497), so this stays `None` and the `Info` body is byte-for-byte the
+            // pre-#494 layout.
+            default_ack_level: None,
         };
         let mut info_body = Vec::new();
         encode_info(&info, &mut info_body);
@@ -1875,6 +1879,7 @@ mod tests {
                 requested_credit: None,
                 requested_credit_bytes: None,
                 wants_gap_marker: true,
+                default_ack_level: None,
             },
             &mut body,
         );
@@ -4731,6 +4736,7 @@ mod tests {
                 requested_credit,
                 requested_credit_bytes,
                 wants_gap_marker: false,
+                default_ack_level: None,
             },
             &mut connect_body,
         );

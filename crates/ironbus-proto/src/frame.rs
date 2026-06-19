@@ -108,6 +108,17 @@ pub enum FrameType {
     /// compacted), sourced from the already-frozen `loss-report.v1` skip record. The `Deliver` (tag
     /// 13) body is UNCHANGED.
     GapMarker,
+    /// Server->producer confirmation that an ack-level-2 (server+client-ack) publish has reached its
+    /// terminal produce outcome (#494, part of #499): the producer's confirmation completes only once
+    /// a CONSUMER acked the record (or it timed out / was dead-lettered). It is the wire frame the
+    /// Cassandra-style ack-level spectrum's Level 2 rides on; Level 0 (fire-and-forget, the existing
+    /// [`crate::message::PUB_FLAG_FIRE_AND_FORGET`]) and Level 1 (the existing `PubAck`, tag 14) are
+    /// unchanged and never use it. It is a NEW append-only tag, so an old producer that never requests
+    /// Level 2 never receives it. Body: the record's durable `offset` as a little-endian `u64`
+    /// (8 bytes) followed by a one-byte `status` (0 = consumed/confirmed, 1 = timed-out,
+    /// 2 = dead-lettered). PROTO/CODEC ONLY in this phase: this frame is DEFINED here but NOTHING
+    /// sends it yet (the server emit path is phase #497).
+    ProduceConfirm,
 }
 
 impl FrameType {
@@ -136,6 +147,7 @@ impl FrameType {
             FrameType::CumulativeAck => 19,
             FrameType::PubAckDuplicate => 20,
             FrameType::GapMarker => 21,
+            FrameType::ProduceConfirm => 22,
         }
     }
 
@@ -165,6 +177,7 @@ impl FrameType {
             19 => FrameType::CumulativeAck,
             20 => FrameType::PubAckDuplicate,
             21 => FrameType::GapMarker,
+            22 => FrameType::ProduceConfirm,
             _ => return None,
         })
     }
@@ -297,7 +310,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 21] = [
+    const ALL_TYPES: [FrameType; 22] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -319,6 +332,7 @@ mod tests {
         FrameType::CumulativeAck,
         FrameType::PubAckDuplicate,
         FrameType::GapMarker,
+        FrameType::ProduceConfirm,
     ];
 
     #[test]
@@ -358,6 +372,30 @@ mod tests {
         assert_eq!(FrameType::CumulativeAck.as_u8(), 19);
         assert_eq!(FrameType::PubAckDuplicate.as_u8(), 20);
         assert_eq!(FrameType::GapMarker.as_u8(), 21);
+        assert_eq!(FrameType::ProduceConfirm.as_u8(), 22);
+    }
+
+    #[test]
+    fn produce_confirm_is_the_next_free_tag_and_frames() {
+        // #494: ProduceConfirm takes tag 22, the next FREE tag after GapMarker (21). It was previously
+        // an UNKNOWN tag, so this pins it as a known type now and confirms it frames at the envelope
+        // level like any other.
+        assert_eq!(FrameType::ProduceConfirm.as_u8(), 22);
+        assert_eq!(FrameType::from_u8(22), Some(FrameType::ProduceConfirm));
+        // 23 is the new next-free tag (still unknown), so it frames but is not a known type.
+        assert_eq!(FrameType::from_u8(23), None);
+        let mut buf = Vec::new();
+        encode_frame(FrameType::ProduceConfirm, b"\x01\x02", &mut buf).unwrap();
+        match decode_frame(&buf).unwrap() {
+            FrameDecode::Frame { type_tag, body, .. } => {
+                assert_eq!(
+                    FrameType::from_u8(type_tag),
+                    Some(FrameType::ProduceConfirm)
+                );
+                assert_eq!(body, b"\x01\x02");
+            }
+            FrameDecode::Incomplete { .. } => panic!("complete"),
+        }
     }
 
     #[test]
@@ -543,7 +581,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 22u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 23u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);
