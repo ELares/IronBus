@@ -250,9 +250,10 @@ retention/reap decrement the record-region total in O(1), so it is the one basis
 reap can relieve. `ironbus_physical_bytes_written` is a write-AMPLIFICATION counter
 that **never decreases on a reap**, so capping on it would tighten after every reap
 and eventually wedge the writer; and the resident terms below are backend- and
-config-specific (the in-memory image is dropping from 2x to 1x in #492; disk
-preallocation depends on `segment_size`), so no single basis can honestly fold them
-in. The cap basis is therefore left untouched and the overhead is published here.
+config-specific (the production in-memory image is now 1x the record region after
+#492; disk preallocation depends on `segment_size`), so no single basis can honestly
+fold them in. The cap basis is therefore left untouched and the overhead is published
+here.
 
 Per-backend multiplier (record region → resident bytes):
 
@@ -260,7 +261,7 @@ Per-backend multiplier (record region → resident bytes):
 | --- | --- | --- |
 | Per-record framing | 44 B/record (36 B header + 8 B trailer) already INSIDE the record region | dominates at small payloads: a 1 B record frames to ~45 B → ~`1.85x` of payload |
 | Per-segment header/footer | 64 B/segment + 32 B/sealed segment | small unless `segment_size` is tiny (many segments) |
-| In-memory image (`--storage memory`) | historically **2x** the record region (the in-RAM copy); dropping to **1x** in #492 | up to 2x of resident until #492 lands |
+| In-memory image (`--storage memory`) | **1x** the record region after #492 — production `--storage memory` runs the single-`Vec` `EphemeralFile`/`EphemeralFs` backend (no `live`+`durable` copy); the historical **2x** in-RAM copy now exists ONLY in the `InMemoryFile` crash-recovery simulation | ~`1x` of the resident framed bytes (the boot RAM guard still charges 2x conservatively — see RAM_BUDGET.md) |
 | Per-segment index cache (memory + disk) | a few entries per segment | small |
 | Disk preallocation (`--storage disk`) | the ACTIVE segment is preallocated to `segment_size` (default 64 MiB) | up to one `segment_size` of apparent disk use beyond the resident framed bytes |
 
@@ -274,8 +275,11 @@ specific — add them from the table above). Practical sizing:
   segment's preallocation). To hold `max_total_bytes` of record bytes, provision at
   least `max_total_bytes + (segment_count × 96 B framing) + segment_size`.
 - **Memory budget** (`--storage memory`) ≈ `resident_bytes_estimate()` × the image
-  multiplier (2x today, 1x after #492). `max_total_bytes` is REQUIRED above `0` for
-  the memory backend precisely because it is the OOM guard — size it as
+  multiplier, which is **1x** after #492 (production runs the single-`Vec`
+  `EphemeralFile`/`EphemeralFs` backend, with no `live`+`durable` copy). The boot
+  RAM guard still charges 2x conservatively (see RAM_BUDGET.md), so a config that the
+  guard refuses still leaves headroom in practice. `max_total_bytes` is REQUIRED
+  above `0` for the memory backend precisely because it is the OOM guard — size it as
   `desired_RAM / image_multiplier`, then subtract the segment-framing overhead.
 
 ### Durability (`[durability]`)
