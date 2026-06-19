@@ -119,6 +119,21 @@ pub enum FrameType {
     /// 2 = dead-lettered). PROTO/CODEC ONLY in this phase: this frame is DEFINED here but NOTHING
     /// sends it yet (the server emit path is phase #497).
     ProduceConfirm,
+    /// Consumer batch-pull FETCH request (#489): a NATS pull-consumer-style request that drains up to
+    /// `max_records` / `max_bytes` of deliverable records in ONE round-trip, amortizing the per-poll
+    /// actor hop and read cost across the whole batch. It is the BATCH twin of [`FrameType::Flow`]
+    /// (tag 10): the server runs the SAME per-record poll the `Flow` path does (same lease/credit,
+    /// at-least-once, broadcast/`key_shared`/competing semantics, never over-delivering past
+    /// `max_in_flight`), so a batch fetch delivers EXACTLY the records N successive per-record polls
+    /// would, just in one request. The RESPONSE reuses the existing delivery frames verbatim — a run
+    /// of [`FrameType::Deliver`] (with any interleaved [`FrameType::DeadLetter`],
+    /// [`FrameType::Truncated`], or [`FrameType::GapMarker`] advisories), terminated by exactly one
+    /// [`FrameType::FlowEnd`] carrying the delivered count — so no new response frame is introduced.
+    /// It is a NEW append-only request tag: an old client never sends it and the existing `Flow`
+    /// wire (tag 10) is byte-for-byte unchanged. Body: a [`crate::message::FetchBody`]
+    /// (`max_records: u32`, `max_bytes: u64`, `expires_ms: u64` relative deadline budget, and a
+    /// `no_wait` flag), versioned and forward-compatible.
+    Fetch,
 }
 
 impl FrameType {
@@ -148,6 +163,7 @@ impl FrameType {
             FrameType::PubAckDuplicate => 20,
             FrameType::GapMarker => 21,
             FrameType::ProduceConfirm => 22,
+            FrameType::Fetch => 23,
         }
     }
 
@@ -178,6 +194,7 @@ impl FrameType {
             20 => FrameType::PubAckDuplicate,
             21 => FrameType::GapMarker,
             22 => FrameType::ProduceConfirm,
+            23 => FrameType::Fetch,
             _ => return None,
         })
     }
@@ -310,7 +327,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 22] = [
+    const ALL_TYPES: [FrameType; 23] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -333,6 +350,7 @@ mod tests {
         FrameType::PubAckDuplicate,
         FrameType::GapMarker,
         FrameType::ProduceConfirm,
+        FrameType::Fetch,
     ];
 
     #[test]
@@ -373,17 +391,15 @@ mod tests {
         assert_eq!(FrameType::PubAckDuplicate.as_u8(), 20);
         assert_eq!(FrameType::GapMarker.as_u8(), 21);
         assert_eq!(FrameType::ProduceConfirm.as_u8(), 22);
+        assert_eq!(FrameType::Fetch.as_u8(), 23);
     }
 
     #[test]
-    fn produce_confirm_is_the_next_free_tag_and_frames() {
-        // #494: ProduceConfirm takes tag 22, the next FREE tag after GapMarker (21). It was previously
-        // an UNKNOWN tag, so this pins it as a known type now and confirms it frames at the envelope
-        // level like any other.
+    fn produce_confirm_is_a_frozen_tag_and_frames() {
+        // #494: ProduceConfirm holds tag 22 (the FREE tag after GapMarker, 21); pinned here so a
+        // future reorder breaks a test, not the wire, and confirmed to frame at the envelope level.
         assert_eq!(FrameType::ProduceConfirm.as_u8(), 22);
         assert_eq!(FrameType::from_u8(22), Some(FrameType::ProduceConfirm));
-        // 23 is the new next-free tag (still unknown), so it frames but is not a known type.
-        assert_eq!(FrameType::from_u8(23), None);
         let mut buf = Vec::new();
         encode_frame(FrameType::ProduceConfirm, b"\x01\x02", &mut buf).unwrap();
         match decode_frame(&buf).unwrap() {
@@ -393,6 +409,28 @@ mod tests {
                     Some(FrameType::ProduceConfirm)
                 );
                 assert_eq!(body, b"\x01\x02");
+            }
+            FrameDecode::Incomplete { .. } => panic!("complete"),
+        }
+    }
+
+    #[test]
+    fn fetch_is_the_next_free_tag_and_frames() {
+        // #489: Fetch takes tag 23, the next FREE tag after ProduceConfirm (22). It was previously an
+        // UNKNOWN tag, so this pins it as a known type now and confirms it frames at the envelope level
+        // like any other. The existing Flow wire (tag 10) is unchanged: this is an ADDITIVE request tag.
+        assert_eq!(FrameType::Fetch.as_u8(), 23);
+        assert_eq!(FrameType::from_u8(23), Some(FrameType::Fetch));
+        // The existing Flow tag is untouched (the batch fetch is additive, not a replacement).
+        assert_eq!(FrameType::Flow.as_u8(), 10);
+        // 24 is the new next-free tag (still unknown), so it frames but is not a known type.
+        assert_eq!(FrameType::from_u8(24), None);
+        let mut buf = Vec::new();
+        encode_frame(FrameType::Fetch, b"\x03\x04", &mut buf).unwrap();
+        match decode_frame(&buf).unwrap() {
+            FrameDecode::Frame { type_tag, body, .. } => {
+                assert_eq!(FrameType::from_u8(type_tag), Some(FrameType::Fetch));
+                assert_eq!(body, b"\x03\x04");
             }
             FrameDecode::Incomplete { .. } => panic!("complete"),
         }
@@ -581,7 +619,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 23u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 24u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);
