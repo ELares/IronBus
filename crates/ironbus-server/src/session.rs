@@ -33,7 +33,7 @@ use ironbus_proto::message::{
     decode_ack, decode_connect, decode_cumulative_ack, decode_fetch, decode_pub,
     decode_stream_commit, decode_stream_fetch, decode_sub, encode_dead_letter, encode_deliver,
     encode_gap_marker, encode_info, encode_produce_confirm, encode_pub_ack, encode_truncated,
-    gap_reason, produce_confirm_status, pub_ack_level, AckLevel, AckOp, CreditAdvert,
+    gap_reason, produce_confirm_status, pub_ack_level, AckLevel, AckOp, ConsumeTier, CreditAdvert,
     DeadLetterBody, DeliverBody, GapMarkerBody, InfoBody, ProduceConfirmBody, PubAckBody,
     TruncatedBody, DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
 };
@@ -270,6 +270,22 @@ pub struct Session {
     /// double-signal and an old consumer that would error on an unknown frame is never sent the new
     /// tag. Default `false` (backward-compatible).
     gap_marker_enabled: bool,
+    /// Whether this connection negotiated the streaming consume tier (Tier-S, #543, V2-M1): set at
+    /// `Connect` time when the client advertised
+    /// [`ironbus_proto::message::CONNECT_FLAG_UNDERSTANDS_STREAMING`]. When `true`, the connection may be
+    /// served Tier-S — including honoring a Tier-S `default_tier` so an unmarked SUB streams. When
+    /// `false` (an old client, or one that opts out) the connection is ALWAYS Tier-W and any Tier-S
+    /// default is ignored, so a pre-streaming client is never moved onto a tier it cannot follow.
+    /// Default `false` (backward-compatible).
+    streaming_enabled: bool,
+    /// This connection's negotiated DEFAULT consume tier (#543, V2-M1): the tier a SUBSCRIPTION adopts
+    /// when it does not explicitly pick one. Fixed at `Connect` time from the client's `default_tier`
+    /// request, folded via [`ironbus_proto::message::ConsumeTier::from_u8`], and gated by
+    /// `streaming_enabled` — a Tier-S default is only honored when the capability bit was also set, so it
+    /// is forced back to [`ConsumeTier::Work`] otherwise. [`ConsumeTier::Work`] by default (an old
+    /// client, or no request), so an unmarked SUB stays on the work-queue tier exactly as before. An
+    /// explicit per-subscription tier selection (#544) still overrides this default.
+    default_tier: ConsumeTier,
     /// Whether this connection has EVER published a Level-2 (server+client-ack) produce (#497): set
     /// when an L2 publish is registered for confirmation, and NEVER cleared. It is the gate that keeps
     /// the per-pass `ProduceConfirm` drain off the actor for a connection that never opted into Level 2
@@ -574,6 +590,21 @@ impl Session {
         // gap-marker consumer receives `GapMarker` (tag 21) for a skipped span; one that did not
         // advertise keeps the legacy `Truncated` (tag 18), so an old client is never sent the new tag.
         self.gap_marker_enabled = req.wants_gap_marker;
+        // Negotiate the streaming consume tier (#543, V2-M1): the server always SUPPORTS Tier-S, so the
+        // capability is active exactly when this consumer advertised it understands streaming. The
+        // negotiated connection DEFAULT tier is the client's requested `default_tier` (folded from the
+        // raw byte), but ONLY when the capability is active — a Tier-S default from a client that did
+        // NOT advertise the capability is ignored and the connection stays Tier-W, so a pre-streaming
+        // client can never be moved onto a tier it cannot follow. With the capability clear the default
+        // is forced to Tier-W (today's behavior, byte-for-byte).
+        self.streaming_enabled = req.understands_streaming;
+        self.default_tier = if self.streaming_enabled {
+            req.default_tier
+                .map(ConsumeTier::from_u8)
+                .unwrap_or_default()
+        } else {
+            ConsumeTier::Work
+        };
         // The server caps, read LOCALLY off the handle (NO actor round-trip), so the handshake never
         // touches the actor's checkpoint/fsync path and a stalled produce on one connection cannot
         // head-of-line-block this Connect (invariant 4, #177). The caps are static engine config.
@@ -604,6 +635,17 @@ impl Session {
             // yet (that is phase #497), so this stays `None` and the `Info` body is byte-for-byte the
             // pre-#494 layout.
             default_ack_level: None,
+            // Confirm the streaming-tier capability the server activated for this connection (#543), so
+            // the client learns whether it may consume at Tier-S, mirroring the gap-marker confirmation.
+            streaming: self.streaming_enabled,
+            // Echo the negotiated connection-default tier ONLY when it is Tier-S (the streaming-capable
+            // case): a Tier-W default echoes nothing, so a connection that negotiated nothing keeps the
+            // `Info` body byte-for-byte the pre-#543 layout (no tier byte) and an old/Tier-W client sees
+            // no change. The echo is the value a tier-less subscription consumes at.
+            default_tier: match self.default_tier {
+                ConsumeTier::Streaming => Some(ConsumeTier::Streaming.as_u8()),
+                ConsumeTier::Work => None,
+            },
         };
         let mut info_body = Vec::new();
         encode_info(&info, &mut info_body);
@@ -1760,6 +1802,29 @@ impl Session {
             }
         })?;
         self.joined_key_shared = joined;
+        // Apply the connection's negotiated DEFAULT consume tier (#543, V2-M1) to the newly-subscribed
+        // group, so a subscription that does not explicitly pick a tier consumes at the connection
+        // default. This is ADDITIVE — it marks the group streaming ONLY when the connection default is
+        // Tier-S, and NEVER clears the flag — so:
+        //   - a connection with a Tier-W default (the back-compat case, an old client, or no negotiation)
+        //     leaves the group's tier untouched, so it stays Tier-W exactly as before;
+        //   - an EXPLICIT per-subscription Tier-S selection (#544 `set_streaming_in`) is never undone by a
+        //     Tier-W-default connection, so the explicit selection always OVERRIDES the default;
+        //   - a Tier-S default marks the group streaming, which an explicit selection (made out of band
+        //     via #544) may already have done — the mark is idempotent.
+        // The default tier is already gated by the streaming capability bit at Connect (a Tier-S default
+        // is forced to Tier-W when the client did not advertise the capability), so a pre-streaming
+        // client never reaches this branch and its groups stay Tier-W.
+        if self.default_tier == ConsumeTier::Streaming {
+            let sub = self.subscription.clone();
+            // A failure here is surfaced exactly like the key_shared mode enable above: it is best-effort
+            // at SUB time (the streaming fetch path re-checks the mode and rejects a non-streaming group),
+            // so SUB stays infallible for the tier selection and a transient engine error does not strand
+            // the subscription.
+            engine.with(move |e| {
+                let _ = e.set_streaming_in(&sub, true);
+            })?;
+        }
         reply(out, FrameType::Ok, &[]);
         Ok(())
     }
@@ -2438,6 +2503,8 @@ mod tests {
                 requested_credit_bytes: None,
                 wants_gap_marker: true,
                 default_ack_level: None,
+                understands_streaming: false,
+                default_tier: None,
             },
             &mut body,
         );
@@ -3408,6 +3475,162 @@ mod tests {
             delivered_payloads(&out),
             vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
             "the freed group still delivers every record to its new lone consumer"
+        );
+    }
+
+    /// Builds a `Connect` frame body advertising the streaming capability (#543) and, optionally, a
+    /// connection-default consume tier. For the tier-negotiation session tests.
+    fn tier_connect_body(
+        understands_streaming: bool,
+        default_tier: Option<ConsumeTier>,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        ironbus_proto::message::encode_connect(
+            &ironbus_proto::message::ConnectBody {
+                requested_credit: None,
+                requested_credit_bytes: None,
+                wants_gap_marker: false,
+                default_ack_level: None,
+                understands_streaming,
+                default_tier: default_tier.map(ConsumeTier::as_u8),
+            },
+            &mut body,
+        );
+        body
+    }
+
+    #[test]
+    fn a_streaming_default_connection_marks_an_unmarked_subscription_tier_s() {
+        // #543, V2-M1: a streaming-CAPABLE client that negotiated a Tier-S connection default has its
+        // unmarked SUB automatically placed on the streaming tier, and the server echoes both the
+        // capability and the default in Info. This is the "one log serves both tiers" wiring: the SUB
+        // never explicitly picked a tier, yet it streams because the connection default says so.
+        let e = DirectEngine::new(engine());
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &e,
+            &frame(
+                FrameType::Connect,
+                &tier_connect_body(true, Some(ConsumeTier::Streaming)),
+            ),
+            &mut out,
+        )
+        .unwrap();
+        // Info confirms the capability AND echoes the Tier-S default.
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::Info);
+        let info = ironbus_proto::message::decode_info(&body).unwrap();
+        assert!(
+            info.streaming,
+            "the server confirms the streaming capability"
+        );
+        assert_eq!(
+            info.default_tier.map(ConsumeTier::from_u8),
+            Some(ConsumeTier::Streaming),
+            "the server echoes the negotiated Tier-S default"
+        );
+
+        // SUB to a named group WITHOUT picking a tier: it adopts the connection default (Tier-S).
+        out.clear();
+        s.process(&e, &frame(FrameType::Sub, b"orders"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        assert!(
+            e.engine_mut().is_streaming_in("orders"),
+            "the unmarked subscription consumes at the connection's Tier-S default"
+        );
+    }
+
+    #[test]
+    fn an_explicit_per_subscription_tier_overrides_the_connection_default() {
+        // #543 + #544: the explicit per-subscription selection (#544 `set_streaming_in`) OVERRIDES the
+        // connection default. A connection whose default is Tier-W (it advertised the capability but
+        // requested no Tier-S default) never un-marks a group that was explicitly placed on Tier-S, so
+        // the explicit choice wins. Symmetrically, a Tier-S default does not require the explicit call.
+        let e = DirectEngine::new(engine());
+        // The explicit per-subscription Tier-S selection lands FIRST (as #544 exposes it on the engine).
+        e.with(|eng| eng.set_streaming_in("orders", true).unwrap())
+            .unwrap();
+        assert!(e.engine_mut().is_streaming_in("orders"));
+
+        // A streaming-capable client with a Tier-W (default) connection default subscribes to it.
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &e,
+            &frame(FrameType::Connect, &tier_connect_body(true, None)),
+            &mut out,
+        )
+        .unwrap();
+        let info = ironbus_proto::message::decode_info(&one_response(&out).1).unwrap();
+        assert!(info.streaming, "the capability is confirmed");
+        assert_eq!(
+            info.default_tier, None,
+            "a Tier-W default echoes no tier byte (byte-identical to before)"
+        );
+        out.clear();
+        s.process(&e, &frame(FrameType::Sub, b"orders"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        assert!(
+            e.engine_mut().is_streaming_in("orders"),
+            "the explicit per-subscription Tier-S selection is NOT cleared by a Tier-W-default SUB: \
+             the explicit tier overrides the connection default"
+        );
+    }
+
+    #[test]
+    fn a_pre_streaming_client_always_gets_tier_w_even_with_a_tier_s_default() {
+        // BACK-COMPAT: a client that did NOT advertise the streaming capability is ALWAYS served
+        // Tier-W, byte-for-byte today's behavior, EVEN IF its Connect body carried a Tier-S default —
+        // the server ignores a default it cannot honor, so a pre-streaming client can never be moved
+        // onto a tier it does not understand. An old (empty) Connect and a capability-clear Connect
+        // both leave every subscribed group on the work-queue tier.
+        let e = DirectEngine::new(engine());
+
+        // (a) A capability-CLEAR Connect that nonetheless asks for a Tier-S default: ignored.
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &e,
+            &frame(
+                FrameType::Connect,
+                &tier_connect_body(false, Some(ConsumeTier::Streaming)),
+            ),
+            &mut out,
+        )
+        .unwrap();
+        let info = ironbus_proto::message::decode_info(&one_response(&out).1).unwrap();
+        assert!(
+            !info.streaming,
+            "the capability is NOT confirmed for a pre-streaming client"
+        );
+        assert_eq!(
+            info.default_tier, None,
+            "a Tier-S default from a capability-clear client is ignored (no echo)"
+        );
+        out.clear();
+        s.process(&e, &frame(FrameType::Sub, b"orders"), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        assert!(
+            !e.engine_mut().is_streaming_in("orders"),
+            "a pre-streaming client's subscription stays Tier-W despite the Tier-S default"
+        );
+
+        // (b) An OLD (empty) Connect: the historical case, also Tier-W.
+        let mut old = Session::new();
+        let mut out2 = Vec::new();
+        old.process(&e, &frame(FrameType::Connect, b""), &mut out2)
+            .unwrap();
+        out2.clear();
+        old.process(&e, &frame(FrameType::Sub, b"legacy"), &mut out2)
+            .unwrap();
+        assert_eq!(one_response(&out2).0, FrameType::Ok);
+        assert!(
+            !e.engine_mut().is_streaming_in("legacy"),
+            "an old client's subscription is Tier-W, byte-for-byte today's behavior"
         );
     }
 
@@ -5295,6 +5518,8 @@ mod tests {
                 requested_credit_bytes,
                 wants_gap_marker: false,
                 default_ack_level: None,
+                understands_streaming: false,
+                default_tier: None,
             },
             &mut connect_body,
         );
@@ -6675,6 +6900,8 @@ mod tests {
                 requested_credit_bytes: None,
                 wants_gap_marker: false,
                 default_ack_level: None,
+                understands_streaming: false,
+                default_tier: None,
             },
             &mut connect_body,
         );
