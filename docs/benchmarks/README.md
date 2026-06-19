@@ -166,3 +166,35 @@ nothing is left running. `assemble-corpus` builds the lint-validated report -- i
 any pair is mislabeled it exits non-zero. The generated `report.md` and
 `report.json`, plus the raw `rows.jsonl`, are committed alongside this README so
 each corpus is versioned with the IronBus revision that produced it.
+
+## Single-consumer consume corpus (#554, V2-M1)
+
+The produce corpus above benched the produce axis (and an appendix consume row on
+the OLD Tier-W work-queue). The CONSUME corpus is the V2-M1 headline: IronBus's
+Tier-S STREAMING consumer (`bench --mode subscribe --consume-tier streaming`: the
+merged streaming-tier consume path — windowed `StreamFetch` + bounded read-ahead +
+periodic cumulative `StreamCommit`) vs a NATS JetStream durable PULL consumer
+(`nats bench <subj> --js --sub 1 --pull`), at the matched `durable-consume` label
+(both persist a consume cursor; a crash redelivers only the uncommitted span). The
+NATS CORE sub (no JetStream) is the non-durable at-most-once reference (appendix
+only). The same fairness lint applies: a durable-vs-non-durable pair fails the
+build (`consume_corpus.rs` tests + `comparison.rs`), so the head-to-head cannot be
+mislabeled. Run it (a t4g AWS Graviton2 here; needs `nats-server`/`nats` and a
+current `ironbus`, no Redis/MQTT/Python deps beyond the stdlib):
+
+```sh
+python3 consume_bench.py --ironbus /path/to/ironbus \
+    --out consume-rows.jsonl --sweep-out consume-sweep.jsonl
+cargo run -p ironbus-bench --bin consume-corpus -- \
+    --rows consume-rows.jsonl --json-out consume-report.json --md-out consume-report.md
+```
+
+The committed `consume-rows.jsonl` (the matched 20k-record head-to-head),
+`consume-sweep.jsonl` (the 256 B record-count CROSSOVER curve), and the generated
+`consume-report.{md,json}` are versioned alongside this README. The honest read is
+in [PERF_LEDGER.md](../PERF_LEDGER.md#consume-scoreboard-single-consumer-durable-consume-vs-nats-554-v2-m1):
+**IronBus Tier-S beats NATS JS pull at the small/moderate prefill (1.15-1.41x at
+20k records) but degrades super-linearly as the pre-filled prefix grows** (the
+server `StreamFetch`-by-offset cost is O(start)), so NATS leads past ~30k records
+— the recorded, not-hidden gap whose lever is an O(1) offset seek on the
+streaming-fetch path.

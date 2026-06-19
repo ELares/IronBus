@@ -143,6 +143,46 @@ impl AckMode {
     }
 }
 
+/// Which CONSUME TIER the SUBSCRIBE drain exercises (#554, V2-M1). The two tiers are two different
+/// durable-consume contracts the broker serves, so a bench that measures one is NOT measuring the
+/// other; the selector makes the measured path explicit instead of implicit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsumeTier {
+    /// TIER-W (the default): the per-message-lease WORK QUEUE. A fetched batch is settled with one
+    /// pipelined `ack_many` round-trip (or one synchronous `ack` per message under
+    /// [`AckMode::PerMessage`]); every lease is committed INDIVIDUALLY by the broker, so it is a
+    /// COMPETING consumer with the at-least-once contract a work queue needs. The [`AckMode`] flag
+    /// (`--per-message-ack`) shapes ONLY this tier.
+    Work,
+    /// TIER-S (#655/#656/#661/#662): the STREAMING consumer-managed-offset path. The drain drives
+    /// the batched [`ironbus_client::StreamingConsumer`] default (a windowed `StreamFetch` with
+    /// bounded read-ahead and a periodic CUMULATIVE `StreamCommit`, the #662 ergonomic default), the
+    /// durable single-consumer streaming-consume contract — the head-to-head with a NATS `JetStream`
+    /// pull consumer's batched-ack drain. The [`AckMode`] flag does not apply here (a streaming
+    /// consumer commits a cursor, it does not ack leases), so `--per-message-ack` is refused with it.
+    Streaming,
+}
+
+impl ConsumeTier {
+    /// Parses the `--consume-tier` value.
+    fn parse(value: &str) -> Option<ConsumeTier> {
+        match value {
+            "work" | "w" => Some(ConsumeTier::Work),
+            "streaming" | "stream" | "s" => Some(ConsumeTier::Streaming),
+            _ => None,
+        }
+    }
+
+    /// The stable string used in JSON and the reproduce line.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConsumeTier::Work => "work",
+            ConsumeTier::Streaming => "streaming",
+        }
+    }
+}
+
 /// The payload shape generated for each message. Default is `realistic`: a repetitive,
 /// codec-friendly byte pattern that compresses like real edge telemetry, so the bytes/op and any
 /// compression ratio are measured on REAL-shaped payloads, not incompressible noise (#94, #12).
@@ -260,6 +300,12 @@ pub struct BenchConfig {
     /// `--per-message-ack`). SUBSCRIBE-only: round-trip's overlapped consumer is unchanged, and
     /// publish never consumes.
     pub consume_ack: AckMode,
+    /// Which CONSUME TIER the SUBSCRIBE drain exercises (#554): [`ConsumeTier::Work`] (the default,
+    /// the per-message-lease work queue the [`AckMode`] flag shapes) or [`ConsumeTier::Streaming`]
+    /// (the Tier-S streaming consumer's batched-fetch + periodic-cumulative-commit default, the
+    /// durable single-consumer streaming-consume path benched head-to-head with a NATS `JetStream`
+    /// pull consumer). SUBSCRIBE-only, exactly like [`Self::consume_ack`].
+    pub consume_tier: ConsumeTier,
     /// Emit the versioned JSON object instead of (well, in addition to a suppressed) human view.
     pub json: bool,
 }
@@ -349,6 +395,7 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
     let mut pub_window: usize = 1;
     let mut storage: Option<StorageArg> = None;
     let mut per_message_ack = false;
+    let mut consume_tier = ConsumeTier::Work;
     let mut json = false;
     let mut i = 0;
     while i < args.len() {
@@ -480,6 +527,19 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
             "--per-message-ack" => {
                 per_message_ack = true;
                 i += 1;
+            }
+            // CONSUME-TIER selector (#554, V2-M1): drive the SUBSCRIBE drain through the Tier-S
+            // STREAMING consumer (`--consume-tier streaming`: batched `StreamFetch` + bounded
+            // read-ahead + periodic cumulative `StreamCommit`, the #662 default) instead of the
+            // default Tier-W per-message-lease work queue (`--consume-tier work`). The Tier-S leg is
+            // the durable single-consumer streaming-consume path the #554 NATS head-to-head measures.
+            "--consume-tier" => {
+                let raw = take(args, &mut i, "--consume-tier")?;
+                consume_tier = ConsumeTier::parse(&raw).ok_or_else(|| {
+                    CliError::Usage(format!(
+                        "`--consume-tier` must be `work` or `streaming`, got `{raw}`"
+                    ))
+                })?;
             }
             "--json" => {
                 json = true;
@@ -618,6 +678,30 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         AckMode::Batched
     };
 
+    // CONSUME-TIER guards (#554). Like `--per-message-ack`, the tier selector only shapes the
+    // SUBSCRIBE drain (publish never consumes; round-trip's overlapped consumer is a separate path),
+    // so accepting it elsewhere would silently mean nothing — refuse it (a no-op flag is a footgun).
+    if consume_tier != ConsumeTier::Work && mode != Mode::Subscribe {
+        return Err(CliError::Usage(
+            "`--consume-tier` selects the `--mode subscribe` consume path (work vs streaming): \
+             publish never consumes and round-trip uses a separate concurrent consumer, so the flag \
+             would mean nothing there. Pass `--mode subscribe`, or drop `--consume-tier` to keep the \
+             default Tier-W work-queue drain."
+                .into(),
+        ));
+    }
+    // The Tier-S streaming consumer commits a CURSOR, not per-message leases, so the lease-ack
+    // strategy (`--per-message-ack`) has nothing to shape there. Reject the combination explicitly so
+    // a caller is never silently handed a flag the streaming path ignores.
+    if consume_tier == ConsumeTier::Streaming && per_message_ack {
+        return Err(CliError::Usage(
+            "`--per-message-ack` shapes the Tier-W work-queue ack strategy and has no meaning for \
+             `--consume-tier streaming` (a streaming consumer commits a cumulative cursor, it does \
+             not ack per-message leases). Drop one of the two flags."
+                .into(),
+        ));
+    }
+
     // AUTO-PIPELINE guards (#508). The auto-pipelining durable producer is a produce-side path that
     // awaits acks at flush points (so it is meaningful only in publish mode), and it is its own
     // distinct in-flight-window mechanism, so it does not stack with `--stream` (the full-duplex
@@ -662,6 +746,7 @@ pub fn parse_bench(args: &[String], random_suffix: &str) -> Result<BenchConfig, 
         pub_window,
         storage,
         consume_ack,
+        consume_tier,
         json,
     })
 }
@@ -754,14 +839,27 @@ pub fn write_human<W: Write + ?Sized>(
     if cfg.mode == Mode::Subscribe {
         writeln!(
             out,
-            "consume ack:    {}",
-            match cfg.consume_ack {
-                AckMode::Batched =>
-                    "BATCHED (ack_many per fetched batch — the fair fetch+batch-ack throughput)",
-                AckMode::PerMessage =>
-                    "per-message (one synchronous ack per message — the ack-RPC-LATENCY ceiling)",
+            "consume tier:   {}",
+            match cfg.consume_tier {
+                ConsumeTier::Work =>
+                    "TIER-W work queue (per-message lease + ack; the competing-consumer drain)",
+                ConsumeTier::Streaming =>
+                    "TIER-S streaming (batched StreamFetch + read-ahead + periodic cumulative \
+                     StreamCommit — the durable single-consumer streaming-consume path)",
             }
         )?;
+        if cfg.consume_tier == ConsumeTier::Work {
+            writeln!(
+                out,
+                "consume ack:    {}",
+                match cfg.consume_ack {
+                    AckMode::Batched =>
+                        "BATCHED (ack_many per fetched batch — the fair fetch+batch-ack throughput)",
+                    AckMode::PerMessage =>
+                        "per-message (one synchronous ack per message — the ack-RPC-LATENCY ceiling)",
+                }
+            )?;
+        }
     }
     if cfg.fire_and_forget {
         writeln!(
@@ -849,7 +947,7 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         s,
         "{{\"schema_version\":{},\"mode\":\"{}\",\"isolated\":{},\"group\":\"{}\",\
          \"bound\":{{{}}},\"target_rate_hz\":{},\"payload_bytes\":{},\"payload_shape\":\"{}\",\
-         \"fetch_batch\":{},\"no_fsync\":{},\"pubwindow\":{},\"stream\":{},\"fire_and_forget\":{},\"auto_pipeline\":{},\"storage\":\"{}\",\"consume_ack\":\"{}\",\"results\":{{\
+         \"fetch_batch\":{},\"no_fsync\":{},\"pubwindow\":{},\"stream\":{},\"fire_and_forget\":{},\"auto_pipeline\":{},\"storage\":\"{}\",\"consume_ack\":\"{}\",\"consume_tier\":\"{}\",\"results\":{{\
          \"produced\":{},\"recorded\":{},\"elapsed_secs\":{},\"msgs_per_sec\":{},\
          \"mb_per_sec\":{},\"bytes_per_op\":{},\
          \"latency_p50_us\":{},\"latency_p99_us\":{},\"latency_p999_us\":{},\"latency_max_us\":{},\
@@ -870,6 +968,7 @@ pub fn bench_json(cfg: &BenchConfig, report: &BenchReport) -> String {
         cfg.auto_pipeline,
         cfg.storage.as_str(),
         cfg.consume_ack.as_str(),
+        cfg.consume_tier.as_str(),
         report.produced,
         report.recorded,
         f64_json(report.elapsed_secs),
@@ -1463,6 +1562,96 @@ mod tests {
         assert!(
             json_per_msg.contains("\"schema_version\":1"),
             "additive, version unchanged: {json_per_msg}"
+        );
+    }
+
+    #[test]
+    fn consume_tier_defaults_to_work_streaming_is_subscribe_only_and_lands_in_the_json() {
+        // The #554 consume-tier selector: the SUBSCRIBE drain runs the Tier-W work queue by DEFAULT;
+        // `--consume-tier streaming` drives the Tier-S streaming consumer (the durable single-consumer
+        // streaming-consume path benched head-to-head with NATS). Subscribe-only (publish never
+        // consumes, round-trip uses a separate consumer), incompatible with `--per-message-ack` (a
+        // streaming consumer commits a cursor, not per-message leases), and echoed additively in JSON.
+        let default_sub = parse(&["--count", "5", "--mode", "subscribe"]).unwrap();
+        assert_eq!(
+            default_sub.consume_tier,
+            ConsumeTier::Work,
+            "the Tier-W work-queue drain is the default"
+        );
+        let streaming = parse(&[
+            "--count",
+            "5",
+            "--mode",
+            "subscribe",
+            "--consume-tier",
+            "streaming",
+        ])
+        .unwrap();
+        assert_eq!(streaming.consume_tier, ConsumeTier::Streaming);
+        // The `work` value is accepted explicitly too, and does not swallow the following flag.
+        let explicit_work = parse(&[
+            "--count",
+            "5",
+            "--mode",
+            "subscribe",
+            "--consume-tier",
+            "work",
+            "--no-fsync",
+        ])
+        .unwrap();
+        assert_eq!(explicit_work.consume_tier, ConsumeTier::Work);
+        assert!(
+            explicit_work.no_fsync,
+            "the flag after --consume-tier must still parse"
+        );
+        // An unknown tier value is a usage error.
+        match parse(&[
+            "--count",
+            "5",
+            "--mode",
+            "subscribe",
+            "--consume-tier",
+            "nope",
+        ]) {
+            Err(CliError::Usage(m)) => assert!(m.contains("work` or `streaming"), "{m}"),
+            other => panic!("a bad --consume-tier value must be a usage error, got {other:?}"),
+        }
+        // Subscribe-only: round-trip (the default) and publish are refused.
+        match parse(&["--count", "5", "--consume-tier", "streaming"]) {
+            Err(CliError::Usage(m)) => assert!(m.contains("--mode subscribe"), "{m}"),
+            other => {
+                panic!("--consume-tier streaming outside subscribe must be a usage error, got {other:?}")
+            }
+        }
+        // Streaming + --per-message-ack is rejected (lease-ack vs cursor-commit are different paths).
+        match parse(&[
+            "--count",
+            "5",
+            "--mode",
+            "subscribe",
+            "--consume-tier",
+            "streaming",
+            "--per-message-ack",
+        ]) {
+            Err(CliError::Usage(m)) => assert!(m.contains("streaming"), "{m}"),
+            other => {
+                panic!("--consume-tier streaming + --per-message-ack must be a usage error, got {other:?}")
+            }
+        }
+        // Both tiers land additively in the JSON; the schema version is unchanged.
+        let json_default = bench_json(&default_sub, &BenchReport::default());
+        assert!(
+            json_default.contains("\"consume_tier\":\"work\""),
+            "{json_default}"
+        );
+        assert!(
+            json_default.contains("\"schema_version\":1"),
+            "additive, version unchanged: {json_default}"
+        );
+        let json_streaming = bench_json(&streaming, &BenchReport::default());
+        assert!(
+            json_streaming.contains("\"consume_tier\":\"streaming\""),
+            "{json_streaming}"
         );
     }
 

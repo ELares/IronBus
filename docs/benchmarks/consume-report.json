@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "pairs": [
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "durable-consume",
+        "message_size_bytes": 256,
+        "device": "t4g-aws-graviton2-2core",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 114984.12721738048,
+        "percentiles": {
+          "p50_us": 1086171.175,
+          "p99_us": 1128557.345,
+          "p999_us": 1129084.761
+        }
+      },
+      "right": {
+        "system": "nats-jetstream",
+        "durability": "durable-consume",
+        "message_size_bytes": 256,
+        "device": "t4g-aws-graviton2-2core",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 99861.0,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      }
+    },
+    {
+      "left": {
+        "system": "ironbus",
+        "durability": "durable-consume",
+        "message_size_bytes": 4096,
+        "device": "t4g-aws-graviton2-2core",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 81410.37747688121,
+        "percentiles": {
+          "p50_us": 5384762.614,
+          "p99_us": 5465975.245,
+          "p999_us": 5467045.551
+        }
+      },
+      "right": {
+        "system": "nats-jetstream",
+        "durability": "durable-consume",
+        "message_size_bytes": 4096,
+        "device": "t4g-aws-graviton2-2core",
+        "placement": "edge-gate",
+        "throughput_msgs_per_sec": 57774.0,
+        "percentiles": {
+          "p50_us": 0.0,
+          "p99_us": 0.0,
+          "p999_us": 0.0
+        }
+      }
+    }
+  ],
+  "appendix": [
+    {
+      "system": "ironbus",
+      "durability": "durable-consume",
+      "message_size_bytes": 256,
+      "device": "t4g-aws-graviton2-2core",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 3325.9692576820016,
+      "percentiles": {
+        "p50_us": 5474699.582,
+        "p99_us": 7010387.183,
+        "p999_us": 7016088.71
+      }
+    },
+    {
+      "system": "nats-core",
+      "durability": "at-most-once",
+      "message_size_bytes": 256,
+      "device": "t4g-aws-graviton2-2core",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 620220.0,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    },
+    {
+      "system": "ironbus",
+      "durability": "durable-consume",
+      "message_size_bytes": 4096,
+      "device": "t4g-aws-graviton2-2core",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 2795.0209432631227,
+      "percentiles": {
+        "p50_us": 9764285.17,
+        "p99_us": 11968058.287,
+        "p999_us": 11986178.049
+      }
+    },
+    {
+      "system": "nats-core",
+      "durability": "at-most-once",
+      "message_size_bytes": 4096,
+      "device": "t4g-aws-graviton2-2core",
+      "placement": "appendix",
+      "throughput_msgs_per_sec": 125800.0,
+      "percentiles": {
+        "p50_us": 0.0,
+        "p99_us": 0.0,
+        "p999_us": 0.0
+      }
+    }
+  ]
+}

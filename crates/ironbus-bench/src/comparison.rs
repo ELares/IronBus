@@ -97,6 +97,17 @@ pub enum DurabilityLabel {
     /// Mosquitto / MQTT `QoS` 2 (exactly-once handshake).
     #[serde(rename = "mqtt-qos2")]
     MqttQos2,
+    /// DURABLE single-consumer CONSUME (#554): a file-backed durable consumer whose offset/cursor is
+    /// persisted, so a crash redelivers only the uncommitted span (at-least-once). The shared,
+    /// power-loss-safe label for IronBus's Tier-S streaming consumer (windowed `StreamFetch` + a
+    /// periodic cumulative `StreamCommit` to durable storage) and a NATS `JetStream` durable PULL
+    /// consumer (explicit batched ack against a file-backed stream): both drain a durable prefix and
+    /// persist their consume position, so the lint can pair them as the matched durable-consume
+    /// head-to-head. It is a CONSUME-side analog of the produce labels (those describe when a PRODUCE
+    /// ack becomes durable; this describes a durable CONSUME cursor), kept distinct so a consume
+    /// number is never paired against a produce number.
+    #[serde(rename = "durable-consume")]
+    DurableConsume,
 }
 
 impl DurabilityLabel {
@@ -115,6 +126,7 @@ impl DurabilityLabel {
             DurabilityLabel::MqttQos1 => "mqtt-qos1",
             DurabilityLabel::MqttQos0 => "mqtt-qos0",
             DurabilityLabel::MqttQos2 => "mqtt-qos2",
+            DurabilityLabel::DurableConsume => "durable-consume",
         }
     }
 
@@ -132,6 +144,10 @@ impl DurabilityLabel {
             // everysec keeps a bounded (~1 s) loss window: a power cut can lose the last second, so
             // it is honestly NOT power-loss safe for the acknowledged write, only crash-safe.
             | DurabilityLabel::MqttQos1
+            // A durable consumer persists its cursor: a crash resumes from the committed offset and
+            // redelivers only the uncommitted span. Power-loss safe in the consume sense (no
+            // committed progress is lost on a brownout).
+            | DurabilityLabel::DurableConsume
             | DurabilityLabel::MqttQos2 => true,
             DurabilityLabel::RedisAofEverysec
             | DurabilityLabel::PageCacheAsync
