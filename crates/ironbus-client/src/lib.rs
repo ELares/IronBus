@@ -27,11 +27,11 @@ use ironbus_core::compress::{
 use ironbus_core::types::RecordFlags;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
-    decode_dead_letter, decode_deliver, decode_gap_marker, decode_info, decode_produce_confirm,
-    decode_pub_ack, decode_truncated, encode_ack, encode_connect, encode_cumulative_ack,
-    encode_fetch, encode_pub, encode_sub, produce_confirm_status, AckBody, AckLevel, AckOp,
-    BodyError, ConnectBody, ConsumeTier, CumulativeAckBody, FetchBody, PubBody, SubBody,
-    PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
+    decode_dead_letter, decode_deliver, decode_deliver_batch, decode_gap_marker, decode_info,
+    decode_produce_confirm, decode_pub_ack, decode_truncated, encode_ack, encode_connect,
+    encode_cumulative_ack, encode_fetch, encode_pub, encode_sub, produce_confirm_status, AckBody,
+    AckLevel, AckOp, BodyError, ConnectBody, ConsumeTier, CumulativeAckBody, DeliverBody,
+    FetchBody, PubBody, SubBody, PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -176,6 +176,15 @@ pub struct ClientConfig {
     /// backward-compatible) sends no default tier, so the body carries no tier byte and the server
     /// applies Tier-W.
     pub default_consume_tier: Option<ConsumeTier>,
+    /// Whether this client ADVERTISES that it understands the raw-framed `DeliverBatch` frame (tag 26,
+    /// #541, M1-I5): when `true`, the `Connect` sets the [`CONNECT_FLAG_UNDERSTANDS_DELIVER_BATCH`]
+    /// capability bit, so the server MAY deliver a contiguous Tier-S run as ONE `DeliverBatch` (the
+    /// records' on-disk frame bytes, which this client decodes locally) instead of N per-record
+    /// `Deliver` frames. When `false` (the default, backward-compatible) the client does not advertise
+    /// it and ALWAYS receives per-record `Deliver` frames — byte-for-byte today's behavior. A caller
+    /// checks [`Client::deliver_batch_enabled`] after connecting to learn whether the server confirmed
+    /// it. The decoded `Message`s are IDENTICAL either way; this only changes the wire framing.
+    pub understands_deliver_batch: bool,
 }
 
 impl Default for ClientConfig {
@@ -205,6 +214,10 @@ impl Default for ClientConfig {
             // so it sends no tier byte and the server applies Tier-W (#543). A caller opts into a
             // connection default by setting this AND `understands_streaming`.
             default_consume_tier: None,
+            // Off by default: an unconfigured client does not advertise DeliverBatch support, so it
+            // always receives per-record `Deliver` frames exactly as before (#541). A caller opts into
+            // the raw-framed batch path by setting this (typically alongside `understands_streaming`).
+            understands_deliver_batch: false,
         }
     }
 }
@@ -485,6 +498,58 @@ fn with_ack_level_bits(flags: u8, level: AckLevel) -> u8 {
     (flags & !PUB_FLAG_ACK_LEVEL_MASK) | bits
 }
 
+/// Ingests one decoded delivery (`d`) into the fetch result, applying the SAME transparent broker-side
+/// decompression (#430) the per-record path does and pushing the resulting [`Message`] onto `messages`
+/// — UNLESS a prior decompression failure already poisoned the batch (`poison.is_some()`), in which case
+/// the delivery is consumed and dropped un-acked (the broker redelivers it). Shared by the per-record
+/// `Deliver` arm and the `DeliverBatch` arm (#541) so a batched delivery yields byte-for-byte the same
+/// `Message` an equivalent per-record `Deliver` would. The FIRST decompression failure is recorded in
+/// `poison` (carrying the record's offset/generation so the caller can ack/nack-skip it); the rest of
+/// the batch is still drained before the error surfaces.
+fn ingest_delivery(
+    d: &DeliverBody<'_>,
+    messages: &mut Vec<Message>,
+    poison: &mut Option<ClientError>,
+) {
+    // Draining after a decompression failure: the frame is consumed (keeping the connection framed) but
+    // the delivery is dropped un-acked, so the broker redelivers it after its visibility timeout.
+    if poison.is_some() {
+        return;
+    }
+    let flags = RecordFlags::from_bits(d.flags);
+    let (flags, payload) = if flags.contains(RecordFlags::COMPRESSED) {
+        match decompress_payload(
+            flags,
+            d.payload,
+            &NoDictionaries,
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
+        ) {
+            Ok(payload) => (d.flags & !RecordFlags::COMPRESSED.bits(), payload),
+            // The poison record's offset and lease generation travel with the error, so the caller can
+            // ack/nack-skip it; the rest of the batch is drained before the error is returned.
+            Err(source) => {
+                *poison = Some(ClientError::Decompress {
+                    source,
+                    offset: d.offset,
+                    generation: d.generation,
+                });
+                return;
+            }
+        }
+    } else {
+        (d.flags, d.payload.to_vec())
+    };
+    messages.push(Message {
+        offset: d.offset,
+        generation: d.generation,
+        flags,
+        timestamp_ms: d.timestamp_ms,
+        key: d.key.to_vec(),
+        headers: d.headers.to_vec(),
+        payload,
+    });
+}
+
 /// Maps a wire `ProduceConfirm` status byte (#497) to a client [`ConfirmOutcome`]. An unknown future
 /// status decodes to [`ConfirmOutcome::Unknown`] (forward-compatible: the codec already tolerated it),
 /// never an error.
@@ -598,6 +663,12 @@ pub struct Client {
     /// confirmed it in `Info`. When `false` (an old server, or the client did not advertise), this
     /// connection is only ever served Tier-W.
     streaming_enabled: bool,
+    /// Whether the raw-framed `DeliverBatch` frame (tag 26) is ACTIVE on this connection (#541, M1-I5):
+    /// `true` only when this client advertised it ([`ClientConfig::understands_deliver_batch`]) AND the
+    /// server confirmed it in `Info`. When `true`, a contiguous Tier-S run may arrive as ONE
+    /// `DeliverBatch` (decoded locally into the same `Message`s); when `false` (an old server, or the
+    /// client did not advertise), every delivery is a per-record `Deliver`.
+    deliver_batch_enabled: bool,
     /// The connection-wide DEFAULT consume tier the SERVER adopted for this connection (#543, V2-M1),
     /// echoed in `Info`, or `None` if the server did not echo one (an old server, or it defaulted to
     /// Tier-W). A subscription that does not pick its own tier consumes at this default server-side.
@@ -641,6 +712,7 @@ impl Client {
             negotiated_credit_bytes: None,
             gap_marker_enabled: false,
             streaming_enabled: false,
+            deliver_batch_enabled: false,
             negotiated_default_tier: None,
             confirm_cache: Vec::new(),
         };
@@ -664,6 +736,10 @@ impl Client {
                 // (byte-for-byte today's behavior); a caller opts in via the config.
                 understands_streaming: config.understands_streaming,
                 default_tier: config.default_consume_tier.map(ConsumeTier::as_u8),
+                // The DeliverBatch capability bit (#541). Off by default, so the body is byte-for-byte
+                // the pre-#541 `Connect` and the client receives only per-record `Deliver` frames; a
+                // caller opts in via the config to receive raw-framed batches.
+                understands_deliver_batch: config.understands_deliver_batch,
             },
             &mut connect_body,
         );
@@ -686,6 +762,10 @@ impl Client {
                 // the connection default a tier-less subscription consumes at.
                 client.streaming_enabled = info.streaming;
                 client.negotiated_default_tier = info.default_tier.map(ConsumeTier::from_u8);
+                // The DeliverBatch frame is active only when the server CONFIRMED it (it does so only
+                // when the client advertised it understands the frame), so an old server's empty Info
+                // leaves it off and every delivery is a per-record `Deliver` (#541).
+                client.deliver_batch_enabled = info.deliver_batch;
                 Ok(client)
             }
             (FrameType::Err, body) => {
@@ -728,6 +808,16 @@ impl Client {
     #[must_use]
     pub fn streaming_enabled(&self) -> bool {
         self.streaming_enabled
+    }
+
+    /// Whether the raw-framed `DeliverBatch` frame (tag 26) is ACTIVE on this connection (#541, M1-I5):
+    /// `true` only when this client advertised it ([`ClientConfig::understands_deliver_batch`]) AND the
+    /// server confirmed it in `Info`. When `true`, a contiguous Tier-S run may arrive as ONE
+    /// `DeliverBatch` (transparently decoded into the same `Message`s a per-record `Deliver` run would
+    /// yield); when `false`, every delivery is a per-record `Deliver`.
+    #[must_use]
+    pub fn deliver_batch_enabled(&self) -> bool {
+        self.deliver_batch_enabled
     }
 
     /// The connection-wide DEFAULT consume tier the server adopted for this connection (#543, V2-M1),
@@ -1384,51 +1474,70 @@ impl Client {
             match (frame_type, body) {
                 (FrameType::Deliver, body) => {
                     let d = decode_deliver(&body).map_err(ClientError::Body)?;
-                    // Draining after a decompression failure: the frame is consumed (keeping the
-                    // connection framed) but the delivery is dropped un-acked, so the broker
-                    // redelivers it after its visibility timeout.
-                    if poison.is_some() {
-                        continue;
+                    ingest_delivery(&d, &mut messages, &mut poison);
+                }
+                // A raw-framed batch (#541): ONE frame carrying a contiguous run of records as their
+                // ON-DISK frame bytes. Decode the header (the run's first_offset / generation /
+                // record_count), then decode each on-disk frame and reconstruct its offset POSITIONALLY
+                // (first_offset + i, the run being dense and contiguous), feeding each through the SAME
+                // per-record path a `Deliver` takes — so the resulting `Message`s are byte-for-byte what
+                // an equivalent run of per-record `Deliver` frames would yield. Each frame's CRC is
+                // VERIFIED here by `codec::decode` (header and body), so integrity is checked end-to-end;
+                // a corrupt frame is a typed error, never silently accepted. Only seen on a
+                // batch-capable connection; an old server never sends this tag.
+                (FrameType::DeliverBatch, body) => {
+                    let (header, record_bytes) =
+                        decode_deliver_batch(&body).map_err(ClientError::Body)?;
+                    // A batch carries N records but counted as ONE frame at the loop top; charge the
+                    // remaining (N - 1) records against the credit bound so a hostile server cannot
+                    // smuggle an unbounded run of records inside one batch frame. The server bounds a
+                    // real batch by the negotiated credit, so this never trips for a well-behaved peer.
+                    frames = frames
+                        .saturating_add(header.record_count as usize)
+                        .saturating_sub(1);
+                    if frames > limit {
+                        return Err(ClientError::BadResponse(
+                            "server streamed more records than the requested credit",
+                        ));
                     }
-                    // Transparent broker-side decompression (#430): a delivery carrying the
-                    // COMPRESSED bit is decompressed back to the original payload (and the bit
-                    // cleared), so the caller sees exactly the bytes the producer published,
-                    // codec-independent. Bounded by the decompressed-size cap (a bomb guard) and
-                    // dictionary-free (`NoDictionaries`; the lz4 path never references one); a
-                    // payload this build cannot decode is the typed `Decompress` error, no panic.
-                    let flags = RecordFlags::from_bits(d.flags);
-                    let (flags, payload) = if flags.contains(RecordFlags::COMPRESSED) {
-                        match decompress_payload(
-                            flags,
-                            d.payload,
-                            &NoDictionaries,
-                            DEFAULT_MAX_DECOMPRESSED_BYTES,
-                        ) {
-                            Ok(payload) => (d.flags & !RecordFlags::COMPRESSED.bits(), payload),
-                            // The poison record's offset and lease generation travel with the
-                            // error, so the caller can ack/nack-skip it; the rest of the batch
-                            // is drained (see `poison` above) before the error is returned.
-                            Err(source) => {
-                                poison = Some(ClientError::Decompress {
-                                    source,
-                                    offset: d.offset,
-                                    generation: d.generation,
-                                });
-                                continue;
-                            }
-                        }
-                    } else {
-                        (d.flags, d.payload.to_vec())
-                    };
-                    messages.push(Message {
-                        offset: d.offset,
-                        generation: d.generation,
-                        flags,
-                        timestamp_ms: d.timestamp_ms,
-                        key: d.key.to_vec(),
-                        headers: d.headers.to_vec(),
-                        payload,
-                    });
+                    let mut cursor = 0usize;
+                    let mut offset = header.first_offset;
+                    let mut decoded = 0u32;
+                    while cursor < record_bytes.len() {
+                        // CRC-verify and decode ONE on-disk record frame. A bad frame (torn, or a CRC
+                        // mismatch) is a typed `BadResponse`, so the broker never slips a corrupt or
+                        // truncated batch past the client unnoticed.
+                        let (view, consumed) = ironbus_core::codec::decode(&record_bytes[cursor..])
+                            .map_err(|_| {
+                                ClientError::BadResponse("malformed record in DeliverBatch body")
+                            })?;
+                        // Reconstruct the on-wire per-record `Deliver` from the on-disk record: the
+                        // OFFSET is positional (the on-disk frame carries `seq`, not offset), and the
+                        // generation is the batch's (0 for the lease-free Tier-S path). The remaining
+                        // fields (flags/timestamp/key/headers/payload) are the stored record's, so the
+                        // delivery is identical to a per-record `Deliver` for the same record.
+                        let d = DeliverBody {
+                            offset,
+                            generation: header.generation,
+                            flags: view.flags.bits(),
+                            timestamp_ms: view.timestamp_ms,
+                            key: view.key,
+                            headers: view.headers,
+                            payload: view.payload,
+                        };
+                        ingest_delivery(&d, &mut messages, &mut poison);
+                        offset = offset.saturating_add(1);
+                        decoded = decoded.saturating_add(1);
+                        cursor += consumed;
+                    }
+                    // The decoded frame count MUST match the header's record_count and consume the body
+                    // exactly: a mismatch means a malformed batch (a partial frame, or a wrong count),
+                    // which is a typed error rather than a silently short batch.
+                    if cursor != record_bytes.len() || decoded != header.record_count {
+                        return Err(ClientError::BadResponse(
+                            "DeliverBatch record_count or body length mismatch",
+                        ));
+                    }
                 }
                 // An in-band dead-letter advisory for an offset skipped as poison (#63). It is
                 // not a delivery, so it carries its own offset and does not ack.
@@ -3481,6 +3590,7 @@ mod tests {
                 default_ack_level: None,
                 streaming: false,
                 default_tier: None,
+                deliver_batch: false,
             },
             &mut body,
         );
@@ -4112,6 +4222,137 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].payload, original);
         assert_eq!(messages[0].flags & RecordFlags::COMPRESSED.bits(), 0);
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    /// One test record's fields `(flags, key, headers, payload)` for building on-disk batch bytes.
+    type BatchRec<'a> = (u8, &'a [u8], &'a [u8], &'a [u8]);
+
+    /// Builds the contiguous on-disk frame bytes for `records` (seq starting at `base_seq`), the body a
+    /// real broker would splice into a `DeliverBatch` from a stored segment.
+    fn on_disk_record_bytes(base_seq: u64, records: &[BatchRec<'_>]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (i, (flags, key, headers, payload)) in records.iter().enumerate() {
+            ironbus_core::codec::encode(
+                &ironbus_core::codec::RecordView {
+                    seq: ironbus_core::types::Seq::new(base_seq + i as u64),
+                    timestamp_ms: 1000 + i as u64,
+                    flags: RecordFlags::from_bits(*flags),
+                    key,
+                    headers,
+                    payload,
+                },
+                &mut bytes,
+            )
+            .unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_scripted_deliver_batch_decodes_to_the_same_messages_as_n_delivers() {
+        // #541 client-side: a scripted server streams ONE DeliverBatch carrying a contiguous run as
+        // on-disk frame bytes; the client decodes it into the SAME `Message`s a per-record `Deliver` run
+        // would yield — offsets reconstructed positionally from the header's first_offset, each record's
+        // CRC verified by the on-disk decode. The decoded messages match a per-record reference exactly.
+        let recs: Vec<BatchRec<'_>> = vec![
+            (0, b"k0", b"h0", b"payload-zero"),
+            (0, b"k1", b"", b"payload-one"),
+            (0, b"", b"h2", b"two"),
+        ];
+        let record_bytes = on_disk_record_bytes(0, &recs);
+        let mut batch_body = Vec::new();
+        ironbus_proto::message::encode_deliver_batch(
+            &ironbus_proto::message::DeliverBatchHeader {
+                first_offset: 100,
+                generation: 0,
+                record_count: 3,
+            },
+            &record_bytes,
+            &mut batch_body,
+        );
+        // The Info advertises the DeliverBatch capability so the client's handshake records it (not
+        // required for decode, but it is the realistic wire). The client decodes the tag regardless.
+        let mut info_body = Vec::new();
+        encode_info(
+            &InfoBody {
+                deliver_batch: true,
+                ..InfoBody::default()
+            },
+            &mut info_body,
+        );
+        let mut script = frame(FrameType::Info, &info_body);
+        script.extend(frame(FrameType::DeliverBatch, &batch_body));
+        script.extend(frame(FrameType::FlowEnd, &3u32.to_le_bytes()));
+        let (addr, handle) = raw_server(script);
+
+        let mut c = Client::connect_with(
+            addr,
+            &ClientConfig {
+                understands_deliver_batch: true,
+                understands_streaming: true,
+                ..ClientConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(c.deliver_batch_enabled(), "the capability is confirmed");
+        let messages = c.fetch(10).unwrap().messages;
+        assert_eq!(messages.len(), 3);
+        // Offsets reconstructed positionally: 100, 101, 102.
+        for (i, m) in messages.iter().enumerate() {
+            assert_eq!(m.offset, 100 + i as u64, "positional offset");
+            assert_eq!(m.generation, 0, "the lease-free streaming generation");
+        }
+        assert_eq!(messages[0].key, b"k0");
+        assert_eq!(messages[0].headers, b"h0");
+        assert_eq!(messages[0].payload, b"payload-zero");
+        assert_eq!(messages[1].key, b"k1");
+        assert_eq!(messages[1].payload, b"payload-one");
+        assert_eq!(messages[2].headers, b"h2");
+        assert_eq!(messages[2].payload, b"two");
+        drop(c);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_scripted_deliver_batch_with_a_corrupt_record_is_a_typed_error_never_a_panic() {
+        // CRC end-to-end: a DeliverBatch body whose on-disk record bytes are corrupted (a flipped byte
+        // breaks the body CRC) is a typed `BadResponse`, never a panic and never a corrupt message handed
+        // to the caller — the client verifies each record's CRC as it decodes the batch.
+        let recs: Vec<BatchRec<'_>> = vec![(0, b"", b"", b"good-record")];
+        let mut record_bytes = on_disk_record_bytes(0, &recs);
+        // Flip a payload byte: the header CRC still passes (the header is untouched), but the body CRC
+        // now mismatches, so `codec::decode` rejects it.
+        let last = record_bytes.len() - ironbus_core::format::RECORD_TRAILER_LEN - 1;
+        record_bytes[last] ^= 0xFF;
+        let mut batch_body = Vec::new();
+        ironbus_proto::message::encode_deliver_batch(
+            &ironbus_proto::message::DeliverBatchHeader {
+                first_offset: 0,
+                generation: 0,
+                record_count: 1,
+            },
+            &record_bytes,
+            &mut batch_body,
+        );
+        let mut script = frame(FrameType::Info, b"");
+        script.extend(frame(FrameType::DeliverBatch, &batch_body));
+        script.extend(frame(FrameType::FlowEnd, &1u32.to_le_bytes()));
+        let (addr, handle) = raw_server(script);
+        let mut c = Client::connect_with(
+            addr,
+            &ClientConfig {
+                understands_deliver_batch: true,
+                ..ClientConfig::default()
+            },
+        )
+        .unwrap();
+        let err = c.fetch(10).unwrap_err();
+        assert!(
+            matches!(err, ClientError::BadResponse(_)),
+            "a corrupt batch record is a typed BadResponse, got {err:?}"
+        );
         drop(c);
         handle.join().unwrap();
     }

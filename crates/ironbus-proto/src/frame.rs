@@ -168,6 +168,31 @@ pub enum FrameType {
     /// followed by the work-group name as the remainder (empty selects the default group) — identical
     /// in shape to the [`crate::message::CumulativeAckBody`].
     StreamCommit,
+    /// Server delivers a CONTIGUOUS run of records to a consumer as ONE batch frame (#541, M1-I5): the
+    /// RAW-FRAMED batch delivery whose body carries the records' ON-DISK frame bytes VERBATIM, so a
+    /// contiguous stored run ships in one frame without the broker re-encoding per record. It is the
+    /// BATCH twin of [`FrameType::Deliver`] (tag 13): where `Deliver` carries ONE record re-encoded into
+    /// the on-WIRE layout (offset / generation / u16 lengths), `DeliverBatch` carries N records as the
+    /// concatenation of their on-DISK frames (seq / u32 lengths / header-CRC + body-CRC trailer) plus a
+    /// small fixed header naming the run's `first_offset` and `generation`, so the CLIENT decodes the
+    /// on-disk layout directly and reconstructs each record's offset POSITIONALLY (`first_offset + i`,
+    /// the run being dense and contiguous). Because the body IS the stored bytes, a later disk
+    /// `sendfile(2)`/`splice(2)` path (#658) can splice the segment's page-cache bytes straight into the
+    /// socket after the fixed header — this frame is that path's HARD prerequisite. Each record's own
+    /// CRC32C (header and body) ships inside the body, so the consumer verifies every record end-to-end
+    /// exactly as it does a per-record `Deliver`; integrity is never silently dropped.
+    ///
+    /// It is OPT-IN and ADDITIVE: the server sends it ONLY to a consumer that advertised it understands
+    /// the frame (the [`crate::message::CONNECT_FLAG_UNDERSTANDS_DELIVER_BATCH`] capability bit, confirmed
+    /// by [`crate::message::INFO_FLAG_DELIVER_BATCH`]). An old client that did not advertise it keeps
+    /// receiving the per-record `Deliver` run, byte-for-byte unchanged, and never sees this NEW
+    /// append-only tag. Used today on the Tier-S `StreamFetch` delivery path (the contiguous
+    /// consumer-managed-offset batch from #544); the response is terminated by exactly one
+    /// [`FrameType::FlowEnd`] carrying the delivered count, exactly as the per-record path. Body: a
+    /// [`crate::message::DeliverBatchHeader`] (`body_version: u8`, `field_len: u16`, then `first_offset:
+    /// u64 LE`, `generation: u64 LE`, `record_count: u32 LE`), then the contiguous on-disk record-frame
+    /// bytes as the remainder.
+    DeliverBatch,
 }
 
 impl FrameType {
@@ -200,6 +225,7 @@ impl FrameType {
             FrameType::Fetch => 23,
             FrameType::StreamFetch => 24,
             FrameType::StreamCommit => 25,
+            FrameType::DeliverBatch => 26,
         }
     }
 
@@ -233,6 +259,7 @@ impl FrameType {
             23 => FrameType::Fetch,
             24 => FrameType::StreamFetch,
             25 => FrameType::StreamCommit,
+            26 => FrameType::DeliverBatch,
             _ => return None,
         })
     }
@@ -365,7 +392,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 25] = [
+    const ALL_TYPES: [FrameType; 26] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -391,6 +418,7 @@ mod tests {
         FrameType::Fetch,
         FrameType::StreamFetch,
         FrameType::StreamCommit,
+        FrameType::DeliverBatch,
     ];
 
     #[test]
@@ -434,6 +462,7 @@ mod tests {
         assert_eq!(FrameType::Fetch.as_u8(), 23);
         assert_eq!(FrameType::StreamFetch.as_u8(), 24);
         assert_eq!(FrameType::StreamCommit.as_u8(), 25);
+        assert_eq!(FrameType::DeliverBatch.as_u8(), 26);
     }
 
     #[test]
@@ -489,8 +518,8 @@ mod tests {
         // The Tier-W verbs are untouched.
         assert_eq!(FrameType::Flow.as_u8(), 10);
         assert_eq!(FrameType::Fetch.as_u8(), 23);
-        // 26 is the new next-free tag (still unknown), so it frames but is not a known type.
-        assert_eq!(FrameType::from_u8(26), None);
+        // 27 is the new next-free tag (still unknown), so it frames but is not a known type.
+        assert_eq!(FrameType::from_u8(27), None);
         for ty in [FrameType::StreamFetch, FrameType::StreamCommit] {
             let mut buf = Vec::new();
             encode_frame(ty, b"\x07\x08", &mut buf).unwrap();
@@ -501,6 +530,29 @@ mod tests {
                 }
                 FrameDecode::Incomplete { .. } => panic!("complete"),
             }
+        }
+    }
+
+    #[test]
+    fn deliver_batch_is_the_next_free_tag_and_frames() {
+        // #541 (M1-I5): DeliverBatch takes tag 26, the next FREE tag after StreamCommit (25). It was
+        // previously an UNKNOWN tag; pin it as a known type now and confirm it frames at the envelope
+        // level. The per-record Deliver wire (tag 13) is byte-for-byte unchanged: the batch frame is
+        // ADDITIVE and opt-in, never a replacement of the per-record delivery path.
+        assert_eq!(FrameType::DeliverBatch.as_u8(), 26);
+        assert_eq!(FrameType::from_u8(26), Some(FrameType::DeliverBatch));
+        // The per-record Deliver tag is untouched.
+        assert_eq!(FrameType::Deliver.as_u8(), 13);
+        // 27 is the next-free tag (still unknown), so it frames but is not a known type.
+        assert_eq!(FrameType::from_u8(27), None);
+        let mut buf = Vec::new();
+        encode_frame(FrameType::DeliverBatch, b"\x09\x0a", &mut buf).unwrap();
+        match decode_frame(&buf).unwrap() {
+            FrameDecode::Frame { type_tag, body, .. } => {
+                assert_eq!(FrameType::from_u8(type_tag), Some(FrameType::DeliverBatch));
+                assert_eq!(body, b"\x09\x0a");
+            }
+            FrameDecode::Incomplete { .. } => panic!("complete"),
         }
     }
 
@@ -687,7 +739,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 26u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 27u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);

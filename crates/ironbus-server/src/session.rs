@@ -19,7 +19,9 @@
 use crate::actor::{
     ActorGone, EngineAccess, OwnedAppend, OwnedDedup, ProduceOutcome, ProduceSubmission,
 };
-use crate::engine::{AckResult, EngineError, NackResult, Poll, ProgressResult, StreamBatch};
+use crate::engine::{
+    AckResult, EngineError, NackResult, Poll, ProgressResult, StreamBatch, StreamRawBatch,
+};
 use bytes::Bytes;
 use ironbus_core::clock::Clock;
 use ironbus_core::compress::{validate_descriptor_shape, DEFAULT_MAX_DECOMPRESSED_BYTES};
@@ -32,10 +34,11 @@ use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, 
 use ironbus_proto::message::{
     decode_ack, decode_connect, decode_cumulative_ack, decode_fetch, decode_pub,
     decode_stream_commit, decode_stream_fetch, decode_sub, encode_dead_letter, encode_deliver,
-    encode_gap_marker, encode_info, encode_produce_confirm, encode_pub_ack, encode_truncated,
-    gap_reason, produce_confirm_status, pub_ack_level, AckLevel, AckOp, ConsumeTier, CreditAdvert,
-    DeadLetterBody, DeliverBody, GapMarkerBody, InfoBody, ProduceConfirmBody, PubAckBody,
-    TruncatedBody, DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
+    encode_deliver_batch, encode_gap_marker, encode_info, encode_produce_confirm, encode_pub_ack,
+    encode_truncated, gap_reason, produce_confirm_status, pub_ack_level, AckLevel, AckOp,
+    ConsumeTier, CreditAdvert, DeadLetterBody, DeliverBatchHeader, DeliverBody, GapMarkerBody,
+    InfoBody, ProduceConfirmBody, PubAckBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER,
+    PUB_WIRE_ONLY_FLAGS,
 };
 use ironbus_storage::fs::Filesystem;
 use std::collections::HashMap;
@@ -286,6 +289,15 @@ pub struct Session {
     /// client, or no request), so an unmarked SUB stays on the work-queue tier exactly as before. An
     /// explicit per-subscription tier selection (#544) still overrides this default.
     default_tier: ConsumeTier,
+    /// Whether this connection negotiated the raw-framed `DeliverBatch` frame (tag 26, #541, M1-I5): set
+    /// at `Connect` time when the client advertised
+    /// [`ironbus_proto::message::CONNECT_FLAG_UNDERSTANDS_DELIVER_BATCH`]. When `true`, the server MAY ship
+    /// a contiguous Tier-S run as ONE `DeliverBatch` (the records' on-disk frame bytes, decoded
+    /// client-side) instead of N per-record `Deliver` frames. When `false` (an old client, or one that
+    /// opts out) the server ALWAYS sends per-record `Deliver` frames — byte-for-byte today's behavior —
+    /// and never sends the new tag, so a pre-batch client is never sent a frame it cannot decode. Default
+    /// `false` (backward-compatible).
+    deliver_batch_enabled: bool,
     /// Whether this connection has EVER published a Level-2 (server+client-ack) produce (#497): set
     /// when an L2 publish is registered for confirmation, and NEVER cleared. It is the gate that keeps
     /// the per-pass `ProduceConfirm` drain off the actor for a connection that never opted into Level 2
@@ -605,6 +617,12 @@ impl Session {
         } else {
             ConsumeTier::Work
         };
+        // Negotiate the raw-framed DeliverBatch frame (#541, M1-I5): the server always SUPPORTS it, so
+        // the capability is active exactly when this consumer advertised it understands the frame. A
+        // batch-capable consumer may receive a contiguous Tier-S run as ONE `DeliverBatch` (tag 26); one
+        // that did not advertise keeps receiving per-record `Deliver` frames and is never sent the new
+        // tag, so an old client that cannot decode the on-disk record layout is never broken.
+        self.deliver_batch_enabled = req.understands_deliver_batch;
         // The server caps, read LOCALLY off the handle (NO actor round-trip), so the handshake never
         // touches the actor's checkpoint/fsync path and a stalled produce on one connection cannot
         // head-of-line-block this Connect (invariant 4, #177). The caps are static engine config.
@@ -646,6 +664,10 @@ impl Session {
                 ConsumeTier::Streaming => Some(ConsumeTier::Streaming.as_u8()),
                 ConsumeTier::Work => None,
             },
+            // Confirm the DeliverBatch capability the server activated for this connection (#541), so the
+            // client learns whether to expect `DeliverBatch` (tag 26) or only per-record `Deliver`,
+            // mirroring the gap-marker / streaming confirmations.
+            deliver_batch: self.deliver_batch_enabled,
         };
         let mut info_body = Vec::new();
         encode_info(&info, &mut info_body);
@@ -1563,6 +1585,15 @@ impl Session {
         let start = Offset::new(req.start_offset);
         let group = self.subscription.clone();
         let member = self.member_id;
+        // A consumer that advertised the DeliverBatch capability (#541) takes the RAW-FRAMED batch path:
+        // a contiguous run ships as ONE `DeliverBatch` (the on-disk frame bytes verbatim, sendfile-ready
+        // for #658) instead of N per-record `Deliver` frames, with no broker re-encode of the sealed run.
+        // A consumer that did NOT advertise it takes the byte-for-byte-unchanged per-record path below.
+        if self.deliver_batch_enabled {
+            return Self::serve_stream_fetch_batch(
+                engine, &group, member, start, want, max_bytes, out,
+            );
+        }
         // ONE actor round-trip serves the whole contiguous batch — the heart of the Tier-S win versus
         // the N per-record round-trips the Tier-W poll loop makes. The engine reads off the shared
         // durable read path, claims no lease, and writes no cursor.
@@ -1604,6 +1635,87 @@ impl Session {
             // The wrong-mode reject (a non-streaming group) and an out-of-range start are client-visible,
             // recoverable rejections: surface the engine's typed reason and keep the connection open. Do
             // NOT also send a FlowEnd (the Err is the terminator), matching the Fetch error path.
+            Err(e) => {
+                reply_err(out, &e.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    /// Serves a Tier-S streaming fetch as a RAW-FRAMED `DeliverBatch` (#541, M1-I5), the batch-capable
+    /// half of [`Session::handle_stream_fetch`]. The contiguous SEALED prefix of the run ships as ONE
+    /// `DeliverBatch` frame whose body is the records' on-disk frame bytes VERBATIM (never re-encoded, so
+    /// #658's disk `sendfile(2)` can splice them); any ACTIVE-tail remainder follows as ordinary
+    /// per-record `Deliver` frames, so the consumer always receives one continuous contiguous run. The
+    /// batch is terminated by exactly one `FlowEnd` carrying the TOTAL delivered count, identical to the
+    /// per-record path, so the client frames the response the same way either way.
+    ///
+    /// CRC integrity end-to-end: the broker copies the stored bytes UNTOUCHED into the batch body, so
+    /// each record's header/body CRC ships verbatim for the client to verify exactly as it does a
+    /// per-record `Deliver`. NO lease, NO generation fence, NO cursor write — the same lease-free Tier-S
+    /// contract; the batch header's `generation` is `0`, matching the per-record streaming delivery.
+    #[allow(clippy::too_many_arguments)]
+    fn serve_stream_fetch_batch<
+        F: Filesystem + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        engine: &E,
+        group: &GroupName,
+        member: MemberId,
+        start: Offset,
+        want: usize,
+        max_bytes: Option<usize>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        let group = group.clone();
+        match engine.with(move |e| e.stream_fetch_raw_in(&group, member, start, want, max_bytes))? {
+            Ok(StreamRawBatch { raw, tail, .. }) => {
+                let mut delivered: u32 = 0;
+                // The contiguous SEALED prefix as ONE DeliverBatch: the on-disk frame bytes verbatim. A
+                // zero-record run is NOT framed (no empty batch on the wire); the per-record tail and the
+                // FlowEnd still terminate the response.
+                if raw.record_count > 0 {
+                    let header = DeliverBatchHeader {
+                        first_offset: raw.first_offset.get(),
+                        // No lease, no fence: a streaming batch carries generation 0, exactly as the
+                        // per-record streaming `Deliver`. The consumer commits by offset (StreamCommit).
+                        generation: 0,
+                        // The record_count is bounded by `want` (a u32 on the wire), so this conversion
+                        // never truncates a real batch; saturate defensively rather than wrap.
+                        record_count: u32::try_from(raw.record_count).unwrap_or(u32::MAX),
+                    };
+                    let mut frame_body = Vec::new();
+                    encode_deliver_batch(&header, &raw.bytes, &mut frame_body);
+                    reply(out, FrameType::DeliverBatch, &frame_body);
+                    delivered = delivered.saturating_add(header.record_count);
+                }
+                // The ACTIVE-tail remainder (which the raw read does not serve) as ordinary per-record
+                // `Deliver` frames, immediately following the batch — so the run stays contiguous.
+                for record in &tail {
+                    let msg = DeliverBody {
+                        offset: record.offset.get(),
+                        generation: 0,
+                        flags: record.flags.bits(),
+                        timestamp_ms: record.timestamp_ms,
+                        key: &record.key,
+                        headers: &record.headers,
+                        payload: &record.payload,
+                    };
+                    let mut frame_body = Vec::new();
+                    if encode_deliver(&msg, &mut frame_body).is_err() {
+                        break;
+                    }
+                    reply(out, FrameType::Deliver, &frame_body);
+                    delivered = delivered.saturating_add(1);
+                }
+                reply(out, FrameType::FlowEnd, &delivered.to_le_bytes());
+                Ok(())
+            }
+            Err(e) if e.is_fatal() => {
+                reply_err(out, "fatal storage error");
+                Err(SessionError::EngineFatal(e))
+            }
             Err(e) => {
                 reply_err(out, &e.to_string());
                 Ok(())
@@ -2505,6 +2617,7 @@ mod tests {
                 default_ack_level: None,
                 understands_streaming: false,
                 default_tier: None,
+                understands_deliver_batch: false,
             },
             &mut body,
         );
@@ -3493,6 +3606,7 @@ mod tests {
                 default_ack_level: None,
                 understands_streaming,
                 default_tier: default_tier.map(ConsumeTier::as_u8),
+                understands_deliver_batch: false,
             },
             &mut body,
         );
@@ -3632,6 +3746,490 @@ mod tests {
             !e.engine_mut().is_streaming_in("legacy"),
             "an old client's subscription is Tier-W, byte-for-byte today's behavior"
         );
+    }
+
+    // ----- Tier-S DeliverBatch raw-framed delivery (#541, M1-I5) -----
+
+    /// A `Connect` body advertising the streaming and/or `DeliverBatch` capabilities (#541), for the
+    /// batch-delivery session tests.
+    fn batch_connect_body(understands_streaming: bool, understands_deliver_batch: bool) -> Vec<u8> {
+        let mut body = Vec::new();
+        ironbus_proto::message::encode_connect(
+            &ironbus_proto::message::ConnectBody {
+                requested_credit: None,
+                requested_credit_bytes: None,
+                wants_gap_marker: false,
+                default_ack_level: None,
+                understands_streaming,
+                default_tier: None,
+                understands_deliver_batch,
+            },
+            &mut body,
+        );
+        body
+    }
+
+    /// Produces a record with explicit key/headers/payload through the engine, so the batch differential
+    /// exercises non-empty variable fields.
+    fn produce_kh<C: Clock + Clone>(
+        e: &DirectEngine<InMemoryFs, C>,
+        key: &[u8],
+        headers: &[u8],
+        payload: &[u8],
+    ) {
+        e.engine_mut()
+            .produce(&Append {
+                timestamp_ms: 42,
+                flags: RecordFlags::EMPTY,
+                key,
+                headers,
+                payload,
+            })
+            .unwrap();
+    }
+
+    /// Decodes a `DeliverBatch` (tag 26) frame body into the per-record `(offset, DeliverBody-equivalent)`
+    /// the way a batch-capable client does: decode the header, then each on-disk frame (CRC-VERIFIED by
+    /// `codec::decode`), reconstructing the offset POSITIONALLY (`first_offset + i`). Returns
+    /// `(offset, generation, flags, ts, key, headers, payload)` per record. Panics on a CRC/length
+    /// mismatch — exactly the integrity check a real client makes.
+    #[allow(clippy::type_complexity)]
+    fn decode_batch_records(body: &[u8]) -> Vec<(u64, u64, u8, u64, Vec<u8>, Vec<u8>, Vec<u8>)> {
+        let (header, record_bytes) =
+            ironbus_proto::message::decode_deliver_batch(body).expect("batch header decodes");
+        let mut out = Vec::new();
+        let mut cursor = 0usize;
+        let mut offset = header.first_offset;
+        while cursor < record_bytes.len() {
+            // `codec::decode` validates the frame's HEADER and BODY CRC before returning a view, so a
+            // record that decodes here is integrity-verified end-to-end.
+            let (view, consumed) =
+                ironbus_core::codec::decode(&record_bytes[cursor..]).expect("record CRC verifies");
+            out.push((
+                offset,
+                header.generation,
+                view.flags.bits(),
+                view.timestamp_ms,
+                view.key.to_vec(),
+                view.headers.to_vec(),
+                view.payload.to_vec(),
+            ));
+            offset += 1;
+            cursor += consumed;
+        }
+        assert_eq!(
+            cursor,
+            record_bytes.len(),
+            "batch body is exactly whole frames"
+        );
+        assert_eq!(
+            out.len() as u64,
+            u64::from(header.record_count),
+            "count matches"
+        );
+        out
+    }
+
+    /// Connects a batch-capable session, marks `group` streaming, subscribes, and returns the session.
+    fn batch_session(e: &DirectEngine<InMemoryFs, ManualClock>, group: &[u8]) -> Session {
+        e.with({
+            let g = String::from_utf8(group.to_vec()).unwrap();
+            move |eng| eng.set_streaming_in(&g, true).unwrap()
+        })
+        .unwrap();
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            e,
+            &frame(FrameType::Connect, &batch_connect_body(true, true)),
+            &mut out,
+        )
+        .unwrap();
+        let info = ironbus_proto::message::decode_info(&one_response(&out).1).unwrap();
+        assert!(
+            info.deliver_batch,
+            "the server confirms the DeliverBatch capability"
+        );
+        out.clear();
+        s.process(e, &frame(FrameType::Sub, group), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        s
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn deliver_batch_yields_the_same_records_as_n_per_record_delivers() {
+        // #541 DIFFERENTIAL (the headline correctness proof): a batch-capable consumer's StreamFetch is
+        // answered with a `DeliverBatch` whose decoded records are BYTE-FOR-BYTE the records a per-record
+        // (batch-incapable) consumer gets as N `Deliver` frames — same offsets, generation, flags,
+        // timestamp, key, headers, payload, same order. Variable key/headers/payload exercise the codec.
+        let e = DirectEngine::new(engine());
+        for i in 0..12u8 {
+            produce_kh(&e, &[i, 7], &[i, 9, 9], &[i; 5]);
+        }
+        let mut batch_s = batch_session(&e, b"s");
+        let mut plain_s = {
+            // A batch-INCAPABLE (streaming-only) consumer: it gets per-record Deliver frames.
+            e.with(|eng| eng.set_streaming_in("s", true).unwrap())
+                .unwrap();
+            let mut s = Session::new();
+            let mut out = Vec::new();
+            s.process(
+                &e,
+                &frame(FrameType::Connect, &batch_connect_body(true, false)),
+                &mut out,
+            )
+            .unwrap();
+            let info = ironbus_proto::message::decode_info(&one_response(&out).1).unwrap();
+            assert!(
+                !info.deliver_batch,
+                "a batch-incapable client gets no confirmation"
+            );
+            out.clear();
+            s.process(&e, &frame(FrameType::Sub, b"s"), &mut out)
+                .unwrap();
+            s
+        };
+
+        let req = {
+            let mut b = Vec::new();
+            ironbus_proto::message::encode_stream_fetch(
+                &ironbus_proto::message::StreamFetchBody {
+                    start_offset: 0,
+                    max_records: 100,
+                    max_bytes: 0,
+                },
+                &mut b,
+            );
+            b
+        };
+
+        // The batch-capable response: ONE DeliverBatch (the whole sealed run) then a FlowEnd.
+        let mut batch_out = Vec::new();
+        batch_s
+            .process(&e, &frame(FrameType::StreamFetch, &req), &mut batch_out)
+            .unwrap();
+        let batch_frames = decode_all(&batch_out);
+        assert!(
+            batch_frames
+                .iter()
+                .any(|(ty, _)| *ty == FrameType::DeliverBatch),
+            "a batch-capable consumer is served a DeliverBatch"
+        );
+        assert!(
+            !batch_frames.iter().any(|(ty, _)| *ty == FrameType::Deliver),
+            "the whole sealed run ships as ONE batch, no per-record Deliver"
+        );
+        let batch_body = &batch_frames
+            .iter()
+            .find(|(ty, _)| *ty == FrameType::DeliverBatch)
+            .unwrap()
+            .1;
+        let from_batch = decode_batch_records(batch_body);
+
+        // The per-record response: N Deliver frames then a FlowEnd.
+        let mut plain_out = Vec::new();
+        plain_s
+            .process(&e, &frame(FrameType::StreamFetch, &req), &mut plain_out)
+            .unwrap();
+        let plain_frames = decode_all(&plain_out);
+        assert!(
+            !plain_frames
+                .iter()
+                .any(|(ty, _)| *ty == FrameType::DeliverBatch),
+            "a batch-incapable consumer NEVER gets a DeliverBatch (back-compat)"
+        );
+        let from_plain: Vec<_> = plain_frames
+            .iter()
+            .filter(|(ty, _)| *ty == FrameType::Deliver)
+            .map(|(_, body)| {
+                let d = decode_deliver(body).unwrap();
+                (
+                    d.offset,
+                    d.generation,
+                    d.flags,
+                    d.timestamp_ms,
+                    d.key.to_vec(),
+                    d.headers.to_vec(),
+                    d.payload.to_vec(),
+                )
+            })
+            .collect();
+
+        assert_eq!(from_batch.len(), 12, "all 12 records delivered");
+        assert_eq!(
+            from_batch, from_plain,
+            "the batch decodes to EXACTLY the per-record Deliver run (offsets reconstructed, CRC verified)"
+        );
+        // Both responses terminate with one FlowEnd carrying the same delivered count.
+        let batch_end = batch_frames
+            .iter()
+            .find(|(ty, _)| *ty == FrameType::FlowEnd)
+            .unwrap();
+        let plain_end = plain_frames
+            .iter()
+            .find(|(ty, _)| *ty == FrameType::FlowEnd)
+            .unwrap();
+        assert_eq!(batch_end.1, plain_end.1, "same FlowEnd delivered count");
+        assert_eq!(
+            batch_end.1,
+            12u32.to_le_bytes(),
+            "FlowEnd counts every record"
+        );
+    }
+
+    #[test]
+    fn deliver_batch_reconstructs_offsets_and_resumes_from_a_mid_run_start() {
+        // Per-record offset reconstruction: a batch starting at a non-zero offset reconstructs each
+        // record's offset POSITIONALLY from the header's first_offset, and a bounded batch resumes
+        // exactly where it left off, contiguous with the previous batch (no gap, no overlap).
+        let e = DirectEngine::new(engine());
+        for i in 0..20u8 {
+            produce_kh(&e, b"", b"", &[i]);
+        }
+        let mut s = batch_session(&e, b"s");
+
+        let fetch_from = |s: &mut Session, start: u64, max: u32| -> Vec<u64> {
+            let mut b = Vec::new();
+            ironbus_proto::message::encode_stream_fetch(
+                &ironbus_proto::message::StreamFetchBody {
+                    start_offset: start,
+                    max_records: max,
+                    max_bytes: 0,
+                },
+                &mut b,
+            );
+            let mut out = Vec::new();
+            s.process(&e, &frame(FrameType::StreamFetch, &b), &mut out)
+                .unwrap();
+            let mut offs = Vec::new();
+            for (ty, body) in decode_all(&out) {
+                if ty == FrameType::DeliverBatch {
+                    for r in decode_batch_records(&body) {
+                        offs.push(r.0);
+                    }
+                }
+            }
+            offs
+        };
+
+        // A batch of 5 starting at offset 5 reconstructs offsets [5, 10).
+        assert_eq!(fetch_from(&mut s, 5, 5), vec![5, 6, 7, 8, 9]);
+        // Resuming at 10 with no overlap/gap.
+        assert_eq!(fetch_from(&mut s, 10, 5), vec![10, 11, 12, 13, 14]);
+        // The full run from 0.
+        assert_eq!(fetch_from(&mut s, 0, 100), (0..20).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn deliver_batch_tolerates_a_future_appended_header_field() {
+        // FORWARD-COMPAT: a future server may append fields to the DeliverBatch header; a client decodes
+        // its known fields and the record bytes still begin right after the DECLARED header block. Build a
+        // batch frame whose header block is one byte longer than v1, then assert it decodes correctly.
+        let e = DirectEngine::new(engine());
+        for i in 0..3u8 {
+            produce_kh(&e, b"", b"", &[i]);
+        }
+        let mut s = batch_session(&e, b"s");
+        let mut req = Vec::new();
+        ironbus_proto::message::encode_stream_fetch(
+            &ironbus_proto::message::StreamFetchBody {
+                start_offset: 0,
+                max_records: 100,
+                max_bytes: 0,
+            },
+            &mut req,
+        );
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::StreamFetch, &req), &mut out)
+            .unwrap();
+        let batch_body = decode_all(&out)
+            .into_iter()
+            .find(|(ty, _)| *ty == FrameType::DeliverBatch)
+            .unwrap()
+            .1;
+        // Splice a future header byte INSIDE the declared block: bump field_len, insert a byte after the
+        // v1 fields, and shift the record bytes after it. The header (version, field_len) is the first 3
+        // bytes; the v1 block is the next 20 (first_offset 8 + generation 8 + record_count 4).
+        let mut extended = Vec::new();
+        extended.push(batch_body[0]); // version
+        let new_field_len = (20u16) + 1;
+        extended.extend_from_slice(&new_field_len.to_le_bytes());
+        extended.extend_from_slice(&batch_body[3..3 + 20]); // the v1 block
+        extended.push(0xEE); // a FUTURE appended header byte, inside the declared block
+        extended.extend_from_slice(&batch_body[3 + 20..]); // the record bytes, unchanged
+                                                           // The client decoder recovers the same records despite the future header field.
+        let records = decode_batch_records(&extended);
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records.iter().map(|r| r.6.clone()).collect::<Vec<_>>(),
+            vec![vec![0], vec![1], vec![2]]
+        );
+    }
+
+    /// An engine with a SMALL segment cap, so a run of records spans several sealed segments plus the
+    /// active tail — the boundary the raw batch (single-segment) splits on.
+    fn small_segment_engine() -> Engine<InMemoryFs, ManualClock> {
+        Engine::open(
+            InMemoryFs::new(),
+            ManualClock::new(),
+            EngineConfig {
+                log: LogConfig {
+                    max_segment_bytes: 160,
+                    ..LogConfig::default()
+                },
+                ..test_config()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn deliver_batch_spans_a_sealed_segment_then_a_per_record_active_tail_partial_batch() {
+        // BOUNDARY / PARTIAL BATCH: with a small segment cap the run spans several sealed segments and the
+        // active tail. The raw batch is bounded to ONE sealed segment, so the response is a SEQUENCE of
+        // DeliverBatch frames (each a sealed segment's run) and per-record Deliver frames (the active
+        // tail), and decoding the whole response in order yields EXACTLY the records — same offsets, same
+        // order — that a per-record-only consumer gets. Integrity (CRC) is verified per record.
+        let e = DirectEngine::new(small_segment_engine());
+        for i in 0..16u8 {
+            produce_kh(&e, &[i], &[i, 1], &[i; 6]);
+        }
+        assert!(
+            e.engine_mut().segment_count() >= 2,
+            "the small cap must have rolled into several segments"
+        );
+        let mut batch_s = batch_session(&e, b"s");
+        let mut plain_s = {
+            e.with(|eng| eng.set_streaming_in("s", true).unwrap())
+                .unwrap();
+            let mut s = Session::new();
+            let mut out = Vec::new();
+            s.process(
+                &e,
+                &frame(FrameType::Connect, &batch_connect_body(true, false)),
+                &mut out,
+            )
+            .unwrap();
+            out.clear();
+            s.process(&e, &frame(FrameType::Sub, b"s"), &mut out)
+                .unwrap();
+            s
+        };
+        let mut req = Vec::new();
+        ironbus_proto::message::encode_stream_fetch(
+            &ironbus_proto::message::StreamFetchBody {
+                start_offset: 0,
+                max_records: 100,
+                max_bytes: 0,
+            },
+            &mut req,
+        );
+
+        // Decode the batch-capable response in order: each DeliverBatch expands to its records, each
+        // Deliver is one record; the concatenation is the whole run.
+        let mut batch_out = Vec::new();
+        batch_s
+            .process(&e, &frame(FrameType::StreamFetch, &req), &mut batch_out)
+            .unwrap();
+        let batch_frames = decode_all(&batch_out);
+        assert!(
+            batch_frames
+                .iter()
+                .any(|(ty, _)| *ty == FrameType::DeliverBatch),
+            "at least one sealed segment ships as a DeliverBatch"
+        );
+        let mut from_batch: Vec<(u64, Vec<u8>)> = Vec::new();
+        for (ty, body) in &batch_frames {
+            match ty {
+                FrameType::DeliverBatch => {
+                    for r in decode_batch_records(body) {
+                        from_batch.push((r.0, r.6));
+                    }
+                }
+                FrameType::Deliver => {
+                    let d = decode_deliver(body).unwrap();
+                    from_batch.push((d.offset, d.payload.to_vec()));
+                }
+                _ => {}
+            }
+        }
+
+        let mut plain_out = Vec::new();
+        plain_s
+            .process(&e, &frame(FrameType::StreamFetch, &req), &mut plain_out)
+            .unwrap();
+        let from_plain: Vec<(u64, Vec<u8>)> = decode_all(&plain_out)
+            .iter()
+            .filter(|(ty, _)| *ty == FrameType::Deliver)
+            .map(|(_, body)| {
+                let d = decode_deliver(body).unwrap();
+                (d.offset, d.payload.to_vec())
+            })
+            .collect();
+
+        assert_eq!(
+            from_batch.len(),
+            16,
+            "every record delivered across the boundary"
+        );
+        assert_eq!(
+            from_batch, from_plain,
+            "batch (sealed segments) + per-record tail == the per-record-only run, in order"
+        );
+        // The offsets are exactly 0..16 with no gap or overlap across the sealed/active boundary.
+        assert_eq!(
+            from_batch.iter().map(|r| r.0).collect::<Vec<_>>(),
+            (0..16).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_old_client_never_gets_a_deliver_batch_and_the_wire_is_byte_identical() {
+        // BACK-COMPAT: a batch-INCAPABLE consumer (an old client, or one that did not advertise) is
+        // served the per-record `Deliver` run byte-for-byte the pre-#541 wire, and NEVER the new tag.
+        let e = DirectEngine::new(engine());
+        for i in 0..5u8 {
+            produce_kh(&e, b"", b"", &[i]);
+        }
+        // A streaming-but-NOT-batch consumer.
+        e.with(|eng| eng.set_streaming_in("s", true).unwrap())
+            .unwrap();
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &e,
+            &frame(FrameType::Connect, &batch_connect_body(true, false)),
+            &mut out,
+        )
+        .unwrap();
+        out.clear();
+        s.process(&e, &frame(FrameType::Sub, b"s"), &mut out)
+            .unwrap();
+        out.clear();
+        let mut req = Vec::new();
+        ironbus_proto::message::encode_stream_fetch(
+            &ironbus_proto::message::StreamFetchBody {
+                start_offset: 0,
+                max_records: 100,
+                max_bytes: 0,
+            },
+            &mut req,
+        );
+        s.process(&e, &frame(FrameType::StreamFetch, &req), &mut out)
+            .unwrap();
+        let frames = decode_all(&out);
+        assert!(
+            !frames.iter().any(|(ty, _)| *ty == FrameType::DeliverBatch),
+            "an old client is NEVER sent the DeliverBatch tag"
+        );
+        let delivers = frames
+            .iter()
+            .filter(|(ty, _)| *ty == FrameType::Deliver)
+            .count();
+        assert_eq!(delivers, 5, "every record arrives as a per-record Deliver");
+        assert_eq!(frames.last().unwrap().0, FrameType::FlowEnd);
     }
 
     /// Produces a keyed record through the engine, for the `key_shared` session tests.
@@ -5520,6 +6118,7 @@ mod tests {
                 default_ack_level: None,
                 understands_streaming: false,
                 default_tier: None,
+                understands_deliver_batch: false,
             },
             &mut connect_body,
         );
@@ -6902,6 +7501,7 @@ mod tests {
                 default_ack_level: None,
                 understands_streaming: false,
                 default_tier: None,
+                understands_deliver_batch: false,
             },
             &mut connect_body,
         );
