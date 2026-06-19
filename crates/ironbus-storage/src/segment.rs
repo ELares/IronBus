@@ -264,6 +264,54 @@ pub struct OwnedRecord {
     pub payload: Bytes,
 }
 
+/// A CONTIGUOUS run of stored record frames returned WITHOUT materializing per-record
+/// [`OwnedRecord`]s and WITHOUT decoding the body — the zero-copy READ primitive (#542, M1-I6).
+///
+/// Where [`SegmentReader::scan_range`] reads the segment bytes into one buffer and then decodes
+/// every frame into an `OwnedRecord` (validating each body CRC and refcount-slicing the three
+/// blobs), this returns the raw on-disk frame bytes for the run `[first_offset, next_offset)` as
+/// ONE refcounted [`Bytes`] handle and stops there: one `read_exact_at`, one allocation, zero body
+/// decodes, zero per-record allocations. On the in-memory backends the underlying buffer is the
+/// segment's own resident bytes (the `Bytes` is a refcount slice, a true no-copy view); on the disk
+/// backend it is one positioned read into one shared buffer (the contiguous-extent foundation a
+/// later `sendfile(2)` path — deferred, see #542's follow-up and #541 `DeliverBatch` — drops in
+/// without re-plumbing the read shape).
+///
+/// ## What `bytes` IS, byte-for-byte
+///
+/// `bytes` is the concatenation of `record_count` complete on-disk record frames in offset order,
+/// each in the frozen on-disk layout (header + key + headers + payload + optional xxh3 + trailer,
+/// per `ironbus_core::format`). It is therefore identical to `scan_range`'s buffer truncated to the
+/// same run: decoding `bytes` front-to-back with `ironbus_core::codec::decode` yields exactly the
+/// records `scan_range` would return over the same range, in the same order, with the same bytes
+/// (the differential test in `read_plane.rs` pins this).
+///
+/// ## CRC integrity is PRESERVED, not dropped
+///
+/// Each frame's own header CRC is validated while walking the run's boundaries (via
+/// `codec::decoded_len`, the cheap header-only check), so a torn or corrupt header ENDS the run
+/// exactly as `scan_range` stops at the first bad frame — a bogus tail is never carried. The body
+/// CRC is NOT re-validated here (the broker never touches the body bytes on this path), but it
+/// ships VERBATIM inside `bytes`, so the consumer verifies the frame end-to-end exactly as it does
+/// today — the zero-copy path moves the body-CRC check to the only place that still touches the
+/// bytes (the client), it never silently drops integrity. (Verify-once-while-resident is the
+/// separate #540.)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawByteRun {
+    /// The raw, contiguous on-disk frame bytes for `[first_offset, next_offset)`, one frame after
+    /// another in the frozen on-disk layout. A refcounted [`Bytes`] slice of the shared read buffer
+    /// (the segment's resident bytes on the memory backends): cloning it is a refcount bump, never a
+    /// copy. Empty iff `record_count == 0`.
+    pub bytes: Bytes,
+    /// The log offset of the FIRST frame in `bytes`.
+    pub first_offset: Offset,
+    /// How many complete frames `bytes` carries. `next_offset == first_offset + record_count`.
+    pub record_count: u64,
+    /// The next offset AFTER the run (the first offset NOT included): where a follow-on read
+    /// resumes. Equals `first_offset` when the run is empty.
+    pub next_offset: Offset,
+}
+
 impl OwnedRecord {
     /// Materializes a record from a CRC-VALIDATED [`RecordView`] by taking refcounted slices of the
     /// shared read `buf` the view borrows (#480). `buf` MUST be the exact buffer the `view` was
@@ -1269,6 +1317,107 @@ impl<F: RandomAccessFile> SegmentReader<F> {
         Ok(records)
     }
 
+    /// Reads a CONTIGUOUS run of up to `max` DENSE (v1) frames starting at the file byte position
+    /// `start_byte` as RAW on-disk bytes — the ZERO-COPY READ primitive (#542, M1-I6) and the
+    /// byte-for-byte sibling of [`SegmentReader::scan_range`] MINUS the per-record decode and
+    /// materialization. `scan_range` reads the region into one buffer and then decodes every frame
+    /// into an [`OwnedRecord`] (a body-CRC check + three refcount slices per record); this reads the
+    /// SAME region into the SAME single shared buffer, walks the frame boundaries with the cheap
+    /// HEADER-ONLY check ([`codec::decoded_len`], which validates each frame's header CRC), and
+    /// returns the contiguous frame bytes for the admitted run as ONE refcounted [`Bytes`] handle.
+    /// No body is decoded, no `OwnedRecord` is allocated.
+    ///
+    /// On the in-memory backends the shared buffer the returned [`RawByteRun::bytes`] slices is the
+    /// segment's own resident bytes, so the run is a true no-copy view; on the disk backend it is
+    /// one `read_exact_at` into one buffer (the contiguous extent a later `sendfile(2)` path — see
+    /// #542's deferred follow-up — would hand to the kernel instead of to user space, without
+    /// changing this read shape).
+    ///
+    /// Bounds, all honored in the single pass and IDENTICAL to `scan_range`'s:
+    /// - `max`: stop after `max` frames. `max == 0` returns an empty run at `start_offset`.
+    /// - `read_end`: no frame whose body would extend at or past it is admitted (the caller passes
+    ///   the segment's flushed `valid_end`, so a torn/unflushed tail is never carried).
+    /// - `max_bytes`: stop once the accumulated frame bytes would EXCEED the cap. `None` means no
+    ///   byte cap. The FIRST frame is ALWAYS taken even if it alone exceeds the cap (the "at least
+    ///   one" fetch rule), so a record larger than the cap never stalls the read; the cap then bounds
+    ///   every frame AFTER the first — the exact rule `scan_range` applies.
+    ///
+    /// The frame at `start_byte` is assigned log offset `start_offset` and each subsequent frame the
+    /// next consecutive offset. `start_byte` MUST be a real frame boundary; a header that fails its
+    /// CRC (a torn or mid-frame read) ENDS the run exactly as `scan_range` stops at the first bad
+    /// frame, so the returned bytes are always a clean prefix of whole, header-validated frames. The
+    /// body CRC of each frame is carried VERBATIM in the returned bytes for the consumer to verify
+    /// end-to-end; it is not re-checked here because the bytes are never touched on this path.
+    ///
+    /// # Errors
+    /// Returns an IO error from reading the region. A torn or corrupt header is NOT an error: it
+    /// ends the returned run.
+    pub fn raw_byte_range(
+        &self,
+        start_byte: u64,
+        start_offset: Offset,
+        read_end: u64,
+        max: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<RawByteRun, StorageError> {
+        let empty = RawByteRun {
+            bytes: Bytes::new(),
+            first_offset: start_offset,
+            record_count: 0,
+            next_offset: start_offset,
+        };
+        if max == 0 || start_byte >= read_end {
+            return Ok(empty);
+        }
+        let len = usize::try_from(read_end.saturating_sub(start_byte))
+            .map_err(|_| StorageError::SegmentFull)?;
+        // ONE read into a shared `Bytes` buffer — the same single allocation `scan_range` makes. The
+        // returned run slices THIS buffer (a refcount bump), so a seek-and-read-forward of N frames is
+        // one syscall + one allocation + zero per-record allocations and zero body decodes.
+        let mut buf = BytesMut::zeroed(len);
+        self.file.read_exact_at(&mut buf, start_byte)?;
+        let body = buf.freeze();
+        let mut cursor = 0usize;
+        let mut byte_total = 0usize;
+        let mut count = 0usize;
+        let mut next_offset = start_offset.get();
+        while cursor < body.len() && count < max {
+            // HEADER-ONLY boundary walk: `decoded_len` validates the frame's HEADER CRC and returns
+            // the full frame length WITHOUT touching the body — the cheap half of `codec::decode`. A
+            // torn or corrupt header ends the run, exactly as `scan_range`'s `decode` does, so the
+            // admitted bytes are always whole, header-validated frames.
+            let Ok(consumed) = codec::decoded_len(&body[cursor..]) else {
+                break;
+            };
+            // The frame must lie WHOLLY within the read region; a frame that would run off the end of
+            // the buffer is a torn tail and ends the run (matching `scan_range`, whose `decode` of a
+            // short tail returns `Truncated` and breaks).
+            if cursor.saturating_add(consumed) > body.len() {
+                break;
+            }
+            // Byte cap: stop BEFORE a frame that would push the accumulated bytes past `max_bytes`,
+            // but ALWAYS admit the first frame so a single frame larger than the cap never stalls —
+            // the identical rule `scan_range` applies against `OwnedRecord::encoded_len`.
+            if let Some(cap) = max_bytes {
+                if count != 0 && byte_total.saturating_add(consumed) > cap {
+                    break;
+                }
+            }
+            byte_total = byte_total.saturating_add(consumed);
+            count += 1;
+            next_offset = next_offset.saturating_add(1);
+            cursor += consumed;
+        }
+        Ok(RawByteRun {
+            // The admitted prefix: the first `byte_total` bytes are exactly `count` whole frames. A
+            // refcount slice of the shared buffer, never a copy.
+            bytes: body.slice(0..byte_total),
+            first_offset: start_offset,
+            record_count: count as u64,
+            next_offset: Offset::new(next_offset),
+        })
+    }
+
     /// Scans a COMPACTED (`version` = 2) segment (#337): validates the v2 header (the caller's
     /// [`SegmentReader::open`] already accepted it), reads its SPARSE survivor records, the v2
     /// footer, and the trailing 44-byte compaction-metadata block, and returns them as a
@@ -2113,6 +2262,142 @@ mod tests {
                 .scan_from(positions[0], Offset::new(0), valid_end, usize::MAX)
                 .unwrap()
         );
+    }
+
+    /// The zero-copy `raw_byte_range` (#542, M1-I6) returns the SAME records `scan_range` materializes
+    /// — proven by decoding the raw bytes and comparing every field — while making ONE read, no body
+    /// decode, and no per-record allocation. Covers the byte-identical differential, the `max`/
+    /// `max_bytes` bounds (with "at least one"), the empty/torn boundaries, and the full-frame CRC
+    /// riding along in the returned bytes.
+    #[test]
+    fn raw_byte_range_is_byte_identical_to_scan_range() {
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        for i in 0..6u64 {
+            w.append(&rec(i, &[u8::try_from(i).unwrap(); 7])).unwrap();
+        }
+        w.sync().unwrap();
+        let reader = SegmentReader::open(Arc::clone(&file)).unwrap();
+        let (positions, valid_end) = reader.record_byte_positions().unwrap();
+        let one_frame = reader
+            .scan_range(positions[0], Offset::new(0), valid_end, 1, None)
+            .unwrap()[0]
+            .encoded_len();
+
+        // Unbounded: the raw run carries all 6 frames and decodes byte-for-byte to scan_range.
+        let materialized = reader
+            .scan_range(positions[0], Offset::new(0), valid_end, usize::MAX, None)
+            .unwrap();
+        let raw = reader
+            .raw_byte_range(positions[0], Offset::new(0), valid_end, usize::MAX, None)
+            .unwrap();
+        assert_eq!(raw.record_count, materialized.len() as u64);
+        assert_eq!(raw.first_offset.get(), 0);
+        assert_eq!(raw.next_offset.get(), materialized.len() as u64);
+        // Decode the raw bytes and compare every field — the byte-identical differential.
+        let mut cursor = 0usize;
+        for (idx, owned) in materialized.iter().enumerate() {
+            let (view, consumed) = codec::decode(&raw.bytes[cursor..]).expect("raw frame decodes");
+            assert_eq!(view.seq, owned.seq, "seq mismatch at {idx}");
+            assert_eq!(
+                view.timestamp_ms, owned.timestamp_ms,
+                "ts mismatch at {idx}"
+            );
+            assert_eq!(view.flags, owned.flags, "flags mismatch at {idx}");
+            assert_eq!(view.key, &owned.key[..], "key mismatch at {idx}");
+            assert_eq!(
+                view.headers,
+                &owned.headers[..],
+                "headers mismatch at {idx}"
+            );
+            assert_eq!(
+                view.payload,
+                &owned.payload[..],
+                "payload mismatch at {idx}"
+            );
+            cursor += consumed;
+        }
+        assert_eq!(cursor, raw.bytes.len(), "no trailing bytes past the frames");
+
+        // max bounds the frame count exactly like scan_range.
+        let raw3 = reader
+            .raw_byte_range(positions[0], Offset::new(0), valid_end, 3, None)
+            .unwrap();
+        assert_eq!(raw3.record_count, 3);
+        assert_eq!(raw3.next_offset.get(), 3);
+
+        // A byte budget of K frames yields K frames; a sub-frame budget still yields one.
+        for k in 1..=4usize {
+            let got = reader
+                .raw_byte_range(
+                    positions[0],
+                    Offset::new(0),
+                    valid_end,
+                    usize::MAX,
+                    Some(k * one_frame),
+                )
+                .unwrap();
+            assert_eq!(got.record_count, k as u64, "byte budget for {k} frames");
+        }
+        for cap in [0usize, 1, one_frame - 1] {
+            let got = reader
+                .raw_byte_range(
+                    positions[0],
+                    Offset::new(0),
+                    valid_end,
+                    usize::MAX,
+                    Some(cap),
+                )
+                .unwrap();
+            assert_eq!(got.record_count, 1, "sub-frame cap {cap} returns one frame");
+        }
+
+        // Empty boundaries: max=0 and start==read_end both serve nothing.
+        let empty = reader
+            .raw_byte_range(positions[0], Offset::new(0), valid_end, 0, None)
+            .unwrap();
+        assert_eq!(empty.record_count, 0);
+        assert!(empty.bytes.is_empty());
+        let at_end = reader
+            .raw_byte_range(valid_end, Offset::new(6), valid_end, 10, None)
+            .unwrap();
+        assert_eq!(at_end.record_count, 0);
+        assert_eq!(at_end.next_offset.get(), 6);
+    }
+
+    /// A torn/corrupt frame header ENDS the raw run exactly as it ends a scan — a bogus tail is never
+    /// carried in the zero-copy bytes (CRC integrity at the run boundary is preserved).
+    #[test]
+    fn raw_byte_range_stops_at_a_torn_frame_like_scan() {
+        let file = Arc::new(InMemoryFile::new());
+        let mut w = SegmentWriter::create(Arc::clone(&file), header()).unwrap();
+        w.append(&rec(0, b"good1")).unwrap();
+        let after_first = w.write_pos();
+        w.append(&rec(1, b"good2")).unwrap();
+        w.sync().unwrap();
+        // Corrupt the second frame's HEADER (the magic byte) so its `decoded_len` header CRC fails.
+        let mut bytes = file.snapshot();
+        let magic_byte = usize::try_from(after_first).unwrap();
+        bytes[magic_byte] ^= 0xFF;
+        file.set_len(0).unwrap();
+        file.write_all_at(&bytes, 0).unwrap();
+
+        let reader = SegmentReader::open(Arc::clone(&file)).unwrap();
+        // Start at the first RECORD frame (past the 64-byte segment header); read_end is the whole FILE
+        // length (past both frames). Reading forward, the corrupt second header fails its CRC in
+        // `decoded_len` and ends the run after the one good frame.
+        let first_record_byte = SEGMENT_HEADER_LEN as u64;
+        let file_len = file.len().unwrap();
+        let raw = reader
+            .raw_byte_range(first_record_byte, Offset::new(0), file_len, 10, None)
+            .unwrap();
+        assert_eq!(
+            raw.record_count, 1,
+            "the torn header ends the run at one frame"
+        );
+        let (view, consumed) = codec::decode(&raw.bytes).expect("the one good frame decodes");
+        assert_eq!(view.payload, b"good1");
+        assert_eq!(consumed, raw.bytes.len());
     }
 
     #[test]

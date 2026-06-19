@@ -86,3 +86,14 @@ harness = false
 [[bench]]
 name = "consume_scaling"
 harness = false
+
+# Informational micro-bench for the ZERO-COPY consume delivery read primitive (#542, M1-I6): the
+# MATERIALIZE+ENCODE delivery path (read_range -> OwnedRecords -> re-encode each into a wire-delivery
+# body) vs the ZERO-COPY raw byte run (read_range_raw -> one Bytes slice, no decode, no re-encode, no
+# payload copy), over the in-memory filesystem and swept across payload sizes. The zero-copy read is a
+# large multiple faster (one alloc + zero per-record decode/encode); the gap is the consume throughput
+# lever. Run on demand (`cargo bench -p ironbus-storage`), not in per-PR CI; the full consume-vs-NATS
+# leg is #554.
+[[bench]]
+name = "zero_copy_delivery"
+harness = false
