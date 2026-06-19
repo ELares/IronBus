@@ -46,7 +46,10 @@
 //! count of tracked windows at [`DedupConfig::max_producers`] (default
 //! [`DEFAULT_MAX_PRODUCERS`]) and, when a fresh `producer_id` would exceed the cap, evicts the
 //! LEAST-RECENTLY-ACTIVE window (an approximate LRU keyed on each window's last-touch monotonic
-//! instant). Evicting a window only loses dedup state for the least-active producer, which then
+//! instant). The victim is found in O(log P) amortized via a last-touch min-heap with lazy
+//! invalidation, NOT an O(P) scan over every window — the scan would otherwise fire on every fresh
+//! `producer_id`, precisely the producer-flood the cap defends against (#478). Evicting a window
+//! only loses dedup state for the least-active producer, which then
 //! falls back to at-least-once for that producer (already the contract for an aged/evicted id),
 //! so eviction is safe. Fully time-expired windows are reaped opportunistically first, so an
 //! idle producer does not pin a slot until the LRU cap forces it. The TOTAL worst case is thus
@@ -54,6 +57,8 @@
 //! [`MAX_PRODUCER_ID_LEN`]; see `docs/RAM_BUDGET.md`.
 
 use crate::types::Offset;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 
@@ -243,6 +248,20 @@ impl ProducerWindow {
 pub struct DedupRegistry {
     config: DedupConfig,
     producers: HashMap<Vec<u8>, ProducerWindow>,
+    /// The LRU recency index for the [`DedupConfig::max_producers`] cap: a MIN-heap (via
+    /// [`Reverse`]) over `(last_touch, producer_id)`, so the smallest `last_touch` is at the top.
+    /// Picking the eviction victim is then O(log P) instead of an O(P) scan over every window on
+    /// every fresh `producer_id` (the producer-flood path the cap defends, #478).
+    ///
+    /// Recency is LAZILY invalidated: a window's `last_touch` is mutated in place on every
+    /// touch (so a producer can have several stale heap entries), and a producer can be removed
+    /// (evicted/reaped) while a heap entry survives. A heap entry `(touch, pid)` is the true LRU
+    /// victim ONLY when `pid` is still tracked AND its current `last_touch == touch`; any entry
+    /// failing that is stale and discarded on pop. Every touch and every insert pushes a fresh
+    /// `(last_touch, pid)`, so the freshest entry for a live producer always reflects its real
+    /// recency, and the heap size is reaped back to the live-window count whenever it grows past
+    /// twice the producer count (so stale entries cannot accumulate without bound).
+    lru: BinaryHeap<Reverse<(u64, Vec<u8>)>>,
 }
 
 impl DedupRegistry {
@@ -258,6 +277,7 @@ impl DedupRegistry {
                 max_producers: config.max_producers.max(1),
             },
             producers: HashMap::new(),
+            lru: BinaryHeap::new(),
         }
     }
 
@@ -296,7 +316,15 @@ impl DedupRegistry {
     /// then, if still at the cap, evicts the LEAST-RECENTLY-active window (the smallest
     /// `last_touch`) so the new producer fits. Evicting a window only drops dedup state for the
     /// least-active producer, which falls back to at-least-once (already the contract), so this is
-    /// safe. Pure: no IO, no panic (the `min_by_key`/`remove` are guarded by the at-cap check).
+    /// safe. Pure: no IO, no panic.
+    ///
+    /// The victim is found via the [`DedupRegistry::lru`] min-heap in O(log P) amortized rather than
+    /// an O(P) scan over every window (#478): pop the smallest `(last_touch, pid)`, skipping any
+    /// STALE entry (a `pid` no longer tracked, or whose current `last_touch` has since advanced past
+    /// this entry's), until a live entry surfaces — that producer is the true LRU and is removed.
+    /// Each window has exactly one heap entry per distinct `last_touch` it ever held, so the total
+    /// pops across a flood are bounded by the touches that produced them; eviction is thus amortized
+    /// O(log P).
     fn make_room_for(&mut self, producer_id: &[u8], now: u64) {
         if self.producers.contains_key(producer_id) {
             return;
@@ -308,18 +336,45 @@ impl DedupRegistry {
         // First try to free a slot for nothing by reaping fully time-expired (now-empty) windows.
         self.reap_empty_windows(now);
         // If reaping was not enough (or the time bound is off), evict the least-recently-active
-        // window. `min_by_key` over a non-empty map yields a key; clone it so the borrow ends
-        // before the remove.
+        // window. Pop the heap until a non-stale entry surfaces: an entry is the live LRU victim
+        // only when its `pid` is still tracked AND its window's current `last_touch` still equals
+        // the heap entry's recorded touch (otherwise the producer was re-touched or already removed,
+        // and a fresher entry for it — if any — sits deeper in the heap).
         while self.producers.len() >= cap {
-            let Some(victim) = self
-                .producers
-                .iter()
-                .min_by_key(|(_, window)| window.last_touch)
-                .map(|(key, _)| key.clone())
-            else {
+            let Some(Reverse((touch, pid))) = self.lru.pop() else {
+                // The heap drained without finding a victim (every entry was stale). This is
+                // unreachable while `producers` is non-empty, because every live window pushed at
+                // least one entry for its current `last_touch`; the loop guard guarantees a live
+                // producer exists, so the break is purely defensive (no panic, no scan fallback).
                 break;
             };
-            self.producers.remove(&victim);
+            if self
+                .producers
+                .get(&pid)
+                .is_some_and(|w| w.last_touch == touch)
+            {
+                self.producers.remove(&pid);
+            }
+        }
+    }
+
+    /// Records on the LRU heap that `producer_id`'s window was touched at monotonic instant `now`,
+    /// pushing a fresh `(now, producer_id)` entry so the O(log P) victim search sees the new recency.
+    /// The caller sets the window's own `last_touch` field; this only maintains the heap index.
+    /// Periodically rebuilds the heap of stale entries (when it grows past twice the live-window
+    /// count) so lazy invalidation cannot let stale entries accumulate without bound.
+    fn touch_lru(&mut self, producer_id: &[u8], now: u64) {
+        self.lru.push(Reverse((now, producer_id.to_vec())));
+        // Bound the heap: stale entries (superseded touches, removed producers) accumulate one per
+        // touch. When the heap exceeds twice the live-window count, rebuild it from the current
+        // windows so its size returns to exactly the producer count. Amortized O(1) per touch (the
+        // rebuild is O(P) but only fires after Θ(P) touches have piled up).
+        if self.lru.len() > self.producers.len().saturating_mul(2) {
+            self.lru = self
+                .producers
+                .iter()
+                .map(|(pid, w)| Reverse((w.last_touch, pid.clone())))
+                .collect();
         }
     }
 
@@ -352,13 +407,21 @@ impl DedupRegistry {
         // never holds more than `max_producers` windows: a flood of distinct attacker-chosen
         // `producer_id`s evicts the least-recently-active window rather than growing without bound.
         self.make_room_for(producer_id, now);
+        // Ensure the window is present and touch the recency clock: this window is the
+        // most-recently-active, so it is not the LRU eviction victim while idle windows exist. The
+        // borrow ends here so `touch_lru` (which reads `self.producers` to bound the heap) sees the
+        // window already inserted.
+        self.producers
+            .entry(producer_id.to_vec())
+            .or_insert_with(|| ProducerWindow::new(epoch, now))
+            .last_touch = now;
+        // Mirror the touch onto the LRU heap, keeping the O(log P) victim search in sync.
+        self.touch_lru(producer_id, now);
+        // Re-borrow the now-present window for the rest of the call (the closure never runs).
         let window = self
             .producers
             .entry(producer_id.to_vec())
             .or_insert_with(|| ProducerWindow::new(epoch, now));
-        // Touch the recency clock: this window is the most-recently-active, so it is not the LRU
-        // eviction victim while idle windows exist.
-        window.last_touch = now;
 
         // Epoch fencing: a stale epoch is rejected; a newer epoch supersedes the old session.
         if epoch < window.epoch {
@@ -397,11 +460,17 @@ impl DedupRegistry {
         // Enforce the producer-count cap before a (possibly new) window is inserted: `record` for a
         // never-checked producer would otherwise grow the map past the cap.
         self.make_room_for(producer_id, now);
+        // Ensure the window is present and touch the recency clock; the borrow ends so `touch_lru`
+        // sees the inserted window when it bounds the heap (see `check`).
+        self.producers
+            .entry(producer_id.to_vec())
+            .or_insert_with(|| ProducerWindow::new(0, now))
+            .last_touch = now;
+        self.touch_lru(producer_id, now);
         let window = self
             .producers
             .entry(producer_id.to_vec())
             .or_insert_with(|| ProducerWindow::new(0, now));
-        window.last_touch = now;
         // A re-record of a live id updates the map in place; the stale order-queue entry is
         // skipped at eviction time by the instant guard, so it never double-removes a live id.
         window.index.insert(msg_id.to_vec(), (offset, now));
@@ -732,6 +801,93 @@ mod tests {
                 offset: Offset::new(42)
             },
             "the continuously-active producer is never the LRU victim"
+        );
+    }
+
+    #[test]
+    fn a_re_touched_window_is_not_the_lru_victim_despite_a_stale_heap_entry() {
+        // Heap lazy-invalidation correctness (#478): when a window is re-touched, its OLD
+        // (smaller-last_touch) heap entry is left behind as a stale entry. The victim search MUST
+        // discard that stale entry (current last_touch no longer matches it) and never evict a
+        // re-touched window while a genuinely older one exists.
+        let max_producers = 3;
+        let mut r = DedupRegistry::new(DedupConfig {
+            max_ids: 4,
+            window_nanos: 0,
+            max_producers,
+        });
+        // "early" is touched first at t=0 (leaving a stale heap entry there), then RE-touched at a
+        // large t so it is actually the most-recently-active.
+        r.check(b"early", 0, b"e", 0);
+        r.record(b"early", b"e", Offset::new(1), 0);
+        // "mid" is the genuinely least-recently-active window (touched once at t=5, never again).
+        r.check(b"mid", 0, b"m", 5);
+        r.record(b"mid", b"m", Offset::new(2), 5);
+        // "late" fills the cap at t=10.
+        r.check(b"late", 0, b"l", 10);
+        r.record(b"late", b"l", Offset::new(3), 10);
+        assert_eq!(r.producer_count(), max_producers);
+        // Re-touch "early" at t=100: its stale (0, "early") heap entry remains, but its real
+        // last_touch is now 100 — the freshest of all three.
+        r.check(b"early", 0, b"e", 100);
+        // A new producer forces one eviction. The victim must be "mid" (smallest live last_touch),
+        // NOT "early" (whose stale heap entry has the smallest touch but is invalid).
+        r.check(b"intruder", 0, b"x", 200);
+        r.record(b"intruder", b"x", Offset::new(4), 200);
+        assert_eq!(r.producer_count(), max_producers);
+        // "early" survived (re-touched), "late" survived, "mid" was evicted.
+        assert_eq!(
+            r.check(b"early", 0, b"e", 300),
+            DedupDecision::Duplicate {
+                offset: Offset::new(1)
+            },
+            "the re-touched window must survive despite its stale heap entry"
+        );
+        assert_eq!(
+            r.check(b"mid", 0, b"m", 301),
+            DedupDecision::Fresh {
+                out_of_window: false
+            },
+            "the genuinely least-recently-active window was the eviction victim"
+        );
+    }
+
+    #[test]
+    fn heavy_re_touching_keeps_the_lru_heap_bounded_and_eviction_correct() {
+        // Heap-bound correctness (#478): re-touching the same hot producer many times piles up
+        // stale heap entries. The periodic rebuild must keep the heap from growing without bound
+        // AND must not corrupt the LRU victim choice. Drive thousands of re-touches of one hot
+        // producer interleaved with a flood of fresh ones; the count stays capped and the hot
+        // producer is never evicted.
+        let max_producers = 8;
+        let mut r = DedupRegistry::new(DedupConfig {
+            max_ids: 4,
+            window_nanos: 0,
+            max_producers,
+        });
+        r.check(b"hot", 0, b"h", 0);
+        r.record(b"hot", b"h", Offset::new(42), 0);
+        for i in 0..1_000u64 {
+            // Re-touch hot repeatedly (each push is a soon-to-be-stale heap entry).
+            r.check(b"hot", 0, b"h", 1_000 + i * 3);
+            // Flood a fresh producer that must evict some OTHER (idle) window, never hot.
+            let pid = format!("flood-{i}");
+            r.check(pid.as_bytes(), 0, b"y", 1_001 + i * 3);
+            r.record(pid.as_bytes(), b"y", Offset::new(1_000 + i), 1_001 + i * 3);
+            assert!(
+                r.producer_count() <= max_producers,
+                "count {} exceeded cap {max_producers}",
+                r.producer_count()
+            );
+        }
+        // hot survived every round (continuously the freshest), and the cap held throughout.
+        assert_eq!(r.producer_count(), max_producers);
+        assert_eq!(
+            r.check(b"hot", 0, b"h", 1_000_000),
+            DedupDecision::Duplicate {
+                offset: Offset::new(42)
+            },
+            "the continuously-hot producer is never evicted despite a flood of stale heap entries"
         );
     }
 
