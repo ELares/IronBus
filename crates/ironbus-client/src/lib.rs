@@ -29,9 +29,10 @@ use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, 
 use ironbus_proto::message::{
     decode_dead_letter, decode_deliver, decode_deliver_batch, decode_gap_marker, decode_info,
     decode_produce_confirm, decode_pub_ack, decode_truncated, encode_ack, encode_connect,
-    encode_cumulative_ack, encode_fetch, encode_pub, encode_sub, produce_confirm_status, AckBody,
-    AckLevel, AckOp, BodyError, ConnectBody, ConsumeTier, CumulativeAckBody, DeliverBody,
-    FetchBody, PubBody, SubBody, PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
+    encode_cumulative_ack, encode_fetch, encode_pub, encode_stream_commit, encode_stream_fetch,
+    encode_sub, produce_confirm_status, AckBody, AckLevel, AckOp, BodyError, ConnectBody,
+    ConsumeTier, CumulativeAckBody, DeliverBody, FetchBody, PubBody, StreamCommitBody,
+    StreamFetchBody, SubBody, PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -402,6 +403,20 @@ const STREAM_FLUSH_BYTES: usize = 32 * 1024;
 /// configurable via [`Client::pipelined_producer_with_window`] for a caller that wants a different
 /// latency/throughput trade.
 pub const DEFAULT_PIPELINE_WINDOW: usize = 64;
+
+/// The default streaming-consumer fetch window (Tier-S, #550): the `max_records` a
+/// [`StreamingConsumer`]'s [`StreamingConsumer::next_batch`] pulls per `StreamFetch`. Sized to
+/// amortize the per-round-trip cost across a healthy batch while staying within a typical negotiated
+/// per-consumer credit (the actual pull is capped at the negotiated credit, #292). Configurable via
+/// [`StreamConsumerConfig::max_records`].
+pub const DEFAULT_STREAM_FETCH_RECORDS: u32 = 256;
+
+/// The default periodic-commit cadence (Tier-S, #550): a [`StreamingConsumer`] auto-commits its
+/// cumulative offset once every this-many fetched windows (and always when the stream drains or the
+/// handle finishes). Commit cadence is the at-least-once knob — a larger cadence amortizes the commit
+/// across more windows (cheaper) at the cost of a larger redeliver-on-crash span; `1` commits after
+/// every window. Configurable via [`StreamConsumerConfig::commit_every_batches`].
+pub const DEFAULT_STREAM_COMMIT_EVERY_BATCHES: u32 = 8;
 
 /// The shared tally between [`Client::produce_stream`]'s writer (the caller thread) and its
 /// reader thread, guarded by a mutex with a condvar the reader signals as window room opens.
@@ -1651,6 +1666,177 @@ impl Client {
         self.read_fetch_response(limit)
     }
 
+    /// Writes ONE `StreamFetch` request (Tier-S, #544 / #550) WITHOUT reading its response: the
+    /// low-level write half of [`Client::stream_fetch`], pulled out so a [`StreamingConsumer`] can
+    /// PIPELINE the next window's request ahead of processing the current batch (the bounded
+    /// read-ahead). The matching response is drained by [`Client::read_stream_fetch_response`].
+    ///
+    /// Returns the client-side `limit` (the frame cap the matching read must honor): `max_records`
+    /// capped at the negotiated per-consumer credit (#292) when the server advertised one, exactly as
+    /// the per-record and batch-pull fetches cap. The negotiated value governs the pull, so the client
+    /// never over-requests past what it agreed to.
+    fn send_stream_fetch(
+        &mut self,
+        start_offset: u64,
+        max_records: u32,
+        max_bytes: u64,
+    ) -> Result<usize, ClientError> {
+        let max_records = match self.negotiated_credit {
+            Some(credit) => max_records.min(credit),
+            None => max_records,
+        };
+        let req = StreamFetchBody {
+            start_offset,
+            max_records,
+            max_bytes,
+        };
+        let mut body = Vec::new();
+        encode_stream_fetch(&req, &mut body);
+        self.send(FrameType::StreamFetch, &body)?;
+        Ok(usize::try_from(max_records).unwrap_or(usize::MAX))
+    }
+
+    /// Reads the response to a previously-sent `StreamFetch` (the read half of
+    /// [`Client::stream_fetch`]). The Tier-S delivery response is byte-for-byte a [`Client::fetch`]
+    /// response past the request frame — a run of `Deliver` (or one raw-framed `DeliverBatch`, #541)
+    /// frames plus any advisories, terminated by exactly one `FlowEnd` — so it shares
+    /// [`Client::read_fetch_response`] verbatim. `limit` is the value [`Client::send_stream_fetch`]
+    /// returned for the matching request, bounding the frames the server may stream before `FlowEnd`.
+    fn read_stream_fetch_response(&mut self, limit: usize) -> Result<Fetch, ClientError> {
+        self.read_fetch_response(limit)
+    }
+
+    /// STREAMING (Tier-S, #544 / #550) consumer-managed-offset fetch: serves a CONTIGUOUS batch of
+    /// records `[start_offset, ...)` off the durable prefix, bounded by `max_records` and `max_bytes`,
+    /// with NO lease, NO generation fence, and NO per-record cursor write. The consumer NAMES its own
+    /// `start_offset` (normally its last committed offset) and advances durability separately via a
+    /// PERIODIC [`Client::stream_commit`] — the Kafka / NATS-pull contract. This is the low-cost twin
+    /// of the per-record-leased [`Client::fetch_batch`]: removing the per-record lease/cursor work is
+    /// exactly what lets a single durable consumer keep up.
+    ///
+    /// AT-LEAST-ONCE holds BY CONSTRUCTION: because the consumer drives the offset, a crash or
+    /// reconnect simply re-fetches from its last committed offset and the uncommitted span redelivers
+    /// (none is lost). The delivered [`Message`]s are byte-for-byte what the leased path yields; only
+    /// the settlement bookkeeping differs. The returned messages carry `generation = 0` (there is no
+    /// fence on this path) and MUST be settled by offset via [`Client::stream_commit`], never by
+    /// [`Client::ack`].
+    ///
+    /// The connection MUST have negotiated Tier-S ([`ClientConfig::understands_streaming`], confirmed
+    /// by [`Client::streaming_enabled`]) and be [`Client::subscribe`]d to a streaming group; otherwise
+    /// the server rejects the verb with a [`ClientError::Server`]. The ergonomic batched-default loop
+    /// (a handle that fetches windows and auto-commits periodically, WITH bounded read-ahead) is
+    /// [`Client::streaming_consumer`]; reach for this raw method only for precise, hand-driven control.
+    ///
+    /// - `start_offset`: the inclusive offset to begin the contiguous read at (the consumer's
+    ///   position).
+    /// - `max_records`: the most records to return, capped at the negotiated per-consumer credit
+    ///   (#292) when the server advertised one.
+    /// - `max_bytes`: the byte budget (`0` = unbounded by bytes; the record count and the durable
+    ///   prefix still bind). The server applies the floor-of-one, so a single over-budget record is
+    ///   never wedged.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, a server error (e.g. the group is not streaming, or
+    /// the connection did not negotiate Tier-S), or a server that streams more frames than the cap.
+    pub fn stream_fetch(
+        &mut self,
+        start_offset: u64,
+        max_records: u32,
+        max_bytes: u64,
+    ) -> Result<Fetch, ClientError> {
+        let limit = self.send_stream_fetch(start_offset, max_records, max_bytes)?;
+        self.read_stream_fetch_response(limit)
+    }
+
+    /// STREAMING (Tier-S, #544 / #550) periodic CUMULATIVE COMMIT: advances the streaming group's
+    /// committed cursor up to the EXCLUSIVE offset `up_to` — the consumer's "everything below `up_to`
+    /// is durably processed" checkpoint. This is the durability point of the consumer-managed-offset
+    /// model: a [`Client::stream_fetch`] never advances the cursor, so retention is pinned only by this
+    /// commit, and a crash redelivers everything fetched-but-not-yet-committed (the at-least-once
+    /// window).
+    ///
+    /// Commit PERIODICALLY (once per N batches or T milliseconds), NOT per record: amortizing the
+    /// commit across a window is the whole ergonomic win over a per-record ack. A re-commit at or below
+    /// the current commit is an idempotent no-op success; the server validates `up_to` against the
+    /// durable head and the earliest-retained offset, and HARD-REJECTS the verb on a group that is not
+    /// streaming. An empty `group` selects the default group.
+    ///
+    /// The [`StreamingConsumer`] handle ([`Client::streaming_consumer`]) drives this automatically on a
+    /// configurable cadence; call it directly only for hand-driven precise commits (e.g. an exactly
+    /// processed-up-to checkpoint).
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the verb (the group is not a streaming
+    /// consumer, or `up_to` is outside the retained window), or a frame or connection error.
+    pub fn stream_commit(&mut self, group: &str, up_to: u64) -> Result<(), ClientError> {
+        let mut body = Vec::new();
+        encode_stream_commit(
+            &StreamCommitBody {
+                up_to,
+                group: group.as_bytes(),
+            },
+            &mut body,
+        );
+        self.send(FrameType::StreamCommit, &body)?;
+        match self.read_frame()? {
+            (FrameType::Ok, _) => Ok(()),
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Opens the ERGONOMIC batched-default streaming consumer (Tier-S, #550): the high-throughput
+    /// companion to the raw [`Client::stream_fetch`] / [`Client::stream_commit`] pair, and the
+    /// recommended way to consume a streaming group. The handle's [`StreamingConsumer::next_batch`]
+    /// loop FETCHES A WINDOW at a time (a [`Client::stream_fetch`] of `max_records` / `max_bytes`,
+    /// delivered as one `DeliverBatch` when the connection negotiated it, #541), commits the offset
+    /// PERIODICALLY and cumulatively ([`Client::stream_commit`]) rather than per record, and PREFETCHES
+    /// the next window while the caller processes the current batch — the Kafka / NATS-pull ergonomic
+    /// default. The per-record fetch-and-ack path is the explicit opt-out, not the default.
+    ///
+    /// The read-ahead is BOUNDED: at most ONE window is in flight ahead of the caller (the next
+    /// window's `StreamFetch` is pipelined the moment the current batch is read, so the next response
+    /// is already arriving while the caller works), and that window is bounded by the SAME
+    /// `max_records` / `max_bytes` budget as the visible one. There is never an unbounded prefetch
+    /// buffer, and because this is a single consumer reading its OWN offset (not a per-group
+    /// server-side buffer fanned out to many consumers) it never duplicates payloads across groups.
+    ///
+    /// AT-LEAST-ONCE is preserved: the consumer commits only what it has processed, so a crash
+    /// redelivers the uncommitted (including the prefetched-but-unprocessed) window and loses nothing.
+    /// See [`StreamConsumerConfig`] for the window size, the commit cadence, the starting offset, and
+    /// the precise-commit opt-out; [`Client::streaming_consumer`] uses the defaults.
+    ///
+    /// The connection MUST have negotiated Tier-S and be [`Client::subscribe`]d to the streaming
+    /// `group` (the handle commits to that group name) before the first batch.
+    #[must_use]
+    pub fn streaming_consumer<'a>(&'a mut self, group: &str) -> StreamingConsumer<'a> {
+        self.streaming_consumer_with(group, &StreamConsumerConfig::default())
+    }
+
+    /// Opens the batched-default streaming consumer (Tier-S, #550) with an explicit
+    /// [`StreamConsumerConfig`]: the window size, the periodic-commit cadence, the starting offset, and
+    /// whether read-ahead is on. See [`Client::streaming_consumer`] for the default-config entry point
+    /// and the full contract.
+    #[must_use]
+    pub fn streaming_consumer_with<'a>(
+        &'a mut self,
+        group: &str,
+        config: &StreamConsumerConfig,
+    ) -> StreamingConsumer<'a> {
+        StreamingConsumer {
+            client: self,
+            group: group.to_string(),
+            config: config.clone(),
+            next_offset: config.start_offset,
+            committed: config.start_offset,
+            batches_since_commit: 0,
+            prefetch: None,
+            stashed: None,
+        }
+    }
+
     /// Acknowledges a fetched message by its offset and fencing generation. Returns `true`
     /// if the ack committed, `false` if it was fenced (stale: the message will redeliver).
     ///
@@ -1970,6 +2156,295 @@ impl Client {
     /// Reads one complete frame, buffering leftover bytes for the next call.
     fn read_frame(&mut self) -> Result<(FrameType, Vec<u8>), ClientError> {
         read_frame_from(&mut self.stream, &mut self.buf)
+    }
+}
+
+/// Tunables for the batched-default streaming consumer (Tier-S, #550), opened by
+/// [`Client::streaming_consumer_with`]. The defaults are the ergonomic batched path: a healthy fetch
+/// window, periodic (not per-record) commit, and bounded read-ahead ON.
+#[derive(Clone, Debug)]
+pub struct StreamConsumerConfig {
+    /// The fetch window's record cap: the `max_records` each `StreamFetch` pulls (the actual pull is
+    /// additionally capped at the negotiated per-consumer credit, #292). Defaults to
+    /// [`DEFAULT_STREAM_FETCH_RECORDS`]. A `0` is treated as `1` so the consumer always makes progress.
+    pub max_records: u32,
+    /// The fetch window's byte budget: the `max_bytes` each `StreamFetch` pulls (`0` = unbounded by
+    /// bytes; the record count and the durable prefix still bind). This ALSO bounds the read-ahead
+    /// buffer — the prefetched window obeys the same byte budget — so the consumer's outstanding
+    /// memory is at most two windows of this size. Defaults to `0`.
+    pub max_bytes: u64,
+    /// The periodic-commit cadence: auto-commit the cumulative offset once every this-many fetched
+    /// windows (and always on drain / [`StreamingConsumer::finish`]). Defaults to
+    /// [`DEFAULT_STREAM_COMMIT_EVERY_BATCHES`]. A `0` is treated as `1` (commit after every window).
+    /// This is the at-least-once knob: a crash redelivers everything fetched since the last commit.
+    pub commit_every_batches: u32,
+    /// The offset to begin consuming at: normally the consumer's last committed offset (so a reconnect
+    /// resumes exactly where it left off and the uncommitted span redelivers). Defaults to `0` (the
+    /// log's start).
+    pub start_offset: u64,
+    /// Whether bounded READ-AHEAD is on (the default): when `true`, the handle pipelines the NEXT
+    /// window's `StreamFetch` the moment it reads the current batch, so the next response is already
+    /// arriving while the caller processes — hiding the fetch round-trip behind processing. At most ONE
+    /// window is ever in flight ahead (bounded by the same `max_records` / `max_bytes` budget), so the
+    /// prefetch buffer never grows without bound. Set `false` for the strict request-then-process loop
+    /// (the no-prefetch baseline), which delivers the SAME records in the SAME order.
+    pub read_ahead: bool,
+}
+
+impl Default for StreamConsumerConfig {
+    fn default() -> Self {
+        StreamConsumerConfig {
+            max_records: DEFAULT_STREAM_FETCH_RECORDS,
+            max_bytes: 0,
+            commit_every_batches: DEFAULT_STREAM_COMMIT_EVERY_BATCHES,
+            start_offset: 0,
+            read_ahead: true,
+        }
+    }
+}
+
+/// One batch handed back by [`StreamingConsumer::next_batch`]: the contiguous run of streaming
+/// messages (Tier-S, #550) plus any in-band advisories the fetch surfaced. The consumer processes
+/// `messages` and the handle commits the covered offset PERIODICALLY (not per record); the caller does
+/// NOT ack these individually (a streaming message carries no fencing lease — `generation` is `0`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StreamBatch {
+    /// The messages delivered in this window, in log order (empty when the stream is fully drained).
+    pub messages: Vec<Message>,
+    /// Dead-letter advisories surfaced during this window (usually empty).
+    pub dead_letters: Vec<DeadLetter>,
+    /// Truncation advisories surfaced during this window (usually empty).
+    pub truncations: Vec<Truncation>,
+    /// Gap markers surfaced during this window for a gap-marker-capable connection (usually empty).
+    pub gaps: Vec<Gap>,
+}
+
+impl StreamBatch {
+    /// Whether this batch delivered no messages: the signal the stream has drained to its durable head
+    /// (a `next_batch` that returns an empty batch has caught up; the caller typically pauses or polls
+    /// again). Advisories without messages also yield `true` here.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+}
+
+/// The ERGONOMIC batched-default streaming consumer (Tier-S, #550), opened by
+/// [`Client::streaming_consumer`] / [`Client::streaming_consumer_with`]. This is the recommended way
+/// to consume a streaming group, and it makes the BATCHED path the default: per [`StreamingConsumer::next_batch`] call it
+/// fetches a WINDOW (one [`Client::stream_fetch`], delivered as a `DeliverBatch` when negotiated),
+/// commits the cumulative offset PERIODICALLY ([`Client::stream_commit`]) rather than per record, and
+/// (by default) PREFETCHES the next window while the caller processes the current one.
+///
+/// # Why this is the default
+///
+/// The per-record fetch-and-ack loop pays one fetch round-trip and one cursor-writing ack PER RECORD —
+/// the dominant cost that makes a single durable consumer lose to NATS. Fetching a window amortizes
+/// the round-trip across the whole batch, periodic cumulative commit removes the per-record ack, and
+/// read-ahead hides the next fetch's latency behind the current batch's processing. The raw
+/// [`Client::stream_fetch`] / [`Client::stream_commit`] pair remains the explicit precise-control
+/// opt-out; this handle is the batched ergonomic default.
+///
+/// # Bounded read-ahead
+///
+/// When [`StreamConsumerConfig::read_ahead`] is on (the default), the handle pipelines the NEXT
+/// window's `StreamFetch` request the instant it has read the current batch off the wire, so the next
+/// response is already in flight (server-side work + the socket buffer) while the caller processes.
+/// At most ONE window is outstanding ahead of the caller, and it is bounded by the SAME `max_records` /
+/// `max_bytes` budget as the visible window — so the outstanding memory is at most two windows and the
+/// prefetch buffer never grows without bound. Because this consumer reads its OWN offset over its OWN
+/// connection (it is NOT a per-group server-side read-ahead buffer fanned out to many consumers), it
+/// never duplicates a payload across consumers — the hazard a per-group prefetch would have.
+///
+/// # At-least-once preserved
+///
+/// The handle commits only offsets it has HANDED to the caller and whose window the commit cadence has
+/// reached; a prefetched-but-not-yet-returned window is never committed. So a crash redelivers every
+/// fetched-but-uncommitted record (including anything read-ahead pulled) and loses nothing — the same
+/// consumer-managed at-least-once contract as the raw [`Client::stream_fetch`]. To tighten the
+/// redeliver window, lower [`StreamConsumerConfig::commit_every_batches`] or call
+/// [`StreamingConsumer::commit_now`] at a precise processed-up-to point.
+///
+/// # Errors and connection state
+///
+/// An IO error, a server error (e.g. the group is not streaming), or an unexpected frame leaves the
+/// connection state undefined: drop the underlying [`Client`], exactly like an errored
+/// [`Client::fetch_batch`]. A pending read-ahead request whose response is never drained is harmless
+/// to the dropped connection.
+#[derive(Debug)]
+pub struct StreamingConsumer<'a> {
+    client: &'a mut Client,
+    /// The streaming group this handle commits to (the `StreamCommit` group name).
+    group: String,
+    /// The window size, commit cadence, and read-ahead policy.
+    config: StreamConsumerConfig,
+    /// The next offset to fetch from: advanced by the count of records each window delivers. This is
+    /// the consumer's own cursor; it is what a reconnect would resume from.
+    next_offset: u64,
+    /// The highest offset the handle has COMMITTED up to (exclusive). Starts at `start_offset` (already
+    /// durable from a prior run). The retention floor for this group is pinned here, not at
+    /// `next_offset`.
+    committed: u64,
+    /// How many windows have been fetched since the last commit: when it reaches
+    /// `commit_every_batches`, the handle commits up to `next_offset` and resets this to `0`.
+    batches_since_commit: u32,
+    /// The BOUNDED read-ahead slot: `Some(limit)` when a next-window `StreamFetch` has been pipelined
+    /// and its response is not yet drained (the `limit` is the frame cap that read must honor); `None`
+    /// when no prefetch is outstanding. At most one is ever held, which is what bounds the read-ahead.
+    prefetch: Option<usize>,
+    /// A drained-but-not-yet-returned read-ahead window, held when [`StreamingConsumer::commit_now`] had
+    /// to clear the wire (a `StreamCommit` is a request/reply that cannot run with a prefetch response
+    /// unread on the FIFO). The next [`StreamingConsumer::next_batch`] returns this BEFORE issuing a new
+    /// fetch, so no record is lost and the at-most-one-window-ahead bound still holds (the stash IS that
+    /// one window, just already materialized). `None` in the common path, where the periodic commit runs
+    /// on an already-clean wire and never needs to drain a prefetch.
+    stashed: Option<Fetch>,
+}
+
+impl StreamingConsumer<'_> {
+    /// The effective per-window record cap (the configured `max_records`, floored at `1` so the
+    /// consumer always makes progress). The actual pull is additionally capped at the negotiated
+    /// per-consumer credit inside [`Client::stream_fetch`].
+    fn window_records(&self) -> u32 {
+        self.config.max_records.max(1)
+    }
+
+    /// The effective commit cadence (the configured `commit_every_batches`, floored at `1`).
+    fn commit_cadence(&self) -> u32 {
+        self.config.commit_every_batches.max(1)
+    }
+
+    /// Fetches the NEXT window of streaming records (Tier-S, #550) and advances the consumer's cursor,
+    /// committing the cumulative offset PERIODICALLY (per [`StreamConsumerConfig::commit_every_batches`])
+    /// and (by default) PREFETCHING the window after this one. Returns the batch's messages and any
+    /// advisories; an EMPTY batch ([`StreamBatch::is_empty`]) means the stream has drained to its
+    /// durable head.
+    ///
+    /// The caller processes the returned `messages` and then calls `next_batch` again; it does NOT ack
+    /// them individually (the handle commits cumulatively by offset). To force a commit at a precise
+    /// processed-up-to point, call [`StreamingConsumer::commit_now`] between batches.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, a server error (the group is not streaming, or Tier-S
+    /// was not negotiated), or a malformed/over-cap response. On error the connection state is
+    /// undefined; drop the [`Client`].
+    pub fn next_batch(&mut self) -> Result<StreamBatch, ClientError> {
+        let start = self.next_offset;
+        // Read this window, in priority order: (1) a window a precise `commit_now` already drained and
+        // stashed; (2) a pipelined read-ahead response outstanding on the wire; (3) a fresh synchronous
+        // fetch. All three yield the SAME contiguous run starting at `start` — the read-ahead only moves
+        // WHEN the request was written, never WHICH records come back.
+        let fetch = if let Some(stashed) = self.stashed.take() {
+            stashed
+        } else if let Some(limit) = self.prefetch.take() {
+            self.client.read_stream_fetch_response(limit)?
+        } else {
+            self.client
+                .stream_fetch(start, self.window_records(), self.config.max_bytes)?
+        };
+        let delivered = u64::try_from(fetch.messages.len()).unwrap_or(u64::MAX);
+        self.next_offset = self.next_offset.saturating_add(delivered);
+
+        // Periodic cumulative commit FIRST, before any read-ahead is in flight. A `StreamCommit` is a
+        // request/REPLY round-trip, and this is a single FIFO connection: committing while a pipelined
+        // prefetch response sat unread would make the commit's `read_frame` consume the prefetch's
+        // delivery instead of the commit's `Ok`. Doing the commit on a CLEAN wire (no prefetch
+        // outstanding — the slot was `take`n above) keeps the FIFO unambiguous. Count this window, and
+        // when the cadence is reached commit up to the consumer's cursor (exclusive) so retention
+        // advances and the at-least-once redeliver window is bounded to the windows fetched since. An
+        // empty window does not tick the cadence (no new ground) but still flushes any pending progress
+        // so a drained stream durably checkpoints.
+        if delivered > 0 {
+            self.batches_since_commit = self.batches_since_commit.saturating_add(1);
+            if self.batches_since_commit >= self.commit_cadence() {
+                self.commit_now()?;
+            }
+        } else {
+            self.commit_now()?;
+        }
+
+        // Bounded read-ahead: with the commit's round-trip settled, pipeline the NEXT window's request so
+        // its response arrives while the caller processes this batch. Only when a non-empty window came
+        // back (an empty window means the stream has drained: prefetching past the head would just
+        // block), and only ONE is ever outstanding (`self.prefetch` holds at most one slot), which bounds
+        // it. The prefetched window obeys the same `max_records` / `max_bytes` budget, so the outstanding
+        // memory is at most two windows and never an unbounded buffer.
+        if self.config.read_ahead && delivered > 0 {
+            let limit = self.client.send_stream_fetch(
+                self.next_offset,
+                self.window_records(),
+                self.config.max_bytes,
+            )?;
+            self.prefetch = Some(limit);
+        }
+
+        Ok(StreamBatch {
+            messages: fetch.messages,
+            dead_letters: fetch.dead_letters,
+            truncations: fetch.truncations,
+            gaps: fetch.gaps,
+        })
+    }
+
+    /// Commits the cumulative offset NOW, up to the consumer's current cursor (every record handed to
+    /// the caller so far): the precise-commit hook over the handle's periodic auto-commit. Idempotent —
+    /// a no-op when nothing new has been fetched since the last commit. Use it to checkpoint at an exact
+    /// processed boundary, or before pausing, so the at-least-once redeliver window is exactly the
+    /// records not yet processed.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the commit (the group is not streaming, or
+    /// the offset is outside the retained window), or a frame or connection error.
+    pub fn commit_now(&mut self) -> Result<(), ClientError> {
+        // A `StreamCommit` is a request/reply round-trip on this single FIFO connection, so it cannot
+        // run with a read-ahead response unread (the commit's `read_frame` would consume the prefetched
+        // delivery). DRAIN any outstanding prefetch into the stash first, clearing the wire WITHOUT
+        // losing the records: the next `next_batch` returns the stash. The prefetched window is NOT part
+        // of `[committed, next_offset)` (the caller has not been handed it), so committing up to
+        // `next_offset` after draining stays correct.
+        if let Some(limit) = self.prefetch.take() {
+            self.stashed = Some(self.client.read_stream_fetch_response(limit)?);
+        }
+        if self.next_offset <= self.committed {
+            return Ok(());
+        }
+        self.client.stream_commit(&self.group, self.next_offset)?;
+        self.committed = self.next_offset;
+        self.batches_since_commit = 0;
+        Ok(())
+    }
+
+    /// Drains any outstanding read-ahead response and COMMITS the consumer's cursor, returning the
+    /// final committed offset (exclusive). Call this before dropping the handle so a pending periodic
+    /// commit is flushed and a pipelined prefetch is not left half-read on the wire. After this the
+    /// connection is clean for the next request.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError`] on an IO error, a server error, or a malformed response while draining
+    /// the prefetch or committing.
+    pub fn finish(mut self) -> Result<u64, ClientError> {
+        // `commit_now` drains any outstanding read-ahead response into the stash (leaving the wire
+        // framed) and commits up to the consumer's cursor. The stashed window's records are NOT
+        // committed (the caller never processed them), so they redeliver on the next run — the
+        // at-least-once contract. Dropping the stash here is correct: it was fetched, never handed out,
+        // and `next_offset` never advanced past it.
+        self.commit_now()?;
+        Ok(self.committed)
+    }
+
+    /// The offset the handle will fetch from next (the consumer's cursor, exclusive of everything
+    /// already delivered). A reconnect would resume from the last COMMITTED offset, not this.
+    #[must_use]
+    pub fn next_offset(&self) -> u64 {
+        self.next_offset
+    }
+
+    /// The highest offset committed so far (exclusive): the durable checkpoint a crash would resume
+    /// from. Everything in `[committed_offset(), next_offset())` is the at-least-once window that
+    /// redelivers on a crash.
+    #[must_use]
+    pub fn committed_offset(&self) -> u64 {
+        self.committed
     }
 }
 
@@ -4483,6 +4958,347 @@ mod tests {
         assert_eq!(fetched.messages[0].offset, 7);
         assert_eq!(fetched.messages[0].payload, b"next-batch");
         drop(c);
+        handle.join().unwrap();
+    }
+
+    // --- Tier-S batched-default streaming consumer (#550) -------------------------------------
+
+    /// A `ClientConfig` that negotiates Tier-S: advertises streaming + `DeliverBatch` and requests the
+    /// streaming connection default, so a SUB auto-marks its group streaming server-side (the wiring
+    /// the batched-default consumer rides on).
+    fn streaming_config() -> ClientConfig {
+        ClientConfig {
+            understands_streaming: true,
+            default_consume_tier: Some(ConsumeTier::Streaming),
+            understands_deliver_batch: true,
+            ..ClientConfig::default()
+        }
+    }
+
+    /// Connects a Tier-S consumer subscribed to `group` against the given address, asserting the
+    /// streaming tier negotiated. The connection's streaming default makes the SUB mark the group
+    /// streaming, so the consumer's `stream_fetch` / `stream_commit` are accepted.
+    fn connect_streaming(addr: std::net::SocketAddr, group: &str) -> Client {
+        let mut c = Client::connect_with(addr, &streaming_config()).unwrap();
+        assert!(
+            c.streaming_enabled(),
+            "the server confirmed the streaming tier"
+        );
+        c.subscribe(group).unwrap();
+        c
+    }
+
+    /// Produces `n` single-byte records (offsets `0..n`) on a fresh producer connection, so a
+    /// streaming consumer has a durable prefix to read.
+    fn produce_n(addr: std::net::SocketAddr, n: u64) {
+        let mut p = Client::connect(addr).unwrap();
+        for i in 0..n {
+            p.produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: &[(i & 0xff) as u8],
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn streaming_consumer_default_fetches_in_batches_and_commits_periodically_not_per_record() {
+        // #550: the batched DEFAULT. A window of 4 over 10 records is 3 fetches (4 + 4 + 2), and a
+        // commit cadence of 2 commits after windows 2 and 3 — NOT once per record. We drive the
+        // consumer to drain, then a SECOND streaming consumer subscribed to the SAME group resumes
+        // from the committed offset and sees NOTHING (everything was committed), proving the periodic
+        // commit advanced the durable cursor cumulatively.
+        let (addr, shutdown, handle) = start_server();
+        produce_n(addr, 10);
+
+        let mut c = connect_streaming(addr, "s");
+        let cfg = StreamConsumerConfig {
+            max_records: 4,
+            max_bytes: 0,
+            commit_every_batches: 2,
+            start_offset: 0,
+            read_ahead: false,
+        };
+        let mut consumer = c.streaming_consumer_with("s", &cfg);
+
+        let b0 = consumer.next_batch().unwrap();
+        assert_eq!(
+            b0.messages.len(),
+            4,
+            "window one is a full batch, not one record"
+        );
+        assert_eq!(b0.messages[0].offset, 0);
+        assert_eq!(b0.messages[3].offset, 3);
+        // Cadence is 2: after ONE window nothing is committed yet (batched, not per-record).
+        assert_eq!(consumer.committed_offset(), 0, "no commit after one window");
+        assert_eq!(consumer.next_offset(), 4);
+
+        let b1 = consumer.next_batch().unwrap();
+        assert_eq!(b1.messages.len(), 4);
+        assert_eq!(b1.messages[0].offset, 4);
+        // The cadence (2) is reached: the cumulative commit covers offsets [0, 8).
+        assert_eq!(
+            consumer.committed_offset(),
+            8,
+            "periodic commit after two windows"
+        );
+
+        let b2 = consumer.next_batch().unwrap();
+        assert_eq!(b2.messages.len(), 2, "the short tail window");
+        assert_eq!(consumer.next_offset(), 10);
+
+        // Drained: an empty window flushes the final commit so the whole prefix is durable.
+        let b3 = consumer.next_batch().unwrap();
+        assert!(b3.is_empty(), "the stream has drained to its head");
+        assert_eq!(
+            consumer.committed_offset(),
+            10,
+            "the drain flushed the final commit"
+        );
+        drop(c);
+
+        // A fresh consumer resuming from the committed offset sees nothing: the periodic cumulative
+        // commit durably advanced the group cursor past every record (no per-record ack was needed).
+        let mut c2 = connect_streaming(addr, "s");
+        let committed = c2.streaming_consumer_with(
+            "s",
+            &StreamConsumerConfig {
+                start_offset: 10,
+                ..cfg.clone()
+            },
+        );
+        drop(committed);
+        // Re-fetch from the committed head directly: empty.
+        let resumed = c2.stream_fetch(10, 16, 0).unwrap();
+        assert!(
+            resumed.messages.is_empty(),
+            "everything below 10 was committed"
+        );
+
+        drop(c2);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn streaming_at_least_once_a_crash_mid_window_redelivers_only_the_uncommitted_span() {
+        // #550 / #544: at-least-once by construction. The consumer fetches [0,10) with a window of 4
+        // and a cadence of 2, so [0,8) is committed but [8,10) is NOT when it "crashes" (drops the
+        // connection). A reconnecting consumer resuming from the committed offset (8) re-reads exactly
+        // the uncommitted span [8,10) — none lost, only the uncommitted window redelivered.
+        let (addr, shutdown, handle) = start_server();
+        produce_n(addr, 10);
+
+        let mut c = connect_streaming(addr, "s");
+        let cfg = StreamConsumerConfig {
+            max_records: 4,
+            commit_every_batches: 2,
+            read_ahead: false,
+            ..StreamConsumerConfig::default()
+        };
+        let mut consumer = c.streaming_consumer_with("s", &cfg);
+
+        let mut seen = Vec::new();
+        // Two windows: [0,4) then [4,8). The cadence-2 commit fires after the second, committing [0,8).
+        for _ in 0..2 {
+            for m in consumer.next_batch().unwrap().messages {
+                seen.push(m.offset);
+            }
+        }
+        let committed = consumer.committed_offset();
+        assert_eq!(
+            committed, 8,
+            "the periodic commit durably checkpointed [0,8)"
+        );
+        // A third window fetches [8,10) and hands it to the caller, but the cadence has NOT been
+        // reached again, so it is NOT committed: this is the uncommitted, at-risk span.
+        for m in consumer.next_batch().unwrap().messages {
+            seen.push(m.offset);
+        }
+        assert_eq!(
+            seen,
+            (0..10).collect::<Vec<u64>>(),
+            "all 10 delivered pre-crash"
+        );
+        assert_eq!(
+            consumer.committed_offset(),
+            8,
+            "[8,10) is uncommitted at crash"
+        );
+        // CRASH: drop the consumer and the connection WITHOUT finishing/committing the last window.
+        drop(consumer);
+        drop(c);
+
+        // Reconnect and resume from the last committed offset: re-read the uncommitted span.
+        let mut c2 = connect_streaming(addr, "s");
+        let redelivered = c2.stream_fetch(committed, 16, 0).unwrap();
+        let redelivered_offsets: Vec<u64> = redelivered.messages.iter().map(|m| m.offset).collect();
+        assert_eq!(
+            redelivered_offsets,
+            vec![8, 9],
+            "exactly the uncommitted span [8,10) redelivers — none lost, none below the commit"
+        );
+
+        drop(c2);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn streaming_read_ahead_is_bounded_and_delivers_the_same_records_in_order_as_no_prefetch() {
+        // #550: the read-ahead is a DIFFERENTIAL no-op on the records — prefetch only moves WHEN the
+        // next request is written, never WHICH records come back. We drain the same 20-record prefix
+        // twice over independent connections, once with read_ahead ON and once OFF, and assert the two
+        // delivered sequences are byte-for-byte identical and in order. The bound is structural: at
+        // most ONE prefetch slot is ever held (`prefetch: Option<usize>`), so the read-ahead buffer
+        // cannot grow without bound regardless of how many windows are drained.
+        let (addr, shutdown, handle) = start_server();
+        produce_n(addr, 20);
+
+        let drain = |read_ahead: bool| -> Vec<(u64, Vec<u8>)> {
+            let mut c = connect_streaming(addr, "s");
+            let cfg = StreamConsumerConfig {
+                max_records: 3,
+                commit_every_batches: 4,
+                read_ahead,
+                ..StreamConsumerConfig::default()
+            };
+            let mut consumer = c.streaming_consumer_with("s", &cfg);
+            let mut out = Vec::new();
+            loop {
+                let batch = consumer.next_batch().unwrap();
+                if batch.is_empty() {
+                    break;
+                }
+                for m in batch.messages {
+                    out.push((m.offset, m.payload));
+                }
+            }
+            consumer.finish().unwrap();
+            out
+        };
+
+        let with_prefetch = drain(true);
+        let without_prefetch = drain(false);
+        assert_eq!(
+            with_prefetch, without_prefetch,
+            "read-ahead delivers the SAME records in the SAME order as the no-prefetch baseline"
+        );
+        assert_eq!(
+            with_prefetch.len(),
+            20,
+            "the whole prefix, exactly once each"
+        );
+        assert_eq!(
+            with_prefetch.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+            (0..20).collect::<Vec<u64>>(),
+            "offsets are contiguous and in order"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn streaming_read_ahead_respects_the_byte_budget_so_the_prefetch_window_stays_bounded() {
+        // #550: the prefetched window obeys the SAME byte budget as the visible one, so the
+        // outstanding memory is at most two bounded windows, never an unbounded buffer. With a tiny
+        // byte budget the server's floor-of-one delivers one record per window, and the consumer still
+        // drains the whole prefix in order with read-ahead on — the bound holds at the small end.
+        let (addr, shutdown, handle) = start_server();
+        produce_n(addr, 6);
+
+        let mut c = connect_streaming(addr, "s");
+        let cfg = StreamConsumerConfig {
+            max_records: 100,
+            // A byte budget below one record's encoded size: the floor-of-one still delivers a single
+            // record per window, so each window (visible AND prefetched) is bounded to one record.
+            max_bytes: 1,
+            commit_every_batches: 3,
+            read_ahead: true,
+            ..StreamConsumerConfig::default()
+        };
+        let mut consumer = c.streaming_consumer_with("s", &cfg);
+        let mut offsets = Vec::new();
+        let mut windows = 0u32;
+        loop {
+            let batch = consumer.next_batch().unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            // The byte budget binds each window (visible AND prefetched) to a small, bounded count
+            // despite the roomy 100-record cap: the prefetch buffer cannot balloon to the record cap.
+            assert!(
+                batch.messages.len() <= 2,
+                "the byte budget bounds each window to a small count (got {}), not the 100-record cap",
+                batch.messages.len()
+            );
+            windows += 1;
+            for m in batch.messages {
+                offsets.push(m.offset);
+            }
+        }
+        consumer.finish().unwrap();
+        assert_eq!(
+            offsets,
+            (0..6).collect::<Vec<u64>>(),
+            "all records, in order, across bounded windows"
+        );
+        assert!(
+            windows >= 3,
+            "the byte budget forced several small windows, not one big fetch"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn tier_w_lease_mode_is_unchanged_a_non_streaming_client_fetches_and_acks_per_record() {
+        // #550: back-compat. A default (non-streaming) client is served Tier-W exactly as before — it
+        // leases per record and acks by fencing generation — and the new streaming-default consumer
+        // changes nothing about it. The lease generation is real (non-zero is allowed) and the ack
+        // commits, the unchanged work-queue contract.
+        let (addr, shutdown, handle) = start_server();
+        produce_n(addr, 3);
+
+        // A plain client: no streaming advertised, so it is Tier-W.
+        let mut c = Client::connect(addr).unwrap();
+        assert!(
+            !c.streaming_enabled(),
+            "an unconfigured client stays Tier-W"
+        );
+        let fetched = c
+            .fetch_batch(3, 0, std::time::Duration::from_secs(1), false)
+            .unwrap();
+        assert_eq!(fetched.messages.len(), 3, "Tier-W batch pull is unchanged");
+        // Each record is leased and acked individually by its fencing generation (the Tier-W contract).
+        let acks: Vec<(u64, u64)> = fetched
+            .messages
+            .iter()
+            .map(|m| (m.offset, m.generation))
+            .collect();
+        let statuses = c.ack_many(&acks).unwrap();
+        assert!(
+            statuses.iter().all(|&ok| ok),
+            "every per-record Tier-W ack commits"
+        );
+        // Nothing left after the per-record acks: the cursor advanced exactly as before.
+        assert!(
+            c.fetch_batch(3, 0, std::time::Duration::from_secs(1), false)
+                .unwrap()
+                .messages
+                .is_empty(),
+            "the Tier-W cursor advanced on the per-record acks, unchanged by #550"
+        );
+
+        drop(c);
+        shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
 }

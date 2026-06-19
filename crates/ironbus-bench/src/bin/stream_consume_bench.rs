@@ -1,0 +1,218 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Single-consumer streaming-consume throughput: the BATCHED + read-ahead default vs the
+//! per-message-fetch + per-message-commit path (#550, V2-M1).
+//!
+//! The first-principles claim behind [M1-I10] is that one fetch round-trip plus one cursor write per
+//! RECORD is the dominant per-message cost of durable consume, and that amortizing the fetch and the
+//! commit across a BATCH (plus hiding the next fetch's round-trip behind processing via bounded
+//! read-ahead) is the ergonomic win that lets a single durable consumer keep up. This bench MEASURES
+//! that delta over the SAME data on the SAME in-process broker the binary ships:
+//!
+//!   - BASELINE: the per-record streaming path — `stream_fetch(off, 1, ..)` for one record, then
+//!     `stream_commit(off+1)` per record (one round-trip + one commit each). This is the self-handicap
+//!     the issue calls out.
+//!   - DEFAULT: the batched `StreamingConsumer` — fetch a window, periodic cumulative commit, bounded
+//!     read-ahead ON (the #550 ergonomic default).
+//!
+//! Both drain the identical durable prefix through the REAL client over a real loopback socket; the
+//! reported delta is the throughput multiple. This is the consume-side setup for the #554 NATS
+//! comparison; it is NOT that comparison, and it is OFF the per-PR CI path (run on demand):
+//!   cargo run -p ironbus-bench --bin stream-consume-bench --release -- --records 50000 --window 256
+
+// The in-process broker (`ironbus_bench::inproc`) is Unix-only, matching the shipped broker, so the
+// whole bench body is `cfg(unix)`. On a non-Unix target the binary compiles to a no-op `main` that
+// explains the platform requirement, so the crate still builds everywhere.
+
+#[cfg(unix)]
+use ironbus_bench::inproc::InProcBroker;
+#[cfg(unix)]
+use ironbus_client::{Client, ClientConfig, StreamConsumerConfig};
+#[cfg(unix)]
+use ironbus_proto::message::{ConsumeTier, PubBody};
+use std::process::ExitCode;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+/// The streaming `ClientConfig`: advertises Tier-S + `DeliverBatch` and a streaming connection default,
+/// so a SUB marks its group streaming server-side (the wiring the batched default rides on).
+fn streaming_config() -> ClientConfig {
+    ClientConfig {
+        understands_streaming: true,
+        default_consume_tier: Some(ConsumeTier::Streaming),
+        understands_deliver_batch: true,
+        ..ClientConfig::default()
+    }
+}
+
+#[cfg(unix)]
+/// Produces `records` payloads of `payload_bytes` each onto the default group, so both consume paths
+/// read the SAME durable prefix.
+fn seed(addr: &str, records: u64, payload_bytes: usize) -> Result<(), String> {
+    let mut p = Client::connect(addr).map_err(|e| format!("producer connect: {e}"))?;
+    let payload = vec![0xABu8; payload_bytes];
+    // A pipelined producer so seeding a large prefix is not floored at one fsync per publish.
+    let mut producer = p.pipelined_producer();
+    for _ in 0..records {
+        producer
+            .produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: &payload,
+            })
+            .map_err(|e| format!("seed produce: {e}"))?;
+    }
+    producer.finish().map_err(|e| format!("seed flush: {e}"))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+/// Drains `records` via the PER-RECORD streaming path: one `stream_fetch` of a single record, then one
+/// `stream_commit` per record. Returns the wall-clock elapsed. This is the self-handicapped baseline.
+fn drain_per_record(addr: &str, records: u64) -> Result<Duration, String> {
+    let mut c = Client::connect_with(addr, &streaming_config())
+        .map_err(|e| format!("per-record consumer connect: {e}"))?;
+    c.subscribe("s")
+        .map_err(|e| format!("per-record sub: {e}"))?;
+    let start = Instant::now();
+    let mut offset = 0u64;
+    let mut drained = 0u64;
+    while drained < records {
+        let batch = c
+            .stream_fetch(offset, 1, 0)
+            .map_err(|e| format!("per-record fetch: {e}"))?;
+        if batch.messages.is_empty() {
+            break;
+        }
+        for m in &batch.messages {
+            // The work the caller would do per message is out of scope; we measure the fetch+commit
+            // overhead the two paths differ in, so the per-record path commits after EACH record.
+            offset = m.offset + 1;
+            c.stream_commit("s", offset)
+                .map_err(|e| format!("per-record commit: {e}"))?;
+            drained += 1;
+        }
+    }
+    Ok(start.elapsed())
+}
+
+#[cfg(unix)]
+/// Drains `records` via the BATCHED + read-ahead `StreamingConsumer` default (#550): fetch a window,
+/// periodic cumulative commit, bounded read-ahead ON. Returns the wall-clock elapsed.
+fn drain_batched(
+    addr: &str,
+    records: u64,
+    window: u32,
+    commit_every: u32,
+) -> Result<Duration, String> {
+    let mut c = Client::connect_with(addr, &streaming_config())
+        .map_err(|e| format!("batched consumer connect: {e}"))?;
+    c.subscribe("s").map_err(|e| format!("batched sub: {e}"))?;
+    let cfg = StreamConsumerConfig {
+        max_records: window,
+        max_bytes: 0,
+        commit_every_batches: commit_every,
+        start_offset: 0,
+        read_ahead: true,
+    };
+    let start = Instant::now();
+    let mut consumer = c.streaming_consumer_with("s", &cfg);
+    let mut drained = 0u64;
+    loop {
+        let batch = consumer
+            .next_batch()
+            .map_err(|e| format!("batched next_batch: {e}"))?;
+        if batch.is_empty() {
+            break;
+        }
+        drained += batch.messages.len() as u64;
+        if drained >= records {
+            break;
+        }
+    }
+    consumer
+        .finish()
+        .map_err(|e| format!("batched finish: {e}"))?;
+    Ok(start.elapsed())
+}
+
+#[cfg(unix)]
+#[allow(clippy::cast_precision_loss)]
+fn throughput(records: u64, elapsed: Duration) -> f64 {
+    records as f64 / elapsed.as_secs_f64()
+}
+
+#[cfg(unix)]
+fn run() -> Result<(), String> {
+    // Minimal arg parsing (no clap in this crate): --records N --window N --commit-every N --payload N.
+    let mut records: u64 = 20_000;
+    let mut window: u32 = 256;
+    let mut commit_every: u32 = 8;
+    let mut payload: usize = 64;
+    let mut args = std::env::args().skip(1);
+    while let Some(flag) = args.next() {
+        let mut val = || {
+            args.next()
+                .ok_or_else(|| format!("flag {flag} needs a value"))
+        };
+        match flag.as_str() {
+            "--records" => records = val()?.parse().map_err(|e| format!("--records: {e}"))?,
+            "--window" => window = val()?.parse().map_err(|e| format!("--window: {e}"))?,
+            "--commit-every" => {
+                commit_every = val()?.parse().map_err(|e| format!("--commit-every: {e}"))?;
+            }
+            "--payload" => payload = val()?.parse().map_err(|e| format!("--payload: {e}"))?,
+            other => return Err(format!("unknown flag {other}")),
+        }
+    }
+
+    let broker = InProcBroker::start()?;
+    let addr = broker.addr().to_string();
+    seed(&addr, records, payload)?;
+
+    // Per-record baseline first (the self-handicap), then the batched default. Each drains the SAME
+    // prefix from offset 0 over its OWN connection / streaming cursor, so the two are apples-to-apples.
+    let per_record = drain_per_record(&addr, records)?;
+    let batched = drain_batched(&addr, records, window, commit_every)?;
+
+    let pr_tput = throughput(records, per_record);
+    let b_tput = throughput(records, batched);
+    let speedup = b_tput / pr_tput;
+
+    println!("stream-consume-bench (#550): single-consumer streaming throughput, same data");
+    println!("  records={records} payload={payload}B window={window} commit_every={commit_every}");
+    println!(
+        "  per-message  (fetch 1 + commit each): {pr_tput:>12.0} msg/s  ({:.3}s)",
+        per_record.as_secs_f64()
+    );
+    println!(
+        "  batched + read-ahead default        : {b_tput:>12.0} msg/s  ({:.3}s)",
+        batched.as_secs_f64()
+    );
+    println!("  speedup (batched / per-message)     : {speedup:>12.2}x");
+    Ok(())
+}
+
+#[cfg(unix)]
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("stream-consume-bench error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn main() -> ExitCode {
+    eprintln!(
+        "stream-consume-bench requires a Unix target (the in-process broker is Unix-only, matching \
+         the shipped broker)."
+    );
+    ExitCode::FAILURE
+}
