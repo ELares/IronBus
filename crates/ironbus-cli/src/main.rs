@@ -2881,8 +2881,8 @@ fn validate_ram_ceiling(config: &ServeConfig) -> Result<(), CliError> {
         max_groups: u64::try_from(config.max_groups).unwrap_or(u64::MAX),
         max_in_flight: u64::from(config.max_in_flight),
         // The #445 store fold: in memory mode the store is RAM and is charged at its byte cap
-        // (times the durable-image clone, applied inside the model); on disk it is file-backed
-        // and stays uncharged, keeping the historical disk verdict bit-for-bit.
+        // (a single live image after #492; the model applies the multiplier); on disk it is
+        // file-backed and stays uncharged, keeping the historical disk verdict bit-for-bit.
         in_memory_store_bytes: match config.storage {
             StorageArg::Memory => config.max_total_bytes,
             StorageArg::Disk => 0,
@@ -2902,8 +2902,8 @@ fn validate_ram_ceiling(config: &ServeConfig) -> Result<(), CliError> {
             let store_note = match config.storage {
                 StorageArg::Memory => format!(
                     " Under `--storage memory` the footprint INCLUDES the in-RAM store: \
-                     `--max-total-bytes` ({max_total_bytes}) is charged TWICE (the live bytes plus \
-                     the durable-image clone the in-memory filesystem keeps at each sync), so the \
+                     `--max-total-bytes` ({max_total_bytes}) is charged ONCE (a single live byte \
+                     image; the production EphemeralFile backend keeps no durable clone), so the \
                      store alone accounts for {store_bytes} bytes of the worst case. Lower \
                      `--max-total-bytes` or raise the ceiling to cover the store. Note: the \
                      dead-letter sink is OUTSIDE this floor (it is deliberately uncapped, poison \
@@ -8994,8 +8994,8 @@ mod tests {
         // (~15 MiB worst case, comfortably under the 64 MiB ceiling), `--max-total-bytes 1GiB`
         // in memory mode BOOTED before this fold (the #115 guard modeled connections, credits,
         // groups, and in-flight only, never the store), which in memory mode is a silent OOM
-        // promise: the store itself is RAM. With the store folded in (charged at 2x for the
-        // in-memory durable-image clone) the same config is now a provable refusal that NAMES
+        // promise: the store itself is RAM. With the store folded in (charged at 1x for the
+        // single live image, post-#492) the same config is now a provable refusal that NAMES
         // the store term and the knob to lower. This test FAILS if the fold is removed. The
         // small buffer caps are what make that kill possible: under the balanced defaults the
         // ceiling is exceeded by the connection terms alone and a fold-less mutant still refuses.
@@ -9018,8 +9018,8 @@ mod tests {
                     "the refusal names the store knob to lower: {m}"
                 );
                 assert!(
-                    m.contains("durable-image clone"),
-                    "the refusal states the 2x clone headroom: {m}"
+                    m.contains("charged ONCE") && m.contains("no durable clone"),
+                    "the refusal states the 1x single-image charge: {m}"
                 );
                 assert_eq!(CliError::Usage(m).exit_code(), EXIT_USAGE);
             }
@@ -9040,41 +9040,36 @@ mod tests {
     }
 
     #[test]
-    fn the_store_fold_charges_two_images_a_one_image_mutant_boots_here() {
+    fn the_store_fold_charges_one_image_a_two_image_mutant_over_refuses_here() {
         // PINS THE MULTIPLIER at the validate level, where the model test alone cannot: the
         // edge-tiny buffer terms sum to ~15 MiB, so with a 32 MiB store cap the worst case is
-        // ~47 MiB charged at ONE image (fits the 64 MiB ceiling, boots) and ~79 MiB charged at
-        // TWO (refuses). The ceiling sits BETWEEN the one-image and two-image floors, so a
-        // mutant that forgets the durable-image clone and charges the cap once BOOTS this exact
-        // config and fails here. Companion to the rss model test, which pins the literal 2 in
-        // the formula; this one proves the 2 reaches the real boot verdict with no slack.
+        // ~47 MiB charged at ONE image (fits the 64 MiB ceiling, BOOTS — the correct post-#492
+        // verdict for the single-image EphemeralFile backend) and ~79 MiB charged at TWO
+        // (refuses). The ceiling sits BETWEEN the one-image and two-image floors, so a STALE 2x
+        // mutant (the pre-#492 InMemoryFile live+durable charge) OVER-refuses this exact valid
+        // config and fails here. Companion to the rss model test, which pins the literal 1 in the
+        // formula; this one proves the 1 reaches the real boot verdict with no slack. (The 1 GiB
+        // test above pins the OTHER direction: a fold-removal mutant that charges 0x boots a
+        // config that must refuse, so together they fix the multiplier at exactly 1.)
         let cfg = ServeConfig {
             storage: StorageArg::Memory,
             ephemeral_loss_ack: true,
             max_total_bytes: 32 * 1024 * 1024,
             ..edge_tiny_caps()
         };
-        match validate_serve_config(&cfg) {
-            Err(CliError::Usage(m)) => {
-                assert!(m.contains("refuses to boot"), "{m}");
-                assert!(
-                    m.contains("--max-total-bytes"),
-                    "the refusal names the store knob: {m}"
-                );
-            }
-            other => panic!(
-                "32 MiB of store cap is 64 MiB of store images; with ~15 MiB of buffers that \
-                 provably exceeds the 64 MiB ceiling, got {other:?}"
-            ),
-        }
+        assert!(
+            validate_serve_config(&cfg).is_ok(),
+            "32 MiB of store cap is 32 MiB of store image (post-#492 single image); with ~15 MiB \
+             of buffers that fits the 64 MiB ceiling and must boot — a stale 2x mutant over-refuses"
+        );
     }
 
     #[test]
     fn memory_storage_boots_when_the_ceiling_covers_the_store_and_buffers() {
         // The fold's accepting direction: a memory-mode config whose ceiling covers the buffer
-        // terms PLUS both store images (2 * max-total-bytes) validates and boots. 8 MiB of cap
-        // means 16 MiB of store images; with the ~15 MiB edge-tiny buffer worst case that sums
-        // well under the 64 MiB ceiling.
+        // terms PLUS the store image (1 * max-total-bytes, post-#492) validates and boots. 8 MiB
+        // of cap means 8 MiB of store image; with the ~15 MiB edge-tiny buffer worst case that
+        // sums well under the 64 MiB ceiling.
         let cfg = ServeConfig {
             storage: StorageArg::Memory,
             ephemeral_loss_ack: true,
