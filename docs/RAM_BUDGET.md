@@ -412,18 +412,28 @@ THE MEMORY-BACKEND STORE FOLD (#445, refs #443): on DISK the store is term 4 of
 the budget above, ~0 in RSS (written straight to file), so the guard does not
 charge it and the disk verdict is the historical one bit-for-bit. Under
 `--storage memory` the store ITSELF is RAM: the engine retains up to
-`--max-total-bytes` of stored bytes, and the in-memory filesystem keeps a SECOND
-byte image per file (the durable image each `sync_data` clones the live bytes
-into, the power-loss-simulation contract), so the guard charges
-`2 * max_total_bytes` and refuses a ceiling below the modeled floor. Memory mode
-already refuses an unlimited (`0`) byte cap at boot, so the store term is always
-finite there. Two honesty caveats on `term4mem`:
+`--max-total-bytes` of stored bytes. Production `--storage memory` now runs the
+single-`Vec` `EphemeralFile`/`EphemeralFs` backend (#492): ONE byte image per file,
+no `live`+`durable` copy, and an O(1) no-op `sync_*`, so the true production
+retained set is **~1x** `max_total_bytes`. The 2x `live`+`durable` byte image now
+exists ONLY in the `InMemoryFile` crash-recovery SIMULATION (the deterministic
+power-loss models), which production never runs. The boot guard nonetheless still
+charges `2 * max_total_bytes` (`IN_MEMORY_STORE_IMAGES = 2`) — a deliberately
+CONSERVATIVE over-charge it has not been retuned down to the ephemeral 1x — and
+refuses a ceiling below that floor, so a config the guard accepts has roughly double
+the store headroom it provably needs. Memory mode already refuses an unlimited (`0`)
+byte cap at boot, so the store term is always finite there. The live framed resident
+bytes are also available programmatically via `Log::resident_bytes_estimate()`
+(#493). Two honesty caveats on `term4mem`:
 
-- **The 2x is the steady-state RETAINED set, not an instantaneous bound.** The
-  durable image is refreshed by `clone_from` inside `sync_data`; when that clone
-  has to reallocate, the old durable allocation and the incoming bytes can
-  briefly coexist, so an instant mid-sync can exceed two images. Amortized and
-  at steady state, exactly two images are retained per file.
+- **The 2x charge is the boot guard's conservative bound, not the production
+  retained set.** Production runs the 1x `EphemeralFs` backend (#492), so the guard's
+  `2 * max_total_bytes` now over-charges by one image. The 2x retained set survives
+  only in the `InMemoryFile` simulation, where the durable image is refreshed by
+  `clone_from` inside `sync_data` and the simulated set is exactly two images per
+  file at steady state (a `clone_from` realloc can briefly exceed it mid-sync). The
+  guard tracks that simulation constant rather than the ephemeral 1x, on the safe
+  side of the ceiling.
 - **The dead-letter sink (the DLQ) is DELIBERATELY excluded.** The DLQ's log is
   byte-UNCAPPED by design (a poison record is the durable evidence of a dropped
   message and must never itself be shed), and in memory mode it lives on the
