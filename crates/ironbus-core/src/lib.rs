@@ -26,6 +26,7 @@ pub mod delivery;
 pub mod dict;
 pub mod format;
 pub mod keyshared;
+pub mod leader_lease;
 pub mod lease;
 pub mod segment;
 pub mod subject;
