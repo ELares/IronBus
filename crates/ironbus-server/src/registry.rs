@@ -7,9 +7,10 @@
 //! either, the registry has a HARD memory ceiling (a fixed sub-100 core-series cost plus 1024
 //! consumer series times a fixed per-series cost, plus the bounded overflow fold-ledger), and
 //! per-consumer lag is cheap to update (the append path that runs on every produce is
-//! O(1): it bumps one shared head counter; the commit path is a bounded scan of at most
-//! [`MAX_CONSUMER_SERIES`] in-memory slots) and O(number of series) to scrape, all independent of
-//! the record count or disk size. Crucially NOTHING here ever walks the durable log or the disk.
+//! O(1): it bumps one shared head counter; the commit path for an existing consumer is O(1) via a
+//! label->slot side-index, falling back to a bounded over-cap fold) and O(number of series) to
+//! scrape, all independent of the record count or disk size. Crucially NOTHING here ever walks the
+//! durable log or the disk.
 //!
 //! NOTE the Prometheus TEXT EXPOSITION the `/metrics` endpoint returns is built by
 //! [`crate::health`] into a `String` and so DOES allocate that body (an inherent, already-bounded
@@ -37,6 +38,8 @@
 //! It is IO-free and clock-seam-clean, so it could live in `ironbus-core`; it lives in
 //! `ironbus-server` next to the engine and the `/metrics` rendering it feeds, alongside the
 //! existing [`crate::metrics`] histogram.
+
+use std::collections::HashMap;
 
 /// The frozen registry-histogram bucket upper bounds, in NANOSECONDS, ascending, matching the
 /// fixed second-valued set the issue pins: `{0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05,
@@ -281,6 +284,20 @@ pub struct ConsumerLagRegistry {
     series: Box<[ConsumerSeries]>,
     /// The number of occupied slots in `series`.
     len: usize,
+    /// A side-index from a consumer's stored (possibly truncated) label key to its slot in `series`,
+    /// so `set_committed` resolves an existing consumer's slot in O(1) instead of a linear
+    /// label-compare over up to [`MAX_CONSUMER_SERIES`] slots on EVERY actor-path ack (#486). The key
+    /// is the SAME truncated key the slot stores (see [`stored_key`]), so a lookup and the slot's
+    /// inline label always agree. It holds one entry per occupied distinct series, never more than
+    /// [`MAX_CONSUMER_SERIES`], and is preallocated at that cap in [`ConsumerLagRegistry::default`] so
+    /// a slot claim never resizes it on the commit path. It is kept consistent with the slot array at
+    /// the single place a slot is claimed: an insert maps the new key to its slot. (There is no slot
+    /// eviction or recycle today — `len`/`used` only ever advance — but if a slot is ever recycled to
+    /// a new label, this map MUST be updated in the same place, or a stale key would resolve to the
+    /// wrong slot.) It is NOT part of the fixed `size_of` memory ceiling the way the boxed arrays are,
+    /// but its heap is bounded by the same [`MAX_CONSUMER_SERIES`] cap (a fixed-cardinality index), so
+    /// it cannot grow without bound.
+    slot_index: HashMap<Box<[u8]>, usize>,
     /// The BOUNDED overflow fold-ledger: up to [`MAX_OVERFLOW_LEDGER`] inline entries, one per
     /// DISTINCT over-cap consumer, each storing that consumer's last committed floor so a re-commit
     /// updates its contribution in place (subtract old, add new) instead of accumulating. Allocated
@@ -315,6 +332,10 @@ impl Default for ConsumerLagRegistry {
             // construction (off the hot path). `vec!` fills exactly MAX_CONSUMER_SERIES Copy slots.
             series: vec![ConsumerSeries::EMPTY; MAX_CONSUMER_SERIES].into_boxed_slice(),
             len: 0,
+            // The label->slot side-index (#486), preallocated at the same cap as `series` ONCE at
+            // construction (off the hot path) so a slot claim on the commit path never resizes it. It
+            // holds at most one entry per distinct series, so its heap stays bounded by the cap.
+            slot_index: HashMap::with_capacity(MAX_CONSUMER_SERIES),
             // The bounded overflow fold-ledger, allocated ONCE at construction the same way, so the
             // fold is idempotent over a fixed-capacity structure (no unbounded per-consumer map).
             overflow_ledger: vec![ConsumerSeries::EMPTY; MAX_OVERFLOW_LEDGER].into_boxed_slice(),
@@ -335,25 +356,36 @@ impl ConsumerLagRegistry {
         self.head = self.head.saturating_add(count);
     }
 
-    /// Sets consumer `name`'s committed record floor to `committed` (the commit path). Allocation-free,
-    /// and a bounded in-memory scan of at most [`MAX_CONSUMER_SERIES`] slots (never the log): it finds
-    /// the consumer's slot (or claims a free one for a new consumer, or folds into the overflow series
-    /// at the cap, incrementing the dropped-labels counter). The stored floor is monotonic
+    /// Sets consumer `name`'s committed record floor to `committed` (the commit path). For an existing
+    /// consumer this is O(1): the label->slot side-index resolves its slot directly (#486), instead of
+    /// the old linear label-compare over up to [`MAX_CONSUMER_SERIES`] slots on every actor-path ack.
+    /// A brand-new consumer claims a free slot and records its key->slot mapping, or (at the cap) folds
+    /// into the overflow series, incrementing the dropped-labels counter. Never walks the log. The
+    /// existing-consumer re-commit path is allocation-free (a borrowed-key lookup); the once-per-new-
+    /// consumer claim records the mapping off the steady-state path. The stored floor is monotonic
     /// non-decreasing (a commit never moves a cursor backwards), so a stale lower value is ignored.
     pub fn set_committed(&mut self, name: &[u8], committed: u64) {
-        // An existing series: advance its floor (monotonic). The linear scan is over the bounded
-        // series array (at most MAX_CONSUMER_SERIES), never the log.
-        for slot in self.series.iter_mut().take(self.len) {
-            if slot.used && slot.label_matches(name) {
+        // An existing series: advance its floor (monotonic). Resolved in O(1) via the label->slot
+        // side-index (#486) instead of a linear label-compare over up to MAX_CONSUMER_SERIES slots on
+        // every actor-path ack; the index key is the SAME truncated `stored_key` the slot holds, so a
+        // hit always points at the matching occupied slot. Never the log. This lookup borrows the key
+        // (no `Box`/`Vec` is built), so the steady-state re-commit path stays allocation-free.
+        let key = stored_key(name);
+        if let Some(&idx) = self.slot_index.get(key) {
+            if let Some(slot) = self.series.get_mut(idx) {
                 slot.committed = slot.committed.max(committed);
                 return;
             }
         }
-        // A new consumer with a free slot: claim it.
+        // A new consumer with a free slot: claim it and record its key->slot mapping so the next
+        // commit resolves it in O(1). The insert (which may allocate the boxed key) happens ONCE per
+        // distinct consumer, off the steady-state ack path; the map is preallocated at the cap, so the
+        // insert never resizes it.
         if self.len < MAX_CONSUMER_SERIES {
             if let Some(slot) = self.series.get_mut(self.len) {
                 store_label(slot, name);
                 slot.committed = committed;
+                self.slot_index.insert(Box::from(key), self.len);
                 self.len += 1;
                 return;
             }
