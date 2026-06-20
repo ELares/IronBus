@@ -307,6 +307,18 @@ pub enum FrameType {
     /// are unchanged. Body: a [`crate::message::SubSubjectBody`] (`body_version: u8`, `field_len: u16`
     /// over `subject` then `group`, each u16-length-prefixed).
     SubSubject,
+    /// Cluster follower → leader durably-replicated-offset REPORT (#593, V2-C2-I2): a follower tells
+    /// the leader "I have `fdatasync`'d every record up to (but not including) `fsynced_offset`". This
+    /// is the load-bearing distinction of the IronBus durability win: the follower reports its
+    /// FSYNC'd (durably-replicated) offset, NOT merely what it has received, so the leader can compute
+    /// a QUORUM-FSYNC commit offset and release a `C2-fsync` `PubAck` only once `min_isr` replicas
+    /// have `fdatasync`'d the record (an R-ack = fsync'd-on-a-quorum BY CONSTRUCTION). It rides the
+    /// SAME `[len][type][body]` envelope and is an ADDITIVE, peer-only tag a client never sends; it
+    /// piggybacks on (or stands alone from) the [`FrameType::FetchRecords`] pull. Body: a fixed
+    /// little-endian header (see [`crate::cluster::isr`] in `ironbus-server`, the only
+    /// encoder/decoder of this body) — `follower_id: u64`, `fsynced_offset: u64`. Tags 1-36 are
+    /// byte-for-byte unchanged.
+    AckReplicated,
 }
 
 impl FrameType {
@@ -350,6 +362,7 @@ impl FrameType {
             FrameType::BindSubject => 34,
             FrameType::PubSubject => 35,
             FrameType::SubSubject => 36,
+            FrameType::AckReplicated => 37,
         }
     }
 
@@ -394,6 +407,7 @@ impl FrameType {
             34 => FrameType::BindSubject,
             35 => FrameType::PubSubject,
             36 => FrameType::SubSubject,
+            37 => FrameType::AckReplicated,
             _ => return None,
         })
     }
@@ -526,7 +540,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 36] = [
+    const ALL_TYPES: [FrameType; 37] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -563,6 +577,7 @@ mod tests {
         FrameType::BindSubject,
         FrameType::PubSubject,
         FrameType::SubSubject,
+        FrameType::AckReplicated,
     ];
 
     #[test]
@@ -630,8 +645,10 @@ mod tests {
         assert_eq!(FrameType::from_u8(34), Some(FrameType::BindSubject));
         assert_eq!(FrameType::from_u8(35), Some(FrameType::PubSubject));
         assert_eq!(FrameType::from_u8(36), Some(FrameType::SubSubject));
-        // 37 is the new next-free tag (still unknown), so it frames but is not a known type.
-        assert_eq!(FrameType::from_u8(37), None);
+        // 37 is the cluster AckReplicated report (#593, V2-C2-I2), the next free tag after the subject
+        // verbs; 38 is now the next-free (still unknown) tag, so it frames but is not a known type.
+        assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
+        assert_eq!(FrameType::from_u8(38), None);
         for ty in [
             FrameType::BindSubject,
             FrameType::PubSubject,
@@ -671,7 +688,9 @@ mod tests {
         assert_eq!(FrameType::from_u8(32), Some(FrameType::FetchRecords));
         assert_eq!(FrameType::from_u8(33), Some(FrameType::FetchResponse));
         assert_eq!(FrameType::from_u8(34), Some(FrameType::BindSubject));
-        assert_eq!(FrameType::from_u8(37), None);
+        // 37 is the cluster AckReplicated report (#593); 38 is the next-free (still unknown) tag.
+        assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
+        assert_eq!(FrameType::from_u8(38), None);
         for ty in [
             FrameType::StreamDeclare,
             FrameType::StreamInfo,
@@ -745,10 +764,12 @@ mod tests {
         // The Tier-W verbs are untouched.
         assert_eq!(FrameType::Flow.as_u8(), 10);
         assert_eq!(FrameType::Fetch.as_u8(), 23);
-        // 37 is the next-free tag (still unknown), so it frames but is not a known type. (Tags 27 =
-        // cluster-peer Raft #667; 28-31 = the stream-addressed verbs #588; 32-33 = the cluster
-        // replication-fetch verbs #590; 34-36 = the subject-routing verbs #585.)
-        assert_eq!(FrameType::from_u8(37), None);
+        // 37 is the cluster AckReplicated report (#593, V2-C2-I2); 38 is now the next-free (still
+        // unknown) tag, so it frames but is not a known type. (Tags 27 = cluster-peer Raft #667;
+        // 28-31 = the stream-addressed verbs #588; 32-33 = the cluster replication-fetch verbs #590;
+        // 34-36 = the subject-routing verbs #585.)
+        assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
+        assert_eq!(FrameType::from_u8(38), None);
         for ty in [FrameType::StreamFetch, FrameType::StreamCommit] {
             let mut buf = Vec::new();
             encode_frame(ty, b"\x07\x08", &mut buf).unwrap();
@@ -772,10 +793,12 @@ mod tests {
         assert_eq!(FrameType::from_u8(26), Some(FrameType::DeliverBatch));
         // The per-record Deliver tag is untouched.
         assert_eq!(FrameType::Deliver.as_u8(), 13);
-        // 37 is the next-free tag (still unknown), so it frames but is not a known type. (Tags 27 =
-        // cluster-peer Raft #667; 28-31 = the stream-addressed verbs #588; 32-33 = the cluster
-        // replication-fetch verbs #590; 34-36 = the subject-routing verbs #585.)
-        assert_eq!(FrameType::from_u8(37), None);
+        // 37 is the cluster AckReplicated report (#593, V2-C2-I2); 38 is now the next-free (still
+        // unknown) tag, so it frames but is not a known type. (Tags 27 = cluster-peer Raft #667;
+        // 28-31 = the stream-addressed verbs #588; 32-33 = the cluster replication-fetch verbs #590;
+        // 34-36 = the subject-routing verbs #585.)
+        assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
+        assert_eq!(FrameType::from_u8(38), None);
         let mut buf = Vec::new();
         encode_frame(FrameType::DeliverBatch, b"\x09\x0a", &mut buf).unwrap();
         match decode_frame(&buf).unwrap() {
@@ -970,7 +993,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 37u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 38u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);
