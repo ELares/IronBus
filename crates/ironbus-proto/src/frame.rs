@@ -193,6 +193,16 @@ pub enum FrameType {
     /// u64 LE`, `generation: u64 LE`, `record_count: u32 LE`), then the contiguous on-disk record-frame
     /// bytes as the remainder.
     DeliverBatch,
+    /// CLUSTER PEER raft message (V2-C1 peer transport, #667): carries one serialized
+    /// `raft::eraftpb::Message` between metadata-Raft cluster nodes over the SEPARATE peer link
+    /// (never the client port). Body: the protobuf-2 wire encoding of the `eraftpb::Message`,
+    /// length-prefixed by this envelope. The body is UNTRUSTED peer input — the cluster transport
+    /// decodes it under a hard size cap (this envelope's length prefix) AND a tight protobuf
+    /// recursion-depth bound, fail-closed, so a hostile peer cannot OOM or stack-overflow the node
+    /// (the bound that makes RUSTSEC-2024-0437 unreachable). It is a NEW append-only tag carried only
+    /// on the peer link, so the client protocol (tags 1-26) is byte-for-byte unchanged and a client
+    /// connection never sees it.
+    Raft,
 }
 
 impl FrameType {
@@ -226,6 +236,7 @@ impl FrameType {
             FrameType::StreamFetch => 24,
             FrameType::StreamCommit => 25,
             FrameType::DeliverBatch => 26,
+            FrameType::Raft => 27,
         }
     }
 
@@ -260,6 +271,7 @@ impl FrameType {
             24 => FrameType::StreamFetch,
             25 => FrameType::StreamCommit,
             26 => FrameType::DeliverBatch,
+            27 => FrameType::Raft,
             _ => return None,
         })
     }
@@ -392,7 +404,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 26] = [
+    const ALL_TYPES: [FrameType; 27] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -419,6 +431,7 @@ mod tests {
         FrameType::StreamFetch,
         FrameType::StreamCommit,
         FrameType::DeliverBatch,
+        FrameType::Raft,
     ];
 
     #[test]
@@ -463,6 +476,7 @@ mod tests {
         assert_eq!(FrameType::StreamFetch.as_u8(), 24);
         assert_eq!(FrameType::StreamCommit.as_u8(), 25);
         assert_eq!(FrameType::DeliverBatch.as_u8(), 26);
+        assert_eq!(FrameType::Raft.as_u8(), 27);
     }
 
     #[test]
@@ -518,8 +532,9 @@ mod tests {
         // The Tier-W verbs are untouched.
         assert_eq!(FrameType::Flow.as_u8(), 10);
         assert_eq!(FrameType::Fetch.as_u8(), 23);
-        // 27 is the new next-free tag (still unknown), so it frames but is not a known type.
-        assert_eq!(FrameType::from_u8(27), None);
+        // 28 is the new next-free tag (still unknown), so it frames but is not a known type. (Tag 27
+        // is now the cluster-peer Raft frame, #667.)
+        assert_eq!(FrameType::from_u8(28), None);
         for ty in [FrameType::StreamFetch, FrameType::StreamCommit] {
             let mut buf = Vec::new();
             encode_frame(ty, b"\x07\x08", &mut buf).unwrap();
@@ -543,8 +558,9 @@ mod tests {
         assert_eq!(FrameType::from_u8(26), Some(FrameType::DeliverBatch));
         // The per-record Deliver tag is untouched.
         assert_eq!(FrameType::Deliver.as_u8(), 13);
-        // 27 is the next-free tag (still unknown), so it frames but is not a known type.
-        assert_eq!(FrameType::from_u8(27), None);
+        // 28 is the next-free tag (still unknown), so it frames but is not a known type. (Tag 27 is
+        // now the cluster-peer Raft frame, #667.)
+        assert_eq!(FrameType::from_u8(28), None);
         let mut buf = Vec::new();
         encode_frame(FrameType::DeliverBatch, b"\x09\x0a", &mut buf).unwrap();
         match decode_frame(&buf).unwrap() {
@@ -739,7 +755,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 27u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 28u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);

@@ -854,6 +854,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "proptest",
  "protobuf",
  "raft",
  "raft-proto",

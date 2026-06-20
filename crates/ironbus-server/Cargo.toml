@@ -139,6 +139,13 @@ tempfile = "3"
 # never linked into the shipped broker binary), matching the storage crate's loss-report fixtures.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The peer-transport adversarial fuzz/property suite (#667) feeds random + malformed + oversized +
+# deeply-nested bytes to the untrusted-peer decoder and asserts it ALWAYS returns a typed error or a
+# valid message (never panics / over-allocates / stack-overflows). `proptest` is the property engine
+# the other IronBus crates' fuzz suites already use (ironbus-proto / ironbus-core / ironbus-storage),
+# so it is already in the workspace lock and adds NO new dependency to cargo-deny; it is DEV-ONLY
+# (never linked into the shipped broker binary).
+proptest = "1"
 
 [lints]
 workspace = true

@@ -16,8 +16,10 @@ all-features = true
 # `cfg-if`, `bytes`, `thiserror`) is `MIT` or `MIT OR Apache-2.0`, with `zerocopy` adding the
 # already-allowed `BSD-2-Clause` arm and `slog` resolving to its `MIT OR Apache-2.0` arm (its license
 # is `MPL-2.0 OR MIT OR Apache-2.0`; cargo-deny accepts the allowed arm). So the raft tree adds NO new
-# license -- every arm is already on the list below. (RUSTSEC advisories for the raft tree --
-# protobuf-2.x and the unmaintained fxhash -- are scoped + justified in `[advisories].ignore`.)
+# license -- every arm is already on the list below. (The protobuf-2.x recursion-DoS advisory for
+# the raft tree, RUSTSEC-2024-0437, is now CLOSED by the #667 bounded peer-transport decode and its
+# ignore REMOVED; the remaining raft-tree advisory -- the unmaintained `fxhash` -- is scoped +
+# justified in `[advisories].ignore`.)
 allow = [
   "MIT",
   "Apache-2.0",
@@ -205,27 +207,40 @@ ignore = [
   #     information leak and no panic are reachable.
   # Drop this ignore when the MSRV reaches 1.81 and `lz4_flex` is bumped to >= 0.11.6 (#387).
   "RUSTSEC-2026-0041",
-  # RUSTSEC-2024-0437 (protobuf < 3.7.2): the rust-protobuf 2.x decoder does not bound recursion
-  # when parsing UNKNOWN fields, so a hostile, deeply-nested message can overflow the stack. It is
-  # pulled transitively by `raft` (tikv/raft-rs) via the vendored, build-script-free `raft-proto`
-  # codec (V2-C1, #578); raft 0.7's `protobuf-codec` is bound to the protobuf 2.x RUNTIME, and the
-  # fixed 3.7.2 lives on the protobuf 3.x line that the protobuf-codec path cannot use (the
-  # alternative `prost-codec` drags an edition2024 / rustc >= 1.85 cascade that breaks the
-  # `msrv (1.78)` gate). IronBus is NOT exposed in this issue:
-  #   * The ONLY thing that decodes `eraftpb` protobuf is the metadata Raft group, and in C1-I1
-  #     there is NO peer transport (that is C1-I3): the group runs on an in-memory `MemStorage` and
-  #     decodes ONLY entries it itself proposed and committed locally. No attacker-controlled bytes
-  #     reach the protobuf parser, so the untrusted-input precondition of the advisory is not met.
-  #   * raft-rs is confined to `ironbus-server`'s `cluster` module and is NOT yet wired into the
-  #     running broker (the n=1 data path never constructs the group), so the default binary decodes
-  #     zero protobuf at runtime.
-  #   * IronBus's own wire/record codecs are the hand-rolled, zero-dep `ironbus-proto` /
-  #     `ironbus-core` parsers (already 32-bit-overflow and recursion hardened, fuzzed); the
-  #     protobuf parser is NOT on the produce/consume or storage path.
-  # Before C1-I3 exposes the metadata group to peer bytes over the wire, this must be revisited:
-  # received Raft messages will be attacker-reachable and MUST be bounded (a size/recursion cap in
-  # the transport/step seam, or a raft-rs codec that is no longer on protobuf 2.x). Re-review then;
-  # drop this ignore once raft-rs can ride a fixed protobuf (>= 3.7.2) under the IronBus MSRV.
+  # RUSTSEC-2024-0437 (protobuf < 3.7.2): TIGHTENED + RE-JUSTIFIED (#667), NOT removed — and here is
+  # the honest reason it CANNOT be removed yet. This is the rust-protobuf 2.x uncontrolled-recursion
+  # DoS (the advisory's named affected function is `CodedInputStream::skip_group`): a hostile,
+  # deeply-nested message could overflow the stack when parsing UNTRUSTED input. It was previously
+  # ignored as UNREACHABLE because NOTHING parsed peer bytes — the metadata Raft group decoded only
+  # entries it itself proposed locally.
+  #
+  # #667 (the cluster PEER TRANSPORT) makes the `eraftpb` protobuf codec reachable with
+  # attacker-controlled peer bytes, so the OLD "no peer bytes are parsed" justification is now FALSE
+  # and has been replaced. The decode is now BOUNDED at the untrusted-input boundary, in
+  # `ironbus-server`'s `cluster::transport`, on EVERY peer message before/at decode:
+  #   * a HARD incoming-message SIZE cap (`MAX_RAFT_MSG_BYTES`, 1 MiB), enforced on the frame
+  #     length prefix BEFORE the body is read or the parser is entered, so an oversized frame is
+  #     rejected without allocating or parsing, and the bytes the parser can ever see are bounded
+  #     (every nested wire level costs >= 1 tag byte, so the size cap also bounds recursion);
+  #   * a TIGHT protobuf RECURSION-DEPTH bound (`set_recursion_limit(16)` on the `CodedInputStream`,
+  #     vs. protobuf's default of 100), so the generic nested-known-message recursion is stack-safe;
+  #   * the decode FAILS CLOSED on any malformed / oversized / over-deep / trailing-garbage input
+  #     (a typed error, frame dropped) and NEVER panics, over-allocates, or stack-overflows.
+  # On the pinned protobuf 2.28.0 the advisory's named `skip_group` deep-recursion does not even
+  # recurse (that bug is the 3.x rewrite of group skipping); 2.28's `skip_group` rejects a nested
+  # start-group with a typed `UnexpectedWireType` error. This is VERIFIED by an adversarial fuzz +
+  # property suite (random / malformed / oversized / deeply-nested bytes always return a typed error
+  # or a valid message, plus a 100k-deep nested-group body decoded to a typed error on a 256 KiB
+  # stack with no overflow) in `cluster::transport::tests`.
+  #
+  # WHY THE IGNORE STAYS (the honest part): RUSTSEC-2024-0437 is a VERSION-MATCH advisory
+  # (`patched = ">= 3.7.2"`), so `cargo deny` flags `protobuf 2.28.0` purely by version and has NO
+  # way to see the runtime size/depth bound above — it would fail the gate no matter how the decode
+  # is bounded in code. The dep cannot be upgraded yet (raft 0.7's `protobuf-codec` is bound to
+  # protobuf 2.x; the fix lives on the 3.x line, and `prost-codec` drags an edition2024 / rustc
+  # >= 1.85 cascade that breaks the `msrv (1.78)` gate). So this ignore is RETAINED but its scope is
+  # now the residual VERSION-match only, with the recursion DoS itself defended in code and tested.
+  # Drop this ignore the moment raft-rs can ride a fixed protobuf (>= 3.7.2) under the IronBus MSRV.
   "RUSTSEC-2024-0437",
   # RUSTSEC-2025-0057 (fxhash unmaintained): `fxhash` is no longer maintained (the advisory points to
   # `rustc-hash`). It is pulled transitively by `raft` (tikv/raft-rs) purely as the internal HashMap
