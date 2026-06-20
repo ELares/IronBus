@@ -37,6 +37,7 @@
 //! GET-only and read-only, with NO route that mutates engine state.
 
 use crate::actor::EngineAccess;
+use crate::cluster::ack_level::{ClusterAckLevel, ClusterAckLevelMetrics};
 use crate::engine::{BackpressureSnapshot, Counters, EngineConfigSnapshot, GroupConsumerStat};
 use crate::liveness::LivenessBeacon;
 use crate::metrics::{LatencyHistogram, FSYNC_BUCKET_LE_SECONDS};
@@ -402,6 +403,12 @@ where
                 power_loss_unsafe: g.power_loss_unsafe(),
                 unsynced_bytes: g.unsynced_bytes(),
             },
+            // The CLUSTER ack-level observability inputs (#605/#610). The cluster ack path is not yet
+            // `serve`-wired (a single-node broker never selects a cluster level), so the scrape reports
+            // the at-rest all-zero block: the per-level counters and the `power_loss_unsafe` gauge exist
+            // (the frozen taxonomy requires them) and report `0`. Wiring a live `ClusterAckLevelMetrics`
+            // through the running broker's quorum-ack release is the follow-up.
+            cluster_ack: ClusterAckLevelMetrics::new(),
             // The backpressure controllers' observable state (#68, #69), read under the same lock.
             backpressure: g.backpressure_snapshot(),
             // Filled in below, outside the engine lock; `None` is the not-yet-read placeholder.
@@ -535,6 +542,13 @@ struct MetricsSnapshot {
     /// unsynced bytes-at-risk. Under the default `sync` the level is `"sync"`, unsafe is `false`, and
     /// the unsynced exposure is always `0`.
     durability: DurabilityMetrics,
+    /// The CLUSTER ack-level observability inputs (#605/#610): one produce count PER cluster ack level
+    /// (`c0`/`c1`/`c2-pagecache`/`c2-fsync`) and the cluster `power_loss_unsafe` gauge. On a single-node
+    /// / no-cluster broker this is the at-rest all-zero block ([`ClusterAckLevelMetrics::new`]): every
+    /// per-level counter is `0` and the gauge is `0`, so the series exist (the frozen taxonomy requires
+    /// them) but report the honest zero. The `serve`-path wiring of a live per-produce selected level is
+    /// the follow-up; this surfaces the taxonomy.
+    cluster_ack: ClusterAckLevelMetrics,
     /// This process's resident-set size in bytes (#118), or `None` when it cannot be read on this
     /// platform. Read OUTSIDE the engine lock (it is a process-level read, not engine state) and
     /// injected after the actor job returns; the RAM-headroom gauge degrades to the unavailable
@@ -675,6 +689,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         fsync,
         edge,
         durability,
+        cluster_ack,
         backpressure,
         rss,
         groups,
@@ -698,6 +713,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
     body.push_str(&fsync_histogram_lines(&fsync));
     body.push_str(&edge_metric_lines(&edge, rss));
     body.push_str(&durability_metric_lines(&durability));
+    body.push_str(&cluster_ack_metric_lines(&cluster_ack));
     body.push_str(&backpressure_metric_lines(&backpressure));
     body.push_str(&group_consumer_lines(&groups, flushed));
     body.push_str(&registry);
@@ -731,6 +747,49 @@ fn durability_metric_lines(durability: &DurabilityMetrics) -> String {
          ironbus_durability_unsynced_bytes {}\n",
         durability.unsynced_bytes,
     )
+}
+
+/// Renders the CLUSTER ACK-LEVEL series (#605/#610), additive to the frozen `(name, type)` contract.
+/// Two series surface the cluster's durability posture — the cluster twin of the durability-level
+/// series above:
+///
+/// - `ironbus_cluster_ack_total{level="..."}`: one COUNTER per cluster ack level
+///   (`c0`/`c1`/`c2_pagecache`/`c2_fsync`) — the number of records acked at each strength, so the
+///   posture is observable. It is a LABELED `_total` counter, so (like `ironbus_retry_shed_total{side}`)
+///   its sample line is excluded from the UNLABELED-`_total` resilience-taxonomy test by construction and
+///   is pinned only in `FROZEN_METRIC_TYPES`. A produce ack is an observability event, not a resilience
+///   SHED, so it does not belong in the loss/shed resilience-counter set.
+/// - `ironbus_cluster_ack_power_loss_unsafe`: the cluster `power_loss_unsafe` GAUGE (no `_total`), `1`
+///   when a weaker-than-fsync cluster level is the active selected level (`c0`/`c1`/`c2-pagecache`), `0`
+///   under the power-loss-safe `c2-fsync` default (or no cluster). An operator alerts on it crossing to
+///   `1` exactly as for the single-node `ironbus_durability_power_loss_unsafe`. NATS has no such gauge.
+///
+/// On a single-node / no-cluster broker every counter is `0` and the gauge is `0` — the series exist
+/// (the frozen taxonomy requires them) and report the honest zero.
+fn cluster_ack_metric_lines(cluster_ack: &ClusterAckLevelMetrics) -> String {
+    let mut out = String::new();
+    // The per-level COUNTER, one labeled sample per level (in spectrum order).
+    out.push_str(
+        "# HELP ironbus_cluster_ack_total Records acked at each cluster ack level (#605); the `level` label is one of c0|c1|c2_pagecache|c2_fsync (no-ack / leader local-fsync / quorum page-cache / quorum fdatasync). c2_fsync is the R>=3 default (fsync'd-on-a-quorum); the weaker levels are explicit opt-ins.\n\
+         # TYPE ironbus_cluster_ack_total counter\n",
+    );
+    for level in ClusterAckLevel::ALL {
+        let _ = writeln!(
+            out,
+            "ironbus_cluster_ack_total{{level=\"{}\"}} {}",
+            level.metric_label(),
+            cluster_ack.count(level),
+        );
+    }
+    // The cluster power-loss-unsafe GAUGE.
+    let unsafe_value = u8::from(cluster_ack.power_loss_unsafe());
+    let _ = write!(
+        out,
+        "# HELP ironbus_cluster_ack_power_loss_unsafe 1 if the active SELECTED cluster ack level WAIVES the quorum-fsync guarantee and can lose acknowledged data on a correlated quorum power cut (c0/c1/c2-pagecache); 0 under the power-loss-safe c2-fsync default or with no cluster.\n\
+         # TYPE ironbus_cluster_ack_power_loss_unsafe gauge\n\
+         ironbus_cluster_ack_power_loss_unsafe {unsafe_value}\n",
+    );
+    out
 }
 
 /// Renders the BACKPRESSURE series (#68, #69), additive to the frozen taxonomy: the CoDel /
@@ -3668,6 +3727,13 @@ mod tests {
         ("ironbus_durability_level_info", "gauge"),
         ("ironbus_durability_power_loss_unsafe", "gauge"),
         ("ironbus_durability_unsynced_bytes", "gauge"),
+        // Cluster ack-level series (#605/#610): the per-level produce COUNTER (a LABELED `_total`, so —
+        // like `ironbus_retry_shed_total{side}` — its sample line is excluded from the UNLABELED-`_total`
+        // resilience-taxonomy test by construction and is pinned ONLY here; a produce ack is an
+        // observability event, not a resilience SHED) and the cluster `power_loss_unsafe` GAUGE (no
+        // `_total`). Both are additive: a cluster durability level is a posture, not a loss/shed.
+        ("ironbus_cluster_ack_total", "counter"),
+        ("ironbus_cluster_ack_power_loss_unsafe", "gauge"),
         // Backpressure series (#68, #69): the CoDel / retry-budget / fire-and-forget / egress shed
         // COUNTERS (the unlabeled four plus the labeled `ironbus_retry_shed_total{side}` and the
         // suspend-gap reset counter), and the sojourn-estimate / retry-ratio / egress-limit GAUGES.

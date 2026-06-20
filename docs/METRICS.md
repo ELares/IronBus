@@ -219,6 +219,45 @@ as the live bytes-at-risk. The level + loss exposure are also in the startup
 `materialized-config` line (`durability_level=`, `power_loss_safe=`). See
 [DURABILITY.md](DURABILITY.md) for the per-level ack/loss contract.
 
+## Cluster ack-level series (#605, #610)
+
+The CLUSTER twin of the durability-level series: they surface the cluster's
+durability posture — the cross-product of *where a record is durable* × *how many
+replicas confirm it*. The cluster ack-level spectrum extends the single-node
+`0/1/2` ack spectrum:
+
+- `c0` — fire-and-forget (no ack).
+- `c1` — leader local-fsync (today's single-node I2 ack, leader-only durability).
+- `c2-pagecache` — a quorum has it in PAGE CACHE (NATS-R3-parity, **weaker**),
+  offered only as an explicit, **loud opt-in** (it waives the quorum-fsync
+  guarantee, surfaces `acked data may be lost if a quorum power-fails before
+  fsync`, and falls back to `c2-fsync` if the opt-in is absent).
+- `c2-fsync` — a quorum has `fdatasync`'d it. The **`R>=3` default** and the
+  strongest level: an R-ack means fsync'd-on-a-quorum **by construction** (the
+  honest beat over NATS R3, which acks on a quorum page-cache).
+
+```
+ironbus_cluster_ack_total{level=...}          records acked at each cluster ack level; level is c0|c1|c2_pagecache|c2_fsync (LABELED _total counter)
+ironbus_cluster_ack_power_loss_unsafe         1 if the active SELECTED cluster ack level waives the quorum-fsync guarantee (c0|c1|c2-pagecache), 0 under the c2-fsync default or no cluster
+```
+
+`ironbus_cluster_ack_total` is a **labeled** `_total` counter, so — exactly like
+`ironbus_retry_shed_total{side}` — its sample line is EXCLUDED from the
+unlabeled-`_total` resilience-taxonomy test by construction and is pinned only in
+`FROZEN_METRIC_TYPES`. A produce ack is an observability event, not a resilience
+shed/loss, so it is outside `FROZEN_RESILIENCE_COUNTERS`.
+`ironbus_cluster_ack_power_loss_unsafe` is a GAUGE (no `_total`), so it extends
+`FROZEN_METRIC_TYPES` only, like its single-node sibling.
+
+On a single-node / no-cluster broker every counter is `0` and the gauge is `0`:
+the series exist (the frozen taxonomy requires them) and report the honest zero,
+because no cluster ack level is selected (the default single-node ack is the
+power-loss-safe local fsync). An operator alerts on
+`ironbus_cluster_ack_power_loss_unsafe` crossing to `1` (a weaker-than-fsync
+cluster durability mode is in use). The quorum-fsync MECHANISM behind `c2-fsync`
+is the C2-I2 ISR / quorum-ack gate (#691); see the `cluster::ack_level` module doc
+and `ironbus-clustering-design.md` §3.
+
 ## Backpressure series (#68, #69)
 
 The backpressure shed COUNTERS are in the resilience-counter table above (every

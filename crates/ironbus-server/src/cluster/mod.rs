@@ -113,9 +113,27 @@
 //! `PubAck` ([`isr::QuorumAckGate`]) ONLY once the produce's offset is quorum-committed — so an
 //! IronBus R-ack means fsync'd-on-a-quorum BY CONSTRUCTION (the win over NATS R3's quorum page-cache).
 //! Below `min_isr` the gate releases NOTHING (the no-false-ack property: unavailable over unsafe). The
-//! explicit cluster ack-level enum / opt-in page-cache level + per-level metrics are C3 (#605/#608);
-//! this ships the C2-fsync quorum gate + the ISR. Like the rest of C1/C2 it is a TESTABLE layer; the
-//! `serve`-path wiring of the gate into the produce-ack release is the follow-up.
+//! explicit cluster ack-level enum / opt-in page-cache level + per-level metrics are C3 (#605/#609/#610,
+//! [`ack_level`]); this ships the C2-fsync quorum gate + the ISR. Like the rest of C1/C2 it is a
+//! TESTABLE layer; the `serve`-path wiring of the gate into the produce-ack release is the follow-up.
+//!
+//! ## Status: C3-I1/I3/I4 (#605/#609/#610) — the cluster ack-level enum + metrics
+//!
+//! [`ack_level`] adds the EXPLICIT, CONFIGURABLE, OBSERVABLE cluster durability level on top of the
+//! quorum-fsync MECHANISM above. [`ack_level::ClusterAckLevel`] extends the single-node `0/1/2` ack
+//! spectrum into the cluster cross-product — `C0` (no-ack) / `C1` (leader local-fsync = today's I2) /
+//! `C2-pagecache` (quorum page-cache, NATS-R3-parity, weaker) / `C2-fsync` (quorum `fdatasync`, the
+//! #691 [`isr::QuorumAckGate`]) — and makes `C2-fsync` the `R >= 3` DEFAULT (the honest beat over NATS's
+//! weaker default). `C2-pagecache` is an EXPLICIT, LOUD opt-in
+//! ([`ack_level::ClusterAckLevel::requires_explicit_opt_in`] +
+//! [`ack_level::ClusterAckLevel::cluster_worst_case_loss_description`]), never the silent default; without
+//! the opt-in [`ack_level::ClusterAckLevel::resolve`] falls back to the safe `C2-fsync`.
+//! [`ack_level::ClusterAckLevelMetrics`] is a COUNTER PER LEVEL + a cluster `power_loss_unsafe` gauge —
+//! the `ironbus_cluster_ack_*` series in the FROZEN metric taxonomy (`docs/METRICS.md`). The enum SELECTS
+//! the #691 gate; it does NOT re-implement it. Self-heal is C4; multi-partition + the `serve`-path
+//! wiring of a per-produce selected level are follow-ups. Single-node is byte-identical: with no cluster
+//! the level degenerates to `C1` (the leader local-fsync I2 ack), the counters render at `0`, and the
+//! cluster `power_loss_unsafe` gauge renders `0`.
 //!
 //! ## Deliberately deferred (later C1 / C2 issues)
 //!
@@ -134,6 +152,7 @@
 //! zero-config path is unaffected (a 1-member group opens NO peer listener; the transport only
 //! activates in a multi-node config).
 
+pub mod ack_level;
 pub mod isr;
 pub mod membership;
 pub mod metadata_group;
@@ -143,6 +162,7 @@ pub mod runtime;
 pub mod state_machine;
 pub mod transport;
 
+pub use ack_level::{ClusterAckLevel, ClusterAckLevelMetrics};
 pub use isr::{AckReplicatedBody, IsrConfig, IsrMembership, IsrTracker, PendingAck, QuorumAckGate};
 pub use membership::{MemberOp, MembershipChange, PeerIdError};
 pub use metadata_group::{GroupError, MetadataRaftGroup};
