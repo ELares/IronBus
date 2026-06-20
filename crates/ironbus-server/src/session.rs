@@ -20,29 +20,34 @@ use crate::actor::{
     ActorGone, EngineAccess, OwnedAppend, OwnedDedup, ProduceOutcome, ProduceSubmission,
 };
 use crate::engine::{
-    AckResult, EngineError, NackResult, Poll, ProgressResult, StreamBatch, StreamRawBatch,
+    AckResult, Engine, EngineError, NackResult, Poll, ProgressResult, StreamBatch, StreamRawBatch,
 };
 use bytes::Bytes;
+use ironbus_core::binding::{single_home, Resolution};
 use ironbus_core::clock::Clock;
 use ironbus_core::compress::{validate_descriptor_shape, DEFAULT_MAX_DECOMPRESSED_BYTES};
 use ironbus_core::confirm::{ConfirmStatus, ReadyConfirm};
 use ironbus_core::dedup::{MAX_MSG_ID_LEN, MAX_PRODUCER_ID_LEN};
 use ironbus_core::keyshared::{KeyOrdering, MemberId};
 use ironbus_core::lease::LeaseToken;
+use ironbus_core::resolve_cache::ResolveCache;
+use ironbus_core::subject::Subject;
 use ironbus_core::types::{Offset, RecordFlags};
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
-    decode_ack, decode_connect, decode_cumulative_ack, decode_fetch, decode_pub, decode_pub_to,
-    decode_stream_commit, decode_stream_declare, decode_stream_fetch, decode_stream_info,
-    decode_sub, decode_sub_to, encode_dead_letter, encode_deliver, encode_deliver_batch,
-    encode_gap_marker, encode_info, encode_produce_confirm, encode_pub_ack,
-    encode_stream_info_response, encode_truncated, gap_reason, produce_confirm_status,
-    pub_ack_level, AckLevel, AckOp, ConsumeTier, CreditAdvert, DeadLetterBody, DeliverBatchHeader,
-    DeliverBody, GapMarkerBody, InfoBody, ProduceConfirmBody, PubAckBody, StreamInfoResponseBody,
-    TruncatedBody, DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
+    decode_ack, decode_bind_subject, decode_connect, decode_cumulative_ack, decode_fetch,
+    decode_pub, decode_pub_subject, decode_pub_to, decode_stream_commit, decode_stream_declare,
+    decode_stream_fetch, decode_stream_info, decode_sub, decode_sub_subject, decode_sub_to,
+    encode_dead_letter, encode_deliver, encode_deliver_batch, encode_gap_marker, encode_info,
+    encode_produce_confirm, encode_pub_ack, encode_stream_info_response, encode_truncated,
+    gap_reason, produce_confirm_status, pub_ack_level, AckLevel, AckOp, ConsumeTier, CreditAdvert,
+    DeadLetterBody, DeliverBatchHeader, DeliverBody, GapMarkerBody, InfoBody, ProduceConfirmBody,
+    PubAckBody, StreamInfoResponseBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER,
+    PUB_WIRE_ONLY_FLAGS,
 };
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
+use ironbus_storage::streamset::StreamId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -345,6 +350,17 @@ pub struct Session {
     /// connection that did not. `false` by default, so an L0/L1-only connection is byte-for-byte
     /// unchanged.
     produced_l2: bool,
+    /// The per-connection, generation-guarded subject-resolve cache (#585, M2-I9): caches a literal
+    /// subject's single-home resolution (the bound [`StreamId`]) so a hot publisher to the same subject
+    /// routes in O(1) — a hash lookup, no trie walk — after the first publish. It is consulted INSIDE
+    /// the actor job (where the engine's wait-free routing snapshot lives) and moved back out, so the
+    /// cache state stays per-connection while the resolve runs against the shared, lock-free trie. A
+    /// bind change advances the snapshot generation; this cache's generation-guard drops its stale
+    /// answer on the next resolve (one O(1) compare — no global flush, the beat over NATS's per-change
+    /// Sublist-cache flush). EMPTY until this connection publishes/subscribes BY SUBJECT, so a
+    /// connection that never uses subject addressing costs nothing here. Bounded (LRU), so a firehose of
+    /// distinct subjects can never grow it without bound.
+    subject_cache: ResolveCache<StreamId>,
 }
 
 impl Session {
@@ -600,6 +616,20 @@ impl Session {
             }
             Some(FrameType::PubTo) => self.handle_pub_to(engine, body, out).map(|()| false),
             Some(FrameType::SubTo) => self.handle_sub_to(engine, body, out).map(|()| false),
+            // The subject-addressed verbs (#585, M2-I9): also GATED on the negotiated `streams_enabled`
+            // capability (subject routing is the subjects half of the same streams story). A BindSubject
+            // registers a binding (changes no committed cursor, `false`); a SubSubject only binds the
+            // subscription (`false`, like Sub/SubTo); a PubSubject never advances a COMMITTED cursor
+            // (`false`, like Pub/PubTo).
+            Some(FrameType::BindSubject) => {
+                self.handle_bind_subject(engine, body, out).map(|()| false)
+            }
+            Some(FrameType::PubSubject) => {
+                self.handle_pub_subject(engine, body, out).map(|()| false)
+            }
+            Some(FrameType::SubSubject) => {
+                self.handle_sub_subject(engine, body, out).map(|()| false)
+            }
             Some(FrameType::Unsub) => self.handle_unsub(engine, out).map(|()| true),
             // The standalone Nack frame type (a client sends a nack as an Ack frame with the
             // Nack op, handled above), or a response-only verb (Info/Pong/Ok/Err/Deliver) a
@@ -2575,6 +2605,265 @@ impl Session {
         Ok(())
     }
 
+    /// Handles a `BindSubject` (#585, M2-I9): BIND a subject PATTERN to a stream. Routes to the engine's
+    /// [`Engine::bind_subject`] (which validates the pattern, declares the stream, registers the binding,
+    /// and swaps the rebuilt trie in — invalidating every connection's resolve cache via the advanced
+    /// generation). GATED on the negotiated streams capability and fail-closed: a malformed pattern /
+    /// stream name or a fork-bound rejection is a typed `Err`. Idempotent. Never panics.
+    fn handle_bind_subject<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        if !self.streams_enabled {
+            reply_err(
+                out,
+                "stream addressing not negotiated (set understands_streams)",
+            );
+            return Ok(());
+        }
+        let Ok(decoded) = decode_bind_subject(body) else {
+            reply_err(out, "malformed bind-subject body");
+            return Ok(());
+        };
+        let Ok(stream) = core::str::from_utf8(decoded.stream_id) else {
+            reply_err(out, "stream id must be valid UTF-8");
+            return Ok(());
+        };
+        let Ok(pattern) = core::str::from_utf8(decoded.pattern) else {
+            reply_err(out, "subject pattern must be valid UTF-8");
+            return Ok(());
+        };
+        let stream = stream.to_string();
+        let pattern = pattern.to_string();
+        match engine.with(move |e| e.bind_subject(&stream, &pattern))? {
+            Ok(_generation) => reply(out, FrameType::Ok, &[]),
+            // A malformed pattern/name or a fork-bound rejection fails closed with the engine's typed
+            // reason (and stable code); the previous binding table stays installed on a rejection.
+            Err(e) => reply_err(out, &e.to_string()),
+        }
+        Ok(())
+    }
+
+    /// Handles a `PubSubject` (#585, M2-I9): publish BY SUBJECT. Resolves the literal subject through
+    /// THIS connection's generation-guarded resolve cache (an O(1) hash lookup on a hot subject, a single
+    /// wait-free trie walk on a miss) under the FAIL-CLOSED single-home default — exactly ONE bound
+    /// stream routes the append there (via [`Engine::produce_in_stream`]), ZERO is a
+    /// `NoStreamForSubject` reject (the explicit beat over NATS's silent drop), two-or-more is an
+    /// `AmbiguousSubject` reject. The verbatim `PubBody` tail is decoded with the UNCHANGED
+    /// [`decode_pub`] codec, so the publish body is shared byte-for-byte with `Pub`/`PubTo`. GATED on the
+    /// negotiated streams capability; fail-closed on a malformed prefix or pub body. Never panics.
+    ///
+    /// The resolve runs INSIDE the actor job (where the engine's wait-free routing snapshot lives): the
+    /// per-connection cache is moved into the job and back out, so the cache stays connection-local while
+    /// the resolve reads the shared, lock-free trie. The append then routes through the SAME id-routed
+    /// produce path a `PubTo` uses, so a subject-addressed publish is at-least-once Level-1-equivalent
+    /// (a `PubAck` after the resolved stream's covering fsync), exactly like `PubTo`.
+    fn handle_pub_subject<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        if !self.streams_enabled {
+            reply_err(
+                out,
+                "stream addressing not negotiated (set understands_streams)",
+            );
+            return Ok(());
+        }
+        let Ok(decoded) = decode_pub_subject(body) else {
+            reply_err(out, "malformed pub-subject body");
+            return Ok(());
+        };
+        let Ok(subject) = core::str::from_utf8(decoded.subject) else {
+            reply_err(out, "subject must be valid UTF-8");
+            return Ok(());
+        };
+        let Ok(msg) = decode_pub(decoded.pub_body) else {
+            reply_err(out, "malformed pub body");
+            return Ok(());
+        };
+        // A subject-addressed publish is at-least-once Level-1-equivalent this phase (same scope as
+        // `PubTo`): a non-Level-1 ack level is refused rather than silently downgraded.
+        if !matches!(pub_ack_level(msg.flags), AckLevel::ServerAck) {
+            reply_err(
+                out,
+                "subject-addressed publish supports only server-ack (level 1) this phase",
+            );
+            return Ok(());
+        }
+        // The dedup-id wire caps (#33), enforced at the boundary exactly as the default `handle_pub` and
+        // `handle_pub_to` do, BEFORE the bytes cross into owned storage.
+        if let Some(d) = msg.dedup.as_ref() {
+            if d.producer_id.len() > MAX_PRODUCER_ID_LEN {
+                reply_err(out, "producer_id too long");
+                return Ok(());
+            }
+            if d.msg_id.len() > MAX_MSG_ID_LEN {
+                reply_err(out, "msg_id too long");
+                return Ok(());
+            }
+        }
+        // Compressed-descriptor SHAPE validation at the wire boundary (#438), same gate as the other
+        // publish paths: a stored compressed object must be decodable by every reader.
+        if RecordFlags::from_bits(msg.flags).contains(RecordFlags::COMPRESSED) {
+            if let Err(e) = validate_descriptor_shape(msg.payload, DEFAULT_MAX_DECOMPRESSED_BYTES) {
+                reply_err(out, &format!("malformed compressed descriptor: {e}"));
+                return Ok(());
+            }
+        }
+        // Build the OWNED append (the wire body borrows the connection buffer, which the closure cannot
+        // hold), then RESOLVE + PRODUCE in ONE actor job: the resolve reads the engine's wait-free
+        // routing snapshot through this connection's cache (moved in and back out), and on a single-home
+        // hit the resolved stream's id-routed produce runs in the same job. A NoStream/Ambiguous
+        // resolution is returned as a typed reject WITHOUT touching a log (no silent drop, no partial
+        // write — the fail-closed beat over NATS).
+        let dedup = msg.dedup.map(|d| OwnedDedup {
+            producer_id: Bytes::copy_from_slice(d.producer_id),
+            epoch: d.epoch,
+            msg_id: Bytes::copy_from_slice(d.msg_id),
+        });
+        let append = OwnedAppend {
+            timestamp_ms: msg.timestamp_ms,
+            flags: msg.flags & !PUB_WIRE_ONLY_FLAGS,
+            key: Bytes::copy_from_slice(msg.key),
+            headers: Bytes::copy_from_slice(msg.headers),
+            payload: Bytes::copy_from_slice(msg.payload),
+            dedup,
+            enqueue_monotonic_nanos: engine.now_monotonic_nanos(),
+            fire_and_forget: false,
+        };
+        let subject = subject.to_string();
+        // Move the per-connection resolve cache into the job; the job returns it (and the produce
+        // outcome) so the cache's freshly-cached entry + adopted generation persist across publishes.
+        let cache = std::mem::take(&mut self.subject_cache);
+        let (cache, outcome) = engine.with(move |e| {
+            let mut cache = cache;
+            let outcome = resolve_then_produce(e, &mut cache, &subject, &append);
+            (cache, outcome)
+        })?;
+        self.subject_cache = cache;
+        match outcome {
+            Ok(offset) => {
+                let ack = PubAckBody {
+                    offset: offset.get(),
+                };
+                let mut ack_body = Vec::new();
+                encode_pub_ack(&ack, &mut ack_body);
+                reply(out, FrameType::PubAck, &ack_body);
+                Ok(())
+            }
+            // A fatal storage error on the resolved stream ends the session, exactly like the other
+            // produce paths (a frozen writer / broken invariant is unrecoverable).
+            Err(e) if e.is_fatal() => {
+                reply_err(out, "fatal storage error");
+                Err(SessionError::EngineFatal(e))
+            }
+            // An unbound (NoStreamForSubject) or ambiguous (AmbiguousSubject) subject, a malformed
+            // subject, or a non-fatal storage shed is a typed, connection-preserving reject — never a
+            // panic and (critically) NEVER a silent drop.
+            Err(e) => {
+                reply_err(out, &e.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    /// Handles a `SubSubject` (#585, M2-I9): subscribe BY SUBJECT. Resolves the subject through this
+    /// connection's generation-guarded resolve cache under the single-home default; a LITERAL subject
+    /// resolves to ONE bound stream and this connection's subsequent `Flow`/`Ack` bind to that stream's
+    /// own competing work-group (via the id-routed `poll_in_stream`/`ack_in_stream`). An unbound subject
+    /// is a `NoStreamForSubject` reject and an ambiguous one an `AmbiguousSubject` reject (single-home;
+    /// fanning a wildcard sub over multiple covered streams is the FLAGGED follow-up). GATED on the
+    /// negotiated streams capability; fail-closed on a malformed body. Never panics.
+    ///
+    /// NOTE the scope: a `SubSubject` resolves the subject to ONE stream and binds THAT stream's
+    /// work-group (single-home). A wildcard subject that single-home-resolves (covers exactly one bound
+    /// stream) is accepted; a wildcard covering MANY bound streams is `AmbiguousSubject` here (the
+    /// multi-stream wildcard fan-out subscribe is the flagged later issue, not this PR).
+    fn handle_sub_subject<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        if !self.streams_enabled {
+            reply_err(
+                out,
+                "stream addressing not negotiated (set understands_streams)",
+            );
+            return Ok(());
+        }
+        let Ok(decoded) = decode_sub_subject(body) else {
+            reply_err(out, "malformed sub-subject body");
+            return Ok(());
+        };
+        let Ok(subject) = core::str::from_utf8(decoded.subject) else {
+            reply_err(out, "subject must be valid UTF-8");
+            return Ok(());
+        };
+        let Ok(group) = core::str::from_utf8(decoded.group) else {
+            reply_err(out, "group name must be valid UTF-8");
+            return Ok(());
+        };
+        // Resolve the subject to its single bound stream INSIDE the actor (through this connection's
+        // cache, moved in and back out). A wildcard subject is parsed as a literal here only for the
+        // single-home walk — `Subject::parse_literal` rejects a wildcard, so a wildcard subject that the
+        // client sends is resolved through the engine's pattern-aware path below instead. To keep the
+        // bind simple and single-home, resolve via `resolve_subject` (literal) and fall back to a typed
+        // reject for a non-literal/unbound/ambiguous subject.
+        let subject_owned = subject.to_string();
+        let cache = std::mem::take(&mut self.subject_cache);
+        let (cache, resolved) = engine.with(move |e| {
+            let mut cache = cache;
+            let resolved = resolve_subject_cached(e, &mut cache, &subject_owned);
+            (cache, resolved)
+        })?;
+        self.subject_cache = cache;
+        let stream = match resolved {
+            Ok(id) => id,
+            Err(e) => {
+                reply_err(out, &e.to_string());
+                return Ok(());
+            }
+        };
+        // Bind this connection's consume path to the resolved stream + the requested work-group, exactly
+        // as a `SubTo` binds an explicit stream id (the resolved stream is already declared by its bind).
+        self.stream = GroupName::from(stream.name());
+        self.subscription = GroupName::from(group);
+        self.registered_subscription = false;
+        self.joined_key_shared = false;
+        self.leased.clear();
+        reply(out, FrameType::Ok, &[]);
+        Ok(())
+    }
+
     fn handle_unsub<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
         &mut self,
         engine: &E,
@@ -2722,6 +3011,65 @@ fn negotiate_credit_bytes(requested: Option<u64>, cap: u64) -> u64 {
         // Both finite: tighten to the smaller.
         Some(want) => want.min(cap),
     }
+}
+
+/// Resolves the literal `subject` to its single bound stream (#585) THROUGH the per-connection
+/// `cache`, against the engine's wait-free routing snapshot — INSIDE an actor job (where `&mut Engine`
+/// is borrowable). A cache HIT is an O(1) hash lookup (no trie walk); a MISS walks the trie once and
+/// caches the result; a bind change (a newer snapshot generation) drops the stale cache on the next
+/// resolve. Returns the resolved [`StreamId`] or the typed fail-closed reject — a malformed/wildcard
+/// subject ([`EngineError::InvalidSubject`]), an unbound subject ([`EngineError::NoStreamForSubject`],
+/// NOT a silent drop), or an ambiguous subject ([`EngineError::AmbiguousSubject`]).
+///
+/// This is the cached twin of [`Engine::resolve_subject`]: the engine method walks the trie directly;
+/// this resolves through the connection's cache so a hot subject is O(1). The single-home reduction is
+/// the shared [`single_home`] policy, so the two agree.
+fn resolve_subject_cached<F: Filesystem, C: Clock + Clone>(
+    engine: &Engine<F, C>,
+    cache: &mut ResolveCache<StreamId>,
+    subject: &str,
+) -> Result<StreamId, EngineError> {
+    // Validate as a #567 LITERAL (no wildcards on the publish/subscribe-by-literal side); a wildcard or
+    // malformed subject is a typed reject before any routing.
+    let subj = Subject::parse_literal(subject).map_err(EngineError::InvalidSubject)?;
+    // Resolve through the cache against the engine's wait-free snapshot, then reduce single-home over the
+    // cached target slice WITHOUT cloning the whole Vec (only the one routed id is cloned on the happy
+    // path).
+    match cache.resolve_with(engine.binding_snapshot(), &subj, single_home) {
+        Resolution::Routed(id) => Ok(id),
+        Resolution::NoStream => Err(EngineError::NoStreamForSubject {
+            subject: subject.to_string(),
+        }),
+        Resolution::Ambiguous { matched } => Err(EngineError::AmbiguousSubject {
+            subject: subject.to_string(),
+            matched,
+        }),
+    }
+}
+
+/// Resolves `subject` single-home through `cache` (fail-closed) and, on a single-home hit, routes the
+/// owned `append` to the resolved stream via the id-routed [`Engine::produce_in_stream`] — the publish
+/// half of a `PubSubject` (#585), run in ONE actor job. An unbound/ambiguous/malformed subject is
+/// returned as a typed reject WITHOUT any append (no silent drop, no partial write — the fail-closed
+/// beat over NATS). Returns the assigned [`Offset`] in the resolved stream on success.
+fn resolve_then_produce<F: Filesystem + Clone, C: Clock + Clone>(
+    engine: &mut Engine<F, C>,
+    cache: &mut ResolveCache<StreamId>,
+    subject: &str,
+    append: &OwnedAppend,
+) -> Result<Offset, EngineError> {
+    // Resolve first (fail-closed): a NoStream/Ambiguous/Invalid subject is refused BEFORE any append.
+    let stream = resolve_subject_cached(engine, cache, subject)?;
+    // Route the append to the resolved stream's log via the id-routed produce (the default stream `""`
+    // routes byte-for-byte through `produce`; a named stream appends to its own log + commit tick).
+    let view = Append {
+        timestamp_ms: append.timestamp_ms,
+        flags: RecordFlags::from_bits(append.flags),
+        key: &append.key,
+        headers: &append.headers,
+        payload: &append.payload,
+    };
+    engine.produce_in_stream(stream.name(), &view)
 }
 
 /// Encodes a response frame. Bodies here are tiny (<= 8 bytes, or a short literal), well
@@ -8648,5 +8996,370 @@ mod tests {
                 .is_empty(),
             "a disconnected producer's confirms are dropped, never delivered"
         );
+    }
+
+    // =================================================================================
+    // #585 (V2-M2-I9): subject->stream binding + subject-addressed pub/sub OVER THE WIRE.
+    // A streams-capable client BindSubjects a pattern, then publishes/subscribes BY SUBJECT
+    // and the broker resolves single-home (fail-closed) through the connection's resolve cache.
+    // The explicit-stream-id (#588) and default verbs are unchanged.
+    // =================================================================================
+
+    /// A Connect body that advertises the streams capability (#588/#585): required to use the
+    /// subject-addressed verbs (they are gated on the negotiated `understands_streams`).
+    fn streams_connect_body() -> Vec<u8> {
+        let mut body = Vec::new();
+        ironbus_proto::message::encode_connect(
+            &ironbus_proto::message::ConnectBody {
+                requested_credit: None,
+                requested_credit_bytes: None,
+                wants_gap_marker: false,
+                default_ack_level: None,
+                understands_streaming: false,
+                default_tier: None,
+                understands_deliver_batch: false,
+                understands_streams: true,
+            },
+            &mut body,
+        );
+        body
+    }
+
+    /// A level-1 (server-ack) `PubBody` carrying `payload`, the body shared by Pub/PubTo/PubSubject.
+    fn pub_body(payload: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                payload,
+                dedup: None,
+                fire_and_forget: false,
+            },
+            &mut b,
+        )
+        .unwrap();
+        b
+    }
+
+    /// Connects a streams-capable session against a fresh direct engine.
+    fn connect_streams() -> (DirectEngine<InMemoryFs, ManualClock>, Session, Vec<u8>) {
+        let e = DirectEngine::new(engine());
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(
+            &e,
+            &frame(FrameType::Connect, &streams_connect_body()),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Info);
+        out.clear();
+        (e, s, out)
+    }
+
+    #[test]
+    fn bind_publish_and_subscribe_by_subject_end_to_end_over_the_wire() {
+        // THE wire end-to-end: BindSubject "order.>" -> "orders"; PubSubject "order.us.created"
+        // resolves single-home and lands in "orders" (a PubAck comes back); then a SubSubject on a
+        // literal subject covered by the binding resolves to "orders" and a Flow delivers the record.
+        let (e, mut s, mut out) = connect_streams();
+
+        // BIND "order.>" to "orders".
+        let mut bind = Vec::new();
+        ironbus_proto::message::encode_bind_subject(
+            &ironbus_proto::message::BindSubjectBody {
+                stream_id: b"orders",
+                pattern: b"order.>",
+            },
+            &mut bind,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::BindSubject, &bind), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok, "bind acknowledged");
+        out.clear();
+
+        // PUBLISH BY SUBJECT -> PubAck at offset 0 in "orders".
+        let mut pubsub = Vec::new();
+        ironbus_proto::message::encode_pub_subject(
+            &ironbus_proto::message::PubSubjectBody {
+                subject: b"order.us.created",
+                pub_body: &pub_body(b"hello"),
+            },
+            &mut pubsub,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::PubSubject, &pubsub), &mut out)
+            .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::PubAck, "publish-by-subject is acked");
+        assert_eq!(decode_pub_ack(&body).unwrap().offset, 0);
+        out.clear();
+        // The record landed in "orders" (the bound stream), NOT the default stream.
+        assert_eq!(e.engine_mut().stream_head("orders").get(), 1);
+        assert_eq!(e.engine_mut().stream_head("").get(), 0);
+
+        // SUBSCRIBE BY SUBJECT (a literal the binding covers) -> Ok, then a Flow delivers the record.
+        let mut subsub = Vec::new();
+        ironbus_proto::message::encode_sub_subject(
+            &ironbus_proto::message::SubSubjectBody {
+                subject: b"order.us.created",
+                group: b"workers",
+            },
+            &mut subsub,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::SubSubject, &subsub), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Ok,
+            "subscribe-by-subject resolved"
+        );
+        out.clear();
+        // A Flow on the subject-bound subscription delivers the record off "orders".
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
+        let frames = decode_all(&out);
+        let delivers: Vec<_> = frames
+            .iter()
+            .filter(|(t, _)| *t == FrameType::Deliver)
+            .collect();
+        assert_eq!(
+            delivers.len(),
+            1,
+            "the subject-resolved consumer got the record: {frames:?}"
+        );
+        assert_eq!(decode_deliver(&delivers[0].1).unwrap().payload, b"hello");
+    }
+
+    #[test]
+    fn publish_to_an_unbound_subject_is_a_typed_err_over_the_wire_not_a_silent_drop() {
+        // THE beat over NATS, on the wire: a PubSubject to a subject with NO binding gets a typed Err
+        // (fail-closed), NOT a PubAck-and-silent-discard. Nothing is written.
+        let (e, mut s, mut out) = connect_streams();
+        let mut pubsub = Vec::new();
+        ironbus_proto::message::encode_pub_subject(
+            &ironbus_proto::message::PubSubjectBody {
+                subject: b"telemetry.cpu",
+                pub_body: &pub_body(b"x"),
+            },
+            &mut pubsub,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::PubSubject, &pubsub), &mut out)
+            .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::Err,
+            "an unbound subject is a typed Err, never a silent drop"
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("no stream is bound"),
+            "the reject names the cause: {}",
+            String::from_utf8_lossy(&body)
+        );
+        // No silent drop: the default stream got nothing.
+        assert_eq!(e.engine_mut().stream_head("").get(), 0);
+    }
+
+    #[test]
+    fn publish_to_an_ambiguous_subject_is_a_typed_err_over_the_wire() {
+        // A subject bound to TWO streams is AmbiguousSubject (single-home) on the wire.
+        let (e, mut s, mut out) = connect_streams();
+        for (stream, pattern) in [
+            (&b"orders"[..], &b"order.>"[..]),
+            (&b"audit"[..], &b"order.us.*"[..]),
+        ] {
+            let mut bind = Vec::new();
+            ironbus_proto::message::encode_bind_subject(
+                &ironbus_proto::message::BindSubjectBody {
+                    stream_id: stream,
+                    pattern,
+                },
+                &mut bind,
+            )
+            .unwrap();
+            s.process(&e, &frame(FrameType::BindSubject, &bind), &mut out)
+                .unwrap();
+            assert_eq!(one_response(&out).0, FrameType::Ok);
+            out.clear();
+        }
+        let mut pubsub = Vec::new();
+        ironbus_proto::message::encode_pub_subject(
+            &ironbus_proto::message::PubSubjectBody {
+                subject: b"order.us.created",
+                pub_body: &pub_body(b"x"),
+            },
+            &mut pubsub,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::PubSubject, &pubsub), &mut out)
+            .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::Err);
+        assert!(
+            String::from_utf8_lossy(&body).contains("resolves to 2 bound streams"),
+            "the ambiguous reject names the count: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    #[test]
+    fn a_bind_change_invalidates_the_connection_resolve_cache_no_stale_routing() {
+        // A connection publishes by subject (caching the route), then a SECOND bind makes the subject
+        // ambiguous. The connection's NEXT publish must see the change (a typed AmbiguousSubject Err),
+        // proving the per-connection resolve cache was invalidated by the bind's generation bump — no
+        // stale single-route. (This is the wire-level proof of the cache-invalidation property.)
+        let (e, mut s, mut out) = connect_streams();
+        let bind = |stream: &[u8], pattern: &[u8]| {
+            let mut b = Vec::new();
+            ironbus_proto::message::encode_bind_subject(
+                &ironbus_proto::message::BindSubjectBody {
+                    stream_id: stream,
+                    pattern,
+                },
+                &mut b,
+            )
+            .unwrap();
+            b
+        };
+        let pub_subject = || {
+            let mut p = Vec::new();
+            ironbus_proto::message::encode_pub_subject(
+                &ironbus_proto::message::PubSubjectBody {
+                    subject: b"order.us.created",
+                    pub_body: &pub_body(b"x"),
+                },
+                &mut p,
+            )
+            .unwrap();
+            p
+        };
+
+        // Bind "order.>" -> "orders", publish (caches the single-home route to "orders").
+        s.process(
+            &e,
+            &frame(FrameType::BindSubject, &bind(b"orders", b"order.>")),
+            &mut out,
+        )
+        .unwrap();
+        out.clear();
+        s.process(&e, &frame(FrameType::PubSubject, &pub_subject()), &mut out)
+            .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::PubAck,
+            "first publish routed"
+        );
+        out.clear();
+
+        // SECOND bind: "audit" also binds a pattern covering the subject -> now ambiguous.
+        s.process(
+            &e,
+            &frame(FrameType::BindSubject, &bind(b"audit", b"order.us.*")),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Ok);
+        out.clear();
+
+        // The SAME connection's next publish of the SAME subject now sees the AMBIGUITY (cache dropped
+        // its stale single-route via the generation guard) — a typed Err, not a stale PubAck.
+        s.process(&e, &frame(FrameType::PubSubject, &pub_subject()), &mut out)
+            .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::Err,
+            "the bind change invalidated the cached route"
+        );
+        assert!(String::from_utf8_lossy(&body).contains("resolves to 2 bound streams"));
+    }
+
+    #[test]
+    fn the_subject_verbs_are_refused_without_the_streams_capability() {
+        // An old client (no understands_streams) is REFUSED the subject verbs with a typed Err, never
+        // the new behavior — so it can only use the default-stream verbs, byte-for-byte unchanged.
+        let e = DirectEngine::new(engine());
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        // Connect WITHOUT the streams capability.
+        s.process(
+            &e,
+            &frame(FrameType::Connect, &gap_marker_connect_body()),
+            &mut out,
+        )
+        .unwrap();
+        out.clear();
+        let mut bind = Vec::new();
+        ironbus_proto::message::encode_bind_subject(
+            &ironbus_proto::message::BindSubjectBody {
+                stream_id: b"orders",
+                pattern: b"order.>",
+            },
+            &mut bind,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::BindSubject, &bind), &mut out)
+            .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::Err);
+        assert!(String::from_utf8_lossy(&body).contains("not negotiated"));
+    }
+
+    #[test]
+    fn the_explicit_stream_id_and_default_publish_paths_are_unchanged_with_subject_routing_present()
+    {
+        // PRESERVE: a plain default-stream Pub and an explicit-id PubTo still work exactly as before even
+        // with subject bindings present — subject routing is an additive parallel path, never a re-route.
+        let (e, mut s, mut out) = connect_streams();
+        // A binding exists, but it must not affect the default/explicit paths.
+        let mut bind = Vec::new();
+        ironbus_proto::message::encode_bind_subject(
+            &ironbus_proto::message::BindSubjectBody {
+                stream_id: b"orders",
+                pattern: b"order.>",
+            },
+            &mut bind,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::BindSubject, &bind), &mut out)
+            .unwrap();
+        out.clear();
+
+        // A plain default-stream Pub still lands in the default stream and is acked.
+        s.process(&e, &frame(FrameType::Pub, &pub_body(b"d0")), &mut out)
+            .unwrap();
+        let dframes = decode_all(&out);
+        assert!(
+            dframes.iter().any(|(t, _)| *t == FrameType::PubAck),
+            "a plain Pub is still acked: {dframes:?}"
+        );
+        assert_eq!(
+            e.engine_mut().stream_head("").get(),
+            1,
+            "the default Pub landed in the default stream"
+        );
+        out.clear();
+
+        // An explicit-id PubTo to "shipments" still routes there (NOT via any subject binding).
+        let mut pubto = Vec::new();
+        ironbus_proto::message::encode_pub_to(
+            &ironbus_proto::message::PubToBody {
+                stream_id: b"shipments",
+                pub_body: &pub_body(b"s0"),
+            },
+            &mut pubto,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::PubTo, &pubto), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::PubAck);
+        assert_eq!(e.engine_mut().stream_head("shipments").get(), 1);
     }
 }

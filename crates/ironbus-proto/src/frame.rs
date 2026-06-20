@@ -252,6 +252,43 @@ pub enum FrameType {
     /// this is an ADDITIVE tag an old client never sends. Body: a [`crate::message::SubToBody`]
     /// (`body_version: u8`, `field_len: u16` over `stream_id` then `group`, each u16-length-prefixed).
     SubTo,
+    /// Client request to BIND a subject PATTERN to a stream (#585, V2-M2-I9): the subject-routing
+    /// "bind" verb that completes the subjects story. The broker registers `(pattern -> stream)` in its
+    /// wait-free routing trie (rebuilding it and advancing the routing generation, which invalidates
+    /// every connection's resolve cache) and `declare`s the target stream, replying a body-less
+    /// [`FrameType::Ok`] on success or [`FrameType::Err`] on a malformed pattern / stream name or a
+    /// fork-bound rejection (fail-closed, never a panic). Idempotent: re-binding the same
+    /// `(pattern, stream)` pair is a no-op success. The `pattern` is a #567 PATTERN (wildcards `*`/`>`
+    /// allowed); the `stream` is the bound stream (the empty name binds the DEFAULT stream). It is a NEW
+    /// append-only request tag: an old client never sends it, and tags 1-31 are byte-for-byte unchanged.
+    /// Body: a [`crate::message::BindSubjectBody`] (`body_version: u8`, `field_len: u16`, then
+    /// `stream_id` and `pattern`, each u16-length-prefixed).
+    BindSubject,
+    /// Producer publish BY SUBJECT (#585, V2-M2-I9): the subject-ADDRESSED twin of [`FrameType::PubTo`]
+    /// (tag 30). It carries a literal `subject` followed by the verbatim [`crate::message::PubBody`]
+    /// bytes (so the publish body codec is shared UNCHANGED with `Pub`/`PubTo`). The broker resolves the
+    /// subject through the binding trie under the FAIL-CLOSED single-home default — EXACTLY ONE bound
+    /// stream routes the append there (via the id-routed `produce_in_stream`), ZERO is an
+    /// `ERR_NO_STREAM_FOR_SUBJECT` reject (the explicit beat over NATS's silent drop), two-or-more is an
+    /// `ERR_AMBIGUOUS_SUBJECT` reject — and replies the SAME [`FrameType::PubAck`] (or [`FrameType::Err`])
+    /// a `PubTo` returns. Resolution rides the connection's generation-guarded resolve cache, so
+    /// steady-state routing is O(1). It is a NEW append-only tag an old client never sends; the existing
+    /// `Pub` (tag 5) / `PubTo` (tag 30) wires are unchanged. Body: a [`crate::message::PubSubjectBody`]
+    /// (`body_version: u8`, `field_len: u16` over the `subject` u16-length name, then the verbatim
+    /// `PubBody` bytes as the remainder).
+    PubSubject,
+    /// Consumer subscribe BY SUBJECT (#585, V2-M2-I9): the subject-ADDRESSED twin of [`FrameType::SubTo`]
+    /// (tag 31). It carries a `subject` (literal or WILDCARD pattern) plus the work-`group` name. The
+    /// broker resolves the subject through the binding trie: a LITERAL subject resolves single-home to
+    /// ONE bound stream and binds this connection's subsequent `Flow`/`Ack` to that stream's own
+    /// competing work-group (via the id-routed `poll_in_stream`/`ack_in_stream`); an unbound subject is
+    /// an `ERR_NO_STREAM_FOR_SUBJECT` reject and an ambiguous one an `ERR_AMBIGUOUS_SUBJECT` reject
+    /// (single-home — fanning a wildcard sub over multiple streams is the flagged follow-up). The reply
+    /// is a body-less [`FrameType::Ok`] on a resolved bind, else [`FrameType::Err`]. It is a NEW
+    /// append-only tag an old client never sends; the existing `Sub` (tag 6) / `SubTo` (tag 31) wires
+    /// are unchanged. Body: a [`crate::message::SubSubjectBody`] (`body_version: u8`, `field_len: u16`
+    /// over `subject` then `group`, each u16-length-prefixed).
+    SubSubject,
 }
 
 impl FrameType {
@@ -290,6 +327,9 @@ impl FrameType {
             FrameType::StreamInfo => 29,
             FrameType::PubTo => 30,
             FrameType::SubTo => 31,
+            FrameType::BindSubject => 32,
+            FrameType::PubSubject => 33,
+            FrameType::SubSubject => 34,
         }
     }
 
@@ -329,6 +369,9 @@ impl FrameType {
             29 => FrameType::StreamInfo,
             30 => FrameType::PubTo,
             31 => FrameType::SubTo,
+            32 => FrameType::BindSubject,
+            33 => FrameType::PubSubject,
+            34 => FrameType::SubSubject,
             _ => return None,
         })
     }
@@ -461,7 +504,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 31] = [
+    const ALL_TYPES: [FrameType; 34] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -493,6 +536,9 @@ mod tests {
         FrameType::StreamInfo,
         FrameType::PubTo,
         FrameType::SubTo,
+        FrameType::BindSubject,
+        FrameType::PubSubject,
+        FrameType::SubSubject,
     ];
 
     #[test]
@@ -542,6 +588,36 @@ mod tests {
         assert_eq!(FrameType::StreamInfo.as_u8(), 29);
         assert_eq!(FrameType::PubTo.as_u8(), 30);
         assert_eq!(FrameType::SubTo.as_u8(), 31);
+        assert_eq!(FrameType::BindSubject.as_u8(), 32);
+        assert_eq!(FrameType::PubSubject.as_u8(), 33);
+        assert_eq!(FrameType::SubSubject.as_u8(), 34);
+    }
+
+    #[test]
+    fn subject_routing_tags_are_the_next_free_tags_after_subto() {
+        // #585 (M2-I9): the subject-addressed verbs BindSubject (32), PubSubject (33), and SubSubject
+        // (34) take the next FREE tags after the explicit-stream-id SubTo (31). Pinned here so a future
+        // reorder breaks a test, not a deployed protocol. They are ADDITIVE: tags 1-31 are unchanged.
+        assert_eq!(FrameType::from_u8(32), Some(FrameType::BindSubject));
+        assert_eq!(FrameType::from_u8(33), Some(FrameType::PubSubject));
+        assert_eq!(FrameType::from_u8(34), Some(FrameType::SubSubject));
+        // 35 is the new next-free tag (still unknown), so it frames but is not a known type.
+        assert_eq!(FrameType::from_u8(35), None);
+        for ty in [
+            FrameType::BindSubject,
+            FrameType::PubSubject,
+            FrameType::SubSubject,
+        ] {
+            let mut buf = Vec::new();
+            encode_frame(ty, b"\x0b\x0c", &mut buf).unwrap();
+            match decode_frame(&buf).unwrap() {
+                FrameDecode::Frame { type_tag, body, .. } => {
+                    assert_eq!(FrameType::from_u8(type_tag), Some(ty));
+                    assert_eq!(body, b"\x0b\x0c");
+                }
+                FrameDecode::Incomplete { .. } => panic!("complete"),
+            }
+        }
     }
 
     #[test]
@@ -560,8 +636,9 @@ mod tests {
         // The default-stream verbs are untouched.
         assert_eq!(FrameType::Pub.as_u8(), 5);
         assert_eq!(FrameType::Sub.as_u8(), 6);
-        // 32 is the new next-free tag (still unknown), so it frames but is not a known type.
-        assert_eq!(FrameType::from_u8(32), None);
+        // Tags 32-34 are now the subject-routing verbs (#585); 35 is the next-free unknown tag.
+        assert_eq!(FrameType::from_u8(32), Some(FrameType::BindSubject));
+        assert_eq!(FrameType::from_u8(35), None);
         for ty in [
             FrameType::StreamDeclare,
             FrameType::StreamInfo,
@@ -633,9 +710,10 @@ mod tests {
         // The Tier-W verbs are untouched.
         assert_eq!(FrameType::Flow.as_u8(), 10);
         assert_eq!(FrameType::Fetch.as_u8(), 23);
-        // 32 is the new next-free tag (still unknown), so it frames but is not a known type. (Tags 27
-        // = cluster-peer Raft #667; 28-31 = the stream-addressed verbs #588.)
-        assert_eq!(FrameType::from_u8(32), None);
+        // 35 is the next-free tag (still unknown), so it frames but is not a known type. (Tags 27 =
+        // cluster-peer Raft #667; 28-31 = the stream-addressed verbs #588; 32-34 = the subject-routing
+        // verbs #585.)
+        assert_eq!(FrameType::from_u8(35), None);
         for ty in [FrameType::StreamFetch, FrameType::StreamCommit] {
             let mut buf = Vec::new();
             encode_frame(ty, b"\x07\x08", &mut buf).unwrap();
@@ -659,9 +737,10 @@ mod tests {
         assert_eq!(FrameType::from_u8(26), Some(FrameType::DeliverBatch));
         // The per-record Deliver tag is untouched.
         assert_eq!(FrameType::Deliver.as_u8(), 13);
-        // 32 is the next-free tag (still unknown), so it frames but is not a known type. (Tags 27 =
-        // cluster-peer Raft #667; 28-31 = the stream-addressed verbs #588.)
-        assert_eq!(FrameType::from_u8(32), None);
+        // 35 is the next-free tag (still unknown), so it frames but is not a known type. (Tags 27 =
+        // cluster-peer Raft #667; 28-31 = the stream-addressed verbs #588; 32-34 = the subject-routing
+        // verbs #585.)
+        assert_eq!(FrameType::from_u8(35), None);
         let mut buf = Vec::new();
         encode_frame(FrameType::DeliverBatch, b"\x09\x0a", &mut buf).unwrap();
         match decode_frame(&buf).unwrap() {
@@ -856,7 +935,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 32u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 35u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);

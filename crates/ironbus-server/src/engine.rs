@@ -22,6 +22,7 @@ use ironbus_core::attempt::{
     decode_attempt_snapshot, encode_attempt_snapshot, ATTEMPT_SNAPSHOT_MIN_LEN,
 };
 use ironbus_core::backpressure::{AimdLimiter, Codel, FsyncHeadroom, RetryBudget, TokenBucket};
+use ironbus_core::binding::{single_home, Resolution};
 use ironbus_core::clock::Clock;
 use ironbus_core::compress::{
     compress_payload, Codec, CompressConfig, DEFAULT_MAX_DECOMPRESSED_BYTES,
@@ -33,6 +34,8 @@ use ironbus_core::keyshared::{KeyOrdering, KeyRouter, MemberId, RouteDecision};
 use ironbus_core::lease::{
     AckOutcome, Claim, ExtendOutcome, LeaseConfig, LeaseTable, LeaseToken, NackOutcome,
 };
+use ironbus_core::subject::{Subject, SubjectError, SubjectPattern};
+use ironbus_core::sublist::{Sublist, SublistBuilder, SublistError, SublistSnapshot};
 use ironbus_core::types::{Offset, RecordFlags};
 use ironbus_storage::checkpoint::{
     AttemptsCheckpoint, Checkpoint, CountersCheckpoint, ATTEMPTS_PAYLOAD, MAX_PAYLOAD,
@@ -588,6 +591,36 @@ pub enum EngineError {
         /// The name of the unknown (never-declared) named stream.
         name: String,
     },
+    /// A subject or subject pattern handed to the binding / subject-addressed path (#585, M2-I9) was
+    /// not valid #567 grammar (empty, an empty token, an illegal/control rune, a misplaced wildcard, or
+    /// over the depth cap). A bind validates a PATTERN (wildcards allowed); a subject-addressed publish
+    /// validates a LITERAL subject (wildcards rejected). Fail-closed at the boundary, never a panic.
+    /// Carries the typed [`SubjectError`] reason.
+    InvalidSubject(SubjectError),
+    /// A `BindSubject` would make the binding set's worst-case wildcard fork frontier exceed the trie's
+    /// fail-closed cap (#568): the WHOLE binding set is refused rather than admitted and silently
+    /// truncated at match time (so routing can never drop a match). Carries the trie's typed
+    /// [`SublistError`] reason. (An individually-valid pattern can still trip this as a property of the
+    /// accepted SET; the bind is rejected and the previous binding table is left installed unchanged.)
+    BindRejected(SublistError),
+    /// A subject-addressed publish resolved to ZERO bound streams (#585, the single-home FAIL-CLOSED
+    /// reject): the publish is REFUSED, NOT silently dropped — the explicit beat over NATS, which would
+    /// discard a publish to a subject with no matching interest while still acking success. The producer
+    /// must bind the subject to a stream first. Carries the offending subject.
+    NoStreamForSubject {
+        /// The literal subject that matched no binding.
+        subject: String,
+    },
+    /// A subject-addressed publish resolved to TWO OR MORE bound streams (#585, the single-home
+    /// FAIL-CLOSED reject): one record needs one unambiguous destination log, so an ambiguous subject is
+    /// refused rather than guessed or fanned out. The opt-in `overlap_ok` fan-out is a separate, later
+    /// feature. Carries the offending subject and how many streams matched.
+    AmbiguousSubject {
+        /// The literal subject that matched more than one binding.
+        subject: String,
+        /// How many bound streams matched (always `>= 2`).
+        matched: usize,
+    },
 }
 
 impl core::fmt::Display for EngineError {
@@ -641,6 +674,17 @@ impl core::fmt::Display for EngineError {
                 f,
                 "stream {name:?} is not open (produce to it first to declare it)"
             ),
+            EngineError::InvalidSubject(e) => write!(f, "invalid subject: {e}"),
+            EngineError::BindRejected(e) => write!(f, "bind rejected: {e}"),
+            EngineError::NoStreamForSubject { subject } => write!(
+                f,
+                "no stream is bound for subject {subject:?} (bind a subject pattern to a stream first)"
+            ),
+            EngineError::AmbiguousSubject { subject, matched } => write!(
+                f,
+                "subject {subject:?} resolves to {matched} bound streams (single-home: a subject must \
+                 resolve to exactly one stream; overlap fan-out is opt-in)"
+            ),
         }
     }
 }
@@ -674,6 +718,23 @@ impl From<StreamError> for EngineError {
             // validation rejection from an IO fault.
             StreamError::InvalidName { name } => EngineError::InvalidStreamName { name },
             StreamError::Storage(s) => EngineError::Storage(s),
+        }
+    }
+}
+
+impl From<SubjectError> for EngineError {
+    fn from(e: SubjectError) -> Self {
+        EngineError::InvalidSubject(e)
+    }
+}
+
+impl From<SublistError> for EngineError {
+    fn from(e: SublistError) -> Self {
+        match e {
+            // A pattern that fails to re-parse is a subject-grammar rejection (surface its typed
+            // reason); a fork-bound rejection is the binding-SET rejection.
+            SublistError::InvalidPattern(p) => EngineError::InvalidSubject(p),
+            other => EngineError::BindRejected(other),
         }
     }
 }
@@ -1829,6 +1890,99 @@ impl WorkGroup {
 /// default stream. A named stream's groups are in-memory only for now (its consumer position does
 /// not survive a restart — only its LOG recovers, via the `StreamSet`), the explicit trade this
 /// reviewable slice makes.
+/// The subject->stream BINDING table (#585, V2-M2-I9): the authoritative registry of
+/// `(SubjectPattern -> StreamId)` bindings PLUS the wait-free routing trie ([`SublistSnapshot`]) it
+/// compiles to. The registry (`entries`) is the source of truth a rebuild reads; the `snapshot` is the
+/// immutable, generation-stamped trie a publish resolves against wait-free.
+///
+/// # Bind = rebuild + swap (invalidates every connection's resolve cache)
+///
+/// A [`BindingTable::bind`] appends a `pattern -> stream` entry, rebuilds a fresh immutable trie from
+/// the whole registry, and [`SublistSnapshot::store`]s it — which bumps the snapshot's monotonic
+/// generation. Each connection's [`ResolveCache`](ironbus_core::resolve_cache::ResolveCache) compares
+/// that generation on its next resolve and drops its stale cached answer (one O(1) compare, no global
+/// flush — the beat over NATS's per-change global Sublist-cache flush). The rebuild is the rare,
+/// amortized cost a bind pays; every resolve against the installed trie is wait-free.
+///
+/// # Fail-closed at ingest
+///
+/// `bind` validates the pattern through the #567 grammar BEFORE registering it, and the trie rebuild is
+/// itself fail-closed on the fork bound (#568): a binding SET whose worst-case wildcard fork frontier
+/// would exceed the cap is REFUSED and the PREVIOUS table is left installed unchanged, so a bad bind
+/// never corrupts routing and never silently truncates a match.
+struct BindingTable {
+    /// The authoritative `(pattern, stream)` registry, the source of truth a rebuild reads. An owned
+    /// pattern string + its target stream; the same pattern may appear for two DISTINCT streams (which
+    /// makes any subject they both cover ambiguous under single-home). In-memory only this phase.
+    entries: Vec<(String, StreamId)>,
+    /// The compiled, wait-free routing trie: a publish resolves a literal subject against this
+    /// snapshot (directly or through a per-connection resolve cache) with no lock and no walk on a
+    /// cache hit. Rebuilt and swapped on every successful `bind`, advancing its generation.
+    snapshot: SublistSnapshot<StreamId>,
+}
+
+impl BindingTable {
+    /// An empty binding table: no subject is bound, so every resolve is a fail-closed `NoStream` until a
+    /// `bind` registers a pattern. The trie starts at generation 0.
+    fn new() -> BindingTable {
+        BindingTable {
+            entries: Vec::new(),
+            snapshot: SublistSnapshot::empty(),
+        }
+    }
+
+    /// Builds an immutable routing trie from the current registry (generation `0`; the snapshot restamps
+    /// it monotonically on `store`). Fail-closed on the #568 fork bound.
+    fn build(&self) -> Result<Sublist<StreamId>, SublistError> {
+        let mut b = SublistBuilder::new();
+        for (pattern, stream) in &self.entries {
+            // Re-validate + register each stored pattern. `bind` only ever stores patterns that parsed,
+            // so an insert error here is an internal-invariant surface, never reached via the public API.
+            b.insert(pattern, stream.clone())
+                .map_err(SublistError::InvalidPattern)?;
+        }
+        b.build(0)
+    }
+
+    /// Registers `pattern -> stream` and atomically swaps in the rebuilt trie, returning the new
+    /// generation. Validates the pattern through the #567 grammar first (fail-closed). If the rebuilt
+    /// SET would exceed the #568 fork bound, the registry is rolled back and the PREVIOUS trie stays
+    /// installed (a bad bind never corrupts routing). Idempotent: re-binding the SAME `(pattern, stream)`
+    /// pair is a no-op success (it does not duplicate the entry), so a client may re-declare its bindings
+    /// safely.
+    ///
+    /// # Errors
+    /// [`SublistError::InvalidPattern`] for a malformed pattern, or [`SublistError::ForkLimitExceeded`]
+    /// if the resulting binding set would exceed the fork bound.
+    fn bind(&mut self, pattern: &str, stream: StreamId) -> Result<u64, SublistError> {
+        // Validate the pattern at the boundary (fail-closed) before it can enter the registry.
+        SubjectPattern::parse(pattern).map_err(SublistError::InvalidPattern)?;
+        // Idempotent: an identical (pattern, stream) pair is already bound -> no rebuild, no duplicate.
+        if self
+            .entries
+            .iter()
+            .any(|(p, s)| p == pattern && *s == stream)
+        {
+            return Ok(self.snapshot.generation());
+        }
+        // Tentatively register, then rebuild. On a fork-bound rejection, ROLL BACK the registry so the
+        // installed trie and the registry stay consistent (the previous table remains the truth).
+        self.entries.push((pattern.to_owned(), stream));
+        match self.build() {
+            Ok(trie) => Ok(self.snapshot.store(trie)),
+            Err(e) => {
+                self.entries.pop();
+                Err(e)
+            }
+        }
+    }
+
+    /// The number of registered bindings (for tests/metrics).
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 struct NamedStream {
     /// This stream's competing work-groups, keyed by group name, byte-for-byte the SAME machinery
     /// as the default stream's [`Engine::groups`] — independent per stream so the same group NAME
@@ -1873,6 +2027,14 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// `declare`); the default stream `""` is NEVER a key here (it uses [`Engine::groups`]). Empty
     /// for a deployment that never names a stream, so the default path costs nothing.
     named_streams: BTreeMap<StreamId, NamedStream>,
+    /// The subject->stream BINDING table (#585, V2-M2-I9): the registry of `(SubjectPattern -> StreamId)`
+    /// bindings plus the wait-free routing trie ([`SublistSnapshot`]) it builds. A `BindSubject` adds a
+    /// `pattern -> stream` entry and rebuilds the immutable trie, swapping a fresh generation in — which
+    /// is exactly the signal each connection's resolve cache watches to drop a stale routing answer
+    /// (#569). A subject-addressed publish resolves through this table to ONE bound stream (single-home,
+    /// fail-closed). Empty until the first bind, so a deployment that never binds a subject costs nothing
+    /// here and the explicit-stream-id (#588) + default-stream paths are entirely unaffected.
+    bindings: BindingTable,
     /// Per-work-group consumer state, keyed by group name. The default group (`""`) is the
     /// durable one (checkpointed to `cursor.ckpt`); named groups are independent
     /// broadcast/competing cursors, in-memory for now (durable per-group state is #60).
@@ -2239,6 +2401,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // consumer cursors across a restart is the flagged #60-style follow-up; today only the
             // named stream's LOG recovers, via the StreamSet.)
             named_streams: BTreeMap::new(),
+            // The subject->stream binding table (#585): EMPTY at open (no subject is bound until a
+            // client `BindSubject`s one). Bindings are in-memory only this phase — a stream's subject
+            // bindings do NOT survive a restart (only its LOG recovers, via the StreamSet); durable
+            // binding persistence is a flagged follow-up. A deployment that never binds keeps this empty,
+            // so the default + explicit-stream-id paths are byte-for-byte unaffected.
+            bindings: BindingTable::new(),
             groups,
             group_last_checkpointed,
             lease_config: config.lease,
@@ -3263,6 +3431,135 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     pub fn named_stream_count(&self) -> usize {
         // The StreamSet's `len()` includes its inert default `""` slot; the named count is the rest.
         self.streams.len().saturating_sub(1)
+    }
+
+    // ===================================================================================
+    // SUBJECT->STREAM BINDING + FAIL-CLOSED SINGLE-HOME RESOLUTION (#585, V2-M2-I9).
+    //
+    // A stream BINDS a set of subject PATTERNS (e.g. "orders" binds "order.>", "payment.*.done"); a
+    // publish to a literal SUBJECT resolves — via the wait-free trie + a per-connection resolve cache —
+    // to the bound stream(s): EXACTLY ONE routes there, ZERO is a fail-closed NoStreamForSubject reject
+    // (the beat over NATS's silent drop), >= 2 is an AmbiguousSubject reject (single-home default; the
+    // overlap_ok fan-out is the SEPARATE later issue, FLAGGED). The binding lives in the trie with
+    // target = StreamId; a bind rebuilds it and advances the generation, invalidating every connection's
+    // resolve cache. The explicit-stream-id (#588) and default-stream paths are untouched.
+    // ===================================================================================
+
+    /// BINDS the subject `pattern` to the stream named `stream` (#585): registers `pattern -> stream` in
+    /// the routing trie and atomically swaps the rebuilt, generation-advanced trie in (invalidating every
+    /// connection's resolve cache). The named stream is `declare`d on bind (materializing its independent
+    /// log + recovery) so a subsequent subject-addressed publish has a destination log; the DEFAULT
+    /// stream (the EMPTY name) is always present and is `declare`-free. The `pattern` is a #567 PATTERN
+    /// (wildcards `*`/`>` allowed). Idempotent: re-binding the same `(pattern, stream)` pair is a no-op
+    /// success. Returns the new routing generation.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidSubject`] for a malformed pattern, [`EngineError::InvalidStreamName`] for a
+    /// malformed named stream, [`EngineError::BindRejected`] if the resulting binding SET would exceed
+    /// the trie's #568 fork bound (the previous table stays installed), or [`EngineError::Storage`] from
+    /// declaring the stream's log.
+    pub fn bind_subject(&mut self, stream: &str, pattern: &str) -> Result<u64, EngineError>
+    where
+        F: Clone,
+    {
+        // Validate the pattern up front (fail-closed) so a malformed pattern never declares a stream.
+        SubjectPattern::parse(pattern)?;
+        let id = if stream.is_empty() {
+            // The default stream is always open (it is the root log), so binding a subject TO the default
+            // stream is legitimate and declare-free: a subject-addressed publish then lands in "".
+            StreamId::default_stream()
+        } else {
+            let id = StreamId::named(stream)?;
+            // Declare-on-bind: the stream must have a log to receive a subject-addressed publish later,
+            // exactly as declare-on-first-produce gives the id-routed path one (idempotent).
+            self.streams.declare(&id).map_err(EngineError::Storage)?;
+            self.named_streams
+                .entry(id.clone())
+                .or_insert_with(NamedStream::new);
+            id
+        };
+        // Register + rebuild + swap (advances the generation; rolls back on a fork-bound rejection).
+        Ok(self.bindings.bind(pattern, id)?)
+    }
+
+    /// Resolves the literal `subject` to a single bound stream under the FAIL-CLOSED single-home default
+    /// (#585), WITHOUT the per-connection resolve cache (a one-shot / server-internal resolve; the hot
+    /// publish path uses the session's cache). The subject is validated as a #567 LITERAL (no wildcards);
+    /// then the trie match is reduced single-home: exactly one bound stream -> that [`StreamId`], zero ->
+    /// `NoStreamForSubject`, two-or-more -> `AmbiguousSubject`.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidSubject`] for a malformed/wildcard subject, [`EngineError::NoStreamForSubject`]
+    /// when no binding matches (fail-closed, never a silent drop), or [`EngineError::AmbiguousSubject`]
+    /// when more than one bound stream matches (single-home).
+    pub fn resolve_subject(&self, subject: &str) -> Result<StreamId, EngineError> {
+        let subj = Subject::parse_literal(subject)?;
+        let mut matched = Vec::new();
+        self.bindings.snapshot.match_into(&subj, &mut matched);
+        match single_home(&matched) {
+            Resolution::Routed(id) => Ok(id),
+            Resolution::NoStream => Err(EngineError::NoStreamForSubject {
+                subject: subject.to_string(),
+            }),
+            Resolution::Ambiguous { matched } => Err(EngineError::AmbiguousSubject {
+                subject: subject.to_string(),
+                matched,
+            }),
+        }
+    }
+
+    /// Produces `message` BY SUBJECT (#585): resolves the literal `subject` to its single bound stream
+    /// (single-home, fail-closed) and routes the append there via the id-routed
+    /// [`Engine::produce_in_stream`] (which is byte-for-byte the default path when the bound stream is
+    /// the default `""`). A subject bound to no stream is a `NoStreamForSubject` reject (the publish is
+    /// REFUSED, not silently dropped — the beat over NATS); a subject bound to two-or-more is an
+    /// `AmbiguousSubject` reject. Returns the assigned [`Offset`] in the resolved stream.
+    ///
+    /// This resolves WITHOUT the per-connection cache (the engine has no per-connection identity); the
+    /// session resolves through its cache and then calls [`Engine::produce_in_stream`] with the resolved
+    /// stream name, so the hot path stays O(1). This entry point exists for callers that want the engine
+    /// to do both steps in one actor job (and for the end-to-end tests).
+    ///
+    /// # Errors
+    /// The [`Engine::resolve_subject`] rejects (invalid/unbound/ambiguous subject), else the
+    /// [`Engine::produce_in_stream`] error taxonomy for the resolved stream.
+    pub fn produce_by_subject(
+        &mut self,
+        subject: &str,
+        message: &Append<'_>,
+    ) -> Result<Offset, EngineError>
+    where
+        F: Clone,
+    {
+        // Resolve first (fail-closed): a NoStream/Ambiguous subject is refused BEFORE any append, so a
+        // publish to an unbound subject never touches a log (no silent drop, no partial write).
+        let id = self.resolve_subject(subject)?;
+        // Route the append to the resolved stream's log via the id-routed path. The default stream `""`
+        // routes byte-for-byte through `produce`; a named stream appends to its own log + commit tick.
+        self.produce_in_stream(id.name(), message)
+    }
+
+    /// The number of registered subject bindings (#585), `0` for a deployment that never bound a subject.
+    /// For tests/metrics.
+    #[must_use]
+    pub fn binding_count(&self) -> usize {
+        self.bindings.len()
+    }
+
+    /// The current routing-table generation (#585): bumped on every successful [`Engine::bind_subject`].
+    /// A per-connection resolve cache compares it to detect a bind change. For tests.
+    #[must_use]
+    pub fn binding_generation(&self) -> u64 {
+        self.bindings.snapshot.generation()
+    }
+
+    /// Borrows the wait-free routing [`SublistSnapshot`] (#585) so a per-connection resolve cache can
+    /// resolve a subject through it (a wait-free `ArcSwap` load + walk on a miss, an O(1) hash lookup on
+    /// a hit). This is the read seam the session's cached subject-resolve uses; the snapshot is immutable
+    /// and generation-stamped, so the cache's generation-guard detects a bind change with one compare.
+    #[must_use]
+    pub fn binding_snapshot(&self) -> &SublistSnapshot<StreamId> {
+        &self.bindings.snapshot
     }
 
     /// Appends `message` durably-pending (write, NO fsync) and records the produce statistics that
@@ -13363,5 +13660,204 @@ mod tests {
         // A consume on a stream that was never produced-to is UnknownStream, not an empty Idle.
         let unknown = e.poll_in_stream("never-declared", "g", 0);
         assert!(matches!(unknown, Err(EngineError::UnknownStream { .. })));
+    }
+
+    // =================================================================================
+    // #585 (V2-M2-I9): subject->stream binding + fail-closed single-home resolution.
+    // A stream BINDS subject patterns; a publish BY SUBJECT resolves single-home to the bound
+    // stream (exactly-one routes, zero is NoStreamForSubject, >=2 is AmbiguousSubject); a bind
+    // change invalidates the resolve cache. The explicit-stream-id (#676) + default "" paths are
+    // unchanged. The beat over NATS: a publish to an unbound subject is a TYPED reject, never a
+    // silent drop.
+    // =================================================================================
+
+    /// Publishes `payload` BY SUBJECT via the subject-addressed entry point (no per-connection cache;
+    /// the engine method resolves through the trie directly).
+    fn produce_subject(
+        e: &mut Engine<InMemoryFs, ManualClock>,
+        subject: &str,
+        payload: &[u8],
+    ) -> Result<Offset, EngineError> {
+        e.produce_by_subject(
+            subject,
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload,
+            },
+        )
+    }
+
+    #[test]
+    fn bind_then_publish_by_subject_lands_in_the_bound_stream_end_to_end() {
+        // THE end-to-end happy path: bind "order.>" to stream "orders"; a publish to a LITERAL subject
+        // "order.us.created" resolves single-home to "orders" and the record lands in THAT stream's log,
+        // readable off "orders" (not the default stream, not any other).
+        let mut e = open(config(10, 5));
+        e.bind_subject("orders", "order.>").unwrap();
+        assert_eq!(e.binding_count(), 1);
+
+        // Publish by subject -> offset 0 in "orders".
+        assert_eq!(
+            produce_subject(&mut e, "order.us.created", b"o0").unwrap(),
+            Offset::new(0)
+        );
+        assert_eq!(
+            produce_subject(&mut e, "order.eu.created", b"o1").unwrap(),
+            Offset::new(1)
+        );
+        // The records landed in "orders" — consume them off that stream.
+        assert_eq!(e.stream_head("orders"), Offset::new(2));
+        let d0 = message(e.poll_in_stream("orders", "g", 0).unwrap());
+        assert_eq!(d0.record.payload.as_ref(), b"o0");
+        let d1 = message(e.poll_in_stream("orders", "g", 0).unwrap());
+        assert_eq!(d1.record.payload.as_ref(), b"o1");
+        // The DEFAULT stream got nothing (the subject did not route there).
+        assert_eq!(e.stream_head(""), Offset::ZERO);
+        // And `resolve_subject` agrees the subject maps to exactly "orders".
+        assert_eq!(
+            e.resolve_subject("order.us.created").unwrap(),
+            StreamId::named("orders").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_publish_to_an_unbound_subject_is_a_typed_no_stream_reject_not_a_silent_drop() {
+        // THE beat over NATS: a publish to a subject with NO matching binding is REFUSED with the typed
+        // NoStreamForSubject (fail-closed), never silently dropped while acking success. Nothing is
+        // written to any log.
+        let mut e = open(config(10, 5));
+        e.bind_subject("orders", "order.>").unwrap();
+        let rejected = produce_subject(&mut e, "telemetry.cpu", b"x");
+        assert!(
+            matches!(rejected, Err(EngineError::NoStreamForSubject { .. })),
+            "an unbound subject is fail-closed, got {rejected:?}"
+        );
+        assert_eq!(
+            rejected.unwrap_err().code(),
+            crate::codes::ErrorCode::ERR_NO_STREAM_FOR_SUBJECT
+        );
+        // No silent drop: neither the bound stream nor the default got the record.
+        assert_eq!(e.stream_head("orders"), Offset::ZERO);
+        assert_eq!(e.stream_head(""), Offset::ZERO);
+    }
+
+    #[test]
+    fn an_ambiguous_subject_bound_to_two_streams_is_a_typed_reject() {
+        // Single-home default: a subject covered by bindings on TWO distinct streams is AmbiguousSubject
+        // (one record needs one unambiguous destination). The overlap_ok fan-out is the flagged later
+        // issue.
+        let mut e = open(config(10, 5));
+        e.bind_subject("orders", "order.>").unwrap();
+        e.bind_subject("audit", "order.us.*").unwrap();
+        let rejected = produce_subject(&mut e, "order.us.created", b"x");
+        match rejected {
+            Err(EngineError::AmbiguousSubject { matched, .. }) => assert_eq!(matched, 2),
+            other => panic!("expected AmbiguousSubject, got {other:?}"),
+        }
+        // A subject only ONE of them covers is unambiguous and routes.
+        assert_eq!(
+            produce_subject(&mut e, "order.eu.created", b"y").unwrap(),
+            Offset::new(0)
+        );
+        assert_eq!(e.stream_head("orders"), Offset::new(1));
+        assert_eq!(e.stream_head("audit"), Offset::ZERO);
+    }
+
+    #[test]
+    fn a_bind_change_is_reflected_by_resolution_no_stale_routing() {
+        // A rebind moves a subject's destination; resolution must reflect the NEW binding immediately
+        // (the engine resolves against the swapped-in trie; a per-connection cache's generation-guard
+        // drops its stale answer — proven in the core resolve_cache + binding tests).
+        let mut e = open(config(10, 5));
+        e.bind_subject("a", "order.>").unwrap();
+        let g0 = e.binding_generation();
+        assert_eq!(
+            e.resolve_subject("order.x").unwrap(),
+            StreamId::named("a").unwrap()
+        );
+        // Rebind the SAME pattern to a different stream "b": the generation advances and resolution moves.
+        let g1 = e.bind_subject("b", "order.>").unwrap();
+        assert!(g1 > g0, "a bind advances the routing generation");
+        // Now "order.x" is bound to BOTH a and b -> ambiguous (single-home). This proves the new binding
+        // took effect (no stale single-route to "a").
+        assert!(matches!(
+            e.resolve_subject("order.x"),
+            Err(EngineError::AmbiguousSubject { matched: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn binding_to_the_default_stream_routes_a_subject_to_the_default_log() {
+        // PRESERVE: a subject may be bound to the DEFAULT stream "" — a publish by that subject then
+        // lands in the default log (byte-for-byte the historical produce). A NO-subject default publish
+        // (`produce`) is unaffected.
+        let mut e = open(config(10, 5));
+        e.bind_subject("", "metric.>").unwrap();
+        assert_eq!(
+            produce_subject(&mut e, "metric.cpu", b"m0").unwrap(),
+            Offset::new(0)
+        );
+        // It landed in the DEFAULT stream's log; no named stream was created.
+        assert_eq!(e.stream_head(""), Offset::new(1));
+        assert_eq!(e.named_stream_count(), 0);
+        let d = message(e.poll_in_stream("", DEFAULT_GROUP, 0).unwrap());
+        assert_eq!(d.record.payload.as_ref(), b"m0");
+    }
+
+    #[test]
+    fn an_invalid_subject_or_pattern_fails_closed_at_the_boundary() {
+        // A malformed bind pattern, and a wildcard/malformed PUBLISH subject, are each a typed
+        // InvalidSubject reject — never a panic, never a silent admit.
+        let mut e = open(config(10, 5));
+        // A bind pattern with a non-final `>` is rejected (the #567 grammar).
+        assert!(matches!(
+            e.bind_subject("orders", "order.>.bad"),
+            Err(EngineError::InvalidSubject(_))
+        ));
+        assert_eq!(e.binding_count(), 0, "a rejected bind registers nothing");
+        // A PUBLISH subject may not carry a wildcard (it must be a literal).
+        e.bind_subject("orders", "order.>").unwrap();
+        assert!(matches!(
+            produce_subject(&mut e, "order.*", b"x"),
+            Err(EngineError::InvalidSubject(_))
+        ));
+    }
+
+    #[test]
+    fn binding_is_idempotent_and_a_named_bind_declares_the_stream() {
+        // Re-binding the same (pattern, stream) pair is a no-op success (no duplicate, no generation
+        // churn), and binding a NAMED stream DECLARES it so a subject-addressed publish has a log.
+        let mut e = open(config(10, 5));
+        let g1 = e.bind_subject("orders", "order.>").unwrap();
+        // Binding declared "orders".
+        assert_eq!(e.named_stream_count(), 1);
+        // Idempotent re-bind: same generation, still one binding.
+        let g2 = e.bind_subject("orders", "order.>").unwrap();
+        assert_eq!(
+            g1, g2,
+            "an idempotent re-bind does not advance the generation"
+        );
+        assert_eq!(e.binding_count(), 1);
+    }
+
+    #[test]
+    fn the_explicit_stream_id_and_default_paths_are_unchanged_by_binding() {
+        // PRESERVE: with bindings present, the explicit-stream-id (#676) and default "" produce/consume
+        // paths behave EXACTLY as before — binding adds a parallel route, it never re-routes them.
+        let mut e = open(config(10, 5));
+        e.bind_subject("orders", "order.>").unwrap();
+        // Explicit-stream-id produce to a DIFFERENT named stream still works and is isolated.
+        assert_eq!(produce_to(&mut e, "shipments", b"s0"), Offset::new(0));
+        assert_eq!(e.stream_head("shipments"), Offset::new(1));
+        // A default no-subject produce still targets the default log.
+        let mut e2 = open(config(10, 5));
+        e2.bind_subject("orders", "order.>").unwrap();
+        assert_eq!(produce_to(&mut e2, "", b"d0"), Offset::new(0));
+        assert_eq!(e2.stream_head(""), Offset::new(1));
+        let d = message(e2.poll_in_stream("", DEFAULT_GROUP, 0).unwrap());
+        assert_eq!(d.record.payload.as_ref(), b"d0");
     }
 }
