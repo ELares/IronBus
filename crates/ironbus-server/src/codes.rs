@@ -138,6 +138,13 @@ impl ErrorCode {
     /// epoch`). Not an `EngineError`: it is an `AppendOutcome`. The contract's `ERR_PRODUCER_FENCED`.
     pub const ERR_PRODUCER_FENCED: ErrorCode = ErrorCode("ERR_PRODUCER_FENCED");
 
+    /// A sequenced idempotent produce presented an OUT-OF-ORDER sequence (`seq > last-accepted + 1`,
+    /// a gap, V2-M8): the broker rejects it (`AppendOutcome::OutOfOrder`, the wire `out-of-order
+    /// producer sequence`), the Kafka `OutOfOrderSequence` semantics, so a later retry of a skipped
+    /// seq cannot double-append. Not an `EngineError`: it is an `AppendOutcome`. The contract's
+    /// `ERR_OUT_OF_ORDER_SEQUENCE`.
+    pub const ERR_OUT_OF_ORDER_SEQUENCE: ErrorCode = ErrorCode("ERR_OUT_OF_ORDER_SEQUENCE");
+
     /// A produce was shed because the durable log is at its byte cap (the drop-new shed). Maps an
     /// at-capacity [`EngineError::Storage`].
     pub const ERR_AT_CAPACITY: ErrorCode = ErrorCode("ERR_AT_CAPACITY");
@@ -220,6 +227,10 @@ mod tests {
         assert_eq!(
             ErrorCode::ERR_PRODUCER_FENCED.as_str(),
             "ERR_PRODUCER_FENCED"
+        );
+        assert_eq!(
+            ErrorCode::ERR_OUT_OF_ORDER_SEQUENCE.as_str(),
+            "ERR_OUT_OF_ORDER_SEQUENCE"
         );
         assert_eq!(ErrorCode::DUPLICATE.as_str(), "DUPLICATE");
         assert_eq!(ErrorCode::OK.as_str(), "OK");

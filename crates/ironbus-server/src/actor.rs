@@ -155,6 +155,11 @@ pub struct OwnedDedup {
     pub epoch: u64,
     /// The idempotency key the broker deduplicates on (never the body).
     pub msg_id: Bytes,
+    /// The OPT-IN Kafka-style idempotent-producer SEQUENCE (V2-M8): `Some` iff the wire publish
+    /// carried a `seq`. When present, the broker routes the produce through the DURABLE per-producer
+    /// sequence high-water (dedup a retry to exactly-once-append, fence a zombie epoch, reject an
+    /// out-of-order gap) instead of the time-bounded `msg_id` window. `None` is today's dedup.
+    pub seq: Option<u64>,
 }
 
 /// The outcome of a produce, mapped to the wire reply by the session. It carries enough to
@@ -170,10 +175,16 @@ pub enum ProduceOutcome {
     /// `rc = 0`), keep the session. Released only after the covering `commit_batch` (I2), so a hit on
     /// an id recorded earlier in the SAME uncommitted batch never replies before that id is durable.
     AppendedDuplicate(Offset),
-    /// A stale-epoch FENCE (#33): a zombie session reusing an old `producer_id` presented an epoch
-    /// below the broker's known high-water. Reply an error, keep the session (the producer can
+    /// A stale-epoch FENCE (#33, V2-M8): a zombie session reusing an old `producer_id` presented an
+    /// epoch below the broker's known high-water. Reply an error, keep the session (the producer can
     /// re-handshake with a fresh epoch).
     Fenced,
+    /// An OUT-OF-ORDER idempotent SEQUENCE rejection (V2-M8): a sequenced publish whose `seq` skipped
+    /// past the next-expected (`seq > last_accepted + 1`) was REJECTED rather than silently accepted
+    /// (the Kafka `OutOfOrderSequence` semantics), so a later retry of a skipped seq cannot
+    /// double-append. Reply a stable error, keep the session (the producer can resync from the
+    /// expected sequence). NOTHING was appended.
+    OutOfOrder,
     /// The durable-log byte cap shed (drop-new): reply a stable "at capacity" error, keep the session.
     AtCapacity,
     /// A CoDel load-shed (#68): the broker is overloaded past the controlled-delay target, so this
@@ -764,6 +775,7 @@ fn dedup_request(append: &OwnedAppend) -> Option<crate::engine::DedupRequest<'_>
         producer_id: &d.producer_id,
         epoch: d.epoch,
         msg_id: &d.msg_id,
+        seq: d.seq,
     })
 }
 
@@ -835,6 +847,8 @@ fn produce_once<F: Filesystem, C: Clock + Clone>(
         },
         // A stale-epoch fence: nothing appended, reject (no fsync needed; nothing changed).
         Ok(crate::engine::AppendOutcome::Fenced { .. }) => ProduceOutcome::Fenced,
+        // An out-of-order idempotent sequence (V2-M8): nothing appended, reject (no fsync needed).
+        Ok(crate::engine::AppendOutcome::OutOfOrder { .. }) => ProduceOutcome::OutOfOrder,
         Err(e) if e.is_at_capacity() => ProduceOutcome::AtCapacity,
         Err(e) if e.is_fatal() => ProduceOutcome::Fatal(e),
         Err(e) => ProduceOutcome::Failed(e),
@@ -1283,6 +1297,12 @@ fn process_produce<F, C>(
         Ok(crate::engine::AppendOutcome::Fenced { .. }) => {
             send_outcome(&reply, ProduceOutcome::Fenced);
         }
+        // An out-of-order idempotent sequence (V2-M8): nothing was written (the gap is rejected so a
+        // later retry of the skipped seq cannot double-append), so reply immediately; it does not join
+        // the durable batch.
+        Ok(crate::engine::AppendOutcome::OutOfOrder { .. }) => {
+            send_outcome(&reply, ProduceOutcome::OutOfOrder);
+        }
         // A shed or a hard error is known WITHOUT the sync (nothing was written), so reply immediately;
         // it does not join the durable batch.
         Err(e) if e.is_at_capacity() => {
@@ -1461,6 +1481,7 @@ mod tests {
                 producer_id: Bytes::copy_from_slice(producer_id),
                 epoch,
                 msg_id: Bytes::copy_from_slice(msg_id),
+                seq: None,
             }),
             enqueue_monotonic_nanos: 0,
             fire_and_forget: false,

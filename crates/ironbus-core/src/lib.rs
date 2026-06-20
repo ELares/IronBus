@@ -34,6 +34,7 @@ pub mod leader_lease;
 pub mod lease;
 pub mod partition;
 pub mod placement;
+pub mod producer_seq;
 pub mod resolve_cache;
 pub mod segment;
 pub mod subject;

@@ -1040,10 +1040,24 @@ impl Session {
                 }
                 return Ok(());
             }
+            // The idempotent-producer SEQUENCE (V2-M8) requires a NON-EMPTY producer_id: the durable
+            // high-water is keyed by producer_id, so an anonymous (empty) id would collapse every
+            // sequenced producer onto one shared high-water and false-dedup/false-reject across them.
+            // Fail closed (a typed, connection-preserving rejection), exactly like the over-long id
+            // rejections above. A sequenced producer with no identity is a client error, not silently
+            // accepted.
+            if d.seq.is_some() && d.producer_id.is_empty() {
+                if !fire_and_forget {
+                    drain_parked(engine, member_id, parked, out)?;
+                    reply_err(out, "idempotent sequence requires a non-empty producer_id");
+                }
+                return Ok(());
+            }
         }
         // Produce-time COMPRESSED-descriptor SHAPE validation (#438). Bit 0 of the PUB flags is a
-        // REAL stored record flag the wire legally carries (`PUB_WIRE_ONLY_FLAGS` masks only bits
-        // 6 and 7): a producer may publish a pre-compressed stored object, and the engine's write
+        // REAL stored record flag the wire legally carries (`PUB_WIRE_ONLY_FLAGS` masks only the
+        // wire-only high bits 3..=7, never bit 0): a producer may publish a pre-compressed stored
+        // object, and the engine's write
         // seam deliberately passes it through untouched (#437, never double-wrapped). The broker
         // is store-and-forward, so nothing downstream ever parses the bytes: without this gate any
         // producer could durably ack a record NO reader can decode, and post-#430 every consumer
@@ -1085,6 +1099,9 @@ impl Session {
             producer_id: Bytes::copy_from_slice(d.producer_id),
             epoch: d.epoch,
             msg_id: Bytes::copy_from_slice(d.msg_id),
+            // The opt-in idempotent SEQUENCE (V2-M8) rides through to the engine's durable per-producer
+            // high-water; `None` keeps the existing time-bounded `msg_id`-window dedup path.
+            seq: d.seq,
         });
         // Carry the produce's bytes as refcounted `Bytes` (#474) so moving/cloning the `OwnedAppend`
         // across the append-actor channel is a refcount bump, not a `Vec` deep copy. The wire body
@@ -1095,9 +1112,10 @@ impl Session {
         // durability and the on-disk image are unchanged.
         let append = OwnedAppend {
             timestamp_ms: msg.timestamp_ms,
-            // Mask BOTH wire-only PUB flag bits (dedup bit 7, fire-and-forget bit 6) out of the
-            // stored record flags (#33, #11): neither is record state. The fire-and-forget marker is
-            // carried in its own field below, not in the stored flags.
+            // Mask the wire-only PUB flag bits (dedup bit 7, fire-and-forget bit 6, the ack-level
+            // field bits 3..=4, and the idempotent-sequence bit 5, #33/#11/#494/#638) out of the
+            // stored record flags: none is record state. The fire-and-forget marker and the sequence
+            // are carried in their own fields, not in the stored flags.
             flags: msg.flags & !PUB_WIRE_ONLY_FLAGS,
             key: Bytes::copy_from_slice(msg.key),
             headers: Bytes::copy_from_slice(msg.headers),
@@ -2586,6 +2604,7 @@ impl Session {
     /// DEFAULT stream's; a named-stream publish here is at-least-once Level-1-equivalent (a `PubAck`
     /// after the named stream's covering fsync) and rejects an unsupported ack level. Per-stream
     /// dedup / ack-levels / Tier-S are the flagged follow-ups (#681 and the #676 scope notes).
+    #[allow(clippy::too_many_lines)]
     fn handle_pub_to<
         F: Filesystem + Clone + 'static,
         C: Clock + Clone + 'static,
@@ -2649,6 +2668,12 @@ impl Session {
                 reply_err(out, "msg_id too long");
                 return Ok(());
             }
+            // The idempotent SEQUENCE (V2-M8) requires a non-empty producer_id (the durable high-water
+            // is keyed by it), same fail-closed gate as the default `handle_pub`.
+            if d.seq.is_some() && d.producer_id.is_empty() {
+                reply_err(out, "idempotent sequence requires a non-empty producer_id");
+                return Ok(());
+            }
         }
         // Compressed-descriptor SHAPE validation at the wire boundary (#438), same gate as the default
         // path: a stored compressed object must be decodable by every reader, or a consumer burns
@@ -2669,6 +2694,9 @@ impl Session {
             producer_id: Bytes::copy_from_slice(d.producer_id),
             epoch: d.epoch,
             msg_id: Bytes::copy_from_slice(d.msg_id),
+            // The opt-in idempotent SEQUENCE (V2-M8) rides through to the engine's durable per-producer
+            // high-water; `None` keeps the existing time-bounded `msg_id`-window dedup path.
+            seq: d.seq,
         });
         let append = OwnedAppend {
             timestamp_ms: msg.timestamp_ms,
@@ -2905,6 +2933,12 @@ impl Session {
                 reply_err(out, "msg_id too long");
                 return Ok(());
             }
+            // The idempotent SEQUENCE (V2-M8) requires a non-empty producer_id (the durable high-water
+            // is keyed by it), same fail-closed gate as `handle_pub` / `handle_pub_to`.
+            if d.seq.is_some() && d.producer_id.is_empty() {
+                reply_err(out, "idempotent sequence requires a non-empty producer_id");
+                return Ok(());
+            }
         }
         // Compressed-descriptor SHAPE validation at the wire boundary (#438), same gate as the other
         // publish paths: a stored compressed object must be decodable by every reader.
@@ -2924,6 +2958,9 @@ impl Session {
             producer_id: Bytes::copy_from_slice(d.producer_id),
             epoch: d.epoch,
             msg_id: Bytes::copy_from_slice(d.msg_id),
+            // The opt-in idempotent SEQUENCE (V2-M8) rides through to the engine's durable per-producer
+            // high-water; `None` keeps the existing time-bounded `msg_id`-window dedup path.
+            seq: d.seq,
         });
         let append = OwnedAppend {
             timestamp_ms: msg.timestamp_ms,
@@ -3448,6 +3485,16 @@ fn write_pub_reply(
         ProduceOutcome::Fenced => {
             if !fire_and_forget {
                 reply_err(out, "fenced: stale producer epoch");
+            }
+            Ok(())
+        }
+        // An out-of-order idempotent SEQUENCE (V2-M8): a sequenced publish skipped past the
+        // next-expected sequence (the Kafka OutOfOrderSequence rejection), so nothing was appended and
+        // a later retry of the skipped seq cannot double-append. Reject it with a distinct, stable
+        // message; the connection stays open so the producer can resync from the expected sequence.
+        ProduceOutcome::OutOfOrder => {
+            if !fire_and_forget {
+                reply_err(out, "out-of-order producer sequence");
             }
             Ok(())
         }
@@ -6329,6 +6376,7 @@ mod tests {
                     producer_id,
                     epoch,
                     msg_id,
+                    seq: None,
                 }),
                 fire_and_forget: false,
                 payload,
@@ -6337,6 +6385,167 @@ mod tests {
         )
         .unwrap();
         body
+    }
+
+    /// Encodes a PUB body carrying an opt-in idempotent SEQUENCE block (V2-M8), for the wire
+    /// sequenced-idempotence tests.
+    fn seq_pub_body(producer_id: &[u8], epoch: u64, seq: u64, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: Some(PubDedup {
+                    producer_id,
+                    epoch,
+                    msg_id: b"",
+                    seq: Some(seq),
+                }),
+                fire_and_forget: false,
+                payload,
+            },
+            &mut body,
+        )
+        .unwrap();
+        body
+    }
+
+    #[test]
+    fn a_sequenced_retry_over_the_wire_replies_pub_ack_duplicate_and_an_out_of_order_replies_err() {
+        // V2-M8 wire properties: a fresh sequenced produce replies PubAck; a RETRY of the same
+        // (producer, epoch, seq) replies PubAckDuplicate (tag 20) with the ORIGINAL offset and adds
+        // NO record; a GAP (out-of-order seq) replies Err and adds no record.
+        let e = DirectEngine::new(engine());
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        // Fresh seq 0: PubAck(0).
+        s.process(
+            &e,
+            &frame(FrameType::Pub, &seq_pub_body(b"p", 1, 0, b"v0")),
+            &mut out,
+        )
+        .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::PubAck);
+        assert_eq!(body, 0u64.to_le_bytes());
+        out.clear();
+        // A RETRY of seq 0: PubAckDuplicate(0), no second record.
+        s.process(
+            &e,
+            &frame(FrameType::Pub, &seq_pub_body(b"p", 1, 0, b"v0-retry")),
+            &mut out,
+        )
+        .unwrap();
+        let (ty, body) = one_response(&out);
+        assert_eq!(
+            ty,
+            FrameType::PubAckDuplicate,
+            "a sequenced retry uses the tag 20 duplicate frame"
+        );
+        assert_eq!(body, 0u64.to_le_bytes(), "the original offset");
+        assert_eq!(
+            e.engine_mut().flushed_offset().get(),
+            1,
+            "the sequenced retry appended nothing"
+        );
+        out.clear();
+        // A GAP (seq 2, expected 1): Err, no record.
+        s.process(
+            &e,
+            &frame(FrameType::Pub, &seq_pub_body(b"p", 1, 2, b"skip")),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Err,
+            "an out-of-order sequence is rejected with an Err"
+        );
+        assert_eq!(
+            e.engine_mut().flushed_offset().get(),
+            1,
+            "the out-of-order produce appended nothing"
+        );
+        assert_eq!(e.engine_mut().producer_out_of_order(), 1);
+    }
+
+    #[test]
+    fn a_sequenced_zombie_epoch_over_the_wire_is_fenced_while_the_new_epoch_writes() {
+        // V2-M8: a restarted producer's higher epoch supersedes; a zombie at the stale epoch is
+        // fenced (Err) and appends nothing, while the new epoch keeps writing.
+        let e = DirectEngine::new(engine());
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        s.process(
+            &e,
+            &frame(FrameType::Pub, &seq_pub_body(b"p", 5, 0, b"e5")),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::PubAck);
+        out.clear();
+        // The new session (epoch 6) supersedes.
+        s.process(
+            &e,
+            &frame(FrameType::Pub, &seq_pub_body(b"p", 6, 0, b"e6")),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::PubAck);
+        out.clear();
+        // A zombie at the OLD epoch 5 is fenced.
+        s.process(
+            &e,
+            &frame(FrameType::Pub, &seq_pub_body(b"p", 5, 1, b"zombie")),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Err,
+            "a stale-epoch zombie is fenced with an Err"
+        );
+        assert_eq!(
+            e.engine_mut().flushed_offset().get(),
+            2,
+            "the fenced zombie appended nothing"
+        );
+    }
+
+    #[test]
+    fn a_sequenced_publish_with_an_empty_producer_id_is_rejected_at_the_wire_boundary() {
+        // V2-M8 fail-closed gate: a `seq` requires a non-empty producer_id (the durable high-water is
+        // keyed by it), else a typed Err and no record (the connection stays open).
+        let e = DirectEngine::new(engine());
+        let mut s = Session::new();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        out.clear();
+        s.process(
+            &e,
+            &frame(FrameType::Pub, &seq_pub_body(b"", 0, 0, b"v")),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            one_response(&out).0,
+            FrameType::Err,
+            "a sequenced publish with an empty producer_id is rejected"
+        );
+        assert_eq!(
+            e.engine_mut().flushed_offset().get(),
+            0,
+            "the rejected sequenced publish appended nothing"
+        );
     }
 
     #[test]

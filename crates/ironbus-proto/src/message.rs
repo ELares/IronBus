@@ -137,6 +137,23 @@ pub const PUB_FLAG_HAS_DEDUP: u8 = 0b1000_0000;
 /// opt-in). Adds NO new frame tag (the `FrameType` vocabulary is unchanged); only this additive flag.
 pub const PUB_FLAG_FIRE_AND_FORGET: u8 = 0b0100_0000;
 
+/// The PUB-body WIRE flag bit that signals an OPT-IN idempotent-producer SEQUENCE rides the dedup
+/// block (V2-M8, #638): an extra `u64 sequence` follows the `(producer_id, epoch, msg_id)` dedup
+/// block when set. It is the Kafka-style monotonic per-producer sequence the broker deduplicates a
+/// RETRIED publish on to exactly-once-append, fences a zombie epoch on, and rejects an out-of-order
+/// gap on — the EFFECTIVELY-ONCE primitive that survives a restart + a long offline gap (where the
+/// time-bounded `msg_id` window, like NATS's `Nats-Msg-Id`, lapses).
+///
+/// It is VALID only ALONGSIDE [`PUB_FLAG_HAS_DEDUP`] (the sequence rides inside the dedup block,
+/// after the `msg_id`), so a `seq` without a dedup block is a malformed body the decoder rejects.
+/// Like the other wire-only bits it is a WIRE-ONLY flag on the PUB body's `flags` byte, masked OUT
+/// ([`PUB_WIRE_ONLY_FLAGS`]) before the byte becomes a stored record flag. It sits at bit 5
+/// (`0b0010_0000`), between the ack-level field (bits 3..=4) and the fire-and-forget bit (bit 6), so
+/// it collides with none of them. A producer that does not use sequence-based idempotence leaves
+/// this bit clear, so the body is byte-for-byte the existing (dedup-or-not) layout (additive,
+/// opt-in): the existing `msg_id`-only dedup path is UNCHANGED.
+pub const PUB_FLAG_HAS_SEQ: u8 = 0b0010_0000;
+
 /// The 2-bit WIRE-ONLY PUB-body field that carries the per-publish produce ACK LEVEL (#494, part of
 /// the Cassandra-consistency-style ack spectrum #499). It occupies the two currently-FREE PUB flag
 /// bits 3 and 4 (`0b0001_1000`), which sit between the stored record flags (`RecordFlags::KNOWN` =
@@ -173,7 +190,7 @@ pub const PUB_FLAG_ACK_LEVEL_SHIFT: u8 = 3;
 /// (`0b111`), so masking them off leaves the stored record byte-for-byte what a pre-feature publish
 /// produced (the conformance byte-identity gate is unaffected).
 pub const PUB_WIRE_ONLY_FLAGS: u8 =
-    PUB_FLAG_HAS_DEDUP | PUB_FLAG_FIRE_AND_FORGET | PUB_FLAG_ACK_LEVEL_MASK;
+    PUB_FLAG_HAS_DEDUP | PUB_FLAG_FIRE_AND_FORGET | PUB_FLAG_ACK_LEVEL_MASK | PUB_FLAG_HAS_SEQ;
 
 /// The per-publish produce ACK LEVEL a [`PubBody`] requests (#494, part of #499): the
 /// Cassandra-consistency-style spectrum from no-ack to server+client-ack. Carried on the wire in the
@@ -300,6 +317,14 @@ pub struct PubDedup<'a> {
     /// The idempotency key the broker deduplicates on (keying is by `msg_id` ONLY, never the
     /// body). Empty is permitted but pointless (it never matches a meaningful prior id).
     pub msg_id: &'a [u8],
+    /// The OPT-IN Kafka-style idempotent-producer SEQUENCE (V2-M8, #638): a per-producer MONOTONIC
+    /// sequence the broker deduplicates a RETRIED publish on to exactly-once-append, surviving a
+    /// restart + a long offline gap. `Some` iff the wire [`PUB_FLAG_HAS_SEQ`] bit was set (it rides
+    /// inside this dedup block, after the `msg_id`); `None` for the existing `msg_id`-window dedup,
+    /// which is then byte-for-byte unchanged. A `seq <= last-accepted` is a duplicate (return the
+    /// original offset), `seq == last + 1` is fresh, a gap is rejected (out-of-order), and the
+    /// producer's `epoch` fences a zombie session.
+    pub seq: Option<u64>,
 }
 
 /// A producer's published message (the PUB frame body).
@@ -363,9 +388,15 @@ pub fn encode_pub(msg: &PubBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError>
     // EXCEPTION: it has no dedicated `PubBody` field, so it is carried IN `flags` and must be
     // PRESERVED. Clear ONLY the two field-derived bits (dedup, faf), keeping the caller's ack-level
     // bits, then OR in exactly what the dedup/faf fields say.
-    let mut flags = msg.flags & !(PUB_FLAG_HAS_DEDUP | PUB_FLAG_FIRE_AND_FORGET);
+    let mut flags = msg.flags & !(PUB_FLAG_HAS_DEDUP | PUB_FLAG_FIRE_AND_FORGET | PUB_FLAG_HAS_SEQ);
     if msg.dedup.is_some() {
         flags |= PUB_FLAG_HAS_DEDUP;
+    }
+    // The idempotent-producer SEQUENCE bit (V2-M8) is derived from the field too, so it and the body
+    // can never disagree. It rides INSIDE the dedup block (a `seq` is meaningless without a producer
+    // identity), so it is only ever set when the dedup block is also present.
+    if msg.dedup.is_some_and(|d| d.seq.is_some()) {
+        flags |= PUB_FLAG_HAS_SEQ;
     }
     if msg.fire_and_forget {
         flags |= PUB_FLAG_FIRE_AND_FORGET;
@@ -378,6 +409,11 @@ pub fn encode_pub(msg: &PubBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError>
         push_var(out, dedup.producer_id)?;
         out.extend_from_slice(&dedup.epoch.to_le_bytes());
         push_var(out, dedup.msg_id)?;
+        // The opt-in idempotent SEQUENCE (V2-M8) is the LAST field of the dedup block when present,
+        // so the historical dedup-block layout (no seq) is byte-for-byte unchanged.
+        if let Some(seq) = dedup.seq {
+            out.extend_from_slice(&seq.to_le_bytes());
+        }
     }
     out.extend_from_slice(msg.payload);
     Ok(())
@@ -402,12 +438,29 @@ pub fn decode_pub(body: &[u8]) -> Result<PubBody<'_>, BodyError> {
         let producer_id = r.var()?;
         let epoch = r.u64()?;
         let msg_id = r.var()?;
+        // The opt-in idempotent SEQUENCE (V2-M8) is the LAST field of the dedup block, present iff
+        // the wire bit is set; absent leaves the historical dedup-block layout byte-for-byte
+        // unchanged. A `seq` bit WITHOUT a dedup block never reaches here (the bit only rides inside
+        // this block), but if a malformed body sets the seq bit and the body is too short for the
+        // u64, `r.u64()?` returns a typed `BodyError` rather than panicking.
+        let seq = if flags & PUB_FLAG_HAS_SEQ != 0 {
+            Some(r.u64()?)
+        } else {
+            None
+        };
         Some(PubDedup {
             producer_id,
             epoch,
             msg_id,
+            seq,
         })
     } else {
+        // A `seq` bit set WITHOUT a dedup block is a protocol violation (the sequence rides inside
+        // the dedup block, after the `msg_id`): fail closed rather than silently fold the would-be
+        // sequence into the payload. The encoder never produces this; a malformed peer does.
+        if flags & PUB_FLAG_HAS_SEQ != 0 {
+            return Err(BodyError::BadLength);
+        }
         None
     };
     // The fire-and-forget (QoS-0) marker is a boolean read directly off the SAME flags byte (#11):
@@ -2836,6 +2889,7 @@ mod tests {
             producer_id: b"producer-7",
             epoch: 42,
             msg_id: b"idem-key-abc",
+            seq: None,
         };
         let msg = PubBody {
             flags: 0,
@@ -2853,6 +2907,104 @@ mod tests {
         let got = decode_pub(&buf).unwrap();
         assert_eq!(got.dedup, Some(dedup));
         assert_eq!(got.payload, b"p");
+    }
+
+    #[test]
+    fn pub_with_an_idempotent_sequence_round_trips_and_sets_the_seq_bit() {
+        // V2-M8: the opt-in idempotent SEQUENCE rides inside the dedup block, after the msg_id, and
+        // sets PUB_FLAG_HAS_SEQ (bit 5). It round-trips and carries the u64 sequence.
+        let dedup = PubDedup {
+            producer_id: b"producer-9",
+            epoch: 7,
+            msg_id: b"k",
+            seq: Some(0xDEAD_BEEF),
+        };
+        let msg = PubBody {
+            flags: 0,
+            timestamp_ms: 3,
+            key: b"",
+            headers: b"",
+            dedup: Some(dedup),
+            fire_and_forget: false,
+            payload: b"body",
+        };
+        let mut buf = Vec::new();
+        encode_pub(&msg, &mut buf).unwrap();
+        assert_eq!(buf[0] & PUB_FLAG_HAS_SEQ, PUB_FLAG_HAS_SEQ);
+        assert_eq!(buf[0] & PUB_FLAG_HAS_DEDUP, PUB_FLAG_HAS_DEDUP);
+        let got = decode_pub(&buf).unwrap();
+        assert_eq!(got.dedup, Some(dedup));
+        assert_eq!(got.dedup.unwrap().seq, Some(0xDEAD_BEEF));
+        assert_eq!(got.payload, b"body");
+    }
+
+    #[test]
+    fn a_dedup_pub_without_a_sequence_is_byte_for_byte_the_pre_m8_dedup_layout() {
+        // Back-compat: a dedup block with NO sequence must be EXACTLY the pre-M8 dedup-block layout
+        // (no trailing u64, the seq bit clear), so the existing msg_id-window dedup path is unchanged.
+        let dedup = PubDedup {
+            producer_id: b"pid",
+            epoch: 0x1122_3344_5566_7788,
+            msg_id: b"mid",
+            seq: None,
+        };
+        let msg = PubBody {
+            flags: 0,
+            timestamp_ms: 1,
+            key: b"k",
+            headers: b"h",
+            dedup: Some(dedup),
+            fire_and_forget: false,
+            payload: b"p",
+        };
+        let mut buf = Vec::new();
+        encode_pub(&msg, &mut buf).unwrap();
+        let mut expected = Vec::new();
+        expected.push(PUB_FLAG_HAS_DEDUP); // only the dedup bit, NOT the seq bit
+        expected.extend_from_slice(&1u64.to_le_bytes());
+        expected.extend_from_slice(&1u16.to_le_bytes());
+        expected.extend_from_slice(b"k");
+        expected.extend_from_slice(&1u16.to_le_bytes());
+        expected.extend_from_slice(b"h");
+        expected.extend_from_slice(&3u16.to_le_bytes());
+        expected.extend_from_slice(b"pid");
+        expected.extend_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        expected.extend_from_slice(&3u16.to_le_bytes());
+        expected.extend_from_slice(b"mid");
+        expected.extend_from_slice(b"p"); // payload immediately after msg_id, NO trailing seq u64
+        assert_eq!(
+            buf, expected,
+            "a no-seq dedup PUB must match the pre-M8 layout"
+        );
+        assert_eq!(buf[0] & PUB_FLAG_HAS_SEQ, 0, "the seq bit stays clear");
+    }
+
+    #[test]
+    fn a_seq_bit_without_a_dedup_block_is_rejected_fail_closed() {
+        // A malformed body that sets the seq bit but no dedup bit is a protocol violation: the
+        // decoder rejects it rather than folding the would-be sequence into the payload.
+        let mut buf = Vec::new();
+        buf.push(PUB_FLAG_HAS_SEQ); // seq bit set, dedup bit clear
+        buf.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+        buf.extend_from_slice(&0u16.to_le_bytes()); // key len 0
+        buf.extend_from_slice(&0u16.to_le_bytes()); // headers len 0
+        assert_eq!(decode_pub(&buf), Err(BodyError::BadLength));
+    }
+
+    #[test]
+    fn a_truncated_sequence_field_is_rejected_not_panicked() {
+        // The seq bit is set and the dedup block is present, but the body ends before the u64
+        // sequence: a typed error, never a panic.
+        let mut buf = Vec::new();
+        buf.push(PUB_FLAG_HAS_DEDUP | PUB_FLAG_HAS_SEQ);
+        buf.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+        buf.extend_from_slice(&0u16.to_le_bytes()); // key
+        buf.extend_from_slice(&0u16.to_le_bytes()); // headers
+        buf.extend_from_slice(&0u16.to_le_bytes()); // producer_id len 0
+        buf.extend_from_slice(&0u64.to_le_bytes()); // epoch
+        buf.extend_from_slice(&0u16.to_le_bytes()); // msg_id len 0
+        buf.extend_from_slice(&[0u8; 3]); // only 3 of the 8 seq bytes
+        assert!(decode_pub(&buf).is_err());
     }
 
     #[test]
@@ -2939,6 +3091,7 @@ mod tests {
             producer_id: b"p",
             epoch: 3,
             msg_id: b"m",
+            seq: None,
         };
         let msg = PubBody {
             flags: 0,
@@ -3350,15 +3503,18 @@ mod tests {
             producer_id in prop::collection::vec(any::<u8>(), 0..200),
             epoch in any::<u64>(),
             msg_id in prop::collection::vec(any::<u8>(), 0..200),
+            seq in prop::option::of(any::<u64>()),
             payload in prop::collection::vec(any::<u8>(), 0..512),
         ) {
-            let dedup = PubDedup { producer_id: &producer_id, epoch, msg_id: &msg_id };
+            let dedup = PubDedup { producer_id: &producer_id, epoch, msg_id: &msg_id, seq };
             let msg = PubBody { flags, timestamp_ms, key: &key, headers: &headers, dedup: Some(dedup), fire_and_forget: false, payload: &payload };
             let mut buf = Vec::new();
             encode_pub(&msg, &mut buf).unwrap();
             let got = decode_pub(&buf).unwrap();
-            // The wire body carries the dedup bit regardless of the caller's flags input.
+            // The wire body carries the dedup bit regardless of the caller's flags input, and the
+            // idempotent-SEQUENCE bit (V2-M8) is set iff a `seq` was present.
             prop_assert_eq!(got.flags & PUB_FLAG_HAS_DEDUP, PUB_FLAG_HAS_DEDUP);
+            prop_assert_eq!(got.flags & PUB_FLAG_HAS_SEQ != 0, seq.is_some());
             prop_assert_eq!(got.dedup, Some(dedup));
             prop_assert_eq!(got.payload, payload.as_slice());
         }
@@ -3871,21 +4027,31 @@ mod tests {
     #[test]
     fn ack_level_bits_are_genuinely_free_and_distinct() {
         // The 2 ack-level bits (3 and 4) sit ABOVE the stored record flags (RecordFlags::KNOWN = bits
-        // 0..=2) and BELOW the existing wire-only bits (faf bit 6, dedup bit 7), colliding with
-        // neither. This pins the chosen free bits so a future flag steals a different bit, not these.
+        // 0..=2) and BELOW the existing wire-only bits (the idempotent-seq bit 5, faf bit 6, dedup bit
+        // 7), colliding with none. This pins the chosen free bits so a future flag steals a different
+        // bit, not these.
         assert_eq!(PUB_FLAG_ACK_LEVEL_MASK, 0b0001_1000);
         assert_eq!(PUB_FLAG_ACK_LEVEL_SHIFT, 3);
+        // The idempotent-producer SEQUENCE bit (V2-M8) is bit 5, between the ack-level field and faf.
+        assert_eq!(PUB_FLAG_HAS_SEQ, 0b0010_0000);
         // No overlap with the other wire-only bits.
         assert_eq!(PUB_FLAG_ACK_LEVEL_MASK & PUB_FLAG_FIRE_AND_FORGET, 0);
         assert_eq!(PUB_FLAG_ACK_LEVEL_MASK & PUB_FLAG_HAS_DEDUP, 0);
+        assert_eq!(PUB_FLAG_ACK_LEVEL_MASK & PUB_FLAG_HAS_SEQ, 0);
+        assert_eq!(PUB_FLAG_HAS_SEQ & PUB_FLAG_FIRE_AND_FORGET, 0);
+        assert_eq!(PUB_FLAG_HAS_SEQ & PUB_FLAG_HAS_DEDUP, 0);
         // No overlap with the stored record flags (the low 3 bits, RecordFlags::KNOWN = 0b111).
         assert_eq!(PUB_FLAG_ACK_LEVEL_MASK & 0b0000_0111, 0);
-        // And the full wire-only mask is exactly the union of the three.
+        assert_eq!(PUB_FLAG_HAS_SEQ & 0b0000_0111, 0);
+        // And the full wire-only mask is exactly the union of the four.
         assert_eq!(
             PUB_WIRE_ONLY_FLAGS,
-            PUB_FLAG_HAS_DEDUP | PUB_FLAG_FIRE_AND_FORGET | PUB_FLAG_ACK_LEVEL_MASK
+            PUB_FLAG_HAS_DEDUP
+                | PUB_FLAG_FIRE_AND_FORGET
+                | PUB_FLAG_ACK_LEVEL_MASK
+                | PUB_FLAG_HAS_SEQ
         );
-        assert_eq!(PUB_WIRE_ONLY_FLAGS, 0b1101_1000);
+        assert_eq!(PUB_WIRE_ONLY_FLAGS, 0b1111_1000);
     }
 
     #[test]

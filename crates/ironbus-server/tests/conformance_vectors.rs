@@ -444,6 +444,7 @@ fn run_produce_dedup(
         producer_id: producer_id.as_bytes(),
         epoch,
         msg_id: msg_id.as_bytes(),
+        seq: None,
     };
     let appended = engine
         .append_no_sync_dedup(&append, Some(dedup))

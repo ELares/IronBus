@@ -3597,6 +3597,7 @@ mod tests {
             producer_id: b"prod-1",
             epoch: 1,
             msg_id: b"id-A",
+            seq: None,
         };
         let body = PubBody {
             flags: 0,
@@ -3868,6 +3869,7 @@ mod tests {
             producer_id: b"producer-1",
             epoch: 1,
             msg_id: b"order-42",
+            seq: None,
         };
         let body = PubBody {
             flags: 0,
