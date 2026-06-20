@@ -207,6 +207,44 @@
 //! rebalance on a placement CHANGE is C5-I2/I3; the real `TcpStream` peer reader/dialer carrying the
 //! data frames is the transport wiring.
 //!
+//! ## Status: C2-I7 (#713) — LIVE data-plane serve wiring (the clustering capstone)
+//!
+//! [`serve`] is the piece that finally RUNS the proven data-plane layers over REAL connections. Where
+//! C2-I6 ([`dataplane`]) built the transport-agnostic [`DataPlaneController`] + [`ProduceAckSeam`] and
+//! proved them in-process, this issue carries the DATA frames over the wire and drives the controller
+//! per the committed placement in a serving cluster:
+//!
+//! * [`serve::DataPlaneLink`] — the DATA-plane twin of the C1 [`PeerLink`](transport): it frames each
+//!   [`DataPlaneFrame`](dataplane::DataPlaneFrame) (prefixed with its partition id) over the SAME
+//!   bounded `[len][type][body]` envelope and reads it back through the SAME bounded, fail-closed layer
+//!   codecs, so an untrusted data-frame's bytes stay size-capped ([`serve::MAX_DATAPLANE_FRAME_BYTES`])
+//!   + CRC-revalidated by the follower (a hostile peer is contained to a dropped frame);
+//! * [`serve::DataPlaneServer`] — the per-node runnable that holds the [`ProduceAckSeam`] (the
+//!   controller + every local partition role + the parked-ack side table), routes one inbound
+//!   data-plane frame at a time, and runs the per-role loops: a LEADER serves `FetchRecords` /
+//!   `OffsetForLeaderEpoch` and records `AckReplicated` reports (driving the quorum-ack gate); a
+//!   FOLLOWER pulls the leader's CRC-revalidated bytes, applies them to its own replica log, and reports
+//!   its fsync'd offset back;
+//! * [`serve::DataPlaneServer::from_placements`] — the serve-path constructor: per local partition,
+//!   [`role_for_placement`](dataplane::role_for_placement) decides the role from the committed
+//!   placement and registers it (a restart re-derives every role from the same committed placement +
+//!   the durable replica log).
+//!
+//! Proven by a 3-node SERVE cluster over REAL loopback sockets: a produce to the leader REPLICATES
+//! byte-identical to its followers, a `C2-fsync` produce's wire `PubAck` is released ONLY after
+//! quorum-fsync (not leader-only), below `min_isr` the ack stays parked (no false ack), a follower that
+//! falls behind catches up, and a restarted node re-establishes its role + resumes replication.
+//! Single-node / no-cluster is byte-identical: [`serve::DataPlaneServer`] constructs ONLY on a
+//! clustered serve, so a no-cluster broker never builds it — the produce/consume path + the immediate
+//! local-fsync (I2) ack are byte-for-byte today's broker.
+//!
+//! FLAGGED (precise, not landed here): the live produce-ack [`session`](crate::session)`::drain_parked`
+//! hot-path wiring (it needs two engine/actor ownership changes — exposing the engine's leader
+//! `&Log<F, C>` to the leader role, and holding the [`ProduceAckSeam`] in shared broker state a session
+//! can consult — both deliberately deferred so the single-node hot path stays untouched); cooperative
+//! REBALANCE on a placement change (C5-I2); leaderless FAILOVER (C5-I3); follower READS (C6);
+//! multi-partition fan-out + geo (later). See the [`serve`] module docs for the exact remaining wiring.
+//!
 //! ## Deliberately deferred (later C1 / C2 issues)
 //!
 //! * **`serve`-path wiring + over-the-wire learner CATCH-UP + C2 replication** — wiring the
@@ -235,6 +273,7 @@ pub mod metadata_storage;
 pub mod placement;
 pub mod replication;
 pub mod runtime;
+pub mod serve;
 pub mod state_machine;
 pub mod transport;
 
@@ -263,6 +302,10 @@ pub use replication::{
     ReplicationFrame, ReplicationLeader, ReplicationLink, MAX_REPL_FETCH_BYTES,
 };
 pub use runtime::{ClusterConfig, ClusterRuntime, ClusterStatus, RuntimeError};
+pub use serve::{
+    decode_dataplane_peer_frame, encode_dataplane_peer_frame, DataPlaneLink, DataPlaneServer,
+    DataPlaneWireError, ReplicaLogFactory, MAX_DATAPLANE_FRAME_BYTES,
+};
 pub use state_machine::{DecodeError, MetadataCommand, MetadataStateMachine, NodeRole, Placement};
 pub use transport::{
     decode_peer_frame, decode_raft_message, encode_raft_message, PeerLink, PeerRegistry,
