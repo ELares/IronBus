@@ -834,17 +834,81 @@ mod tests {
         let _ = StdAtomicU64::new(f);
     }
 
+    /// Measures THIS thread's real CPU throughput by timing a fixed slug of dependent integer work
+    /// (the #687/#666 adaptive-calibration idiom). On an unloaded host the slug runs in a fixed, short
+    /// wall-clock; under CI CPU starvation the SAME work takes proportionally longer because the thread
+    /// is repeatedly preempted. That ratio is exactly the starvation that delays the reader threads
+    /// here from getting a timeslice to serve an off-actor read, so it is the right thing to scale the
+    /// "exercise the off-actor path" wait deadline by. Pure arithmetic behind a `black_box` fence so the
+    /// optimiser cannot fold it away.
+    fn probe_busy_nanos() -> u128 {
+        // ~2M iterations of dependent integer work: long enough to dwarf timer granularity and span
+        // several scheduler slices under contention, short enough to be negligible on an idle host.
+        const ITERS: u64 = 2_000_000;
+        let start = std::time::Instant::now();
+        let mut acc: u64 = 0x9E37_79B9_7F4A_7C15;
+        for i in 0..ITERS {
+            acc = acc
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(i | 1);
+        }
+        std::hint::black_box(acc);
+        start.elapsed().as_nanos().max(1)
+    }
+
+    /// Scales a GENEROUS base deadline by the observed host slowdown so a wait is robust to CI CPU
+    /// contention WITHOUT weakening what it proves (the #687 `host_scaled`). [`probe_busy_nanos`]
+    /// measures this thread's real CPU throughput; the base is multiplied by how many times slower
+    /// than a fast reference host we are, clamped to `[1, MAX_SCALE]`. On an unloaded host the factor
+    /// is ~1, so the deadline stays the generous base and any early-exit poll still exits the instant
+    /// its condition is met (fast). On a starved host the factor grows, so the equally-starved reader
+    /// threads get proportionally more wall-clock to do the SAME off-actor read. Never SHORTER than the
+    /// base — we only ever extend.
+    fn host_scaled(base: std::time::Duration) -> std::time::Duration {
+        /// A fast, unloaded reference host runs [`probe_busy_nanos`]'s slug in roughly this long.
+        const REFERENCE_BUSY_NANOS: u128 = 4_000_000; // ~4 ms for ~2M iters on a fast core.
+        /// Cap the multiplier so a pathologically wedged host still fails in bounded time rather than
+        /// hanging the suite — a genuinely never-serving plane (a real bug) must still surface.
+        const MAX_SCALE: u32 = 12;
+        // The ratio is clamped to `[1, MAX_SCALE]`, so it always fits a `u32` (MAX_SCALE is small).
+        let factor =
+            u32::try_from((probe_busy_nanos() / REFERENCE_BUSY_NANOS).min(u128::from(MAX_SCALE)))
+                .unwrap_or(MAX_SCALE)
+                .max(1);
+        base.saturating_mul(factor)
+    }
+
     /// Concurrent READERS read the sealed prefix off-actor WHILE a WRITER appends/syncs/rolls on its
     /// own thread: the readers never deadlock or contend on the writer (they touch only the shared
     /// atomics, never the `Log`), never observe a record at or past the frontier they loaded, and
     /// every record they DO serve is byte-identical to its log offset. This is the multi-consumer
     /// scaling property and the read-plane data-race coverage (the loom permutation of the atomic
     /// publish/observe is in `tools/loom-tests`).
+    ///
+    /// ## Why the positive case is poll-until-served, not best-effort (#671)
+    ///
+    /// The off-actor-served check is a POSITIVE-EXISTENCE assertion: at least one reader must serve a
+    /// record off the lock-free plane, so the off-actor path is actually EXERCISED concurrently with
+    /// the writer. The original test let the writer flip a `stop` flag as soon as it finished its
+    /// append loop and only THEN asserted some reader had served. On a contended/slow CI runner the
+    /// writer (the main thread) could blow through every append and stop before a STARVED reader thread
+    /// ever got a timeslice to complete a serving read, so the served count was 0 and the assertion
+    /// flaked — a pure scheduling race, NOT a correctness bug (the never-beyond-frontier check below
+    /// and the loom memory-ordering models still hold). The fix makes the positive case DETERMINISTIC:
+    /// the priming seals visible segments BEFORE the readers spawn (asserted from the main thread), and
+    /// each reader POLLS until it serves at least one record off-actor, exiting early the instant it
+    /// does; the writer runs until every reader has confirmed a serve OR a GENEROUS, host-tolerant
+    /// deadline elapses. So an off-actor read is GUARANTEED to be exercised regardless of the scheduler
+    /// interleaving, while the writer still races against the readers and EVERY correctness assertion
+    /// (no record at/past the observed frontier) runs unchanged on every iteration.
     #[test]
     fn concurrent_readers_and_a_writer_race_safely() {
-        use std::sync::atomic::{AtomicBool, Ordering as O};
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering as O};
         use std::sync::Arc as StdArc;
         use std::thread;
+        use std::time::{Duration, Instant};
+
+        const READERS: u32 = 4;
 
         let mut log = small_log();
         // Prime a few sealed segments so readers have a non-empty snapshot from the start, then
@@ -857,14 +921,30 @@ mod tests {
         }
         log.sync().unwrap();
         let plane = log.read_plane().unwrap();
-        let stop = StdArc::new(AtomicBool::new(false));
 
-        let readers: Vec<_> = (0..4)
+        // Make the positive case DETERMINISTIC: the priming MUST leave a sealed-and-visible prefix the
+        // plane can serve off-actor, so the readers below cannot be starved into a never-served state
+        // by an empty snapshot. If this fails the test setup is wrong, not the scheduler.
+        let primed = plane.read_range(Offset::ZERO, 64, None).unwrap();
+        assert!(
+            !primed.records.is_empty(),
+            "priming must seal a visible prefix the read plane can serve off-actor"
+        );
+
+        let stop = StdArc::new(AtomicBool::new(false));
+        // How many readers have served at least one record off-actor. The writer waits for all of them
+        // (or a generous host-scaled deadline) before stopping, so the off-actor path is GUARANTEED to
+        // be exercised concurrently with the writer regardless of scheduling.
+        let served_at_least_once = StdArc::new(AtomicU32::new(0));
+
+        let readers: Vec<_> = (0..READERS)
             .map(|_| {
                 let plane = plane.clone();
                 let stop = StdArc::clone(&stop);
+                let served_at_least_once = StdArc::clone(&served_at_least_once);
                 thread::spawn(move || {
                     let mut total_served = 0u64;
+                    let mut announced = false;
                     while !stop.load(O::Acquire) {
                         // One Acquire frontier load, one wait-free snapshot load, then a lock-free
                         // read. The bound the reader OBSERVES is `plane.flushed()`.
@@ -880,6 +960,12 @@ mod tests {
                             );
                         }
                         total_served += sealed.records.len() as u64;
+                        // The first time this reader actually serves a record off-actor, announce it so
+                        // the writer knows the off-actor path has been exercised on this thread.
+                        if !announced && total_served > 0 {
+                            announced = true;
+                            served_at_least_once.fetch_add(1, O::Release);
+                        }
                     }
                     total_served
                 })
@@ -887,17 +973,35 @@ mod tests {
             .collect();
 
         // The writer keeps appending + syncing + rolling (the small cap rolls often), publishing the
-        // frontier and new snapshots, while the readers run.
-        for i in 40..600u32 {
+        // frontier and new snapshots, while the readers run. Don't stop until EVERY reader has served a
+        // record off-actor (the off-actor path is exercised) or a GENEROUS, host-tolerant deadline has
+        // passed — so a starved reader thread on a contended CI runner still gets enough wall-clock to
+        // complete a serving read before the writer stops (#671). The deadline only bounds a wedged
+        // host; the wait is otherwise governed by the readers all serving, which happens fast on a
+        // healthy host. `host_scaled` keeps the off-actor read GUARANTEED to be exercised without a
+        // brittle fixed timing window.
+        let deadline = Instant::now() + host_scaled(Duration::from_secs(10));
+        let mut i = 40u32;
+        loop {
+            // Keep the writer busy (append + frequent sync/roll) so readers always have fresh frontiers
+            // and snapshots to race against. Cycle the offsets once the priming range is exhausted so
+            // the writer never idles while waiting on a starved reader.
             log.append(&rec(&i.to_le_bytes())).unwrap();
             if i % 3 == 0 {
                 log.sync().unwrap();
+            }
+            i = if i >= 599 { 40 } else { i + 1 };
+            if served_at_least_once.load(O::Acquire) >= READERS || Instant::now() >= deadline {
+                break;
             }
         }
         log.sync().unwrap();
         stop.store(true, O::Release);
 
-        // No reader deadlocked or panicked; each made progress (read SOME records off-actor).
+        // No reader deadlocked or panicked; each made progress (read SOME records off-actor). This is
+        // now DETERMINISTIC: the writer waited for every reader to serve (or the host-tolerant deadline),
+        // so an off-actor read was guaranteed to be exercised — a 0 here means the plane genuinely never
+        // served within a generous host-scaled window (a real regression), not a lucky interleaving.
         let mut any_progress = false;
         for h in readers {
             let served = h
