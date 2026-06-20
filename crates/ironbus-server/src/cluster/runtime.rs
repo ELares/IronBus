@@ -737,7 +737,10 @@ fn run_reader(
     }
 }
 
-#[cfg(test)]
+// Unix-only: these tests use `StdFs` (the real on-disk backend), which is `#[cfg(unix)]` —
+// the cluster runtime is a Unix-only on-disk feature, like `serve`. Gating the module keeps the
+// Windows CI build green (no `StdFs` reference there).
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::cluster::state_machine::MetadataCommand;
@@ -1115,7 +1118,7 @@ mod tests {
 /// A tiny shim so the test module can name the broker's `SystemClock` without ironbus-server
 /// depending on ironbus-cli. The cluster runtime is generic over any `Clock`; the broker uses
 /// [`crate::clock::SystemClock`], so the tests use it directly via this re-export path.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod ironbus_server_test_clock {
     pub use crate::clock::SystemClock;
 }
