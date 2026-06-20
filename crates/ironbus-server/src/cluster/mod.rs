@@ -85,12 +85,14 @@
 pub mod membership;
 pub mod metadata_group;
 pub mod metadata_storage;
+pub mod runtime;
 pub mod state_machine;
 pub mod transport;
 
 pub use membership::{MemberOp, MembershipChange, PeerIdError};
 pub use metadata_group::{GroupError, MetadataRaftGroup};
 pub use metadata_storage::{MetadataLogStorage, MetadataStorageError, METADATA_SUBDIR};
+pub use runtime::{ClusterConfig, ClusterRuntime, ClusterStatus, RuntimeError};
 pub use state_machine::{DecodeError, MetadataCommand, MetadataStateMachine, NodeRole, Placement};
 pub use transport::{
     decode_peer_frame, decode_raft_message, encode_raft_message, PeerLink, PeerRegistry,
