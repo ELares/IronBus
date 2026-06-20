@@ -78,8 +78,30 @@
 //! the leader's committed prefix)`, so only committed-and-replicated data is visible. Like the C1
 //! peer transport, it is a TESTABLE layer (a [`replication::ReplicationLink`] over any `Read + Write`,
 //! driven by an in-process leader↔follower loopback) — the `serve`-path wiring is deferred.
-//! Leader-epoch truncation (C2-I4, #599), divergence self-heal (C4), and multi-partition fan-out are
-//! deferred to those issues.
+//! Divergence self-heal (C4) and multi-partition fan-out are deferred to those issues.
+//!
+//! ## Status: C2-I4 (#599) — leader-epoch truncation on follower divergence (KIP-101)
+//!
+//! [`replication`] now makes replication SAFE under a LEADER CHANGE: where C2-I1 fails closed on any
+//! gap/overlap (it assumed the follower shared the leader's lineage), a follower that replicated from
+//! an OLD leader may hold an uncommitted suffix from an old epoch the NEW leader never had (or has
+//! different records at the same offsets). Truncating to the high-watermark is INSUFFICIENT — it can
+//! leave divergent committed-looking data or over-truncate. KIP-101 tracks the LEADER EPOCH per
+//! offset-range in a reconstructible, IO-free [`ironbus_core::epoch_cache::EpochCache`] (an
+//! epoch->start-offset map, NEVER stamped into the on-disk frames — the segment format is unchanged
+//! and old logs stay readable), and on a leader change the follower
+//! ([`replication::EpochAwareFollower`]) QUERIES the leader's epoch history (the new
+//! [`ironbus_proto::frame::FrameType::OffsetForLeaderEpoch`] wire tag 38, request+response sharing the
+//! tag), finds the DIVERGENCE POINT (the first offset its epoch lineage disagrees with the leader's),
+//! and TRUNCATES exactly there via the new bounded, REPORTED [`ironbus_storage::log::Log::truncate_to`]
+//! (keep the longest common prefix, drop only the divergent suffix), then re-fetches and converges
+//! BYTE-IDENTICAL to the new leader. The truncation is bounded + reported (a typed
+//! [`replication::DivergenceTruncation`] event, never a silent drop — the beat over NATS #5576) and
+//! NEVER drops committed data (the divergence point is clamped at or above the quorum-commit HW of
+//! #691). Single-node is unaffected: with no cluster a follower / epoch cache is never built, so no
+//! truncation ever runs and the on-disk layout is byte-for-byte unchanged. Footer/CRC cross-replica
+//! divergence DETECTION + self-heal is a DIFFERENT mechanism (silent corruption/drift) deferred to C4
+//! (#611/#612); this issue is leader-change LOG divergence only.
 //!
 //! ## Status: C2-I2 (#593) — ISR set + min-in-sync-replicas + quorum-FSYNC ack release
 //!
@@ -126,7 +148,8 @@ pub use membership::{MemberOp, MembershipChange, PeerIdError};
 pub use metadata_group::{GroupError, MetadataRaftGroup};
 pub use metadata_storage::{MetadataLogStorage, MetadataStorageError, METADATA_SUBDIR};
 pub use replication::{
-    ApplyOutcome, FetchRecordsBody, FetchResponseBody, Follower, ReplicationError,
+    ApplyOutcome, DivergenceTruncation, EpochAwareFollower, FetchRecordsBody, FetchResponseBody,
+    Follower, OffsetForLeaderEpochBody, OffsetForLeaderEpochResponse, ReplicationError,
     ReplicationFrame, ReplicationLeader, ReplicationLink, MAX_REPL_FETCH_BYTES,
 };
 pub use runtime::{ClusterConfig, ClusterRuntime, ClusterStatus, RuntimeError};

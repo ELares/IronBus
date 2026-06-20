@@ -85,6 +85,20 @@ pub enum StorageError {
         /// The oldest offset still present in the log.
         oldest: u64,
     },
+    /// A [`crate::log::Log::truncate_to`] (the C2-I4 leader-epoch divergence truncation, #599) was
+    /// asked to truncate to an offset that is not within the log's current durable range
+    /// `[earliest, next_offset]`: below the earliest retained offset (the bytes are already reaped,
+    /// not truncatable) or above the durable head (there is nothing there to truncate). Fail-closed:
+    /// the log is left untouched. A truncation to exactly `next_offset` (drop nothing) or to
+    /// `earliest` (drop everything retained) is in range and allowed.
+    TruncateOutOfRange {
+        /// The offset the truncation targeted.
+        requested: u64,
+        /// The earliest offset still present (the floor; truncating below it is impossible).
+        earliest: u64,
+        /// The log's next offset (the durable head; truncating above it is meaningless).
+        next_offset: u64,
+    },
     /// Recovery would drop more than the bounded-loss caps allow, so it fails closed rather
     /// than accept unbounded silent loss (#120, I3).
     ExcessiveRecoveryLoss(CapViolation),
@@ -174,6 +188,14 @@ impl core::fmt::Display for StorageError {
             StorageError::OffsetOutOfRange { requested, oldest } => write!(
                 f,
                 "read offset {requested} is older than the oldest retained offset {oldest}"
+            ),
+            StorageError::TruncateOutOfRange {
+                requested,
+                earliest,
+                next_offset,
+            } => write!(
+                f,
+                "truncate offset {requested} is outside the durable range [{earliest}, {next_offset}]"
             ),
             StorageError::ExcessiveRecoveryLoss(v) => {
                 write!(f, "recovery exceeded the bounded-loss cap: {v}")

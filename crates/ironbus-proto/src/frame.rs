@@ -319,6 +319,21 @@ pub enum FrameType {
     /// encoder/decoder of this body) — `follower_id: u64`, `fsynced_offset: u64`. Tags 1-36 are
     /// byte-for-byte unchanged.
     AckReplicated,
+    /// Cluster follower ⇄ leader LEADER-EPOCH offset query (#599, V2-C2-I4, KIP-101): the
+    /// divergence-truncation handshake that makes replication SAFE under a leader change. A follower
+    /// that may have replicated from an OLD leader sends, per its highest leader epoch, "what is the
+    /// last offset YOU hold for leadership epoch `E`?"; the leader answers its end-offset for that
+    /// epoch (the start of its next epoch, or its log end if `E` is current, or the bound of the
+    /// next-higher epoch it holds when it never saw `E`). The follower walks its epoch cache down
+    /// until the leader SHARES an epoch, takes the divergence point = `min(its end, the leader's
+    /// end)`, TRUNCATES its divergent suffix to exactly there ([`crate::cluster::replication`] in
+    /// `ironbus-server`, the only encoder/decoder of these bodies), then resumes fetching — keeping
+    /// the longest common prefix, dropping only the genuinely-divergent suffix. It rides the SAME
+    /// `[len][type][body]` envelope and is an ADDITIVE, peer-only tag a client never sends. Request
+    /// and response share this tag (like `StreamInfo`), distinguished by a leading `kind` byte. Body
+    /// (request): `kind: u8 = 0`, `epoch: u64`. Body (response): `kind: u8 = 1`, `requested_epoch:
+    /// u64`, `answered_epoch: u64`, `end_offset: u64`. Tags 1-37 are byte-for-byte unchanged.
+    OffsetForLeaderEpoch,
 }
 
 impl FrameType {
@@ -363,6 +378,7 @@ impl FrameType {
             FrameType::PubSubject => 35,
             FrameType::SubSubject => 36,
             FrameType::AckReplicated => 37,
+            FrameType::OffsetForLeaderEpoch => 38,
         }
     }
 
@@ -408,6 +424,7 @@ impl FrameType {
             35 => FrameType::PubSubject,
             36 => FrameType::SubSubject,
             37 => FrameType::AckReplicated,
+            38 => FrameType::OffsetForLeaderEpoch,
             _ => return None,
         })
     }
@@ -540,7 +557,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 37] = [
+    const ALL_TYPES: [FrameType; 38] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -578,6 +595,7 @@ mod tests {
         FrameType::PubSubject,
         FrameType::SubSubject,
         FrameType::AckReplicated,
+        FrameType::OffsetForLeaderEpoch,
     ];
 
     #[test]
@@ -632,6 +650,8 @@ mod tests {
         assert_eq!(FrameType::BindSubject.as_u8(), 34);
         assert_eq!(FrameType::PubSubject.as_u8(), 35);
         assert_eq!(FrameType::SubSubject.as_u8(), 36);
+        assert_eq!(FrameType::AckReplicated.as_u8(), 37);
+        assert_eq!(FrameType::OffsetForLeaderEpoch.as_u8(), 38);
     }
 
     #[test]
@@ -646,9 +666,14 @@ mod tests {
         assert_eq!(FrameType::from_u8(35), Some(FrameType::PubSubject));
         assert_eq!(FrameType::from_u8(36), Some(FrameType::SubSubject));
         // 37 is the cluster AckReplicated report (#593, V2-C2-I2), the next free tag after the subject
-        // verbs; 38 is now the next-free (still unknown) tag, so it frames but is not a known type.
+        // verbs; 38 is the cluster OffsetForLeaderEpoch divergence-query (#599, V2-C2-I4); 39 is now
+        // the next-free (still unknown) tag, so it frames but is not a known type.
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
-        assert_eq!(FrameType::from_u8(38), None);
+        assert_eq!(
+            FrameType::from_u8(38),
+            Some(FrameType::OffsetForLeaderEpoch)
+        );
+        assert_eq!(FrameType::from_u8(39), None);
         for ty in [
             FrameType::BindSubject,
             FrameType::PubSubject,
@@ -688,9 +713,14 @@ mod tests {
         assert_eq!(FrameType::from_u8(32), Some(FrameType::FetchRecords));
         assert_eq!(FrameType::from_u8(33), Some(FrameType::FetchResponse));
         assert_eq!(FrameType::from_u8(34), Some(FrameType::BindSubject));
-        // 37 is the cluster AckReplicated report (#593); 38 is the next-free (still unknown) tag.
+        // 37 is the cluster AckReplicated report (#593); 38 is the cluster OffsetForLeaderEpoch
+        // divergence-query (#599); 39 is the next-free (still unknown) tag.
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
-        assert_eq!(FrameType::from_u8(38), None);
+        assert_eq!(
+            FrameType::from_u8(38),
+            Some(FrameType::OffsetForLeaderEpoch)
+        );
+        assert_eq!(FrameType::from_u8(39), None);
         for ty in [
             FrameType::StreamDeclare,
             FrameType::StreamInfo,
@@ -764,12 +794,17 @@ mod tests {
         // The Tier-W verbs are untouched.
         assert_eq!(FrameType::Flow.as_u8(), 10);
         assert_eq!(FrameType::Fetch.as_u8(), 23);
-        // 37 is the cluster AckReplicated report (#593, V2-C2-I2); 38 is now the next-free (still
+        // 37 is the cluster AckReplicated report (#593, V2-C2-I2); 38 is the cluster
+        // OffsetForLeaderEpoch divergence-query (#599, V2-C2-I4); 39 is now the next-free (still
         // unknown) tag, so it frames but is not a known type. (Tags 27 = cluster-peer Raft #667;
         // 28-31 = the stream-addressed verbs #588; 32-33 = the cluster replication-fetch verbs #590;
         // 34-36 = the subject-routing verbs #585.)
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
-        assert_eq!(FrameType::from_u8(38), None);
+        assert_eq!(
+            FrameType::from_u8(38),
+            Some(FrameType::OffsetForLeaderEpoch)
+        );
+        assert_eq!(FrameType::from_u8(39), None);
         for ty in [FrameType::StreamFetch, FrameType::StreamCommit] {
             let mut buf = Vec::new();
             encode_frame(ty, b"\x07\x08", &mut buf).unwrap();
@@ -793,12 +828,17 @@ mod tests {
         assert_eq!(FrameType::from_u8(26), Some(FrameType::DeliverBatch));
         // The per-record Deliver tag is untouched.
         assert_eq!(FrameType::Deliver.as_u8(), 13);
-        // 37 is the cluster AckReplicated report (#593, V2-C2-I2); 38 is now the next-free (still
+        // 37 is the cluster AckReplicated report (#593, V2-C2-I2); 38 is the cluster
+        // OffsetForLeaderEpoch divergence-query (#599, V2-C2-I4); 39 is now the next-free (still
         // unknown) tag, so it frames but is not a known type. (Tags 27 = cluster-peer Raft #667;
         // 28-31 = the stream-addressed verbs #588; 32-33 = the cluster replication-fetch verbs #590;
         // 34-36 = the subject-routing verbs #585.)
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
-        assert_eq!(FrameType::from_u8(38), None);
+        assert_eq!(
+            FrameType::from_u8(38),
+            Some(FrameType::OffsetForLeaderEpoch)
+        );
+        assert_eq!(FrameType::from_u8(39), None);
         let mut buf = Vec::new();
         encode_frame(FrameType::DeliverBatch, b"\x09\x0a", &mut buf).unwrap();
         match decode_frame(&buf).unwrap() {
@@ -993,7 +1033,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 38u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 39u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);

@@ -25,6 +25,7 @@ pub mod delivery;
 /// in storage/cli (`docs/DICTIONARY_LIFECYCLE.md`). Absent entirely from the default build.
 #[cfg(feature = "zstd")]
 pub mod dict;
+pub mod epoch_cache;
 pub mod format;
 pub mod keyshared;
 pub mod leader_lease;
