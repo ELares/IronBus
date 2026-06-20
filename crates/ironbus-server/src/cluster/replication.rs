@@ -606,6 +606,16 @@ impl<F: Filesystem, C: Clock> Follower<F, C> {
         &self.log
     }
 
+    /// Borrow the follower's underlying log MUTABLY — for the C4 self-heal path
+    /// ([`crate::cluster::divergence`]), which truncates a detected-divergent suffix via the bounded,
+    /// reported [`Log::truncate_to`] before re-fetching the clean bytes from the quorum. The C4 resync
+    /// runs through the ordinary [`Follower`] fetch/apply path afterward, so the byte-identity and
+    /// fail-closed properties are unchanged.
+    #[must_use]
+    pub fn log_mut(&mut self) -> &mut Log<F, C> {
+        &mut self.log
+    }
+
     /// Apply a leader's fetch RESPONSE to the follower's local log: re-validate every frame's CRC,
     /// append only validated frames, sync, and advance the high-watermark.
     ///

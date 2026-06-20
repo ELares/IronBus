@@ -96,6 +96,15 @@ protobuf = { version = "2", default-features = false }
 # the all-features otlp/tonic tree, so making it a first-class default dependency adds no new crate.
 bytes = { version = "1", default-features = false }
 
+# Per-segment content hash for cross-replica divergence DETECTION (V2-C4-I1, #611). The C4
+# `cluster::divergence` fingerprint hashes a sealed segment's verbatim on-disk record bytes with
+# xxh3-64 to catch silent body corruption that the footer triple alone cannot see. `xxhash-rust`
+# (xxh3) is the SAME hash crate `ironbus-core` already uses for the record-frame xxh3, ALREADY
+# resolved in the lockfile, so making it a first-class dependency here adds NO new crate to the
+# graph. Pure Rust (no `links`, no C build script), permissive (MIT), MSRV below the 1.78 floor.
+# `default-features = false` + the `xxh3` feature keeps only the one algorithm we use.
+xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
+
 # Structured tracing (#16, #99). `tracing` is the instrumentation facade; `tracing-subscriber` (the
 # `fmt` + `json` features only, no `env-filter`/`ansi`, to keep the transitive surface minimal)
 # provides the JSON log layer compiled in BY DEFAULT. Both, and their whole transitive tree

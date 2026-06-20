@@ -334,6 +334,19 @@ pub enum FrameType {
     /// (request): `kind: u8 = 0`, `epoch: u64`. Body (response): `kind: u8 = 1`, `requested_epoch:
     /// u64`, `answered_epoch: u64`, `end_offset: u64`. Tags 1-37 are byte-for-byte unchanged.
     OffsetForLeaderEpoch,
+    /// Cluster replica → peer SEGMENT-FINGERPRINT advertisement (#611, V2-C4-I1): the cross-replica
+    /// divergence-DETECTION wire. A replica advertises, per SEALED segment, the cheap fingerprint
+    /// `(segment_id, record_count, last_seq, footer_CRC, content_hash)` plus its committed
+    /// high-watermark, so a peer can DETECT divergence/corruption in O(segments) WITHOUT shipping any
+    /// record bytes — the signal NATS computes but never acts on (`errFirstSequenceMismatch`,
+    /// nats-server #5576). On a mismatch the divergent replica truncates + re-fetches the clean bytes
+    /// from the quorum (#612) or quarantines a corrupt minority segment and re-syncs (#613); a minority
+    /// fault can never delete data or lose quorum (the beat over nats-server #7556). It rides the SAME
+    /// `[len][type][body]` envelope and is an ADDITIVE, peer-only tag a client never sends. Body: a
+    /// fixed little-endian header (`committed_hw: u64`, `count: u32`) followed by `count` fixed-layout
+    /// fingerprints (see [`crate::cluster::divergence`] in `ironbus-server`, the only encoder/decoder of
+    /// this body); the `count` is bounded before any allocation. Tags 1-38 are byte-for-byte unchanged.
+    SegmentFingerprints,
 }
 
 impl FrameType {
@@ -379,6 +392,7 @@ impl FrameType {
             FrameType::SubSubject => 36,
             FrameType::AckReplicated => 37,
             FrameType::OffsetForLeaderEpoch => 38,
+            FrameType::SegmentFingerprints => 39,
         }
     }
 
@@ -425,6 +439,7 @@ impl FrameType {
             36 => FrameType::SubSubject,
             37 => FrameType::AckReplicated,
             38 => FrameType::OffsetForLeaderEpoch,
+            39 => FrameType::SegmentFingerprints,
             _ => return None,
         })
     }
@@ -557,7 +572,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 38] = [
+    const ALL_TYPES: [FrameType; 39] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -596,6 +611,7 @@ mod tests {
         FrameType::SubSubject,
         FrameType::AckReplicated,
         FrameType::OffsetForLeaderEpoch,
+        FrameType::SegmentFingerprints,
     ];
 
     #[test]
@@ -652,6 +668,7 @@ mod tests {
         assert_eq!(FrameType::SubSubject.as_u8(), 36);
         assert_eq!(FrameType::AckReplicated.as_u8(), 37);
         assert_eq!(FrameType::OffsetForLeaderEpoch.as_u8(), 38);
+        assert_eq!(FrameType::SegmentFingerprints.as_u8(), 39);
     }
 
     #[test]
@@ -666,14 +683,16 @@ mod tests {
         assert_eq!(FrameType::from_u8(35), Some(FrameType::PubSubject));
         assert_eq!(FrameType::from_u8(36), Some(FrameType::SubSubject));
         // 37 is the cluster AckReplicated report (#593, V2-C2-I2), the next free tag after the subject
-        // verbs; 38 is the cluster OffsetForLeaderEpoch divergence-query (#599, V2-C2-I4); 39 is now
-        // the next-free (still unknown) tag, so it frames but is not a known type.
+        // verbs; 38 is the cluster OffsetForLeaderEpoch divergence-query (#599, V2-C2-I4); 39 is the
+        // cluster SegmentFingerprints divergence-advertisement (#611, V2-C4-I1); 40 is now the
+        // next-free (still unknown) tag, so it frames but is not a known type.
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
         assert_eq!(
             FrameType::from_u8(38),
             Some(FrameType::OffsetForLeaderEpoch)
         );
-        assert_eq!(FrameType::from_u8(39), None);
+        assert_eq!(FrameType::from_u8(39), Some(FrameType::SegmentFingerprints));
+        assert_eq!(FrameType::from_u8(40), None);
         for ty in [
             FrameType::BindSubject,
             FrameType::PubSubject,
@@ -714,13 +733,15 @@ mod tests {
         assert_eq!(FrameType::from_u8(33), Some(FrameType::FetchResponse));
         assert_eq!(FrameType::from_u8(34), Some(FrameType::BindSubject));
         // 37 is the cluster AckReplicated report (#593); 38 is the cluster OffsetForLeaderEpoch
-        // divergence-query (#599); 39 is the next-free (still unknown) tag.
+        // divergence-query (#599); 39 is the cluster SegmentFingerprints divergence-advertisement
+        // (#611); 40 is the next-free (still unknown) tag.
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
         assert_eq!(
             FrameType::from_u8(38),
             Some(FrameType::OffsetForLeaderEpoch)
         );
-        assert_eq!(FrameType::from_u8(39), None);
+        assert_eq!(FrameType::from_u8(39), Some(FrameType::SegmentFingerprints));
+        assert_eq!(FrameType::from_u8(40), None);
         for ty in [
             FrameType::StreamDeclare,
             FrameType::StreamInfo,
@@ -795,16 +816,18 @@ mod tests {
         assert_eq!(FrameType::Flow.as_u8(), 10);
         assert_eq!(FrameType::Fetch.as_u8(), 23);
         // 37 is the cluster AckReplicated report (#593, V2-C2-I2); 38 is the cluster
-        // OffsetForLeaderEpoch divergence-query (#599, V2-C2-I4); 39 is now the next-free (still
-        // unknown) tag, so it frames but is not a known type. (Tags 27 = cluster-peer Raft #667;
-        // 28-31 = the stream-addressed verbs #588; 32-33 = the cluster replication-fetch verbs #590;
-        // 34-36 = the subject-routing verbs #585.)
+        // OffsetForLeaderEpoch divergence-query (#599, V2-C2-I4); 39 is the cluster SegmentFingerprints
+        // divergence-advertisement (#611, V2-C4-I1); 40 is now the next-free (still unknown) tag, so it
+        // frames but is not a known type. (Tags 27 = cluster-peer Raft #667; 28-31 = the
+        // stream-addressed verbs #588; 32-33 = the cluster replication-fetch verbs #590; 34-36 = the
+        // subject-routing verbs #585.)
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
         assert_eq!(
             FrameType::from_u8(38),
             Some(FrameType::OffsetForLeaderEpoch)
         );
-        assert_eq!(FrameType::from_u8(39), None);
+        assert_eq!(FrameType::from_u8(39), Some(FrameType::SegmentFingerprints));
+        assert_eq!(FrameType::from_u8(40), None);
         for ty in [FrameType::StreamFetch, FrameType::StreamCommit] {
             let mut buf = Vec::new();
             encode_frame(ty, b"\x07\x08", &mut buf).unwrap();
@@ -829,16 +852,18 @@ mod tests {
         // The per-record Deliver tag is untouched.
         assert_eq!(FrameType::Deliver.as_u8(), 13);
         // 37 is the cluster AckReplicated report (#593, V2-C2-I2); 38 is the cluster
-        // OffsetForLeaderEpoch divergence-query (#599, V2-C2-I4); 39 is now the next-free (still
-        // unknown) tag, so it frames but is not a known type. (Tags 27 = cluster-peer Raft #667;
-        // 28-31 = the stream-addressed verbs #588; 32-33 = the cluster replication-fetch verbs #590;
-        // 34-36 = the subject-routing verbs #585.)
+        // OffsetForLeaderEpoch divergence-query (#599, V2-C2-I4); 39 is the cluster SegmentFingerprints
+        // divergence-advertisement (#611, V2-C4-I1); 40 is now the next-free (still unknown) tag, so it
+        // frames but is not a known type. (Tags 27 = cluster-peer Raft #667; 28-31 = the
+        // stream-addressed verbs #588; 32-33 = the cluster replication-fetch verbs #590; 34-36 = the
+        // subject-routing verbs #585.)
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
         assert_eq!(
             FrameType::from_u8(38),
             Some(FrameType::OffsetForLeaderEpoch)
         );
-        assert_eq!(FrameType::from_u8(39), None);
+        assert_eq!(FrameType::from_u8(39), Some(FrameType::SegmentFingerprints));
+        assert_eq!(FrameType::from_u8(40), None);
         let mut buf = Vec::new();
         encode_frame(FrameType::DeliverBatch, b"\x09\x0a", &mut buf).unwrap();
         match decode_frame(&buf).unwrap() {
@@ -1033,7 +1058,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 39u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 40u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);
