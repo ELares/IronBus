@@ -62,7 +62,7 @@ pub fn serve<F, C>(
     progress: &crate::liveness::LivenessBeacon,
 ) -> std::io::Result<()>
 where
-    F: Filesystem + 'static,
+    F: Filesystem + Clone + 'static,
     C: Clock + Clone + 'static,
 {
     listener.set_nonblocking(true)?;
@@ -118,7 +118,7 @@ fn handle_connection<F, C>(
     member_id: MemberId,
 ) -> std::io::Result<()>
 where
-    F: Filesystem + 'static,
+    F: Filesystem + Clone + 'static,
     C: Clock + Clone + 'static,
 {
     stream.set_nonblocking(false)?; // the handler reads blocking
@@ -178,7 +178,7 @@ fn connection_loop<F, C>(
     session: &mut Session,
 ) -> std::io::Result<()>
 where
-    F: Filesystem + 'static,
+    F: Filesystem + Clone + 'static,
     C: Clock + Clone + 'static,
 {
     let mut inbuf: Vec<u8> = Vec::new();

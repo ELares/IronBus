@@ -207,11 +207,17 @@ impl IsolatedBroker<EphemeralFs> {
 
 impl<F: Filesystem + 'static> IsolatedBroker<F> {
     /// Hosts an ALREADY-OPENED engine: actor spawn, ephemeral loopback bind, serve thread. The
-    /// shared backend-independent body behind both spawn constructors.
+    /// shared backend-independent body behind both spawn constructors. `F: Clone` because the serve
+    /// thread (`server::serve`) drives `Session::process`, whose stream-addressed verbs (#588) reach
+    /// `StreamSet::declare` (the per-stream log open clones the fs); every opened `Engine<F, _>`
+    /// already carries `F: Clone` (`Engine::open` requires it), so this is no new restriction.
     fn from_engine(
         engine: ironbus_server::engine::Engine<F, ironbus_server::clock::SystemClock>,
         config: &ServeConfig,
-    ) -> Result<IsolatedBroker<F>, CliError> {
+    ) -> Result<IsolatedBroker<F>, CliError>
+    where
+        F: Clone,
+    {
         // Honor the resolved group-commit gather (#454, #472), so the bench broker reflects the
         // SAME default as the real `serve` path (`run_broker` wires `config.commit_gather_us` the
         // same way). Without this the bench would always run the gather-off actor and never measure
