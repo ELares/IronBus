@@ -782,6 +782,12 @@ mod tests {
     /// Spin until `pred` holds or `timeout` elapses; returns whether it held. Used to wait for the
     /// asynchronous, thread-driven cluster to reach a state (a leader elected, an entry applied)
     /// without sleeping a fixed, brittle duration.
+    ///
+    /// It POLLS at a fine interval and returns the instant `pred` first holds, so on a healthy host
+    /// it exits early (the cluster elects in ~1 s, so these waits cost ~1 s, not the full `timeout`).
+    /// The `timeout` is only the GENEROUS upper bound for a slow/contended host; pair it with
+    /// [`host_scaled`] so that bound stretches with the host rather than being a fixed wall-clock
+    /// value that races under CI CPU starvation.
     fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -791,6 +797,69 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         }
         pred()
+    }
+
+    /// A fixed slug of pure-CPU work whose wall-clock cost MEASURES how much CPU this thread is
+    /// actually getting. On an idle host it runs in well under a millisecond; on a CPU-starved CI
+    /// runner (every core pegged by other test binaries) the SAME work takes many times longer in
+    /// wall-clock because the thread is repeatedly preempted. That ratio is exactly the starvation
+    /// that slows the runtime's driver thread (which must accumulate ~10 election-timeout `tick`s to
+    /// elect), so it is the right thing to scale the election-wait deadline by. Pure arithmetic with a
+    /// `black_box` fence so the optimiser cannot fold it away.
+    fn probe_busy_nanos() -> u128 {
+        // ~2M iterations of dependent integer work: long enough to dwarf timer granularity and to
+        // span several scheduler slices under contention, short enough to be negligible on an idle
+        // host (sub-millisecond).
+        const ITERS: u64 = 2_000_000;
+        let start = Instant::now();
+        let mut acc: u64 = 0x9E37_79B9_7F4A_7C15;
+        for i in 0..ITERS {
+            acc = acc
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(i | 1);
+            acc ^= acc >> 29;
+        }
+        std::hint::black_box(acc);
+        start.elapsed().as_nanos().max(1)
+    }
+
+    /// Scale a GENEROUS base election-wait deadline by the observed host slowdown so the cluster
+    /// election tests are robust to CI CPU contention WITHOUT weakening what they prove.
+    ///
+    /// The fix for #687: the runtime drives raft on a fixed-ms `tick` cadence on a driver thread, and
+    /// an election needs ~10 ticks. A FIXED wall-clock wait races under CI starvation — the starved
+    /// driver thread doesn't accumulate enough ticks inside the bound, so the leader-elected assertion
+    /// flakes (a timing race, not a logic bug: it passes locally and on re-run). Rather than bump a
+    /// fixed sleep (which still races on a slow-enough host) or weaken the assertion, we calibrate the
+    /// deadline to the host: [`probe_busy_nanos`] measures this thread's real CPU throughput, and we
+    /// multiply the base deadline by how many times slower than a fast reference host we are (clamped).
+    ///
+    /// On an unloaded host the factor is ~1, so the deadline stays the generous base and the poll
+    /// still exits early the instant a leader is elected (the test is FAST). On a starved host the
+    /// factor grows, stretching the cap so the (equally starved) driver thread is given proportionally
+    /// more wall-clock time to do the SAME number of ticks. The assertion is UNCHANGED — it still
+    /// fails if a leader is never elected / nothing commits within the (now host-tolerant) deadline,
+    /// which is a real regression. Same adaptive-calibration philosophy as the #666 `injected_stall` fix.
+    fn host_scaled(base: Duration) -> Duration {
+        /// A fast, unloaded reference host runs [`probe_busy_nanos`]'s slug in roughly this long. The
+        /// scale factor is `observed / reference`, clamped to `[1, MAX_SCALE]`: a host at or faster
+        /// than the reference gets the base deadline (factor 1, never SHORTER — we only ever extend),
+        /// a slower/contended host gets a proportionally longer one.
+        const REFERENCE_BUSY_NANOS: u128 = 4_000_000; // ~4 ms for ~2M iters on a fast core.
+        /// Cap the multiplier so a pathologically wedged host still fails in bounded time rather than
+        /// hanging the suite — a genuinely never-electing cluster (a real bug) must still surface.
+        const MAX_SCALE: u32 = 12;
+
+        // Take the median of three probes so a single descheduled probe doesn't skew the estimate.
+        let mut samples = [probe_busy_nanos(), probe_busy_nanos(), probe_busy_nanos()];
+        samples.sort_unstable();
+        let observed = samples[1];
+
+        let factor = (observed / REFERENCE_BUSY_NANOS).clamp(1, u128::from(MAX_SCALE));
+        // `factor` is clamped to [1, MAX_SCALE] (both fit a u32), so the conversion is infallible;
+        // fall back to the cap rather than `unwrap` to keep the helper panic-free regardless.
+        let factor = u32::try_from(factor).unwrap_or(MAX_SCALE);
+        base * factor
     }
 
     /// Start a runtime for one node of a cluster, rooted at a per-node temp dir.
@@ -832,9 +901,11 @@ mod tests {
             })
             .collect();
 
-        // A leader is elected within a few seconds (election ~1 s at the 100 ms tick cadence; allow
-        // generous head-room for thread scheduling + the loopback connect/backoff).
-        let elected = wait_until(Duration::from_secs(20), || {
+        // A leader is elected within a few seconds (election ~1 s at the 100 ms tick cadence). The
+        // poll exits the instant exactly one leader appears (fast on a healthy host); the deadline is
+        // a GENEROUS upper bound that `host_scaled` stretches under CI CPU starvation so the starved
+        // driver thread still gets enough wall-clock time to accumulate its election ticks (#687).
+        let elected = wait_until(host_scaled(Duration::from_secs(20)), || {
             nodes.iter().filter(|n| n.status().is_leader).count() == 1
         });
         assert!(elected, "exactly one leader should be elected");
@@ -856,8 +927,10 @@ mod tests {
             .expect("propose");
 
         // The applied index advances past the leader's no-op election entry on every node once the
-        // SetConfig entry commits and applies across the quorum.
-        let committed = wait_until(Duration::from_secs(20), || {
+        // SetConfig entry commits and applies across the quorum. Same host-scaled, early-exit poll:
+        // it returns as soon as the entry is replicated everywhere, and the deadline stretches under
+        // contention rather than racing the (starved) replication round-trip (#687).
+        let committed = wait_until(host_scaled(Duration::from_secs(20)), || {
             nodes.iter().all(|n| n.status().applied_index >= 2)
         });
         assert!(
@@ -909,7 +982,7 @@ mod tests {
             .collect();
 
         assert!(
-            wait_until(Duration::from_secs(20), || nodes
+            wait_until(host_scaled(Duration::from_secs(20)), || nodes
                 .iter()
                 .filter(|n| n.status().is_leader)
                 .count()
@@ -927,7 +1000,7 @@ mod tests {
 
         // The remaining two nodes still form a quorum (2 of 3 is a majority).
         assert!(
-            wait_until(Duration::from_secs(20), || nodes[..2]
+            wait_until(host_scaled(Duration::from_secs(20)), || nodes[..2]
                 .iter()
                 .filter(|n| n.status().is_leader)
                 .count()
@@ -938,7 +1011,7 @@ mod tests {
         // Restart node id 3 over the SAME data dir; it recovers and rejoins.
         nodes[2] = start_node(&mk(3), dirs[2].path());
         assert!(
-            wait_until(Duration::from_secs(20), || {
+            wait_until(host_scaled(Duration::from_secs(20)), || {
                 // The rejoined node catches up to a non-zero applied index (it is replicated to) and
                 // the cluster still has exactly one leader.
                 nodes.iter().filter(|n| n.status().is_leader).count() == 1
@@ -964,7 +1037,9 @@ mod tests {
         let mut node = start_node(&ClusterConfig { node_id: 1, peers }, dir.path());
 
         assert!(
-            wait_until(Duration::from_secs(10), || node.status().is_leader),
+            wait_until(host_scaled(Duration::from_secs(10)), || node
+                .status()
+                .is_leader),
             "the lone voter self-elects"
         );
         assert!(
@@ -998,7 +1073,7 @@ mod tests {
             .collect();
 
         assert!(
-            wait_until(Duration::from_secs(20), || nodes
+            wait_until(host_scaled(Duration::from_secs(20)), || nodes
                 .iter()
                 .filter(|n| n.status().is_leader)
                 .count()
@@ -1030,7 +1105,7 @@ mod tests {
 
         // The cluster survives the hostile probe: a leader is still present a moment later.
         assert!(
-            wait_until(Duration::from_secs(10), || nodes
+            wait_until(host_scaled(Duration::from_secs(10)), || nodes
                 .iter()
                 .filter(|n| n.status().is_leader)
                 .count()
@@ -1067,7 +1142,7 @@ mod tests {
         let peers = peer_map(&[1], &ports);
         let mut node = start_node(&ClusterConfig { node_id: 1, peers }, configured.path());
         assert!(
-            wait_until(Duration::from_secs(10), || configured
+            wait_until(host_scaled(Duration::from_secs(10)), || configured
                 .path()
                 .join(super::super::METADATA_SUBDIR)
                 .exists()),
