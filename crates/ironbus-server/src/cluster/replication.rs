@@ -79,6 +79,7 @@ use ironbus_proto::frame::{
 };
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::{Append, Log, TruncateOutcome};
+use ironbus_storage::read_plane::ReadPlane;
 use ironbus_storage::segment::StorageError;
 
 /// The hard maximum size, in bytes, of the CRC-framed record-byte payload a single replication
@@ -524,6 +525,118 @@ impl<'a, F: Filesystem, C: Clock> ReplicationLeader<'a, F, C> {
         req: &OffsetForLeaderEpochBody,
     ) -> OffsetForLeaderEpochResponse {
         let end = leader_epochs.end_offset_for_epoch(req.epoch, self.log.flushed_offset());
+        OffsetForLeaderEpochResponse { end_offset: end }
+    }
+}
+
+/// The LEADER side of replication that serves a follower's fetch through the LOCK-FREE, OFF-ACTOR READ
+/// PLANE (#654) instead of a `&Log` borrow — the #715 engine-ownership refactor.
+///
+/// ## Why this exists (the `Send` crux)
+///
+/// [`ReplicationLeader`] holds a `&'a Log<F, C>`, so a controller that owns it is NOT `Send` and cannot
+/// run on a peer-I/O thread alongside the engine's single append actor. The engine owns its partition
+/// log PRIVATELY behind that actor (it is the ONLY writer of the log — the single-writer invariant), so
+/// the data plane cannot take a second borrow of it across threads. But the engine ALSO publishes a
+/// [`ReadPlane`] (#654): an `Arc`-shared, lock-free, off-actor view of the SEALED, flushed prefix (an
+/// `AtomicU64` flushed frontier + an `ArcSwap` of the immutable sealed-segment snapshot). The append
+/// actor keeps publishing to it after every commit/seal; any number of readers observe it with no lock
+/// and no actor round-trip. A leader-serve is EXACTLY that read pattern — serve a committed byte range —
+/// so the leader serves through a cloned `ReadPlane` (an `Arc`, `Send`) and NEVER borrows or writes the
+/// leader's log. The data plane reads via the read plane; it is never a second writer. That is what
+/// makes the controller `Send`.
+///
+/// ## The high-watermark and the active (flushed-but-unsealed) tail
+///
+/// The advertised high-watermark is the read plane's [`ReadPlane::flushed`] frontier — the SAME value
+/// the append actor publishes from [`Log::flushed_offset`] after every commit (the through-actor leader
+/// advertised exactly this). It is the true committed frontier, so a follower's visible HW (clamped to
+/// `min(its own durable prefix, this HW)`) is identical to the through-actor path's.
+///
+/// The read plane serves only the SEALED prefix; a leader's flushed frontier can sit AHEAD of the
+/// sealed end (the active segment holds flushed-but-unsealed records). When a fetch starts in that
+/// active tail the read plane returns an EMPTY run (and a `fallback_from`); the follower applies the
+/// empty run as a clean no-op, observes the advertised HW, and re-fetches. It catches up to the sealed
+/// end byte-identically and replicates the active tail the moment it seals (a roll). This is CORRECT by
+/// construction — no false ack, no false visibility (the follower only ever shows what it durably
+/// holds) — but a follower can LAG by up to the active-segment size until that segment seals. That
+/// liveness window (closing it by serving the active flushed tail off-actor, e.g. via an actor-fallback
+/// read on the peer thread, or an active-segment read-plane extension) is FLAGGED as the follow-up; it
+/// is not a correctness gap and does not affect the single-writer / byte-identical invariants.
+pub struct ReadPlaneLeader<'a, F: Filesystem> {
+    plane: &'a ReadPlane<F>,
+}
+
+impl<'a, F: Filesystem> ReadPlaneLeader<'a, F> {
+    /// Wrap a leader's `Arc`-shared read plane as an off-actor replication source. The plane is the
+    /// engine's own [`Engine::read_plane`](crate::engine::Engine::read_plane) clone (#654); it is
+    /// `Send` and never borrows or writes the leader's log.
+    #[must_use]
+    pub fn new(plane: &'a ReadPlane<F>) -> Self {
+        Self { plane }
+    }
+
+    /// The leader's current high-watermark: the read plane's flushed frontier — the same flushed /
+    /// committed offset [`ReplicationLeader::high_watermark`] reads from the log, published by the
+    /// append actor after every commit. A follower never replicates (or makes visible) past it.
+    #[must_use]
+    pub fn high_watermark(&self) -> Offset {
+        Offset::new(self.plane.flushed())
+    }
+
+    /// Serve a follower's fetch from the SEALED, flushed prefix through the read plane — the off-actor
+    /// twin of [`ReplicationLeader::serve_fetch`]. Reads a contiguous CRC-framed [`RawByteRun`] of the
+    /// leader's own durable bytes via [`ReadPlane::read_range_raw`] (zero-copy, single sealed segment),
+    /// bounded by the smaller of the request budget and [`MAX_REPL_FETCH_BYTES`], and advertises the
+    /// read plane's flushed frontier as the high-watermark.
+    ///
+    /// The run is the SEALED prefix only: a fetch whose `from_offset` is already in the active
+    /// (flushed-but-unsealed) tail returns an EMPTY run with the true HW (the follower no-ops and
+    /// re-fetches; it catches up byte-identically as segments seal). The leader NEVER writes its log
+    /// here — it only reads the immutable sealed bytes via the `Arc`-shared plane.
+    ///
+    /// # Errors
+    /// Returns [`ReplicationError::Storage`] if the underlying raw read fails (e.g. the requested
+    /// offset is older than the oldest retained record).
+    pub fn serve_fetch(
+        &self,
+        req: &FetchRecordsBody,
+    ) -> Result<FetchResponseBody, ReplicationError> {
+        let hw = self.plane.flushed();
+        let from = Offset::new(req.from_offset);
+        // Bound the served bytes to the cap regardless of what the follower asked for (mirrors
+        // ReplicationLeader exactly): `0` request bytes means "use the cap", so a follower without a
+        // byte budget still makes progress; the record-count budget still bounds it.
+        let req_bytes = if req.max_bytes == 0 {
+            MAX_REPL_FETCH_BYTES
+        } else {
+            req.max_bytes.min(MAX_REPL_FETCH_BYTES)
+        };
+        let max_records = req.max_records as usize;
+        // The read plane serves the SEALED prefix and reports `fallback_from` for the active tail; the
+        // follower drives the cadence (it re-fetches from where it left off), so we serve the sealed
+        // run this fetch covers and let the follower come back for the rest as it seals.
+        let sealed = self
+            .plane
+            .read_range_raw(from, max_records, Some(req_bytes as usize))?;
+        Ok(FetchResponseBody {
+            high_watermark: hw,
+            first_offset: sealed.run.first_offset.get(),
+            record_count: u32::try_from(sealed.run.record_count).unwrap_or(u32::MAX),
+            frame_bytes: sealed.run.bytes.to_vec(),
+        })
+    }
+
+    /// Answer a follower's [`OffsetForLeaderEpochBody`] from the leader's epoch cache — the off-actor
+    /// twin of [`ReplicationLeader::serve_epoch_query`]. The leader's log end is its high-watermark
+    /// (the read plane's flushed frontier), so a follower never truncates to an uncommitted offset.
+    #[must_use]
+    pub fn serve_epoch_query(
+        &self,
+        leader_epochs: &EpochCache,
+        req: &OffsetForLeaderEpochBody,
+    ) -> OffsetForLeaderEpochResponse {
+        let end = leader_epochs.end_offset_for_epoch(req.epoch, Offset::new(self.plane.flushed()));
         OffsetForLeaderEpochResponse { end_offset: end }
     }
 }

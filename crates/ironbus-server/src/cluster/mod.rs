@@ -298,8 +298,8 @@ pub use metadata_storage::{MetadataLogStorage, MetadataStorageError, METADATA_SU
 pub use placement::{decide_placement, placement_command, placement_node_from, PlacementOutcome};
 pub use replication::{
     ApplyOutcome, DivergenceTruncation, EpochAwareFollower, FetchRecordsBody, FetchResponseBody,
-    Follower, OffsetForLeaderEpochBody, OffsetForLeaderEpochResponse, ReplicationError,
-    ReplicationFrame, ReplicationLeader, ReplicationLink, MAX_REPL_FETCH_BYTES,
+    Follower, OffsetForLeaderEpochBody, OffsetForLeaderEpochResponse, ReadPlaneLeader,
+    ReplicationError, ReplicationFrame, ReplicationLeader, ReplicationLink, MAX_REPL_FETCH_BYTES,
 };
 pub use runtime::{ClusterConfig, ClusterRuntime, ClusterStatus, RuntimeError};
 pub use serve::{
