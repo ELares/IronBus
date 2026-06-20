@@ -135,6 +135,30 @@
 //! the level degenerates to `C1` (the leader local-fsync I2 ack), the counters render at `0`, and the
 //! cluster `power_loss_unsafe` gauge renders `0`.
 //!
+//! ## Status: C4-I1/I2/I3 (#611/#612/#613) — cross-replica divergence detection + self-heal
+//!
+//! [`divergence`] is the RECOVERY DIFFERENTIATOR: it extends the single-node I3 contract (bounded,
+//! reported, fail-closed recovery) CLUSTER-WIDE, fixing the two NATS failures that have no fix today.
+//! Replicas advertise a per-SEALED-segment FINGERPRINT — the footer triple `(record_count, last_seq,
+//! footer_CRC)` plus an xxh3-64 `content_hash` over the segment's verbatim on-disk record bytes — over
+//! the bounded, validated [`ironbus_proto::frame::FrameType::SegmentFingerprints`] wire (tag 39).
+//! [`divergence::compare_fingerprints`] DETECTS divergence in O(segments) (a clean cluster detects
+//! NOTHING — no false positive), emitting a typed [`divergence::DivergenceReport`]; this is the signal
+//! NATS computes (`errFirstSequenceMismatch`) but never acts on (#5576). On a detected divergence
+//! [`divergence::plan_resync`] + [`divergence::execute_resync`] TRUNCATE the divergent suffix (clamped
+//! at or above the committed high-watermark of #691, so committed data is NEVER dropped) and RE-FETCH
+//! the clean CRC-validated bytes from the quorum (the C2 [`replication::Follower`] path), converging
+//! BYTE-IDENTICAL — bounded by the I3 caps ([`divergence::ResyncBounds`]) and REPORTED as a
+//! [`divergence::ResyncReport`] (fail-closed over the cap). When a divergent segment on a MINORITY is
+//! locally corrupt, [`divergence::quarantine_and_resync`] COPY-THEN-DROPS it into the existing capped
+//! forensic [`ironbus_storage::quarantine::QuarantineStore`] (the corrupt bytes are PRESERVED, NEVER
+//! deleted) and re-syncs from the clean majority — the partition stays available; a minority fault can
+//! neither delete data nor lose quorum (the direct beat over NATS #7556's minority-corruption-deletes-
+//! stream). The leader-completeness ELECTION restriction (a corrupt replica can't win) is C4-I4 (#614)
+//! and the CI1-CI4 doc/checkers are C4-I5 (#615) — both DEFERRED. Single-node is byte-identical: with
+//! no cluster a broker never advertises, compares, or resyncs, and the single-node quarantine/recovery
+//! path is unchanged.
+//!
 //! ## Deliberately deferred (later C1 / C2 issues)
 //!
 //! * **`serve`-path wiring + over-the-wire learner CATCH-UP + C2 replication** — wiring the
@@ -153,6 +177,7 @@
 //! activates in a multi-node config).
 
 pub mod ack_level;
+pub mod divergence;
 pub mod isr;
 pub mod membership;
 pub mod metadata_group;
@@ -163,6 +188,11 @@ pub mod state_machine;
 pub mod transport;
 
 pub use ack_level::{ClusterAckLevel, ClusterAckLevelMetrics};
+pub use divergence::{
+    compare_fingerprints, execute_resync, fingerprint_log, plan_resync, quarantine_and_resync,
+    DivergenceDetected, DivergenceError, DivergenceField, DivergenceReport, ResyncBounds,
+    ResyncPlan, ResyncReport, SegmentFingerprint, SegmentFingerprints, MAX_FINGERPRINTS,
+};
 pub use isr::{AckReplicatedBody, IsrConfig, IsrMembership, IsrTracker, PendingAck, QuorumAckGate};
 pub use membership::{MemberOp, MembershipChange, PeerIdError};
 pub use metadata_group::{GroupError, MetadataRaftGroup};

@@ -865,6 +865,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "xxhash-rust",
 ]
 
 [[package]]
