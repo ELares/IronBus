@@ -1688,15 +1688,28 @@ struct ParsedServe {
 /// even required.
 #[derive(Clone, Debug, Default)]
 struct TransportSecurityFlags {
-    /// `--tls-cert` PEM path (the server certificate chain), or `None`.
+    /// `--tls-cert` PEM path (the server certificate chain), or `None`. RESERVED, NOT YET HONORED
+    /// (#107): the TLS 1.3 handshake is not wired (no allowed crypto provider), so this build REFUSES
+    /// any `--tls-*` value rather than accept a cert that would imply encryption it cannot deliver. Kept
+    /// on the struct so the flag/env surface is stable and the re-enable (when #107 lands) is local.
     tls_cert: Option<String>,
-    /// `--tls-key` PEM path (the server private key), or `None`.
+    /// `--tls-key` PEM path (the server private key), or `None`. RESERVED, NOT YET HONORED (#107): see
+    /// `tls_cert`; a non-`None` value is a fail-closed startup refusal until the TLS layer lands.
     tls_key: Option<String>,
-    /// `--tls-client-ca` PEM path (the mTLS client-CA trust anchor), or `None`. When present it is
-    /// BOTH TLS material and a configured auth identity.
+    /// `--tls-client-ca` PEM path (the mTLS client-CA trust anchor), or `None`. RESERVED, NOT YET
+    /// HONORED (#107): mTLS identity-mapping needs the (unwired) TLS layer to supply a verified peer
+    /// certificate, so a non-`None` value is a fail-closed startup refusal until then.
     tls_client_ca: Option<String>,
     /// `--auth-config` path (the credential-bearing identity table), or `None`.
     auth_config: Option<String>,
+    /// `--insecure-plaintext-wire` (#629): the EXPLICIT, loud opt-in that ALLOWS a non-loopback bind
+    /// WITHOUT TLS but WITH auth, for the legitimate TLS-terminated-upstream pattern (a mesh / proxy /
+    /// VPN encrypts the wire and the broker terminates plaintext+auth behind it). The operator thereby
+    /// accepts that the BROKER wire is plaintext. Required because the native TLS 1.3 handshake is not
+    /// yet implemented (#107), so a `--tls-*` cert cannot encrypt the wire; this flag is the honest way
+    /// to run a non-loopback bind today. It NEVER permits plaintext+anonymous: an auth identity is still
+    /// required, and a loud startup WARNING is always emitted. Inert on loopback.
+    insecure_plaintext_wire: bool,
     /// `--max-preauth-connections`: the half-open (pre-auth) connection cap (default 128).
     max_preauth_connections: usize,
     /// `--preauth-rate-per-ip`: the per-source-IP connection rate, connections/sec (default 10).
@@ -1706,18 +1719,30 @@ struct TransportSecurityFlags {
 }
 
 impl TransportSecurityFlags {
-    /// Whether TLS material is configured (#629): a server certificate AND its private key, OR a
-    /// client-CA trust anchor (mTLS), so the listener could complete a TLS 1.3 handshake. This is the
-    /// "TLS material is configured" half of the fail-closed bind precondition.
-    fn has_tls_material(&self) -> bool {
-        (self.tls_cert.is_some() && self.tls_key.is_some()) || self.tls_client_ca.is_some()
+    /// The name of any `--tls-*` flag that was set (#107), or `None` if no TLS material is configured.
+    /// Any non-`None` value is a fail-closed startup REFUSAL: the TLS 1.3 handshake is not yet wired
+    /// (no allowed crypto provider), so a `--tls-*` cert can NEVER encrypt the wire, and accepting it
+    /// would imply encryption this build cannot deliver. Catches both the CLI flag and the
+    /// `IRONBUS_TLS_*` env var (the resolved value is checked), so neither path can create a false
+    /// impression of encryption. Re-enabled (to actually wire rustls) when the TLS layer lands.
+    fn reserved_tls_flag(&self) -> Option<&'static str> {
+        if self.tls_cert.is_some() {
+            Some("--tls-cert")
+        } else if self.tls_key.is_some() {
+            Some("--tls-key")
+        } else if self.tls_client_ca.is_some() {
+            Some("--tls-client-ca")
+        } else {
+            None
+        }
     }
 
-    /// Whether at least one auth identity is configured (#631): an identity-table file OR an mTLS
-    /// client-CA trust anchor (a client cert that verifies against it is an authenticated network
-    /// client). This is the "an auth identity is configured" half of the precondition.
+    /// Whether at least one auth identity is configured (#631): an identity-table file. (An mTLS
+    /// client-CA would also be an auth identity, but `--tls-client-ca` is a reserved/not-yet-honored
+    /// TLS flag — see [`reserved_tls_flag`] — so it cannot reach here; it is refused at startup before
+    /// any bind decision.) This is the "an auth identity is configured" half of the precondition.
     fn has_auth_identity(&self) -> bool {
-        self.auth_config.is_some() || self.tls_client_ca.is_some()
+        self.auth_config.is_some()
     }
 }
 
@@ -1903,19 +1928,25 @@ struct ServeFlags {
     /// is a typed usage error. Empty (no `--cluster-peer`) = the single-node default, no cluster.
     /// CLI-only and repeatable, exactly like `--key-shared-group`.
     cluster_peers: Vec<String>,
-    /// The TLS server certificate chain file (#629, V2-M7): a PEM path. Part of the "TLS material"
-    /// the fail-closed bind invariant requires for a non-loopback bind. Sourced by REFERENCE (a path,
-    /// never an inline secret). The actual TLS 1.3 handshake wiring (rustls) is the FLAGGED follow-up;
-    /// this flag makes "TLS material is configured" a checkable startup precondition.
+    /// The TLS server certificate chain file (#629, V2-M7): a PEM path. RESERVED, NOT YET HONORED
+    /// (#107): the TLS 1.3 handshake (rustls) is not wired (no allowed crypto provider), so a set value
+    /// is a fail-closed startup REFUSAL rather than an accepted cert that would imply encryption this
+    /// build cannot deliver. Kept so the flag/env surface is stable; re-enabled when the TLS layer lands.
     tls_cert: Option<String>,
-    /// The TLS server PRIVATE KEY file (#629): a PEM path. The most sensitive on-box material, so it
-    /// is subject to the fail-closed `StrictModes` secret-file-permission check at boot (group/world
-    /// readable or wrong-owner refuses to start). Sourced by reference.
+    /// The TLS server PRIVATE KEY file (#629): a PEM path. RESERVED, NOT YET HONORED (#107): see
+    /// `tls_cert`; a set value is a fail-closed startup refusal until the TLS handshake is wired.
     tls_key: Option<String>,
-    /// The TLS CLIENT-CA trust anchor file for mTLS (#629/#631): a PEM path. When set, it is BOTH TLS
-    /// material and a configured auth identity (a client cert that verifies against it is an
-    /// authenticated network client), so it satisfies the bind invariant's precondition on its own.
+    /// The TLS CLIENT-CA trust anchor file for mTLS (#629/#631): a PEM path. RESERVED, NOT YET HONORED
+    /// (#107): mTLS identity-mapping needs the (unwired) TLS layer to supply a verified peer
+    /// certificate, so a set value is a fail-closed startup refusal until the TLS layer lands.
     tls_client_ca: Option<String>,
+    /// The EXPLICIT, loud opt-in for a plaintext non-loopback wire (#629): the `--insecure-plaintext-wire`
+    /// bare flag. ALLOWS a non-loopback bind WITHOUT TLS but WITH auth, for the legitimate
+    /// TLS-terminated-upstream pattern (a mesh / proxy / VPN encrypts the wire; the broker terminates
+    /// plaintext+auth behind it). Required because the native TLS 1.3 handshake is not yet implemented
+    /// (#107). It NEVER allows plaintext+anonymous (an auth identity is still required) and always emits
+    /// a loud startup warning. Inert on loopback. A bare boolean flag.
+    insecure_plaintext_wire: bool,
     /// The connection-scoped AUTH IDENTITY-TABLE file (#631): a path to the credential-bearing config
     /// (bearer-token digests, Argon2id PHC strings, accepted mTLS SAN identities, each with a scope
     /// set). Sourced by reference and subject to the `StrictModes` permission check (it carries secret
@@ -2133,12 +2164,31 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
                 f.otlp_endpoint = Some(take_value("--otlp-endpoint", args, &mut i)?);
             }
             // Transport-security material + auth + pre-auth DoS knobs (#629/#631/#633, V2-M7).
-            "--tls-cert" => f.tls_cert = Some(take_value("--tls-cert", args, &mut i)?),
-            "--tls-key" => f.tls_key = Some(take_value("--tls-key", args, &mut i)?),
+            // The `--tls-*` flags are RESERVED, NOT YET HONORED (#107): the TLS 1.3 handshake is not
+            // wired (no allowed crypto provider), so accepting a cert would imply encryption this build
+            // cannot deliver. We REFUSE at parse time with a typed usage error (the value is still
+            // consumed so the message names the flag, not a stray positional). The same refusal is
+            // enforced again on the RESOLVED value in `cmd_serve` to also catch the `IRONBUS_TLS_*` env
+            // path, so no source — flag or env — can create a false impression of encryption.
+            "--tls-cert" => {
+                let _ = take_value("--tls-cert", args, &mut i)?;
+                return Err(reserved_tls_flag_refusal("--tls-cert"));
+            }
+            "--tls-key" => {
+                let _ = take_value("--tls-key", args, &mut i)?;
+                return Err(reserved_tls_flag_refusal("--tls-key"));
+            }
             "--tls-client-ca" => {
-                f.tls_client_ca = Some(take_value("--tls-client-ca", args, &mut i)?);
+                let _ = take_value("--tls-client-ca", args, &mut i)?;
+                return Err(reserved_tls_flag_refusal("--tls-client-ca"));
             }
             "--auth-config" => f.auth_config = Some(take_value("--auth-config", args, &mut i)?),
+            // The EXPLICIT, loud plaintext-wire opt-in (#629). A bare boolean flag (no value): advance
+            // ONE token, not two, or the loop spins.
+            "--insecure-plaintext-wire" => {
+                f.insecure_plaintext_wire = true;
+                i += 1;
+            }
             "--max-preauth-connections" => {
                 f.max_preauth_connections =
                     Some(take_number("--max-preauth-connections", args, &mut i)?);
@@ -2597,6 +2647,13 @@ fn parse_serve_flags_with_env_and_reader(
             tls_key: resolve_opt_string("--tls-key", f.tls_key, env),
             tls_client_ca: resolve_opt_string("--tls-client-ca", f.tls_client_ca, env),
             auth_config: resolve_opt_string("--auth-config", f.auth_config, env),
+            // The explicit plaintext-wire opt-in (#629): flag > env > default false. Resolved here so
+            // the bind decision (and the `IRONBUS_INSECURE_PLAINTEXT_WIRE` env path) see one value.
+            insecure_plaintext_wire: resolve_bool(
+                "--insecure-plaintext-wire",
+                f.insecure_plaintext_wire,
+                env,
+            )?,
             max_preauth_connections: resolve_number(
                 "--max-preauth-connections",
                 f.max_preauth_connections,
@@ -3686,15 +3743,37 @@ fn health_bind_decision(haddr: &str, allow_public: bool) -> Result<HealthBindDec
 }
 
 /// The outcome of THE FAIL-CLOSED WIRE-BIND INVARIANT (#629, V2-M7, `docs/TRANSPORT.md` section 2): the
-/// load-bearing safety property that a non-loopback `--addr` cannot serve plaintext/anonymous traffic
-/// by construction. Carries only whether the bind requires transport security (true for a non-loopback
-/// bind, which by the time this exists has ALREADY passed the precondition).
+/// load-bearing safety property that a non-loopback `--addr` cannot serve plaintext-and-anonymous
+/// traffic, nor plaintext that a config claimed was encrypted, by construction. By the time this exists
+/// the bind has ALREADY passed the precondition (any other case is a fail-closed refusal upstream).
+///
+/// Because the native TLS 1.3 handshake is NOT yet implemented (#107) and `--tls-*` is therefore
+/// refused (it cannot encrypt), the ONLY way a non-loopback bind exists today is the explicit
+/// `--insecure-plaintext-wire` opt-in WITH an auth identity — an honestly plaintext wire (TLS
+/// terminated upstream). So a non-loopback decision here is ALWAYS a plaintext opt-in, surfaced for
+/// audit and for the loud startup warning. A loopback bind needs nothing (zero-config dev).
 #[cfg(any(unix, test))]
 #[derive(Debug)]
 struct WireBindDecision {
-    /// `true` for a non-loopback bind (TLS + auth are required and were verified present), so the
-    /// startup log states the protected posture; `false` for a loopback (zero-config dev) bind.
-    requires_security: bool,
+    /// The audited plaintext-opt-in posture for a NON-LOOPBACK bind (#629): `Some` only when the
+    /// operator passed `--insecure-plaintext-wire` (with auth), recording that the wire is plaintext
+    /// and TLS is terminated upstream. `None` for a loopback (zero-config dev) bind. There is no longer
+    /// a "TLS-encrypted non-loopback" case in this build: until #107, `--tls-*` is refused, so a
+    /// non-loopback bind is either this explicit plaintext opt-in or a fail-closed refusal.
+    transport_plaintext_optin: Option<TransportPlaintextOptin>,
+}
+
+/// The auditable shape of an accepted `--insecure-plaintext-wire` non-loopback bind (#629): the
+/// operator EXPLICITLY accepted that the broker wire is plaintext (TLS terminated upstream by a mesh /
+/// proxy / VPN). Carried out of the decision so `cmd_serve` emits the loud startup WARNING and a
+/// reviewer/test can assert the posture. Holds only the (non-secret) address; the auth identity that is
+/// also required is loaded separately. Its presence is itself the audit signal — "this bind is plaintext
+/// by explicit operator opt-in", never silent.
+#[cfg(any(unix, test))]
+#[derive(Debug, Clone)]
+struct TransportPlaintextOptin {
+    /// The non-loopback wire address the operator opted into binding in plaintext (non-secret).
+    addr: String,
 }
 
 /// Classifies the wire `--addr` loopback-vs-non-loopback by the SAME rule as the health bind: a bind
@@ -3722,40 +3801,65 @@ fn resolve_and_classify_wire_bind(addr: &str) -> Result<bool, CliError> {
     Ok(resolved.iter().all(|a| a.ip().is_loopback()))
 }
 
-/// THE FAIL-CLOSED WIRE-BIND INVARIANT (#629, V2-M7): a NON-LOOPBACK `--addr` is permitted ONLY when
-/// BOTH TLS material AND an auth identity are configured; otherwise the broker refuses to start with a
-/// typed usage error and NEVER opens a listener. Unlike `--health-allow-public`, there is NO override:
-/// a public wire bind cannot be plaintext or anonymous. A loopback bind needs neither (the zero-config
-/// dev path). The check is on the RESOLVED address and runs PRE-LISTEN.
+/// THE FAIL-CLOSED WIRE-BIND INVARIANT (#629, V2-M7) — the HONEST non-loopback posture: no config may
+/// imply encryption that is not delivered, and no non-loopback wire is ever silently plaintext.
 ///
-/// Both halves are required because each closes a different hole: TLS without auth gives an encrypted
-/// channel to an anonymous-anyone broker; auth without TLS sends the credential in plaintext over the
-/// network. A configured mTLS client-CA satisfies both halves at once.
+/// Because the native TLS 1.3 handshake is NOT yet implemented (#107, no allowed crypto provider), this
+/// build cannot encrypt the wire. So the non-loopback matrix is:
+///
+/// - **any `--tls-*` set** (cert/key/client-ca, by flag OR env) -> REFUSED: a cert cannot encrypt
+///   today, so accepting it would falsely imply encryption. (Refused on ANY bind, even loopback, so a
+///   cert never creates a false impression of safety; the loopback zero-config path itself is unchanged
+///   because zero-config passes no `--tls-*`.)
+/// - **non-loopback, no opt-in** -> REFUSED: bind a loopback address and terminate TLS upstream, or
+///   pass `--insecure-plaintext-wire`, or wait for native TLS (#107). NO silent plaintext.
+/// - **non-loopback, `--insecure-plaintext-wire`, WITH auth** -> ALLOWED as an explicit plaintext
+///   opt-in (TLS terminated upstream); a loud startup WARNING is emitted by `cmd_serve`.
+/// - **non-loopback, `--insecure-plaintext-wire`, NO auth** -> REFUSED: never plaintext+anonymous off
+///   loopback. The opt-in accepts a plaintext WIRE, not anonymous access.
+/// - **loopback** -> ALLOWED with zero config (no TLS, no auth, no opt-in): the trust boundary is the
+///   host itself; byte-for-byte the historical dev path.
+///
+/// The check is on the RESOLVED address and runs PRE-LISTEN, so there is no window where an unprotected
+/// non-loopback socket accepts a connection. When native TLS lands (#107), the `--tls-*` path is
+/// re-enabled to actually encrypt and rejoin this decision.
 ///
 /// # Errors
-/// [`CliError::Usage`] if `--addr` does not resolve, or if it is non-loopback and TLS material and/or
-/// an auth identity is missing (the actionable refusal naming `--addr` and the missing precondition).
+/// [`CliError::Usage`] if any `--tls-*` material is set (reserved/not-yet-honored), if `--addr` does
+/// not resolve, or if it is non-loopback and the explicit opt-in and/or an auth identity is missing.
 #[cfg(any(unix, test))]
 fn wire_bind_decision(
     addr: &str,
     transport: &TransportSecurityFlags,
 ) -> Result<WireBindDecision, CliError> {
+    // FIRST and on ANY bind: a `--tls-*` value (flag or env) is refused as not-yet-honored, so a cert
+    // can NEVER imply encryption this build does not deliver. Loopback zero-config is unaffected (it
+    // passes no `--tls-*`); a loopback bind WITH a stray cert is also refused, by design.
+    if let Some(flag) = transport.reserved_tls_flag() {
+        return Err(reserved_tls_flag_refusal(flag));
+    }
     let loopback = resolve_and_classify_wire_bind(addr)?;
     if loopback {
-        // Loopback MAY run without TLS/auth, silently: the trust boundary is the host itself, and the
-        // same-host CLI/tooling must work with zero configuration (byte-for-byte unchanged).
+        // Loopback MAY run without TLS/auth/opt-in, silently: the trust boundary is the host itself, and
+        // the same-host CLI/tooling must work with zero configuration (byte-for-byte unchanged).
         return Ok(WireBindDecision {
-            requires_security: false,
+            transport_plaintext_optin: None,
         });
     }
-    // Non-loopback: BOTH preconditions must hold, or refuse to start (fail-closed, pre-listen).
-    let has_tls = transport.has_tls_material();
-    let has_auth = transport.has_auth_identity();
-    if !has_tls || !has_auth {
-        return Err(wire_non_loopback_refusal(addr, has_tls, has_auth));
+    // Non-loopback. Native TLS is not wired (#107), so the ONLY honest way to bind here is the explicit
+    // plaintext opt-in WITH auth; anything else is a fail-closed refusal (pre-listen).
+    if !transport.insecure_plaintext_wire {
+        return Err(wire_non_loopback_refusal(addr));
+    }
+    if !transport.has_auth_identity() {
+        // Plaintext opt-in is NOT a license for anonymous access: an auth identity is still required, so
+        // a non-loopback plaintext bind is never plaintext+anonymous.
+        return Err(wire_plaintext_optin_without_auth_refusal(addr));
     }
     Ok(WireBindDecision {
-        requires_security: true,
+        transport_plaintext_optin: Some(TransportPlaintextOptin {
+            addr: addr.to_string(),
+        }),
     })
 }
 
@@ -3996,27 +4100,51 @@ fn load_one_credential(
     Ok(ironbus_server::auth::CredentialSet::Mtls { san_identities })
 }
 
-/// The fatal usage error for a non-loopback `--addr` that lacks TLS material and/or an auth identity
-/// (#629). Names the address, says exactly which precondition(s) failed, and points at the flags that
-/// satisfy them. There is deliberately no override flag to mention: the only ways out are configure
-/// TLS+auth, or bind a loopback address.
+/// The fatal usage error for a `--tls-*` flag (or `IRONBUS_TLS_*` env var) set in a build where the
+/// native TLS 1.3 handshake is NOT yet implemented (#107). Refused so a cert can NEVER create the false
+/// impression that the wire is encrypted: there is no allowed crypto provider, so the handshake cannot
+/// run and the wire would be plaintext despite the cert. Names the offending flag and points at the
+/// honest alternatives (loopback + upstream TLS termination, or the explicit plaintext opt-in).
 #[cfg(any(unix, test))]
-fn wire_non_loopback_refusal(addr: &str, has_tls: bool, has_auth: bool) -> CliError {
-    let missing = match (has_tls, has_auth) {
-        (false, false) => "BOTH TLS material AND an auth identity",
-        (false, true) => "TLS material (a server certificate + key, or an mTLS client-CA)",
-        (true, false) => "an auth identity (an --auth-config identity table, or an mTLS client-CA)",
-        (true, true) => "nothing", // unreachable: the caller only refuses when one is missing
-    };
+fn reserved_tls_flag_refusal(flag: &str) -> CliError {
     CliError::Usage(format!(
-        "refusing to bind non-loopback wire address `{addr}` without transport security ({missing} \
-         missing). A non-loopback bind REQUIRES BOTH: TLS material (set --tls-cert and --tls-key, or \
-         --tls-client-ca for mTLS) AND at least one auth identity (set --auth-config, or \
-         --tls-client-ca for mTLS). There is NO override: a public wire bind cannot be plaintext or \
-         anonymous by construction. To run without TLS and auth, bind a loopback address (the \
-         default 127.0.0.1:7777). NOTE: the TLS 1.3 handshake itself (rustls) is the flagged \
-         follow-up; this build ENFORCES the precondition and the auth/scope model, so a public bind \
-         that lacks the material is refused here regardless."
+        "{flag} is not yet honored: the TLS 1.3 handshake is the flagged follow-up #107 (no allowed \
+         pure-Rust crypto provider is on the deny.toml allowlist yet), so a TLS cert CANNOT encrypt \
+         the wire in this build — accepting it would falsely imply encryption that is not delivered. \
+         Do not pass {flag} expecting encryption. To bind a non-loopback address today, terminate TLS \
+         upstream (mesh / proxy / VPN) and bind a loopback address, or pass --insecure-plaintext-wire \
+         to explicitly accept a plaintext wire WITH auth, or wait for native TLS (#107). When native \
+         TLS lands, {flag} is re-enabled to actually encrypt."
+    ))
+}
+
+/// The fatal usage error for a NON-LOOPBACK `--addr` with no `--insecure-plaintext-wire` opt-in (#629).
+/// Native TLS is not wired (#107), so this build cannot encrypt the wire; rather than serve plaintext
+/// while a `--tls-*` cert implies encryption (the misleading posture this fix removes), a non-loopback
+/// bind is REFUSED until real TLS lands. Names the address and the three honest ways forward.
+#[cfg(any(unix, test))]
+fn wire_non_loopback_refusal(addr: &str) -> CliError {
+    CliError::Usage(format!(
+        "non-loopback bind `{addr}` refused: the TLS 1.3 handshake is not yet implemented (#107), so \
+         the wire cannot be encrypted; bind a loopback address and terminate TLS upstream \
+         (mesh / proxy / VPN), pass --insecure-plaintext-wire to explicitly accept a plaintext wire \
+         with auth, or wait for native TLS. There is NO --tls-* path today: a cert cannot encrypt this \
+         build's wire, so it is rejected rather than accepted as a false implication of encryption. To \
+         run with zero config, bind a loopback address (the default 127.0.0.1:7777)."
+    ))
+}
+
+/// The fatal usage error for `--insecure-plaintext-wire` on a non-loopback `--addr` with NO auth
+/// identity (#629). The opt-in accepts a plaintext WIRE (TLS terminated upstream); it is NOT a license
+/// for anonymous network access. A non-loopback plaintext bind without auth would be plaintext AND
+/// anonymous off loopback — the worst case — so it is refused. Names the address and the fix.
+#[cfg(any(unix, test))]
+fn wire_plaintext_optin_without_auth_refusal(addr: &str) -> CliError {
+    CliError::Usage(format!(
+        "--insecure-plaintext-wire on non-loopback `{addr}` requires an auth identity: the opt-in \
+         accepts a PLAINTEXT wire (with TLS terminated upstream), but NEVER anonymous network access. \
+         Set --auth-config <identity-table> so network clients are authenticated. A plaintext AND \
+         anonymous non-loopback bind is refused by construction."
     ))
 }
 
@@ -4172,12 +4300,14 @@ fn cmd_serve(
 
     // THE FAIL-CLOSED BIND INVARIANT (#629, V2-M7, docs/TRANSPORT.md section 2) — the load-bearing
     // safety property, FAIL-CLOSED and BEFORE any side effect (no data dir touched, no lock, no
-    // listener). A NON-LOOPBACK `--addr` is permitted ONLY when BOTH TLS material AND an auth identity
-    // are configured; if either is missing the broker refuses to start with a typed usage error and
-    // NEVER opens a listener. There is NO override flag (unlike `--health-allow-public`): a public
-    // wire bind cannot be plaintext or anonymous by construction. A loopback bind needs neither (the
-    // zero-config dev path, byte-for-byte unchanged). The validation runs PRE-LISTEN, so there is no
-    // window where an unprotected non-loopback wire socket accepts a connection.
+    // listener). Because the native TLS 1.3 handshake is not yet implemented (#107), the HONEST
+    // non-loopback posture is: any `--tls-*` material is REFUSED (a cert cannot encrypt this build's
+    // wire, so it must never imply encryption); a non-loopback bind with no opt-in is REFUSED (no
+    // silent plaintext); a non-loopback bind is ALLOWED only via the explicit `--insecure-plaintext-wire`
+    // opt-in AND an auth identity (an honestly plaintext wire, TLS terminated upstream); a plaintext
+    // opt-in without auth is REFUSED (never plaintext+anonymous off loopback). A loopback bind needs
+    // none of this (the zero-config dev path, byte-for-byte unchanged). The validation runs PRE-LISTEN,
+    // so there is no window where an unprotected non-loopback wire socket accepts a connection.
     let wire_bind = wire_bind_decision(addr, transport)?;
     // Load + validate the auth identity table (and StrictModes-check every secret-bearing file) IFF
     // an auth identity is configured. This is the in-memory `AuthConfig` the accept loop pins per
@@ -4185,21 +4315,22 @@ fn cmd_serve(
     // misconfigured non-loopback bind fails on the invariant first, and BEFORE any listener so a bad
     // secret file fails closed pre-listen.
     let auth = load_auth_config(transport)?;
-    // Surface the resolved transport posture in the startup log (no secret material, only paths and
-    // the on/off shape), so an operator can see what protects the bind. The pre-auth DoS knobs
-    // (#633) are RESOLVED and surfaced here; their ENFORCEMENT in the accept loop (the per-IP token
-    // bucket + half-open cap + connections_rejected_total{reason}) is the FLAGGED follow-up — the
-    // knobs and their safe defaults exist so the config surface is stable, but this PR does not yet
-    // throttle, so an operator reads the intended values and knows enforcement is pending.
-    if wire_bind.requires_security {
+    // Surface the resolved transport posture in the startup log (no secret material, only the on/off
+    // shape), so an operator can see what protects the bind. A non-loopback bind is, in this build,
+    // ALWAYS an explicit plaintext opt-in (TLS terminated upstream), so emit the LOUD plaintext WARNING
+    // — never a "requires TLS" claim the build cannot back. The pre-auth DoS knobs (#633) are RESOLVED
+    // and surfaced here; their ENFORCEMENT in the accept loop (the per-IP token bucket + half-open cap
+    // + connections_rejected_total{reason}) is the FLAGGED follow-up — the knobs and their safe defaults
+    // exist so the config surface is stable, but this PR does not yet throttle.
+    if let Some(optin) = &wire_bind.transport_plaintext_optin {
         writeln!(
             out,
-            "transport: non-loopback wire bind {addr} requires TLS + auth (fail-closed bind \
-             invariant): tls_material={}, auth_identity={}, preauth_dos[max_preauth_connections={}, \
-             preauth_rate_per_ip={}/s, auth_failure_lockout={}] (ENFORCEMENT flagged; the TLS 1.3 \
-             handshake itself is also the flagged follow-up; this build enforces the bind \
-             precondition and the auth/scope model)",
-            transport.has_tls_material(),
+            "WARNING: --insecure-plaintext-wire: the broker wire on {} is PLAINTEXT; credentials and \
+             data are exposed unless TLS is terminated upstream (mesh / proxy / VPN). Native TLS is \
+             not yet implemented (#107). auth_identity={}, preauth_dos[max_preauth_connections={}, \
+             preauth_rate_per_ip={}/s, auth_failure_lockout={}] (ENFORCEMENT flagged; this build \
+             enforces the bind precondition and the auth/scope model)",
+            optin.addr,
             transport.has_auth_identity(),
             transport.max_preauth_connections,
             transport.preauth_rate_per_ip,
@@ -5244,6 +5375,9 @@ fn cmd_serve(
         transport.tls_key.is_some(),
         transport.tls_client_ca.is_some(),
         transport.auth_config.is_some(),
+        // The explicit plaintext-wire opt-in (#629): consumed here too so the Windows `-D warnings`
+        // build does not trip field-never-read on the new flag (the #288/#99 footgun).
+        transport.insecure_plaintext_wire,
         transport.max_preauth_connections,
         transport.preauth_rate_per_ip,
         transport.auth_failure_lockout,
@@ -12244,12 +12378,14 @@ mod tests {
         tls_key: Option<&str>,
         tls_client_ca: Option<&str>,
         auth_config: Option<&str>,
+        insecure_plaintext_wire: bool,
     ) -> TransportSecurityFlags {
         TransportSecurityFlags {
             tls_cert: tls_cert.map(str::to_string),
             tls_key: tls_key.map(str::to_string),
             tls_client_ca: tls_client_ca.map(str::to_string),
             auth_config: auth_config.map(str::to_string),
+            insecure_plaintext_wire,
             max_preauth_connections: DEFAULT_MAX_PREAUTH_CONNECTIONS,
             preauth_rate_per_ip: DEFAULT_PREAUTH_RATE_PER_IP,
             auth_failure_lockout: DEFAULT_AUTH_FAILURE_LOCKOUT,
@@ -12258,62 +12394,135 @@ mod tests {
 
     #[test]
     fn a_non_loopback_bind_without_tls_and_auth_is_refused_before_listen() {
-        // THE must-have: a public (non-loopback) wire bind with NEITHER TLS material NOR an auth
-        // identity is REFUSED with a typed usage error, BEFORE any listener. No override exists.
-        let empty = ts(None, None, None, None);
+        // THE must-have (#629/#107): the native TLS 1.3 handshake is NOT yet wired, so a non-loopback
+        // wire bind with NO `--insecure-plaintext-wire` opt-in is REFUSED with a typed usage error,
+        // BEFORE any listener. There is no silent plaintext: refused, not served.
+        let empty = ts(None, None, None, None, false);
         let e = wire_bind_decision("0.0.0.0:7777", &empty).unwrap_err();
         assert_eq!(e.exit_code(), EXIT_USAGE);
         match e {
             CliError::Usage(m) => {
                 assert!(m.contains("0.0.0.0:7777"), "names the address: {m}");
-                assert!(m.contains("BOTH TLS material AND an auth identity"), "{m}");
                 assert!(
-                    m.contains("NO override"),
-                    "states there is no escape hatch: {m}"
+                    m.contains("not yet implemented (#107)"),
+                    "names the missing native TLS: {m}"
+                );
+                assert!(
+                    m.contains("--insecure-plaintext-wire"),
+                    "points at the honest opt-in: {m}"
+                );
+                assert!(
+                    m.contains("NO --tls-* path today"),
+                    "states a cert cannot encrypt this build: {m}"
                 );
             }
             other => panic!("expected Usage, got {other:?}"),
         }
-        // TLS but no auth: still refused (encrypted channel to an anonymous-anyone broker).
-        let tls_only = ts(Some("/c.pem"), Some("/k.pem"), None, None);
-        assert!(wire_bind_decision("203.0.113.5:7777", &tls_only).is_err());
-        // Auth but no TLS: still refused (credential in plaintext over the network).
-        let auth_only = ts(None, None, None, Some("/auth.toml"));
+        // Auth but no opt-in: still refused (no plaintext wire without the explicit opt-in).
+        let auth_only = ts(None, None, None, Some("/auth.toml"), false);
         assert!(wire_bind_decision("203.0.113.5:7777", &auth_only).is_err());
     }
 
     #[test]
-    fn a_non_loopback_bind_with_both_tls_and_auth_is_permitted() {
-        // TLS material (cert+key) AND an auth identity (the table) satisfies the precondition.
-        let both = ts(Some("/c.pem"), Some("/k.pem"), None, Some("/auth.toml"));
-        let d = wire_bind_decision("0.0.0.0:7777", &both).unwrap();
-        assert!(d.requires_security, "a non-loopback bind requires security");
-        // An mTLS client-CA satisfies BOTH halves at once (it is TLS material AND an auth identity).
-        let mtls = ts(Some("/c.pem"), Some("/k.pem"), Some("/ca.pem"), None);
-        assert!(
-            wire_bind_decision("0.0.0.0:7777", &mtls)
-                .unwrap()
-                .requires_security
+    fn a_non_loopback_bind_with_any_tls_material_is_refused_not_yet_honored() {
+        // #107/#629: a `--tls-*` value CANNOT encrypt this build's wire (no allowed crypto provider),
+        // so accepting it would falsely imply encryption. Every `--tls-*` shape is REFUSED with a typed
+        // usage error that names the offending flag — a cert can NEVER imply undelivered encryption.
+        for (transport, flag) in [
+            (ts(Some("/c.pem"), None, None, None, false), "--tls-cert"),
+            (ts(None, Some("/k.pem"), None, None, false), "--tls-key"),
+            (
+                ts(None, None, Some("/ca.pem"), None, false),
+                "--tls-client-ca",
+            ),
+            // Even alongside auth and the opt-in: the reserved-TLS refusal is checked FIRST.
+            (
+                ts(
+                    Some("/c.pem"),
+                    Some("/k.pem"),
+                    None,
+                    Some("/auth.toml"),
+                    true,
+                ),
+                "--tls-cert",
+            ),
+        ] {
+            let e = wire_bind_decision("0.0.0.0:7777", &transport).unwrap_err();
+            assert_eq!(e.exit_code(), EXIT_USAGE);
+            match e {
+                CliError::Usage(m) => {
+                    assert!(m.contains(flag), "names the offending flag {flag}: {m}");
+                    assert!(
+                        m.contains("not yet honored"),
+                        "states the flag is reserved/not-yet-honored: {m}"
+                    );
+                    assert!(
+                        m.contains("CANNOT encrypt"),
+                        "states a cert cannot encrypt this build: {m}"
+                    );
+                }
+                other => panic!("expected Usage, got {other:?}"),
+            }
+        }
+        // A `--tls-*` value is refused even on a LOOPBACK bind, so a stray cert never creates a false
+        // impression of safety anywhere.
+        let loopback_cert = ts(Some("/c.pem"), None, None, None, false);
+        assert!(wire_bind_decision("127.0.0.1:7777", &loopback_cert).is_err());
+    }
+
+    #[test]
+    fn a_non_loopback_plaintext_optin_with_auth_is_permitted_and_warns() {
+        // The ONLY honest non-loopback bind today (#629): `--insecure-plaintext-wire` WITH an auth
+        // identity — an explicit plaintext wire (TLS terminated upstream). The decision carries the
+        // audited opt-in so `cmd_serve` emits the loud startup WARNING.
+        let optin = ts(None, None, None, Some("/auth.toml"), true);
+        let d = wire_bind_decision("0.0.0.0:7777", &optin).unwrap();
+        let recorded = d
+            .transport_plaintext_optin
+            .expect("a non-loopback plaintext opt-in is recorded for the loud warning");
+        assert_eq!(
+            recorded.addr, "0.0.0.0:7777",
+            "the audited opt-in carries the bind address"
         );
-        // A client-CA alone (no server cert/key) is BOTH halves too, so it is permitted.
-        let ca_only = ts(None, None, Some("/ca.pem"), None);
+        // Another non-loopback address resolves and is permitted the same way.
+        let d = wire_bind_decision("198.51.100.9:7777", &optin).unwrap();
         assert!(
-            wire_bind_decision("198.51.100.9:7777", &ca_only)
-                .unwrap()
-                .requires_security
+            d.transport_plaintext_optin.is_some(),
+            "every non-loopback bind is an explicit, audited plaintext opt-in"
         );
     }
 
     #[test]
+    fn a_non_loopback_plaintext_optin_without_auth_is_refused() {
+        // The opt-in accepts a plaintext WIRE, never anonymous access: `--insecure-plaintext-wire` on a
+        // non-loopback bind with NO auth identity is REFUSED. Plaintext AND anonymous off loopback is
+        // the worst case, refused by construction.
+        let optin_no_auth = ts(None, None, None, None, true);
+        let e = wire_bind_decision("0.0.0.0:7777", &optin_no_auth).unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => {
+                assert!(m.contains("0.0.0.0:7777"), "names the address: {m}");
+                assert!(
+                    m.contains("requires an auth identity"),
+                    "states auth is still required: {m}"
+                );
+                assert!(m.contains("--auth-config"), "points at the fix: {m}");
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_loopback_bind_needs_neither_tls_nor_auth_zero_config_dev() {
-        // The loopback (zero-config dev) path: no TLS, no auth, and it is PERMITTED, silently — the
-        // dev experience is byte-for-byte unchanged.
-        let empty = ts(None, None, None, None);
+        // The loopback (zero-config dev) path: no TLS, no auth, no opt-in, and it is PERMITTED,
+        // silently — the dev experience is byte-for-byte unchanged.
+        let empty = ts(None, None, None, None, false);
         for addr in ["127.0.0.1:7777", "127.0.0.5:7777", "[::1]:7777"] {
             let d = wire_bind_decision(addr, &empty).unwrap();
             assert!(
-                !d.requires_security,
-                "a loopback bind ({addr}) needs no transport security"
+                d.transport_plaintext_optin.is_none(),
+                "a loopback bind ({addr}) needs no transport security and records no opt-in"
             );
         }
     }
@@ -12333,15 +12542,15 @@ mod tests {
 
     #[test]
     fn serve_parses_the_transport_security_flags() {
+        // The honest surface (#629/#107): auth + the DoS knobs + the explicit plaintext-wire opt-in
+        // parse; the `--tls-*` flags are RESERVED/NOT-YET-HONORED and refuse at parse time (asserted
+        // separately below), so they never reach a parsed `ServeFlags` here.
         let set = parse_serve_flags(&[
             "--data-dir".to_string(),
             "/tmp/x".to_string(),
-            "--tls-cert".to_string(),
-            "/c.pem".to_string(),
-            "--tls-key".to_string(),
-            "/k.pem".to_string(),
             "--auth-config".to_string(),
             "/auth.toml".to_string(),
+            "--insecure-plaintext-wire".to_string(),
             "--max-preauth-connections".to_string(),
             "64".to_string(),
             "--preauth-rate-per-ip".to_string(),
@@ -12350,14 +12559,45 @@ mod tests {
             "3".to_string(),
         ])
         .unwrap();
-        assert_eq!(set.transport.tls_cert.as_deref(), Some("/c.pem"));
-        assert_eq!(set.transport.tls_key.as_deref(), Some("/k.pem"));
+        assert_eq!(set.transport.tls_cert.as_deref(), None);
+        assert_eq!(set.transport.tls_key.as_deref(), None);
+        assert_eq!(set.transport.tls_client_ca.as_deref(), None);
         assert_eq!(set.transport.auth_config.as_deref(), Some("/auth.toml"));
+        assert!(
+            set.transport.insecure_plaintext_wire,
+            "the bare --insecure-plaintext-wire flag parses to true"
+        );
         assert_eq!(set.transport.max_preauth_connections, 64);
         assert_eq!(set.transport.preauth_rate_per_ip, 5);
         assert_eq!(set.transport.auth_failure_lockout, 3);
-        assert!(set.transport.has_tls_material() && set.transport.has_auth_identity());
-        // The DoS knobs take their safe defaults when absent.
+        assert!(set.transport.has_auth_identity());
+        assert_eq!(
+            set.transport.reserved_tls_flag(),
+            None,
+            "no --tls-* material reached the parsed flags"
+        );
+
+        // Each `--tls-*` flag REFUSES at parse time with a typed usage error naming the flag, so a cert
+        // can never reach a bind decision and imply undelivered encryption (#107).
+        for flag in ["--tls-cert", "--tls-key", "--tls-client-ca"] {
+            let e = parse_serve_flags(&[
+                "--data-dir".to_string(),
+                "/tmp/x".to_string(),
+                flag.to_string(),
+                "/x.pem".to_string(),
+            ])
+            .unwrap_err();
+            assert_eq!(e.exit_code(), EXIT_USAGE);
+            match e {
+                CliError::Usage(m) => {
+                    assert!(m.contains(flag), "names the offending flag {flag}: {m}");
+                    assert!(m.contains("not yet honored"), "{m}");
+                }
+                other => panic!("expected Usage for {flag}, got {other:?}"),
+            }
+        }
+
+        // The DoS knobs and the opt-in take their safe defaults when absent.
         let def = parse_serve_flags(&["--data-dir".to_string(), "/tmp/x".to_string()]).unwrap();
         assert_eq!(
             def.transport.max_preauth_connections,
@@ -12371,7 +12611,12 @@ mod tests {
             def.transport.auth_failure_lockout,
             DEFAULT_AUTH_FAILURE_LOCKOUT
         );
-        assert!(!def.transport.has_tls_material() && !def.transport.has_auth_identity());
+        assert!(
+            !def.transport.insecure_plaintext_wire,
+            "the plaintext-wire opt-in defaults off"
+        );
+        assert!(!def.transport.has_auth_identity());
+        assert_eq!(def.transport.reserved_tls_flag(), None);
     }
 
     #[test]
@@ -12443,7 +12688,7 @@ mod tests {
         .unwrap();
         drop(f);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let transport = ts(None, None, None, Some(path.to_str().unwrap()));
+        let transport = ts(None, None, None, Some(path.to_str().unwrap()), false);
         let cfg = load_auth_config(&transport)
             .unwrap()
             .expect("an auth config");
