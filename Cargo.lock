@@ -856,6 +856,7 @@ dependencies = [
  "opentelemetry_sdk",
  "protobuf",
  "raft",
+ "raft-proto",
  "serde",
  "serde_json",
  "slog",
