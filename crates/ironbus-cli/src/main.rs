@@ -1725,6 +1725,10 @@ impl TransportSecurityFlags {
     /// would imply encryption this build cannot deliver. Catches both the CLI flag and the
     /// `IRONBUS_TLS_*` env var (the resolved value is checked), so neither path can create a false
     /// impression of encryption. Re-enabled (to actually wire rustls) when the TLS layer lands.
+    // Only the bind-decision path (`wire_bind_decision`, `cmd_serve`) consumes this; both are
+    // `#[cfg(any(unix, test))]` / `#[cfg(unix)]` (serve is unix-only via StdFs), so gate the method
+    // to match — otherwise it is dead_code on a Windows non-test binary build (-D warnings).
+    #[cfg(any(unix, test))]
     fn reserved_tls_flag(&self) -> Option<&'static str> {
         if self.tls_cert.is_some() {
             Some("--tls-cert")
@@ -1741,6 +1745,9 @@ impl TransportSecurityFlags {
     /// client-CA would also be an auth identity, but `--tls-client-ca` is a reserved/not-yet-honored
     /// TLS flag — see [`reserved_tls_flag`] — so it cannot reach here; it is refused at startup before
     /// any bind decision.) This is the "an auth identity is configured" half of the precondition.
+    // Consumed only by the bind-decision path (`wire_bind_decision`, `cmd_serve`), both unix/test-
+    // gated — so gate the method to match, else it is dead_code on a Windows non-test build.
+    #[cfg(any(unix, test))]
     fn has_auth_identity(&self) -> bool {
         self.auth_config.is_some()
     }
