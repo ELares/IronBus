@@ -3595,7 +3595,7 @@ fn cmd_serve(
                                  // immutable-config handle + reload, the health server, the accept
                                  // loop, the graceful drain); splitting it further would scatter a
                                  // single concern across helpers.
-fn run_broker<F: Filesystem + 'static>(
+fn run_broker<F: Filesystem + Clone + 'static>(
     engine: Engine<F, SystemClock>,
     addr: &str,
     data_dir: Option<&Path>,
@@ -6639,7 +6639,7 @@ mod tests {
         std::thread::JoinHandle<Engine<F, C>>,
     )
     where
-        F: ironbus_storage::fs::Filesystem + 'static,
+        F: ironbus_storage::fs::Filesystem + Clone + 'static,
         C: ironbus_core::clock::Clock + Clone + Default + 'static,
     {
         let (handle, actor) = spawn_actor(engine, DEFAULT_CHANNEL_BOUND);

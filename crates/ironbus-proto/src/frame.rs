@@ -203,6 +203,55 @@ pub enum FrameType {
     /// on the peer link, so the client protocol (tags 1-26) is byte-for-byte unchanged and a client
     /// connection never sees it.
     Raft,
+    /// Client request to CREATE-OR-ENSURE a named stream (#588, V2-M2-I10): the explicit-stream-id
+    /// "declare" verb that makes a named stream CLIENT-reachable. The broker `declare`s the stream in
+    /// its [`ironbus_storage::streamset::StreamSet`] (materializing its independent log + recovery) and
+    /// replies a body-less [`FrameType::Ok`] on success or [`FrameType::Err`] on a malformed/over-long
+    /// stream name (fail-closed, never a panic). It is idempotent: re-declaring an existing stream is a
+    /// no-op success. The DEFAULT stream (the empty name `""`) is ALWAYS present and is NOT declared
+    /// this way; a declare of `""` is rejected as a malformed name. Body: a
+    /// [`crate::message::StreamDeclareBody`] (`body_version: u8`, `field_len: u16`, then the
+    /// `stream_id` as a u16-length-prefixed name). It is a NEW append-only request tag: an old client
+    /// never sends it, and the existing tags 1-27 are byte-for-byte unchanged. (See the module doc on
+    /// tag allocation: tags 22-27 were ALREADY taken before this PR, so the streams verbs start at 28,
+    /// NOT the "tags 22+" the originating issue text predates.)
+    StreamDeclare,
+    /// Client query for a named stream's existence and durable head (#588, V2-M2-I10): the
+    /// explicit-stream-id "info" verb. The broker replies a [`FrameType::StreamInfo`] response frame
+    /// (reusing this same tag) carrying whether the stream EXISTS and, if so, its durable head offset,
+    /// or [`FrameType::Err`] on a malformed name. A request and its response share this tag, framed and
+    /// distinguished by their bodies (request = [`crate::message::StreamInfoBody`]; response =
+    /// [`crate::message::StreamInfoResponseBody`]), exactly as `Connect`/`Info` pair across two tags —
+    /// here a single verb round-trips request/response. The default stream `""` always reports
+    /// `exists = true`. A NEW append-only tag; old clients never send it. Body (request): a
+    /// `StreamInfoBody` (`stream_id` as a u16-length name); body (response): a
+    /// `StreamInfoResponseBody` (`exists: u8`, `head: u64 LE`).
+    StreamInfo,
+    /// Producer publish to a NAMED stream (#588, V2-M2-I10): the stream-addressed twin of
+    /// [`FrameType::Pub`] (tag 5). It carries an explicit target `stream_id` followed by a body that is
+    /// BYTE-FOR-BYTE the existing [`crate::message::PubBody`] layout (the same `flags` / timestamp /
+    /// key / headers / opt-in dedup / payload, including the ack-level and fire-and-forget wire bits),
+    /// so the only difference from a plain `Pub` is the stream-id prefix. The broker routes the append
+    /// to the named stream's own log via the engine's id-routed `produce_in_stream` (#676/#679), which
+    /// `declare`s the stream on first produce; the reply is the SAME [`FrameType::PubAck`] (or
+    /// [`FrameType::PubAckDuplicate`]/[`FrameType::Err`]) the default-stream `Pub` returns. A publish to
+    /// the EMPTY stream id is exactly a default-stream publish (it routes through `produce_in_stream("",
+    /// ...)`, byte-for-byte today's behavior). The existing `Pub` (tag 5) wire is UNCHANGED: this is an
+    /// ADDITIVE tag an old client never sends. Body: a [`crate::message::PubToBody`] (`body_version:
+    /// u8`, `field_len: u16` over the `stream_id` u16-length name, then the verbatim `PubBody` bytes as
+    /// the remainder).
+    PubTo,
+    /// Consumer subscribe to a NAMED stream's per-stream work-group (#588, V2-M2-I10): the
+    /// stream-addressed twin of [`FrameType::Sub`] (tag 6). It carries an explicit `stream_id` plus the
+    /// work-`group` name, binding this connection's subsequent stream-scoped `Flow`/`Ack` to that
+    /// stream's OWN competing work-group (independent per stream via the engine's id-routed
+    /// `poll_in_stream`/`ack_in_stream`, #676/#679 — the same group name in two streams is two
+    /// unrelated cursors). The reply is a body-less [`FrameType::Ok`] (the stream must already exist;
+    /// an unknown stream is an [`FrameType::Err`]). A subscribe to the EMPTY stream id targets the
+    /// default stream and is equivalent to a plain `Sub`. The existing `Sub` (tag 6) wire is UNCHANGED:
+    /// this is an ADDITIVE tag an old client never sends. Body: a [`crate::message::SubToBody`]
+    /// (`body_version: u8`, `field_len: u16` over `stream_id` then `group`, each u16-length-prefixed).
+    SubTo,
 }
 
 impl FrameType {
@@ -237,6 +286,10 @@ impl FrameType {
             FrameType::StreamCommit => 25,
             FrameType::DeliverBatch => 26,
             FrameType::Raft => 27,
+            FrameType::StreamDeclare => 28,
+            FrameType::StreamInfo => 29,
+            FrameType::PubTo => 30,
+            FrameType::SubTo => 31,
         }
     }
 
@@ -272,6 +325,10 @@ impl FrameType {
             25 => FrameType::StreamCommit,
             26 => FrameType::DeliverBatch,
             27 => FrameType::Raft,
+            28 => FrameType::StreamDeclare,
+            29 => FrameType::StreamInfo,
+            30 => FrameType::PubTo,
+            31 => FrameType::SubTo,
             _ => return None,
         })
     }
@@ -404,7 +461,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 27] = [
+    const ALL_TYPES: [FrameType; 31] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -432,6 +489,10 @@ mod tests {
         FrameType::StreamCommit,
         FrameType::DeliverBatch,
         FrameType::Raft,
+        FrameType::StreamDeclare,
+        FrameType::StreamInfo,
+        FrameType::PubTo,
+        FrameType::SubTo,
     ];
 
     #[test]
@@ -477,6 +538,46 @@ mod tests {
         assert_eq!(FrameType::StreamCommit.as_u8(), 25);
         assert_eq!(FrameType::DeliverBatch.as_u8(), 26);
         assert_eq!(FrameType::Raft.as_u8(), 27);
+        assert_eq!(FrameType::StreamDeclare.as_u8(), 28);
+        assert_eq!(FrameType::StreamInfo.as_u8(), 29);
+        assert_eq!(FrameType::PubTo.as_u8(), 30);
+        assert_eq!(FrameType::SubTo.as_u8(), 31);
+    }
+
+    #[test]
+    fn stream_wire_tags_are_the_next_free_tags_after_raft_and_frame() {
+        // #588 (M2-I10): the stream-addressed verbs StreamDeclare (28), StreamInfo (29), PubTo (30),
+        // and SubTo (31) take the next FREE tags after the cluster-peer Raft frame (27). The
+        // originating issue text said "tags 22+", but tags 22-27 (ProduceConfirm, Fetch, StreamFetch,
+        // StreamCommit, DeliverBatch, Raft) were ALL allocated before this PR, so the streams verbs
+        // start at 28 — pinned here so a future reorder breaks a test, not a deployed protocol. The
+        // existing client verbs (Pub tag 5, Sub tag 6) are byte-for-byte unchanged: these are ADDITIVE
+        // tags an old client never sends.
+        assert_eq!(FrameType::from_u8(28), Some(FrameType::StreamDeclare));
+        assert_eq!(FrameType::from_u8(29), Some(FrameType::StreamInfo));
+        assert_eq!(FrameType::from_u8(30), Some(FrameType::PubTo));
+        assert_eq!(FrameType::from_u8(31), Some(FrameType::SubTo));
+        // The default-stream verbs are untouched.
+        assert_eq!(FrameType::Pub.as_u8(), 5);
+        assert_eq!(FrameType::Sub.as_u8(), 6);
+        // 32 is the new next-free tag (still unknown), so it frames but is not a known type.
+        assert_eq!(FrameType::from_u8(32), None);
+        for ty in [
+            FrameType::StreamDeclare,
+            FrameType::StreamInfo,
+            FrameType::PubTo,
+            FrameType::SubTo,
+        ] {
+            let mut buf = Vec::new();
+            encode_frame(ty, b"\x0b\x0c", &mut buf).unwrap();
+            match decode_frame(&buf).unwrap() {
+                FrameDecode::Frame { type_tag, body, .. } => {
+                    assert_eq!(FrameType::from_u8(type_tag), Some(ty));
+                    assert_eq!(body, b"\x0b\x0c");
+                }
+                FrameDecode::Incomplete { .. } => panic!("complete"),
+            }
+        }
     }
 
     #[test]
@@ -532,9 +633,9 @@ mod tests {
         // The Tier-W verbs are untouched.
         assert_eq!(FrameType::Flow.as_u8(), 10);
         assert_eq!(FrameType::Fetch.as_u8(), 23);
-        // 28 is the new next-free tag (still unknown), so it frames but is not a known type. (Tag 27
-        // is now the cluster-peer Raft frame, #667.)
-        assert_eq!(FrameType::from_u8(28), None);
+        // 32 is the new next-free tag (still unknown), so it frames but is not a known type. (Tags 27
+        // = cluster-peer Raft #667; 28-31 = the stream-addressed verbs #588.)
+        assert_eq!(FrameType::from_u8(32), None);
         for ty in [FrameType::StreamFetch, FrameType::StreamCommit] {
             let mut buf = Vec::new();
             encode_frame(ty, b"\x07\x08", &mut buf).unwrap();
@@ -558,9 +659,9 @@ mod tests {
         assert_eq!(FrameType::from_u8(26), Some(FrameType::DeliverBatch));
         // The per-record Deliver tag is untouched.
         assert_eq!(FrameType::Deliver.as_u8(), 13);
-        // 28 is the next-free tag (still unknown), so it frames but is not a known type. (Tag 27 is
-        // now the cluster-peer Raft frame, #667.)
-        assert_eq!(FrameType::from_u8(28), None);
+        // 32 is the next-free tag (still unknown), so it frames but is not a known type. (Tags 27 =
+        // cluster-peer Raft #667; 28-31 = the stream-addressed verbs #588.)
+        assert_eq!(FrameType::from_u8(32), None);
         let mut buf = Vec::new();
         encode_frame(FrameType::DeliverBatch, b"\x09\x0a", &mut buf).unwrap();
         match decode_frame(&buf).unwrap() {
@@ -755,7 +856,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 28u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 32u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);

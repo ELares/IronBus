@@ -28,11 +28,13 @@ use ironbus_core::types::RecordFlags;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
     decode_dead_letter, decode_deliver, decode_deliver_batch, decode_gap_marker, decode_info,
-    decode_produce_confirm, decode_pub_ack, decode_truncated, encode_ack, encode_connect,
-    encode_cumulative_ack, encode_fetch, encode_pub, encode_stream_commit, encode_stream_fetch,
-    encode_sub, produce_confirm_status, AckBody, AckLevel, AckOp, BodyError, ConnectBody,
-    ConsumeTier, CumulativeAckBody, DeliverBody, FetchBody, PubBody, StreamCommitBody,
-    StreamFetchBody, SubBody, PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
+    decode_produce_confirm, decode_pub_ack, decode_stream_info_response, decode_truncated,
+    encode_ack, encode_connect, encode_cumulative_ack, encode_fetch, encode_pub, encode_pub_to,
+    encode_stream_commit, encode_stream_declare, encode_stream_fetch, encode_stream_info,
+    encode_sub, encode_sub_to, produce_confirm_status, AckBody, AckLevel, AckOp, BodyError,
+    ConnectBody, ConsumeTier, CumulativeAckBody, DeliverBody, FetchBody, PubBody, PubToBody,
+    StreamCommitBody, StreamDeclareBody, StreamFetchBody, StreamInfoBody, SubBody, SubToBody,
+    PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -127,6 +129,10 @@ impl From<io::Error> for ClientError {
 /// The defaults are conservative but finite, so a misbehaving broker fails the call instead
 /// of hanging the caller indefinitely. Set a field to `None` to block forever on that
 /// operation (the pre-timeout behavior), which is rarely what you want.
+// Each bool advertises a DISTINCT wire CAPABILITY this client understands (gap-marker / streaming /
+// deliver-batch / streams, #346/#543/#541/#588), mapped one-to-one to a `Connect` handshake bit — a
+// documented protocol surface, not internal state a bitfield could replace.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
     /// Cap on the initial TCP connect. `None` uses the OS default, which can be minutes.
@@ -186,6 +192,15 @@ pub struct ClientConfig {
     /// checks [`Client::deliver_batch_enabled`] after connecting to learn whether the server confirmed
     /// it. The decoded `Message`s are IDENTICAL either way; this only changes the wire framing.
     pub understands_deliver_batch: bool,
+    /// Whether this client ADVERTISES that it understands the stream-addressed wire verbs
+    /// (`StreamDeclare`/`StreamInfo`/`PubTo`/`SubTo`, tags 28-31, #588, V2-M2-I10): when `true`, the
+    /// `Connect` sets the [`CONNECT_FLAG_UNDERSTANDS_STREAMS`] capability bit, so the server confirms it
+    /// in `Info` and the client may declare / publish-to / subscribe-to NAMED streams by id
+    /// ([`Client::declare_stream`] / [`Client::publish_to`] / [`Client::subscribe_to`]). When `false`
+    /// (the default, backward-compatible) the client uses only the default-stream verbs — byte-for-byte
+    /// today's behavior. A caller checks [`Client::streams_enabled`] after connecting to learn whether
+    /// the server confirmed it.
+    pub understands_streams: bool,
 }
 
 impl Default for ClientConfig {
@@ -219,6 +234,10 @@ impl Default for ClientConfig {
             // always receives per-record `Deliver` frames exactly as before (#541). A caller opts into
             // the raw-framed batch path by setting this (typically alongside `understands_streaming`).
             understands_deliver_batch: false,
+            // Off by default: an unconfigured client does not advertise stream addressing, so it uses
+            // only the default-stream verbs exactly as before (#588). A caller that wants to address
+            // named streams opts in by setting this.
+            understands_streams: false,
         }
     }
 }
@@ -653,6 +672,10 @@ pub struct StreamSummary {
 }
 
 /// A connected IronBus client over one TCP connection.
+// Each bool records a DISTINCT server-CONFIRMED wire capability for this connection (gap-marker /
+// streaming / deliver-batch / streams), each set from its `Info` echo bit — protocol negotiation
+// state, not internal flags a bitfield could replace.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct Client {
     stream: TcpStream,
@@ -684,6 +707,12 @@ pub struct Client {
     /// `DeliverBatch` (decoded locally into the same `Message`s); when `false` (an old server, or the
     /// client did not advertise), every delivery is a per-record `Deliver`.
     deliver_batch_enabled: bool,
+    /// Whether the stream-addressed wire verbs (`StreamDeclare`/`StreamInfo`/`PubTo`/`SubTo`, tags
+    /// 28-31) are ACTIVE on this connection (#588, V2-M2-I10): `true` only when this client advertised
+    /// it ([`ClientConfig::understands_streams`]) AND the server confirmed it in `Info`. When `false`
+    /// (an old server, or the client did not advertise), the client may use only the default-stream
+    /// verbs.
+    streams_enabled: bool,
     /// The connection-wide DEFAULT consume tier the SERVER adopted for this connection (#543, V2-M1),
     /// echoed in `Info`, or `None` if the server did not echo one (an old server, or it defaulted to
     /// Tier-W). A subscription that does not pick its own tier consumes at this default server-side.
@@ -728,6 +757,7 @@ impl Client {
             gap_marker_enabled: false,
             streaming_enabled: false,
             deliver_batch_enabled: false,
+            streams_enabled: false,
             negotiated_default_tier: None,
             confirm_cache: Vec::new(),
         };
@@ -755,6 +785,10 @@ impl Client {
                 // the pre-#541 `Connect` and the client receives only per-record `Deliver` frames; a
                 // caller opts in via the config to receive raw-framed batches.
                 understands_deliver_batch: config.understands_deliver_batch,
+                // The stream-addressing capability bit (#588). Off by default, so the body is
+                // byte-for-byte the pre-#588 `Connect` and the client uses only the default-stream
+                // verbs; a caller opts in via the config to address named streams by id.
+                understands_streams: config.understands_streams,
             },
             &mut connect_body,
         );
@@ -781,6 +815,10 @@ impl Client {
                 // when the client advertised it understands the frame), so an old server's empty Info
                 // leaves it off and every delivery is a per-record `Deliver` (#541).
                 client.deliver_batch_enabled = info.deliver_batch;
+                // The stream-addressed verbs are active only when the server CONFIRMED them (it does so
+                // only when the client advertised it understands them), so an old server's empty Info
+                // leaves it off and the client uses only the default-stream verbs (#588).
+                client.streams_enabled = info.streams;
                 Ok(client)
             }
             (FrameType::Err, body) => {
@@ -833,6 +871,16 @@ impl Client {
     #[must_use]
     pub fn deliver_batch_enabled(&self) -> bool {
         self.deliver_batch_enabled
+    }
+
+    /// Whether the stream-addressed wire verbs (`StreamDeclare`/`StreamInfo`/`PubTo`/`SubTo`, tags
+    /// 28-31) are ACTIVE on this connection (#588, V2-M2-I10): `true` only when this client advertised
+    /// it ([`ClientConfig::understands_streams`]) AND the server confirmed it in `Info`. When `false`
+    /// (an old server, or the client did not advertise), the client may use only the default-stream
+    /// verbs ([`Client::produce`] / [`Client::subscribe`] target the default stream).
+    #[must_use]
+    pub fn streams_enabled(&self) -> bool {
+        self.streams_enabled
     }
 
     /// The connection-wide DEFAULT consume tier the server adopted for this connection (#543, V2-M1),
@@ -2137,6 +2185,147 @@ impl Client {
             &mut body,
         );
         self.send(FrameType::CumulativeAck, &body)?;
+        match self.read_frame()? {
+            (FrameType::Ok, _) => Ok(()),
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// CREATE-OR-ENSURE a NAMED stream by id (#588, M2-I10): the `StreamDeclare` verb. Idempotent —
+    /// re-declaring an existing stream is a no-op success — and the broker materializes the stream's
+    /// independent log on the first declare. Requires the connection to have negotiated stream
+    /// addressing ([`ClientConfig::understands_streams`] AND the server confirming it, observable via
+    /// [`Client::streams_enabled`]); a server that did not negotiate it replies an `Err`. The default
+    /// stream (the empty name) is always present and need not be declared.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the declare (capability not negotiated, or
+    /// a malformed/over-long name), [`ClientError::Body`] on an over-large field, or a frame/connection
+    /// error.
+    pub fn declare_stream(&mut self, stream: &str) -> Result<(), ClientError> {
+        let mut body = Vec::new();
+        encode_stream_declare(
+            &StreamDeclareBody {
+                stream_id: stream.as_bytes(),
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::StreamDeclare, &body)?;
+        match self.read_frame()? {
+            (FrameType::Ok, _) => Ok(()),
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Queries a NAMED stream's existence and durable head (#588, M2-I10): the `StreamInfo` verb.
+    /// Returns `(exists, head)` — `exists = true` and the stream's durable head offset when the stream
+    /// is open, or `(false, 0)` when it does not exist. The default stream (the empty name) always
+    /// reports `exists = true`. Requires the stream-addressing capability (see
+    /// [`Client::declare_stream`]).
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the query (capability not negotiated, or a
+    /// malformed name), [`ClientError::Body`] on an over-large field, [`ClientError::BadResponse`] on a
+    /// malformed reply, or a frame/connection error.
+    pub fn stream_info(&mut self, stream: &str) -> Result<(bool, u64), ClientError> {
+        let mut body = Vec::new();
+        encode_stream_info(
+            &StreamInfoBody {
+                stream_id: stream.as_bytes(),
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::StreamInfo, &body)?;
+        match self.read_frame()? {
+            (FrameType::StreamInfo, body) => {
+                let resp = decode_stream_info_response(&body)
+                    .map_err(|_| ClientError::BadResponse("malformed stream-info response"))?;
+                Ok((resp.exists, resp.head))
+            }
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Publishes a message to a NAMED stream by id (#588, M2-I10): the `PubTo` verb, the stream-
+    /// addressed twin of [`Client::produce`]. The publish body is the SAME [`PubBody`] the default-
+    /// stream produce carries, prefixed with the target stream id, so the broker appends it to that
+    /// named stream's own log and replies a `PubAck` with the assigned offset (ack-implies-durable per
+    /// stream). An EMPTY `stream` targets the default stream (equivalent to [`Client::produce`]). The
+    /// publish is at-least-once (server-ack, Level 1); the fire-and-forget / consumer-ack tiers are the
+    /// default stream's this phase. Requires the stream-addressing capability (see
+    /// [`Client::declare_stream`]).
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the publish (capability not negotiated, a
+    /// malformed name, or a non-server-ack level), [`ClientError::Body`] on an over-large field,
+    /// [`ClientError::BadResponse`] on a malformed ack, or a frame/connection error.
+    pub fn publish_to(&mut self, stream: &str, message: &PubBody<'_>) -> Result<u64, ClientError> {
+        // Force at-least-once server-ack (Level 1) on the carried body: the named-stream path accepts
+        // only that level this phase, and an old caller never set a level bit, so this is a no-op for
+        // them and a guard against a mismatched method/wire for everyone.
+        let at_least_once = PubBody {
+            fire_and_forget: false,
+            ..*message
+        };
+        let mut pub_body = Vec::new();
+        encode_pub(&at_least_once, &mut pub_body).map_err(ClientError::Body)?;
+        let mut body = Vec::new();
+        encode_pub_to(
+            &PubToBody {
+                stream_id: stream.as_bytes(),
+                pub_body: &pub_body,
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::PubTo, &body)?;
+        match self.read_frame()? {
+            (FrameType::PubAck, body) => {
+                let ack = decode_pub_ack(&body)
+                    .map_err(|_| ClientError::BadResponse("publish-to reply was not an offset"))?;
+                Ok(ack.offset)
+            }
+            (FrameType::Err, body) => {
+                Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
+            }
+            (other, _) => Err(ClientError::Unexpected(other)),
+        }
+    }
+
+    /// Subscribes this connection's consume path to a NAMED stream's work-group (#588, M2-I10): the
+    /// `SubTo` verb, the stream-addressed twin of [`Client::subscribe`]. Subsequent [`Client::fetch`] /
+    /// [`Client::flow`] and [`Client::ack`] consume from and commit to THAT stream's own competing
+    /// work-group (independent per stream, so the same group name in two streams is two unrelated
+    /// cursors). The stream must already exist (declare or publish to it first); an EMPTY `stream`
+    /// targets the default stream (equivalent to [`Client::subscribe`]). Requires the stream-addressing
+    /// capability (see [`Client::declare_stream`]).
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Server`] if the server rejects the subscription (capability not
+    /// negotiated, an unknown stream, or a malformed name), [`ClientError::Body`] on an over-large
+    /// field, or a frame/connection error.
+    pub fn subscribe_to(&mut self, stream: &str, group: &str) -> Result<(), ClientError> {
+        let mut body = Vec::new();
+        encode_sub_to(
+            &SubToBody {
+                stream_id: stream.as_bytes(),
+                group: group.as_bytes(),
+            },
+            &mut body,
+        )
+        .map_err(ClientError::Body)?;
+        self.send(FrameType::SubTo, &body)?;
         match self.read_frame()? {
             (FrameType::Ok, _) => Ok(()),
             (FrameType::Err, body) => {
@@ -4066,6 +4255,7 @@ mod tests {
                 streaming: false,
                 default_tier: None,
                 deliver_batch: false,
+                streams: false,
             },
             &mut body,
         );
@@ -5298,6 +5488,290 @@ mod tests {
         );
 
         drop(c);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    // ===== Stream-addressed wire verbs (#588, V2-M2-I10), END-TO-END over the REAL server =====
+
+    /// A client config that advertises the stream-addressing capability (#588).
+    fn config_understanding_streams() -> ClientConfig {
+        ClientConfig {
+            understands_streams: true,
+            ..ClientConfig::default()
+        }
+    }
+
+    #[test]
+    fn streams_capability_negotiates_against_a_real_server() {
+        // #588: a client that advertises `understands_streams` has it CONFIRMED by the server
+        // (`streams_enabled()` true); a client that does NOT advertise it leaves it off, so an old
+        // client is never told it may address named streams. The negotiation is the server->client AND.
+        let (addr, shutdown, handle) = start_server();
+
+        let capable = Client::connect_with(addr, &config_understanding_streams()).unwrap();
+        assert!(
+            capable.streams_enabled(),
+            "the server confirms stream addressing for a client that advertised it"
+        );
+
+        let old = Client::connect(addr).unwrap();
+        assert!(
+            !old.streams_enabled(),
+            "a client that did not advertise stream addressing is never told it may use it"
+        );
+
+        drop(capable);
+        drop(old);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn declare_publish_subscribe_consume_ack_a_named_stream_end_to_end() {
+        // TEETH (#588): the whole named-stream round-trip over the REAL wire server — a streams-capable
+        // client DECLARES a named stream, PUBLISHES to it by id, SUBSCRIBES to its per-stream
+        // work-group, CONSUMES the record via that group, and ACKS it. StreamInfo reports the stream
+        // exists with the right durable head along the way.
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect_with(addr, &config_understanding_streams()).unwrap();
+        assert!(c.streams_enabled());
+
+        // A query before declare: the named stream does not exist yet.
+        let (exists, _head) = c.stream_info("orders").unwrap();
+        assert!(!exists, "an undeclared named stream does not exist");
+
+        // Declare it (idempotent), then a re-declare is still Ok.
+        c.declare_stream("orders").unwrap();
+        c.declare_stream("orders").unwrap();
+        let (exists, head) = c.stream_info("orders").unwrap();
+        assert!(exists, "the declared named stream now exists");
+        assert_eq!(
+            head, 0,
+            "a freshly declared stream has an empty durable head"
+        );
+
+        // Publish two records to the NAMED stream by id; the offsets are the stream's OWN.
+        let body = |p: &'static [u8]| PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: p,
+        };
+        let off0 = c.publish_to("orders", &body(b"order-A")).unwrap();
+        let off1 = c.publish_to("orders", &body(b"order-B")).unwrap();
+        assert_eq!(
+            (off0, off1),
+            (0, 1),
+            "the named stream has its own offset space"
+        );
+
+        let (_exists, head) = c.stream_info("orders").unwrap();
+        assert_eq!(
+            head, 2,
+            "the named stream's durable head advanced to two records"
+        );
+
+        // Subscribe to the named stream's work-group, then consume + ack both records via that group.
+        c.subscribe_to("orders", "workers").unwrap();
+        let mut got = Vec::new();
+        for _ in 0..10 {
+            let messages = c.fetch(10).unwrap().messages;
+            for m in &messages {
+                got.push(m.payload.clone());
+                assert!(
+                    c.ack(m.offset, m.generation).unwrap(),
+                    "the named-stream ack commits"
+                );
+            }
+            if got.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            got,
+            vec![b"order-A".to_vec(), b"order-B".to_vec()],
+            "the consumer received exactly the named stream's records, in order"
+        );
+
+        // A re-fetch after acking both delivers nothing: the named stream's cursor advanced.
+        assert!(
+            c.fetch(10).unwrap().messages.is_empty(),
+            "the named stream's committed cursor advanced past both acked records"
+        );
+
+        drop(c);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn cross_stream_isolation_over_the_wire() {
+        // TEETH (#588): a publish to stream A is NEVER seen by a consumer subscribed to stream B — two
+        // named streams are fully independent over the wire (their own logs AND their own per-stream
+        // work-group cursors). The consumer on B sees only B's record; the default stream stays empty.
+        let (addr, shutdown, handle) = start_server();
+        let mut producer = Client::connect_with(addr, &config_understanding_streams()).unwrap();
+        producer.declare_stream("stream-a").unwrap();
+        producer.declare_stream("stream-b").unwrap();
+
+        let body = |p: &'static [u8]| PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: p,
+        };
+        producer
+            .publish_to("stream-a", &body(b"only-in-a"))
+            .unwrap();
+        producer
+            .publish_to("stream-b", &body(b"only-in-b"))
+            .unwrap();
+
+        // A consumer bound to stream B sees ONLY B's record, never A's.
+        let mut consumer = Client::connect_with(addr, &config_understanding_streams()).unwrap();
+        consumer.subscribe_to("stream-b", "g").unwrap();
+        let mut got = Vec::new();
+        for _ in 0..10 {
+            let messages = consumer.fetch(10).unwrap().messages;
+            for m in &messages {
+                got.push(m.payload.clone());
+                assert!(consumer.ack(m.offset, m.generation).unwrap());
+            }
+            if !got.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            got,
+            vec![b"only-in-b".to_vec()],
+            "a consumer on stream B sees B's record and NEVER stream A's"
+        );
+
+        // Switch the SAME consumer to stream A and it now sees ONLY A's record (its own cursor).
+        consumer.subscribe_to("stream-a", "g").unwrap();
+        let mut got_a = Vec::new();
+        for _ in 0..10 {
+            let messages = consumer.fetch(10).unwrap().messages;
+            for m in &messages {
+                got_a.push(m.payload.clone());
+                assert!(consumer.ack(m.offset, m.generation).unwrap());
+            }
+            if !got_a.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            got_a,
+            vec![b"only-in-a".to_vec()],
+            "the same connection on stream A sees ONLY A's record (independent per-stream cursor)"
+        );
+
+        // The DEFAULT stream was never published to, so a default-stream consumer sees nothing.
+        let mut default_consumer = Client::connect(addr).unwrap();
+        assert!(
+            default_consumer.fetch(10).unwrap().messages.is_empty(),
+            "the default stream is untouched by the named-stream publishes"
+        );
+
+        drop(producer);
+        drop(consumer);
+        drop(default_consumer);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn an_old_client_hits_the_default_stream_byte_identically() {
+        // #588 back-compat: a client that did NOT negotiate stream addressing (the capability bit
+        // clear) uses only the default-stream verbs (`produce` / `subscribe` / `fetch` / `ack`), which
+        // target the default stream `""` byte-for-byte today's behavior — a streams-capable client
+        // publishing to the EMPTY stream id (`publish_to("", ...)`) lands in the SAME default stream
+        // and is consumed by the OLD client's plain default subscription, proving the empty-id path is
+        // exactly the default path.
+        let (addr, shutdown, handle) = start_server();
+
+        // The old client produces to the default stream the classic way.
+        let mut old = Client::connect(addr).unwrap();
+        assert!(!old.streams_enabled());
+        let body = |p: &'static [u8]| PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: p,
+        };
+        let off_old = old.produce(&body(b"classic")).unwrap();
+        assert_eq!(off_old, 0, "the default stream starts at offset 0");
+
+        // A streams-capable client publishes to the EMPTY stream id: it MUST land in the default stream
+        // at the next default offset, indistinguishable from a plain `produce`.
+        let mut capable = Client::connect_with(addr, &config_understanding_streams()).unwrap();
+        let off_empty = capable.publish_to("", &body(b"via-empty-id")).unwrap();
+        assert_eq!(
+            off_empty, 1,
+            "an empty stream id routes to the DEFAULT stream's offset space (byte-identical)"
+        );
+
+        // The old client's plain default subscription consumes BOTH records in order — the empty-id
+        // publish is in the same default stream it always was.
+        old.subscribe("").unwrap();
+        let mut got = Vec::new();
+        for _ in 0..10 {
+            let messages = old.fetch(10).unwrap().messages;
+            for m in &messages {
+                got.push(m.payload.clone());
+                assert!(old.ack(m.offset, m.generation).unwrap());
+            }
+            if got.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            got,
+            vec![b"classic".to_vec(), b"via-empty-id".to_vec()],
+            "the default stream carries both the classic produce and the empty-id publish-to, in order"
+        );
+
+        drop(old);
+        drop(capable);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn the_stream_verbs_are_refused_without_the_negotiated_capability() {
+        // #588 fail-closed: a client that did NOT negotiate stream addressing is REFUSED the
+        // stream-addressed verbs with a typed server error — it can never reach the named-stream path
+        // by accident. (The default-stream verbs stay fully available, exercised above.)
+        let (addr, shutdown, handle) = start_server();
+        let mut old = Client::connect(addr).unwrap();
+        assert!(!old.streams_enabled());
+
+        let declare = old.declare_stream("nope");
+        assert!(
+            matches!(declare, Err(ClientError::Server(_))),
+            "declare without the capability is a typed server error, got {declare:?}"
+        );
+        let info = old.stream_info("nope");
+        assert!(
+            matches!(info, Err(ClientError::Server(_))),
+            "stream_info without the capability is a typed server error, got {info:?}"
+        );
+
+        drop(old);
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }

@@ -2995,6 +2995,56 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         Ok(offset)
     }
 
+    /// CREATE-OR-ENSURE the named stream `stream` WITHOUT producing to it (#588, M2-I10): the
+    /// engine-side of the `StreamDeclare` wire verb. The default stream (the EMPTY name) is always
+    /// present and is a no-op success (`Ok(false)`, "already existed") — it is NEVER materialized via
+    /// the named `streams/` subtree. A NAMED stream is `declare`d in the [`StreamSet`] (materializing
+    /// `streams/<hex(name)>/` and its independent log + recovery) and mirrored in the per-stream
+    /// consumer state, exactly as the declare-on-first-produce in [`Engine::produce_in_stream`] does,
+    /// so a later produce/consume reuses the same open log. Idempotent: re-declaring an open stream is
+    /// `Ok(false)`; a first declare is `Ok(true)`.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidStreamName`] for a malformed NAMED name (empty is the default, never a
+    /// named-name error here because it short-circuits above; otherwise the graphic-ASCII / length rule
+    /// fails closed at the boundary, before the filesystem), else a storage error from opening the
+    /// stream's log.
+    pub fn declare_stream(&mut self, stream: &str) -> Result<bool, EngineError>
+    where
+        F: Clone,
+    {
+        // The default stream is always open and lives on the root log, NOT in the StreamSet's named
+        // subtree: declaring it is a no-op success, so a `StreamDeclare("")` (which the proto rejects
+        // anyway) never materializes the inert `""` slot.
+        if stream.is_empty() {
+            return Ok(false);
+        }
+        let id = StreamId::named(stream)?;
+        let created = self.streams.declare(&id).map_err(EngineError::Storage)?;
+        // Mirror the per-stream consumer state so a subsequent consume resolves the same way a
+        // produce-declared stream does (idempotent: an existing entry is left untouched).
+        self.named_streams
+            .entry(id)
+            .or_insert_with(NamedStream::new);
+        Ok(created)
+    }
+
+    /// Whether the named stream `stream` EXISTS (is open) (#588): the engine-side of the `StreamInfo`
+    /// wire verb's existence bit. The default stream (the EMPTY name) ALWAYS exists. A named stream
+    /// exists once it has been declared (via [`Engine::declare_stream`] or declare-on-first-produce).
+    /// A malformed named name reports `false` (it can never have been declared), never an error — the
+    /// wire layer fails a malformed id closed before this is reached, so this is a pure existence read.
+    #[must_use]
+    pub fn stream_exists(&self, stream: &str) -> bool {
+        if stream.is_empty() {
+            return true;
+        }
+        let Ok(id) = StreamId::named(stream) else {
+            return false;
+        };
+        self.streams.get(&id).is_some()
+    }
+
     /// Polls the stream named `stream` in work-group `group` (#676): the default stream routes to
     /// today's [`Engine::poll_in`] BYTE-FOR-BYTE; a NAMED stream delivers off its OWN log + its own
     /// per-stream work-group (the same competing lease/cursor machinery, independent per stream, so

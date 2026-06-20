@@ -1065,6 +1065,21 @@ pub const CONNECT_FLAG_HAS_DEFAULT_TIER: u8 = 0b0010_0000;
 /// [`CONNECT_FLAG_WANTS_GAP_MARKER`] / [`CONNECT_FLAG_UNDERSTANDS_STREAMING`].
 pub const CONNECT_FLAG_UNDERSTANDS_DELIVER_BATCH: u8 = 0b0100_0000;
 
+/// The `Connect` CAPABILITY bit (#588, V2-M2-I10) by which a client advertises that it UNDERSTANDS
+/// the stream-ADDRESSED wire verbs — `StreamDeclare` (tag 28), `StreamInfo` (tag 29), `PubTo` (tag
+/// 30), and `SubTo` (tag 31) — that make NAMED streams client-reachable. When set, the server
+/// confirms the capability with [`INFO_FLAG_STREAMS`] and the client may declare / publish-to /
+/// subscribe-to a named stream by its explicit id. When CLEAR (an old client, or one that opts out)
+/// the client uses only the default-stream verbs (`Pub`/`Sub`/`Flow`/`Fetch`), which target the
+/// default stream `""` — byte-for-byte today's behavior — and is NEVER sent a streams reply it did
+/// not ask for. Distinct from [`CONNECT_FLAG_UNDERSTANDS_STREAMING`] (the Tier-S consume-tier
+/// capability, #543): that bit names the consume MODE; this bit names multi-stream ADDRESSING. It is
+/// a pure capability flag (no associated value), so it occupies no slot in the v1 field block beyond
+/// this `flags` bit, exactly like [`CONNECT_FLAG_WANTS_GAP_MARKER`]. It is the LAST free bit (bit 7)
+/// of the handshake `flags` byte; a future capability needs an appended flags byte (the version+len
+/// framing already tolerates it).
+pub const CONNECT_FLAG_UNDERSTANDS_STREAMS: u8 = 0b1000_0000;
+
 /// The `Info` presence-flag bit signalling that the server's advertised per-consumer message-credit
 /// fields (`negotiated` + `cap`) are present (#292). A server that does not advertise leaves it clear,
 /// and a client then keeps its own local credit (backward-compat).
@@ -1114,6 +1129,16 @@ pub const INFO_FLAG_HAS_DEFAULT_TIER: u8 = 0b0010_0000;
 /// [`INFO_FLAG_STREAMING`] confirmations.
 pub const INFO_FLAG_DELIVER_BATCH: u8 = 0b0100_0000;
 
+/// The `Info` CAPABILITY bit (#588, V2-M2-I10) by which the server CONFIRMS this connection may use
+/// the stream-addressed wire verbs (`StreamDeclare`/`StreamInfo`/`PubTo`/`SubTo`): `true` only when
+/// the client advertised [`CONNECT_FLAG_UNDERSTANDS_STREAMS`] AND the server supports named streams.
+/// When clear (an old server, or a client that did not advertise) the client knows it will only ever
+/// use the default-stream verbs. The negotiation is AND, the server->client twin of
+/// [`CONNECT_FLAG_UNDERSTANDS_STREAMS`], mirroring the [`INFO_FLAG_GAP_MARKER`] / [`INFO_FLAG_STREAMING`]
+/// / [`INFO_FLAG_DELIVER_BATCH`] confirmations. It is the LAST free bit (bit 7) of the `Info` `flags`
+/// byte.
+pub const INFO_FLAG_STREAMS: u8 = 0b1000_0000;
+
 /// A client's handshake request (the `Connect` frame body, #292). The client MAY request a
 /// per-consumer message credit and/or byte budget; the server clamps each to its own cap and replies
 /// the negotiated value in [`InfoBody`]. A field is REQUESTED only when its presence bit is set in
@@ -1132,6 +1157,10 @@ pub const INFO_FLAG_DELIVER_BATCH: u8 = 0b0100_0000;
 /// neither appended byte is byte-for-byte the historical body. Any bytes past `field_len` (a FUTURE
 /// version's appended fields, e.g. the #71 `wire_protocol_version`) are TOLERATED and ignored by a v1
 /// reader. An empty body is the all-absent default.
+// Each bool is a DISTINCT negotiated wire CAPABILITY flag (gap-marker / streaming / deliver-batch /
+// streams, #346/#543/#541/#588), one bit of the handshake `flags` byte — a documented wire ABI, not
+// internal state a bitfield could replace, so the clippy "more than 3 bools" suggestion does not apply.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConnectBody {
     /// The per-consumer message credit the client requests, or `None` to defer to the server default.
@@ -1175,6 +1204,14 @@ pub struct ConnectBody {
     /// new tag, so a pre-batch client is never sent a frame it cannot decode. A pure capability flag, so
     /// it adds no block slot beyond its `flags` bit.
     pub understands_deliver_batch: bool,
+    /// Whether this client UNDERSTANDS the stream-addressed wire verbs (`StreamDeclare`/`StreamInfo`/
+    /// `PubTo`/`SubTo`, tags 28-31, #588, V2-M2-I10): the [`CONNECT_FLAG_UNDERSTANDS_STREAMS`]
+    /// capability bit. When `true`, the client may address NAMED streams by id and the server confirms
+    /// with [`InfoBody::streams`]. When `false` (the default, and an old client) the client uses only
+    /// the default-stream verbs (`Pub`/`Sub`/`Flow`/`Fetch`) — byte-for-byte today's behavior — and is
+    /// never sent a streams reply it did not request. A pure capability flag, so it adds no block slot
+    /// beyond its `flags` bit.
+    pub understands_streams: bool,
 }
 
 /// The number of bytes in the `Connect` v1 known-field block with NO appended bytes (#494, #543):
@@ -1225,6 +1262,9 @@ pub fn encode_connect(req: &ConnectBody, out: &mut Vec<u8>) {
     }
     if req.understands_deliver_batch {
         flags |= CONNECT_FLAG_UNDERSTANDS_DELIVER_BATCH;
+    }
+    if req.understands_streams {
+        flags |= CONNECT_FLAG_UNDERSTANDS_STREAMS;
     }
     out.push(flags);
     out.extend_from_slice(&req.requested_credit.unwrap_or(0).to_le_bytes());
@@ -1295,6 +1335,7 @@ pub fn decode_connect(body: &[u8]) -> Result<ConnectBody, BodyError> {
     let wants_gap_marker = flags & CONNECT_FLAG_WANTS_GAP_MARKER != 0;
     let understands_streaming = flags & CONNECT_FLAG_UNDERSTANDS_STREAMING != 0;
     let understands_deliver_batch = flags & CONNECT_FLAG_UNDERSTANDS_DELIVER_BATCH != 0;
+    let understands_streams = flags & CONNECT_FLAG_UNDERSTANDS_STREAMS != 0;
     Ok(ConnectBody {
         requested_credit,
         requested_credit_bytes,
@@ -1303,6 +1344,7 @@ pub fn decode_connect(body: &[u8]) -> Result<ConnectBody, BodyError> {
         understands_streaming,
         default_tier,
         understands_deliver_batch,
+        understands_streams,
     })
 }
 
@@ -1333,6 +1375,10 @@ pub struct CreditAdvert<T> {
 /// [`INFO_FLAG_HAS_DEFAULT_TIER`]). Each appended byte is OMITTED (and `field_len` shrinks by it) when
 /// absent; an advertisement with neither is byte-for-byte the historical body. Trailing bytes past the
 /// block are a future version's fields, tolerated and ignored. An empty body is the all-absent case.
+// Each bool is a DISTINCT server-confirmed wire CAPABILITY echo (gap-marker / streaming /
+// deliver-batch / streams), one bit of the `Info` `flags` byte — a documented wire ABI, not internal
+// state a bitfield could replace, so the clippy "more than 3 bools" suggestion does not apply.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InfoBody {
     /// The server's per-consumer message-credit advertisement, or `None` if the server does not
@@ -1371,6 +1417,13 @@ pub struct InfoBody {
     /// advertised it understands the frame AND the server supports it. `false` (an old server, or a
     /// client that did not advertise) tells the client it will only ever see per-record `Deliver` runs.
     pub deliver_batch: bool,
+    /// Whether the server CONFIRMS this connection may use the stream-addressed wire verbs
+    /// (`StreamDeclare`/`StreamInfo`/`PubTo`/`SubTo`, tags 28-31, #588, V2-M2-I10): the
+    /// [`INFO_FLAG_STREAMS`] capability echo, the server->client twin of
+    /// [`ConnectBody::understands_streams`]. `true` only when the client advertised it understands the
+    /// verbs AND the server supports named streams. `false` (an old server, or a client that did not
+    /// advertise) tells the client it will only ever use the default-stream verbs.
+    pub streams: bool,
 }
 
 /// The number of bytes in the `Info` v1 known-field block with NO appended bytes (#494, #543):
@@ -1418,6 +1471,9 @@ pub fn encode_info(info: &InfoBody, out: &mut Vec<u8>) {
     }
     if info.deliver_batch {
         flags |= INFO_FLAG_DELIVER_BATCH;
+    }
+    if info.streams {
+        flags |= INFO_FLAG_STREAMS;
     }
     out.push(flags);
     let credit = info.credit.unwrap_or(CreditAdvert {
@@ -1494,6 +1550,7 @@ pub fn decode_info(body: &[u8]) -> Result<InfoBody, BodyError> {
     let gap_marker = flags & INFO_FLAG_GAP_MARKER != 0;
     let streaming = flags & INFO_FLAG_STREAMING != 0;
     let deliver_batch = flags & INFO_FLAG_DELIVER_BATCH != 0;
+    let streams = flags & INFO_FLAG_STREAMS != 0;
     Ok(InfoBody {
         credit,
         credit_bytes,
@@ -1502,6 +1559,7 @@ pub fn decode_info(body: &[u8]) -> Result<InfoBody, BodyError> {
         streaming,
         default_tier,
         deliver_batch,
+        streams,
     })
 }
 
@@ -1742,6 +1800,317 @@ pub fn decode_stream_commit(body: &[u8]) -> Result<StreamCommitBody<'_>, BodyErr
     Ok(StreamCommitBody { up_to, group })
 }
 
+// ===================================================================================
+// STREAM-ADDRESSED WIRE BODIES (#588, V2-M2-I10): the explicit-stream-id verbs that make NAMED
+// streams CLIENT-reachable — StreamDeclare (tag 28), StreamInfo (tag 29), PubTo (tag 30), SubTo
+// (tag 31). Each rides a `body_version: u8` + `field_len: u16` frame (mirroring `FetchBody` /
+// `StreamFetchBody`) so a future version can append fields without a wire break: a v1 reader reads
+// the known fields from the front of the declared block and TOLERATES (ignores) trailing bytes. The
+// stream id is a `u16`-length-prefixed byte field, capped BEFORE any read by `Reader::take`, so a
+// malformed/oversized id is a typed [`BodyError`], never a panic or over-read (fail-closed). The
+// SUBJECT->stream binding + subject-addressed routing (a `SubTo` resolving a subject/wildcard to a
+// stream) is the SEPARATE M2-I9 (#585) work; THESE bodies carry an EXPLICIT stream id only.
+// ===================================================================================
+
+/// The version of the stream-addressed body framing (#588). Version `1` is the first (and only)
+/// layout. Carried as a leading byte so a future version can extend a body without a wire break: a
+/// reader rejects a version it does not understand rather than mis-parsing it, exactly like
+/// [`FETCH_BODY_VERSION`]. Shared by `StreamDeclare`, `StreamInfo` (request + response), `PubTo`, and
+/// `SubTo`, which all use the same version/length framing.
+pub const STREAM_WIRE_BODY_VERSION: u8 = 1;
+
+/// The hard cap on a stream-id byte length the proto codecs enforce at the wire boundary (#588): the
+/// engine's `StreamId::named` further validates the name's SHAPE (graphic ASCII, non-empty, its own
+/// length bound), but this cap fails a hostile/oversized id closed at decode time BEFORE the name
+/// crosses into the server, so a malformed-id frame is a typed [`BodyError::BadLength`] rather than a
+/// large reservation. It is generous (the engine's own bound is tighter) so it never rejects a name
+/// the engine would accept; it only stops an absurdly long id.
+pub const MAX_STREAM_ID_LEN: usize = 1024;
+
+/// Reads a `u16`-length-prefixed stream-id field, enforcing [`MAX_STREAM_ID_LEN`] (#588). A declared
+/// length over the cap is a typed [`BodyError::BadLength`] (fail-closed) BEFORE the bytes are taken,
+/// so a hostile id cannot force an over-read; a short body is [`BodyError::Truncated`] via
+/// [`Reader::take`]. The returned slice borrows the body (zero-copy).
+fn read_stream_id<'a>(r: &mut Reader<'a>) -> Result<&'a [u8], BodyError> {
+    let len = r.u16()? as usize;
+    if len > MAX_STREAM_ID_LEN {
+        return Err(BodyError::BadLength);
+    }
+    r.take(len)
+}
+
+/// A client's request to CREATE-OR-ENSURE a named stream (the `StreamDeclare` frame body, tag 28,
+/// #588): it carries the explicit `stream_id` to declare. The broker `declare`s it (idempotent) and
+/// replies `Ok`, or `Err` on a malformed/over-long name (the empty name `""` is rejected — the
+/// default stream is always present and is never declared this way).
+///
+/// Layout (version+length framed, forward-compatible): `body_version: u8`
+/// ([`STREAM_WIRE_BODY_VERSION`]), `field_len: u16` (the length of the v1 known-field block), then the
+/// v1 block: `stream_id: u16-len + bytes`. Bytes past `field_len` (a future version's appended fields)
+/// are TOLERATED and ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamDeclareBody<'a> {
+    /// The name of the stream to create-or-ensure (validated server-side by `StreamId::named`).
+    pub stream_id: &'a [u8],
+}
+
+/// Encodes a `StreamDeclare` body onto the end of `out` (#588).
+///
+/// # Errors
+/// Returns [`BodyError::FieldTooLarge`] if the stream id exceeds the `u16` wire limit.
+pub fn encode_stream_declare(
+    req: &StreamDeclareBody<'_>,
+    out: &mut Vec<u8>,
+) -> Result<(), BodyError> {
+    let id_len = u16::try_from(req.stream_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    let field_len = u16::try_from(2 + req.stream_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    out.push(STREAM_WIRE_BODY_VERSION);
+    out.extend_from_slice(&field_len.to_le_bytes());
+    out.extend_from_slice(&id_len.to_le_bytes());
+    out.extend_from_slice(req.stream_id);
+    Ok(())
+}
+
+/// Decodes a `StreamDeclare` body (#588), cap-before-alloc and panic-free.
+///
+/// The body MUST carry the version byte and `u16` field-length; the v1 `stream_id` is read from the
+/// front of the declared block and trailing block bytes (a future version's fields) are tolerated. A
+/// body too short for its declared block, or a stream id over [`MAX_STREAM_ID_LEN`], is a typed
+/// [`BodyError`] (fail-closed), never a panic or over-read. An EMPTY body is NOT valid (the frame type
+/// is new, with no historical empty case), so it is [`BodyError::Truncated`].
+///
+/// # Errors
+/// [`BodyError::Truncated`] for a short body, [`BodyError::BadLength`] for an over-cap id, or
+/// [`BodyError::BadHandshakeVersion`] for an unknown body version.
+pub fn decode_stream_declare(body: &[u8]) -> Result<StreamDeclareBody<'_>, BodyError> {
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != STREAM_WIRE_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    let mut fr = Reader::new(block);
+    let stream_id = read_stream_id(&mut fr)?;
+    Ok(StreamDeclareBody { stream_id })
+}
+
+/// A client's query for a named stream (the `StreamInfo` REQUEST body, tag 29, #588): it carries the
+/// `stream_id` to query. The broker replies a `StreamInfo` frame whose body is a
+/// [`StreamInfoResponseBody`], or `Err` on a malformed name. Same version/length framing as
+/// [`StreamDeclareBody`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamInfoBody<'a> {
+    /// The name of the stream being queried (validated server-side).
+    pub stream_id: &'a [u8],
+}
+
+/// Encodes a `StreamInfo` REQUEST body onto the end of `out` (#588).
+///
+/// # Errors
+/// Returns [`BodyError::FieldTooLarge`] if the stream id exceeds the `u16` wire limit.
+pub fn encode_stream_info(req: &StreamInfoBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
+    let id_len = u16::try_from(req.stream_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    let field_len = u16::try_from(2 + req.stream_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    out.push(STREAM_WIRE_BODY_VERSION);
+    out.extend_from_slice(&field_len.to_le_bytes());
+    out.extend_from_slice(&id_len.to_le_bytes());
+    out.extend_from_slice(req.stream_id);
+    Ok(())
+}
+
+/// Decodes a `StreamInfo` REQUEST body (#588), cap-before-alloc and panic-free (same discipline as
+/// [`decode_stream_declare`]).
+///
+/// # Errors
+/// [`BodyError::Truncated`] for a short body, [`BodyError::BadLength`] for an over-cap id, or
+/// [`BodyError::BadHandshakeVersion`] for an unknown body version.
+pub fn decode_stream_info(body: &[u8]) -> Result<StreamInfoBody<'_>, BodyError> {
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != STREAM_WIRE_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    let mut fr = Reader::new(block);
+    let stream_id = read_stream_id(&mut fr)?;
+    Ok(StreamInfoBody { stream_id })
+}
+
+/// The server's reply to a `StreamInfo` query (the `StreamInfo` RESPONSE body, tag 29, #588): whether
+/// the queried stream EXISTS and, if so, its durable head offset. The default stream `""` always
+/// reports `exists = true`. An unknown future `exists` byte is folded to `false` by the decoder (never
+/// an error), so the field stays forward-compatible.
+///
+/// Layout (version+length framed): `body_version: u8`, `field_len: u16`, then the v1 block:
+/// `exists: u8` (`0` = absent, `1` = present), `head: u64 LE` (the durable head; `0` when absent).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct StreamInfoResponseBody {
+    /// Whether the queried stream exists (has been declared / produced-to). The default stream is
+    /// always `true`.
+    pub exists: bool,
+    /// The stream's durable head (flushed) offset; `0` when the stream does not exist.
+    pub head: u64,
+}
+
+/// The number of bytes in the `StreamInfo` RESPONSE v1 known-field block: `exists: u8` + `head: u64`.
+const STREAM_INFO_RESP_V1_FIELD_LEN: u16 = 1 + 8;
+
+/// Encodes a `StreamInfo` RESPONSE body onto the end of `out` (#588): the version byte, the v1
+/// field-block length, then the v1 block.
+pub fn encode_stream_info_response(resp: &StreamInfoResponseBody, out: &mut Vec<u8>) {
+    out.push(STREAM_WIRE_BODY_VERSION);
+    out.extend_from_slice(&STREAM_INFO_RESP_V1_FIELD_LEN.to_le_bytes());
+    out.push(u8::from(resp.exists));
+    out.extend_from_slice(&resp.head.to_le_bytes());
+}
+
+/// Decodes a `StreamInfo` RESPONSE body (#588), cap-before-alloc and panic-free. A short block reads
+/// what is present and defaults the rest (never panicking); a non-`0`/`1` `exists` byte folds to
+/// `false`. An EMPTY body is NOT valid, so it is [`BodyError::Truncated`].
+///
+/// # Errors
+/// [`BodyError::Truncated`] for a short body, or [`BodyError::BadHandshakeVersion`] for an unknown
+/// body version.
+pub fn decode_stream_info_response(body: &[u8]) -> Result<StreamInfoResponseBody, BodyError> {
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != STREAM_WIRE_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    let mut fr = Reader::new(block);
+    let exists = fr.u8().unwrap_or(0) == 1;
+    let head = fr.u64().unwrap_or(0);
+    Ok(StreamInfoResponseBody { exists, head })
+}
+
+/// A producer's publish to a NAMED stream (the `PubTo` frame body, tag 30, #588): an explicit target
+/// `stream_id` followed by a body that IS the verbatim [`PubBody`] bytes (the default-stream `Pub`
+/// body). It deliberately carries the `pub_body` as an opaque borrowed slice rather than a decoded
+/// [`PubBody`], so the stream-addressed publish reuses the EXISTING [`decode_pub`] codec UNCHANGED
+/// (the session decodes the prefix here, then the `pub_body` with `decode_pub`), and the `Pub` (tag 5)
+/// wire stays byte-for-byte identical — the only added bytes are the version/length-framed stream-id
+/// prefix.
+///
+/// Layout (version+length framed): `body_version: u8`, `field_len: u16` (over the `stream_id` field
+/// ONLY), then the v1 block: `stream_id: u16-len + bytes`; then the verbatim `PubBody` bytes as the
+/// REMAINDER after the block. Putting the `PubBody` after the declared block (not inside it) lets a
+/// future version append PubTo-specific fields to the block while the `PubBody` stays the tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PubToBody<'a> {
+    /// The target stream name (empty routes to the default stream, byte-for-byte a plain `Pub`).
+    pub stream_id: &'a [u8],
+    /// The verbatim [`PubBody`] bytes, decoded by the caller with [`decode_pub`] (so the publish body
+    /// codec is shared UNCHANGED with the default-stream `Pub`).
+    pub pub_body: &'a [u8],
+}
+
+/// Encodes a `PubTo` body onto the end of `out` (#588): the version byte, the field-block length over
+/// the stream id, the stream id, then the verbatim `pub_body` bytes. The caller produces `pub_body`
+/// with [`encode_pub`].
+///
+/// # Errors
+/// Returns [`BodyError::FieldTooLarge`] if the stream id exceeds the `u16` wire limit.
+pub fn encode_pub_to(req: &PubToBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
+    let id_len = u16::try_from(req.stream_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    let field_len = u16::try_from(2 + req.stream_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    out.push(STREAM_WIRE_BODY_VERSION);
+    out.extend_from_slice(&field_len.to_le_bytes());
+    out.extend_from_slice(&id_len.to_le_bytes());
+    out.extend_from_slice(req.stream_id);
+    out.extend_from_slice(req.pub_body);
+    Ok(())
+}
+
+/// Decodes a `PubTo` body (#588) into its `stream_id` and the verbatim `pub_body` tail, cap-before-alloc
+/// and panic-free. The caller decodes `pub_body` with [`decode_pub`]. A body too short for its declared
+/// block, or a stream id over [`MAX_STREAM_ID_LEN`], is a typed [`BodyError`] (fail-closed). An EMPTY
+/// body is NOT valid, so it is [`BodyError::Truncated`].
+///
+/// # Errors
+/// [`BodyError::Truncated`] for a short body, [`BodyError::BadLength`] for an over-cap id, or
+/// [`BodyError::BadHandshakeVersion`] for an unknown body version.
+pub fn decode_pub_to(body: &[u8]) -> Result<PubToBody<'_>, BodyError> {
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != STREAM_WIRE_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    // The PubBody is everything AFTER the declared block (so a future version may grow the block
+    // without disturbing the PubBody tail).
+    let pub_body = r.rest();
+    let mut fr = Reader::new(block);
+    let stream_id = read_stream_id(&mut fr)?;
+    Ok(PubToBody {
+        stream_id,
+        pub_body,
+    })
+}
+
+/// A consumer's subscribe to a NAMED stream's work-group (the `SubTo` frame body, tag 31, #588): an
+/// explicit `stream_id` plus the work-`group` name. It binds the connection's subsequent
+/// stream-scoped `Flow`/`Ack` to that stream's OWN competing work-group (independent per stream). The
+/// EMPTY stream id targets the default stream (equivalent to a plain `Sub`); the empty group selects
+/// the default group.
+///
+/// Layout (version+length framed): `body_version: u8`, `field_len: u16`, then the v1 block:
+/// `stream_id: u16-len + bytes`, `group: u16-len + bytes`. Both fields ride INSIDE the declared block
+/// (each `u16`-length-prefixed), so a future version appends after them. Trailing block bytes are
+/// tolerated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubToBody<'a> {
+    /// The target stream name (empty selects the default stream).
+    pub stream_id: &'a [u8],
+    /// The work-group name (empty selects the default group), validated server-side.
+    pub group: &'a [u8],
+}
+
+/// Encodes a `SubTo` body onto the end of `out` (#588): the version byte, the field-block length, then
+/// the stream id and group, each `u16`-length-prefixed.
+///
+/// # Errors
+/// Returns [`BodyError::FieldTooLarge`] if the stream id or group exceeds the `u16` wire limit.
+pub fn encode_sub_to(req: &SubToBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
+    let id_len = u16::try_from(req.stream_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    let group_len = u16::try_from(req.group.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    let field_len = u16::try_from(2 + req.stream_id.len() + 2 + req.group.len())
+        .map_err(|_| BodyError::FieldTooLarge)?;
+    out.push(STREAM_WIRE_BODY_VERSION);
+    out.extend_from_slice(&field_len.to_le_bytes());
+    out.extend_from_slice(&id_len.to_le_bytes());
+    out.extend_from_slice(req.stream_id);
+    out.extend_from_slice(&group_len.to_le_bytes());
+    out.extend_from_slice(req.group);
+    Ok(())
+}
+
+/// Decodes a `SubTo` body (#588), cap-before-alloc and panic-free. The stream id is capped at
+/// [`MAX_STREAM_ID_LEN`]; the group is `u16`-length-prefixed (its SHAPE is validated server-side, as
+/// for a plain `Sub`). A body too short for its declared block is a typed [`BodyError`] (fail-closed).
+/// An EMPTY body is NOT valid, so it is [`BodyError::Truncated`].
+///
+/// # Errors
+/// [`BodyError::Truncated`] for a short body, [`BodyError::BadLength`] for an over-cap id, or
+/// [`BodyError::BadHandshakeVersion`] for an unknown body version.
+pub fn decode_sub_to(body: &[u8]) -> Result<SubToBody<'_>, BodyError> {
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != STREAM_WIRE_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    let mut fr = Reader::new(block);
+    let stream_id = read_stream_id(&mut fr)?;
+    let group = fr.var()?;
+    Ok(SubToBody { stream_id, group })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1847,6 +2216,7 @@ mod tests {
             understands_streaming: false,
             default_tier: None,
             understands_deliver_batch: false,
+            understands_streams: false,
         };
         let mut buf = Vec::new();
         encode_connect(&req, &mut buf);
@@ -1871,6 +2241,7 @@ mod tests {
             streaming: false,
             default_tier: None,
             deliver_batch: false,
+            streams: false,
         };
         let mut buf = Vec::new();
         encode_info(&info, &mut buf);
@@ -2717,8 +3088,9 @@ mod tests {
             understands_streaming in any::<bool>(),
             default_tier in proptest::option::of(any::<u8>()),
             understands_deliver_batch in any::<bool>(),
+            understands_streams in any::<bool>(),
         ) {
-            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: credit_bytes, wants_gap_marker, default_ack_level, understands_streaming, default_tier, understands_deliver_batch };
+            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: credit_bytes, wants_gap_marker, default_ack_level, understands_streaming, default_tier, understands_deliver_batch, understands_streams };
             let mut buf = Vec::new();
             encode_connect(&req, &mut buf);
             prop_assert_eq!(buf[0], HANDSHAKE_BODY_VERSION, "the body leads with its version");
@@ -2738,6 +3110,7 @@ mod tests {
             streaming in any::<bool>(),
             default_tier in proptest::option::of(any::<u8>()),
             deliver_batch in any::<bool>(),
+            streams in any::<bool>(),
         ) {
             let info = InfoBody {
                 credit: credit.map(|(negotiated, cap)| CreditAdvert { negotiated, cap }),
@@ -2747,6 +3120,7 @@ mod tests {
                 streaming,
                 default_tier,
                 deliver_batch,
+                streams,
             };
             let mut buf = Vec::new();
             encode_info(&info, &mut buf);
@@ -2775,7 +3149,7 @@ mod tests {
             credit in proptest::option::of(any::<u32>()),
             trailing in prop::collection::vec(any::<u8>(), 0..64),
         ) {
-            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: None, wants_gap_marker: false, default_ack_level: None, understands_streaming: false, default_tier: None, understands_deliver_batch: false };
+            let req = ConnectBody { requested_credit: credit, requested_credit_bytes: None, wants_gap_marker: false, default_ack_level: None, understands_streaming: false, default_tier: None, understands_deliver_batch: false, understands_streams: false };
             let mut buf = Vec::new();
             encode_connect(&req, &mut buf);
             let mut extended = buf.clone();
@@ -2790,6 +3164,7 @@ mod tests {
                 streaming: false,
                 default_tier: None,
                 deliver_batch: false,
+                streams: false,
             };
             let mut ibuf = Vec::new();
             encode_info(&info, &mut ibuf);
@@ -2864,6 +3239,7 @@ mod tests {
                 understands_streaming: false,
                 default_tier: None,
                 understands_deliver_batch: false,
+                understands_streams: false,
             }
         );
     }
@@ -2883,6 +3259,7 @@ mod tests {
                 streaming: false,
                 default_tier: None,
                 deliver_batch: false,
+                streams: false,
             }
         );
     }
@@ -2897,6 +3274,7 @@ mod tests {
             understands_streaming: false,
             default_tier: None,
             understands_deliver_batch: false,
+            understands_streams: false,
         };
         let mut buf = Vec::new();
         encode_connect(&req, &mut buf);
@@ -2924,6 +3302,7 @@ mod tests {
             streaming: false,
             default_tier: None,
             deliver_batch: false,
+            streams: false,
         };
         let mut buf = Vec::new();
         encode_info(&info, &mut buf);
@@ -3152,6 +3531,7 @@ mod tests {
             understands_streaming: false,
             default_tier: None,
             understands_deliver_batch: false,
+            understands_streams: false,
         };
         let mut pre = Vec::new();
         encode_connect(&no_level, &mut pre);
@@ -3205,6 +3585,7 @@ mod tests {
             streaming: false,
             default_tier: None,
             deliver_batch: false,
+            streams: false,
         };
         let mut pre = Vec::new();
         encode_info(&no_level, &mut pre);
@@ -3243,6 +3624,7 @@ mod tests {
             understands_streaming: false,
             default_tier: None,
             understands_deliver_batch: false,
+            understands_streams: false,
         };
         let mut pre = Vec::new();
         encode_connect(&none, &mut pre);
@@ -3313,6 +3695,7 @@ mod tests {
             streaming: false,
             default_tier: None,
             deliver_batch: false,
+            streams: false,
         };
         let mut pre = Vec::new();
         encode_info(&none, &mut pre);
@@ -3353,6 +3736,7 @@ mod tests {
             understands_streaming: true,
             default_tier: Some(ConsumeTier::Streaming.as_u8()),
             understands_deliver_batch: false,
+            understands_streams: false,
         };
         let mut buf = Vec::new();
         encode_connect(&both, &mut buf);
@@ -3413,6 +3797,7 @@ mod tests {
                 understands_streaming: false,
                 default_tier: None,
                 understands_deliver_batch: false,
+                understands_streams: false,
             }
         );
 
@@ -3433,7 +3818,189 @@ mod tests {
                 streaming: false,
                 default_tier: None,
                 deliver_batch: false,
+                streams: false,
             }
         );
+    }
+
+    // ===== Stream-addressed wire bodies (#588, V2-M2-I10) =====
+
+    #[test]
+    fn connect_and_info_carry_the_streams_capability_bit() {
+        // #588: a streams-capable client sets CONNECT_FLAG_UNDERSTANDS_STREAMS (a pure flags bit, no
+        // block byte); the bit round-trips, appends no byte, and an EMPTY (old-client) Connect never
+        // advertises it. The Info echo (INFO_FLAG_STREAMS) mirrors it.
+        let req = ConnectBody {
+            understands_streams: true,
+            ..ConnectBody::default()
+        };
+        let mut buf = Vec::new();
+        encode_connect(&req, &mut buf);
+        assert_eq!(
+            buf[3] & CONNECT_FLAG_UNDERSTANDS_STREAMS,
+            CONNECT_FLAG_UNDERSTANDS_STREAMS,
+            "the streams capability bit is set in the flags byte"
+        );
+        let mut plain = Vec::new();
+        encode_connect(&ConnectBody::default(), &mut plain);
+        assert_eq!(
+            buf.len(),
+            plain.len(),
+            "the streams capability bit appends no block byte"
+        );
+        assert_eq!(decode_connect(&buf).unwrap(), req);
+        // An EMPTY (old-client) Connect never advertises streams.
+        assert!(!decode_connect(&[]).unwrap().understands_streams);
+
+        let info = InfoBody {
+            streams: true,
+            ..InfoBody::default()
+        };
+        let mut ibuf = Vec::new();
+        encode_info(&info, &mut ibuf);
+        assert_eq!(
+            ibuf[3] & INFO_FLAG_STREAMS,
+            INFO_FLAG_STREAMS,
+            "the Info streams echo bit is set"
+        );
+        assert_eq!(decode_info(&ibuf).unwrap(), info);
+        assert!(!decode_info(&[]).unwrap().streams);
+    }
+
+    #[test]
+    fn stream_declare_and_info_round_trip_with_the_stream_id() {
+        // #588: StreamDeclare / StreamInfo (request) carry the stream id under version+length framing,
+        // round-tripping exactly. The default-stream empty id round-trips too.
+        for id in [b"orders".as_slice(), b"", b"a/b.c-1"] {
+            let mut buf = Vec::new();
+            encode_stream_declare(&StreamDeclareBody { stream_id: id }, &mut buf).unwrap();
+            assert_eq!(
+                buf[0], STREAM_WIRE_BODY_VERSION,
+                "leads with the body version"
+            );
+            assert_eq!(decode_stream_declare(&buf).unwrap().stream_id, id);
+
+            let mut ibuf = Vec::new();
+            encode_stream_info(&StreamInfoBody { stream_id: id }, &mut ibuf).unwrap();
+            assert_eq!(decode_stream_info(&ibuf).unwrap().stream_id, id);
+        }
+    }
+
+    #[test]
+    fn stream_info_response_round_trips_existence_and_head() {
+        // #588: the StreamInfo response carries exists + head; a non-existent stream reports head 0.
+        for (exists, head) in [(true, 42u64), (false, 0), (true, 0)] {
+            let resp = StreamInfoResponseBody { exists, head };
+            let mut buf = Vec::new();
+            encode_stream_info_response(&resp, &mut buf);
+            assert_eq!(decode_stream_info_response(&buf).unwrap(), resp);
+        }
+    }
+
+    #[test]
+    fn pub_to_carries_the_stream_id_and_the_verbatim_pub_body() {
+        // #588: PubTo prefixes a stream id, then carries the EXISTING PubBody bytes verbatim, so the
+        // session reuses decode_pub UNCHANGED. The pub_body round-trips byte-for-byte and decodes back
+        // through the existing codec.
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 7,
+                key: b"k",
+                headers: b"h",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"hello-named-stream",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        encode_pub_to(
+            &PubToBody {
+                stream_id: b"orders",
+                pub_body: &pub_body,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        let decoded = decode_pub_to(&buf).unwrap();
+        assert_eq!(decoded.stream_id, b"orders");
+        assert_eq!(decoded.pub_body, pub_body.as_slice());
+        // The carried pub_body decodes through the UNCHANGED PubBody codec.
+        let pb = decode_pub(decoded.pub_body).unwrap();
+        assert_eq!(pb.payload, b"hello-named-stream");
+        assert_eq!(pb.key, b"k");
+    }
+
+    #[test]
+    fn sub_to_round_trips_stream_id_and_group() {
+        // #588: SubTo carries both a stream id and a work-group name, each round-tripping; empty
+        // stream id (default stream) and empty group (default group) both round-trip.
+        for (id, group) in [
+            (b"orders".as_slice(), b"workers".as_slice()),
+            (b"", b""),
+            (b"s", b""),
+            (b"", b"g"),
+        ] {
+            let mut buf = Vec::new();
+            encode_sub_to(
+                &SubToBody {
+                    stream_id: id,
+                    group,
+                },
+                &mut buf,
+            )
+            .unwrap();
+            let decoded = decode_sub_to(&buf).unwrap();
+            assert_eq!(decoded.stream_id, id);
+            assert_eq!(decoded.group, group);
+        }
+    }
+
+    #[test]
+    fn stream_bodies_tolerate_a_future_appended_field() {
+        // #588 forward-compat: a future version may append fields INSIDE the declared block; a v1
+        // reader reads the known fields from the front and TOLERATES (ignores) the trailing bytes,
+        // never erroring. Hand-craft a StreamDeclare body whose field_len is two bytes longer than the
+        // v1 stream-id field and assert the id still decodes.
+        let id = b"future";
+        let mut buf = vec![STREAM_WIRE_BODY_VERSION];
+        let v1_field_len = 2 + id.len();
+        let field_len = u16::try_from(v1_field_len + 2).unwrap(); // two appended future bytes
+        buf.extend_from_slice(&field_len.to_le_bytes());
+        buf.extend_from_slice(&u16::try_from(id.len()).unwrap().to_le_bytes());
+        buf.extend_from_slice(id);
+        buf.extend_from_slice(&[0xaa, 0xbb]); // a future version's appended block bytes
+        assert_eq!(decode_stream_declare(&buf).unwrap().stream_id, id);
+    }
+
+    #[test]
+    fn stream_bodies_fail_closed_on_malformed_input() {
+        // #588 fail-closed: an empty body, an unknown version, a declared field_len past the body, and
+        // an over-cap stream id are each a TYPED BodyError, never a panic or an over-read.
+        // Empty body -> Truncated (no historical empty case for a new frame type).
+        assert_eq!(decode_stream_declare(&[]), Err(BodyError::Truncated));
+        assert_eq!(decode_pub_to(&[]), Err(BodyError::Truncated));
+        assert_eq!(decode_sub_to(&[]), Err(BodyError::Truncated));
+        // Unknown body version -> BadHandshakeVersion.
+        assert_eq!(
+            decode_stream_declare(&[STREAM_WIRE_BODY_VERSION + 1, 0, 0]),
+            Err(BodyError::BadHandshakeVersion {
+                version: STREAM_WIRE_BODY_VERSION + 1
+            })
+        );
+        // A field_len that claims more than the body holds -> Truncated (cap-before-alloc).
+        let mut over = vec![STREAM_WIRE_BODY_VERSION];
+        over.extend_from_slice(&9999u16.to_le_bytes()); // declares 9999 block bytes, has none
+        assert_eq!(decode_stream_declare(&over), Err(BodyError::Truncated));
+        // An over-cap stream id length inside the block -> BadLength, never an over-read.
+        let mut huge = vec![STREAM_WIRE_BODY_VERSION];
+        let claimed_id_len = u16::try_from(MAX_STREAM_ID_LEN + 1).unwrap();
+        let field_len = u16::try_from(2usize).unwrap(); // only room for the 2-byte len prefix
+        huge.extend_from_slice(&field_len.to_le_bytes());
+        huge.extend_from_slice(&claimed_id_len.to_le_bytes());
+        assert_eq!(decode_stream_declare(&huge), Err(BodyError::BadLength));
     }
 }

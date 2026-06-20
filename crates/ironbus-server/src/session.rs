@@ -32,15 +32,17 @@ use ironbus_core::lease::LeaseToken;
 use ironbus_core::types::{Offset, RecordFlags};
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
-    decode_ack, decode_connect, decode_cumulative_ack, decode_fetch, decode_pub,
-    decode_stream_commit, decode_stream_fetch, decode_sub, encode_dead_letter, encode_deliver,
-    encode_deliver_batch, encode_gap_marker, encode_info, encode_produce_confirm, encode_pub_ack,
-    encode_truncated, gap_reason, produce_confirm_status, pub_ack_level, AckLevel, AckOp,
-    ConsumeTier, CreditAdvert, DeadLetterBody, DeliverBatchHeader, DeliverBody, GapMarkerBody,
-    InfoBody, ProduceConfirmBody, PubAckBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER,
-    PUB_WIRE_ONLY_FLAGS,
+    decode_ack, decode_connect, decode_cumulative_ack, decode_fetch, decode_pub, decode_pub_to,
+    decode_stream_commit, decode_stream_declare, decode_stream_fetch, decode_stream_info,
+    decode_sub, decode_sub_to, encode_dead_letter, encode_deliver, encode_deliver_batch,
+    encode_gap_marker, encode_info, encode_produce_confirm, encode_pub_ack,
+    encode_stream_info_response, encode_truncated, gap_reason, produce_confirm_status,
+    pub_ack_level, AckLevel, AckOp, ConsumeTier, CreditAdvert, DeadLetterBody, DeliverBatchHeader,
+    DeliverBody, GapMarkerBody, InfoBody, ProduceConfirmBody, PubAckBody, StreamInfoResponseBody,
+    TruncatedBody, DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
 };
 use ironbus_storage::fs::Filesystem;
+use ironbus_storage::log::Append;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -312,6 +314,26 @@ pub struct Session {
     /// and never sends the new tag, so a pre-batch client is never sent a frame it cannot decode. Default
     /// `false` (backward-compatible).
     deliver_batch_enabled: bool,
+    /// Whether this connection negotiated the stream-ADDRESSED wire verbs (#588, M2-I10): set at
+    /// `Connect` time when the client advertised
+    /// [`ironbus_proto::message::CONNECT_FLAG_UNDERSTANDS_STREAMS`]. When `true`, the connection may
+    /// declare / publish-to / subscribe-to a NAMED stream by id (`StreamDeclare` / `StreamInfo` /
+    /// `PubTo` / `SubTo`, tags 28-31), each routed to the engine's id-routed entry points (#676/#679);
+    /// the server confirms it in `Info` ([`ironbus_proto::message::INFO_FLAG_STREAMS`]). When `false`
+    /// (an old client, or one that opts out) those verbs are REFUSED with a typed `Err` and the
+    /// connection uses ONLY the default-stream verbs (`Pub`/`Sub`/`Flow`/`Fetch`), which target the
+    /// default stream `""` — byte-for-byte today's behavior. Default `false` (backward-compatible).
+    streams_enabled: bool,
+    /// The NAMED stream this connection's consume path is bound to (#588, M2-I10), `""` (the default
+    /// stream) until a `SubTo` binds a named one. A `SubTo` sets BOTH this and `subscription` (the
+    /// work-group within the stream); a plain `Sub`/`Unsub` resets it to the default stream. The Flow
+    /// poll loop and the Ack path route through the engine's id-routed `poll_in_stream` /
+    /// `ack_in_stream` when this is non-empty, and through the unchanged default-stream
+    /// `poll_now_in_member` / `ack_in` when it is empty — so an OLD client (which never sends `SubTo`)
+    /// consumes the default stream byte-for-byte. Held as `Arc<str>` (#487) so handing the name to the
+    /// engine job by value across the actor channel is a refcount bump, not an allocation, exactly like
+    /// `subscription`.
+    stream: GroupName,
     /// Whether this connection has EVER published a Level-2 (server+client-ack) produce (#497): set
     /// when an L2 publish is registered for confirmation, and NEVER cleared. It is the gate that keeps
     /// the per-pass `ProduceConfirm` drain off the actor for a connection that never opted into Level 2
@@ -392,7 +414,11 @@ impl Session {
     /// Returns [`SessionError::BadFrame`] if a frame envelope is malformed (the caller must then
     /// close the connection, a length-prefixed stream cannot resync), [`SessionError::EngineFatal`]
     /// on an unrecoverable engine error, or [`SessionError::ActorGone`] if the append actor exited.
-    pub fn process<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
+    pub fn process<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
         &mut self,
         engine: &E,
         input: &[u8],
@@ -502,7 +528,11 @@ impl Session {
     /// stalled produce fsync cannot block it, #177); a produce advances the durable head but not a
     /// COMMITTED cursor. An `Ack`/`Flow`/`Unsub` returns `true` (an ack commits, a flow can commit
     /// past a dead-letter, an unsub may evict a caught-up group).
-    fn dispatch<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
+    fn dispatch<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
         &mut self,
         engine: &E,
         type_tag: u8,
@@ -556,6 +586,20 @@ impl Session {
                 self.handle_stream_commit(engine, body, out).map(|()| true)
             }
             Some(FrameType::Sub) => self.handle_sub(engine, body, out).map(|()| false),
+            // The stream-addressed verbs (#588, M2-I10): each is GATED on the negotiated
+            // `streams_enabled` capability (a client that did not advertise `understands_streams` gets
+            // a typed `Err`, never the new behavior), then routes to the engine's id-routed entry
+            // points (#676/#679). A StreamDeclare/StreamInfo changes no committed cursor (`false`); a
+            // SubTo only binds the subscription (`false`, like Sub); a PubTo never advances a COMMITTED
+            // cursor (`false`, like Pub).
+            Some(FrameType::StreamDeclare) => self
+                .handle_stream_declare(engine, body, out)
+                .map(|()| false),
+            Some(FrameType::StreamInfo) => {
+                self.handle_stream_info(engine, body, out).map(|()| false)
+            }
+            Some(FrameType::PubTo) => self.handle_pub_to(engine, body, out).map(|()| false),
+            Some(FrameType::SubTo) => self.handle_sub_to(engine, body, out).map(|()| false),
             Some(FrameType::Unsub) => self.handle_unsub(engine, out).map(|()| true),
             // The standalone Nack frame type (a client sends a nack as an Ack frame with the
             // Nack op, handled above), or a response-only verb (Info/Pong/Ok/Err/Deliver) a
@@ -637,6 +681,15 @@ impl Session {
         // that did not advertise keeps receiving per-record `Deliver` frames and is never sent the new
         // tag, so an old client that cannot decode the on-disk record layout is never broken.
         self.deliver_batch_enabled = req.understands_deliver_batch;
+        // Negotiate the stream-ADDRESSED wire verbs (#588, M2-I10): the server always SUPPORTS named
+        // streams, so the capability is active exactly when this client advertised it understands the
+        // verbs. A streams-capable client may declare / publish-to / subscribe-to a NAMED stream; one
+        // that did not advertise is REFUSED those verbs (a typed `Err`) and is never sent a streams
+        // reply it did not ask for, so an old client uses only the default-stream verbs unchanged.
+        self.streams_enabled = req.understands_streams;
+        // A repeated Connect re-negotiates idempotently: reset the active named stream to the default
+        // so a re-handshake never leaves a stale named-stream binding from a prior negotiation.
+        self.stream = GroupName::default();
         // The server caps, read LOCALLY off the handle (NO actor round-trip), so the handshake never
         // touches the actor's checkpoint/fsync path and a stalled produce on one connection cannot
         // head-of-line-block this Connect (invariant 4, #177). The caps are static engine config.
@@ -682,6 +735,11 @@ impl Session {
             // client learns whether to expect `DeliverBatch` (tag 26) or only per-record `Deliver`,
             // mirroring the gap-marker / streaming confirmations.
             deliver_batch: self.deliver_batch_enabled,
+            // Confirm the stream-ADDRESSED capability the server activated for this connection (#588),
+            // so the client learns whether it may address named streams by id, mirroring the
+            // gap-marker / streaming / deliver-batch confirmations. The negotiation is AND: this is
+            // `true` only when the client advertised the verbs AND the server supports named streams.
+            streams: self.streams_enabled,
         };
         let mut info_body = Vec::new();
         encode_info(&info, &mut info_body);
@@ -875,7 +933,11 @@ impl Session {
     /// session is fenced (status 0) without touching the engine, so a second connection cannot
     /// commit or requeue a message destined for another consumer. The generation token still
     /// fences a stale op on an own-but-already-redelivered lease.
-    fn handle_ack<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
+    fn handle_ack<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
         &mut self,
         engine: &E,
         body: &[u8],
@@ -907,6 +969,15 @@ impl Session {
         // reply 2 = cap reached). A status of 0 always means fenced: the token was stale (the message
         // already redelivered or was acked), so the client must NOT drop its state.
         let group = self.subscription.clone();
+        // A NAMED-stream consumer (#588) routes its ACK to the stream's OWN per-stream group cursor via
+        // the engine's id-routed `ack_in_stream` (#676/#679); the nack/term/progress and the egress-AIMD
+        // keep-up are the DEFAULT stream's lease machinery (the named path is plain ack-or-fence this
+        // phase, the #676 scope), so a named-stream consumer that sends one of those gets a fence rather
+        // than a cross-stream effect. The default stream (`self.stream` empty) is byte-for-byte unchanged.
+        let stream = self.stream.clone();
+        if !stream.is_empty() {
+            return self.handle_ack_in_stream(engine, stream, group, ack, &token, out);
+        }
         match ack.op {
             AckOp::Ack => {
                 let status = match engine.with(move |e| e.ack_in(&group, &token))? {
@@ -986,6 +1057,48 @@ impl Session {
                     }
                 };
                 reply(out, FrameType::AckStatus, &[status]);
+                Ok(())
+            }
+        }
+    }
+
+    /// The ACK path for a NAMED-stream consumer (#588, M2-I10): commits the ack `token` in the active
+    /// named stream's OWN per-stream work-group cursor via the engine's id-routed `ack_in_stream`
+    /// (#676/#679), connection-scoped exactly like the default-stream ack (the lease-ownership check ran
+    /// in [`Session::handle_ack`] before this is reached). The named consume path is plain ack-or-fence
+    /// this phase (no nack/term/progress per stream, the #676 scope), so those ops reply FENCED (status
+    /// 0) — a named-stream consumer that re-processes a message simply lets the lease expire and
+    /// redeliver, never crossing into the default stream's lease machinery.
+    fn handle_ack_in_stream<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        stream: GroupName,
+        group: GroupName,
+        ack: ironbus_proto::message::AckBody,
+        token: &LeaseToken,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        match ack.op {
+            AckOp::Ack => {
+                let token = *token;
+                let status = match engine.with(move |e| e.ack_in_stream(&stream, &group, &token))? {
+                    AckResult::Acked => 1u8,
+                    AckResult::Fenced => 0u8,
+                };
+                self.leased.remove(&ack.offset);
+                reply(out, FrameType::AckStatus, &[status]);
+                Ok(())
+            }
+            // Nack/Term/Progress are not on the per-stream consume path this phase (#676 scope): fence
+            // them (status 0) rather than acting on the default stream's lease table. The lease expires
+            // and redelivers on schedule, so at-least-once for the named stream is preserved.
+            AckOp::Nack | AckOp::Term | AckOp::Progress => {
+                self.leased.remove(&ack.offset);
+                reply(out, FrameType::AckStatus, &[0]);
                 Ok(())
             }
         }
@@ -1192,6 +1305,20 @@ impl Session {
         if self.leased.is_empty() {
             return Ok(());
         }
+        // A NAMED-stream consumer (#588) prunes its leases by the stream's COMMITTED cursor rather than
+        // the default stream's per-lease active-lease probe: the #676 named consume path exposes the
+        // per-stream committed offset but not a per-stream `holds_active_lease_in`, so an offset at or
+        // below the named stream's committed watermark is dropped (it was acked), and an expired-but-
+        // not-committed lease stays — it is harmlessly re-leased and overwritten in `leased` on its
+        // redelivery. This keeps `leased` bounded for the named path without the default-stream probe.
+        if !self.stream.is_empty() {
+            let stream = self.stream.clone();
+            let group = self.subscription.clone();
+            let committed =
+                engine.with(move |e| e.committed_offset_in_stream(&stream, &group).get())?;
+            self.leased.retain(|&offset, _| offset >= committed);
+            return Ok(());
+        }
         let group = self.subscription.clone();
         let pairs: Vec<(u64, u64)> = self
             .leased
@@ -1323,9 +1450,25 @@ impl Session {
             // member id; for a plain competing group it is identical to poll_now_in, so the
             // KeyOrdering::None path is unchanged. One poll = one actor round-trip; the actor flushes
             // any pending produce batch first, so each poll sees a consistent durable head.
+            //
+            // A NAMED-stream consumer (#588) routes to the engine's id-routed `poll_in_stream` instead
+            // (its OWN log + per-stream competing work-group, #676/#679), reading the engine's monotonic
+            // `now` inside the job. The named path is plain competing (no key_shared/Tier-S/compaction
+            // this phase, the #676 scope), so it returns only `Poll::Message`/`Poll::Idle`/an error; the
+            // advisory arms below are unreachable for it but cost nothing. The default stream
+            // (`self.stream` empty) is byte-for-byte the existing member-aware poll.
             let group = self.subscription.clone();
             let member = self.member_id;
-            match engine.with(move |e| e.poll_now_in_member(&group, member))? {
+            let stream = self.stream.clone();
+            let poll = engine.with(move |e| {
+                if stream.is_empty() {
+                    e.poll_now_in_member(&group, member)
+                } else {
+                    let now = e.now_monotonic();
+                    e.poll_in_stream(&stream, &group, now)
+                }
+            })?;
+            match poll {
                 Ok(Poll::Message(d)) => {
                     let msg = DeliverBody {
                         offset: d.offset.get(),
@@ -1419,9 +1562,18 @@ impl Session {
             }
         }
         // Drop ownership of any offset now committed (acked here, or committed past on a
-        // dead-letter), keeping `leased` bounded to the in-flight window.
+        // dead-letter), keeping `leased` bounded to the in-flight window. A NAMED-stream consumer
+        // (#588) reads its OWN per-stream committed cursor; the default stream reads the default
+        // cursor byte-for-byte.
         let group = self.subscription.clone();
-        let committed = engine.with(move |e| e.committed_offset_in(&group).get())?;
+        let stream = self.stream.clone();
+        let committed = engine.with(move |e| {
+            if stream.is_empty() {
+                e.committed_offset_in(&group).get()
+            } else {
+                e.committed_offset_in_stream(&stream, &group).get()
+            }
+        })?;
         self.leased.retain(|&offset, _| offset >= committed);
         // CREDIT AUTO-TUNE keep-up (#552): the consumer was COUNT-BOUND by its own window (it asked for
         // at least the whole remaining window) AND drained the full grant it was given (`delivered ==
@@ -2055,6 +2207,11 @@ impl Session {
         // cap are validated by the engine on the first FLOW (#240), surfaced as an Err.
         self.subscription = GroupName::from(group);
         self.registered_subscription = !new_group.is_empty();
+        // A plain `Sub` binds the DEFAULT stream (#588): clear any named-stream binding a prior
+        // `SubTo` set, so this connection's Flow/Ack route to the default stream byte-for-byte. (An old
+        // client never sends `SubTo`, so `self.stream` is already default for it; this only matters for
+        // a streams-capable client switching from a named stream back to a plain default subscribe.)
+        self.stream = GroupName::default();
         self.leased.clear();
         // If the new group is configured key_shared (#64), put it into that mode and join as a
         // member so this connection's keys route to it. A failure to enable the mode (an invalid
@@ -2101,6 +2258,323 @@ impl Session {
         Ok(())
     }
 
+    /// Handles a `StreamDeclare` (#588, M2-I10): CREATE-OR-ENSURE a named stream by id, then reply a
+    /// body-less `Ok`. Routes to the engine's [`Engine::declare_stream`] (which `declare`s the named
+    /// stream in the [`StreamSet`], materializing its independent log + recovery; idempotent). GATED on
+    /// the negotiated streams capability and fail-closed: a client that did not advertise
+    /// `understands_streams` is refused; a malformed/over-long stream id is a typed `Err`; the EMPTY
+    /// name (the default stream, always present) is rejected as a malformed name (the default stream is
+    /// never declared this way). Never panics.
+    fn handle_stream_declare<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        if !self.streams_enabled {
+            reply_err(
+                out,
+                "stream addressing not negotiated (set understands_streams)",
+            );
+            return Ok(());
+        }
+        let Ok(decoded) = decode_stream_declare(body) else {
+            reply_err(out, "malformed stream-declare body");
+            return Ok(());
+        };
+        let Ok(stream) = core::str::from_utf8(decoded.stream_id) else {
+            reply_err(out, "stream id must be valid UTF-8");
+            return Ok(());
+        };
+        // The DEFAULT stream is always present and is NEVER declared via the named subtree (#588): an
+        // empty id is a malformed name here, not a silent success, so a client cannot conflate the
+        // default stream with a named one.
+        if stream.is_empty() {
+            reply_err(out, "cannot declare the default stream (empty id)");
+            return Ok(());
+        }
+        let stream = stream.to_string();
+        match engine.with(move |e| e.declare_stream(&stream))? {
+            // Idempotent: a first declare (`true`) and a re-declare (`false`) both reply a body-less Ok.
+            Ok(_) => reply(out, FrameType::Ok, &[]),
+            // A malformed/over-long NAMED name fails closed with the engine's typed reason.
+            Err(e) => reply_err(out, &e.to_string()),
+        }
+        Ok(())
+    }
+
+    /// Handles a `StreamInfo` query (#588, M2-I10): reply a `StreamInfo` RESPONSE frame carrying
+    /// whether the named stream EXISTS and, if so, its durable head offset. The default stream `""`
+    /// always reports `exists = true`. GATED on the negotiated streams capability; a malformed id is a
+    /// typed `Err`. Never panics, never declares (a query is read-only).
+    fn handle_stream_info<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        if !self.streams_enabled {
+            reply_err(
+                out,
+                "stream addressing not negotiated (set understands_streams)",
+            );
+            return Ok(());
+        }
+        let Ok(decoded) = decode_stream_info(body) else {
+            reply_err(out, "malformed stream-info body");
+            return Ok(());
+        };
+        let Ok(stream) = core::str::from_utf8(decoded.stream_id) else {
+            reply_err(out, "stream id must be valid UTF-8");
+            return Ok(());
+        };
+        let stream = stream.to_string();
+        // One round-trip reads both the existence bit and the durable head: the head is meaningful only
+        // when the stream exists, and `stream_head` reports `0` for an unknown/malformed stream (which
+        // the response folds with `exists = false`), so the two reads are consistent.
+        let (exists, head) =
+            engine.with(move |e| (e.stream_exists(&stream), e.stream_head(&stream).get()))?;
+        let resp = StreamInfoResponseBody { exists, head };
+        let mut resp_body = Vec::new();
+        encode_stream_info_response(&resp, &mut resp_body);
+        reply(out, FrameType::StreamInfo, &resp_body);
+        Ok(())
+    }
+
+    /// Handles a `PubTo` (#588, M2-I10): publish to a NAMED stream by id. The stream-id prefix is
+    /// stripped here and the verbatim `PubBody` tail is decoded with the UNCHANGED [`decode_pub`] codec,
+    /// so the publish body is shared byte-for-byte with the default-stream `Pub`. An EMPTY stream id is
+    /// exactly a default-stream publish and is routed to the existing [`Session::handle_pub`] path
+    /// (byte-for-byte today's behavior, including the pipelined window). A NAMED stream's append is
+    /// routed through the engine's id-routed [`Engine::produce_in_stream`] (which declares-on-first-
+    /// produce and commits via the cross-stream group-commit tick), via one actor `with` job so the
+    /// covering fsync is the engine's, not a parked window. GATED on the negotiated streams capability;
+    /// fail-closed on a malformed prefix or pub body. Never panics.
+    ///
+    /// SCOPE (#588): this is EXPLICIT-stream-id addressing only. The Level-2 confirm registry, the
+    /// dedup-id-cap pre-check, the CoDel/headroom shed taxonomy, and the pipelined window are the
+    /// DEFAULT stream's; a named-stream publish here is at-least-once Level-1-equivalent (a `PubAck`
+    /// after the named stream's covering fsync) and rejects an unsupported ack level. Per-stream
+    /// dedup / ack-levels / Tier-S are the flagged follow-ups (#681 and the #676 scope notes).
+    fn handle_pub_to<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        if !self.streams_enabled {
+            reply_err(
+                out,
+                "stream addressing not negotiated (set understands_streams)",
+            );
+            return Ok(());
+        }
+        let Ok(decoded) = decode_pub_to(body) else {
+            reply_err(out, "malformed pub-to body");
+            return Ok(());
+        };
+        // An EMPTY stream id is a default-stream publish: route the verbatim PubBody tail through the
+        // EXISTING default-stream produce path, byte-for-byte (#588 back-compat — a `PubTo("")` is
+        // indistinguishable from a plain `Pub` downstream).
+        if decoded.stream_id.is_empty() {
+            let mut parked = Vec::new();
+            self.handle_pub(engine, decoded.pub_body, &mut parked, out)?;
+            return drain_parked(engine, self.member_id, &mut parked, out);
+        }
+        let Ok(stream) = core::str::from_utf8(decoded.stream_id) else {
+            reply_err(out, "stream id must be valid UTF-8");
+            return Ok(());
+        };
+        let Ok(msg) = decode_pub(decoded.pub_body) else {
+            reply_err(out, "malformed pub body");
+            return Ok(());
+        };
+        // A named-stream publish is at-least-once Level-1-equivalent this phase: the no-ack (Level-0)
+        // and consumer-ack (Level-2) tiers are the default stream's, so a non-Level-1 ack level on a
+        // PubTo is refused rather than silently downgraded (the producer must use the default stream for
+        // those tiers, or wait for the per-stream ack-level follow-up).
+        if !matches!(pub_ack_level(msg.flags), AckLevel::ServerAck) {
+            reply_err(
+                out,
+                "named-stream publish supports only server-ack (level 1) this phase",
+            );
+            return Ok(());
+        }
+        // The dedup-id wire caps (#33), enforced at the boundary exactly as the default `handle_pub`
+        // does, BEFORE the bytes cross into owned storage.
+        if let Some(d) = msg.dedup.as_ref() {
+            if d.producer_id.len() > MAX_PRODUCER_ID_LEN {
+                reply_err(out, "producer_id too long");
+                return Ok(());
+            }
+            if d.msg_id.len() > MAX_MSG_ID_LEN {
+                reply_err(out, "msg_id too long");
+                return Ok(());
+            }
+        }
+        // Compressed-descriptor SHAPE validation at the wire boundary (#438), same gate as the default
+        // path: a stored compressed object must be decodable by every reader, or a consumer burns
+        // max-deliver cycles on it. A 9-byte header parse, NO decompression.
+        if RecordFlags::from_bits(msg.flags).contains(RecordFlags::COMPRESSED) {
+            if let Err(e) = validate_descriptor_shape(msg.payload, DEFAULT_MAX_DECOMPRESSED_BYTES) {
+                reply_err(out, &format!("malformed compressed descriptor: {e}"));
+                return Ok(());
+            }
+        }
+        // Build the OWNED append (the wire body borrows the connection buffer, which the closure
+        // cannot hold), then route it to the NAMED stream via the engine's id-routed produce in ONE
+        // actor job. `produce_in_stream` declares-on-first-produce and commits the named stream's log
+        // with the cross-stream group-commit tick, so the `PubAck` below is ack-implies-durable for the
+        // named stream (I2 per stream). The default stream's batched/pipelined produce path is entirely
+        // untouched — this is a separate, additive route reached only for a non-empty stream id.
+        let dedup = msg.dedup.map(|d| OwnedDedup {
+            producer_id: Bytes::copy_from_slice(d.producer_id),
+            epoch: d.epoch,
+            msg_id: Bytes::copy_from_slice(d.msg_id),
+        });
+        let append = OwnedAppend {
+            timestamp_ms: msg.timestamp_ms,
+            flags: msg.flags & !PUB_WIRE_ONLY_FLAGS,
+            key: Bytes::copy_from_slice(msg.key),
+            headers: Bytes::copy_from_slice(msg.headers),
+            payload: Bytes::copy_from_slice(msg.payload),
+            dedup,
+            enqueue_monotonic_nanos: engine.now_monotonic_nanos(),
+            fire_and_forget: false,
+        };
+        let stream = stream.to_string();
+        let outcome = engine.with(move |e| {
+            let view = Append {
+                timestamp_ms: append.timestamp_ms,
+                flags: RecordFlags::from_bits(append.flags),
+                key: &append.key,
+                headers: &append.headers,
+                payload: &append.payload,
+            };
+            e.produce_in_stream(&stream, &view)
+        })?;
+        match outcome {
+            Ok(offset) => {
+                let ack = PubAckBody {
+                    offset: offset.get(),
+                };
+                let mut ack_body = Vec::new();
+                encode_pub_ack(&ack, &mut ack_body);
+                reply(out, FrameType::PubAck, &ack_body);
+                Ok(())
+            }
+            // A fatal storage error on the named stream ends the session, exactly like the default
+            // produce path (a frozen writer / broken invariant is unrecoverable).
+            Err(e) if e.is_fatal() => {
+                reply_err(out, "fatal storage error");
+                Err(SessionError::EngineFatal(e))
+            }
+            // A malformed name or a non-fatal storage error (e.g. a byte-cap shed) is a typed,
+            // connection-preserving reject, never a panic.
+            Err(e) => {
+                reply_err(out, &e.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    /// Handles a `SubTo` (#588, M2-I10): subscribe to a NAMED stream's per-stream work-group. Binds
+    /// BOTH `self.stream` (the named stream) and `self.subscription` (the work-group within it), so
+    /// this connection's subsequent `Flow`/`Ack` route to that stream's OWN competing work-group via
+    /// the engine's id-routed `poll_in_stream` / `ack_in_stream` (#676/#679 — the same group name in
+    /// two streams is two unrelated cursors). The named stream must already EXIST (a `StreamDeclare` or
+    /// a prior `PubTo` declared it); an unknown stream is an `Err`. An EMPTY stream id targets the
+    /// default stream and is equivalent to a plain `Sub`. GATED on the negotiated streams capability;
+    /// fail-closed on a malformed body. Never panics.
+    fn handle_sub_to<
+        F: Filesystem + Clone + 'static,
+        C: Clock + Clone + 'static,
+        E: EngineAccess<F, C>,
+    >(
+        &mut self,
+        engine: &E,
+        body: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if !self.connected {
+            reply_err(out, "not connected");
+            return Ok(());
+        }
+        if !self.streams_enabled {
+            reply_err(
+                out,
+                "stream addressing not negotiated (set understands_streams)",
+            );
+            return Ok(());
+        }
+        let Ok(decoded) = decode_sub_to(body) else {
+            reply_err(out, "malformed sub-to body");
+            return Ok(());
+        };
+        // An EMPTY stream id is a default-stream subscribe: route through the EXISTING `handle_sub` so
+        // a `SubTo("", group)` is byte-for-byte a plain `Sub` (it also clears any prior named binding).
+        // A `Sub` body IS the raw group-name bytes (see `decode_sub`), so the decoded group slice is
+        // exactly the `Sub` body `handle_sub` expects.
+        if decoded.stream_id.is_empty() {
+            return self.handle_sub(engine, decoded.group, out);
+        }
+        let Ok(stream) = core::str::from_utf8(decoded.stream_id) else {
+            reply_err(out, "stream id must be valid UTF-8");
+            return Ok(());
+        };
+        let Ok(group) = core::str::from_utf8(decoded.group) else {
+            reply_err(out, "group name must be valid UTF-8");
+            return Ok(());
+        };
+        // The named stream must already exist: a SubTo binds a consume cursor, and consuming an
+        // unknown (never-declared) stream is a typed rejection, never a silent empty subscription.
+        let stream_owned = stream.to_string();
+        if !engine.with(move |e| e.stream_exists(&stream_owned))? {
+            reply_err(
+                out,
+                &format!("stream {stream:?} does not exist (declare or publish to it first)"),
+            );
+            return Ok(());
+        }
+        // Switching to a named stream abandons this connection's default-stream leases (they redeliver
+        // there after the visibility timeout); the named subscription starts clean. The per-stream
+        // work-group is created lazily on the first named poll under the per-stream group cap (#676).
+        self.stream = GroupName::from(stream);
+        self.subscription = GroupName::from(group);
+        // A named-stream consume is plain competing (#676): it does not register in the default-stream
+        // key_shared/broadcast subscriber sets, so leave any such default-stream membership/registration
+        // behind (a no-op for a connection that never had one) rather than stranding it.
+        self.registered_subscription = false;
+        self.joined_key_shared = false;
+        self.leased.clear();
+        reply(out, FrameType::Ok, &[]);
+        Ok(())
+    }
+
     fn handle_unsub<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAccess<F, C>>(
         &mut self,
         engine: &E,
@@ -2122,6 +2596,12 @@ impl Session {
         // It is a no-op for the default group, for a group still holding leases (they redeliver or
         // expire first, then the natural idle sweep reclaims it), and when eviction is disabled.
         let leaving = std::mem::take(&mut self.subscription);
+        // Clear any named-stream binding (#588): after an Unsub the connection reverts to the default
+        // stream, so a later Flow with no SubTo polls the default stream byte-for-byte. The named
+        // stream's per-stream work-group is NOT registered in the default-stream key_shared/broadcast/
+        // eviction structures (#676 named consume is plain competing only), so the leave/evict calls
+        // above are no-ops for it; only this local binding needs resetting.
+        self.stream = GroupName::default();
         self.leased.clear();
         if !leaving.is_empty() {
             engine.with(move |e| {
@@ -2778,6 +3258,7 @@ mod tests {
                 understands_streaming: false,
                 default_tier: None,
                 understands_deliver_batch: false,
+                understands_streams: false,
             },
             &mut body,
         );
@@ -3987,6 +4468,7 @@ mod tests {
                 understands_streaming,
                 default_tier: default_tier.map(ConsumeTier::as_u8),
                 understands_deliver_batch: false,
+                understands_streams: false,
             },
             &mut body,
         );
@@ -4143,6 +4625,7 @@ mod tests {
                 understands_streaming,
                 default_tier: None,
                 understands_deliver_batch,
+                understands_streams: false,
             },
             &mut body,
         );
@@ -6499,6 +6982,7 @@ mod tests {
                 understands_streaming: false,
                 default_tier: None,
                 understands_deliver_batch: false,
+                understands_streams: false,
             },
             &mut connect_body,
         );
@@ -7882,6 +8366,7 @@ mod tests {
                 understands_streaming: false,
                 default_tier: None,
                 understands_deliver_batch: false,
+                understands_streams: false,
             },
             &mut connect_body,
         );
