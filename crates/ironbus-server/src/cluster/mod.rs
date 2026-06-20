@@ -154,10 +154,32 @@
 //! forensic [`ironbus_storage::quarantine::QuarantineStore`] (the corrupt bytes are PRESERVED, NEVER
 //! deleted) and re-syncs from the clean majority — the partition stays available; a minority fault can
 //! neither delete data nor lose quorum (the direct beat over NATS #7556's minority-corruption-deletes-
-//! stream). The leader-completeness ELECTION restriction (a corrupt replica can't win) is C4-I4 (#614)
-//! and the CI1-CI4 doc/checkers are C4-I5 (#615) — both DEFERRED. Single-node is byte-identical: with
-//! no cluster a broker never advertises, compares, or resyncs, and the single-node quarantine/recovery
-//! path is unchanged.
+//! stream). Single-node is byte-identical: with no cluster a broker never advertises, compares, or
+//! resyncs, and the single-node quarantine/recovery path is unchanged.
+//!
+//! ## Status: C4-I4/I5 (#614/#615) — leader-completeness election restriction + CI1-CI4 checkers
+//!
+//! [`eligibility`] completes the cluster SAFETY story: it makes a stale/corrupt replica INELIGIBLE for
+//! partition leadership, the construction that prevents the Jepsen NATS 2.12.1 failure (a corrupt node
+//! "managed to become the leader … despite its corrupt state" and then DELETED the stream, losing
+//! ~49.7% of acked writes). When a partition leader is (re)assigned, eligibility =
+//! `(in ISR) AND (durable prefix >= committed HW) AND (no detected divergence)` — reusing the #668
+//! epoch, the #691 ISR + quorum HW ([`isr::IsrTracker`]), and the #697 divergence detection
+//! ([`divergence::DivergenceReport`]). A replica BEHIND the committed HW (stale), or one whose log
+//! DIVERGES from the committed lineage (corrupt), is excluded BY CONSTRUCTION — it can never win, the
+//! Kafka ELR "Leader Candidate Completeness" / KIP-966 restriction. The pure predicate lives IO-free in
+//! [`ironbus_core::cluster_invariants::LeaderEligibility`]; [`eligibility::eligible_leaders`] is the
+//! function the metadata-plane PLACEMENT consults (the placement/rebalance itself — WHICH eligible
+//! replica to designate, and when — is C5, #616+). Alongside it,
+//! [`ironbus_core::cluster_invariants`] ratifies CI1-CI4 as pure-function checkers mirroring the
+//! single-node I1-I4 (`ironbus-storage/src/invariants.rs`): CI1 (in-sync replicas share the committed
+//! prefix), CI2 (a C2-fsync ack implies a quorum fsync — #691), CI3 (divergence is bounded + reported +
+//! repaired, never silently served / deleted — #697), CI4 (epoch monotonic, no stale-leader-commit —
+//! #668 + #614), each falsifiable against a constructed bad state. The cluster recovery contract is
+//! documented in `docs/CLUSTER_INVARIANTS.md`. Single-node is byte-identical: the lone replica is its
+//! own ISR, is complete to its own HW, and cannot diverge from itself, so it is trivially eligible; the
+//! eligibility / CI layer never constructs in a standalone broker. The `serve`-path wiring of the
+//! eligibility check into the running metadata placement is the follow-up.
 //!
 //! ## Deliberately deferred (later C1 / C2 issues)
 //!
@@ -178,6 +200,7 @@
 
 pub mod ack_level;
 pub mod divergence;
+pub mod eligibility;
 pub mod isr;
 pub mod membership;
 pub mod metadata_group;
@@ -192,6 +215,10 @@ pub use divergence::{
     compare_fingerprints, execute_resync, fingerprint_log, plan_resync, quarantine_and_resync,
     DivergenceDetected, DivergenceError, DivergenceField, DivergenceReport, ResyncBounds,
     ResyncPlan, ResyncReport, SegmentFingerprint, SegmentFingerprints, MAX_FINGERPRINTS,
+};
+pub use eligibility::{
+    eligible_leaders, evaluate_eligibility, is_eligible_leader, replica_state_from,
+    IneligibleReason, ReplicaState,
 };
 pub use isr::{AckReplicatedBody, IsrConfig, IsrMembership, IsrTracker, PendingAck, QuorumAckGate};
 pub use membership::{MemberOp, MembershipChange, PeerIdError};
