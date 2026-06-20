@@ -12619,6 +12619,11 @@ mod tests {
         assert_eq!(def.transport.reserved_tls_flag(), None);
     }
 
+    // `#[cfg(unix)]`: the StrictModes secret-file check is inherently unix (POSIX mode bits + owner
+    // uid), so `strict_mode_check_secret_file` is itself `#[cfg(unix)]` and the test uses
+    // `std::os::unix::fs::PermissionsExt`/`from_mode`. Gated so the Windows build compiles (matching
+    // the #683 `cfg(all(test, unix))` precedent for the other mode-bit tests in this module).
+    #[cfg(unix)]
     #[test]
     fn a_group_or_world_readable_secret_file_is_refused_at_boot() {
         // The StrictModes check (#635): a 0o644 (group/world-readable) secret file fails closed.
@@ -12648,6 +12653,10 @@ mod tests {
         assert!(strict_mode_check_secret_file("/no/such/secret/file").is_err());
     }
 
+    // `#[cfg(unix)]`: calls `load_auth_config` (itself `#[cfg(unix)]` — it StrictModes-checks the
+    // secret file via POSIX mode bits) and uses `std::os::unix::fs::PermissionsExt`/`from_mode` to
+    // stage the 0o600 file. Gated so the Windows build compiles (the #683 `cfg(unix)` precedent).
+    #[cfg(unix)]
     #[test]
     fn load_auth_config_parses_a_three_mechanism_identity_table() {
         use ironbus_server::auth::Scope;
