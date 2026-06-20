@@ -44,30 +44,55 @@
 //! of [`lease.rs`](ironbus_core::lease)'s per-consumer generation fencing — so the metadata
 //! group only WIRES the raft term + the I6 monotonic clock into it.
 //!
-//! ## Deliberately deferred (later C1 issues)
+//! ## C1 peer transport (#667) — the BOUNDED, FAIL-CLOSED wire (this issue's addition)
 //!
-//! * **PEER TRANSPORT + the wire CATCH-UP + RUSTSEC-2024-0437 (#667)** — the wire that parses
-//!   untrusted peer Raft bytes (and the bounding of incoming message size / recursion + removing
-//!   the deny.toml ignore), AND the over-the-wire learner catch-up / snapshot transfer, are a
-//!   SEPARATE, security-sensitive follow-up. C1-I4 implements the learner ROLE + promotion in the
-//!   membership state machine + the raft conf change, but the actual back-fill of a joining
-//!   learner over the network lands with #667. C1-I4 parses NO peer bytes (a membership change is
-//!   proposed through the LOCAL raft log API, not by parsing a peer's wire bytes), so the advisory
-//!   stays unreachable and its scoped ignore is unchanged here.
+//! [`transport`] adds the wire that carries `eraftpb::Message`s between cluster nodes: it
+//! serializes the outbound messages [`metadata_group::MetadataRaftGroup::drive_ready`] surfaces and
+//! sends them to the addressed peer, and it decodes the bytes a peer sends back into an
+//! `eraftpb::Message` to feed [`metadata_group::MetadataRaftGroup::step`]. This is the FIRST place
+//! IronBus parses UNTRUSTED PEER BYTES through the vendored protobuf-2 `eraftpb` codec, so it is
+//! built to treat every incoming byte as adversarial: a hard incoming-message SIZE cap
+//! ([`transport::MAX_RAFT_MSG_BYTES`], enforced on the frame length prefix BEFORE any allocation)
+//! and a tight protobuf RECURSION-DEPTH bound ([`transport::RAFT_DECODE_RECURSION_LIMIT`], set on
+//! the `CodedInputStream` before merge) together make RUSTSEC-2024-0437 (the protobuf-2.x
+//! deep-nesting stack overflow) UNREACHABLE — a hostile message is rejected with a typed error,
+//! never a panic / OOM / stack overflow. The decoded message's `from` is also authenticated against
+//! the known membership (the wire-side application of C1-I4 peer-id validation). With the bound in
+//! place the `deny.toml` `RUSTSEC-2024-0437` ignore is REMOVED.
+//!
+//! [`transport`] is the testable transport LAYER (the bounded codec + frame helpers + peer-id
+//! registry + a [`transport::PeerLink`] over any `Read + Write`, driven by a loopback harness). The
+//! full `serve`-path wiring (a cluster listener/dialer on a multi-node config, the broker actually
+//! replicating) is the next step and is DEFERRED below.
+//!
+//! ## Deliberately deferred (later C1 / C2 issues)
+//!
+//! * **`serve`-path wiring + over-the-wire learner CATCH-UP + C2 replication** — wiring the
+//!   transport into the running broker (a cluster listener/dialer bound to a multi-node config) and
+//!   the actual back-fill of a joining learner / replication is the follow-up. This issue ships the
+//!   bounded, fail-closed transport layer + closes the RUSTSEC advisory; it does NOT make the broker
+//!   run multi-node by default.
 //! * **metadata snapshot DATA + log COMPACTION (#660, C1-I2b)** — physically reclaiming the
 //!   applied metadata-log prefix and filling in snapshot data.
+//! * **mTLS peer authentication** — IronBus is plaintext TCP today; the transport binds a message
+//!   to a known-membership peer id but does not yet cryptographically authenticate the peer.
 //!
 //! This module is NOT yet referenced by the running broker (no `serve`-path wiring), so its
 //! presence does not change the single-node binary's behavior or on-disk layout — the n=1
-//! zero-config path is unaffected (a 1-member group's membership change is degenerate but
-//! correct: adding the 2nd member is the first real joint-consensus change).
+//! zero-config path is unaffected (a 1-member group opens NO peer listener; the transport only
+//! activates in a multi-node config).
 
 pub mod membership;
 pub mod metadata_group;
 pub mod metadata_storage;
 pub mod state_machine;
+pub mod transport;
 
 pub use membership::{MemberOp, MembershipChange, PeerIdError};
 pub use metadata_group::{GroupError, MetadataRaftGroup};
 pub use metadata_storage::{MetadataLogStorage, MetadataStorageError, METADATA_SUBDIR};
 pub use state_machine::{DecodeError, MetadataCommand, MetadataStateMachine, NodeRole, Placement};
+pub use transport::{
+    decode_peer_frame, decode_raft_message, encode_raft_message, PeerLink, PeerRegistry,
+    PeerWireError, MAX_RAFT_MSG_BYTES, RAFT_DECODE_RECURSION_LIMIT,
+};

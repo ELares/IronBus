@@ -213,6 +213,15 @@ impl<F: Filesystem, C: Clock + Clone> MetadataRaftGroup<F, C> {
         self.node.raft.state == StateRole::Leader
     }
 
+    /// True if the group has a pending `Ready` to drain (work the caller's transport should pump
+    /// with [`Self::drive_ready`]). A driver loops [`Self::tick`] + [`Self::drive_ready`] until this
+    /// is false to reach a fixed point. (The peer transport, #667, uses this to know when a node has
+    /// nothing more to say.)
+    #[must_use]
+    pub fn has_pending_ready(&self) -> bool {
+        self.node.has_ready()
+    }
+
     /// The current Raft term (the raw consensus term). Prefer [`Self::leader_epoch`] as the
     /// monotonic cluster fencing token: the term raw off the raft core can briefly read lower
     /// than the highest epoch this group has observed mid-transition, whereas the epoch never
