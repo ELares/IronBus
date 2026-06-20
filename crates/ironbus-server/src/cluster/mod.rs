@@ -77,9 +77,23 @@
 //! never blind-trusts the leader's bytes. The follower's high-watermark = `min(its durable prefix,
 //! the leader's committed prefix)`, so only committed-and-replicated data is visible. Like the C1
 //! peer transport, it is a TESTABLE layer (a [`replication::ReplicationLink`] over any `Read + Write`,
-//! driven by an in-process leader↔follower loopback) — the `serve`-path wiring is deferred. The
-//! ISR set / min-isr / quorum-ack release (C2-I2 / C3), leader-epoch truncation (C2-I4, #599),
-//! divergence self-heal (C4), and multi-partition fan-out are deferred to those issues.
+//! driven by an in-process leader↔follower loopback) — the `serve`-path wiring is deferred.
+//! Leader-epoch truncation (C2-I4, #599), divergence self-heal (C4), and multi-partition fan-out are
+//! deferred to those issues.
+//!
+//! ## Status: C2-I2 (#593) — ISR set + min-in-sync-replicas + quorum-FSYNC ack release
+//!
+//! [`isr`] turns C2-I1's follower-fetch into a DURABILITY GUARANTEE: the leader tracks the in-sync
+//! replica set ([`isr::IsrTracker`]) from each follower's reported FSYNC'd offset
+//! ([`isr::AckReplicatedBody`], the new wire tag 37 — the follower reports what it has `fdatasync`'d,
+//! NOT merely received), evicts a follower that lags past a bound, computes the QUORUM-COMMIT offset
+//! (the highest offset `min_isr` in-sync replicas have all fsync'd), and releases a `C2-fsync`
+//! `PubAck` ([`isr::QuorumAckGate`]) ONLY once the produce's offset is quorum-committed — so an
+//! IronBus R-ack means fsync'd-on-a-quorum BY CONSTRUCTION (the win over NATS R3's quorum page-cache).
+//! Below `min_isr` the gate releases NOTHING (the no-false-ack property: unavailable over unsafe). The
+//! explicit cluster ack-level enum / opt-in page-cache level + per-level metrics are C3 (#605/#608);
+//! this ships the C2-fsync quorum gate + the ISR. Like the rest of C1/C2 it is a TESTABLE layer; the
+//! `serve`-path wiring of the gate into the produce-ack release is the follow-up.
 //!
 //! ## Deliberately deferred (later C1 / C2 issues)
 //!
@@ -98,6 +112,7 @@
 //! zero-config path is unaffected (a 1-member group opens NO peer listener; the transport only
 //! activates in a multi-node config).
 
+pub mod isr;
 pub mod membership;
 pub mod metadata_group;
 pub mod metadata_storage;
@@ -106,6 +121,7 @@ pub mod runtime;
 pub mod state_machine;
 pub mod transport;
 
+pub use isr::{AckReplicatedBody, IsrConfig, IsrMembership, IsrTracker, PendingAck, QuorumAckGate};
 pub use membership::{MemberOp, MembershipChange, PeerIdError};
 pub use metadata_group::{GroupError, MetadataRaftGroup};
 pub use metadata_storage::{MetadataLogStorage, MetadataStorageError, METADATA_SUBDIR};
