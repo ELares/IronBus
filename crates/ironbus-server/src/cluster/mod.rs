@@ -65,6 +65,22 @@
 //! full `serve`-path wiring (a cluster listener/dialer on a multi-node config, the broker actually
 //! replicating) is the next step and is DEFERRED below.
 //!
+//! ## Status: C2-I1 (#590) — follower-fetch per-partition data replication
+//!
+//! [`replication`] adds the FIRST real multi-node DATA fault-tolerance: per-partition leader + ISR
+//! PULL replication of the existing CRC-framed log. A follower sends a
+//! [`replication::FetchRecordsBody`] to the leader; the leader serves a contiguous CRC-framed byte
+//! range from its own log ([`replication::ReplicationLeader`], reusing the zero-copy `raw_byte_range`
+//! / `read_range_raw` of #657) plus its high-watermark; the follower
+//! ([`replication::Follower`]) RE-VALIDATES every frame's CRC with the existing intact-record
+//! predicate ([`ironbus_core::codec::decode`]) and appends only validated frames — fail-closed, it
+//! never blind-trusts the leader's bytes. The follower's high-watermark = `min(its durable prefix,
+//! the leader's committed prefix)`, so only committed-and-replicated data is visible. Like the C1
+//! peer transport, it is a TESTABLE layer (a [`replication::ReplicationLink`] over any `Read + Write`,
+//! driven by an in-process leader↔follower loopback) — the `serve`-path wiring is deferred. The
+//! ISR set / min-isr / quorum-ack release (C2-I2 / C3), leader-epoch truncation (C2-I4, #599),
+//! divergence self-heal (C4), and multi-partition fan-out are deferred to those issues.
+//!
 //! ## Deliberately deferred (later C1 / C2 issues)
 //!
 //! * **`serve`-path wiring + over-the-wire learner CATCH-UP + C2 replication** — wiring the
@@ -85,6 +101,7 @@
 pub mod membership;
 pub mod metadata_group;
 pub mod metadata_storage;
+pub mod replication;
 pub mod runtime;
 pub mod state_machine;
 pub mod transport;
@@ -92,6 +109,10 @@ pub mod transport;
 pub use membership::{MemberOp, MembershipChange, PeerIdError};
 pub use metadata_group::{GroupError, MetadataRaftGroup};
 pub use metadata_storage::{MetadataLogStorage, MetadataStorageError, METADATA_SUBDIR};
+pub use replication::{
+    ApplyOutcome, FetchRecordsBody, FetchResponseBody, Follower, ReplicationError,
+    ReplicationFrame, ReplicationLeader, ReplicationLink, MAX_REPL_FETCH_BYTES,
+};
 pub use runtime::{ClusterConfig, ClusterRuntime, ClusterStatus, RuntimeError};
 pub use state_machine::{DecodeError, MetadataCommand, MetadataStateMachine, NodeRole, Placement};
 pub use transport::{
