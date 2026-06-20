@@ -61,6 +61,15 @@ ironbus-storage = { path = "../ironbus-storage", version = "0.0.0" }
 # default single-node binary's behavior and on-disk layout are byte-for-byte unchanged.
 raft = { version = "=0.7.0", default-features = false, features = ["protobuf-codec"] }
 
+# `raft-proto` is raft-rs's eraftpb / conf-change types crate. raft-rs takes (and does NOT
+# re-export) the `ConfChangeI` trait from here — `RawNode::propose_conf_change` /
+# `apply_conf_change` are `impl ConfChangeI` — so the C1-I4 (#584) membership apply path names
+# it directly. It is the SAME crate already in the tree: the workspace root patches `raft-proto`
+# to the build-script-free vendored drop-in (`[patch.crates-io]`), so this resolves to that exact
+# `=0.7.0` vendored copy, adds NO new crate to the graph, and does not change `Cargo.lock`.
+# Pure Rust (no `protoc`, no `links`, no C build script), permissive (Apache-2.0), MSRV below 1.78.
+raft-proto = { version = "=0.7.0", default-features = false }
+
 # raft-rs's `RawNode::new` takes a `&slog::Logger` and does not re-export `slog`, so it is a
 # direct dependency here. We pass a `Discard` drain (default-logger is off), so no log output
 # is produced; bridging raft-rs's slog to IronBus's `tracing` is deferred (C1-I3+). `slog` is

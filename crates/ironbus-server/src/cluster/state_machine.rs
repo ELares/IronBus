@@ -330,6 +330,34 @@ impl MetadataStateMachine {
         Ok(())
     }
 
+    /// Replace the membership table from an applied raft `ConfState`'s voter / learner sets.
+    ///
+    /// This is the C1-I4 seam: when a committed conf-change entry is applied to the raft core
+    /// (`apply_conf_change`), the resulting `ConfState`'s voters become [`NodeRole::Voter`] and
+    /// its learners [`NodeRole::Learner`] in this state machine, so the state machine's view of
+    /// membership always tracks the durable `ConfState` (and a node present in BOTH the incoming
+    /// and outgoing majorities of a joint config, or staged in `learners_next`, is reflected). A
+    /// voter takes precedence over a learner for the same id (a node can be listed in both during
+    /// a joint transition; it is acting as a voter). `index` is the applied entry index.
+    pub fn set_membership(
+        &mut self,
+        index: u64,
+        voters: &[u64],
+        voters_outgoing: &[u64],
+        learners: &[u64],
+        learners_next: &[u64],
+    ) {
+        self.members.clear();
+        // Learners first, then voters, so a voter overrides a learner for the same id.
+        for &node in learners.iter().chain(learners_next) {
+            self.members.insert(node, NodeRole::Learner);
+        }
+        for &node in voters.iter().chain(voters_outgoing) {
+            self.members.insert(node, NodeRole::Voter);
+        }
+        self.applied_index = index;
+    }
+
     /// The role of `node`, if it is a member.
     #[must_use]
     pub fn role(&self, node: u64) -> Option<NodeRole> {

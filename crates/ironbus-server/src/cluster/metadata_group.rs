@@ -28,10 +28,13 @@ use ironbus_core::clock::Clock;
 use ironbus_core::leader_lease::{EpochObservation, LeaderEpoch, LeaderLease, LeadershipTracker};
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::LogConfig;
-use raft::eraftpb::{Entry, EntryType, Message};
+use protobuf::Message as _;
+use raft::eraftpb::{ConfChange, ConfChangeV2, ConfState, Entry, EntryType, Message};
 use raft::{Config, RawNode, StateRole, Storage as _};
+use raft_proto::ConfChangeI;
 use slog::{o, Discard, Logger};
 
+use crate::cluster::membership::{validate_change, MembershipChange, PeerIdError};
 use crate::cluster::metadata_storage::{MetadataLogStorage, MetadataStorageError};
 use crate::cluster::state_machine::{DecodeError, MetadataCommand, MetadataStateMachine};
 
@@ -56,6 +59,9 @@ pub enum GroupError {
     Decode(DecodeError),
     /// The durable metadata storage (open / persist / fsync / recover) returned an error.
     Storage(MetadataStorageError),
+    /// A proposed membership change failed peer-id validation (the #6403-class rejection):
+    /// a mangled / duplicate / phantom peer was refused before it could enter the metadata log.
+    PeerId(PeerIdError),
 }
 
 impl core::fmt::Display for GroupError {
@@ -73,6 +79,7 @@ impl core::fmt::Display for GroupError {
             GroupError::Raft(e) => write!(f, "raft error: {e}"),
             GroupError::Decode(e) => write!(f, "metadata command decode error: {e}"),
             GroupError::Storage(e) => write!(f, "metadata storage error: {e}"),
+            GroupError::PeerId(e) => write!(f, "membership peer-id validation error: {e}"),
         }
     }
 }
@@ -94,6 +101,12 @@ impl From<DecodeError> for GroupError {
 impl From<MetadataStorageError> for GroupError {
     fn from(e: MetadataStorageError) -> Self {
         GroupError::Storage(e)
+    }
+}
+
+impl From<PeerIdError> for GroupError {
+    fn from(e: PeerIdError) -> Self {
+        GroupError::PeerId(e)
     }
 }
 
@@ -310,6 +323,74 @@ impl<F: Filesystem, C: Clock + Clone> MetadataRaftGroup<F, C> {
         Ok(())
     }
 
+    /// The current durable configuration state (the voter / learner membership), as recovered /
+    /// maintained by the metadata log storage. This is the membership a [`MembershipChange`] is
+    /// validated against, and it survives a restart (the persisted `ConfState`, #659).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GroupError::Raft`] if the storage's `initial_state` read fails.
+    pub fn conf_state(&self) -> Result<ConfState, GroupError> {
+        Ok(self.node.store().initial_state()?.conf_state)
+    }
+
+    /// Propose a joint-consensus MEMBERSHIP CHANGE (leader only): add / remove voters, add a
+    /// learner, or promote a learner to a voter. The change is **peer-id-validated first** (the
+    /// #6403 fix) against the current durable `ConfState`; only if every named peer id is
+    /// well-formed and consistent is it proposed, as a raft-rs `ConfChangeV2`, through the
+    /// metadata raft log. It takes effect when the resulting conf-change entry commits and is
+    /// applied (drive [`Self::drive_ready`] after proposing).
+    ///
+    /// A change touching more than one voter goes through raft-rs **joint consensus** — the
+    /// configuration is briefly *joint*, requiring a majority of BOTH the old and new voter
+    /// sets, so the old and new majorities always overlap (Raft §6) and the change can never
+    /// split the cluster. A lone single change uses the simpler single-server protocol, which is
+    /// itself safe (one voter changed at a time). The conf change is proposed through the durable
+    /// log, so it is replicated and committed exactly like a normal entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GroupError::PeerId`] if the change names a mangled (id 0) / duplicate / phantom
+    /// peer or would remove the last voter (validation REFUSES it before it can be proposed);
+    /// [`GroupError::Raft`] if the core rejects the proposal (e.g. this node is not the leader,
+    /// or a conf change is already pending); or [`GroupError::Storage`] if reading the current
+    /// `ConfState` fails.
+    pub fn propose_membership_change(
+        &mut self,
+        change: &MembershipChange,
+    ) -> Result<(), GroupError> {
+        // THE #6403 FIX: validate the proposed peer identities against the CURRENT membership
+        // before anything enters the log. A mangled / duplicate / phantom peer is rejected here,
+        // so a bad peer-id can never be replicated and can never freeze quorum.
+        let conf_state = self.conf_state()?;
+        validate_change(change, &conf_state)?;
+
+        let cc = change.to_conf_change_v2();
+        self.node.propose_conf_change(vec![], cc)?;
+        Ok(())
+    }
+
+    /// Convenience: propose adding `node` as a NON-VOTING learner (it back-fills the log but
+    /// never counts toward quorum until promoted). The over-the-wire catch-up is peer transport
+    /// (#667); this proposes the learner ROLE.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::propose_membership_change`].
+    pub fn add_learner(&mut self, node: u64) -> Result<(), GroupError> {
+        self.propose_membership_change(&MembershipChange::new().add_learner(node))
+    }
+
+    /// Convenience: propose promoting an existing learner `node` to a voter (the catch-up →
+    /// promote path).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::propose_membership_change`].
+    pub fn promote_learner(&mut self, node: u64) -> Result<(), GroupError> {
+        self.propose_membership_change(&MembershipChange::new().promote_learner(node))
+    }
+
     /// Run one full `ready` cycle: persist the `Ready` (entries, hard state, snapshot)
     /// DURABLY to the IronBus metadata log and FSYNC it, hand outbound messages to the
     /// (currently absent) transport, then `advance` and apply the committed entries into the
@@ -385,6 +466,17 @@ impl<F: Filesystem, C: Clock + Clone> MetadataRaftGroup<F, C> {
         outbound.extend(light.take_messages());
         self.apply_committed(light.take_committed_entries())?;
 
+        // 9. Advance the core's APPLIED index now that every committed entry from this cycle has
+        //    been applied to our state machine. This is the apply half of the raft-rs contract
+        //    (`advance` only advances the APPEND position; `advance_apply` advances the APPLIED
+        //    position). It is load-bearing for JOINT CONSENSUS (C1-I4): when the enter-joint
+        //    conf change is marked applied, the leader auto-appends the empty leave-joint conf
+        //    change, so the cluster transitions OUT of the joint configuration. Without this the
+        //    config would be stuck joint forever (the old + new majorities never collapse to the
+        //    new one). The auto-appended leave-joint entry surfaces as new ready work and is
+        //    persisted / committed / applied on the next cycle.
+        self.node.advance_apply();
+
         // Fold the (possibly-changed) term / leadership into the epoch + lease: an election that
         // committed this cycle advances the epoch and grants the new leader its monotonic-clock
         // lease; a step-down drops it. The epoch is durable (it is the persisted term) and the
@@ -394,24 +486,66 @@ impl<F: Filesystem, C: Clock + Clone> MetadataRaftGroup<F, C> {
         Ok(outbound)
     }
 
-    /// Fold a batch of committed entries into the state machine. Empty entries (the no-op a
-    /// new leader commits to establish its term) and config-change entries are skipped here
-    /// — config changes are applied to the conf state in C1-I4, not the metadata SM.
+    /// Fold a batch of committed entries into the state machine. A leader's empty no-op entry
+    /// (which establishes its term) advances the index but applies nothing; a normal entry is a
+    /// metadata command; a CONF-CHANGE entry (C1-I4) is applied to the raft `ConfState` AND the
+    /// state machine's membership.
     fn apply_committed(&mut self, entries: Vec<Entry>) -> Result<(), GroupError> {
         for entry in entries {
-            if entry.data.is_empty() {
-                // A leader's empty no-op entry: nothing to apply, but it advances the index.
-                continue;
-            }
             match entry.get_entry_type() {
                 EntryType::EntryNormal => {
+                    if entry.data.is_empty() {
+                        // A leader's empty no-op entry: nothing to apply, but it advances the index.
+                        continue;
+                    }
                     self.state.apply_encoded(entry.index, &entry.data)?;
                 }
-                EntryType::EntryConfChange | EntryType::EntryConfChangeV2 => {
-                    // Membership changes are C1-I4; ignore for C1-I1.
+                EntryType::EntryConfChange => {
+                    // A legacy single-server (V1) conf change. (The C1-I4 membership API always
+                    // proposes V2, but we apply a V1 entry too for completeness / forward-compat.)
+                    let cc = ConfChange::parse_from_bytes(&entry.data)
+                        .map_err(MetadataStorageError::from)?;
+                    self.apply_conf_change_entry(entry.index, &cc)?;
+                }
+                EntryType::EntryConfChangeV2 => {
+                    // A joint-consensus (V2) conf change — the C1-I4 path. An EMPTY V2 entry is
+                    // the auto-appended LEAVE-JOINT change raft-rs emits to transition out of a
+                    // joint configuration; it parses to a default (empty) ConfChangeV2 and is
+                    // applied exactly the same way (leaving the joint config).
+                    let cc = ConfChangeV2::parse_from_bytes(&entry.data)
+                        .map_err(MetadataStorageError::from)?;
+                    self.apply_conf_change_entry(entry.index, &cc)?;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Apply one committed conf-change entry: hand it to the raft core (`apply_conf_change`,
+    /// which mutates the active configuration and returns the new `ConfState`), DURABLY persist
+    /// the new `ConfState` to the metadata log (and fsync — membership is as load-bearing as the
+    /// hard state, so it survives a restart, #659), then fold the new membership into the state
+    /// machine so its voter / learner view tracks the durable config.
+    ///
+    /// The empty leave-joint change is applied here too (it transitions out of the joint config);
+    /// raft-rs auto-appends it once the enter-joint change is applied, so the caller never has to.
+    fn apply_conf_change_entry(
+        &mut self,
+        index: u64,
+        cc: &impl ConfChangeI,
+    ) -> Result<(), GroupError> {
+        let new_conf_state = self.node.apply_conf_change(cc)?;
+        // Persist the new membership durably (paired with the current hard state) and fsync, the
+        // same persist-before-act discipline as the hard state — then fold it into the SM.
+        self.node.mut_store().set_conf_state(&new_conf_state)?;
+        self.node.mut_store().sync()?;
+        self.state.set_membership(
+            index,
+            new_conf_state.get_voters(),
+            new_conf_state.get_voters_outgoing(),
+            new_conf_state.get_learners(),
+            new_conf_state.get_learners_next(),
+        );
         Ok(())
     }
 }
@@ -843,5 +977,405 @@ mod tests {
             "a recovered node holds no leadership lease until it re-campaigns"
         );
         assert!(reopened.leader_lease().is_none());
+    }
+
+    // --- C1-I4 (#584): joint-consensus membership + learners + peer-id validation. ---
+
+    use crate::cluster::membership::{MembershipChange, PeerIdError};
+
+    /// Elect the lone voter and settle, returning a leader-ready single-node group over `fs`.
+    fn elected_single(fs: &InMemoryFs) -> TestGroup {
+        let mut group = open_on(fs, 1, &[1]);
+        group.campaign().expect("campaign");
+        settle(&mut group);
+        assert!(group.is_leader(), "lone voter self-elects");
+        group
+    }
+
+    /// The voters currently in the durable conf state, sorted.
+    fn voters_of(group: &TestGroup) -> Vec<u64> {
+        let mut v = group.conf_state().expect("conf state").voters;
+        v.sort_unstable();
+        v
+    }
+
+    /// The learners currently in the durable conf state, sorted.
+    fn learners_of(group: &TestGroup) -> Vec<u64> {
+        let mut l = group.conf_state().expect("conf state").learners;
+        l.sort_unstable();
+        l
+    }
+
+    /// THE FIRST REAL JOINT CHANGE: n=1 -> add the 2nd member as a voter. The change is proposed
+    /// through the metadata raft log, committed, applied to the `ConfState` AND the state machine,
+    /// and — crucially — SURVIVES a reopen (durable via #659). At n=1 the single change uses the
+    /// simple protocol; this is the degenerate-but-correct case the brief calls out.
+    #[test]
+    fn n1_add_second_voter_is_committed_through_the_log_and_survives_reopen() {
+        let fs = InMemoryFs::new();
+        {
+            let mut group = elected_single(&fs);
+            assert_eq!(voters_of(&group), vec![1]);
+
+            group
+                .propose_membership_change(&MembershipChange::new().add_voter(2))
+                .expect("propose add-voter");
+            settle(&mut group);
+
+            // The new voter is in the durable ConfState AND folded into the state machine.
+            assert_eq!(voters_of(&group), vec![1, 2], "node 2 is now a voter");
+            assert_eq!(group.state().role(2), Some(NodeRole::Voter));
+            assert_eq!(
+                group.state().voter_count(),
+                2,
+                "the state machine tracks 2 voters"
+            );
+            // Not joint anymore: the (auto-)leave finished, no outgoing voters remain.
+            assert!(
+                group.conf_state().unwrap().voters_outgoing.is_empty(),
+                "the joint config was left"
+            );
+        }
+
+        // Reopen over the SAME durable image (a restart): the membership change is durable. The
+        // recovered ConfState carries both voters.
+        let reopened = open_on(&fs, 1, &[1]);
+        assert_eq!(
+            voters_of(&reopened),
+            vec![1, 2],
+            "the committed membership change survives a reopen (#659)"
+        );
+    }
+
+    /// A learner JOINS as a non-voting member first (it never counts toward quorum), then is
+    /// PROMOTED to a voter via a second conf change. The wire catch-up of the learner is peer
+    /// transport (#667); here the learner ROLE + promotion in the conf change + state machine is
+    /// what is exercised.
+    #[test]
+    fn add_a_learner_then_promote_it_to_a_voter() {
+        let fs = InMemoryFs::new();
+        let mut group = elected_single(&fs);
+
+        // Add node 2 as a NON-VOTING learner.
+        group.add_learner(2).expect("add learner");
+        settle(&mut group);
+        assert_eq!(learners_of(&group), vec![2], "node 2 joined as a learner");
+        assert_eq!(group.state().role(2), Some(NodeRole::Learner));
+        assert_eq!(
+            group.state().voter_count(),
+            1,
+            "a learner does NOT count toward quorum"
+        );
+        assert_eq!(voters_of(&group), vec![1]);
+
+        // Promote the learner to a voter.
+        group.promote_learner(2).expect("promote learner");
+        settle(&mut group);
+        assert_eq!(voters_of(&group), vec![1, 2], "node 2 is now a voter");
+        assert!(
+            learners_of(&group).is_empty(),
+            "node 2 is no longer a learner"
+        );
+        assert_eq!(group.state().role(2), Some(NodeRole::Voter));
+        assert_eq!(group.state().voter_count(), 2);
+    }
+
+    // --- A deterministic in-memory MESH of metadata groups. ---
+    //
+    // Removing a voter (or any change touching the quorum past n=1) requires the new voters to
+    // actually replicate, so a single isolated group cannot commit it. The OVER-THE-WIRE peer
+    // transport (serialization + bounding untrusted bytes) is #667 and explicitly out of scope
+    // here. To exercise REAL joint consensus deterministically WITHOUT that wire, the tests run a
+    // small in-process mesh: each node is a `MetadataRaftGroup`, and we hand-deliver the
+    // `Message`s a node's `drive_ready` emits to the addressed peer's `step` — moving in-memory
+    // `Message` VALUES between groups, parsing no bytes. This is the raft-rs `five_mem_node`
+    // pattern, scoped to tests.
+
+    /// A fixed-membership mesh of groups keyed by node id, each over its own in-memory fs so the
+    /// `metaraft/` subdirs never collide.
+    struct Mesh {
+        nodes: std::collections::BTreeMap<u64, TestGroup>,
+    }
+
+    impl Mesh {
+        /// Build a mesh of `voters`, each a group that knows the full voter set.
+        fn new(voters: &[u64]) -> Self {
+            let mut nodes = std::collections::BTreeMap::new();
+            for &id in voters {
+                // Each node gets its OWN fs (its own durable metaraft/ image).
+                let fs = InMemoryFs::new();
+                let group =
+                    MetadataRaftGroup::open(id, voters, &fs, ManualClock::new(), log_config())
+                        .expect("open mesh node");
+                // Leak the fs into the group's storage lifetime: the group owns its log, and the
+                // InMemoryFs is reference-counted internally, so we just drop our handle.
+                nodes.insert(id, group);
+            }
+            Self { nodes }
+        }
+
+        /// Tick every node once (drives election timers).
+        fn tick_all(&mut self) {
+            for node in self.nodes.values_mut() {
+                node.tick();
+            }
+        }
+
+        /// Drain every node's ready cycle once, routing each emitted message to its destination
+        /// node's `step`. Returns the number of messages routed this round (0 once the mesh has
+        /// nothing more to say).
+        fn pump_once(&mut self) -> usize {
+            // Collect outbound from every node's drive_ready, then deliver. Two phases so the
+            // borrow of `self.nodes` for draining is dropped before the borrow for delivery.
+            let mut outbox: Vec<Message> = Vec::new();
+            for node in self.nodes.values_mut() {
+                let msgs = node.drive_ready().expect("drive ready");
+                outbox.extend(msgs);
+            }
+            let routed = outbox.len();
+            for msg in outbox {
+                let to = msg.to;
+                if let Some(dst) = self.nodes.get_mut(&to) {
+                    // Ignore a step error for a message addressed to a node mid-removal (it may
+                    // no longer recognise the sender); the mesh is a best-effort router.
+                    let _ = dst.step(msg);
+                }
+            }
+            routed
+        }
+
+        /// True once no node has pending ready work (the mesh has quiesced).
+        fn quiesced(&self) -> bool {
+            self.nodes.values().all(|n| !n.node.has_ready())
+        }
+
+        /// Run the mesh to a fixed point: repeatedly tick (to drive heartbeats / re-broadcasts)
+        /// and pump messages until a full pass routes nothing and no node has pending work. The
+        /// per-pass pump is itself iterated so a message produced by one node's `step` is drained
+        /// and routed in the same pass — important so a leader's just-appended entry (e.g. the
+        /// auto-appended LEAVE-JOINT conf change) replicates and commits within `run`. Bounded by
+        /// generous fuel so a bug cannot hang the test.
+        fn run(&mut self) {
+            for _ in 0..1024 {
+                self.tick_all();
+                // Drain-and-route to a local fixed point before the next tick.
+                let mut progressed = false;
+                for _ in 0..256 {
+                    let routed = self.pump_once();
+                    if routed > 0 {
+                        progressed = true;
+                    }
+                    if routed == 0 && self.quiesced() {
+                        break;
+                    }
+                }
+                if self.quiesced() && !progressed {
+                    break;
+                }
+            }
+        }
+
+        /// Elect node `id` as leader and drive the mesh to a stable leadership.
+        fn elect(&mut self, id: u64) {
+            self.nodes
+                .get_mut(&id)
+                .expect("node")
+                .campaign()
+                .expect("campaign");
+            self.run();
+            assert!(self.nodes[&id].is_leader(), "node {id} should be leader");
+        }
+
+        /// The leader node's id, if exactly one node believes it leads.
+        fn leader(&self) -> Option<u64> {
+            let leaders: Vec<u64> = self
+                .nodes
+                .iter()
+                .filter(|(_, n)| n.is_leader())
+                .map(|(id, _)| *id)
+                .collect();
+            (leaders.len() == 1).then(|| leaders[0])
+        }
+
+        /// Propose a membership change on the current leader and drive the mesh to convergence.
+        fn change_on_leader(&mut self, change: &MembershipChange) -> Result<(), GroupError> {
+            let leader = self.leader().expect("a leader");
+            self.nodes
+                .get_mut(&leader)
+                .unwrap()
+                .propose_membership_change(change)?;
+            self.run();
+            Ok(())
+        }
+
+        /// The sorted voter set as seen by node `id`.
+        fn voters_seen_by(&self, id: u64) -> Vec<u64> {
+            let mut v = self.nodes[&id].conf_state().expect("conf state").voters;
+            v.sort_unstable();
+            v
+        }
+    }
+
+    /// Remove a voter via joint consensus on a REAL 3-node mesh. A 3-voter group elects a leader,
+    /// replicates, then removes one voter; the change goes through the joint configuration
+    /// (overlapping old+new majorities, Raft §6) and converges to the 2-voter config on the
+    /// surviving voters.
+    #[test]
+    fn remove_a_voter_via_joint_consensus_on_a_mesh() {
+        let mut mesh = Mesh::new(&[1, 2, 3]);
+        mesh.elect(1);
+        assert_eq!(mesh.voters_seen_by(1), vec![1, 2, 3]);
+
+        // Remove node 3 (a single-voter change; raft-rs uses the simple protocol, still safe).
+        mesh.change_on_leader(&MembershipChange::new().remove_node(3))
+            .expect("remove 3");
+
+        // The two surviving voters converge to {1, 2}, with the joint state (if any) left.
+        let leader = mesh.leader().expect("still a leader after removal");
+        assert_eq!(mesh.voters_seen_by(leader), vec![1, 2], "node 3 removed");
+        let cs = mesh.nodes[&leader].conf_state().unwrap();
+        assert!(cs.voters_outgoing.is_empty(), "joint config left");
+        assert_eq!(
+            mesh.nodes[&leader].state().voter_count(),
+            2,
+            "the state machine tracks 2 voters"
+        );
+    }
+
+    /// A genuine MULTI-VOTER change ENTERS JOINT CONSENSUS on a REAL mesh: a 5-voter group
+    /// atomically removes TWO voters in one transition (distinct ids 4 and 5). raft-rs reports
+    /// `enter_joint`, the configuration is briefly joint (a majority of the old {1..5} and of the
+    /// new {1,2,3} overlap — Raft §6), then auto-leaves to the 3-voter config. This is the
+    /// load-bearing joint-consensus correctness case: more than one voter changes atomically,
+    /// safely, through the durable log.
+    #[test]
+    fn a_multi_voter_change_enters_joint_consensus_and_converges_on_a_mesh() {
+        let mut mesh = Mesh::new(&[1, 2, 3, 4, 5]);
+        mesh.elect(1);
+        assert_eq!(mesh.voters_seen_by(1), vec![1, 2, 3, 4, 5]);
+
+        // Atomically remove voters 4 AND 5 — a 2-op change is joint consensus. Quorum is
+        // preserved throughout: a majority of {1..5} (3 nodes) overlaps a majority of {1,2,3}.
+        let change = MembershipChange::new().remove_node(4).remove_node(5);
+        assert_eq!(
+            change.to_conf_change_v2().enter_joint(),
+            Some(true),
+            "a 2-voter change uses joint consensus"
+        );
+        mesh.change_on_leader(&change)
+            .expect("joint remove of 4 and 5");
+
+        let leader = mesh.leader().expect("leader after joint change");
+        assert_eq!(
+            mesh.voters_seen_by(leader),
+            vec![1, 2, 3],
+            "both voters were removed atomically"
+        );
+        let cs = mesh.nodes[&leader].conf_state().unwrap();
+        assert!(
+            cs.voters_outgoing.is_empty(),
+            "the joint config was auto-left"
+        );
+        assert_eq!(
+            mesh.nodes[&leader].state().voter_count(),
+            3,
+            "the state machine tracks the new 3-voter config"
+        );
+    }
+
+    /// A learner added on a real mesh never counts toward quorum: a 3-voter mesh adds a 4th node
+    /// as a learner; the voter set stays {1,2,3} and the learner is {4} on the committed config.
+    #[test]
+    fn a_learner_added_on_a_mesh_does_not_count_toward_quorum() {
+        let mut mesh = Mesh::new(&[1, 2, 3]);
+        mesh.elect(1);
+        // Node 4 is not in the mesh's transport, but adding it as a LEARNER does not change the
+        // quorum (still a majority of {1,2,3}), so the change commits without node 4 replicating.
+        mesh.change_on_leader(&MembershipChange::new().add_learner(4))
+            .expect("add learner 4");
+        let leader = mesh.leader().expect("leader");
+        assert_eq!(
+            mesh.voters_seen_by(leader),
+            vec![1, 2, 3],
+            "the voter set is unchanged: a learner is non-voting"
+        );
+        assert_eq!(
+            mesh.nodes[&leader].conf_state().unwrap().learners,
+            vec![4],
+            "node 4 joined as a learner"
+        );
+    }
+
+    /// THE #6403-CLASS FIX: peer-id validation REJECTS a mangled / duplicate / phantom peer with
+    /// a typed error, and the change NEVER enters the log (the membership and conf state are
+    /// unchanged after a rejected propose).
+    #[test]
+    fn peer_id_validation_rejects_mangled_duplicate_and_phantom_peers() {
+        let fs = InMemoryFs::new();
+        let mut group = elected_single(&fs);
+        // Establish a 2-voter group so a remove is meaningful.
+        group
+            .propose_membership_change(&MembershipChange::new().add_voter(2))
+            .expect("add 2");
+        settle(&mut group);
+        assert_eq!(voters_of(&group), vec![1, 2]);
+
+        // (a) MANGLED: peer id 0 (raft's INVALID_ID) is rejected — raft-rs would silently drop it.
+        assert!(matches!(
+            group.propose_membership_change(&MembershipChange::new().add_voter(0)),
+            Err(GroupError::PeerId(PeerIdError::MangledPeerId))
+        ));
+
+        // (b) DUPLICATE: the same id twice in one change is rejected.
+        assert!(matches!(
+            group.propose_membership_change(&MembershipChange::new().add_voter(3).remove_node(3)),
+            Err(GroupError::PeerId(PeerIdError::DuplicatePeerId { node: 3 }))
+        ));
+
+        // (c) PHANTOM remove: removing a node that is not a member is rejected.
+        assert!(matches!(
+            group.propose_membership_change(&MembershipChange::new().remove_node(99)),
+            Err(GroupError::PeerId(PeerIdError::NotAMember { node: 99 }))
+        ));
+
+        // (d) PHANTOM promote: promoting a non-member is rejected.
+        assert!(matches!(
+            group.propose_membership_change(&MembershipChange::new().promote_learner(99)),
+            Err(GroupError::PeerId(PeerIdError::NotAMember { node: 99 }))
+        ));
+
+        // (e) LAST-VOTER freeze: a change that would empty the voter set is rejected.
+        assert!(matches!(
+            group.propose_membership_change(&MembershipChange::new().remove_node(1).remove_node(2)),
+            Err(GroupError::PeerId(PeerIdError::WouldRemoveLastVoter))
+        ));
+
+        // After ALL the rejected proposes, the membership is UNCHANGED — no bad change leaked
+        // into the log, so quorum cannot be frozen by a phantom peer (the #6403 property).
+        settle(&mut group);
+        assert_eq!(
+            voters_of(&group),
+            vec![1, 2],
+            "no rejected change touched the durable membership"
+        );
+        assert_eq!(group.state().voter_count(), 2);
+    }
+
+    /// A membership change is proposed through the LOCAL raft log API (built from caller node
+    /// ids), NOT by parsing untrusted peer wire bytes — so C1-I4 introduces no new peer-byte
+    /// parsing. This test documents the seam: the change is constructed and validated entirely
+    /// from in-process data.
+    #[test]
+    fn membership_changes_parse_no_peer_bytes() {
+        let fs = InMemoryFs::new();
+        let mut group = elected_single(&fs);
+        // The change is a value built from a node id; there is no peer-supplied byte buffer
+        // anywhere on this path. Proposing it touches only the local log.
+        let change = MembershipChange::new().add_learner(2);
+        group
+            .propose_membership_change(&change)
+            .expect("propose from local data");
+        settle(&mut group);
+        assert_eq!(learners_of(&group), vec![2]);
     }
 }
