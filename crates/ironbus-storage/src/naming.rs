@@ -208,6 +208,50 @@ pub fn parse_segment_file_name(name: &str) -> Option<u64> {
     u64::from_str_radix(id, 16).ok()
 }
 
+/// Parses a cursor-checkpoint file name back to its work-group name, the inverse of
+/// [`cursor_checkpoint_name`], returning `None` for any file that is not a canonical cursor
+/// checkpoint. The default file `cursor.ckpt` decodes to the empty (default) group `""`; a
+/// `cursor-<hex>.ckpt` decodes its hex middle back to the original group bytes (rejecting a
+/// non-canonical hex middle or non-UTF-8 name). A `None` is skipped exactly as a foreign segment file
+/// is skipped by [`segment_ids`], so a stray `cursor-*.ckpt` never masquerades as a real group.
+#[must_use]
+pub fn parse_cursor_checkpoint_name(name: &str) -> Option<String> {
+    if name == DEFAULT_CURSOR_CHECKPOINT {
+        return Some(String::new());
+    }
+    let middle = name
+        .strip_prefix(NAMED_CURSOR_PREFIX)?
+        .strip_suffix(NAMED_CURSOR_SUFFIX)?;
+    // The default-group file is `cursor.ckpt`, which does NOT carry the `cursor-` prefix, so it never
+    // reaches here; an empty hex middle (`cursor-.ckpt`) is foreign and rejected (the empty group is
+    // only ever the default file). Decode the hex back to the original, possibly path-unsafe, name.
+    if middle.is_empty() {
+        return None;
+    }
+    let bytes = hex_decode(middle)?;
+    String::from_utf8(bytes).ok()
+}
+
+/// Lists every work-group whose durable cursor checkpoint is present in the data directory, as
+/// `(group_name, file_name)` pairs sorted by file name, skipping any file that is not a canonical
+/// cursor checkpoint (#601, the read-only `ironbus verify` cursor-validation pass). It is the cursor
+/// twin of [`segment_ids`]: a pure read-only directory listing that lets the verify fsck open and
+/// range-check every consumer cursor without a running broker. The default group is the empty string.
+///
+/// # Errors
+/// Propagates the underlying [`Filesystem`] error.
+pub fn cursor_checkpoint_names<F: Filesystem>(fs: &F) -> io::Result<Vec<(String, String)>> {
+    let mut found: Vec<(String, String)> = fs
+        .list()?
+        .iter()
+        .filter_map(|name| parse_cursor_checkpoint_name(name).map(|group| (group, name.clone())))
+        .collect();
+    // Sort by the on-disk file name so the order does not depend on any `Filesystem::list` ordering
+    // guarantee (matching `segment_ids`), giving a deterministic verify report.
+    found.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(found)
+}
+
 /// Lists the segment ids present in the data directory, in ascending order, skipping
 /// any file that is not a segment.
 ///
@@ -253,6 +297,51 @@ mod tests {
         // The default and named forms can never collide (`cursor.` vs `cursor-`).
         assert!(cursor_checkpoint_name("").starts_with("cursor."));
         assert!(cursor_checkpoint_name("x").starts_with("cursor-"));
+    }
+
+    #[test]
+    fn parse_cursor_checkpoint_name_is_the_inverse_and_rejects_foreign() {
+        // Round-trips the default and a named group, and rejects non-cursor / non-canonical names.
+        assert_eq!(
+            parse_cursor_checkpoint_name("cursor.ckpt"),
+            Some(String::new())
+        );
+        assert_eq!(
+            parse_cursor_checkpoint_name(&cursor_checkpoint_name("orders")),
+            Some("orders".to_string())
+        );
+        assert_eq!(
+            parse_cursor_checkpoint_name("cursor-612f62.ckpt"),
+            Some("a/b".to_string())
+        );
+        // Foreign / non-canonical: a segment, an empty hex middle, a bad suffix, a non-hex middle.
+        assert_eq!(
+            parse_cursor_checkpoint_name("seg-0000000000000000.log"),
+            None
+        );
+        assert_eq!(parse_cursor_checkpoint_name("cursor-.ckpt"), None);
+        assert_eq!(parse_cursor_checkpoint_name("cursor-6f.txt"), None);
+        assert_eq!(parse_cursor_checkpoint_name("cursor-zz.ckpt"), None);
+        assert_eq!(parse_cursor_checkpoint_name("layout.meta"), None);
+    }
+
+    #[test]
+    fn cursor_checkpoint_names_lists_only_cursors_sorted() {
+        let fs = InMemoryFs::new();
+        // A mix of cursor checkpoints, a segment, and a foreign file: only the cursors are listed.
+        for name in [
+            cursor_checkpoint_name(""),
+            cursor_checkpoint_name("orders"),
+            segment_file_name(0),
+            "layout.meta".to_string(),
+            "cursor-zz.ckpt".to_string(), // non-canonical hex, skipped
+        ] {
+            fs.create_new(&name).unwrap();
+        }
+        let found = cursor_checkpoint_names(&fs).unwrap();
+        let groups: Vec<&str> = found.iter().map(|(g, _)| g.as_str()).collect();
+        // The default ("") and "orders" only; sorted by file name (`cursor-...` before `cursor.`).
+        assert_eq!(groups, vec!["orders", ""]);
     }
 
     #[test]

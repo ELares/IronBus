@@ -160,6 +160,42 @@ pub fn open_or_upgrade<F: Filesystem>(fs: &F) -> Result<u32, StorageError> {
     Ok(LAYOUT_VERSION)
 }
 
+/// The read-only outcome of inspecting the data-directory layout marker (#601, the `ironbus verify`
+/// fsck). Unlike [`open_or_upgrade`] this NEVER writes the marker on an absent/torn directory, so it
+/// is safe for the read-only verify path; it still fail-closes the same way on a future version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutMarker {
+    /// A fully-valid, CRC-checked marker present on disk, declaring this version (today only `1`).
+    Present(u32),
+    /// No valid marker on disk (absent, torn, corrupt, or foreign). Treated as layout v1 by
+    /// recovery, which would WRITE the v1 marker best-effort; verify only REPORTS this without
+    /// writing, so the directory is left byte-for-byte unchanged.
+    AbsentTreatedAsV1,
+}
+
+/// Inspects the data-directory layout marker READ-ONLY, the verify-path twin of [`open_or_upgrade`]
+/// that NEVER writes (#601). It applies the SAME fail-closed reject as recovery — a fully-valid
+/// marker declaring a version greater than [`LAYOUT_VERSION`] returns
+/// [`StorageError::IncompatibleLayoutVersion`] — but on an absent/torn/corrupt marker it returns
+/// [`LayoutMarker::AbsentTreatedAsV1`] instead of writing the v1 marker, so an `ironbus verify` run
+/// changes no bytes. `verify` reports a present-but-future marker as a structural block, exactly as
+/// the broker would refuse to open it.
+///
+/// # Errors
+/// Returns [`StorageError::IncompatibleLayoutVersion`] (and ONLY that) when a valid marker declares a
+/// future version. A read IO error is swallowed (best-effort), resolving to
+/// [`LayoutMarker::AbsentTreatedAsV1`], exactly as `open_or_upgrade` treats an unreadable marker.
+pub fn check_layout_marker<F: Filesystem>(fs: &F) -> Result<LayoutMarker, StorageError> {
+    match read_marker_version(fs) {
+        Some(version) if version > LAYOUT_VERSION => Err(StorageError::IncompatibleLayoutVersion {
+            found: version,
+            supported: LAYOUT_VERSION,
+        }),
+        Some(version) => Ok(LayoutMarker::Present(version)),
+        None => Ok(LayoutMarker::AbsentTreatedAsV1),
+    }
+}
+
 /// Reads the layout version from `layout.meta`, returning `None` if it is absent, unreadable, torn,
 /// corrupt, or foreign (any case that should be treated as "no valid marker", i.e. layout v1). A
 /// `Some(version)` is a fully-valid, CRC-checked marker payload (the caller decides whether that
@@ -286,6 +322,54 @@ mod tests {
         assert_eq!(open_or_upgrade(&fs).unwrap(), 1);
         // And it is durable + valid again on the next open.
         assert_eq!(open_or_upgrade(&fs).unwrap(), 1);
+    }
+
+    /// The read-only `check_layout_marker` (the `ironbus verify` path) reports an ABSENT marker as
+    /// `AbsentTreatedAsV1` WITHOUT writing it, unlike `open_or_upgrade` which upgrades on disk.
+    #[test]
+    fn check_layout_marker_is_read_only_on_an_absent_marker() {
+        let fs = InMemoryFs::new();
+        assert!(!fs.exists(LAYOUT_MARKER_FILE).unwrap());
+        assert_eq!(
+            check_layout_marker(&fs).unwrap(),
+            LayoutMarker::AbsentTreatedAsV1
+        );
+        // CRUCIAL: it did NOT write the marker (verify never mutates), unlike open_or_upgrade.
+        assert!(
+            !fs.exists(LAYOUT_MARKER_FILE).unwrap(),
+            "check_layout_marker must not write the marker"
+        );
+    }
+
+    /// `check_layout_marker` reports a PRESENT, valid marker as `Present(version)`.
+    #[test]
+    fn check_layout_marker_reports_a_present_version() {
+        let fs = InMemoryFs::new();
+        assert_eq!(open_or_upgrade(&fs).unwrap(), 1); // write a real v1 marker
+        assert_eq!(
+            check_layout_marker(&fs).unwrap(),
+            LayoutMarker::Present(LAYOUT_VERSION)
+        );
+    }
+
+    /// `check_layout_marker` fail-closes on a valid FUTURE marker exactly as `open_or_upgrade` does
+    /// (so verify surfaces the same structural block the broker would refuse to open), but it still
+    /// never writes.
+    #[test]
+    fn check_layout_marker_fail_closes_on_a_future_version() {
+        let fs = InMemoryFs::new();
+        let file = fs.create_new(LAYOUT_MARKER_FILE).unwrap();
+        file.sync_all().unwrap();
+        fs.sync_dir().unwrap();
+        let (mut cp, _) = Checkpoint::open(file).unwrap();
+        cp.write(&encode_marker(LAYOUT_VERSION + 1)).unwrap();
+        assert!(matches!(
+            check_layout_marker(&fs).unwrap_err(),
+            StorageError::IncompatibleLayoutVersion {
+                found,
+                supported,
+            } if found == LAYOUT_VERSION + 1 && supported == LAYOUT_VERSION
+        ));
     }
 
     /// Persisting the marker is BEST-EFFORT: a filesystem whose every write fails still resolves to

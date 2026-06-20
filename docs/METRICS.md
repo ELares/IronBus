@@ -107,6 +107,42 @@ snapshot already dominates the replay increments nothing).
 | `ironbus_fire_and_forget_shed_total` | A fire-and-forget (QoS-0) message is DROPPED by the per-connection **token bucket** because either bucket (message or byte) was empty (#69, #11). The producer set the `PUB_FLAG_FIRE_AND_FORGET` PUB flag and did not wait for a `PubAck`. | **Uncontrolled-tier cap**: the QoS-0 path is bounded to its configured rate so it cannot bypass the consumer-credit brake or starve credited traffic; the QoS-0 producer accepts the drop by contract. It sheds fire-and-forget messages and NOTHING ELSE (the at-least-once path is untouched). Zero unless the bucket is enabled. |
 | `ironbus_egress_shed_total` | The **AIMD** egress limiter throttled a Flow batch below what the consumer wanted because it was falling behind (a would-block at the egress grant with a near-full in-flight set, or a nack), so the effective per-consumer egress credit was multiplicatively decreased (#69, #402). | **Egress backpressure**: a consumer falling behind has its effective egress credit halved (within the negotiated #292 cap) rather than the broker piling on, then it recovers additively as the consumer acks promptly. Zero unless the AIMD is enabled (`--egress-limit` non-zero). |
 | `ironbus_wal_fsync_headroom_shed_total` | A NEW `produce` is shed by the **fsync-headroom** admission credit (#378): the un-fsynced (buffered-but-not-durable) backlog was at the configured `--wal-fsync-headroom-bytes` and a group-commit drain could not free it (only reachable under a relaxed durability level that defers the fsync). | **Un-fsynced backlog bound** (a memory / loss-window guard): the broker refuses the *new* write to keep the un-fsynced frontier within the headroom. Decided BEFORE the append, so it NEVER drops an already-accepted record (I2 holds). Under the default `sync` level the headroom THROTTLES (drain-then-admit) instead of shedding, so this stays `0` there; a rising value is a relaxed-level broker capping its loss window. |
+| `ironbus_torn_tail_repairs_total` | A torn/unsynced tail is truncated to the longest valid prefix at recovery (#575). One increment per `TornTail` loss event a recovery run dropped. | **Power-loss repair, NOT data loss**: the common brownout case, the tail bytes were never fully written. The unlabeled half of the recovery-EVENT family; the marquee NATS-can't recovery signal (NATS's truncate-and-drop recovery is silent). |
+
+### Recovery-event counters (the marquee NATS-can't series)
+
+The recovery-EVENT counters (#575) count corruption recovery as it happens, so an
+operator can **alert on recovery actually firing**. They are the flagship
+"IronBus can, NATS can't" differentiator: NATS has **no corruption-recovery metric
+at all** — its truncate-and-drop recovery is silent and unbounded (#7549/#7556), so
+its only signal is a missing message an operator discovers downstream. Each
+counter is bumped **once per `Engine::open` recovery run**, derived from the
+durable loss report, so they are monotonic `_total` counters that survive a `kill
+-9` (the durable loss report re-derives them on the next open without
+double-counting: the report reflects only this recovery, so a clean re-open adds a
+`clean` run and zero repairs).
+
+| Counter | Event that increments it | Resilience meaning |
+|---------|--------------------------|--------------------|
+| `ironbus_recovery_runs_total{outcome="clean"}` | A recovery run completed with **no loss event** (the clean-shutdown / no-corruption case). | Baseline: how often the broker opened cleanly. The denominator for a "fraction of opens that needed a repair" alert. |
+| `ironbus_recovery_runs_total{outcome="torn_tail_truncated"}` | A recovery run's only loss was a **torn/unsynced tail** truncated to the longest valid prefix (no data loss). | **Power-loss repair**: the common brownout case. A non-zero rate is expected on an edge fleet, never alarming. |
+| `ironbus_recovery_runs_total{outcome="quarantined"}` | A recovery run dropped at least one **data-loss corruption span**, copied to the `quarantine/` forensic store before truncation. | **Corruption recovered, bounded + reported**: the I3-capped, quarantine-preserving recovery NATS cannot do. The alert signal that real bytes were lost (and forensically preserved). |
+| `ironbus_recovery_runs_total{outcome="data_loss"}` | Reserved: a data-loss recovery whose quarantine capture did not succeed (e.g. the quarantine store was over its cap). | Reserved bucket so the `outcome` taxonomy is frozen up front; the loss is still bounded + reported via the loss report. |
+| `ironbus_corruption_repairs_total{artifact="segment"}` | A **corruption span in the main log** was quarantined-and-dropped at recovery (or by the offline `ironbus repair`). | **Segment corruption repaired**: the headline corruption signal. NATS has **no** corruption-repair metric. |
+| `ironbus_corruption_repairs_total{artifact="cursor"}` | A **consumer cursor** corruption was repaired (reserved: a torn cursor reverts via its dual-slot checkpoint, so recovery does not emit one today; driven by the offline `ironbus repair` cursor path). | Reserved + offline-`repair`-driven, frozen up front. |
+| `ironbus_corruption_repairs_total{artifact="dlq"}` | A **DLQ** corruption was repaired (reserved, same shape as `cursor`). | Reserved + offline-`repair`-driven, frozen up front. |
+
+`ironbus_recovery_runs_total` and `ironbus_corruption_repairs_total` are **labeled**
+`_total` counters, so (exactly like `ironbus_cluster_ack_total{level}` and
+`ironbus_retry_shed_total{side}`) their sample lines are excluded from the
+unlabeled-`_total` frozen **resilience-counter** set by construction and are pinned
+only in the `(name, type)` **metric-types** contract. `ironbus_torn_tail_repairs_total`
+is unlabeled, so it is in **both** frozen sets. The `outcome` label is the fixed
+four-value enum (`clean`, `torn_tail_truncated`, `quarantined`, `data_loss`) and
+`artifact` the fixed three-value enum (`segment`, `cursor`, `dlq`); no offset,
+group, message-id, or subject is ever a label, so the cardinality is bounded. See
+[RECOVERY.md](RECOVERY.md) §8 for the operator runbook tying these counters to the
+`ironbus verify` / `ironbus repair` CLI and the I3 loss bounds.
 
 ### Recovery-loss series (startup, per reason)
 

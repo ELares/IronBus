@@ -38,7 +38,7 @@ use crate::checkpoint::Checkpoint;
 use crate::dlq::{read_dlq_entries, DlqEntry};
 use crate::fs::Filesystem;
 use crate::log::{Append, Log, LogConfig};
-use crate::naming::cursor_checkpoint_name;
+use crate::naming::{cursor_checkpoint_name, cursor_checkpoint_names};
 use crate::offline::OfflineReader;
 use crate::segment::StorageError;
 use ironbus_core::clock::Clock;
@@ -229,6 +229,63 @@ fn read_committed<F: Filesystem>(fs: &F, group: &str) -> Result<Option<u64>, Sto
         .and_then(|s| <[u8; 8]>::try_from(s).ok())
         .map_or(0, u64::from_le_bytes);
     Ok(Some(committed))
+}
+
+/// One work-group's cursor as the read-only `ironbus verify` fsck sees it (#601): the group name, its
+/// durable committed offset (decoded with the broker's exact codec), and whether that offset is valid
+/// against the durable range `[earliest_retained, durable_head]`. A cursor below `earliest_retained`
+/// (its records were reaped out from under it) or above `durable_head` (it points past the end of the
+/// log) is a cursor-vs-log MISMATCH the broker would clamp on next start; verify only REPORTS it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CursorStatus {
+    /// The work-group name (the empty string is the default group).
+    pub group: String,
+    /// The durable committed offset the cursor decoded to.
+    pub committed: u64,
+    /// `true` when `committed` is within `[earliest_retained, durable_head]`; `false` is a mismatch.
+    pub in_range: bool,
+}
+
+/// Inspects every durable consumer cursor in a STOPPED broker's data directory READ-ONLY (#601, the
+/// `ironbus verify` cursor pass), reporting each group's committed offset and whether it is valid
+/// against the durable range `[earliest_retained, durable_head]`. It opens an [`OfflineReader`] (which
+/// never mutates) to learn the range, enumerates the cursor checkpoints with
+/// [`cursor_checkpoint_names`], and decodes each with the broker's exact codec (the same one
+/// [`reset_consumer`] reports the "before" value with). It NEVER writes — it is the detect-and-report
+/// twin of `reset_consumer`, so an `ironbus verify` run leaves every cursor byte-for-byte unchanged.
+///
+/// A cursor whose checkpoint is present but undecodable (both slots torn) is skipped, not reported as
+/// a mismatch: a torn cursor reverts to its prior durable slot on the broker's next open exactly as
+/// the checkpoint contract guarantees, so it is not a log inconsistency. Returns the statuses sorted
+/// by cursor file name (matching `cursor_checkpoint_names`). Takes the filesystem BY VALUE (mirroring
+/// [`OfflineReader::open`] and [`reset_consumer`]) and returns it, so the caller can reuse the handle.
+///
+/// # Errors
+/// [`StorageError`] for a missing/corrupt data directory or an IO fault (the same classification the
+/// other offline readers use).
+pub fn inspect_cursors<F: Filesystem>(fs: F) -> Result<(Vec<CursorStatus>, F), StorageError> {
+    // The durable range to validate each cursor against, learned read-only (no mutation). The
+    // OfflineReader hands the filesystem back so the cursor decode below reuses the same handle.
+    let reader = OfflineReader::open(fs)?;
+    let earliest = reader.earliest_retained().get();
+    let head = reader.durable_head().get();
+    let fs = reader.into_filesystem();
+
+    let mut statuses = Vec::new();
+    for (group, _file) in cursor_checkpoint_names(&fs)? {
+        // Decode the committed watermark with the broker's exact codec. A cursor whose both slots are
+        // torn (no recovered payload) is skipped: the checkpoint reverts it cleanly on next open, so
+        // it is not a log inconsistency to flag.
+        if let Some(committed) = read_committed(&fs, &group)? {
+            let in_range = committed >= earliest && committed <= head;
+            statuses.push(CursorStatus {
+                group,
+                committed,
+                in_range,
+            });
+        }
+    }
+    Ok((statuses, fs))
 }
 
 /// Rewrites a work-group's durable cursor checkpoint to a chosen offset, clamped to the durable
@@ -552,6 +609,55 @@ mod tests {
             }
             other => panic!("expected OutOfRange, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn inspect_cursors_reports_in_range_and_out_of_range_read_only() {
+        // The read-only `ironbus verify` cursor pass: it enumerates every cursor, decodes the
+        // committed watermark with the broker's codec, and flags one out of the durable range.
+        let fs = log_with(5); // durable range [0, 5]
+                              // A VALID cursor (in range) via the real reset path.
+        let (_, fs) = reset_consumer(fs, "good", ResetTarget::Offset(3)).unwrap();
+        // An OUT-OF-RANGE cursor: write a committed offset past the head directly (bypassing the
+        // clamp), the cursor-vs-log mismatch verify must catch.
+        let name = cursor_checkpoint_name("bad");
+        let file = fs.create_new(&name).unwrap();
+        fs.sync_dir().unwrap();
+        let (mut ckpt, _) = Checkpoint::open(file).unwrap();
+        let mut payload = Vec::new();
+        AckCursor::resume(Offset::new(99)).encode_snapshot(&mut payload);
+        ckpt.write(&payload).unwrap();
+
+        // Snapshot the cursor files to prove inspect_cursors mutates nothing.
+        let good_before = fs.open(&cursor_checkpoint_name("good")).unwrap();
+        let bad_before = fs.open(&name).unwrap();
+        let good_bytes_before = read_all(&good_before);
+        let bad_bytes_before = read_all(&bad_before);
+
+        let (statuses, fs) = inspect_cursors(fs).unwrap();
+        let good = statuses.iter().find(|c| c.group == "good").unwrap();
+        let bad = statuses.iter().find(|c| c.group == "bad").unwrap();
+        assert_eq!((good.committed, good.in_range), (3, true));
+        assert_eq!(
+            (bad.committed, bad.in_range),
+            (99, false),
+            "a cursor past the head is an out-of-range mismatch"
+        );
+
+        // READ-ONLY: the cursor files are byte-for-byte unchanged.
+        assert_eq!(
+            read_all(&fs.open(&cursor_checkpoint_name("good")).unwrap()),
+            good_bytes_before
+        );
+        assert_eq!(read_all(&fs.open(&name).unwrap()), bad_bytes_before);
+    }
+
+    /// Reads a whole file's bytes (a test helper for the read-only assertions above).
+    fn read_all<R: crate::io::RandomAccessFile>(f: &R) -> Vec<u8> {
+        let len = f.len().unwrap();
+        let mut buf = vec![0u8; usize::try_from(len).unwrap()];
+        f.read_exact_at(&mut buf, 0).unwrap();
+        buf
     }
 
     #[test]
