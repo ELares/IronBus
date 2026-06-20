@@ -44,6 +44,18 @@ pub const COUNTERS_PAYLOAD: usize = 256;
 /// It stays under the slot's `u16` length field (65535), so a snapshot at the cap still frames.
 pub const ATTEMPTS_PAYLOAD: usize = 32 * 1024;
 
+/// The per-slot payload cap for the durable idempotent-producer SEQUENCE checkpoint (V2-M8,
+/// #638/#639): the `(producer_id, epoch, last_seq, last_offset)` high-water per active producer that
+/// makes effectively-once dedup survive a broker restart AND a long offline gap (the beat over
+/// NATS's time-bounded `Nats-Msg-Id` window). One fixed high-water per producer (NOT per message),
+/// so the snapshot is O(active producers): each entry is `2 + producer_id (<= 256) + 24` bytes, at
+/// most ~282 bytes. This 60 KiB cap holds ~210 worst-case entries (far more with short `producer_id`s)
+/// and, like the attempt-count checkpoint, the server keeps the most-recently-active producers that
+/// FIT and drops the overflow tail — which only resets those few producers to at-least-once after a
+/// restart (a later publish reads fresh), never a correctness break. It stays under the slot's `u16`
+/// length field (65535), so a snapshot at the cap still frames.
+pub const PRODUCER_SEQ_PAYLOAD: usize = 60 * 1024;
+
 const SEQ_LEN: usize = 8;
 const LEN_LEN: usize = 2;
 const CRC_LEN: usize = 4;
@@ -120,6 +132,15 @@ pub type CountersCheckpoint<F> = SlotCheckpoint<F, COUNTERS_PAYLOAD>;
 /// a torn or missing snapshot recovers as "no carried counts" (every in-flight message resumes at
 /// attempt 1, the pre-#358 behavior) without ever blocking startup.
 pub type AttemptsCheckpoint<F> = SlotCheckpoint<F, ATTEMPTS_PAYLOAD>;
+
+/// The crash-safe checkpoint for the durable idempotent-producer SEQUENCE high-water map (V2-M8,
+/// #638/#639): a [`PRODUCER_SEQ_PAYLOAD`]-per-slot [`SlotCheckpoint`]. It reuses the identical
+/// dual-slot CRC discipline as the cursor, counters, and attempt-count checkpoints — a torn write
+/// reverts to the prior slot and a torn or missing snapshot recovers as "no carried high-waters"
+/// (every producer resumes at-least-once, the safe degrade) without ever blocking startup. Restoring
+/// it is what makes a replayed retry across a broker restart STILL deduped, and because the bound is
+/// SEQUENCE state (not wall-clock), a long offline gap never drops it — the beat over NATS.
+pub type ProducerSeqCheckpoint<F> = SlotCheckpoint<F, PRODUCER_SEQ_PAYLOAD>;
 
 impl<F: RandomAccessFile, const PAYLOAD_CAP: usize> SlotCheckpoint<F, PAYLOAD_CAP> {
     /// Bytes per slot for this cap: sequence, payload length, payload, CRC.

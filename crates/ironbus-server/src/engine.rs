@@ -34,12 +34,16 @@ use ironbus_core::keyshared::{KeyOrdering, KeyRouter, MemberId, RouteDecision};
 use ironbus_core::lease::{
     AckOutcome, Claim, ExtendOutcome, LeaseConfig, LeaseTable, LeaseToken, NackOutcome,
 };
+use ironbus_core::producer_seq::{
+    decode_seq_snapshot, encode_seq_snapshot, ProducerSeqRegistry, SeqConfig, SeqDecision,
+};
 use ironbus_core::subject::{Subject, SubjectError, SubjectPattern};
 use ironbus_core::sublist::{Sublist, SublistBuilder, SublistError, SublistSnapshot};
 use ironbus_core::ttl::{decode_ttl_headers, is_expired, Ttl};
 use ironbus_core::types::{Offset, RecordFlags};
 use ironbus_storage::checkpoint::{
-    AttemptsCheckpoint, Checkpoint, CountersCheckpoint, ATTEMPTS_PAYLOAD, MAX_PAYLOAD,
+    AttemptsCheckpoint, Checkpoint, CountersCheckpoint, ProducerSeqCheckpoint, ATTEMPTS_PAYLOAD,
+    MAX_PAYLOAD, PRODUCER_SEQ_PAYLOAD,
 };
 use ironbus_storage::dlq::{DeadLetterReason, DlqSink, DLQ_SUBDIR};
 use ironbus_storage::fs::Filesystem;
@@ -222,10 +226,17 @@ pub struct DedupRequest<'a> {
     pub epoch: u64,
     /// The idempotency key the broker deduplicates on (keying is by `msg_id` ONLY, never the body).
     pub msg_id: &'a [u8],
+    /// The OPT-IN Kafka-style idempotent-producer SEQUENCE (V2-M8): `Some` iff the wire publish
+    /// carried a `seq`. When present, the broker routes the produce through the DURABLE per-producer
+    /// sequence high-water (deduplicate a retry to exactly-once-append, fence a zombie epoch, reject an
+    /// out-of-order gap) INSTEAD of the time-bounded `msg_id` window — the effectively-once path that
+    /// survives a restart + a long offline gap. `None` is exactly today's `msg_id`-window dedup.
+    pub seq: Option<u64>,
 }
 
-/// The outcome of an [`Engine::append_no_sync_dedup`] (#3, #33): a fresh append, a benign dedup hit,
-/// or a stale-epoch fence. The actor maps each to its wire reply.
+/// The outcome of an [`Engine::append_no_sync_dedup`] (#3, #33, V2-M8): a fresh append, a benign dedup
+/// hit, a stale-epoch fence, or an out-of-order-sequence rejection. The actor maps each to its wire
+/// reply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppendOutcome {
     /// A fresh produce was appended at this offset (write, NO fsync); park its reply behind the
@@ -241,6 +252,13 @@ pub enum AppendOutcome {
     Fenced {
         /// The producer's current (newer) known epoch that fenced this produce.
         current_epoch: u64,
+    },
+    /// The produce presented an OUT-OF-ORDER idempotent SEQUENCE (V2-M8): `seq > last_accepted + 1`,
+    /// a gap. Accepting it would corrupt idempotence (a later retry of a skipped seq would read
+    /// fresh), so it is REJECTED — the Kafka `OutOfOrderSequence` semantics. NOTHING was appended.
+    OutOfOrder {
+        /// The sequence the broker expected next (`last_accepted + 1`), so the producer can resync.
+        expected: u64,
     },
 }
 
@@ -1075,6 +1093,15 @@ pub struct Counters {
     /// TTL is configured, so a non-TTL broker is byte-identical. Saturating; exposed as the
     /// `ironbus_expired_total` counter.
     pub expired: u64,
+    /// OUT-OF-ORDER idempotent-producer SEQUENCE rejections (V2-M8, #638): a sequenced publish whose
+    /// `seq` skipped past the next-expected (`seq > last_accepted + 1`) was REJECTED rather than
+    /// silently accepted (the Kafka `OutOfOrderSequence` semantics), so a later retry of the skipped
+    /// seq cannot double-append. A non-zero rate means a producer's sequence stream has a genuine gap
+    /// (a lost in-flight publish, or a client bug) the operator should investigate; it is a resilience
+    /// event, never silent. Zero unless a producer opts into sequence-based idempotence, so a
+    /// non-idempotent broker is byte-identical. Saturating; exposed as the
+    /// `ironbus_producer_out_of_order_total` counter.
+    pub producer_out_of_order: u64,
 }
 
 /// The recovery-event counter family (#575): the FLAGSHIP corruption-recovery metrics NATS has no
@@ -1270,6 +1297,10 @@ impl Counters {
             // short to hold it (it reads as zero). It is an operational counter with no replay
             // reconciliation, so the resumed value is the #306 snapshot-only lower bound.
             self.expired,
+            // The idempotent-producer out-of-order rejection counter (V2-M8), appended after the TTL
+            // family: a pre-M8 snapshot is too short to hold it (it reads as zero). Operational, no
+            // replay reconciliation, so the resumed value is the snapshot-only lower bound.
+            self.producer_out_of_order,
         ] {
             buf.extend_from_slice(&v.to_le_bytes());
         }
@@ -1331,6 +1362,9 @@ impl Counters {
             // The TTL family (#549), appended after recovery at field 25: a pre-#549 snapshot reads
             // it as zero (the tolerant decode). Operational, no replay reconciliation.
             expired: field(25),
+            // The idempotent-producer out-of-order rejection counter (V2-M8) at field 26: a pre-M8
+            // snapshot reads it as zero (the tolerant decode). Operational, no replay reconciliation.
+            producer_out_of_order: field(26),
         }
     }
 }
@@ -2362,6 +2396,27 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// serially) and pure (the monotonic clock comes through the seam). Lost on restart by default
     /// (session-scoped); see [`ironbus_core::dedup`].
     dedup: ironbus_core::dedup::DedupRegistry,
+    /// The idempotent-producer SEQUENCE registry (V2-M8, #638/#639): the per-producer
+    /// `(epoch, last_seq, last_offset)` high-water that deduplicates a Kafka-style sequenced retry to
+    /// exactly-once-append, fences a zombie epoch, and rejects an out-of-order gap. Empty until a
+    /// producer opts in by sending a `seq`, so a broker no producer sequences against costs nothing.
+    /// Consulted on the produce path (the actor thread, serially) and pure. UNLIKE [`Self::dedup`],
+    /// its state is DURABLE: the high-water is snapshotted to [`Self::producer_seq_checkpoint`] and
+    /// RESTORED at open, so dedup survives a broker restart AND a long offline gap (the beat over
+    /// NATS's time-bounded window). The state is O(active producers), bounded with LRU eviction; a
+    /// long-dead producer is reclaimed under cap pressure. See [`ironbus_core::producer_seq`].
+    producer_seq: ironbus_core::producer_seq::ProducerSeqRegistry,
+    /// The durable idempotent-producer SEQUENCE checkpoint (V2-M8, #638/#639): a CRC'd dual-slot
+    /// `producer-seq.ckpt` holding every active producer's `(epoch, last_seq, last_offset)`
+    /// high-water, written on the same cursor-checkpoint cadence and the graceful-shutdown flush.
+    /// On [`Engine::open`] its snapshot RESTORES [`Self::producer_seq`], so a replayed retry across
+    /// a broker restart is STILL deduped and a long offline gap never drops it. It is CORRECTNESS
+    /// state but tolerant: a torn or missing snapshot recovers as no carried high-waters (every
+    /// producer resumes at-least-once, the safe degrade), so it can never block open. The map is
+    /// O(active producers) and the snapshot is capped to a slot (the most-recently-active producers
+    /// that fit), so it never grows unbounded. `None` until the first sequenced produce, so a broker
+    /// no producer sequences against never creates the file (the disk image is unchanged).
+    producer_seq_checkpoint: Option<ProducerSeqCheckpoint<F::File>>,
     /// The DURABILITY LEVEL (#341, #379): the default [`DurabilityLevel::Sync`] acks only after the
     /// covering fsync (I2 holds, zero acked loss). The relaxed levels ack before the covering fsync
     /// for a documented loss window. Read on every `commit_batch` to decide whether to issue the
@@ -2446,6 +2501,17 @@ const COUNTERS_CHECKPOINT: &str = "counters.ckpt";
 /// and named groups use `attempts-<hex>.ckpt`.
 const ATTEMPTS_CHECKPOINT: &str = "attempts.ckpt";
 
+/// The file name of the durable idempotent-producer SEQUENCE checkpoint (V2-M8, #638/#639). It never
+/// collides with the cursor/counters/attempts checkpoints (`producer-seq.` vs `cursor.`/`counters.`/
+/// `attempts.`). UNLIKE the others it is opened lazily: a broker no producer sequences against never
+/// creates it, so the disk image of a non-idempotent workload is unchanged.
+const PRODUCER_SEQ_CHECKPOINT: &str = "producer-seq.ckpt";
+
+/// The result of opening the durable idempotent-producer SEQUENCE checkpoint (V2-M8): the dual-slot
+/// handle (only `Some` if the file already existed at open) plus the recovered snapshot bytes (decoded
+/// and clamped by the caller), or `None` if the file was absent or its slots were torn.
+type RecoveredProducerSeq<File> = (Option<ProducerSeqCheckpoint<File>>, Option<Vec<u8>>);
+
 /// The result of opening the durable attempt-count checkpoint (#358): the long-lived dual-slot
 /// handle plus the recovered snapshot bytes (decoded and clamped by the caller), or `None` if the
 /// file was fresh or its slots were torn. Named so the [`Engine::open_attempts_checkpoint`]
@@ -2520,6 +2586,16 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // recovery-loss family with the durable log / loss report (#307). Factored out to keep `open`
         // readable; the never-block-recovery contract and the checkpoint-plus-replay max live there.
         let (counters_checkpoint, counters) = Self::open_counters_checkpoint(&log)?;
+
+        // Recover the durable idempotent-producer SEQUENCE high-waters (V2-M8). If the
+        // `producer-seq.ckpt` file exists, open its dual-slot handle and decode the last fully-durable
+        // snapshot; a torn or corrupt snapshot decodes to nothing (every producer resumes
+        // at-least-once, the safe degrade), never blocking open. The decoded high-waters are RESTORED
+        // into the registry after construction (seed_producer_seq_from_recovered), so a replayed retry
+        // across this restart is STILL deduped — and because the bound is sequence state, not
+        // wall-clock, a long offline gap never drops it (the beat over NATS). A broker that never had a
+        // sequenced producer has no file and opens with an empty registry + no handle (disk unchanged).
+        let (producer_seq_checkpoint, recovered_seq) = Self::open_producer_seq_checkpoint(&log)?;
 
         let flushed = log.flushed_offset().get();
         // The open-time monotonic instant, used to seed each group's last-activity (#277), so a
@@ -2675,6 +2751,16 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // The opt-in dedup registry (#33), sized by the configured window. Empty until a
             // producer opts in by sending a `msg_id`, so it costs nothing for a no-dedup workload.
             dedup: ironbus_core::dedup::DedupRegistry::new(config.dedup),
+            // The idempotent-producer SEQUENCE registry (V2-M8). Self-bounded by `SeqConfig` internal
+            // defaults (NOT a new `EngineConfig` field, like the confirm registry), so every config
+            // construction site is unchanged; a knob can be threaded later. Empty here, then RESTORED
+            // from the recovered `producer-seq.ckpt` snapshot by `seed_producer_seq_from_recovered`
+            // below, so a sequenced retry is deduped across this restart.
+            producer_seq: ProducerSeqRegistry::new(SeqConfig::default()),
+            // The durable idempotent-SEQUENCE checkpoint handle: `Some` iff a `producer-seq.ckpt`
+            // already existed at open (recovered above), else `None` until the FIRST sequenced produce
+            // creates it. A broker no producer sequences against never creates the file.
+            producer_seq_checkpoint,
             // The durability level (#341, #379): default `sync` is the historical durable broker
             // (ack only after the covering fsync, I2). The interval window is held in nanoseconds on
             // the monotonic clock seam; the time-window anchor is seeded to the open instant so a
@@ -2713,6 +2799,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             dead_letter_expired: config.dead_letter_expired,
         };
         engine.seed_registry_from_recovered_state(flushed);
+        // RESTORE the durable idempotent-producer SEQUENCE high-waters (V2-M8) into the registry, so a
+        // replayed sequenced retry across this broker restart is STILL deduped to the original offset
+        // and a long offline gap never drops it. A `None`/torn snapshot restores nothing (every
+        // producer resumes at-least-once). Clamped to the durable head so a high-water can never point
+        // past a record the log actually holds (a snapshot written slightly ahead of a torn-tail
+        // recovery degrades to at-least-once for that producer rather than returning a phantom offset).
+        engine.seed_producer_seq_from_recovered(recovered_seq.as_deref(), flushed, opened_at);
         Ok(engine)
     }
 
@@ -2842,6 +2935,61 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             }
         };
         Ok(AttemptsCheckpoint::open(attempts_file)?)
+    }
+
+    /// Opens the durable idempotent-producer SEQUENCE checkpoint (V2-M8) IF it already exists, and
+    /// recovers the last snapshot bytes, returning `(Some(handle), recovered)`; if the file is absent
+    /// it returns `(None, None)` WITHOUT creating it (a broker no producer sequences against never
+    /// materializes the file, so a non-idempotent workload's disk image is unchanged — the handle is
+    /// created lazily on the first sequenced produce by [`Engine::ensure_producer_seq_checkpoint`]).
+    /// A torn or missing snapshot is surfaced as `None` by the dual-slot fallback, so it never blocks
+    /// open; the only errors are genuine IO failures from opening or reading the file.
+    ///
+    /// # Errors
+    /// Propagates a genuine IO error from opening the producer-seq checkpoint file.
+    fn open_producer_seq_checkpoint(
+        log: &Log<F, C>,
+    ) -> Result<RecoveredProducerSeq<F::File>, EngineError> {
+        let fs = log.filesystem();
+        if !fs.exists(PRODUCER_SEQ_CHECKPOINT)? {
+            return Ok((None, None));
+        }
+        let file = fs.open(PRODUCER_SEQ_CHECKPOINT)?;
+        let (checkpoint, recovered) = ProducerSeqCheckpoint::open(file)?;
+        Ok((Some(checkpoint), recovered))
+    }
+
+    /// RESTORES the recovered idempotent-producer SEQUENCE high-waters (V2-M8) into the registry at
+    /// open, so a replayed sequenced retry across this broker restart is STILL deduped to its original
+    /// offset and a long offline gap never drops it (the durability beat over NATS's time-bounded
+    /// window). A `None` or torn snapshot restores nothing — every producer resumes at-least-once, the
+    /// safe degrade. Each high-water is CLAMPED to the durable head `flushed`: a snapshot whose
+    /// `last_offset` points PAST a record the log actually holds (e.g. it was written slightly ahead of
+    /// a torn-tail recovery) is dropped for that producer rather than returning a phantom offset, so a
+    /// recovered duplicate can never point past the durable log. `now` seeds the LRU recency.
+    fn seed_producer_seq_from_recovered(
+        &mut self,
+        recovered: Option<&[u8]>,
+        flushed: u64,
+        now: u64,
+    ) {
+        let Some(bytes) = recovered else {
+            return;
+        };
+        let Ok(entries) = decode_seq_snapshot(bytes) else {
+            // A torn or corrupt snapshot: restore nothing (at-least-once), never trust bad state.
+            return;
+        };
+        for (producer_id, epoch, last_seq, last_offset) in entries {
+            // Clamp: a high-water offset must point at a record the durable log holds. `flushed` is
+            // the count of durable records, so a valid record offset is strictly below it. Drop a
+            // high-water whose offset is past the durable head (degrade that producer to at-least-once).
+            if last_offset.get() >= flushed {
+                continue;
+            }
+            self.producer_seq
+                .restore(&producer_id, epoch, last_seq, last_offset, now);
+        }
     }
 
     /// Opens (creating if absent) the durable resilience-counters checkpoint (#98) and recovers the
@@ -3103,6 +3251,88 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         Ok(())
     }
 
+    /// Builds the CRC-protected idempotent-producer SEQUENCE snapshot payload (V2-M8), capped to a
+    /// checkpoint slot. The high-waters come from the registry SORTED by `producer_id`; if the snapshot
+    /// would overflow a slot (more active producers than fit), only the leading entries that fit are
+    /// kept — dropping the overflow tail only resets those few producers to at-least-once after a
+    /// restart (a later publish reads fresh), never a correctness break, and the registry's
+    /// `max_producers` cap bounds the count anyway. Sorting is stable, so the SAME producers persist
+    /// each flush rather than thrashing. (A future refinement could prefer the most-recently-active
+    /// producers; sorted-prefix is the simple, deterministic bound today.)
+    fn producer_seq_snapshot_payload(&self) -> Vec<u8> {
+        let entries = self.producer_seq.snapshot_pairs();
+        let mut buf = Vec::new();
+        encode_seq_snapshot(&entries, &mut buf);
+        if buf.len() <= PRODUCER_SEQ_PAYLOAD {
+            return buf;
+        }
+        // Trim to the leading entries that fit. Each entry is `2 + producer_id + 24` bytes; we cannot
+        // assume a fixed size, so grow the kept prefix until the encoded size would exceed the cap.
+        let mut kept: Vec<ironbus_core::producer_seq::SeqHighWater> = Vec::new();
+        let mut probe = Vec::new();
+        for entry in entries {
+            probe.clear();
+            let mut candidate = kept.clone();
+            candidate.push(entry.clone());
+            encode_seq_snapshot(&candidate, &mut probe);
+            if probe.len() > PRODUCER_SEQ_PAYLOAD {
+                break;
+            }
+            kept.push(entry);
+        }
+        let mut out = Vec::new();
+        encode_seq_snapshot(&kept, &mut out);
+        out
+    }
+
+    /// Lazily opens (creating if absent) the durable idempotent-producer SEQUENCE checkpoint handle
+    /// (V2-M8) on the FIRST sequenced produce, so a broker no producer sequences against never creates
+    /// `producer-seq.ckpt` (its disk image is unchanged). A no-op once the handle exists.
+    ///
+    /// # Errors
+    /// Propagates a genuine IO error from creating or opening the checkpoint file.
+    fn ensure_producer_seq_checkpoint(&mut self) -> Result<(), EngineError> {
+        if self.producer_seq_checkpoint.is_some() {
+            return Ok(());
+        }
+        let file = {
+            let fs = self.log.filesystem();
+            if fs.exists(PRODUCER_SEQ_CHECKPOINT)? {
+                fs.open(PRODUCER_SEQ_CHECKPOINT)?
+            } else {
+                let f = fs.create_new(PRODUCER_SEQ_CHECKPOINT)?;
+                fs.sync_dir()?; // the new file's directory entry must be durable
+                f
+            }
+        };
+        let (checkpoint, _) = ProducerSeqCheckpoint::open(file)?;
+        self.producer_seq_checkpoint = Some(checkpoint);
+        Ok(())
+    }
+
+    /// Durably writes the idempotent-producer SEQUENCE high-water snapshot to `producer-seq.ckpt`
+    /// (V2-M8), via the same CRC'd dual-slot checkpoint discipline the cursor and attempt counts use.
+    /// This is what makes a replayed sequenced retry across a broker restart STILL deduped and a long
+    /// offline gap never drop it — the durability beat over NATS's time-bounded window. A NO-OP when no
+    /// producer has ever sequenced (the handle is `None`), so a non-idempotent workload pays nothing.
+    /// CORRECTNESS state (like the attempt counts), so a write error propagates.
+    ///
+    /// # Errors
+    /// Propagates a storage error from writing the checkpoint.
+    fn checkpoint_producer_seq(&mut self) -> Result<(), EngineError> {
+        if self.producer_seq_checkpoint.is_none() {
+            return Ok(()); // no sequenced producer has ever published; nothing durable to write
+        }
+        // Build the (slot-capped) payload BEFORE taking the mutable handle borrow, so the immutable
+        // `self.producer_seq` read does not overlap the `&mut self.producer_seq_checkpoint` write.
+        let payload = self.producer_seq_snapshot_payload();
+        // The handle is `Some` (checked above); the cap-trimmed payload always fits the slot.
+        if let Some(cp) = self.producer_seq_checkpoint.as_mut() {
+            cp.write(&payload)?;
+        }
+        Ok(())
+    }
+
     /// Checkpoints the committed cursor if it has advanced at least `checkpoint_interval`
     /// offsets since the last checkpoint, returning whether a checkpoint was written. This
     /// bounds how many messages a crash redelivers to roughly `checkpoint_interval` while
@@ -3125,6 +3355,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // write failure propagates rather than being swallowed.
             self.checkpoint_default_attempts()?;
             self.last_attempts_checkpointed = committed;
+            // Persist the idempotent-producer SEQUENCE high-waters on the same cadence (V2-M8): a
+            // sequenced producer's `(epoch, last_seq, last_offset)` must stay durable so a retry is
+            // deduped across an unclean restart AND a long offline gap (the beat over NATS's
+            // time-bounded window). CORRECTNESS state, so a write failure propagates. A no-op when no
+            // producer has ever sequenced (the handle is `None`).
+            self.checkpoint_producer_seq()?;
             // Piggyback the resilience-counters snapshot on the cursor-checkpoint cadence (#98), so
             // the counters become durable on the same low-frequency rhythm without a per-increment
             // fsync. Best-effort: a counters write failure only loses some observability history on
@@ -3259,6 +3495,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         for name in names {
             self.checkpoint_group(&name)?;
         }
+        // Flush the idempotent-producer SEQUENCE high-waters (V2-M8) on the clean-shutdown barrier too,
+        // AFTER the cursors are flushed (so the durable head the high-waters clamp against is advanced)
+        // and BEFORE the observability-only counters. CORRECTNESS state: a restart after a clean stop
+        // resumes dedup exactly where it left off. A no-op when no producer has ever sequenced.
+        self.checkpoint_producer_seq()?;
         // Flush the resilience counters LAST, so the cursor flushes (correctness) always complete
         // first. A restart after this clean stop resumes the final counts (#98).
         self.checkpoint_counters()?;
@@ -3989,6 +4230,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // No dedup requested: identical to the historical no-dedup append.
             return self.append_no_sync(message).map(AppendOutcome::Appended);
         };
+        // The idempotent-producer SEQUENCE path (V2-M8): when the publish carried a `seq`, route
+        // through the DURABLE per-producer sequence high-water (effectively-once across a restart + a
+        // long offline gap) INSTEAD of the time-bounded `msg_id` window. This is the Kafka-style
+        // dedup-to-exactly-once-append + zombie-epoch fencing + out-of-order rejection.
+        if let Some(seq) = req.seq {
+            return self.append_no_sync_seq(message, req.producer_id, req.epoch, seq);
+        }
         let now = self.log.now_monotonic();
         match self
             .dedup
@@ -4017,6 +4265,87 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 Ok(AppendOutcome::Appended(offset))
             }
         }
+    }
+
+    /// The idempotent-producer SEQUENCE variant of [`Engine::append_no_sync_dedup`] (V2-M8): it
+    /// consults the DURABLE per-producer `(epoch, last_seq, last_offset)` high-water FIRST, then
+    /// appends only on the next-expected (fresh) sequence. This is the EFFECTIVELY-ONCE path that
+    /// survives a broker restart AND a long offline gap (the high-water is persisted, not a
+    /// time-bounded window like the `msg_id` ring or NATS's `Nats-Msg-Id`).
+    ///
+    /// The four outcomes, decided on the actor thread serially so they cannot race:
+    /// - [`AppendOutcome::Duplicate`]: `seq <= last_accepted`, a RETRY. NOTHING is appended; the
+    ///   producer's last-accepted offset is returned for a `PubAckDuplicate` (`duplicate = true`,
+    ///   `rc = 0`). A retry is deduped to exactly-once-append; counts the benign dedup hit.
+    /// - [`AppendOutcome::Fenced`]: a STALE epoch (a zombie session). NOTHING is appended.
+    /// - [`AppendOutcome::OutOfOrder`]: `seq > last_accepted + 1`, a GAP. REJECTED (Kafka
+    ///   `OutOfOrderSequence`), so a later retry of a skipped seq cannot double-append; NOTHING is
+    ///   appended; counts the rejection.
+    /// - [`AppendOutcome::Appended`]: the next-expected sequence. The record is appended (write, no
+    ///   fsync), the high-water is advanced to `(epoch, seq, offset)` IMMEDIATELY (so a same-batch
+    ///   retry dedups before its fsync), and the offset is parked behind the covering commit (I2).
+    ///   The durable `producer-seq.ckpt` handle is opened on the first such append (lazily, so a
+    ///   non-idempotent workload never creates the file) and the high-water is snapshotted on the
+    ///   checkpoint cadence + the graceful-shutdown flush.
+    ///
+    /// `now` (monotonic, from the clock seam) is used ONLY for the registry's LRU recency; the dedup
+    /// decision itself is wall-clock-independent — the whole point of effectively-once over a gap.
+    ///
+    /// # Errors
+    /// On a fresh produce, the same storage errors as [`Engine::append_no_sync`], plus an IO error
+    /// from lazily creating the durable checkpoint file on the first sequenced append. A duplicate,
+    /// fence, or out-of-order rejection never appends, so it never errors here.
+    fn append_no_sync_seq(
+        &mut self,
+        message: &Append<'_>,
+        producer_id: &[u8],
+        epoch: u64,
+        seq: u64,
+    ) -> Result<AppendOutcome, EngineError> {
+        let now = self.log.now_monotonic();
+        match self.producer_seq.check(producer_id, epoch, seq, now) {
+            SeqDecision::Duplicate { offset } => {
+                // A benign retry: return the original offset, append nothing, count the hit (it is the
+                // same observable as a msg_id dedup hit, so it shares the `ironbus_dedup_hits_total`
+                // counter — no extra metric for the same effect).
+                self.counters.dedup_hits = self.counters.dedup_hits.saturating_add(1);
+                Ok(AppendOutcome::Duplicate(offset))
+            }
+            SeqDecision::Fenced { current_epoch } => Ok(AppendOutcome::Fenced { current_epoch }),
+            SeqDecision::OutOfOrder { expected } => {
+                // A silent reorder would corrupt idempotence; reject it (never append) and count it.
+                self.counters.producer_out_of_order =
+                    self.counters.producer_out_of_order.saturating_add(1);
+                Ok(AppendOutcome::OutOfOrder { expected })
+            }
+            SeqDecision::Fresh => {
+                // Ensure the durable checkpoint handle exists BEFORE the append, so the first
+                // sequenced produce's high-water can be persisted on the next checkpoint tick (and a
+                // file-creation IO error fails the produce rather than silently losing durability).
+                self.ensure_producer_seq_checkpoint()?;
+                let offset = self.append_no_sync(message)?;
+                // Advance the high-water at append time (offset assigned), so a same-batch retry of
+                // this seq dedups before the covering fsync. The reply is still parked behind that
+                // fsync, so a duplicate never returns an offset that is not (or will not be) durable.
+                self.producer_seq
+                    .record(producer_id, epoch, seq, offset, now);
+                Ok(AppendOutcome::Appended(offset))
+            }
+        }
+    }
+
+    /// The current out-of-order idempotent-sequence rejection count (the
+    /// `ironbus_producer_out_of_order_total` counter, V2-M8).
+    #[must_use]
+    pub fn producer_out_of_order(&self) -> u64 {
+        self.counters.producer_out_of_order
+    }
+
+    /// The number of producers currently tracked by the idempotent-sequence registry (V2-M8), for
+    /// tests and introspection: O(active producers), bounded with LRU eviction.
+    #[must_use]
+    pub fn producer_seq_count(&self) -> usize {
+        self.producer_seq.producer_count()
     }
 
     /// The current benign dedup-hit count (the `ironbus_dedup_hits_total` counter, #33).
@@ -9149,6 +9478,9 @@ mod tests {
             // The TTL family (#549), appended after recovery; non-zero so the round-trip proves the
             // new trailing field is carried.
             expired: 999,
+            // The idempotent-producer out-of-order rejection counter (V2-M8), appended after TTL;
+            // non-zero so the round-trip proves the new trailing field is carried.
+            producer_out_of_order: 1357,
         };
         let encoded = counters.encode_snapshot();
         assert_eq!(Counters::decode_snapshot(&encoded), counters);
@@ -12516,11 +12848,283 @@ mod tests {
                     producer_id,
                     epoch,
                     msg_id,
+                    seq: None,
                 }),
             )
             .unwrap();
         e.commit_batch().unwrap();
         outcome
+    }
+
+    // ===================================================================================
+    // V2-M8: idempotent producer (PID + epoch + monotonic sequence) — effectively-once across a
+    // broker restart + a long offline gap (#638/#639).
+    // ===================================================================================
+
+    /// Produces with an opt-in idempotent SEQUENCE through the engine's group-commit primitives, the
+    /// V2-M8 sequenced twin of `produce_dedup`: the `seq` routes the produce through the DURABLE
+    /// per-producer high-water (dedup-to-exactly-once-append, epoch fencing, out-of-order rejection).
+    fn produce_seq(
+        e: &mut Engine<InMemoryFs, std::sync::Arc<ManualClock>>,
+        payload: &[u8],
+        producer_id: &[u8],
+        epoch: u64,
+        seq: u64,
+    ) -> AppendOutcome {
+        let outcome = e
+            .append_no_sync_dedup(
+                &Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload,
+                },
+                Some(DedupRequest {
+                    producer_id,
+                    epoch,
+                    // The msg_id is unused on the sequence path (the engine routes on `seq`), so an
+                    // empty one is fine; the wire layer still carries it.
+                    msg_id: b"",
+                    seq: Some(seq),
+                }),
+            )
+            .unwrap();
+        e.commit_batch().unwrap();
+        outcome
+    }
+
+    /// Opens an engine over a SHARED `InMemoryFs` + `ManualClock`, so a test can drop it and reopen
+    /// the SAME data directory to model a broker restart (the durability tests need this).
+    fn open_on(
+        fs: InMemoryFs,
+        clock: std::sync::Arc<ManualClock>,
+        config: EngineConfig,
+    ) -> Engine<InMemoryFs, std::sync::Arc<ManualClock>> {
+        Engine::open(fs, clock, config).unwrap()
+    }
+
+    #[test]
+    fn a_retried_sequenced_publish_deduplicates_to_one_append() {
+        // The headline guarantee: a retry of the same (producer, epoch, seq) returns the ORIGINAL
+        // offset via Duplicate and appends NOTHING — the log holds exactly ONE record.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(10, 5), clock);
+        assert_eq!(
+            produce_seq(&mut e, b"v1", b"p", 0, 0),
+            AppendOutcome::Appended(Offset::new(0))
+        );
+        assert_eq!(e.flushed_offset(), Offset::new(1));
+        // Retry the SAME seq (payload differs; the sequence path ignores the body): the ORIGINAL
+        // offset, no second record, the dedup-hit counter increments.
+        assert_eq!(
+            produce_seq(&mut e, b"v1-retry", b"p", 0, 0),
+            AppendOutcome::Duplicate(Offset::new(0))
+        );
+        assert_eq!(
+            e.flushed_offset(),
+            Offset::new(1),
+            "the durable head did NOT advance on a sequenced retry (one append only)"
+        );
+        assert_eq!(e.dedup_hits(), 1);
+        // seq 1 is the next expected: fresh.
+        assert_eq!(
+            produce_seq(&mut e, b"v2", b"p", 0, 1),
+            AppendOutcome::Appended(Offset::new(1))
+        );
+        assert_eq!(e.flushed_offset(), Offset::new(2));
+    }
+
+    #[test]
+    fn an_out_of_order_sequence_is_rejected_not_silently_accepted() {
+        // The Kafka OutOfOrderSequence rule: a gap (seq > last + 1) is REJECTED so a later retry of
+        // the skipped seq cannot double-append. Nothing is appended and the counter fires.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(10, 5), clock);
+        produce_seq(&mut e, b"a", b"p", 0, 0); // offset 0, high-water seq 0
+        assert_eq!(
+            produce_seq(&mut e, b"skip", b"p", 0, 2),
+            AppendOutcome::OutOfOrder { expected: 1 },
+            "a gapped sequence is rejected, not appended"
+        );
+        assert_eq!(
+            e.flushed_offset(),
+            Offset::new(1),
+            "the out-of-order produce appended nothing"
+        );
+        assert_eq!(e.producer_out_of_order(), 1);
+        // The in-order seq 1 still reads fresh (no corruption from the rejected gap).
+        assert_eq!(
+            produce_seq(&mut e, b"b", b"p", 0, 1),
+            AppendOutcome::Appended(Offset::new(1))
+        );
+    }
+
+    #[test]
+    fn a_zombie_stale_epoch_is_fenced_while_the_new_epoch_writes() {
+        // A restarted producer comes back with a higher epoch (fresh sequence space); the OLD session
+        // reusing the old producer_id at the stale epoch is FENCED, so a zombie cannot double-write.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(10, 5), clock);
+        // Epoch 5 establishes and writes seq 0.
+        assert_eq!(
+            produce_seq(&mut e, b"e5s0", b"p", 5, 0),
+            AppendOutcome::Appended(Offset::new(0))
+        );
+        // The new session (epoch 6) supersedes: its seq 0 is fresh (the sequence space reset).
+        assert_eq!(
+            produce_seq(&mut e, b"e6s0", b"p", 6, 0),
+            AppendOutcome::Appended(Offset::new(1))
+        );
+        // A ZOMBIE at the OLD epoch 5 is fenced — it appends nothing.
+        assert_eq!(
+            produce_seq(&mut e, b"zombie", b"p", 5, 1),
+            AppendOutcome::Fenced { current_epoch: 6 }
+        );
+        assert_eq!(
+            e.flushed_offset(),
+            Offset::new(2),
+            "the fenced zombie appended nothing"
+        );
+        // The new epoch keeps writing.
+        assert_eq!(
+            produce_seq(&mut e, b"e6s1", b"p", 6, 1),
+            AppendOutcome::Appended(Offset::new(2))
+        );
+    }
+
+    #[test]
+    fn sequenced_dedup_survives_a_broker_restart() {
+        // The DURABILITY beat: persist the high-water, restart the broker (reopen the SAME data dir),
+        // and a replayed retry is STILL deduped to the original offset — where NATS's volatile window
+        // would have forgotten and re-appended.
+        let fs = InMemoryFs::new();
+        let clock = std::sync::Arc::new(ManualClock::new());
+        {
+            let mut e = open_on(fs.clone(), std::sync::Arc::clone(&clock), config(10, 5));
+            produce_seq(&mut e, b"v0", b"p", 1, 0); // offset 0
+            produce_seq(&mut e, b"v1", b"p", 1, 1); // offset 1
+                                                    // A clean shutdown flush persists the producer-seq high-water.
+            e.checkpoint_all_groups().unwrap();
+        }
+        // Restart: reopen the same fs. The high-water is restored from `producer-seq.ckpt`.
+        let mut e2 = open_on(fs, std::sync::Arc::clone(&clock), config(10, 5));
+        assert_eq!(
+            e2.flushed_offset(),
+            Offset::new(2),
+            "the two records survived the restart"
+        );
+        // A replayed RETRY of seq 1 across the restart is STILL a duplicate at its original offset.
+        assert_eq!(
+            produce_seq(&mut e2, b"v1-replay", b"p", 1, 1),
+            AppendOutcome::Duplicate(Offset::new(1)),
+            "the dedup high-water survived the restart (the NATS beat)"
+        );
+        assert_eq!(
+            e2.flushed_offset(),
+            Offset::new(2),
+            "the replayed retry appended nothing after the restart"
+        );
+        // The next expected seq still reads fresh, and a stale epoch is still fenced post-restart.
+        assert_eq!(
+            produce_seq(&mut e2, b"v2", b"p", 1, 2),
+            AppendOutcome::Appended(Offset::new(2))
+        );
+        assert_eq!(
+            produce_seq(&mut e2, b"zombie", b"p", 0, 9),
+            AppendOutcome::Fenced { current_epoch: 1 },
+            "a stale epoch is still fenced after the restart (the high-water carried the epoch)"
+        );
+    }
+
+    #[test]
+    fn sequenced_dedup_survives_a_long_offline_gap_no_time_expiry() {
+        // The other half of the beat: the dedup is bounded by SEQUENCE state, not wall-clock, so a
+        // LONG offline gap (huge monotonic advance) never drops it — unlike the time-bounded msg_id
+        // window / NATS Nats-Msg-Id, which would have lapsed.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(10, 5), std::sync::Arc::clone(&clock));
+        produce_seq(&mut e, b"v0", b"p", 1, 0); // offset 0 at t=0
+                                                // A producer goes offline for a very long time (far past any dedup time window).
+        clock.advance_monotonic_nanos(10 * 365 * 24 * 3_600 * 1_000_000_000); // ~10 years
+                                                                              // A replayed retry of seq 0 is STILL a duplicate — no time bound to expire it.
+        assert_eq!(
+            produce_seq(&mut e, b"v0-replay", b"p", 1, 0),
+            AppendOutcome::Duplicate(Offset::new(0)),
+            "sequence dedup never lapses with the clock (the gap beat over NATS)"
+        );
+        assert_eq!(
+            e.flushed_offset(),
+            Offset::new(1),
+            "the long-gap retry appended nothing"
+        );
+    }
+
+    #[test]
+    fn sequenced_dedup_survives_a_restart_then_a_long_gap_combined() {
+        // Restart AND a long gap together — the full effectively-once survival claim.
+        let fs = InMemoryFs::new();
+        let clock = std::sync::Arc::new(ManualClock::new());
+        {
+            let mut e = open_on(fs.clone(), std::sync::Arc::clone(&clock), config(10, 5));
+            produce_seq(&mut e, b"v0", b"p", 3, 0); // offset 0
+            e.checkpoint_all_groups().unwrap();
+        }
+        // A long offline gap spans the restart.
+        clock.advance_monotonic_nanos(5 * 365 * 24 * 3_600 * 1_000_000_000); // ~5 years
+        let mut e2 = open_on(fs, std::sync::Arc::clone(&clock), config(10, 5));
+        assert_eq!(
+            produce_seq(&mut e2, b"v0-replay", b"p", 3, 0),
+            AppendOutcome::Duplicate(Offset::new(0)),
+            "dedup survived BOTH a restart and a long gap"
+        );
+        assert_eq!(e2.flushed_offset(), Offset::new(1));
+    }
+
+    #[test]
+    fn a_non_sequenced_producer_is_byte_identical_at_least_once() {
+        // Back-compat: a produce with NO seq (and no msg_id) is exactly today's at-least-once append.
+        // The producer-seq registry is never touched, no `producer-seq.ckpt` is created, and two
+        // identical payloads both append.
+        let fs = InMemoryFs::new();
+        let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(produce(&mut e, b"same"), Offset::new(0));
+        assert_eq!(produce(&mut e, b"same"), Offset::new(1));
+        assert_eq!(e.flushed_offset(), Offset::new(2), "both appended");
+        assert_eq!(e.producer_seq_count(), 0, "no producer was sequenced");
+        assert_eq!(e.producer_out_of_order(), 0);
+        // A clean shutdown flush must NOT create the producer-seq checkpoint file when no producer
+        // ever sequenced (the disk image of a non-idempotent workload is unchanged).
+        e.checkpoint_all_groups().unwrap();
+        assert!(
+            !fs.exists(PRODUCER_SEQ_CHECKPOINT).unwrap(),
+            "a non-idempotent workload never creates producer-seq.ckpt"
+        );
+    }
+
+    #[test]
+    fn the_producer_seq_state_is_bounded_o_producers_and_reclaims_dead_producers() {
+        // The memory bound: a flood of distinct producer_ids keeps the registry state O(producers),
+        // never O(messages). The registry's `max_producers` cap (its internal default) bounds it; the
+        // LRU evicts (reclaims) the least-recently-active producer, so a dead producer does not pin a
+        // slot forever. We assert it stays bounded under far more producers than messages-per-producer.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let mut e = open_with_clock(config(10, 5), clock);
+        let cap = ironbus_core::producer_seq::DEFAULT_MAX_SEQ_PRODUCERS;
+        for i in 0..(cap as u64 + 500) {
+            let pid = format!("producer-{i}");
+            // Each distinct producer publishes exactly one sequenced record.
+            produce_seq(&mut e, b"x", pid.as_bytes(), 0, 0);
+            assert!(
+                e.producer_seq_count() <= cap,
+                "producer-seq state exceeded the O(producers) cap"
+            );
+        }
+        assert_eq!(
+            e.producer_seq_count(),
+            cap,
+            "the registry holds exactly the cap after the flood (dead producers reclaimed by LRU)"
+        );
     }
 
     #[test]
@@ -13864,7 +14468,8 @@ mod tests {
             DEFAULT_MAX_DECOMPRESSED_BYTES,
         };
         // A producer-compressed stored object, exactly what a producer may legally deliver with
-        // bit 0 set (PUB_WIRE_ONLY_FLAGS masks only bits 6 and 7). The seam MUST pass it through
+        // bit 0 set (PUB_WIRE_ONLY_FLAGS masks only the wire-only high bits 3..=7, never bit 0). The
+        // seam MUST pass it through
         // untouched: re-compressing would wrap the descriptor in a descriptor and decode to
         // garbage.
         //

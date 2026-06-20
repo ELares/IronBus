@@ -658,7 +658,10 @@ fn broker_core_lines(
          ironbus_dedup_hits_total {dedup_hits}\n\
          # HELP ironbus_dedup_out_of_window_total Dedup ids evicted by the time bound (their dedup protection lapsed, so a later republish would not be deduped).\n\
          # TYPE ironbus_dedup_out_of_window_total counter\n\
-         ironbus_dedup_out_of_window_total {dedup_out_of_window}\n",
+         ironbus_dedup_out_of_window_total {dedup_out_of_window}\n\
+         # HELP ironbus_producer_out_of_order_total Idempotent-producer publishes rejected for an out-of-order sequence (seq skipped past the next-expected, the Kafka OutOfOrderSequence rejection, so a later retry of a skipped seq cannot double-append).\n\
+         # TYPE ironbus_producer_out_of_order_total counter\n\
+         ironbus_producer_out_of_order_total {producer_out_of_order}\n",
         healthy_value = u8::from(healthy),
         produced = counters.produced,
         produced_bytes = counters.produced_bytes,
@@ -674,6 +677,7 @@ fn broker_core_lines(
         truncated_records = counters.truncated_records,
         dedup_hits = counters.dedup_hits,
         dedup_out_of_window = counters.dedup_out_of_window,
+        producer_out_of_order = counters.producer_out_of_order,
     )
 }
 
@@ -2045,6 +2049,16 @@ mod tests {
             "{m}"
         );
         assert!(m.contains("\nironbus_dedup_out_of_window_total 0\n"), "{m}");
+        // The idempotent-producer out-of-order rejection counter (V2-M8) is present and zero on a
+        // broker no producer sequences against.
+        assert!(
+            m.contains("# TYPE ironbus_producer_out_of_order_total counter"),
+            "{m}"
+        );
+        assert!(
+            m.contains("\nironbus_producer_out_of_order_total 0\n"),
+            "{m}"
+        );
         // The DLQ depth counter is present and zero on a broker that has never dead-lettered.
         assert!(
             m.contains("# TYPE ironbus_dlq_records_total counter"),
@@ -3699,6 +3713,13 @@ mod tests {
         // PubAckDuplicate frames, not a metric.
         "ironbus_dedup_hits_total",
         "ironbus_dedup_out_of_window_total",
+        // The idempotent-producer out-of-order rejection counter (V2-M8, #638): a sequenced publish
+        // whose seq skipped past the next-expected was REJECTED (the Kafka OutOfOrderSequence rule, so
+        // a later retry of the skipped seq cannot double-append). A never-silent resilience event the
+        // taxonomy guarantees is counted, an unlabeled `_total`, so it joins this set. (A sequenced
+        // dedup HIT shares `ironbus_dedup_hits_total` — the same observable as a msg_id dedup hit — so
+        // it adds no new counter there; the durable high-water carries no new gauge.)
+        "ironbus_producer_out_of_order_total",
         // The backpressure shed counters (#68, #69): each is a deliberate resilience SHED the #16
         // contract guarantees is never silent. CoDel sojourn shed and the depth/byte backstop shed
         // (#68); the fire-and-forget token-bucket shed and the egress AIMD shed (#69); and the
@@ -3821,6 +3842,7 @@ mod tests {
         // Opt-in effectively-once dedup counters (#3, #33): the benign-hit and out-of-window counts.
         ("ironbus_dedup_hits_total", "counter"),
         ("ironbus_dedup_out_of_window_total", "counter"),
+        ("ironbus_producer_out_of_order_total", "counter"),
         // Edge write-amplification (#118): two byte counters (TYPE counter, but NOT `_total`-named,
         // matching the issue's contract, so the resilience-taxonomy `_total` filter excludes them)
         // plus the daily-write-budget shed counter (a resilience shed, so it IS `_total` and in the
