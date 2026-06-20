@@ -67,6 +67,88 @@ pub fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+/// Decodes a lowercase-hex string back to its bytes, the inverse of [`hex_encode`], returning `None`
+/// for any string that is not canonical lowercase hex of even length (an odd length, an uppercase
+/// digit, or a non-hex byte). This is how a `streams/<hex>/` subdir name is decoded back to its
+/// original stream name at open ([`parse_stream_subdir_name`]): a foreign or non-canonical directory
+/// is rejected (a `None`) rather than misread, exactly as [`parse_segment_file_name`] rejects a
+/// non-canonical segment name.
+#[must_use]
+pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    fn nibble(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            _ => None,
+        }
+    }
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        out.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
+    }
+    Some(out)
+}
+
+/// The on-disk directory name for a NAMED stream's per-stream log, under the data-dir's reserved
+/// `streams/` subtree (M2-I2). The stream NAME is lowercase-hex-encoded (the same reversible,
+/// path-safe encoding [`cursor_checkpoint_name`] uses for a work-group name), so a path-unsafe byte
+/// (`/`, `.`, `..`, NUL) in the name never reaches the filesystem as a directory separator or a
+/// traversal. The default stream `""` is NOT named here — it is today's ROOT log, not a `streams/`
+/// child — so this is only ever called for a non-empty, validated name.
+///
+/// `streams/<hex(name)>/` mirrors the `dlq/` subdir pattern (one self-contained
+/// [`crate::log::Log`] per directory), generalized to N streams; the hex encoding makes the round
+/// trip exact so [`parse_stream_subdir_name`] recovers the original name byte-for-byte.
+#[must_use]
+pub fn stream_subdir_name(name: &str) -> String {
+    hex_encode(name.as_bytes())
+}
+
+/// Parses a `streams/` child directory name back to its stream name, the inverse of
+/// [`stream_subdir_name`], returning `None` for any directory that is not a canonical hex-encoded
+/// stream name (a foreign directory, or one whose decoded bytes are not a valid stream name). A
+/// `None` is skipped at open exactly as a foreign segment file is skipped by [`segment_ids`], so a
+/// stray directory under `streams/` never opens as (or shadows) a real stream.
+///
+/// The decoded bytes must themselves pass [`is_valid_stream_name`] (non-empty, within the length
+/// bound, graphic-ASCII): the empty name decodes to the default stream `""`, which does NOT live
+/// under `streams/`, so an empty (`""` -> `""`) decode is rejected here rather than aliasing the
+/// root log.
+#[must_use]
+pub fn parse_stream_subdir_name(dir: &str) -> Option<String> {
+    let bytes = hex_decode(dir)?;
+    let name = String::from_utf8(bytes).ok()?;
+    if is_valid_stream_name(&name) {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+/// The maximum byte length of a NAMED stream's name, matching the engine's `MAX_GROUP_NAME_LEN`
+/// (128): a stream id is named under the same graphic-ASCII, length-bounded discipline as a
+/// work-group, so the two name spaces validate identically and a stream name is always short enough
+/// to hex-encode into a path component well within any filesystem's name limit (128 bytes -> 256 hex
+/// chars).
+pub const MAX_STREAM_NAME_LEN: usize = 128;
+
+/// Whether `name` is a valid NAMED stream name: 1 to [`MAX_STREAM_NAME_LEN`] graphic-ASCII bytes.
+/// This is the SAME rule the engine's `validate_group_name` (and `admin::validate_group`) applies to
+/// a work-group name, reused so a stream id and a work-group id share one validation contract.
+///
+/// Note the DEFAULT stream `""` (the empty name) is intentionally NOT valid here: it is today's root
+/// log, addressed by the empty name as a special case by the caller, never created as a `streams/`
+/// child. So `is_valid_stream_name("")` is `false` — the empty name is the default stream, not a
+/// named one.
+#[must_use]
+pub fn is_valid_stream_name(name: &str) -> bool {
+    (1..=MAX_STREAM_NAME_LEN).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_graphic())
+}
+
 /// Parses a segment file name back to its segment id, returning `None` for any name
 /// that is not a canonical segment file (any foreign file in the data directory).
 ///
@@ -139,6 +221,70 @@ mod tests {
         assert_eq!(hex_encode(b""), "");
         assert_eq!(hex_encode(&[0x00, 0x0f, 0xff]), "000fff");
         assert_eq!(hex_encode(b"AB"), "4142");
+    }
+
+    #[test]
+    fn hex_decode_is_the_inverse_of_encode_and_rejects_non_canonical() {
+        // Round-trips every byte value.
+        for b in 0u8..=255 {
+            let enc = hex_encode(&[b]);
+            assert_eq!(hex_decode(&enc), Some(vec![b]));
+        }
+        assert_eq!(hex_decode(""), Some(vec![]));
+        assert_eq!(hex_decode("000fff"), Some(vec![0x00, 0x0f, 0xff]));
+        // Odd length, uppercase (non-canonical), and a non-hex digit are all rejected, so a foreign
+        // directory name never decodes to a real stream name.
+        assert_eq!(hex_decode("abc"), None);
+        assert_eq!(hex_decode("AB"), None);
+        assert_eq!(hex_decode("zz"), None);
+    }
+
+    #[test]
+    fn stream_subdir_name_round_trips_through_parse() {
+        for name in [
+            "orders",
+            "a/b",
+            "metrics.cpu",
+            "x",
+            &"n".repeat(MAX_STREAM_NAME_LEN),
+        ] {
+            let dir = stream_subdir_name(name);
+            // The on-disk dir is path-safe hex (no `/`, `.`, `..`), so it is a single safe component.
+            assert!(!dir.contains('/') && dir != "." && dir != "..");
+            assert_eq!(parse_stream_subdir_name(&dir).as_deref(), Some(name));
+        }
+    }
+
+    #[test]
+    fn parse_stream_subdir_rejects_foreign_and_the_empty_default() {
+        // The empty stream (the default root log) is NOT a `streams/` child: its hex-encoding is the
+        // empty string, which must NOT parse back to a valid named stream.
+        assert_eq!(stream_subdir_name(""), "");
+        assert_eq!(parse_stream_subdir_name(""), None);
+        // A foreign directory under streams/ (non-hex, uppercase, odd length) is skipped, never read
+        // as a stream.
+        assert_eq!(parse_stream_subdir_name("not-hex"), None);
+        assert_eq!(parse_stream_subdir_name("4142z"), None);
+        // Hex that decodes to bytes that are not a valid stream name (a control byte) is rejected.
+        assert_eq!(parse_stream_subdir_name(&hex_encode(b"a\nb")), None);
+        // Hex that decodes to a too-long name is rejected.
+        let too_long = hex_encode(&[b'x'; MAX_STREAM_NAME_LEN + 1]);
+        assert_eq!(parse_stream_subdir_name(&too_long), None);
+    }
+
+    #[test]
+    fn is_valid_stream_name_matches_the_group_rule() {
+        // 1..=128 graphic-ASCII bytes, exactly like a work-group name.
+        assert!(is_valid_stream_name("orders"));
+        assert!(is_valid_stream_name("a/b")); // graphic ASCII; the filesystem-unsafe `/` is handled by hex-encoding
+        assert!(is_valid_stream_name(&"n".repeat(MAX_STREAM_NAME_LEN)));
+        // The default stream "" is NOT a valid NAMED stream (it is the root log).
+        assert!(!is_valid_stream_name(""));
+        // Too long, whitespace, a control byte, and non-ASCII are all rejected.
+        assert!(!is_valid_stream_name(&"n".repeat(MAX_STREAM_NAME_LEN + 1)));
+        assert!(!is_valid_stream_name("has space"));
+        assert!(!is_valid_stream_name("tab\tname"));
+        assert!(!is_valid_stream_name("café"));
     }
 
     #[test]
