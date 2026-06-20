@@ -97,3 +97,14 @@ harness = false
 [[bench]]
 name = "zero_copy_delivery"
 harness = false
+
+# Informational micro-bench + PROOF for the cross-stream CommitCoordinator (#564, M2-I3): the batched
+# durability barrier over a StreamSet. Counts the ACTUAL fdatasyncs a commit tick issues (via the
+# counting FaultFs) for a FIXED total record rate spread across 1/4/16 streams, proving the fsync
+# COUNT is O(dirtied-streams-per-tick) while the per-RECORD fsync cost stays O(1/batch) — group-commit
+# generalized across streams. A second criterion-timed leg measures the coordinator's CPU overhead per
+# tick over the in-memory fs (no device fsync). Run on demand (`cargo bench -p ironbus-storage`), not in
+# per-PR CI; device-dependent fsync latency is the macro rig's job.
+[[bench]]
+name = "commit_coordinator"
+harness = false
