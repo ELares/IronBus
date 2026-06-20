@@ -196,15 +196,19 @@ def nats_core_sub(payload, records):
             os.remove(cfg)
 
 
-# The headline record-count SWEEP (256 B): IronBus Tier-S streaming consume throughput degrades as
-# the pre-filled prefix grows (the server StreamFetch-by-offset cost is super-linear in the prefix),
-# while NATS JS pull stays roughly flat. Sweeping both over the same record counts captures the
-# CROSSOVER honestly instead of cherry-picking one N. Recorded in PERF_LEDGER as the consume curve.
+# The headline record-count SWEEP (256 B): IronBus Tier-S streaming durable consume vs NATS JS pull
+# over the same record counts. Pre-#665 this sweep exposed a super-linear IronBus degradation (the
+# server StreamFetch read SPAN was segment-wide, so each fetch read O(distance-to-segment-end) bytes
+# => ~O(N^2) over the drain) that crossed UNDER NATS near ~30k records. #665 clamps the read span to
+# the consumer window, so post-#665 the IronBus curve is FLAT-to-rising and beats NATS at every point
+# of 20k..200k (the unconditional win). Sweeping over the same counts is what makes that flat-vs-
+# crossover claim falsifiable rather than a single cherry-picked N. Recorded in PERF_LEDGER.
 SWEEP_COUNTS = [20_000, 50_000, 100_000, 200_000]
 # The single MATCHED record count the lint-gated corpus pairs build at (the headline scoreboard
-# point). DEFAULT 20k: the realistic small/moderate prefill where the streaming-tier consume win is
-# real (the crossover with NATS JS pull is ~30k; past it IronBus's super-linear StreamFetch-by-offset
-# cost dominates and NATS leads — the full degradation curve is published in the sweep, not hidden).
+# point). DEFAULT 20k: a realistic small/moderate prefill. Post-#665 the streaming-tier consume win
+# holds across the WHOLE sweep (no NATS crossover in range), so 20k is a representative point on a
+# flat curve rather than the only point where IronBus leads — the full curve is published in the
+# sweep regardless.
 CORPUS_N = 20_000
 
 

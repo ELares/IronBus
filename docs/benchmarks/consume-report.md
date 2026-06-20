@@ -8,8 +8,8 @@ Both sides drain a pre-filled durable file-backed prefix and persist their consu
 
 | payload | IronBus Tier-S streaming | NATS JS pull | IronBus / NATS |
 | --- | --- | --- | --- |
-| 256 B | 114984 | 99861 | 1.15x |
-| 4096 B | 81410 | 57774 | 1.41x |
+| 256 B | 700855 | 106448 | 6.58x |
+| 4096 B | 195892 | 54780 | 3.58x |
 
 ## Context (appendix, NOT a durable head-to-head)
 
@@ -17,6 +17,6 @@ The IronBus Tier-W work-queue consume column (the per-message-lease path IronBus
 
 | payload | IronBus Tier-W work-queue | NATS core sub (non-durable) |
 | --- | --- | --- |
-| 256 B | 3326 | 620220 |
-| 4096 B | 2795 | 125800 |
+| 256 B | 9776 | 685770 |
+| 4096 B | 9178 | 131845 |
 
