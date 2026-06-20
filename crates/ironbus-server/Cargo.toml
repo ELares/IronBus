@@ -105,6 +105,40 @@ bytes = { version = "1", default-features = false }
 # `default-features = false` + the `xxh3` feature keeps only the one algorithm we use.
 xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
 
+# Connection-scoped AUTHENTICATION primitives (#631, V2-M7, docs/AUTHENTICATION.md + docs/SECRETS.md).
+# This is the SMALL, ENUMERABLE crypto surface the security epic's auth half needs, every crate
+# PURE RUST (no `links` key, no C-building build script) and permissive (MIT / Apache-2.0), already
+# covered by the deny.toml license allow-list, so the C-FFI ban (#102) and the #139 pure-Rust policy
+# hold (auth runs on the connection handshake, off the record path). NONE of these is `ring` /
+# `aws-lc-sys` (both on the deny.toml `[bans]` denylist): they are RustCrypto hash / KDF /
+# constant-time / zeroize crates, NOT a TLS provider. The actual TLS 1.3 handshake (rustls + a crypto
+# provider) is the FLAGGED follow-up whose provider choice is a deliberate supply-chain decision owned
+# by #107 (the only pure-Rust rustls provider available today is an alpha crate that pulls `cc`), so
+# this PR deliberately adds NO rustls/provider crate. All build on stable 1.78 with the committed lock
+# (the `msrv (1.78)` gate).
+#
+# `sha2`: SHA-256 for bearer-token STORAGE (the broker stores only the token digest; #631). RustCrypto,
+# MIT OR Apache-2.0, pure Rust. Its only transitive non-RustCrypto dep is `cpufeatures`, which pulls
+# `libc` on x86/aarch64 for runtime ISA detection — `libc` is a pure-Rust syscall binding ALREADY on
+# the deny.toml allow-list and explicitly exempted by the cffi-ban allowlist, so no new C enters the
+# graph.
+sha2 = { version = "0.10", default-features = false }
+# `subtle`: the NON-short-circuiting constant-time equality the token-digest compare uses (#631). A
+# byte-by-byte early-exit compare is a timing oracle the auth spec forbids, so this is mandatory.
+# RustCrypto, MIT, pure Rust, no transitive deps.
+subtle = { version = "2", default-features = false }
+# `argon2`: Argon2id password hashing at the OWASP edge profile (m = 19 MiB, t = 2, p = 1) for the
+# username+password mechanism (#631). A password is low-entropy, so a memory-hard KDF (not a fast
+# hash) is correct. RustCrypto, MIT OR Apache-2.0, pure Rust; pulls `blake2` + `password-hash` (the
+# PHC-string parser, so a stored credential is the self-describing Argon2id PHC string), both
+# RustCrypto/pure-Rust on the allow-list. `default-features = false` + `alloc` + `password-hash` keeps
+# the surface minimal (the operator mints the PHC string out of band; the broker only verifies).
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
+# `zeroize`: best-effort zeroization of secret material on drop (the redacting newtype's `Drop`), with
+# a non-elidable write so the optimizer cannot remove the clear as dead (#635, docs/SECRETS.md). Apache-2.0
+# OR MIT, pure Rust, no transitive deps.
+zeroize = { version = "1", default-features = false }
+
 # Structured tracing (#16, #99). `tracing` is the instrumentation facade; `tracing-subscriber` (the
 # `fmt` + `json` features only, no `env-filter`/`ansi`, to keep the transitive surface minimal)
 # provides the JSON log layer compiled in BY DEFAULT. Both, and their whole transitive tree

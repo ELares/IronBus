@@ -123,8 +123,6 @@ use ironbus_server::engine::{DiskFullPolicy, DurabilityLevel, Engine, EngineConf
 #[cfg(unix)]
 use ironbus_server::health::serve_health;
 #[cfg(unix)]
-use ironbus_server::server::serve;
-#[cfg(unix)]
 use ironbus_storage::admin::{inspect_cursors, CursorStatus};
 #[cfg(all(unix, feature = "zstd"))]
 use ironbus_storage::dict_store::{CachingDictResolver, DictSidecarStore, DICTS_SUBDIR};
@@ -1676,7 +1674,59 @@ struct ParsedServe {
     /// opts into the additive metadata-Raft plane (#682/#683): the metadata quorum runs, but the
     /// DATA-plane produce/consume replication (#686/#691) is the FLAGGED follow-up, NOT this PR.
     cluster: Option<ClusterConfig>,
+    /// The transport-security material + auth references + pre-auth `DoS` knobs (#629/#631/#633, V2-M7),
+    /// resolved from the `--tls-*` / `--auth-config` / `--*-preauth-*` flags. Carried as one bundle so
+    /// the (large) `ServeConfig` and its `Default` stay untouched. `cmd_serve` runs the fail-closed
+    /// bind invariant against it (a non-loopback `--addr` requires TLS material AND an auth identity,
+    /// validated pre-listen) and loads the identity table from it.
+    transport: TransportSecurityFlags,
 }
+
+/// The raw transport-security flag references (#629/#631/#633), before the bind guard validates them.
+/// These are PATHS and counts, not loaded material — the `StrictModes` check and the identity-table
+/// load happen at `cmd_serve` (Unix, file IO), after the bind classification decides whether they are
+/// even required.
+#[derive(Clone, Debug, Default)]
+struct TransportSecurityFlags {
+    /// `--tls-cert` PEM path (the server certificate chain), or `None`.
+    tls_cert: Option<String>,
+    /// `--tls-key` PEM path (the server private key), or `None`.
+    tls_key: Option<String>,
+    /// `--tls-client-ca` PEM path (the mTLS client-CA trust anchor), or `None`. When present it is
+    /// BOTH TLS material and a configured auth identity.
+    tls_client_ca: Option<String>,
+    /// `--auth-config` path (the credential-bearing identity table), or `None`.
+    auth_config: Option<String>,
+    /// `--max-preauth-connections`: the half-open (pre-auth) connection cap (default 128).
+    max_preauth_connections: usize,
+    /// `--preauth-rate-per-ip`: the per-source-IP connection rate, connections/sec (default 10).
+    preauth_rate_per_ip: u32,
+    /// `--auth-failure-lockout`: the failed-auth lockout threshold (default 5).
+    auth_failure_lockout: u32,
+}
+
+impl TransportSecurityFlags {
+    /// Whether TLS material is configured (#629): a server certificate AND its private key, OR a
+    /// client-CA trust anchor (mTLS), so the listener could complete a TLS 1.3 handshake. This is the
+    /// "TLS material is configured" half of the fail-closed bind precondition.
+    fn has_tls_material(&self) -> bool {
+        (self.tls_cert.is_some() && self.tls_key.is_some()) || self.tls_client_ca.is_some()
+    }
+
+    /// Whether at least one auth identity is configured (#631): an identity-table file OR an mTLS
+    /// client-CA trust anchor (a client cert that verifies against it is an authenticated network
+    /// client). This is the "an auth identity is configured" half of the precondition.
+    fn has_auth_identity(&self) -> bool {
+        self.auth_config.is_some() || self.tls_client_ca.is_some()
+    }
+}
+
+/// The safe defaults for the pre-auth `DoS` knobs (#633, `docs/TRANSPORT.md` section 3): conservative
+/// because IronBus connections are long-lived and reconnect rarely, so a legitimate client sits far
+/// below them. On by default for a non-loopback bind; inert on loopback.
+const DEFAULT_MAX_PREAUTH_CONNECTIONS: usize = 128;
+const DEFAULT_PREAUTH_RATE_PER_IP: u32 = 10;
+const DEFAULT_AUTH_FAILURE_LOCKOUT: u32 = 5;
 
 fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     // Production reads the real process environment through the injected seam; tests drive
@@ -1692,6 +1742,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         parsed.health_addr.as_deref(),
         &parsed.config_warnings,
         parsed.cluster.as_ref(),
+        &parsed.transport,
         ReloadSource {
             config_path: parsed.config_path.as_deref(),
             allow_unknown_config: parsed.allow_unknown_config,
@@ -1852,6 +1903,37 @@ struct ServeFlags {
     /// is a typed usage error. Empty (no `--cluster-peer`) = the single-node default, no cluster.
     /// CLI-only and repeatable, exactly like `--key-shared-group`.
     cluster_peers: Vec<String>,
+    /// The TLS server certificate chain file (#629, V2-M7): a PEM path. Part of the "TLS material"
+    /// the fail-closed bind invariant requires for a non-loopback bind. Sourced by REFERENCE (a path,
+    /// never an inline secret). The actual TLS 1.3 handshake wiring (rustls) is the FLAGGED follow-up;
+    /// this flag makes "TLS material is configured" a checkable startup precondition.
+    tls_cert: Option<String>,
+    /// The TLS server PRIVATE KEY file (#629): a PEM path. The most sensitive on-box material, so it
+    /// is subject to the fail-closed `StrictModes` secret-file-permission check at boot (group/world
+    /// readable or wrong-owner refuses to start). Sourced by reference.
+    tls_key: Option<String>,
+    /// The TLS CLIENT-CA trust anchor file for mTLS (#629/#631): a PEM path. When set, it is BOTH TLS
+    /// material and a configured auth identity (a client cert that verifies against it is an
+    /// authenticated network client), so it satisfies the bind invariant's precondition on its own.
+    tls_client_ca: Option<String>,
+    /// The connection-scoped AUTH IDENTITY-TABLE file (#631): a path to the credential-bearing config
+    /// (bearer-token digests, Argon2id PHC strings, accepted mTLS SAN identities, each with a scope
+    /// set). Sourced by reference and subject to the `StrictModes` permission check (it carries secret
+    /// hashes). When set (or when `--tls-client-ca` is set), "an auth identity is configured" holds.
+    auth_config: Option<String>,
+    /// The half-open (pre-auth) connection cap (#633): the maximum connections accepted but not yet
+    /// authenticated at any instant. `None` -> the safe default (128). On by default for a
+    /// non-loopback bind; inert on loopback. Bounds a handshake-flood pile-up independently of the
+    /// (larger) global connection cap.
+    max_preauth_connections: Option<usize>,
+    /// The per-source-IP new-connection rate limit (#633), connections/sec, token-bucket. `None` ->
+    /// the safe default (10/s). The per-source control the global cap lacks; on by default for a
+    /// non-loopback bind, inert on loopback.
+    preauth_rate_per_ip: Option<u32>,
+    /// The failed-auth lockout threshold (#633): after N failed authentication attempts from a source
+    /// the broker applies an escalating accept-time delay. `None` -> the safe default (5). On by
+    /// default for a non-loopback bind, inert on loopback.
+    auth_failure_lockout: Option<u32>,
 }
 
 /// Collects the `serve` arg list into [`ServeFlags`], each knob `Some` only if its flag appeared.
@@ -2049,6 +2131,23 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             }
             "--otlp-endpoint" => {
                 f.otlp_endpoint = Some(take_value("--otlp-endpoint", args, &mut i)?);
+            }
+            // Transport-security material + auth + pre-auth DoS knobs (#629/#631/#633, V2-M7).
+            "--tls-cert" => f.tls_cert = Some(take_value("--tls-cert", args, &mut i)?),
+            "--tls-key" => f.tls_key = Some(take_value("--tls-key", args, &mut i)?),
+            "--tls-client-ca" => {
+                f.tls_client_ca = Some(take_value("--tls-client-ca", args, &mut i)?);
+            }
+            "--auth-config" => f.auth_config = Some(take_value("--auth-config", args, &mut i)?),
+            "--max-preauth-connections" => {
+                f.max_preauth_connections =
+                    Some(take_number("--max-preauth-connections", args, &mut i)?);
+            }
+            "--preauth-rate-per-ip" => {
+                f.preauth_rate_per_ip = Some(take_number("--preauth-rate-per-ip", args, &mut i)?);
+            }
+            "--auth-failure-lockout" => {
+                f.auth_failure_lockout = Some(take_number("--auth-failure-lockout", args, &mut i)?);
             }
             flag if flag.starts_with("--") => {
                 return Err(CliError::Usage(format!("unknown flag `{flag}` for serve")))
@@ -2490,6 +2589,33 @@ fn parse_serve_flags_with_env_and_reader(
         // set of cluster flags builds a `ClusterConfig` here; a malformed peer spec or a missing
         // `--cluster-id` is a typed usage error (fail-closed), surfaced by `?` before any side effect.
         cluster: parse_cluster_config(f.cluster_id, &f.cluster_peers)?,
+        // Transport security material + auth references + pre-auth DoS knobs (#629/#631/#633): paths
+        // resolved with flag > env > default; the bind guard + StrictModes + identity-table load run
+        // at `cmd_serve` (after the bind is classified). The DoS knobs take their safe defaults.
+        transport: TransportSecurityFlags {
+            tls_cert: resolve_opt_string("--tls-cert", f.tls_cert, env),
+            tls_key: resolve_opt_string("--tls-key", f.tls_key, env),
+            tls_client_ca: resolve_opt_string("--tls-client-ca", f.tls_client_ca, env),
+            auth_config: resolve_opt_string("--auth-config", f.auth_config, env),
+            max_preauth_connections: resolve_number(
+                "--max-preauth-connections",
+                f.max_preauth_connections,
+                env,
+                DEFAULT_MAX_PREAUTH_CONNECTIONS,
+            )?,
+            preauth_rate_per_ip: resolve_number(
+                "--preauth-rate-per-ip",
+                f.preauth_rate_per_ip,
+                env,
+                DEFAULT_PREAUTH_RATE_PER_IP,
+            )?,
+            auth_failure_lockout: resolve_number(
+                "--auth-failure-lockout",
+                f.auth_failure_lockout,
+                env,
+                DEFAULT_AUTH_FAILURE_LOCKOUT,
+            )?,
+        },
     };
     // Fold in the FILE layer's non-fatal warnings and its explicit-retention-request flag, then run
     // the WHOLE-config coupled-set validation as a UNIT (#86, #382, docs/CONFIG.md section 4): every
@@ -2795,6 +2921,7 @@ fn finish_serve(
     health_addr: Option<&str>,
     config_warnings: &[String],
     cluster: Option<&ClusterConfig>,
+    transport: &TransportSecurityFlags,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -2843,6 +2970,7 @@ fn finish_serve(
         health_addr,
         config_warnings,
         cluster,
+        transport,
         reload,
         out,
     )
@@ -3557,6 +3685,341 @@ fn health_bind_decision(haddr: &str, allow_public: bool) -> Result<HealthBindDec
     })
 }
 
+/// The outcome of THE FAIL-CLOSED WIRE-BIND INVARIANT (#629, V2-M7, `docs/TRANSPORT.md` section 2): the
+/// load-bearing safety property that a non-loopback `--addr` cannot serve plaintext/anonymous traffic
+/// by construction. Carries only whether the bind requires transport security (true for a non-loopback
+/// bind, which by the time this exists has ALREADY passed the precondition).
+#[cfg(any(unix, test))]
+#[derive(Debug)]
+struct WireBindDecision {
+    /// `true` for a non-loopback bind (TLS + auth are required and were verified present), so the
+    /// startup log states the protected posture; `false` for a loopback (zero-config dev) bind.
+    requires_security: bool,
+}
+
+/// Classifies the wire `--addr` loopback-vs-non-loopback by the SAME rule as the health bind: a bind
+/// is loopback only when EVERY resolved address is loopback (`127.0.0.0/8` or `::1`); the wildcards
+/// `0.0.0.0`/`::` are non-loopback (they expose every interface). Resolution is on the RESOLVED
+/// address, not the literal string, so a hostname that maps to a routable IP is non-loopback.
+///
+/// # Errors
+/// [`CliError::Usage`] if the address cannot be resolved (a typo fails closed, never binds nothing).
+#[cfg(any(unix, test))]
+fn resolve_and_classify_wire_bind(addr: &str) -> Result<bool, CliError> {
+    let resolved: Vec<SocketAddr> = addr
+        .to_socket_addrs()
+        .map_err(|e| {
+            CliError::Usage(format!(
+                "`--addr` value `{addr}` could not be resolved to an address: {e}"
+            ))
+        })?
+        .collect();
+    if resolved.is_empty() {
+        return Err(CliError::Usage(format!(
+            "`--addr` value `{addr}` resolved to no address"
+        )));
+    }
+    Ok(resolved.iter().all(|a| a.ip().is_loopback()))
+}
+
+/// THE FAIL-CLOSED WIRE-BIND INVARIANT (#629, V2-M7): a NON-LOOPBACK `--addr` is permitted ONLY when
+/// BOTH TLS material AND an auth identity are configured; otherwise the broker refuses to start with a
+/// typed usage error and NEVER opens a listener. Unlike `--health-allow-public`, there is NO override:
+/// a public wire bind cannot be plaintext or anonymous. A loopback bind needs neither (the zero-config
+/// dev path). The check is on the RESOLVED address and runs PRE-LISTEN.
+///
+/// Both halves are required because each closes a different hole: TLS without auth gives an encrypted
+/// channel to an anonymous-anyone broker; auth without TLS sends the credential in plaintext over the
+/// network. A configured mTLS client-CA satisfies both halves at once.
+///
+/// # Errors
+/// [`CliError::Usage`] if `--addr` does not resolve, or if it is non-loopback and TLS material and/or
+/// an auth identity is missing (the actionable refusal naming `--addr` and the missing precondition).
+#[cfg(any(unix, test))]
+fn wire_bind_decision(
+    addr: &str,
+    transport: &TransportSecurityFlags,
+) -> Result<WireBindDecision, CliError> {
+    let loopback = resolve_and_classify_wire_bind(addr)?;
+    if loopback {
+        // Loopback MAY run without TLS/auth, silently: the trust boundary is the host itself, and the
+        // same-host CLI/tooling must work with zero configuration (byte-for-byte unchanged).
+        return Ok(WireBindDecision {
+            requires_security: false,
+        });
+    }
+    // Non-loopback: BOTH preconditions must hold, or refuse to start (fail-closed, pre-listen).
+    let has_tls = transport.has_tls_material();
+    let has_auth = transport.has_auth_identity();
+    if !has_tls || !has_auth {
+        return Err(wire_non_loopback_refusal(addr, has_tls, has_auth));
+    }
+    Ok(WireBindDecision {
+        requires_security: true,
+    })
+}
+
+/// The fail-closed `StrictModes` secret-file permission check (#635, V2-M7, `docs/SECRETS.md` "The
+/// fail-closed permission check"). Before opening any listener, the broker stats every secret-bearing
+/// file it was told to source and REFUSES to start if the file is unsafe, matching OpenSSH
+/// `StrictModes`:
+///
+/// - Group- or world-readable/writable is fatal: a mode with ANY bit in `0o077` set
+///   (`mode & 0o077 != 0`) is rejected (a secret a group or the world can read is not a secret).
+/// - Wrong owner is fatal: a secret file not owned by the user the broker runs as is rejected (a
+///   `0o600` file owned by another user is still readable by that user).
+///
+/// The error names the offending path and the failing condition; it NEVER reads or logs the file
+/// contents. A missing or unreadable file is also fatal (fail closed, never a silent no-secret).
+#[cfg(unix)]
+fn strict_mode_check_secret_file(path: &str) -> Result<(), CliError> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).map_err(|e| {
+        CliError::Usage(format!(
+            "refusing to start: secret-bearing file `{path}` could not be read ({e}); a configured \
+             secret reference must resolve to a readable, owner-only file"
+        ))
+    })?;
+    // `mode & 0o077`: any group/other read/write/execute bit is fatal.
+    let mode = meta.mode();
+    if mode & 0o077 != 0 {
+        return Err(CliError::Usage(format!(
+            "refusing to start: secret-bearing file `{path}` is group- or world-accessible (mode \
+             {:o}); a secret must be owner-only (chmod 0600). The file contents were not read.",
+            mode & 0o7777
+        )));
+    }
+    // Wrong-owner: a 0600 file owned by ANOTHER user is still readable by that user.
+    let uid = meta.uid();
+    let our_uid = unsafe_getuid();
+    if uid != our_uid && our_uid != 0 {
+        return Err(CliError::Usage(format!(
+            "refusing to start: secret-bearing file `{path}` is owned by uid {uid}, not the broker's \
+             uid {our_uid}; a secret file must be owned by the user the broker runs as. The file \
+             contents were not read."
+        )));
+    }
+    Ok(())
+}
+
+/// The broker process's real user id, for the `StrictModes` wrong-owner check (#635). `libc::getuid`
+/// is always-successful and the only FFI here; `libc` is already a pure-Rust syscall binding in the
+/// shipped graph (the data-dir lock uses `flock(2)` the same way).
+#[cfg(unix)]
+fn unsafe_getuid() -> u32 {
+    // SAFETY: getuid() takes no arguments, never fails, and only reads the process's real uid.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::getuid()
+    }
+}
+
+/// Loads + validates the auth identity table referenced by `--auth-config` (and `StrictModes`-checks
+/// every secret-bearing file the transport config names), returning the in-memory [`AuthConfig`] the
+/// accept loop pins per connection, or `None` when no auth identity is configured (the no-auth
+/// loopback-dev broker). All secret-bearing files (the auth-config table, the TLS private key) are
+/// `StrictModes`-checked BEFORE any listener opens, so a group/world-readable secret fails closed.
+///
+/// The identity-table file format is TOML (`docs/AUTHENTICATION.md` "Configuration surface"): a list of
+/// `[[identity]]` tables, each with a `name`, a `scopes` list drawn from `{publish, subscribe,
+/// admin}`, and exactly one mechanism's additive credential list (`token_hashes`, or `username` +
+/// `password_hashes` PHC strings, or `mtls_san`). Secrets are the stored HASHES, never plaintext.
+///
+/// # Errors
+/// [`CliError::Usage`] for a missing/unsafe secret file (`StrictModes`), a malformed table, an unknown
+/// scope, or a credential that does not parse (a fail-closed reject, never a silent skip).
+#[cfg(unix)]
+fn load_auth_config(
+    transport: &TransportSecurityFlags,
+) -> Result<Option<std::sync::Arc<ironbus_server::auth::AuthConfig>>, CliError> {
+    use ironbus_server::auth::{AuthConfig, Identity, Scope, ScopeSet};
+    // StrictModes-check the TLS private key first if present (the most sensitive on-box material).
+    if let Some(key) = &transport.tls_key {
+        strict_mode_check_secret_file(key)?;
+    }
+    let Some(path) = &transport.auth_config else {
+        // No identity-table file. An mTLS client-CA alone is a configured auth identity, but it maps
+        // certificates to scopes via the (flagged) TLS layer; with no table there are no
+        // bearer/password identities to load, so the in-memory table is empty here. The bind
+        // invariant has already accepted a client-CA as satisfying the precondition.
+        return Ok(None);
+    };
+    // The identity-table file carries credential HASHES, so it is StrictModes-checked fail-closed.
+    strict_mode_check_secret_file(path)?;
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| CliError::Usage(format!("cannot read --auth-config `{path}`: {e}")))?;
+    let parsed: toml::Value = raw
+        .parse()
+        .map_err(|e| CliError::Usage(format!("--auth-config `{path}` is not valid TOML: {e}")))?;
+    let identities = parsed
+        .get("identity")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            CliError::Usage(format!(
+                "--auth-config `{path}` must contain at least one `[[identity]]` table"
+            ))
+        })?;
+    let mut cfg = AuthConfig::new();
+    for (i, ident) in identities.iter().enumerate() {
+        let name = ident
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| {
+                CliError::Usage(format!(
+                    "--auth-config identity #{i} is missing a string `name`"
+                ))
+            })?
+            .to_string();
+        // Scopes: an explicit list, no implication. An unknown scope is a fail-closed reject.
+        let mut scopes = ScopeSet::empty();
+        let scope_list = ident
+            .get("scopes")
+            .and_then(toml::Value::as_array)
+            .ok_or_else(|| {
+                CliError::Usage(format!(
+                    "--auth-config identity `{name}` needs a `scopes` list (any of publish, \
+                     subscribe, admin)"
+                ))
+            })?;
+        for s in scope_list {
+            let s = s.as_str().ok_or_else(|| {
+                CliError::Usage(format!(
+                    "--auth-config identity `{name}` has a non-string scope"
+                ))
+            })?;
+            let scope = match s {
+                "publish" => Scope::Publish,
+                "subscribe" => Scope::Subscribe,
+                "admin" => Scope::Admin,
+                other => {
+                    return Err(CliError::Usage(format!(
+                        "--auth-config identity `{name}` has unknown scope `{other}` (expected \
+                         publish, subscribe, or admin)"
+                    )))
+                }
+            };
+            scopes.grant(scope);
+        }
+        // Exactly one mechanism per identity, by which credential list is present.
+        let credential = load_one_credential(&name, ident).map_err(CliError::Usage)?;
+        cfg.add_identity(Identity {
+            name,
+            scopes,
+            credential,
+        });
+    }
+    Ok(Some(std::sync::Arc::new(cfg)))
+}
+
+/// Loads exactly one identity's additive credential set from its `[[identity]]` TOML table (#631),
+/// dispatching on which mechanism's key is present (`token_hashes`, `username`+`password_hashes`, or
+/// `mtls_san`). Exactly one must be present; zero or more than one is a fail-closed reject.
+#[cfg(unix)]
+fn load_one_credential(
+    name: &str,
+    ident: &toml::Value,
+) -> Result<ironbus_server::auth::CredentialSet, String> {
+    use ironbus_server::auth::{parse_token_digest_hex, CredentialSet, Secret};
+    let has_token = ident.get("token_hashes").is_some();
+    let has_password = ident.get("password_hashes").is_some() || ident.get("username").is_some();
+    let has_mtls = ident.get("mtls_san").is_some();
+    let count = usize::from(has_token) + usize::from(has_password) + usize::from(has_mtls);
+    if count != 1 {
+        return Err(format!(
+            "identity `{name}` must declare EXACTLY one mechanism: `token_hashes`, or \
+             `username`+`password_hashes`, or `mtls_san` (found {count})"
+        ));
+    }
+    if has_token {
+        let arr = ident
+            .get("token_hashes")
+            .and_then(toml::Value::as_array)
+            .ok_or_else(|| {
+                format!("identity `{name}` `token_hashes` must be a list of hex digests")
+            })?;
+        let mut digests = Vec::with_capacity(arr.len());
+        for h in arr {
+            let hex = h
+                .as_str()
+                .ok_or_else(|| format!("identity `{name}` has a non-string token hash"))?;
+            digests
+                .push(parse_token_digest_hex(hex).map_err(|e| format!("identity `{name}`: {e}"))?);
+        }
+        if digests.is_empty() {
+            return Err(format!("identity `{name}` `token_hashes` is empty"));
+        }
+        return Ok(CredentialSet::Bearer { digests });
+    }
+    if has_password {
+        let username = ident
+            .get("username")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| format!("identity `{name}` password mechanism needs a `username`"))?
+            .to_string();
+        let arr = ident
+            .get("password_hashes")
+            .and_then(toml::Value::as_array)
+            .ok_or_else(|| {
+                format!("identity `{name}` needs a `password_hashes` list of Argon2id PHC strings")
+            })?;
+        let mut phc_hashes = Vec::with_capacity(arr.len());
+        for h in arr {
+            let phc = h
+                .as_str()
+                .ok_or_else(|| format!("identity `{name}` has a non-string password hash"))?;
+            phc_hashes.push(Secret::new(phc.as_bytes().to_vec()));
+        }
+        if phc_hashes.is_empty() {
+            return Err(format!("identity `{name}` `password_hashes` is empty"));
+        }
+        return Ok(CredentialSet::Password {
+            username,
+            phc_hashes,
+        });
+    }
+    // mTLS SAN identities.
+    let arr = ident
+        .get("mtls_san")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| format!("identity `{name}` `mtls_san` must be a list of SAN identities"))?;
+    let mut san_identities = Vec::with_capacity(arr.len());
+    for s in arr {
+        san_identities.push(
+            s.as_str()
+                .ok_or_else(|| format!("identity `{name}` has a non-string SAN"))?
+                .to_string(),
+        );
+    }
+    if san_identities.is_empty() {
+        return Err(format!("identity `{name}` `mtls_san` is empty"));
+    }
+    Ok(ironbus_server::auth::CredentialSet::Mtls { san_identities })
+}
+
+/// The fatal usage error for a non-loopback `--addr` that lacks TLS material and/or an auth identity
+/// (#629). Names the address, says exactly which precondition(s) failed, and points at the flags that
+/// satisfy them. There is deliberately no override flag to mention: the only ways out are configure
+/// TLS+auth, or bind a loopback address.
+#[cfg(any(unix, test))]
+fn wire_non_loopback_refusal(addr: &str, has_tls: bool, has_auth: bool) -> CliError {
+    let missing = match (has_tls, has_auth) {
+        (false, false) => "BOTH TLS material AND an auth identity",
+        (false, true) => "TLS material (a server certificate + key, or an mTLS client-CA)",
+        (true, false) => "an auth identity (an --auth-config identity table, or an mTLS client-CA)",
+        (true, true) => "nothing", // unreachable: the caller only refuses when one is missing
+    };
+    CliError::Usage(format!(
+        "refusing to bind non-loopback wire address `{addr}` without transport security ({missing} \
+         missing). A non-loopback bind REQUIRES BOTH: TLS material (set --tls-cert and --tls-key, or \
+         --tls-client-ca for mTLS) AND at least one auth identity (set --auth-config, or \
+         --tls-client-ca for mTLS). There is NO override: a public wire bind cannot be plaintext or \
+         anonymous by construction. To run without TLS and auth, bind a loopback address (the \
+         default 127.0.0.1:7777). NOTE: the TLS 1.3 handshake itself (rustls) is the flagged \
+         follow-up; this build ENFORCES the precondition and the auth/scope model, so a public bind \
+         that lacks the material is refused here regardless."
+    ))
+}
+
 /// Builds the MATERIALIZED-CONFIG line (#87): one structured `key=value` line carrying the active
 /// profile, the [`PROFILE_SCHEMA_VERSION`], and EVERY resolved tuning knob, so an operator can see
 /// exactly what a broker is running and a profile content change is auditable across an upgrade. It
@@ -3672,6 +4135,7 @@ fn cmd_serve(
     health_addr: Option<&str>,
     config_warnings: &[String],
     cluster: Option<&ClusterConfig>,
+    transport: &TransportSecurityFlags,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -3705,6 +4169,43 @@ fn cmd_serve(
         Some(haddr) => Some(health_bind_decision(haddr, config.health_allow_public)?),
         None => None,
     };
+
+    // THE FAIL-CLOSED BIND INVARIANT (#629, V2-M7, docs/TRANSPORT.md section 2) — the load-bearing
+    // safety property, FAIL-CLOSED and BEFORE any side effect (no data dir touched, no lock, no
+    // listener). A NON-LOOPBACK `--addr` is permitted ONLY when BOTH TLS material AND an auth identity
+    // are configured; if either is missing the broker refuses to start with a typed usage error and
+    // NEVER opens a listener. There is NO override flag (unlike `--health-allow-public`): a public
+    // wire bind cannot be plaintext or anonymous by construction. A loopback bind needs neither (the
+    // zero-config dev path, byte-for-byte unchanged). The validation runs PRE-LISTEN, so there is no
+    // window where an unprotected non-loopback wire socket accepts a connection.
+    let wire_bind = wire_bind_decision(addr, transport)?;
+    // Load + validate the auth identity table (and StrictModes-check every secret-bearing file) IFF
+    // an auth identity is configured. This is the in-memory `AuthConfig` the accept loop pins per
+    // connection; `None` is the no-auth (loopback-dev) broker. Done AFTER the bind guard so a
+    // misconfigured non-loopback bind fails on the invariant first, and BEFORE any listener so a bad
+    // secret file fails closed pre-listen.
+    let auth = load_auth_config(transport)?;
+    // Surface the resolved transport posture in the startup log (no secret material, only paths and
+    // the on/off shape), so an operator can see what protects the bind. The pre-auth DoS knobs
+    // (#633) are RESOLVED and surfaced here; their ENFORCEMENT in the accept loop (the per-IP token
+    // bucket + half-open cap + connections_rejected_total{reason}) is the FLAGGED follow-up — the
+    // knobs and their safe defaults exist so the config surface is stable, but this PR does not yet
+    // throttle, so an operator reads the intended values and knows enforcement is pending.
+    if wire_bind.requires_security {
+        writeln!(
+            out,
+            "transport: non-loopback wire bind {addr} requires TLS + auth (fail-closed bind \
+             invariant): tls_material={}, auth_identity={}, preauth_dos[max_preauth_connections={}, \
+             preauth_rate_per_ip={}/s, auth_failure_lockout={}] (ENFORCEMENT flagged; the TLS 1.3 \
+             handshake itself is also the flagged follow-up; this build enforces the bind \
+             precondition and the auth/scope model)",
+            transport.has_tls_material(),
+            transport.has_auth_identity(),
+            transport.max_preauth_connections,
+            transport.preauth_rate_per_ip,
+            transport.auth_failure_lockout,
+        )?;
+    }
 
     // The storage-backend dispatch (#443): a TWO-ARMED STATIC match, each arm monomorphizing the
     // generic [`run_broker`] over its concrete filesystem (`StdFs` / `EphemeralFs`). The whole serve
@@ -3744,6 +4245,7 @@ fn cmd_serve(
                 health_bind,
                 config_warnings,
                 cluster_runtime,
+                auth,
                 reload,
                 out,
             )
@@ -3775,6 +4277,7 @@ fn cmd_serve(
                 health_bind,
                 config_warnings,
                 None,
+                auth,
                 reload,
                 out,
             )
@@ -3855,6 +4358,7 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     health_bind: Option<HealthBindDecision>,
     config_warnings: &[String],
     cluster_runtime: Option<ClusterRuntime>,
+    auth: Option<std::sync::Arc<ironbus_server::auth::AuthConfig>>,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -4028,13 +4532,18 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     // The wire accept loop ticks the liveness beacon (#95) on its OWN clock clone (same origin), so
     // `/healthz` measures the accept loop's progress. The clone keeps the original `health_clock`
     // available above for the health server's own reads.
-    let result = serve(
+    // The accept loop pins the connection-scoped auth table per connection (#631): with `Some(_)`
+    // every Connect must authenticate and verbs are scope-gated; with `None` the gate is bypassed
+    // (the no-auth loopback-dev broker, byte-for-byte unchanged). The fail-closed bind invariant has
+    // already guaranteed that a NON-LOOPBACK bind cannot reach here with `auth = None` AND no TLS.
+    let result = ironbus_server::server::serve_with_auth(
         &listener,
         &shared,
         &shutdown,
         config.max_connections,
         &health_clock.clone(),
         &progress,
+        auth,
     )
     .map_err(|e| CliError::Internal(format!("serve loop failed: {e}")));
     // The wire serve returns only when shutdown is set (a stop signal, or a fatal listener error that
@@ -4589,6 +5098,7 @@ fn cmd_serve(
     health_addr: Option<&str>,
     config_warnings: &[String],
     cluster: Option<&ClusterConfig>,
+    transport: &TransportSecurityFlags,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -4725,6 +5235,18 @@ fn cmd_serve(
         // `-D warnings` build trips unused-variable, invisible to a macOS reviewer (the recurring
         // #288/#99 footgun). Reach an inner field so the `ClusterConfig` type is exercised here too.
         cluster.map(|c| c.node_id),
+        // The transport-security flags (#629/#631/#633) are read only on the Unix serve path (the
+        // fail-closed bind invariant + StrictModes + identity-table load), so the non-Unix stub must
+        // consume them too or the Windows `-D warnings` build trips unused-variable, invisible to a
+        // macOS reviewer (the recurring #288/#99 footgun). `serve` is Unix-only, so the non-Unix path
+        // never enforces the invariant; it only references the fields here.
+        transport.tls_cert.is_some(),
+        transport.tls_key.is_some(),
+        transport.tls_client_ca.is_some(),
+        transport.auth_config.is_some(),
+        transport.max_preauth_connections,
+        transport.preauth_rate_per_ip,
+        transport.auth_failure_lockout,
         out,
     );
     Err(CliError::Internal(
@@ -10652,6 +11174,7 @@ mod tests {
             parsed.health_addr.as_deref(),
             &parsed.config_warnings,
             parsed.cluster.as_ref(),
+            &parsed.transport,
             ReloadSource {
                 config_path: parsed.config_path.as_deref(),
                 allow_unknown_config: parsed.allow_unknown_config,
@@ -11490,14 +12013,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         assert!(!dir.exists());
         let mut buf = Vec::new();
-        // Port 0 binds fine, so use a host the OS refuses to bind to force a post-prepare error.
+        // Port 0 binds fine, so use a LOOPBACK address the OS refuses to bind to force a post-prepare
+        // error. `127.0.0.1:1` is loopback (so it passes the #629 fail-closed bind invariant, which
+        // would otherwise refuse a NON-loopback bind without TLS+auth BEFORE the data dir is touched)
+        // yet port 1 is privileged, so a non-root test binds it with EACCES — failing at the bind step
+        // AFTER the data dir is prepared, exactly as this test needs.
         let e = run(
             &[
                 "serve".to_string(),
                 "--data-dir".to_string(),
                 dir.display().to_string(),
                 "--addr".to_string(),
-                "240.0.0.1:1".to_string(),
+                "127.0.0.1:1".to_string(),
             ],
             &mut buf,
         )
@@ -11708,6 +12235,241 @@ mod tests {
             "an acknowledged non-loopback bind warns loudly"
         );
         assert!(!d.addrs.is_empty(), "it resolves an address to bind");
+    }
+
+    // ---- The fail-closed WIRE-BIND invariant (#629, V2-M7) — the load-bearing security property ----
+
+    fn ts(
+        tls_cert: Option<&str>,
+        tls_key: Option<&str>,
+        tls_client_ca: Option<&str>,
+        auth_config: Option<&str>,
+    ) -> TransportSecurityFlags {
+        TransportSecurityFlags {
+            tls_cert: tls_cert.map(str::to_string),
+            tls_key: tls_key.map(str::to_string),
+            tls_client_ca: tls_client_ca.map(str::to_string),
+            auth_config: auth_config.map(str::to_string),
+            max_preauth_connections: DEFAULT_MAX_PREAUTH_CONNECTIONS,
+            preauth_rate_per_ip: DEFAULT_PREAUTH_RATE_PER_IP,
+            auth_failure_lockout: DEFAULT_AUTH_FAILURE_LOCKOUT,
+        }
+    }
+
+    #[test]
+    fn a_non_loopback_bind_without_tls_and_auth_is_refused_before_listen() {
+        // THE must-have: a public (non-loopback) wire bind with NEITHER TLS material NOR an auth
+        // identity is REFUSED with a typed usage error, BEFORE any listener. No override exists.
+        let empty = ts(None, None, None, None);
+        let e = wire_bind_decision("0.0.0.0:7777", &empty).unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => {
+                assert!(m.contains("0.0.0.0:7777"), "names the address: {m}");
+                assert!(m.contains("BOTH TLS material AND an auth identity"), "{m}");
+                assert!(
+                    m.contains("NO override"),
+                    "states there is no escape hatch: {m}"
+                );
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        // TLS but no auth: still refused (encrypted channel to an anonymous-anyone broker).
+        let tls_only = ts(Some("/c.pem"), Some("/k.pem"), None, None);
+        assert!(wire_bind_decision("203.0.113.5:7777", &tls_only).is_err());
+        // Auth but no TLS: still refused (credential in plaintext over the network).
+        let auth_only = ts(None, None, None, Some("/auth.toml"));
+        assert!(wire_bind_decision("203.0.113.5:7777", &auth_only).is_err());
+    }
+
+    #[test]
+    fn a_non_loopback_bind_with_both_tls_and_auth_is_permitted() {
+        // TLS material (cert+key) AND an auth identity (the table) satisfies the precondition.
+        let both = ts(Some("/c.pem"), Some("/k.pem"), None, Some("/auth.toml"));
+        let d = wire_bind_decision("0.0.0.0:7777", &both).unwrap();
+        assert!(d.requires_security, "a non-loopback bind requires security");
+        // An mTLS client-CA satisfies BOTH halves at once (it is TLS material AND an auth identity).
+        let mtls = ts(Some("/c.pem"), Some("/k.pem"), Some("/ca.pem"), None);
+        assert!(
+            wire_bind_decision("0.0.0.0:7777", &mtls)
+                .unwrap()
+                .requires_security
+        );
+        // A client-CA alone (no server cert/key) is BOTH halves too, so it is permitted.
+        let ca_only = ts(None, None, Some("/ca.pem"), None);
+        assert!(
+            wire_bind_decision("198.51.100.9:7777", &ca_only)
+                .unwrap()
+                .requires_security
+        );
+    }
+
+    #[test]
+    fn a_loopback_bind_needs_neither_tls_nor_auth_zero_config_dev() {
+        // The loopback (zero-config dev) path: no TLS, no auth, and it is PERMITTED, silently — the
+        // dev experience is byte-for-byte unchanged.
+        let empty = ts(None, None, None, None);
+        for addr in ["127.0.0.1:7777", "127.0.0.5:7777", "[::1]:7777"] {
+            let d = wire_bind_decision(addr, &empty).unwrap();
+            assert!(
+                !d.requires_security,
+                "a loopback bind ({addr}) needs no transport security"
+            );
+        }
+    }
+
+    #[test]
+    fn the_wire_bind_classifies_loopback_vs_non_loopback_like_the_health_bind() {
+        assert!(resolve_and_classify_wire_bind("127.0.0.1:7777").unwrap());
+        assert!(resolve_and_classify_wire_bind("127.0.0.9:7777").unwrap());
+        assert!(resolve_and_classify_wire_bind("[::1]:7777").unwrap());
+        // The wildcard exposes every interface, so it is NOT loopback.
+        assert!(!resolve_and_classify_wire_bind("0.0.0.0:7777").unwrap());
+        assert!(!resolve_and_classify_wire_bind("[::]:7777").unwrap());
+        assert!(!resolve_and_classify_wire_bind("203.0.113.1:7777").unwrap());
+        // A typo fails closed (does not bind nothing).
+        assert!(resolve_and_classify_wire_bind("not-a-host-port").is_err());
+    }
+
+    #[test]
+    fn serve_parses_the_transport_security_flags() {
+        let set = parse_serve_flags(&[
+            "--data-dir".to_string(),
+            "/tmp/x".to_string(),
+            "--tls-cert".to_string(),
+            "/c.pem".to_string(),
+            "--tls-key".to_string(),
+            "/k.pem".to_string(),
+            "--auth-config".to_string(),
+            "/auth.toml".to_string(),
+            "--max-preauth-connections".to_string(),
+            "64".to_string(),
+            "--preauth-rate-per-ip".to_string(),
+            "5".to_string(),
+            "--auth-failure-lockout".to_string(),
+            "3".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(set.transport.tls_cert.as_deref(), Some("/c.pem"));
+        assert_eq!(set.transport.tls_key.as_deref(), Some("/k.pem"));
+        assert_eq!(set.transport.auth_config.as_deref(), Some("/auth.toml"));
+        assert_eq!(set.transport.max_preauth_connections, 64);
+        assert_eq!(set.transport.preauth_rate_per_ip, 5);
+        assert_eq!(set.transport.auth_failure_lockout, 3);
+        assert!(set.transport.has_tls_material() && set.transport.has_auth_identity());
+        // The DoS knobs take their safe defaults when absent.
+        let def = parse_serve_flags(&["--data-dir".to_string(), "/tmp/x".to_string()]).unwrap();
+        assert_eq!(
+            def.transport.max_preauth_connections,
+            DEFAULT_MAX_PREAUTH_CONNECTIONS
+        );
+        assert_eq!(
+            def.transport.preauth_rate_per_ip,
+            DEFAULT_PREAUTH_RATE_PER_IP
+        );
+        assert_eq!(
+            def.transport.auth_failure_lockout,
+            DEFAULT_AUTH_FAILURE_LOCKOUT
+        );
+        assert!(!def.transport.has_tls_material() && !def.transport.has_auth_identity());
+    }
+
+    #[test]
+    fn a_group_or_world_readable_secret_file_is_refused_at_boot() {
+        // The StrictModes check (#635): a 0o644 (group/world-readable) secret file fails closed.
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "x = 1").unwrap();
+        drop(f);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let e = strict_mode_check_secret_file(path.to_str().unwrap()).unwrap_err();
+        match e {
+            CliError::Usage(m) => {
+                assert!(m.contains("group- or world-accessible"), "{m}");
+                assert!(
+                    m.contains("contents were not read"),
+                    "never reads the file: {m}"
+                );
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        // The SAME file at 0o600 (owner-only) passes.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(strict_mode_check_secret_file(path.to_str().unwrap()).is_ok());
+        // A missing file fails closed.
+        assert!(strict_mode_check_secret_file("/no/such/secret/file").is_err());
+    }
+
+    #[test]
+    fn load_auth_config_parses_a_three_mechanism_identity_table() {
+        use ironbus_server::auth::Scope;
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.toml");
+        // A SHA-256 hex digest for a token (the broker stores only the digest).
+        let token_hex = {
+            use sha2::{Digest, Sha256};
+            use std::fmt::Write as _;
+            let d = Sha256::digest(b"a-token");
+            let mut s = String::new();
+            for b in d {
+                let _ = write!(s, "{b:02x}");
+            }
+            s
+        };
+        // A valid Argon2id PHC string for a password.
+        let phc = {
+            use argon2::password_hash::{PasswordHasher, SaltString};
+            use argon2::Argon2;
+            let salt = SaltString::encode_b64(b"a-fixed-test-salt").unwrap();
+            Argon2::default()
+                .hash_password(b"pw", &salt)
+                .unwrap()
+                .to_string()
+        };
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            "[[identity]]\nname = \"producer\"\nscopes = [\"publish\"]\ntoken_hashes = [\"{token_hex}\"]\n\n\
+             [[identity]]\nname = \"alice\"\nscopes = [\"subscribe\", \"admin\"]\nusername = \"alice\"\n\
+             password_hashes = [\"{phc}\"]\n\n\
+             [[identity]]\nname = \"fleet\"\nscopes = [\"publish\", \"subscribe\"]\n\
+             mtls_san = [\"spiffe://x/fleet\"]\n",
+        )
+        .unwrap();
+        drop(f);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let transport = ts(None, None, None, Some(path.to_str().unwrap()));
+        let cfg = load_auth_config(&transport)
+            .unwrap()
+            .expect("an auth config");
+        assert!(cfg.has_any_identity());
+        // Verify each mechanism authenticates with the right pinned scopes.
+        let (id, _) = cfg
+            .authenticate(
+                &ironbus_proto::message::AuthCredential {
+                    mechanism: ironbus_proto::message::AuthMechanism::Bearer,
+                    material: b"a-token".to_vec(),
+                },
+                None,
+            )
+            .unwrap();
+        assert!(id.scopes.has(Scope::Publish) && !id.scopes.has(Scope::Admin));
+        let (id2, _) = cfg
+            .authenticate(
+                &ironbus_proto::message::AuthCredential {
+                    mechanism: ironbus_proto::message::AuthMechanism::Password,
+                    material: ironbus_proto::message::pack_password_material(b"alice", b"pw")
+                        .unwrap(),
+                },
+                None,
+            )
+            .unwrap();
+        assert!(id2.scopes.has(Scope::Subscribe) && id2.scopes.has(Scope::Admin));
     }
 
     #[test]
@@ -12679,6 +13441,7 @@ mod tests {
             parsed.health_addr.as_deref(),
             &parsed.config_warnings,
             parsed.cluster.as_ref(),
+            &parsed.transport,
             ReloadSource {
                 config_path: parsed.config_path.as_deref(),
                 allow_unknown_config: parsed.allow_unknown_config,

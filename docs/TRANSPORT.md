@@ -8,16 +8,29 @@ checked. It is the network-boundary half of the security epic (#18); the
 credential model it leans on (auth identities, the three authorization scopes) is
 specified separately in #106.
 
-> **Status: specified, not yet implemented; tracked by #107.** None of the
-> controls below exist in the binary today. IronBus has no TLS, no auth, and no
-> at-rest encryption wired in right now, and the default bind is a localhost
-> *default*, not an *enforced* invariant. See
-> [THREAT_MODEL.md](THREAT_MODEL.md) for the honest current posture. This
-> document specifies the design; it does not describe shipped code, and it never
-> claims a control exists when it does not. Where it constrains the handshake it
-> cites #11 (the wire protocol and client API), where it adds a setting it cites
-> #14 (the configuration system), and where it closes a threat it cites #105 (the
-> threat model).
+> **Status (updated #629/#631/#633, V2-M7): the FAIL-CLOSED BIND INVARIANT
+> (section 2) is now IMPLEMENTED and enforced; the TLS 1.3 handshake itself
+> (section 1) and the pre-auth DoS *enforcement* (section 3) are FLAGGED
+> follow-ups.** What ships: a non-loopback `--addr` is refused at startup, before
+> any listener opens, with a typed usage error and NO override, unless BOTH TLS
+> material AND an auth identity are configured (the precondition is checked
+> pre-listen on the resolved address); loopback stays zero-config. The
+> connection-scoped auth model and the three-scope authorization (#631,
+> [AUTHENTICATION.md](AUTHENTICATION.md)) ship with it (bearer/password verify on
+> audited pure-Rust RustCrypto primitives; mTLS identity-mapping is wired but
+> needs the TLS layer to supply a verified peer certificate). What is FLAGGED: the
+> actual rustls TLS 1.3 handshake — its crypto provider is a deliberate
+> supply-chain decision (the only pure-Rust rustls provider available is an alpha
+> crate that pulls a C builder; `ring`/`aws-lc-sys` are on the `deny.toml` bans
+> list), so the encryption layer is the next PR rather than shipping a weak crypto
+> path; and the pre-auth DoS knobs (section 3) are parsed, validated, and surfaced
+> with safe defaults, but their accept-loop *enforcement* (the per-IP token bucket
+> + half-open cap + `connections_rejected_total{reason}`) is the next PR. The
+> at-rest encryption (#108) and the audit-event export stream (#109/#635) remain
+> specified-only. See [THREAT_MODEL.md](THREAT_MODEL.md) for the honest posture.
+> Where this document constrains the handshake it cites #11 (the wire protocol and
+> client API), where it adds a setting it cites #14 (the configuration system),
+> and where it closes a threat it cites #105 (the threat model).
 
 The single rule this document exists to enforce comes first, so no reader walks
 away thinking IronBus can be put on a hostile network without TLS and auth:

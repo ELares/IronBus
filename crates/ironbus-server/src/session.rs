@@ -40,10 +40,10 @@ use ironbus_proto::message::{
     decode_stream_fetch, decode_stream_info, decode_sub, decode_sub_subject, decode_sub_to,
     encode_dead_letter, encode_deliver, encode_deliver_batch, encode_gap_marker, encode_info,
     encode_produce_confirm, encode_pub_ack, encode_stream_info_response, encode_truncated,
-    gap_reason, produce_confirm_status, pub_ack_level, AckLevel, AckOp, ConsumeTier, CreditAdvert,
-    DeadLetterBody, DeliverBatchHeader, DeliverBody, GapMarkerBody, InfoBody, ProduceConfirmBody,
-    PubAckBody, StreamInfoResponseBody, TruncatedBody, DEAD_LETTER_MAX_DELIVER,
-    PUB_WIRE_ONLY_FLAGS,
+    gap_reason, parse_connect_auth, produce_confirm_status, pub_ack_level, AckLevel, AckOp,
+    ConsumeTier, CreditAdvert, DeadLetterBody, DeliverBatchHeader, DeliverBody, GapMarkerBody,
+    InfoBody, ProduceConfirmBody, PubAckBody, StreamInfoResponseBody, TruncatedBody,
+    DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
 };
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
@@ -65,6 +65,13 @@ pub enum SessionError {
     /// be served: the session ends cleanly rather than hanging on a dead actor. This is the
     /// typed "actor gone" path (#177): a closed channel is an error, never a panic.
     ActorGone,
+    /// An authentication or authorization failure on an auth-required broker (#631, V2-M7): the
+    /// uniform "Authorization Violation" `Err` frame has ALREADY been written to the output buffer
+    /// (so the client receives it), and the connection must now CLOSE — per the auth contract, every
+    /// authn/authz failure replies the one uniform error and then closes. The variant carries no
+    /// sub-reason on the wire (the `Err` body is the fixed message with no code), so it leaks no
+    /// oracle; the trusted-side detail lives in the (future #635) audit log, never here.
+    AuthViolation,
 }
 
 impl core::fmt::Display for SessionError {
@@ -74,6 +81,9 @@ impl core::fmt::Display for SessionError {
             SessionError::EngineFatal(e) => write!(f, "fatal engine error, closing session: {e}"),
             SessionError::ActorGone => {
                 write!(f, "the append actor is gone, closing session")
+            }
+            SessionError::AuthViolation => {
+                write!(f, "authorization violation, closing session")
             }
         }
     }
@@ -361,6 +371,33 @@ pub struct Session {
     /// connection that never uses subject addressing costs nothing here. Bounded (LRU), so a firehose of
     /// distinct subjects can never grow it without bound.
     subject_cache: ResolveCache<StreamId>,
+    /// The connection-scoped AUTHORIZATION authority pinned at `Connect` time (#631, V2-M7): the
+    /// resolved identity's scope set, bound to the connection for its entire lifetime. A verb is
+    /// authorized against THIS set, never against anything the client asserts in a later frame, so a
+    /// client cannot escalate by re-sending a scope. On a broker with NO auth configured (the
+    /// zero-config loopback-dev mode), the scope gate is BYPASSED entirely (see `authenticated`), so
+    /// the empty default here is never consulted and the dev experience is byte-for-byte unchanged.
+    /// On an auth-required broker it is the empty set until a successful `Connect` pins the identity's
+    /// scopes; a verb attempted before that (or after a failed auth) is an Authorization Violation.
+    scopes: crate::auth::ScopeSet,
+    /// Whether THIS connection has completed a successful authenticating `Connect` (#631). Distinct
+    /// from `connected` (which means "the Connect handshake ran"): on an auth-required broker a
+    /// `connected` connection is only `authenticated` after the credential verified, and a verb is
+    /// gated on `authenticated && scopes.has(required)`. On a no-auth broker the gate is bypassed
+    /// (the broker has no identities, so there is nothing to authenticate against). Default `false`.
+    authenticated: bool,
+    /// The broker's connection-scoped auth table (#631), shared immutably across connections via
+    /// `Arc` (a clone is a refcount bump, no per-connection deep copy of the identity table). `None`
+    /// is the zero-config loopback-dev broker: no identities, the scope gate is bypassed, and the
+    /// dev experience is byte-for-byte unchanged. `Some(_)` is an auth-required broker: the `Connect`
+    /// handshake must authenticate and every scope-gated verb is checked against `scopes`.
+    auth_config: Option<std::sync::Arc<crate::auth::AuthConfig>>,
+    /// The verified mTLS peer certificate's resolved SAN identity (#631), if the connection presented
+    /// one at the TLS layer. `None` until the TLS handshake (the FLAGGED follow-up) extracts and
+    /// verifies a client certificate; consulted ONLY by the mTLS mechanism at `Connect`. In this PR it
+    /// is always `None`, so an mTLS-mechanism connect fails closed (no verified cert) until TLS lands —
+    /// the safe behavior, never a default-scope grant.
+    peer_san: Option<String>,
 }
 
 impl Session {
@@ -379,6 +416,26 @@ impl Session {
     pub fn with_member_id(member_id: MemberId) -> Session {
         Session {
             member_id,
+            ..Session::default()
+        }
+    }
+
+    /// A new session bound to an AUTH-REQUIRED broker (#631, V2-M7): the explicit member identity plus
+    /// the shared (immutable, `Arc`-clone) auth table and the verified mTLS peer SAN identity (if the
+    /// TLS layer presented one — `None` until the FLAGGED TLS handshake lands). On a session built this
+    /// way the `Connect` handshake MUST authenticate against the table and every scope-gated verb is
+    /// checked against the pinned scope set. A no-auth (loopback-dev) connection uses
+    /// [`Session::with_member_id`] instead and is byte-for-byte unchanged.
+    #[must_use]
+    pub fn with_member_id_and_auth(
+        member_id: MemberId,
+        auth_config: std::sync::Arc<crate::auth::AuthConfig>,
+        peer_san: Option<String>,
+    ) -> Session {
+        Session {
+            member_id,
+            auth_config: Some(auth_config),
+            peer_san,
             ..Session::default()
         }
     }
@@ -561,7 +618,11 @@ impl Session {
             // infallible (the caps are read LOCALLY off the handle, no actor round-trip, #177), so it
             // returns `false` directly (no committed-cursor progress).
             Some(FrameType::Connect) => {
-                self.handle_connect(engine, body, out);
+                // Auth (#631) rides the Connect handshake: a failed authentication writes the uniform
+                // Authorization Violation and returns `Err(AuthViolation)` so the connection closes,
+                // exactly as the auth contract requires. A successful (or no-auth) connect returns
+                // `false` (no committed-cursor progress), byte-for-byte the historical path.
+                self.handle_connect(engine, body, out)?;
                 Ok(false)
             }
             Some(FrameType::Ping) => {
@@ -577,60 +638,101 @@ impl Session {
                 self.handle_pub(engine, body, &mut parked, out)?;
                 drain_parked(engine, member_id, &mut parked, out).map(|()| false)
             }
-            Some(FrameType::Ack) => self.handle_ack(engine, body, out).map(|()| true),
+            // The consume/ack vocabulary all requires the `subscribe` scope (#631): a connection
+            // without `subscribe` is refused with the uniform Authorization Violation, BEFORE the verb
+            // runs, with no implication from any other scope it might hold (admin does NOT grant it).
+            Some(FrameType::Ack) => {
+                self.require_scope(crate::auth::Scope::Subscribe, out)?;
+                self.handle_ack(engine, body, out).map(|()| true)
+            }
             // A cumulative ack commits the broadcast cursor (when accepted), so it returns `true` to
             // run the interval checkpoint, exactly like a per-message Ack (#288).
             Some(FrameType::CumulativeAck) => {
+                self.require_scope(crate::auth::Scope::Subscribe, out)?;
                 self.handle_cumulative_ack(engine, body, out).map(|()| true)
             }
-            Some(FrameType::Flow) => self.handle_flow(engine, body, out).map(|()| true),
+            Some(FrameType::Flow) => {
+                self.require_scope(crate::auth::Scope::Subscribe, out)?;
+                self.handle_flow(engine, body, out).map(|()| true)
+            }
             // The batch-pull FETCH (#489): the amortized twin of Flow. It runs the SAME per-record poll
             // loop bounded by max_records/max_bytes/expires/no_wait, so it returns `true` to run the
             // interval checkpoint exactly like Flow (it commits cursor progress the same way).
-            Some(FrameType::Fetch) => self.handle_fetch(engine, body, out).map(|()| true),
+            Some(FrameType::Fetch) => {
+                self.require_scope(crate::auth::Scope::Subscribe, out)?;
+                self.handle_fetch(engine, body, out).map(|()| true)
+            }
             // The Tier-S STREAMING fetch (#544): a consumer-managed-offset contiguous read. It grants
             // NO lease and writes NO cursor, so it never commits progress and there is nothing for the
             // interval checkpoint to flush — it returns `false`. Durability is the separate periodic
             // StreamCommit below.
             Some(FrameType::StreamFetch) => {
+                self.require_scope(crate::auth::Scope::Subscribe, out)?;
                 self.handle_stream_fetch(engine, body, out).map(|()| false)
             }
             // The Tier-S periodic CUMULATIVE COMMIT (#544): advances the streaming group's committed
             // cursor (when accepted), so it returns `true` to run the interval checkpoint, exactly like
             // the broadcast CumulativeAck.
             Some(FrameType::StreamCommit) => {
+                self.require_scope(crate::auth::Scope::Subscribe, out)?;
                 self.handle_stream_commit(engine, body, out).map(|()| true)
             }
-            Some(FrameType::Sub) => self.handle_sub(engine, body, out).map(|()| false),
+            Some(FrameType::Sub) => {
+                self.require_scope(crate::auth::Scope::Subscribe, out)?;
+                self.handle_sub(engine, body, out).map(|()| false)
+            }
             // The stream-addressed verbs (#588, M2-I10): each is GATED on the negotiated
             // `streams_enabled` capability (a client that did not advertise `understands_streams` gets
             // a typed `Err`, never the new behavior), then routes to the engine's id-routed entry
             // points (#676/#679). A StreamDeclare/StreamInfo changes no committed cursor (`false`); a
             // SubTo only binds the subscription (`false`, like Sub); a PubTo never advances a COMMITTED
             // cursor (`false`, like Pub).
-            Some(FrameType::StreamDeclare) => self
-                .handle_stream_declare(engine, body, out)
-                .map(|()| false),
+            // Stream/subject MANAGEMENT verbs that create a stream or mutate the routing trie
+            // (StreamDeclare, BindSubject) require the `admin` scope (#631: "anything that mutates
+            // retention, identities, or consumer state"). StreamInfo is a read of a stream's existence
+            // and durable head — stored operational state — so it requires `subscribe` (a consumer
+            // read), not anonymous. None is reachable from `publish` alone.
+            Some(FrameType::StreamDeclare) => {
+                self.require_scope(crate::auth::Scope::Admin, out)?;
+                self.handle_stream_declare(engine, body, out)
+                    .map(|()| false)
+            }
             Some(FrameType::StreamInfo) => {
+                self.require_scope(crate::auth::Scope::Subscribe, out)?;
                 self.handle_stream_info(engine, body, out).map(|()| false)
             }
-            Some(FrameType::PubTo) => self.handle_pub_to(engine, body, out).map(|()| false),
-            Some(FrameType::SubTo) => self.handle_sub_to(engine, body, out).map(|()| false),
+            // Stream-addressed produce/consume require the same scopes as their default-stream twins:
+            // PubTo needs `publish`, SubTo needs `subscribe`.
+            Some(FrameType::PubTo) => {
+                self.require_scope(crate::auth::Scope::Publish, out)?;
+                self.handle_pub_to(engine, body, out).map(|()| false)
+            }
+            Some(FrameType::SubTo) => {
+                self.require_scope(crate::auth::Scope::Subscribe, out)?;
+                self.handle_sub_to(engine, body, out).map(|()| false)
+            }
             // The subject-addressed verbs (#585, M2-I9): also GATED on the negotiated `streams_enabled`
             // capability (subject routing is the subjects half of the same streams story). A BindSubject
             // registers a binding (changes no committed cursor, `false`); a SubSubject only binds the
             // subscription (`false`, like Sub/SubTo); a PubSubject never advances a COMMITTED cursor
-            // (`false`, like Pub/PubTo).
+            // (`false`, like Pub/PubTo). BindSubject mutates the routing trie -> `admin`; PubSubject
+            // produces -> `publish`; SubSubject consumes -> `subscribe`.
             Some(FrameType::BindSubject) => {
+                self.require_scope(crate::auth::Scope::Admin, out)?;
                 self.handle_bind_subject(engine, body, out).map(|()| false)
             }
             Some(FrameType::PubSubject) => {
+                self.require_scope(crate::auth::Scope::Publish, out)?;
                 self.handle_pub_subject(engine, body, out).map(|()| false)
             }
             Some(FrameType::SubSubject) => {
+                self.require_scope(crate::auth::Scope::Subscribe, out)?;
                 self.handle_sub_subject(engine, body, out).map(|()| false)
             }
-            Some(FrameType::Unsub) => self.handle_unsub(engine, out).map(|()| true),
+            Some(FrameType::Unsub) => {
+                self.require_scope(crate::auth::Scope::Subscribe, out)?;
+                self.handle_unsub(engine, out).map(|()| true)
+            }
             // The standalone Nack frame type (a client sends a nack as an Ack frame with the
             // Nack op, handled above), or a response-only verb (Info/Pong/Ok/Err/Deliver) a
             // client should not send.
@@ -669,16 +771,47 @@ impl Session {
         engine: &E,
         body: &[u8],
         out: &mut Vec<u8>,
-    ) {
+    ) -> Result<(), SessionError> {
         let req = match decode_connect(body) {
             Ok(req) => req,
             // A non-empty but malformed Connect body: surface a typed error and keep the connection
             // open. The credit is not fixed, so a subsequent valid Connect/Flow still negotiates.
             Err(e) => {
                 reply_err(out, &e.to_string());
-                return;
+                return Ok(());
             }
         };
+        // AUTHENTICATE FIRST (#631, V2-M7), before any negotiation or `connected` flip. On an
+        // auth-required broker (an identity table is configured) the `Connect` MUST carry a valid
+        // credential; the resolved identity's scope set is PINNED to the connection for its lifetime. On
+        // a no-auth broker (`auth_config` is `None`, the zero-config loopback-dev path) this is a no-op
+        // and the handshake is byte-for-byte unchanged. Every auth failure replies the ONE uniform
+        // Authorization Violation and closes — no oracle, no anonymous fallback on a configured-auth
+        // broker.
+        if let Some(auth) = self.auth_config.clone() {
+            // Resolve the presented credential to a pinned scope set, or fall through to the single
+            // uniform Authorization Violation. EVERY failure path — no credential (no anonymous
+            // fallback), a malformed/unknown-mechanism auth section, or a bad/unmatched credential —
+            // collapses to the SAME outcome, so there is no oracle, and the close happens after the
+            // one uniform Err. A well-formed, verified credential pins the identity's scopes.
+            let resolved = match parse_connect_auth(body) {
+                Ok(Some(cred)) => auth.authenticate(&cred, self.peer_san.as_deref()).ok(),
+                // No credential, a malformed section, or an unknown mechanism: all "no resolution",
+                // which becomes the uniform violation below.
+                Ok(None) | Err(_) => None,
+            };
+            let Some((_identity, outcome)) = resolved else {
+                reply_auth_violation(out);
+                return Err(SessionError::AuthViolation);
+            };
+            // Pin the identity's scopes for the connection lifetime. The audit event (#635, the
+            // trusted-side `outcome`) is the FLAGGED follow-up; no credential is logged here and the
+            // wire saw no oracle.
+            if let crate::auth::AuthOutcome::Authenticated { scopes, .. } = outcome {
+                self.scopes = scopes;
+            }
+            self.authenticated = true;
+        }
         self.connected = true;
         // Record the client's request (re-recorded on a repeated Connect, which re-negotiates
         // idempotently). It is also used by the lazy `credit_ceiling` fallback for a session that never
@@ -774,6 +907,44 @@ impl Session {
         let mut info_body = Vec::new();
         encode_info(&info, &mut info_body);
         reply(out, FrameType::Info, &info_body);
+        Ok(())
+    }
+
+    /// The per-verb AUTHORIZATION gate (#631, V2-M7): on an auth-required broker, a verb is allowed
+    /// only when this connection authenticated AND its pinned scope set grants the required scope, with
+    /// NO implication between scopes (`admin` does NOT grant `publish` or `subscribe`). A denial writes
+    /// the ONE uniform Authorization Violation (indistinguishable on the wire from an authn failure)
+    /// and returns [`SessionError::AuthViolation`] so the caller closes the connection.
+    ///
+    /// On a NO-AUTH broker (`auth_config` is `None`, the zero-config loopback-dev path) this is a
+    /// no-op `Ok(())`: the gate is bypassed and every verb behaves byte-for-byte as before, so the dev
+    /// experience is unchanged. This is the single choke point every scope-gated verb funnels through,
+    /// so the no-implication property lives in exactly one tested place.
+    fn require_scope(
+        &self,
+        scope: crate::auth::Scope,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SessionError> {
+        if self.scope_denied(scope) {
+            reply_auth_violation(out);
+            return Err(SessionError::AuthViolation);
+        }
+        Ok(())
+    }
+
+    /// The pure (no side-effect) half of the scope gate: whether the named scope is DENIED for this
+    /// connection (#631). `false` on a no-auth broker (the gate is inert, loopback-dev unchanged) and
+    /// on an authenticated connection that holds the scope; `true` only on an auth-required broker
+    /// where the connection did not authenticate OR its pinned scope set lacks the scope (with NO
+    /// implication from any other scope). Used by the `Pub` path, which must drain its parked acks
+    /// before writing the violation, so it needs the predicate without the write.
+    fn scope_denied(&self, scope: crate::auth::Scope) -> bool {
+        // No auth configured: never denied (loopback-dev, byte-for-byte unchanged).
+        if self.auth_config.is_none() {
+            return false;
+        }
+        // Auth-required: allowed only when authenticated AND holding exactly the named scope.
+        !(self.authenticated && self.scopes.has(scope))
     }
 
     /// Handles a `Pub`: validates the wire body, then SUBMITS the produce to the actor and PARKS
@@ -795,6 +966,19 @@ impl Session {
             drain_parked(engine, member_id, parked, out)?;
             reply_err(out, "not connected");
             return Ok(());
+        }
+        // The `publish` scope gate (#631), checked here (not only in `dispatch`) because the `process`
+        // pipelined loop intercepts `Pub` frames and calls `handle_pub` DIRECTLY, bypassing `dispatch`
+        // — so gating here is the single point that covers BOTH paths. A connection without `publish`
+        // (with no implication from `admin`/`subscribe`) is refused with the uniform Authorization
+        // Violation, after draining any parked acks so the wire order is preserved, then the connection
+        // closes. On a no-auth broker the gate is inert (loopback-dev, byte-for-byte unchanged).
+        if self.scope_denied(crate::auth::Scope::Publish) {
+            // Drain the earlier produces' acks FIRST (so they reach the wire ahead of the close), then
+            // write the uniform violation, then close — the same pre-submit error ordering as above.
+            drain_parked(engine, member_id, parked, out)?;
+            reply_auth_violation(out);
+            return Err(SessionError::AuthViolation);
         }
         let Ok(msg) = decode_pub(body) else {
             drain_parked(engine, member_id, parked, out)?;
@@ -3082,6 +3266,21 @@ fn reply(out: &mut Vec<u8>, frame_type: FrameType, body: &[u8]) {
 
 fn reply_err(out: &mut Vec<u8>, message: &str) {
     reply(out, FrameType::Err, message.as_bytes());
+}
+
+/// Writes the single UNIFORM "Authorization Violation" `Err` frame (#631, V2-M7,
+/// `docs/AUTHENTICATION.md` "The uniform Authorization Violation"). EVERY authentication and
+/// authorization failure — unknown mechanism, bad credential, unknown username, a verifying mTLS cert
+/// that matches no identity, or a verb the pinned scope set does not grant — uses THIS one message,
+/// with no numeric code and no sub-reason, so the wire carries no oracle distinguishing a bad
+/// credential from an insufficient scope and no username-enumeration signal. The caller then closes
+/// the connection (returns [`SessionError::AuthViolation`]).
+fn reply_auth_violation(out: &mut Vec<u8>) {
+    reply(
+        out,
+        FrameType::Err,
+        crate::auth::AuthError::MESSAGE.as_bytes(),
+    );
 }
 
 /// Emits a publish-ack reply (`PubAck` for a fresh produce, `PubAckDuplicate` for a #33 dedup hit)
@@ -9361,5 +9560,299 @@ mod tests {
             .unwrap();
         assert_eq!(one_response(&out).0, FrameType::PubAck);
         assert_eq!(e.engine_mut().stream_head("shipments").get(), 1);
+    }
+
+    // ---- Connection-scoped auth + three-scope authorization (#631, V2-M7) ----
+    //
+    // These exercise the load-bearing security properties: a connect must authenticate on an
+    // auth-required broker, a verb is gated on the pinned scope set with NO implication, and a no-auth
+    // (loopback-dev) broker is byte-for-byte unchanged.
+
+    use crate::auth::{AuthConfig, CredentialSet, Identity, Scope, ScopeSet, Secret};
+    use ironbus_proto::message::{
+        append_connect_auth, encode_connect, pack_password_material, AuthCredential,
+        AuthMechanism as WireMechanism, ConnectBody,
+    };
+
+    fn sha256_hex_token(token: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+        let d = Sha256::digest(token);
+        let mut s = String::with_capacity(64);
+        for b in d {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    }
+
+    /// Builds an `Arc<AuthConfig>` with a single bearer identity holding exactly `scopes`.
+    fn bearer_auth(token: &[u8], scopes: &[Scope]) -> Arc<AuthConfig> {
+        let mut cfg = AuthConfig::new();
+        cfg.add_identity(Identity {
+            name: "id".to_string(),
+            scopes: ScopeSet::from_scopes(scopes),
+            credential: CredentialSet::Bearer {
+                digests: vec![
+                    crate::auth::parse_token_digest_hex(&sha256_hex_token(token)).unwrap(),
+                ],
+            },
+        });
+        Arc::new(cfg)
+    }
+
+    /// Encodes a `Connect` body carrying a bearer credential for `token`.
+    fn connect_with_bearer(token: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        encode_connect(&ConnectBody::default(), &mut body);
+        append_connect_auth(
+            &mut body,
+            &AuthCredential {
+                mechanism: WireMechanism::Bearer,
+                material: token.to_vec(),
+            },
+        )
+        .unwrap();
+        frame(FrameType::Connect, &body)
+    }
+
+    #[test]
+    fn an_unauthenticated_connect_to_an_auth_required_broker_is_refused() {
+        // An empty (no-credential) Connect on an auth-required broker is the uniform Authorization
+        // Violation and the connection closes. There is no anonymous fallback.
+        let e = DirectEngine::new(engine());
+        let auth = bearer_auth(b"a-secret-token-of-32-bytes-len!!", &[Scope::Publish]);
+        let mut s = Session::with_member_id_and_auth(MemberId::new(0), auth, None);
+        let mut out = Vec::new();
+        let err = s
+            .process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap_err();
+        assert!(matches!(err, SessionError::AuthViolation));
+        let (ty, body) = one_response(&out);
+        assert_eq!(ty, FrameType::Err);
+        assert_eq!(body, crate::auth::AuthError::MESSAGE.as_bytes());
+    }
+
+    #[test]
+    fn a_valid_bearer_credential_authenticates_and_pins_its_scopes() {
+        let e = DirectEngine::new(engine());
+        let token = b"a-secret-token-of-32-bytes-len!!";
+        let auth = bearer_auth(token, &[Scope::Publish]);
+        let mut s = Session::with_member_id_and_auth(MemberId::new(0), auth, None);
+        let mut out = Vec::new();
+        s.process(&e, &connect_with_bearer(token), &mut out)
+            .unwrap();
+        // The handshake replies Info (success), and a subsequent Pub (publish scope) is allowed.
+        assert_eq!(one_response(&out).0, FrameType::Info);
+        assert!(s.authenticated);
+        assert!(s.scopes.has(Scope::Publish));
+
+        out.clear();
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"hi",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::Pub, &pub_body), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::PubAck);
+    }
+
+    #[test]
+    fn a_produce_without_the_publish_scope_is_refused() {
+        // The identity holds ONLY subscribe; a Pub is the uniform violation and closes.
+        let e = DirectEngine::new(engine());
+        let token = b"sub-only-token-padding-32bytes!!";
+        let auth = bearer_auth(token, &[Scope::Subscribe]);
+        let mut s = Session::with_member_id_and_auth(MemberId::new(0), auth, None);
+        let mut out = Vec::new();
+        s.process(&e, &connect_with_bearer(token), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Info);
+
+        out.clear();
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"nope",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        let err = s
+            .process(&e, &frame(FrameType::Pub, &pub_body), &mut out)
+            .unwrap_err();
+        assert!(matches!(err, SessionError::AuthViolation));
+        assert_eq!(one_response(&out).0, FrameType::Err);
+        assert_eq!(
+            one_response(&out).1,
+            crate::auth::AuthError::MESSAGE.as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_subscribe_without_the_subscribe_scope_is_refused() {
+        let e = DirectEngine::new(engine());
+        let token = b"pub-only-token-padding-32bytes!!";
+        let auth = bearer_auth(token, &[Scope::Publish]);
+        let mut s = Session::with_member_id_and_auth(MemberId::new(0), auth, None);
+        let mut out = Vec::new();
+        s.process(&e, &connect_with_bearer(token), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Info);
+
+        out.clear();
+        // A Flow (consume) requires subscribe; a publish-only identity is refused.
+        let err = s
+            .process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap_err();
+        assert!(matches!(err, SessionError::AuthViolation));
+        assert_eq!(one_response(&out).0, FrameType::Err);
+    }
+
+    #[test]
+    fn admin_does_not_imply_publish_or_subscribe() {
+        // The headline no-implication property: an admin-only identity is refused BOTH a Pub and a
+        // Flow. admin grants neither.
+        let e = DirectEngine::new(engine());
+        let token = b"admin-only-token-pad-32-bytes!!!";
+        let auth = bearer_auth(token, &[Scope::Admin]);
+        let mut s = Session::with_member_id_and_auth(MemberId::new(0), auth, None);
+        let mut out = Vec::new();
+        s.process(&e, &connect_with_bearer(token), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Info);
+        assert!(s.scopes.has(Scope::Admin));
+
+        // Pub is refused (admin does NOT grant publish).
+        out.clear();
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"x",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        assert!(matches!(
+            s.process(&e, &frame(FrameType::Pub, &pub_body), &mut out)
+                .unwrap_err(),
+            SessionError::AuthViolation
+        ));
+
+        // A fresh connection (the old one is closed) is refused a Flow too (admin does NOT grant
+        // subscribe).
+        let mut s2 = Session::with_member_id_and_auth(
+            MemberId::new(1),
+            bearer_auth(token, &[Scope::Admin]),
+            None,
+        );
+        let mut out2 = Vec::new();
+        s2.process(&e, &connect_with_bearer(token), &mut out2)
+            .unwrap();
+        out2.clear();
+        assert!(matches!(
+            s2.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out2)
+                .unwrap_err(),
+            SessionError::AuthViolation
+        ));
+    }
+
+    #[test]
+    fn a_password_credential_authenticates_with_argon2() {
+        use argon2::password_hash::{PasswordHasher, SaltString};
+        use argon2::Argon2;
+        let salt = SaltString::encode_b64(b"a-fixed-test-salt-bytes").unwrap();
+        let phc = Argon2::default()
+            .hash_password(b"hunter2", &salt)
+            .unwrap()
+            .to_string();
+        let mut cfg = AuthConfig::new();
+        cfg.add_identity(Identity {
+            name: "alice".to_string(),
+            scopes: ScopeSet::from_scopes(&[Scope::Publish, Scope::Subscribe]),
+            credential: CredentialSet::Password {
+                username: "alice".to_string(),
+                phc_hashes: vec![Secret::new(phc.into_bytes())],
+            },
+        });
+        let e = DirectEngine::new(engine());
+        let mut s = Session::with_member_id_and_auth(MemberId::new(0), Arc::new(cfg), None);
+        let mut body = Vec::new();
+        encode_connect(&ConnectBody::default(), &mut body);
+        append_connect_auth(
+            &mut body,
+            &AuthCredential {
+                mechanism: WireMechanism::Password,
+                material: pack_password_material(b"alice", b"hunter2").unwrap(),
+            },
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, &body), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Info);
+        assert!(s.authenticated && s.scopes.has(Scope::Publish) && s.scopes.has(Scope::Subscribe));
+    }
+
+    #[test]
+    fn a_no_auth_broker_is_byte_for_byte_unchanged_zero_config_dev() {
+        // The loopback-dev path: a session built WITHOUT an auth config requires no credential and
+        // gates no verb. An empty Connect succeeds and a Pub + Flow round-trips, exactly as before.
+        let e = DirectEngine::new(engine());
+        let mut s = Session::new(); // no auth_config
+        let mut out = Vec::new();
+        s.process(&e, &frame(FrameType::Connect, b""), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::Info);
+        assert!(
+            !s.authenticated,
+            "no auth was required, so authenticated stays false"
+        );
+
+        out.clear();
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"dev",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        s.process(&e, &frame(FrameType::Pub, &pub_body), &mut out)
+            .unwrap();
+        assert_eq!(one_response(&out).0, FrameType::PubAck);
+
+        out.clear();
+        s.process(&e, &frame(FrameType::Flow, &1u32.to_le_bytes()), &mut out)
+            .unwrap();
+        // The Flow returns the delivered record then a FlowEnd terminator — no auth gate in the way.
+        assert_eq!(decode_all(&out)[0].0, FrameType::Deliver);
     }
 }

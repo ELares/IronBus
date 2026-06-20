@@ -1,15 +1,27 @@
 # IronBus connection-scoped authentication and the three-scope authorization model
 
-**Status: specified, not yet implemented.** This document is the normative design
-for connection-scoped authentication and authorization in IronBus. None of it is
-wired into the binary today. The current handshake authenticates nothing (the
-`Connect`/`Info` bodies are empty and the server sets `connected = true` with no
-negotiated state), so reachability is full produce/consume/ack access. The honest
-current posture is recorded in [THREAT_MODEL.md](THREAT_MODEL.md) (no auth, no TLS,
-no at-rest encryption). This spec is tracked by #106 and is the core auth contract
-every verb is gated by; it is the child of the security epic #18 and the sibling
-of the TLS spec (#107), the at-rest encryption spec (#108), and the secret-handling
-spec (#109).
+**Status (updated #631, V2-M7): IMPLEMENTED.** The connection-scoped
+authentication and three-scope authorization model in this document is now wired
+into the broker. On an auth-required broker (an `--auth-config` identity table or
+an mTLS client-CA is configured) the `Connect` handshake authenticates against the
+identity table, the resolved scope set is pinned to the connection for its
+lifetime, and every scope-gated verb is checked against it with NO implication
+between scopes (`admin` does NOT grant `publish` or `subscribe`); every failure is
+the single uniform "Authorization Violation" with no oracle. Bearer (SHA-256 +
+constant-time compare) and username/password (Argon2id) verify on audited
+pure-Rust RustCrypto primitives. The credential rides an additive, backward-
+compatible section of the `Connect` body, so a no-auth (loopback-dev) broker is
+byte-for-byte unchanged. The mTLS mechanism's SAN-to-identity mapping is
+implemented and enforced; it becomes reachable once the TLS layer (the FLAGGED
+follow-up, [TRANSPORT.md](TRANSPORT.md) section 1) supplies a verified peer
+certificate — until then an mTLS-mechanism connect fails closed (no verified
+cert), never a default-scope grant. The fail-closed bind invariant (a non-loopback
+bind requires both TLS material and an auth identity, validated pre-listen) ships
+with this. The honest posture is recorded in
+[THREAT_MODEL.md](THREAT_MODEL.md). This spec is tracked by #106/#631 and is the
+core auth contract every verb is gated by; it is the child of the security epic
+#18 and the sibling of the TLS spec (#107), the at-rest encryption spec (#108),
+and the secret-handling spec (#109).
 
 Where this spec constrains an existing surface it cites the issue that owns it: the
 #11 CONNECT handshake (the wire frames it extends), the #14 configuration system
