@@ -136,8 +136,9 @@ subtle = { version = "2", default-features = false }
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
 # `zeroize`: best-effort zeroization of secret material on drop (the redacting newtype's `Drop`), with
 # a non-elidable write so the optimizer cannot remove the clear as dead (#635, docs/SECRETS.md). Apache-2.0
-# OR MIT, pure Rust, no transitive deps.
-zeroize = { version = "1", default-features = false }
+# OR MIT, pure Rust, no transitive deps. PINNED to =1.8.2: zeroize 1.9.0 bumped to edition2024 /
+# rust-version 1.85, which breaks the MSRV-1.78 gate (same =-pin discipline as lz4_flex/blake3/toml).
+zeroize = { version = "=1.8.2", default-features = false }
 
 # Structured tracing (#16, #99). `tracing` is the instrumentation facade; `tracing-subscriber` (the
 # `fmt` + `json` features only, no `env-filter`/`ansi`, to keep the transitive surface minimal)
