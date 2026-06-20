@@ -4527,7 +4527,7 @@ fn open_memory_engine(
 /// (same caps, same retention, same durability mapping, same compression). `context` names the
 /// store in an open error (e.g. `at /var/lib/ironbus`, `in memory`).
 #[cfg(unix)]
-fn open_engine_with<F: Filesystem>(
+fn open_engine_with<F: Filesystem + Clone>(
     fs: F,
     config: &ServeConfig,
     key_shared_groups: &[String],

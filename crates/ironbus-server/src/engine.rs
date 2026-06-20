@@ -41,7 +41,9 @@ use ironbus_storage::dlq::{DlqSink, DLQ_SUBDIR};
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::{Append, Log, LogConfig, RetentionBounds};
 use ironbus_storage::loss::LossReport;
+use ironbus_storage::naming::MAX_STREAM_NAME_LEN;
 use ironbus_storage::segment::{OwnedRecord, RawByteRun, StorageError};
+use ironbus_storage::streamset::{CommitOutcome, StreamError, StreamId, StreamSet};
 use std::collections::BTreeMap;
 
 /// What the engine does with a produce that would exceed the durable-log byte cap
@@ -568,6 +570,24 @@ pub enum EngineError {
         /// inclusive, since committing exactly up to the head commits every existing record).
         durable_head: u64,
     },
+    /// A stream name handed to the id-routed produce/consume path (#676, M2-I2b) was empty, too
+    /// long, or held a non-graphic-ASCII byte. The default stream is addressed by the EMPTY name
+    /// (which routes to today's root log byte-for-byte) via [`StreamId::default_stream`], never by
+    /// passing `""` to the NAMED constructor, so a bad NAMED name fails closed at the boundary
+    /// rather than reaching the filesystem. Carries the rejected name. This mirrors
+    /// [`EngineError::InvalidGroupName`] for the stream axis (the same graphic-ASCII rule).
+    InvalidStreamName {
+        /// The rejected stream name.
+        name: String,
+    },
+    /// A consume/ack/commit targeted a NAMED stream that is not open (#676): a stream must be
+    /// produced to (which declares it) before it can be consumed from, so a consume on an
+    /// unknown named stream is a typed rejection, not a silent empty read. The default stream is
+    /// always open and never reaches this. Carries the unknown stream's name.
+    UnknownStream {
+        /// The name of the unknown (never-declared) named stream.
+        name: String,
+    },
 }
 
 impl core::fmt::Display for EngineError {
@@ -612,6 +632,15 @@ impl core::fmt::Display for EngineError {
                 "cumulative ack up_to {up_to} is outside the retained window \
                  [{earliest_retained}, {durable_head}]"
             ),
+            EngineError::InvalidStreamName { name } => write!(
+                f,
+                "invalid stream name {name:?} (the default stream is \"\", otherwise 1 to \
+                 {MAX_STREAM_NAME_LEN} graphic-ASCII bytes)"
+            ),
+            EngineError::UnknownStream { name } => write!(
+                f,
+                "stream {name:?} is not open (produce to it first to declare it)"
+            ),
         }
     }
 }
@@ -634,6 +663,18 @@ impl From<StorageError> for EngineError {
 impl From<std::io::Error> for EngineError {
     fn from(e: std::io::Error) -> Self {
         EngineError::Storage(StorageError::Io(e))
+    }
+}
+
+impl From<StreamError> for EngineError {
+    fn from(e: StreamError) -> Self {
+        match e {
+            // A bad NAMED stream name fails closed as the typed `InvalidStreamName` (the stream-axis
+            // twin of `InvalidGroupName`), never as an opaque storage error, so a caller can tell a
+            // validation rejection from an IO fault.
+            StreamError::InvalidName { name } => EngineError::InvalidStreamName { name },
+            StreamError::Storage(s) => EngineError::Storage(s),
+        }
     }
 }
 
@@ -1771,11 +1812,74 @@ impl WorkGroup {
     }
 }
 
+/// The PER-NAMED-STREAM engine state (#676, V2-M2-I2b): each named stream owns its OWN
+/// `groups: BTreeMap<GroupName, WorkGroup>` (the lease / `AckCursor` / 0-1-2-ack core
+/// RE-INSTANTIATED per stream, UNCHANGED logic), exactly as the DEFAULT stream `""` owns
+/// [`Engine::groups`]. The named stream's durable LOG itself lives in the [`Engine::streams`]
+/// [`StreamSet`] (so the cross-stream `commit_tick` barrier, #678/#564, coordinates its
+/// durability); this struct holds only the per-stream CONSUMER state that mirrors the default
+/// stream's group machinery.
+///
+/// Scope (#676): a named stream's consume path here re-instantiates the SAME competing
+/// work-group primitives the default stream uses — the [`AckCursor`], the [`LeaseTable`], the
+/// 0/1/2 ack spectrum — independently per stream. The richer sub-paths a named stream does NOT
+/// yet thread (a per-stream DLQ, retry-throttle, key-shared routing, the Tier-S streaming mode,
+/// durable per-group cursor/attempt checkpoints, and the per-stream metric LABELS) are FLAGGED as
+/// follow-ups (M2-I5 retention, M2-I14 metrics); they are inert here, never REMOVED from the
+/// default stream. A named stream's groups are in-memory only for now (its consumer position does
+/// not survive a restart — only its LOG recovers, via the `StreamSet`), the explicit trade this
+/// reviewable slice makes.
+struct NamedStream {
+    /// This stream's competing work-groups, keyed by group name, byte-for-byte the SAME machinery
+    /// as the default stream's [`Engine::groups`] — independent per stream so the same group NAME
+    /// in stream A and stream B is two unrelated cursors (the per-stream-groups isolation #676
+    /// requires). The default group `""` is created lazily on the first consume of this stream.
+    groups: BTreeMap<String, WorkGroup>,
+}
+
+impl NamedStream {
+    /// A freshly-declared named stream with no work-groups yet (created lazily on first consume).
+    fn new() -> NamedStream {
+        NamedStream {
+            groups: BTreeMap::new(),
+        }
+    }
+}
+
 pub struct Engine<F: Filesystem, C: Clock> {
     log: Log<F, C>,
+    /// The per-NAMED-stream LOG substrate (#676, V2-M2-I2b): a [`StreamSet`] over the SAME data
+    /// directory, holding each named stream's independent [`Log`] under `streams/<hex(name)>/` (the
+    /// `dlq/` subdir pattern, generalized — #563). It is opened EAGERLY at [`Engine::open`] so any
+    /// named streams already on disk recover, and a named stream is `declare`d on its first produce.
+    ///
+    /// The DEFAULT stream `""` is served entirely by [`Engine::log`] above (byte-for-byte today): the
+    /// engine NEVER appends to, syncs, or reads the `StreamSet`'s own `""` slot, so the default
+    /// stream's produce / consume / durability / recovery / metrics are untouched and a deployment
+    /// that never names a stream never materializes `streams/` (the `StreamSet`'s `""` slot is an
+    /// inert re-open of the root that is never written — see the scope note in the PR; folding the
+    /// default fully INTO the `StreamSet` is the follow-up that removes that inert slot).
+    ///
+    /// The cross-stream group-commit [`StreamSet::commit_tick`] (#678/#564) coordinates the durability
+    /// barrier across the DIRTIED named streams: a produce pass touching K named streams commits with
+    /// ONE coordinated tick (K `fdatasync` barriers, amortized over the batch), and because the engine
+    /// never dirties the `""` slot, the default stream's single-log group-commit on [`Engine::log`] is
+    /// byte-identical.
+    streams: StreamSet<F, C>,
+    /// The per-NAMED-stream CONSUMER state (#676), keyed by [`StreamId`]: each entry mirrors the
+    /// default stream's work-group machinery (its `groups` map of [`WorkGroup`]s) for one named
+    /// stream, so the same group name in two streams is two independent cursors (cross-stream
+    /// isolation). A named stream gets an entry on its first produce (alongside its `StreamSet`
+    /// `declare`); the default stream `""` is NEVER a key here (it uses [`Engine::groups`]). Empty
+    /// for a deployment that never names a stream, so the default path costs nothing.
+    named_streams: BTreeMap<StreamId, NamedStream>,
     /// Per-work-group consumer state, keyed by group name. The default group (`""`) is the
     /// durable one (checkpointed to `cursor.ckpt`); named groups are independent
     /// broadcast/competing cursors, in-memory for now (durable per-group state is #60).
+    ///
+    /// This is the DEFAULT stream `""`'s group map (#676): named streams keep their OWN groups in
+    /// [`Engine::named_streams`], so this field is untouched by the multi-stream re-key and the
+    /// default-stream consume path is byte-for-byte today.
     groups: BTreeMap<String, WorkGroup>,
     /// The lease configuration, kept to build a new group's lease table on first use.
     lease_config: LeaseConfig,
@@ -1974,6 +2078,11 @@ const ATTEMPTS_CHECKPOINT: &str = "attempts.ckpt";
 /// signature stays simple.
 type RecoveredAttempts<File> = (AttemptsCheckpoint<File>, Option<Vec<u8>>);
 
+/// The result of [`Engine::open_log_and_streams`] (#676): the DEFAULT stream's root [`Log`] paired
+/// with the per-NAMED-stream [`StreamSet`] substrate. Named so the two-element tuple does not trip
+/// the `type_complexity` lint and reads as one value at the call site.
+type LogAndStreams<F, C> = (Log<F, C>, StreamSet<F, C>);
+
 /// Materializes the engine's write-path compression configuration (#430, ADR-0003): the
 /// configured codec over the frozen defaults (the 64-byte raw-store threshold, `dict_id` 0, no
 /// dictionary, the default zstd level). Kept out of [`Engine::open`] so the open path stays
@@ -1998,11 +2107,19 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// # Errors
     /// Returns [`EngineError::ZeroMaxInFlight`] for a zero window, or a storage error from
     /// opening the log or the cursor checkpoint.
-    pub fn open(fs: F, clock: C, config: EngineConfig) -> Result<Engine<F, C>, EngineError> {
+    #[allow(clippy::too_many_lines)]
+    pub fn open(fs: F, clock: C, config: EngineConfig) -> Result<Engine<F, C>, EngineError>
+    where
+        F: Clone,
+    {
         if config.max_in_flight == 0 {
             return Err(EngineError::ZeroMaxInFlight);
         }
-        let log = Log::open(fs, clock, config.log)?;
+        // Open the DEFAULT stream's root log AND the per-named-stream StreamSet substrate (#676). The
+        // root log is opened FIRST so it owns the authoritative recovery (truncating + reporting any
+        // torn tail, byte for byte as before); the StreamSet then re-opens the already-clean root for
+        // its inert `""` slot and recovers the named streams. See [`Engine::open_log_and_streams`].
+        let (log, streams) = Self::open_log_and_streams(fs, clock, config.log)?;
 
         // Open (creating if absent) the cursor checkpoint through the log's filesystem.
         let checkpoint_file = {
@@ -2112,6 +2229,16 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let backpressure = Backpressure::from_engine_config(&config);
         let mut engine = Engine {
             log,
+            // The per-named-stream LOG substrate (#676), opened above; recovered named streams (if
+            // any) are already in it. The default stream is served by `log`, never this set's `""`.
+            streams,
+            // The per-named-stream CONSUMER state (#676): EMPTY at open. A named stream gets its
+            // entry on its first produce (alongside the StreamSet `declare`); its work-groups are
+            // created lazily on first consume. A deployment that never names a stream keeps this
+            // empty, so the default path is byte-for-byte today. (Recovering a named stream's
+            // consumer cursors across a restart is the flagged #60-style follow-up; today only the
+            // named stream's LOG recovers, via the StreamSet.)
+            named_streams: BTreeMap::new(),
             groups,
             group_last_checkpointed,
             lease_config: config.lease,
@@ -2200,6 +2327,40 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// SEALED segments and writes a NEW v2 segment, never the active one, so it cannot race or block
     /// an append. Pass a [`CompactionConfig`](ironbus_storage::compaction::CompactionConfig) with
     /// `enabled: true` to turn it on; the default is disabled.
+    /// Opens the DEFAULT stream's root [`Log`] and the per-NAMED-stream [`StreamSet`] substrate over
+    /// the SAME data directory (#676), in the load-bearing ORDER:
+    ///   1. the root log FIRST, from the ORIGINAL `fs`: today's single-log open, which performs the
+    ///      #670 layout-marker check and the longest-valid-prefix recovery, TRUNCATING any torn
+    ///      active-segment tail and REPORTING that loss — byte for byte as before. It owns the
+    ///      authoritative recovery of the root.
+    ///   2. the [`StreamSet`] SECOND, from a CLONE of `fs`: its inert `""` slot is a read-only re-open
+    ///      of the now-already-recovered root that the engine NEVER writes (the default stream is
+    ///      served by the root `Log`), and it recovers each NAMED stream under `streams/`
+    ///      independently. A data dir with no `streams/` subtree opens with only the inert `""` slot
+    ///      and never materializes `streams/`, so the disk image is unchanged.
+    ///
+    /// The order matters: a [`StreamSet`] open BEFORE the root open would recover (repair) the torn
+    /// tail first, so the root's own open would then find it already clean and report ZERO loss,
+    /// masking the recovery-loss the existing tests (and the loss report) assert. (Folding the default
+    /// fully INTO the [`StreamSet`] to drop the inert duplicate `""` slot is the flagged follow-up.)
+    ///
+    /// # Errors
+    /// Propagates a storage error from either open (including the fail-closed layout-version check).
+    fn open_log_and_streams(
+        fs: F,
+        clock: C,
+        config: LogConfig,
+    ) -> Result<LogAndStreams<F, C>, EngineError>
+    where
+        F: Clone,
+    {
+        let fs_for_streams = fs.clone();
+        let log = Log::open(fs, clock.clone(), config)?;
+        let (streams, _stream_recoveries) =
+            StreamSet::open(&fs_for_streams, clock, config).map_err(EngineError::Storage)?;
+        Ok((log, streams))
+    }
+
     pub fn set_compaction_config(&mut self, config: ironbus_storage::compaction::CompactionConfig) {
         self.compaction = config;
     }
@@ -2766,6 +2927,292 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         let offset = self.append_no_sync(message)?;
         self.commit_batch()?;
         Ok(offset)
+    }
+
+    // ===================================================================================
+    // ID-ROUTED produce / consume / ack (#676, V2-M2-I2b — thread the StreamSet through the
+    // Engine). These entry points carry a STREAM ID. The default stream `""` routes to today's
+    // single-log path BYTE-FOR-BYTE (it calls the EXISTING `produce` / `poll_in` / `ack_in` on
+    // `self.log` + `self.groups`, unchanged); a NAMED stream routes to its own `Log` in the
+    // `StreamSet` + its own per-stream `groups` in `self.named_streams`, re-instantiating the SAME
+    // competing work-group primitives (AckCursor / LeaseTable / 0-1-2 ack) per stream.
+    //
+    // SCOPE (#676): the stream id arrives on these INTERNAL entry points and defaults to `""` when
+    // absent, so an old client (and every existing caller) reaches the default stream unchanged.
+    // The client-facing WIRE frames that carry a stream id (StreamDeclare / PubTo / SubTo) are
+    // M2-I10 (#588) — NOT in this PR; the engine is merely READY to receive a stream id. The named
+    // stream's consume path here is the COMPETING work-group only; a named stream's DLQ,
+    // retry-throttle, key-shared routing, Tier-S streaming, durable per-group cursors, and per-stream
+    // metric labels are FLAGGED follow-ups (never removed from the default stream).
+    // ===================================================================================
+
+    /// Produces `message` to the stream named `stream` (#676): the default stream (the EMPTY name)
+    /// routes to today's single-log [`Engine::produce`] BYTE-FOR-BYTE, while a NAMED stream appends
+    /// to its OWN [`Log`] in the [`StreamSet`] and commits it with the cross-stream
+    /// [`StreamSet::commit_tick`] barrier (#678/#564). A named stream is `declare`d on its first
+    /// produce (materializing `streams/<hex(name)>/` and its independent log + recovery), so a
+    /// producer need not declare it separately.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidStreamName`] for a malformed NAMED name (fail-closed at the boundary,
+    /// before the filesystem); else a storage error from the named stream's append or its commit
+    /// barrier. The default stream surfaces exactly [`Engine::produce`]'s error taxonomy.
+    pub fn produce_in_stream(
+        &mut self,
+        stream: &str,
+        message: &Append<'_>,
+    ) -> Result<Offset, EngineError>
+    where
+        F: Clone,
+    {
+        // The default stream is today's root log, byte-for-byte: route straight to the existing
+        // single-log produce on `self.log`. NOTHING about the default path changes when a stream id
+        // is supplied as `""` — an old client (no stream id) and a new client naming `""` are
+        // indistinguishable from the historical broker.
+        if stream.is_empty() {
+            return self.produce(message);
+        }
+        let id = StreamId::named(stream)?;
+        // Declare-on-first-produce: open the named stream's independent log under `streams/<hex>/`
+        // (idempotent — a no-op if already open) and mirror it in the per-stream consumer state.
+        self.streams.declare(&id).map_err(EngineError::Storage)?;
+        self.named_streams
+            .entry(id.clone())
+            .or_insert_with(NamedStream::new);
+        // Append to THIS stream's log (a single-`Log` append; appending to X never touches Y, so
+        // per-record cost stays flat as streams grow), then make it durable with the cross-stream
+        // group-commit tick. The tick syncs ONLY the dirtied streams; because the engine never
+        // dirties the StreamSet's `""` slot (the default stream lives on `self.log`), the default
+        // stream's durability is entirely unaffected.
+        let offset = self
+            .streams
+            .append_to(&id, message)
+            .map_err(EngineError::Storage)?;
+        // ONE coordinated commit tick (#678): K dirtied named streams => K fdatasync barriers,
+        // amortized over the batch; a clean stream costs nothing. The default `""` slot is never
+        // dirtied here, so this never syncs the root a second time.
+        let _outcome: CommitOutcome = self.streams.commit_tick();
+        Ok(offset)
+    }
+
+    /// Polls the stream named `stream` in work-group `group` (#676): the default stream routes to
+    /// today's [`Engine::poll_in`] BYTE-FOR-BYTE; a NAMED stream delivers off its OWN log + its own
+    /// per-stream work-group (the same competing lease/cursor machinery, independent per stream, so
+    /// the same group name in two streams is two unrelated cursors).
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidStreamName`] / [`EngineError::UnknownStream`] for a bad or never-declared
+    /// named stream, [`EngineError::InvalidGroupName`] / [`EngineError::TooManyGroups`] from the group
+    /// gate, else a storage error from the read.
+    pub fn poll_in_stream(
+        &mut self,
+        stream: &str,
+        group: &str,
+        now: u64,
+    ) -> Result<Poll, EngineError> {
+        if stream.is_empty() {
+            return self.poll_in(group, now);
+        }
+        let id = StreamId::named(stream)?;
+        // A named stream must be produced-to (declared) before it can be consumed: an unknown stream
+        // is a typed rejection, never a silent empty read (matching `StreamSet::read_range`).
+        let Some(flushed) = self.streams.get(&id).map(|log| log.flushed_offset().get()) else {
+            return Err(EngineError::UnknownStream {
+                name: stream.to_string(),
+            });
+        };
+        validate_group_name(group)?;
+        let lease_config = self.lease_config;
+        let max_groups = self.max_groups;
+        // Resolve (creating lazily, under the per-stream group cap) this stream's work-group. The
+        // cap is PER STREAM (each named stream gets its own `max_groups` budget), so a noisy stream
+        // cannot starve a sibling's group slots — at least as strong as the default-stream bound.
+        let named = self
+            .named_streams
+            .entry(id.clone())
+            .or_insert_with(NamedStream::new);
+        if !named.groups.contains_key(group) {
+            if max_groups != 0 && named.groups.len() >= max_groups {
+                return Err(EngineError::TooManyGroups { max: max_groups });
+            }
+            named
+                .groups
+                .insert(group.to_string(), WorkGroup::new(lease_config, now));
+        }
+        self.deliver_from_named_stream(&id, group, now, flushed)
+    }
+
+    /// The competing claim/deliver loop for a NAMED stream (#676), factored out of
+    /// [`Engine::poll_in_stream`] so the public entry point stays small. The work-group `group` of
+    /// stream `id` is already present (the caller created it under the per-stream cap), and `flushed`
+    /// is that stream's durable head. Re-instantiates the SAME primitives the default stream uses —
+    /// the [`AckCursor`], the [`LeaseTable`] claim/ack, the 0/1/2-ack disposition — per stream.
+    ///
+    /// Each iteration resolves the group in its OWN scoped borrow: the per-record log read borrows
+    /// `&self.streams` (a field DISJOINT from `self.named_streams`), so a persistent group borrow held
+    /// across the read would be a borrow conflict; resolving the group fresh per use keeps the borrows
+    /// non-overlapping. `id`/`group` are guaranteed present by the caller, so the lookups never miss.
+    fn deliver_from_named_stream(
+        &mut self,
+        id: &StreamId,
+        group: &str,
+        now: u64,
+        flushed: u64,
+    ) -> Result<Poll, EngineError> {
+        // Stamp the polled group active and read its committed cursor in a SHORT scoped borrow, so the
+        // borrow ends before the loop re-borrows `self.named_streams` per iteration.
+        let Some(committed) = self.named_group_mut(id, group).map(|g| {
+            g.last_activity = now;
+            g.touched = true;
+            g.cursor.committed().get()
+        }) else {
+            return Ok(Poll::Idle);
+        };
+        // The delivery window: at most `max_in_flight` offsets above the committed cursor, never past
+        // the durable end — the SAME window as the default-stream poll.
+        let window_end = committed
+            .saturating_add(u64::from(self.max_in_flight))
+            .min(flushed);
+        let mut offset = committed;
+        while offset < window_end {
+            let off = Offset::new(offset);
+            // Skip an already-acked offset and claim the next deliverable lease (scoped group borrow).
+            let Some(claim) = self.named_group_mut(id, group).map(|g| {
+                if g.cursor.is_acked(off) {
+                    None
+                } else {
+                    Some(g.leases.claim(off, now))
+                }
+            }) else {
+                return Ok(Poll::Idle);
+            };
+            let (token, deliveries) = match claim {
+                None | Some(Claim::InFlight) => {
+                    offset += 1;
+                    continue;
+                }
+                Some(Claim::Exhausted) => return Err(EngineError::GenerationExhausted),
+                Some(Claim::Granted { token, deliveries }) => (token, deliveries),
+            };
+            // Read the leased record off THIS stream's log (immutable `&self.streams` borrow, now that
+            // the group borrow above has ended).
+            let record = match self.streams.get(id) {
+                Some(log) => log.read_from(off, 1).map_err(EngineError::Storage)?,
+                None => return Ok(Poll::Idle),
+            };
+            let Some(record) = record.into_iter().next() else {
+                return Err(EngineError::MissingRecord { offset });
+            };
+            match self.delivery.disposition(deliveries) {
+                Disposition::Deliver => {
+                    self.counters.delivered += 1;
+                    if deliveries > 1 {
+                        self.counters.redelivered += 1;
+                    }
+                    return Ok(Poll::Message(Delivery {
+                        offset: off,
+                        token,
+                        deliveries,
+                        record,
+                    }));
+                }
+                Disposition::DeadLetter => {
+                    // No per-stream DLQ yet (#676 scope): commit PAST the poison message so it never
+                    // redelivers (at-least-once preserved; the forensic DLQ copy is the flagged
+                    // follow-up). The default stream keeps its full crash-atomic DLQ move unchanged.
+                    if let Some(g) = self.named_group_mut(id, group) {
+                        g.leases.ack(&token);
+                        g.cursor.ack(off);
+                    }
+                    self.counters.dead_lettered = self.counters.dead_lettered.saturating_add(1);
+                    offset += 1;
+                }
+            }
+        }
+        Ok(Poll::Idle)
+    }
+
+    /// Mutably borrows work-group `group` of NAMED stream `id`, or `None` if the stream or group is
+    /// not present (#676). The single resolution point for the per-stream consume/ack paths, so they
+    /// never `.expect()` (the missing case is handled, not a panic).
+    fn named_group_mut(&mut self, id: &StreamId, group: &str) -> Option<&mut WorkGroup> {
+        self.named_streams
+            .get_mut(id)
+            .and_then(|s| s.groups.get_mut(group))
+    }
+
+    /// Acks `token` in work-group `group` of the stream named `stream` (#676): the default stream
+    /// routes to today's [`Engine::ack_in`] BYTE-FOR-BYTE; a NAMED stream commits in its OWN
+    /// per-stream group cursor and frees its lease slot, independent of every other stream and of the
+    /// default stream. An ack on an unknown stream or group is a fence, never a new allocation.
+    pub fn ack_in_stream(&mut self, stream: &str, group: &str, token: &LeaseToken) -> AckResult {
+        if stream.is_empty() {
+            return self.ack_in(group, token);
+        }
+        let Ok(id) = StreamId::named(stream) else {
+            return AckResult::Fenced;
+        };
+        let now = self.streams.get(&id).map_or(0, Log::now_monotonic);
+        let Some(named) = self.named_streams.get_mut(&id) else {
+            return AckResult::Fenced;
+        };
+        let Some(g) = named.groups.get_mut(group) else {
+            return AckResult::Fenced;
+        };
+        g.last_activity = now;
+        g.touched = true;
+        match g.leases.ack(token) {
+            AckOutcome::Acked => {
+                g.cursor.ack(token.offset);
+                self.counters.acks += 1;
+                AckResult::Acked
+            }
+            AckOutcome::Fenced => AckResult::Fenced,
+        }
+    }
+
+    /// The committed offset of work-group `group` in the stream named `stream` (#676): the default
+    /// stream reads today's [`Engine::committed_offset_in`]; a NAMED stream reads its OWN per-stream
+    /// group cursor (`Offset::ZERO` for an unknown stream or group). Used by the cross-stream
+    /// isolation tests to assert a named stream's cursor is independent of the default's.
+    #[must_use]
+    pub fn committed_offset_in_stream(&self, stream: &str, group: &str) -> Offset {
+        if stream.is_empty() {
+            return self.committed_offset_in(group);
+        }
+        let Ok(id) = StreamId::named(stream) else {
+            return Offset::ZERO;
+        };
+        self.named_streams
+            .get(&id)
+            .and_then(|s| s.groups.get(group))
+            .map_or(Offset::ZERO, |g| g.cursor.committed())
+    }
+
+    /// The durable head (flushed offset) of the stream named `stream` (#676): the default stream's
+    /// head from [`Engine::log`], or a NAMED stream's head from its own log in the [`StreamSet`]
+    /// (`Offset::ZERO` for an unknown named stream). Lets a test assert a produce to a named stream
+    /// advanced ONLY that stream's head, not the default's (cross-stream data isolation).
+    #[must_use]
+    pub fn stream_head(&self, stream: &str) -> Offset {
+        if stream.is_empty() {
+            return self.log.flushed_offset();
+        }
+        let Ok(id) = StreamId::named(stream) else {
+            return Offset::ZERO;
+        };
+        self.streams
+            .get(&id)
+            .map_or(Offset::ZERO, Log::flushed_offset)
+    }
+
+    /// The number of OPEN named streams (#676), EXCLUDING the always-present default stream: `0` for
+    /// a deployment that never named a stream. (The [`StreamSet`] always carries its `""` slot, so we
+    /// subtract it to report the named count an operator cares about.)
+    #[must_use]
+    pub fn named_stream_count(&self) -> usize {
+        // The StreamSet's `len()` includes its inert default `""` slot; the named count is the rest.
+        self.streams.len().saturating_sub(1)
     }
 
     /// Appends `message` durably-pending (write, NO fsync) and records the produce statistics that
@@ -12618,5 +13065,253 @@ mod tests {
             1,
             "the byte cap floors at one record so a stream never wedges"
         );
+    }
+
+    // =================================================================================
+    // #676 (V2-M2-I2b): thread the StreamSet through the Engine — id-routed produce/consume.
+    // The default stream "" must stay byte-for-byte today; a NAMED stream is an independent
+    // log + its own per-stream work-groups; the two are isolated; recovery reopens both.
+    // =================================================================================
+
+    /// Produces `payload` to the NAMED stream `stream` via the id-routed entry point.
+    fn produce_to(e: &mut Engine<InMemoryFs, ManualClock>, stream: &str, payload: &[u8]) -> Offset {
+        e.produce_in_stream(
+            stream,
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_no_stream_id_produce_consume_is_byte_for_byte_the_default_stream() {
+        // Routing through the id-routed entry points with the EMPTY stream name must behave EXACTLY
+        // like the historical no-stream produce/poll/ack on the default group. (The single-log
+        // golden-path test `produce_poll_ack_advances_the_cursor` already pins the bare-method
+        // behavior; this asserts the id-routed `""` path is indistinguishable from it.)
+        let mut e = open(config(10, 5));
+        assert_eq!(produce_to(&mut e, "", b"a"), Offset::new(0));
+        assert_eq!(produce_to(&mut e, "", b"b"), Offset::new(1));
+        // The default head advanced; NO named stream was created (the `""` path never names one).
+        assert_eq!(e.stream_head(""), Offset::new(2));
+        assert_eq!(
+            e.named_stream_count(),
+            0,
+            "the default path never materializes a named stream"
+        );
+
+        let d0 = message(e.poll_in_stream("", DEFAULT_GROUP, 0).unwrap());
+        assert_eq!(d0.offset, Offset::new(0));
+        assert_eq!(d0.record.payload.as_ref(), b"a");
+        assert_eq!(
+            e.ack_in_stream("", DEFAULT_GROUP, &d0.token),
+            AckResult::Acked
+        );
+        assert_eq!(e.committed_offset(), Offset::new(1));
+        // The id-routed default ack moved the SAME cursor the bare `committed_offset()` reads.
+        assert_eq!(
+            e.committed_offset_in_stream("", DEFAULT_GROUP),
+            Offset::new(1)
+        );
+
+        let d1 = message(e.poll_in_stream("", DEFAULT_GROUP, 0).unwrap());
+        assert_eq!(d1.offset, Offset::new(1));
+        assert_eq!(
+            e.ack_in_stream("", DEFAULT_GROUP, &d1.token),
+            AckResult::Acked
+        );
+        assert_eq!(e.committed_offset(), Offset::new(2));
+        assert!(matches!(
+            e.poll_in_stream("", DEFAULT_GROUP, 0).unwrap(),
+            Poll::Idle
+        ));
+    }
+
+    #[test]
+    fn a_named_stream_end_to_end_declare_produce_consume_ack() {
+        // Produce DECLARES the named stream (no separate declare needed), the consume delivers off
+        // ITS OWN log + group, and the ack advances ITS OWN cursor — the full work-queue cycle on a
+        // stream other than the default.
+        let mut e = open(config(10, 5));
+        assert_eq!(produce_to(&mut e, "orders", b"o0"), Offset::new(0));
+        assert_eq!(produce_to(&mut e, "orders", b"o1"), Offset::new(1));
+        assert_eq!(e.named_stream_count(), 1);
+        assert_eq!(e.stream_head("orders"), Offset::new(2));
+
+        let d0 = message(e.poll_in_stream("orders", "g", 0).unwrap());
+        assert_eq!(d0.offset, Offset::new(0));
+        assert_eq!(d0.record.payload.as_ref(), b"o0");
+        assert_eq!(d0.deliveries, 1);
+        assert_eq!(e.ack_in_stream("orders", "g", &d0.token), AckResult::Acked);
+        assert_eq!(e.committed_offset_in_stream("orders", "g"), Offset::new(1));
+
+        let d1 = message(e.poll_in_stream("orders", "g", 0).unwrap());
+        assert_eq!(d1.offset, Offset::new(1));
+        assert_eq!(e.ack_in_stream("orders", "g", &d1.token), AckResult::Acked);
+        assert_eq!(e.committed_offset_in_stream("orders", "g"), Offset::new(2));
+        assert!(matches!(
+            e.poll_in_stream("orders", "g", 0).unwrap(),
+            Poll::Idle
+        ));
+    }
+
+    #[test]
+    fn a_named_stream_is_isolated_from_the_default_streams_data_and_cursor() {
+        // The cross-stream ISOLATION property (#676): a produce/consume/ack on a named stream NEVER
+        // touches the default stream's data or cursor, and vice versa.
+        let mut e = open(config(10, 5));
+        // Default stream gets two records; the named stream gets one DIFFERENT record.
+        assert_eq!(produce(&mut e, b"default-0"), Offset::new(0));
+        assert_eq!(produce(&mut e, b"default-1"), Offset::new(1));
+        assert_eq!(produce_to(&mut e, "metrics", b"metrics-0"), Offset::new(0));
+
+        // Each stream has its OWN head/offset space: the named stream's offset 0 is independent of
+        // the default stream's offsets.
+        assert_eq!(e.stream_head(""), Offset::new(2));
+        assert_eq!(e.stream_head("metrics"), Offset::new(1));
+
+        // Consume + ack the named stream fully. The default stream's cursor must NOT move.
+        let m = message(e.poll_in_stream("metrics", "g", 0).unwrap());
+        assert_eq!(m.record.payload.as_ref(), b"metrics-0");
+        assert_eq!(e.ack_in_stream("metrics", "g", &m.token), AckResult::Acked);
+        assert_eq!(e.committed_offset_in_stream("metrics", "g"), Offset::new(1));
+        assert_eq!(
+            e.committed_offset(),
+            Offset::ZERO,
+            "acking the named stream must not advance the default stream's cursor"
+        );
+
+        // Now consume the DEFAULT stream: it still serves its own data, unaffected by the named
+        // stream's activity, and the named stream's cursor stays put.
+        let d = message(e.poll(0).unwrap());
+        assert_eq!(d.record.payload.as_ref(), b"default-0");
+        assert_eq!(e.ack(&d.token), AckResult::Acked);
+        assert_eq!(e.committed_offset(), Offset::new(1));
+        assert_eq!(
+            e.committed_offset_in_stream("metrics", "g"),
+            Offset::new(1),
+            "consuming the default stream must not disturb the named stream's cursor"
+        );
+    }
+
+    #[test]
+    fn the_same_group_name_in_two_streams_is_two_independent_cursors() {
+        // PER-STREAM GROUPS (#676): a group name `g` in stream A and `g` in stream B are unrelated
+        // cursors — acking in A's `g` never advances B's `g`.
+        let mut e = open(config(10, 5));
+        produce_to(&mut e, "a", b"a0");
+        produce_to(&mut e, "a", b"a1");
+        produce_to(&mut e, "b", b"b0");
+        produce_to(&mut e, "b", b"b1");
+
+        // Drain stream A's group `g` by ONE; stream B's group `g` is untouched.
+        let a0 = message(e.poll_in_stream("a", "g", 0).unwrap());
+        assert_eq!(a0.record.payload.as_ref(), b"a0");
+        assert_eq!(e.ack_in_stream("a", "g", &a0.token), AckResult::Acked);
+        assert_eq!(e.committed_offset_in_stream("a", "g"), Offset::new(1));
+        assert_eq!(
+            e.committed_offset_in_stream("b", "g"),
+            Offset::ZERO,
+            "the SAME group name in a sibling stream is an independent cursor"
+        );
+
+        // Stream B's group `g` still delivers from ITS offset 0 (not skipped by A's progress).
+        let b0 = message(e.poll_in_stream("b", "g", 0).unwrap());
+        assert_eq!(b0.offset, Offset::new(0));
+        assert_eq!(b0.record.payload.as_ref(), b"b0");
+    }
+
+    #[test]
+    fn commit_tick_commits_multiple_named_streams_in_one_tick() {
+        // The cross-stream #678 commit_tick path: producing to TWO named streams makes both durable
+        // (their durable heads advance), and the records are independently readable from each stream.
+        // (`produce_in_stream` drives one tick per produce; this asserts the multi-stream durability
+        // result the tick guarantees — each dirtied stream's head reaches its appended count.)
+        let mut e = open(config(10, 5));
+        produce_to(&mut e, "s1", b"x");
+        produce_to(&mut e, "s2", b"y");
+        produce_to(&mut e, "s1", b"z");
+        // Both named streams committed independently; the default stream stayed empty (never dirtied
+        // by the named-stream commit tick).
+        assert_eq!(e.stream_head("s1"), Offset::new(2));
+        assert_eq!(e.stream_head("s2"), Offset::new(1));
+        assert_eq!(
+            e.stream_head(""),
+            Offset::ZERO,
+            "the default stream is never touched by named produces"
+        );
+        assert_eq!(e.named_stream_count(), 2);
+
+        // The durable records are readable per stream (proving the tick made them durable+visible).
+        let m1 = message(e.poll_in_stream("s1", "g", 0).unwrap());
+        assert_eq!(m1.record.payload.as_ref(), b"x");
+        let m2 = message(e.poll_in_stream("s2", "g", 0).unwrap());
+        assert_eq!(m2.record.payload.as_ref(), b"y");
+    }
+
+    #[test]
+    fn recovery_reopens_all_streams_engine_state() {
+        // RECOVERY (#676): after a restart, the engine reopens the default stream AND every named
+        // stream's log, so produced records on each stream survive and remain consumable. (Named
+        // streams' CONSUMER cursors are in-memory for now — the flagged #60-style follow-up — so this
+        // asserts the LOG of each stream recovers and redelivers its records, the durable guarantee.)
+        let fs = InMemoryFs::new();
+        {
+            let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+            produce(&mut e, b"default-survives"); // default stream, offset 0
+            produce_to(&mut e, "alpha", b"alpha-survives"); // named stream, offset 0
+            produce_to(&mut e, "beta", b"beta-survives"); // named stream, offset 0
+            assert_eq!(e.named_stream_count(), 2);
+        }
+        // Reopen over the SAME filesystem: every stream's log recovers.
+        let mut e2 = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert_eq!(
+            e2.named_stream_count(),
+            2,
+            "both named streams recovered from disk at reopen"
+        );
+        assert_eq!(e2.stream_head(""), Offset::new(1));
+        assert_eq!(e2.stream_head("alpha"), Offset::new(1));
+        assert_eq!(e2.stream_head("beta"), Offset::new(1));
+
+        // Each recovered stream redelivers its own record (the log survived the restart).
+        let d = message(e2.poll(0).unwrap());
+        assert_eq!(d.record.payload.as_ref(), b"default-survives");
+        let a = message(e2.poll_in_stream("alpha", "g", 0).unwrap());
+        assert_eq!(a.record.payload.as_ref(), b"alpha-survives");
+        let b = message(e2.poll_in_stream("beta", "g", 0).unwrap());
+        assert_eq!(b.record.payload.as_ref(), b"beta-survives");
+    }
+
+    #[test]
+    fn an_invalid_named_stream_fails_closed_and_an_unknown_stream_consume_rejects() {
+        // The validation boundary (#676): a malformed NAMED name fails closed BEFORE the filesystem,
+        // and a consume on a never-declared stream is a typed rejection, not a silent empty read.
+        let mut e = open(config(10, 5));
+        // A name with a control byte is rejected (the graphic-ASCII rule, the same as a group name).
+        let bad = e.produce_in_stream(
+            "bad\nname",
+            &Append {
+                timestamp_ms: 0,
+                flags: RecordFlags::EMPTY,
+                key: b"",
+                headers: b"",
+                payload: b"x",
+            },
+        );
+        assert!(matches!(bad, Err(EngineError::InvalidStreamName { .. })));
+        assert_eq!(
+            e.named_stream_count(),
+            0,
+            "a rejected name never materializes a stream"
+        );
+        // A consume on a stream that was never produced-to is UnknownStream, not an empty Idle.
+        let unknown = e.poll_in_stream("never-declared", "g", 0);
+        assert!(matches!(unknown, Err(EngineError::UnknownStream { .. })));
     }
 }
