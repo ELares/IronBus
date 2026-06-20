@@ -36,11 +36,12 @@ use ironbus_core::lease::{
 };
 use ironbus_core::subject::{Subject, SubjectError, SubjectPattern};
 use ironbus_core::sublist::{Sublist, SublistBuilder, SublistError, SublistSnapshot};
+use ironbus_core::ttl::{decode_ttl_headers, is_expired, Ttl};
 use ironbus_core::types::{Offset, RecordFlags};
 use ironbus_storage::checkpoint::{
     AttemptsCheckpoint, Checkpoint, CountersCheckpoint, ATTEMPTS_PAYLOAD, MAX_PAYLOAD,
 };
-use ironbus_storage::dlq::{DlqSink, DLQ_SUBDIR};
+use ironbus_storage::dlq::{DeadLetterReason, DlqSink, DLQ_SUBDIR};
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::{Append, Log, LogConfig, RetentionBounds};
 use ironbus_storage::loss::LossReport;
@@ -498,6 +499,30 @@ pub struct EngineConfig {
     /// UNCHANGED, never double-wrapped. (The DLQ redrive preserves the flag too, but it appends
     /// via `Log::append` directly, below this seam.)
     pub compression: Codec,
+    /// The per-STREAM default message TTL in MILLISECONDS (V2-M4, #549): a record older than this
+    /// many ms (its durable producer `timestamp_ms + ttl` against the engine WALL-clock seam) is
+    /// EXPIRED — skipped on read, never delivered, and reclaimed by the existing segment retention
+    /// reap. A per-message TTL (carried in the record headers) combines with this LOWER-WINS (the
+    /// tighter of the two applies), so a stream-wide default coexists with tighter per-message TTLs.
+    /// `0` means DISABLED (no per-stream default), the default, so a non-TTL stream is byte-identical
+    /// to today (records never expire on read). This is the DELIVERY-skip TTL; the disk-reclamation
+    /// counterpart is [`EngineConfig::max_age_ms`] (the segment reap), which the TTL piggybacks on.
+    pub default_message_ttl_ms: u64,
+    /// The configurable dead-letter EXCHANGE (V2-M4, #551): the data-dir SUBDIR a dead-lettered
+    /// message is routed to. `None` (the default) keeps the existing FIXED behavior byte-identical —
+    /// max-deliver dead-letters go to the default `dlq/` sink via the unchanged reason-less path. A
+    /// `Some(subdir)` routes EVERY dead-letter (max-deliver, TTL-expired, rejected) to that named
+    /// sink instead, recording the [`DeadLetterReason`](ironbus_storage::dlq::DeadLetterReason) —
+    /// the `RabbitMQ` DLX-parity beat over a single fixed DLQ.
+    pub dead_letter_exchange: Option<String>,
+    /// Whether a TTL-EXPIRED message is dead-lettered (routed to the dead-letter exchange with
+    /// [`DeadLetterReason::TtlExpired`](ironbus_storage::dlq::DeadLetterReason)) rather than silently
+    /// reclaimed by retention (V2-M4, #549/#551). `false` (the default) reclaims an expired message
+    /// via the segment reap (still BOUNDED and never delivered — an expired-and-not-dead-lettered
+    /// message is reclaimed, not lost-by-surprise). `true` routes it to the DLX so the expiry is a
+    /// recorded event. Has effect only when a [`dead_letter_exchange`](Self::dead_letter_exchange)
+    /// is configured; with no DLX an expired message is always reclaimed by retention.
+    pub dead_letter_expired: bool,
 }
 
 /// An error from the engine.
@@ -945,7 +970,8 @@ pub struct Counters {
     pub delivered: u64,
     /// Deliveries that were a redelivery (the message had been delivered before).
     pub redelivered: u64,
-    /// Messages dead-lettered (parked past `MaxDeliver`); the resilience drop signal.
+    /// Messages dead-lettered (parked past `MaxDeliver`, or routed to a dead-letter exchange after a
+    /// TTL expiry / explicit reject, #551); the resilience drop signal.
     pub dead_lettered: u64,
     /// Below-earliest TRUNCATION events served to a consumer (#82, #84): each is one
     /// [`Poll::Truncated`] returned because a group's cursor had fallen below the oldest retained
@@ -1040,6 +1066,15 @@ pub struct Counters {
     /// just-recovered durable [`LossReport`]), not runtime, so they reconcile cleanly from the durable
     /// artifact on every open and stay monotonic non-decreasing across a `kill -9`.
     pub recovery: RecoveryCounters,
+    /// Messages EXPIRED-and-reclaimed by a per-message/per-stream TTL (V2-M4, #549): a record whose
+    /// effective TTL (the lower of its per-message TTL and the stream's `default_message_ttl_ms`) had
+    /// passed when a consumer reached it, so it was SKIPPED on read (never delivered) and committed
+    /// past, its bytes left for the segment retention reap to reclaim. This is the "expired, not
+    /// dead-lettered" bucket: the DLX-routed expiry path increments `dead_lettered` instead, so an
+    /// expired message is ALWAYS accounted in exactly one of the two (no silent drop). Zero unless a
+    /// TTL is configured, so a non-TTL broker is byte-identical. Saturating; exposed as the
+    /// `ironbus_expired_total` counter.
+    pub expired: u64,
 }
 
 /// The recovery-event counter family (#575): the FLAGSHIP corruption-recovery metrics NATS has no
@@ -1182,7 +1217,10 @@ const COUNTERS_SNAPSHOT_VERSION: u8 = 1;
 /// `runs_by_outcome` buckets, `torn_tail_repairs`, and the three `corruption_repairs_by_artifact`
 /// buckets), same forward/backward-compatible rule (a pre-#575 snapshot reads them as zero, and
 /// reconciliation on open re-derives them from the durable loss report).
-const COUNTERS_FIELD_COUNT: usize = 25;
+/// The TTL family (#549) appended one more trailing field (`expired`), same rule: a pre-#549
+/// snapshot reads it as zero, and a newer snapshot decodes on an old binary (the trailing field is
+/// ignored).
+const COUNTERS_FIELD_COUNT: usize = 26;
 
 impl Counters {
     /// Serializes the counters into a small versioned little-endian byte string for the durable
@@ -1228,6 +1266,10 @@ impl Counters {
             self.recovery.corruption_repairs_by_artifact[0],
             self.recovery.corruption_repairs_by_artifact[1],
             self.recovery.corruption_repairs_by_artifact[2],
+            // The TTL family (#549), appended after the recovery family: a pre-#549 snapshot is too
+            // short to hold it (it reads as zero). It is an operational counter with no replay
+            // reconciliation, so the resumed value is the #306 snapshot-only lower bound.
+            self.expired,
         ] {
             buf.extend_from_slice(&v.to_le_bytes());
         }
@@ -1286,6 +1328,9 @@ impl Counters {
                 torn_tail_repairs: field(21),
                 corruption_repairs_by_artifact: [field(22), field(23), field(24)],
             },
+            // The TTL family (#549), appended after recovery at field 25: a pre-#549 snapshot reads
+            // it as zero (the tolerant decode). Operational, no replay reconciliation.
+            expired: field(25),
         }
     }
 }
@@ -2286,6 +2331,24 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// log, but with NO total-byte cap (a poison record must never be shed, it is the durable
     /// evidence of a dropped message).
     dlq_config: LogConfig,
+    /// The per-STREAM default message TTL (V2-M4, #549): a record reached on the poll path whose
+    /// EFFECTIVE TTL (the lower of this and the record's own per-message TTL) has passed against the
+    /// WALL-clock seam (anchored to the record's durable producer `timestamp_ms`) is EXPIRED — skipped
+    /// on read and committed past, its bytes reclaimed by the same segment retention reap that ages
+    /// out `max_age_ms`. [`Ttl::NONE`] (the default) means no per-stream TTL, so a non-TTL stream is
+    /// byte-identical (records never expire on read). See [`EngineConfig::default_message_ttl_ms`].
+    default_message_ttl: Ttl,
+    /// The configurable dead-letter EXCHANGE target subdir (V2-M4, #551), or `None` for the default
+    /// fixed `dlq/` sink. When set, EVERY dead-letter (max-deliver, TTL-expired, rejected) routes to
+    /// this named sink via the reason-carrying append; `None` keeps the existing fixed-DLQ path
+    /// byte-identical. See [`EngineConfig::dead_letter_exchange`].
+    dead_letter_exchange: Option<String>,
+    /// Whether a TTL-EXPIRED message is DEAD-LETTERED (to the configured exchange, with reason
+    /// [`DeadLetterReason::TtlExpired`]) rather than reclaimed by retention (V2-M4, #549/#551). Has
+    /// effect only when `dead_letter_exchange` is `Some`; with no exchange an expired message is
+    /// always reclaimed by the reap (still bounded, never delivered, counted in `expired`). See
+    /// [`EngineConfig::dead_letter_expired`].
+    dead_letter_expired: bool,
     /// The set of group names CONFIGURED to use `key_shared` ordering (#64), declared server-side
     /// (NOT on the wire). Empty by default, so every group is plain competing
     /// ([`KeyOrdering::None`]) unless an operator opts it in. A session consults
@@ -2519,13 +2582,21 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // physical write budget (the flash-wear governor is for the main produce path only, #118).
             daily_physical_write_budget_bytes: 0,
         };
-        // Eagerly open (recovering its high-water mark) the DLQ sink IF its subdirectory already
-        // exists from a prior run, so the idempotency key is present before the first poison
-        // redelivers after a crash. A fresh data directory has no `dlq/` yet, so the sink stays
-        // unopened (lazy) and the no-poison path never creates it.
-        let dlq = if Self::dlq_dir_exists(&log) {
-            Some(DlqSink::open(
+        // The dead-letter sink's subdir: the configured dead-letter EXCHANGE target (#551), or the
+        // default fixed `dlq/` (byte-identical to today) when none is configured.
+        let dlq_subdir = config
+            .dead_letter_exchange
+            .as_deref()
+            .unwrap_or(DLQ_SUBDIR)
+            .to_string();
+        // Eagerly open (recovering its high-water mark) the dead-letter sink IF its subdirectory
+        // already exists from a prior run, so the idempotency key is present before the first poison
+        // redelivers after a crash. A fresh data directory has no sink subdir yet, so the sink stays
+        // unopened (lazy) and the no-dead-letter path never creates it.
+        let dlq = if Self::dlq_dir_exists(&log, &dlq_subdir) {
+            Some(DlqSink::open_at(
                 log.filesystem(),
+                &dlq_subdir,
                 log.clock_clone(),
                 dlq_config,
             )?)
@@ -2633,6 +2704,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // group, which every plain producer/consumer uses. An operator can redesignate it via
             // `set_confirm_group` server-side (NOT on the wire).
             confirm_group: DEFAULT_GROUP.to_string(),
+            // The per-stream default message TTL (V2-M4, #549), as the pure `Ttl` policy type; `0`
+            // (the default) is `Ttl::NONE`, so a non-TTL broker never expires a record on read.
+            default_message_ttl: Ttl::from_millis(config.default_message_ttl_ms),
+            // The configurable dead-letter exchange + the expired-routing flag (#551), inert by
+            // default (`None` keeps the fixed `dlq/` sink byte-identical).
+            dead_letter_exchange: config.dead_letter_exchange,
+            dead_letter_expired: config.dead_letter_expired,
         };
         engine.seed_registry_from_recovered_state(flushed);
         Ok(engine)
@@ -2731,13 +2809,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         }
     }
 
-    /// Whether the `dlq/` subdirectory already exists, so a prior run dead-lettered at least one
-    /// message. Used by [`Engine::open`] to decide whether to eagerly open the sink (rebuilding the
-    /// idempotency high-water mark) versus deferring to the lazy open on the first dead-letter.
+    /// Whether the dead-letter sink's `subdir` already exists, so a prior run dead-lettered at least
+    /// one message there. `subdir` is the configured dead-letter EXCHANGE target (#551), or the
+    /// default `dlq/`. Used by [`Engine::open`] to decide whether to eagerly open the sink (rebuilding
+    /// the idempotency high-water mark) versus deferring to the lazy open on the first dead-letter.
     /// This is a non-creating probe ([`Filesystem::subdir_exists`]), so `Engine::open` on a fresh
-    /// data directory never materializes the DLQ subdirectory.
-    fn dlq_dir_exists(log: &Log<F, C>) -> bool {
-        log.filesystem().subdir_exists(DLQ_SUBDIR).unwrap_or(false)
+    /// data directory never materializes the sink subdirectory.
+    fn dlq_dir_exists(log: &Log<F, C>, subdir: &str) -> bool {
+        log.filesystem().subdir_exists(subdir).unwrap_or(false)
     }
 
     /// Opens (creating if absent) the default group's durable per-message ATTEMPT-COUNT checkpoint
@@ -4918,6 +4997,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // mutably (it borrows the log immutably).
         let earliest = self.log.earliest_offset().get();
         let lease_config = self.lease_config;
+        // The TTL knobs read ONCE before the group borrow (V2-M4, #549): the per-stream default TTL,
+        // the wall-clock seam instant the whole scan checks deadlines against (so expiry is
+        // seam-anchored and `ManualClock`-deterministic with no per-record clock read in the hot
+        // scan), and whether an expired message routes to a dead-letter exchange. All read here
+        // because the group borrow below cannot coexist with a later `&self` read.
+        let default_ttl = self.default_message_ttl;
+        let now_unix_millis = self.log.now_unix_millis();
+        let dead_letters_expired = self.dead_letters_expired();
         let g = self
             .groups
             .entry(group.to_string())
@@ -4969,6 +5056,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // crash-atomic DLQ move runs OUTSIDE the borrow of `g` (the DLQ append needs `&mut self`
         // for the sink, which cannot coexist with the live `&mut self.groups` borrow).
         let mut dead_letter: Option<(Offset, LeaseToken, u32, OwnedRecord)> = None;
+        // A TTL-EXPIRED message to route to the dead-letter EXCHANGE (V2-M4, #549/#551), captured the
+        // same way (the DLX append needs `&mut self`). Only used when an exchange + the expired flag
+        // are configured; otherwise an expired record is committed-past INLINE (reclaim, no DLX).
+        let mut expired_dlx: Option<(Offset, u32, OwnedRecord)> = None;
+        // Whether the scan committed past at least one INLINE-reclaimed expired record (#549), so the
+        // consumer-lag floor is synced ONCE after the borrow ends (no per-record `&mut self` call).
+        let mut expired_inline = false;
         while offset < window_end {
             let off = Offset::new(offset);
             if g.cursor.is_acked(off) {
@@ -5027,6 +5121,29 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                             to: record.offset,
                         });
                     }
+                    // TTL EXPIRY (V2-M4, #549): a record whose effective TTL has passed against the
+                    // wall-clock seam is EXPIRED — it is NEVER delivered. The lease just claimed is
+                    // dropped. With a dead-letter exchange + the expired flag configured, capture it
+                    // for the crash-atomic DLX move below (reason TtlExpired); otherwise SKIP it on
+                    // read: commit the cursor past it INLINE (it is reclaimed by the segment reap,
+                    // bounded, no per-message timer) and keep scanning for a live message. Either way
+                    // it is ACCOUNTED (the `expired` or `dead_lettered` counter), never silently
+                    // dropped. The non-TTL fast path returns false here, so the hot scan is unchanged.
+                    if Self::record_is_expired(default_ttl, now_unix_millis, &record) {
+                        g.leases.ack(&token);
+                        if dead_letters_expired {
+                            expired_dlx = Some((off, deliveries, record));
+                            break;
+                        }
+                        g.cursor.ack(off);
+                        if let Some(router) = g.router.as_mut() {
+                            router.clear_offset(off);
+                        }
+                        self.counters.expired += 1;
+                        expired_inline = true;
+                        offset += 1;
+                        continue;
+                    }
                     match self.delivery.disposition(deliveries) {
                         Disposition::Deliver => {
                             self.counters.delivered += 1;
@@ -5051,6 +5168,20 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     }
                 }
             }
+        }
+        // An EXPIRED-and-DLX'd message (#551) routes to the dead-letter exchange OUTSIDE the group
+        // borrow (the sink append needs `&mut self`), exactly as the max-deliver dead-letter does.
+        if let Some((off, deliveries, record)) = expired_dlx {
+            return self.expire_dead_letter_in(group, off, deliveries, record);
+        }
+        // The inline expiry skip(s) advanced this group's committed cursor past the reclaimed
+        // records; sync the consumer-lag floor ONCE now the borrow has ended (#97/#549).
+        if expired_inline {
+            let committed = self
+                .groups
+                .get(group)
+                .map_or(0, |g| g.cursor.committed().get());
+            self.sync_consumer_lag(group, committed);
         }
         match dead_letter {
             Some((off, _token, deliveries, record)) => {
@@ -5091,39 +5222,24 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // APPEND to the DLQ and FSYNC, BEFORE committing the source cursor. A storage error
             // (including a frozen DLQ writer) propagates WITHOUT committing the source, so the move
             // simply did not happen and the message redelivers, never lost and never half-moved.
-            self.dlq_sink()?.append_poison(group, &record, attempt)?;
+            // A configured dead-letter EXCHANGE (#551) records the reason; with no exchange this
+            // stays the reason-less v1 max-deliver append, byte-identical to before #551.
+            if self.dead_letter_exchange.is_some() {
+                self.dlq_sink()?.append_dead_letter(
+                    group,
+                    &record,
+                    attempt,
+                    DeadLetterReason::MaxDeliverExceeded,
+                )?;
+            } else {
+                self.dlq_sink()?.append_poison(group, &record, attempt)?;
+            }
         }
         // The DLQ record is now durable (or was already), so commit the source cursor past the
         // poison message: drop nothing, never redeliver. This is the second, ordered durability
-        // step; only after the append's fsync does the source advance.
-        let Some(g) = self.groups.get_mut(group) else {
-            // Unreachable: poll_in created/looked up the group before reaching here.
-            return Err(EngineError::MissingRecord { offset: off.get() });
-        };
-        g.cursor.ack(off);
-        // key_shared (#64): committing past a poison offset frees its key (the poll path already
-        // cleared it, so this is idempotent belt-and-suspenders). A no-op for a competing group.
-        if let Some(router) = g.router.as_mut() {
-            router.clear_offset(off);
-        }
-        // Committing past the poison advances this group's cursor, so push the new floor to the lag
-        // registry (#97), keeping the consumer-lag series correct after a dead-letter.
-        let committed = g.cursor.committed().get();
-        self.sync_consumer_lag(group, committed);
-        self.counters.dead_lettered += 1;
-        self.last_dead_lettered = Some(off);
-        // The Level-2 dead-letter terminal (#497): if the DESIGNATED confirm group dead-lettered this
-        // offset, its record can never be consumed (acked) by that group, so fire a `DeadLettered`
-        // `ProduceConfirm` instead of leaving the producer to wait out the whole TTL. A no-op unless
-        // an L2 confirm was actually pending for this offset in the designated group. The cursor
-        // commit above ALSO ran the per-offset `confirm_up_to` via no hook here on purpose: a
-        // dead-letter is NOT a consume, so it must surface a NON-success terminal, which `terminate`
-        // does. `terminate` removes the pending entry, so the later `confirm_designated_commit` paths
-        // can never double-fire it.
-        if group == self.confirm_group {
-            self.confirm_registry
-                .terminate(off, ConfirmStatus::DeadLettered);
-        }
+        // step; only after the append's fsync does the source advance. The shared commit also fires
+        // the Level-2 designated-group dead-letter terminal (#497) and the lag/counter bookkeeping.
+        self.commit_dead_letter_past(group, off);
         Ok(Poll::Parked {
             offset: off,
             record,
@@ -5137,8 +5253,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     /// so the high-water mark is present before the first poison redelivers.
     fn dlq_sink(&mut self) -> Result<&mut DlqSink<F, C>, EngineError> {
         if self.dlq.is_none() {
-            let sink = DlqSink::open(
+            // Route to the configured dead-letter EXCHANGE subdir (#551) when set, else the default
+            // fixed `dlq/` (byte-identical to the pre-#551 path).
+            let subdir = self.dead_letter_exchange.as_deref().unwrap_or(DLQ_SUBDIR);
+            let sink = DlqSink::open_at(
                 self.log.filesystem(),
+                subdir,
                 self.log.clock_clone(),
                 self.dlq_config,
             )?;
@@ -5148,6 +5268,92 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.dlq
             .as_mut()
             .ok_or(EngineError::MissingRecord { offset: 0 })
+    }
+
+    /// Whether `record` has EXPIRED at the wall-clock seam (V2-M4, #549): its EFFECTIVE TTL (the lower
+    /// of its per-message TTL, decoded from the headers prefix, and `default_ttl`) has a deadline
+    /// (anchored to the record's DURABLE producer `timestamp_ms`, so it survives a restart) that has
+    /// passed at the wall-clock instant `now_unix_millis`. A record with no effective TTL is never
+    /// expired (the non-TTL fast path, byte-identical). Free of `&self` so the poll loop can call it
+    /// while holding a mutable group borrow — the caller reads the wall-clock seam ONCE before the
+    /// borrow ([`Clock::now_unix_millis`], never a raw host-clock read) and threads it in, so the
+    /// deadline is still seam-anchored and `ManualClock`-deterministic, with no per-record clock read
+    /// in the hot scan.
+    fn record_is_expired(default_ttl: Ttl, now_unix_millis: u64, record: &OwnedRecord) -> bool {
+        let (per_message, _original) = decode_ttl_headers(&record.headers);
+        let ttl = Ttl::lower_of(per_message, default_ttl);
+        if ttl.is_none() {
+            return false;
+        }
+        is_expired(ttl, record.timestamp_ms, now_unix_millis)
+    }
+
+    /// Whether an EXPIRED record should be routed to a dead-letter exchange (V2-M4, #549/#551): only
+    /// when an exchange is configured AND the expired-routing flag is set. Otherwise an expired record
+    /// is reclaimed by retention (skipped on read, committed past, counted in `expired`).
+    fn dead_letters_expired(&self) -> bool {
+        self.dead_letter_expired && self.dead_letter_exchange.is_some()
+    }
+
+    /// Crash-atomically DEAD-LETTERS an EXPIRED message (V2-M4, #549/#551) to the configured exchange,
+    /// recording [`DeadLetterReason::TtlExpired`], then commits the source group's cursor past it and
+    /// returns [`Poll::Parked`]. The ordering and idempotency are identical to [`Engine::dead_letter_in`]
+    /// (APPEND+FSYNC the reason-carrying dead-letter record BEFORE the cursor commit; a redelivered
+    /// re-expired message is a no-op append at or below the per-group high-water mark), so an expiry is
+    /// a fully reported, exactly-once event. Used only when [`Engine::dead_letters_expired`] holds.
+    fn expire_dead_letter_in(
+        &mut self,
+        group: &str,
+        off: Offset,
+        attempt: u32,
+        record: OwnedRecord,
+    ) -> Result<Poll, EngineError> {
+        // Idempotency: a re-expired message already durably in the exchange (at or below the group's
+        // high-water mark) is committed-past WITHOUT a second append, exactly as the poison path.
+        let already = self.dlq_sink()?.already_dead_lettered(group, off.get());
+        if !already {
+            // APPEND the reason-carrying (TtlExpired) dead-letter and FSYNC, BEFORE committing the
+            // source cursor: the same crash-safety contract as the max-deliver path.
+            self.dlq_sink()?.append_dead_letter(
+                group,
+                &record,
+                attempt,
+                DeadLetterReason::TtlExpired,
+            )?;
+        }
+        self.commit_dead_letter_past(group, off);
+        Ok(Poll::Parked {
+            offset: off,
+            record,
+        })
+    }
+
+    /// Commits a group's cursor PAST a dead-lettered/expired offset and updates the shared
+    /// bookkeeping (key-share router clear, consumer-lag floor, `dead_lettered` counter, the
+    /// last-dead-lettered gauge, and the Level-2 designated-group dead-letter terminal). Shared by the
+    /// max-deliver [`Engine::dead_letter_in`] and the TTL-expiry [`Engine::expire_dead_letter_in`]
+    /// (both append to the durable sink first, then call this), so the post-append commit is identical
+    /// regardless of WHY the message died.
+    fn commit_dead_letter_past(&mut self, group: &str, off: Offset) {
+        let Some(g) = self.groups.get_mut(group) else {
+            // Unreachable: the poll path created/looked up the group before reaching here.
+            return;
+        };
+        g.cursor.ack(off);
+        // key_shared (#64): committing past a dead-lettered offset frees its key (idempotent).
+        if let Some(router) = g.router.as_mut() {
+            router.clear_offset(off);
+        }
+        let committed = g.cursor.committed().get();
+        self.sync_consumer_lag(group, committed);
+        self.counters.dead_lettered += 1;
+        self.last_dead_lettered = Some(off);
+        // The Level-2 dead-letter terminal (#497): if the DESIGNATED confirm group dead-lettered this
+        // offset, fire a `DeadLettered` confirm rather than leaving the producer to wait out the TTL.
+        if group == self.confirm_group {
+            self.confirm_registry
+                .terminate(off, ConfirmStatus::DeadLettered);
+        }
     }
 
     /// Like [`Engine::poll`] but reads the current monotonic time from the engine's own
@@ -5501,6 +5707,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // name gates have already passed via set_key_ordering_in.
         let earliest = self.log.earliest_offset().get();
         let lease_config = self.lease_config;
+        // The TTL knobs read ONCE before the group borrow (V2-M4, #549), exactly as in `poll_in`:
+        // the per-stream default TTL, the seam-anchored wall-clock instant, and the expired-routing
+        // flag. Read here because the group borrow below cannot coexist with a later `&self` read.
+        let default_ttl = self.default_message_ttl;
+        let now_unix_millis = self.log.now_unix_millis();
+        let dead_letters_expired = self.dead_letters_expired();
         let g = self
             .groups
             .entry(group.to_string())
@@ -5549,6 +5761,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .min(flushed);
         let mut offset = committed;
         let mut dead_letter: Option<(Offset, LeaseToken, u32, OwnedRecord)> = None;
+        // The TTL-expiry capture + the lag-sync flag (V2-M4, #549), exactly as in `poll_in`: an
+        // expired record is never routed to any member; with a DLX + the expired flag it is captured
+        // for the crash-atomic move below, otherwise reclaimed inline. The TTL knobs were read above
+        // the group borrow.
+        let mut expired_dlx: Option<(Offset, u32, OwnedRecord)> = None;
+        let mut expired_inline = false;
         while offset < window_end {
             let off = Offset::new(offset);
             if g.cursor.is_acked(off) {
@@ -5586,6 +5804,26 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     from: off,
                     to: record.offset,
                 });
+            }
+            // TTL EXPIRY (V2-M4, #549), key_shared path: an expired record is NEVER routed to any
+            // member. No lease is held yet here (the claim is below), so there is nothing to release.
+            // With a dead-letter exchange + the expired flag, capture it for the crash-atomic DLX move
+            // (reason TtlExpired); otherwise SKIP it on read — commit the cursor past it inline (the
+            // segment reap reclaims the bytes, bounded) and keep scanning. Either way it is accounted
+            // (`expired` or `dead_lettered`), never silently dropped. The non-TTL path is unchanged.
+            if Self::record_is_expired(default_ttl, now_unix_millis, &record) {
+                if dead_letters_expired {
+                    expired_dlx = Some((off, 1, record));
+                    break;
+                }
+                g.cursor.ack(off);
+                if let Some(router) = g.router.as_mut() {
+                    router.clear_offset(off);
+                }
+                self.counters.expired += 1;
+                expired_inline = true;
+                offset += 1;
+                continue;
             }
             let Some(router) = g.router.as_ref() else {
                 // Unreachable: the mode check above proved the router is present.
@@ -5652,6 +5890,18 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                     }
                 },
             }
+        }
+        // An EXPIRED-and-DLX'd message (#551) routes to the dead-letter exchange OUTSIDE the borrow.
+        if let Some((off, deliveries, record)) = expired_dlx {
+            return self.expire_dead_letter_in(group, off, deliveries, record);
+        }
+        // Sync the consumer-lag floor once if the scan reclaimed inline-expired records (#97/#549).
+        if expired_inline {
+            let committed = self
+                .groups
+                .get(group)
+                .map_or(0, |g| g.cursor.committed().get());
+            self.sync_consumer_lag(group, committed);
         }
         match dead_letter {
             Some((off, _token, deliveries, record)) => {
@@ -6713,6 +6963,11 @@ mod tests {
             // image stays byte-identical to the pre-compression broker; the compression tests
             // build a config with `Codec::Lz4` explicitly.
             compression: Codec::None,
+            // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
+            // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
+            default_message_ttl_ms: 0,
+            dead_letter_exchange: None,
+            dead_letter_expired: false,
         }
     }
 
@@ -8891,6 +9146,9 @@ mod tests {
                 torn_tail_repairs: 505,
                 corruption_repairs_by_artifact: [506, 507, 508],
             },
+            // The TTL family (#549), appended after recovery; non-zero so the round-trip proves the
+            // new trailing field is carried.
+            expired: 999,
         };
         let encoded = counters.encode_snapshot();
         assert_eq!(Counters::decode_snapshot(&encoded), counters);
@@ -10621,6 +10879,321 @@ mod tests {
             "the dlq/ subdir must not exist on the no-poison path"
         );
         assert!(read_dlq_entries(&fs).unwrap().is_empty());
+    }
+
+    // ----- Per-message / per-stream TTL + configurable dead-letter exchanges (V2-M4, #549/#551) -----
+
+    use ironbus_core::ttl::encode_ttl_headers;
+    use ironbus_storage::dlq::read_dead_letter_entries;
+
+    /// A config with a per-STREAM default message TTL (V2-M4, #549): `default_message_ttl_ms` set,
+    /// the dead-letter exchange and expired-routing flag left inert. Spread from the shared `config`
+    /// so every other field keeps its golden-path value.
+    fn config_with_ttl(default_message_ttl_ms: u64) -> EngineConfig {
+        EngineConfig {
+            default_message_ttl_ms,
+            ..config(64, 5)
+        }
+    }
+
+    /// A config with a configurable dead-letter EXCHANGE (#551) AND the expired-routing flag on, so a
+    /// TTL-expired message is dead-lettered (reason `TtlExpired`) to the named subdir rather than
+    /// reclaimed by retention. `max_deliver` is high so the only dead-letter trigger here is the TTL.
+    fn config_with_dlx_for_expired(default_message_ttl_ms: u64, exchange: &str) -> EngineConfig {
+        EngineConfig {
+            default_message_ttl_ms,
+            dead_letter_exchange: Some(exchange.to_string()),
+            dead_letter_expired: true,
+            ..config(64, 5)
+        }
+    }
+
+    /// Produces one record at producer timestamp `timestamp_ms` carrying a per-message TTL header
+    /// (or no TTL header when `Ttl::NONE`), returning its offset. The TTL is anchored to this durable
+    /// producer timestamp, so advancing the WALL clock past `timestamp_ms + ttl` expires it.
+    fn produce_with_ttl<F: Filesystem>(
+        e: &mut Engine<F, std::sync::Arc<ManualClock>>,
+        timestamp_ms: u64,
+        ttl: Ttl,
+        payload: &[u8],
+    ) -> Offset {
+        let headers = encode_ttl_headers(ttl, b"orig");
+        e.produce(&Append {
+            timestamp_ms,
+            flags: RecordFlags::EMPTY,
+            key: b"k",
+            headers: &headers,
+            payload,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_per_message_ttl_expires_on_read_and_is_reclaimed_not_delivered() {
+        // The marquee TTL behavior (#549), driven by a ManualClock so expiry is DETERMINISTIC (no
+        // wall-clock flake). A record with a 1_000 ms per-message TTL produced at wall-clock 100 is
+        // LIVE before its 1_100 deadline and EXPIRED at/after it: at the deadline the poll SKIPS it
+        // (never delivers), commits the cursor PAST it (reclaimed by retention, bounded), and counts
+        // it as `expired` (no silent drop).
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(100));
+        let mut e = open_with_clock(config_with_ttl(0), std::sync::Arc::clone(&clock));
+        let off = produce_with_ttl(&mut e, 100, Ttl::from_millis(1_000), b"perishable");
+
+        // BEFORE the deadline (wall clock 100 < 1_100): the record is delivered normally.
+        clock.set_unix_millis(1_099);
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.offset, off, "a live record is delivered");
+        // Nack it back (let the lease expire) so it is re-pollable, then cross the deadline.
+        clock.advance_monotonic_nanos(200); // expire the visibility lease
+        clock.set_unix_millis(1_100); // AT the deadline: now expired
+
+        // At/after the deadline the next poll does NOT deliver it: it is skipped, committed past,
+        // and counted as expired. With no live record behind it the poll is Idle.
+        assert!(
+            matches!(e.poll_now().unwrap(), Poll::Idle),
+            "an expired record is never delivered"
+        );
+        assert_eq!(
+            e.counters().expired,
+            1,
+            "the expiry is accounted (no silent drop)"
+        );
+        assert_eq!(
+            e.counters().delivered,
+            1,
+            "only the one pre-deadline delivery"
+        );
+        assert_eq!(
+            e.committed_offset(),
+            Offset::new(off.get() + 1),
+            "the cursor committed PAST the expired record (reclaimed, not redelivered forever)"
+        );
+        // No dead-letter exchange configured, so an expired record is reclaimed, never dead-lettered.
+        assert_eq!(e.counters().dead_lettered, 0);
+        assert_eq!(e.dlq_records(), 0);
+    }
+
+    #[test]
+    fn a_no_ttl_record_never_expires_byte_identical() {
+        // Back-compat (#549): a record with NO TTL header (and no per-stream default) is NEVER
+        // expired, no matter how far the wall clock advances — byte-identical to the pre-TTL broker.
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let mut e = open_with_clock(config_with_ttl(0), std::sync::Arc::clone(&clock));
+        let off = produce_with_ttl(&mut e, 0, Ttl::NONE, b"eternal");
+        // Advance the wall clock to the far future: a no-TTL record is still delivered.
+        clock.set_unix_millis(u64::MAX);
+        let d = message(e.poll_now().unwrap());
+        assert_eq!(d.offset, off);
+        assert_eq!(e.counters().expired, 0, "no TTL = never expires");
+    }
+
+    #[test]
+    fn a_per_stream_default_ttl_expires_a_record_with_no_per_message_ttl() {
+        // The per-STREAM default TTL (#549): a record produced WITHOUT its own per-message TTL still
+        // expires under the stream-wide `default_message_ttl_ms`. Proves the default applies on its
+        // own (lower-wins with NONE = the default), via the deterministic ManualClock.
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let mut e = open_with_clock(config_with_ttl(500), std::sync::Arc::clone(&clock));
+        let off = produce_with_ttl(&mut e, 0, Ttl::NONE, b"defaulted");
+        // Cross the 0 + 500 deadline.
+        clock.set_unix_millis(500);
+        assert!(
+            matches!(e.poll_now().unwrap(), Poll::Idle),
+            "expired under the stream default"
+        );
+        assert_eq!(e.counters().expired, 1);
+        assert_eq!(e.committed_offset(), Offset::new(off.get() + 1));
+    }
+
+    #[test]
+    fn lower_wins_a_tighter_per_message_ttl_beats_a_looser_stream_default() {
+        // Lower-wins precedence (#549): a tight 100 ms per-message TTL expires BEFORE the looser
+        // 10_000 ms per-stream default. At wall-clock 100 (the per-message deadline) the record is
+        // already expired even though the stream default would keep it until 10_000.
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let mut e = open_with_clock(config_with_ttl(10_000), std::sync::Arc::clone(&clock));
+        produce_with_ttl(&mut e, 0, Ttl::from_millis(100), b"tight");
+        clock.set_unix_millis(100); // the tighter per-message deadline
+        assert!(matches!(e.poll_now().unwrap(), Poll::Idle));
+        assert_eq!(e.counters().expired, 1, "the tighter per-message TTL won");
+    }
+
+    #[test]
+    fn an_expired_record_routes_to_the_configured_dead_letter_exchange_with_the_reason() {
+        // The configurable dead-letter EXCHANGE (#551): with an exchange + the expired flag, a
+        // TTL-expired record is NOT silently reclaimed — it is dead-lettered to the NAMED subdir,
+        // recording reason `TtlExpired`, crash-atomically and exactly-once. Beats NATS's single fixed
+        // DLQ + matches RabbitMQ DLX. The default `dlq/` sink is NEVER touched.
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(
+            fs,
+            std::sync::Arc::clone(&clock),
+            config_with_dlx_for_expired(1_000, "dlx-expired"),
+        )
+        .unwrap();
+        let off = produce_with_ttl(&mut e, 0, Ttl::from_millis(1_000), b"to-the-dlx");
+
+        // Cross the 0 + 1_000 deadline, then poll: the expired record is dead-lettered to the DLX.
+        clock.set_unix_millis(1_000);
+        match e.poll_now().unwrap() {
+            Poll::Parked { offset, .. } => assert_eq!(offset, off),
+            other => panic!("expected the expired record Parked to the DLX, got {other:?}"),
+        }
+        assert_eq!(
+            e.counters().expired,
+            0,
+            "a DLX'd expiry is counted as dead_lettered, not expired"
+        );
+        assert_eq!(
+            e.counters().dead_lettered,
+            1,
+            "the expiry is a recorded dead-letter (no silent drop)"
+        );
+        assert_eq!(
+            e.committed_offset(),
+            Offset::new(off.get() + 1),
+            "committed past"
+        );
+        assert!(
+            matches!(e.poll_now().unwrap(), Poll::Idle),
+            "never redelivers"
+        );
+        drop(e);
+
+        // The default dlq/ sink is untouched; the configured exchange holds the dead-letter with the
+        // TtlExpired reason and the original source offset.
+        assert!(
+            read_dlq_entries(&probe).unwrap().is_empty(),
+            "the default dlq/ sink is never used"
+        );
+        let entries = read_dead_letter_entries(&probe, "dlx-expired").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].reason,
+            DeadLetterReason::TtlExpired,
+            "the trigger is recorded"
+        );
+        assert_eq!(entries[0].source_offset, off.get());
+    }
+
+    #[test]
+    fn a_max_deliver_dead_letter_with_no_exchange_is_byte_identical_v1() {
+        // Back-compat (#551): with NO dead-letter exchange configured, the max-deliver dead-letter
+        // path still writes the default `dlq/` sink as a v1 (reason-less) record that decodes as
+        // MaxDeliverExceeded — byte-identical to the pre-#551 broker.
+        let clock = std::sync::Arc::new(ManualClock::new());
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 1)).unwrap();
+        let off = poison_once(&mut e, &clock, b"poison");
+        drop(e);
+        let entries = read_dlq_entries(&probe).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_offset, off.get());
+        assert_eq!(
+            entries[0].reason,
+            DeadLetterReason::MaxDeliverExceeded,
+            "a no-exchange max-deliver dead-letter decodes as the original trigger (v1 back-compat)"
+        );
+    }
+
+    #[test]
+    fn an_expired_record_with_no_routing_flag_is_reclaimed_not_dead_lettered() {
+        // The "expired, not dead-lettered" path even WITH an exchange configured: when the
+        // expired-routing flag is OFF, a TTL-expired record is reclaimed by retention (counted in
+        // `expired`), NOT routed to the exchange. Bounded + accounted, no silent drop.
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let cfg = EngineConfig {
+            default_message_ttl_ms: 1_000,
+            dead_letter_exchange: Some("dlx-unused".to_string()),
+            dead_letter_expired: false, // routing OFF: reclaim, do not dead-letter
+            ..config(64, 5)
+        };
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock), cfg).unwrap();
+        let off = produce_with_ttl(&mut e, 0, Ttl::from_millis(1_000), b"reclaim-me");
+        clock.set_unix_millis(1_000);
+        assert!(matches!(e.poll_now().unwrap(), Poll::Idle));
+        assert_eq!(e.counters().expired, 1, "reclaimed, counted as expired");
+        assert_eq!(
+            e.counters().dead_lettered,
+            0,
+            "NOT dead-lettered (routing flag off)"
+        );
+        assert_eq!(e.committed_offset(), Offset::new(off.get() + 1));
+        drop(e);
+        // Neither the default nor the named exchange subdir was materialized: nothing was dead-lettered.
+        assert!(read_dlq_entries(&probe).unwrap().is_empty());
+        assert!(read_dead_letter_entries(&probe, "dlx-unused")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn an_expired_dlx_record_survives_a_restart_deadline_anchored_to_the_producer_timestamp() {
+        // The deadline is anchored to the DURABLE producer timestamp (#549), so it survives a
+        // restart: a record produced before a reboot still expires at producer_ts + ttl after it.
+        // Produce under one clock, drop the engine, reopen, advance the wall clock past the deadline,
+        // and confirm the reopened engine expires + dead-letters it (the on-disk DLX exists).
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let cfg = || config_with_dlx_for_expired(1_000, "dlx-expired");
+        let mut e = Engine::open(fs.clone(), std::sync::Arc::clone(&clock), cfg()).unwrap();
+        let off = produce_with_ttl(&mut e, 0, Ttl::from_millis(1_000), b"survives-restart");
+        // Checkpoint + drop WITHOUT crossing the deadline (wall clock still 0).
+        e.checkpoint_all_groups().unwrap();
+        drop(e);
+
+        // Reopen over a FRESH clock already past the deadline: the record produced at 0 with a 1_000
+        // ms TTL is expired at wall-clock 5_000, so the reopened engine dead-letters it.
+        let clock2 = std::sync::Arc::new(ManualClock::at_unix_millis(5_000));
+        let mut e = Engine::open(fs, std::sync::Arc::clone(&clock2), cfg()).unwrap();
+        match e.poll_now().unwrap() {
+            Poll::Parked { offset, .. } => assert_eq!(offset, off),
+            other => panic!("expected the restored record to expire+dead-letter, got {other:?}"),
+        }
+        assert_eq!(e.counters().dead_lettered, 1);
+        drop(e);
+        let entries = read_dead_letter_entries(&probe, "dlx-expired").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].reason, DeadLetterReason::TtlExpired);
+    }
+
+    #[test]
+    fn re_expiring_the_same_offset_to_the_dlx_does_not_double_write() {
+        // Idempotency for the TTL-DLX move, mirroring the poison idempotency (#551): a re-expired
+        // offset already at/below the group's high-water mark is committed-past WITHOUT a second
+        // append. Drive the move once, then re-run the move helper directly on the same offset.
+        let clock = std::sync::Arc::new(ManualClock::at_unix_millis(0));
+        let fs = InMemoryFs::new();
+        let probe = fs.clone();
+        let mut e = Engine::open(
+            fs,
+            std::sync::Arc::clone(&clock),
+            config_with_dlx_for_expired(1_000, "dlx-expired"),
+        )
+        .unwrap();
+        let off = produce_with_ttl(&mut e, 0, Ttl::from_millis(1_000), b"once");
+        clock.set_unix_millis(1_000);
+        let record = e.log.read_from(off, 1).unwrap().into_iter().next().unwrap();
+        let _ = e
+            .expire_dead_letter_in(DEFAULT_GROUP, off, 1, record.clone())
+            .unwrap();
+        // A second move of the SAME offset must be a no-op append (idempotent high-water mark).
+        let _ = e
+            .expire_dead_letter_in(DEFAULT_GROUP, off, 1, record)
+            .unwrap();
+        drop(e);
+        let entries = read_dead_letter_entries(&probe, "dlx-expired").unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "re-expiring the same offset writes exactly one DLX record"
+        );
     }
 
     #[test]
