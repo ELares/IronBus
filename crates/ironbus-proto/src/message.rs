@@ -2113,8 +2113,8 @@ pub fn decode_sub_to(body: &[u8]) -> Result<SubToBody<'_>, BodyError> {
 
 // ===================================================================================
 // SUBJECT-ADDRESSED WIRE BODIES (#585, V2-M2-I9): the subject->stream binding + subject-addressed
-// pub/sub verbs that complete the SUBJECTS story — BindSubject (tag 32), PubSubject (tag 33), SubSubject
-// (tag 34). Each rides the SAME `body_version: u8` + `field_len: u16` frame as the explicit-stream-id
+// pub/sub verbs that complete the SUBJECTS story — BindSubject (tag 34), PubSubject (tag 35), SubSubject
+// (tag 36). Each rides the SAME `body_version: u8` + `field_len: u16` frame as the explicit-stream-id
 // verbs (#588), so a future version appends fields without a wire break. A subject/pattern field is a
 // `u16`-length-prefixed byte field capped at [`MAX_STREAM_ID_LEN`] BEFORE any read (fail-closed): a
 // malformed/oversized subject is a typed [`BodyError`], never a panic or over-read. The server further
@@ -2134,7 +2134,7 @@ fn read_subject<'a>(r: &mut Reader<'a>) -> Result<&'a [u8], BodyError> {
     r.take(len)
 }
 
-/// A client's request to BIND a subject PATTERN to a stream (the `BindSubject` frame body, tag 32,
+/// A client's request to BIND a subject PATTERN to a stream (the `BindSubject` frame body, tag 34,
 /// #585): an explicit `stream_id` (the empty name binds the DEFAULT stream) and a `pattern` (#567
 /// pattern, wildcards allowed). The broker registers `(pattern -> stream)` and replies `Ok`, or `Err`
 /// on a malformed pattern / stream name or a fork-bound rejection.
@@ -2187,7 +2187,7 @@ pub fn decode_bind_subject(body: &[u8]) -> Result<BindSubjectBody<'_>, BodyError
     Ok(BindSubjectBody { stream_id, pattern })
 }
 
-/// A producer's publish BY SUBJECT (the `PubSubject` frame body, tag 33, #585): a literal `subject`
+/// A producer's publish BY SUBJECT (the `PubSubject` frame body, tag 35, #585): a literal `subject`
 /// followed by the verbatim [`PubBody`] bytes (decoded by the caller with [`decode_pub`], so the publish
 /// body codec is shared UNCHANGED with `Pub`/`PubTo`). The broker resolves the subject single-home to one
 /// bound stream and routes the append there (or rejects unbound/ambiguous, fail-closed).
@@ -2239,7 +2239,7 @@ pub fn decode_pub_subject(body: &[u8]) -> Result<PubSubjectBody<'_>, BodyError> 
     Ok(PubSubjectBody { subject, pub_body })
 }
 
-/// A consumer's subscribe BY SUBJECT (the `SubSubject` frame body, tag 34, #585): a `subject` (literal
+/// A consumer's subscribe BY SUBJECT (the `SubSubject` frame body, tag 36, #585): a `subject` (literal
 /// or wildcard) plus the work-`group` name. The broker resolves the subject single-home to one bound
 /// stream and binds the connection's subsequent `Flow`/`Ack` to that stream's competing work-group (or
 /// rejects unbound/ambiguous, fail-closed).
