@@ -240,8 +240,8 @@ pub mod transport;
 
 pub use ack_level::{ClusterAckLevel, ClusterAckLevelMetrics};
 pub use dataplane::{
-    decode_dataplane_frame, role_for_placement, AckToken, DataPlaneAction, DataPlaneController,
-    DataPlaneError, DataPlaneFrame, PlacementRole,
+    decode_dataplane_frame, role_for_placement, AckDisposition, AckToken, DataPlaneAction,
+    DataPlaneController, DataPlaneError, DataPlaneFrame, PlacementRole, ProduceAckSeam,
 };
 pub use divergence::{
     compare_fingerprints, execute_resync, fingerprint_log, plan_resync, quarantine_and_resync,
