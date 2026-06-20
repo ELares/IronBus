@@ -279,6 +279,32 @@ pub struct ReapOutcome {
     pub bytes_reaped: u64,
 }
 
+/// What a [`Log::truncate_to`] dropped: the typed, REPORTED result of a leader-epoch divergence
+/// truncation (C2-I4, #599). A divergence truncation is NEVER silent — the caller surfaces this as a
+/// divergence event / metric (the beat over NATS #5576, where a divergent replica returns with no
+/// data and never reconciles). Distinct from a [`crate::loss::LossReport`] event (which records
+/// CORRUPTION / torn-tail loss): this is an INTENTIONAL, correct reconciliation of a divergent
+/// suffix against the new leader's lineage, not data corruption — so it is reported separately and
+/// does not count against the I3 corruption-loss caps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TruncateOutcome {
+    /// The offset the log was truncated TO: records `[truncated_to, next_offset_before)` were
+    /// dropped, records `[earliest, truncated_to)` (the common prefix) were kept untouched.
+    pub truncated_to: u64,
+    /// The log's `next_offset` BEFORE the truncation (so the dropped offset range is
+    /// `[truncated_to, next_offset_before)`).
+    pub next_offset_before: u64,
+    /// How many records were dropped (`next_offset_before - truncated_to`). Zero when the target was
+    /// already at the durable head (a clean no-op — the follower simply fetches forward).
+    pub records_dropped: u64,
+    /// The durable RECORD bytes the truncation reclaimed (the on-disk record bytes of the dropped
+    /// suffix, the same per-segment term [`Log::durable_record_bytes`] is defined over).
+    pub bytes_dropped: u64,
+    /// How many whole segment FILES were unlinked (the dropped suffix may span several sealed
+    /// segments above the truncation point).
+    pub segments_dropped: u64,
+}
+
 /// An in-memory directory entry: a segment id, the log offset of its first record, and the
 /// per-segment retention metadata the reaper consults without rescanning the file. Held sorted
 /// by `base_offset` (which is monotonic with the id) so a read can binary search for the segment
@@ -2744,6 +2770,200 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
             segments_reaped: 1,
             bytes_reaped: segment_record_bytes,
         }))
+    }
+
+    /// TRUNCATES the log so its durable bytes end exactly at `target` — dropping the suffix
+    /// `[target, next_offset)` and keeping the prefix `[earliest, target)` byte-for-byte. This is the
+    /// storage primitive behind C2-I4 leader-epoch divergence truncation (KIP-101, #599): when a
+    /// follower discovers (via the epoch cache + the leader's epoch history) that its uncommitted tail
+    /// diverges from a new leader's lineage, it truncates EXACTLY to the divergence point, drops only
+    /// the genuinely-divergent suffix, and re-fetches forward — never silently diverging, never
+    /// over-truncating committed data.
+    ///
+    /// It REUSES the existing recovery machinery: it performs the physical file surgery (unlink whole
+    /// segments above the kept one, `set_len` + fsync the kept segment down to `target`'s record-frame
+    /// boundary), then RE-DERIVES every in-memory field by re-running the same [`Log::scan_recover_chain`]
+    /// scan over the surviving durable bytes — so the post-truncation log is BYTE-IDENTICAL to a fresh
+    /// log of the same prefix, and recovery stays a pure function of the durable bytes (I4). The
+    /// truncation is BOUNDED (it drops a measured, reported suffix) and REPORTED (it returns a typed
+    /// [`TruncateOutcome`] the caller surfaces as a divergence event — never a silent drop, the beat
+    /// over NATS #5576).
+    ///
+    /// The kept segment is the one holding the LAST surviving record (offset `target - 1`); truncating
+    /// to a segment's exact base offset drops that segment wholesale and UNSEALS its predecessor as the
+    /// new active writer — so the result is the same shape a fresh log of `target` records has, never a
+    /// sealed-tail-plus-empty-active artifact.
+    ///
+    /// `target` must lie in `[earliest_offset(), next_offset()]`:
+    /// - `target == next_offset()` drops nothing (a clean no-op `TruncateOutcome`).
+    /// - `target == earliest_offset()` drops the whole retained range (the log stays writable, empty).
+    ///
+    /// The CALLER guarantees `target` is at or above the committed high-watermark, so committed data
+    /// (fsync'd on a quorum, #691) is NEVER truncated — only the uncommitted-divergent suffix is. This
+    /// method enforces the durable-range bound; the never-below-HW property is the cluster layer's.
+    ///
+    /// # Errors
+    /// - [`StorageError::TruncateOutOfRange`] if `target` is below the earliest retained offset or
+    ///   above the durable head, or lands inside a COMPACTED segment (committed data, out of the
+    ///   C2-I4 uncommitted-suffix contract) — fail-closed: the log is left untouched.
+    /// - [`StorageError::WriterFrozen`] if the writer is frozen, or an IO/segment error from the file
+    ///   surgery or the re-derivation. The unlink-then-truncate order keeps the chain
+    ///   valid-prefix-recoverable at every step, so a crash mid-surgery is reconciled by [`Log::open`].
+    pub fn truncate_to(&mut self, target: Offset) -> Result<TruncateOutcome, StorageError> {
+        // Fail closed if the writer is already dead: we never truncate against a frozen log.
+        self.active()?;
+        let next = self.next_offset.get();
+        let earliest = self.earliest_offset().get();
+        let target_v = target.get();
+        if target_v > next || target_v < earliest {
+            return Err(StorageError::TruncateOutOfRange {
+                requested: target_v,
+                earliest,
+                next_offset: next,
+            });
+        }
+        // A truncate to the durable head drops nothing.
+        if target_v == next {
+            return Ok(TruncateOutcome {
+                truncated_to: target_v,
+                next_offset_before: next,
+                records_dropped: 0,
+                bytes_dropped: 0,
+                segments_dropped: 0,
+            });
+        }
+
+        // The durable record bytes BEFORE the surgery, so the reclaimed bytes are the exact drop.
+        let bytes_before = self.durable_record_bytes();
+
+        // The kept segment is the one holding the LAST surviving record. When the whole retained range
+        // is dropped (`target == earliest`), there is no surviving record, so keep the FIRST segment
+        // and empty it to header-only — the log stays writable from `earliest`.
+        let keep_idx = if target_v > earliest {
+            self.segment_index_for(target_v - 1)
+        } else {
+            0
+        };
+        let keep_slot = self.segments[keep_idx];
+        // A compacted segment never holds an uncommitted divergent suffix (its records are committed +
+        // compacted, always below the caller's HW floor): a target landing in one is out of the C2-I4
+        // contract, refused fail-closed.
+        if keep_slot.compacted_covered.is_some() {
+            return Err(StorageError::TruncateOutOfRange {
+                requested: target_v,
+                earliest,
+                next_offset: next,
+            });
+        }
+
+        // Drop the active writer before any file surgery: it is rebuilt from the recovered chain.
+        self.active = None;
+
+        // Unlink every WHOLE segment strictly ABOVE the kept one (its base_offset >= target, so its
+        // entire range is in the divergent suffix). `split_off` keeps `[0, keep_idx]` and yields the
+        // tail to unlink. Unlink them (the iteration order does not matter — each is wholly dropped),
+        // then a single dir-sync below makes every removal durable together.
+        let mut segments_dropped = 0u64;
+        for slot in self.segments.split_off(keep_idx + 1) {
+            self.fs.remove(&segment_file_name(slot.id))?;
+            self.evict_segment_index(slot.id);
+            segments_dropped += 1;
+        }
+
+        // Truncate the kept segment's file down to the frame boundary of `target`. The record at log
+        // offset `target` (and every record after it within this segment) is dropped; the region
+        // `[header, byte_pos_of(target))` survives. When `target` is the kept segment's own next
+        // offset (it held only surviving records), nothing inside it is cut beyond removing a sealed
+        // footer — which unseals it into the active writer, matching a fresh log's shape.
+        let keep_name = segment_file_name(keep_slot.id);
+        let reader = SegmentReader::open(self.fs.open(&keep_name)?)?;
+        let (positions, body_end) = reader.record_byte_positions()?;
+        let within = usize::try_from(target_v - keep_slot.base_offset)
+            .map_err(|_| StorageError::SegmentFull)?;
+        // `positions[i]` is the frame start of the (base_offset + i)-th record; `body_end` is the end
+        // of the record region (excluding any sealed footer). The cut is that frame start for an
+        // in-segment record, or `body_end` when `target` is this segment's next offset (drop only the
+        // footer, if any).
+        let truncate_at = positions.get(within).copied().unwrap_or(body_end);
+        let file = self.fs.open(&keep_name)?;
+        if truncate_at < file.len()? {
+            file.set_len(truncate_at)?;
+            file.sync_all()?;
+        }
+        // Persist the unlinks + the truncation durably before we trust the new on-disk shape.
+        self.fs.sync_dir()?;
+
+        // Re-derive EVERY in-memory field from the surviving durable bytes, exactly as a reopen would
+        // (recovery is a pure function of the durable bytes, I4), and commit the new state.
+        let new_next_offset = self.rederive_state_after_truncation(keep_slot.id)?;
+
+        let records_dropped = next.saturating_sub(new_next_offset.get());
+        let bytes_dropped = bytes_before.saturating_sub(self.durable_record_bytes());
+        Ok(TruncateOutcome {
+            truncated_to: new_next_offset.get(),
+            next_offset_before: next,
+            records_dropped,
+            bytes_dropped,
+            segments_dropped,
+        })
+    }
+
+    /// Re-derives every in-memory field of the log from the surviving durable bytes after the
+    /// truncation file surgery has run, exactly as [`Log::recover`] would on a reopen (recovery is a
+    /// pure function of the durable bytes, I4), and commits the new state. `last_id` is the kept
+    /// (now-truncated, unsealed) highest segment, which becomes the active writer. Returns the new
+    /// `next_offset`. Factored out of [`Log::truncate_to`] to keep both functions small.
+    fn rederive_state_after_truncation(&mut self, last_id: u64) -> Result<Offset, StorageError> {
+        // The surviving ids are the kept slot and its predecessors (the divergent suffix's whole
+        // segments were already unlinked from `self.segments`).
+        let surviving_ids: Vec<u64> = self.segments.iter().map(|s| s.id).collect();
+        let RecoveredChain {
+            slots,
+            next_base_offset,
+            next_base_seq,
+            durable_bytes,
+            total_record_count,
+            highest: scan,
+        } = Self::scan_recover_chain(&self.fs, &surviving_ids)?;
+
+        let new_next_offset = Offset::new(next_base_offset);
+        let highest_record_bytes = scan.valid_end.saturating_sub(SEGMENT_HEADER_LEN as u64);
+        let sealed_record_bytes = durable_bytes.saturating_sub(highest_record_bytes);
+
+        // Rebuild the active writer over the (now-truncated, unsealed) highest segment. After a
+        // truncation the highest segment is NEVER sealed (we cut its footer off), so we always resume
+        // it as the writer — there is no roll-forward case here.
+        let file = self.fs.open(&segment_file_name(last_id))?;
+        let record_count =
+            u32::try_from(scan.record_count).map_err(|_| StorageError::SegmentFull)?;
+        let writer = SegmentWriter::resume(
+            file,
+            scan.header,
+            scan.valid_end,
+            record_count,
+            scan.last_seq,
+            scan.max_timestamp_ms,
+        );
+
+        // Commit the re-derived state. Everything recovered is durable, so both the visible and the
+        // durable head are the recovered head (#341). The truncation only ever LOWERS these.
+        self.segments = slots;
+        self.active = Some(writer);
+        self.active_id = last_id;
+        self.next_offset = new_next_offset;
+        self.next_seq = Seq::new(next_base_seq);
+        self.flushed_offset = new_next_offset;
+        self.synced_offset = new_next_offset;
+        self.sealed_record_bytes = sealed_record_bytes;
+        self.total_record_count = total_record_count;
+        self.unsynced_record_bytes = 0;
+        // The kept active segment's resident seek index must be rebuilt from the truncated bytes, so
+        // evict any stale one (a later read rebuilds it). The dropped segments' indexes were evicted.
+        self.evict_segment_index(last_id);
+        // The truncation RETIRED the divergent suffix: republish the off-actor read plane so any
+        // concurrent reader's snapshot drops the now-removed offsets and cannot seek into them.
+        self.republish_read_plane();
+        Ok(new_next_offset)
     }
 
     /// Runs ONE rate-limited, OFF-HOT-PATH key-compaction pass if compaction is enabled and a run of
@@ -6964,5 +7184,209 @@ mod tests {
             eprintln!("  total={total:>7}  drained={drained:>7}  {rps:>12.0} rec/s");
             assert_eq!(drained, flushed, "drained the whole log");
         }
+    }
+
+    // ----- C2-I4 (#599): Log::truncate_to leader-epoch divergence truncation primitive -----
+
+    /// Read every segment file's full bytes keyed by name — the ground truth for byte-identity.
+    fn dump_all_segments(log: &Log<InMemoryFs, ManualClock>) -> Vec<(String, Vec<u8>)> {
+        let fs = log.filesystem();
+        let mut out = Vec::new();
+        for name in fs.list().unwrap() {
+            let file = fs.open(&name).unwrap();
+            let len = usize::try_from(file.len().unwrap()).unwrap();
+            let mut buf = vec![0u8; len];
+            file.read_exact_at(&mut buf, 0).unwrap();
+            out.push((name, buf));
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn truncate_to_drops_the_suffix_and_keeps_a_byte_identical_prefix() {
+        // Build a log of 30 records that rolls across several small segments, then truncate to 13 (an
+        // offset that lands mid-segment, so the kept segment is cut in its body).
+        let mut log = open_mem(small_config());
+        for i in 0..30u32 {
+            log.append(&rec(format!("t{i:02}").as_bytes())).unwrap();
+        }
+        log.sync().unwrap();
+        assert_eq!(log.next_offset(), Offset::new(30));
+
+        // An independent reference log built with ONLY the first 13 records: the truncated log must
+        // end byte-identical to it (recovery is a pure function of the surviving durable bytes).
+        let mut reference = open_mem(small_config());
+        for i in 0..13u32 {
+            reference
+                .append(&rec(format!("t{i:02}").as_bytes()))
+                .unwrap();
+        }
+        reference.sync().unwrap();
+
+        let outcome = log.truncate_to(Offset::new(13)).unwrap();
+        assert_eq!(outcome.truncated_to, 13);
+        assert_eq!(outcome.next_offset_before, 30);
+        assert_eq!(outcome.records_dropped, 17);
+        assert!(outcome.bytes_dropped > 0);
+        assert!(outcome.segments_dropped >= 1, "the suffix spanned segments");
+
+        // The log now ends exactly at offset 13, and is BYTE-IDENTICAL to the reference.
+        assert_eq!(log.next_offset(), Offset::new(13));
+        assert_eq!(log.flushed_offset(), Offset::new(13));
+        assert_eq!(
+            dump_all_segments(&log),
+            dump_all_segments(&reference),
+            "the truncated log is byte-identical to a fresh 13-record log"
+        );
+
+        // The surviving records decode correctly and the log keeps appending from 13.
+        let recs = log.read_from(Offset::ZERO, 100).unwrap();
+        assert_eq!(recs.len(), 13);
+        for (i, r) in recs.iter().enumerate() {
+            assert_eq!(r.payload.as_ref(), format!("t{i:02}").as_bytes());
+        }
+        log.append(&rec(b"new13")).unwrap();
+        log.sync().unwrap();
+        assert_eq!(log.next_offset(), Offset::new(14));
+    }
+
+    #[test]
+    fn truncate_to_a_segment_boundary_unseals_the_predecessor_byte_identical() {
+        // When `target` lands EXACTLY on a segment base offset, the empty segment is dropped wholesale
+        // and its predecessor is UNSEALED into the active writer — the same shape a fresh log has, not
+        // a sealed-tail-plus-empty-active artifact. We sweep every offset so a boundary hit is covered.
+        for target in 1..30u64 {
+            let mut log = open_mem(small_config());
+            for i in 0..30u32 {
+                log.append(&rec(format!("b{i:02}").as_bytes())).unwrap();
+            }
+            log.sync().unwrap();
+
+            let mut reference = open_mem(small_config());
+            for i in 0..u32::try_from(target).unwrap() {
+                reference
+                    .append(&rec(format!("b{i:02}").as_bytes()))
+                    .unwrap();
+            }
+            reference.sync().unwrap();
+
+            log.truncate_to(Offset::new(target)).unwrap();
+            assert_eq!(log.next_offset(), Offset::new(target), "target {target}");
+            assert_eq!(
+                dump_all_segments(&log),
+                dump_all_segments(&reference),
+                "truncate to {target} is byte-identical to a fresh {target}-record log"
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_to_reopens_byte_identical_recovery_is_a_pure_function_of_durable_bytes() {
+        // After a truncate, a REOPEN of the same filesystem yields an identical log — the truncation
+        // left the durable bytes in a clean state recovery reconstructs deterministically.
+        let fs = InMemoryFs::new();
+        let mut log = Log::open(fs.clone(), ManualClock::new(), small_config()).unwrap();
+        for i in 0..25u32 {
+            log.append(&rec(format!("r{i:02}").as_bytes())).unwrap();
+        }
+        log.sync().unwrap();
+        log.truncate_to(Offset::new(9)).unwrap();
+        let after_truncate = dump_all_segments(&log);
+        let next_after = log.next_offset();
+        drop(log);
+
+        let reopened = Log::open(fs, ManualClock::new(), small_config()).unwrap();
+        assert_eq!(reopened.next_offset(), next_after);
+        assert_eq!(
+            dump_all_segments(&reopened),
+            after_truncate,
+            "a reopen after truncation recovers the same bytes (I4 pure function)"
+        );
+        assert_eq!(reopened.read_from(Offset::ZERO, 100).unwrap().len(), 9);
+    }
+
+    #[test]
+    fn truncate_to_within_a_single_active_segment_cuts_at_the_frame_boundary() {
+        // A log that fits in ONE segment: truncating mid-segment cuts the active file at the record
+        // frame boundary and resumes the writer there.
+        let mut log = open_mem(LogConfig::default());
+        for i in 0..8u32 {
+            log.append(&rec(format!("s{i}").as_bytes())).unwrap();
+        }
+        log.sync().unwrap();
+        assert_eq!(log.segment_count(), 1, "all 8 fit in one segment");
+
+        let outcome = log.truncate_to(Offset::new(5)).unwrap();
+        assert_eq!(outcome.records_dropped, 3);
+        assert_eq!(outcome.segments_dropped, 0, "no whole segment was dropped");
+        assert_eq!(log.next_offset(), Offset::new(5));
+        let recs = log.read_from(Offset::ZERO, 100).unwrap();
+        assert_eq!(recs.len(), 5);
+        // The writer resumes: appending continues the offset/seq space from 5.
+        let off = log.append(&rec(b"five")).unwrap();
+        assert_eq!(off, Offset::new(5));
+        assert_eq!(log.next_seq(), Seq::new(6));
+    }
+
+    #[test]
+    fn truncate_to_the_head_is_a_clean_no_op() {
+        let mut log = open_mem(small_config());
+        for i in 0..10u32 {
+            log.append(&rec(format!("h{i}").as_bytes())).unwrap();
+        }
+        log.sync().unwrap();
+        let before = dump_all_segments(&log);
+        let outcome = log.truncate_to(Offset::new(10)).unwrap();
+        assert_eq!(outcome.records_dropped, 0);
+        assert_eq!(outcome.bytes_dropped, 0);
+        assert_eq!(outcome.segments_dropped, 0);
+        assert_eq!(log.next_offset(), Offset::new(10));
+        assert_eq!(
+            dump_all_segments(&log),
+            before,
+            "head truncation changes nothing"
+        );
+    }
+
+    #[test]
+    fn truncate_to_zero_empties_the_log_but_keeps_it_writable() {
+        let mut log = open_mem(small_config());
+        for i in 0..12u32 {
+            log.append(&rec(format!("z{i}").as_bytes())).unwrap();
+        }
+        log.sync().unwrap();
+        let outcome = log.truncate_to(Offset::ZERO).unwrap();
+        assert_eq!(outcome.records_dropped, 12);
+        assert_eq!(log.next_offset(), Offset::ZERO);
+        assert_eq!(log.read_from(Offset::ZERO, 100).unwrap().len(), 0);
+        // The emptied log still appends from 0.
+        let off = log.append(&rec(b"fresh")).unwrap();
+        assert_eq!(off, Offset::ZERO);
+    }
+
+    #[test]
+    fn truncate_to_out_of_range_fails_closed_and_leaves_the_log_untouched() {
+        let mut log = open_mem(small_config());
+        for i in 0..6u32 {
+            log.append(&rec(format!("o{i}").as_bytes())).unwrap();
+        }
+        log.sync().unwrap();
+        let before = dump_all_segments(&log);
+        // Above the durable head: rejected.
+        assert!(matches!(
+            log.truncate_to(Offset::new(7)),
+            Err(StorageError::TruncateOutOfRange {
+                requested: 7,
+                next_offset: 6,
+                ..
+            })
+        ));
+        // The log is untouched after the rejected truncation.
+        assert_eq!(log.next_offset(), Offset::new(6));
+        assert_eq!(dump_all_segments(&log), before);
+        // It still works normally.
+        log.append(&rec(b"still")).unwrap();
+        assert_eq!(log.next_offset(), Offset::new(7));
     }
 }

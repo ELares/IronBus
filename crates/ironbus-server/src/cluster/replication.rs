@@ -69,12 +69,16 @@ use std::io::{self, Read, Write};
 
 use ironbus_core::clock::Clock;
 use ironbus_core::codec::{self, DecodeError};
+use ironbus_core::epoch_cache::{
+    DivergencePoint, EpochCache, EpochCacheError, LeaderEpochEndOffset,
+};
+use ironbus_core::leader_lease::LeaderEpoch;
 use ironbus_core::types::Offset;
 use ironbus_proto::frame::{
     decode_frame_with_cap, encode_frame, FrameDecode, FrameError, FrameType, MAX_FRAME_LEN,
 };
 use ironbus_storage::fs::Filesystem;
-use ironbus_storage::log::{Append, Log};
+use ironbus_storage::log::{Append, Log, TruncateOutcome};
 use ironbus_storage::segment::StorageError;
 
 /// The hard maximum size, in bytes, of the CRC-framed record-byte payload a single replication
@@ -225,6 +229,96 @@ impl FetchResponseBody {
     }
 }
 
+/// The `kind` discriminant byte leading an [`FrameType::OffsetForLeaderEpoch`] body, so the request
+/// and the response (which share the wire tag, like `StreamInfo`) are never confused.
+const EPOCH_QUERY_KIND_REQUEST: u8 = 0;
+const EPOCH_QUERY_KIND_RESPONSE: u8 = 1;
+
+/// The fixed little-endian byte length of an encoded [`OffsetForLeaderEpochBody`]:
+/// `kind: u8` + `epoch: u64`.
+const EPOCH_QUERY_REQUEST_LEN: usize = 1 + 8;
+
+/// The fixed little-endian byte length of an encoded [`OffsetForLeaderEpochResponse`]:
+/// `kind: u8` + `requested_epoch: u64` + `answered_epoch: u64` + `end_offset: u64`.
+const EPOCH_QUERY_RESPONSE_LEN: usize = 1 + 8 + 8 + 8;
+
+/// A follower → leader LEADER-EPOCH offset QUERY (#599, KIP-101): "what is the last offset YOU hold
+/// for leadership epoch `epoch`?". The follower asks this for the epochs in its own epoch cache,
+/// highest first, to find the divergence point against the leader's lineage. Rides the
+/// [`FrameType::OffsetForLeaderEpoch`] envelope (tag 38) with a leading `kind = 0` byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OffsetForLeaderEpochBody {
+    /// The leadership epoch the follower is asking the leader's end-offset for.
+    pub epoch: LeaderEpoch,
+}
+
+impl OffsetForLeaderEpochBody {
+    /// Encode this request to its fixed-layout little-endian body bytes.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(EPOCH_QUERY_REQUEST_LEN);
+        out.push(EPOCH_QUERY_KIND_REQUEST);
+        out.extend_from_slice(&self.epoch.get().to_le_bytes());
+        out
+    }
+
+    /// Decode a request from its body bytes.
+    ///
+    /// # Errors
+    /// Returns [`ReplicationError::MalformedEpochQuery`] if `body` is not exactly the request length
+    /// or its `kind` byte is not the request discriminant — fail-closed, never guessed at.
+    pub fn decode(body: &[u8]) -> Result<OffsetForLeaderEpochBody, ReplicationError> {
+        if body.len() != EPOCH_QUERY_REQUEST_LEN || body[0] != EPOCH_QUERY_KIND_REQUEST {
+            return Err(ReplicationError::MalformedEpochQuery { len: body.len() });
+        }
+        Ok(OffsetForLeaderEpochBody {
+            epoch: LeaderEpoch::new(read_u64_le(body, 1)),
+        })
+    }
+}
+
+/// A leader → follower LEADER-EPOCH offset RESPONSE (#599, KIP-101): the leader's end-offset for the
+/// queried epoch (the start of its next epoch, its log end if the epoch is current, or the bound of
+/// the next-higher epoch it holds when it never saw the queried one). Rides the
+/// [`FrameType::OffsetForLeaderEpoch`] envelope (tag 38) with a leading `kind = 1` byte. It is the
+/// wire form of [`LeaderEpochEndOffset`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OffsetForLeaderEpochResponse {
+    /// The leader's [`LeaderEpochEndOffset`] for the queried epoch.
+    pub end_offset: LeaderEpochEndOffset,
+}
+
+impl OffsetForLeaderEpochResponse {
+    /// Encode this response to its fixed-layout little-endian body bytes.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(EPOCH_QUERY_RESPONSE_LEN);
+        out.push(EPOCH_QUERY_KIND_RESPONSE);
+        out.extend_from_slice(&self.end_offset.requested_epoch.get().to_le_bytes());
+        out.extend_from_slice(&self.end_offset.answered_epoch.get().to_le_bytes());
+        out.extend_from_slice(&self.end_offset.end_offset.get().to_le_bytes());
+        out
+    }
+
+    /// Decode a response from its body bytes.
+    ///
+    /// # Errors
+    /// Returns [`ReplicationError::MalformedEpochQuery`] if `body` is not exactly the response length
+    /// or its `kind` byte is not the response discriminant.
+    pub fn decode(body: &[u8]) -> Result<OffsetForLeaderEpochResponse, ReplicationError> {
+        if body.len() != EPOCH_QUERY_RESPONSE_LEN || body[0] != EPOCH_QUERY_KIND_RESPONSE {
+            return Err(ReplicationError::MalformedEpochQuery { len: body.len() });
+        }
+        Ok(OffsetForLeaderEpochResponse {
+            end_offset: LeaderEpochEndOffset {
+                requested_epoch: LeaderEpoch::new(read_u64_le(body, 1)),
+                answered_epoch: LeaderEpoch::new(read_u64_le(body, 9)),
+                end_offset: Offset::new(read_u64_le(body, 17)),
+            },
+        })
+    }
+}
+
 /// A typed replication error. Every failure mode of serving / receiving / validating / applying a
 /// fetch is one of these — the layer NEVER panics, NEVER blind-appends an unvalidated byte, and
 /// FAILS CLOSED on any corrupt / malformed / out-of-order input.
@@ -274,6 +368,15 @@ pub enum ReplicationError {
         /// The number of complete frames actually decoded from the bytes.
         actual: u32,
     },
+    /// An [`FrameType::OffsetForLeaderEpoch`] (#599) request/response body was malformed: a wrong
+    /// length or a bad `kind` discriminant byte. Fail closed; the epoch handshake never guesses.
+    MalformedEpochQuery {
+        /// The body length seen.
+        len: usize,
+    },
+    /// The leader-epoch cache (#599) rejected an operation (a backward epoch / offset) while
+    /// reconstructing or extending the follower's epoch history — a fail-closed contract violation.
+    EpochCache(EpochCacheError),
     /// The local log rejected an append (e.g. at-capacity / writer frozen) while applying a
     /// validated record. Surfaced rather than swallowed.
     Storage(StorageError),
@@ -311,6 +414,12 @@ impl core::fmt::Display for ReplicationError {
                 f,
                 "replication fetch response record_count {claimed} != {actual} complete frames decoded"
             ),
+            ReplicationError::MalformedEpochQuery { len } => {
+                write!(f, "malformed leader-epoch offset query body ({len} bytes)")
+            }
+            ReplicationError::EpochCache(e) => {
+                write!(f, "replication leader-epoch cache error: {e}")
+            }
             ReplicationError::Storage(e) => write!(f, "replication local append failed: {e}"),
             ReplicationError::Io(e) => write!(f, "replication peer link IO error: {e}"),
             ReplicationError::Frame { what } => write!(f, "replication peer frame error: {what}"),
@@ -329,6 +438,12 @@ impl From<io::Error> for ReplicationError {
 impl From<StorageError> for ReplicationError {
     fn from(e: StorageError) -> Self {
         ReplicationError::Storage(e)
+    }
+}
+
+impl From<EpochCacheError> for ReplicationError {
+    fn from(e: EpochCacheError) -> Self {
+        ReplicationError::EpochCache(e)
     }
 }
 
@@ -389,6 +504,27 @@ impl<'a, F: Filesystem, C: Clock> ReplicationLeader<'a, F, C> {
             record_count: u32::try_from(run.record_count).unwrap_or(u32::MAX),
             frame_bytes: run.bytes.to_vec(),
         })
+    }
+
+    /// Answer a follower's [`OffsetForLeaderEpochBody`] (#599, KIP-101): the leader's end-offset for
+    /// the queried epoch, computed from the leader's epoch history (`leader_epochs`) and its current
+    /// log end (its flushed/committed head). This is the leader half of the divergence handshake; the
+    /// follower uses the answers to locate exactly where its lineage diverges from the leader's.
+    ///
+    /// The leader's epoch cache is metadata-group state (the metadata Raft assigns each leadership a
+    /// monotonic epoch, #668), so it is passed in rather than reconstructed from the log bytes — the
+    /// epoch is NOT stamped into the on-disk frames (the on-disk format is unchanged). The leader's
+    /// log end here is its high-watermark (`flushed_offset`): the leader only ever advertises an
+    /// end-offset over a committed range, so a follower never truncates to an uncommitted leader
+    /// offset.
+    #[must_use]
+    pub fn serve_epoch_query(
+        &self,
+        leader_epochs: &EpochCache,
+        req: &OffsetForLeaderEpochBody,
+    ) -> OffsetForLeaderEpochResponse {
+        let end = leader_epochs.end_offset_for_epoch(req.epoch, self.log.flushed_offset());
+        OffsetForLeaderEpochResponse { end_offset: end }
     }
 }
 
@@ -570,6 +706,175 @@ impl<F: Filesystem, C: Clock> Follower<F, C> {
     }
 }
 
+/// The typed, REPORTED outcome of a leader-epoch divergence reconciliation (C2-I4, #599) — never a
+/// silent drop. When a follower adopts a (possibly-new) leader and finds its uncommitted tail
+/// diverges from the leader's lineage, [`EpochAwareFollower::reconcile_with_leader`] truncates to the
+/// divergence point and returns this so the cluster surfaces it as a divergence event / metric (the
+/// beat over NATS #5576, where a divergent replica silently returns with no data and never
+/// reconciles). When nothing diverged it reports a clean no-op ([`DivergenceTruncation::is_no_op`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DivergenceTruncation {
+    /// The divergence point computed from the epoch caches: the offset the follower truncated to,
+    /// keeping the common prefix `[earliest, truncated_to)` and dropping the divergent suffix.
+    pub divergence_point: DivergencePoint,
+    /// The storage truncation outcome (records / bytes / segments actually dropped). Its
+    /// `records_dropped` is `0` for a clean no-op (the follower was already a prefix of the leader).
+    pub truncation: TruncateOutcome,
+}
+
+impl DivergenceTruncation {
+    /// True if nothing was actually dropped: the follower shared the leader's lineage and was already
+    /// a prefix of it, so it simply resumes fetching forward — no divergent suffix existed.
+    #[must_use]
+    pub fn is_no_op(&self) -> bool {
+        self.truncation.records_dropped == 0
+    }
+}
+
+/// A FOLLOWER augmented with a leader-epoch cache (KIP-101, C2-I4, #599): it wraps a plain
+/// [`Follower`] (the C2-I1 fetch + CRC-validate + append machinery) with the epoch tracking and the
+/// divergence-truncation that make replication SAFE under a leader change.
+///
+/// The epoch cache is IN-MEMORY and RECONSTRUCTIBLE (it is NEVER stamped into the on-disk frames, so
+/// the segment format is unchanged and old logs stay readable): the follower learns the leader's
+/// epoch boundaries over the wire as it replicates ([`assign_epoch`](EpochAwareFollower::assign_epoch))
+/// and can rebuild the cache from the leader's advertised history after a reopen
+/// ([`with_epochs`](EpochAwareFollower::with_epochs)).
+///
+/// On adopting a (possibly-new) leader, [`reconcile_with_leader`](EpochAwareFollower::reconcile_with_leader)
+/// queries the leader's epoch history, finds the divergence point, and — if the follower's tail
+/// diverges — TRUNCATES exactly there via the bounded, reported [`Log::truncate_to`], keeping the
+/// longest common prefix and dropping only the genuinely-divergent suffix. It NEVER truncates below
+/// the committed high-watermark: the divergence point is clamped to be at or above the follower's HW,
+/// so committed data (fsync'd on a quorum, #691) is never dropped.
+pub struct EpochAwareFollower<F: Filesystem, C: Clock> {
+    follower: Follower<F, C>,
+    /// The follower's leader-epoch cache: the `(epoch, start_offset)` boundaries of its own log.
+    epochs: EpochCache,
+}
+
+impl<F: Filesystem, C: Clock> EpochAwareFollower<F, C> {
+    /// Wrap a plain [`Follower`] with a fresh (empty) epoch cache. A follower replicating from
+    /// scratch learns its epoch boundaries as it goes; one recovered with a prefix learns them from
+    /// the leader on its next reconcile (or is seeded via [`with_epochs`](EpochAwareFollower::with_epochs)).
+    pub fn new(follower: Follower<F, C>) -> Self {
+        Self {
+            follower,
+            epochs: EpochCache::new(),
+        }
+    }
+
+    /// Wrap a [`Follower`] with a KNOWN epoch cache — e.g. one reconstructed from the leader's
+    /// advertised epoch history after a reopen (the "reconstruct the epoch cache from existing data"
+    /// path: the cache is not persisted, it is rehydrated).
+    pub fn with_epochs(follower: Follower<F, C>, epochs: EpochCache) -> Self {
+        Self { follower, epochs }
+    }
+
+    /// Borrow the wrapped follower (to drive fetches, read its log, or check its high-watermark).
+    #[must_use]
+    pub fn follower(&self) -> &Follower<F, C> {
+        &self.follower
+    }
+
+    /// Borrow the wrapped follower mutably (to apply fetch responses through the C2-I1 path).
+    pub fn follower_mut(&mut self) -> &mut Follower<F, C> {
+        &mut self.follower
+    }
+
+    /// The follower's leader-epoch cache (its `(epoch, start_offset)` boundaries).
+    #[must_use]
+    pub fn epochs(&self) -> &EpochCache {
+        &self.epochs
+    }
+
+    /// Records that the records the follower is replicating FROM `start_offset` were appended under
+    /// leadership `epoch` — extending the epoch cache by one boundary on a leadership change (a no-op
+    /// while the epoch is unchanged). The follower calls this as it learns the leader's epoch
+    /// boundaries during replication (the leader advertises the epoch a fetched range belongs to).
+    ///
+    /// # Errors
+    /// [`ReplicationError::EpochCache`] if `epoch`/`start_offset` would go backward (the
+    /// strictly-increasing invariant) — fail-closed.
+    pub fn assign_epoch(
+        &mut self,
+        epoch: LeaderEpoch,
+        start_offset: Offset,
+    ) -> Result<(), ReplicationError> {
+        self.epochs.assign(epoch, start_offset)?;
+        Ok(())
+    }
+
+    /// RECONCILE the follower against a (possibly-new) leader: find the divergence point between the
+    /// follower's epoch history and the leader's, and TRUNCATE the divergent suffix to exactly there
+    /// — the KIP-101 leader-epoch truncation. Returns a typed, REPORTED [`DivergenceTruncation`]
+    /// (never a silent drop). After this the follower's log is the longest common prefix with the
+    /// leader; the caller resumes fetching forward (which now converges byte-identically because the
+    /// lineages agree from here).
+    ///
+    /// `leader_end_offset` answers the leader's end-offset for a queried epoch — in production it is
+    /// wired to send an [`OffsetForLeaderEpochBody`] over the [`ReplicationLink`] and read the
+    /// [`OffsetForLeaderEpochResponse`]; in a test it calls the leader's
+    /// [`ReplicationLeader::serve_epoch_query`] directly. `committed_hw` is the follower's committed
+    /// high-watermark (from #691); the divergence point is CLAMPED to be at or above it, so committed
+    /// data is NEVER truncated (only the uncommitted-divergent suffix is).
+    ///
+    /// # Errors
+    /// - [`ReplicationError::Storage`] if the underlying [`Log::truncate_to`] fails.
+    /// - [`ReplicationError::EpochCache`] if rebuilding the epoch cache after truncation fails.
+    pub fn reconcile_with_leader<L>(
+        &mut self,
+        committed_hw: Offset,
+        leader_end_offset: L,
+    ) -> Result<DivergenceTruncation, ReplicationError>
+    where
+        L: FnMut(LeaderEpoch) -> LeaderEpochEndOffset,
+    {
+        let log_end = self.follower.log.next_offset();
+        // Compute the divergence point from the epoch caches (the pure KIP-101 algorithm).
+        let raw = self.epochs.divergence_point(log_end, leader_end_offset);
+        // CLAMP the truncation target to be at or above the committed high-watermark: committed data
+        // (fsync'd on a quorum, #691) is NEVER truncated, only the uncommitted-divergent suffix. A
+        // correct lineage never asks to drop committed data, but the clamp makes that a hard floor —
+        // the never-truncate-committed-data guarantee by construction, not by trust.
+        let clamped_to = Offset::new(raw.truncate_to.get().max(committed_hw.get()));
+        let divergence_point = DivergencePoint {
+            truncate_to: clamped_to,
+            diverged_at_epoch: raw.diverged_at_epoch,
+        };
+
+        if !divergence_point.needs_truncation(log_end) {
+            // The follower is already a prefix of the leader's lineage (or has nothing above the
+            // divergence point): nothing to drop, just fetch forward. Report a clean no-op.
+            return Ok(DivergenceTruncation {
+                divergence_point,
+                truncation: TruncateOutcome {
+                    truncated_to: log_end.get(),
+                    next_offset_before: log_end.get(),
+                    records_dropped: 0,
+                    bytes_dropped: 0,
+                    segments_dropped: 0,
+                },
+            });
+        }
+
+        // Truncate the divergent suffix on the durable bytes — bounded + reported.
+        let truncation = self.follower.log.truncate_to(clamped_to)?;
+        // Mirror the truncation in the epoch cache: drop the boundaries of the divergent suffix so the
+        // cache covers only the surviving common prefix, then the follower re-learns the new leader's
+        // epoch as it fetches forward.
+        self.epochs.truncate_to(clamped_to);
+        // The follower's observed leader high-watermark must not claim more than it now durably holds;
+        // reset it to the truncated head so its visible HW is correct until the next fetch raises it.
+        self.follower.leader_high_watermark = clamped_to.get();
+
+        Ok(DivergenceTruncation {
+            divergence_point,
+            truncation,
+        })
+    }
+}
+
 /// A bidirectional REPLICATION peer link over any byte stream (`Read + Write`): a real `TcpStream`
 /// in production, an in-memory pipe in the in-process leader↔follower test. It frames a
 /// [`FetchRecordsBody`] / [`FetchResponseBody`] with the bounded `ironbus_proto::frame` envelope and
@@ -592,6 +897,10 @@ pub enum ReplicationFrame {
     Request(FetchRecordsBody),
     /// A leader's [`FetchResponseBody`] (received on the follower side).
     Response(FetchResponseBody),
+    /// A follower's [`OffsetForLeaderEpochBody`] divergence query (received on the leader side, #599).
+    EpochQuery(OffsetForLeaderEpochBody),
+    /// A leader's [`OffsetForLeaderEpochResponse`] (received on the follower side, #599).
+    EpochResponse(OffsetForLeaderEpochResponse),
 }
 
 impl<S: Read + Write> ReplicationLink<S> {
@@ -619,6 +928,28 @@ impl<S: Read + Write> ReplicationLink<S> {
     /// envelope cap), or [`ReplicationError::Io`] on a write failure.
     pub fn send_response(&mut self, resp: &FetchResponseBody) -> Result<(), ReplicationError> {
         self.send(FrameType::FetchResponse, &resp.encode())
+    }
+
+    /// Send a follower → leader leader-epoch offset QUERY (#599).
+    ///
+    /// # Errors
+    /// Returns [`ReplicationError::Frame`] / [`ReplicationError::Io`] as [`send_request`](ReplicationLink::send_request).
+    pub fn send_epoch_query(
+        &mut self,
+        req: &OffsetForLeaderEpochBody,
+    ) -> Result<(), ReplicationError> {
+        self.send(FrameType::OffsetForLeaderEpoch, &req.encode())
+    }
+
+    /// Send a leader → follower leader-epoch offset RESPONSE (#599).
+    ///
+    /// # Errors
+    /// Returns [`ReplicationError::Frame`] / [`ReplicationError::Io`] as [`send_response`](ReplicationLink::send_response).
+    pub fn send_epoch_response(
+        &mut self,
+        resp: &OffsetForLeaderEpochResponse,
+    ) -> Result<(), ReplicationError> {
+        self.send(FrameType::OffsetForLeaderEpoch, &resp.encode())
     }
 
     fn send(&mut self, ty: FrameType, body: &[u8]) -> Result<(), ReplicationError> {
@@ -686,6 +1017,18 @@ impl<S: Read + Write> ReplicationLink<S> {
             }
             Some(FrameType::FetchResponse) => {
                 Ok(ReplicationFrame::Response(FetchResponseBody::decode(body)?))
+            }
+            Some(FrameType::OffsetForLeaderEpoch) => {
+                // The query and the response share tag 38; the leading `kind` byte distinguishes them.
+                match body.first().copied() {
+                    Some(EPOCH_QUERY_KIND_REQUEST) => Ok(ReplicationFrame::EpochQuery(
+                        OffsetForLeaderEpochBody::decode(body)?,
+                    )),
+                    Some(EPOCH_QUERY_KIND_RESPONSE) => Ok(ReplicationFrame::EpochResponse(
+                        OffsetForLeaderEpochResponse::decode(body)?,
+                    )),
+                    _ => Err(ReplicationError::MalformedEpochQuery { len: body.len() }),
+                }
             }
             _ => Err(ReplicationError::Frame {
                 what: format!("unexpected frame type tag {type_tag} on a replication link"),
@@ -1199,9 +1542,7 @@ mod tests {
             let got = leader_link.recv().unwrap().unwrap();
             let req = match got {
                 ReplicationFrame::Request(r) => r,
-                other @ ReplicationFrame::Response(_) => {
-                    panic!("leader expected a Request, got {other:?}")
-                }
+                other => panic!("leader expected a Request, got {other:?}"),
             };
             // Leader serves → wire → follower.
             let resp = leader.serve_fetch(&req).unwrap();
@@ -1209,9 +1550,7 @@ mod tests {
             let got = follower_link.recv().unwrap().unwrap();
             let resp = match got {
                 ReplicationFrame::Response(r) => r,
-                other @ ReplicationFrame::Request(_) => {
-                    panic!("follower expected a Response, got {other:?}")
-                }
+                other => panic!("follower expected a Response, got {other:?}"),
             };
             follower.apply_fetch_response(&resp).unwrap();
         }
@@ -1282,5 +1621,426 @@ mod tests {
             }
         ));
         assert_eq!(follower.next_fetch_offset().get(), 0, "nothing appended");
+    }
+
+    // ===== C2-I4 (#599): leader-epoch truncation on follower divergence (KIP-101) =====
+
+    use ironbus_core::epoch_cache::EpochEntry;
+
+    /// Drive a fetch catch-up of an [`EpochAwareFollower`] to the leader's HW (leader-serve →
+    /// follower-apply), returning the wrapper. Mirrors `replicate_to_catch_up` for the epoch-aware
+    /// follower.
+    fn epoch_replicate_to_catch_up(
+        leader_log: &Log<InMemoryFs, ManualClock>,
+        mut follower: EpochAwareFollower<InMemoryFs, ManualClock>,
+        max_records: u32,
+        max_bytes: u32,
+    ) -> EpochAwareFollower<InMemoryFs, ManualClock> {
+        let leader = ReplicationLeader::new(leader_log);
+        let hw = leader.high_watermark().get();
+        for _ in 0..(hw + 2) {
+            if follower.follower().next_fetch_offset().get() >= hw {
+                break;
+            }
+            let req = follower.follower().fetch_request(max_records, max_bytes);
+            let resp = leader.serve_fetch(&req).expect("leader serves fetch");
+            follower
+                .follower_mut()
+                .apply_fetch_response(&resp)
+                .expect("follower applies a valid fetch");
+        }
+        follower
+    }
+
+    /// Build a leader log whose records carry a known epoch history, and the matching leader epoch
+    /// cache. `runs` is `(epoch, count)` pairs appended in order; the cache records a boundary at the
+    /// start offset of each new epoch.
+    fn build_leader_with_epochs(
+        config: LogConfig,
+        runs: &[(u64, u32)],
+        prefix: &str,
+    ) -> (Log<InMemoryFs, ManualClock>, EpochCache) {
+        let mut log = open_log(InMemoryFs::new(), config);
+        let mut epochs = EpochCache::new();
+        let mut offset = 0u64;
+        let mut n = 0u32;
+        for &(epoch, count) in runs {
+            epochs
+                .assign(LeaderEpoch::new(epoch), Offset::new(offset))
+                .expect("epoch assign");
+            for _ in 0..count {
+                log.append(&rec(format!("{prefix}-{n:03}").as_bytes()))
+                    .unwrap();
+                n += 1;
+                offset += 1;
+            }
+        }
+        log.sync().unwrap();
+        (log, epochs)
+    }
+
+    // ----- the headline: a divergent follower truncates to the divergence point + converges -----
+
+    #[test]
+    fn a_divergent_follower_truncates_to_the_divergence_point_then_converges_byte_identical() {
+        // The OLD leader's lineage: epoch 1 for offsets [0,10), epoch 5 for [10,18). The follower
+        // replicated all 18 records from it (the epoch-5 tail [10,18) is UNCOMMITTED — never quorum'd).
+        let cfg = small_config();
+        let (old_leader, old_epochs) = build_leader_with_epochs(cfg, &[(1, 10), (5, 8)], "rec");
+        let mut follower = EpochAwareFollower::new(Follower::new(open_log(InMemoryFs::new(), cfg)));
+        // Replicate the OLD leader's 18 records, learning its epoch boundaries as it goes.
+        follower
+            .assign_epoch(LeaderEpoch::new(1), Offset::ZERO)
+            .unwrap();
+        follower = epoch_replicate_to_catch_up(&old_leader, follower, 100, u32::MAX);
+        follower
+            .assign_epoch(LeaderEpoch::new(5), Offset::new(10))
+            .unwrap();
+        assert_eq!(follower.follower().next_fetch_offset().get(), 18);
+
+        // The NEW leader's lineage shares the epoch-1 prefix [0,10) but DIVERGED at epoch 5: it only
+        // ever held [10,14) under epoch 5, then took a NEW epoch 6 for [14, ...). So the follower's
+        // records [14,18) under epoch 5 are a DIVERGENT suffix the new leader never had. The new
+        // leader's records [0,14) are byte-identical to the follower's (same epochs + same producer
+        // content), and [14, ...) is its own epoch-6 lineage.
+        let (new_leader, new_epochs) =
+            build_leader_with_epochs(cfg, &[(1, 10), (5, 4), (6, 9)], "rec");
+
+        // RECONCILE the follower against the NEW leader. committed_hw = 10 (only the epoch-1 prefix was
+        // committed/quorum'd; the epoch-5 tail was uncommitted). The divergence point is 14: the
+        // shared epoch 5 ended at 14 on the new leader.
+        let outcome = follower
+            .reconcile_with_leader(Offset::new(10), |e| {
+                ReplicationLeader::new(&new_leader)
+                    .serve_epoch_query(&new_epochs, &OffsetForLeaderEpochBody { epoch: e })
+                    .end_offset
+            })
+            .expect("reconcile");
+        assert_eq!(
+            outcome.divergence_point.truncate_to,
+            Offset::new(14),
+            "truncate to where the shared epoch 5 ended on the new leader"
+        );
+        assert_eq!(
+            outcome.divergence_point.diverged_at_epoch,
+            LeaderEpoch::new(5)
+        );
+        assert!(!outcome.is_no_op(), "a real divergent suffix was dropped");
+        assert_eq!(outcome.truncation.records_dropped, 4, "[14,18) dropped");
+        assert_eq!(follower.follower().next_fetch_offset().get(), 14);
+
+        // The epoch cache now covers only the common prefix [0,14): epoch 1 + epoch 5 (its start 10 is
+        // below 14), the divergent epoch boundaries are gone.
+        assert_eq!(
+            follower.epochs().entries(),
+            &[
+                EpochEntry {
+                    epoch: LeaderEpoch::new(1),
+                    start_offset: Offset::ZERO
+                },
+                EpochEntry {
+                    epoch: LeaderEpoch::new(5),
+                    start_offset: Offset::new(10)
+                },
+            ]
+        );
+
+        // RE-FETCH forward from the NEW leader and CONVERGE. The follower learns epoch 6 at offset 14.
+        follower
+            .assign_epoch(LeaderEpoch::new(6), Offset::new(14))
+            .unwrap();
+        follower = epoch_replicate_to_catch_up(&new_leader, follower, 100, u32::MAX);
+
+        // BYTE-IDENTICAL to the new leader: the follower kept the common prefix [0,14) and re-fetched
+        // the new leader's epoch-6 lineage, so its on-disk log matches the new leader's frame-for-frame.
+        let new_hw = new_leader.flushed_offset().get();
+        assert_eq!(follower.follower().next_fetch_offset().get(), new_hw);
+        assert_eq!(
+            dump_segments(follower.follower().log()),
+            dump_segments(&new_leader),
+            "after divergence-truncation + re-fetch the follower is byte-identical to the new leader"
+        );
+        // And it never used the old leader (the divergent records are gone).
+        let _ = old_epochs;
+    }
+
+    #[test]
+    fn committed_data_below_the_high_watermark_is_never_truncated() {
+        // Even if a (buggy or adversarial) divergence computation pointed BELOW the committed HW, the
+        // clamp guarantees committed data is never dropped. Here the follower committed [0,12) (HW=12)
+        // but the raw divergence point is 8 (inside committed data); the clamp floors the truncation
+        // at 12, so NOTHING committed is lost.
+        let cfg = small_config();
+        let (leader, _epochs) = build_leader_with_epochs(cfg, &[(3, 20)], "c");
+        let mut follower = EpochAwareFollower::new(Follower::new(open_log(InMemoryFs::new(), cfg)));
+        follower
+            .assign_epoch(LeaderEpoch::new(3), Offset::ZERO)
+            .unwrap();
+        follower = epoch_replicate_to_catch_up(&leader, follower, 100, u32::MAX);
+        assert_eq!(follower.follower().next_fetch_offset().get(), 20);
+
+        // Force a divergence query that (incorrectly) claims the shared epoch ended at offset 8 — below
+        // the committed HW of 12. The clamp must refuse to truncate below 12.
+        let outcome = follower
+            .reconcile_with_leader(Offset::new(12), |e| LeaderEpochEndOffset {
+                requested_epoch: e,
+                answered_epoch: e,
+                end_offset: Offset::new(8),
+            })
+            .expect("reconcile");
+        assert_eq!(
+            outcome.divergence_point.truncate_to,
+            Offset::new(12),
+            "the truncation is clamped to the committed HW, never below it"
+        );
+        assert_eq!(follower.follower().next_fetch_offset().get(), 12);
+        // The committed records [0,12) all survive.
+        assert_eq!(
+            follower
+                .follower()
+                .log()
+                .read_from(Offset::ZERO, 100)
+                .unwrap()
+                .len(),
+            12
+        );
+    }
+
+    #[test]
+    fn a_follower_that_is_a_prefix_of_the_leader_reconciles_to_a_clean_no_op() {
+        // The follower's whole log is a prefix of the new leader's identical lineage: nothing diverges,
+        // so reconcile is a no-op and the follower simply continues fetching forward.
+        let cfg = small_config();
+        let (leader, epochs) = build_leader_with_epochs(cfg, &[(2, 15)], "p");
+        let mut follower = EpochAwareFollower::new(Follower::new(open_log(InMemoryFs::new(), cfg)));
+        follower
+            .assign_epoch(LeaderEpoch::new(2), Offset::ZERO)
+            .unwrap();
+        // Replicate only the first 6 records (a strict prefix), looping since the small segment cap
+        // bounds each fetch to one segment.
+        let leader_src = ReplicationLeader::new(&leader);
+        while follower.follower().next_fetch_offset().get() < 6 {
+            let want = 6 - follower.follower().next_fetch_offset().get();
+            let req = follower
+                .follower()
+                .fetch_request(u32::try_from(want).unwrap(), u32::MAX);
+            let resp = leader_src.serve_fetch(&req).unwrap();
+            follower.follower_mut().apply_fetch_response(&resp).unwrap();
+        }
+        assert_eq!(follower.follower().next_fetch_offset().get(), 6);
+
+        let outcome = follower
+            .reconcile_with_leader(Offset::new(6), |e| {
+                leader_src
+                    .serve_epoch_query(&epochs, &OffsetForLeaderEpochBody { epoch: e })
+                    .end_offset
+            })
+            .expect("reconcile");
+        assert!(outcome.is_no_op(), "a prefix follower truncates nothing");
+        assert_eq!(outcome.truncation.records_dropped, 0);
+        assert_eq!(
+            follower.follower().next_fetch_offset().get(),
+            6,
+            "log unchanged"
+        );
+
+        // It converges by fetching forward.
+        follower = epoch_replicate_to_catch_up(&leader, follower, 100, u32::MAX);
+        assert_eq!(
+            dump_segments(follower.follower().log()),
+            dump_segments(&leader)
+        );
+    }
+
+    #[test]
+    fn the_epoch_cache_reconstructs_correctly_after_a_reopen() {
+        // The epoch cache is NOT persisted (it is never stamped into the on-disk frames); after a
+        // reopen the follower's log recovers from durable bytes, and the epoch cache is REHYDRATED
+        // from the leader's advertised epoch history — yielding the same cache, so a subsequent
+        // divergence reconcile is identical to one before the reopen.
+        let cfg = small_config();
+        let (leader, leader_epochs) = build_leader_with_epochs(cfg, &[(1, 8), (4, 7)], "k");
+        let follower_fs = InMemoryFs::new();
+        {
+            let mut follower =
+                EpochAwareFollower::new(Follower::new(open_log(follower_fs.clone(), cfg)));
+            follower
+                .assign_epoch(LeaderEpoch::new(1), Offset::ZERO)
+                .unwrap();
+            follower = epoch_replicate_to_catch_up(&leader, follower, 100, u32::MAX);
+            follower
+                .assign_epoch(LeaderEpoch::new(4), Offset::new(8))
+                .unwrap();
+            assert_eq!(follower.follower().next_fetch_offset().get(), 15);
+            assert_eq!(follower.epochs().entries().len(), 2);
+        }
+        // Reopen: the log recovers its 15 records; the epoch cache is rebuilt from the leader's history
+        // (the same boundaries the leader advertises).
+        let reopened_log = open_log(follower_fs, cfg);
+        assert_eq!(
+            reopened_log.next_offset().get(),
+            15,
+            "durable prefix recovered"
+        );
+        let rebuilt = EpochCache::from_entries(leader_epochs.entries().to_vec()).unwrap();
+        let follower = EpochAwareFollower::with_epochs(Follower::new(reopened_log), rebuilt);
+        assert_eq!(
+            follower.epochs().entries(),
+            leader_epochs.entries(),
+            "the rehydrated epoch cache matches the leader's advertised history"
+        );
+        // A reconcile against the same leader is a clean no-op (the follower IS the leader's lineage).
+        let mut follower = follower;
+        let outcome = follower
+            .reconcile_with_leader(Offset::new(15), |e| {
+                ReplicationLeader::new(&leader)
+                    .serve_epoch_query(&leader_epochs, &OffsetForLeaderEpochBody { epoch: e })
+                    .end_offset
+            })
+            .expect("reconcile");
+        assert!(outcome.is_no_op());
+    }
+
+    #[test]
+    fn divergence_across_multiple_epoch_changes_truncates_at_the_right_point() {
+        // A deeper divergence: the follower and the new leader share epochs 2 and 4 then diverge. The
+        // common prefix ends where epoch 4 ended on the new leader.
+        let cfg = small_config();
+        // Follower lineage: 2@[0,5), 4@[5,12), 7@[12,20) (epoch 7 is the divergent tail).
+        let (old_leader, _) = build_leader_with_epochs(cfg, &[(2, 5), (4, 7), (7, 8)], "m");
+        let mut follower = EpochAwareFollower::new(Follower::new(open_log(InMemoryFs::new(), cfg)));
+        follower
+            .assign_epoch(LeaderEpoch::new(2), Offset::ZERO)
+            .unwrap();
+        follower = epoch_replicate_to_catch_up(&old_leader, follower, 100, u32::MAX);
+        follower
+            .assign_epoch(LeaderEpoch::new(4), Offset::new(5))
+            .unwrap();
+        follower
+            .assign_epoch(LeaderEpoch::new(7), Offset::new(12))
+            .unwrap();
+        assert_eq!(follower.follower().next_fetch_offset().get(), 20);
+
+        // New leader: 2@[0,5), 4@[5,12), 8@[12, ...). It shares [0,12) but never had epoch 7. So the
+        // divergence point is 12 (where epoch 4 ended on both); the epoch-7 suffix [12,20) is dropped.
+        let (new_leader, new_epochs) =
+            build_leader_with_epochs(cfg, &[(2, 5), (4, 7), (8, 10)], "m");
+        let outcome = follower
+            .reconcile_with_leader(Offset::new(5), |e| {
+                ReplicationLeader::new(&new_leader)
+                    .serve_epoch_query(&new_epochs, &OffsetForLeaderEpochBody { epoch: e })
+                    .end_offset
+            })
+            .expect("reconcile");
+        assert_eq!(outcome.divergence_point.truncate_to, Offset::new(12));
+        assert_eq!(
+            outcome.divergence_point.diverged_at_epoch,
+            LeaderEpoch::new(4)
+        );
+        assert_eq!(outcome.truncation.records_dropped, 8);
+
+        follower
+            .assign_epoch(LeaderEpoch::new(8), Offset::new(12))
+            .unwrap();
+        follower = epoch_replicate_to_catch_up(&new_leader, follower, 100, u32::MAX);
+        assert_eq!(
+            dump_segments(follower.follower().log()),
+            dump_segments(&new_leader),
+            "converges byte-identical to the new leader across multiple epoch changes"
+        );
+    }
+
+    #[test]
+    fn single_node_is_unaffected_no_epoch_truncation_without_a_cluster() {
+        // The epoch-aware machinery is opt-in: a plain single-node log is byte-for-byte what it always
+        // was. No EpochAwareFollower / EpochCache is built without a cluster, so no truncation runs and
+        // the on-disk layout is unchanged — proven by an identical plain log built the ordinary way.
+        let cfg = small_config();
+        let mut a = open_log(InMemoryFs::new(), cfg);
+        let mut b = open_log(InMemoryFs::new(), cfg);
+        for i in 0..15u32 {
+            let p = format!("plain-{i}");
+            a.append(&rec(p.as_bytes())).unwrap();
+            b.append(&rec(p.as_bytes())).unwrap();
+        }
+        a.sync().unwrap();
+        b.sync().unwrap();
+        assert_eq!(dump_segments(&a), dump_segments(&b));
+        assert_eq!(a.flushed_offset().get(), 15);
+    }
+
+    // ----- the epoch-query wire codec + over-the-wire round-trip -----
+
+    #[test]
+    fn epoch_query_request_round_trips_through_its_codec() {
+        let req = OffsetForLeaderEpochBody {
+            epoch: LeaderEpoch::new(0xABCD),
+        };
+        assert_eq!(
+            OffsetForLeaderEpochBody::decode(&req.encode()).unwrap(),
+            req
+        );
+        // A wrong length or bad kind byte is rejected.
+        assert!(matches!(
+            OffsetForLeaderEpochBody::decode(&[0u8; 4]),
+            Err(ReplicationError::MalformedEpochQuery { .. })
+        ));
+        let mut bad = req.encode();
+        bad[0] = 9; // not the request kind
+        assert!(matches!(
+            OffsetForLeaderEpochBody::decode(&bad),
+            Err(ReplicationError::MalformedEpochQuery { .. })
+        ));
+    }
+
+    #[test]
+    fn epoch_query_response_round_trips_through_its_codec() {
+        let resp = OffsetForLeaderEpochResponse {
+            end_offset: LeaderEpochEndOffset {
+                requested_epoch: LeaderEpoch::new(7),
+                answered_epoch: LeaderEpoch::new(9),
+                end_offset: Offset::new(123),
+            },
+        };
+        assert_eq!(
+            OffsetForLeaderEpochResponse::decode(&resp.encode()).unwrap(),
+            resp
+        );
+    }
+
+    #[test]
+    fn epoch_query_round_trips_over_the_wire_link() {
+        // The follower sends a real OffsetForLeaderEpoch query over the ReplicationLink; the leader
+        // receives it, serves it from its epoch cache, sends the response back, and the follower reads
+        // it — all over the bounded frame envelope, request and response sharing tag 38.
+        let cfg = small_config();
+        let (leader_log, leader_epochs) = build_leader_with_epochs(cfg, &[(1, 10), (4, 10)], "w");
+
+        let (follower_end, leader_end) = Pipe::pair();
+        let mut follower_link = ReplicationLink::new(follower_end);
+        let mut leader_link = ReplicationLink::new(leader_end);
+        let leader = ReplicationLeader::new(&leader_log);
+
+        // Follower asks for epoch 1's end-offset.
+        follower_link
+            .send_epoch_query(&OffsetForLeaderEpochBody {
+                epoch: LeaderEpoch::new(1),
+            })
+            .unwrap();
+        let got = leader_link.recv().unwrap().unwrap();
+        let query = match got {
+            ReplicationFrame::EpochQuery(q) => q,
+            other => panic!("leader expected an EpochQuery, got {other:?}"),
+        };
+        let resp = leader.serve_epoch_query(&leader_epochs, &query);
+        leader_link.send_epoch_response(&resp).unwrap();
+        let got = follower_link.recv().unwrap().unwrap();
+        let resp = match got {
+            ReplicationFrame::EpochResponse(r) => r,
+            other => panic!("follower expected an EpochResponse, got {other:?}"),
+        };
+        // Epoch 1 ended where epoch 4 began: offset 10.
+        assert_eq!(resp.end_offset.answered_epoch, LeaderEpoch::new(1));
+        assert_eq!(resp.end_offset.end_offset, Offset::new(10));
     }
 }
