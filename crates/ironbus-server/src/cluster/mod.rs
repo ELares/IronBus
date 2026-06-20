@@ -181,6 +181,32 @@
 //! eligibility / CI layer never constructs in a standalone broker. The `serve`-path wiring of the
 //! eligibility check into the running metadata placement is the follow-up.
 //!
+//! ## Status: C2-I6 — data-plane serve-wiring (the controller that RUNS the layers)
+//!
+//! [`dataplane`] is the piece that finally WIRES the DATA-plane layers above into a serving cluster.
+//! [`dataplane::DataPlaneController`] reads the committed placements
+//! ([`state_machine::Placement`], #616) and, per LOCAL partition replica
+//! ([`dataplane::role_for_placement`]), runs the right role: a LEADER serves
+//! [`replication::FetchRecordsBody`] pulls to its followers ([`replication::ReplicationLeader`]) AND
+//! gates a `C2-fsync` produce's `PubAck` through the partition's [`isr::IsrTracker`] +
+//! [`isr::QuorumAckGate`] (#593) — the ack releases only once `min_isr` replicas have each
+//! `fdatasync`'d the record, and below `min_isr` it releases NOTHING (the no-false-ack property); a
+//! FOLLOWER runs the [`replication::Follower`] fetch loop, applies only CRC-revalidated bytes, reports
+//! its fsync'd offset back ([`isr::AckReplicatedBody`]), and on a detected divergence self-heals via
+//! the leader-epoch truncation (#599, [`replication::EpochAwareFollower`]). The controller is
+//! TRANSPORT-AGNOSTIC: it returns a [`dataplane::DataPlaneAction`] describing what to send and is
+//! routed inbound via [`dataplane::decode_dataplane_frame`] + [`dataplane::DataPlaneController::handle_frame`],
+//! so the same logic is the serve-path driver AND the unit under the in-process 3-node test (a produce
+//! to the leader REPLICATES byte-identical to two followers, the `C2-fsync` ack releases only after the
+//! ISR quorum fsync'd, below `min_isr` the produce blocks, a divergent follower self-heals, a single
+//! replica acks on its own fsync, and a restart re-establishes the role from the committed placement).
+//! Single-node is byte-identical: with no cluster config NO controller is constructed and the produce
+//! path is the existing local-fsync (I2) ack. FLAGGED remaining hookup: threading the parked-reply
+//! token through `engine.rs` / `session.rs` so a real produce on a leader partition parks its wire
+//! `PubAck` in the gate (the exact seam is documented on [`dataplane::DataPlaneController::park_produce_ack`]);
+//! rebalance on a placement CHANGE is C5-I2/I3; the real `TcpStream` peer reader/dialer carrying the
+//! data frames is the transport wiring.
+//!
 //! ## Deliberately deferred (later C1 / C2 issues)
 //!
 //! * **`serve`-path wiring + over-the-wire learner CATCH-UP + C2 replication** — wiring the
@@ -199,6 +225,7 @@
 //! activates in a multi-node config).
 
 pub mod ack_level;
+pub mod dataplane;
 pub mod divergence;
 pub mod eligibility;
 pub mod isr;
@@ -212,6 +239,10 @@ pub mod state_machine;
 pub mod transport;
 
 pub use ack_level::{ClusterAckLevel, ClusterAckLevelMetrics};
+pub use dataplane::{
+    decode_dataplane_frame, role_for_placement, AckToken, DataPlaneAction, DataPlaneController,
+    DataPlaneError, DataPlaneFrame, PlacementRole,
+};
 pub use divergence::{
     compare_fingerprints, execute_resync, fingerprint_log, plan_resync, quarantine_and_resync,
     DivergenceDetected, DivergenceError, DivergenceField, DivergenceReport, ResyncBounds,
