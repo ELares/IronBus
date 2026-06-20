@@ -252,6 +252,24 @@ pub enum FrameType {
     /// this is an ADDITIVE tag an old client never sends. Body: a [`crate::message::SubToBody`]
     /// (`body_version: u8`, `field_len: u16` over `stream_id` then `group`, each u16-length-prefixed).
     SubTo,
+    /// Cluster follower → leader replication fetch request (#590, V2-C2-I1): a follower asks the
+    /// leader for the contiguous CRC-framed segment byte range of one partition log starting at
+    /// `from_offset`, up to a bounded record/byte budget. This is the Kafka-ISR PULL model: the
+    /// follower drives replication on its own cadence, the leader never pushes. It rides the SAME
+    /// `[len][type][body]` envelope as every other frame and is an ADDITIVE, peer-only tag a client
+    /// never sends. Body: a fixed little-endian header (see
+    /// [`crate::cluster::replication`] in `ironbus-server`, the only encoder/decoder of these
+    /// bodies) — `from_offset: u64`, `max_records: u32`, `max_bytes: u32`.
+    FetchRecords,
+    /// Cluster leader → follower replication fetch response (#590, V2-C2-I1): the leader's reply to a
+    /// [`FrameType::FetchRecords`]. It carries the leader's current high-watermark (its flushed /
+    /// committed offset) and a contiguous run of CRC-framed on-disk record frames (a zero-copy
+    /// `RawByteRun`, #657) starting at the requested `from_offset`. The follower RE-VALIDATES every
+    /// frame's CRC with the existing intact-record predicate before appending any of it (fail-closed:
+    /// a corrupt / tampered frame is detected and NOT appended). Body: a fixed little-endian header —
+    /// `high_watermark: u64`, `first_offset: u64`, `record_count: u32`, `frame_bytes_len: u32` — then
+    /// the verbatim CRC-framed record bytes.
+    FetchResponse,
 }
 
 impl FrameType {
@@ -290,6 +308,8 @@ impl FrameType {
             FrameType::StreamInfo => 29,
             FrameType::PubTo => 30,
             FrameType::SubTo => 31,
+            FrameType::FetchRecords => 32,
+            FrameType::FetchResponse => 33,
         }
     }
 
@@ -329,6 +349,8 @@ impl FrameType {
             29 => FrameType::StreamInfo,
             30 => FrameType::PubTo,
             31 => FrameType::SubTo,
+            32 => FrameType::FetchRecords,
+            33 => FrameType::FetchResponse,
             _ => return None,
         })
     }
@@ -461,7 +483,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 31] = [
+    const ALL_TYPES: [FrameType; 33] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -493,6 +515,8 @@ mod tests {
         FrameType::StreamInfo,
         FrameType::PubTo,
         FrameType::SubTo,
+        FrameType::FetchRecords,
+        FrameType::FetchResponse,
     ];
 
     #[test]
@@ -560,13 +584,19 @@ mod tests {
         // The default-stream verbs are untouched.
         assert_eq!(FrameType::Pub.as_u8(), 5);
         assert_eq!(FrameType::Sub.as_u8(), 6);
-        // 32 is the new next-free tag (still unknown), so it frames but is not a known type.
-        assert_eq!(FrameType::from_u8(32), None);
+        // 32/33 are the cluster replication-fetch tags (#590, V2-C2-I1), the next free tags after
+        // SubTo (31); 34 is now the next-free (still unknown) tag, so it frames but is not a known
+        // type.
+        assert_eq!(FrameType::from_u8(32), Some(FrameType::FetchRecords));
+        assert_eq!(FrameType::from_u8(33), Some(FrameType::FetchResponse));
+        assert_eq!(FrameType::from_u8(34), None);
         for ty in [
             FrameType::StreamDeclare,
             FrameType::StreamInfo,
             FrameType::PubTo,
             FrameType::SubTo,
+            FrameType::FetchRecords,
+            FrameType::FetchResponse,
         ] {
             let mut buf = Vec::new();
             encode_frame(ty, b"\x0b\x0c", &mut buf).unwrap();
@@ -633,9 +663,10 @@ mod tests {
         // The Tier-W verbs are untouched.
         assert_eq!(FrameType::Flow.as_u8(), 10);
         assert_eq!(FrameType::Fetch.as_u8(), 23);
-        // 32 is the new next-free tag (still unknown), so it frames but is not a known type. (Tags 27
-        // = cluster-peer Raft #667; 28-31 = the stream-addressed verbs #588.)
-        assert_eq!(FrameType::from_u8(32), None);
+        // 34 is the new next-free tag (still unknown), so it frames but is not a known type. (Tags 27
+        // = cluster-peer Raft #667; 28-31 = the stream-addressed verbs #588; 32-33 = the cluster
+        // replication-fetch verbs #590.)
+        assert_eq!(FrameType::from_u8(34), None);
         for ty in [FrameType::StreamFetch, FrameType::StreamCommit] {
             let mut buf = Vec::new();
             encode_frame(ty, b"\x07\x08", &mut buf).unwrap();
@@ -659,9 +690,10 @@ mod tests {
         assert_eq!(FrameType::from_u8(26), Some(FrameType::DeliverBatch));
         // The per-record Deliver tag is untouched.
         assert_eq!(FrameType::Deliver.as_u8(), 13);
-        // 32 is the next-free tag (still unknown), so it frames but is not a known type. (Tags 27 =
-        // cluster-peer Raft #667; 28-31 = the stream-addressed verbs #588.)
-        assert_eq!(FrameType::from_u8(32), None);
+        // 34 is the next-free tag (still unknown), so it frames but is not a known type. (Tags 27 =
+        // cluster-peer Raft #667; 28-31 = the stream-addressed verbs #588; 32-33 = the cluster
+        // replication-fetch verbs #590.)
+        assert_eq!(FrameType::from_u8(34), None);
         let mut buf = Vec::new();
         encode_frame(FrameType::DeliverBatch, b"\x09\x0a", &mut buf).unwrap();
         match decode_frame(&buf).unwrap() {
@@ -856,7 +888,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 32u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 34u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);
