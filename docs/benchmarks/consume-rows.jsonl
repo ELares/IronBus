@@ -1,8 +1,8 @@
-{"system": "ironbus", "tier": "tier-s-streaming", "payload": 256, "records": 20000, "mode": "consume", "throughput": 114984.12721738049, "p50": 1086171.175, "p99": 1128557.345, "p999": 1129084.761}
-{"system": "nats", "tier": "js-pull", "payload": 256, "records": 20000, "mode": "consume", "throughput": 99861.0, "p50": null, "p99": null, "p999": null}
-{"system": "ironbus", "tier": "tier-w-work", "payload": 256, "records": 20000, "mode": "consume", "throughput": 3325.9692576820016, "p50": 5474699.582, "p99": 7010387.183, "p999": 7016088.71}
-{"system": "nats-core", "tier": "core-sub", "payload": 256, "records": 20000, "mode": "consume", "throughput": 620220.0, "p50": null, "p99": null, "p999": null}
-{"system": "ironbus", "tier": "tier-s-streaming", "payload": 4096, "records": 20000, "mode": "consume", "throughput": 81410.37747688121, "p50": 5384762.614, "p99": 5465975.245, "p999": 5467045.551}
-{"system": "nats", "tier": "js-pull", "payload": 4096, "records": 20000, "mode": "consume", "throughput": 57774.0, "p50": null, "p99": null, "p999": null}
-{"system": "ironbus", "tier": "tier-w-work", "payload": 4096, "records": 20000, "mode": "consume", "throughput": 2795.0209432631227, "p50": 9764285.17, "p99": 11968058.287, "p999": 11986178.049}
-{"system": "nats-core", "tier": "core-sub", "payload": 4096, "records": 20000, "mode": "consume", "throughput": 125800.0, "p50": null, "p99": null, "p999": null}
+{"system": "ironbus", "tier": "tier-s-streaming", "payload": 256, "records": 20000, "mode": "consume", "throughput": 700854.5379209963, "p50": 1012600.981, "p99": 1021748.898, "p999": 1022035.148}
+{"system": "nats", "tier": "js-pull", "payload": 256, "records": 20000, "mode": "consume", "throughput": 106448.0, "p50": null, "p99": null, "p999": null}
+{"system": "ironbus", "tier": "tier-w-work", "payload": 256, "records": 20000, "mode": "consume", "throughput": 9776.247006938433, "p50": 2027157.499, "p99": 3014702.805, "p999": 3035689.252}
+{"system": "nats-core", "tier": "core-sub", "payload": 256, "records": 20000, "mode": "consume", "throughput": 685770.0, "p50": null, "p99": null, "p999": null}
+{"system": "ironbus", "tier": "tier-s-streaming", "payload": 4096, "records": 20000, "mode": "consume", "throughput": 195891.87317098206, "p50": 5254678.443, "p99": 5297568.327, "p999": 5298444.94}
+{"system": "nats", "tier": "js-pull", "payload": 4096, "records": 20000, "mode": "consume", "throughput": 54780.0, "p50": null, "p99": null, "p999": null}
+{"system": "ironbus", "tier": "tier-w-work", "payload": 4096, "records": 20000, "mode": "consume", "throughput": 9177.730879746341, "p50": 6085532.293, "p99": 7145182.103, "p999": 7166852.747}
+{"system": "nats-core", "tier": "core-sub", "payload": 4096, "records": 20000, "mode": "consume", "throughput": 131845.0, "p50": null, "p99": null, "p999": null}

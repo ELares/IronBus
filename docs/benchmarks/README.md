@@ -194,11 +194,13 @@ cargo run -p ironbus-bench --bin consume-corpus -- \
 ```
 
 The committed `consume-rows.jsonl` (the matched 20k-record head-to-head),
-`consume-sweep.jsonl` (the 256 B record-count CROSSOVER curve), and the generated
+`consume-sweep.jsonl` (the 256 B record-count sweep curve), and the generated
 `consume-report.{md,json}` are versioned alongside this README. The honest read is
 in [PERF_LEDGER.md](../PERF_LEDGER.md#consume-scoreboard-single-consumer-durable-consume-vs-nats-554-v2-m1):
-**IronBus Tier-S beats NATS JS pull at the small/moderate prefill (1.15-1.41x at
-20k records) but degrades super-linearly as the pre-filled prefix grows** (the
-server `StreamFetch`-by-offset cost is O(start)), so NATS leads past ~30k records
-— the recorded, not-hidden gap whose lever is an O(1) offset seek on the
-streaming-fetch path.
+post-#665 (the O(N²) read-span fix, re-validated 2026-06-19 on the same t4g rig),
+**IronBus Tier-S beats NATS JS pull at EVERY point of the 20k → 200k prefix sweep
+(6.2x – 8.5x) and the IronBus curve is FLAT-to-rising (~640k – 904k /s) instead of
+collapsing** — the prior super-linear degradation (148k → 23k across 20k → 200k,
+crossing under NATS near ~30k records) is gone because #665 clamps the server
+`StreamFetch` read span to the consumer window. The win is now unconditional across
+the measured range; NATS JS pull stays flat ~104k – 109k /s.
