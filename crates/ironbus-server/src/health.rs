@@ -38,7 +38,10 @@
 
 use crate::actor::EngineAccess;
 use crate::cluster::ack_level::{ClusterAckLevel, ClusterAckLevelMetrics};
-use crate::engine::{BackpressureSnapshot, Counters, EngineConfigSnapshot, GroupConsumerStat};
+use crate::engine::{
+    BackpressureSnapshot, Counters, EngineConfigSnapshot, GroupConsumerStat, RecoveryArtifact,
+    RecoveryCounters, RecoveryOutcome,
+};
 use crate::liveness::LivenessBeacon;
 use crate::metrics::{LatencyHistogram, FSYNC_BUCKET_LE_SECONDS};
 use crate::registry::{FixedHistogram, REGISTRY_BUCKET_LE_SECONDS};
@@ -710,6 +713,7 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
     body.push_str(&recovery_loss_lines(&recovery_loss));
     body.push_str(&recovery_data_loss_lines(recovery_data_loss));
     body.push_str(&recovery_loss_records_lines(&recovery_loss_records));
+    body.push_str(&recovery_event_lines(&counters.recovery));
     body.push_str(&fsync_histogram_lines(&fsync));
     body.push_str(&edge_metric_lines(&edge, rss));
     body.push_str(&durability_metric_lines(&durability));
@@ -1243,6 +1247,61 @@ fn recovery_loss_records_lines(by_reason: &[u64; ReasonCode::ALL.len()]) -> Stri
             s,
             "ironbus_recovery_loss_records{{reason=\"{}\"}} {records}",
             reason.metric_label()
+        );
+    }
+    s
+}
+
+/// Renders the recovery-EVENT counter family (#575): the FLAGSHIP corruption-recovery metrics NATS
+/// has no analogue for (its truncate-and-drop recovery is silent, #7549/#7556). Each is bumped once
+/// per `Engine::open` recovery run from the durable loss report, so they are monotonic `_total`
+/// counters an operator can alert on. Three series:
+///
+/// - `ironbus_recovery_runs_total{outcome=clean|torn_tail_truncated|quarantined|data_loss}`: a
+///   LABELED `_total`, one increment per open into the outcome bucket the run classified into. Like
+///   the other labeled `_total`s (`ironbus_cluster_ack_total{level}`, `ironbus_retry_shed_total{side}`)
+///   its sample lines are excluded from the UNLABELED-`_total` resilience-taxonomy set by construction
+///   and pinned only in `FROZEN_METRIC_TYPES`. The `outcome` label is a fixed four-value enum, so the
+///   cardinality is bounded.
+/// - `ironbus_torn_tail_repairs_total`: an UNLABELED `_total`, the count of torn/unsynced tails
+///   truncated to the longest valid prefix (a power-loss repair, NOT data loss). It joins the frozen
+///   resilience-counter taxonomy (a never-silent recovery event).
+/// - `ironbus_corruption_repairs_total{artifact=segment|cursor|dlq}`: a LABELED `_total`, the count of
+///   data-loss corruption spans quarantined-and-dropped, by the on-disk artifact. Bounded
+///   three-value `artifact` enum; pinned only in `FROZEN_METRIC_TYPES` (labeled), the marquee metric
+///   NATS structurally lacks.
+fn recovery_event_lines(recovery: &RecoveryCounters) -> String {
+    let mut s = String::from(
+        "# HELP ironbus_recovery_runs_total Recovery runs (one per broker open), by outcome (clean|torn_tail_truncated|quarantined|data_loss). The flagship corruption-recovery signal NATS has no analogue for.\n\
+         # TYPE ironbus_recovery_runs_total counter\n",
+    );
+    for (outcome, runs) in RecoveryOutcome::ALL
+        .iter()
+        .zip(recovery.runs_by_outcome.iter())
+    {
+        let _ = writeln!(
+            s,
+            "ironbus_recovery_runs_total{{outcome=\"{}\"}} {runs}",
+            outcome.metric_label()
+        );
+    }
+    let _ = write!(
+        s,
+        "# HELP ironbus_torn_tail_repairs_total Torn/unsynced tails truncated to the longest valid prefix across all recovery runs (a power-loss repair, not data loss).\n\
+         # TYPE ironbus_torn_tail_repairs_total counter\n\
+         ironbus_torn_tail_repairs_total {}\n\
+         # HELP ironbus_corruption_repairs_total Corruption spans quarantined-and-dropped across all recovery runs, by on-disk artifact (segment|cursor|dlq). NATS has NO corruption-repair metric (its recovery is silent truncate-and-drop).\n\
+         # TYPE ironbus_corruption_repairs_total counter\n",
+        recovery.torn_tail_repairs,
+    );
+    for (artifact, repairs) in RecoveryArtifact::ALL
+        .iter()
+        .zip(recovery.corruption_repairs_by_artifact.iter())
+    {
+        let _ = writeln!(
+            s,
+            "ironbus_corruption_repairs_total{{artifact=\"{}\"}} {repairs}",
+            artifact.metric_label()
         );
     }
     s
@@ -3605,6 +3664,16 @@ mod tests {
         // set. The companion `ironbus_wal_fsync_headroom_bytes` is a GAUGE (no `_total`), so it is
         // excluded here and pinned only in `FROZEN_METRIC_TYPES`.
         "ironbus_wal_fsync_headroom_shed_total",
+        // The torn-tail recovery-repair counter (#575): a torn/unsynced tail truncated to the longest
+        // valid prefix at recovery (a power-loss repair, NOT data loss). A never-silent recovery EVENT
+        // the marquee NATS-can't taxonomy guarantees is counted, an UNLABELED `_total`, so it joins
+        // this set. Its labeled siblings `ironbus_recovery_runs_total{outcome}` and
+        // `ironbus_corruption_repairs_total{artifact}` carry a label, so their sample lines are
+        // excluded from this unlabeled-`_total` set by construction and pinned only in
+        // `FROZEN_METRIC_TYPES`, exactly like `ironbus_cluster_ack_total` / `ironbus_retry_shed_total`.
+        // The `ironbus_recovery_loss_*` / `ironbus_recovery_data_loss_bytes` series are GAUGES (no
+        // `_total`), so they are excluded here too.
+        "ironbus_torn_tail_repairs_total",
     ];
 
     #[test]
@@ -3763,6 +3832,14 @@ mod tests {
         ("ironbus_recovery_loss_bytes", "gauge"),
         ("ironbus_recovery_loss_records", "gauge"),
         ("ironbus_recovery_data_loss_bytes", "gauge"),
+        // Recovery-EVENT counters (#575), the marquee NATS-can't corruption-recovery taxonomy. The
+        // unlabeled `ironbus_torn_tail_repairs_total` is ALSO in FROZEN_RESILIENCE_COUNTERS; the two
+        // LABELED `_total`s (`{outcome}` and `{artifact}`) are pinned ONLY here (their sample lines
+        // carry a label, so the unlabeled-`_total` resilience-taxonomy filter excludes them by
+        // construction, exactly like `ironbus_cluster_ack_total`). NATS has NO corruption metric.
+        ("ironbus_recovery_runs_total", "counter"),
+        ("ironbus_torn_tail_repairs_total", "counter"),
+        ("ironbus_corruption_repairs_total", "counter"),
         // Reconciled skip/loss gauges (the resilience watermarks; NOT `_total`).
         ("ironbus_records_skipped", "gauge"),
         ("ironbus_bytes_skipped", "gauge"),

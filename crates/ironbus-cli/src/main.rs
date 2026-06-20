@@ -124,12 +124,16 @@ use ironbus_server::engine::{DiskFullPolicy, DurabilityLevel, Engine, EngineConf
 use ironbus_server::health::serve_health;
 #[cfg(unix)]
 use ironbus_server::server::serve;
+#[cfg(unix)]
+use ironbus_storage::admin::{inspect_cursors, CursorStatus};
 #[cfg(all(unix, feature = "zstd"))]
 use ironbus_storage::dict_store::{CachingDictResolver, DictSidecarStore, DICTS_SUBDIR};
 #[cfg(unix)]
 use ironbus_storage::dlq::{read_dlq_entries, DlqEntry};
 #[cfg(unix)]
 use ironbus_storage::fs::{EphemeralFs, Filesystem, StdFs};
+#[cfg(unix)]
+use ironbus_storage::layout::{check_layout_marker, LayoutMarker};
 #[cfg(unix)]
 use ironbus_storage::log::LogConfig;
 #[cfg(unix)]
@@ -770,7 +774,8 @@ USAGE:
     ironbus dump  --data-dir <dir> [--limit <n>] [--json] [--dlq]
                   [--raw] [--require-dict]
     ironbus scrub --data-dir <dir> [--json]
-    ironbus repair --data-dir <dir> [--apply] [--json]
+    ironbus verify --data-dir <dir> [--json]
+    ironbus repair --data-dir <dir> [--apply --force] [--json]
     ironbus top   (--addr <host:port> | --health-addr <host:port> | --data-dir <dir>)
                   [--interval <secs>] [--once] [--json] [--no-color]
     ironbus bench (--duration <secs> | --count <n>) [--mode <publish|subscribe|round-trip>]
@@ -916,12 +921,27 @@ Notes:
     hides, what recovery would quarantine. It exits 0 if clean (a torn-tail-only result stays 0,
     matching recovery's data-loss boundary), 3 if it found and reported real data-loss corruption,
     2 if the data dir is missing, 4 if the chain is structurally corrupt and could not be read.
-    repair defaults to the SAME read-only plan as scrub (print what it WOULD do, change nothing).
-    --apply performs the repair: it takes the EXCLUSIVE data-dir lock first (exit 5 if a broker
-    holds it), QUARANTINES (copies to quarantine/, never deletes) any corrupt span, truncates to
-    the longest valid prefix exactly as recovery does, and preserves the data dir's uid/gid/mode.
-    It is recovery made explicit and offline; it never makes the data less recoverable than
-    recovery already would.
+    verify is the first-class READ-ONLY offline fsck (the recovery-as-feature command NATS lacks):
+    it CRC-validates every segment of the log, then ALSO validates the layout marker, every
+    consumer cursor (against the durable range), and the DLQ, and reports the quarantine footprint.
+    It MUTATES NOTHING (a torn tail or corruption is detected and reported, never truncated or
+    quarantined; run repair for that). The structured result (human, or --json
+    ironbus.cli.verify.v1 with the segment/cursor/dlq/quarantine/layout findings) names what is
+    wrong, where (segment + byte offset), and how much is lost (bounded by the I3 caps). Exit codes:
+    0 clean, 3 it found and reported real data-loss corruption or a cursor-vs-log mismatch, 2 the
+    data dir is missing, 4 the chain is structurally unreadable (or a future layout marker blocks
+    the open). A torn-tail-only result stays 0 (recovery's data-loss boundary). It is scrub plus the
+    cursor/DLQ/layout passes, and the read-only twin of repair: see docs/RECOVERY.md.
+    repair is the first-class MUTATING recovery command. With NO flags it is a read-only PLAN (the
+    same plan as scrub/verify: print what it WOULD do, change nothing). --apply performs the repair
+    and REQUIRES --force (the confirmation gate: a mutating --apply on a bare invocation is refused,
+    exit 1, so repair never silently destroys). --apply --force takes the EXCLUSIVE data-dir lock
+    first (exit 5 if a broker holds it), QUARANTINES (copies to quarantine/, never deletes) any
+    corrupt span, truncates to the longest valid prefix exactly as recovery does, and preserves the
+    data dir's uid/gid/mode. It is recovery made explicit and offline; it never makes the data less
+    recoverable than recovery already would, it preserves every committed record, and it preserves
+    the forensic bytes (copy-then-drop into the capped quarantine, never a delete). The bounded loss
+    is REPORTED (the LossReport, human or --json ironbus.cli.repair.v1).
     top is a strictly READ-ONLY status view with two explicit modes. LIVE
     (--addr/--health-addr <host:port>) polls the broker's read-only /admin v1 JSON every --interval
     seconds (default 1, minimum 1) and renders the #16 counters: durable head, per-group lag and
@@ -1099,6 +1119,7 @@ fn run(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         "peek" => run_peek(rest, out),
         "dump" => run_dump(rest, out),
         "scrub" => run_scrub(rest, out),
+        "verify" => run_verify(rest, out),
         "repair" => run_repair(rest, out),
         "top" => top::run_top(rest, out),
         "bench" => run_bench(rest, out),
@@ -5291,6 +5312,7 @@ fn run_repair(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     let mut data_dir: Option<String> = None;
     let mut json = false;
     let mut apply = false;
+    let mut force = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -5301,6 +5323,10 @@ fn run_repair(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
             }
             "--apply" => {
                 apply = true;
+                i += 1;
+            }
+            "--force" => {
+                force = true;
                 i += 1;
             }
             flag if flag.starts_with("--") => {
@@ -5315,7 +5341,58 @@ fn run_repair(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     }
     let data_dir = data_dir
         .ok_or_else(|| CliError::Usage("repair requires `--data-dir <dir>`".to_string()))?;
+    // The confirmation gate: a MUTATING --apply must carry --force, so a bare `repair --apply` never
+    // silently quarantines-and-truncates. --force without --apply is a no-op on the read-only plan
+    // (the plan changes nothing, so the gate is unnecessary there) but rejected as a usage error so
+    // the operator is not misled into thinking they confirmed a mutation that never ran.
+    if apply && !force {
+        return Err(CliError::Usage(
+            "repair --apply MUTATES the data dir (quarantine + truncate); pass --force to confirm \
+             (a bare --apply is refused so repair never silently destroys)"
+                .to_string(),
+        ));
+    }
+    if force && !apply {
+        return Err(CliError::Usage(
+            "repair --force only applies with --apply (the read-only plan mutates nothing)"
+                .to_string(),
+        ));
+    }
     cmd_repair(Path::new(&data_dir), apply, json, out)
+}
+
+/// Parses and runs `verify` (#601, M6-I17): the first-class READ-ONLY offline fsck. CRC-validates
+/// every segment (reusing the recovery scan in read-only mode), then validates the layout marker,
+/// every consumer cursor, and the DLQ, and reports the quarantine footprint — WITHOUT mutating a
+/// byte. Unix-only (the on-disk storage is Unix-only in v1).
+///
+/// # Errors
+/// [`CliError::Usage`] for a bad flag or a missing `--data-dir`; the verify-result exit mapping
+/// otherwise (see [`cmd_verify`]).
+fn run_verify(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let mut data_dir: Option<String> = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data-dir" => data_dir = Some(take_value("--data-dir", args, &mut i)?),
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(CliError::Usage(format!("unknown flag `{flag}` for verify")));
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "verify takes no positional arguments, got `{other}`"
+                )));
+            }
+        }
+    }
+    let data_dir = data_dir
+        .ok_or_else(|| CliError::Usage("verify requires `--data-dir <dir>`".to_string()))?;
+    cmd_verify(Path::new(&data_dir), json, out)
 }
 
 /// Parses and runs `bench` (#94): the publish / subscribe / round-trip load generator with the
@@ -5942,6 +6019,294 @@ const SCRUB_SCHEMA_VERSION: u32 = 1;
 /// per [`docs/CLI_CONTRACT.md`]. Same bump rule as [`SCRUB_SCHEMA_VERSION`].
 #[cfg(unix)]
 const REPAIR_SCHEMA_VERSION: u32 = 1;
+/// The current schema version of the `verify` `--json` result object (`ironbus.cli.verify.vN`),
+/// per [`docs/CLI_CONTRACT.md`]. Same bump rule as [`SCRUB_SCHEMA_VERSION`].
+#[cfg(unix)]
+const VERIFY_SCHEMA_VERSION: u32 = 1;
+
+/// The structured result of a read-only `verify` fsck (#601): the segment-scan plan (the same loss
+/// report `scrub` computes, so the two agree byte-for-byte on the log), plus the cursor, DLQ,
+/// quarantine, and layout-marker findings the extra verify passes add. Built entirely from read-only
+/// reads; constructing it mutates nothing.
+#[cfg(unix)]
+struct VerifyReport {
+    /// The segment integrity plan (CRC-validated longest-valid-prefix loss, exactly as `scrub`).
+    plan: ScrubPlan,
+    /// The layout-marker (#670) finding: `Some(version)` for a present, valid marker; `None` for an
+    /// absent/torn marker treated as v1 (verify never WRITES the marker, unlike recovery). A
+    /// fully-valid FUTURE marker is a structural block surfaced as exit 4 before this is built.
+    layout_version: Option<u32>,
+    /// Every consumer cursor's committed offset and whether it is valid against the durable range.
+    cursors: Vec<CursorStatus>,
+    /// The number of cursors that are out of range (a cursor-vs-log mismatch): a data-integrity
+    /// finding that trips the non-zero exit even when the log itself is clean.
+    cursor_mismatches: usize,
+    /// The count of durable DLQ records the read-only DLQ scan decoded (an integrity signal: the DLQ
+    /// opened and decoded cleanly; a corrupt DLQ surfaces as a structural error before this).
+    dlq_records: usize,
+    /// The persisted on-disk bytes of the forensic quarantine store (`quarantine/`). `> 0` means a
+    /// prior recovery (or `repair`) preserved corrupt bytes; verify REPORTS it (quarantine-present)
+    /// without touching the blobs.
+    quarantine_bytes: u64,
+}
+
+#[cfg(unix)]
+impl VerifyReport {
+    /// `true` when verify found nothing wrong: the log is clean (or torn-tail-only, NOT data loss)
+    /// AND no cursor is out of range. A present quarantine store is NOT itself an issue (it is the
+    /// expected forensic residue of a prior repair), so it does not flip this.
+    fn is_clean(&self) -> bool {
+        self.plan.data_loss_bytes == 0 && self.cursor_mismatches == 0
+    }
+
+    /// The frozen exit code this verify run returns: 3 ([`EXIT_HANDLED_CORRUPTION`]) when it found
+    /// real data-loss corruption or a cursor-vs-log mismatch (the fsck found a problem), else 0. A
+    /// torn-tail-only result stays 0 (recovery's data-loss boundary). The structural blocks (missing
+    /// dir -> 2, unreadable chain / future layout -> 4) are mapped before the report is built.
+    fn exit_code(&self) -> u8 {
+        if self.is_clean() {
+            0
+        } else {
+            EXIT_HANDLED_CORRUPTION
+        }
+    }
+}
+
+/// Runs `verify` (#601, M6-I17): the first-class READ-ONLY offline fsck NATS lacks. It composes the
+/// existing recovery-grade read-only machinery, MUTATING NOTHING:
+///
+/// 1. CRC-validate every segment of the log via [`OfflineReader::open`] (the same decode path
+///    recovery uses, in read-only mode — it never truncates, quarantines, rolls, or creates a
+///    segment), yielding the longest-valid-prefix [`ScrubPlan`] (torn tails + corrupt regions, each
+///    with the segment id and byte span).
+/// 2. Check the layout marker (#670) READ-ONLY via [`check_layout_marker`], which (unlike recovery's
+///    `open_or_upgrade`) NEVER writes the v1 marker on an absent dir; a fully-valid FUTURE marker is
+///    a structural block (exit 4), exactly as the broker would refuse to open it.
+/// 3. Validate every consumer cursor against the durable range via [`inspect_cursors`] (read-only),
+///    flagging a cursor below `earliest_retained` or above `durable_head` as a mismatch.
+/// 4. Validate + count the DLQ via [`read_dlq_entries`] (read-only; a corrupt DLQ surfaces as a
+///    structural error) and report the forensic [`quarantine`](ironbus_storage::quarantine) footprint
+///    via [`ironbus_storage::quarantine::persisted_bytes`] (read-only).
+///
+/// It writes the structured result (human, or `--json` `ironbus.cli.verify.v1`) and returns the exit
+/// code: 0 clean (or torn-tail-only), 3 it found and reported data-loss corruption or a cursor
+/// mismatch, 2 the data dir is missing, 4 the chain is structurally unreadable or a future layout
+/// marker blocks the open. It is the read-only twin of `repair`: it detects + reports, never repairs.
+#[cfg(unix)]
+fn cmd_verify(data_dir: &Path, json: bool, out: &mut impl Write) -> Result<(), CliError> {
+    // 1) The segment integrity scan: read-only, the same loss report `scrub` computes (so the two
+    //    agree on the log). `OfflineReader::open` is documented (and tested here) to never mutate.
+    let reader = OfflineReader::open(StdFs::new(data_dir.to_path_buf()))
+        .map_err(|e| map_offline_err(data_dir, &e))?;
+    let plan = ScrubPlan::from_report(reader.loss_report(), reader.segment_ids().len());
+    drop(reader);
+
+    // 2) The layout marker (#670), read-only: a future marker is a structural block (exit 4), exactly
+    //    as the broker would refuse the open; an absent/torn marker is treated as v1 WITHOUT writing.
+    let layout_version = match check_layout_marker(&StdFs::new(data_dir.to_path_buf()))
+        .map_err(|e| map_offline_err(data_dir, &e))?
+    {
+        LayoutMarker::Present(v) => Some(v),
+        LayoutMarker::AbsentTreatedAsV1 => None,
+    };
+
+    // 3) Every consumer cursor, validated against the durable range (read-only). A cursor out of
+    //    range is a cursor-vs-log mismatch the broker would clamp on next start; verify reports it.
+    let (cursors, _fs) = inspect_cursors(StdFs::new(data_dir.to_path_buf()))
+        .map_err(|e| map_offline_err(data_dir, &e))?;
+    let cursor_mismatches = cursors.iter().filter(|c| !c.in_range).count();
+
+    // 4) The DLQ (read-only validate + count) and the forensic quarantine footprint (read-only).
+    let dlq_records = read_dlq_entries(&StdFs::new(data_dir.to_path_buf()))
+        .map_err(|e| map_offline_err(data_dir, &e))?
+        .len();
+    let quarantine_bytes =
+        ironbus_storage::quarantine::persisted_bytes(&StdFs::new(data_dir.to_path_buf()));
+
+    let report = VerifyReport {
+        plan,
+        layout_version,
+        cursors,
+        cursor_mismatches,
+        dlq_records,
+        quarantine_bytes,
+    };
+    write_verify_result(data_dir, &report, json, out)?;
+    let code = report.exit_code();
+    if code == EXIT_HANDLED_CORRUPTION {
+        // The structured result is already on stdout; the non-zero return only carries the exit code.
+        return Err(CliError::HandledCorruption(format!(
+            "verify found {} data-loss corruption span(s) ({} byte(s)) and {} cursor mismatch(es)",
+            report.plan.data_loss_spans, report.plan.data_loss_bytes, report.cursor_mismatches,
+        )));
+    }
+    Ok(())
+}
+
+/// Writes the `verify` result: the human report (or the `ironbus.cli.verify.v1` `--json` object). The
+/// JSON object is emitted on EVERY exit path (clean exit 0 AND the exit-3 finding path), carrying the
+/// `exit_code` it is about to return, so a script keys off the structured findings, never the wording.
+#[cfg(unix)]
+fn write_verify_result(
+    data_dir: &Path,
+    report: &VerifyReport,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    if json {
+        write_verify_json(data_dir, report, out)
+    } else {
+        write_verify_human(data_dir, report, out)
+    }
+}
+
+/// Renders the `verify` result as a human report: a clean/damage header, then the per-pass findings
+/// (segments, cursors, DLQ, quarantine, layout). Wording is NOT a stability contract (only `--json`
+/// is); a script should pass `--json` and key off `schema`.
+#[cfg(unix)]
+fn write_verify_human(
+    data_dir: &Path,
+    report: &VerifyReport,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let layout = report.layout_version.map_or_else(
+        || "absent (treated as v1, not written)".to_string(),
+        |v| format!("v{v}"),
+    );
+    if report.is_clean() {
+        writeln!(
+            out,
+            "verify: {} is clean ({} segment(s) CRC-valid, {} cursor(s) in range, {} DLQ record(s), layout {})",
+            data_dir.display(),
+            report.plan.segments,
+            report.cursors.len(),
+            report.dlq_records,
+            layout,
+        )?;
+        if report.plan.torn_tail_bytes > 0 {
+            writeln!(
+                out,
+                "  note: {} torn-tail byte(s) present (not data loss; run repair to truncate)",
+                report.plan.torn_tail_bytes,
+            )?;
+        }
+        if report.quarantine_bytes > 0 {
+            writeln!(
+                out,
+                "  note: {} quarantined byte(s) present in quarantine/ (forensic residue of a prior repair)",
+                report.quarantine_bytes,
+            )?;
+        }
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "verify: {} has issues: {} segment(s) scanned, {} byte(s) of data loss, {} torn-tail byte(s) (not data loss), {} cursor mismatch(es)",
+        data_dir.display(),
+        report.plan.segments,
+        report.plan.data_loss_bytes,
+        report.plan.torn_tail_bytes,
+        report.cursor_mismatches,
+    )?;
+    for e in &report.plan.events {
+        let kind = if e.is_data_loss {
+            "data-loss"
+        } else {
+            "torn-tail (no data loss)"
+        };
+        writeln!(
+            out,
+            "  segment {} bytes [{}, {}) reason={} {kind}",
+            e.segment_id, e.start, e.end, e.reason,
+        )?;
+    }
+    for c in report.cursors.iter().filter(|c| !c.in_range) {
+        let group = if c.group.is_empty() {
+            "(default)"
+        } else {
+            &c.group
+        };
+        writeln!(
+            out,
+            "  cursor group={group} committed={} out-of-range (cursor-vs-log mismatch)",
+            c.committed,
+        )?;
+    }
+    writeln!(
+        out,
+        "  read-only fsck: nothing changed; run `ironbus repair --apply --force` to quarantine + truncate (see docs/RECOVERY.md)",
+    )?;
+    Ok(())
+}
+
+/// Renders the `verify` result as the single versioned `--json` object (`ironbus.cli.verify.v1`): the
+/// segment tallies + per-span `events` (the same field names the loss report and `scrub` use), the
+/// `cursors` array (group / committed / `in_range`), the `dlq_records` count, the `quarantine_bytes`
+/// footprint, the `layout_version`, the `exit_code` it is about to return, and `ok` (clean exit-0).
+#[cfg(unix)]
+fn write_verify_json(
+    data_dir: &Path,
+    report: &VerifyReport,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let plan = &report.plan;
+    let exit_code = report.exit_code();
+    write!(
+        out,
+        "{{\"schema\":\"ironbus.cli.verify.v{VERIFY_SCHEMA_VERSION}\",\"data_dir\":\"{}\",\"segments\":{},\"skipped_spans\":{},\"data_loss_spans\":{},\"data_loss_bytes\":{},\"torn_tail_bytes\":{},",
+        escape_json(&data_dir.display().to_string()),
+        plan.segments,
+        plan.skipped_spans,
+        plan.data_loss_spans,
+        plan.data_loss_bytes,
+        plan.torn_tail_bytes,
+    )?;
+    write!(out, "\"events\":[")?;
+    for (n, e) in plan.events.iter().enumerate() {
+        if n > 0 {
+            write!(out, ",")?;
+        }
+        write!(
+            out,
+            "{{\"segment\":{},\"start\":{},\"end\":{},\"reason\":\"{}\",\"data_loss\":{}}}",
+            e.segment_id, e.start, e.end, e.reason, e.is_data_loss,
+        )?;
+    }
+    write!(out, "],\"cursors\":[")?;
+    for (n, c) in report.cursors.iter().enumerate() {
+        if n > 0 {
+            write!(out, ",")?;
+        }
+        write!(
+            out,
+            "{{\"group\":\"{}\",\"committed\":{},\"in_range\":{}}}",
+            escape_json(&c.group),
+            c.committed,
+            c.in_range,
+        )?;
+    }
+    write!(out, "],\"cursor_mismatches\":{},", report.cursor_mismatches)?;
+    write!(out, "\"dlq_records\":{},", report.dlq_records)?;
+    write!(out, "\"quarantine_bytes\":{},", report.quarantine_bytes)?;
+    match report.layout_version {
+        Some(v) => write!(out, "\"layout_version\":{v},")?,
+        None => write!(out, "\"layout_version\":null,")?,
+    }
+    let ok = exit_code == 0;
+    writeln!(out, "\"ok\":{ok},\"exit_code\":{exit_code}}}")?;
+    Ok(())
+}
+
+/// `verify` requires Unix in v1, for the same reason as `scrub`/`repair` (the on-disk store uses
+/// positioned IO the Windows path does not yet implement). The stub consumes every parameter so the
+/// Windows `-D warnings` build stays clean (the #99/#288 cfg(not(unix)) field-read footgun).
+#[cfg(not(unix))]
+fn cmd_verify(data_dir: &Path, json: bool, out: &mut impl Write) -> Result<(), CliError> {
+    let _ = (data_dir, json, out);
+    Err(CliError::Internal(
+        "ironbus verify requires a Unix host in v1: on-disk storage is Unix-only".to_string(),
+    ))
+}
 
 /// Runs `scrub` (#92): a strictly READ-ONLY offline full integrity scan of the data dir, sharing the
 /// recovery decode path ([`OfflineReader`]). It opens the directory read-only (which NEVER mutates
@@ -8500,6 +8865,291 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ---- verify (#601, M6-I17) + repair first-class (#604, M6-I18) ------------------------------
+
+    /// Overwrites a group's durable cursor checkpoint with an ARBITRARY committed offset, bypassing
+    /// the range-clamp `reset_consumer` enforces, so a test can plant a deliberate cursor-vs-log
+    /// MISMATCH (a cursor pointing past the durable head) for `verify` to detect.
+    #[cfg(unix)]
+    fn plant_cursor_at(dir: &Path, group: &str, committed: u64) {
+        use ironbus_core::cursor::AckCursor;
+        use ironbus_core::types::Offset;
+        use ironbus_storage::checkpoint::Checkpoint;
+        use ironbus_storage::fs::Filesystem;
+        use ironbus_storage::naming::cursor_checkpoint_name;
+        let fs = StdFs::new(dir.to_path_buf());
+        let name = cursor_checkpoint_name(group);
+        let file = if fs.exists(&name).unwrap() {
+            fs.open(&name).unwrap()
+        } else {
+            let f = fs.create_new(&name).unwrap();
+            fs.sync_dir().unwrap();
+            f
+        };
+        let (mut ckpt, _) = Checkpoint::open(file).unwrap();
+        let mut payload = Vec::new();
+        AckCursor::resume(Offset::new(committed)).encode_snapshot(&mut payload);
+        ckpt.write(&payload).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_on_a_clean_dir_exits_0_and_mutates_nothing() {
+        let dir = make_data_dir("verifyclean", 5);
+        let before = dir_snapshot(&dir);
+        let mut buf = Vec::new();
+        cmd_verify(&dir, false, &mut buf).unwrap(); // exit 0
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("is clean"), "clean report: {text}");
+        // READ-ONLY: not a single byte changed, and no quarantine subdir was created.
+        let after = dir_snapshot(&dir);
+        assert_eq!(before, after, "verify must not mutate the data directory");
+        assert!(
+            !dir.join("quarantine").exists(),
+            "verify never creates the quarantine/ subdir (it is read-only)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_on_a_torn_tail_reports_it_exits_0_and_mutates_nothing() {
+        let dir = make_data_dir("verifytorn", 4);
+        // Tear three bytes off the active segment: a torn tail (reported skip, NOT data loss).
+        let seg = dir.join("seg-0000000000000000.log");
+        let f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
+        let len = f.metadata().unwrap().len();
+        f.set_len(len - 3).unwrap();
+        f.sync_all().unwrap();
+        let before = dir_snapshot(&dir);
+        // --json so the structured report is machine-checkable.
+        let mut buf = Vec::new();
+        cmd_verify(&dir, true, &mut buf).unwrap(); // exit 0: torn-tail-only stays clean
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("\"schema\":\"ironbus.cli.verify.v1\""),
+            "versioned schema: {text}"
+        );
+        assert!(
+            text.contains("\"reason\":\"torn_tail\""),
+            "reports the torn tail: {text}"
+        );
+        assert!(
+            text.contains("\"data_loss\":false"),
+            "torn tail is not data loss: {text}"
+        );
+        assert!(
+            text.contains("\"exit_code\":0"),
+            "torn-tail-only is exit 0: {text}"
+        );
+        assert!(text.contains("\"ok\":true"), "{text}");
+        // READ-ONLY: verify detected the torn tail but did NOT truncate it (that is repair's job).
+        let after = dir_snapshot(&dir);
+        assert_eq!(before, after, "verify must not truncate a torn tail");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_on_a_corrupt_region_reports_the_offset_exits_3_and_mutates_nothing() {
+        let dir = make_data_dir("verifycorrupt", 5);
+        let seg = dir.join("seg-0000000000000000.log");
+        let physical_len = std::fs::metadata(&seg).unwrap().len();
+        plant_corrupt_body(&dir);
+        let before = dir_snapshot(&dir);
+        let mut buf = Vec::new();
+        let e = cmd_verify(&dir, true, &mut buf).unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_HANDLED_CORRUPTION, "{e}");
+        let text = String::from_utf8(buf).unwrap();
+        // The corruption is reported WITH its segment + byte offset span ending at EOF.
+        assert!(
+            text.contains("\"reason\":\"corrupt_record_body\""),
+            "{text}"
+        );
+        assert!(text.contains("\"data_loss\":true"), "{text}");
+        assert!(
+            text.contains(&format!("\"end\":{physical_len}")),
+            "the span ends at the physical EOF {physical_len}: {text}"
+        );
+        assert!(text.contains("\"exit_code\":3"), "{text}");
+        assert!(text.contains("\"ok\":false"), "{text}");
+        // READ-ONLY: verify detected the corruption but did NOT quarantine or truncate it.
+        let after = dir_snapshot(&dir);
+        assert_eq!(
+            before, after,
+            "verify must not quarantine/truncate a corrupt region"
+        );
+        assert!(
+            !dir.join("quarantine").exists(),
+            "verify never creates quarantine/ (that is repair's job)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_detects_a_cursor_vs_log_mismatch() {
+        let dir = make_data_dir("verifycursor", 5);
+        // Plant a cursor for "orders" pointing PAST the durable head (head is 5): an out-of-range
+        // cursor-vs-log mismatch the broker would clamp on next start. verify reports it.
+        plant_cursor_at(&dir, "orders", 999);
+        let before = dir_snapshot(&dir);
+        let mut buf = Vec::new();
+        let e = cmd_verify(&dir, true, &mut buf).unwrap_err();
+        // Exit 3 even though the LOG itself is clean: a cursor mismatch is an integrity finding.
+        assert_eq!(e.exit_code(), EXIT_HANDLED_CORRUPTION, "{e}");
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("\"group\":\"orders\",\"committed\":999,\"in_range\":false"),
+            "reports the out-of-range cursor: {text}"
+        );
+        assert!(text.contains("\"cursor_mismatches\":1"), "{text}");
+        assert!(
+            text.contains("\"data_loss_bytes\":0"),
+            "the log is clean: {text}"
+        );
+        assert!(text.contains("\"exit_code\":3"), "{text}");
+        // READ-ONLY: verify reported the mismatch but did NOT rewrite the cursor (that is repair).
+        let after = dir_snapshot(&dir);
+        assert_eq!(before, after, "verify must not rewrite a mismatched cursor");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_on_a_missing_dir_is_not_found() {
+        let dir =
+            std::env::temp_dir().join(format!("ironbus-cli-verifyabsent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut buf = Vec::new();
+        let e = cmd_verify(&dir, false, &mut buf).unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_NOT_FOUND, "{e}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_apply_is_confirmation_gated_a_bare_apply_is_refused_and_changes_nothing() {
+        let dir = make_data_dir("repairgate", 5);
+        plant_corrupt_body(&dir);
+        let before = dir_snapshot(&dir);
+        // A MUTATING --apply WITHOUT --force is refused (exit 1, usage), so repair never silently
+        // destroys: the gate is checked before any lock or recovery, so nothing changes.
+        let e = run_repair(
+            &[
+                "--data-dir".to_string(),
+                dir.display().to_string(),
+                "--apply".to_string(),
+            ],
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE, "a bare --apply is refused: {e}");
+        assert!(
+            format!("{e}").contains("--force"),
+            "the error names the confirmation flag: {e}"
+        );
+        let after = dir_snapshot(&dir);
+        assert_eq!(before, after, "a refused --apply mutates nothing");
+        assert!(
+            !dir.join("quarantine").exists(),
+            "no quarantine on a refused --apply"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_force_without_apply_is_a_usage_error() {
+        let dir = make_data_dir("repairforcenoapply", 3);
+        // --force alone (no --apply) is rejected: the read-only plan mutates nothing, so confirming
+        // a mutation that never runs would mislead the operator.
+        let e = run_repair(
+            &[
+                "--data-dir".to_string(),
+                dir.display().to_string(),
+                "--force".to_string(),
+            ],
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE, "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_apply_force_preserves_every_committed_record() {
+        let dir = make_data_dir("repaircommitted", 6);
+        // Capture the committed records (offsets 0..5) BEFORE corrupting + repairing. The corruption
+        // is in the LAST frame only, so the repair must drop just that span and keep the rest.
+        let committed_before: Vec<String> = {
+            let reader = OfflineReader::open(StdFs::new(dir.clone())).unwrap();
+            let mut payloads = Vec::new();
+            for &id in reader.segment_ids() {
+                for rec in reader.read_segment(id).unwrap() {
+                    payloads.push(String::from_utf8(rec.payload.to_vec()).unwrap());
+                }
+            }
+            payloads
+        };
+        plant_corrupt_body(&dir);
+        // Run through the real parser so the --apply --force gate is exercised end to end.
+        let (out, code) = {
+            let owned = vec![
+                "repair".to_string(),
+                "--data-dir".to_string(),
+                dir.display().to_string(),
+                "--apply".to_string(),
+                "--force".to_string(),
+            ];
+            let mut buf = Vec::new();
+            match run(&owned, &mut buf) {
+                Ok(()) => (String::from_utf8(buf).unwrap(), 0u8),
+                Err(e) => (String::from_utf8(buf).unwrap(), e.exit_code()),
+            }
+        };
+        assert_eq!(
+            code, EXIT_HANDLED_CORRUPTION,
+            "repaired real data loss: {out}"
+        );
+        assert!(out.contains("applied: quarantined"), "{out}");
+
+        // PRESERVED committed data: every record EXCEPT the corrupt last one survives, in order. The
+        // corruption took the final frame, so the repaired log holds the leading committed prefix.
+        let committed_after: Vec<String> = {
+            let reader = OfflineReader::open(StdFs::new(dir.clone())).unwrap();
+            let mut payloads = Vec::new();
+            for &id in reader.segment_ids() {
+                for rec in reader.read_segment(id).unwrap() {
+                    payloads.push(String::from_utf8(rec.payload.to_vec()).unwrap());
+                }
+            }
+            payloads
+        };
+        assert!(
+            !committed_after.is_empty() && committed_after.len() < committed_before.len(),
+            "the repair kept the committed prefix and dropped only the corrupt tail: before={committed_before:?} after={committed_after:?}"
+        );
+        assert_eq!(
+            committed_after.as_slice(),
+            &committed_before[..committed_after.len()],
+            "the surviving records are the exact leading prefix of the originals (committed data preserved, in order)"
+        );
+        // FORENSICS preserved: the corrupt bytes were COPIED into quarantine/, never deleted.
+        assert!(
+            dir.join("quarantine").is_dir(),
+            "forensic quarantine preserved"
+        );
+        // The repaired dir now verifies CLEAN, proving a consistent prefix.
+        let mut vbuf = Vec::new();
+        cmd_verify(&dir, false, &mut vbuf).unwrap();
+        assert!(
+            String::from_utf8(vbuf).unwrap().contains("is clean"),
+            "the repaired dir verifies clean"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn dump_raw_and_require_dict_on_raw_stored_records_render_the_historical_form() {
@@ -9877,6 +10527,24 @@ mod tests {
         assert!(
             USAGE.contains("--ephemeral-loss-ack"),
             "USAGE must document --ephemeral-loss-ack"
+        );
+    }
+
+    #[test]
+    fn usage_lists_the_verify_and_first_class_repair_verbs() {
+        // The recovery-as-feature verbs (#601 verify, #604 first-class repair) are in the USAGE
+        // synopsis, so `ironbus help` surfaces the read-only fsck and the --force-gated repair.
+        assert!(
+            USAGE.contains("ironbus verify --data-dir <dir> [--json]"),
+            "USAGE must document the verify synopsis"
+        );
+        assert!(
+            USAGE.contains("ironbus repair --data-dir <dir> [--apply --force]"),
+            "USAGE must document the --force confirmation gate on repair --apply"
+        );
+        assert!(
+            USAGE.contains("verify is the first-class READ-ONLY offline fsck"),
+            "USAGE must describe verify as the read-only fsck"
         );
     }
 

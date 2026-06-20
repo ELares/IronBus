@@ -1033,6 +1033,131 @@ pub struct Counters {
     /// signal an operator watches to size [`EngineConfig::dedup`]. Exposed as the
     /// `ironbus_dedup_out_of_window_total` counter. Saturating.
     pub dedup_out_of_window: u64,
+    /// RECOVERY-EVENT counters (#575, the marquee NATS-can't differentiator): each is bumped ONCE per
+    /// [`Engine::open`] recovery run, so an operator can alert on recovery actually firing. NATS has
+    /// NO corruption-recovery metric at all (its truncate-and-drop recovery is silent, #7549/#7556),
+    /// so these counters ARE the differentiator. They are recovery-event-derived (a function of the
+    /// just-recovered durable [`LossReport`]), not runtime, so they reconcile cleanly from the durable
+    /// artifact on every open and stay monotonic non-decreasing across a `kill -9`.
+    pub recovery: RecoveryCounters,
+}
+
+/// The recovery-event counter family (#575): the FLAGSHIP corruption-recovery metrics NATS has no
+/// analogue for. Each is raised once per [`Engine::open`] recovery run from the just-recovered durable
+/// [`LossReport`], so they are monotonic non-decreasing and replay-reconstructable across a hard crash
+/// (the same durability the recovery-loss family already has). Rendered by `health.rs` as
+/// `ironbus_recovery_runs_total{outcome}`, `ironbus_torn_tail_repairs_total`, and
+/// `ironbus_corruption_repairs_total{artifact}` in the frozen METRICS.md taxonomy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryCounters {
+    /// Recovery RUNS by outcome, indexed in [`RecoveryOutcome::ALL`] order: one increment per open,
+    /// in the bucket the run's loss report classifies it into (clean / torn-tail-truncated /
+    /// quarantined / data-loss). Exposed as `ironbus_recovery_runs_total{outcome=...}`.
+    pub runs_by_outcome: [u64; RecoveryOutcome::ALL.len()],
+    /// TORN-TAIL truncation repairs: the count of `TornTail` loss events the recovery runs dropped
+    /// (a power-loss tail truncated to the longest valid prefix, NOT data loss). Exposed as the
+    /// unlabeled `ironbus_torn_tail_repairs_total` counter. Saturating.
+    pub torn_tail_repairs: u64,
+    /// CORRUPTION repairs by artifact, indexed in [`RecoveryArtifact::ALL`] order: the count of
+    /// data-loss (corruption-skip) loss events the recovery runs quarantined-and-dropped, bucketed by
+    /// the on-disk artifact the corruption was in (a log segment, a cursor, or the DLQ). Exposed as
+    /// `ironbus_corruption_repairs_total{artifact=...}`. Saturating.
+    pub corruption_repairs_by_artifact: [u64; RecoveryArtifact::ALL.len()],
+}
+
+/// The frozen `outcome` label vocabulary of `ironbus_recovery_runs_total` (#575): the bounded,
+/// fixed-cardinality classification of one recovery run. Append-only (a new variant goes at the END so
+/// the durable snapshot order is stable), mirroring the [`ReasonCode`] frozen-vocabulary discipline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryOutcome {
+    /// The log opened with no loss event at all (the common clean-shutdown case).
+    Clean,
+    /// The only loss was a torn/unsynced tail truncated to the longest valid prefix (NOT data loss).
+    TornTailTruncated,
+    /// At least one corruption span was quarantined-and-dropped (real data loss, copied to forensics).
+    Quarantined,
+    /// Recovery completed but the loss report carried data loss without a successful quarantine
+    /// capture (e.g. the quarantine store was over its cap): the reported-but-uncaptured data-loss
+    /// outcome. Reserved alongside `Quarantined` so the outcome taxonomy is frozen up front.
+    DataLoss,
+}
+
+impl RecoveryOutcome {
+    /// Every outcome in a fixed order; the index into [`RecoveryCounters::runs_by_outcome`].
+    /// Append-only, so the durable snapshot field order never shifts.
+    pub const ALL: [RecoveryOutcome; 4] = [
+        RecoveryOutcome::Clean,
+        RecoveryOutcome::TornTailTruncated,
+        RecoveryOutcome::Quarantined,
+        RecoveryOutcome::DataLoss,
+    ];
+
+    /// This outcome's index into [`RecoveryOutcome::ALL`] (and so into `runs_by_outcome`). A total
+    /// match in `ALL` order, so it is infallible (no panic path) and stays in sync with the array.
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            RecoveryOutcome::Clean => 0,
+            RecoveryOutcome::TornTailTruncated => 1,
+            RecoveryOutcome::Quarantined => 2,
+            RecoveryOutcome::DataLoss => 3,
+        }
+    }
+
+    /// The frozen Prometheus `outcome` label value. Frozen alongside the metric name; a rename is a
+    /// breaking taxonomy change gated by the frozen-taxonomy test.
+    #[must_use]
+    pub fn metric_label(self) -> &'static str {
+        match self {
+            RecoveryOutcome::Clean => "clean",
+            RecoveryOutcome::TornTailTruncated => "torn_tail_truncated",
+            RecoveryOutcome::Quarantined => "quarantined",
+            RecoveryOutcome::DataLoss => "data_loss",
+        }
+    }
+}
+
+/// The frozen `artifact` label vocabulary of `ironbus_corruption_repairs_total` (#575): the bounded
+/// on-disk artifact a corruption repair acted on. Append-only, mirroring [`ReasonCode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryArtifact {
+    /// A log segment (the main append-only record log).
+    Segment,
+    /// A consumer cursor checkpoint.
+    Cursor,
+    /// The dead-letter sink (`dlq/`).
+    Dlq,
+}
+
+impl RecoveryArtifact {
+    /// Every artifact in a fixed order; the index into
+    /// [`RecoveryCounters::corruption_repairs_by_artifact`]. Append-only.
+    pub const ALL: [RecoveryArtifact; 3] = [
+        RecoveryArtifact::Segment,
+        RecoveryArtifact::Cursor,
+        RecoveryArtifact::Dlq,
+    ];
+
+    /// This artifact's index into [`RecoveryArtifact::ALL`]. A total match in `ALL` order, so it is
+    /// infallible (no panic path) and stays in sync with the array.
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            RecoveryArtifact::Segment => 0,
+            RecoveryArtifact::Cursor => 1,
+            RecoveryArtifact::Dlq => 2,
+        }
+    }
+
+    /// The frozen Prometheus `artifact` label value.
+    #[must_use]
+    pub fn metric_label(self) -> &'static str {
+        match self {
+            RecoveryArtifact::Segment => "segment",
+            RecoveryArtifact::Cursor => "cursor",
+            RecoveryArtifact::Dlq => "dlq",
+        }
+    }
 }
 
 /// The durable counters-snapshot format version (#98). A future field addition bumps this only if
@@ -1053,7 +1178,11 @@ const COUNTERS_SNAPSHOT_VERSION: u8 = 1;
 /// The dedup family (#33) appended two more trailing fields (`dedup_hits`, `dedup_out_of_window`),
 /// so an older snapshot still decodes (they read as zero) and a newer snapshot still decodes on an
 /// old binary (the trailing fields are ignored).
-const COUNTERS_FIELD_COUNT: usize = 17;
+/// The recovery-event family (#575) appended eight more trailing fields (the four
+/// `runs_by_outcome` buckets, `torn_tail_repairs`, and the three `corruption_repairs_by_artifact`
+/// buckets), same forward/backward-compatible rule (a pre-#575 snapshot reads them as zero, and
+/// reconciliation on open re-derives them from the durable loss report).
+const COUNTERS_FIELD_COUNT: usize = 25;
 
 impl Counters {
     /// Serializes the counters into a small versioned little-endian byte string for the durable
@@ -1087,6 +1216,18 @@ impl Counters {
             // The dedup family (#33) appended after #307, same forward/backward-compatible rule.
             self.dedup_hits,
             self.dedup_out_of_window,
+            // The recovery-event family (#575), appended after dedup in a fixed order: the four
+            // outcome buckets, the torn-tail repair count, then the three artifact buckets. A
+            // pre-#575 snapshot is too short to hold these (they read as zero), and reconciliation
+            // on open re-derives them from the durable loss report.
+            self.recovery.runs_by_outcome[0],
+            self.recovery.runs_by_outcome[1],
+            self.recovery.runs_by_outcome[2],
+            self.recovery.runs_by_outcome[3],
+            self.recovery.torn_tail_repairs,
+            self.recovery.corruption_repairs_by_artifact[0],
+            self.recovery.corruption_repairs_by_artifact[1],
+            self.recovery.corruption_repairs_by_artifact[2],
         ] {
             buf.extend_from_slice(&v.to_le_bytes());
         }
@@ -1137,6 +1278,14 @@ impl Counters {
             // no replay reconciliation, so the resumed value is the #306 snapshot-only lower bound.
             dedup_hits: field(15),
             dedup_out_of_window: field(16),
+            // The recovery-event family (#575), appended after dedup at fields 17..=24: a pre-#575
+            // snapshot reads them as zero, and reconciliation on open re-derives them from the
+            // durable loss report (replay-reconstructable like the recovery-loss family).
+            recovery: RecoveryCounters {
+                runs_by_outcome: [field(17), field(18), field(19), field(20)],
+                torn_tail_repairs: field(21),
+                corruption_repairs_by_artifact: [field(22), field(23), field(24)],
+            },
         }
     }
 }
@@ -2666,7 +2815,58 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             log.loss_report(),
             log.flushed_offset().get(),
         );
+        // Recovery-EVENT counters (#575): record THIS open as one recovery run, classified by its loss
+        // report, and add this run's per-event repair counts. Unlike the recovery-LOSS `max`
+        // reconciliation above, these are additive per-open EVENT counts, which is correct and never
+        // double-counts: `loss_report()` reflects only THIS recovery (a torn tail or corruption span
+        // this open dropped), and a clean re-open after a prior recovery already truncated/quarantined
+        // the damage carries an EMPTY report, so it adds a clean-outcome run and zero repairs.
+        Self::accumulate_recovery_events(&mut counters.recovery, log.loss_report());
         Ok((counters_checkpoint, counters))
+    }
+
+    /// Records ONE recovery run in the recovery-EVENT counter family (#575), the marquee
+    /// corruption-recovery metrics NATS has no analogue for. It is called once per [`Engine::open`]
+    /// with the just-recovered durable [`LossReport`]:
+    ///
+    /// - bumps exactly ONE `runs_by_outcome` bucket: `Clean` for an empty report, else
+    ///   `TornTailTruncated` when the only loss was a torn tail (no data loss), else `Quarantined`
+    ///   when a data-loss corruption span was dropped (the corruption was copied to the quarantine
+    ///   store before truncation, per the recovery contract);
+    /// - adds the count of `TornTail` loss events to `torn_tail_repairs`;
+    /// - adds each data-loss (corruption) event to the matching `corruption_repairs_by_artifact`
+    ///   bucket. A corruption skip in the main log is the `Segment` artifact; recovery does not
+    ///   today produce cursor or DLQ corruption loss events (a torn cursor reverts via its dual-slot
+    ///   checkpoint, never producing a loss event), so those buckets stay zero here, reserved for the
+    ///   frozen taxonomy and incremented by the offline `repair` path when it acts on those artifacts.
+    ///
+    /// It is a pure, saturating accumulation over the in-memory report (no IO, never fails recovery),
+    /// and adding only THIS open's events keeps the counters monotonic non-decreasing across restarts
+    /// without double-counting (the report is per-recovery; a clean re-open adds nothing).
+    fn accumulate_recovery_events(recovery: &mut RecoveryCounters, loss: &LossReport) {
+        let data_loss = loss.data_loss_bytes() > 0;
+        let outcome = if loss.is_empty() {
+            RecoveryOutcome::Clean
+        } else if data_loss {
+            RecoveryOutcome::Quarantined
+        } else {
+            RecoveryOutcome::TornTailTruncated
+        };
+        let bucket = &mut recovery.runs_by_outcome[outcome.index()];
+        *bucket = bucket.saturating_add(1);
+
+        for event in &loss.events {
+            if event.reason_code.is_data_loss() {
+                // A corruption skip in the main log: the `Segment` artifact. (Recovery does not
+                // emit cursor/DLQ loss events today; those buckets are driven by the offline
+                // `repair` path, reserved here so the taxonomy is frozen up front.)
+                let idx = RecoveryArtifact::Segment.index();
+                recovery.corruption_repairs_by_artifact[idx] =
+                    recovery.corruption_repairs_by_artifact[idx].saturating_add(1);
+            } else {
+                recovery.torn_tail_repairs = recovery.torn_tail_repairs.saturating_add(1);
+            }
+        }
     }
 
     /// Checkpoint-plus-replay reconciliation for the RECOVERY-LOSS counter family (#307), the
@@ -8495,11 +8695,17 @@ mod tests {
         e.checkpoint_all_groups().unwrap();
         let fs = e.into_filesystem();
 
-        // Reopen on the same fs: the counters resume from the snapshot, byte-for-byte.
+        // Reopen on the same fs: the OPERATIONAL counters resume from the snapshot, byte-for-byte.
+        // The recovery-EVENT family (#575) legitimately advances on the reopen (a reopen IS another
+        // recovery run), so it is compared separately by `recovery_event_counters_*`; zero it here so
+        // this assertion stays about the operational-counter resume it was written to check.
         let e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 1)).unwrap();
+        let mut resumed = e.counters();
+        resumed.recovery = RecoveryCounters::default();
+        let mut expected = before;
+        expected.recovery = RecoveryCounters::default();
         assert_eq!(
-            e.counters(),
-            before,
+            resumed, expected,
             "the resilience counters resumed from the durable snapshot, not zeroed"
         );
     }
@@ -8520,8 +8726,13 @@ mod tests {
         assert!(!fs.exists(COUNTERS_CHECKPOINT).unwrap());
 
         let e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        // The OPERATIONAL counters recover as all-zeros (the missing snapshot). The recovery-EVENT
+        // family legitimately records this clean open as one run, so it is excluded from the
+        // all-zeros check (covered by `recovery_event_counters_*`).
+        let mut resumed = e.counters();
+        resumed.recovery = RecoveryCounters::default();
         assert_eq!(
-            e.counters(),
+            resumed,
             Counters::default(),
             "a missing counters snapshot recovers as all-zeros"
         );
@@ -8562,8 +8773,12 @@ mod tests {
         // Open must SUCCEED (never a hard error), recover zero counters, and leave the log and
         // cursor untouched.
         let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        // The OPERATIONAL counters recover as all-zeros (the torn snapshot). The recovery-EVENT
+        // family records this clean open as one run, so it is excluded here.
+        let mut resumed = e.counters();
+        resumed.recovery = RecoveryCounters::default();
         assert_eq!(
-            e.counters(),
+            resumed,
             Counters::default(),
             "a torn counters snapshot recovers as all-zeros, never a hard failure"
         );
@@ -8599,9 +8814,14 @@ mod tests {
         let fs = e.into_filesystem();
 
         let e = Engine::open(fs, std::sync::Arc::clone(&clock), config(10, 5)).unwrap();
+        // The OPERATIONAL counters resume from the shutdown flush; the recovery-EVENT family advances
+        // on the reopen (another clean run), so zero it for this operational-counter assertion.
+        let mut resumed = e.counters();
+        resumed.recovery = RecoveryCounters::default();
+        let mut expected = final_counts;
+        expected.recovery = RecoveryCounters::default();
         assert_eq!(
-            e.counters(),
-            final_counts,
+            resumed, expected,
             "the graceful-shutdown flush persisted the final counts"
         );
         assert_eq!(e.counters().produced, 3);
@@ -8664,6 +8884,13 @@ mod tests {
             // proves the two new trailing fields are carried.
             dedup_hits: 314,
             dedup_out_of_window: 42,
+            // The recovery-event family (#575), appended after dedup; every field non-zero so the
+            // round-trip proves all eight new trailing fields are carried in order.
+            recovery: RecoveryCounters {
+                runs_by_outcome: [501, 502, 503, 504],
+                torn_tail_repairs: 505,
+                corruption_repairs_by_artifact: [506, 507, 508],
+            },
         };
         let encoded = counters.encode_snapshot();
         assert_eq!(Counters::decode_snapshot(&encoded), counters);
@@ -8737,6 +8964,102 @@ mod tests {
         assert_eq!(
             c.counter_checkpoint_repairs, 1,
             "exactly one repair: the replay raised a skip/loss value above the snapshot"
+        );
+    }
+
+    #[test]
+    fn recovery_event_counters_classify_and_count_each_outcome() {
+        // The recovery-EVENT family (#575) records one run per accumulation, in the right outcome
+        // bucket, and adds the per-event torn-tail / corruption repair counts. Driven directly over
+        // the helper so each outcome is pinned deterministically.
+        let mut r = RecoveryCounters::default();
+
+        // 1) A CLEAN report: one clean run, no repairs.
+        Engine::<InMemoryFs, ManualClock>::accumulate_recovery_events(&mut r, &LossReport::new());
+        assert_eq!(r.runs_by_outcome[RecoveryOutcome::Clean.index()], 1);
+        assert_eq!(r.torn_tail_repairs, 0);
+        assert_eq!(
+            r.corruption_repairs_by_artifact[RecoveryArtifact::Segment.index()],
+            0
+        );
+
+        // 2) A TORN-TAIL-only report: one torn_tail_truncated run, one torn-tail repair, NO
+        //    corruption (a torn tail is not data loss).
+        let mut torn = LossReport::new();
+        torn.push(LossEvent::span(0, 16, 64, 1, ReasonCode::TornTail));
+        Engine::<InMemoryFs, ManualClock>::accumulate_recovery_events(&mut r, &torn);
+        assert_eq!(
+            r.runs_by_outcome[RecoveryOutcome::TornTailTruncated.index()],
+            1
+        );
+        assert_eq!(r.torn_tail_repairs, 1);
+        assert_eq!(
+            r.corruption_repairs_by_artifact[RecoveryArtifact::Segment.index()],
+            0,
+            "a torn tail is never counted as a corruption repair"
+        );
+
+        // 3) A CORRUPTION report (data loss): one quarantined run, one segment corruption repair.
+        let mut corrupt = LossReport::new();
+        corrupt.push(LossEvent::span(
+            1,
+            0,
+            4096,
+            1,
+            ReasonCode::CorruptRecordBody,
+        ));
+        Engine::<InMemoryFs, ManualClock>::accumulate_recovery_events(&mut r, &corrupt);
+        assert_eq!(r.runs_by_outcome[RecoveryOutcome::Quarantined.index()], 1);
+        assert_eq!(
+            r.corruption_repairs_by_artifact[RecoveryArtifact::Segment.index()],
+            1
+        );
+        // The torn-tail count is unchanged by a pure-corruption run.
+        assert_eq!(r.torn_tail_repairs, 1);
+
+        // The counters are monotonic across the three accumulations (one run each = three runs).
+        let total_runs: u64 = r.runs_by_outcome.iter().sum();
+        assert_eq!(total_runs, 3, "exactly one run recorded per accumulation");
+
+        // The hand-written `index()` stays in lockstep with `ALL` (the array order the renderer and
+        // the durable snapshot both depend on).
+        for (i, o) in RecoveryOutcome::ALL.iter().enumerate() {
+            assert_eq!(o.index(), i, "RecoveryOutcome::index must match ALL order");
+        }
+        for (i, a) in RecoveryArtifact::ALL.iter().enumerate() {
+            assert_eq!(a.index(), i, "RecoveryArtifact::index must match ALL order");
+        }
+    }
+
+    #[test]
+    fn recovery_event_counters_fire_on_a_real_torn_tail_reopen() {
+        // End to end: a hard crash tears the tail, and reopening the engine bumps the recovery-event
+        // counters once (one torn_tail_truncated run + one torn-tail repair), the operator-facing
+        // proof the recovery actually fired. NATS has no such metric.
+        let fs = InMemoryFs::new();
+        let mut e = Engine::open(fs.clone(), ManualClock::new(), config(10, 5)).unwrap();
+        for _ in 0..4 {
+            produce(&mut e, &[0xcd; 16]);
+        }
+        drop(e);
+        tear_segment_tail(&fs, 3);
+
+        let reopened = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        let r = reopened.counters().recovery;
+        assert_eq!(
+            r.runs_by_outcome[RecoveryOutcome::TornTailTruncated.index()],
+            1,
+            "the torn-tail reopen recorded exactly one torn_tail_truncated run"
+        );
+        assert!(
+            r.torn_tail_repairs >= 1,
+            "the torn tail was counted as a torn-tail repair, got {}",
+            r.torn_tail_repairs
+        );
+        assert_eq!(
+            r.corruption_repairs_by_artifact[RecoveryArtifact::Segment.index()],
+            0,
+            "a torn tail is never a corruption repair"
         );
     }
 

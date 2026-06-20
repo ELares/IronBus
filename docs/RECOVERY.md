@@ -513,3 +513,121 @@ overlap resolution, the before-vs-after identical-recovery gate, and the fail-cl
 No contradiction with the merged code was found that is left unresolved: every
 divergence above is a case where the shipped code is SAFER or simpler than the
 draft, and this document ratifies the shipped behavior as the authority.
+
+---
+
+## 8. The operator runbook: recovery-as-a-feature (`verify` -> `repair` -> metric)
+
+Sections 1 to 7 ratify the recovery MODEL. This section is the OPERATOR story: the
+two first-class CLI commands and the metric that turn "a segment went bad" into a
+bounded, knowable, reported recovery — the marquee **IronBus can, NATS can't**
+differentiator. NATS's only documented corruption-recovery path is
+restore-from-backup (its official DR docs state no in-place fix exists), its
+truncate-and-drop recovery is silent and unbounded (#7549/#7556), and it exposes
+**no corruption metric at all**. IronBus makes recovery a command, a metric, and a
+bounded loss envelope.
+
+### 8.1 The two commands
+
+Both are OFFLINE store tools: they run against a STOPPED broker's `--data-dir` with
+no server and do not touch the broker runtime. They share the recovery decode path
+(section 1.2), so the offline view and the broker's next-start recovery agree on
+every byte.
+
+- **`ironbus verify --data-dir <dir> [--json]`** — the READ-ONLY fsck (the
+  `fsck --dry-run` NATS lacks). It CRC-validates every segment of the log (the
+  longest-valid-prefix scan of section 1.3, in read-only mode), then ALSO validates
+  the layout marker (section 1.1 / #670), every consumer cursor against the durable
+  range `[earliest_retained, durable_head]`, and the DLQ, and reports the forensic
+  `quarantine/` footprint. It **MUTATES NOTHING**: a torn tail or corruption is
+  DETECTED and REPORTED — never truncated, never quarantined, never a cursor
+  rewritten. It is built entirely from the read-only `OfflineReader`,
+  `check_layout_marker` (which, unlike recovery's `open_or_upgrade`, never writes the
+  v1 marker), `inspect_cursors`, `read_dlq_entries`, and `quarantine::persisted_bytes`.
+  Exit codes (the frozen scheme): **0** clean (a torn-tail-only result stays 0, the
+  data-loss boundary of section 1.3), **3** it found and reported real data-loss
+  corruption OR a cursor-vs-log mismatch, **2** the data dir is missing, **4** the
+  chain is structurally unreadable (or a future layout marker blocks the open,
+  section 1.1). `--json` emits a single `ironbus.cli.verify.v1` object with the
+  segment `events` (segment id + byte span + reason + `data_loss`), the `cursors`
+  array, `dlq_records`, `quarantine_bytes`, `layout_version`, and the `exit_code`.
+
+- **`ironbus repair --data-dir <dir> [--apply --force] [--json]`** — the MUTATING
+  command, recovery made explicit and offline. With NO flags it is the read-only
+  PLAN (the same plan `verify`/`scrub` print: what it WOULD do, changing nothing).
+  `--apply` performs the repair and **REQUIRES `--force`** (the confirmation gate: a
+  bare `repair --apply` is refused with exit 1, checked before any lock or recovery,
+  so `repair` never silently destroys). `--apply --force` takes the EXCLUSIVE
+  data-dir lock first (exit 5 if a broker holds it — it never races a live writer),
+  then runs recovery via `Log::open`, which:
+  1. **QUARANTINES (copy-then-drop, NEVER delete)** each corrupt span to the capped
+     `quarantine/` store BEFORE truncating it (section 3.2). The forensic bytes
+     survive; nothing is ever deleted.
+  2. **Truncates to the longest valid prefix** exactly as recovery does (section
+     1.3), preserving every committed record and the data dir's uid/gid/mode.
+  It NEVER makes the data less recoverable than the broker's own next-start recovery
+  would. The bounded loss is REPORTED (the `LossReport`, human or
+  `ironbus.cli.repair.v1`).
+
+`verify` is the read-only twin of `repair`: run `verify` to SEE the problem, run
+`repair --apply --force` to FIX it. After a repair, `verify` is clean (the repaired
+prefix is consistent), proving the repair left a log the broker accepts unchanged.
+
+### 8.2 The metric the recovery fires
+
+When the BROKER itself recovers at startup (`Engine::open`), it counts the recovery
+as an EVENT (#575) — the flagship metric NATS has no analogue for. Each is bumped
+once per open from the durable loss report and is monotonic across a `kill -9`:
+
+- `ironbus_recovery_runs_total{outcome="clean|torn_tail_truncated|quarantined|data_loss"}`
+  — one increment per recovery run, in its outcome bucket. The
+  `fraction-of-opens-that-needed-a-repair` signal.
+- `ironbus_torn_tail_repairs_total` — torn/unsynced tails truncated to the longest
+  valid prefix (power-loss repairs, NOT data loss).
+- `ironbus_corruption_repairs_total{artifact="segment|cursor|dlq"}` — corruption
+  spans quarantined-and-dropped, by artifact. **This is the metric NATS structurally
+  lacks**: a non-zero `{artifact="segment"}` is the alertable "real bytes were lost
+  (and forensically preserved) at recovery" signal.
+
+These join the existing recovery-loss GAUGES (`ironbus_recovery_data_loss_bytes`,
+`ironbus_recovery_loss_bytes{reason}`, `ironbus_quarantine_bytes`) that report the
+LAST recovery's loss. See [METRICS.md](METRICS.md) for the full taxonomy; the names
+are pinned in the frozen-taxonomy test, so they can never silently drift.
+
+### 8.3 Why the loss is BOUNDED (the knowable envelope)
+
+The whole point: an operator can state the loss envelope BEFORE running anything,
+because recovery is capped (the I3 caps, section 1.4). A single dropped span can
+never exceed one segment or 64 MiB (`PER_EVENT_BYTE_CAP`), and the total can never
+exceed 1% of durable bytes (floored at the per-event cap). If recovery WOULD exceed
+the caps it FAILS CLOSED (`ExcessiveRecoveryLoss`) rather than silently dropping
+more — so the loss is either within the published bound or the open is refused. The
+`quarantine/` store is likewise capped (oldest blobs evicted first), so the forensic
+footprint is bounded too. `verify` reports the exact span (segment + `[start, end)`
+byte offsets) and `ironbus_recovery_data_loss_bytes` / `ironbus_corruption_repairs_total`
+report the totals, so "how much did I lose and why is it bounded" is answerable from
+the CLI and the metric together.
+
+### 8.4 The runbook: a segment went bad
+
+1. **Stop the broker** (the offline tools take the exclusive data-dir lock; a live
+   broker blocks `repair --apply` with exit 5).
+2. **`ironbus verify --data-dir <dir> --json`** — see WHAT is wrong, WHERE (segment +
+   byte offset), and HOW MUCH is lost (bounded by the I3 caps). Exit 3 means a
+   data-loss corruption or a cursor mismatch; exit 0 means clean or torn-tail-only.
+   This mutates nothing, so it is always safe to run.
+3. **`ironbus repair --data-dir <dir>`** (no flags) — review the read-only PLAN: what
+   `--apply` WOULD quarantine and truncate, changing nothing.
+4. **`ironbus repair --data-dir <dir> --apply --force`** — perform the bounded,
+   reported repair: quarantine the corrupt span (copy-then-drop, forensics
+   preserved), truncate to the longest valid prefix (committed data preserved).
+5. **`ironbus verify --data-dir <dir>`** — confirm the dir is now clean.
+6. **Restart the broker.** Its `Engine::open` recovery is a no-op on the
+   already-repaired dir (an empty loss report), and `ironbus_recovery_runs_total{outcome="clean"}`
+   ticks. Watch `ironbus_corruption_repairs_total{artifact="segment"}` and
+   `ironbus_recovery_data_loss_bytes` for the historical record of what was lost.
+
+The **NATS contrast**: at step 2 NATS has no `fsck` to run (the only recovery path is
+restore-from-backup); at step 4 its in-place recovery is a silent, unbounded
+truncate-and-drop with no quarantine forensics; at step 6 it has no corruption metric
+to alert on. IronBus's recovery is a command, a bounded envelope, and a metric.
