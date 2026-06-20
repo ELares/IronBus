@@ -29,6 +29,7 @@ pub mod dict;
 pub mod epoch_cache;
 pub mod format;
 pub mod keyshared;
+pub mod kv;
 pub mod leader_lease;
 pub mod lease;
 pub mod partition;
