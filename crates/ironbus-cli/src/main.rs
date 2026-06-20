@@ -85,6 +85,13 @@ use ironbus_client::{Client, ClientError};
 use ironbus_core::clock::Clock;
 use ironbus_proto::message::PubBody;
 use ironbus_server::clock::SystemClock;
+// The metadata-cluster CLI surface (#684, V2-C1). `ClusterConfig` is constructed by the
+// cross-platform serve flag parser (and named in the platform-independent unit tests), so it is
+// imported unconditionally; `ClusterRuntime`/`RuntimeError` are only STARTED on the Unix serve
+// path, so they follow the same `#[cfg(unix)]` gate as the rest of the broker run.
+use ironbus_server::cluster::ClusterConfig;
+#[cfg(unix)]
+use ironbus_server::cluster::{ClusterRuntime, RuntimeError};
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
@@ -1641,6 +1648,13 @@ struct ParsedServe {
     /// Which live-reloadable keys were pinned by a flag/env at startup (#380), so a SIGHUP file
     /// re-read does not override them (the `flag > env > FILE` precedence). All false with no flag/env.
     reload_pins: ReloadPins,
+    /// The validated metadata-cluster config (#684, V2-C1), built from `--cluster-id` +
+    /// `--cluster-peer`. `None` (no cluster flags) is the SINGLE-NODE DEFAULT: `cmd_serve` then
+    /// never starts a [`ClusterRuntime`], so the on-disk layout, the threads, and the
+    /// produce/consume path are byte-for-byte today's broker (the non-negotiable guarantee). `Some`
+    /// opts into the additive metadata-Raft plane (#682/#683): the metadata quorum runs, but the
+    /// DATA-plane produce/consume replication (#686/#691) is the FLAGGED follow-up, NOT this PR.
+    cluster: Option<ClusterConfig>,
 }
 
 fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
@@ -1656,6 +1670,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         &parsed.broadcast_groups,
         parsed.health_addr.as_deref(),
         &parsed.config_warnings,
+        parsed.cluster.as_ref(),
         ReloadSource {
             config_path: parsed.config_path.as_deref(),
             allow_unknown_config: parsed.allow_unknown_config,
@@ -1803,6 +1818,19 @@ struct ServeFlags {
     wal_fsync_headroom_bytes: Option<u64>,
     key_shared_groups: Vec<String>,
     broadcast_groups: Vec<String>,
+    /// This node's id within the metadata cluster (#684, V2-C1), from `--cluster-id <node-id>`.
+    /// `None` (no `--cluster-id`) = the single-node default: NO cluster runtime is started, so the
+    /// on-disk layout, the threads, and the produce/consume path are byte-for-byte today's broker.
+    /// CLI-only (no env / config-file mapping yet; the `[cluster]` config-file section is the
+    /// FLAGGED follow-up), like the repeatable group flags. Present with the peer map below it
+    /// opts the broker into the additive metadata-Raft plane (#682/#683).
+    cluster_id: Option<u64>,
+    /// The cluster peer map (#684), from repeatable `--cluster-peer <id>=<addr>` (one per member,
+    /// INCLUDING this node's own id+addr). Collected as raw `id=addr` strings here and parsed into
+    /// the [`ironbus_server::cluster::ClusterConfig`] peer map after collection, so a malformed spec
+    /// is a typed usage error. Empty (no `--cluster-peer`) = the single-node default, no cluster.
+    /// CLI-only and repeatable, exactly like `--key-shared-group`.
+    cluster_peers: Vec<String>,
 }
 
 /// Collects the `serve` arg list into [`ServeFlags`], each knob `Some` only if its flag appeared.
@@ -1960,6 +1988,19 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             "--broadcast-group" => {
                 f.broadcast_groups
                     .push(take_value("--broadcast-group", args, &mut i)?);
+            }
+            // The metadata-cluster opt-in (#684). `--cluster-id` is this node's raft node id; a bad
+            // value (non-numeric) is a typed usage error from `take_number`, naming the flag.
+            "--cluster-id" => {
+                f.cluster_id = Some(take_number("--cluster-id", args, &mut i)?);
+            }
+            // Repeatable, exactly like `--key-shared-group`: each `--cluster-peer <id>=<addr>` is
+            // one cluster member. The raw `id=addr` string is parsed into the peer map after
+            // collection (a malformed spec is a typed usage error there), so a missing value here
+            // is the only failure `take_value` reports.
+            "--cluster-peer" => {
+                f.cluster_peers
+                    .push(take_value("--cluster-peer", args, &mut i)?);
             }
             "--visibility-timeout-ms" => {
                 f.visibility_ms = Some(take_number("--visibility-timeout-ms", args, &mut i)?);
@@ -2423,6 +2464,11 @@ fn parse_serve_flags_with_env_and_reader(
         // file-combined seam shadowed `env`, so a key set ONLY by the file is correctly NOT pinned
         // (the file remains reloadable; only a flag/env-set key is frozen against the file on reload).
         reload_pins,
+        // The metadata-cluster config (#684): `None` (no `--cluster-id`/`--cluster-peer`) is the
+        // single-node default — NO cluster runtime, byte-for-byte today's broker. A present, valid
+        // set of cluster flags builds a `ClusterConfig` here; a malformed peer spec or a missing
+        // `--cluster-id` is a typed usage error (fail-closed), surfaced by `?` before any side effect.
+        cluster: parse_cluster_config(f.cluster_id, &f.cluster_peers)?,
     };
     // Fold in the FILE layer's non-fatal warnings and its explicit-retention-request flag, then run
     // the WHOLE-config coupled-set validation as a UNIT (#86, #382, docs/CONFIG.md section 4): every
@@ -2609,6 +2655,111 @@ fn map_durability_level(level: DurabilityLevelArg) -> ironbus_core::config::Dura
     }
 }
 
+/// Builds the validated metadata-cluster [`ClusterConfig`] (#684, V2-C1) from the `--cluster-id`
+/// and the repeated `--cluster-peer <id>=<addr>` flags, or `None` when NEITHER is given (the
+/// single-node default: `cmd_serve` then never starts a [`ClusterRuntime`], so the broker is
+/// byte-for-byte today's — the non-negotiable guarantee).
+///
+/// This is the CLI-side, FAIL-CLOSED validation, done here so a malformed cluster surface is a
+/// typed [`CliError::Usage`] (exit 1) BEFORE any broker side effect (no data dir touched, no
+/// listener bound), exactly like every other bad serve flag. The runtime's own
+/// [`ironbus_server::cluster::ClusterConfig`] validation runs again at
+/// [`ClusterRuntime::start`] (the durable belt-and-braces check); these are the operator-facing
+/// messages naming the flag.
+///
+/// Rejected (each a typed usage error):
+/// * `--cluster-peer` given without `--cluster-id` (which node am I?) — and the symmetric
+///   `--cluster-id` with no `--cluster-peer` (no membership) — so a half-specified cluster never
+///   silently starts;
+/// * a malformed `--cluster-peer` spec (no `=`, an empty/non-numeric id, a node id `0` — the raft
+///   `INVALID_ID` — or an unparseable socket address);
+/// * a duplicate peer id;
+/// * a `--cluster-id` that is not one of the configured peers (the local node must be a member).
+///
+/// The supported peer-set SIZE check (1, 3, or 5) is left to the runtime's `start` validation so
+/// the one rule lives in one place (the runtime that depends on it), surfaced as a usage error
+/// there; this layer guarantees a well-FORMED config reaches it.
+fn parse_cluster_config(
+    cluster_id: Option<u64>,
+    cluster_peers: &[String],
+) -> Result<Option<ClusterConfig>, CliError> {
+    // The single-node default: NEITHER flag given. Nothing cluster is constructed, so `cmd_serve`
+    // starts no runtime and the broker stays byte-for-byte today's.
+    match (cluster_id, cluster_peers.is_empty()) {
+        (None, true) => return Ok(None),
+        (None, false) => {
+            // Peers without an id: we cannot know which member this broker is. Fail closed.
+            return Err(CliError::Usage(
+                "`--cluster-peer` was given without `--cluster-id`: a cluster node must declare its \
+                 own id (one of the `--cluster-peer` ids) so the broker knows which member it is"
+                    .to_string(),
+            ));
+        }
+        (Some(_), true) => {
+            // An id without any membership: there is no cluster to join. Fail closed.
+            return Err(CliError::Usage(
+                "`--cluster-id` was given without any `--cluster-peer`: a cluster needs its peer \
+                 set (repeat `--cluster-peer <id>=<addr>` for every member, including this node)"
+                    .to_string(),
+            ));
+        }
+        (Some(_), false) => {}
+    }
+    let node_id = cluster_id.expect("cluster_id is Some in this arm");
+
+    // Parse each `id=addr` spec into the peer map. A malformed spec, a duplicate id, or the
+    // reserved id `0` is a typed usage error NAMING the offending spec (fail-closed).
+    let mut peers: std::collections::BTreeMap<u64, std::net::SocketAddr> =
+        std::collections::BTreeMap::new();
+    for spec in cluster_peers {
+        let (id, addr) = parse_cluster_peer(spec)?;
+        if peers.insert(id, addr).is_some() {
+            return Err(CliError::Usage(format!(
+                "`--cluster-peer` lists peer id {id} more than once: each member id must be unique"
+            )));
+        }
+    }
+
+    // The local node must be a member of its own peer set (its entry is where its listener binds).
+    if !peers.contains_key(&node_id) {
+        return Err(CliError::Usage(format!(
+            "`--cluster-id {node_id}` is not one of the `--cluster-peer` ids: this node must be \
+             listed as a member (add `--cluster-peer {node_id}=<addr>` for its own listen address)"
+        )));
+    }
+
+    Ok(Some(ClusterConfig { node_id, peers }))
+}
+
+/// Parses one `--cluster-peer <id>=<addr>` spec into a `(node_id, addr)` pair, or a typed usage
+/// error naming the offending spec (#684). Fail-closed: a missing `=`, an empty or non-numeric id,
+/// the reserved id `0` (raft `INVALID_ID`), or an unparseable socket address each reject the spec.
+fn parse_cluster_peer(spec: &str) -> Result<(u64, std::net::SocketAddr), CliError> {
+    let (id_str, addr_str) = spec.split_once('=').ok_or_else(|| {
+        CliError::Usage(format!(
+            "`--cluster-peer` must be `<id>=<addr>` (e.g. `1=127.0.0.1:7400`), got `{spec}`"
+        ))
+    })?;
+    let id: u64 = id_str.parse().map_err(|_| {
+        CliError::Usage(format!(
+            "`--cluster-peer` id must be a non-negative integer, got `{id_str}` in `{spec}`"
+        ))
+    })?;
+    if id == 0 {
+        // raft::INVALID_ID is 0; a member can never carry it (the runtime rejects it too).
+        return Err(CliError::Usage(format!(
+            "`--cluster-peer` id 0 is reserved and cannot be a cluster member (in `{spec}`)"
+        )));
+    }
+    let addr: std::net::SocketAddr = addr_str.parse().map_err(|_| {
+        CliError::Usage(format!(
+            "`--cluster-peer` address must be a socket address like `127.0.0.1:7400`, got \
+             `{addr_str}` in `{spec}`"
+        ))
+    })?;
+    Ok((id, addr))
+}
+
 /// Resolves the required `--data-dir`, validates the assembled config, and dispatches to the
 /// platform `cmd_serve`. Split out of `run_serve` so the flag-parsing loop stays a single concern.
 #[allow(clippy::too_many_arguments)] // each input (addr, data dir, config, groups, health, the
@@ -2622,9 +2773,23 @@ fn finish_serve(
     broadcast_groups: &[String],
     health_addr: Option<&str>,
     config_warnings: &[String],
+    cluster: Option<&ClusterConfig>,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
+    // The metadata-cluster plane (#684) is a DURABLE, on-disk feature: it roots its `metaraft/`
+    // log under the data dir and recovers it on restart. `--storage memory` has no data dir and no
+    // durability, so a cluster config there would be a meaningless RAM-only quorum that loses its
+    // metadata on every stop. Reject it fail-closed BEFORE any side effect (the wire bind etc.),
+    // rather than silently start a non-durable cluster.
+    if cluster.is_some() && config.storage == StorageArg::Memory {
+        return Err(CliError::Usage(
+            "`--cluster-id`/`--cluster-peer` require `--storage disk`: the metadata cluster is a \
+             durable on-disk plane (it keeps a `metaraft/` log under the data dir and recovers it \
+             on restart), so it cannot run under `--storage memory` (which keeps no on-disk state)"
+                .to_string(),
+        ));
+    }
     // The data dir is storage-conditional (#443). DISK (the default): REQUIRED, exactly the
     // historical rule. MEMORY: it must be ABSENT (the broker stores nothing on disk, so a given
     // `--data-dir` would silently mean nothing; a usage error keeps the semantics explicit), and
@@ -2656,6 +2821,7 @@ fn finish_serve(
         broadcast_groups,
         health_addr,
         config_warnings,
+        cluster,
         reload,
         out,
     )
@@ -3473,9 +3639,9 @@ fn durability_loss_description(config: &ServeConfig) -> String {
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 // each input (addr, data dir, config, the declared groups,
-// health addr, the config-file warnings, the reload source,
-// out) is a distinct concern; a bundling struct would only
-// move the noise.
+// health addr, the config-file warnings, the cluster config,
+// the reload source, out) is a distinct concern; a bundling
+// struct would only move the noise.
 fn cmd_serve(
     addr: &str,
     data_dir: Option<&Path>,
@@ -3484,6 +3650,7 @@ fn cmd_serve(
     broadcast_groups: &[String],
     health_addr: Option<&str>,
     config_warnings: &[String],
+    cluster: Option<&ClusterConfig>,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -3540,6 +3707,13 @@ fn cmd_serve(
             dirlock::prepare_data_dir(data_dir).map_err(|e| map_dir_error(&e))?;
             let _dir_lock = dirlock::DirLock::acquire(data_dir).map_err(|e| map_dir_error(&e))?;
             let engine = open_disk_engine(data_dir, config, key_shared_groups, broadcast_groups)?;
+            // Start the additive metadata-cluster plane (#684, V2-C1) IFF cluster flags were given.
+            // This is the ONLY place a `ClusterRuntime` is started, on the DISK path, where a
+            // concrete `StdFs` and the data dir are known — the runtime roots its `metaraft/` log
+            // under it. With NO cluster config the runtime is never constructed, so no `metaraft/`
+            // dir, no peer listener, and no driver thread exist: the broker is byte-for-byte
+            // today's (the single-node-default guarantee, owned right here by the `Option` check).
+            let cluster_runtime = start_cluster_runtime(cluster, data_dir, config)?;
             run_broker(
                 engine,
                 addr,
@@ -3548,6 +3722,7 @@ fn cmd_serve(
                 health_addr,
                 health_bind,
                 config_warnings,
+                cluster_runtime,
                 reload,
                 out,
             )
@@ -3562,6 +3737,14 @@ fn cmd_serve(
             // enforced the explicit `--ephemeral-loss-ack` consent and the non-zero
             // `--max-total-bytes` RAM bound before any of this runs.
             let engine = open_memory_engine(config, key_shared_groups, broadcast_groups)?;
+            // The metadata cluster is a durable on-disk plane and is rejected for `--storage memory`
+            // in `finish_serve` BEFORE reaching here, so `cluster` is `None` on this arm. Pass `None`
+            // explicitly (never start a cluster in memory mode); the `debug_assert` documents the
+            // invariant for a direct caller that bypassed `finish_serve`.
+            debug_assert!(
+                cluster.is_none(),
+                "a cluster config must be rejected for --storage memory before cmd_serve's memory arm"
+            );
             run_broker(
                 engine,
                 addr,
@@ -3570,11 +3753,58 @@ fn cmd_serve(
                 health_addr,
                 health_bind,
                 config_warnings,
+                None,
                 reload,
                 out,
             )
         }
     }
+}
+
+/// Starts the additive metadata-cluster runtime (#684, V2-C1) when a [`ClusterConfig`] is present,
+/// or returns `None` for the single-node default (no cluster flags) — the byte-for-byte-today path.
+///
+/// This is the ONE call site of [`ClusterRuntime::start`] in the broker. It builds a fresh
+/// [`StdFs`] rooted at the SAME `data_dir` the engine uses (the runtime roots its `metaraft/`
+/// subdirectory under it) and a [`LogConfig`] from the SAME `--max-segment-bytes` the engine's
+/// metadata log inherits, then starts the runtime (which binds the peer listener and spawns the
+/// driver + listener + dialer threads). The metadata quorum then runs; the DATA-plane
+/// produce/consume replication (#686/#691) is the FLAGGED follow-up and is NOT wired here.
+///
+/// # Errors
+/// [`CliError::Usage`] for a config the runtime rejects as invalid (an unsupported peer-set size —
+/// the CLI layer already guaranteed the config is well-FORMED, so this is the size rule), or
+/// [`CliError::Internal`] if the durable metadata group cannot be opened or the peer listener
+/// cannot bind.
+#[cfg(unix)]
+fn start_cluster_runtime(
+    cluster: Option<&ClusterConfig>,
+    data_dir: &Path,
+    config: &ServeConfig,
+) -> Result<Option<ClusterRuntime>, CliError> {
+    let Some(cluster) = cluster else {
+        // The single-node default: NOTHING cluster starts. No metaraft/, no listener, no thread.
+        return Ok(None);
+    };
+    // A fresh StdFs over the broker's data dir: the runtime opens the metadata log under it
+    // (`metaraft/`), separate from the engine's own filesystem handle but rooted at the same path.
+    let fs = StdFs::new(data_dir.to_path_buf());
+    // The metadata log inherits the broker's segment cap (the same `--max-segment-bytes`), so the
+    // cluster log rolls like the data log; this is the only LogConfig knob the runtime takes.
+    let log_config = LogConfig::new(config.max_segment_bytes)
+        .map_err(|e| CliError::Internal(format!("cluster log config: {e}")))?;
+    ClusterRuntime::start(cluster, &fs, SystemClock::new(), log_config)
+        .map(Some)
+        .map_err(|e| match e {
+            // An invalid config (e.g. an unsupported peer-set size: the CLI layer guarantees a
+            // well-formed config, so this is the size rule the runtime owns) is an operator usage
+            // error (exit 1), naming the cluster flags.
+            RuntimeError::Config(m) => CliError::Usage(format!(
+                "invalid `--cluster-id`/`--cluster-peer` config: {m}"
+            )),
+            // A durable-open or peer-listener-bind failure is a runtime fault (exit 70).
+            other => CliError::Internal(format!("cannot start the metadata cluster: {other}")),
+        })
 }
 
 /// Runs an ALREADY-OPENED engine as the broker: actor spawn, wire bind, startup logging, the
@@ -3603,6 +3833,7 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     health_addr: Option<&str>,
     health_bind: Option<HealthBindDecision>,
     config_warnings: &[String],
+    cluster_runtime: Option<ClusterRuntime>,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -3792,6 +4023,15 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     signal_thread.stop();
     if let Some(h) = health_handle {
         let _ = h.join();
+    }
+    // Stop the metadata-cluster runtime (#684), if one was started: signal its own shutdown flag and
+    // JOIN the driver / listener / dialer threads (a deterministic teardown, never a leak), BEFORE
+    // the actor drain below. With no cluster (the single-node default) this is `None` and a no-op, so
+    // the default serve path is unchanged. The cluster plane is metadata-only, fully independent of
+    // the data-path actor drain that follows, so the order between them is not load-bearing; we stop
+    // it here so its threads are joined while the engine handle is still alive.
+    if let Some(mut runtime) = cluster_runtime {
+        runtime.stop();
     }
     result?;
     // Graceful-shutdown drain (#195): the serve loop has stopped accepting and every connection
@@ -4327,6 +4567,7 @@ fn cmd_serve(
     broadcast_groups: &[String],
     health_addr: Option<&str>,
     config_warnings: &[String],
+    cluster: Option<&ClusterConfig>,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -4458,6 +4699,11 @@ fn cmd_serve(
         reload.reload_pins.max_messages,
         reload.reload_pins.disk_full_policy,
         health_addr,
+        // The metadata-cluster config (#684) is STARTED only on the Unix serve path (the
+        // `ClusterRuntime`), so the non-Unix stub must consume the param too or the Windows
+        // `-D warnings` build trips unused-variable, invisible to a macOS reviewer (the recurring
+        // #288/#99 footgun). Reach an inner field so the `ClusterConfig` type is exercised here too.
+        cluster.map(|c| c.node_id),
         out,
     );
     Err(CliError::Internal(
@@ -9737,6 +9983,7 @@ mod tests {
             &parsed.broadcast_groups,
             parsed.health_addr.as_deref(),
             &parsed.config_warnings,
+            parsed.cluster.as_ref(),
             ReloadSource {
                 config_path: parsed.config_path.as_deref(),
                 allow_unknown_config: parsed.allow_unknown_config,
@@ -11507,5 +11754,353 @@ mod tests {
                 String::from_utf8_lossy(&out)
             );
         }
+    }
+
+    // ---- The metadata-cluster CLI surface (#684, V2-C1) ----------------------------------------
+    //
+    // These prove the `--cluster-id` / `--cluster-peer` -> `ClusterConfig` wiring and, crucially,
+    // the non-negotiable SINGLE-NODE DEFAULT: with NO cluster flags, `parsed.cluster` is `None`, so
+    // `cmd_serve` never starts a `ClusterRuntime` (no metaraft/, no peer listener, no driver thread)
+    // and the broker is byte-for-byte today's. The DATA-plane produce/consume replication wiring
+    // (#686/#691) is the FLAGGED follow-up and is NOT exercised here.
+
+    /// THE GUARANTEE: with no cluster flags, no `ClusterConfig` is built. `cmd_serve` keys the whole
+    /// metadata plane off this `Option` being `Some`, so `None` means nothing cluster ever starts —
+    /// the single-node default stays byte-identical to today's broker.
+    #[test]
+    fn no_cluster_flags_yields_no_cluster_config() {
+        let parsed = parse_serve_flags(&serve_args(&["--data-dir", "/tmp/x"])).unwrap();
+        assert!(
+            parsed.cluster.is_none(),
+            "no --cluster-id/--cluster-peer must produce NO ClusterConfig (the byte-identical default)"
+        );
+    }
+
+    /// A 1-member cluster (the degenerate case): one `--cluster-id` + one `--cluster-peer` for its
+    /// own id builds a valid `ClusterConfig` whose peer map is exactly that member.
+    #[test]
+    fn a_single_member_cluster_config_is_built() {
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--cluster-id",
+            "1",
+            "--cluster-peer",
+            "1=127.0.0.1:7400",
+        ]))
+        .unwrap();
+        let cfg = parsed.cluster.expect("a cluster config is built");
+        assert_eq!(cfg.node_id, 1);
+        assert_eq!(cfg.peers.len(), 1);
+        assert_eq!(
+            cfg.peers.get(&1).map(std::string::ToString::to_string),
+            Some("127.0.0.1:7400".to_string())
+        );
+    }
+
+    /// A 3-member cluster: repeated `--cluster-peer` flags build the full id->addr peer map, and the
+    /// local `--cluster-id` is one of them.
+    #[test]
+    fn a_three_member_cluster_config_is_built() {
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--cluster-id",
+            "2",
+            "--cluster-peer",
+            "1=127.0.0.1:7401",
+            "--cluster-peer",
+            "2=127.0.0.1:7402",
+            "--cluster-peer",
+            "3=127.0.0.1:7403",
+        ]))
+        .unwrap();
+        let cfg = parsed.cluster.expect("a cluster config is built");
+        assert_eq!(cfg.node_id, 2);
+        assert_eq!(cfg.peers.len(), 3);
+        assert!(
+            cfg.peers.contains_key(&1) && cfg.peers.contains_key(&2) && cfg.peers.contains_key(&3)
+        );
+    }
+
+    /// FAIL-CLOSED: `--cluster-peer` without `--cluster-id` is a typed usage error (the broker can't
+    /// know which member it is), never a silently half-started cluster.
+    #[test]
+    fn cluster_peer_without_cluster_id_is_a_usage_error() {
+        let e = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--cluster-peer",
+            "1=127.0.0.1:7400",
+        ]))
+        .unwrap_err();
+        match e {
+            CliError::Usage(m) => assert!(
+                m.contains("--cluster-id") && m.contains("--cluster-peer"),
+                "the error must name both flags: {m}"
+            ),
+            other => panic!("expected a Usage error, got {other:?}"),
+        }
+    }
+
+    /// FAIL-CLOSED: `--cluster-id` without any `--cluster-peer` is a typed usage error (no cluster to
+    /// join).
+    #[test]
+    fn cluster_id_without_any_peer_is_a_usage_error() {
+        let e = parse_serve_flags(&serve_args(&["--data-dir", "/tmp/x", "--cluster-id", "1"]))
+            .unwrap_err();
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--cluster-peer"), "{m}"),
+            other => panic!("expected a Usage error, got {other:?}"),
+        }
+    }
+
+    /// FAIL-CLOSED: a `--cluster-id` that is not one of the peer ids is a typed usage error (the
+    /// local node must be a member of its own peer set).
+    #[test]
+    fn cluster_id_not_in_the_peer_set_is_a_usage_error() {
+        let e = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--cluster-id",
+            "9",
+            "--cluster-peer",
+            "1=127.0.0.1:7401",
+            "--cluster-peer",
+            "2=127.0.0.1:7402",
+            "--cluster-peer",
+            "3=127.0.0.1:7403",
+        ]))
+        .unwrap_err();
+        match e {
+            CliError::Usage(m) => assert!(
+                m.contains("--cluster-id 9") && m.contains("member"),
+                "the error must name the absent id: {m}"
+            ),
+            other => panic!("expected a Usage error, got {other:?}"),
+        }
+    }
+
+    /// FAIL-CLOSED: a malformed `--cluster-peer` (no `=`, a non-numeric id, the reserved id `0`, or a
+    /// bad socket address) is a typed usage error naming the offending spec.
+    #[test]
+    fn a_malformed_cluster_peer_is_a_usage_error() {
+        // no `=` separator
+        for bad in ["noeq", "1@127.0.0.1:7400"] {
+            let e = parse_serve_flags(&serve_args(&[
+                "--data-dir",
+                "/tmp/x",
+                "--cluster-id",
+                "1",
+                "--cluster-peer",
+                bad,
+            ]))
+            .unwrap_err();
+            assert!(
+                matches!(&e, CliError::Usage(m) if m.contains("<id>=<addr>")),
+                "no-`=` spec `{bad}` must be a usage error naming the grammar, got {e:?}"
+            );
+        }
+        // a non-numeric id
+        let e = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--cluster-id",
+            "1",
+            "--cluster-peer",
+            "x=127.0.0.1:7400",
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(&e, CliError::Usage(m) if m.contains("id must be")),
+            "a non-numeric id must be a usage error, got {e:?}"
+        );
+        // the reserved id 0 (raft INVALID_ID)
+        let e = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--cluster-id",
+            "0",
+            "--cluster-peer",
+            "0=127.0.0.1:7400",
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(&e, CliError::Usage(m) if m.contains("reserved")),
+            "the reserved id 0 must be a usage error, got {e:?}"
+        );
+        // a bad socket address
+        let e = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--cluster-id",
+            "1",
+            "--cluster-peer",
+            "1=not-an-addr",
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(&e, CliError::Usage(m) if m.contains("socket address")),
+            "a bad address must be a usage error, got {e:?}"
+        );
+    }
+
+    /// FAIL-CLOSED: a duplicate peer id is a typed usage error.
+    #[test]
+    fn a_duplicate_cluster_peer_id_is_a_usage_error() {
+        let e = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--cluster-id",
+            "1",
+            "--cluster-peer",
+            "1=127.0.0.1:7401",
+            "--cluster-peer",
+            "1=127.0.0.1:7402",
+        ]))
+        .unwrap_err();
+        match e {
+            CliError::Usage(m) => assert!(m.contains("more than once"), "{m}"),
+            other => panic!("expected a Usage error, got {other:?}"),
+        }
+    }
+
+    /// A non-numeric `--cluster-id` value is rejected at flag parse (the `take_number` discipline),
+    /// naming the flag.
+    #[test]
+    fn a_non_numeric_cluster_id_is_a_usage_error() {
+        let e = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--cluster-id",
+            "abc",
+            "--cluster-peer",
+            "1=127.0.0.1:7400",
+        ]))
+        .unwrap_err();
+        match e {
+            CliError::Usage(m) => assert!(m.contains("--cluster-id"), "{m}"),
+            other => panic!("expected a Usage error, got {other:?}"),
+        }
+    }
+
+    /// The cluster is a DURABLE on-disk plane, so `--storage memory` + cluster flags is a typed usage
+    /// error from `finish_serve` (no broker side effect), never a meaningless RAM-only quorum.
+    #[test]
+    fn cluster_flags_under_storage_memory_are_rejected() {
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--storage",
+            "memory",
+            "--ephemeral-loss-ack",
+            "--max-total-bytes",
+            "1048576",
+            "--cluster-id",
+            "1",
+            "--cluster-peer",
+            "1=127.0.0.1:7400",
+        ]))
+        .unwrap();
+        assert!(parsed.cluster.is_some(), "the flags parse into a config");
+        let mut buf = Vec::new();
+        let e = finish_serve(
+            &parsed.addr,
+            parsed.data_dir.as_deref(),
+            &parsed.config,
+            &parsed.key_shared_groups,
+            &parsed.broadcast_groups,
+            parsed.health_addr.as_deref(),
+            &parsed.config_warnings,
+            parsed.cluster.as_ref(),
+            ReloadSource {
+                config_path: parsed.config_path.as_deref(),
+                allow_unknown_config: parsed.allow_unknown_config,
+                reload_pins: parsed.reload_pins,
+            },
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(
+                m.contains("--storage disk") && m.contains("durable"),
+                "the rejection must explain the durable-disk requirement: {m}"
+            ),
+            other => panic!("expected a Usage error, got {other:?}"),
+        }
+    }
+
+    /// THE START HOOK, end-to-end at the CLI layer (Unix only — `start_cluster_runtime` opens the
+    /// real on-disk metadata log via `StdFs`). A 1-member cluster config STARTS the runtime: it
+    /// creates the `metaraft/` log under the data dir, the lone voter self-elects, and the runtime
+    /// tears down cleanly on `stop`. The contrast — `start_cluster_runtime(None, ..)` — starts
+    /// NOTHING and creates NO `metaraft/`, the byte-identical single-node default proven at this
+    /// exact call site.
+    #[cfg(unix)]
+    #[test]
+    fn start_cluster_runtime_starts_a_member_and_none_starts_nothing() {
+        use ironbus_server::cluster::METADATA_SUBDIR;
+        use std::net::{Ipv4Addr, TcpListener};
+        use std::time::{Duration, Instant};
+
+        // A per-test data dir under the temp dir, removed on drop (no tempfile dev-dep in this crate).
+        struct RemoveDirOnDrop(std::path::PathBuf);
+        impl Drop for RemoveDirOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let base = std::env::temp_dir().join(format!(
+            "ironbus-cli-684-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+
+        // (a) THE DEFAULT: no cluster config -> start nothing, create no metaraft/.
+        let plain_dir = base.join("plain");
+        std::fs::create_dir_all(&plain_dir).unwrap();
+        let _plain_guard = RemoveDirOnDrop(plain_dir.clone());
+        let config = ServeConfig::bench_default();
+        let none = start_cluster_runtime(None, &plain_dir, &config).unwrap();
+        assert!(none.is_none(), "no config -> no runtime");
+        assert!(
+            !plain_dir.join(METADATA_SUBDIR).exists(),
+            "the single-node default must create NO metaraft/ (byte-identical today's broker)"
+        );
+
+        // (b) THE OPT-IN: a 1-member cluster config -> the runtime starts, self-elects, and creates
+        // metaraft/. Grab a free loopback port the same way the runtime's own tests do.
+        let cluster_dir = base.join("cluster");
+        std::fs::create_dir_all(&cluster_dir).unwrap();
+        let _cluster_guard = RemoveDirOnDrop(cluster_dir.clone());
+        let port = {
+            let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            l.local_addr().unwrap().port()
+            // the listener drops here, freeing the port for the runtime to rebind
+        };
+        let mut peers = std::collections::BTreeMap::new();
+        peers.insert(1u64, SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+        let cfg = ClusterConfig { node_id: 1, peers };
+        let mut runtime = start_cluster_runtime(Some(&cfg), &cluster_dir, &config)
+            .unwrap()
+            .expect("a configured 1-member cluster starts a runtime");
+
+        // The lone voter self-elects within a few seconds; poll so the test is not a fixed sleep.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut elected = false;
+        while Instant::now() < deadline {
+            if runtime.status().is_leader {
+                elected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(elected, "the lone voter self-elects");
+        assert!(
+            cluster_dir.join(METADATA_SUBDIR).exists(),
+            "a configured cluster runtime DOES create metaraft/ (the additive opt-in plane)"
+        );
+
+        // Tears down cleanly (joins the driver / listener / dialer threads).
+        runtime.stop();
     }
 }
