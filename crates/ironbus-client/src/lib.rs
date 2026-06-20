@@ -2931,6 +2931,11 @@ mod tests {
                 // The write-path codec under test (#430): `None` for every historical test
                 // (byte-identical broker), `Lz4` for the transparency end-to-end test.
                 compression,
+                // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
+                // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
+                default_message_ttl_ms: 0,
+                dead_letter_exchange: None,
+                dead_letter_expired: false,
             },
         )
         .unwrap();

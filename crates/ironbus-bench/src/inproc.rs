@@ -78,6 +78,11 @@ fn engine_config_with_credit(consumer_credit: u32, max_in_flight: u32) -> Engine
         max_retained_bytes: 0,
         max_age_ms: 0,
         max_messages: 0,
+        // V2-M4 routing richness defaults to inert in the bench: no message TTL, no dead-letter
+        // exchange (the existing fixed-DLQ behavior), so the harness measures the unchanged path.
+        default_message_ttl_ms: 0,
+        dead_letter_exchange: None,
+        dead_letter_expired: false,
         max_groups: DEFAULT_MAX_GROUPS,
         group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
         disk_full_policy: DiskFullPolicy::DropNew,

@@ -629,9 +629,12 @@ fn broker_core_lines(
          # HELP ironbus_redelivered_total Deliveries that were a redelivery.\n\
          # TYPE ironbus_redelivered_total counter\n\
          ironbus_redelivered_total {redelivered}\n\
-         # HELP ironbus_dead_lettered_total Messages dead-lettered past MaxDeliver.\n\
+         # HELP ironbus_dead_lettered_total Messages dead-lettered (past MaxDeliver, or routed to a dead-letter exchange after a TTL expiry or reject).\n\
          # TYPE ironbus_dead_lettered_total counter\n\
          ironbus_dead_lettered_total {dead_lettered}\n\
+         # HELP ironbus_expired_total Messages expired by a per-message/per-stream TTL and reclaimed by retention (skipped on read, not delivered, not dead-lettered).\n\
+         # TYPE ironbus_expired_total counter\n\
+         ironbus_expired_total {expired}\n\
          # HELP ironbus_dlq_records_total Records durably written to the dead-letter sink (the DLQ depth, survives restart).\n\
          # TYPE ironbus_dlq_records_total counter\n\
          ironbus_dlq_records_total {dlq_records}\n\
@@ -663,6 +666,7 @@ fn broker_core_lines(
         delivered = counters.delivered,
         redelivered = counters.redelivered,
         dead_lettered = counters.dead_lettered,
+        expired = counters.expired,
         acks = counters.acks,
         segments_reaped = counters.segments_reaped,
         segments_force_reaped = counters.segments_force_reaped,
@@ -1692,6 +1696,11 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
+                // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
+                default_message_ttl_ms: 0,
+                dead_letter_exchange: None,
+                dead_letter_expired: false,
             },
         )
         .unwrap();
@@ -1801,6 +1810,11 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
+                // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
+                default_message_ttl_ms: 0,
+                dead_letter_exchange: None,
+                dead_letter_expired: false,
             },
         )
         .unwrap();
@@ -2319,6 +2333,11 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
+                // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
+                default_message_ttl_ms: 0,
+                dead_letter_exchange: None,
+                dead_letter_expired: false,
             },
         )
         .unwrap();
@@ -2458,6 +2477,11 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
+                // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
+                default_message_ttl_ms: 0,
+                dead_letter_exchange: None,
+                dead_letter_expired: false,
             },
         )
         .unwrap();
@@ -2529,6 +2553,11 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
+                // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
+                default_message_ttl_ms: 0,
+                dead_letter_exchange: None,
+                dead_letter_expired: false,
             },
         )
         .unwrap();
@@ -2799,6 +2828,11 @@ mod tests {
                     fire_and_forget_refill_ms: 0,
                     egress_limit: 0,
                     wal_fsync_headroom_bytes: 0,
+                    // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
+                    // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
+                    default_message_ttl_ms: 0,
+                    dead_letter_exchange: None,
+                    dead_letter_expired: false,
                 },
             )
             .unwrap();
@@ -2849,6 +2883,11 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
+                // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
+                default_message_ttl_ms: 0,
+                dead_letter_exchange: None,
+                dead_letter_expired: false,
             },
         )
         .unwrap();
@@ -3002,6 +3041,11 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
+                // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
+                default_message_ttl_ms: 0,
+                dead_letter_exchange: None,
+                dead_letter_expired: false,
             },
         )
         .unwrap();
@@ -3135,6 +3179,11 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
+                // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
+                default_message_ttl_ms: 0,
+                dead_letter_exchange: None,
+                dead_letter_expired: false,
             },
         )
         .unwrap();
@@ -3345,6 +3394,11 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
+                // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
+                default_message_ttl_ms: 0,
+                dead_letter_exchange: None,
+                dead_letter_expired: false,
             },
         )
         .unwrap();
@@ -3599,6 +3653,9 @@ mod tests {
         "ironbus_delivered_total",
         "ironbus_redelivered_total",
         "ironbus_dead_lettered_total",
+        // The TTL expiry-and-reclaim counter (V2-M4, #549): a resilience drop signal alongside
+        // dead_lettered (an expired-and-reclaimed message is accounted here, not silently dropped).
+        "ironbus_expired_total",
         "ironbus_dlq_records_total",
         "ironbus_acks_total",
         "ironbus_segments_reaped_total",
@@ -3752,6 +3809,7 @@ mod tests {
         ("ironbus_delivered_total", "counter"),
         ("ironbus_redelivered_total", "counter"),
         ("ironbus_dead_lettered_total", "counter"),
+        ("ironbus_expired_total", "counter"),
         ("ironbus_dlq_records_total", "counter"),
         ("ironbus_acks_total", "counter"),
         ("ironbus_segments_reaped_total", "counter"),
@@ -4061,6 +4119,11 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
+                // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
+                default_message_ttl_ms: 0,
+                dead_letter_exchange: None,
+                dead_letter_expired: false,
             },
         )
         .unwrap();
@@ -4261,6 +4324,11 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
+                // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
+                default_message_ttl_ms: 0,
+                dead_letter_exchange: None,
+                dead_letter_expired: false,
             },
         )
         .unwrap();
@@ -4472,6 +4540,11 @@ mod tests {
                 fire_and_forget_refill_ms: 0,
                 egress_limit: 0,
                 wal_fsync_headroom_bytes: 0,
+                // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
+                // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
+                default_message_ttl_ms: 0,
+                dead_letter_exchange: None,
+                dead_letter_expired: false,
             },
         )
         .unwrap();

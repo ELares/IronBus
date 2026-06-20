@@ -40,17 +40,77 @@ use ironbus_core::clock::Clock;
 use ironbus_core::types::{Offset, RecordFlags};
 use std::collections::BTreeMap;
 
-/// The subdirectory of the data directory that holds the dead-letter sink's segments.
+/// The subdirectory of the data directory that holds the DEFAULT dead-letter sink's segments. A
+/// dead-letter EXCHANGE (V2-M4, #551) routes to a CONFIGURABLE subdir instead (the target name), so
+/// this is only the default sink when no DLX is configured — kept byte-identical to today.
 pub const DLQ_SUBDIR: &str = "dlq";
 
-/// The 4-byte magic that opens a DLQ record's metadata header, also pinning the v1 metadata
-/// layout. A header that does not begin with this is not a DLQ record this build understands.
+/// The 4-byte magic that opens a v1 DLQ record's metadata header, also pinning the v1 metadata
+/// layout. A header that does not begin with a recognized DLQ magic is not a DLQ record this build
+/// understands. v1 carries no reason byte; it decodes as [`DeadLetterReason::MaxDeliverExceeded`]
+/// (the only dead-letter trigger before #551), so every existing v1 record reads back identically.
 pub const DLQ_HEADER_MAGIC: [u8; 4] = *b"DLQ1";
+
+/// The 4-byte magic that opens a v2 DLQ record's metadata header (V2-M4, #551). v2 is v1 plus a
+/// leading reason byte, written ONLY by the reason-carrying [`DlqSink::append_dead_letter`]. The
+/// reason-less [`DlqSink::append_poison`] still writes v1, so the existing max-deliver-to-`dlq/`
+/// path is byte-identical and a reader handles both.
+pub const DLQ_HEADER_MAGIC_V2: [u8; 4] = *b"DLQ2";
+
+/// Why a message was dead-lettered (V2-M4, #551 — `RabbitMQ` DLX-parity: a dead-letter records its
+/// trigger). A v1 record (no reason byte) decodes as [`DeadLetterReason::MaxDeliverExceeded`], the
+/// only trigger before #551, so existing records read back unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum DeadLetterReason {
+    /// The message was delivered more than `max_deliver` times (the original, default trigger).
+    #[default]
+    MaxDeliverExceeded = 0,
+    /// The message's per-message or per-stream TTL expired before it was consumed (#549).
+    TtlExpired = 1,
+    /// A consumer explicitly REJECTED the message (`RabbitMQ` `basic.reject`/`nack` to the DLX).
+    Rejected = 2,
+}
+
+impl DeadLetterReason {
+    /// The on-disk reason byte.
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        self as u8
+    }
+
+    /// Decodes a reason byte, or `None` for an unknown (future) reason (decoded fail-closed so a
+    /// newer record's reason is never silently misreported as `MaxDeliverExceeded`).
+    #[must_use]
+    pub const fn from_byte(b: u8) -> Option<DeadLetterReason> {
+        match b {
+            0 => Some(DeadLetterReason::MaxDeliverExceeded),
+            1 => Some(DeadLetterReason::TtlExpired),
+            2 => Some(DeadLetterReason::Rejected),
+            _ => None,
+        }
+    }
+
+    /// A short, stable label for the operator-facing DLQ view and metrics.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            DeadLetterReason::MaxDeliverExceeded => "max-deliver-exceeded",
+            DeadLetterReason::TtlExpired => "ttl-expired",
+            DeadLetterReason::Rejected => "rejected",
+        }
+    }
+}
 
 /// The fixed size of the dead-letter metadata header that prefixes a DLQ record's `headers` blob,
 /// ahead of the original record's headers: `magic`(4) + `source_offset`(8) + `attempt`(4) +
 /// `group_len`(2) + `orig_headers_len`(2).
 pub const DLQ_META_LEN: usize = 4 + 8 + 4 + 2 + 2;
+
+/// The fixed size of a v2 (#551) dead-letter metadata header: [`DLQ_META_LEN`] plus a 1-byte reason
+/// inserted after the magic. `magic`(4) + `reason`(1) + `source_offset`(8) + `attempt`(4) +
+/// `group_len`(2) + `orig_headers_len`(2).
+pub const DLQ_META_V2_LEN: usize = DLQ_META_LEN + 1;
 
 /// The fully decoded contents of one DLQ record: the original record (rebuilt verbatim) plus the
 /// dead-letter metadata it was poisoned with.
@@ -65,6 +125,9 @@ pub struct DlqEntry {
     pub source_offset: u64,
     /// The attempt (delivery) count at which the message was dead-lettered.
     pub attempt: u32,
+    /// WHY the message was dead-lettered (#551). A v1 record (written before #551, or by the
+    /// reason-less `append_poison` path) decodes as [`DeadLetterReason::MaxDeliverExceeded`].
+    pub reason: DeadLetterReason,
     /// The original record's producer timestamp, milliseconds since the Unix epoch (preserved).
     pub timestamp_ms: u64,
     /// The original record's routing/ordering key (preserved verbatim).
@@ -117,11 +180,40 @@ pub fn encode_dlq_headers(
     Some(out)
 }
 
+/// Encodes a v2 (#551) DLQ metadata header that ADDS a reason byte after the magic, otherwise the
+/// same layout as [`encode_dlq_headers`]: `magic`(4) + `reason`(1) + `source_offset`(8) +
+/// `attempt`(4) + `group_len`(2) + `orig_headers_len`(2) + group + original headers. Written only by
+/// the reason-carrying [`DlqSink::append_dead_letter`]; the reason-less [`DlqSink::append_poison`]
+/// keeps emitting v1 so the existing path is byte-identical. Returns `None` on the same length
+/// overflow as the v1 encoder.
+#[must_use]
+pub fn encode_dlq_headers_v2(
+    group: &str,
+    source_offset: u64,
+    attempt: u32,
+    reason: DeadLetterReason,
+    original_headers: &[u8],
+) -> Option<Vec<u8>> {
+    let group_len = u16::try_from(group.len()).ok()?;
+    let headers_len = u16::try_from(original_headers.len()).ok()?;
+    let mut out = Vec::with_capacity(DLQ_META_V2_LEN + group.len() + original_headers.len());
+    out.extend_from_slice(&DLQ_HEADER_MAGIC_V2);
+    out.push(reason.as_byte());
+    out.extend_from_slice(&source_offset.to_le_bytes());
+    out.extend_from_slice(&attempt.to_le_bytes());
+    out.extend_from_slice(&group_len.to_le_bytes());
+    out.extend_from_slice(&headers_len.to_le_bytes());
+    out.extend_from_slice(group.as_bytes());
+    out.extend_from_slice(original_headers);
+    Some(out)
+}
+
 /// The dead-letter metadata parsed out of a DLQ record's `headers` blob: the source offset, the
 /// attempt, the group, and the byte range of the original headers within the blob.
 struct DlqMeta {
     source_offset: u64,
     attempt: u32,
+    reason: DeadLetterReason,
     group: String,
     original_headers: Vec<u8>,
 }
@@ -148,14 +240,24 @@ fn read_u16(blob: &[u8], at: usize) -> Option<usize> {
 /// (a foreign or corrupt record). The metadata block and the trailing original headers must fit
 /// exactly, so a malformed record is rejected rather than misread.
 fn decode_dlq_headers(blob: &[u8]) -> Option<DlqMeta> {
-    if blob.get(0..4)? != DLQ_HEADER_MAGIC {
+    let magic = blob.get(0..4)?;
+    // v2 (#551) inserts a reason byte after the magic, shifting every field by one; v1 has none and
+    // decodes as MaxDeliverExceeded (the only pre-#551 trigger), so a v1 record reads back unchanged.
+    let (reason, fixed_len) = if magic == DLQ_HEADER_MAGIC {
+        (DeadLetterReason::MaxDeliverExceeded, DLQ_META_LEN)
+    } else if magic == DLQ_HEADER_MAGIC_V2 {
+        // A v2 record with an unknown (future) reason byte fails closed rather than being misread.
+        (DeadLetterReason::from_byte(*blob.get(4)?)?, DLQ_META_V2_LEN)
+    } else {
         return None;
-    }
-    let source_offset = read_u64(blob, 4)?;
-    let attempt = read_u32(blob, 12)?;
-    let group_len = read_u16(blob, 16)?;
-    let headers_len = read_u16(blob, 18)?;
-    let group_start = DLQ_META_LEN;
+    };
+    // The numeric fields start right after the magic for v1, and after magic+reason for v2.
+    let off = fixed_len - DLQ_META_LEN; // 0 for v1, 1 for v2
+    let source_offset = read_u64(blob, 4 + off)?;
+    let attempt = read_u32(blob, 12 + off)?;
+    let group_len = read_u16(blob, 16 + off)?;
+    let headers_len = read_u16(blob, 18 + off)?;
+    let group_start = fixed_len;
     let headers_start = group_start.checked_add(group_len)?;
     let headers_end = headers_start.checked_add(headers_len)?;
     // The blob must be EXACTLY the metadata plus the two declared spans: a longer or shorter blob
@@ -168,6 +270,7 @@ fn decode_dlq_headers(blob: &[u8]) -> Option<DlqMeta> {
     Some(DlqMeta {
         source_offset,
         attempt,
+        reason,
         group,
         original_headers,
     })
@@ -183,6 +286,7 @@ pub fn decode_entry(record: &OwnedRecord) -> Option<DlqEntry> {
         group: meta.group,
         source_offset: meta.source_offset,
         attempt: meta.attempt,
+        reason: meta.reason,
         timestamp_ms: record.timestamp_ms,
         // `DlqEntry` is the cold operator-facing dead-letter view (not the consume hot read path), so
         // its key/payload stay owned `Vec`s: the `record` blobs are now `Bytes` (#480), so make the
@@ -206,6 +310,10 @@ pub struct DlqSink<F: Filesystem, C: Clock> {
     /// The number of records durably appended to the sink across its lifetime (the DLQ depth at
     /// open plus every append since), for the operator's `ironbus_dlq_records_total` metric.
     records: u64,
+    /// The subdirectory this sink is rooted at (the dead-letter EXCHANGE target, #551). The DEFAULT
+    /// sink uses [`DLQ_SUBDIR`] (`dlq/`, byte-identical to today); a configured DLX uses its own
+    /// target subdir, so a stream/group can route dead letters somewhere other than the fixed sink.
+    subdir: String,
 }
 
 impl<F: Filesystem, C: Clock> std::fmt::Debug for DlqSink<F, C> {
@@ -227,15 +335,40 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
     /// Propagates a storage error from creating the subdirectory, opening the DLQ log, or scanning
     /// its records.
     pub fn open(parent_fs: &F, clock: C, config: LogConfig) -> Result<DlqSink<F, C>, StorageError> {
-        let dlq_fs = parent_fs.subdir(DLQ_SUBDIR).map_err(StorageError::Io)?;
+        DlqSink::open_at(parent_fs, DLQ_SUBDIR, clock, config)
+    }
+
+    /// Opens (recovering, or creating fresh) a dead-letter sink rooted at the `subdir` subdirectory
+    /// of `parent_fs` — the dead-letter EXCHANGE target (#551). [`DlqSink::open`] is this with the
+    /// default [`DLQ_SUBDIR`], so the existing fixed-DLQ behavior is byte-identical; a configured DLX
+    /// names a different `subdir` to route dead letters to a separate sink. The on-disk format and
+    /// the idempotent high-water-mark rebuild are identical for every target.
+    ///
+    /// # Errors
+    /// Propagates a storage error from creating the subdirectory, opening the DLQ log, or scanning
+    /// its records.
+    pub fn open_at(
+        parent_fs: &F,
+        subdir: &str,
+        clock: C,
+        config: LogConfig,
+    ) -> Result<DlqSink<F, C>, StorageError> {
+        let dlq_fs = parent_fs.subdir(subdir).map_err(StorageError::Io)?;
         let log = Log::open(dlq_fs, clock, config)?;
         let mut sink = DlqSink {
             log,
             highest_source_offset: BTreeMap::new(),
             records: 0,
+            subdir: subdir.to_string(),
         };
         sink.rebuild_high_water_mark()?;
         Ok(sink)
+    }
+
+    /// The subdirectory this sink (dead-letter exchange target) is rooted at (#551).
+    #[must_use]
+    pub fn subdir(&self) -> &str {
+        &self.subdir
     }
 
     /// Scans every durable DLQ record (reusing the recovery decode path) and rebuilds the per-group
@@ -307,12 +440,53 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
         source: &OwnedRecord,
         attempt: u32,
     ) -> Result<Offset, StorageError> {
-        let source_offset = source.offset.get();
-        let headers = encode_dlq_headers(group, source_offset, attempt, &source.headers)
+        // The reason-LESS path writes a v1 header (no reason byte), so an existing max-deliver
+        // dead-letter to the default `dlq/` sink is byte-identical to before #551.
+        let headers = encode_dlq_headers(group, source.offset.get(), attempt, &source.headers)
             // A group name or header blob over u16::MAX cannot be framed; the wire bounds both, so
             // this is unreachable in practice, surfaced as the structural SegmentFull rather than a
             // panic so the move simply does not happen and the source is not committed.
             .ok_or(StorageError::SegmentFull)?;
+        self.append_encoded(group, source, &headers)
+    }
+
+    /// The reason-carrying dead-letter append (V2-M4, #551): like [`append_poison`](Self::append_poison)
+    /// but records the [`DeadLetterReason`] (max-deliver / TTL-expired / rejected) in a v2 metadata
+    /// header, so a dead-letter is a fully reported event regardless of WHY it died. Used by a
+    /// configured dead-letter EXCHANGE; the reason-less `append_poison` keeps writing v1 for the
+    /// default fixed-DLQ max-deliver path, so that path stays byte-identical.
+    ///
+    /// The crash-safety contract (append-and-fsync the dead-letter record HERE before the caller
+    /// commits the source cursor) and the idempotent per-group high-water mark are identical to
+    /// `append_poison`.
+    ///
+    /// # Errors
+    /// Same as [`append_poison`](Self::append_poison).
+    pub fn append_dead_letter(
+        &mut self,
+        group: &str,
+        source: &OwnedRecord,
+        attempt: u32,
+        reason: DeadLetterReason,
+    ) -> Result<Offset, StorageError> {
+        let headers =
+            encode_dlq_headers_v2(group, source.offset.get(), attempt, reason, &source.headers)
+                .ok_or(StorageError::SegmentFull)?;
+        self.append_encoded(group, source, &headers)
+    }
+
+    /// Appends one dead-letter record (with its already-encoded metadata `headers` blob) to the sink,
+    /// fsyncs it BEFORE returning, and advances the per-group high-water mark + record count. This is
+    /// the shared durable core of [`append_poison`](Self::append_poison) and
+    /// [`append_dead_letter`](Self::append_dead_letter); the only difference between them is the v1 vs
+    /// v2 metadata encoding, computed by the caller.
+    fn append_encoded(
+        &mut self,
+        group: &str,
+        source: &OwnedRecord,
+        headers: &[u8],
+    ) -> Result<Offset, StorageError> {
+        let source_offset = source.offset.get();
         // Preserve HAS_KEY consistency: the codec derives the key flag from the key length and
         // overwrites it, so clear the original HAS_KEY bit and let the log re-derive it from the
         // (preserved) key. The other flags (e.g. COMPRESSED) are carried through unchanged.
@@ -321,12 +495,12 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
             timestamp_ms: source.timestamp_ms,
             flags,
             key: &source.key,
-            headers: &headers,
+            headers,
             payload: &source.payload,
         })?;
-        // Make the poison record durable BEFORE the caller commits the source cursor: this ordering
-        // is the crash-safety contract. A failed durability barrier freezes the DLQ writer and is
-        // surfaced, so the caller does not commit the source past an un-fsynced DLQ record.
+        // Make the dead-letter record durable BEFORE the caller commits the source cursor: this
+        // ordering is the crash-safety contract. A failed durability barrier freezes the DLQ writer
+        // and is surfaced, so the caller does not commit the source past an un-fsynced record.
         self.log.sync()?;
         let entry = self
             .highest_source_offset
@@ -370,17 +544,29 @@ impl<F: Filesystem, C: Clock> DlqSink<F, C> {
 /// Propagates an IO error or a chain error from the offline reader. A missing `dlq/` subdirectory
 /// is NOT an error (it yields an empty list).
 pub fn read_dlq_entries<F: Filesystem>(parent_fs: &F) -> Result<Vec<DlqEntry>, StorageError> {
-    // The DLQ subdir may not exist yet (nothing was ever dead-lettered): treat that as empty,
+    read_dead_letter_entries(parent_fs, DLQ_SUBDIR)
+}
+
+/// Reads back every durable record in a dead-letter sink rooted at `subdir` (the configurable
+/// dead-letter EXCHANGE target, #551), decoded into [`DlqEntry`]s, read-only and WITHOUT mutating
+/// the directory. [`read_dlq_entries`] is this with the default [`DLQ_SUBDIR`]. An ABSENT `subdir`
+/// reads as an empty list, not an error.
+///
+/// # Errors
+/// Propagates an IO error or a chain error from the offline reader. A missing `subdir` is NOT an
+/// error (it yields an empty list).
+pub fn read_dead_letter_entries<F: Filesystem>(
+    parent_fs: &F,
+    subdir: &str,
+) -> Result<Vec<DlqEntry>, StorageError> {
+    // The subdir may not exist yet (nothing was ever dead-lettered there): treat that as empty,
     // never an error, so `dump --dlq` on a clean directory shows nothing. Probe WITHOUT creating
     // it (the inspector must never mutate the directory), so a read of a poison-free data dir does
-    // not materialize a `dlq/` subdirectory.
-    if !parent_fs
-        .subdir_exists(DLQ_SUBDIR)
-        .map_err(StorageError::Io)?
-    {
+    // not materialize the subdirectory.
+    if !parent_fs.subdir_exists(subdir).map_err(StorageError::Io)? {
         return Ok(Vec::new());
     }
-    let dlq_fs = parent_fs.subdir(DLQ_SUBDIR).map_err(StorageError::Io)?;
+    let dlq_fs = parent_fs.subdir(subdir).map_err(StorageError::Io)?;
     let reader = OfflineReader::open(dlq_fs)?;
     let mut entries = Vec::new();
     for &id in reader.segment_ids() {
@@ -424,8 +610,55 @@ mod tests {
         let meta = decode_dlq_headers(&blob).unwrap();
         assert_eq!(meta.source_offset, 42);
         assert_eq!(meta.attempt, 6);
+        // A v1 (reason-less) record decodes as the original max-deliver trigger.
+        assert_eq!(meta.reason, DeadLetterReason::MaxDeliverExceeded);
         assert_eq!(meta.group, "orders");
         assert_eq!(meta.original_headers, b"orig-headers");
+    }
+
+    #[test]
+    fn v2_headers_round_trip_with_each_reason() {
+        for reason in [
+            DeadLetterReason::MaxDeliverExceeded,
+            DeadLetterReason::TtlExpired,
+            DeadLetterReason::Rejected,
+        ] {
+            let blob = encode_dlq_headers_v2("orders", 42, 6, reason, b"orig-headers").unwrap();
+            assert_eq!(&blob[0..4], &DLQ_HEADER_MAGIC_V2);
+            let meta = decode_dlq_headers(&blob).unwrap();
+            assert_eq!(meta.source_offset, 42);
+            assert_eq!(meta.attempt, 6);
+            assert_eq!(meta.reason, reason);
+            assert_eq!(meta.group, "orders");
+            assert_eq!(meta.original_headers, b"orig-headers");
+        }
+    }
+
+    #[test]
+    fn v2_decode_fails_closed_on_an_unknown_reason() {
+        let mut blob =
+            encode_dlq_headers_v2("g", 1, 1, DeadLetterReason::TtlExpired, b"h").unwrap();
+        blob[4] = 0xFF; // an unknown future reason byte
+        assert!(
+            decode_dlq_headers(&blob).is_none(),
+            "an unknown reason is not silently misreported as max-deliver"
+        );
+    }
+
+    #[test]
+    fn v1_records_remain_byte_identical() {
+        // The exact bytes a v1 record produces must not change: assert the full layout explicitly so
+        // any accidental drift to the default fixed-DLQ format is caught.
+        let blob = encode_dlq_headers("g", 0x0102_0304_0506_0708, 0x0A0B_0C0D, b"hh").unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"DLQ1");
+        expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        expected.extend_from_slice(&0x0A0B_0C0Du32.to_le_bytes());
+        expected.extend_from_slice(&1u16.to_le_bytes()); // group_len
+        expected.extend_from_slice(&2u16.to_le_bytes()); // headers_len
+        expected.extend_from_slice(b"g");
+        expected.extend_from_slice(b"hh");
+        assert_eq!(blob, expected);
     }
 
     #[test]
@@ -464,10 +697,34 @@ mod tests {
         assert_eq!(e.group, "orders");
         assert_eq!(e.source_offset, 7);
         assert_eq!(e.attempt, 6);
+        assert_eq!(e.reason, DeadLetterReason::MaxDeliverExceeded);
         assert_eq!(e.timestamp_ms, src.timestamp_ms);
         assert_eq!(e.key, b"k");
         assert_eq!(e.headers, b"hdr");
         assert_eq!(e.payload, b"the-payload");
+    }
+
+    #[test]
+    fn append_dead_letter_records_the_reason_and_a_configurable_target() {
+        // A dead-letter EXCHANGE (#551): route to a NON-default subdir and record the reason.
+        let fs = InMemoryFs::new();
+        let mut dlx = DlqSink::open_at(&fs, "dlx-expired", ManualClock::new(), config()).unwrap();
+        assert_eq!(dlx.subdir(), "dlx-expired");
+        let src = source_record(9, b"k", b"hdr", b"body");
+        dlx.append_dead_letter("orders", &src, 1, DeadLetterReason::TtlExpired)
+            .unwrap();
+        assert_eq!(dlx.records(), 1);
+
+        // The DEFAULT dlq/ subdir was never touched: a DLX routes elsewhere.
+        assert!(!fs.subdir_exists(DLQ_SUBDIR).unwrap());
+        assert!(read_dlq_entries(&fs).unwrap().is_empty());
+
+        // Read the configured target back: the reason is recorded.
+        let entries = read_dead_letter_entries(&fs, "dlx-expired").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].reason, DeadLetterReason::TtlExpired);
+        assert_eq!(entries[0].source_offset, 9);
+        assert_eq!(entries[0].group, "orders");
     }
 
     #[test]
