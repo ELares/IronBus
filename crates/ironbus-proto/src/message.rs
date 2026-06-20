@@ -1220,6 +1220,91 @@ pub struct ConnectBody {
 /// `default_tier`) adds exactly one to it, so an all-absent request is byte-for-byte the old body.
 const CONNECT_V1_FIELD_LEN: u16 = 1 + 4 + 8;
 
+/// The mechanism selector for a connection-scoped authentication credential carried in the
+/// `Connect` body (#631, V2-M7, the auth contract in `docs/AUTHENTICATION.md`). It is the WIRE
+/// selector only — the proto layer carries the OPAQUE credential bytes and never hashes, compares,
+/// or interprets them; the server resolves a credential to an identity and a scope set
+/// ([`crate::frame::FrameType::Connect`] handling in `ironbus-server`). v1 specifies exactly three
+/// mechanisms (bearer token, username+password, mTLS); nkey/JWT are deliberately out of scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AuthMechanism {
+    /// A high-entropy opaque bearer token. The credential bytes are the raw token (presented inside
+    /// the established TLS session on a non-loopback bind); the server stores only its SHA-256 and
+    /// compares constant-time. Possession is proof of identity.
+    Bearer,
+    /// A username plus password. The credential carries the two as `u16`-length-prefixed fields
+    /// (`username`, then `password`); the server verifies the password against the stored Argon2id
+    /// PHC hash for the username, constant-time.
+    Password,
+    /// Mutual TLS: the credential is the peer certificate already presented at the TLS layer, so the
+    /// `Connect` body carries NO credential bytes (the selector alone). The server maps the verified
+    /// certificate's SAN identity to a configured scope set. Selecting this on a connection with no
+    /// verified client certificate is an Authorization Violation.
+    Mtls,
+}
+
+impl AuthMechanism {
+    /// The wire selector byte. `1`/`2`/`3` are used (not `0`) so a zero byte can never be mistaken
+    /// for a present-but-default mechanism in a malformed body.
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        match self {
+            AuthMechanism::Bearer => 1,
+            AuthMechanism::Password => 2,
+            AuthMechanism::Mtls => 3,
+        }
+    }
+
+    /// Folds a wire selector byte to a mechanism, or `None` for an unknown selector (which the
+    /// server treats as an Authorization Violation, never a silent fall-through to no-auth).
+    #[must_use]
+    pub fn from_u8(b: u8) -> Option<AuthMechanism> {
+        Some(match b {
+            1 => AuthMechanism::Bearer,
+            2 => AuthMechanism::Password,
+            3 => AuthMechanism::Mtls,
+            _ => return None,
+        })
+    }
+}
+
+/// A connection-scoped authentication credential carried in the `Connect` body (#631, V2-M7). It is
+/// a WIRE type: the proto layer frames the mechanism selector and the OPAQUE credential bytes and
+/// never inspects the secret (no hashing, no comparison, no logging happens here). The server owns
+/// the verification.
+///
+/// The credential rides an APPENDED, length-prefixed section AFTER the `field_len` v1 block (in the
+/// "bytes past `field_len`, tolerated and ignored by an old reader" zone that
+/// [`decode_connect`] already documents), so the wire stays strictly backward-compatible: an old
+/// client, and the empty `Connect` body, decode to `auth = None`, byte-for-byte unchanged. A client
+/// that authenticates appends this section; the section is the ONLY place a secret travels on the
+/// wire, and on a non-loopback bind it travels only inside the established TLS session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthCredential {
+    /// Which of the three v1 mechanisms this credential is for.
+    pub mechanism: AuthMechanism,
+    /// The mechanism-specific credential bytes, opaque to the proto layer:
+    /// - `Bearer`: the raw token bytes.
+    /// - `Password`: `username` then `password`, each `u16`-length-prefixed.
+    /// - `Mtls`: empty (the credential is the TLS peer certificate, not body bytes).
+    pub material: Vec<u8>,
+}
+
+/// The TRAILING-section marker byte that introduces an appended auth credential in the `Connect`
+/// body (#631, V2-M7). The auth section lives ENTIRELY AFTER the `field_len` v1 block (and after any
+/// appended `default_ack_level`/`default_tier` bytes), in the "bytes past `field_len`, tolerated and
+/// ignored by an old reader" zone [`decode_connect`] documents — so it disturbs NO existing fixed
+/// offset and does NOT consume a bit of the (full) historical `flags` byte. The layout of the
+/// section is exactly: `[AUTH_SECTION_MARKER: u8][mechanism: u8][material: u16-length-prefixed]`.
+///
+/// A body with no trailing bytes (an old client, the empty `Connect` body, a connection that does
+/// not authenticate) decodes to `auth = None`, byte-for-byte the historical body. The marker is a
+/// fixed sentinel (not zero, not a printable ASCII run) so a stray future trailing field is never
+/// silently misread as an auth section: a trailing byte that is not this marker leaves `auth = None`
+/// and is ignored, exactly as the forward-compat rule requires.
+pub const CONNECT_AUTH_SECTION_MARKER: u8 = 0xA7;
+
 /// Encodes a `Connect` body onto the end of `out` (#292, #494, #543). The result is the version byte,
 /// the v1 field-block length, then the v1 block; an all-`None` request still encodes a well-formed
 /// (non-empty) v1 body whose presence flags are clear, which the server reads as "use my defaults".
@@ -1346,6 +1431,119 @@ pub fn decode_connect(body: &[u8]) -> Result<ConnectBody, BodyError> {
         understands_deliver_batch,
         understands_streams,
     })
+}
+
+/// Appends a connection-scoped auth section to an ALREADY-ENCODED, NON-EMPTY `Connect` body (#631,
+/// V2-M7). The caller MUST first write a valid v1 body with [`encode_connect`] (the auth section
+/// rides in the trailing zone past the v1 `field_len` block, so a version header must precede it; an
+/// mTLS client that has no other v1 fields to request still calls `encode_connect(&ConnectBody::
+/// default(), ..)` first to lay down the version header). This then appends the credential. The
+/// section is strictly additive: a body without it decodes to no-auth on every reader, and an old
+/// reader ignores these trailing bytes entirely.
+///
+/// Layout: `[CONNECT_AUTH_SECTION_MARKER: u8][mechanism: u8][material: u16-length-prefixed]`. This is
+/// a WIRE codec only — the credential bytes are opaque here; the server verifies them.
+///
+/// # Errors
+/// [`BodyError::FieldTooLarge`] if the credential material exceeds the `u16` wire limit (a token or
+/// username+password far beyond any legitimate credential size), so an oversized credential fails
+/// closed at encode rather than silently truncating.
+pub fn append_connect_auth(out: &mut Vec<u8>, cred: &AuthCredential) -> Result<(), BodyError> {
+    debug_assert!(
+        !out.is_empty(),
+        "append_connect_auth requires a v1 Connect body (version header) to be written first"
+    );
+    out.push(CONNECT_AUTH_SECTION_MARKER);
+    out.push(cred.mechanism.as_u8());
+    push_var(out, &cred.material)
+}
+
+/// Parses a connection-scoped auth section from a raw `Connect` body, if one is present (#631,
+/// V2-M7). It re-walks the body past the v1 `field_len` block (and any appended
+/// `default_ack_level`/`default_tier` bytes) to the trailing zone and reads the auth section IFF the
+/// trailing bytes begin with [`CONNECT_AUTH_SECTION_MARKER`].
+///
+/// Returns `Ok(None)` for the no-auth cases that MUST stay byte-for-byte compatible: an empty body,
+/// an old-client body with no trailing bytes, or trailing bytes that do not begin with the auth
+/// marker. Returns `Ok(Some(cred))` when a well-formed auth section is present. This is decoupled
+/// from [`decode_connect`] on purpose: the credential is opaque wire bytes the server (not the
+/// proto layer) verifies, and keeping it separate leaves [`ConnectBody`] a `Copy` POD.
+///
+/// # Errors
+/// [`BodyError::BadHandshakeVersion`] for an unknown body version, or [`BodyError::Truncated`] /
+/// [`BodyError::BadLength`] if a PRESENT auth section (the marker was seen) is malformed — a started
+/// but truncated credential is an error, never a silent fall-through to no-auth, so a corrupt auth
+/// section fails closed. An UNKNOWN mechanism selector is a typed `Truncated`-class reject here is
+/// avoided: the selector is validated by the server (so it can map to the uniform Authorization
+/// Violation), and this parser returns the raw selector via [`AuthMechanism::from_u8`] failing into
+/// a `BadAckOp`-free typed error below.
+pub fn parse_connect_auth(body: &[u8]) -> Result<Option<AuthCredential>, BodyError> {
+    // The empty body is the historical no-auth case.
+    if body.is_empty() {
+        return Ok(None);
+    }
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != HANDSHAKE_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    // Skip the v1 field block exactly as decode_connect bounds it (cap-before-alloc via `take`). The
+    // encoder writes `field_len` to INCLUDE the appended default_ack_level / default_tier bytes, so
+    // taking the whole block lands the reader directly on the trailing zone — no separate skip of the
+    // appended bytes is needed (they live inside the block, not after it).
+    let field_len = r.u16()? as usize;
+    let _block = r.take(field_len)?;
+    // The trailing zone. No bytes, or a leading byte that is not the auth marker, is the no-auth
+    // case (an old body, or some other future trailing field): ignore and report no auth.
+    if r.at_end() {
+        return Ok(None);
+    }
+    let marker = r.u8()?;
+    if marker != CONNECT_AUTH_SECTION_MARKER {
+        return Ok(None);
+    }
+    // The marker was seen, so a malformed remainder is now a fail-closed error, not no-auth.
+    let mech_byte = r.u8()?;
+    let Some(mechanism) = AuthMechanism::from_u8(mech_byte) else {
+        // An unknown mechanism selector: a typed error so the server can refuse with the uniform
+        // Authorization Violation rather than silently treating the connection as anonymous.
+        return Err(BodyError::BadAckOp { op: mech_byte });
+    };
+    let material = r.var()?.to_vec();
+    Ok(Some(AuthCredential {
+        mechanism,
+        material,
+    }))
+}
+
+/// Packs a username and password into the `Password`-mechanism credential material (#631): each is
+/// `u16`-length-prefixed, username first. The server unpacks with [`unpack_password_material`]. The
+/// password bytes are opaque here; the server verifies them against the stored Argon2id hash.
+///
+/// # Errors
+/// [`BodyError::FieldTooLarge`] if the username or password exceeds the `u16` wire limit.
+pub fn pack_password_material(username: &[u8], password: &[u8]) -> Result<Vec<u8>, BodyError> {
+    let mut v = Vec::with_capacity(4 + username.len() + password.len());
+    push_var(&mut v, username)?;
+    push_var(&mut v, password)?;
+    Ok(v)
+}
+
+/// Unpacks the `Password`-mechanism credential material into `(username, password)` (#631). The
+/// inverse of [`pack_password_material`].
+///
+/// # Errors
+/// [`BodyError::Truncated`] / [`BodyError::BadLength`] if the material is not two well-formed
+/// `u16`-length-prefixed fields, or [`BodyError::TrailingBytes`] if extra bytes follow — a malformed
+/// password credential fails closed.
+pub fn unpack_password_material(material: &[u8]) -> Result<(&[u8], &[u8]), BodyError> {
+    let mut r = Reader::new(material);
+    let username = r.var()?;
+    let password = r.var()?;
+    if !r.at_end() {
+        return Err(BodyError::TrailingBytes);
+    }
+    Ok((username, password))
 }
 
 /// One advertised credit dimension in the `Info` body (#292): the NEGOTIATED value the client should
@@ -3424,6 +3622,141 @@ mod tests {
                 understands_streams: false,
             }
         );
+    }
+
+    #[test]
+    fn connect_auth_is_absent_on_old_and_empty_bodies() {
+        // The load-bearing backward-compat property (#631): a body that carries no auth section
+        // parses to `None` on EVERY no-auth shape, so an old client (and the empty Connect body)
+        // is byte-for-byte unchanged and authenticates nothing on the wire.
+        assert_eq!(
+            parse_connect_auth(&[]).unwrap(),
+            None,
+            "empty body = no auth"
+        );
+        let mut full = Vec::new();
+        encode_connect(
+            &ConnectBody {
+                requested_credit: Some(32),
+                requested_credit_bytes: Some(1024),
+                wants_gap_marker: true,
+                default_ack_level: Some(2),
+                understands_streaming: true,
+                default_tier: Some(1),
+                understands_deliver_batch: true,
+                understands_streams: true,
+            },
+            &mut full,
+        );
+        // A full v1 body WITHOUT an appended auth section still parses to no auth: the appended
+        // ack-level/tier bytes are skipped and the reader lands at end with nothing trailing.
+        assert_eq!(
+            parse_connect_auth(&full).unwrap(),
+            None,
+            "a full v1 body with no auth section = no auth"
+        );
+    }
+
+    #[test]
+    fn connect_auth_round_trips_each_mechanism() {
+        for cred in [
+            AuthCredential {
+                mechanism: AuthMechanism::Bearer,
+                material: b"a-high-entropy-token".to_vec(),
+            },
+            AuthCredential {
+                mechanism: AuthMechanism::Password,
+                material: pack_password_material(b"alice", b"correct horse").unwrap(),
+            },
+            AuthCredential {
+                mechanism: AuthMechanism::Mtls,
+                material: Vec::new(),
+            },
+        ] {
+            // Minimal-body base (mTLS-style: the client lays down a default v1 body, then the
+            // selector). A version header must precede the trailing auth section.
+            let mut buf = Vec::new();
+            encode_connect(&ConnectBody::default(), &mut buf);
+            append_connect_auth(&mut buf, &cred).unwrap();
+            assert_eq!(parse_connect_auth(&buf).unwrap(), Some(cred.clone()));
+
+            // And appended onto a real v1 body with appended ack-level + tier bytes, to prove the
+            // reader walks PAST those to find the trailing auth section at the right offset.
+            let mut body = Vec::new();
+            encode_connect(
+                &ConnectBody {
+                    requested_credit: Some(7),
+                    requested_credit_bytes: None,
+                    wants_gap_marker: false,
+                    default_ack_level: Some(1),
+                    understands_streaming: true,
+                    default_tier: Some(1),
+                    understands_deliver_batch: false,
+                    understands_streams: false,
+                },
+                &mut body,
+            );
+            append_connect_auth(&mut body, &cred).unwrap();
+            assert_eq!(parse_connect_auth(&body).unwrap(), Some(cred.clone()));
+            // The v1 fields still decode correctly with the auth section trailing (it is ignored by
+            // decode_connect, which only reads its field_len block + appended bytes).
+            let decoded = decode_connect(&body).unwrap();
+            assert_eq!(decoded.requested_credit, Some(7));
+            assert_eq!(decoded.default_tier, Some(1));
+        }
+    }
+
+    #[test]
+    fn connect_password_material_round_trips_and_rejects_trailing() {
+        let m = pack_password_material(b"user", b"pw").unwrap();
+        assert_eq!(
+            unpack_password_material(&m).unwrap(),
+            (&b"user"[..], &b"pw"[..])
+        );
+        // A malformed (extra-byte) material fails closed.
+        let mut bad = m.clone();
+        bad.push(0);
+        assert_eq!(
+            unpack_password_material(&bad),
+            Err(BodyError::TrailingBytes)
+        );
+    }
+
+    #[test]
+    fn connect_auth_unknown_mechanism_is_fail_closed() {
+        // A present auth section (marker seen) with an unknown mechanism selector is a typed error,
+        // NOT a silent fall-through to no-auth: the server maps it to the uniform Authorization
+        // Violation. This is the no-silent-weakening property at the wire layer.
+        let mut buf = Vec::new();
+        encode_connect(&ConnectBody::default(), &mut buf);
+        buf.push(CONNECT_AUTH_SECTION_MARKER);
+        buf.push(0xFF); // unknown mechanism selector
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        assert!(matches!(
+            parse_connect_auth(&buf),
+            Err(BodyError::BadAckOp { op: 0xFF })
+        ));
+    }
+
+    #[test]
+    fn connect_auth_truncated_section_is_fail_closed() {
+        // Marker present but the credential is truncated: an error, never no-auth.
+        let mut truncated = Vec::new();
+        encode_connect(&ConnectBody::default(), &mut truncated);
+        truncated.push(CONNECT_AUTH_SECTION_MARKER);
+        truncated.push(AuthMechanism::Bearer.as_u8());
+        // no u16 length / material follows
+        assert!(parse_connect_auth(&truncated).is_err());
+    }
+
+    #[test]
+    fn connect_non_marker_trailing_byte_is_ignored_as_no_auth() {
+        // Forward-compat: a trailing byte that is not the auth marker (a hypothetical future trailing
+        // field) leaves auth = None and never errors, exactly as the tolerate-trailing rule requires.
+        let mut buf = Vec::new();
+        encode_connect(&ConnectBody::default(), &mut buf);
+        buf.push(0x01); // not CONNECT_AUTH_SECTION_MARKER
+        assert_eq!(parse_connect_auth(&buf).unwrap(), None);
     }
 
     #[test]

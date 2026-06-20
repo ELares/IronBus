@@ -12,6 +12,7 @@
 //! so a connection flood cannot spawn unbounded threads.
 
 use crate::actor::EngineHandle;
+use crate::auth::AuthConfig;
 use crate::session::Session;
 use ironbus_core::clock::Clock;
 use ironbus_core::keyshared::MemberId;
@@ -65,6 +66,46 @@ where
     F: Filesystem + Clone + 'static,
     C: Clock + Clone + 'static,
 {
+    // The no-auth overload: an accept loop with no configured identity table (the zero-config
+    // loopback-dev broker, and every test/bench that drives the loop directly). The scope gate is
+    // bypassed for the whole loop, byte-for-byte today's behavior.
+    serve_with_auth(
+        listener,
+        engine,
+        shutdown,
+        max_connections,
+        clock,
+        progress,
+        None,
+    )
+}
+
+/// Serves connections exactly like [`serve`], with an OPTIONAL connection-scoped auth table (#631,
+/// V2-M7). When `auth` is `Some(_)`, every connection's `Connect` handshake must authenticate against
+/// the table and a verb is gated on the resolved scope set; when `None`, the broker has no identities
+/// and the scope gate is bypassed (the zero-config loopback-dev path). The auth table is shared across
+/// connections via a cheap `Arc` clone per accept — it is immutable for the broker's lifetime, read
+/// off the actor's hot path (like the credit caps), so it never head-of-line-blocks a handshake.
+///
+/// # Errors
+/// Propagates a fatal listener error, exactly like [`serve`].
+// `auth` is taken BY VALUE because each accepted connection clones the `Arc` and MOVES the clone into
+// its own `'static` handler thread, so the loop needs to own the `Option<Arc<_>>` to keep cloning it
+// for the whole accept lifetime — a borrow could not outlive the spawned threads.
+#[allow(clippy::needless_pass_by_value)]
+pub fn serve_with_auth<F, C>(
+    listener: &TcpListener,
+    engine: &EngineHandle<F, C>,
+    shutdown: &AtomicBool,
+    max_connections: usize,
+    clock: &C,
+    progress: &crate::liveness::LivenessBeacon,
+    auth: Option<Arc<AuthConfig>>,
+) -> std::io::Result<()>
+where
+    F: Filesystem + Clone + 'static,
+    C: Clock + Clone + 'static,
+{
     listener.set_nonblocking(true)?;
     let active = Arc::new(AtomicUsize::new(0));
     // A monotonic per-connection counter that mints a distinct key_shared member id (#64) for each
@@ -92,11 +133,14 @@ where
                 let engine = engine.clone();
                 let active = Arc::clone(&active);
                 let member_id = MemberId::new(next_member.fetch_add(1, Ordering::Relaxed));
+                // A cheap `Arc` clone of the shared, immutable auth table (or `None` on a no-auth
+                // broker), so the handler can pin the connection's scope set at `Connect` time.
+                let auth = auth.clone();
                 std::thread::spawn(move || {
                     // The guard decrements the slot on return AND on a panic unwind, so a
                     // panicking handler can never permanently leak a connection-cap slot.
                     let _slot = ConnectionSlot(&active);
-                    let _ = handle_connection(stream, &engine, member_id);
+                    let _ = handle_connection(stream, &engine, member_id, auth);
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -116,6 +160,7 @@ fn handle_connection<F, C>(
     mut stream: TcpStream,
     engine: &EngineHandle<F, C>,
     member_id: MemberId,
+    auth: Option<Arc<AuthConfig>>,
 ) -> std::io::Result<()>
 where
     F: Filesystem + Clone + 'static,
@@ -126,7 +171,14 @@ where
                                     // write that makes no progress within the window errors out and closes the connection.
     stream.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
     stream.set_write_timeout(Some(CONNECTION_TIMEOUT))?;
-    let mut session = Session::with_member_id(member_id);
+    // Pin the auth requirement onto the session: with a configured table the `Connect` handshake must
+    // authenticate and verbs are scope-gated; with `None` the gate is bypassed (loopback-dev). No TLS
+    // peer certificate is available in this PR (the TLS handshake is the flagged follow-up), so the
+    // mTLS SAN identity is `None` for now — an mTLS-mechanism connect fails closed until TLS lands.
+    let mut session = match auth {
+        Some(cfg) => Session::with_member_id_and_auth(member_id, cfg, None),
+        None => Session::with_member_id(member_id),
+    };
     // The read/dispatch loop, run to completion so the cleanup below ALWAYS executes on exit:
     // whether the client closed cleanly, a read/write timed out, or a malformed frame ended the
     // session, this connection must leave any key_shared group it joined (#64) and flush its cursor.
@@ -502,7 +554,7 @@ mod tests {
             let engine = handle.clone();
             move || {
                 let (stream, _) = listener.accept().unwrap();
-                handle_connection(stream, &engine, MemberId::new(0))
+                handle_connection(stream, &engine, MemberId::new(0), None)
             }
         });
 

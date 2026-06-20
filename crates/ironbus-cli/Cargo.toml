@@ -90,6 +90,15 @@ libc = "0.2"
 # leaves the supply-chain / C-FFI gates untouched; it is pure Rust and already in the workspace tree.
 [dev-dependencies]
 bytes = { version = "1", default-features = false }
+# Temp dirs for the StrictModes secret-file-permission tests and the auth-config-table load tests
+# (#629/#631/#635, V2-M7). DEV-ONLY (never linked into the shipped `ironbus` binary), permissive
+# (MIT OR Apache-2.0), already in the workspace lock (the server/storage crates use it). The same
+# pure-Rust crypto crates the auth path uses are dev-deps here so a test can MINT a known
+# token-SHA-256 / Argon2id-PHC fixture; they are DEV-ONLY for the CLI (the runtime auth verification
+# lives in `ironbus-server`, already a normal dependency).
+tempfile = "3"
+sha2 = { version = "0.10", default-features = false }
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
 
 [lints]
 workspace = true
