@@ -32,6 +32,7 @@ pub mod keyshared;
 pub mod leader_lease;
 pub mod lease;
 pub mod partition;
+pub mod placement;
 pub mod resolve_cache;
 pub mod segment;
 pub mod subject;
