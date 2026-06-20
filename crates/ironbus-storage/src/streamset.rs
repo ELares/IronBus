@@ -38,13 +38,66 @@
 //! X. Adding a stream therefore costs one directory + its segments, never a per-record tax on the
 //! others.
 //!
+//! ## The cross-stream `CommitCoordinator` (M2-I3, #564) — group-commit ACROSS streams
+//!
+//! Per-stream logs create a Big-O hazard the naive [`StreamSet::sync_all`] embodies: it calls
+//! `log.sync()` per stream, and each `Log::sync` is `flush_pending` + `fdatasync`. Driven once per
+//! produced record that touches a new stream, that is one `fdatasync` PER stream PER commit, making
+//! the fsync cost O(streams) and destroying the durable-produce throughput win the single-log
+//! group-commit earned (where ONE `Log::sync` = ONE `write_all_at` + ONE `fdatasync` amortizes the
+//! barrier across a whole batch of buffered appends).
+//!
+//! [`StreamSet::commit_tick`] restores the amortization by generalizing that single-log group-commit
+//! ACROSS streams. In ONE tick it:
+//!   1. picks only the DIRTIED streams ([`Log::has_unsynced_records`] — a stream with appended,
+//!      not-yet-durable records); a CLEAN/COLD stream is skipped entirely and costs nothing;
+//!   2. for each dirtied stream, [`Log::flush_no_sync`] drains its `pending` buffer to the page
+//!      cache (independent per fd, cheap, no fsync);
+//!   3. for each dirtied stream, [`Log::sync_data_only`] issues the covering `fdatasync` on its fd;
+//!   4. for each dirtied stream whose fdatasync SUCCEEDED,
+//!      [`Log::advance_synced_offset_after_external_sync`] advances its durable head and releases
+//!      its parked producer acks — together, in the same tick, no extra actor round-trips.
+//!
+//! ### The HONEST cost framing (the load-bearing claim)
+//!
+//! A tick touching K dirtied streams issues exactly K `fdatasync` calls. This is NOT one syscall:
+//! `fdatasync` operates on a single fd and the kernel CANNOT batch a durability barrier across
+//! different fds, so K dirtied streams genuinely cost K barriers — we do not pretend otherwise. The
+//! win is AMORTIZATION, not syscall-count magic: those K barriers are issued with ZERO extra actor
+//! wakeups/round-trips (one flush pass, one fsync pass, one ack-release pass), and ONLY dirtied
+//! streams are synced (cold streams cost nothing). So for a FIXED total record rate spread over a
+//! bounded hot set of streams, the K barriers per tick are amortized across ALL the records the tick
+//! commits — the per-RECORD fsync cost stays O(1/batch), exactly as today's single-log group-commit
+//! amortizes its one `fdatasync` across a batch of records. The fsync COUNT is
+//! O(dirtied-streams-per-tick); the per-RECORD cost is O(1/batch). When only the default stream `""`
+//! is dirtied, a tick is ONE flush + ONE fdatasync + ONE durable-head advance — byte-for-byte and
+//! behavior-for-behavior today's single-log group-commit.
+//!
+//! ### Per-stream I2 + isolation preserved
+//!
+//! Each stream's producer ack is released ONLY after THAT stream's covering `fdatasync` returns
+//! (I2, ack-implies-durable, per stream): a stream's durable head advances in step (4) only on the
+//! success path of its own step-(3) barrier. No cross-stream ordering is promised, and none is
+//! needed — each stream's `synced_offset` advances independently. A failed `fdatasync` on stream X
+//! FREEZES stream X (the writer-freeze discipline, [`Log::sync_data_only`]) WITHOUT advancing X's
+//! durable head (its acks stay parked) and WITHOUT bricking a sibling: the tick records X's freeze
+//! and continues the barrier for every other dirtied stream. Recovery stays a pure function of each
+//! stream's durable bytes (longest-valid-prefix per stream); the on-disk format is untouched.
+//!
+//! ### The DLQ stays independent (scope)
+//!
+//! The DLQ ([`crate::dlq::DlqSink`]) is a second independent log that fsyncs itself in-band inside
+//! `append_poison` (the poison record must be durable BEFORE the source cursor commits — a
+//! crash-safety contract). The coordinator does NOT fold the DLQ into the cross-stream barrier:
+//! the DLQ is not a member of the `StreamSet`, and its bespoke append-then-self-sync ordering is
+//! preserved unchanged (not regressed). Folding it in would require a deferred-sync append path on
+//! `DlqSink` while preserving that ordering — out of scope for #564.
+//!
 //! ## Scope boundary (what this module is NOT)
 //!
-//! This is the StreamSet storage primitive ONLY: multi-`Log` open / recover / declare / route-by-id.
+//! This is the StreamSet storage primitive ONLY: multi-`Log` open / recover / declare / route-by-id,
+//! PLUS the cross-stream group-commit [`StreamSet::commit_tick`] (M2-I3, #564 — see below).
 //! It deliberately does NOT do:
-//! - the cross-stream group-commit `CommitCoordinator` (one `fdatasync` batched across streams) —
-//!   that is M2-I3 (#564). Here each stream syncs INDEPENDENTLY ([`StreamSet::sync_stream`] /
-//!   [`StreamSet::sync_all`]); correctness first, the fsync-batching optimization is I3's job.
 //! - the `max_open_streams` hot-set / fd LRU bound — M2-I4 (#565). Here every declared stream's
 //!   [`Log`] is kept resident.
 //! - per-stream retention/compaction — M2-I5.
@@ -178,6 +231,30 @@ pub struct StreamRecovery {
     /// skipped (torn tail or corrupt body), bounded and reported. Empty for a clean recovery. A
     /// torn/corrupt sibling's events are NEVER in this stream's report (the isolation property).
     pub loss_report: LossReport,
+}
+
+/// The result of one [`StreamSet::commit_tick`]: which streams the tick synced, how many `fdatasync`
+/// barriers it issued, and which (if any) streams FROZE on their barrier. The HONEST cost framing
+/// reads straight off this: `fdatasyncs_issued == synced.len() + froze.len()` is the fsync COUNT for
+/// the tick (one barrier attempted per DIRTIED stream — `fsync` cannot be batched across fds), and
+/// it is O(dirtied streams in the tick), NOT O(messages): a tick committing many records per dirtied
+/// stream amortizes its K barriers across all of them, so the per-RECORD fsync cost is O(1/batch).
+/// Cold (clean) streams are absent from every field — they cost nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommitOutcome {
+    /// The dirtied streams whose covering `fdatasync` SUCCEEDED this tick, each paired with its new
+    /// durable head ([`Log::synced_offset`]) — the offset up to which THAT stream's parked producer
+    /// acks may now be released (per-stream I2). Deterministic (default-stream-first) order.
+    pub synced: Vec<(StreamId, Offset)>,
+    /// The dirtied streams whose `fdatasync` FAILED this tick: each is now FROZEN read-only (the
+    /// writer-freeze discipline), its durable head was NOT advanced, and its parked acks were NOT
+    /// released. A frozen stream does not brick its siblings — the rest of the tick still committed.
+    /// Empty on a fully-successful tick.
+    pub froze: Vec<StreamId>,
+    /// The number of `fdatasync` barriers this tick ISSUED — one per DIRTIED stream (success or
+    /// freeze), i.e. `synced.len() + froze.len()`. This is the tick's fsync COUNT, the
+    /// O(dirtied-streams) quantity; a clean tick (nothing dirtied) issues zero.
+    pub fdatasyncs_issued: usize,
 }
 
 /// N independently-opened, independently-recovered IronBus [`Log`]s over one [`Filesystem`], keyed by
@@ -429,6 +506,97 @@ impl<F: Filesystem, C: Clock> StreamSet<F, C> {
             log.sync()?;
         }
         Ok(())
+    }
+
+    /// THE CROSS-STREAM GROUP-COMMIT (M2-I3, #564). Runs ONE commit tick over the whole set: a single
+    /// batched durability barrier that makes every DIRTIED stream's appended records durable and
+    /// releases their parked producer acks together, while a clean/cold stream costs nothing. This is
+    /// today's single-log group-commit (`flush_pending` then ONE `fdatasync` amortized over a batch of
+    /// appends), GENERALIZED across the per-stream logs so per-stream isolation does NOT cost the
+    /// durable-produce throughput win.
+    ///
+    /// The tick has three passes over the dirtied streams (those with appended, not-yet-durable
+    /// records — [`Log::has_unsynced_records`]):
+    ///   1. **flush**: [`Log::flush_no_sync`] drains each dirtied stream's `pending` buffer to the
+    ///      page cache (independent per fd, cheap, no fsync);
+    ///   2. **barrier**: [`Log::sync_data_only`] issues the covering `fdatasync` on each dirtied
+    ///      stream's fd — K dirtied streams = K barriers (the kernel cannot batch `fdatasync` across
+    ///      different fds; this is honest, see [`CommitOutcome`]);
+    ///   3. **release**: for each stream whose barrier SUCCEEDED,
+    ///      [`Log::advance_synced_offset_after_external_sync`] advances its durable head and the
+    ///      returned [`CommitOutcome::synced`] reports the offset up to which its acks may release.
+    ///
+    /// ### Cost (the load-bearing claim)
+    /// The fsync COUNT is `O(dirtied streams this tick)` ([`CommitOutcome::fdatasyncs_issued`]), NOT
+    /// `O(messages)`: a tick that commits many records across a bounded hot set of streams amortizes
+    /// its K barriers over ALL those records, so the per-RECORD fsync cost stays `O(1/batch)` — the
+    /// exact amortization the single-log group-commit already gives, now spanning streams. A tick that
+    /// dirties only the default stream `""` is ONE flush + ONE fdatasync + ONE advance: byte- and
+    /// behavior-identical to today's single-log group-commit.
+    ///
+    /// ### I2 + isolation
+    /// Each stream's acks release ONLY after ITS OWN covering `fdatasync` (per-stream I2): a stream
+    /// appears in [`CommitOutcome::synced`] only on the success path of its own barrier. A failed
+    /// `fdatasync` FREEZES that one stream (recorded in [`CommitOutcome::froze`]; its durable head is
+    /// NOT advanced, its acks stay parked) and the tick CONTINUES for every sibling — one bad fd does
+    /// not brick the batch. No cross-stream ordering is promised or needed.
+    ///
+    /// This never returns `Err`: a per-stream barrier failure is reported in
+    /// [`CommitOutcome::froze`], not raised, because one frozen stream must not abort a sibling's
+    /// commit. (Contrast [`StreamSet::sync_all`], which stops on the first error — that is the
+    /// pre-#564 correctness-first path and is kept for callers that want fail-fast.)
+    #[must_use]
+    pub fn commit_tick(&mut self) -> CommitOutcome {
+        // Pick the DIRTIED streams up front (default-first, deterministic). A clean/cold stream — or
+        // a frozen one — is never touched, so a tick's cost scales with the hot set, not the total
+        // stream count. We snapshot the ids so the three passes below borrow each log mutably in turn.
+        let dirtied: Vec<StreamId> = self
+            .streams
+            .iter()
+            .filter(|(_, log)| log.has_unsynced_records())
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        let mut outcome = CommitOutcome {
+            synced: Vec::with_capacity(dirtied.len()),
+            froze: Vec::new(),
+            fdatasyncs_issued: 0,
+        };
+
+        for id in dirtied {
+            let Some(log) = self.streams.get_mut(&id) else {
+                // A stream cannot vanish mid-tick (no concurrent declare/drop here), but be defensive.
+                continue;
+            };
+
+            // PASS 1 — flush this stream's pending bytes to the page cache (no fsync). A flush
+            // failure is the fatal frozen-writer class, identical to a failed barrier: record the
+            // freeze, do NOT advance the durable head, and continue with the siblings.
+            if log.flush_no_sync().is_err() {
+                outcome.fdatasyncs_issued += 1; // the barrier this stream owed is accounted, frozen pre-sync
+                outcome.froze.push(id);
+                continue;
+            }
+
+            // PASS 2 — the covering fdatasync on THIS stream's fd. K dirtied streams => K barriers
+            // (fdatasync cannot be batched across fds). One barrier per dirtied stream is counted
+            // whether it succeeds or freezes the writer.
+            outcome.fdatasyncs_issued += 1;
+            if log.sync_data_only().is_err() {
+                // The barrier failed: this one stream is now frozen read-only, its acks stay PARKED
+                // (I2 upheld — never ack-as-durable without a returned fdatasync). Siblings continue.
+                outcome.froze.push(id);
+                continue;
+            }
+
+            // PASS 3 — the barrier returned: advance THIS stream's durable head and report the
+            // offset up to which its parked acks may release. Per-stream I2: this stream's acks
+            // release only now, after its own fdatasync.
+            log.advance_synced_offset_after_external_sync();
+            outcome.synced.push((id, log.synced_offset()));
+        }
+
+        outcome
     }
 
     /// The ids of every open stream, in deterministic (default-first) order. The default stream `""`
@@ -803,5 +971,305 @@ mod tests {
         assert!(set.sync_stream(&ghost).is_err());
         // The default stream is always open and routable.
         assert!(set.is_open(&StreamId::default_stream()));
+    }
+
+    // ============================ M2-I3 (#564): the CommitCoordinator ============================
+    //
+    // These tests exercise `StreamSet::commit_tick` — the cross-stream group-commit — over a counting
+    // fault filesystem so we can assert the HONEST fsync-count claim directly (a tick over K dirtied
+    // streams issues exactly K fdatasyncs, and a cold stream issues none), plus per-stream I2, the
+    // single-dirtied-stream byte/behaviour identity with today's single-log group-commit, the
+    // freeze-one-stream-not-siblings isolation, and per-stream recovery after a coordinated commit.
+
+    use crate::fault::{FaultControl, FaultFs};
+
+    /// Opens a `StreamSet` over a counting [`FaultFs`], returning the set, its recoveries, and the
+    /// [`FaultControl`] so a test can read `sync_count()` (every `sync_data`/`sync_all`) and arm a
+    /// sync failure. The control is cloned out before the fs is moved into the set.
+    fn open_faulty(
+        inner: InMemoryFs,
+    ) -> (
+        StreamSet<FaultFs<InMemoryFs>, ManualClock>,
+        BTreeMap<StreamId, StreamRecovery>,
+        FaultControl,
+    ) {
+        let (fs, control) = FaultFs::new(inner);
+        let (set, recoveries) = StreamSet::open(&fs, ManualClock::new(), cfg()).unwrap();
+        (set, recoveries, control)
+    }
+
+    /// THE HONEST FSYNC-COUNT TEST: a commit tick over K DIRTIED streams issues EXACTLY K fdatasyncs,
+    /// and COLD (clean) streams are not synced — so the fsync count is O(dirtied streams per tick),
+    /// not O(streams) and not O(messages). We assert the count off the counting fs directly.
+    #[test]
+    fn commit_tick_syncs_exactly_the_dirtied_streams_cold_streams_cost_nothing() {
+        let (mut set, _, control) = open_faulty(InMemoryFs::new());
+        let def = StreamId::default_stream();
+        let a = StreamId::named("a").unwrap();
+        let b = StreamId::named("b").unwrap();
+        let c = StreamId::named("c").unwrap();
+        for id in [&a, &b, &c] {
+            set.declare(id).unwrap();
+        }
+
+        // Dirty 3 of the 4 streams (default, a, b); leave c COLD (no append). Many records per dirtied
+        // stream — the amortization is over records, the fsync count is over dirtied streams.
+        for _ in 0..10 {
+            set.append_to(&def, &rec(b"d")).unwrap();
+            set.append_to(&a, &rec(b"a")).unwrap();
+            set.append_to(&b, &rec(b"b")).unwrap();
+        }
+
+        // One tick. No segment rolls happen for these tiny records (one open segment per stream), so
+        // every `sync_data`/`sync_all` the counter sees is a coordinator barrier.
+        let syncs_before = control.sync_count();
+        let outcome = set.commit_tick();
+        let barriers = control.sync_count() - syncs_before;
+
+        // EXACTLY 3 fdatasyncs for the 3 dirtied streams — the cold stream `c` cost nothing.
+        assert_eq!(
+            barriers, 3,
+            "one fdatasync per DIRTIED stream, cold stream not synced"
+        );
+        assert_eq!(outcome.fdatasyncs_issued, 3);
+        assert_eq!(outcome.synced.len(), 3);
+        assert!(outcome.froze.is_empty());
+        // The synced set is exactly {default, a, b}, deterministic (default-first); c is absent.
+        let synced_ids: Vec<&StreamId> = outcome.synced.iter().map(|(id, _)| id).collect();
+        assert_eq!(synced_ids, vec![&def, &a, &b]);
+        assert!(!synced_ids.contains(&&c));
+
+        // A SECOND tick with nothing newly dirtied issues ZERO fdatasyncs (all caught up + cold c).
+        let syncs_before = control.sync_count();
+        let outcome2 = set.commit_tick();
+        assert_eq!(
+            control.sync_count() - syncs_before,
+            0,
+            "a tick with no dirtied stream issues no barrier"
+        );
+        assert_eq!(outcome2.fdatasyncs_issued, 0);
+        assert!(outcome2.synced.is_empty());
+
+        // 30 records were committed across the 3 dirtied streams for 3 barriers: ~0.1 fsync/record.
+        // Doubling the per-stream record count would NOT change the barrier count — O(1/batch).
+    }
+
+    /// PER-STREAM I2: each stream's durable head ([`Log::synced_offset`]) advances only after ITS OWN
+    /// covering fdatasync, and the tick reports per-stream the offset up to which acks may release.
+    /// Before the tick a dirtied stream's durable head trails its append head; after, it equals it.
+    #[test]
+    fn commit_tick_advances_each_streams_durable_head_only_after_its_sync() {
+        let (mut set, _, _control) = open_faulty(InMemoryFs::new());
+        let def = StreamId::default_stream();
+        let a = StreamId::named("a").unwrap();
+        set.declare(&a).unwrap();
+
+        set.append_to(&def, &rec(b"d0")).unwrap();
+        set.append_to(&def, &rec(b"d1")).unwrap();
+        set.append_to(&a, &rec(b"a0")).unwrap();
+
+        // Pre-tick: appended but NOT durable — each durable head trails its next-append head.
+        assert!(set.get(&def).unwrap().synced_offset() != set.get(&def).unwrap().next_offset());
+        assert!(set.get(&a).unwrap().synced_offset() != set.get(&a).unwrap().next_offset());
+
+        let outcome = set.commit_tick();
+
+        // Post-tick: each dirtied stream's durable head caught up to its append head (acks releasable
+        // up to that offset), and the outcome reports each stream's release offset = its next_offset.
+        for id in [&def, &a] {
+            let log = set.get(id).unwrap();
+            assert_eq!(
+                log.synced_offset(),
+                log.next_offset(),
+                "{}'s durable head advanced after its own fsync",
+                id.name()
+            );
+        }
+        // Default committed 2 records (next_offset == 2), stream a committed 1 (next_offset == 1).
+        let released: BTreeMap<&str, Offset> = outcome
+            .synced
+            .iter()
+            .map(|(id, off)| (id.name(), *off))
+            .collect();
+        assert_eq!(released[""], set.get(&def).unwrap().next_offset());
+        assert_eq!(released["a"], set.get(&a).unwrap().next_offset());
+        assert_eq!(released[""].get(), 2);
+        assert_eq!(released["a"].get(), 1);
+    }
+
+    /// SINGLE-DIRTIED-STREAM == TODAY'S SINGLE-LOG GROUP-COMMIT, byte- and behaviour-identical. A tick
+    /// that dirties only the default stream `""` issues ONE fdatasync (exactly today's `Log::sync`),
+    /// produces the same on-disk image, and the same durable head, as a bare single `Log::sync`.
+    #[test]
+    fn single_dirtied_stream_tick_is_byte_identical_to_a_single_log_sync() {
+        // We hold a handle to the underlying InMemoryFs (Clone shares the backing store) for each
+        // side so we can read raw segment snapshots, while the Log/StreamSet run over a counting
+        // FaultFs wrapping that same store.
+        // Baseline: a bare single Log, two records, ONE sync. Count its barriers over a counting fs.
+        let base_inner = InMemoryFs::new();
+        {
+            let (base_fs, base_ctl) = FaultFs::new(base_inner.clone());
+            let mut log = Log::open(base_fs, ManualClock::new(), cfg()).unwrap();
+            log.append(&rec(b"x")).unwrap();
+            log.append(&rec(b"y")).unwrap();
+            let before = base_ctl.sync_count();
+            log.sync().unwrap();
+            assert_eq!(
+                base_ctl.sync_count() - before,
+                1,
+                "a single Log::sync is ONE fdatasync"
+            );
+        }
+
+        // Coordinator: a fresh set, the SAME two records to the DEFAULT stream only, ONE commit_tick.
+        let set_inner = InMemoryFs::new();
+        let (set_fs, set_ctl) = FaultFs::new(set_inner.clone());
+        let mut set = {
+            let (s, _) = StreamSet::open(&set_fs, ManualClock::new(), cfg()).unwrap();
+            s
+        };
+        let def = StreamId::default_stream();
+        set.append_to(&def, &rec(b"x")).unwrap();
+        set.append_to(&def, &rec(b"y")).unwrap();
+        let before = set_ctl.sync_count();
+        let outcome = set.commit_tick();
+        // ONE fdatasync — identical to the single-log group-commit.
+        assert_eq!(
+            set_ctl.sync_count() - before,
+            1,
+            "a single-dirtied-stream tick is ONE fdatasync"
+        );
+        assert_eq!(outcome.fdatasyncs_issued, 1);
+        assert_eq!(outcome.synced.len(), 1);
+        assert_eq!(outcome.synced[0].0, def);
+
+        // No `streams/` was materialized (default = root log), and the root segment bytes match the
+        // single-log baseline byte-for-byte (read through the underlying InMemoryFs handles).
+        assert!(!set_inner.subdir_exists(STREAMS_SUBDIR).unwrap());
+        let base_ids = segment_ids(&base_inner).unwrap();
+        let set_ids = segment_ids(&set_inner).unwrap();
+        assert_eq!(base_ids, set_ids);
+        for id in set_ids {
+            let b = base_inner.open(&segment_file_name(id)).unwrap().snapshot();
+            let s = set_inner.open(&segment_file_name(id)).unwrap().snapshot();
+            assert_eq!(
+                b, s,
+                "segment {id} differs between single-log sync and single-stream tick"
+            );
+        }
+    }
+
+    /// FAILED FSYNC FREEZES ONE STREAM, SIBLINGS HEALTHY. A barrier failure freezes the dirtied
+    /// stream (recorded in `froze`, its durable head NOT advanced, its acks NOT released), and a
+    /// later tick still commits a sibling — the freeze did not brick the set.
+    #[test]
+    fn failed_fsync_freezes_one_stream_and_leaves_siblings_healthy() {
+        let (mut set, _, control) = open_faulty(InMemoryFs::new());
+        let victim = StreamId::named("victim").unwrap();
+        let sibling = StreamId::named("sibling").unwrap();
+        set.declare(&victim).unwrap();
+        set.declare(&sibling).unwrap();
+
+        // Tick 1: dirty ONLY the victim, fail every fsync. The victim's barrier fails -> it freezes.
+        set.append_to(&victim, &rec(b"v0")).unwrap();
+        control.set_fail_sync(true);
+        let outcome = set.commit_tick();
+        control.set_fail_sync(false);
+
+        // The victim froze: in `froze`, not `synced`; its durable head did NOT advance; not writable.
+        assert_eq!(outcome.froze, vec![victim.clone()]);
+        assert!(outcome.synced.is_empty());
+        assert_eq!(
+            outcome.fdatasyncs_issued, 1,
+            "the one dirtied stream's barrier was attempted"
+        );
+        assert!(
+            !set.get(&victim).unwrap().is_writable(),
+            "the victim is frozen read-only"
+        );
+        // Its acks stayed PARKED: durable head still trails the append head (nothing acked-as-durable).
+        assert!(
+            set.get(&victim).unwrap().synced_offset() != set.get(&victim).unwrap().next_offset()
+        );
+
+        // Tick 2: the sibling is healthy and commits fine; the frozen victim is simply skipped (a
+        // frozen writer reports no unsynced records, so it owes no barrier).
+        set.append_to(&sibling, &rec(b"s0")).unwrap();
+        let before = control.sync_count();
+        let outcome2 = set.commit_tick();
+        assert_eq!(
+            control.sync_count() - before,
+            1,
+            "only the healthy sibling is synced; the frozen victim is skipped"
+        );
+        assert_eq!(outcome2.synced.len(), 1);
+        assert_eq!(outcome2.synced[0].0, sibling);
+        assert!(outcome2.froze.is_empty());
+        // The sibling is fully durable; the victim is still frozen but cannot be appended to.
+        assert_eq!(
+            set.get(&sibling).unwrap().synced_offset(),
+            set.get(&sibling).unwrap().next_offset()
+        );
+        assert!(
+            set.append_to(&victim, &rec(b"v1")).is_err(),
+            "a frozen stream rejects appends"
+        );
+    }
+
+    /// RECOVERY PER STREAM AFTER A COORDINATED COMMIT: every stream committed in one tick recovers,
+    /// on reopen, to its own durable prefix (longest-valid-prefix per stream), independently.
+    #[test]
+    fn recovery_per_stream_after_a_coordinated_commit_is_correct() {
+        let inner = InMemoryFs::new();
+        let def = StreamId::default_stream();
+        let a = StreamId::named("alpha").unwrap();
+        let b = StreamId::named("beta").unwrap();
+        {
+            let (fs, _control) = FaultFs::new(inner.clone());
+            let (mut set, _) = StreamSet::open(&fs, ManualClock::new(), cfg()).unwrap();
+            set.declare(&a).unwrap();
+            set.declare(&b).unwrap();
+            set.append_to(&def, &rec(b"d0")).unwrap();
+            set.append_to(&a, &rec(b"a0")).unwrap();
+            set.append_to(&a, &rec(b"a1")).unwrap();
+            set.append_to(&b, &rec(b"b0")).unwrap();
+            // One coordinated commit makes all three durable together.
+            let outcome = set.commit_tick();
+            assert_eq!(outcome.synced.len(), 3);
+            assert!(outcome.froze.is_empty());
+        }
+
+        // Reopen over the same durable image: each stream recovers clean to exactly its own records.
+        let (set, recoveries) = StreamSet::open(&inner, ManualClock::new(), cfg()).unwrap();
+        for id in [&def, &a, &b] {
+            assert!(
+                recoveries[id].loss_report.is_empty(),
+                "{} recovered clean",
+                id.name()
+            );
+        }
+        assert_eq!(
+            set.read_range(&def, Offset::ZERO, 100, None).unwrap().len(),
+            1
+        );
+        let ar = set.read_range(&a, Offset::ZERO, 100, None).unwrap();
+        assert_eq!(ar.len(), 2);
+        assert_eq!(&*ar[0].payload, b"a0");
+        assert_eq!(&*ar[1].payload, b"a1");
+        assert_eq!(
+            set.read_range(&b, Offset::ZERO, 100, None).unwrap().len(),
+            1
+        );
+    }
+
+    /// A no-op tick (a fresh set, nothing appended) issues zero barriers and an empty outcome — the
+    /// `Default` outcome — so a coordinator driven on an idle pass costs nothing.
+    #[test]
+    fn an_idle_tick_is_a_zero_cost_noop() {
+        let (mut set, _, control) = open_faulty(InMemoryFs::new());
+        let before = control.sync_count();
+        let outcome = set.commit_tick();
+        assert_eq!(control.sync_count() - before, 0);
+        assert_eq!(outcome, CommitOutcome::default());
     }
 }

@@ -1992,6 +1992,95 @@ impl<F: Filesystem, C: Clock> Log<F, C> {
         Ok(())
     }
 
+    /// Issues the covering `fdatasync` for this log's active segment ALONE — the bare durability
+    /// barrier, WITHOUT re-flushing pending bytes and WITHOUT advancing the durable head (#564).
+    /// This is the middle phase of [`Log::sync`] exposed on its own so the cross-stream
+    /// `CommitCoordinator` (M2-I3) can drive a single commit tick as: (a) one
+    /// [`Log::flush_no_sync`] pass over every DIRTIED stream (drains each `pending` to the page
+    /// cache, raises each visible head), then (b) one `sync_data_only` per dirtied stream's fd (the
+    /// K fdatasyncs the kernel cannot batch across different fds), then (c) one
+    /// [`Log::advance_synced_offset_after_external_sync`] per dirtied stream to advance its durable
+    /// head and release its parked acks. Splitting the phases this way amortizes the per-stream
+    /// barrier across the whole batch exactly as today's single-log group-commit amortizes one
+    /// `fdatasync` across a batch of appends — the per-RECORD fsync cost stays O(1/batch); only the
+    /// fsync COUNT per tick is O(dirtied streams).
+    ///
+    /// The caller MUST have flushed this log first (via [`Log::flush_no_sync`]); this method does
+    /// NOT flush, so it makes durable exactly the prefix already in the file. It does NOT touch
+    /// `synced_offset`: durability is only ACKNOWLEDGED once the caller follows a SUCCESSFUL
+    /// `sync_data_only` with [`Log::advance_synced_offset_after_external_sync`], preserving I2
+    /// (ack-implies-durable) — never advance the durable head before its covering fdatasync returns.
+    ///
+    /// A failed barrier FREEZES this writer read-only (drops the active segment, surfaces
+    /// [`StorageError::WriterFrozen`]), exactly as [`Log::sync`] does — and because each stream is
+    /// its OWN `Log`, freezing this one cannot touch a sibling stream (the per-stream
+    /// resilience-isolation property). The coordinator skips the durable-head advance for a frozen
+    /// stream (its acks are NOT released) and continues the batch for its siblings.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::WriterFrozen`] if the writer is already frozen, or if this fdatasync
+    /// fails its durability barrier (which freezes the writer read-only).
+    pub(crate) fn sync_data_only(&mut self) -> Result<(), StorageError> {
+        self.active()?;
+        let frozen = match self.active.as_mut() {
+            Some(w) => w.sync_data_only().is_err(),
+            None => true,
+        };
+        if frozen {
+            self.active = None;
+            return Err(StorageError::WriterFrozen);
+        }
+        Ok(())
+    }
+
+    /// Advances the DURABLE head to the visible head after an EXTERNALLY-issued covering
+    /// `fdatasync` ([`Log::sync_data_only`]) has returned successfully (#564): the final phase of
+    /// [`Log::sync`] exposed on its own for the cross-stream `CommitCoordinator`. It advances
+    /// `synced_offset` to `next_offset`, zeroes the unsynced at-risk byte exposure, and republishes
+    /// the flushed frontier — exactly the post-barrier bookkeeping [`Log::sync`] does inline, minus
+    /// the fsync (already done by the coordinator's batched barrier).
+    ///
+    /// SAFETY OF THE CONTRACT (I2): the caller MUST call this ONLY after a successful
+    /// [`Log::sync_data_only`] (or [`Log::sync`]) that covered the records in
+    /// `[synced_offset, next_offset)`. Calling it without that covering fdatasync would advertise
+    /// records as durable that a power loss could revert — violating I2 (ack-implies-durable). The
+    /// coordinator enforces this by advancing a stream's durable head ONLY on the success path of
+    /// its `sync_data_only`, and skipping it (leaving the acks parked) for any stream whose barrier
+    /// froze. A debug assert guards the obvious misuse: the writer must still be live (a frozen
+    /// writer's barrier failed, so its durable head must not advance).
+    ///
+    /// Idempotent for a fully-synced log (`synced_offset` already equals `next_offset`): advancing
+    /// to the same head and re-zeroing an already-zero exposure is a no-op, so a coordinator that
+    /// over-calls it on a clean stream does no harm.
+    pub(crate) fn advance_synced_offset_after_external_sync(&mut self) {
+        debug_assert!(
+            self.is_writable(),
+            "advance_synced_offset_after_external_sync must follow a SUCCESSFUL covering fdatasync; \
+             a frozen writer's durable head must never advance (#564)"
+        );
+        self.flushed_offset = self.next_offset;
+        self.synced_offset = self.next_offset;
+        self.raise_active_index_flushed_end();
+        self.unsynced_record_bytes = 0;
+        self.publish_flushed_frontier();
+    }
+
+    /// Whether this log has appended records not yet covered by a returned `fdatasync` — i.e. it is
+    /// DIRTIED and owes the next commit tick a durability barrier (#564). The exact gate the
+    /// cross-stream `CommitCoordinator` uses to pick which streams a tick must sync: a stream whose
+    /// durable head ([`Log::synced_offset`]) trails the offset its next append will receive
+    /// ([`Log::next_offset`]) has un-synced records. A fully-synced (or never-appended) stream is
+    /// CLEAN and the coordinator skips it entirely (a cold stream costs zero fdatasyncs), so the
+    /// tick's fsync count scales with the dirtied (hot) streams, not with the total stream count.
+    ///
+    /// A frozen writer (`active` is `None`) reports `false`: it can no longer be made durable, so
+    /// the coordinator must not pick it for a barrier (it would only re-surface `WriterFrozen`); its
+    /// acked-but-now-lost tail is a recovery/loss concern, not a commit-tick concern.
+    #[must_use]
+    pub(crate) fn has_unsynced_records(&self) -> bool {
+        self.is_writable() && self.synced_offset != self.next_offset
+    }
+
     /// Advances the ACTIVE segment's resident seek index `flushed_end` to its current `valid_end`
     /// (#537): called after a `sync`/`flush_no_sync` flushes the writer's pending bytes to the file
     /// and raises the visible head, so the index's flushed (in-file) read bound now reaches the whole

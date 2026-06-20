@@ -667,6 +667,32 @@ impl<F: RandomAccessFile> SegmentWriter<F> {
         Ok(())
     }
 
+    /// Issues the `fdatasync` ALONE, WITHOUT first flushing the pending buffer (#564): the
+    /// barrier-only half of [`SegmentWriter::sync`]. The caller MUST have already drained the
+    /// pending bytes to the page cache (via [`SegmentWriter::flush_pending`], typically through
+    /// the log's `flush_no_sync`), so the bytes this fdatasync makes durable are exactly the
+    /// bytes already in the file; this method does NOT re-flush. It exists so the cross-stream
+    /// `CommitCoordinator` can split a commit tick into one page-cache-flush pass over every
+    /// dirtied stream followed by one `fdatasync` per dirtied stream's fd — the two phases of
+    /// [`SegmentWriter::sync`] driven separately across many streams, instead of fused per stream.
+    ///
+    /// Calling this with un-flushed pending bytes would make a SHORTER prefix durable than the
+    /// caller believes, so the contract is: flush first, then `sync_data_only`. (A debug assert
+    /// guards the misuse: the pending buffer must be empty here.)
+    ///
+    /// # Errors
+    /// Propagates the underlying IO error. A fatal sync error must be treated as terminal by the
+    /// caller (the writer is frozen read-only), exactly as for [`SegmentWriter::sync`].
+    pub fn sync_data_only(&mut self) -> Result<(), StorageError> {
+        debug_assert!(
+            self.pending.is_empty(),
+            "sync_data_only requires the pending buffer already flushed to the page cache; \
+             call flush_pending (or the log's flush_no_sync) first (#564)"
+        );
+        self.file.sync_data()?;
+        Ok(())
+    }
+
     /// Writes the pending appended records to the file with ONE `write_all_at` (#452), making
     /// them readable (page cache) but NOT durable (no fsync). Called from every flush point:
     /// `sync` (before its fdatasync), the log's visible-head raise, the seal, and the spill cap.

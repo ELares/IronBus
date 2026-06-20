@@ -360,7 +360,13 @@ impl FaultControl {
 
 /// A [`Filesystem`] that wraps another and hands out [`FaultFile`]s sharing one
 /// [`FaultControl`]. Directory operations delegate unchanged; only the files can fault.
-#[derive(Debug)]
+///
+/// `Clone` (when the inner fs is `Clone`) clones the inner filesystem and SHARES the one
+/// [`FaultControl`] (its state is `Arc`-backed): every clone faults and counts against the same
+/// control, so a [`StreamSet`](crate::streamset::StreamSet) — which clones the fs to root each
+/// stream's [`Log`] — observes one consistent fault/count surface across all its streams. This is
+/// what a cross-stream group-commit test needs: one `sync_count()` aggregating every stream's fd.
+#[derive(Clone, Debug)]
 pub struct FaultFs<F> {
     inner: F,
     control: FaultControl,
