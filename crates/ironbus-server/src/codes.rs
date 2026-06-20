@@ -109,6 +109,14 @@ impl ErrorCode {
     /// [`EngineError::InvalidGroupName`].
     pub const ERR_INVALID_GROUP_NAME: ErrorCode = ErrorCode("ERR_INVALID_GROUP_NAME");
 
+    /// A NAMED stream name was empty, too long, or non-graphic ASCII (#676). Maps
+    /// [`EngineError::InvalidStreamName`].
+    pub const ERR_INVALID_STREAM_NAME: ErrorCode = ErrorCode("ERR_INVALID_STREAM_NAME");
+
+    /// A consume/ack/commit targeted a NAMED stream that was never declared (#676). Maps
+    /// [`EngineError::UnknownStream`].
+    pub const ERR_UNKNOWN_STREAM: ErrorCode = ErrorCode("ERR_UNKNOWN_STREAM");
+
     /// A produce presented a STALE producer epoch (a zombie session reusing an old `producer_id`,
     /// #33): the broker rejects it (`AppendOutcome::Fenced`, the wire `fenced: stale producer
     /// epoch`). Not an `EngineError`: it is an `AppendOutcome`. The contract's `ERR_PRODUCER_FENCED`.
@@ -147,6 +155,8 @@ impl ErrorCode {
             EngineError::BroadcastGroupNotNamed { .. } => Self::ERR_BROADCAST_GROUP_NOT_NAMED,
             EngineError::TooManyGroups { .. } => Self::ERR_TOO_MANY_GROUPS,
             EngineError::InvalidGroupName => Self::ERR_INVALID_GROUP_NAME,
+            EngineError::InvalidStreamName { .. } => Self::ERR_INVALID_STREAM_NAME,
+            EngineError::UnknownStream { .. } => Self::ERR_UNKNOWN_STREAM,
             EngineError::GenerationExhausted => Self::ERR_GENERATION_EXHAUSTED,
             EngineError::MissingRecord { .. } => Self::ERR_MISSING_RECORD,
             EngineError::ZeroMaxInFlight => Self::ERR_ZERO_MAX_IN_FLIGHT,
@@ -231,6 +241,18 @@ mod tests {
             (
                 EngineError::InvalidGroupName,
                 ErrorCode::ERR_INVALID_GROUP_NAME,
+            ),
+            (
+                EngineError::InvalidStreamName {
+                    name: "bad name".to_string(),
+                },
+                ErrorCode::ERR_INVALID_STREAM_NAME,
+            ),
+            (
+                EngineError::UnknownStream {
+                    name: "ghost".to_string(),
+                },
+                ErrorCode::ERR_UNKNOWN_STREAM,
             ),
             (
                 EngineError::GenerationExhausted,
