@@ -4105,7 +4105,11 @@ fn load_one_credential(
 /// impression that the wire is encrypted: there is no allowed crypto provider, so the handshake cannot
 /// run and the wire would be plaintext despite the cert. Names the offending flag and points at the
 /// honest alternatives (loopback + upstream TLS termination, or the explicit plaintext opt-in).
-#[cfg(any(unix, test))]
+///
+/// NOT cfg-gated: the `--tls-*` flag parser that calls this is platform-agnostic (a Windows user
+/// passing `--tls-cert` must get this refusal too), and `cargo test` builds the regular `ironbus`
+/// binary with `cfg(test)=false`, so an `any(unix, test)` gate would vanish on a Windows non-test
+/// build while its ungated caller remained → E0425. It uses no unix API (pure error string).
 fn reserved_tls_flag_refusal(flag: &str) -> CliError {
     CliError::Usage(format!(
         "{flag} is not yet honored: the TLS 1.3 handshake is the flagged follow-up #107 (no allowed \
