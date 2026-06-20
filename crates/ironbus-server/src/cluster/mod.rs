@@ -205,6 +205,7 @@ pub mod isr;
 pub mod membership;
 pub mod metadata_group;
 pub mod metadata_storage;
+pub mod placement;
 pub mod replication;
 pub mod runtime;
 pub mod state_machine;
@@ -224,6 +225,7 @@ pub use isr::{AckReplicatedBody, IsrConfig, IsrMembership, IsrTracker, PendingAc
 pub use membership::{MemberOp, MembershipChange, PeerIdError};
 pub use metadata_group::{GroupError, MetadataRaftGroup};
 pub use metadata_storage::{MetadataLogStorage, MetadataStorageError, METADATA_SUBDIR};
+pub use placement::{decide_placement, placement_command, placement_node_from, PlacementOutcome};
 pub use replication::{
     ApplyOutcome, DivergenceTruncation, EpochAwareFollower, FetchRecordsBody, FetchResponseBody,
     Follower, OffsetForLeaderEpochBody, OffsetForLeaderEpochResponse, ReplicationError,

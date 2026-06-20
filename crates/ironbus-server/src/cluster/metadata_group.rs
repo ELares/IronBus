@@ -685,10 +685,7 @@ mod tests {
         settle(&mut group);
         assert_eq!(
             group.state().placement(7),
-            Some(Placement {
-                leader: 1,
-                epoch: group.term()
-            })
+            Some(Placement::leader_only(1, group.term()))
         );
         assert!(group.state().applied_index() > prev_index);
     }
@@ -732,10 +729,7 @@ mod tests {
             settle(&mut group);
             assert_eq!(
                 group.state().placement(3),
-                Some(Placement {
-                    leader: 1,
-                    epoch: 1
-                })
+                Some(Placement::leader_only(1, 1))
             );
             (
                 group.term(),
@@ -774,11 +768,54 @@ mod tests {
         settle(&mut reopened);
         assert_eq!(
             reopened.state().placement(3),
-            Some(Placement {
-                leader: 1,
-                epoch: 1
-            }),
+            Some(Placement::leader_only(1, 1)),
             "the committed placement must survive a reopen of the durable group"
+        );
+    }
+
+    /// The C5-I1 (#616) durability acceptance test: a full REPLICA-SET placement (a
+    /// `PlacePartition` command — `R` replicas + a designated leader) commits through the metadata
+    /// log and SURVIVES a reopen, exactly like the leader-only placement above. This proves the
+    /// placement is durable-through-the-metadata-log (one entry, reusing the #659 round-trip), not
+    /// a transient in-memory decision.
+    #[test]
+    fn committed_replica_set_placement_survives_a_group_reopen() {
+        let fs = InMemoryFs::new();
+        let expected = Placement {
+            replicas: vec![1, 2, 3],
+            leader: 1,
+            epoch: 4,
+        };
+        {
+            let mut group = open_on(&fs, 1, &[1]);
+            group.campaign().expect("campaign");
+            settle(&mut group);
+            assert!(group.is_leader());
+
+            group
+                .propose(&MetadataCommand::PlacePartition {
+                    partition: 8,
+                    replicas: vec![1, 2, 3],
+                    leader: 1,
+                    epoch: 4,
+                })
+                .expect("propose placement");
+            settle(&mut group);
+            assert_eq!(
+                group.state().placement(8),
+                Some(expected.clone()),
+                "the replica-set placement applied on the live group"
+            );
+        }
+
+        // Reopen over the SAME durable image (a process restart): re-applying the durable entries
+        // must reconstruct the identical replica-set placement.
+        let mut reopened = open_on(&fs, 1, &[1]);
+        settle(&mut reopened);
+        assert_eq!(
+            reopened.state().placement(8),
+            Some(expected),
+            "the committed replica-set placement must survive a reopen of the durable group"
         );
     }
 

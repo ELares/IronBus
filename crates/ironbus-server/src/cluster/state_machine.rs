@@ -51,15 +51,49 @@ impl NodeRole {
     }
 }
 
-/// The current placement of a single partition: which node leads it and under which
-/// monotonic leader epoch. The epoch is the fencing token (a stale leader's writes are
-/// rejected once a higher epoch exists); exposing it to the broker is C1-I3.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The current placement of a single partition: the ordered set of `R` replica nodes that hold
+/// it, which one of them leads it, and under which monotonic leader epoch. The epoch is the
+/// fencing token (a stale leader's writes are rejected once a higher epoch exists); exposing it
+/// to the broker is C1-I3.
+///
+/// `replicas` is the ordered replica set the C5-I1 placement policy
+/// ([`ironbus_core::placement`]) decided — `R` distinct nodes spread across failure domains, the
+/// leader first. The `leader` is always one of `replicas` and is always an ELIGIBLE replica
+/// (#700: in-ISR, complete, non-divergent), because the policy only ever designates an eligible
+/// replica leader.
+///
+/// For BACKWARD compatibility, a [`MetadataCommand::AssignPartition`] (the C1 leader-only command,
+/// which carries no replica set) yields a placement whose `replicas` is just `[leader]` — the
+/// single-node degenerate shape, unchanged on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placement {
-    /// The node id currently designated leader for the partition.
+    /// The ordered set of replica node ids that hold this partition (leader first). For an
+    /// `AssignPartition` (leader-only) command this is `[leader]`.
+    pub replicas: Vec<u64>,
+    /// The node id currently designated leader for the partition (always one of `replicas`, always
+    /// an eligible replica).
     pub leader: u64,
     /// The monotonic leadership epoch assigned at this placement.
     pub epoch: u64,
+}
+
+impl Placement {
+    /// A leader-only placement: the single-node / `AssignPartition` degenerate shape, whose replica
+    /// set is exactly `[leader]`.
+    #[must_use]
+    pub fn leader_only(leader: u64, epoch: u64) -> Self {
+        Placement {
+            replicas: vec![leader],
+            leader,
+            epoch,
+        }
+    }
+
+    /// The replication factor (number of replica nodes holding this partition).
+    #[must_use]
+    pub fn replication_factor(&self) -> usize {
+        self.replicas.len()
+    }
 }
 
 /// One deterministic mutation of the metadata state machine. A committed Raft log entry's
@@ -72,9 +106,25 @@ pub enum MetadataCommand {
     AddNode { node: u64, role: NodeRole },
     /// Remove a node from the membership table.
     RemoveNode { node: u64 },
-    /// Assign `partition` to `leader` at `epoch` (placement + leader-epoch in one step).
+    /// Assign `partition` to `leader` at `epoch` (placement + leader-epoch in one step). The
+    /// leader-only C1 command: it carries no replica set, so it yields a placement whose replicas
+    /// are exactly `[leader]`. Retained for backward compatibility and the n=1 degenerate case.
     AssignPartition {
         partition: u64,
+        leader: u64,
+        epoch: u64,
+    },
+    /// Place `partition`'s full replica set (the C5-I1 command): the ordered `replicas` the
+    /// placement policy decided, the `leader` among them (always an eligible replica), and the
+    /// monotonic `epoch`. This commits a whole placement — `R` replicas + a balanced eligible
+    /// leader — through the metadata log as ONE entry (not a per-partition Raft group).
+    ///
+    /// The leader MUST be one of `replicas` (the placement policy guarantees this); a command whose
+    /// leader is absent from its replica set is rejected at decode time
+    /// ([`DecodeError::LeaderNotAReplica`]) so a malformed placement can never enter the state.
+    PlacePartition {
+        partition: u64,
+        replicas: Vec<u64>,
         leader: u64,
         epoch: u64,
     },
@@ -97,6 +147,12 @@ pub enum DecodeError {
     BadUtf8,
     /// Bytes remained after a single command was decoded.
     TrailingBytes,
+    /// A `PlacePartition` command named a leader that is not in its own replica set — a malformed
+    /// placement (the leader must always be one of the replicas), rejected fail-closed.
+    LeaderNotAReplica,
+    /// A `PlacePartition` command had an empty replica set (a placement must hold at least one
+    /// replica).
+    EmptyReplicaSet,
 }
 
 impl core::fmt::Display for DecodeError {
@@ -110,6 +166,10 @@ impl core::fmt::Display for DecodeError {
             }
             DecodeError::BadUtf8 => write!(f, "metadata command string field is not valid UTF-8"),
             DecodeError::TrailingBytes => write!(f, "trailing bytes after a metadata command"),
+            DecodeError::LeaderNotAReplica => {
+                write!(f, "placement leader is not in its own replica set")
+            }
+            DecodeError::EmptyReplicaSet => write!(f, "placement has an empty replica set"),
         }
     }
 }
@@ -121,6 +181,7 @@ const TAG_ADD_NODE: u8 = 1;
 const TAG_REMOVE_NODE: u8 = 2;
 const TAG_ASSIGN_PARTITION: u8 = 3;
 const TAG_SET_CONFIG: u8 = 4;
+const TAG_PLACE_PARTITION: u8 = 5;
 
 impl MetadataCommand {
     /// Encode the command to its canonical little-endian wire bytes.
@@ -147,6 +208,22 @@ impl MetadataCommand {
             } => {
                 out.push(TAG_ASSIGN_PARTITION);
                 out.extend_from_slice(&partition.to_le_bytes());
+                out.extend_from_slice(&leader.to_le_bytes());
+                out.extend_from_slice(&epoch.to_le_bytes());
+            }
+            MetadataCommand::PlacePartition {
+                partition,
+                replicas,
+                leader,
+                epoch,
+            } => {
+                out.push(TAG_PLACE_PARTITION);
+                out.extend_from_slice(&partition.to_le_bytes());
+                let count = u32::try_from(replicas.len()).unwrap_or(u32::MAX);
+                out.extend_from_slice(&count.to_le_bytes());
+                for r in replicas {
+                    out.extend_from_slice(&r.to_le_bytes());
+                }
                 out.extend_from_slice(&leader.to_le_bytes());
                 out.extend_from_slice(&epoch.to_le_bytes());
             }
@@ -185,6 +262,33 @@ impl MetadataCommand {
                 let epoch = cur.u64()?;
                 MetadataCommand::AssignPartition {
                     partition,
+                    leader,
+                    epoch,
+                }
+            }
+            TAG_PLACE_PARTITION => {
+                let partition = cur.u64()?;
+                let count = cur.u32()? as usize;
+                // Each replica is a u64 (8 bytes): reject a count whose bytes cannot all be present
+                // BEFORE allocating, so a hostile/truncated length can never over-allocate.
+                if cur.remaining() < count.saturating_mul(8) {
+                    return Err(DecodeError::BadLength);
+                }
+                let mut replicas = Vec::with_capacity(count);
+                for _ in 0..count {
+                    replicas.push(cur.u64()?);
+                }
+                let leader = cur.u64()?;
+                let epoch = cur.u64()?;
+                if replicas.is_empty() {
+                    return Err(DecodeError::EmptyReplicaSet);
+                }
+                if !replicas.contains(&leader) {
+                    return Err(DecodeError::LeaderNotAReplica);
+                }
+                MetadataCommand::PlacePartition {
+                    partition,
+                    replicas,
                     leader,
                     epoch,
                 }
@@ -303,9 +407,19 @@ impl MetadataStateMachine {
                 leader,
                 epoch,
             } => {
+                self.placements
+                    .insert(*partition, Placement::leader_only(*leader, *epoch));
+            }
+            MetadataCommand::PlacePartition {
+                partition,
+                replicas,
+                leader,
+                epoch,
+            } => {
                 self.placements.insert(
                     *partition,
                     Placement {
+                        replicas: replicas.clone(),
                         leader: *leader,
                         epoch: *epoch,
                     },
@@ -376,7 +490,7 @@ impl MetadataStateMachine {
     /// The current placement for `partition`, if assigned.
     #[must_use]
     pub fn placement(&self, partition: u64) -> Option<Placement> {
-        self.placements.get(&partition).copied()
+        self.placements.get(&partition).cloned()
     }
 
     /// A config value by key.
@@ -441,15 +555,97 @@ mod tests {
                 value: "3".to_owned(),
             },
         );
-        assert_eq!(
-            sm.placement(4),
-            Some(Placement {
-                leader: 2,
-                epoch: 9
-            })
-        );
+        assert_eq!(sm.placement(4), Some(Placement::leader_only(2, 9)));
         assert_eq!(sm.config("replication"), Some("3"));
         assert_eq!(sm.config("missing"), None);
+    }
+
+    #[test]
+    fn place_partition_applies_the_full_replica_set_and_leader() {
+        let mut sm = MetadataStateMachine::new();
+        sm.apply(
+            1,
+            &MetadataCommand::PlacePartition {
+                partition: 4,
+                replicas: vec![2, 1, 3],
+                leader: 2,
+                epoch: 9,
+            },
+        );
+        let placement = sm.placement(4).expect("placement applied");
+        assert_eq!(
+            placement.replicas,
+            vec![2, 1, 3],
+            "the ordered replica set is stored"
+        );
+        assert_eq!(placement.leader, 2, "the designated leader is stored");
+        assert_eq!(placement.epoch, 9);
+        assert_eq!(placement.replication_factor(), 3);
+        assert!(
+            placement.replicas.contains(&placement.leader),
+            "the leader is always one of the replicas"
+        );
+    }
+
+    #[test]
+    fn assign_partition_yields_a_leader_only_replica_set() {
+        // The backward-compatible C1 command: a leader-only placement has replicas == [leader].
+        let mut sm = MetadataStateMachine::new();
+        sm.apply(
+            1,
+            &MetadataCommand::AssignPartition {
+                partition: 7,
+                leader: 5,
+                epoch: 3,
+            },
+        );
+        let placement = sm.placement(7).expect("placement applied");
+        assert_eq!(placement.replicas, vec![5]);
+        assert_eq!(placement.leader, 5);
+        assert_eq!(placement.replication_factor(), 1);
+    }
+
+    #[test]
+    fn decode_rejects_a_placement_whose_leader_is_not_a_replica() {
+        // A hand-built PlacePartition whose leader (99) is absent from its replica set must be
+        // rejected fail-closed at decode time — a malformed placement can never enter the state.
+        let cmd = MetadataCommand::PlacePartition {
+            partition: 1,
+            replicas: vec![1, 2, 3],
+            leader: 99,
+            epoch: 1,
+        };
+        let bytes = cmd.encode();
+        assert_eq!(
+            MetadataCommand::decode(&bytes),
+            Err(DecodeError::LeaderNotAReplica)
+        );
+    }
+
+    #[test]
+    fn decode_rejects_a_placement_with_an_empty_replica_set() {
+        let cmd = MetadataCommand::PlacePartition {
+            partition: 1,
+            replicas: vec![],
+            leader: 0,
+            epoch: 1,
+        };
+        let bytes = cmd.encode();
+        assert_eq!(
+            MetadataCommand::decode(&bytes),
+            Err(DecodeError::EmptyReplicaSet)
+        );
+    }
+
+    #[test]
+    fn decode_rejects_a_placement_with_an_overrunning_replica_count() {
+        // A length prefix claiming more replicas than the buffer holds must be rejected BEFORE any
+        // large allocation (the hostile-length guard).
+        let mut buf = vec![TAG_PLACE_PARTITION];
+        buf.extend_from_slice(&1u64.to_le_bytes()); // partition
+        buf.extend_from_slice(&1000u32.to_le_bytes()); // claims 1000 replicas
+        buf.extend_from_slice(&1u64.to_le_bytes()); // but only one u64 follows
+        assert_eq!(MetadataCommand::decode(&buf), Err(DecodeError::BadLength));
     }
 
     #[test]
@@ -468,6 +664,18 @@ mod tests {
                 partition: 1,
                 leader: 5,
                 epoch: 12,
+            },
+            MetadataCommand::PlacePartition {
+                partition: 8,
+                replicas: vec![3, 1, 2],
+                leader: 3,
+                epoch: 7,
+            },
+            MetadataCommand::PlacePartition {
+                partition: 9,
+                replicas: vec![42],
+                leader: 42,
+                epoch: 1,
             },
             MetadataCommand::SetConfig {
                 key: "k".to_owned(),
