@@ -2111,6 +2111,188 @@ pub fn decode_sub_to(body: &[u8]) -> Result<SubToBody<'_>, BodyError> {
     Ok(SubToBody { stream_id, group })
 }
 
+// ===================================================================================
+// SUBJECT-ADDRESSED WIRE BODIES (#585, V2-M2-I9): the subject->stream binding + subject-addressed
+// pub/sub verbs that complete the SUBJECTS story — BindSubject (tag 34), PubSubject (tag 35), SubSubject
+// (tag 36). Each rides the SAME `body_version: u8` + `field_len: u16` frame as the explicit-stream-id
+// verbs (#588), so a future version appends fields without a wire break. A subject/pattern field is a
+// `u16`-length-prefixed byte field capped at [`MAX_STREAM_ID_LEN`] BEFORE any read (fail-closed): a
+// malformed/oversized subject is a typed [`BodyError`], never a panic or over-read. The server further
+// validates a subject through the #567 grammar; the wire cap only stops an absurdly long field. These are
+// ADDITIVE tags an old client never sends; the explicit-stream-id verbs (tags 28-31) are unchanged.
+// ===================================================================================
+
+/// Reads a `u16`-length-prefixed subject/pattern field, reusing [`MAX_STREAM_ID_LEN`] as the wire cap
+/// (#585). A declared length over the cap is a typed [`BodyError::BadLength`] (fail-closed) BEFORE the
+/// bytes are taken; a short body is [`BodyError::Truncated`] via [`Reader::take`]. The slice borrows the
+/// body (zero-copy). The server's #567 grammar is the real validator; this only fails a hostile length.
+fn read_subject<'a>(r: &mut Reader<'a>) -> Result<&'a [u8], BodyError> {
+    let len = r.u16()? as usize;
+    if len > MAX_STREAM_ID_LEN {
+        return Err(BodyError::BadLength);
+    }
+    r.take(len)
+}
+
+/// A client's request to BIND a subject PATTERN to a stream (the `BindSubject` frame body, tag 34,
+/// #585): an explicit `stream_id` (the empty name binds the DEFAULT stream) and a `pattern` (#567
+/// pattern, wildcards allowed). The broker registers `(pattern -> stream)` and replies `Ok`, or `Err`
+/// on a malformed pattern / stream name or a fork-bound rejection.
+///
+/// Layout (version+length framed): `body_version: u8`, `field_len: u16`, then the v1 block:
+/// `stream_id: u16-len + bytes`, `pattern: u16-len + bytes`. Trailing block bytes are tolerated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindSubjectBody<'a> {
+    /// The bound stream's name (empty binds the default stream), validated server-side.
+    pub stream_id: &'a [u8],
+    /// The subject PATTERN to bind (#567 pattern, validated server-side).
+    pub pattern: &'a [u8],
+}
+
+/// Encodes a `BindSubject` body onto the end of `out` (#585).
+///
+/// # Errors
+/// Returns [`BodyError::FieldTooLarge`] if the stream id or pattern exceeds the `u16` wire limit.
+pub fn encode_bind_subject(req: &BindSubjectBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
+    let id_len = u16::try_from(req.stream_id.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    let pat_len = u16::try_from(req.pattern.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    let field_len = u16::try_from(2 + req.stream_id.len() + 2 + req.pattern.len())
+        .map_err(|_| BodyError::FieldTooLarge)?;
+    out.push(STREAM_WIRE_BODY_VERSION);
+    out.extend_from_slice(&field_len.to_le_bytes());
+    out.extend_from_slice(&id_len.to_le_bytes());
+    out.extend_from_slice(req.stream_id);
+    out.extend_from_slice(&pat_len.to_le_bytes());
+    out.extend_from_slice(req.pattern);
+    Ok(())
+}
+
+/// Decodes a `BindSubject` body (#585), cap-before-alloc and panic-free. A short body or an over-cap
+/// field is a typed [`BodyError`]; an EMPTY body is [`BodyError::Truncated`].
+///
+/// # Errors
+/// [`BodyError::Truncated`] for a short body, [`BodyError::BadLength`] for an over-cap field, or
+/// [`BodyError::BadHandshakeVersion`] for an unknown body version.
+pub fn decode_bind_subject(body: &[u8]) -> Result<BindSubjectBody<'_>, BodyError> {
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != STREAM_WIRE_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    let mut fr = Reader::new(block);
+    let stream_id = read_stream_id(&mut fr)?;
+    let pattern = read_subject(&mut fr)?;
+    Ok(BindSubjectBody { stream_id, pattern })
+}
+
+/// A producer's publish BY SUBJECT (the `PubSubject` frame body, tag 35, #585): a literal `subject`
+/// followed by the verbatim [`PubBody`] bytes (decoded by the caller with [`decode_pub`], so the publish
+/// body codec is shared UNCHANGED with `Pub`/`PubTo`). The broker resolves the subject single-home to one
+/// bound stream and routes the append there (or rejects unbound/ambiguous, fail-closed).
+///
+/// Layout (version+length framed): `body_version: u8`, `field_len: u16` (over the `subject` field ONLY),
+/// then the v1 block: `subject: u16-len + bytes`; then the verbatim `PubBody` bytes as the REMAINDER.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PubSubjectBody<'a> {
+    /// The literal subject to publish on (validated #567 literal server-side).
+    pub subject: &'a [u8],
+    /// The verbatim [`PubBody`] bytes, decoded by the caller with [`decode_pub`].
+    pub pub_body: &'a [u8],
+}
+
+/// Encodes a `PubSubject` body onto the end of `out` (#585): the version byte, the field-block length
+/// over the subject, the subject, then the verbatim `pub_body` bytes.
+///
+/// # Errors
+/// Returns [`BodyError::FieldTooLarge`] if the subject exceeds the `u16` wire limit.
+pub fn encode_pub_subject(req: &PubSubjectBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
+    let subj_len = u16::try_from(req.subject.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    let field_len = u16::try_from(2 + req.subject.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    out.push(STREAM_WIRE_BODY_VERSION);
+    out.extend_from_slice(&field_len.to_le_bytes());
+    out.extend_from_slice(&subj_len.to_le_bytes());
+    out.extend_from_slice(req.subject);
+    out.extend_from_slice(req.pub_body);
+    Ok(())
+}
+
+/// Decodes a `PubSubject` body (#585) into its `subject` and the verbatim `pub_body` tail,
+/// cap-before-alloc and panic-free. A short body or an over-cap subject is a typed [`BodyError`]; an
+/// EMPTY body is [`BodyError::Truncated`].
+///
+/// # Errors
+/// [`BodyError::Truncated`] for a short body, [`BodyError::BadLength`] for an over-cap subject, or
+/// [`BodyError::BadHandshakeVersion`] for an unknown body version.
+pub fn decode_pub_subject(body: &[u8]) -> Result<PubSubjectBody<'_>, BodyError> {
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != STREAM_WIRE_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    let pub_body = r.rest();
+    let mut fr = Reader::new(block);
+    let subject = read_subject(&mut fr)?;
+    Ok(PubSubjectBody { subject, pub_body })
+}
+
+/// A consumer's subscribe BY SUBJECT (the `SubSubject` frame body, tag 36, #585): a `subject` (literal
+/// or wildcard) plus the work-`group` name. The broker resolves the subject single-home to one bound
+/// stream and binds the connection's subsequent `Flow`/`Ack` to that stream's competing work-group (or
+/// rejects unbound/ambiguous, fail-closed).
+///
+/// Layout (version+length framed): `body_version: u8`, `field_len: u16`, then the v1 block:
+/// `subject: u16-len + bytes`, `group: u16-len + bytes`. Trailing block bytes are tolerated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubSubjectBody<'a> {
+    /// The subject to subscribe on (a literal or wildcard pattern, validated server-side).
+    pub subject: &'a [u8],
+    /// The work-group name (empty selects the default group), validated server-side.
+    pub group: &'a [u8],
+}
+
+/// Encodes a `SubSubject` body onto the end of `out` (#585): the version byte, the field-block length,
+/// then the subject and group, each `u16`-length-prefixed.
+///
+/// # Errors
+/// Returns [`BodyError::FieldTooLarge`] if the subject or group exceeds the `u16` wire limit.
+pub fn encode_sub_subject(req: &SubSubjectBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
+    let subj_len = u16::try_from(req.subject.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    let group_len = u16::try_from(req.group.len()).map_err(|_| BodyError::FieldTooLarge)?;
+    let field_len = u16::try_from(2 + req.subject.len() + 2 + req.group.len())
+        .map_err(|_| BodyError::FieldTooLarge)?;
+    out.push(STREAM_WIRE_BODY_VERSION);
+    out.extend_from_slice(&field_len.to_le_bytes());
+    out.extend_from_slice(&subj_len.to_le_bytes());
+    out.extend_from_slice(req.subject);
+    out.extend_from_slice(&group_len.to_le_bytes());
+    out.extend_from_slice(req.group);
+    Ok(())
+}
+
+/// Decodes a `SubSubject` body (#585), cap-before-alloc and panic-free. A short body or an over-cap
+/// subject is a typed [`BodyError`]; an EMPTY body is [`BodyError::Truncated`].
+///
+/// # Errors
+/// [`BodyError::Truncated`] for a short body, [`BodyError::BadLength`] for an over-cap subject, or
+/// [`BodyError::BadHandshakeVersion`] for an unknown body version.
+pub fn decode_sub_subject(body: &[u8]) -> Result<SubSubjectBody<'_>, BodyError> {
+    let mut r = Reader::new(body);
+    let version = r.u8()?;
+    if version != STREAM_WIRE_BODY_VERSION {
+        return Err(BodyError::BadHandshakeVersion { version });
+    }
+    let field_len = r.u16()? as usize;
+    let block = r.take(field_len)?;
+    let mut fr = Reader::new(block);
+    let subject = read_subject(&mut fr)?;
+    let group = fr.var()?;
+    Ok(SubSubjectBody { subject, group })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4002,5 +4184,100 @@ mod tests {
         huge.extend_from_slice(&field_len.to_le_bytes());
         huge.extend_from_slice(&claimed_id_len.to_le_bytes());
         assert_eq!(decode_stream_declare(&huge), Err(BodyError::BadLength));
+    }
+
+    // ---- #585 (M2-I9): subject-addressed bodies ----
+
+    #[test]
+    fn bind_subject_round_trips_stream_and_pattern() {
+        // BindSubject carries both a stream id and a subject PATTERN, each round-tripping (wildcards
+        // are part of the pattern bytes; the proto does not validate the grammar — the server does).
+        for (stream, pattern) in [
+            (&b"orders"[..], &b"order.>"[..]),
+            (&b""[..], &b"payment.*.done"[..]), // empty stream binds the default stream
+            (&b"metrics"[..], &b">"[..]),
+        ] {
+            let mut buf = Vec::new();
+            encode_bind_subject(
+                &BindSubjectBody {
+                    stream_id: stream,
+                    pattern,
+                },
+                &mut buf,
+            )
+            .unwrap();
+            let decoded = decode_bind_subject(&buf).unwrap();
+            assert_eq!(decoded.stream_id, stream);
+            assert_eq!(decoded.pattern, pattern);
+        }
+    }
+
+    #[test]
+    fn pub_subject_round_trips_subject_and_verbatim_pub_body() {
+        // PubSubject prefixes a literal subject, then carries the EXISTING PubBody bytes VERBATIM, so the
+        // publish body codec is shared byte-for-byte with Pub/PubTo.
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &PubBody {
+                flags: 0,
+                timestamp_ms: 99,
+                key: b"k",
+                headers: b"h",
+                payload: b"payload-bytes",
+                dedup: None,
+                fire_and_forget: false,
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        encode_pub_subject(
+            &PubSubjectBody {
+                subject: b"order.us.created",
+                pub_body: &pub_body,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        let decoded = decode_pub_subject(&buf).unwrap();
+        assert_eq!(decoded.subject, b"order.us.created");
+        // The verbatim tail decodes with the UNCHANGED decode_pub codec.
+        assert_eq!(decoded.pub_body, pub_body.as_slice());
+        let msg = decode_pub(decoded.pub_body).unwrap();
+        assert_eq!(msg.payload, b"payload-bytes");
+    }
+
+    #[test]
+    fn sub_subject_round_trips_subject_and_group() {
+        for (subject, group) in [
+            (&b"order.>"[..], &b"workers"[..]), // a wildcard subject is legal on the sub side
+            (&b"metric.cpu"[..], &b""[..]),     // empty group selects the default group
+        ] {
+            let mut buf = Vec::new();
+            encode_sub_subject(&SubSubjectBody { subject, group }, &mut buf).unwrap();
+            let decoded = decode_sub_subject(&buf).unwrap();
+            assert_eq!(decoded.subject, subject);
+            assert_eq!(decoded.group, group);
+        }
+    }
+
+    #[test]
+    fn subject_bodies_fail_closed_on_malformed_input() {
+        // Empty body -> Truncated; unknown version -> BadHandshakeVersion; over-cap subject -> BadLength.
+        assert_eq!(decode_bind_subject(&[]), Err(BodyError::Truncated));
+        assert_eq!(decode_pub_subject(&[]), Err(BodyError::Truncated));
+        assert_eq!(decode_sub_subject(&[]), Err(BodyError::Truncated));
+        assert_eq!(
+            decode_pub_subject(&[STREAM_WIRE_BODY_VERSION + 1, 0, 0]),
+            Err(BodyError::BadHandshakeVersion {
+                version: STREAM_WIRE_BODY_VERSION + 1
+            })
+        );
+        // An over-cap subject length inside the block -> BadLength, never an over-read.
+        let mut huge = vec![STREAM_WIRE_BODY_VERSION];
+        let claimed = u16::try_from(MAX_STREAM_ID_LEN + 1).unwrap();
+        huge.extend_from_slice(&u16::try_from(2usize).unwrap().to_le_bytes());
+        huge.extend_from_slice(&claimed.to_le_bytes());
+        assert_eq!(decode_pub_subject(&huge), Err(BodyError::BadLength));
     }
 }

@@ -117,6 +117,22 @@ impl ErrorCode {
     /// [`EngineError::UnknownStream`].
     pub const ERR_UNKNOWN_STREAM: ErrorCode = ErrorCode("ERR_UNKNOWN_STREAM");
 
+    /// A subject or bind pattern was not valid #567 grammar (#585). Maps
+    /// [`EngineError::InvalidSubject`].
+    pub const ERR_INVALID_SUBJECT: ErrorCode = ErrorCode("ERR_INVALID_SUBJECT");
+
+    /// A `BindSubject` was refused because the resulting binding set would exceed the routing trie's
+    /// fork bound (#585/#568). Maps [`EngineError::BindRejected`].
+    pub const ERR_BIND_REJECTED: ErrorCode = ErrorCode("ERR_BIND_REJECTED");
+
+    /// A subject-addressed publish resolved to NO bound stream — the fail-closed reject, NOT a silent
+    /// drop (#585). Maps [`EngineError::NoStreamForSubject`].
+    pub const ERR_NO_STREAM_FOR_SUBJECT: ErrorCode = ErrorCode("ERR_NO_STREAM_FOR_SUBJECT");
+
+    /// A subject-addressed publish resolved to two-or-more bound streams under the single-home default
+    /// (#585). Maps [`EngineError::AmbiguousSubject`].
+    pub const ERR_AMBIGUOUS_SUBJECT: ErrorCode = ErrorCode("ERR_AMBIGUOUS_SUBJECT");
+
     /// A produce presented a STALE producer epoch (a zombie session reusing an old `producer_id`,
     /// #33): the broker rejects it (`AppendOutcome::Fenced`, the wire `fenced: stale producer
     /// epoch`). Not an `EngineError`: it is an `AppendOutcome`. The contract's `ERR_PRODUCER_FENCED`.
@@ -157,6 +173,10 @@ impl ErrorCode {
             EngineError::InvalidGroupName => Self::ERR_INVALID_GROUP_NAME,
             EngineError::InvalidStreamName { .. } => Self::ERR_INVALID_STREAM_NAME,
             EngineError::UnknownStream { .. } => Self::ERR_UNKNOWN_STREAM,
+            EngineError::InvalidSubject(_) => Self::ERR_INVALID_SUBJECT,
+            EngineError::BindRejected(_) => Self::ERR_BIND_REJECTED,
+            EngineError::NoStreamForSubject { .. } => Self::ERR_NO_STREAM_FOR_SUBJECT,
+            EngineError::AmbiguousSubject { .. } => Self::ERR_AMBIGUOUS_SUBJECT,
             EngineError::GenerationExhausted => Self::ERR_GENERATION_EXHAUSTED,
             EngineError::MissingRecord { .. } => Self::ERR_MISSING_RECORD,
             EngineError::ZeroMaxInFlight => Self::ERR_ZERO_MAX_IN_FLIGHT,
@@ -253,6 +273,30 @@ mod tests {
                     name: "ghost".to_string(),
                 },
                 ErrorCode::ERR_UNKNOWN_STREAM,
+            ),
+            (
+                EngineError::InvalidSubject(ironbus_core::subject::SubjectError::Empty),
+                ErrorCode::ERR_INVALID_SUBJECT,
+            ),
+            (
+                EngineError::BindRejected(ironbus_core::sublist::SublistError::ForkLimitExceeded {
+                    worst_case: 2048,
+                    limit: 1024,
+                }),
+                ErrorCode::ERR_BIND_REJECTED,
+            ),
+            (
+                EngineError::NoStreamForSubject {
+                    subject: "telemetry.cpu".to_string(),
+                },
+                ErrorCode::ERR_NO_STREAM_FOR_SUBJECT,
+            ),
+            (
+                EngineError::AmbiguousSubject {
+                    subject: "order.us.created".to_string(),
+                    matched: 2,
+                },
+                ErrorCode::ERR_AMBIGUOUS_SUBJECT,
             ),
             (
                 EngineError::GenerationExhausted,

@@ -11,6 +11,7 @@ pub(crate) mod raw;
 
 pub mod attempt;
 pub mod backpressure;
+pub mod binding;
 pub mod clock;
 pub mod codec;
 pub mod compress;
