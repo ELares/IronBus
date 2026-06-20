@@ -108,3 +108,14 @@ harness = false
 [[bench]]
 name = "commit_coordinator"
 harness = false
+
+# Informational micro-bench + PROOF for PARTITIONS as the parallel-consume lever (#591, M2-I11): a
+# stream split into P independent sub-logs lets P consumers drain P partitions in PARALLEL, where a
+# single total-order log (P=1) admits one ordered reader. Spreads a FIXED total record rate across
+# 1/2/4/8 partitions and times the aggregate parallel drain (P threads, each its own partition) over
+# the in-memory fs — the aggregate time falls as P rises (per-partition order preserved, no
+# cross-partition order). Run on demand (`cargo bench -p ironbus-storage`), not in per-PR CI; the full
+# consume-vs-NATS leg is #554.
+[[bench]]
+name = "partition_parallel_consume"
+harness = false

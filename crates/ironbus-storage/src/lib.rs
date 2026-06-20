@@ -23,6 +23,15 @@ pub mod log;
 pub mod loss;
 pub mod naming;
 pub mod offline;
+/// A [`PartitionedStream`](partitioned::PartitionedStream): ONE stream optionally subdivided into `P`
+/// independent sub-logs (partitions) — the parallel-consume scaling lever (#591, V2-M2 M2-I11).
+/// `P = 1` (the default) is the stream's single log at its root (byte-identical to a non-partitioned
+/// stream); `P > 1` is `P` independent [`log::Log`]s under `p-<08x>/` (the StreamSet subdir pattern,
+/// at the partition granularity). A keyed record routes by a stable `xxh3_64(key) % P` hash
+/// (per-key order preserved within a partition); a keyless record round-robins. Each partition
+/// recovers independently (I1–I4 isolation), has its own cursor/poll/lease (P-way parallel consume),
+/// and folds into a cross-partition group-commit.
+pub mod partitioned;
 pub mod quarantine;
 /// The lock-free, off-actor consume READ plane (#539): an atomic flushed frontier plus an
 /// arc-swapped immutable snapshot of the sealed segments + their seek indexes, so a consumer read
