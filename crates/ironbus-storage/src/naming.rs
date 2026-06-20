@@ -129,6 +129,45 @@ pub fn parse_stream_subdir_name(dir: &str) -> Option<String> {
     }
 }
 
+/// The fixed prefix of a partition sub-log directory name, ahead of its zero-padded hex index.
+const PARTITION_PREFIX: &str = "p-";
+/// The width of a partition index's hex field: a `u32` is exactly 8 hex digits, so the name is
+/// fixed-width and sorts lexicographically in partition-index order (mirroring `seg-<016x>.log`).
+const PARTITION_IDX_HEX_LEN: usize = 8;
+
+/// The on-disk directory name for partition `idx` of a stream subdivided into `P > 1` partitions
+/// (M2-I11): `p-<08x>/` under the stream's root, with the index zero-padded lowercase hex so the
+/// names sort in index order. Partition 0 is `p-00000000`.
+///
+/// This mirrors the `streams/<hex(name)>/` and `seg-<016x>.log` discipline: a self-describing,
+/// path-safe, fixed-width name parsed back by [`parse_partition_subdir_name`], so a foreign directory
+/// under a partitioned stream's root is skipped, never opened as a partition. A SINGLE-partition
+/// stream (`P = 1`) does NOT use this — its one partition IS the stream's own log (the root log for
+/// the default stream, `streams/<hex>/` for a named one), with NO `p-*/` subdir, so a single-partition
+/// stream is byte-for-byte a non-partitioned stream on disk.
+#[must_use]
+pub fn partition_subdir_name(idx: u32) -> String {
+    format!("{PARTITION_PREFIX}{idx:08x}")
+}
+
+/// Parses a partition sub-log directory name back to its index, the inverse of
+/// [`partition_subdir_name`], returning `None` for any directory that is not a canonical
+/// `p-<8 lowercase hex>` name (a foreign directory, or a non-canonical width/case). A `None` is
+/// skipped at open exactly as a foreign segment file is skipped, so a stray directory under a
+/// partitioned stream's root never opens as a partition.
+#[must_use]
+pub fn parse_partition_subdir_name(dir: &str) -> Option<u32> {
+    let idx = dir.strip_prefix(PARTITION_PREFIX)?;
+    if idx.len() != PARTITION_IDX_HEX_LEN {
+        return None;
+    }
+    // Canonical lowercase hex only (not uppercase, not a sign), so the round trip is exact.
+    if !idx.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    u32::from_str_radix(idx, 16).ok()
+}
+
 /// The maximum byte length of a NAMED stream's name, matching the engine's `MAX_GROUP_NAME_LEN`
 /// (128): a stream id is named under the same graphic-ASCII, length-bounded discipline as a
 /// work-group, so the two name spaces validate identically and a stream name is always short enough
@@ -270,6 +309,52 @@ mod tests {
         // Hex that decodes to a too-long name is rejected.
         let too_long = hex_encode(&[b'x'; MAX_STREAM_NAME_LEN + 1]);
         assert_eq!(parse_stream_subdir_name(&too_long), None);
+    }
+
+    #[test]
+    fn partition_subdir_name_round_trips_through_parse() {
+        for idx in [0u32, 1, 15, 255, 4096, 1_000_000, u32::MAX] {
+            let dir = partition_subdir_name(idx);
+            // Path-safe, fixed-width, single component (no `/`, `.`, `..`).
+            assert!(!dir.contains('/') && dir != "." && dir != "..");
+            assert_eq!(dir.len(), PARTITION_PREFIX.len() + PARTITION_IDX_HEX_LEN);
+            assert_eq!(parse_partition_subdir_name(&dir), Some(idx));
+        }
+        assert_eq!(partition_subdir_name(0), "p-00000000");
+        assert_eq!(partition_subdir_name(255), "p-000000ff");
+    }
+
+    #[test]
+    fn parse_partition_subdir_rejects_foreign_and_non_canonical() {
+        // A foreign directory (a stream subdir, a segment file, a non-`p-` name) is skipped.
+        assert_eq!(parse_partition_subdir_name("streams"), None);
+        assert_eq!(parse_partition_subdir_name("not-a-partition"), None);
+        assert_eq!(
+            parse_partition_subdir_name(&stream_subdir_name("orders")),
+            None
+        );
+        // Wrong width, uppercase, a non-hex digit, and a missing prefix are all rejected.
+        assert_eq!(parse_partition_subdir_name("p-0"), None);
+        assert_eq!(parse_partition_subdir_name("p-000000FF"), None);
+        assert_eq!(parse_partition_subdir_name("p-0000000g"), None);
+        assert_eq!(parse_partition_subdir_name("00000000"), None);
+        assert_eq!(parse_partition_subdir_name("p-000000001"), None);
+    }
+
+    #[test]
+    fn partition_names_sort_in_index_order() {
+        // Fixed-width hex means lexicographic order is numeric order, so a directory listing of a
+        // partitioned stream enumerates its partitions in index order.
+        let mut names: Vec<String> = [255u32, 1, 16, 0, 4096]
+            .iter()
+            .map(|idx| partition_subdir_name(*idx))
+            .collect();
+        names.sort();
+        let idxs: Vec<u32> = names
+            .iter()
+            .map(|n| parse_partition_subdir_name(n).unwrap())
+            .collect();
+        assert_eq!(idxs, vec![0, 1, 16, 255, 4096]);
     }
 
     #[test]
