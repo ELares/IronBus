@@ -4876,7 +4876,7 @@ fn unsafe_getuid() -> u32 {
     }
 }
 
-/// Builds the pre-auth DoS configuration (#633) from the resolved serve flags. Called ONLY for a
+/// Builds the pre-auth `DoS` configuration (#633) from the resolved serve flags. Called ONLY for a
 /// non-loopback bind (the caller gates it; loopback is inert, byte-for-byte unchanged). Maps the three
 /// operator knobs (`--preauth-rate-per-ip`, `--max-preauth-connections`, `--auth-failure-lockout`) to
 /// the [`PreAuthConfig`], deriving the burst from the rate and using the default lockout window /
@@ -7020,11 +7020,10 @@ fn run_broker<F: Filesystem + Clone + 'static>(
 // struct would only move the noise, not remove it.
 // GENERIC over the engine's Filesystem (#443), like `run_broker`: the disk and memory storage
 // backends share the one health-server wiring, monomorphized by the same static dispatch.
-// `F: Clone` since the engine handle is used as an `EngineAccess` by `serve_health`, and the
+// `F: Clone` since the engine handle is used as an `EngineAccess` by `serve_health_connz`, and the
 // `EngineAccess` impl for `EngineHandle` carries `F: Clone` (the #735 follower-read consume override
 // builds a read plane over a follower's owned log). The shipped filesystems are all `Clone`, so this is
 // no real constraint — it just matches the serve loop, which already requires `F: Clone`.
-#[allow(clippy::too_many_arguments)]
 fn start_health_server<F: Filesystem + Clone + 'static>(
     config: &ServeConfig,
     health_addr: Option<&str>,

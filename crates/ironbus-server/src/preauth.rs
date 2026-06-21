@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Pre-auth DoS defenses (#633, V2-M7): the O(1)-bounded resource limits an UNAUTHENTICATED attacker
+//! Pre-auth `DoS` defenses (#633, V2-M7): the O(1)-bounded resource limits an UNAUTHENTICATED attacker
 //! hits BEFORE the broker does any real work.
 //!
 //! The auth contract (`docs/AUTHENTICATION.md`) closes the *credential* side; this module closes the
@@ -54,7 +54,7 @@ use crate::connz::{ConnectionMetrics, RejectReason};
 /// concurrent unauthenticated work regardless of how many IPs are in flight.
 pub const MAX_TRACKED_IPS: usize = 4096;
 
-/// The configuration for the pre-auth DoS defenses (#633). Built from the operator's serve flags. A
+/// The configuration for the pre-auth `DoS` defenses (#633). Built from the operator's serve flags. A
 /// field left at its disabling value (`per_ip_rate_per_sec == 0`, `half_open_cap == 0`,
 /// `lockout_threshold == 0`) turns OFF just that one defense; if ALL are disabled the broker builds
 /// NO [`PreAuthGuard`] (the byte-identical historical accept path).
@@ -150,7 +150,7 @@ impl IpState {
 /// One whole connection token, in milli-tokens.
 const ONE_TOKEN_MILLI: u64 = 1000;
 
-/// The pre-auth DoS guard (#633): the per-IP rate limiter (bounded map), the global half-open cap, and
+/// The pre-auth `DoS` guard (#633): the per-IP rate limiter (bounded map), the global half-open cap, and
 /// the failed-auth lockout, all clock-injected. Shared by the accept loop (`Arc`); cheap to clone.
 ///
 /// The per-IP map is behind a `Mutex` — taken ONLY at accept time and at an auth outcome, never on the
@@ -175,10 +175,7 @@ impl std::fmt::Debug for PreAuthGuard {
         // (there is none here — only counts and a bounded config).
         f.debug_struct("PreAuthGuard")
             .field("cfg", &self.cfg)
-            .field(
-                "tracked_ips",
-                &self.ips.lock().map(|m| m.len()).unwrap_or(0),
-            )
+            .field("tracked_ips", &self.lock_ips().len())
             .field("half_open", &self.half_open.load(Ordering::Acquire))
             .finish_non_exhaustive()
     }
@@ -210,6 +207,17 @@ impl PreAuthGuard {
         u64::from(self.cfg.per_ip_burst.max(1)).saturating_mul(ONE_TOKEN_MILLI)
     }
 
+    /// Locks the per-IP map, RECOVERING from a poisoned lock rather than panicking: the limiter state
+    /// is best-effort throttling/observability (never correctness state), so a handler that panicked
+    /// while holding this lock must not crash the accept loop or the broker. The recovered guard sees
+    /// the map as it was at the panic, which at worst slightly mis-meters one IP's bucket — acceptable
+    /// for a `DoS` limiter, and strictly safer than aborting. This keeps every caller panic-free.
+    fn lock_ips(&self) -> std::sync::MutexGuard<'_, BTreeMap<IpAddr, IpState>> {
+        self.ips
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Decides whether to ACCEPT a new connection from `ip`, applying every enabled defense in order:
     /// lockout first (a locked-out IP is refused before any other work), then the per-IP rate limit,
     /// then the global half-open cap. On accept, the half-open count is incremented and an RAII
@@ -232,7 +240,7 @@ impl PreAuthGuard {
 
         // Defenses 1 & 2 (lockout, rate limit) consult the per-IP map. Take the lock once.
         if self.cfg.lockout_threshold > 0 || self.cfg.per_ip_rate_per_sec > 0 {
-            let mut ips = self.ips.lock().expect("preauth ip map poisoned");
+            let mut ips = self.lock_ips();
             let burst_milli = self.burst_milli();
             let entry = Self::entry_mut(&mut ips, ip, burst_milli, now_ns);
             entry.last_seen_ns = now_ns;
@@ -309,7 +317,7 @@ impl PreAuthGuard {
         let window_ns = self.cfg.lockout_window_ms.saturating_mul(1_000_000);
         let cooldown_ns = self.cfg.lockout_cooldown_ms.saturating_mul(1_000_000);
         let burst_milli = self.burst_milli();
-        let mut ips = self.ips.lock().expect("preauth ip map poisoned");
+        let mut ips = self.lock_ips();
         let entry = Self::entry_mut(&mut ips, ip, burst_milli, now_ns);
         entry.last_seen_ns = now_ns;
         // Slide the window: if the current window has elapsed, restart it at this failure.
@@ -331,7 +339,7 @@ impl PreAuthGuard {
             return;
         }
         let now_ns = self.clock.now_monotonic_nanos();
-        let mut ips = self.ips.lock().expect("preauth ip map poisoned");
+        let mut ips = self.lock_ips();
         if let Some(entry) = ips.get_mut(&ip) {
             entry.failed_count = 0;
             entry.window_start_ns = now_ns;
@@ -344,12 +352,12 @@ impl PreAuthGuard {
     /// and `ip` is NOT already present, the least-recently-seen entry is evicted first, so the map's
     /// memory is bounded O(cap) regardless of how many distinct IPs are ever seen. Returns a mutable
     /// reference to the (existing or freshly inserted) entry.
-    fn entry_mut<'a>(
-        ips: &'a mut BTreeMap<IpAddr, IpState>,
+    fn entry_mut(
+        ips: &mut BTreeMap<IpAddr, IpState>,
         ip: IpAddr,
         burst_milli: u64,
         now_ns: u64,
-    ) -> &'a mut IpState {
+    ) -> &mut IpState {
         if !ips.contains_key(&ip) && ips.len() >= MAX_TRACKED_IPS {
             // Evict the least-recently-seen entry (O(n) scan over a BOUNDED n = cap, so still O(1) in
             // the size of the input — the table can never grow past the cap). A bounded linear scan on
@@ -366,7 +374,7 @@ impl PreAuthGuard {
     /// The current count of tracked source IPs (for the bounded-map test). Always `<= MAX_TRACKED_IPS`.
     #[cfg(test)]
     fn tracked_ip_count(&self) -> usize {
-        self.ips.lock().expect("preauth ip map poisoned").len()
+        self.lock_ips().len()
     }
 
     /// The current half-open count (for tests).
@@ -580,15 +588,12 @@ mod tests {
         // MAX_TRACKED_IPS with least-recently-seen eviction. (Uses a small synthetic flood; the cap
         // itself is asserted to hold.)
         let (g, clock, _connz) = guard(rate_only(1, 1));
-        // Touch far more distinct IPs than the cap would be if it were tiny; assert the map never
-        // exceeds the cap. We advance the clock per IP so last_seen ordering is well-defined.
-        for i in 0..(MAX_TRACKED_IPS as u64 + 50) {
-            let addr = IpAddr::V4(Ipv4Addr::new(
-                (i >> 24) as u8,
-                (i >> 16) as u8,
-                (i >> 8) as u8,
-                i as u8,
-            ));
+        // Touch far more distinct IPs than the cap; assert the map never exceeds the cap. We advance the
+        // clock per IP so last_seen ordering is well-defined. Each distinct u32 maps to a distinct IPv4
+        // via `Ipv4Addr::from`, with no lossy byte-shift cast.
+        let flood = u32::try_from(MAX_TRACKED_IPS).unwrap() + 50;
+        for i in 0..flood {
+            let addr = IpAddr::V4(Ipv4Addr::from(i));
             clock.advance_monotonic_nanos(1);
             let _ = g.on_accept(addr);
             assert!(

@@ -14,7 +14,7 @@
 //!
 //! Connz is a FIXED set of scalar gauges/counters (total accepted, total closed, total refused,
 //! currently-open, total authenticated) plus ONE labeled counter family,
-//! `ironbus_connections_rejected_total{reason}` (#633): the pre-auth DoS rejections, with a `reason`
+//! `ironbus_connections_rejected_total{reason}` (#633): the pre-auth `DoS` rejections, with a `reason`
 //! label drawn from a FIXED, four-value enum ([`RejectReason`]). There is NO per-connection-id,
 //! per-peer, or per-address label — a connection id (or a source IP) is exactly the kind of
 //! unbounded, per-connection label the #576 cardinality firewall forbids; the `reason` label is a
@@ -23,7 +23,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The bounded reason an UNAUTHENTICATED connection was rejected by a pre-auth DoS defense (#633),
+/// The bounded reason an UNAUTHENTICATED connection was rejected by a pre-auth `DoS` defense (#633),
 /// the `reason` label on `ironbus_connections_rejected_total`. It is a CLOSED four-value enum so the
 /// labeled family is low-cardinality by construction (the #576 firewall's `reason` key is already
 /// allowlisted): a per-IP or per-connection label here would be the unbounded footgun the firewall
@@ -147,7 +147,7 @@ impl ConnectionMetrics {
         self.authenticated.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Records one PRE-AUTH DoS rejection (#633) by its bounded [`RejectReason`]: bump the per-reason
+    /// Records one PRE-AUTH `DoS` rejection (#633) by its bounded [`RejectReason`]: bump the per-reason
     /// total. Lock-free (a single relaxed atomic add into one of four fixed atomics, NO map, NO label
     /// allocation), so an unauthenticated connection FLOOD costs one atomic per rejection and never
     /// touches the engine. The `reason` label is materialized only at scrape time, so the record path
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn rejected_total_accounts_each_reason_independently_and_is_bounded() {
-        // #633: each pre-auth DoS reason is its own monotonic counter; the `reason` label is a closed
+        // #633: each pre-auth `DoS` reason is its own monotonic counter; the `reason` label is a closed
         // four-value enum (never a per-IP label), so the family is bounded by construction.
         let m = ConnectionMetrics::new();
         m.record_rejected(RejectReason::RateLimited);

@@ -133,7 +133,7 @@ where
     )
 }
 
-/// Serves connections exactly like [`serve_with_auth_connz`], plus the OPTIONAL pre-auth DoS defenses
+/// Serves connections exactly like [`serve_with_auth_connz`], plus the OPTIONAL pre-auth `DoS` defenses
 /// (#633, V2-M7): a per-source-IP connect rate limit, a global half-open (accepted-not-yet-authed)
 /// connection cap, and a failed-auth lockout, all bounded O(1) and clock-injected. When `preauth` is
 /// `Some(_)`, every accept is checked against the guard BEFORE a handler thread spawns or a handshake
@@ -201,7 +201,7 @@ where
 {
     // The connz-less overload: a fresh, un-scraped metric keeps this entry point's signature stable
     // for the existing callers (#572). The connz-aware bootstrap uses `serve_with_auth_connz`. No
-    // pre-auth DoS guard on this legacy path (#633): the connz-and-DoS-aware bootstrap uses
+    // pre-auth `DoS` guard on this legacy path (#633): the connz-and-`DoS`-aware bootstrap uses
     // `serve_with_auth_connz_preauth`.
     serve_inner(
         listener,
@@ -253,13 +253,13 @@ where
         progress.mark_progress(clock.now_monotonic_nanos());
         match listener.accept() {
             Ok((stream, addr)) => {
-                // PRE-AUTH DoS DEFENSES (#633), checked FIRST, before the connection cap and before any
+                // PRE-AUTH `DoS` DEFENSES (#633), checked FIRST, before the connection cap and before any
                 // broker work: an UNAUTHENTICATED attacker hits the O(1)-bounded per-IP rate limit, the
                 // global half-open cap, and the failed-auth lockout here, so a flood is shed at the
                 // cheapest possible point. On reject the stream is dropped (it closes) and the bounded
                 // `rejected_total{reason}` counter is bumped by the guard; this is NOT a connz "refused"
                 // (that is the connection-cap signal) — the rejection reason is its own metric. When no
-                // DoS defense is configured (`preauth` is `None`) this is skipped entirely: the accept
+                // `DoS` defense is configured (`preauth` is `None`) this is skipped entirely: the accept
                 // path is byte-for-byte the historical one (no IP read, no map, no clock read). On
                 // ACCEPT the guard returns a `HalfOpenSlot` the handler holds until the handshake
                 // resolves, decrementing the half-open count on drop.
@@ -305,7 +305,7 @@ where
                 // A cheap `Arc` clone of the shared connz metric, so the slot guard can record the
                 // close and the session can record the authed-flip (#572).
                 let connz = Arc::clone(connz);
-                // A cheap `Arc` clone of the pre-auth DoS guard (#633), so the session can report its
+                // A cheap `Arc` clone of the pre-auth `DoS` guard (#633), so the session can report its
                 // auth outcome (failure -> per-IP lockout; success -> clear the IP's failed window).
                 let preauth_for_conn = preauth.clone();
                 std::thread::spawn(move || {
@@ -379,9 +379,9 @@ where
         None => Session::with_member_id(member_id),
     }
     .with_connz(Arc::clone(connz));
-    // Attach the pre-auth DoS guard (#633) so the `Connect` handshake reports its auth outcome to the
+    // Attach the pre-auth `DoS` guard (#633) so the `Connect` handshake reports its auth outcome to the
     // per-IP failed-auth lockout (a failure feeds the lockout + bumps `rejected_total{auth_failed}`; a
-    // success clears the IP's window). A no-op when no DoS defense is configured.
+    // success clears the IP's window). A no-op when no `DoS` defense is configured.
     if let Some(guard) = preauth {
         session = session.with_preauth(guard, peer_ip);
     }
