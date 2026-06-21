@@ -56,6 +56,18 @@ pub const ATTEMPTS_PAYLOAD: usize = 32 * 1024;
 /// length field (65535), so a snapshot at the cap still frames.
 pub const PRODUCER_SEQ_PAYLOAD: usize = 60 * 1024;
 
+/// The per-slot payload cap for the durable METADATA-RAFT SNAPSHOT checkpoint (V2-C1, #660): a
+/// serialized raft `Snapshot` (its index/term/`ConfState` metadata plus the metadata
+/// state-machine's snapshot bytes — members / placements / committed-HW / config). The metadata
+/// state is small BY CONSTRUCTION (a cluster's control plane, NOT per-record data), so even a
+/// large cluster's snapshot is a few KiB; this 60 KiB cap holds a control plane with thousands of
+/// placements/members/config entries with generous headroom, and stays under the slot's `u16`
+/// length field (65535) so a snapshot at the cap still frames. The snapshot is persisted to BOTH
+/// slots alternately with the SAME dual-slot CRC discipline as the other checkpoints, so a crash
+/// mid-write reverts to the prior durable snapshot — NEVER a torn one — which (paired with the
+/// retained log tail) is what makes metadata compaction crash-safe (#660 non-negotiable 3).
+pub const METADATA_SNAPSHOT_PAYLOAD: usize = 60 * 1024;
+
 const SEQ_LEN: usize = 8;
 const LEN_LEN: usize = 2;
 const CRC_LEN: usize = 4;
@@ -141,6 +153,17 @@ pub type AttemptsCheckpoint<F> = SlotCheckpoint<F, ATTEMPTS_PAYLOAD>;
 /// it is what makes a replayed retry across a broker restart STILL deduped, and because the bound is
 /// SEQUENCE state (not wall-clock), a long offline gap never drops it — the beat over NATS.
 pub type ProducerSeqCheckpoint<F> = SlotCheckpoint<F, PRODUCER_SEQ_PAYLOAD>;
+
+/// The crash-safe checkpoint for the durable METADATA-RAFT SNAPSHOT (V2-C1, #660): a
+/// [`METADATA_SNAPSHOT_PAYLOAD`]-per-slot [`SlotCheckpoint`]. It reuses the identical dual-slot CRC
+/// discipline as the cursor, counters, attempt-count, and producer-seq checkpoints — a torn write
+/// reverts to the prior durable snapshot and a torn or missing one recovers as "no snapshot" (the
+/// node then recovers purely from the full retained log, the pre-#660 behavior) without ever
+/// blocking startup. Persisting the snapshot here BEFORE the metadata log prefix is truncated is
+/// what makes compaction crash-safe: a crash mid-compaction leaves either the prior snapshot + the
+/// full log, or the new snapshot + the (un-truncated or truncated) log — never a gap where neither
+/// holds the committed state.
+pub type MetadataSnapshotCheckpoint<F> = SlotCheckpoint<F, METADATA_SNAPSHOT_PAYLOAD>;
 
 impl<F: RandomAccessFile, const PAYLOAD_CAP: usize> SlotCheckpoint<F, PAYLOAD_CAP> {
     /// Bytes per slot for this cap: sequence, payload length, payload, CRC.
