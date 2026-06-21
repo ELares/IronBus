@@ -272,6 +272,7 @@ pub mod membership;
 pub mod metadata_group;
 pub mod metadata_storage;
 pub mod placement;
+pub mod read_consistency;
 pub mod replication;
 pub mod runtime;
 pub mod serve;
@@ -282,7 +283,8 @@ pub use ack_level::{ClusterAckLevel, ClusterAckLevelMetrics};
 pub use client_ack::ClientAckGate;
 pub use dataplane::{
     decode_dataplane_frame, role_for_placement, AckDisposition, AckToken, DataPlaneAction,
-    DataPlaneController, DataPlaneError, DataPlaneFrame, PlacementRole, ProduceAckSeam,
+    DataPlaneController, DataPlaneError, DataPlaneFrame, FollowerReadOutcome, PlacementRole,
+    ProduceAckSeam,
 };
 pub use divergence::{
     compare_fingerprints, execute_resync, fingerprint_log, plan_resync, quarantine_and_resync,
@@ -300,6 +302,10 @@ pub use metadata_storage::{MetadataLogStorage, MetadataStorageError, METADATA_SU
 pub use placement::{
     decide_placement, placement_command, placement_node_from, reassign_leadership, FailoverOutcome,
     PlacementOutcome,
+};
+pub use read_consistency::{
+    classify_follower_read, classify_leader_local_read, follower_safe_watermark,
+    FollowerReadDecision, LeaderReadDecision, ReadTier,
 };
 pub use replication::{
     ApplyOutcome, DivergenceTruncation, EpochAwareFollower, FetchRecordsBody, FetchResponseBody,

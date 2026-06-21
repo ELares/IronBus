@@ -2960,4 +2960,271 @@ mod live_runtime_tests {
         f_rt2.stop();
         leader_rt.stop();
     }
+
+    // ---- C6 (#620/#621/#622): a CONSUMER reads committed data FROM A FOLLOWER over the live runtime ---
+
+    /// Decode a zero-copy raw run into `(offset, payload)` pairs via the full `codec::decode` (header +
+    /// body CRC) — the consumer-side half of a C6 follower read: the served bytes are integrity-checkable
+    /// end-to-end (#622 zero-copy delivery reuses the read-plane raw run verbatim).
+    fn decode_run(run: &ironbus_storage::segment::RawByteRun) -> Vec<(u64, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut cursor = 0usize;
+        let mut offset = run.first_offset.get();
+        while cursor < run.bytes.len() {
+            let (view, consumed) = ironbus_core::codec::decode(&run.bytes[cursor..])
+                .expect("every C6 follower-served frame passes header AND body CRC");
+            out.push((offset, view.payload.to_vec()));
+            offset += 1;
+            cursor += consumed;
+        }
+        out
+    }
+
+    /// THE C6 HEADLINE (#621/#622): a real 3-node serve cluster over real loopback sockets, where a
+    /// CONSUMER reads COMMITTED records FROM A FOLLOWER (not the leader) and gets BYTE-IDENTICAL committed
+    /// data — the CRAQ committed-local read that makes read throughput scale with replicas — AND a read
+    /// ABOVE the committed HW is NOT served stale (it confirms with the leader; never speculative).
+    ///
+    /// The leader + two followers each run their OWN `DataPlaneRuntime` (the SAME construct `run_broker`
+    /// spawns) on their own threads over real sockets; the runtimes' threads do the replication. Once a
+    /// follower has caught up, we read FROM THAT FOLLOWER's replica via the C6 serve path and verify:
+    ///   1. the follower serves committed records LOCALLY (its own read plane, zero-copy);
+    ///   2. those bytes are byte-identical to the leader's over the same committed prefix;
+    ///   3. a "latest" read STARTING AT the follower's known committed bar does NOT serve the
+    ///      uncommitted/unknown tail stale — it asks the leader to confirm the current HW first.
+    #[test]
+    fn live_three_node_runtime_a_consumer_reads_committed_data_from_a_follower_craq() {
+        use crate::cluster::dataplane::FollowerReadOutcome;
+        use crate::cluster::read_consistency::ReadTier;
+
+        const P: u64 = 0;
+        // Serialize against the other heavy multi-node tests so this thread-spinning cluster forms on an
+        // un-contended host (the #687 starvation guard).
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let placement = Placement {
+            replicas: vec![1, 2, 3],
+            leader: 1,
+            epoch: 5,
+        };
+        let placements: BTreeMap<u64, Placement> = [(P, placement)].into_iter().collect();
+        let data_addrs: BTreeMap<u64, SocketAddr> = [1u64, 2, 3]
+            .into_iter()
+            .map(|id| (id, SocketAddr::from((Ipv4Addr::LOCALHOST, free_port()))))
+            .collect();
+
+        // The LEADER (node 1): 25 records produced + fsync'd; serves through the off-actor read plane.
+        let leader_dir = tempfile::tempdir().expect("leader dir");
+        let leader_log = leaked_disk_leader(leader_dir.path(), 25);
+        let leader_pl = disk_leader_plane(leader_log);
+        let served_end = plane_served_end(&leader_pl);
+        assert!(
+            served_end > 0,
+            "the read plane serves a non-empty committed prefix"
+        );
+
+        let leader_server = DataPlaneServer::from_placements(
+            1,
+            &placements,
+            quorum3(),
+            |p| (p == P).then(|| Arc::clone(&leader_pl)),
+            &DiskReplicaLogs {
+                root: leader_dir.path().to_path_buf(),
+            },
+            |_| EpochCache::new(),
+        )
+        .expect("leader server builds");
+        let mut leader_rt =
+            DataPlaneRuntime::start(leader_server, data_addrs[&1], &data_addrs).expect("leader rt");
+
+        // The two FOLLOWERS (nodes 2 + 3), each its own runtime + replica log + threads dialing node 1.
+        let f2_dir = tempfile::tempdir().expect("f2 dir");
+        let f3_dir = tempfile::tempdir().expect("f3 dir");
+        let mk_follower = |id: u64, root: std::path::PathBuf| {
+            DataPlaneServer::from_placements(
+                id,
+                &placements,
+                quorum3(),
+                |_| None,
+                &DiskReplicaLogs { root },
+                |_| EpochCache::new(),
+            )
+            .expect("follower server builds")
+        };
+        let mut f2_rt = DataPlaneRuntime::start(
+            mk_follower(2, f2_dir.path().to_path_buf()),
+            data_addrs[&2],
+            &data_addrs,
+        )
+        .expect("f2 rt");
+        let mut f3_rt = DataPlaneRuntime::start(
+            mk_follower(3, f3_dir.path().to_path_buf()),
+            data_addrs[&3],
+            &data_addrs,
+        )
+        .expect("f3 rt");
+
+        // Wait until follower 2 has caught up to the leader's committed prefix over the LIVE transport.
+        let f2_hw = || {
+            f2_rt
+                .server()
+                .lock()
+                .unwrap()
+                .seam()
+                .controller()
+                .follower_high_watermark(P)
+                .unwrap_or(0)
+        };
+        assert!(
+            wait_until(Duration::from_secs(30), || f2_hw() >= served_end),
+            "follower 2 caught up over the live runtime (hw={}, served_end={served_end})",
+            f2_hw()
+        );
+
+        // The committed HW the cluster has recorded: with a 2-of-3 quorum met (the leader + follower 2
+        // both hold the served prefix) the committed HW covers it. In a real serve this is the replicated
+        // `CheckpointCommittedHw` bar; here we read the leader's live quorum-commit, which is exactly that
+        // bar (the highest offset min_isr replicas have all fsync'd).
+        let committed_hw = wait_until(Duration::from_secs(15), || {
+            leader_rt
+                .server()
+                .lock()
+                .unwrap()
+                .seam()
+                .controller()
+                .quorum_commit(P)
+                .unwrap_or(0)
+                >= served_end
+        })
+        .then_some(served_end)
+        .expect("the cluster committed the served prefix on a 2-of-3 quorum");
+
+        // (1) + (2): a CONSUMER reads COMMITTED records FROM FOLLOWER 2 (NOT the leader), LOCALLY off the
+        // follower's own read plane, and gets BYTE-IDENTICAL bytes to the leader's committed prefix. Chain
+        // the clean read across the prefix (one sealed segment per raw read).
+        let mut follower_records: Vec<(u64, Vec<u8>)> = Vec::new();
+        {
+            let f2 = f2_rt.server().lock().unwrap();
+            let ctrl = f2.seam().controller();
+            let mut from = ironbus_core::types::Offset::ZERO;
+            let mut guard = 0u32;
+            loop {
+                guard += 1;
+                assert!(guard < 10_000, "follower-read chain failed to terminate");
+                let outcome = ctrl
+                    .serve_follower_read(
+                        P,
+                        ReadTier::FollowerCommitted,
+                        Some(committed_hw),
+                        from,
+                        usize::MAX,
+                        None,
+                    )
+                    .expect("the follower serves a committed read locally");
+                let run = match outcome {
+                    FollowerReadOutcome::Served(r) => r,
+                    FollowerReadOutcome::ConfirmWithLeader { .. } => {
+                        panic!("a clean committed read serves locally, not a confirm")
+                    }
+                };
+                let recs = decode_run(&run.run);
+                if recs.is_empty() {
+                    break;
+                }
+                // SAFETY: every served offset is strictly below the committed HW (never the uncommitted
+                // tail) — the non-negotiable for a follower read.
+                for (off, _) in &recs {
+                    assert!(
+                        *off < committed_hw,
+                        "follower served offset {off} at/past committed HW"
+                    );
+                }
+                let next = run.run.next_offset.get();
+                follower_records.extend(recs);
+                if next <= from.get() {
+                    break;
+                }
+                from = ironbus_core::types::Offset::new(next);
+            }
+        }
+        assert!(
+            !follower_records.is_empty(),
+            "the consumer read committed records FROM THE FOLLOWER (CRAQ committed-local read)"
+        );
+
+        // The leader's committed prefix, decoded over the same range (the byte-identity oracle).
+        let mut leader_records: Vec<(u64, Vec<u8>)> = Vec::new();
+        {
+            let mut from = ironbus_core::types::Offset::ZERO;
+            while from.get() < served_end {
+                let run = leader_pl
+                    .read_range_raw(from, usize::MAX, None)
+                    .expect("leader read plane serves");
+                let recs = decode_run(&run.run);
+                if recs.is_empty() {
+                    break;
+                }
+                let next = run.run.next_offset.get();
+                leader_records.extend(recs);
+                if next <= from.get() {
+                    break;
+                }
+                from = ironbus_core::types::Offset::new(next);
+            }
+        }
+        // The follower's served records are byte-identical to the leader's at the same offsets (a
+        // byte-identical PREFIX — the follower's last replicated segment may not have sealed yet, the same
+        // active-tail lag the leader-fetch path has; FLAGGED).
+        assert!(
+            !follower_records.is_empty() && follower_records.len() <= leader_records.len(),
+            "the follower never serves more than the leader's committed prefix"
+        );
+        for (f, l) in follower_records.iter().zip(leader_records.iter()) {
+            assert_eq!(
+                f.0, l.0,
+                "offset mismatch leader vs follower over the live runtime"
+            );
+            assert_eq!(
+                f.1, l.1,
+                "payload byte mismatch leader vs follower at offset {} over the live runtime",
+                f.0
+            );
+        }
+
+        // (3): a "latest" read STARTING AT the follower's served prefix end (above its known-committed
+        // bar if we feed it a STALE lower known HW) is NOT served stale — it asks the leader to CONFIRM
+        // the current HW first, never speculatively serving the unconfirmed tail.
+        {
+            let f2 = f2_rt.server().lock().unwrap();
+            let ctrl = f2.seam().controller();
+            // Feed a STALE known HW BELOW the served prefix and read starting AT it: the latest read must
+            // confirm with the leader rather than serve the unknown-committed region stale.
+            let stale_known = committed_hw / 2;
+            let outcome = ctrl
+                .serve_follower_read(
+                    P,
+                    ReadTier::FollowerLatest,
+                    Some(stale_known),
+                    ironbus_core::types::Offset::new(stale_known),
+                    usize::MAX,
+                    None,
+                )
+                .expect("the follower classifies a latest read");
+            match outcome {
+                FollowerReadOutcome::ConfirmWithLeader { current_safe } => {
+                    assert_eq!(
+                        current_safe.get(),
+                        stale_known,
+                        "a latest read above the known bar confirms with the leader (never stale)"
+                    );
+                }
+                FollowerReadOutcome::Served(_) => {
+                    panic!("a latest read above the known committed bar must NOT serve stale local data")
+                }
+            }
+        }
+
+        leader_rt.stop();
+        f2_rt.stop();
+        f3_rt.stop();
+    }
 }
