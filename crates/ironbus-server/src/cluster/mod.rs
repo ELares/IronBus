@@ -266,6 +266,7 @@ pub mod ack_level;
 pub mod client_ack;
 pub mod dataplane;
 pub mod divergence;
+pub mod domain;
 pub mod eligibility;
 pub mod geo;
 pub mod isr;
@@ -291,6 +292,9 @@ pub use divergence::{
     compare_fingerprints, execute_resync, fingerprint_log, plan_resync, quarantine_and_resync,
     DivergenceDetected, DivergenceError, DivergenceField, DivergenceReport, ResyncBounds,
     ResyncPlan, ResyncReport, SegmentFingerprint, SegmentFingerprints, MAX_FINGERPRINTS,
+};
+pub use domain::{
+    Domain, DomainError, DomainRef, DomainResolver, DOMAIN_REF_SIGIL, MAX_DOMAIN_LEN,
 };
 pub use eligibility::{
     eligible_leaders, evaluate_eligibility, is_eligible_leader, replica_state_from,

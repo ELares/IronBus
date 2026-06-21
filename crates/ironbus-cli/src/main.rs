@@ -95,7 +95,10 @@ use ironbus_server::cluster::{
     IsrConfig, MetadataCommand, MetadataProposer, MirrorApplier, OriginCursorStore, Placement,
     ReplicaLogFactory, RuntimeError, GEO_POLL,
 };
-use ironbus_server::cluster::{ClusterConfig, GeoConfig, GeoMode, GeoOrigin, GeoStreamConfig};
+use ironbus_server::cluster::{
+    ClusterConfig, Domain, DomainRef, DomainResolver, GeoConfig, GeoMode, GeoOrigin,
+    GeoStreamConfig,
+};
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
@@ -1969,6 +1972,17 @@ struct ServeFlags {
     /// `--source <local>=<addr1>/<stream1>,<addr2>/<stream2>,...` declares a local stream that FANS IN one
     /// or more remote origin streams. Raw strings parsed after collection. Empty = the non-geo default.
     sources: Vec<String>,
+    /// This cluster's stable cross-cluster DOMAIN / cluster-id (#624, V2-C7-I2), from
+    /// `--cluster-domain <id>`. `None` (no flag) = the non-namespaced default: a `@domain/stream`
+    /// reference cannot be a self-reference (there is no own domain), and behavior is exactly today's.
+    /// Validated into a [`ironbus_server::cluster::Domain`] after collection (a malformed id is a typed
+    /// usage error). CLI-only and singular.
+    cluster_domain: Option<String>,
+    /// Repeatable remote-domain LINK specs (#624): each `--cluster-link <domain>=<addr>` maps a remote
+    /// cluster's domain to its geo-pull endpoint address, the ONLY way a `@domain/stream` origin resolves
+    /// to a dial address (no auto-discovery). Raw `domain=addr` strings, validated after collection. Empty
+    /// = no remote domains configured. CLI-only and repeatable, like `--cluster-peer`.
+    cluster_links: Vec<String>,
     /// The TLS server certificate chain file (#629, V2-M7): a PEM path. RESERVED, NOT YET HONORED
     /// (#107): the TLS 1.3 handshake (rustls) is not wired (no allowed crypto provider), so a set value
     /// is a fail-closed startup REFUSAL rather than an accepted cert that would imply encryption this
@@ -2197,6 +2211,18 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             // read-only single-origin replica; `--source` is a fan-in of one or more origins.
             "--mirror" => f.mirrors.push(take_value("--mirror", args, &mut i)?),
             "--source" => f.sources.push(take_value("--source", args, &mut i)?),
+            // The cross-cluster NAMESPACE (#624): this cluster's own domain + the remote-domain link
+            // table, so a `--mirror`/`--source` origin can be a stable `@<domain>/<stream>` reference, not
+            // only a raw `host:port` address. Validated after collection (a malformed domain/link is a
+            // typed usage error). `--cluster-domain` is singular; `--cluster-link` is repeatable like
+            // `--cluster-peer`. NOTE: distinct from the numeric `--cluster-id` (this node's raft id).
+            "--cluster-domain" => {
+                f.cluster_domain = Some(take_value("--cluster-domain", args, &mut i)?);
+            }
+            "--cluster-link" => {
+                f.cluster_links
+                    .push(take_value("--cluster-link", args, &mut i)?);
+            }
             "--visibility-timeout-ms" => {
                 f.visibility_ms = Some(take_number("--visibility-timeout-ms", args, &mut i)?);
             }
@@ -2705,10 +2731,17 @@ fn parse_serve_flags_with_env_and_reader(
             f.cluster_join_as_learner,
             &f.cluster_pending_learners,
         )?,
-        // The cross-cluster GEO config (#623): empty (no `--mirror`/`--source`) is the non-geo default —
-        // NO geo plane, byte-for-byte today's broker. A malformed spec is a typed usage error here,
-        // fail-closed before any side effect.
-        geo: parse_geo_config(&f.mirrors, &f.sources)?,
+        // The cross-cluster GEO config (#623) + the DOMAIN NAMESPACE (#624): empty (no
+        // `--mirror`/`--source`) is the non-geo default — NO geo plane, byte-for-byte today's broker. The
+        // domain resolver (`--cluster-domain` + `--cluster-link`) resolves any `@<domain>/<stream>` origin
+        // reference to a concrete address at parse time, so the downstream pull plane is unchanged; a raw
+        // `<addr>/<stream>` origin never touches the namespace (the back-compat path). A malformed
+        // spec/domain/link is a typed usage error here, fail-closed before any side effect.
+        geo: parse_geo_config(
+            &f.mirrors,
+            &f.sources,
+            &build_domain_resolver(f.cluster_domain.as_deref(), &f.cluster_links)?,
+        )?,
         // Transport security material + auth references + pre-auth DoS knobs (#629/#631/#633): paths
         // resolved with flag > env > default; the bind guard + StrictModes + identity-table load run
         // at `cmd_serve` (after the bind is classified). The DoS knobs take their safe defaults.
@@ -3084,6 +3117,53 @@ fn parse_cluster_peer(spec: &str) -> Result<(u64, std::net::SocketAddr), CliErro
     Ok((id, addr))
 }
 
+/// Builds the cross-cluster DOMAIN [`DomainResolver`] (#624, V2-C7-I2) from `--cluster-domain` (this
+/// cluster's own domain) + the repeated `--cluster-link <domain>=<addr>` flags, or an EMPTY resolver when
+/// none are given (the non-namespaced default; a `@domain/stream` reference then resolves to nothing).
+/// Fail-closed: a malformed own-domain, a malformed link spec, an empty link address, or a duplicate link
+/// domain is a typed usage error before any side effect.
+///
+/// The own domain is OPTIONAL: it only changes self-reference handling (a `@<own>/stream` reference is a
+/// typed error rather than a remote dial). The link table is the ONLY source of a remote dial address (no
+/// auto-discovery), so an unconfigured domain in a reference is a typed error at resolution time.
+fn build_domain_resolver(
+    cluster_domain: Option<&str>,
+    cluster_links: &[String],
+) -> Result<DomainResolver, CliError> {
+    let own = match cluster_domain {
+        Some(id) => Some(Domain::parse(id).map_err(|e| {
+            CliError::Usage(format!("invalid `--cluster-domain` value `{id}`: {e}"))
+        })?),
+        None => None,
+    };
+    let mut resolver = DomainResolver::new(own);
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for spec in cluster_links {
+        let (domain_str, addr) = spec.split_once('=').ok_or_else(|| {
+            CliError::Usage(format!(
+                "`--cluster-link` must be `<domain>=<addr>` (e.g. `--cluster-link east=10.0.0.1:7500`), \
+                 got `{spec}`"
+            ))
+        })?;
+        let domain = Domain::parse(domain_str).map_err(|e| {
+            CliError::Usage(format!("invalid `--cluster-link` domain in `{spec}`: {e}"))
+        })?;
+        if addr.is_empty() {
+            return Err(CliError::Usage(format!(
+                "`--cluster-link` endpoint address is empty in `{spec}`"
+            )));
+        }
+        if !seen.insert(domain.as_str().to_string()) {
+            return Err(CliError::Usage(format!(
+                "`--cluster-link` domain `{domain}` is declared more than once (in `{spec}`); each \
+                 remote domain maps to exactly one endpoint"
+            )));
+        }
+        resolver.add_link(domain, addr.to_string());
+    }
+    Ok(resolver)
+}
+
 /// Builds the validated cross-cluster [`GeoConfig`] (#623, V2-C7-I1) from the repeated `--mirror` /
 /// `--source` specs, or an EMPTY config when none are given (the non-geo default). Fail-closed: a
 /// malformed spec, an empty local name, a duplicate local stream across mirror/source, or an origin spec
@@ -3091,13 +3171,23 @@ fn parse_cluster_peer(spec: &str) -> Result<(u64, std::net::SocketAddr), CliErro
 ///
 /// `--mirror <local>=<origin-addr>/<origin-stream>` (exactly ONE origin, read-only).
 /// `--source <local>=<addr1>/<stream1>,<addr2>/<stream2>,...` (one or more origins, fan-in).
-fn parse_geo_config(mirrors: &[String], sources: &[String]) -> Result<GeoConfig, CliError> {
+///
+/// Each origin is EITHER a raw `<addr>/<stream>` (the #623/#728 back-compat path) OR a domain-QUALIFIED
+/// `@<domain>/<stream>` reference (#624). A domain reference is resolved through `resolver` to its
+/// configured endpoint address at parse time, so it flows into the SAME [`GeoOrigin`] a raw reference does
+/// and the downstream pull plane is unchanged. A self-domain / unconfigured-domain reference is a typed
+/// usage error here (fail-closed, no silent leakage).
+fn parse_geo_config(
+    mirrors: &[String],
+    sources: &[String],
+    resolver: &DomainResolver,
+) -> Result<GeoConfig, CliError> {
     let mut streams = Vec::new();
     let mut seen_local: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for spec in mirrors {
         let (local, origins_str) = split_geo_spec("--mirror", spec)?;
-        let origins = parse_geo_origins("--mirror", spec, origins_str)?;
+        let origins = parse_geo_origins("--mirror", spec, origins_str, resolver)?;
         if origins.len() != 1 {
             return Err(CliError::Usage(format!(
                 "`--mirror` declares exactly ONE origin (a read-only single-origin replica); use \
@@ -3119,7 +3209,7 @@ fn parse_geo_config(mirrors: &[String], sources: &[String]) -> Result<GeoConfig,
 
     for spec in sources {
         let (local, origins_str) = split_geo_spec("--source", spec)?;
-        let origins = parse_geo_origins("--source", spec, origins_str)?;
+        let origins = parse_geo_origins("--source", spec, origins_str, resolver)?;
         if origins.is_empty() {
             return Err(CliError::Usage(format!(
                 "`--source` needs at least one `<addr>/<stream>` origin (in `{spec}`)"
@@ -3158,34 +3248,62 @@ fn split_geo_spec<'a>(flag: &str, spec: &'a str) -> Result<(String, &'a str), Cl
     Ok((local.to_string(), origins))
 }
 
-/// Parse a comma-separated list of `<addr>/<stream>` origin specs into [`GeoOrigin`]s. Fail-closed on a
-/// missing `/`, an empty addr, or an over-long origin stream name.
-fn parse_geo_origins(flag: &str, spec: &str, origins: &str) -> Result<Vec<GeoOrigin>, CliError> {
+/// Parse a comma-separated list of origin specs into [`GeoOrigin`]s, where each is EITHER a raw
+/// `<addr>/<stream>` (the back-compat #623/#728 path) OR a domain-qualified `@<domain>/<stream>` reference
+/// (#624) resolved through `resolver`. Fail-closed on a missing `/`, an empty addr, an over-long origin
+/// stream name, or a domain reference that is a self-reference / names an unconfigured domain.
+///
+/// The first byte CLASSIFIES the origin with no guesswork: a leading `@` is a domain reference (it never
+/// appears in a raw `host:port`); anything else is a raw address. Both produce the same [`GeoOrigin`]
+/// `{ addr, stream }`, so the downstream pull plane never sees a domain.
+fn parse_geo_origins(
+    flag: &str,
+    spec: &str,
+    origins: &str,
+    resolver: &DomainResolver,
+) -> Result<Vec<GeoOrigin>, CliError> {
     let mut out = Vec::new();
     for one in origins.split(',') {
-        // Split at the FIRST `/` so the addr keeps its `host:port` and the stream is the remainder (a
-        // stream name may itself contain no `/`, which the engine's name rule already enforces).
-        let (addr, stream) = one.split_once('/').ok_or_else(|| {
+        // CLASSIFY: a `@<domain>/<stream>` reference (#624) resolves through the link table to a concrete
+        // address; a raw `<addr>/<stream>` (no `@`) takes the historical path. `DomainRef::parse` returns
+        // `Ok(None)` for a non-`@` spec, so the match cleanly separates the two without re-checking the
+        // sigil here.
+        let maybe_ref = DomainRef::parse(one).map_err(|e| {
             CliError::Usage(format!(
-                "`{flag}` origin must be `<addr>/<stream>` (e.g. `10.0.0.1:7500/orders`), got `{one}` \
-                 in `{spec}`"
+                "`{flag}` domain reference `{one}` (in `{spec}`): {e}"
             ))
         })?;
-        if addr.is_empty() {
-            return Err(CliError::Usage(format!(
-                "`{flag}` origin address is empty in `{one}` (in `{spec}`)"
-            )));
-        }
+        let (addr, stream) = if let Some(reference) = maybe_ref {
+            // A domain reference resolves ONLY through the explicit `--cluster-link` table (no
+            // auto-discovery): a self-reference or an unconfigured domain is a typed usage error.
+            resolver.resolve(&reference).map_err(|e| {
+                CliError::Usage(format!(
+                    "`{flag}` cannot resolve domain reference `{one}` (in `{spec}`): {e}"
+                ))
+            })?
+        } else {
+            // The raw-address path, unchanged: split at the FIRST `/` so the addr keeps its
+            // `host:port` and the stream is the remainder.
+            let (addr, stream) = one.split_once('/').ok_or_else(|| {
+                CliError::Usage(format!(
+                    "`{flag}` origin must be `<addr>/<stream>` or `@<domain>/<stream>` (e.g. \
+                     `10.0.0.1:7500/orders` or `@east/orders`), got `{one}` in `{spec}`"
+                ))
+            })?;
+            if addr.is_empty() {
+                return Err(CliError::Usage(format!(
+                    "`{flag}` origin address is empty in `{one}` (in `{spec}`)"
+                )));
+            }
+            (addr.to_string(), stream.to_string())
+        };
         if stream.len() > ironbus_server::cluster::MAX_ORIGIN_STREAM_LEN {
             return Err(CliError::Usage(format!(
                 "`{flag}` origin stream name `{stream}` is over the {}-byte cap (in `{spec}`)",
                 ironbus_server::cluster::MAX_ORIGIN_STREAM_LEN
             )));
         }
-        out.push(GeoOrigin {
-            addr: addr.to_string(),
-            stream: stream.to_string(),
-        });
+        out.push(GeoOrigin { addr, stream });
     }
     Ok(out)
 }
@@ -14853,6 +14971,178 @@ mod tests {
                 "the rejection must explain the durable-disk requirement: {m}"
             ),
             other => panic!("expected a Usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_domain_qualified_origin_resolves_through_the_link_table() {
+        // `--cluster-domain` + `--cluster-link` let a `--mirror`/`--source` origin be a stable
+        // `@<domain>/<stream>` reference; it resolves at parse time to the configured endpoint, flowing
+        // into the SAME GeoOrigin a raw address would (the downstream pull plane never sees a domain).
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--cluster-domain",
+            "home",
+            "--cluster-link",
+            "east=10.0.0.1:7500",
+            "--cluster-link",
+            "west=10.0.0.2:7500",
+            "--mirror",
+            "mirror-orders=@east/orders",
+            "--source",
+            "events=@east/a,@west/b",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.geo.streams.len(), 2);
+        match &parsed.geo.streams[0].mode {
+            GeoMode::Mirror(o) => {
+                assert_eq!(
+                    o.addr, "10.0.0.1:7500",
+                    "@east resolved to its link address"
+                );
+                assert_eq!(o.stream, "orders");
+            }
+            GeoMode::Source(_) => panic!("expected a mirror, got a source"),
+        }
+        match &parsed.geo.streams[1].mode {
+            GeoMode::Source(os) => {
+                assert_eq!(os.len(), 2);
+                assert_eq!(os[0].addr, "10.0.0.1:7500");
+                assert_eq!(os[0].stream, "a");
+                assert_eq!(os[1].addr, "10.0.0.2:7500");
+                assert_eq!(os[1].stream, "b");
+            }
+            GeoMode::Mirror(_) => panic!("expected a source, got a mirror"),
+        }
+    }
+
+    #[test]
+    fn a_raw_address_and_a_domain_reference_can_be_mixed_in_one_source() {
+        // Back-compat + namespace coexist: a source can fan in a RAW `<addr>/<stream>` (the #623/#728
+        // path) AND a `@<domain>/<stream>` reference, in any order.
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--cluster-link",
+            "east=10.0.0.1:7500",
+            "--source",
+            "events=10.9.9.9:7500/raw,@east/named",
+        ]))
+        .unwrap();
+        match &parsed.geo.streams[0].mode {
+            GeoMode::Source(os) => {
+                assert_eq!(os[0].addr, "10.9.9.9:7500", "the raw origin is untouched");
+                assert_eq!(os[0].stream, "raw");
+                assert_eq!(os[1].addr, "10.0.0.1:7500", "the @east origin resolved");
+                assert_eq!(os[1].stream, "named");
+            }
+            GeoMode::Mirror(_) => panic!("expected a source"),
+        }
+    }
+
+    #[test]
+    fn a_self_domain_reference_is_a_typed_usage_error() {
+        // A `@<own-domain>/...` reference is rejected fail-closed (a self-mirror is not a valid topology).
+        let e = parse_serve_flags(&serve_args(&[
+            "--cluster-domain",
+            "home",
+            "--mirror",
+            "m=@home/orders",
+        ]))
+        .unwrap_err();
+        match e {
+            CliError::Usage(m) => assert!(
+                m.contains("home") && m.contains("own"),
+                "the rejection must name the self-referenced domain: {m}"
+            ),
+            other => panic!("expected a Usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unconfigured_domain_reference_is_a_typed_usage_error_no_leakage() {
+        // A `@<domain>/...` with NO `--cluster-link` is rejected (never auto-discovered): no silent
+        // cross-domain leakage to an unconfigured address.
+        let e = parse_serve_flags(&serve_args(&["--mirror", "m=@nowhere/orders"])).unwrap_err();
+        match e {
+            CliError::Usage(m) => assert!(
+                m.contains("nowhere") && m.contains("cluster-link"),
+                "the rejection must name the unknown domain + the link flag: {m}"
+            ),
+            other => panic!("expected a Usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_cluster_domain_or_link_is_a_typed_usage_error() {
+        // An uppercase own-domain (outside the [a-z0-9-] grammar) is rejected.
+        assert!(matches!(
+            parse_serve_flags(&serve_args(&["--cluster-domain", "Home"])),
+            Err(CliError::Usage(_))
+        ));
+        // A link with no `=`.
+        assert!(matches!(
+            parse_serve_flags(&serve_args(&["--cluster-link", "no-equals"])),
+            Err(CliError::Usage(_))
+        ));
+        // A link with an empty address.
+        assert!(matches!(
+            parse_serve_flags(&serve_args(&["--cluster-link", "east="])),
+            Err(CliError::Usage(_))
+        ));
+        // A duplicate link domain.
+        assert!(matches!(
+            parse_serve_flags(&serve_args(&[
+                "--cluster-link",
+                "east=a:1",
+                "--cluster-link",
+                "east=b:2",
+            ])),
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn a_local_stream_and_a_remote_domain_stream_do_not_collide_at_the_cli() {
+        // The NAMESPACE-collision guarantee at the CLI: a LOCAL mirror named `s` (raw origin) and a
+        // REMOTE `@east/s` origin are distinct — the local name is `s`, and `@east/s` resolves to east's
+        // address with origin stream `s`. No collision between local `s` and remote east/s.
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--cluster-link",
+            "east=10.0.0.1:7500",
+            "--mirror",
+            "s=10.0.0.9:7500/s",
+            "--mirror",
+            "from-east=@east/s",
+        ]))
+        .unwrap();
+        // Two distinct local streams.
+        let locals: Vec<&str> = parsed
+            .geo
+            .streams
+            .iter()
+            .map(|st| st.local_stream.as_str())
+            .collect();
+        assert_eq!(locals, vec!["s", "from-east"]);
+        // The remote `@east/s` resolved to east, origin stream `s` — a different endpoint than local `s`.
+        match &parsed.geo.streams[1].mode {
+            GeoMode::Mirror(o) => {
+                assert_eq!(o.addr, "10.0.0.1:7500");
+                assert_eq!(o.stream, "s");
+            }
+            GeoMode::Source(_) => panic!("expected a mirror"),
+        }
+    }
+
+    #[test]
+    fn a_raw_mirror_still_works_with_no_domain_flags() {
+        // BACK-COMPAT: a raw-address mirror (the #623/#728 path) parses identically with NO
+        // `--cluster-domain`/`--cluster-link`, byte-for-byte the pre-#624 behavior.
+        let parsed =
+            parse_serve_flags(&serve_args(&["--mirror", "m=10.0.0.1:7500/orders"])).unwrap();
+        match &parsed.geo.streams[0].mode {
+            GeoMode::Mirror(o) => {
+                assert_eq!(o.addr, "10.0.0.1:7500");
+                assert_eq!(o.stream, "orders");
+            }
+            GeoMode::Source(_) => panic!("expected a mirror"),
         }
     }
 

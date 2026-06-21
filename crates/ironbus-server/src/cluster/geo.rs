@@ -1669,6 +1669,51 @@ mod tests {
         assert_eq!(cfg.read_only_streams(), vec!["m".to_string()]);
         assert!(!cfg.is_empty());
     }
+
+    #[test]
+    fn a_domain_resolved_origin_drives_a_byte_faithful_mirror() {
+        use super::super::domain::{Domain, DomainRef, DomainResolver};
+
+        // The NAMESPACE (#624) ties to the geo plane (#623): a `@<domain>/<stream>` reference resolves
+        // through the link table to the SAME `(addr, stream)` a raw origin produces, so the resolved
+        // GeoOrigin drives the geo pull plane EXACTLY as a raw one — byte-faithfully.
+        let mut resolver = DomainResolver::new(Some(Domain::parse("home").unwrap()));
+        resolver.add_link(Domain::parse("east").unwrap(), "10.0.0.1:7500".to_string());
+
+        let reference = DomainRef::parse("@east/orders").unwrap().unwrap();
+        let (addr, stream) = resolver.resolve(&reference).unwrap();
+        let origin = GeoOrigin { addr, stream };
+        assert_eq!(origin.addr, "10.0.0.1:7500");
+        assert_eq!(origin.stream, "orders");
+        // The resolved origin's durable cursor key is stable (domain resolution did not change the geo
+        // identity contract): it is the `<addr>/<stream>` the cursor store keys on.
+        assert_eq!(origin.cursor_key(), "10.0.0.1:7500/orders");
+
+        // Drive an in-process mirror over an origin log USING the resolved origin's stream, and confirm
+        // it converges byte-faithfully — the resolved namespace reference behaves identically to a raw
+        // one through the whole apply path.
+        let mut origin_log =
+            Log::open(InMemoryFs::new(), ManualClock::new(), small_config()).unwrap();
+        for i in 0..30u32 {
+            origin_log
+                .append(&rec(format!("o-{i:02}").as_bytes()))
+                .unwrap();
+        }
+        origin_log.sync().unwrap();
+        let served = plane_served_end(&origin_log);
+
+        let mut app = applier(InMemoryFs::new());
+        let key = origin.cursor_key();
+        let applied = drain_into(&mut app, &origin_log, &key);
+        assert_eq!(
+            applied, served,
+            "the domain-resolved mirror applied the sealed prefix"
+        );
+        let recs = app.log().read_from(Offset::new(0), 100).unwrap();
+        for (i, r) in recs.iter().enumerate() {
+            assert_eq!(r.payload.as_ref(), format!("o-{i:02}").as_bytes());
+        }
+    }
 }
 
 /// The REAL two-"cluster" integration tests (#623): an ORIGIN serve and a separate MIRROR / SOURCE serve
