@@ -220,10 +220,14 @@ impl PreAuthGuard {
     /// byte, so an unauthenticated attacker hits an O(1)-bounded limit before any broker work. The map
     /// lock is held only for this short decision, off the engine lock.
     ///
+    /// Takes `self: &Arc<Self>` so the returned [`HalfOpenSlot`] OWNS an `Arc` clone of the guard and
+    /// is therefore `'static` — it can move into the spawned per-connection handler thread and
+    /// decrement the half-open count on drop there, exactly when the handshake resolves.
+    ///
     /// # Errors
     /// The [`RejectReason`] the connection was refused for (`locked_out` / `rate_limited` /
     /// `half_open_cap`). The corresponding `rejected_total{reason}` counter is bumped before return.
-    pub fn on_accept(&self, ip: IpAddr) -> Result<HalfOpenSlot<'_>, RejectReason> {
+    pub fn on_accept(self: &Arc<Self>, ip: IpAddr) -> Result<HalfOpenSlot, RejectReason> {
         let now_ns = self.clock.now_monotonic_nanos();
 
         // Defenses 1 & 2 (lockout, rate limit) consult the per-IP map. Take the lock once.
@@ -283,12 +287,12 @@ impl PreAuthGuard {
                 }
             }
             return Ok(HalfOpenSlot {
-                half_open: Some(&self.half_open),
+                guard: Some(Arc::clone(self)),
             });
         }
 
         // The half-open cap is disabled: nothing to decrement, so the slot is inert.
-        Ok(HalfOpenSlot { half_open: None })
+        Ok(HalfOpenSlot { guard: None })
     }
 
     /// Records one FAILED authentication attempt from `ip` (#633): increments the windowed failed
@@ -375,21 +379,24 @@ impl PreAuthGuard {
 /// An RAII slot for one half-open (accepted-but-not-yet-authed) connection (#633). Held by the
 /// connection handler for the whole handshake window; on drop (handshake resolved — success, failure,
 /// or disconnect) it decrements the global half-open count, so a stalled/slowloris half-open client
-/// holds at most one slot and the count can never leak. When the half-open cap is disabled the slot is
-/// inert (`half_open: None`), so a no-cap broker pays nothing.
+/// holds at most one slot and the count can never leak. It OWNS an `Arc` clone of the guard so it is
+/// `'static` and moves into the spawned handler thread. When the half-open cap is disabled the slot is
+/// inert (`guard: None`), so a no-cap broker pays nothing.
 #[derive(Debug)]
-pub struct HalfOpenSlot<'a> {
-    half_open: Option<&'a AtomicUsize>,
+pub struct HalfOpenSlot {
+    guard: Option<Arc<PreAuthGuard>>,
 }
 
-impl Drop for HalfOpenSlot<'_> {
+impl Drop for HalfOpenSlot {
     fn drop(&mut self) {
-        if let Some(counter) = self.half_open {
+        if let Some(guard) = &self.guard {
             // Saturating decrement: a slot is created exactly once per admitted accept and dropped
             // exactly once, so this never underflows in practice; saturate defensively.
-            let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                Some(v.saturating_sub(1))
-            });
+            let _ = guard
+                .half_open
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                    Some(v.saturating_sub(1))
+                });
         }
     }
 }
@@ -404,10 +411,14 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(10, 0, 0, n))
     }
 
-    fn guard(cfg: PreAuthConfig) -> (PreAuthGuard, Arc<ManualClock>, Arc<ConnectionMetrics>) {
+    fn guard(cfg: PreAuthConfig) -> (Arc<PreAuthGuard>, Arc<ManualClock>, Arc<ConnectionMetrics>) {
         let clock = Arc::new(ManualClock::new());
         let connz = Arc::new(ConnectionMetrics::new());
-        let g = PreAuthGuard::new(cfg, clock.clone() as Arc<dyn Clock>, connz.clone());
+        let g = Arc::new(PreAuthGuard::new(
+            cfg,
+            clock.clone() as Arc<dyn Clock>,
+            connz.clone(),
+        ));
         (g, clock, connz)
     }
 

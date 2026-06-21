@@ -129,6 +129,47 @@ where
         progress,
         auth,
         connz,
+        None,
+    )
+}
+
+/// Serves connections exactly like [`serve_with_auth_connz`], plus the OPTIONAL pre-auth DoS defenses
+/// (#633, V2-M7): a per-source-IP connect rate limit, a global half-open (accepted-not-yet-authed)
+/// connection cap, and a failed-auth lockout, all bounded O(1) and clock-injected. When `preauth` is
+/// `Some(_)`, every accept is checked against the guard BEFORE a handler thread spawns or a handshake
+/// byte is read, so an unauthenticated flood is shed at the cheapest point and the rejection surfaces
+/// on `ironbus_connections_rejected_total{reason}`. When `None`, the accept path is byte-for-byte the
+/// historical one (no IP read, no map, no clock read). The broker bootstrap shares the SAME `connz`
+/// `Arc` with the health server so `/metrics` exposes the live rejection counters.
+///
+/// # Errors
+/// Propagates a fatal listener error, exactly like [`serve`].
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+pub fn serve_with_auth_connz_preauth<F, C>(
+    listener: &TcpListener,
+    engine: &EngineHandle<F, C>,
+    shutdown: &AtomicBool,
+    max_connections: usize,
+    clock: &C,
+    progress: &crate::liveness::LivenessBeacon,
+    auth: Option<Arc<AuthConfig>>,
+    connz: &Arc<ConnectionMetrics>,
+    preauth: Option<Arc<crate::preauth::PreAuthGuard>>,
+) -> std::io::Result<()>
+where
+    F: Filesystem + Clone + 'static,
+    C: Clock + Clone + 'static,
+{
+    serve_inner(
+        listener,
+        engine,
+        shutdown,
+        max_connections,
+        clock,
+        progress,
+        auth,
+        connz,
+        preauth,
     )
 }
 
@@ -159,7 +200,9 @@ where
     C: Clock + Clone + 'static,
 {
     // The connz-less overload: a fresh, un-scraped metric keeps this entry point's signature stable
-    // for the existing callers (#572). The connz-aware bootstrap uses `serve_with_auth_connz`.
+    // for the existing callers (#572). The connz-aware bootstrap uses `serve_with_auth_connz`. No
+    // pre-auth DoS guard on this legacy path (#633): the connz-and-DoS-aware bootstrap uses
+    // `serve_with_auth_connz_preauth`.
     serve_inner(
         listener,
         engine,
@@ -169,6 +212,7 @@ where
         progress,
         auth,
         &Arc::new(ConnectionMetrics::new()),
+        None,
     )
 }
 
@@ -187,6 +231,7 @@ fn serve_inner<F, C>(
     progress: &crate::liveness::LivenessBeacon,
     auth: Option<Arc<AuthConfig>>,
     connz: &Arc<ConnectionMetrics>,
+    preauth: Option<Arc<crate::preauth::PreAuthGuard>>,
 ) -> std::io::Result<()>
 where
     F: Filesystem + Clone + 'static,
@@ -207,16 +252,45 @@ where
         // only then does `/healthz` shed after the hysteresis window (#95).
         progress.mark_progress(clock.now_monotonic_nanos());
         match listener.accept() {
-            Ok((stream, _addr)) => {
+            Ok((stream, addr)) => {
+                // PRE-AUTH DoS DEFENSES (#633), checked FIRST, before the connection cap and before any
+                // broker work: an UNAUTHENTICATED attacker hits the O(1)-bounded per-IP rate limit, the
+                // global half-open cap, and the failed-auth lockout here, so a flood is shed at the
+                // cheapest possible point. On reject the stream is dropped (it closes) and the bounded
+                // `rejected_total{reason}` counter is bumped by the guard; this is NOT a connz "refused"
+                // (that is the connection-cap signal) — the rejection reason is its own metric. When no
+                // DoS defense is configured (`preauth` is `None`) this is skipped entirely: the accept
+                // path is byte-for-byte the historical one (no IP read, no map, no clock read). On
+                // ACCEPT the guard returns a `HalfOpenSlot` the handler holds until the handshake
+                // resolves, decrementing the half-open count on drop.
+                let half_open_slot = match preauth.as_ref() {
+                    Some(guard) => match guard.on_accept(addr.ip()) {
+                        Ok(slot) => Some(slot),
+                        Err(_reason) => {
+                            // The guard already recorded `rejected_total{reason}`; refuse this
+                            // connection before it can consume a handler thread or a handshake byte.
+                            drop(stream);
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 if active.load(Ordering::Acquire) >= max_connections {
                     // At capacity: REFUSE by dropping the stream (it closes). Record the refusal on
                     // connz (#572): it never became a live handler, so it counts only as refused, not
-                    // accepted/open. Off the engine lock, a single relaxed atomic.
+                    // accepted/open. Off the engine lock, a single relaxed atomic. Dropping
+                    // `half_open_slot` here releases the half-open slot the guard reserved (the
+                    // connection never reached a handler), so the half-open count never leaks.
+                    drop(half_open_slot);
                     connz.record_refused();
                     drop(stream);
                     continue;
                 }
                 active.fetch_add(1, Ordering::AcqRel);
+                // The source IP, captured for the per-IP failed-auth lockout (#633). It is passed to the
+                // session for the auth-outcome callback ONLY; it is NEVER a metric label (the guard keeps
+                // it internal), so the metric surface stays low-cardinality.
+                let peer_ip = addr.ip();
                 // The connection is now live: record the ACCEPT on connz (#572), the accept half the
                 // slot guard's drop matches with a close. Off the engine lock.
                 connz.record_accept();
@@ -231,6 +305,9 @@ where
                 // A cheap `Arc` clone of the shared connz metric, so the slot guard can record the
                 // close and the session can record the authed-flip (#572).
                 let connz = Arc::clone(connz);
+                // A cheap `Arc` clone of the pre-auth DoS guard (#633), so the session can report its
+                // auth outcome (failure -> per-IP lockout; success -> clear the IP's failed window).
+                let preauth_for_conn = preauth.clone();
                 std::thread::spawn(move || {
                     // The guard decrements the cap slot AND records the connz close on return OR a
                     // panic unwind, so a panicking handler can never leak a slot nor miss a close.
@@ -238,7 +315,21 @@ where
                         active,
                         connz: Arc::clone(&connz),
                     };
-                    let _ = handle_connection(stream, &engine, member_id, auth, &connz);
+                    // Hold the half-open slot (#633) for the WHOLE handshake window: it is dropped here
+                    // when the handler returns (handshake resolved — success, failure, or disconnect),
+                    // decrementing the global half-open count, so a stalled/slowloris half-open client
+                    // holds at most one slot and the count can never leak. `None` when the half-open cap
+                    // is disabled (the slot is inert).
+                    let _half_open = half_open_slot;
+                    let _ = handle_connection(
+                        stream,
+                        &engine,
+                        member_id,
+                        auth,
+                        &connz,
+                        preauth_for_conn,
+                        peer_ip,
+                    );
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -259,12 +350,15 @@ where
 
 /// Drives one connection: read bytes, run the session, write responses, until the client
 /// closes or the session ends.
+#[allow(clippy::too_many_arguments)]
 fn handle_connection<F, C>(
     mut stream: TcpStream,
     engine: &EngineHandle<F, C>,
     member_id: MemberId,
     auth: Option<Arc<AuthConfig>>,
     connz: &Arc<ConnectionMetrics>,
+    preauth: Option<Arc<crate::preauth::PreAuthGuard>>,
+    peer_ip: std::net::IpAddr,
 ) -> std::io::Result<()>
 where
     F: Filesystem + Clone + 'static,
@@ -285,6 +379,12 @@ where
         None => Session::with_member_id(member_id),
     }
     .with_connz(Arc::clone(connz));
+    // Attach the pre-auth DoS guard (#633) so the `Connect` handshake reports its auth outcome to the
+    // per-IP failed-auth lockout (a failure feeds the lockout + bumps `rejected_total{auth_failed}`; a
+    // success clears the IP's window). A no-op when no DoS defense is configured.
+    if let Some(guard) = preauth {
+        session = session.with_preauth(guard, peer_ip);
+    }
     // The read/dispatch loop, run to completion so the cleanup below ALWAYS executes on exit:
     // whether the client closed cleanly, a read/write timed out, or a malformed frame ended the
     // session, this connection must leave any key_shared group it joined (#64) and flush its cursor.
@@ -681,9 +781,17 @@ mod tests {
         let server = std::thread::spawn({
             let engine = handle.clone();
             move || {
-                let (stream, _) = listener.accept().unwrap();
+                let (stream, peer) = listener.accept().unwrap();
                 let connz = Arc::new(ConnectionMetrics::new());
-                handle_connection(stream, &engine, MemberId::new(0), None, &connz)
+                handle_connection(
+                    stream,
+                    &engine,
+                    MemberId::new(0),
+                    None,
+                    &connz,
+                    None,
+                    peer.ip(),
+                )
             }
         });
 

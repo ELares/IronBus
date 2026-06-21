@@ -137,7 +137,7 @@ use ironbus_server::actor::{spawn_actor_with_gather, DEFAULT_CHANNEL_BOUND};
 #[cfg(unix)]
 use ironbus_server::engine::{DiskFullPolicy, DurabilityLevel, Engine, EngineConfig};
 #[cfg(unix)]
-use ironbus_server::health::serve_health;
+use ironbus_server::health::serve_health_connz;
 #[cfg(unix)]
 use ironbus_storage::admin::{inspect_cursors, CursorStatus};
 #[cfg(all(unix, feature = "zstd"))]
@@ -1871,6 +1871,16 @@ impl TransportSecurityFlags {
 const DEFAULT_MAX_PREAUTH_CONNECTIONS: usize = 128;
 const DEFAULT_PREAUTH_RATE_PER_IP: u32 = 10;
 const DEFAULT_AUTH_FAILURE_LOCKOUT: u32 = 5;
+/// The per-source-IP burst the rate limiter allows above the sustained `--preauth-rate-per-ip` (#633):
+/// a small multiple of the rate, so a legitimate client's reconnect storm (e.g. after a broker
+/// restart) is absorbed without throttling, while a flood is still capped at the sustained rate.
+const DEFAULT_PREAUTH_BURST_MULT: u32 = 4;
+/// The failed-auth lockout WINDOW (#633): the threshold count is over this rolling window. Generous
+/// because IronBus connections are long-lived; an honest client never makes this many failed connects.
+const DEFAULT_LOCKOUT_WINDOW_MS: u64 = 60_000;
+/// The failed-auth lockout COOLDOWN (#633): once locked out, a source IP's new connections are refused
+/// for this long. Long enough to blunt online guessing, short enough to self-heal a fat-fingered op.
+const DEFAULT_LOCKOUT_COOLDOWN_MS: u64 = 300_000;
 
 fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
     // Production reads the real process environment through the injected seam; tests drive
@@ -4866,6 +4876,32 @@ fn unsafe_getuid() -> u32 {
     }
 }
 
+/// Builds the pre-auth DoS configuration (#633) from the resolved serve flags. Called ONLY for a
+/// non-loopback bind (the caller gates it; loopback is inert, byte-for-byte unchanged). Maps the three
+/// operator knobs (`--preauth-rate-per-ip`, `--max-preauth-connections`, `--auth-failure-lockout`) to
+/// the [`PreAuthConfig`], deriving the burst from the rate and using the default lockout window /
+/// cooldown (no separate flags for those in v1; the threshold is the operator-facing knob).
+#[cfg(unix)]
+fn build_preauth_config(
+    transport: &TransportSecurityFlags,
+) -> ironbus_server::preauth::PreAuthConfig {
+    ironbus_server::preauth::PreAuthConfig {
+        per_ip_rate_per_sec: transport.preauth_rate_per_ip,
+        // The burst is a small multiple of the sustained rate (at least 1), so a legitimate reconnect
+        // storm is absorbed while a flood is still capped at the sustained rate.
+        per_ip_burst: transport
+            .preauth_rate_per_ip
+            .saturating_mul(DEFAULT_PREAUTH_BURST_MULT)
+            .max(1),
+        // `max_preauth_connections` is a usize knob; clamp to u32 for the cap (a half-open cap far below
+        // u32::MAX in any real deployment).
+        half_open_cap: u32::try_from(transport.max_preauth_connections).unwrap_or(u32::MAX),
+        lockout_threshold: transport.auth_failure_lockout,
+        lockout_window_ms: DEFAULT_LOCKOUT_WINDOW_MS,
+        lockout_cooldown_ms: DEFAULT_LOCKOUT_COOLDOWN_MS,
+    }
+}
+
 /// Loads + validates the auth identity table referenced by `--auth-config` (and `StrictModes`-checks
 /// every secret-bearing file the transport config names), returning the in-memory [`AuthConfig`] the
 /// accept loop pins per connection, or `None` when no auth identity is configured (the no-auth
@@ -5277,21 +5313,29 @@ fn cmd_serve(
     // misconfigured non-loopback bind fails on the invariant first, and BEFORE any listener so a bad
     // secret file fails closed pre-listen.
     let auth = load_auth_config(transport)?;
+    // The pre-auth DoS defenses (#633) are ON for a NON-LOOPBACK bind, INERT on loopback (the trust
+    // boundary is the host itself, so the zero-config loopback-dev path stays byte-for-byte unchanged —
+    // no rate limit, no half-open cap, no lockout). `Some(_)` here means a non-loopback bind, exactly
+    // the condition that classifies the bind as exposed.
+    let preauth_cfg = if wire_bind.transport_plaintext_optin.is_some() {
+        Some(build_preauth_config(transport))
+    } else {
+        None
+    };
     // Surface the resolved transport posture in the startup log (no secret material, only the on/off
     // shape), so an operator can see what protects the bind. A non-loopback bind is, in this build,
     // ALWAYS an explicit plaintext opt-in (TLS terminated upstream), so emit the LOUD plaintext WARNING
-    // — never a "requires TLS" claim the build cannot back. The pre-auth DoS knobs (#633) are RESOLVED
-    // and surfaced here; their ENFORCEMENT in the accept loop (the per-IP token bucket + half-open cap
-    // + connections_rejected_total{reason}) is the FLAGGED follow-up — the knobs and their safe defaults
-    // exist so the config surface is stable, but this PR does not yet throttle.
+    // — never a "requires TLS" claim the build cannot back. The pre-auth DoS knobs (#633) are RESOLVED,
+    // surfaced here, and ENFORCED in the accept loop (the per-IP token bucket + half-open cap + the
+    // failed-auth lockout, all surfaced on `ironbus_connections_rejected_total{reason}`).
     if let Some(optin) = &wire_bind.transport_plaintext_optin {
         writeln!(
             out,
             "WARNING: --insecure-plaintext-wire: the broker wire on {} is PLAINTEXT; credentials and \
              data are exposed unless TLS is terminated upstream (mesh / proxy / VPN). Native TLS is \
              not yet implemented (#107). auth_identity={}, preauth_dos[max_preauth_connections={}, \
-             preauth_rate_per_ip={}/s, auth_failure_lockout={}] (ENFORCEMENT flagged; this build \
-             enforces the bind precondition and the auth/scope model)",
+             preauth_rate_per_ip={}/s, auth_failure_lockout={}] (ENFORCED: per-IP rate limit, \
+             half-open cap, and failed-auth lockout are active on this non-loopback bind)",
             optin.addr,
             transport.has_auth_identity(),
             transport.max_preauth_connections,
@@ -5395,6 +5439,7 @@ fn cmd_serve(
                 dataplane,
                 client_ack_slot,
                 auth,
+                preauth_cfg,
                 reload,
                 out,
             );
@@ -5445,6 +5490,7 @@ fn cmd_serve(
                 None,
                 None,
                 auth,
+                preauth_cfg,
                 reload,
                 out,
             )
@@ -6690,6 +6736,7 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     dataplane: Option<DataPlaneServeHandle>,
     client_ack_slot: Option<ironbus_server::actor::ClientAckSlot<F, SystemClock>>,
     auth: Option<std::sync::Arc<ironbus_server::auth::AuthConfig>>,
+    preauth_cfg: Option<ironbus_server::preauth::PreAuthConfig>,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -6855,6 +6902,26 @@ fn run_broker<F: Filesystem + Clone + 'static>(
         health_clock.now_monotonic_nanos(),
     ));
 
+    // ONE shared connection-signal ("connz", #572) metric, recorded by the wire accept loop / handlers
+    // and READ by the health server's `/metrics` scrape, so the live connz AND the pre-auth DoS
+    // `ironbus_connections_rejected_total{reason}` family (#633) are exposed on the prod broker. The
+    // SAME `Arc` is handed to both planes below.
+    let connz = Arc::new(ironbus_server::connz::ConnectionMetrics::new());
+
+    // Build the pre-auth DoS guard (#633) when defenses are configured (a non-loopback bind). It reads
+    // the same monotonic clock the liveness beacon uses (a fresh clone, same origin) and records every
+    // rejection on the shared `connz`. `None` (a loopback / no-defense broker) is the byte-identical
+    // historical accept path. A guard is built only when at least one knob is enabled.
+    let preauth_guard = preauth_cfg
+        .filter(ironbus_server::preauth::PreAuthConfig::any_enabled)
+        .map(|cfg| {
+            Arc::new(ironbus_server::preauth::PreAuthGuard::new(
+                cfg,
+                Arc::new(health_clock.clone()) as Arc<dyn ironbus_core::clock::Clock>,
+                Arc::clone(&connz),
+            ))
+        });
+
     // Start the health endpoints (if `--health-addr` was set), warning about an enabled-but-unreachable
     // admin endpoint and an acknowledged public bind. The secure-bind guard already classified and
     // (where required) refused the bind at the top of this function, so `health_bind` here is safe.
@@ -6866,6 +6933,8 @@ fn run_broker<F: Filesystem + Clone + 'static>(
         &shutdown,
         &progress,
         &health_clock,
+        &connz,
+        data_dir,
         out,
     )?;
 
@@ -6876,7 +6945,7 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     // every Connect must authenticate and verbs are scope-gated; with `None` the gate is bypassed
     // (the no-auth loopback-dev broker, byte-for-byte unchanged). The fail-closed bind invariant has
     // already guaranteed that a NON-LOOPBACK bind cannot reach here with `auth = None` AND no TLS.
-    let result = ironbus_server::server::serve_with_auth(
+    let result = ironbus_server::server::serve_with_auth_connz_preauth(
         &listener,
         &shared,
         &shutdown,
@@ -6884,6 +6953,8 @@ fn run_broker<F: Filesystem + Clone + 'static>(
         &health_clock.clone(),
         &progress,
         auth,
+        &connz,
+        preauth_guard,
     )
     .map_err(|e| CliError::Internal(format!("serve loop failed: {e}")));
     // The wire serve returns only when shutdown is set (a stop signal, or a fatal listener error that
@@ -6943,15 +7014,17 @@ fn run_broker<F: Filesystem + Clone + 'static>(
 /// # Errors
 /// [`CliError::Internal`] if the health listener cannot bind or its local address cannot be read.
 #[cfg(unix)]
-#[allow(clippy::too_many_arguments)] // the wiring inputs (config, bind, engine, shutdown, beacon,
-                                     // clock, out) are each a distinct concern; bundling them into a
-                                     // struct would only move the noise, not remove it.
-                                     // GENERIC over the engine's Filesystem (#443), like `run_broker`: the disk and memory storage
-                                     // backends share the one health-server wiring, monomorphized by the same static dispatch.
-                                     // `F: Clone` since the engine handle is used as an `EngineAccess` by `serve_health`, and the
-                                     // `EngineAccess` impl for `EngineHandle` carries `F: Clone` (the #735 follower-read consume override
-                                     // builds a read plane over a follower's owned log). The shipped filesystems are all `Clone`, so this is
-                                     // no real constraint — it just matches the serve loop, which already requires `F: Clone`.
+#[allow(clippy::too_many_arguments)]
+// the wiring inputs (config, bind, engine, shutdown, beacon,
+// clock, out) are each a distinct concern; bundling them into a
+// struct would only move the noise, not remove it.
+// GENERIC over the engine's Filesystem (#443), like `run_broker`: the disk and memory storage
+// backends share the one health-server wiring, monomorphized by the same static dispatch.
+// `F: Clone` since the engine handle is used as an `EngineAccess` by `serve_health`, and the
+// `EngineAccess` impl for `EngineHandle` carries `F: Clone` (the #735 follower-read consume override
+// builds a read plane over a follower's owned log). The shipped filesystems are all `Clone`, so this is
+// no real constraint — it just matches the serve loop, which already requires `F: Clone`.
+#[allow(clippy::too_many_arguments)]
 fn start_health_server<F: Filesystem + Clone + 'static>(
     config: &ServeConfig,
     health_addr: Option<&str>,
@@ -6960,6 +7033,8 @@ fn start_health_server<F: Filesystem + Clone + 'static>(
     shutdown: &Arc<AtomicBool>,
     progress: &Arc<ironbus_server::liveness::LivenessBeacon>,
     health_clock: &SystemClock,
+    connz: &Arc<ironbus_server::connz::ConnectionMetrics>,
+    data_dir: Option<&Path>,
     out: &mut impl Write,
 ) -> Result<Option<std::thread::JoinHandle<()>>, CliError> {
     // The opt-in read-only `/admin` introspection endpoint (#99) needs the health server, which only
@@ -7013,8 +7088,12 @@ fn start_health_server<F: Filesystem + Clone + 'static>(
     let liveness_window_nanos = config.health_liveness_window_ms.saturating_mul(1_000_000);
     let progress = Arc::clone(progress);
     let health_clock = health_clock.clone();
+    // The SHARED connz metric (#572/#633): the same `Arc` the wire accept loop records into, so the
+    // `/metrics` scrape exposes the LIVE connection signals and the pre-auth DoS rejection counters.
+    let connz = Arc::clone(connz);
+    let data_dir = data_dir.map(Path::to_path_buf);
     Ok(Some(std::thread::spawn(move || {
-        let _ = serve_health(
+        let _ = serve_health_connz(
             &health_listener,
             &engine,
             &shutdown,
@@ -7022,6 +7101,8 @@ fn start_health_server<F: Filesystem + Clone + 'static>(
             &progress,
             liveness_window_nanos,
             &health_clock,
+            &connz,
+            data_dir.as_deref(),
         );
     })))
 }

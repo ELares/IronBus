@@ -406,6 +406,17 @@ pub struct Session {
     /// handshake) on it; accept/close/refuse are recorded by the accept loop / slot guard, not here. A
     /// cheap `Arc`-clone reference, never per-connection deep state.
     connz: Option<std::sync::Arc<crate::connz::ConnectionMetrics>>,
+    /// The pre-auth DoS guard (#633) and this connection's source IP, if the server wired one in.
+    /// `None` when no DoS defense is configured (the byte-identical historical path — no failed-auth
+    /// lockout bookkeeping, no `rejected_total{reason="auth_failed"}`). When `Some((guard, ip))`, the
+    /// `Connect` handshake reports its auth OUTCOME to the guard: a failure feeds the per-IP lockout
+    /// (and bumps the auth-failed counter), a success clears the IP's failed window. The IP is the
+    /// only per-connection datum here; it is NEVER a metric label (the guard keeps it internal), so the
+    /// metric surface stays low-cardinality.
+    preauth: Option<(
+        std::sync::Arc<crate::preauth::PreAuthGuard>,
+        std::net::IpAddr,
+    )>,
 }
 
 impl Session {
@@ -455,6 +466,21 @@ impl Session {
     #[must_use]
     pub fn with_connz(mut self, connz: std::sync::Arc<crate::connz::ConnectionMetrics>) -> Session {
         self.connz = Some(connz);
+        self
+    }
+
+    /// Attaches the pre-auth DoS guard (#633) and this connection's source IP so the `Connect`
+    /// handshake reports its auth outcome to the guard's per-IP failed-auth lockout. A builder-style
+    /// setter (like [`with_connz`](Session::with_connz)) so every existing call site is unchanged and
+    /// only the server's live accept path opts in. Takes a cheap `Arc` clone. When never called the
+    /// handshake runs the byte-identical historical path (no lockout bookkeeping).
+    #[must_use]
+    pub fn with_preauth(
+        mut self,
+        guard: std::sync::Arc<crate::preauth::PreAuthGuard>,
+        peer_ip: std::net::IpAddr,
+    ) -> Session {
+        self.preauth = Some((guard, peer_ip));
         self
     }
 
@@ -832,6 +858,13 @@ impl Session {
                 Ok(None) | Err(_) => None,
             };
             let Some((_identity, outcome)) = resolved else {
+                // Report the FAILED auth to the pre-auth DoS guard (#633): it feeds the per-IP
+                // failed-auth lockout and bumps `rejected_total{reason="auth_failed"}`. A no-op when no
+                // DoS defense is wired (the byte-identical path). No credential is passed — only the IP
+                // the guard already holds — so nothing secret crosses here.
+                if let Some((guard, ip)) = self.preauth.as_ref() {
+                    guard.on_auth_failure(*ip);
+                }
                 reply_auth_violation(out);
                 return Err(SessionError::AuthViolation);
             };
@@ -842,6 +875,12 @@ impl Session {
                 self.scopes = scopes;
             }
             self.authenticated = true;
+            // Report the SUCCESSFUL auth to the pre-auth DoS guard (#633): it clears this IP's
+            // failed-auth window so an occasional fat-fingered password before a correct one never
+            // accumulates toward a lockout. A no-op when no DoS defense is wired.
+            if let Some((guard, ip)) = self.preauth.as_ref() {
+                guard.on_auth_success(*ip);
+            }
             // Record the AUTHED-FLIP on the shared connz metric (#572): a `Connect` handshake that
             // successfully resolved a credential. Recorded ONLY on the auth-required path (a no-auth
             // broker authenticates nothing, so its authenticated total is honestly 0), off the engine
