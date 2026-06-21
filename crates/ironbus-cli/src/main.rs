@@ -92,9 +92,10 @@ use ironbus_server::clock::SystemClock;
 #[cfg(unix)]
 use ironbus_server::cluster::{
     dataplane_addr, push_loop, ClusterAckLevel, ClusterRuntime, CrossClusterServeConfig,
-    CrossClusterServeRuntime, DataPlaneRuntime, DataPlaneServer, GeoLink, IsrConfig, LeafForwarder,
-    LeafLink, LeafPushCursor, MetadataCommand, MetadataProposer, MirrorApplier, OriginCursorStore,
-    Placement, ReplicaLogFactory, RuntimeError, GEO_POLL, LEAF_PUSH_POLL,
+    CrossClusterServeRuntime, DataPlaneRuntime, DataPlaneServer, GeoLink, HubPushReceiver,
+    IsrConfig, LeafForwarder, LeafLink, LeafPushCursor, MetadataCommand, MetadataProposer,
+    MirrorApplier, OriginCursorStore, Placement, ReplicaLogFactory, RuntimeError, GEO_POLL,
+    LEAF_PUSH_POLL,
 };
 use ironbus_server::cluster::{
     ClusterConfig, Domain, DomainRef, DomainResolver, FederatedStream, FederationConfig, GeoConfig,
@@ -1703,6 +1704,20 @@ struct ParsedServe {
     /// (read-only) FROM them, loop-safe by the origin-domain discipline. A gateway is NOT a Raft voter in
     /// any peer (this never touches any peer's metadata group), and each cluster stays independent.
     federation: FederationConfig,
+    /// The node-id -> CLIENT-address advertise map (#737, follow-up to #735), built from
+    /// `--cluster-peer-client`. EMPTY (no flag) is the default: the `NOT_LEADER` produce-redirect (#735)
+    /// still fires correctly but HINTLESS (the client re-tries its own peers). A populated map is installed
+    /// on the clustered data plane's [`ClientAckGate`](ironbus_server::cluster::ClientAckGate) so the
+    /// redirect carries the CURRENT committed leader's CLIENT address (one-hop reconnect). Only meaningful
+    /// with a cluster; `cmd_serve` only consults it on the clustered disk serve path.
+    cluster_peer_clients: std::collections::BTreeMap<u64, std::net::SocketAddr>,
+    /// The leaf-hub receive-stream (#738, follow-up to #732/#734), built from `--leaf-hub-serve`. `None`
+    /// (no flag) is the default: NO leaf-hub listener, byte-for-byte today's broker. `Some` makes this node
+    /// a leaf HUB that ACCEPTS inbound `LeafPush` connections into the named receive-stream via the leaf
+    /// [`HubPushReceiver`](ironbus_server::cluster::HubPushReceiver) — `cmd_serve` then opens the hub
+    /// receive-log and starts the cross-cluster serve-accept listener for it (in addition to any federation
+    /// served streams). A leaf hub is NOT a Raft voter (this never touches the metadata group).
+    leaf_hub_serve: Option<String>,
     /// The transport-security material + auth references + pre-auth `DoS` knobs (#629/#631/#633, V2-M7),
     /// resolved from the `--tls-*` / `--auth-config` / `--*-preauth-*` flags. Carried as one bundle so
     /// the (large) `ServeConfig` and its `Default` stay untouched. `cmd_serve` runs the fail-closed
@@ -1806,6 +1821,8 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         &parsed.geo,
         &parsed.leaf,
         &parsed.federation,
+        &parsed.cluster_peer_clients,
+        parsed.leaf_hub_serve.as_deref(),
         &parsed.transport,
         ReloadSource {
             config_path: parsed.config_path.as_deref(),
@@ -1967,6 +1984,16 @@ struct ServeFlags {
     /// is a typed usage error. Empty (no `--cluster-peer`) = the single-node default, no cluster.
     /// CLI-only and repeatable, exactly like `--key-shared-group`.
     cluster_peers: Vec<String>,
+    /// The node-id -> CLIENT-address advertise map (#737, follow-up to #735), from repeatable
+    /// `--cluster-peer-client <id>=<client-addr>` (one per cluster member whose CLIENT `--addr` listener
+    /// should be advertised). Distinct from `--cluster-peer` (which carries only the metadata/peer-transport
+    /// address): this names the address a CLIENT dials to reach a node's broker. Collected as raw
+    /// `id=client-addr` strings here and parsed into a `BTreeMap<u64, SocketAddr>` after collection (a
+    /// malformed spec is a typed usage error). EMPTY (no `--cluster-peer-client`) is the default: the
+    /// `NOT_LEADER` produce-redirect (#735) still fires correctly but HINTLESS (the client re-tries its own
+    /// peers); a populated map lets the redirect carry the CURRENT leader's CLIENT address so the client
+    /// reconnects in one hop. CLI-only and repeatable, exactly like `--cluster-peer`.
+    cluster_peer_clients: Vec<String>,
     /// JOIN an already-running cluster as a non-voting LEARNER (#617), from `--cluster-join-as-learner`.
     /// When set, this node is NOT seeded as a voter: it back-fills the committed metadata log by
     /// replication and is promoted to a voter only ONCE it is caught up (the leader's promotion gate),
@@ -2018,6 +2045,14 @@ struct ServeFlags {
     /// forward local stream MUST differ from every mirror local (the loop-safety guard). Empty = no
     /// write-through. CLI-only and repeatable.
     leaf_forwards: Vec<String>,
+    /// ENABLE this node as a LEAF HUB (#738, follow-up to #732/#734), from `--leaf-hub-serve
+    /// <receive-stream>`. Declares that the node ACCEPTS inbound `LeafPush` (wire tag 41) connections into
+    /// the named RECEIVE-STREAM via the leaf [`HubPushReceiver`](ironbus_server::cluster::HubPushReceiver),
+    /// making a leaf-spoke HUB configurable. Distinct from `--leaf-hub` (which makes this node a leaf SPOKE
+    /// that dials OUTBOUND to a hub): `--leaf-hub-serve` makes it the HUB that receives. `None` (no flag) is
+    /// the default: NO leaf-hub listener, byte-for-byte today's broker. The receive-stream name is the
+    /// validated stream the hub appends pushed records to (its OWN single-writer log). CLI-only and singular.
+    leaf_hub_serve: Option<String>,
     /// Repeatable PEER GATEWAY endpoints (#626, V2-C7-I4): each `--gateway <domain>=<addr>` maps a PEER
     /// cluster's domain to its gateway dial address — the symmetric supercluster peering, the ONLY source
     /// of a peer's address (no auto-discovery). Raw `domain=addr` strings, validated after collection.
@@ -2243,6 +2278,14 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
                 f.cluster_peers
                     .push(take_value("--cluster-peer", args, &mut i)?);
             }
+            // Repeatable (#737, follow-up to #735): each `--cluster-peer-client <id>=<client-addr>`
+            // advertises a node's CLIENT address for the `NOT_LEADER` leader hint. The raw `id=client-addr`
+            // string is parsed into the advertise map after collection (a malformed spec is a typed usage
+            // error there), like `--cluster-peer`. Distinct from `--cluster-peer` (metadata address only).
+            "--cluster-peer-client" => {
+                f.cluster_peer_clients
+                    .push(take_value("--cluster-peer-client", args, &mut i)?);
+            }
             // A bare boolean flag (#617): JOIN an existing cluster as a non-voting learner. Advance ONE
             // token (no value), like the other boolean flags, or the loop spins.
             "--cluster-join-as-learner" => {
@@ -2288,6 +2331,13 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             "--leaf-forward" => f
                 .leaf_forwards
                 .push(take_value("--leaf-forward", args, &mut i)?),
+            // ENABLE a LEAF HUB (#738, follow-up to #732/#734): this node ACCEPTS inbound `LeafPush`
+            // connections into the named receive-stream. Singular (one hub receive-stream this slice); the
+            // value is validated after collection (a malformed / empty stream name is a typed usage error
+            // there). Distinct from `--leaf-hub` (a leaf SPOKE that dials OUTBOUND): this is the HUB side.
+            "--leaf-hub-serve" => {
+                f.leaf_hub_serve = Some(take_value("--leaf-hub-serve", args, &mut i)?);
+            }
             // The GATEWAY / SUPERCLUSTER FEDERATION topology (#626): a SYMMETRIC set of peer clusters.
             // `--gateway-domain` is this cluster's own federation identity; `--gateway <domain>=<addr>` are
             // the peer gateway endpoints (repeatable); `--federate <local>=@<origin>/<stream>` declares a
@@ -2842,6 +2892,18 @@ fn parse_serve_flags_with_env_and_reader(
             &f.gateways,
             &f.federates,
         )?,
+        // The NOT_LEADER leader-address advertise map (#737, follow-up to #735): EMPTY (no
+        // `--cluster-peer-client`) is the default — the redirect fires HINTLESS (the client re-tries its
+        // peers). A populated map fills the leader hint. A `--cluster-peer-client` without a `--cluster-peer`
+        // set is a typed usage error here (it advertises cluster members), fail-closed before any side effect.
+        cluster_peer_clients: parse_cluster_peer_clients(
+            &f.cluster_peer_clients,
+            &f.cluster_peers,
+        )?,
+        // The leaf-hub serve enablement (#738, follow-up to #732/#734): `None` (no `--leaf-hub-serve`) is the
+        // default — NO leaf-hub listener, byte-for-byte today's broker. A present, valid receive-stream name
+        // makes this node a leaf HUB; an empty / over-long stream name is a typed usage error here.
+        leaf_hub_serve: parse_leaf_hub_serve(f.leaf_hub_serve.as_deref())?,
         // Transport security material + auth references + pre-auth DoS knobs (#629/#631/#633): paths
         // resolved with flag > env > default; the bind guard + StrictModes + identity-table load run
         // at `cmd_serve` (after the bind is classified). The DoS knobs take their safe defaults.
@@ -3217,6 +3279,78 @@ fn parse_cluster_peer(spec: &str) -> Result<(u64, std::net::SocketAddr), CliErro
     Ok((id, addr))
 }
 
+/// Builds the node-id -> CLIENT-address advertise map (#737, follow-up to #735) from the repeated
+/// `--cluster-peer-client <id>=<client-addr>` specs, or an EMPTY map when none are given (the default:
+/// the `NOT_LEADER` redirect still fires, hintless). The map is what fills the leader HINT in the
+/// `NOT_LEADER` produce-redirect so a client reconnects straight to the current leader's CLIENT listener.
+///
+/// Fail-closed: a `--cluster-peer-client` given without any `--cluster-peer` (it advertises addresses for
+/// cluster members, so a cluster must be configured), a malformed spec, the reserved id `0`, or a duplicate
+/// id is a typed usage error before any side effect. The advertised id need NOT be a known `--cluster-peer`
+/// id: a hint for a node not in the local peer set is simply never looked up (the redirect falls back to
+/// hintless), so an extra entry is harmless rather than rejected.
+fn parse_cluster_peer_clients(
+    cluster_peer_clients: &[String],
+    cluster_peers: &[String],
+) -> Result<std::collections::BTreeMap<u64, std::net::SocketAddr>, CliError> {
+    if cluster_peer_clients.is_empty() {
+        // The default: no advertised client addresses, so the `NOT_LEADER` redirect is hintless (#735).
+        return Ok(std::collections::BTreeMap::new());
+    }
+    // An advertise without a cluster is meaningless (there is no `NOT_LEADER` redirect off-cluster) — fail
+    // closed rather than silently ignore it, mirroring the learner-without-cluster guard.
+    if cluster_peers.is_empty() {
+        return Err(CliError::Usage(
+            "`--cluster-peer-client` needs `--cluster-id` and `--cluster-peer`: it advertises a \
+             cluster member's CLIENT address for the NOT_LEADER leader hint, so a cluster must be \
+             configured"
+                .to_string(),
+        ));
+    }
+    let mut map: std::collections::BTreeMap<u64, std::net::SocketAddr> =
+        std::collections::BTreeMap::new();
+    for spec in cluster_peer_clients {
+        let (id, addr) = parse_cluster_peer_client(spec)?;
+        if map.insert(id, addr).is_some() {
+            return Err(CliError::Usage(format!(
+                "`--cluster-peer-client` lists node id {id} more than once: each advertised id must \
+                 be unique"
+            )));
+        }
+    }
+    Ok(map)
+}
+
+/// Parses one `--cluster-peer-client <id>=<client-addr>` spec into a `(node_id, client_addr)` pair, or a
+/// typed usage error naming the offending spec (#737). Fail-closed exactly like [`parse_cluster_peer`]: a
+/// missing `=`, an empty / non-numeric id, the reserved id `0`, or an unparseable socket address rejects it.
+fn parse_cluster_peer_client(spec: &str) -> Result<(u64, std::net::SocketAddr), CliError> {
+    let (id_str, addr_str) = spec.split_once('=').ok_or_else(|| {
+        CliError::Usage(format!(
+            "`--cluster-peer-client` must be `<id>=<client-addr>` (e.g. `1=127.0.0.1:7000`), got \
+             `{spec}`"
+        ))
+    })?;
+    let id: u64 = id_str.parse().map_err(|_| {
+        CliError::Usage(format!(
+            "`--cluster-peer-client` id must be a non-negative integer, got `{id_str}` in `{spec}`"
+        ))
+    })?;
+    if id == 0 {
+        // raft::INVALID_ID is 0; a member can never carry it.
+        return Err(CliError::Usage(format!(
+            "`--cluster-peer-client` id 0 is reserved and cannot be a cluster member (in `{spec}`)"
+        )));
+    }
+    let addr: std::net::SocketAddr = addr_str.parse().map_err(|_| {
+        CliError::Usage(format!(
+            "`--cluster-peer-client` address must be a socket address like `127.0.0.1:7000`, got \
+             `{addr_str}` in `{spec}`"
+        ))
+    })?;
+    Ok((id, addr))
+}
+
 /// Builds the cross-cluster DOMAIN [`DomainResolver`] (#624, V2-C7-I2) from `--cluster-domain` (this
 /// cluster's own domain) + the repeated `--cluster-link <domain>=<addr>` flags, or an EMPTY resolver when
 /// none are given (the non-namespaced default; a `@domain/stream` reference then resolves to nothing).
@@ -3538,6 +3672,35 @@ fn split_leaf_spec(flag: &str, spec: &str) -> Result<(String, String), CliError>
     Ok((local.to_string(), hub_stream.to_string()))
 }
 
+/// Validates the `--leaf-hub-serve <receive-stream>` value (#738, follow-up to #732/#734) into the hub
+/// receive-stream name, or `None` when the flag is absent (the default: NO leaf-hub listener, byte-for-byte
+/// today's broker). When set, this node ACCEPTS inbound `LeafPush` connections into the named receive-stream
+/// via the leaf [`HubPushReceiver`](ironbus_server::cluster::HubPushReceiver).
+///
+/// Fail-closed: an empty stream name or one over the [`MAX_ORIGIN_STREAM_LEN`](ironbus_server::cluster::MAX_ORIGIN_STREAM_LEN)
+/// cap is a typed usage error before any side effect. The default stream (`""`) cannot be a hub receive
+/// stream (it is the broker's own client log; a leaf hub receive-stream is a distinct named log).
+fn parse_leaf_hub_serve(leaf_hub_serve: Option<&str>) -> Result<Option<String>, CliError> {
+    let Some(stream) = leaf_hub_serve else {
+        // No `--leaf-hub-serve` => no leaf-hub listener (byte-for-byte today's broker).
+        return Ok(None);
+    };
+    if stream.is_empty() {
+        return Err(CliError::Usage(
+            "`--leaf-hub-serve` receive-stream name is empty; the default stream (`\"\"`) cannot be a \
+             leaf-hub receive stream — name a distinct stream (e.g. `--leaf-hub-serve hub-inbox`)"
+                .to_string(),
+        ));
+    }
+    if stream.len() > ironbus_server::cluster::MAX_ORIGIN_STREAM_LEN {
+        return Err(CliError::Usage(format!(
+            "`--leaf-hub-serve` receive-stream name `{stream}` is over the {}-byte cap",
+            ironbus_server::cluster::MAX_ORIGIN_STREAM_LEN
+        )));
+    }
+    Ok(Some(stream.to_string()))
+}
+
 /// Builds the validated GATEWAY / SUPERCLUSTER FEDERATION [`FederationConfig`] (#626, V2-C7-I4) from
 /// `--gateway-domain` (this cluster's own federation domain) + the repeated `--gateway <domain>=<addr>`
 /// peer endpoints + the repeated `--federate <local>=@<origin-domain>/<stream>` stream declarations, or an
@@ -3651,6 +3814,8 @@ fn finish_serve(
     geo: &GeoConfig,
     leaf: &LeafConfig,
     federation: &FederationConfig,
+    cluster_peer_clients: &std::collections::BTreeMap<u64, std::net::SocketAddr>,
+    leaf_hub_serve: Option<&str>,
     transport: &TransportSecurityFlags,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
@@ -3692,6 +3857,19 @@ fn finish_serve(
                 .to_string(),
         ));
     }
+    // The LEAF-HUB SERVE plane (#738) is likewise DURABLE: a hub appends pushed leaf records to its OWN
+    // on-disk receive log (fsync-before-ack), so a leaf can resume at-least-once across a hub restart.
+    // Under `--storage memory` the received records would be lost on every stop (the leaf would re-push
+    // everything each boot, and a crash would silently drop acked data), so reject it fail-closed BEFORE
+    // any side effect rather than silently start a non-durable hub.
+    if leaf_hub_serve.is_some() && config.storage == StorageArg::Memory {
+        return Err(CliError::Usage(
+            "`--leaf-hub-serve` requires `--storage disk`: a leaf hub appends pushed leaf records to a \
+             durable on-disk receive log (fsync-before-ack) so a leaf resumes across a hub restart, so \
+             it cannot run under `--storage memory` (which keeps no on-disk state)"
+                .to_string(),
+        ));
+    }
     // The data dir is storage-conditional (#443). DISK (the default): REQUIRED, exactly the
     // historical rule. MEMORY: it must be ABSENT (the broker stores nothing on disk, so a given
     // `--data-dir` would silently mean nothing; a usage error keeps the semantics explicit), and
@@ -3727,6 +3905,8 @@ fn finish_serve(
         geo,
         leaf,
         federation,
+        cluster_peer_clients,
+        leaf_hub_serve,
         transport,
         reload,
         out,
@@ -4975,6 +5155,8 @@ fn cmd_serve(
     geo: &GeoConfig,
     leaf: &LeafConfig,
     federation: &FederationConfig,
+    cluster_peer_clients: &std::collections::BTreeMap<u64, std::net::SocketAddr>,
+    leaf_hub_serve: Option<&str>,
     transport: &TransportSecurityFlags,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
@@ -5091,14 +5273,22 @@ fn cmd_serve(
             // `--gateway-domain`; a gateway is NOT a Raft voter in any peer (the non-federated/non-voter
             // guarantee + the deferred accept-serve side are in `spawn_federation_plane`'s docs).
             let fed_plane = spawn_federation_plane_if_configured(federation, data_dir, config)?;
-            // The cross-cluster SERVE-ACCEPT listener (#728/#732/#733 follow-up): bind a listener that
-            // ACCEPTS inbound `MirrorPull` connections and serves this broker's FEDERATION own-origin
-            // streams READ-ONLY off the engine read plane (captured HERE, before the engine moves into
-            // the append actor). Spawned ONLY when a federation own-origin served stream is configured;
-            // with none NOTHING binds and the broker is byte-for-byte today's. This closes the deferred
-            // SERVE side the #728/#732/#733 PRs flagged (their PULLER side is the planes above).
-            let mut cross_cluster_serve =
-                spawn_cross_cluster_serve_if_configured(&engine, federation, addr)?;
+            // The cross-cluster SERVE-ACCEPT listener (#728/#732/#733/#738 follow-up): bind a listener
+            // that ACCEPTS inbound `MirrorPull` connections (served READ-ONLY off the engine read plane,
+            // captured HERE before the engine moves into the append actor) AND/OR inbound `LeafPush`
+            // connections when `--leaf-hub-serve` configured a leaf-hub receive-stream (#738), applied to
+            // the hub's OWN on-disk receive log via the leaf `HubPushReceiver` (its own single writer).
+            // Spawned ONLY when a federation own-origin served stream OR a leaf-hub receive-stream is
+            // configured; with neither NOTHING binds and the broker is byte-for-byte today's. This closes
+            // the deferred SERVE side the #728/#732/#733 PRs flagged (their PULLER side is the planes above).
+            let mut cross_cluster_serve = spawn_cross_cluster_serve_if_configured(
+                &engine,
+                federation,
+                leaf_hub_serve,
+                data_dir,
+                config,
+                addr,
+            )?;
             // Start the additive metadata-cluster plane (#684, V2-C1) IFF cluster flags were given.
             // This is the ONLY place a `ClusterRuntime` is started, on the DISK path, where a
             // concrete `StdFs` and the data dir are known — the runtime roots its `metaraft/` log
@@ -5112,7 +5302,13 @@ fn cmd_serve(
             // the `DataPlaneServer`, and runs the replication + quorum-ack data plane over real TCP.
             // With NO cluster this is `None` — nothing constructs, and the produce hot path is unchanged.
             let dataplane = match cluster_runtime.as_ref() {
-                Some(runtime) => Some(spawn_dataplane_serve(&engine, runtime, data_dir, config)?),
+                Some(runtime) => Some(spawn_dataplane_serve(
+                    &engine,
+                    runtime,
+                    data_dir,
+                    config,
+                    cluster_peer_clients,
+                )?),
                 None => None,
             };
             // The shared client produce-ack slot (#719) the bootstrap fills, cloned out BEFORE the
@@ -5464,58 +5660,97 @@ fn cross_cluster_serve_addr(broker_addr: &str) -> Result<std::net::SocketAddr, C
     Ok(serve)
 }
 
-/// Spawn the cross-cluster SERVE-ACCEPT listener (#728/#732/#733 follow-up) IFF this broker SERVES a
+/// Spawn the cross-cluster SERVE-ACCEPT listener (#728/#732/#733/#738 follow-up) IFF this broker SERVES a
 /// cross-cluster stream — i.e. it has a FEDERATION own-origin served stream
-/// ([`FederationConfig::served_streams`], the precisely-configured serve side the #733 PR deferred).
-/// With none configured this returns `None` and NOTHING binds — the byte-identical off-feature
-/// guarantee (the broker is byte-for-byte today's). A remote mirror / source / gateway dials
-/// [`cross_cluster_serve_addr`] and sends a `MirrorPull` (wire tag 40); this broker serves the requested
-/// committed records READ-ONLY off the engine's `Arc`-shared off-actor read plane via the geo
-/// `OriginServer` — the served log is NEVER written (the single append actor stays the sole writer).
+/// ([`FederationConfig::served_streams`], the precisely-configured serve side the #733 PR deferred), AND/OR
+/// `leaf_hub_serve` named a leaf-hub RECEIVE-STREAM (#738, the leaf-hub enablement). With NEITHER
+/// configured this returns `None` and NOTHING binds — the byte-identical off-feature guarantee (the broker
+/// is byte-for-byte today's).
 ///
-/// The `engine` read plane is captured HERE while the engine is still owned (before it moves into the
-/// append actor), exactly as [`spawn_dataplane_serve`] captures it. In this single-stream slice (#693) a
-/// `MirrorPull` for any served stream name resolves to the broker's one default-stream read plane;
-/// mapping named served streams to distinct read planes is the multi-partition follow-up.
+/// * The MIRRORPULL serve (federation): a remote mirror / source / gateway dials
+///   [`cross_cluster_serve_addr`] and sends a `MirrorPull` (wire tag 40); this broker serves the requested
+///   committed records READ-ONLY off the engine's `Arc`-shared off-actor read plane via the geo
+///   `OriginServer` — the served log is NEVER written (the single append actor stays the sole writer). The
+///   `engine` read plane is captured HERE while the engine is still owned (before it moves into the append
+///   actor), exactly as [`spawn_dataplane_serve`] captures it. In this single-stream slice (#693) a
+///   `MirrorPull` for any served stream name resolves to the broker's one default-stream read plane.
+/// * The LEAFPUSH accept (#738, leaf hub): when `leaf_hub_serve` is `Some`, a leaf dials the SAME listener
+///   and sends `LeafPush` frames (wire tag 41); this broker CRC-revalidates each pushed record and APPENDS
+///   it to the hub's OWN on-disk receive log under `<data_dir>/leaf-hub/<hex(receive-stream)>/` via the leaf
+///   [`HubPushReceiver`]'s single writer (single-writer preserved — a DISTINCT log from the broker's own
+///   client stream and from any served read plane). The receiver is held behind a `Mutex` so the
+///   per-connection readers serialize their appends through its one writer.
 ///
-/// The leaf-HUB `LeafPush` accept path is fully wired + tested in
-/// [`CrossClusterServeRuntime`](ironbus_server::cluster::CrossClusterServeRuntime); its CLI enablement
-/// awaits a dedicated hub-serve flag (a leaf hub is NOT the same role as a federation gateway, so it is
-/// not co-enabled here) — see the PR notes. `serve_plane`-only is wired now.
+/// Both share the one dedicated cross-cluster listener (the [`CrossClusterServeRuntime`] dispatches each
+/// frame by its type), so a node may be a federation origin, a leaf hub, or both.
 ///
 /// # Errors
 /// [`CliError::Usage`] if the cross-cluster serve address cannot be derived (an unresolved / ephemeral
-/// `--addr`), or [`CliError::Internal`] if the engine read plane cannot be built or the serve listener
-/// cannot bind.
+/// `--addr`), or [`CliError::Internal`] if the engine read plane / the hub receive log cannot be built or
+/// the serve listener cannot bind.
 #[cfg(unix)]
 fn spawn_cross_cluster_serve_if_configured(
     engine: &Engine<StdFs, SystemClock>,
     federation: &FederationConfig,
+    leaf_hub_serve: Option<&str>,
+    data_dir: &Path,
+    config: &ServeConfig,
     broker_addr: &str,
 ) -> Result<Option<CrossClusterServeRuntime>, CliError> {
-    // The CONFIG-DRIVEN gate: only a FEDERATION own-origin served stream makes this broker a
-    // cross-cluster ORIGIN that must ACCEPT inbound pulls. Nothing else serves, so with no served stream
-    // NOTHING binds (byte-identical).
-    if federation.served_streams().is_empty() {
+    // The CONFIG-DRIVEN gate: a FEDERATION own-origin served stream makes this broker a cross-cluster
+    // ORIGIN that must ACCEPT inbound pulls; a `--leaf-hub-serve` receive-stream makes it a leaf HUB that
+    // must ACCEPT inbound pushes. With NEITHER, NOTHING binds (byte-identical).
+    let serves_federation = !federation.served_streams().is_empty();
+    if !serves_federation && leaf_hub_serve.is_none() {
         return Ok(None);
     }
 
-    // Capture the engine's off-actor read plane NOW, while the engine is still owned here (before it
-    // moves into the append actor). Arc-backed + read-only: the OriginServer serves committed bytes
-    // through it; the single append actor stays the sole writer (single-writer preserved).
-    let read_plane = std::sync::Arc::new(engine.read_plane().map_err(|e| {
-        CliError::Internal(format!(
-            "cannot build the cross-cluster serve read plane: {e}"
-        ))
-    })?);
+    // The MIRRORPULL half (federation): capture the engine's off-actor read plane NOW, while the engine is
+    // still owned here (before it moves into the append actor). Arc-backed + read-only: the OriginServer
+    // serves committed bytes through it; the single append actor stays the sole writer. Built ONLY when a
+    // federation own-origin stream is served — a pure leaf hub serves no MirrorPull (its serve_plane is None).
+    let serve_plane = if serves_federation {
+        Some(std::sync::Arc::new(engine.read_plane().map_err(|e| {
+            CliError::Internal(format!(
+                "cannot build the cross-cluster serve read plane: {e}"
+            ))
+        })?))
+    } else {
+        None
+    };
+
+    // The LEAFPUSH half (#738, leaf hub): when `--leaf-hub-serve` named a receive-stream, open the hub's OWN
+    // on-disk receive log under `<data_dir>/leaf-hub/<hex(stream)>/` and wrap it as a `HubPushReceiver`
+    // behind a `Mutex` (the per-connection readers serialize their appends through its one writer — the
+    // single-writer invariant across connections). A DISTINCT log from the broker's client stream and from
+    // any federation read plane: the hub never writes a served stream's log. `None` for a non-hub broker.
+    let hub_receiver = match leaf_hub_serve {
+        Some(receive_stream) => {
+            let log_config = LogConfig::new(config.max_segment_bytes)
+                .map_err(|e| CliError::Internal(format!("leaf-hub log config: {e}")))?
+                .with_max_total_bytes(config.max_total_bytes);
+            let dir = data_dir.join("leaf-hub").join(hex_dir_name(receive_stream));
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| CliError::Internal(format!("mkdir {}: {e}", dir.display())))?;
+            let log = ironbus_storage::log::Log::open(
+                StdFs::new(dir.clone()),
+                SystemClock::new(),
+                log_config,
+            )
+            .map_err(|e| {
+                CliError::Internal(format!("open leaf-hub receive log {}: {e}", dir.display()))
+            })?;
+            Some(std::sync::Arc::new(std::sync::Mutex::new(
+                HubPushReceiver::new(log),
+            )))
+        }
+        None => None,
+    };
 
     let serve_addr = cross_cluster_serve_addr(broker_addr)?;
-    // `C = SystemClock` annotates the (here-unused) hub-receiver half so the broker's clock type is
-    // fixed; the leaf-hub accept path awaits a dedicated hub-serve flag (see the fn doc): a federation
-    // gateway is not implicitly a leaf hub, so it is not co-enabled here.
     let serve_config: CrossClusterServeConfig<StdFs, SystemClock> = CrossClusterServeConfig {
-        serve_plane: Some(read_plane),
-        hub_receiver: None,
+        serve_plane,
+        hub_receiver,
     };
     let runtime = CrossClusterServeRuntime::start(serve_addr, serve_config).map_err(|e| {
         CliError::Internal(format!(
@@ -6007,6 +6242,7 @@ fn spawn_dataplane_serve(
     runtime: &ClusterRuntime,
     data_dir: &Path,
     config: &ServeConfig,
+    cluster_peer_clients: &std::collections::BTreeMap<u64, std::net::SocketAddr>,
 ) -> Result<DataPlaneServeHandle, CliError> {
     // Capture the engine's off-actor read plane NOW, while the engine is still owned here (before it
     // moves into the append actor). It is Arc-backed, so the leader role holds an Arc<ReadPlane> and
@@ -6059,6 +6295,15 @@ fn spawn_dataplane_serve(
     let client_ack_slot: ClientAckSlot = std::sync::Arc::new(std::sync::OnceLock::new());
     let client_ack_slot_t = std::sync::Arc::clone(&client_ack_slot);
 
+    // The node-id -> CLIENT-address advertise map (#737, follow-up to #735): the source of the
+    // `NOT_LEADER` produce-redirect leader HINT. Owned into the bootstrap thread (it is `'static`) and
+    // installed on the data plane's `ClientAckGate`. EMPTY (no `--cluster-peer-client`) keeps today's
+    // hintless redirect (the client re-tries its peers); a populated map lets the redirect carry the
+    // CURRENT committed leader's CLIENT address so the client reconnects in one hop. The map only ever
+    // FILLS the hint — when the current leader's id is not in it, the redirect falls back to hintless
+    // (never a wrong hint), so an extra / stale entry is harmless.
+    let leader_client_addrs = cluster_peer_clients.clone();
+
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_t = std::sync::Arc::clone(&shutdown);
 
@@ -6077,6 +6322,7 @@ fn spawn_dataplane_serve(
                 &failover_installer,
                 &data_dir,
                 log_config,
+                leader_client_addrs,
                 &client_ack_slot_t,
                 &shutdown_t,
             );
@@ -6117,6 +6363,7 @@ fn run_dataplane_bootstrap(
     failover_installer: &ironbus_server::cluster::FailoverInstaller,
     data_dir: &Path,
     log_config: LogConfig,
+    leader_client_addrs: std::collections::BTreeMap<u64, std::net::SocketAddr>,
     client_ack_slot: &ClientAckSlot,
     shutdown: &std::sync::atomic::AtomicBool,
 ) {
@@ -6210,18 +6457,20 @@ fn run_dataplane_bootstrap(
     // the shared slot so every per-connection produce path (which captured the slot at serve start)
     // reaches it: from now on a clustered `C2-fsync` led produce's wire `PubAck` is withheld until
     // quorum-fsync. Before this fill, the produce path acked immediately (the brief bootstrap window).
-    // The node-id -> CLIENT-address advertise map for the #735 `NOT_LEADER` leader HINT. There is no
-    // per-peer client-address config today (`--cluster-peer` carries only the metadata address; a peer's
-    // CLIENT listener `--addr` is not advertised), so this is EMPTY in production for now: the `NOT_LEADER`
-    // redirect still fires correctly (a client on a non-leader is redirected before any append/ack), but
-    // with NO concrete hint — the client re-tries its own configured peer set to find the leader. A
-    // `--cluster-peer-client <id>=<addr>` advertise that fills this hint is the flagged follow-up (#735).
-    let leader_client_addrs: std::collections::BTreeMap<u64, std::net::SocketAddr> =
-        std::collections::BTreeMap::new();
-    // Start the runtime with the client gate AND the #735 client cluster-awareness wiring: the (currently
-    // empty) leader-hint advertise map and the shared metadata status snapshot (the follower-read
-    // committed-HW safe-watermark source). The status handle is what lets a FOLLOWER serve committed reads
-    // over the wire (without it the follower-read fails closed to a 0 safe bar).
+    //
+    // The node-id -> CLIENT-address advertise map (#737, follow-up to #735) for the `NOT_LEADER` leader
+    // HINT comes from `--cluster-peer-client` (passed in as `leader_client_addrs`). EMPTY (no flag) keeps
+    // today's HINTLESS redirect: the `NOT_LEADER` still fires correctly (a client on a non-leader is
+    // redirected before any append/ack), but the client re-tries its own configured peer set to find the
+    // leader. A POPULATED map lets the redirect carry the CURRENT committed leader's CLIENT address (the
+    // gate maps the follower's committed leader-target node id through this map), so the client reconnects
+    // in one hop. The hint is ALWAYS the current committed leader (the gate reads the live placement) and
+    // falls back to hintless if that leader's id is not in the map — never a wrong / stale hint.
+    //
+    // Start the runtime with the client gate AND the #735 client cluster-awareness wiring: the leader-hint
+    // advertise map and the shared metadata status snapshot (the follower-read committed-HW safe-watermark
+    // source). The status handle is what lets a FOLLOWER serve committed reads over the wire (without it
+    // the follower-read fails closed to a 0 safe bar).
     let mut dp_runtime = match DataPlaneRuntime::start_with_client_gate_aware(
         server,
         self_data_addr,
@@ -7136,6 +7385,8 @@ fn cmd_serve(
     geo: &GeoConfig,
     leaf: &LeafConfig,
     federation: &FederationConfig,
+    cluster_peer_clients: &std::collections::BTreeMap<u64, std::net::SocketAddr>,
+    leaf_hub_serve: Option<&str>,
     transport: &TransportSecurityFlags,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
@@ -7149,6 +7400,12 @@ fn cmd_serve(
     // stub consumes its parsed config to keep this signature byte-for-byte identical to the Unix one (the
     // same #288/#99 footgun: a new serve arg MUST appear in BOTH cmd_serve signatures).
     let _ = leaf;
+    // The #737 NOT_LEADER leader-address advertise map and the #738 leaf-hub serve receive-stream are wired
+    // only on the Unix serve path (the data plane / cross-cluster serve-accept), so the non-Unix stub
+    // consumes them to keep this signature byte-for-byte identical to the Unix one (the same #288/#99
+    // footgun: a new serve arg MUST appear in BOTH cmd_serve signatures, non-unix stub `let _ = arg;`).
+    let _ = cluster_peer_clients;
+    let _ = leaf_hub_serve;
     // The GATEWAY / SUPERCLUSTER FEDERATION plane (#626) is likewise spawned only on the Unix serve path,
     // so the non-Unix stub consumes its parsed config to keep this signature byte-for-byte identical to the
     // Unix one (the same #288/#99 footgun: a new serve arg MUST appear in BOTH cmd_serve signatures).
@@ -9938,6 +10195,36 @@ mod tests {
     /// use to drive the hand-rolled parser.
     fn serve_args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Scale a GENEROUS base wait by the observed host slowdown (#618): a local copy of the cluster
+    /// tests' `host_scaled` (max-of-3-probes + a 24x cap), so a real-socket integration test's timing
+    /// waits stay truthful and flake-free on a contended host WITHOUT weakening what they prove. On an
+    /// unloaded host the factor is ~1 and the wait stays the base (the test exits the instant its
+    /// predicate holds).
+    #[cfg(unix)]
+    fn host_scaled(base: std::time::Duration) -> std::time::Duration {
+        fn probe_busy_nanos() -> u128 {
+            const ITERS: u64 = 2_000_000;
+            let start = std::time::Instant::now();
+            let mut acc: u64 = 0x9E37_79B9_7F4A_7C15;
+            for i in 0..ITERS {
+                acc = acc
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(i | 1);
+                acc ^= acc >> 29;
+            }
+            std::hint::black_box(acc);
+            start.elapsed().as_nanos().max(1)
+        }
+        const REFERENCE_BUSY_NANOS: u128 = 4_000_000;
+        const MAX_SCALE: u32 = 24;
+        let mut samples = [probe_busy_nanos(), probe_busy_nanos(), probe_busy_nanos()];
+        samples.sort_unstable();
+        let observed = samples[2];
+        let factor = (observed / REFERENCE_BUSY_NANOS).clamp(1, u128::from(MAX_SCALE));
+        let factor = u32::try_from(factor).unwrap_or(MAX_SCALE);
+        base * factor
     }
 
     // ---- #382 TOML config-FILE layer + flag > env > FILE > default precedence ----
@@ -13253,6 +13540,8 @@ mod tests {
             &parsed.geo,
             &parsed.leaf,
             &parsed.federation,
+            &parsed.cluster_peer_clients,
+            parsed.leaf_hub_serve.as_deref(),
             &parsed.transport,
             ReloadSource {
                 config_path: parsed.config_path.as_deref(),
@@ -15742,6 +16031,8 @@ mod tests {
             &parsed.geo,
             &parsed.leaf,
             &parsed.federation,
+            &parsed.cluster_peer_clients,
+            parsed.leaf_hub_serve.as_deref(),
             &parsed.transport,
             ReloadSource {
                 config_path: parsed.config_path.as_deref(),
@@ -15854,6 +16145,8 @@ mod tests {
             &parsed.geo,
             &parsed.leaf,
             &parsed.federation,
+            &parsed.cluster_peer_clients,
+            parsed.leaf_hub_serve.as_deref(),
             &parsed.transport,
             ReloadSource {
                 config_path: parsed.config_path.as_deref(),
@@ -15868,6 +16161,55 @@ mod tests {
             CliError::Usage(m) => assert!(
                 m.contains("--storage disk") && m.contains("durable"),
                 "the rejection must explain the durable-disk requirement: {m}"
+            ),
+            other => panic!("expected a Usage error, got {other:?}"),
+        }
+    }
+
+    /// FAIL-CLOSED (#738): `--leaf-hub-serve` under `--storage memory` is rejected (a leaf hub keeps a
+    /// durable on-disk receive log — fsync-before-ack — so a leaf resumes across a hub restart).
+    #[test]
+    fn leaf_hub_serve_under_storage_memory_is_rejected() {
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--storage",
+            "memory",
+            "--ephemeral-loss-ack",
+            "--max-total-bytes",
+            "1048576",
+            "--leaf-hub-serve",
+            "hub-inbox",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.leaf_hub_serve.as_deref(), Some("hub-inbox"));
+        let mut buf = Vec::new();
+        let e = finish_serve(
+            &parsed.addr,
+            parsed.data_dir.as_deref(),
+            &parsed.config,
+            &parsed.key_shared_groups,
+            &parsed.broadcast_groups,
+            parsed.health_addr.as_deref(),
+            &parsed.config_warnings,
+            parsed.cluster.as_ref(),
+            &parsed.geo,
+            &parsed.leaf,
+            &parsed.federation,
+            &parsed.cluster_peer_clients,
+            parsed.leaf_hub_serve.as_deref(),
+            &parsed.transport,
+            ReloadSource {
+                config_path: parsed.config_path.as_deref(),
+                allow_unknown_config: parsed.allow_unknown_config,
+                reload_pins: parsed.reload_pins,
+            },
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(
+                m.contains("--leaf-hub-serve") && m.contains("--storage disk"),
+                "the rejection must name the flag + the durable-disk requirement: {m}"
             ),
             other => panic!("expected a Usage error, got {other:?}"),
         }
@@ -15968,6 +16310,212 @@ mod tests {
             ])),
             Err(CliError::Usage(_))
         ));
+    }
+
+    // ---- #737: `--cluster-peer-client` (the NOT_LEADER leader-address advertise map) ----
+
+    /// `--cluster-peer-client <id>=<client-addr>` (repeatable) parses into the node-id -> client-address
+    /// advertise map alongside a `--cluster-peer` set.
+    #[test]
+    fn cluster_peer_client_flags_parse_into_the_advertise_map() {
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--cluster-id",
+            "1",
+            "--cluster-peer",
+            "1=127.0.0.1:7401",
+            "--cluster-peer",
+            "2=127.0.0.1:7402",
+            "--cluster-peer",
+            "3=127.0.0.1:7403",
+            // Advertise nodes 2 and 3's CLIENT addresses (distinct from their metadata addresses above).
+            "--cluster-peer-client",
+            "2=127.0.0.1:7002",
+            "--cluster-peer-client",
+            "3=127.0.0.1:7003",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.cluster_peer_clients.len(), 2);
+        assert_eq!(
+            parsed.cluster_peer_clients.get(&2),
+            Some(&"127.0.0.1:7002".parse().unwrap())
+        );
+        assert_eq!(
+            parsed.cluster_peer_clients.get(&3),
+            Some(&"127.0.0.1:7003".parse().unwrap())
+        );
+    }
+
+    /// No `--cluster-peer-client` = the EMPTY advertise map (the default: the `NOT_LEADER` redirect is
+    /// hintless), even with a cluster configured. The byte-identical-off-flag guarantee for #737.
+    #[test]
+    fn no_cluster_peer_client_is_the_empty_advertise_map() {
+        // No cluster at all: empty map.
+        let parsed = parse_serve_flags(&serve_args(&[])).unwrap();
+        assert!(
+            parsed.cluster_peer_clients.is_empty(),
+            "no --cluster-peer-client = no advertise map"
+        );
+        // A cluster WITHOUT `--cluster-peer-client`: still empty (the hintless redirect default).
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--cluster-id",
+            "1",
+            "--cluster-peer",
+            "1=127.0.0.1:7401",
+            "--cluster-peer",
+            "2=127.0.0.1:7402",
+            "--cluster-peer",
+            "3=127.0.0.1:7403",
+        ]))
+        .unwrap();
+        assert!(
+            parsed.cluster_peer_clients.is_empty(),
+            "a cluster without --cluster-peer-client keeps the hintless redirect (empty map)"
+        );
+    }
+
+    /// FAIL-CLOSED: a malformed `--cluster-peer-client` (no `=`, a non-numeric id, the reserved id `0`, or
+    /// a bad socket address) is a typed usage error naming the offending spec.
+    #[test]
+    fn a_malformed_cluster_peer_client_is_a_usage_error() {
+        let base = |spec: &str| {
+            serve_args(&[
+                "--data-dir",
+                "/tmp/x",
+                "--cluster-id",
+                "1",
+                "--cluster-peer",
+                "1=127.0.0.1:7401",
+                "--cluster-peer",
+                "2=127.0.0.1:7402",
+                "--cluster-peer",
+                "3=127.0.0.1:7403",
+                "--cluster-peer-client",
+                spec,
+            ])
+        };
+        // no `=` separator
+        assert!(
+            matches!(parse_serve_flags(&base("noeq")), Err(CliError::Usage(m)) if m.contains("<id>=<client-addr>")),
+            "a no-`=` spec must name the grammar"
+        );
+        // a non-numeric id
+        assert!(
+            matches!(parse_serve_flags(&base("x=127.0.0.1:7002")), Err(CliError::Usage(m)) if m.contains("id must be")),
+            "a non-numeric id must be a usage error"
+        );
+        // the reserved id 0
+        assert!(
+            matches!(parse_serve_flags(&base("0=127.0.0.1:7002")), Err(CliError::Usage(m)) if m.contains("reserved")),
+            "the reserved id 0 must be a usage error"
+        );
+        // a bad socket address
+        assert!(
+            matches!(parse_serve_flags(&base("2=not-an-addr")), Err(CliError::Usage(m)) if m.contains("socket address")),
+            "a bad address must be a usage error"
+        );
+    }
+
+    /// FAIL-CLOSED: a duplicate advertised id is a typed usage error.
+    #[test]
+    fn a_duplicate_cluster_peer_client_id_is_a_usage_error() {
+        let e = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--cluster-id",
+            "1",
+            "--cluster-peer",
+            "1=127.0.0.1:7401",
+            "--cluster-peer",
+            "2=127.0.0.1:7402",
+            "--cluster-peer",
+            "3=127.0.0.1:7403",
+            "--cluster-peer-client",
+            "2=127.0.0.1:7002",
+            "--cluster-peer-client",
+            "2=127.0.0.1:9999",
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(&e, CliError::Usage(m) if m.contains("more than once")),
+            "a duplicate advertised id must be a usage error, got {e:?}"
+        );
+    }
+
+    /// FAIL-CLOSED: `--cluster-peer-client` without a `--cluster-peer` set is a typed usage error (it
+    /// advertises cluster members, so a cluster must be configured).
+    #[test]
+    fn cluster_peer_client_without_a_cluster_is_a_usage_error() {
+        let e = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--cluster-peer-client",
+            "2=127.0.0.1:7002",
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(&e, CliError::Usage(m) if m.contains("--cluster-peer")),
+            "an advertise without a cluster must be a usage error, got {e:?}"
+        );
+    }
+
+    // ---- #738: `--leaf-hub-serve` (the leaf-hub serve enablement) ----
+
+    /// `--leaf-hub-serve <receive-stream>` parses into the leaf-hub receive-stream name.
+    #[test]
+    fn leaf_hub_serve_flag_parses_into_the_receive_stream() {
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--leaf-hub-serve",
+            "hub-inbox",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.leaf_hub_serve.as_deref(), Some("hub-inbox"));
+    }
+
+    /// No `--leaf-hub-serve` = `None` (the default: NO leaf-hub listener). The byte-identical-off-flag
+    /// guarantee for #738.
+    #[test]
+    fn no_leaf_hub_serve_is_none() {
+        let parsed = parse_serve_flags(&serve_args(&[])).unwrap();
+        assert!(
+            parsed.leaf_hub_serve.is_none(),
+            "no --leaf-hub-serve = no leaf-hub listener"
+        );
+    }
+
+    /// FAIL-CLOSED: an empty or over-long `--leaf-hub-serve` receive-stream name is a typed usage error.
+    #[test]
+    fn a_malformed_leaf_hub_serve_is_a_usage_error() {
+        // an empty stream name (the default stream cannot be a hub receive stream)
+        let e = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--leaf-hub-serve",
+            "",
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(&e, CliError::Usage(m) if m.contains("empty")),
+            "an empty receive-stream name must be a usage error, got {e:?}"
+        );
+        // an over-long stream name (past MAX_ORIGIN_STREAM_LEN)
+        let long = "x".repeat(ironbus_server::cluster::MAX_ORIGIN_STREAM_LEN + 1);
+        let e = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--leaf-hub-serve",
+            &long,
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(&e, CliError::Usage(m) if m.contains("cap")),
+            "an over-long receive-stream name must be a usage error, got {e:?}"
+        );
     }
 
     #[test]
@@ -16119,6 +16667,8 @@ mod tests {
             &parsed.geo,
             &parsed.leaf,
             &parsed.federation,
+            &parsed.cluster_peer_clients,
+            parsed.leaf_hub_serve.as_deref(),
             &parsed.transport,
             ReloadSource {
                 config_path: parsed.config_path.as_deref(),
@@ -16443,9 +16993,17 @@ mod tests {
             .unwrap()
             .expect("a configured cluster starts a runtime");
 
-        // Construct + spawn + drive the data plane (the #717 plumbing under test).
-        let mut dp = spawn_dataplane_serve(&engine, &runtime, &data_dir, &config)
-            .expect("data plane spawns");
+        // Construct + spawn + drive the data plane (the #717 plumbing under test). No
+        // `--cluster-peer-client` advertise map here (the #737 default: the NOT_LEADER redirect is
+        // hintless), so pass an empty map.
+        let mut dp = spawn_dataplane_serve(
+            &engine,
+            &runtime,
+            &data_dir,
+            &config,
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("data plane spawns");
 
         // The bootstrap proposes the static placement once this node is the metadata leader; once it
         // commits + applies, the runtime publishes it. Poll until partition 0 is committed-and-led.
@@ -16498,13 +17056,20 @@ mod tests {
         let config = test_serve_config(64, 1);
         let engine = open_disk_engine(&data_dir, &config, &[], &[]).expect("disk engine");
 
-        // The NON-federated default: nothing served.
+        // The NON-federated default: nothing served, and no leaf-hub-serve.
         let empty = FederationConfig::default();
         assert!(
-            spawn_cross_cluster_serve_if_configured(&engine, &empty, "127.0.0.1:7700")
-                .expect("gating never errors")
-                .is_none(),
-            "no federation config => no cross-cluster serve listener"
+            spawn_cross_cluster_serve_if_configured(
+                &engine,
+                &empty,
+                None,
+                &data_dir,
+                &config,
+                "127.0.0.1:7700"
+            )
+            .expect("gating never errors")
+            .is_none(),
+            "no federation config + no --leaf-hub-serve => no cross-cluster serve listener"
         );
 
         // A PEER-MIRROR-only federation (own domain `west`, mirroring east's `events`, serving NOTHING of
@@ -16521,10 +17086,17 @@ mod tests {
             "a peer-mirror-only gateway serves nothing of its own"
         );
         assert!(
-            spawn_cross_cluster_serve_if_configured(&engine, &mirror_only, "127.0.0.1:7700")
-                .expect("gating never errors")
-                .is_none(),
-            "a peer-mirror-only federation serves nothing => no listener"
+            spawn_cross_cluster_serve_if_configured(
+                &engine,
+                &mirror_only,
+                None,
+                &data_dir,
+                &config,
+                "127.0.0.1:7700"
+            )
+            .expect("gating never errors")
+            .is_none(),
+            "a peer-mirror-only federation + no --leaf-hub-serve serves nothing => no listener"
         );
     }
 
@@ -16573,9 +17145,16 @@ mod tests {
             "one own-origin served stream"
         );
 
-        let mut serve = spawn_cross_cluster_serve_if_configured(&engine, &federation, &broker_addr)
-            .expect("serve spawns")
-            .expect("a served stream binds the listener");
+        let mut serve = spawn_cross_cluster_serve_if_configured(
+            &engine,
+            &federation,
+            None,
+            &data_dir,
+            &config,
+            &broker_addr,
+        )
+        .expect("serve spawns")
+        .expect("a served stream binds the listener");
 
         // A real client socket can CONNECT to the spawned accept loop at the derived address — the
         // accept loop is LIVE. (A produce-and-pull byte-faithful proof over the socket is the
@@ -16596,6 +17175,255 @@ mod tests {
         );
 
         // Clean teardown: signal shutdown + join the accept thread.
+        serve.stop();
+    }
+
+    /// GATING (#738, the byte-identical guarantee): with NO `--leaf-hub-serve` AND no federation served
+    /// stream, the cross-cluster serve-accept listener is NOT spawned — no leaf-hub listener binds, the
+    /// broker is byte-for-byte today's. (The federation half is covered by
+    /// `no_served_stream_spawns_no_cross_cluster_serve`; this asserts the leaf-hub half of the same gate.)
+    #[cfg(unix)]
+    #[test]
+    fn no_leaf_hub_serve_spawns_no_cross_cluster_serve() {
+        struct RemoveDirOnDrop(std::path::PathBuf);
+        impl Drop for RemoveDirOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let data_dir = std::env::temp_dir().join(format!(
+            "ironbus-cli-leafhub-gate-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let _guard = RemoveDirOnDrop(data_dir.clone());
+        let config = test_serve_config(64, 1);
+        let engine = open_disk_engine(&data_dir, &config, &[], &[]).expect("disk engine");
+
+        // No federation served stream AND no --leaf-hub-serve: nothing binds.
+        let empty = FederationConfig::default();
+        assert!(
+            spawn_cross_cluster_serve_if_configured(
+                &engine,
+                &empty,
+                None,
+                &data_dir,
+                &config,
+                "127.0.0.1:7700"
+            )
+            .expect("gating never errors")
+            .is_none(),
+            "no --leaf-hub-serve + no federation => no cross-cluster serve listener"
+        );
+    }
+
+    /// THE #738 CLI WIRING end-to-end: with `--leaf-hub-serve <receive-stream>`, the broker spawns the
+    /// cross-cluster serve-accept listener as a leaf HUB, a real leaf dials it over a real `TcpStream` and
+    /// PUSHES a local stream's committed records, and the hub ACCEPTS + applies them into its OWN on-disk
+    /// receive log under `<data_dir>/leaf-hub/<hex(receive-stream)>/`, byte-faithfully. This extends the
+    /// #734 serve-accept real-socket proof to the CLI enablement gate (the flag opens the listener + routes
+    /// `LeafPush` to the `HubPushReceiver`).
+    // A single coherent end-to-end scenario whose length is intrinsic (open the hub engine, enable the
+    // leaf hub, seed a leaf log, drive the push protocol over a real socket, assert byte-identity).
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn leaf_hub_serve_accepts_a_real_leaf_push_into_the_receive_stream() {
+        use ironbus_core::types::Offset;
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+        use std::time::{Duration, Instant};
+
+        struct RemoveDirOnDrop(std::path::PathBuf);
+        impl Drop for RemoveDirOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let base = std::env::temp_dir().join(format!(
+            "ironbus-cli-leafhub-push-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let hub_dir = base.join("hub");
+        let leaf_dir = base.join("leaf");
+        let cursor_dir = base.join("cursor");
+        for d in [&hub_dir, &leaf_dir, &cursor_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let _guard = RemoveDirOnDrop(base.clone());
+
+        let config = test_serve_config(64, 1);
+        // The hub broker engine (its own client log; the hub receive-log is a DISTINCT log under
+        // `<data_dir>/leaf-hub/<hex(stream)>/`, opened by the spawn fn — never the client log).
+        let engine = open_disk_engine(&hub_dir, &config, &[], &[]).expect("hub disk engine");
+
+        // ENABLE the leaf hub via the flag's parsed value (no federation served stream — a PURE leaf hub).
+        // The serve listener binds at the DERIVED port `client_port + 2`. Picking an ephemeral client port
+        // and deriving + 2 races another parallel test that could grab the derived port between our probe
+        // and the serve bind; retry with a fresh client port until the bind succeeds (a transient
+        // resource race, never a logic failure — distinguished from a Usage error, which is fatal here).
+        let receive_stream = "hub-inbox";
+        let (mut serve, serve_port) = {
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                assert!(
+                    attempt < 50,
+                    "could not find a free derived serve port to bind"
+                );
+                let client_port = {
+                    let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                    l.local_addr().unwrap().port()
+                };
+                let broker_addr = format!("127.0.0.1:{client_port}");
+                let serve_port = client_port + CROSS_CLUSTER_SERVE_PORT_OFFSET;
+                match spawn_cross_cluster_serve_if_configured(
+                    &engine,
+                    &FederationConfig::default(),
+                    Some(receive_stream),
+                    &hub_dir,
+                    &config,
+                    &broker_addr,
+                ) {
+                    Ok(Some(runtime)) => break (runtime, serve_port),
+                    // A bind race (the derived port was taken between probe and bind): the loop retries a
+                    // fresh client port on the next pass.
+                    Err(CliError::Internal(_)) => {}
+                    Ok(None) => panic!("--leaf-hub-serve must bind a listener"),
+                    Err(e) => panic!("unexpected serve-spawn error: {e:?}"),
+                }
+            }
+        };
+
+        // Seed a real on-disk LEAF log with records to push up (a separate stream the leaf forwards). A
+        // SMALL segment cap so the records roll to sealed segments — the LeafForwarder only forwards the
+        // sealed/flushed prefix (the same discipline the #734 serve-accept real-socket test uses).
+        let leaf_log_cfg = LogConfig {
+            max_segment_bytes: 256,
+            max_total_bytes: 0,
+            ..LogConfig::default()
+        };
+        let mut leaf_log = ironbus_storage::log::Log::open(
+            StdFs::new(leaf_dir.clone()),
+            SystemClock::new(),
+            leaf_log_cfg,
+        )
+        .expect("leaf log opens");
+        let n: u64 = 40;
+        for i in 0..n {
+            leaf_log
+                .append(&Append {
+                    timestamp_ms: 7,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload: format!("hub-{i:02}").as_bytes(),
+                })
+                .unwrap();
+        }
+        leaf_log.sync().unwrap();
+        // The SEALED served prefix the leaf can forward (the read plane serves only sealed segments). The
+        // last, still-open segment is not forwardable; assert against this sealed end, not the raw count.
+        let served = {
+            let plane = leaf_log.read_plane().unwrap();
+            let flushed = plane.flushed();
+            let mut next = 0u64;
+            let mut guard = 0u32;
+            while next < flushed {
+                guard += 1;
+                assert!(guard < 100_000);
+                let raw = plane
+                    .read_range_raw(Offset::new(next), 1_000, None)
+                    .unwrap();
+                let adv = raw.run.next_offset.get();
+                if adv > next {
+                    next = adv;
+                } else {
+                    break;
+                }
+            }
+            next
+        };
+        assert!(served > 0, "the leaf has a non-empty sealed prefix to push");
+
+        // A real leaf client dials the spawned listener and pushes its stream up to the hub, advancing a
+        // durable push cursor to the hub's ack — exactly the #734 serve-accept protocol over a real socket.
+        let serve_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, serve_port));
+        let key = format!("{serve_addr}/{receive_stream}");
+        let mut cursor =
+            LeafPushCursor::open(&StdFs::new(cursor_dir.clone())).expect("push cursor");
+        // Scale a GENEROUS base wait by the observed host slowdown (#618) so the connect-then-push retry
+        // loop stays flake-free on a contended host WITHOUT weakening what it proves (it exits the instant
+        // the whole sealed prefix is acked). The same `host_scaled` discipline the serve_accept tests use.
+        let deadline = Instant::now() + host_scaled(Duration::from_secs(20));
+        // A GENEROUS, host-scaled per-read timeout so a slow hub reply under heavy parallel-test
+        // contention does NOT break the connection mid-push (the hub's accept loop polls every 100ms and
+        // the hub append + fsync can lag under CPU starvation); the connection stays productive across the
+        // whole multi-round push instead of churning reconnects.
+        let read_timeout = host_scaled(Duration::from_secs(2));
+        let mut pushed_all = false;
+        while Instant::now() < deadline {
+            let Ok(stream) = TcpStream::connect(serve_addr) else {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            };
+            stream.set_read_timeout(Some(read_timeout)).unwrap();
+            let mut link = LeafLink::new(stream);
+            loop {
+                let plane = leaf_log.read_plane().unwrap();
+                let fwd = LeafForwarder::new(&plane);
+                let Ok(req) = fwd.next_push(receive_stream, cursor.cursor(&key)) else {
+                    break;
+                };
+                if req.record_count == 0 {
+                    break;
+                }
+                if link.send_request(&req).is_err() {
+                    break;
+                }
+                match link.recv() {
+                    Ok(Some(ironbus_server::cluster::LeafFrame::Response(ack))) => {
+                        cursor
+                            .commit(&key, ack.accepted_through_leaf_offset)
+                            .unwrap();
+                    }
+                    _ => break,
+                }
+            }
+            if cursor.cursor(&key) == served {
+                pushed_all = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            pushed_all,
+            "the leaf pushed its whole sealed prefix up to the hub over the real socket (cursor {} of {served})",
+            cursor.cursor(&key)
+        );
+
+        // The hub's receive log holds the leaf's records byte-faithfully, in order — the leaf-hub listener
+        // accepted + applied each push into its OWN receive log under `<data_dir>/leaf-hub/<hex(stream)>/`.
+        let hub_receive_dir = hub_dir.join("leaf-hub").join(hex_dir_name(receive_stream));
+        let hub_log = ironbus_storage::log::Log::open(
+            StdFs::new(hub_receive_dir.clone()),
+            SystemClock::new(),
+            LogConfig::new(config.max_segment_bytes)
+                .unwrap()
+                .with_max_total_bytes(config.max_total_bytes),
+        )
+        .expect("hub receive log re-opens");
+        let recs = hub_log.read_from(Offset::new(0), 10_000).unwrap();
+        assert_eq!(
+            recs.len() as u64,
+            served,
+            "every pushed (sealed) record landed in the hub"
+        );
+        for (i, r) in recs.iter().enumerate() {
+            assert_eq!(r.payload.as_ref(), format!("hub-{i:02}").as_bytes());
+        }
+
         serve.stop();
     }
 
@@ -16624,7 +17452,14 @@ mod tests {
             parse_federation_config(Some("west"), &[], &["orders=@west/orders".to_string()])
                 .expect("federation parses");
         assert!(matches!(
-            spawn_cross_cluster_serve_if_configured(&engine, &federation, "127.0.0.1:0"),
+            spawn_cross_cluster_serve_if_configured(
+                &engine,
+                &federation,
+                None,
+                &data_dir,
+                &config,
+                "127.0.0.1:0"
+            ),
             Err(CliError::Usage(_))
         ));
     }
