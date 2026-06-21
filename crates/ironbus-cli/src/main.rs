@@ -14166,6 +14166,11 @@ mod tests {
     /// proven counterpart: `start_cluster_runtime(None, ..)` returns `None`, so `spawn_dataplane_serve`
     /// is never reached (the disk arm only calls it when `cluster_runtime.is_some()`) — nothing
     /// constructs, the produce hot path is byte-for-byte today's.
+    // Unix-only: exercises the cluster disk-serve path (`open_disk_engine` / `start_cluster_runtime`
+    // / `spawn_dataplane_serve`, all `#[cfg(unix)]` since serve is unix-only via StdFs). A Windows
+    // `cargo test` builds the regular bin with cfg(test)=false, so those fns are absent there — gate
+    // the test to match (same pattern as the other cluster-serve tests).
+    #[cfg(unix)]
     #[test]
     fn spawn_dataplane_serve_brings_up_the_data_plane_on_a_clustered_serve() {
         use std::net::{Ipv4Addr, TcpListener};
