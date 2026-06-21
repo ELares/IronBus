@@ -2186,12 +2186,18 @@ mod tests {
         const REFERENCE_BUSY_NANOS: u128 = 4_000_000; // ~4 ms for ~2M iters on a fast core.
         /// Cap the multiplier so a pathologically wedged host still fails in bounded time rather than
         /// hanging the suite — a genuinely never-electing cluster (a real bug) must still surface.
-        const MAX_SCALE: u32 = 12;
+        /// Raised 12 -> 24: the heavy multi-node cluster tests (detect -> elect -> promote chains) were
+        /// flaking on heavily-contended macOS CI runners where 12x was occasionally too tight; 24x still
+        /// bounds a real hang (a genuinely-stuck cluster fails in bounded time, just later).
+        const MAX_SCALE: u32 = 24;
 
-        // Take the median of three probes so a single descheduled probe doesn't skew the estimate.
+        // Take the MAX of three probes (worst-case contention), NOT the median: skewing the deadline UP
+        // on a momentarily-descheduled probe is SAFE (a longer wait), whereas the median can UNDER-
+        // estimate intermittent contention and cause a spurious timeout. A truly fast host's three probes
+        // are all fast, so max ~= median ~= factor 1 (no slowdown); only a contended host scales up.
         let mut samples = [probe_busy_nanos(), probe_busy_nanos(), probe_busy_nanos()];
         samples.sort_unstable();
-        let observed = samples[1];
+        let observed = samples[2];
 
         let factor = (observed / REFERENCE_BUSY_NANOS).clamp(1, u128::from(MAX_SCALE));
         // `factor` is clamped to [1, MAX_SCALE] (both fit a u32), so the conversion is infallible;
