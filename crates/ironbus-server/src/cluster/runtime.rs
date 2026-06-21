@@ -62,7 +62,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use ironbus_core::clock::Clock;
-use ironbus_core::placement::{LeaderLoad, PlacementNode};
+use ironbus_core::leader_lease::LeaderEpoch;
+use ironbus_core::placement::PlacementNode;
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::LogConfig;
 use raft::eraftpb::Message;
@@ -113,6 +114,18 @@ const DIALER_RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 /// seam, so the kill-the-leader test drives detection deterministically (advance a [`ManualClock`])
 /// rather than sleeping a real 3 s — no wall-clock flake.
 pub const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_millis(3_000);
+
+/// How often the data-plane LEADER proposes a committed-HW CHECKPOINT into the metadata Raft (#618b):
+/// the cadence at which it persists "every offset below this is quorum-fsync'd" so the bar SURVIVES its
+/// death. It is deliberately PERIODIC, NOT per record — a per-record checkpoint would put a metadata
+/// Raft round-trip on the produce hot path. At this cadence the persisted bar trails the live committed
+/// HW by at most one interval; a successor is only ever required to hold up to the LAST checkpointed bar,
+/// so it never loses *checkpointed* committed data, and the small trailing window is the documented
+/// availability/cost trade (the checkpoint is cheap; raising the cadence tightens the window). It is the
+/// committed-HW analogue of [`TICK_INTERVAL`]: bounded, low-rate, self-healing if a single proposal is
+/// dropped (the next cycle re-proposes the then-current HW). Proposed only when this node both LEADS the
+/// metadata group AND leads the partition's data plane (it is the only node that knows the live HW).
+const COMMITTED_HW_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The fixed TCP-port offset the DATA-plane peer listener binds at, RELATIVE to a node's configured
 /// metadata address (#717). One `--cluster-peer <id>=<addr>` entry thus serves BOTH transports: the
@@ -178,17 +191,34 @@ pub type SurvivorStateFn = dyn Fn(u64, &[u64]) -> Vec<PlacementNode> + Send + Sy
 /// member already holds), supplied cross-plane by the data plane alongside [`SurvivorStateFn`].
 pub type CommittedHwFn = dyn Fn(u64) -> u64 + Send + Sync;
 
-/// The cross-plane inputs the F2 auto-failover driver reads to pick an ISR successor. INSTALLED by the
-/// data-plane bootstrap ([`ClusterRuntime::set_failover_inputs`]) once it owns the live data plane;
-/// ABSENT until then, so a runtime with no data plane fails CLOSED — it auto-proposes NO promotion
-/// (rather than promoting blind). The `survivors` closure surfaces the live ISR; `committed_hw` the
-/// per-partition committed frontier.
+/// THIS node's OWN real data-plane durable frontier for a partition (its follower high-watermark, or
+/// its leader quorum-commit) — the prefix it has itself durably appended (#618b). Supplied cross-plane
+/// by the data plane. The auto-failover path can ONLY prove a successor complete from data the surviving
+/// cluster actually holds, and the only frontier the metadata leader KNOWS is its OWN; so the
+/// provably-complete-or-fail-closed rule compares THIS against the persisted committed-HW checkpoint.
+pub type OwnFrontierFn = dyn Fn(u64) -> u64 + Send + Sync;
+
+/// The cross-plane inputs the F2 auto-failover driver reads. INSTALLED by the data-plane bootstrap
+/// ([`ClusterRuntime::set_failover_inputs`]) once it owns the live data plane; ABSENT until then, so a
+/// runtime with no data plane fails CLOSED — it auto-proposes NO promotion (rather than promoting
+/// blind).
+///
+/// As of #618b these inputs serve BOTH the (cheap, periodic) committed-HW CHECKPOINT the data-plane
+/// leader proposes AND the provably-complete-or-fail-closed auto-promotion: `own_frontier` is THIS
+/// node's real durable frontier (the only frontier the metadata leader can vouch for), `survivors` is
+/// the live ISR-aware projection, and `committed_hw` is this node's own committed frontier (what it
+/// checkpoints when it leads).
 #[derive(Clone)]
 pub struct FailoverInputs {
     /// The live ISR-aware survivor-state projection (see [`SurvivorStateFn`]).
     pub survivors: Arc<SurvivorStateFn>,
-    /// The live per-partition committed high-watermark (see [`CommittedHwFn`]).
+    /// The live per-partition committed high-watermark THIS node observes (see [`CommittedHwFn`]). When
+    /// this node is the data-plane leader it is the quorum-commit frontier it CHECKPOINTS periodically.
     pub committed_hw: Arc<CommittedHwFn>,
+    /// THIS node's own real durable frontier per partition (see [`OwnFrontierFn`]). The provably-complete
+    /// auto-failover compares this against the PERSISTED committed-HW checkpoint to decide whether THIS
+    /// node may safely self-promote (frontier >= checkpoint) or must fail closed.
+    pub own_frontier: Arc<OwnFrontierFn>,
 }
 
 /// A point-in-time snapshot of the local cluster member's metadata-plane state, published by the
@@ -239,6 +269,12 @@ pub struct ClusterStatus {
     /// leader's partitions, re-placed onto an ISR successor). Observability only; cleared when the
     /// promotion commits (the placement's leader is no longer the departed node).
     pub failover_proposed: BTreeSet<u64>,
+    /// The last-checkpointed quorum-committed high-watermark per partition (#618b), as applied from the
+    /// replicated metadata ([`MetadataCommand::CheckpointCommittedHw`]). This is the SAFE bar that
+    /// SURVIVES the leader's death: after a leader dies a survivor reads this to know the committed offset
+    /// a successor MUST hold before it may be auto-promoted. Empty until the data-plane leader has
+    /// checkpointed at least once. Monotonic per partition (the state machine only ever raises it).
+    pub last_committed_hw: BTreeMap<u64, u64>,
 }
 
 /// A command for the driver to propose to the metadata group on behalf of the broker (or a test):
@@ -945,6 +981,15 @@ fn run_driver<F, C>(
 
     let deadline_nanos = duration_to_nanos(failover.liveness.timeout);
 
+    // CP STATE (#618b): the cadence + the last monotonic time we proposed a committed-HW checkpoint, so
+    // a leader checkpoints PERIODICALLY (not per cycle / per record). Seeded back a full interval so the
+    // first checkpoint can fire as soon as the data plane installs its inputs.
+    let checkpoint_interval_nanos = duration_to_nanos(COMMITTED_HW_CHECKPOINT_INTERVAL);
+    let mut last_checkpoint_nanos = failover
+        .clock
+        .now_monotonic_nanos()
+        .saturating_sub(checkpoint_interval_nanos);
+
     while !shutdown.load(Ordering::Acquire) {
         // Advance the logical election/heartbeat timer once per cadence.
         group.tick();
@@ -1078,15 +1123,55 @@ fn run_driver<F, C>(
             }
         }
 
-        // ----- F2: AUTO-FIRE the failover. On a committed membership shrink (`departed_members`
-        // non-empty), the metadata leader auto-plans a promotion for every partition a departed node
-        // LED, feeding `plan_failovers` the LIVE data-plane ISR (the installed cross-plane providers),
-        // and proposes each resulting PlacePartition through the metadata Raft. Single proposer +
-        // idempotent: a partition whose committed placement no longer names the departed node as leader
-        // has already failed over (skip). Fail-closed: with no installed providers, or no eligible ISR
-        // survivor, NO promotion is proposed (the partition stays leaderless until a survivor catches
-        // up) — committed data is never lost by promoting an incomplete replica. -----
         let placements = group.state().placements();
+
+        // ----- CP: PERSIST the committed-HW CHECKPOINT (#618b). On a cadence the metadata leader, IF it
+        // also leads a partition's data plane (so it knows the live committed HW), proposes a
+        // `CheckpointCommittedHw` into the metadata Raft. This is what makes the committed bar SURVIVE the
+        // leader's death: after the leader dies a survivor reads the last committed checkpoint and knows
+        // the SAFE offset a successor MUST hold. It is PERIODIC + bounded (never per record). -----
+        if group.is_leader() {
+            let due = now.saturating_sub(last_checkpoint_nanos) >= checkpoint_interval_nanos;
+            if due {
+                if let Some(inputs) = shared.failover_inputs.lock().ok().and_then(|g| g.clone()) {
+                    // Checkpoint only the partitions THIS node currently LEADS in the committed
+                    // placement (it is the only node that knows their live committed HW). A new placement
+                    // value re-checkpoints under the next leader once it owns the data plane.
+                    for (&partition, placement) in &placements {
+                        if placement.leader != node_id {
+                            continue;
+                        }
+                        let hw = (inputs.committed_hw)(partition);
+                        // Skip a no-op: the bar is monotonic, so re-proposing an already-recorded (or
+                        // lower) value adds nothing. Only propose when it would RAISE the persisted bar.
+                        let persisted = group.state().committed_hw(partition).unwrap_or(0);
+                        if hw <= persisted {
+                            continue;
+                        }
+                        let cmd = MetadataCommand::CheckpointCommittedHw {
+                            partition,
+                            offset: hw,
+                        };
+                        if let Err(e) = group.propose(&cmd) {
+                            tracing::debug!(partition, error = %e, "cluster: committed-HW checkpoint deferred");
+                        }
+                    }
+                }
+                last_checkpoint_nanos = now;
+            }
+        }
+
+        // ----- F2: AUTO-FIRE the failover — PROVABLY committed-safe, fail-closed (#618b). On a committed
+        // membership shrink (`departed_members` non-empty), the metadata leader auto-promotes a partition
+        // a departed node LED, but ONLY a successor it can PROVE holds every committed record — i.e.
+        // ONLY ITSELF, and only when its own real durable frontier has reached the PERSISTED committed-HW
+        // checkpoint (the bar that survived the dead leader). It does NOT know remote frontiers (no ISR
+        // gossip yet), so a remote node — even a committed replica — is NEVER blind-promoted. In EVERY
+        // case it cannot prove safety (own frontier behind the bar, or only a remote node might be
+        // complete) it FAILS CLOSED: proposes nothing, leaves the partition leaderless, and logs the
+        // withholding. The chosen successor is re-verified against CI5 before it is proposed, so the
+        // runtime — not just a test — enforces the committed-completeness invariant. Single proposer +
+        // idempotent (a partition already re-led by a survivor is skipped). -----
         // Drop any "proposed" marks whose committed placement has already moved off the departed leader
         // (the promotion landed) so a later, distinct departure can re-fire.
         failover_proposed.retain(|p| {
@@ -1097,29 +1182,93 @@ fn run_driver<F, C>(
         if group.is_leader() && !departed_members.is_empty() {
             let inputs = shared.failover_inputs.lock().ok().and_then(|g| g.clone());
             if let Some(inputs) = inputs {
-                let survivors = Arc::clone(&inputs.survivors);
-                let committed_hw = Arc::clone(&inputs.committed_hw);
-                let proposals = plan_failovers(
-                    &placements,
-                    &departed_members,
-                    |partition, s| survivors(partition, s),
-                    |partition| committed_hw(partition),
-                    &LeaderLoad::new(),
-                );
-                for cmd in proposals {
-                    let MetadataCommand::PlacePartition { partition, .. } = &cmd else {
-                        continue;
-                    };
-                    let partition = *partition;
+                for (&partition, placement) in &placements {
+                    if !departed_members.contains(&placement.leader) {
+                        continue; // not led by a departed node (or already failed over).
+                    }
                     if failover_proposed.contains(&partition) {
                         continue; // promotion already in flight; let it commit.
                     }
+                    // The SAFE bar: the PERSISTED committed-HW checkpoint that survived the dead leader.
+                    // Absent (no checkpoint ever committed for this partition) => we cannot prove ANY
+                    // successor safe => fail closed.
+                    let Some(safe_bar) = group.state().committed_hw(partition) else {
+                        tracing::info!(
+                            partition,
+                            "cluster: F2 auto-failover WITHHELD — no persisted committed-HW checkpoint; \
+                             leaving the partition leaderless until a provably-complete replica is known"
+                        );
+                        continue;
+                    };
+                    // The ONLY successor we can PROVE complete is THIS node, and only when its own real
+                    // durable frontier has reached the safe bar. We do not know remote frontiers.
+                    let own_frontier = (inputs.own_frontier)(partition);
+                    if own_frontier < safe_bar {
+                        tracing::info!(
+                            partition,
+                            own_frontier,
+                            safe_bar,
+                            "cluster: F2 auto-failover WITHHELD (fail-closed) — the metadata leader's own \
+                             frontier is behind the persisted committed-HW checkpoint; no provably-complete \
+                             replica is known, so the partition stays leaderless (recoverable)"
+                        );
+                        continue;
+                    }
+                    // Build the self-promotion and re-verify it against CI5 (the runtime gate, not just a
+                    // test): the successor is THIS node, it is in its own ISR by construction (it leads /
+                    // holds the committed log to the bar), its durable prefix >= the bar, and the new
+                    // epoch strictly exceeds the dead leader's. If CI5 rejects it for ANY reason, fail
+                    // closed rather than propose it.
+                    let new_epoch = placement.epoch.saturating_add(1);
+                    let failover = ironbus_core::cluster_invariants::Failover {
+                        dead_leader: placement.leader,
+                        successor: node_id,
+                        successor_in_isr: true,
+                        successor_durable_prefix: own_frontier,
+                        committed_hw: safe_bar,
+                        dead_leader_epoch: LeaderEpoch::new(placement.epoch),
+                        successor_epoch: LeaderEpoch::new(new_epoch),
+                    };
+                    if let Err(violation) =
+                        ironbus_core::cluster_invariants::check_failover_preserves_committed(
+                            &failover,
+                        )
+                    {
+                        tracing::warn!(
+                            partition,
+                            %violation,
+                            "cluster: F2 auto-failover WITHHELD — the self-promotion failed the CI5 \
+                             committed-completeness gate; failing closed"
+                        );
+                        continue;
+                    }
+                    // Survivors = the old replica set minus the departed leader, with THIS node ensured
+                    // present (it is the new leader). The bar is carried in the command so the apply-time
+                    // self-verify (defense in depth) can re-check it before this node becomes leader.
+                    let mut survivors: Vec<u64> = placement
+                        .replicas
+                        .iter()
+                        .copied()
+                        .filter(|&n| n != placement.leader)
+                        .collect();
+                    if !survivors.contains(&node_id) {
+                        survivors.push(node_id);
+                    }
+                    let cmd = MetadataCommand::PlacePartition {
+                        partition,
+                        replicas: survivors,
+                        leader: node_id,
+                        epoch: new_epoch,
+                    };
                     match group.propose(&cmd) {
                         Ok(()) => {
                             failover_proposed.insert(partition);
                             tracing::info!(
                                 partition,
-                                "cluster: F2 auto-fire proposed an ISR-successor promotion (leaderless failover)"
+                                successor = node_id,
+                                safe_bar,
+                                "cluster: F2 auto-fire proposed a PROVABLY-COMPLETE self-promotion (the \
+                                 metadata leader's frontier holds the persisted committed-HW checkpoint)"
                             );
                         }
                         Err(e) => {
@@ -1144,6 +1293,10 @@ fn run_driver<F, C>(
             let applied = group.state().applied_index();
             if applied != s.applied_index {
                 s.placements = placements.clone();
+                // The persisted committed-HW checkpoints (#618b) advance with the applied log, so
+                // re-publish them whenever the applied index does (they are the SAFE bars survivors read
+                // after a leader death).
+                s.last_committed_hw = group.state().committed_hws();
             }
             s.applied_index = applied;
             // Publish the leaderless-failover detection signal (the departed-members set), so the
@@ -2003,11 +2156,27 @@ mod tests {
     const TEST_PARTITION: u64 = 0;
 
     /// Install a SIMULATED healthy-ISR failover-input provider on a node: every surviving committed
-    /// replica is reported in-ISR and complete to the committed HW, so the F2 auto-fire path has a
-    /// valid cross-plane ISR to choose a successor from (the metadata plane does not itself hold ISR
-    /// state — this is the seam the real data-plane bootstrap fills, #618). `committed_hw` is the
-    /// quorum-acked frontier every ISR member holds; `replicas` the committed replica set.
+    /// replica is reported in-ISR and complete to the committed HW, and THIS node's own frontier is
+    /// reported AT the committed HW (a caught-up survivor). With every survivor caught up, the metadata
+    /// leader's own frontier reaches the persisted committed-HW checkpoint, so the SAFE path
+    /// self-promotes (#618b). The metadata plane does not itself hold ISR/frontier state — this is the
+    /// seam the real data-plane bootstrap fills. `committed_hw` is the quorum-acked frontier every ISR
+    /// member holds; `replicas` the committed replica set.
     fn install_healthy_isr(node: &ClusterRuntime, replicas: Vec<u64>, committed_hw: u64) {
+        install_isr_with_own_frontier(node, replicas, committed_hw, committed_hw);
+    }
+
+    /// Like [`install_healthy_isr`] but with an explicit OWN-frontier value, so a test can model THIS
+    /// node LAGGING the committed HW (own frontier < committed HW) — the case the safe path must FAIL
+    /// CLOSED on. Every surviving committed replica is still reported in-ISR + complete (the cross-plane
+    /// ISR cannot see remote frontiers), but this node's own frontier is what the provably-complete rule
+    /// actually compares against the persisted checkpoint.
+    fn install_isr_with_own_frontier(
+        node: &ClusterRuntime,
+        replicas: Vec<u64>,
+        committed_hw: u64,
+        own_frontier: u64,
+    ) {
         let committed: BTreeSet<u64> = replicas.into_iter().collect();
         let survivors: Arc<SurvivorStateFn> = Arc::new(move |_partition, survivor_ids: &[u64]| {
             survivor_ids
@@ -2017,9 +2186,11 @@ mod tests {
                 .collect()
         });
         let committed_hw_fn: Arc<CommittedHwFn> = Arc::new(move |_partition| committed_hw);
+        let own_frontier_fn: Arc<OwnFrontierFn> = Arc::new(move |_partition| own_frontier);
         node.set_failover_inputs(FailoverInputs {
             survivors,
             committed_hw: committed_hw_fn,
+            own_frontier: own_frontier_fn,
         });
     }
 
@@ -2106,10 +2277,23 @@ mod tests {
         );
 
         // Install a healthy-ISR provider on every node (the cross-plane seam): committed HW = 100, the
-        // surviving committed replicas are all in-sync. This is what lets F2 pick an ISR successor.
+        // surviving committed replicas are all in-sync and every node's OWN frontier is at the HW. This
+        // is what lets the safe F2 path self-promote a caught-up successor.
         for n in &nodes {
             install_healthy_isr(n, vec![1, 2, 3], 100);
         }
+
+        // The metadata leader (it leads the partition's data plane in this model) auto-checkpoints the
+        // committed HW on its cadence. Wait until the persisted committed-HW checkpoint has committed on
+        // every node, so the SAFE bar (= 100) survives the leader's death and a successor can be proven
+        // complete against it (#618b). Without this persisted bar the safe path would (correctly) fail
+        // closed, so the kill-the-leader test depends on it being durably recorded first.
+        assert!(
+            wait_until(host_scaled(Duration::from_secs(20)), || nodes.iter().all(
+                |n| { n.status().last_committed_hw.get(&TEST_PARTITION).copied() == Some(100) }
+            )),
+            "the committed-HW checkpoint (=100) committed on every node"
+        );
 
         (serial, nodes, ids, dirs, leader_idx)
     }
@@ -2373,6 +2557,179 @@ mod tests {
 
         for n in &mut nodes {
             n.stop();
+        }
+    }
+
+    /// THE #618b REGRESSION TEST — a LAGGING survivor is NEVER promoted (committed-data-loss is closed).
+    ///
+    /// Scenario (the realistic 3-node R3, `min_isr`=2 bug): a committed, client-acked record reached quorum
+    /// on the leader + ONE follower only, so the THIRD survivor is BEHIND the committed HW. The leader
+    /// dies. We drive the deterministic auto path and assert the auto path NEVER promotes the lagging
+    /// node — EITHER it promotes the COMPLETE survivor (when that survivor is the new metadata leader,
+    /// whose own frontier reaches the persisted committed-HW checkpoint and self-promotes) OR it FAILS
+    /// CLOSED (no leader elected for the partition, because the new metadata leader is the lagging one and
+    /// cannot prove itself complete). In BOTH outcomes NO committed record is lost: no surviving leader is
+    /// ever missing a pre-death quorum-acked offset.
+    ///
+    /// Modeled deterministically (no real-time sleep): the persisted committed-HW checkpoint = 100 (the
+    /// pre-death committed bar); the COMPLETE survivor's own frontier = 100; the LAGGING survivor's own
+    /// frontier = 80 (it missed the last committed record). The lagging node can therefore never satisfy
+    /// `own_frontier >= safe_bar`, so it can never self-promote — exactly the safety property.
+    #[test]
+    fn a_lagging_survivor_is_never_auto_promoted_and_no_committed_record_is_lost() {
+        // Bring up the placed cluster with the persisted committed-HW checkpoint = 100 (the safe bar).
+        let (_serial, mut nodes, ids, _dirs, leader_idx) =
+            bring_up_placed_cluster(LivenessConfig::default());
+        let dead_id = ids[leader_idx];
+        let safe_bar = 100u64; // the persisted committed HW every promotion must clear.
+
+        // The two survivors. Pick ONE to be the LAGGING node (behind the committed HW) and the other to
+        // be the COMPLETE node (caught up). We model their REAL own-frontiers via the cross-plane seam:
+        // the lagging node's own frontier is 80 (< the bar), the complete node's is 100 (== the bar).
+        let survivors: Vec<usize> = (0..3).filter(|&i| i != leader_idx).collect();
+        let lagging_i = survivors[0];
+        let complete_i = survivors[1];
+        let lagging_id = ids[lagging_i];
+        let complete_id = ids[complete_i];
+        // Re-install the providers to reflect the divergent frontiers (the bar persisted from setup
+        // stays = 100; only each node's OWN frontier differs now).
+        install_isr_with_own_frontier(&nodes[lagging_i], vec![1, 2, 3], safe_bar, 80);
+        install_isr_with_own_frontier(&nodes[complete_i], vec![1, 2, 3], safe_bar, safe_bar);
+
+        // KILL the leader and drive detection deterministically on the survivors.
+        nodes[leader_idx].stop();
+        for &i in &survivors {
+            nodes[i].force_peer_unreachable(dead_id, true);
+        }
+
+        // A new metadata leader is elected among the survivors and the dead leader is removed (F1).
+        assert!(
+            wait_until(host_scaled(Duration::from_secs(25)), || survivors
+                .iter()
+                .any(|&i| {
+                    let s = nodes[i].status();
+                    s.departed_members.contains(&dead_id) && s.is_leader
+                })),
+            "a surviving metadata leader is elected and the dead leader is removed"
+        );
+
+        // Give the auto path a generous window to do WHATEVER it is going to do, then assert the two
+        // safety properties hold throughout AND at the end. We poll the converged outcome.
+        let observe_until = Instant::now() + host_scaled(Duration::from_secs(8));
+        while Instant::now() < observe_until {
+            for &i in &survivors {
+                let s = nodes[i].status();
+                // PROPERTY 1: the LAGGING node is NEVER the committed partition leader. This is the core
+                // committed-data-loss guard — promoting it would lose offsets 80..100.
+                if let Some(p) = s.placements.get(&TEST_PARTITION) {
+                    assert_ne!(
+                        p.leader, lagging_id,
+                        "the lagging survivor must NEVER be auto-promoted (it is missing committed offsets 80..100)"
+                    );
+                    // PROPERTY 2 (no committed loss): any committed partition leader is either the dead
+                    // leader (not yet failed over) or the COMPLETE survivor — never an incomplete node.
+                    assert!(
+                        p.leader == dead_id || p.leader == complete_id,
+                        "a committed partition leader is only ever the (pre-failover) dead leader or the complete survivor, got {}",
+                        p.leader
+                    );
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // FINAL converged outcome: EITHER the complete survivor was promoted (it became the metadata
+        // leader and self-promoted) OR the partition stayed leaderless under the dead leader (the new
+        // metadata leader was the lagging one and FAILED CLOSED). Both are committed-safe.
+        let promoted_complete = survivors.iter().any(|&i| {
+            nodes[i]
+                .status()
+                .placements
+                .get(&TEST_PARTITION)
+                .is_some_and(|p| p.leader == complete_id)
+        });
+        let stayed_leaderless = survivors.iter().all(|&i| {
+            nodes[i]
+                .status()
+                .placements
+                .get(&TEST_PARTITION)
+                .is_some_and(|p| p.leader == dead_id)
+        });
+        assert!(
+            promoted_complete || stayed_leaderless,
+            "the auto path either promoted the COMPLETE survivor or failed closed (leaderless) — never the lagging node"
+        );
+        // The lagging node is never promoted in EITHER outcome (re-assert at the converged state).
+        for &i in &survivors {
+            if let Some(p) = nodes[i].status().placements.get(&TEST_PARTITION) {
+                assert_ne!(
+                    p.leader, lagging_id,
+                    "converged: the lagging node was never promoted"
+                );
+            }
+        }
+
+        for &i in &survivors {
+            nodes[i].stop();
+        }
+    }
+
+    /// FAIL-CLOSED, safety-over-availability (#618b): when the metadata leader's OWN frontier is BEHIND
+    /// the persisted committed-HW checkpoint, it proposes NO promotion — the partition stays leaderless
+    /// (recoverable) rather than risk losing committed data. This pins the safety-over-availability
+    /// trade: a complete replica may exist REMOTELY, but the metadata leader cannot prove it (no ISR
+    /// gossip), so it withholds. Deterministic: we force EVERY survivor's own frontier behind the bar, so
+    /// whichever one wins the election cannot self-promote.
+    #[test]
+    fn the_metadata_leader_behind_the_committed_bar_proposes_no_promotion_fail_closed() {
+        let (_serial, mut nodes, ids, _dirs, leader_idx) =
+            bring_up_placed_cluster(LivenessConfig::default());
+        let dead_id = ids[leader_idx];
+        let safe_bar = 100u64;
+        let survivors: Vec<usize> = (0..3).filter(|&i| i != leader_idx).collect();
+
+        // BOTH survivors lag the persisted bar (own frontier 70 < 100) — model the case where the only
+        // complete replica is the (now-dead) one, so no survivor can prove itself complete.
+        for &i in &survivors {
+            install_isr_with_own_frontier(&nodes[i], vec![1, 2, 3], safe_bar, 70);
+        }
+
+        nodes[leader_idx].stop();
+        for &i in &survivors {
+            nodes[i].force_peer_unreachable(dead_id, true);
+        }
+
+        // The dead leader IS detected + removed (F1 needs no completeness).
+        assert!(
+            wait_until(host_scaled(Duration::from_secs(25)), || survivors
+                .iter()
+                .any(|&i| nodes[i].status().departed_members.contains(&dead_id))),
+            "the dead leader is auto-detected + removed"
+        );
+
+        // But NO promotion is ever proposed (fail-closed): no survivor can prove it holds the bar. The
+        // partition stays led by the (departed) old leader; `failover_proposed` stays empty. Observe for
+        // a generous window AFTER the removal committed.
+        let check_until = Instant::now() + host_scaled(Duration::from_secs(6));
+        while Instant::now() < check_until {
+            for &i in &survivors {
+                let s = nodes[i].status();
+                assert!(
+                    s.failover_proposed.is_empty(),
+                    "fail-closed: NO promotion proposed when no survivor can prove it holds the committed bar"
+                );
+                if let Some(p) = s.placements.get(&TEST_PARTITION) {
+                    assert_eq!(
+                        p.leader, dead_id,
+                        "fail-closed: the partition stays leaderless (still names the departed leader), never blind-promoted"
+                    );
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        for &i in &survivors {
+            nodes[i].stop();
         }
     }
 

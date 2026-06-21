@@ -130,6 +130,15 @@ pub enum MetadataCommand {
     },
     /// Set a cluster-wide configuration key to a value.
     SetConfig { key: String, value: String },
+    /// CHECKPOINT the last-known quorum-committed high-watermark for `partition` into the replicated
+    /// metadata (#618b committed-data-loss fix). The data-plane LEADER proposes this PERIODICALLY (on a
+    /// cadence — NOT per record; cheap + bounded), so the committed bar SURVIVES the leader's death: a
+    /// surviving node reads this checkpoint and knows the SAFE offset a successor MUST hold before it may
+    /// be auto-promoted. `offset` is the committed HW (every offset strictly below it was quorum-fsync'd
+    /// on `min_isr` replicas). It is MONOTONIC per partition in the state machine — a stale/lower
+    /// checkpoint never lowers the bar, so the bar can only ever rise (a successor must always clear the
+    /// highest committed HW the cluster ever durably recorded).
+    CheckpointCommittedHw { partition: u64, offset: u64 },
 }
 
 /// Errors from decoding a [`MetadataCommand`] off a committed log entry's bytes.
@@ -182,6 +191,7 @@ const TAG_REMOVE_NODE: u8 = 2;
 const TAG_ASSIGN_PARTITION: u8 = 3;
 const TAG_SET_CONFIG: u8 = 4;
 const TAG_PLACE_PARTITION: u8 = 5;
+const TAG_CHECKPOINT_COMMITTED_HW: u8 = 6;
 
 impl MetadataCommand {
     /// Encode the command to its canonical little-endian wire bytes.
@@ -231,6 +241,11 @@ impl MetadataCommand {
                 out.push(TAG_SET_CONFIG);
                 push_str(&mut out, key);
                 push_str(&mut out, value);
+            }
+            MetadataCommand::CheckpointCommittedHw { partition, offset } => {
+                out.push(TAG_CHECKPOINT_COMMITTED_HW);
+                out.extend_from_slice(&partition.to_le_bytes());
+                out.extend_from_slice(&offset.to_le_bytes());
             }
         }
         out
@@ -297,6 +312,11 @@ impl MetadataCommand {
                 let key = cur.string()?;
                 let value = cur.string()?;
                 MetadataCommand::SetConfig { key, value }
+            }
+            TAG_CHECKPOINT_COMMITTED_HW => {
+                let partition = cur.u64()?;
+                let offset = cur.u64()?;
+                MetadataCommand::CheckpointCommittedHw { partition, offset }
             }
             other => return Err(DecodeError::UnknownTag(other)),
         };
@@ -377,6 +397,12 @@ pub struct MetadataStateMachine {
     members: BTreeMap<u64, NodeRole>,
     /// partition id -> current placement (leader + epoch).
     placements: BTreeMap<u64, Placement>,
+    /// partition id -> the last-checkpointed quorum-committed high-watermark (#618b). The data-plane
+    /// leader proposes a [`MetadataCommand::CheckpointCommittedHw`] periodically; this is the SAFE bar a
+    /// successor must hold before it may be auto-promoted on a leader death (it SURVIVES the leader's
+    /// death because it is replicated metadata). MONOTONIC per partition (a lower checkpoint never lowers
+    /// the bar), so committed data the cluster once recorded as quorum-fsync'd can never be "forgotten".
+    committed_hw: BTreeMap<u64, u64>,
     /// cluster-wide config key -> value.
     config: BTreeMap<String, String>,
     /// The index of the last entry applied to this state machine (monotonic).
@@ -427,6 +453,14 @@ impl MetadataStateMachine {
             }
             MetadataCommand::SetConfig { key, value } => {
                 self.config.insert(key.clone(), value.clone());
+            }
+            MetadataCommand::CheckpointCommittedHw { partition, offset } => {
+                // MONOTONIC: only ever RAISE the bar. A late/duplicate/stale checkpoint (a lower offset,
+                // e.g. from an out-of-order proposal or a node that briefly read a lower frontier) must
+                // NEVER lower the safe bar a successor has to clear — that would silently re-admit a loss
+                // window. So we keep the maximum committed HW the cluster has ever durably recorded.
+                let entry = self.committed_hw.entry(*partition).or_insert(0);
+                *entry = (*entry).max(*offset);
             }
         }
         self.applied_index = index;
@@ -500,6 +534,23 @@ impl MetadataStateMachine {
     #[must_use]
     pub fn placements(&self) -> BTreeMap<u64, Placement> {
         self.placements.clone()
+    }
+
+    /// The last-checkpointed quorum-committed high-watermark for `partition` (#618b), or `None` if no
+    /// [`MetadataCommand::CheckpointCommittedHw`] has committed for it yet. This is the SAFE bar a
+    /// successor MUST hold before the auto-failover path may promote it — it survives the leader's death
+    /// because it is replicated metadata.
+    #[must_use]
+    pub fn committed_hw(&self, partition: u64) -> Option<u64> {
+        self.committed_hw.get(&partition).copied()
+    }
+
+    /// A snapshot of EVERY partition's last-checkpointed committed high-watermark (#618b), keyed by
+    /// partition id. The driver publishes this each cycle so a surviving node can read the SAFE bar a
+    /// successor must clear AFTER the leader that produced it has died. Empty until a checkpoint commits.
+    #[must_use]
+    pub fn committed_hws(&self) -> BTreeMap<u64, u64> {
+        self.committed_hw.clone()
     }
 
     /// A config value by key.
@@ -694,6 +745,14 @@ mod tests {
                 key: String::new(),
                 value: String::new(),
             },
+            MetadataCommand::CheckpointCommittedHw {
+                partition: 0,
+                offset: 0,
+            },
+            MetadataCommand::CheckpointCommittedHw {
+                partition: 7,
+                offset: 123_456,
+            },
         ];
         for cmd in &cmds {
             let bytes = cmd.encode();
@@ -721,6 +780,57 @@ mod tests {
             MetadataCommand::decode(&buf),
             Err(DecodeError::TrailingBytes)
         );
+    }
+
+    #[test]
+    fn checkpoint_committed_hw_stores_and_is_monotonic() {
+        // The committed-HW checkpoint (#618b) records the SAFE bar a successor must hold. It is stored
+        // per partition and is MONOTONIC: a later, LOWER checkpoint never lowers the bar (it would
+        // silently re-open a loss window), so the bar only ever rises.
+        let mut sm = MetadataStateMachine::new();
+        assert_eq!(sm.committed_hw(0), None, "no checkpoint yet");
+        sm.apply(
+            1,
+            &MetadataCommand::CheckpointCommittedHw {
+                partition: 0,
+                offset: 100,
+            },
+        );
+        assert_eq!(sm.committed_hw(0), Some(100));
+        // A higher checkpoint raises the bar.
+        sm.apply(
+            2,
+            &MetadataCommand::CheckpointCommittedHw {
+                partition: 0,
+                offset: 150,
+            },
+        );
+        assert_eq!(sm.committed_hw(0), Some(150));
+        // A LOWER (stale / out-of-order) checkpoint must NOT lower the bar.
+        sm.apply(
+            3,
+            &MetadataCommand::CheckpointCommittedHw {
+                partition: 0,
+                offset: 120,
+            },
+        );
+        assert_eq!(
+            sm.committed_hw(0),
+            Some(150),
+            "a stale lower checkpoint never lowers the safe bar"
+        );
+        // It is per-partition.
+        sm.apply(
+            4,
+            &MetadataCommand::CheckpointCommittedHw {
+                partition: 9,
+                offset: 42,
+            },
+        );
+        assert_eq!(sm.committed_hw(9), Some(42));
+        assert_eq!(sm.committed_hw(0), Some(150));
+        assert_eq!(sm.committed_hws().get(&0), Some(&150));
+        assert_eq!(sm.committed_hws().get(&9), Some(&42));
     }
 
     #[test]

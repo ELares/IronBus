@@ -309,7 +309,7 @@ pub use replication::{
 pub use runtime::{
     dataplane_addr, partitions_led_by, plan_failovers, ClusterConfig, ClusterRuntime,
     ClusterStatus, CommittedHwFn, FailoverInputs, FailoverInstaller, LivenessConfig,
-    MetadataProposer, RuntimeError, SurvivorStateFn, DATAPLANE_PORT_OFFSET,
+    MetadataProposer, OwnFrontierFn, RuntimeError, SurvivorStateFn, DATAPLANE_PORT_OFFSET,
     DEFAULT_LIVENESS_TIMEOUT,
 };
 pub use serve::{

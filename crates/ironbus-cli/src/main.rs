@@ -4826,22 +4826,26 @@ fn run_dataplane_bootstrap(
         let _ = client_ack_slot.set(std::sync::Arc::clone(gate));
     }
 
-    // INSTALL the cross-plane F2 auto-failover inputs (#618): now that the data plane is live, the
-    // metadata-Raft leader can auto-promote an ISR successor on a leader crash. The survivor-state
-    // provider surfaces the LIVE ISR: for THIS node it reports its real data-plane frontier (its
-    // follower high-watermark, or the served frontier if it leads), for a remote survivor it reports
-    // a node complete to the committed HW IFF that survivor was a committed replica — sound because the
-    // committed HW is the quorum-fsync'd frontier every ISR member holds by definition.
+    // INSTALL the cross-plane F2 auto-failover inputs (#618 / #618b): now that the data plane is live,
+    // these surface THIS node's real data-plane frontiers to the metadata driver. They serve two roles:
     //
-    // FLAGGED (the honest cross-plane gap): a remote survivor that had LAGGED OUT of the ISR before the
-    // crash is not distinguished here without ISR gossip across the data plane; the conservative default
-    // treats a committed replica as in-ISR. THIS node's own out-of-ISR state IS detected (its real
-    // frontier is read). Full ISR gossip so any node can vet any survivor is the multi-partition / ISR-
-    // gossip follow-on (#693). For the single-partition target the surviving committed replicas that
-    // caught up ARE the ISR, so the default is correct for the shipped scope.
+    //   1. when this node LEADS the partition's data plane + the metadata group, the driver periodically
+    //      CHECKPOINTS `committed_hw` into the metadata Raft (so the committed bar SURVIVES the leader's
+    //      death — the persisted SAFE bar a successor must hold); and
+    //   2. on a leader death, the driver's provably-complete-or-fail-closed rule compares `own_frontier`
+    //      (THIS node's real durable frontier) against that persisted bar to decide whether THIS node may
+    //      safely SELF-promote — it never blind-promotes a remote node whose frontier it cannot see.
+    //
+    // CRITICAL (#618b safety): we report ONLY frontiers this node actually KNOWS — its OWN. We do NOT
+    // claim a remote committed replica is "complete" (the previous optimistic default did, which could
+    // promote a LAGGING survivor and silently lose committed data). A remote node's true frontier is
+    // unknown without cross-data-plane ISR gossip (#693), so `survivors` reports completeness ONLY for
+    // THIS node; the driver consequently self-promotes only this node and otherwise fails closed. The
+    // shipped guarantee: auto-failover never loses committed data; it self-heals whenever the surviving
+    // metadata leader is itself a complete replica, and fails closed (leaderless, recoverable) otherwise.
     {
         // This node's live committed frontier for a partition (its follower HW, or its leader
-        // quorum-commit) — the quorum-fsync'd prefix the ISR holds by definition.
+        // quorum-commit) — the quorum-fsync'd prefix it durably holds.
         let own_frontier_for = {
             let server = std::sync::Arc::clone(dp_runtime.server());
             move |partition: u64| -> u64 {
@@ -4857,35 +4861,44 @@ fn run_dataplane_bootstrap(
                     .unwrap_or(0)
             }
         };
-        let committed_replicas: std::collections::BTreeSet<u64> =
-            replicas.iter().copied().collect();
         let own_frontier_s = own_frontier_for.clone();
+        let own_frontier_s2 = own_frontier_for.clone();
+        // The survivor-state projection reports completeness ONLY for THIS node (its REAL frontier). A
+        // remote node's frontier is UNKNOWN here, so it is reported as out-of-ISR (never a blind-promotion
+        // candidate) — the conservative, committed-safe default. Full ISR gossip that lets any node vet a
+        // remote survivor's completeness is the follow-on (#693).
         let survivors: std::sync::Arc<ironbus_server::cluster::SurvivorStateFn> =
             std::sync::Arc::new(move |partition: u64, survivor_ids: &[u64]| {
                 let own_hw = own_frontier_s(partition);
                 survivor_ids
                     .iter()
-                    .filter_map(|&n| {
+                    .map(|&n| {
                         if n == node_id {
-                            // THIS node: report its REAL durable frontier (out-of-ISR if it lags).
-                            Some(ironbus_core::placement::PlacementNode::healthy(n, own_hw))
-                        } else if committed_replicas.contains(&n) {
-                            // A remote committed replica: report it complete to THIS node's committed HW
-                            // (the quorum-fsync'd prefix the ISR holds). Eligible iff it was a committed
-                            // replica — the conservative single-partition default (FLAGGED above).
-                            Some(ironbus_core::placement::PlacementNode::healthy(n, own_hw))
+                            // THIS node: report its REAL durable frontier (in-ISR + complete iff it holds
+                            // the committed prefix; out-of-ISR if it lags).
+                            ironbus_core::placement::PlacementNode::healthy(n, own_hw)
                         } else {
-                            None // not a committed replica — never a candidate.
+                            // A REMOTE survivor: its true frontier is unknown without ISR gossip. Report
+                            // it OUT-OF-ISR so it is never blind-promoted (committed-safe default, #618b).
+                            let mut node = ironbus_core::placement::PlacementNode::healthy(n, 0);
+                            node.in_isr = false;
+                            node
                         }
                     })
                     .collect()
             });
-        // The committed HW the successor must be complete to: this node's own committed frontier.
+        // The committed HW this node observes (its own committed frontier): what it CHECKPOINTS when it
+        // leads, and the bar a successor must clear.
         let committed_hw: std::sync::Arc<ironbus_server::cluster::CommittedHwFn> =
             std::sync::Arc::new(move |partition: u64| own_frontier_for(partition));
+        // THIS node's own real durable frontier — what the provably-complete rule compares to the
+        // persisted committed-HW checkpoint to decide a safe self-promotion.
+        let own_frontier: std::sync::Arc<ironbus_server::cluster::OwnFrontierFn> =
+            std::sync::Arc::new(move |partition: u64| own_frontier_s2(partition));
         failover_installer.install(ironbus_server::cluster::FailoverInputs {
             survivors,
             committed_hw,
+            own_frontier,
         });
     }
 
