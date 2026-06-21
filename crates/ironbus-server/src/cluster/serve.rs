@@ -199,6 +199,9 @@ fn frame_type_for(frame: &DataPlaneFrame) -> FrameType {
         DataPlaneFrame::EpochQuery(_) | DataPlaneFrame::EpochResponse(_) => {
             FrameType::OffsetForLeaderEpoch
         }
+        DataPlaneFrame::CommittedHwQuery(_) | DataPlaneFrame::CommittedHwResponse(_) => {
+            FrameType::CommittedHwQuery
+        }
     }
 }
 
@@ -211,6 +214,8 @@ fn encode_dataplane_body(frame: &DataPlaneFrame) -> Vec<u8> {
         DataPlaneFrame::AckReplicated(b) => b.encode(),
         DataPlaneFrame::EpochQuery(b) => b.encode(),
         DataPlaneFrame::EpochResponse(b) => b.encode(),
+        DataPlaneFrame::CommittedHwQuery(b) => b.encode(),
+        DataPlaneFrame::CommittedHwResponse(b) => b.encode(),
     }
 }
 
@@ -348,6 +353,63 @@ impl<S: Read + Write> DataPlaneLink<S> {
             }
             self.inbuf.extend_from_slice(&chunk[..n]);
         }
+    }
+}
+
+/// The bounded timeout for the DIRTY-TIER committed-HW confirm (#739): how long the follower's query
+/// link waits to CONNECT to, and to READ a [`CommittedHwResponseBody`] from, the partition leader. It is
+/// deliberately SHORT (sub-second): the confirm sits on the consume serve path, so a slow / dead leader
+/// must NOT stall the consumer — on a timeout the follower FAILS CLOSED to the clean tier (serve only up
+/// to its safe watermark, never an unconfirmed offset). The same `connect_timeout` + `read_timeout`
+/// discipline the follower fetch loop uses, sized for a single round-trip rather than a steady poll.
+///
+/// This is the PRODUCTION default; it is what [`ClientAckGate`](super::client_ack::ClientAckGate) holds
+/// unless overridden ([`ClientAckGate::set_confirm_timeout`](super::client_ack::ClientAckGate::set_confirm_timeout),
+/// a test-robustness seam). Production behaviour is unchanged: the confirm still bounds at 500 ms.
+pub const HW_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Perform ONE bounded, over-the-wire DIRTY-TIER committed-HW CONFIRM (#739): dial the partition
+/// LEADER's data-plane address `leader_data_addr`, send a [`DataPlaneFrame::CommittedHwQuery`] for
+/// `partition`, and read back the leader's current committed HW from its
+/// [`DataPlaneFrame::CommittedHwResponse`]. This is the #723 `ConfirmWithLeader` made REAL over the
+/// wire — a tiny HW-version query (NOT the data) so a follower can serve a read-your-writes prefix above
+/// its known safe watermark, and NEVER an offset the leader has not confirmed committed.
+///
+/// It is a short-lived, single-shot link with `timeout` bound on BOTH the connect and the read, so a
+/// slow / dead / wrong-role leader cannot stall the consume path. `timeout` is the caller's confirm
+/// budget — [`HW_CONFIRM_TIMEOUT`] (500 ms) in production; a test may pass a host-scaled value so the
+/// confirm completes under a contended CI runner WITHOUT changing the fail-closed semantics. Returns
+/// `Some(committed_hw)` ONLY on a clean round-trip whose response is the leader's committed HW for THIS
+/// partition; on ANY failure (no route, connect/read timeout, link error, wrong partition / verb) it
+/// returns `None` so the caller FAILS CLOSED to the clean tier (serves only up to its safe watermark —
+/// never unconfirmed). The timeout only governs HOW LONG the confirm waits — never WHETHER an unconfirmed
+/// offset is served (on a timeout it still returns `None` → fail-closed), so never-serve-unconfirmed holds
+/// for any timeout.
+///
+/// It never panics and never serves data: it is a read-only HW query (single-writer preserved).
+#[must_use]
+pub fn query_leader_committed_hw(
+    leader_data_addr: SocketAddr,
+    partition: u64,
+    timeout: Duration,
+) -> Option<u64> {
+    let stream = TcpStream::connect_timeout(&leader_data_addr, timeout).ok()?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    stream.set_write_timeout(Some(timeout)).ok()?;
+    let mut link = DataPlaneLink::new(stream);
+    link.send(
+        partition,
+        &DataPlaneFrame::CommittedHwQuery(super::dataplane::CommittedHwQueryBody),
+    )
+    .ok()?;
+    // Read exactly one response, bounded by the read timeout. Anything other than a committed-HW response
+    // for THIS partition is a failed confirm → `None` → the caller serves the clean tier (never
+    // unconfirmed). The leader-side reader answers a CommittedHwQuery with exactly this frame.
+    match link.recv() {
+        Ok(Some((p, DataPlaneFrame::CommittedHwResponse(resp)))) if p == partition => {
+            Some(resp.committed_hw)
+        }
+        _ => None,
     }
 }
 
@@ -671,9 +733,18 @@ struct ClientGateConfig {
     /// The node-id -> CLIENT-address advertise map for the `NOT_LEADER` leader hint (#735); empty means the
     /// redirect carries no hint (the client re-tries its known peers).
     leader_client_addrs: BTreeMap<u64, SocketAddr>,
+    /// The node-id -> DATA-PLANE peer address map for the dirty-tier committed-HW confirm (#739); empty
+    /// means a "latest" follower-read above the safe watermark fails closed to the clean tier (never
+    /// unconfirmed).
+    leader_data_addrs: BTreeMap<u64, SocketAddr>,
     /// The shared metadata status snapshot the follower-read reads the committed-HW bar from (#735, half
     /// B); `None` fails the follower-read closed (serve nothing) until a checkpoint is known.
     status: Option<Arc<Mutex<super::runtime::ClusterStatus>>>,
+    /// The dirty-tier committed-HW CONFIRM timeout (#739) the built gate holds — the connect+read budget
+    /// for [`query_leader_committed_hw`]. PRODUCTION uses [`HW_CONFIRM_TIMEOUT`] (500 ms); a test may
+    /// override it (e.g. host-scaled) so the confirm completes under a contended runner without weakening
+    /// the fail-closed semantics. A `None` here defaults to [`HW_CONFIRM_TIMEOUT`].
+    confirm_timeout: Option<Duration>,
 }
 
 pub struct DataPlaneRuntime<F: Filesystem, C: Clock> {
@@ -774,7 +845,13 @@ where
             Some(ClientGateConfig {
                 configured_level,
                 leader_client_addrs: BTreeMap::new(),
+                // The dirty-tier confirm (#739) targets the leader's data-plane address — the SAME
+                // `peer_data_addrs` the follower fetch loop dials. With no #735-aware wiring there is no
+                // status handle, so the follower-read fails closed anyway; the data addresses still make
+                // the dirty-tier confirm reachable for a runtime started this way.
+                leader_data_addrs: peer_data_addrs.clone(),
                 status: None,
+                confirm_timeout: None,
             }),
         )
     }
@@ -805,7 +882,12 @@ where
             Some(ClientGateConfig {
                 configured_level,
                 leader_client_addrs,
+                // The dirty-tier committed-HW confirm (#739) dials the leader's DATA-plane address — the
+                // SAME `peer_data_addrs` the follower fetch loop uses — so a "latest" follower-read above
+                // the safe watermark can confirm with the leader before serving (never unconfirmed).
+                leader_data_addrs: peer_data_addrs.clone(),
                 status: Some(status),
+                confirm_timeout: None,
             }),
         )
     }
@@ -837,9 +919,13 @@ where
         let client_gate = client_cfg.map(|cfg| {
             let mut gate =
                 super::client_ack::ClientAckGate::new(Arc::clone(&server), cfg.configured_level)
-                    .with_leader_client_addrs(cfg.leader_client_addrs);
+                    .with_leader_client_addrs(cfg.leader_client_addrs)
+                    .with_leader_data_addrs(cfg.leader_data_addrs);
             if let Some(status) = cfg.status {
                 gate = gate.with_status_handle(status);
+            }
+            if let Some(confirm_timeout) = cfg.confirm_timeout {
+                gate = gate.with_confirm_timeout(confirm_timeout);
             }
             Arc::new(gate)
         });
@@ -1044,6 +1130,19 @@ fn run_dataplane_reader<F, C>(
                     }) => {
                         if link
                             .send(partition, &DataPlaneFrame::EpochResponse(response))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    // The DIRTY-TIER committed-HW confirm (#739): the leader answers a follower's
+                    // HW-version query with its current committed HW on the SAME link.
+                    Some(DataPlaneAction::SendCommittedHwResponse {
+                        partition,
+                        response,
+                    }) => {
+                        if link
+                            .send(partition, &DataPlaneFrame::CommittedHwResponse(response))
                             .is_err()
                         {
                             return;
@@ -1500,6 +1599,11 @@ mod tests {
                     end_offset: Offset::new(14),
                 },
             }),
+            // The #739 dirty-tier committed-HW confirm (tag 43): request + response share the tag.
+            DataPlaneFrame::CommittedHwQuery(crate::cluster::dataplane::CommittedHwQueryBody),
+            DataPlaneFrame::CommittedHwResponse(
+                crate::cluster::dataplane::CommittedHwResponseBody { committed_hw: 4242 },
+            ),
         ];
         for (partition, frame) in frames.iter().enumerate() {
             let p = partition as u64 + 1;
@@ -2738,6 +2842,37 @@ mod live_runtime_tests {
         pred()
     }
 
+    /// Scale a GENEROUS base budget by the observed host slowdown (#618): a local copy of the runtime
+    /// test's `host_scaled` (max-of-3-probes + a 24x cap), so a timing-sensitive budget stays truthful and
+    /// flake-free on a contended CI runner WITHOUT weakening what the test proves. On an unloaded host the
+    /// factor is ~1 and the budget stays the base. Used by the #739 dirty-tier HAPPY-PATH test to size the
+    /// over-the-wire committed-HW CONFIRM timeout so the confirm completes even under heavy CI contention
+    /// (the production default stays the hardcoded 500 ms — this only governs how long the confirm waits,
+    /// never the fail-closed / never-serve-unconfirmed semantics).
+    fn host_scaled(base: Duration) -> Duration {
+        fn probe_busy_nanos() -> u128 {
+            const ITERS: u64 = 2_000_000;
+            let start = Instant::now();
+            let mut acc: u64 = 0x9E37_79B9_7F4A_7C15;
+            for i in 0..ITERS {
+                acc = acc
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(i | 1);
+                acc ^= acc >> 29;
+            }
+            std::hint::black_box(acc);
+            start.elapsed().as_nanos().max(1)
+        }
+        const REFERENCE_BUSY_NANOS: u128 = 4_000_000;
+        const MAX_SCALE: u32 = 24;
+        let mut samples = [probe_busy_nanos(), probe_busy_nanos(), probe_busy_nanos()];
+        samples.sort_unstable();
+        let observed = samples[2];
+        let factor = (observed / REFERENCE_BUSY_NANOS).clamp(1, u128::from(MAX_SCALE));
+        let factor = u32::try_from(factor).unwrap_or(MAX_SCALE);
+        base * factor
+    }
+
     fn dump_segments(log: &Log<StdFs, ManualClock>) -> Vec<(String, Vec<u8>)> {
         let fs = log.filesystem();
         let mut out = Vec::new();
@@ -3683,5 +3818,457 @@ mod live_runtime_tests {
         f_rt2.stop();
         f_rt.stop();
         leader_rt.stop();
+    }
+
+    // ============================================================================================
+    //  #739: the follower-read DIRTY-TIER leader-confirm over the REAL wire.
+    // ============================================================================================
+
+    /// The served end of a follower-read run (its exclusive next offset).
+    fn run_next(outcome: &crate::cluster::dataplane::FollowerReadOutcome) -> u64 {
+        match outcome {
+            crate::cluster::dataplane::FollowerReadOutcome::Served(r) => r.run.next_offset.get(),
+            crate::cluster::dataplane::FollowerReadOutcome::ConfirmWithLeader { .. } => {
+                panic!("a resolved follower-read is always a Served run, never a confirm")
+            }
+        }
+    }
+
+    /// Chain follower-read consumes from `from` and return all served `(offset, payload)` pairs (drains
+    /// the whole servable prefix at the given tier, the read plane serving one sealed segment per call).
+    fn drain_follower_consume(
+        gate: &crate::cluster::client_ack::ClientAckGate<StdFs, ManualClock>,
+        partition: u64,
+        tier: crate::cluster::read_consistency::ReadTier,
+        from: u64,
+    ) -> Vec<(u64, Vec<u8>)> {
+        use ironbus_core::types::Offset;
+        let mut from = from;
+        let mut out = Vec::new();
+        let mut guard = 0u32;
+        loop {
+            guard += 1;
+            assert!(guard < 10_000, "follower-read chain failed to terminate");
+            let outcome = gate
+                .serve_follower_consume(partition, tier, Offset::new(from), usize::MAX, None)
+                .expect("a follower returns Some(outcome)");
+            let run = match &outcome {
+                crate::cluster::dataplane::FollowerReadOutcome::Served(r) => &r.run,
+                crate::cluster::dataplane::FollowerReadOutcome::ConfirmWithLeader { .. } => {
+                    panic!("a resolved follower-read is always a Served run, never a confirm")
+                }
+            };
+            let recs = decode_run(run);
+            if recs.is_empty() {
+                break;
+            }
+            out.extend(recs);
+            let next = run_next(&outcome);
+            if next <= from {
+                break;
+            }
+            from = next;
+        }
+        out
+    }
+
+    /// THE #739 DIRTY-TIER test over the REAL wire: a follower whose KNOWN committed-HW bar is STALE (a
+    /// low checkpoint) serves only its CLEAN committed prefix at the clean tier — but a LATEST/dirty read
+    /// reaching ABOVE that stale bar performs a real over-the-wire committed-HW CONFIRM with the live
+    /// leader and then serves the now-confirmed prefix LOCALLY, byte-faithfully, and NEVER an offset above
+    /// the leader-confirmed HW.
+    #[test]
+    fn live_runtime_follower_dirty_tier_confirms_with_the_leader_then_serves() {
+        use crate::cluster::read_consistency::ReadTier;
+        const P: u64 = 0;
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let placement = Placement {
+            replicas: vec![1, 2],
+            leader: 1,
+            epoch: 7,
+        };
+        let placements: BTreeMap<u64, Placement> = [(P, placement)].into_iter().collect();
+        let isr = IsrConfig {
+            min_isr: 1,
+            max_lag_records: 0,
+        };
+        let data_addrs: BTreeMap<u64, SocketAddr> = [1u64, 2]
+            .into_iter()
+            .map(|id| (id, SocketAddr::from((Ipv4Addr::LOCALHOST, free_port()))))
+            .collect();
+
+        // The LEADER (node 1): a real on-disk leader serving through its read plane. Its committed HW is
+        // its read plane's flushed frontier (>= served_end).
+        let leader_dir = tempfile::tempdir().expect("leader dir");
+        let leader_log = leaked_disk_leader(leader_dir.path(), 30);
+        let leader_pl = disk_leader_plane(leader_log);
+        let served_end = plane_served_end(&leader_pl);
+        assert!(served_end >= 10, "leader has a healthy committed prefix");
+        let leader_server = DataPlaneServer::from_placements(
+            1,
+            &placements,
+            isr,
+            |p| (p == P).then(|| Arc::clone(&leader_pl)),
+            &DiskReplicaLogs {
+                root: leader_dir.path().to_path_buf(),
+            },
+            |_| EpochCache::new(),
+        )
+        .unwrap();
+        let leader_status = Arc::new(Mutex::new(crate::cluster::runtime::ClusterStatus::default()));
+        let mut leader_rt = DataPlaneRuntime::start_with_client_gate_aware(
+            leader_server,
+            data_addrs[&1],
+            &data_addrs,
+            crate::cluster::ack_level::ClusterAckLevel::C1,
+            BTreeMap::new(),
+            Arc::clone(&leader_status),
+        )
+        .expect("leader runtime");
+
+        // The FOLLOWER (node 2): a STALE committed-HW bar (a low checkpoint). The follower-read safe
+        // watermark is min(own_flushed, stale_known); the clean tier serves only up to it.
+        let stale_known = served_end / 3;
+        assert!(stale_known > 0 && stale_known < served_end);
+        let f_dir = tempfile::tempdir().expect("f dir");
+        let mut status = crate::cluster::runtime::ClusterStatus::default();
+        status.last_committed_hw.insert(P, stale_known);
+        let f_status = Arc::new(Mutex::new(status));
+        let follower_server = DataPlaneServer::from_placements(
+            2,
+            &placements,
+            isr,
+            |_| None,
+            &DiskReplicaLogs {
+                root: f_dir.path().to_path_buf(),
+            },
+            |_| EpochCache::new(),
+        )
+        .unwrap();
+        assert!(follower_server.seam().controller().is_follower(P));
+        // Start the follower runtime WITH the client gate: `data_addrs` is threaded as both the fetch
+        // targets AND (via #739) the gate's leader_data_addrs, so the dirty-tier confirm dials node 1.
+        let mut f_rt = DataPlaneRuntime::start_with_client_gate_aware(
+            follower_server,
+            data_addrs[&2],
+            &data_addrs,
+            crate::cluster::ack_level::ClusterAckLevel::C1,
+            BTreeMap::new(),
+            Arc::clone(&f_status),
+        )
+        .expect("follower runtime with client gate");
+        let gate = f_rt
+            .client_gate()
+            .cloned()
+            .expect("the follower runtime built a client gate");
+        // HAPPY-PATH ROBUSTNESS (#739): the over-the-wire committed-HW CONFIRM is bounded by a SHORT
+        // production timeout (500 ms). On a heavily-contended CI runner a localhost round-trip can exceed
+        // that, so the confirm would TIME OUT and the dirty read would (correctly) FAIL CLOSED to the clean
+        // tier — failing THIS happy-path assertion. Give the confirm a HOST-SCALED budget so it completes
+        // even under load. This changes ONLY how long this test waits for the confirm; production keeps the
+        // hardcoded default, and the fail-closed / never-serve-unconfirmed semantics are untouched (the
+        // fail-closed test below proves an unreachable leader still fails fast on connect-refused).
+        gate.set_confirm_timeout(host_scaled(Duration::from_millis(500)));
+
+        // Wait until the follower's runtime fetch loop has replicated the leader's whole served prefix.
+        let f_hw = || {
+            f_rt.server()
+                .lock()
+                .unwrap()
+                .seam()
+                .controller()
+                .follower_high_watermark(P)
+                .unwrap_or(0)
+        };
+        assert!(
+            wait_until(Duration::from_secs(30), || f_hw() >= served_end),
+            "the follower replicated the served prefix (hw={}, served_end={served_end})",
+            f_hw()
+        );
+
+        // CLEAN tier at the stale bar: serves ONLY the committed prefix [0, stale_known) — never above.
+        let clean = drain_follower_consume(&gate, P, ReadTier::FollowerCommitted, 0);
+        assert!(
+            !clean.is_empty(),
+            "the clean tier served the committed prefix"
+        );
+        for (off, _) in &clean {
+            assert!(
+                *off < stale_known,
+                "clean tier served offset {off} at/above the stale bar {stale_known}"
+            );
+        }
+
+        // DIRTY tier from the stale bar: the read reaches ABOVE the safe watermark, so the gate performs
+        // the real over-the-wire committed-HW confirm with the live leader and serves the now-confirmed
+        // prefix [stale_known, served_end) — byte-faithfully, and NEVER above the leader's confirmed HW.
+        let leader_confirmed_hw = leader_pl.flushed();
+        assert!(leader_confirmed_hw >= served_end);
+        let dirty = drain_follower_consume(&gate, P, ReadTier::FollowerLatest, stale_known);
+        assert!(
+            !dirty.is_empty(),
+            "the dirty tier served the confirmed read-your-writes prefix above the stale bar"
+        );
+        for (off, payload) in &dirty {
+            assert!(
+                *off >= stale_known,
+                "the dirty serve resumed at the stale bar"
+            );
+            assert!(
+                *off < leader_confirmed_hw,
+                "the dirty serve crossed the leader-confirmed HW (offset {off} >= {leader_confirmed_hw}) — an UNCONFIRMED offset!"
+            );
+            // Byte-faithful: the payload is the leader's record verbatim (rep-NN).
+            assert_eq!(payload, format!("rep-{off:02}").as_bytes());
+        }
+        // The dirty serve extended STRICTLY beyond the stale bar — read-your-writes that the CLEAN tier
+        // (clamped to the stale bar) could never have served — proving the over-the-wire confirm RAISED
+        // the servable bound to the leader-confirmed HW. It is clamped to min(own_flushed, confirmed_hw):
+        // the follower's read-plane SEALED frontier can lag served_end by the still-unsealed active tail
+        // (the FLAGGED active-tail lag), so the bound is `>= stale_known` and `<= served_end`, never above.
+        let dirty_max = dirty.iter().map(|(o, _)| *o).max().unwrap();
+        assert!(
+            dirty_max >= stale_known,
+            "the dirty tier served read-your-writes at/above the stale bar (max={dirty_max}, stale={stale_known})"
+        );
+        assert!(
+            dirty_max < leader_confirmed_hw,
+            "the dirty tier never served above the leader-confirmed HW (max={dirty_max}, hw={leader_confirmed_hw})"
+        );
+
+        f_rt.stop();
+        leader_rt.stop();
+    }
+
+    /// THE #739 FAIL-CLOSED test: when the dirty-tier committed-HW confirm CANNOT reach the leader (the
+    /// leader is down / unreachable), a LATEST read above the safe watermark FALLS BACK to the clean tier
+    /// — it serves only up to the follower's safe watermark, NEVER an unconfirmed offset.
+    #[test]
+    fn live_runtime_follower_dirty_tier_fails_closed_when_the_leader_is_unreachable() {
+        use crate::cluster::read_consistency::ReadTier;
+        const P: u64 = 0;
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let placement = Placement {
+            replicas: vec![1, 2],
+            leader: 1,
+            epoch: 2,
+        };
+        let placements: BTreeMap<u64, Placement> = [(P, placement)].into_iter().collect();
+        let isr = IsrConfig {
+            min_isr: 1,
+            max_lag_records: 0,
+        };
+        let data_addrs: BTreeMap<u64, SocketAddr> = [1u64, 2]
+            .into_iter()
+            .map(|id| (id, SocketAddr::from((Ipv4Addr::LOCALHOST, free_port()))))
+            .collect();
+
+        // Bring a leader up briefly to let the follower replicate, then STOP it so the confirm can't reach
+        // it. The follower keeps the replicated prefix; only the live leader confirm is now unavailable.
+        let leader_dir = tempfile::tempdir().expect("leader dir");
+        let leader_log = leaked_disk_leader(leader_dir.path(), 30);
+        let leader_pl = disk_leader_plane(leader_log);
+        let served_end = plane_served_end(&leader_pl);
+        let leader_server = DataPlaneServer::from_placements(
+            1,
+            &placements,
+            isr,
+            |p| (p == P).then(|| Arc::clone(&leader_pl)),
+            &DiskReplicaLogs {
+                root: leader_dir.path().to_path_buf(),
+            },
+            |_| EpochCache::new(),
+        )
+        .unwrap();
+        let mut leader_rt = DataPlaneRuntime::start_with_client_gate_aware(
+            leader_server,
+            data_addrs[&1],
+            &data_addrs,
+            crate::cluster::ack_level::ClusterAckLevel::C1,
+            BTreeMap::new(),
+            Arc::new(Mutex::new(crate::cluster::runtime::ClusterStatus::default())),
+        )
+        .expect("leader runtime");
+
+        let stale_known = served_end / 3;
+        assert!(stale_known > 0 && stale_known < served_end);
+        let f_dir = tempfile::tempdir().expect("f dir");
+        let mut status = crate::cluster::runtime::ClusterStatus::default();
+        status.last_committed_hw.insert(P, stale_known);
+        let f_status = Arc::new(Mutex::new(status));
+        let follower_server = DataPlaneServer::from_placements(
+            2,
+            &placements,
+            isr,
+            |_| None,
+            &DiskReplicaLogs {
+                root: f_dir.path().to_path_buf(),
+            },
+            |_| EpochCache::new(),
+        )
+        .unwrap();
+        let mut f_rt = DataPlaneRuntime::start_with_client_gate_aware(
+            follower_server,
+            data_addrs[&2],
+            &data_addrs,
+            crate::cluster::ack_level::ClusterAckLevel::C1,
+            BTreeMap::new(),
+            Arc::clone(&f_status),
+        )
+        .expect("follower runtime");
+        let gate = f_rt.client_gate().cloned().expect("client gate");
+        let f_hw = || {
+            f_rt.server()
+                .lock()
+                .unwrap()
+                .seam()
+                .controller()
+                .follower_high_watermark(P)
+                .unwrap_or(0)
+        };
+        assert!(
+            wait_until(Duration::from_secs(30), || f_hw() >= served_end),
+            "the follower replicated before the leader is stopped (hw={})",
+            f_hw()
+        );
+
+        // STOP the leader: its data-plane listener is gone, so the dirty-tier confirm dial will fail/
+        // time out. (The follower's fetch loop will also fail, but it has the prefix already.)
+        leader_rt.stop();
+
+        // A LATEST read above the stale bar now CANNOT confirm -> it FAILS CLOSED to the clean tier: it
+        // serves only [_, stale_known) — never an offset at/above the unconfirmed safe watermark.
+        let dirty = drain_follower_consume(&gate, P, ReadTier::FollowerLatest, 0);
+        for (off, _) in &dirty {
+            assert!(
+                *off < stale_known,
+                "fail-closed: served offset {off} at/above the unconfirmed bar {stale_known}"
+            );
+        }
+        // A read STARTING at the stale bar serves NOTHING when the confirm cannot reach the leader.
+        let at_bar = drain_follower_consume(&gate, P, ReadTier::FollowerLatest, stale_known);
+        assert!(
+            at_bar.is_empty(),
+            "fail-closed: with no reachable leader the dirty read above the safe watermark serves nothing"
+        );
+
+        f_rt.stop();
+    }
+
+    /// THE #739 CLEAN-TIER-NO-ROUNDTRIP test: a committed read (`<=` the safe watermark) serves LOCALLY
+    /// with NO leader confirm — proven by serving it with the LEADER NEVER STARTED (no data-plane listener
+    /// to confirm against). The clean tier never dials the leader, so it serves the committed prefix even
+    /// when no leader is reachable.
+    #[test]
+    fn live_runtime_follower_clean_tier_serves_without_a_leader_roundtrip() {
+        use crate::cluster::read_consistency::ReadTier;
+        const P: u64 = 0;
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let placement = Placement {
+            replicas: vec![1, 2],
+            leader: 1,
+            epoch: 4,
+        };
+        let placements: BTreeMap<u64, Placement> = [(P, placement)].into_iter().collect();
+        let isr = IsrConfig {
+            min_isr: 1,
+            max_lag_records: 0,
+        };
+        let data_addrs: BTreeMap<u64, SocketAddr> = [1u64, 2]
+            .into_iter()
+            .map(|id| (id, SocketAddr::from((Ipv4Addr::LOCALHOST, free_port()))))
+            .collect();
+
+        // A leader runtime to let the follower replicate the prefix, then stopped (the clean tier needs
+        // no live leader at all once replicated — it serves locally with no confirm).
+        let leader_dir = tempfile::tempdir().expect("leader dir");
+        let leader_log = leaked_disk_leader(leader_dir.path(), 24);
+        let leader_pl = disk_leader_plane(leader_log);
+        let served_end = plane_served_end(&leader_pl);
+        let leader_server = DataPlaneServer::from_placements(
+            1,
+            &placements,
+            isr,
+            |p| (p == P).then(|| Arc::clone(&leader_pl)),
+            &DiskReplicaLogs {
+                root: leader_dir.path().to_path_buf(),
+            },
+            |_| EpochCache::new(),
+        )
+        .unwrap();
+        let mut leader_rt = DataPlaneRuntime::start_with_client_gate_aware(
+            leader_server,
+            data_addrs[&1],
+            &data_addrs,
+            crate::cluster::ack_level::ClusterAckLevel::C1,
+            BTreeMap::new(),
+            Arc::new(Mutex::new(crate::cluster::runtime::ClusterStatus::default())),
+        )
+        .expect("leader runtime");
+
+        // The follower KNOWS the full committed HW (a caught-up checkpoint), so the whole replicated prefix
+        // is within its safe watermark — a clean read serves all of it with NO confirm.
+        let f_dir = tempfile::tempdir().expect("f dir");
+        let mut status = crate::cluster::runtime::ClusterStatus::default();
+        status.last_committed_hw.insert(P, served_end);
+        let f_status = Arc::new(Mutex::new(status));
+        let follower_server = DataPlaneServer::from_placements(
+            2,
+            &placements,
+            isr,
+            |_| None,
+            &DiskReplicaLogs {
+                root: f_dir.path().to_path_buf(),
+            },
+            |_| EpochCache::new(),
+        )
+        .unwrap();
+        let mut f_rt = DataPlaneRuntime::start_with_client_gate_aware(
+            follower_server,
+            data_addrs[&2],
+            &data_addrs,
+            crate::cluster::ack_level::ClusterAckLevel::C1,
+            BTreeMap::new(),
+            Arc::clone(&f_status),
+        )
+        .expect("follower runtime");
+        let gate = f_rt.client_gate().cloned().expect("client gate");
+        let f_hw = || {
+            f_rt.server()
+                .lock()
+                .unwrap()
+                .seam()
+                .controller()
+                .follower_high_watermark(P)
+                .unwrap_or(0)
+        };
+        assert!(
+            wait_until(Duration::from_secs(30), || f_hw() >= served_end),
+            "the follower replicated before the leader is stopped (hw={})",
+            f_hw()
+        );
+
+        // STOP the leader: there is now NO data-plane listener to confirm against. The CLEAN tier must
+        // still serve the whole committed prefix locally (no leader round-trip on the committed path).
+        leader_rt.stop();
+
+        let clean = drain_follower_consume(&gate, P, ReadTier::FollowerCommitted, 0);
+        assert!(
+            !clean.is_empty(),
+            "the clean tier served the committed prefix with NO live leader to confirm against"
+        );
+        // The clean tier serves the committed prefix LOCALLY with no leader round-trip; its bound is the
+        // follower's read-plane SEALED frontier (`<= served_end`, the FLAGGED active-tail lag), never past
+        // it. The load-bearing fact for THIS test is that it served WITHOUT a reachable leader.
+        let clean_max = clean.iter().map(|(o, _)| *o).max().unwrap();
+        assert!(
+            clean_max < served_end,
+            "the clean tier never serves past the committed prefix (max={clean_max}, served_end={served_end})"
+        );
+        for (off, payload) in &clean {
+            assert_eq!(payload, format!("rep-{off:02}").as_bytes());
+        }
+
+        f_rt.stop();
     }
 }

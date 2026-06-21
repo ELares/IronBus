@@ -42,7 +42,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ironbus_core::clock::Clock;
 use ironbus_core::keyshared::MemberId;
@@ -60,6 +62,17 @@ use super::serve::DataPlaneServer;
 /// client produce-ack gate routes every produce to it. Multi-partition routing (a produce to the right
 /// partition leader's seam) is the #693 multi-partition engine — FLAGGED, out of scope here.
 pub const DEFAULT_PARTITION: u64 = 0;
+
+/// The PRODUCTION dirty-tier committed-HW CONFIRM timeout (#739) in MILLISECONDS — the default the gate's
+/// `confirm_timeout_millis` is seeded with: [`HW_CONFIRM_TIMEOUT`](super::serve::HW_CONFIRM_TIMEOUT)
+/// (500 ms). Kept as a `u64` (no lossy `u128`->`u64` cast) and pinned to the [`Duration`] source of truth
+/// by the `const` assertion below, so the two can never drift.
+const HW_CONFIRM_DEFAULT_MILLIS: u64 = 500;
+
+// Compile-time guard: the `u64`-millis default MUST equal the production `Duration` confirm timeout, so
+// the gate's seeded default is exactly the hardcoded production budget (#739, production unchanged).
+const _: () =
+    assert!(super::serve::HW_CONFIRM_TIMEOUT.as_millis() == HW_CONFIRM_DEFAULT_MILLIS as u128);
 
 /// How a clustered produce to `partition` should be ROUTED at the wire level (#735, the `NOT_LEADER`
 /// redirect, half A). The output of [`ClientAckGate::produce_routing`]: the produce path consults it
@@ -116,6 +129,15 @@ pub struct ClientAckGate<F: Filesystem, C: Clock> {
     /// fires, but with no hint — the client re-tries its own known peers). Immutable after construction
     /// (the committed placement is static this phase; #693 dynamic re-placement is the flagged follow-up).
     leader_client_addrs: BTreeMap<u64, SocketAddr>,
+    /// The node-id -> DATA-PLANE peer address map (#739): the destination of the dirty-tier committed-HW
+    /// CONFIRM. When a "latest/dirty" follower-read reaches ABOVE the follower's safe watermark, the gate
+    /// dials the partition leader's data-plane address (mapped here from the follower's committed
+    /// leader-target node id) and asks for the leader's current committed HW before serving (#723's
+    /// `ConfirmWithLeader` over the wire). EMPTY when no data addresses are wired (the in-process tests
+    /// drive the confirm directly, and a no-addr confirm FAILS CLOSED to the clean tier — serve only up to
+    /// the safe watermark, never unconfirmed). Immutable after construction (static placement this phase;
+    /// #693 dynamic re-placement is the flagged follow-up).
+    leader_data_addrs: BTreeMap<u64, SocketAddr>,
     /// The shared metadata-plane status snapshot (#722/#735, half B): the source of the per-partition
     /// committed-HW bar (`last_committed_hw`) the follower-read safe watermark `min(own_flushed,
     /// known_committed_hw)` clamps to. `None` when no status handle was installed (the in-process tests
@@ -123,6 +145,17 @@ pub struct ClientAckGate<F: Filesystem, C: Clock> {
     /// to a `0` committed bar (serve nothing) rather than risk a stale read. Read under a brief lock, never
     /// across a socket write.
     status: Option<Arc<Mutex<super::runtime::ClusterStatus>>>,
+    /// The DIRTY-TIER committed-HW CONFIRM connect+read timeout (#739), in MILLISECONDS — the budget
+    /// [`resolve_dirty_tier`](Self::resolve_dirty_tier) gives
+    /// [`query_leader_committed_hw`](super::serve::query_leader_committed_hw) for one over-the-wire confirm.
+    /// PRODUCTION holds [`HW_CONFIRM_TIMEOUT`](super::serve::HW_CONFIRM_TIMEOUT) (500 ms): a slow / dead
+    /// leader cannot stall the consume path, and on a timeout the read FAILS CLOSED to the clean tier
+    /// (never an unconfirmed offset). An [`AtomicU64`] so a test holding the shared `Arc<ClientAckGate>`
+    /// can OVERRIDE it to a host-scaled value ([`Self::set_confirm_timeout`]) so the confirm completes
+    /// under a contended CI runner — the override only changes HOW LONG the confirm waits, never the
+    /// fail-closed / never-serve-unconfirmed semantics. Read with `Relaxed` (a single scalar; no other
+    /// state is ordered against it).
+    confirm_timeout_millis: AtomicU64,
 }
 
 impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
@@ -138,7 +171,10 @@ impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
             configured_level,
             outbox: Mutex::new(HashMap::new()),
             leader_client_addrs: BTreeMap::new(),
+            leader_data_addrs: BTreeMap::new(),
             status: None,
+            // PRODUCTION default — the dirty-tier confirm bounds at 500 ms unless overridden (#739).
+            confirm_timeout_millis: AtomicU64::new(HW_CONFIRM_DEFAULT_MILLIS),
         }
     }
 
@@ -154,6 +190,19 @@ impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
         self
     }
 
+    /// Install the node-id -> DATA-PLANE peer address map (#739) used to DIAL the partition leader for the
+    /// dirty-tier committed-HW CONFIRM, returning the gate. Each entry maps a cluster node id to the
+    /// address of that node's data-plane peer listener (its [`dataplane_addr`](super::runtime::dataplane_addr)).
+    /// The dirty-tier confirm works only with a populated map; with an EMPTY map a "latest" follower-read
+    /// above the safe watermark FAILS CLOSED to the clean tier (serve only up to the safe watermark, never
+    /// unconfirmed) rather than risk a stale read. Builder-style so the runtime can supply it at
+    /// construction (a non-cluster broker never builds the gate, so this never runs off-cluster).
+    #[must_use]
+    pub fn with_leader_data_addrs(mut self, addrs: BTreeMap<u64, SocketAddr>) -> Self {
+        self.leader_data_addrs = addrs;
+        self
+    }
+
     /// Install the shared metadata-plane status snapshot (#735, half B), returning the gate. The
     /// follower-read consume reads the per-partition committed-HW bar (`last_committed_hw`) from it for the
     /// SAFE watermark `min(own_flushed, known_committed_hw)`. Without it the follower-read fails CLOSED
@@ -164,6 +213,39 @@ impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
     pub fn with_status_handle(mut self, status: Arc<Mutex<super::runtime::ClusterStatus>>) -> Self {
         self.status = Some(status);
         self
+    }
+
+    /// Override the DIRTY-TIER committed-HW CONFIRM timeout (#739), returning the gate. PRODUCTION leaves
+    /// it at [`HW_CONFIRM_TIMEOUT`](super::serve::HW_CONFIRM_TIMEOUT) (500 ms — the default this builder is
+    /// NOT called for): this exists so a test can give a contended runner a host-scaled budget so the
+    /// confirm completes in time, WITHOUT changing the fail-closed / never-serve-unconfirmed semantics (the
+    /// timeout only governs how long the confirm waits). Builder-style; a non-cluster broker never builds
+    /// the gate, so this never runs off-cluster.
+    #[must_use]
+    pub fn with_confirm_timeout(self, timeout: Duration) -> Self {
+        self.set_confirm_timeout(timeout);
+        self
+    }
+
+    /// Set the DIRTY-TIER committed-HW CONFIRM timeout (#739) through a SHARED reference — usable on the
+    /// `Arc<ClientAckGate>` a runtime hands back ([`DataPlaneRuntime::client_gate`](super::serve::DataPlaneRuntime::client_gate)).
+    /// Same contract as [`Self::with_confirm_timeout`]: PRODUCTION never calls it (stays at 500 ms); a test
+    /// uses it to scale the confirm budget for a contended runner without weakening fail-closed. A timeout
+    /// of zero is clamped to 1 ms (a zero connect-timeout is an immediate error on some platforms — never
+    /// what a caller asking to "wait this long" means). `Relaxed`: a single scalar with nothing ordered
+    /// against it.
+    pub fn set_confirm_timeout(&self, timeout: Duration) {
+        let millis = u64::try_from(timeout.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        self.confirm_timeout_millis.store(millis, Ordering::Relaxed);
+    }
+
+    /// The current DIRTY-TIER committed-HW CONFIRM timeout (#739): [`HW_CONFIRM_TIMEOUT`](super::serve::HW_CONFIRM_TIMEOUT)
+    /// (500 ms) in production, or whatever a test installed via [`Self::set_confirm_timeout`].
+    #[must_use]
+    pub fn confirm_timeout(&self) -> Duration {
+        Duration::from_millis(self.confirm_timeout_millis.load(Ordering::Relaxed))
     }
 
     /// The per-partition committed-HW bar this node has applied from the replicated metadata (#722) — the
@@ -376,12 +458,34 @@ impl<F: Filesystem + Clone, C: Clock> ClientAckGate<F, C> {
     ///
     /// Returns `None` when this node holds NO follower role for the partition (it is the leader, or holds
     /// no role): the caller then serves the consume through the normal (leader/local-engine) path. Returns
-    /// `Some(outcome)` when this node follows the partition: either the served zero-copy bytes
-    /// ([`FollowerReadOutcome::Served`]) or a [`FollowerReadOutcome::ConfirmWithLeader`] signal for a
-    /// latest/dirty read above the safe watermark.
+    /// `Some(outcome)` when this node follows the partition: the served zero-copy bytes
+    /// ([`FollowerReadOutcome::Served`]). A [`FollowerReadOutcome::ConfirmWithLeader`] is surfaced ONLY
+    /// when the dirty-tier leader confirm could not be performed AND was not needed (see below); a
+    /// `FollowerLatest` read that reaches above the safe watermark is RESOLVED in-place by the #739
+    /// dirty-tier confirm.
     ///
-    /// Locks the shared server briefly, never across a socket write. A poisoned lock fails SAFE to `None`
-    /// (the caller serves through the normal path rather than risk a stale follower read).
+    /// ## The DIRTY tier (#739): read-your-writes from a follower, never unconfirmed
+    ///
+    /// For a [`ReadTier::FollowerLatest`] (or a [`ReadTier::LeaderLocal`] degraded onto a follower) read
+    /// that reaches ABOVE the follower's safe watermark `min(own_flushed, known_committed_hw)`, the #723
+    /// classifier returns `ConfirmWithLeader` — it WON'T serve the unconfirmed tail speculatively. This
+    /// method then performs the real, bounded, over-the-wire committed-HW CONFIRM
+    /// ([`query_leader_committed_hw`](super::serve::query_leader_committed_hw)): it dials the partition
+    /// leader's data-plane address and asks for the leader's CURRENT committed HW (a tiny HW-version
+    /// query, NOT the data). On a successful confirm it RE-SERVES at the CLEAN tier with the bar RAISED to
+    /// `max(known_committed_hw, confirmed_hw)`, so it serves up to `min(own_flushed, confirmed_hw)` —
+    /// every served offset is one the LEADER confirmed committed AND the follower durably holds, never an
+    /// unconfirmed/divergent offset. On ANY confirm failure (no data address for the leader, a
+    /// connect/read timeout, a link error) it FAILS CLOSED: it re-serves at the CLEAN tier with the
+    /// ORIGINAL (un-raised) bar — serving only up to the safe watermark, never unconfirmed.
+    ///
+    /// The CLEAN tier ([`ReadTier::FollowerCommitted`], the common case) is UNCHANGED: a committed read
+    /// `<=` the safe watermark serves locally with NO leader round-trip — the confirm only ever runs for a
+    /// dirty read above the safe watermark.
+    ///
+    /// Locks the shared server briefly, NEVER across a socket write or the confirm round-trip (the confirm
+    /// is performed entirely off-lock). A poisoned lock fails SAFE to `None` (the caller serves through the
+    /// normal path rather than risk a stale follower read).
     #[must_use]
     pub fn serve_follower_consume(
         &self,
@@ -395,22 +499,97 @@ impl<F: Filesystem + Clone, C: Clock> ClientAckGate<F, C> {
         // Read BEFORE the server lock (its own brief lock), and `None` when unknown -> the serve fails
         // closed to a `0` safe bar (serve nothing) rather than risk a stale read.
         let known_committed_hw = self.known_committed_hw(partition);
+        // FIRST serve attempt under a SHORT lock (released before any network round-trip). The CLEAN tier
+        // resolves here with no round-trip; a DIRTY read above the safe watermark comes back as
+        // `ConfirmWithLeader` and is resolved off-lock below.
+        let first = {
+            let Ok(srv) = self.server.lock() else {
+                return None;
+            };
+            // Only a FOLLOWER serves a follower read. A leader / no-role partition returns `None` so the
+            // caller uses the normal consume path (the single-writer / leader read plane), never this.
+            if !srv.seam().controller().is_follower(partition) {
+                return None;
+            }
+            // A serve fault (IO) or a role race maps to `None` (the caller serves the normal path) — never
+            // a panic on the serve path and never an unsafe stale serve.
+            srv.seam()
+                .controller()
+                .serve_follower_read(
+                    partition,
+                    tier,
+                    known_committed_hw,
+                    from,
+                    max_records,
+                    max_bytes,
+                )
+                .ok()?
+        };
+        match first {
+            // CLEAN serve (or an empty run): the common, zero-round-trip path. Return it verbatim.
+            served @ FollowerReadOutcome::Served(_) => Some(served),
+            // DIRTY tier above the safe watermark: perform the real, bounded, over-the-wire leader confirm
+            // OFF-LOCK, then re-serve. Never speculative — the re-serve is clamped to the CONFIRMED HW.
+            FollowerReadOutcome::ConfirmWithLeader { .. } => {
+                self.resolve_dirty_tier(partition, known_committed_hw, from, max_records, max_bytes)
+            }
+        }
+    }
+
+    /// Resolve a DIRTY-TIER follower-read (#739) that reached above the safe watermark: perform the
+    /// bounded, over-the-wire committed-HW CONFIRM with the partition leader OFF-LOCK, then re-serve at the
+    /// CLEAN tier with the bar raised to the leader-confirmed HW (fail-closed to the un-raised bar on a
+    /// failed confirm). Returns the re-served outcome (always a `Served` run — never another confirm, and
+    /// never an unconfirmed offset).
+    fn resolve_dirty_tier(
+        &self,
+        partition: u64,
+        known_committed_hw: Option<u64>,
+        from: Offset,
+        max_records: usize,
+        max_bytes: Option<usize>,
+    ) -> Option<FollowerReadOutcome> {
+        // Find the partition's current leader (the follower's committed fetch target) and its DATA-plane
+        // address, under a SHORT lock that is released BEFORE the network round-trip.
+        let leader_data_addr = {
+            let Ok(srv) = self.server.lock() else {
+                return None;
+            };
+            srv.follower_leader(partition)
+                .and_then(|leader_id| self.leader_data_addrs.get(&leader_id).copied())
+        };
+        // The real, bounded, over-the-wire confirm (#723's `ConfirmWithLeader`): ask the leader for its
+        // CURRENT committed HW, bounded by the gate's confirm timeout (PRODUCTION 500 ms; a test may scale
+        // it). `None` on no route / timeout / link error -> fail closed (the clean tier).
+        let confirm_timeout = self.confirm_timeout();
+        let confirmed_hw = leader_data_addr.and_then(|addr| {
+            super::serve::query_leader_committed_hw(addr, partition, confirm_timeout)
+        });
+        // RAISE the bar to the confirmed HW (never lower it): the re-serve uses `max(known, confirmed)`,
+        // so it serves up to `min(own_flushed, raised_bar)`. On a FAILED confirm `confirmed_hw` is `None`,
+        // so the bar stays the original `known_committed_hw` and the re-serve is the plain clean tier —
+        // never an offset above the safe watermark, never unconfirmed.
+        let raised_bar = match (known_committed_hw, confirmed_hw) {
+            (Some(k), Some(c)) => Some(k.max(c)),
+            (None, Some(c)) => Some(c),
+            (k, None) => k,
+        };
+        // RE-SERVE at the CLEAN tier (committed-only) with the raised bar, under a short lock. The clean
+        // tier serves only `<= min(own_flushed, raised_bar)` — every served offset is leader-confirmed
+        // committed AND durably held here. This NEVER returns `ConfirmWithLeader` (the clean tier never
+        // does), so the dirty read is fully resolved with no second round-trip.
         let Ok(srv) = self.server.lock() else {
             return None;
         };
-        // Only a FOLLOWER serves a follower read. A leader / no-role partition returns `None` so the
-        // caller uses the normal consume path (the single-writer / leader read plane), never this.
         if !srv.seam().controller().is_follower(partition) {
             return None;
         }
-        // A serve fault (IO) or a role race maps to `None` (the caller serves the normal path) — never a
-        // panic on the serve path and never an unsafe stale serve.
         srv.seam()
             .controller()
             .serve_follower_read(
                 partition,
-                tier,
-                known_committed_hw,
+                ReadTier::FollowerCommitted,
+                raised_bar,
                 from,
                 max_records,
                 max_bytes,
@@ -925,5 +1104,95 @@ mod tests {
                 .is_none(),
             "the leader uses the normal consume path, not the follower-read"
         );
+    }
+
+    // ---- #739: the dirty-tier confirm fail-closes when the leader is unreachable -----------------
+
+    /// THE #739 in-process FAIL-CLOSED unit test: a caught-up follower whose KNOWN committed-HW bar is
+    /// STALE, with NO leader data address to confirm against. A `FollowerLatest` (dirty) read above the
+    /// stale bar CANNOT confirm (no route), so it FALLS BACK to the clean tier — it serves ONLY up to the
+    /// stale safe watermark, NEVER an unconfirmed offset (a read STARTING at the bar serves nothing).
+    #[test]
+    fn serve_follower_consume_dirty_tier_fails_closed_with_no_leader_route() {
+        let (caught, served_end) = caught_up_follower_gate(30);
+        assert!(served_end >= 6, "a healthy replicated prefix");
+        // Rebuild a gate over the SAME caught-up server with a STALE committed-HW bar and a follower target
+        // (so the dirty path tries to resolve a leader) but NO leader_data_addrs (so the confirm can find
+        // no route -> fail-closed). The follower target is set on the shared server.
+        let server = Arc::clone(caught.server());
+        let stale = served_end / 3;
+        assert!(stale > 0 && stale < served_end);
+        {
+            let mut srv = server.lock().unwrap();
+            srv.set_follower_target(P, 1); // names a leader, but with no data address mapped
+        }
+        let mut status = super::super::runtime::ClusterStatus::default();
+        status.last_committed_hw.insert(P, stale);
+        let gate = ClientAckGate::new(server, ClusterAckLevel::C2Fsync)
+            .with_status_handle(Arc::new(Mutex::new(status)));
+        // leader_data_addrs is EMPTY (never wired), so the confirm finds no route -> fail-closed.
+
+        // A DIRTY read from 0: it serves the clean prefix [0, stale) and never above the unconfirmed bar.
+        let mut from = Offset::ZERO;
+        let mut max_seen: Option<u64> = None;
+        let mut guard = 0u32;
+        loop {
+            guard += 1;
+            assert!(guard < 10_000, "chain failed to terminate");
+            let outcome = gate
+                .serve_follower_consume(P, ReadTier::FollowerLatest, from, usize::MAX, None)
+                .expect("a follower returns Some(outcome)");
+            let run = match outcome {
+                FollowerReadOutcome::Served(r) => r.run,
+                FollowerReadOutcome::ConfirmWithLeader { .. } => {
+                    panic!(
+                        "a fail-closed dirty read resolves to a clean Served run, never a confirm"
+                    )
+                }
+            };
+            if run.record_count == 0 {
+                break;
+            }
+            let mut off = run.first_offset.get();
+            let mut cursor = 0usize;
+            while cursor < run.bytes.len() {
+                let (_v, consumed) = ironbus_core::codec::decode(&run.bytes[cursor..]).unwrap();
+                assert!(
+                    off < stale,
+                    "fail-closed: served offset {off} at/above the unconfirmed bar {stale}"
+                );
+                max_seen = Some(max_seen.map_or(off, |m| m.max(off)));
+                off += 1;
+                cursor += consumed;
+            }
+            let next = run.next_offset.get();
+            if next <= from.get() {
+                break;
+            }
+            from = Offset::new(next);
+        }
+        assert!(
+            max_seen.is_some(),
+            "the clean fallback still served the committed prefix below the stale bar"
+        );
+        // A dirty read STARTING at the stale bar serves NOTHING (the confirm cannot raise the bar).
+        let at_bar = gate
+            .serve_follower_consume(
+                P,
+                ReadTier::FollowerLatest,
+                Offset::new(stale),
+                usize::MAX,
+                None,
+            )
+            .expect("a follower returns Some(outcome)");
+        match at_bar {
+            FollowerReadOutcome::Served(r) => assert_eq!(
+                r.run.record_count, 0,
+                "fail-closed: a dirty read at the bar with no reachable leader serves nothing"
+            ),
+            FollowerReadOutcome::ConfirmWithLeader { .. } => {
+                panic!("a fail-closed dirty read never surfaces a confirm to the caller")
+            }
+        }
     }
 }
