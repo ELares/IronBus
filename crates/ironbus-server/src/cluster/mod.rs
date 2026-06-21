@@ -268,6 +268,7 @@ pub mod dataplane;
 pub mod divergence;
 pub mod domain;
 pub mod eligibility;
+pub mod federation;
 pub mod geo;
 pub mod isr;
 pub mod leaf;
@@ -301,6 +302,10 @@ pub use domain::{
 pub use eligibility::{
     eligible_leaders, evaluate_eligibility, is_eligible_leader, replica_state_from,
     IneligibleReason, ReplicaState,
+};
+pub use federation::{
+    parse_gateway_peer, resolve_peer_addr, FederatedStream, FederationConfig, FederationError,
+    MirroredStream, ServedStream,
 };
 pub use geo::{
     pull_loop, ApplyOutcome as GeoApplyOutcome, GeoConfig, GeoError, GeoFrame, GeoLink, GeoMode,
