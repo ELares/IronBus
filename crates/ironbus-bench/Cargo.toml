@@ -82,10 +82,6 @@ libc = "0.2"
 ironbus-server = { path = "../ironbus-server", version = "0.0.0" }
 ironbus-storage = { path = "../ironbus-storage", version = "0.0.0" }
 ironbus-core = { path = "../ironbus-core", version = "0.0.0" }
-# Per-node scratch dirs for the on-disk leader + follower replica logs in the clustered-consume
-# scaling harness (`cluster-consume-bench`, #634). Unix-only with the rest of the in-process broker
-# deps. MIT OR Apache-2.0; already in the workspace lock (every broker crate's dev-dep).
-tempfile = "3"
 
 [lints]
 workspace = true

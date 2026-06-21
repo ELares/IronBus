@@ -210,13 +210,49 @@ mod imp {
         pred()
     }
 
+    /// A minimal RAII temp directory — a local stand-in for the `tempfile` crate so the bench's
+    /// dependency tree stays MSRV-1.78-clean (`tempfile`'s transitive `getrandom 0.4` requires the
+    /// `edition2024` Cargo feature, unstable on 1.78). Creates a process-unique dir under the system
+    /// temp dir and removes it on drop, same lifecycle as `tempfile::TempDir`.
+    struct TempDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> std::io::Result<TempDir> {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "ironbus-cluster-bench-{}-{nanos}-{n}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path)?;
+            Ok(TempDir { path })
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
     /// One live cluster of `replicas` nodes (node 1 leads partition `P`; the rest follow), built from
     /// a freshly-filled leader log. Holds the runtimes so they stay up for the run, plus the
     /// committed bar the readers must not cross.
     struct LiveCluster {
         runtimes: Vec<DataPlaneRuntime<StdFs, ManualClock>>,
         committed_hw: u64,
-        _dirs: Vec<tempfile::TempDir>,
+        _dirs: Vec<TempDir>,
     }
 
     impl LiveCluster {
@@ -234,10 +270,10 @@ mod imp {
                 .collect();
             let qc = quorum(replicas);
 
-            let mut dirs: Vec<tempfile::TempDir> = Vec::new();
+            let mut dirs: Vec<TempDir> = Vec::new();
 
             // Node 1 (leader): real on-disk log + off-actor read plane.
-            let leader_dir = tempfile::tempdir().expect("leader dir");
+            let leader_dir = TempDir::new().expect("leader dir");
             let leader_log = build_leader_log(leader_dir.path(), records, payload_bytes, seg_bytes);
             let leader_pl = Arc::new(leader_log.read_plane().expect("read plane"));
             let served_end = plane_served_end(&leader_pl);
@@ -246,7 +282,7 @@ mod imp {
                 "the leader serves a non-empty committed prefix"
             );
 
-            let leader_replica_root = tempfile::tempdir().expect("leader replica dir");
+            let leader_replica_root = TempDir::new().expect("leader replica dir");
             let leader_server = DataPlaneServer::from_placements(
                 1,
                 &placements,
@@ -270,7 +306,7 @@ mod imp {
             // The followers (nodes 2..=replicas): each its own runtime + on-disk replica log, dialing
             // the leader's data-plane address and applying CRC-revalidated bytes.
             for &id in ids.iter().skip(1) {
-                let fdir = tempfile::tempdir().expect("follower dir");
+                let fdir = TempDir::new().expect("follower dir");
                 let server = DataPlaneServer::from_placements(
                     id,
                     &placements,
