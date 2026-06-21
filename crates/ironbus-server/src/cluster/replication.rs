@@ -840,6 +840,30 @@ impl<F: Filesystem, C: Clock> Follower<F, C> {
     }
 }
 
+// The C6 FOLLOWER-READ path (#621/#622) builds an `Arc`-shared, off-actor [`ReadPlane`] over the
+// follower's OWN replica log — the SAME zero-copy machinery the leader serves through (#654/#715). It
+// needs `F: Clone` (the read plane clones the filesystem handle behind an `Arc` so the plane can read the
+// immutable sealed files concurrently with the follower's writer), so it is a SEPARATE impl block (the
+// rest of the follower keeps the looser `F: Filesystem` bound; the single-node path links neither).
+impl<F: Filesystem + Clone, C: Clock> Follower<F, C> {
+    /// Build an `Arc`-shared, off-actor [`ReadPlane`] over the follower's OWN replica log — the C6
+    /// zero-copy follower-read source (#622). A FOLLOWER serves committed reads from this plane EXACTLY
+    /// as a leader serves fetches from its plane: arc-swapped sealed segments out of its own page cache,
+    /// no user-space copy, no append-actor round-trip. The follower NEVER writes a log through this — it
+    /// only READS the immutable sealed bytes; the follower's single ingest writer stays the sole writer.
+    ///
+    /// The plane's [`flushed`](ReadPlane::flushed) frontier is the follower's durably-replicated,
+    /// CRC-revalidated prefix; a C6 follower read clamps it further to the KNOWN committed HW (the safe
+    /// watermark, [`crate::cluster::read_consistency::follower_safe_watermark`]) so it never serves an
+    /// uncommitted / epoch-truncatable record.
+    ///
+    /// # Errors
+    /// Returns [`ReplicationError::Storage`] if the read plane cannot be built (an underlying IO fault).
+    pub fn read_plane(&self) -> Result<ReadPlane<F>, ReplicationError> {
+        Ok(self.log.read_plane()?)
+    }
+}
+
 /// The typed, REPORTED outcome of a leader-epoch divergence reconciliation (C2-I4, #599) — never a
 /// silent drop. When a follower adopts a (possibly-new) leader and finds its uncommitted tail
 /// diverges from the leader's lineage, [`EpochAwareFollower::reconcile_with_leader`] truncates to the

@@ -119,10 +119,15 @@ use ironbus_core::types::Offset;
 use ironbus_proto::frame::FrameType;
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Log;
-use ironbus_storage::read_plane::ReadPlane;
+use ironbus_storage::read_plane::{RawSealedRead, ReadPlane};
+use ironbus_storage::segment::RawByteRun;
 
 use super::ack_level::ClusterAckLevel;
 use super::isr::{AckReplicatedBody, IsrConfig, IsrTracker, QuorumAckGate};
+use super::read_consistency::{
+    classify_follower_read, classify_leader_local_read, follower_safe_watermark,
+    FollowerReadDecision, LeaderReadDecision, ReadTier,
+};
 use super::replication::{
     DivergenceTruncation, EpochAwareFollower, FetchRecordsBody, FetchResponseBody, Follower,
     OffsetForLeaderEpochBody, OffsetForLeaderEpochResponse, ReadPlaneLeader, ReplicationError,
@@ -165,6 +170,15 @@ pub enum DataPlaneError {
         /// The committed-HW bar the successor had to hold (and did not).
         committed_hw: u64,
     },
+    /// A LEADER-LEASE LINEARIZABLE LOCAL read (#620, [`DataPlaneController::serve_leader_local_read`])
+    /// was requested but the leaseholder's lease is in DOUBT (expired, or this node is on a stale epoch /
+    /// is not the current leaseholder). The read is REFUSED fail-closed rather than risk a stale local
+    /// read — the caller falls back to a read-index/quorum confirm or returns unavailable. This is the
+    /// #694/#722 soundness fence: no serving-as-leader on a stale epoch.
+    LeaseNotValid {
+        /// The partition whose lease was in doubt.
+        partition: u64,
+    },
 }
 
 impl core::fmt::Display for DataPlaneError {
@@ -190,6 +204,11 @@ impl core::fmt::Display for DataPlaneError {
                 "partition {partition} failover aborted (fail-closed): this node's durable frontier \
                  {durable_frontier} is behind the committed-HW bar {committed_hw}; it is missing \
                  committed data and must not become leader"
+            ),
+            DataPlaneError::LeaseNotValid { partition } => write!(
+                f,
+                "partition {partition} leader-lease local read refused (fail-closed): the leader lease \
+                 is in doubt (expired / stale epoch); not serving a stale local read"
             ),
         }
     }
@@ -490,6 +509,80 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
                 needed: "leader",
             }),
             None => Err(DataPlaneError::UnknownPartition { partition }),
+        }
+    }
+
+    // ---- C6 reads: leader-lease linearizable local read + the HW-version query the dirty tier needs --
+
+    /// The leader's CURRENT committed high-watermark for `partition` — the read plane's flushed frontier,
+    /// the SAME committed offset [`ReadPlaneLeader::high_watermark`] advertises (#654/#715). This is the
+    /// answer to a follower's "latest/dirty" HW-VERSION query (#621, [`ReadTier::FollowerLatest`]): a
+    /// follower wanting data above its known safe watermark asks the leader for this offset (NOT the
+    /// data), then serves the confirmed prefix locally. Leader-only; `None` for a follower / absent
+    /// partition (a follower never answers an authoritative committed-HW query).
+    #[must_use]
+    pub fn leader_committed_hw(&self, partition: u64) -> Option<u64> {
+        match self.roles.get(&partition) {
+            Some(PartitionRole::Leader { plane, .. }) => Some(plane.flushed()),
+            _ => None,
+        }
+    }
+
+    /// Serve a LEADER-LEASE LINEARIZABLE LOCAL read of `[from, from + max_records)` for `partition` from
+    /// the leader's OWN off-actor read plane — a 0-RTT linearizable read with NO quorum round (#620).
+    /// Leader-only.
+    ///
+    /// `lease_valid` is the leaseholder's lease-validity bit at the CURRENT monotonic time and epoch —
+    /// exactly [`MetadataRaftGroup::can_act_as_leader`](super::metadata_group::MetadataRaftGroup::can_act_as_leader)
+    /// (a held, unexpired lease under the current epoch). The serve path is SOUND by the #694/#722 fence:
+    /// if the lease is in doubt the leader REFUSES the local read ([`DataPlaneError::LeaseNotValid`])
+    /// rather than risk a stale read — the caller falls back to a read-index/quorum confirm or returns
+    /// unavailable. No serving-as-leader on a stale epoch.
+    ///
+    /// On a valid lease the read is served zero-copy from the leader's read plane via
+    /// [`ReadPlane::read_range_raw`] (the SAME machinery the leader serves fetches from), bounded by the
+    /// leader's flushed frontier (the linearizable committed prefix), `max_records`, and the optional
+    /// `max_bytes`.
+    ///
+    /// # Errors
+    /// [`DataPlaneError::UnknownPartition`] if this node holds no role for `partition`;
+    /// [`DataPlaneError::WrongRole`] if it is a follower; [`DataPlaneError::LeaseNotValid`] if the lease
+    /// is in doubt (the soundness fence — never a stale local read);
+    /// [`DataPlaneError::Replication`] on a serve fault.
+    pub fn serve_leader_local_read(
+        &self,
+        partition: u64,
+        lease_valid: bool,
+        from: Offset,
+        max_records: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<RawSealedRead, DataPlaneError> {
+        let plane = match self.roles.get(&partition) {
+            Some(PartitionRole::Leader { plane, .. }) => plane,
+            Some(PartitionRole::Follower { .. }) => {
+                return Err(DataPlaneError::WrongRole {
+                    partition,
+                    needed: "leader",
+                })
+            }
+            None => return Err(DataPlaneError::UnknownPartition { partition }),
+        };
+        let leader_flushed = plane.flushed();
+        // The wanted exclusive end: `from + max_records`, saturated. `usize::MAX` records means "as much
+        // as is linearizable", clamped to the flushed frontier by the classifier.
+        let wanted_end = Offset::new(from.get().saturating_add(max_records as u64));
+        match classify_leader_local_read(lease_valid, from, wanted_end, leader_flushed) {
+            // The SOUNDNESS FENCE: an in-doubt lease refuses the local read (never a stale read).
+            LeaderReadDecision::Refuse => Err(DataPlaneError::LeaseNotValid { partition }),
+            LeaderReadDecision::Nothing => Ok(empty_raw_read(from)),
+            LeaderReadDecision::ServeLocal { from, .. } => {
+                // The classifier already clamped to the flushed frontier; the read plane re-applies the
+                // SAME flushed bound internally (its frontier is the hard exclusive bound), so a record
+                // at/past the linearizable prefix is never returned. Zero-copy raw serve.
+                plane
+                    .read_range_raw(from, max_records, max_bytes)
+                    .map_err(|e| DataPlaneError::Replication(ReplicationError::Storage(e)))
+            }
         }
     }
 
@@ -916,6 +1009,144 @@ impl<F: Filesystem + Clone, C: Clock> DataPlaneController<F, C> {
         drop(log);
         self.start_leader(partition, plane, epochs, replica_ids, isr_config);
         Ok(())
+    }
+
+    // ---- C6 FOLLOWER reads (#621/#622): CRAQ committed-local + the dirty-tier leader confirm --------
+
+    /// The SAFE committed watermark a FOLLOWER of `partition` may serve reads up to (#621): `min(its own
+    /// read-plane flushed frontier, the KNOWN committed HW)` — the bar BOTH durably-held-here AND
+    /// committed-on-a-quorum (see [`crate::cluster::read_consistency::follower_safe_watermark`]). A
+    /// follower NEVER serves a record at or past this. Follower-only; `None` for a leader / absent
+    /// partition.
+    ///
+    /// `known_committed_hw` is the last [`CheckpointCommittedHw`](super::state_machine::MetadataCommand::CheckpointCommittedHw)
+    /// bar this node has applied from the replicated metadata (#722) — read by the caller from
+    /// [`committed_hw`](super::state_machine::MetadataStateMachine::committed_hw); pass `None` when no
+    /// checkpoint has committed yet (the safe bar is then 0 — fail closed).
+    ///
+    /// # Errors
+    /// [`DataPlaneError::Replication`] if the follower's read plane cannot be built (an IO fault).
+    pub fn follower_safe_read_watermark(
+        &self,
+        partition: u64,
+        known_committed_hw: Option<u64>,
+    ) -> Result<Option<u64>, DataPlaneError> {
+        match self.roles.get(&partition) {
+            Some(PartitionRole::Follower { follower }) => {
+                // The follower's OWN durably-replicated, CRC-revalidated flushed prefix.
+                let own_flushed = follower.follower().read_plane()?.flushed();
+                Ok(Some(follower_safe_watermark(
+                    own_flushed,
+                    known_committed_hw,
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Serve a CRAQ-style FOLLOWER read of `[from, from + max_records)` for `partition` at `tier`,
+    /// LOCALLY from the follower's OWN off-actor read plane (#621/#622) — zero-copy, no leader data
+    /// round-trip. Follower-only.
+    ///
+    /// `known_committed_hw` is the committed-HW bar this node has applied from the replicated metadata
+    /// (#722). The serve is fail-closed by the safe watermark (`min(own_flushed, known_committed_hw)`):
+    ///
+    /// * [`ReadTier::FollowerCommitted`] (clean): serves the committed prefix `<=` the safe watermark
+    ///   locally; a read starting in the uncommitted tail serves an empty run.
+    /// * [`ReadTier::FollowerLatest`] (dirty): if the wanted range is already provably committed-and-held
+    ///   it serves locally; if it reaches ABOVE the safe watermark it returns
+    ///   [`FollowerReadOutcome::ConfirmWithLeader`] (the caller does the HW-version query via
+    ///   [`leader_committed_hw`](Self::leader_committed_hw), updates `known_committed_hw`, and re-serves)
+    ///   — NEVER speculatively serving unconfirmed bytes.
+    /// * [`ReadTier::LeaderLocal`] on a follower escalates to the dirty-tier confirm (never a stale local
+    ///   serve).
+    ///
+    /// The served bytes are the SAME zero-copy [`RawByteRun`] the read plane hands a leader fetch (#542):
+    /// arc-swapped sealed-segment byte ranges, no user-space copy. The read plane re-applies its own
+    /// flushed bound internally, and the safe-watermark clamp bounds it further to the committed prefix,
+    /// so a record at/past the safe watermark is never returned.
+    ///
+    /// # Errors
+    /// [`DataPlaneError::UnknownPartition`] if this node holds no role; [`DataPlaneError::WrongRole`] if
+    /// it is a leader; [`DataPlaneError::Replication`] on a serve fault.
+    pub fn serve_follower_read(
+        &self,
+        partition: u64,
+        tier: ReadTier,
+        known_committed_hw: Option<u64>,
+        from: Offset,
+        max_records: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<FollowerReadOutcome, DataPlaneError> {
+        let follower = match self.roles.get(&partition) {
+            Some(PartitionRole::Follower { follower }) => follower,
+            Some(PartitionRole::Leader { .. }) => {
+                return Err(DataPlaneError::WrongRole {
+                    partition,
+                    needed: "follower",
+                })
+            }
+            None => return Err(DataPlaneError::UnknownPartition { partition }),
+        };
+        let plane = follower.follower().read_plane()?;
+        let safe = follower_safe_watermark(plane.flushed(), known_committed_hw);
+        let wanted_end = Offset::new(from.get().saturating_add(max_records as u64));
+        match classify_follower_read(tier, from, wanted_end, safe) {
+            FollowerReadDecision::Nothing => Ok(FollowerReadOutcome::Served(empty_raw_read(from))),
+            FollowerReadDecision::ConfirmWithLeader { current_safe } => {
+                Ok(FollowerReadOutcome::ConfirmWithLeader { current_safe })
+            }
+            FollowerReadDecision::ServeLocal { from, serve_up_to } => {
+                // The classifier clamped `serve_up_to` to the safe watermark. Bound the read-plane read
+                // by `serve_up_to - from` records so it never serves past the committed bar. The read
+                // plane ALSO clamps to its own flushed frontier (the hard exclusive bound), so the two
+                // bounds together never return a record at/past `min(own_flushed, known_committed_hw)`.
+                let safe_records = usize::try_from(serve_up_to.get().saturating_sub(from.get()))
+                    .unwrap_or(usize::MAX)
+                    .min(max_records);
+                if safe_records == 0 {
+                    return Ok(FollowerReadOutcome::Served(empty_raw_read(from)));
+                }
+                let run = plane
+                    .read_range_raw(from, safe_records, max_bytes)
+                    .map_err(|e| DataPlaneError::Replication(ReplicationError::Storage(e)))?;
+                Ok(FollowerReadOutcome::Served(run))
+            }
+        }
+    }
+}
+
+/// The outcome of [`DataPlaneController::serve_follower_read`] (#621): either the zero-copy bytes served
+/// locally, or a signal that the "latest/dirty" read must CONFIRM the leader's current committed HW
+/// before it can serve above the follower's known safe watermark.
+#[derive(Debug)]
+pub enum FollowerReadOutcome {
+    /// The follower served `[from, ...)` LOCALLY from its read plane (committed-and-held bytes,
+    /// zero-copy). May be an empty run (nothing safe to serve at this position/tier yet).
+    Served(RawSealedRead),
+    /// The read reaches ABOVE the follower's known safe watermark: the caller must query the leader's
+    /// current committed HW (a tiny HW-version query, [`DataPlaneController::leader_committed_hw`] in the
+    /// in-process test, an `OffsetForLeaderEpoch`-style HW frame over the wire in a real serve), update
+    /// `known_committed_hw`, and re-serve. NEVER serve unconfirmed bytes speculatively.
+    ConfirmWithLeader {
+        /// The follower's CURRENT safe watermark (the clean prefix it could serve right now without
+        /// confirmation).
+        current_safe: Offset,
+    },
+}
+
+/// An empty zero-copy [`RawSealedRead`] anchored at `from` — what a read serves when nothing is safe to
+/// return at this position/tier (the request is empty, the start is past the safe watermark, or a
+/// leader-lease read has an exhausted range). Mirrors the read plane's own empty-run shape.
+fn empty_raw_read(from: Offset) -> RawSealedRead {
+    RawSealedRead {
+        run: RawByteRun {
+            bytes: bytes::Bytes::new(),
+            first_offset: from,
+            record_count: 0,
+            next_offset: from,
+        },
+        fallback_from: None,
     }
 }
 
@@ -2186,5 +2417,473 @@ mod tests {
             other => panic!("expected an already-committed fast release, got {other:?}"),
         }
         assert_eq!(seam.parked_len(), 0, "nothing remains withheld");
+    }
+
+    // ---- C6 reads (#620/#621/#622): leader-lease local + CRAQ follower committed reads -------------
+
+    use super::{FollowerReadOutcome, ReadTier};
+
+    /// Decode a zero-copy raw run into `(offset, payload)` pairs the way a consumer that received the
+    /// run would — full `codec::decode` (header + body CRC), so a served run is integrity-checkable
+    /// end-to-end (the C6 zero-copy delivery, #622, reuses the read-plane raw run verbatim).
+    fn decode_run(run: &ironbus_storage::segment::RawByteRun) -> Vec<(u64, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut cursor = 0usize;
+        let mut offset = run.first_offset.get();
+        while cursor < run.bytes.len() {
+            let (view, consumed) = ironbus_core::codec::decode(&run.bytes[cursor..])
+                .expect("every shipped C6 follower-read frame passes header AND body CRC");
+            out.push((offset, view.payload.to_vec()));
+            offset += 1;
+            cursor += consumed;
+        }
+        assert_eq!(out.len() as u64, run.record_count);
+        out
+    }
+
+    /// Catch `follower` up to the leader's read-plane-served prefix over the in-process fetch path, then
+    /// return that served end (the offset the follower durably holds up to).
+    fn catch_follower_up(
+        leader: &mut DataPlaneController<InMemoryFs, ManualClock>,
+        follower: &mut DataPlaneController<InMemoryFs, ManualClock>,
+        partition: u64,
+        served_end: u64,
+        rounds: u64,
+    ) {
+        for _ in 0..rounds {
+            if follower.follower_high_watermark(partition).unwrap() >= served_end {
+                break;
+            }
+            let req = follower.make_fetch_request(partition, 8, 4096).unwrap();
+            let resp = leader.serve_fetch(partition, &req).unwrap();
+            follower.apply_fetch_response(partition, &resp).unwrap();
+        }
+    }
+
+    /// THE C6 follower-read SAFETY test (#621 non-negotiable 1): a follower whose FLUSHED prefix is
+    /// BEYOND the known committed HW serves only `<= committed HW`, NEVER the uncommitted tail. The
+    /// follower replicates a leader's whole sealed prefix (its own flushed frontier is the served end),
+    /// but we hand it a committed-HW bar STRICTLY BELOW that — the safe watermark is the bar, and the
+    /// clean read serves nothing past it.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one coherent safety scenario (replicate, set a low bar, chain-read)
+    fn a_follower_serves_only_up_to_the_committed_hw_never_the_uncommitted_tail() {
+        const P: u64 = 0;
+        let mut leader_log = open_log(InMemoryFs::new(), small_config());
+        for i in 0..30u32 {
+            leader_log
+                .append(&rec(format!("c6-{i:02}").as_bytes()))
+                .unwrap();
+        }
+        leader_log.sync().unwrap();
+        let plane = leader_plane(&leader_log);
+        let served_end = plane_served_end(&plane);
+        assert!(
+            served_end >= 10,
+            "need a healthy sealed prefix (got {served_end})"
+        );
+
+        let mut leader = DataPlaneController::new(1);
+        leader.start_leader(P, Arc::clone(&plane), EpochCache::new(), &[1, 2], quorum3());
+        let mut follower = DataPlaneController::new(2);
+        follower.start_follower(P, open_log(InMemoryFs::new(), small_config()));
+        catch_follower_up(&mut leader, &mut follower, P, served_end, served_end + 8);
+        let own_flushed = follower.follower_high_watermark(P).unwrap();
+        assert!(
+            own_flushed >= served_end,
+            "the follower durably holds the served prefix (own_flushed={own_flushed})"
+        );
+
+        // The committed HW is STRICTLY BELOW the follower's flushed prefix: [committed_hw, own_flushed)
+        // is an uncommitted (still epoch-truncatable) tail the follower happens to hold.
+        let committed_hw = served_end / 2;
+        assert!(committed_hw > 0 && committed_hw < own_flushed);
+
+        // The SAFE watermark is the committed HW (the MIN), so a CLEAN read for everything serves only
+        // [0, committed_hw) — never a record at/past committed_hw.
+        assert_eq!(
+            follower
+                .follower_safe_read_watermark(P, Some(committed_hw))
+                .unwrap(),
+            Some(committed_hw),
+        );
+        // CHAIN clean reads across the whole prefix (the read plane serves one sealed segment per raw
+        // read). EVERY served record must be strictly BELOW the committed HW — never the uncommitted tail
+        // [committed_hw, own_flushed). The chain must serve SOMETHING (not vacuously empty) and stop
+        // exactly at the bar, never crossing it.
+        let mut from = Offset::ZERO;
+        let mut served_any = false;
+        let mut guard = 0u32;
+        loop {
+            guard += 1;
+            assert!(guard < 10_000, "follower-read chain failed to terminate");
+            let outcome = follower
+                .serve_follower_read(
+                    P,
+                    ReadTier::FollowerCommitted,
+                    Some(committed_hw),
+                    from,
+                    usize::MAX,
+                    None,
+                )
+                .unwrap();
+            let run = match outcome {
+                FollowerReadOutcome::Served(r) => r,
+                FollowerReadOutcome::ConfirmWithLeader { .. } => {
+                    panic!("expected a local serve, not a confirm")
+                }
+            };
+            let records = decode_run(&run.run);
+            for (off, _payload) in &records {
+                assert!(
+                    *off < committed_hw,
+                    "served offset {off} at/past the committed HW {committed_hw} (the uncommitted tail!)"
+                );
+            }
+            if records.is_empty() {
+                break;
+            }
+            served_any = true;
+            let next = run.run.next_offset.get();
+            assert!(
+                next <= committed_hw,
+                "the served run crossed the committed HW (next={next} > {committed_hw})"
+            );
+            if next <= from.get() {
+                break;
+            }
+            from = Offset::new(next);
+        }
+        assert!(
+            served_any,
+            "the follower served the committed prefix locally (not vacuously empty)"
+        );
+        // The clean chain stopped exactly at the committed bar: a read STARTING at the bar serves nothing.
+        let at_bar = follower
+            .serve_follower_read(
+                P,
+                ReadTier::FollowerCommitted,
+                Some(committed_hw),
+                Offset::new(committed_hw),
+                usize::MAX,
+                None,
+            )
+            .unwrap();
+        match at_bar {
+            FollowerReadOutcome::Served(r) => {
+                assert_eq!(
+                    r.run.record_count, 0,
+                    "a clean read at the committed bar serves nothing"
+                );
+            }
+            FollowerReadOutcome::ConfirmWithLeader { .. } => {
+                panic!("a clean read at the committed bar serves an empty run, not a confirm")
+            }
+        }
+    }
+
+    /// THE C6 follower-read CORRECTNESS test (#621/#622): a follower serves COMMITTED records LOCALLY,
+    /// BYTE-IDENTICAL to the leader's, with NO leader round-trip — the CRAQ clean tier + zero-copy
+    /// delivery. The committed HW covers the whole served prefix here (the steady state once a checkpoint
+    /// caught up), so the clean read serves the full committed prefix from the follower's own read plane.
+    #[test]
+    fn a_follower_serves_committed_records_locally_byte_identical_to_the_leader() {
+        const P: u64 = 0;
+        let mut leader_log = open_log(InMemoryFs::new(), small_config());
+        for i in 0..30u32 {
+            leader_log
+                .append(&rec(format!("c6-{i:02}").as_bytes()))
+                .unwrap();
+        }
+        leader_log.sync().unwrap();
+        let plane = leader_plane(&leader_log);
+        let served_end = plane_served_end(&plane);
+
+        let mut leader = DataPlaneController::new(1);
+        leader.start_leader(P, Arc::clone(&plane), EpochCache::new(), &[1, 2], quorum3());
+        let mut follower = DataPlaneController::new(2);
+        follower.start_follower(P, open_log(InMemoryFs::new(), small_config()));
+        catch_follower_up(&mut leader, &mut follower, P, served_end, served_end + 8);
+
+        // The committed HW covers the whole served prefix (a checkpoint has caught up). CHAIN the clean
+        // read across the whole committed prefix off the FOLLOWER's own read plane (one sealed segment
+        // per raw read), collecting (offset, payload).
+        let collect_committed =
+            |c: &DataPlaneController<InMemoryFs, ManualClock>| -> Vec<(u64, Vec<u8>)> {
+                let mut out = Vec::new();
+                let mut from = Offset::ZERO;
+                let mut guard = 0u32;
+                loop {
+                    guard += 1;
+                    assert!(guard < 10_000, "chain failed to terminate");
+                    let outcome = c
+                        .serve_follower_read(
+                            P,
+                            ReadTier::FollowerCommitted,
+                            Some(served_end),
+                            from,
+                            usize::MAX,
+                            None,
+                        )
+                        .unwrap();
+                    let run = match outcome {
+                        FollowerReadOutcome::Served(r) => r,
+                        FollowerReadOutcome::ConfirmWithLeader { .. } => {
+                            panic!("expected a local serve, not a confirm")
+                        }
+                    };
+                    let recs = decode_run(&run.run);
+                    if recs.is_empty() {
+                        break;
+                    }
+                    let next = run.run.next_offset.get();
+                    out.extend(recs);
+                    if next <= from.get() {
+                        break;
+                    }
+                    from = Offset::new(next);
+                }
+                out
+            };
+        let follower_records = collect_committed(&follower);
+        assert!(
+            !follower_records.is_empty(),
+            "the follower served committed records locally"
+        );
+
+        // BYTE-IDENTICAL to the leader: chain the LEADER's read plane over the same prefix and compare
+        // every (offset, payload). The follower's bytes are its OWN replica's page cache (zero-copy), and
+        // they decode to the same records as the leader's — real CRAQ committed reads off a replica.
+        let mut leader_records: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut from = Offset::ZERO;
+        while from.get() < served_end {
+            let leader_run = plane
+                .read_range_raw(from, usize::MAX, None)
+                .expect("leader read plane serves");
+            let recs = decode_run(&leader_run.run);
+            if recs.is_empty() {
+                break;
+            }
+            let next = leader_run.run.next_offset.get();
+            leader_records.extend(recs);
+            if next <= from.get() {
+                break;
+            }
+            from = Offset::new(next);
+        }
+        // The follower serves its OWN SEALED page-cache prefix, which is a byte-identical PREFIX of the
+        // leader's committed prefix (the follower's last replicated segment may not have sealed yet — its
+        // read plane, like the leader's, serves only the sealed prefix). So the follower's served records
+        // are byte-identical to the leader's at the same offsets, and the follower covers a non-trivial
+        // chunk (real committed reads off the replica), but it need not cover the leader's still-active
+        // tail (FLAGGED, the same active-tail lag the leader-fetch path has).
+        assert!(
+            follower_records.len() <= leader_records.len(),
+            "the follower never serves MORE than the leader's committed prefix"
+        );
+        assert!(
+            follower_records.len() * 2 >= leader_records.len(),
+            "the follower served a healthy committed prefix off its own read plane (got {}, leader {})",
+            follower_records.len(),
+            leader_records.len()
+        );
+        for (f, l) in follower_records.iter().zip(leader_records.iter()) {
+            assert_eq!(f.0, l.0, "offset mismatch leader vs follower");
+            assert_eq!(
+                f.1, l.1,
+                "payload byte mismatch leader vs follower at offset {}",
+                f.0
+            );
+        }
+    }
+
+    /// THE C6 dirty-tier test (#621): a "latest" read ABOVE the follower's known safe watermark CONFIRMS
+    /// the leader's current committed HW (a HW-version query) before serving — never speculatively
+    /// serving unconfirmed bytes — and after the confirm it serves the now-confirmed prefix locally.
+    #[test]
+    fn a_latest_follower_read_above_the_safe_watermark_confirms_with_the_leader_then_serves() {
+        const P: u64 = 0;
+        let mut leader_log = open_log(InMemoryFs::new(), small_config());
+        for i in 0..30u32 {
+            leader_log
+                .append(&rec(format!("c6-{i:02}").as_bytes()))
+                .unwrap();
+        }
+        leader_log.sync().unwrap();
+        let plane = leader_plane(&leader_log);
+        let served_end = plane_served_end(&plane);
+
+        let mut leader = DataPlaneController::new(1);
+        leader.start_leader(P, Arc::clone(&plane), EpochCache::new(), &[1, 2], quorum3());
+        let mut follower = DataPlaneController::new(2);
+        follower.start_follower(P, open_log(InMemoryFs::new(), small_config()));
+        catch_follower_up(&mut leader, &mut follower, P, served_end, served_end + 8);
+
+        // The follower KNOWS only a low committed HW (a stale checkpoint). A "latest" read STARTING AT
+        // that known-safe bar has nothing committed to serve from there with current knowledge, so it
+        // must CONFIRM the leader's current HW first — never speculatively serving the unconfirmed tail.
+        let stale_known = served_end / 3;
+        assert!(stale_known > 0 && stale_known < served_end);
+        let outcome = follower
+            .serve_follower_read(
+                P,
+                ReadTier::FollowerLatest,
+                Some(stale_known),
+                Offset::new(stale_known),
+                usize::MAX,
+                None,
+            )
+            .unwrap();
+        let current_safe = match outcome {
+            FollowerReadOutcome::ConfirmWithLeader { current_safe } => current_safe,
+            FollowerReadOutcome::Served(_) => {
+                panic!("a latest read at/above the known bar must confirm, not serve")
+            }
+        };
+        assert_eq!(
+            current_safe.get(),
+            stale_known,
+            "the clean prefix is the known-safe bar"
+        );
+
+        // The caller does the tiny HW-VERSION query to the leader (NOT the data) — the leader's current
+        // committed HW. The follower updates its known HW and re-serves: now the previously-unconfirmed
+        // prefix is confirmed-committed, so it serves locally.
+        let leader_hw = leader
+            .leader_committed_hw(P)
+            .expect("leader answers the HW query");
+        assert!(
+            leader_hw >= served_end,
+            "the leader's committed HW covers the served prefix"
+        );
+        let reserved = follower
+            .serve_follower_read(
+                P,
+                ReadTier::FollowerLatest,
+                Some(leader_hw),
+                Offset::new(stale_known),
+                usize::MAX,
+                None,
+            )
+            .unwrap();
+        let run = match reserved {
+            FollowerReadOutcome::Served(r) => r,
+            FollowerReadOutcome::ConfirmWithLeader { .. } => {
+                panic!("after the confirm the follower serves locally, not another confirm")
+            }
+        };
+        assert!(
+            run.run.record_count > 0,
+            "the confirmed prefix is served locally after the HW confirm"
+        );
+        // Every served record is at/above where we resumed and strictly below the confirmed HW.
+        for (off, _) in decode_run(&run.run) {
+            assert!(off >= stale_known && off < leader_hw);
+        }
+    }
+
+    /// A follower is NOT an authoritative committed-HW source: `leader_committed_hw` returns `None` on a
+    /// follower (only the leader answers the dirty-tier HW-version query), and `serve_leader_local_read`
+    /// / `serve_follower_read` reject the wrong role.
+    #[test]
+    fn role_gating_for_the_c6_read_apis() {
+        const P: u64 = 0;
+        let mut leader_log = open_log(InMemoryFs::new(), small_config());
+        for i in 0..10u32 {
+            leader_log
+                .append(&rec(format!("g-{i}").as_bytes()))
+                .unwrap();
+        }
+        leader_log.sync().unwrap();
+        let plane = leader_plane(&leader_log);
+        let mut leader = DataPlaneController::<InMemoryFs, ManualClock>::new(1);
+        leader.start_leader(P, Arc::clone(&plane), EpochCache::new(), &[1, 2], quorum3());
+        let mut follower = DataPlaneController::new(2);
+        follower.start_follower(P, open_log(InMemoryFs::new(), small_config()));
+
+        // A follower never answers an authoritative committed-HW query.
+        assert_eq!(follower.leader_committed_hw(P), None);
+        assert!(leader.leader_committed_hw(P).is_some());
+        // A follower-read on a LEADER is a wrong-role error.
+        assert!(matches!(
+            leader.serve_follower_read(
+                P,
+                ReadTier::FollowerCommitted,
+                Some(5),
+                Offset::ZERO,
+                8,
+                None
+            ),
+            Err(DataPlaneError::WrongRole {
+                needed: "follower",
+                ..
+            })
+        ));
+        // A leader-local read on a FOLLOWER is a wrong-role error.
+        assert!(matches!(
+            follower.serve_leader_local_read(P, true, Offset::ZERO, 8, None),
+            Err(DataPlaneError::WrongRole {
+                needed: "leader",
+                ..
+            })
+        ));
+        // An unknown partition is a typed error on both.
+        assert!(matches!(
+            leader.serve_leader_local_read(99, true, Offset::ZERO, 8, None),
+            Err(DataPlaneError::UnknownPartition { partition: 99 })
+        ));
+    }
+
+    /// THE C6 leader-lease LOCAL-read test (#620): a VALID leaseholder serves a 0-RTT linearizable read
+    /// LOCALLY from its own read plane; an EXPIRED/INVALID lease does NOT serve a stale local read — it
+    /// REFUSES fail-closed (the #694/#722 soundness fence).
+    #[test]
+    fn a_valid_leaseholder_serves_a_local_linearizable_read_an_invalid_lease_refuses() {
+        const P: u64 = 0;
+        let mut leader_log = open_log(InMemoryFs::new(), small_config());
+        for i in 0..20u32 {
+            leader_log
+                .append(&rec(format!("ll-{i:02}").as_bytes()))
+                .unwrap();
+        }
+        leader_log.sync().unwrap();
+        let plane = leader_plane(&leader_log);
+        let served_end = plane_served_end(&plane);
+        assert!(served_end > 0);
+        let mut leader = DataPlaneController::<InMemoryFs, ManualClock>::new(1);
+        leader.start_leader(P, Arc::clone(&plane), EpochCache::new(), &[1], {
+            IsrConfig {
+                min_isr: 1,
+                max_lag_records: 0,
+            }
+        });
+
+        // VALID lease: serve a linearizable read LOCALLY from the leader's own read plane (no quorum
+        // round). The served bytes decode to the leader's committed records, byte-identical.
+        let outcome = leader
+            .serve_leader_local_read(P, true, Offset::ZERO, usize::MAX, None)
+            .expect("a valid leaseholder serves locally");
+        let local = decode_run(&outcome.run);
+        assert!(
+            !local.is_empty(),
+            "the leaseholder served records locally with no quorum round"
+        );
+        let plane_run = plane
+            .read_range_raw(Offset::ZERO, usize::MAX, None)
+            .unwrap();
+        let plane_records = decode_run(&plane_run.run);
+        for (a, b) in local.iter().zip(plane_records.iter()) {
+            assert_eq!(
+                a, b,
+                "the local linearizable read is byte-identical to the leader's read plane"
+            );
+        }
+
+        // INVALID lease (in doubt — expired / stale epoch): REFUSE, never a stale local read.
+        let refused = leader.serve_leader_local_read(P, false, Offset::ZERO, usize::MAX, None);
+        assert!(
+            matches!(refused, Err(DataPlaneError::LeaseNotValid { partition: P })),
+            "an in-doubt lease refuses the local read (the #694/#722 soundness fence), got {refused:?}"
+        );
     }
 }
