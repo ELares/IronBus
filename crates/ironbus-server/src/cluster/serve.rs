@@ -885,6 +885,14 @@ fn run_dataplane_listener<F, C>(
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _addr)) => {
+                // The listener is NON-BLOCKING (so this accept loop can poll the shutdown flag), and on
+                // BSD/macOS an accepted stream INHERITS the listener's `O_NONBLOCK`. A blocking-mode read
+                // timeout (`SO_RCVTIMEO`, set below) is IGNORED on a non-blocking socket: `read` returns
+                // `WouldBlock` instantly instead of parking up to the timeout, so the leader-side reader
+                // would hot-spin instead of blocking on an idle follower link — the #632 idle busy-spin.
+                // Restore BLOCKING mode so the read timeout takes effect and an idle reader genuinely
+                // PARKS (it still wakes every `DATAPLANE_POLL` to re-check shutdown).
+                let _ = stream.set_nonblocking(false);
                 // A short read timeout so a reader's blocking `recv` re-checks shutdown promptly and an
                 // idle inbound link never wedges a stop.
                 let _ = stream.set_read_timeout(Some(DATAPLANE_POLL));

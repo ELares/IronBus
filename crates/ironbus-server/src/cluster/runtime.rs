@@ -83,6 +83,15 @@ use crate::cluster::transport::{PeerLink, PeerRegistry, PeerWireError};
 /// cluster wakes ~10x/s, not in a hot loop.
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
 
+/// The most logical raft ticks the driver fires in ONE loop cycle when catching up missed
+/// [`TICK_INTERVAL`] windows (#632). The driver paces `tick()` to wall-clock, catching up any whole
+/// intervals elapsed since the last tick so a slow cycle never drops a heartbeat — but a process that
+/// was PAUSED (a long GC, a debugger stop, a suspended VM) could otherwise resume and fire a huge burst
+/// of logical ticks at once, spuriously timing out an election. Capping the catch-up at `election_tick`
+/// (10) bounds that to at most one election window of ticks per cycle, which the next real heartbeat
+/// round heals; a normal cycle catches up 0 or 1 tick, so the cap never bites in steady state.
+const MAX_TICK_CATCH_UP: u64 = 10;
+
 /// The bound on each per-peer outbound queue. The metadata group emits a tiny, bounded number of
 /// messages per ready cycle (heartbeats / votes / a bounded run of small append entries — never
 /// asset data), so a healthy peer drains far faster than this fills. The bound exists only so a
@@ -1150,9 +1159,42 @@ fn run_driver<F, C>(
         .now_monotonic_nanos()
         .saturating_sub(checkpoint_interval_nanos);
 
+    // TICK CADENCE (#632): raft's `tick()` advances a LOGICAL election/heartbeat counter and MUST be
+    // driven on a fixed WALL-CLOCK cadence (`heartbeat_tick=3` × `TICK_INTERVAL` = ~300 ms heartbeats,
+    // `election_tick=10` = ~1 s election). The loop below wakes on EVERY inbound peer message (so a
+    // burst is stepped + driven promptly, keeping replication latency low), which is far more often than
+    // once per `TICK_INTERVAL` on a busy link. Calling `tick()` unconditionally per wake-up made the
+    // logical clock run at the MESSAGE rate, not wall time: the leader hit `heartbeat_tick` almost
+    // every few messages, fanned out a fresh heartbeat round, the followers replied, those replies woke
+    // the driver again, and the loop self-amplified into a tight heartbeat storm — burning ~2 cores per
+    // node IDLE (no client load) in the per-peer reader's per-message buffer churn. Gating `tick()` on
+    // elapsed monotonic time decouples the logical clock from the wake-up rate: heartbeats/elections
+    // fire on their designed cadence regardless of how often the loop spins, so an idle cluster does ~0
+    // work while a real inbound message is still stepped + driven immediately (no latency regression).
+    let tick_interval_nanos = duration_to_nanos(TICK_INTERVAL);
+    let mut last_tick_nanos = failover.clock.now_monotonic_nanos();
+
     while !shutdown.load(Ordering::Acquire) {
-        // Advance the logical election/heartbeat timer once per cadence.
-        group.tick();
+        // Advance the logical election/heartbeat timer ONCE PER WALL-CLOCK `TICK_INTERVAL`, not once per
+        // loop wake-up (#632): the loop wakes on every inbound message, but a `tick()` per wake-up would
+        // run raft's logical clock at the message rate and self-amplify into a heartbeat storm. Catch up
+        // any whole intervals missed since the last tick (a slow cycle never drops a heartbeat), capping
+        // the catch-up so a long stall can never burst-fire an election's worth of ticks at once.
+        let tick_now = failover.clock.now_monotonic_nanos();
+        let mut elapsed_ticks = tick_now.saturating_sub(last_tick_nanos) / tick_interval_nanos;
+        if elapsed_ticks > 0 {
+            // Cap the catch-up: at most `election_tick` ticks in one cycle, so a paused process resuming
+            // does not fire a storm of logical ticks (which could spuriously time out an election).
+            elapsed_ticks = elapsed_ticks.min(MAX_TICK_CATCH_UP);
+            for _ in 0..elapsed_ticks {
+                group.tick();
+            }
+            // Advance the baseline by the consumed whole intervals (keep the sub-interval remainder so
+            // the cadence does not drift): never jump it past `tick_now`.
+            last_tick_nanos = last_tick_nanos
+                .saturating_add(elapsed_ticks.saturating_mul(tick_interval_nanos))
+                .min(tick_now);
+        }
 
         // Apply any pending driver commands from the broker/tests. A `Propose` is leader-only (a
         // non-leader proposal is rejected by the core and logged, never panics); a `ForcePeerUnreachable`
@@ -1709,6 +1751,14 @@ fn run_listener(
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _addr)) => {
+                // The listener is NON-BLOCKING (so this accept loop can poll the shutdown flag), and on
+                // BSD/macOS an accepted stream INHERITS the listener's `O_NONBLOCK`. A blocking-mode read
+                // timeout (`SO_RCVTIMEO`, set below) is IGNORED on a non-blocking socket: `read` returns
+                // `WouldBlock` instantly instead of parking up to the timeout, so the reader would
+                // hot-spin (re-locking the registry + re-allocating its read buffer hundreds of
+                // thousands of times a second) — the #632 idle busy-spin. Restore BLOCKING mode on the
+                // accepted stream so the read timeout takes effect and an idle reader genuinely PARKS.
+                let _ = stream.set_nonblocking(false);
                 // A short read timeout so a reader's blocking `recv` re-checks shutdown promptly and
                 // an idle inbound link never wedges a stop.
                 let _ = stream.set_read_timeout(Some(TICK_INTERVAL));
@@ -1937,6 +1987,83 @@ mod failover_planning_tests {
             &LeaderLoad::new(),
         );
         assert!(proposals.is_empty(), "no departure => no failover");
+    }
+}
+
+// The #632 idle-busy-spin REGRESSION GUARD. Cross-platform (plain loopback TCP, no `StdFs`), so it is
+// gated only on `test`, not `unix`. It pins the ROOT CAUSE — and the fix — DETERMINISTICALLY, with no
+// CPU-percentage assertion (which would be flaky): an accepted reader stream must be in BLOCKING mode so
+// its read timeout (`SO_RCVTIMEO`) actually PARKS the reader instead of returning `WouldBlock` instantly
+// (which made `run_reader` hot-spin). The bug was that an accepted stream INHERITS the non-blocking
+// listener's `O_NONBLOCK` on BSD/macOS, so `set_read_timeout` was a no-op until `set_nonblocking(false)`.
+#[cfg(test)]
+mod idle_spin_regression_tests {
+    use std::io::Read;
+    use std::net::{Ipv4Addr, TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
+
+    /// An accepted stream off a NON-BLOCKING listener — set back to BLOCKING with a read timeout, exactly
+    /// as the peer/data-plane accept loops do — must BLOCK on an empty read for ~the timeout, NOT return
+    /// instantly. A return faster than a small floor proves the read timeout is being ignored (the socket
+    /// is still non-blocking), i.e. the busy-spin would be back. No CPU sampling, no wall-clock flake:
+    /// the floor is a small fraction of the timeout, comfortably below it on any host.
+    #[test]
+    fn accepted_reader_stream_blocks_on_idle_read_after_restoring_blocking_mode() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral");
+        let addr = listener.local_addr().expect("local addr");
+        // Mirror the runtime's accept loop: the listener is non-blocking so the loop can poll shutdown.
+        listener
+            .set_nonblocking(true)
+            .expect("listener nonblocking");
+
+        // Connect a client (it sends NOTHING — the server side will read an idle link).
+        let _client = TcpStream::connect(addr).expect("connect");
+
+        // Accept the inbound stream, retrying while the non-blocking accept reports WouldBlock.
+        let accepted = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("accept failed: {e}"),
+            }
+        };
+
+        // THE FIX under test: restore blocking mode, then set the read timeout — the exact order the
+        // peer/data-plane accept loops use. Without the `set_nonblocking(false)`, the accepted stream
+        // keeps the listener's `O_NONBLOCK` and `read` returns WouldBlock instantly (the busy-spin).
+        accepted
+            .set_nonblocking(false)
+            .expect("restore blocking mode");
+        let timeout = Duration::from_millis(120);
+        accepted
+            .set_read_timeout(Some(timeout))
+            .expect("set read timeout");
+
+        // A read on the idle link must PARK until ~the timeout, then return WouldBlock/TimedOut. We only
+        // assert it took a SAFE FLOOR (a quarter of the timeout): on the buggy non-blocking path it
+        // returns in microseconds, far under the floor; on the fixed path it parks the full ~timeout.
+        let mut stream = accepted;
+        let mut buf = [0u8; 64];
+        let start = Instant::now();
+        let res = stream.read(&mut buf);
+        let waited = start.elapsed();
+
+        match res {
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            other => panic!("idle read should time out (WouldBlock/TimedOut), got {other:?}"),
+        }
+        let floor = timeout / 4;
+        assert!(
+            waited >= floor,
+            "idle read returned in {waited:?} (< floor {floor:?}): the read timeout is being \
+             ignored — the accepted stream is still non-blocking, so the reader would busy-spin (#632)"
+        );
     }
 }
 
