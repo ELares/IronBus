@@ -98,7 +98,11 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
-use std::sync::Arc;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use ironbus_core::clock::Clock;
 use ironbus_core::epoch_cache::EpochCache;
@@ -527,6 +531,421 @@ impl<F: Filesystem, C: Clock> DataPlaneServer<F, C> {
             seam: ProduceAckSeam::new(controller),
             follower_targets,
         })
+    }
+}
+
+/// How long a data-plane peer thread (the leader accept loop, a per-connection reader, a follower
+/// fetch loop) sleeps / blocks between shutdown re-checks, so a `stop` is prompt and an idle loop never
+/// busy-spins. The same cadence the metadata [`ClusterRuntime`](super::runtime::ClusterRuntime) uses.
+const DATAPLANE_POLL: Duration = Duration::from_millis(100);
+
+/// The follower fetch budgets: how many records / bytes a follower asks for per `FetchRecords`. The
+/// leader's read plane already bounds a response to a single sealed segment run, so a catch-up is
+/// several rounds; these are generous upper bounds, themselves under
+/// [`MAX_REPL_FETCH_BYTES`](super::replication::MAX_REPL_FETCH_BYTES).
+const FETCH_MAX_RECORDS: u32 = 1024;
+const FETCH_MAX_BYTES: u32 = 1024 * 1024;
+
+/// A LIVE, running data-plane server: the piece that finally CONSTRUCTS, SPAWNS, and DRIVES the proven
+/// [`DataPlaneServer`] over real `TcpStream`s in a serving cluster (V2-C2-I9, #717). Where
+/// [`DataPlaneServer::from_placements`] builds the (transport-agnostic) per-partition roles and the
+/// 3-node capstone test (#713) drove them cooperatively on one thread, this owns the SHARED server and
+/// runs it on its own threads alongside the engine's single append actor:
+///
+/// 1. a **data-plane LISTENER** thread (the LEADER side): it binds the node's data-plane peer address
+///    ([`dataplane_addr`](super::runtime::dataplane_addr) of the configured metadata address) and, per
+///    accepted connection, a reader thread that pulls bounded, CRC-revalidated data frames off the wire
+///    ([`DataPlaneLink::recv`]) and routes each through the shared server — a `FetchRecords` /
+///    `OffsetForLeaderEpoch` is answered with a response frame from the off-actor read plane (#654, the
+///    leader NEVER writes its log), an `AckReplicated` report drives the quorum-ack gate;
+/// 2. one **follower FETCH** thread per partition this node FOLLOWS: it dials the leader's data-plane
+///    address (reconnecting on a drop), and on a cadence sends a `FetchRecords`, applies the
+///    CRC-revalidated response to its OWN replica log (its own writer — the single-writer invariant),
+///    and reports its fsync'd frontier back ([`AckReplicatedBody`](super::isr::AckReplicatedBody)),
+///    self-healing on a detected divergence via the leader-epoch truncation (#599).
+///
+/// The [`DataPlaneServer`] is held in an `Arc<Mutex<..>>` so every data-plane thread (and, when the
+/// produce-ack seam is threaded, the produce path) takes the SAME server under a short lock per frame —
+/// the gate's parked state + the parked-reply side-table never drift apart. The server is `Send` (#715:
+/// the leader serves through the `Arc`-shared off-actor read plane, not a `&Log` borrow), so this all
+/// runs off the append actor.
+///
+/// ## Single-node / no-cluster: never constructed (the byte-identical guarantee)
+///
+/// [`DataPlaneRuntime::start`] is called ONLY on a clustered serve (a
+/// [`ClusterConfig`](super::ClusterConfig) present, surfaced by the metadata
+/// [`ClusterRuntime`](super::runtime::ClusterRuntime)). With no cluster config NOTHING here is
+/// constructed — no server, no listener, no thread, no data frame — and the broker's produce/consume
+/// hot path is byte-for-byte today's.
+pub struct DataPlaneRuntime<F: Filesystem, C: Clock> {
+    /// The shared, `Send` data-plane server every peer thread drives under a short per-frame lock.
+    server: Arc<Mutex<DataPlaneServer<F, C>>>,
+    /// The shutdown flag the runtime OWNS; `stop` sets it and joins every thread.
+    shutdown: Arc<AtomicBool>,
+    /// The data-plane peer LISTENER thread (leader side: accepts inbound links, spawns readers).
+    listener: Option<JoinHandle<()>>,
+    /// One FOLLOWER fetch thread per followed partition (dials the leader, fetch + apply + report).
+    followers: Vec<JoinHandle<()>>,
+}
+
+impl<F, C> DataPlaneRuntime<F, C>
+where
+    F: Filesystem + Send + Sync + 'static,
+    C: Clock + Send + 'static,
+{
+    /// Construct, spawn, and drive the data plane for a serving cluster (#717). `server` is the
+    /// [`DataPlaneServer`] already built from the committed placement (see
+    /// [`DataPlaneServer::from_placements`]); `self_data_addr` is THIS node's data-plane listener
+    /// address ([`dataplane_addr`](super::runtime::dataplane_addr) of its metadata address);
+    /// `peer_data_addrs` resolves every peer id to its data-plane address (the follower fetch loop dials
+    /// its leader's). Binds the listener synchronously (so a bind failure is reported before any thread
+    /// spawns) and spawns the listener + one follower fetch thread per followed partition.
+    ///
+    /// # Errors
+    /// An [`io::Error`] if the data-plane peer listener cannot bind its address. On an error NO threads
+    /// are left running.
+    ///
+    /// # Panics
+    /// Panics only if the OS refuses to spawn a runtime thread (the listener or a follower fetch
+    /// thread) — an unrecoverable resource-exhaustion condition at start, treated like a failed
+    /// allocation. Once `start` returns `Ok`, the runtime never panics on the serve path.
+    pub fn start(
+        server: DataPlaneServer<F, C>,
+        self_data_addr: SocketAddr,
+        peer_data_addrs: &BTreeMap<u64, SocketAddr>,
+    ) -> io::Result<Self> {
+        // Bind the data-plane peer listener BEFORE spawning anything, so a bind failure is synchronous
+        // (no half-started runtime). Non-blocking so the accept loop polls the shutdown flag.
+        let listener = TcpListener::bind(self_data_addr)?;
+        listener.set_nonblocking(true)?;
+
+        let follower_partitions = server.follower_partitions();
+        let server = Arc::new(Mutex::new(server));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        // The LEADER side: accept inbound peer links and serve fetches / record reports.
+        let shutdown_l = Arc::clone(&shutdown);
+        let server_l = Arc::clone(&server);
+        let listener_handle = std::thread::Builder::new()
+            .name("ib-dataplane-listen".to_string())
+            .spawn(move || run_dataplane_listener(listener, server_l, shutdown_l))
+            .expect("spawn data-plane listener thread");
+
+        // The FOLLOWER side: one fetch loop per followed partition, dialing the leader's data address.
+        let mut followers = Vec::with_capacity(follower_partitions.len());
+        for (partition, leader_id) in follower_partitions {
+            let Some(&leader_addr) = peer_data_addrs.get(&leader_id) else {
+                // A followed partition whose leader has no resolvable data address: skip its fetch loop
+                // (it will simply not replicate that partition) rather than fail the whole runtime — a
+                // misconfigured single peer must not take down the data plane. Logged for the operator.
+                tracing::warn!(
+                    partition,
+                    leader = leader_id,
+                    "data plane: no peer data address for the partition leader; not following it"
+                );
+                continue;
+            };
+            let shutdown_f = Arc::clone(&shutdown);
+            let server_f = Arc::clone(&server);
+            let handle = std::thread::Builder::new()
+                .name(format!("ib-dataplane-fetch-{partition}"))
+                .spawn(move || {
+                    run_follower_fetch(partition, leader_addr, server_f, &shutdown_f);
+                })
+                .expect("spawn data-plane follower fetch thread");
+            followers.push(handle);
+        }
+
+        Ok(Self {
+            server,
+            shutdown,
+            listener: Some(listener_handle),
+            followers,
+        })
+    }
+
+    /// The shared server, for the produce path (when the seam is threaded) or for observability /
+    /// tests: lock it briefly to consult roles or drive the seam.
+    #[must_use]
+    pub fn server(&self) -> &Arc<Mutex<DataPlaneServer<F, C>>> {
+        &self.server
+    }
+
+    /// Signal shutdown and join every data-plane thread. Idempotent. Called by the broker's serve teardown
+    /// alongside [`ClusterRuntime::stop`](super::runtime::ClusterRuntime::stop).
+    pub fn stop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(h) = self.listener.take() {
+            let _ = h.join();
+        }
+        for h in self.followers.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+impl<F: Filesystem, C: Clock> Drop for DataPlaneRuntime<F, C> {
+    fn drop(&mut self) {
+        // Best-effort: a caller that forgets `stop` (or a panic on the serve path) still signals the
+        // threads to wind down rather than leaking them. The deterministic join is `stop`.
+        self.shutdown.store(true, Ordering::Release);
+    }
+}
+
+/// The data-plane LISTENER thread: accept inbound peer connections and spawn a reader per connection.
+/// Reader threads are detached; they exit on a closed/broken link or shutdown. The accept loop is
+/// non-blocking and polls the shutdown flag so a stop is prompt.
+// A thread entry point: it OWNS the listener, the shared server, and the shutdown flag (cloned into
+// each per-connection reader it spawns) for the thread's lifetime; a borrow would fight the 'static
+// spawn bound and prevent cloning into the spawned readers.
+#[allow(clippy::needless_pass_by_value)]
+fn run_dataplane_listener<F, C>(
+    listener: TcpListener,
+    server: Arc<Mutex<DataPlaneServer<F, C>>>,
+    shutdown: Arc<AtomicBool>,
+) where
+    F: Filesystem + Send + Sync + 'static,
+    C: Clock + Send + 'static,
+{
+    while !shutdown.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                // A short read timeout so a reader's blocking `recv` re-checks shutdown promptly and an
+                // idle inbound link never wedges a stop.
+                let _ = stream.set_read_timeout(Some(DATAPLANE_POLL));
+                let server = Arc::clone(&server);
+                let sd = Arc::clone(&shutdown);
+                let _ = std::thread::Builder::new()
+                    .name("ib-dataplane-read".to_string())
+                    .spawn(move || run_dataplane_reader(DataPlaneLink::new(stream), &server, &sd));
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                sleep_interruptible(DATAPLANE_POLL, &shutdown);
+            }
+            Err(_) => sleep_interruptible(DATAPLANE_POLL, &shutdown),
+        }
+    }
+}
+
+/// A per-connection data-plane reader (the LEADER side of one follower's link): pull bounded,
+/// CRC-revalidated frames off the wire and route each through the shared server, writing any response
+/// back on the SAME link. A `FetchRecords` / `OffsetForLeaderEpoch` is answered with a response frame
+/// served from the off-actor read plane; an `AckReplicated` report drives the quorum-ack gate (the
+/// released wire-`PubAck` bytes are the produce path's to flush — when the seam is threaded — so they
+/// are taken under the lock and dropped here, since this slice does not yet own the parked producer
+/// connections; the gate's parked state is correctly advanced regardless).
+///
+/// Every bound in [`DataPlaneLink::recv`] is applied: a hostile / oversized / corrupt frame is a typed
+/// error that drops the link, never a panic or an over-allocation (the fail-closed bounded codec).
+fn run_dataplane_reader<F, C>(
+    mut link: DataPlaneLink<TcpStream>,
+    server: &Arc<Mutex<DataPlaneServer<F, C>>>,
+    shutdown: &AtomicBool,
+) where
+    F: Filesystem + Send + Sync + 'static,
+    C: Clock + Send + 'static,
+{
+    while !shutdown.load(Ordering::Acquire) {
+        match link.recv() {
+            Ok(Some((partition, frame))) => {
+                // Route one frame under a short lock, computing the outbound action, then RELEASE the
+                // lock before writing it to the wire (never hold the server lock across a socket write).
+                let action = {
+                    let Ok(mut srv) = server.lock() else {
+                        return; // poisoned: the runtime is tearing down
+                    };
+                    match frame {
+                        DataPlaneFrame::AckReplicated(report) => {
+                            // Drive the quorum-ack gate. The released wire-`PubAck` bytes belong to the
+                            // produce path (FLAGGED: the per-connection seam thread); advancing the gate
+                            // here keeps the ISR / parked state correct. Drop the bytes for now.
+                            let _ = srv.on_follower_report_bytes(partition, &report);
+                            None
+                        }
+                        other => srv.handle_frame(partition, other).ok(),
+                    }
+                };
+                match action {
+                    Some(DataPlaneAction::SendFetchResponse {
+                        partition,
+                        response,
+                    }) => {
+                        if link
+                            .send(partition, &DataPlaneFrame::FetchResponse(response))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Some(DataPlaneAction::SendEpochResponse {
+                        partition,
+                        response,
+                    }) => {
+                        if link
+                            .send(partition, &DataPlaneFrame::EpochResponse(response))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Some(DataPlaneAction::ReleaseAcks { .. } | DataPlaneAction::None) | None => {}
+                }
+            }
+            Ok(None) => return, // peer closed cleanly
+            Err(DataPlaneWireError::Io(e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                // The read timeout elapsed with no full frame; the link buffers any partial frame, so
+                // loop and re-check shutdown.
+            }
+            Err(e) => {
+                // A framing / decode error from a misbehaving or hostile peer: drop the link. The
+                // bounded codec already contained it to this typed error (no panic, no OOM).
+                tracing::debug!(error = %e, "data plane: peer read error; dropping link");
+                return;
+            }
+        }
+    }
+}
+
+/// A FOLLOWER fetch loop for one partition: dial the leader's data-plane address (reconnecting on a
+/// drop) and, on a cadence, send a `FetchRecords` from the follower's current frontier, apply the
+/// CRC-revalidated response to its OWN replica log, and report its fsync'd frontier back. The follower
+/// writes its OWN replica log via its OWN writer (the single-writer invariant: the leader is read-only
+/// via the read plane; a follower owns its replica log). On a divergence the apply fails closed and the
+/// loop reconnects/refetches; the leader-epoch self-heal (#599) is driven by the controller's
+/// `reconcile_follower` when a future epoch-aware fetch path engages it (FLAGGED for the lineage-change
+/// case; the steady-state same-lineage fetch+apply+report runs here end-to-end).
+// A thread entry point: it OWNS the shared server `Arc` for the thread's lifetime; a borrow would
+// fight the 'static spawn bound.
+#[allow(clippy::needless_pass_by_value)]
+fn run_follower_fetch<F, C>(
+    partition: u64,
+    leader_addr: SocketAddr,
+    server: Arc<Mutex<DataPlaneServer<F, C>>>,
+    shutdown: &AtomicBool,
+) where
+    F: Filesystem + Send + Sync + 'static,
+    C: Clock + Send + 'static,
+{
+    while !shutdown.load(Ordering::Acquire) {
+        match TcpStream::connect_timeout(&leader_addr, DATAPLANE_POLL) {
+            Ok(stream) => {
+                let _ = stream.set_read_timeout(Some(DATAPLANE_POLL));
+                let _ = stream.set_write_timeout(Some(DATAPLANE_POLL));
+                let mut link = DataPlaneLink::new(stream);
+                follower_fetch_loop(partition, &mut link, &server, shutdown);
+            }
+            Err(_) => {
+                // Leader not reachable yet (it may still be binding / electing); back off and retry.
+                sleep_interruptible(DATAPLANE_POLL, shutdown);
+            }
+        }
+    }
+}
+
+/// Drive one connected follower link: fetch → apply → report, on a cadence, until shutdown or the link
+/// breaks (then [`run_follower_fetch`] reconnects). Each round takes the server lock only to BUILD the
+/// fetch request and to APPLY the response + build the report — never across a socket read/write.
+fn follower_fetch_loop<F, C>(
+    partition: u64,
+    link: &mut DataPlaneLink<TcpStream>,
+    server: &Arc<Mutex<DataPlaneServer<F, C>>>,
+    shutdown: &AtomicBool,
+) where
+    F: Filesystem + Send + Sync + 'static,
+    C: Clock + Send + 'static,
+{
+    while !shutdown.load(Ordering::Acquire) {
+        // Build the next fetch request under a short lock (the follower's current frontier + budgets).
+        let req = {
+            let Ok(srv) = server.lock() else {
+                return;
+            };
+            match srv.seam().controller().make_fetch_request(
+                partition,
+                FETCH_MAX_RECORDS,
+                FETCH_MAX_BYTES,
+            ) {
+                Ok(req) => req,
+                // No longer a follower of this partition (a future rebalance): stop fetching.
+                Err(_) => return,
+            }
+        };
+        if link
+            .send(partition, &DataPlaneFrame::FetchRequest(req))
+            .is_err()
+        {
+            return; // link broke; reconnect
+        }
+        // Read the response (blocking up to the read timeout). On a timeout, loop and re-fetch.
+        match link.recv() {
+            Ok(Some((p, DataPlaneFrame::FetchResponse(resp)))) if p == partition => {
+                // Apply + build the report under a short lock, then send the report off-lock.
+                let report = {
+                    let Ok(mut srv) = server.lock() else {
+                        return;
+                    };
+                    if resp.record_count > 0 {
+                        // Apply the CRC-revalidated bytes to the follower's own replica log. A
+                        // divergence / corrupt frame fails closed (nothing from the bad frame is
+                        // appended); drop this response and re-fetch from the current frontier.
+                        if srv
+                            .seam_mut()
+                            .controller_mut()
+                            .apply_fetch_response(partition, &resp)
+                            .is_err()
+                        {
+                            // Fail-closed: reconnect + refetch from the recovered frontier.
+                            return;
+                        }
+                    }
+                    srv.seam().controller().follower_report(partition).ok()
+                };
+                if let Some(report) = report {
+                    if link
+                        .send(partition, &DataPlaneFrame::AckReplicated(report))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                // If the leader served a non-empty run there may be more to pull; loop promptly.
+                // Otherwise pace the next poll so a caught-up follower does not hot-loop.
+                if resp.record_count == 0 {
+                    sleep_interruptible(DATAPLANE_POLL, shutdown);
+                }
+            }
+            Ok(Some(_)) => {
+                // A frame for another partition / an unexpected verb on this link: ignore + re-poll.
+                sleep_interruptible(DATAPLANE_POLL, shutdown);
+            }
+            Err(DataPlaneWireError::Io(e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                // No response within the read window; re-fetch on the next loop.
+            }
+            // The leader closed, or a decode / link error: drop the link and reconnect.
+            Ok(None) | Err(_) => return,
+        }
+    }
+}
+
+/// Sleep for `dur` but wake early if shutdown is set, in small slices, so a stop is never delayed by a
+/// full sleep. Used by the accept poll, the dialer backoff, and the caught-up follower pacing.
+fn sleep_interruptible(dur: Duration, shutdown: &AtomicBool) {
+    let slice = Duration::from_millis(20);
+    let mut left = dur;
+    while left > Duration::ZERO && !shutdown.load(Ordering::Acquire) {
+        let this = slice.min(left);
+        std::thread::sleep(this);
+        left = left.checked_sub(this).unwrap_or(Duration::ZERO);
     }
 }
 
@@ -1439,5 +1858,510 @@ mod tests {
             Some(true),
             "the leader serve loop survives a hostile frame and still serves a valid fetch"
         );
+    }
+}
+
+// ===================================================================================================
+//  #717 INTEGRATION TESTS: the LIVE DataPlaneRuntime — construct + spawn + DRIVE the data plane over
+//  real sockets, exactly as `run_broker` does. A real 3-node serve cluster (1 leader runtime + 2
+//  follower runtimes, each on its OWN threads over real loopback TcpStreams) replicates produced data
+//  byte-identical + a C2-fsync produce's parked ack is released ONLY on quorum-fsync driven by REAL
+//  wire reports; below min_isr it stays parked; a node restart resumes. Real on-disk StdFs (Unix-only,
+//  like serve) so the runtime's `Send + Sync` bounds are exercised on production filesystem types, with
+//  a deterministic ManualClock so the on-disk segment-header bytes are byte-identical leader<->follower.
+// ===================================================================================================
+#[cfg(all(test, unix))]
+#[allow(clippy::similar_names, clippy::too_many_lines)]
+mod live_runtime_tests {
+    use super::*;
+    use crate::cluster::isr::IsrConfig;
+    use crate::cluster::state_machine::Placement;
+    use ironbus_core::clock::ManualClock;
+    use ironbus_core::types::RecordFlags;
+    use ironbus_proto::frame::encode_frame as proto_encode_frame;
+    use ironbus_proto::message::{encode_pub_ack, PubAckBody};
+    use ironbus_storage::fs::StdFs;
+    use ironbus_storage::io::RandomAccessFile;
+    use ironbus_storage::log::{Append, Log, LogConfig};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+    use std::time::{Duration, Instant};
+
+    // A real on-disk StdFs backend (real sockets + real files), but a deterministic ManualClock at
+    // zero so the SEGMENT HEADER timestamps (stamped from the clock seam) are byte-identical between the
+    // leader and the follower — exactly the discipline the in-memory capstone test uses. The data plane
+    // is generic over the clock; production wires the broker's SystemClock, but byte-identity of frames
+    // (the property under test) is what makes ManualClock the right choice here.
+
+    fn small_config() -> LogConfig {
+        LogConfig {
+            max_segment_bytes: 256,
+            max_total_bytes: 0,
+            ..LogConfig::default()
+        }
+    }
+
+    fn rec(payload: &[u8]) -> Append<'_> {
+        Append {
+            timestamp_ms: 7,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload,
+        }
+    }
+
+    /// A real on-disk leader log with `n` records, fsync'd, leaked to `'static` so its read plane keeps
+    /// observing it for the test's lifetime (in a real serve the engine's append actor owns it).
+    fn leaked_disk_leader(dir: &std::path::Path, n: u32) -> &'static Log<StdFs, ManualClock> {
+        let fs = StdFs::new(dir.to_path_buf());
+        let mut log = Log::open(fs, ManualClock::new(), small_config()).expect("leader log opens");
+        for i in 0..n {
+            log.append(&rec(format!("rep-{i:02}").as_bytes())).unwrap();
+        }
+        log.sync().unwrap();
+        Box::leak(Box::new(log))
+    }
+
+    /// The off-actor read plane over a leader log — what the leader role serves fetches from (no &Log).
+    fn disk_leader_plane(log: &Log<StdFs, ManualClock>) -> Arc<ReadPlane<StdFs>> {
+        Arc::new(log.read_plane().expect("read plane builds"))
+    }
+
+    /// The first offset the read plane does NOT serve off-actor (its sealed-served end): a follower
+    /// converges to this over the live transport before the active (flushed-but-unsealed) tail seals.
+    fn plane_served_end(plane: &ReadPlane<StdFs>) -> u64 {
+        let flushed = plane.flushed();
+        let mut next = 0u64;
+        let mut guard = 0u32;
+        while next < flushed {
+            guard += 1;
+            assert!(guard < 100_000, "read-plane chain failed to terminate");
+            let raw = plane
+                .read_range_raw(ironbus_core::types::Offset::new(next), 1_000, None)
+                .expect("read plane serves");
+            let advanced = raw.run.next_offset.get();
+            if advanced > next {
+                next = advanced;
+            } else {
+                break;
+            }
+        }
+        next
+    }
+
+    /// A replica-log factory that opens each follower's replica as a real on-disk `StdFs` log under a
+    /// per-node temp dir (the same shape the CLI `DiskReplicaLogs` uses under `<data_dir>/replicas/`).
+    struct DiskReplicaLogs {
+        root: std::path::PathBuf,
+    }
+    impl ReplicaLogFactory<StdFs, ManualClock> for DiskReplicaLogs {
+        fn open_replica_log(&self, partition: u64) -> Result<Log<StdFs, ManualClock>, String> {
+            let dir = self.root.join("replicas").join(partition.to_string());
+            std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+            Log::open(StdFs::new(dir), ManualClock::new(), small_config())
+                .map_err(|e| format!("open replica {partition}: {e}"))
+        }
+    }
+
+    fn quorum3() -> IsrConfig {
+        IsrConfig {
+            min_isr: 2,
+            max_lag_records: 0,
+        }
+    }
+
+    fn wire_pub_ack(offset: u64) -> Vec<u8> {
+        let mut body = Vec::with_capacity(8);
+        encode_pub_ack(&PubAckBody { offset }, &mut body);
+        let mut frame = Vec::new();
+        proto_encode_frame(FrameType::PubAck, &body, &mut frame).expect("PubAck frame encodes");
+        frame
+    }
+
+    /// Bind an ephemeral loopback port, read it, drop the listener (the runtime rebinds it). A small
+    /// TOCTOU window, fine for a quiet in-process loopback test.
+    fn free_port() -> u16 {
+        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral");
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    }
+
+    fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        pred()
+    }
+
+    fn dump_segments(log: &Log<StdFs, ManualClock>) -> Vec<(String, Vec<u8>)> {
+        let fs = log.filesystem();
+        let mut out = Vec::new();
+        for name in fs.list().expect("list segments") {
+            let file = fs.open(&name).expect("open segment");
+            let len = usize::try_from(file.len().expect("len")).expect("len fits usize");
+            let mut buf = vec![0u8; len];
+            file.read_exact_at(&mut buf, 0).expect("read segment bytes");
+            out.push((name, buf));
+        }
+        out
+    }
+
+    /// Assert a follower replica dump is a byte-identical prefix of the leader, with at least one fully
+    /// sealed segment byte-for-byte equal (real sealed replication over the live transport).
+    fn assert_replicated_byte_identical(
+        follower_dump: &[(String, Vec<u8>)],
+        leader_log: &Log<StdFs, ManualClock>,
+    ) {
+        let leader: BTreeMap<String, Vec<u8>> = dump_segments(leader_log).into_iter().collect();
+        assert!(
+            follower_dump.iter().any(|(_, b)| !b.is_empty()),
+            "follower replicated at least one segment file"
+        );
+        let mut any_exact = false;
+        for (name, bytes) in follower_dump {
+            let leader_bytes = leader
+                .get(name)
+                .unwrap_or_else(|| panic!("leader missing replicated segment file {name}"));
+            assert!(
+                leader_bytes.starts_with(bytes),
+                "follower segment {name} is not a byte-identical prefix of the leader's"
+            );
+            any_exact |= bytes == leader_bytes;
+        }
+        assert!(
+            any_exact,
+            "no fully-sealed follower segment is byte-identical to the leader's over the live runtime"
+        );
+    }
+
+    /// THE #717 CAPSTONE: a real 3-node serve cluster driven by the actual [`DataPlaneRuntime`] (the
+    /// SAME construct `run_broker` spawns) over real loopback sockets replicates produced data
+    /// byte-identical, and a parked C2-fsync produce's wire ack is released ONLY once the ISR quorum
+    /// reports fsync over the REAL wire. Each follower runs its OWN `DataPlaneRuntime` on its OWN threads
+    /// (listener + fetch loop); the leader runs its own. Nothing is hand-driven — the runtimes' threads
+    /// do the fetch / apply / report / serve / gate over the sockets.
+    #[test]
+    fn live_three_node_runtime_replicates_and_quorum_gates_a_c2_fsync_produce() {
+        const P: u64 = 0;
+        let placement = Placement {
+            replicas: vec![1, 2, 3],
+            leader: 1,
+            epoch: 5,
+        };
+        let placements: BTreeMap<u64, Placement> = [(P, placement)].into_iter().collect();
+
+        // Allocate one DATA-plane port per node (the runtime binds these directly here; in the CLI they
+        // are derived from the metadata addr via `dataplane_addr`).
+        let data_addrs: BTreeMap<u64, SocketAddr> = [1u64, 2, 3]
+            .into_iter()
+            .map(|id| (id, SocketAddr::from((Ipv4Addr::LOCALHOST, free_port()))))
+            .collect();
+
+        let leader_dir = tempfile::tempdir().expect("leader dir");
+        let leader_log = leaked_disk_leader(leader_dir.path(), 25);
+        let leader_pl = disk_leader_plane(leader_log);
+        let served_end = plane_served_end(&leader_pl);
+        assert!(served_end > 0, "the read plane serves a non-empty prefix");
+
+        // The LEADER runtime (node 1): leader role over the read plane, listening on its data port.
+        let leader_server = DataPlaneServer::from_placements(
+            1,
+            &placements,
+            quorum3(),
+            |p| (p == P).then(|| Arc::clone(&leader_pl)),
+            &DiskReplicaLogs {
+                root: leader_dir.path().to_path_buf(),
+            },
+            |_| EpochCache::new(),
+        )
+        .expect("leader server builds");
+        assert!(leader_server.seam().controller().is_leader(P));
+
+        // PARK a real C2-fsync produce's wire PubAck for the last sealed-served record, BEFORE the
+        // followers come up: the leader has locally fsync'd (I2) but no follower has the data, so the
+        // 2-of-3 quorum is not met — the ack parks (no false ack).
+        let offset = served_end - 1;
+        let reply = wire_pub_ack(offset);
+        let leader_rt = {
+            let mut server = leader_server;
+            let disposition = server
+                .seam_mut()
+                .on_local_fsynced_ack(
+                    crate::cluster::ack_level::ClusterAckLevel::C2Fsync,
+                    P,
+                    offset,
+                    reply,
+                )
+                .expect("park");
+            assert_eq!(
+                disposition,
+                crate::cluster::dataplane::AckDisposition::Parked,
+                "a clustered C2-fsync led produce parks its wire PubAck (no quorum yet)"
+            );
+            assert_eq!(server.seam().parked_len(), 1, "the ack is withheld");
+            DataPlaneRuntime::start(server, data_addrs[&1], &data_addrs).expect("leader runtime")
+        };
+
+        // The two FOLLOWER runtimes (nodes 2 + 3), each from the SAME committed placement, each with its
+        // own on-disk replica log + its own threads dialing the leader's data port.
+        let f2_dir = tempfile::tempdir().expect("f2 dir");
+        let f3_dir = tempfile::tempdir().expect("f3 dir");
+        let follower2 = DataPlaneServer::from_placements(
+            2,
+            &placements,
+            quorum3(),
+            |_| None,
+            &DiskReplicaLogs {
+                root: f2_dir.path().to_path_buf(),
+            },
+            |_| EpochCache::new(),
+        )
+        .expect("f2 server");
+        let follower3 = DataPlaneServer::from_placements(
+            3,
+            &placements,
+            quorum3(),
+            |_| None,
+            &DiskReplicaLogs {
+                root: f3_dir.path().to_path_buf(),
+            },
+            |_| EpochCache::new(),
+        )
+        .expect("f3 server");
+        assert!(follower2.seam().controller().is_follower(P));
+        assert_eq!(follower2.follower_leader(P), Some(1));
+
+        let f2_rt = DataPlaneRuntime::start(follower2, data_addrs[&2], &data_addrs).expect("f2 rt");
+        let f3_rt = DataPlaneRuntime::start(follower3, data_addrs[&3], &data_addrs).expect("f3 rt");
+
+        // The runtimes' own threads drive everything. Wait until BOTH followers have caught up to the
+        // leader's sealed-served prefix over the live transport.
+        let f2_hw = || {
+            f2_rt
+                .server()
+                .lock()
+                .unwrap()
+                .seam()
+                .controller()
+                .follower_high_watermark(P)
+                .unwrap_or(0)
+        };
+        let f3_hw = || {
+            f3_rt
+                .server()
+                .lock()
+                .unwrap()
+                .seam()
+                .controller()
+                .follower_high_watermark(P)
+                .unwrap_or(0)
+        };
+        let caught_up = wait_until(Duration::from_secs(30), || {
+            f2_hw() >= served_end && f3_hw() >= served_end
+        });
+        assert!(
+            caught_up,
+            "both followers caught up over the live runtime (f2={}, f3={}, served_end={served_end})",
+            f2_hw(),
+            f3_hw()
+        );
+
+        // The parked C2-fsync ack is RELEASED once a 2-of-3 quorum reported fsync over the wire: the
+        // leader's gate no longer withholds it (the real follower reports drove the quorum-commit past
+        // the offset). This proves the wire ack WAITED for quorum-fsync end-to-end via the live runtime.
+        let released = wait_until(Duration::from_secs(15), || {
+            leader_rt.server().lock().unwrap().seam().parked_len() == 0
+        });
+        assert!(
+            released,
+            "the parked C2-fsync wire ack is released ONLY after the ISR quorum fsync'd over the wire"
+        );
+        assert_eq!(
+            leader_rt
+                .server()
+                .lock()
+                .unwrap()
+                .seam()
+                .controller()
+                .pending_ack_count(P),
+            0,
+            "no produce ack remains withheld once quorum-fsync'd"
+        );
+
+        // Each follower's replica is BYTE-IDENTICAL to the leader over the served prefix, over the live
+        // runtime: lock the server and dump the follower's own replica log.
+        {
+            let f2 = f2_rt.server().lock().unwrap();
+            let dump = dump_segments(f2.seam().controller().follower_log(P).unwrap());
+            assert_replicated_byte_identical(&dump, leader_log);
+        }
+        {
+            let f3 = f3_rt.server().lock().unwrap();
+            let dump = dump_segments(f3.seam().controller().follower_log(P).unwrap());
+            assert_replicated_byte_identical(&dump, leader_log);
+        }
+
+        let mut leader_rt = leader_rt;
+        let mut f2_rt = f2_rt;
+        let mut f3_rt = f3_rt;
+        leader_rt.stop();
+        f2_rt.stop();
+        f3_rt.stop();
+    }
+
+    /// Below `min_isr` a parked C2-fsync ack is NEVER released over the live runtime: node 1 leads
+    /// `{1,2,3}` with `min_isr=2`, but NO follower ever comes up, so the ISR is the leader alone (size
+    /// 1 < 2). The leader runtime runs (its listener accepts nothing useful), and the parked ack stays
+    /// withheld — no false ack on the real wire.
+    #[test]
+    fn live_runtime_below_min_isr_keeps_the_wire_ack_parked() {
+        const P: u64 = 0;
+        let placement = Placement {
+            replicas: vec![1, 2, 3],
+            leader: 1,
+            epoch: 1,
+        };
+        let placements: BTreeMap<u64, Placement> = [(P, placement)].into_iter().collect();
+        let data_addrs: BTreeMap<u64, SocketAddr> = (1u64..=3)
+            .map(|id| (id, SocketAddr::from((Ipv4Addr::LOCALHOST, free_port()))))
+            .collect();
+
+        let dir = tempfile::tempdir().expect("dir");
+        let leader_log = leaked_disk_leader(dir.path(), 10);
+        let leader_pl = disk_leader_plane(leader_log);
+        let mut server = DataPlaneServer::from_placements(
+            1,
+            &placements,
+            quorum3(),
+            |p| (p == P).then(|| Arc::clone(&leader_pl)),
+            &DiskReplicaLogs {
+                root: dir.path().to_path_buf(),
+            },
+            |_| EpochCache::new(),
+        )
+        .unwrap();
+        let offset = 9;
+        assert_eq!(
+            server
+                .seam_mut()
+                .on_local_fsynced_ack(
+                    crate::cluster::ack_level::ClusterAckLevel::C2Fsync,
+                    P,
+                    offset,
+                    wire_pub_ack(offset),
+                )
+                .unwrap(),
+            crate::cluster::dataplane::AckDisposition::Parked
+        );
+        let mut rt = DataPlaneRuntime::start(server, data_addrs[&1], &data_addrs).expect("rt");
+
+        // Give the runtime ample time; with no follower ever reporting, the ack must stay parked.
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            rt.server().lock().unwrap().seam().parked_len(),
+            1,
+            "below min_isr the wire ack is NEVER released (no false ack on the real wire)"
+        );
+        rt.stop();
+    }
+
+    /// A node RESTART resumes replication over the live runtime: a follower runtime replicates, is
+    /// stopped, then a FRESH runtime is started over the SAME replica-log dir (as on a process restart).
+    /// It recovers its replica log and resumes fetching from its recovered head, catching back up to the
+    /// leader's served prefix.
+    #[test]
+    fn live_runtime_follower_restart_resumes_replication() {
+        const P: u64 = 0;
+        let placement = Placement {
+            replicas: vec![1, 2],
+            leader: 1,
+            epoch: 3,
+        };
+        let placements: BTreeMap<u64, Placement> = [(P, placement)].into_iter().collect();
+        // R=2, min_isr=1: a single in-sync follower (or the leader alone) is a quorum here — this test
+        // is about replication resuming on restart, not the quorum-ack gate.
+        let isr = IsrConfig {
+            min_isr: 1,
+            max_lag_records: 0,
+        };
+        let data_addrs: BTreeMap<u64, SocketAddr> = (1u64..=2)
+            .map(|id| (id, SocketAddr::from((Ipv4Addr::LOCALHOST, free_port()))))
+            .collect();
+
+        let leader_dir = tempfile::tempdir().expect("leader dir");
+        let leader_log = leaked_disk_leader(leader_dir.path(), 20);
+        let leader_pl = disk_leader_plane(leader_log);
+        let served_end = plane_served_end(&leader_pl);
+
+        let leader_server = DataPlaneServer::from_placements(
+            1,
+            &placements,
+            isr,
+            |p| (p == P).then(|| Arc::clone(&leader_pl)),
+            &DiskReplicaLogs {
+                root: leader_dir.path().to_path_buf(),
+            },
+            |_| EpochCache::new(),
+        )
+        .unwrap();
+        let mut leader_rt =
+            DataPlaneRuntime::start(leader_server, data_addrs[&1], &data_addrs).expect("leader rt");
+
+        // The follower's replica dir is STABLE across the restart (a real on-disk recovery).
+        let f_dir = tempfile::tempdir().expect("f dir");
+        let mk_follower = || {
+            DataPlaneServer::from_placements(
+                2,
+                &placements,
+                isr,
+                |_| None,
+                &DiskReplicaLogs {
+                    root: f_dir.path().to_path_buf(),
+                },
+                |_| EpochCache::new(),
+            )
+            .expect("follower server")
+        };
+
+        // First incarnation: catch up.
+        let mut f_rt =
+            DataPlaneRuntime::start(mk_follower(), data_addrs[&2], &data_addrs).expect("f rt");
+        let hw = |rt: &DataPlaneRuntime<StdFs, ManualClock>| {
+            rt.server()
+                .lock()
+                .unwrap()
+                .seam()
+                .controller()
+                .follower_high_watermark(P)
+                .unwrap_or(0)
+        };
+        assert!(
+            wait_until(Duration::from_secs(30), || hw(&f_rt) >= served_end),
+            "the follower caught up before the restart"
+        );
+        f_rt.stop();
+
+        // Restart over the SAME replica dir: the fresh runtime recovers the replica log and resumes from
+        // its recovered head (already caught up), staying at the served prefix.
+        let mut f_rt2 =
+            DataPlaneRuntime::start(mk_follower(), data_addrs[&2], &data_addrs).expect("f rt2");
+        assert!(
+            wait_until(Duration::from_secs(30), || hw(&f_rt2) >= served_end),
+            "the restarted follower recovered its replica log and resumed at the served prefix (hw={})",
+            hw(&f_rt2)
+        );
+        // Its recovered replica is byte-identical to the leader.
+        {
+            let f = f_rt2.server().lock().unwrap();
+            let dump = dump_segments(f.seam().controller().follower_log(P).unwrap());
+            assert_replicated_byte_identical(&dump, leader_log);
+        }
+        f_rt2.stop();
+        leader_rt.stop();
     }
 }

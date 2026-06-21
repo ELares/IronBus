@@ -301,10 +301,13 @@ pub use replication::{
     Follower, OffsetForLeaderEpochBody, OffsetForLeaderEpochResponse, ReadPlaneLeader,
     ReplicationError, ReplicationFrame, ReplicationLeader, ReplicationLink, MAX_REPL_FETCH_BYTES,
 };
-pub use runtime::{ClusterConfig, ClusterRuntime, ClusterStatus, RuntimeError};
+pub use runtime::{
+    dataplane_addr, ClusterConfig, ClusterRuntime, ClusterStatus, MetadataProposer, RuntimeError,
+    DATAPLANE_PORT_OFFSET,
+};
 pub use serve::{
-    decode_dataplane_peer_frame, encode_dataplane_peer_frame, DataPlaneLink, DataPlaneServer,
-    DataPlaneWireError, ReplicaLogFactory, MAX_DATAPLANE_FRAME_BYTES,
+    decode_dataplane_peer_frame, encode_dataplane_peer_frame, DataPlaneLink, DataPlaneRuntime,
+    DataPlaneServer, DataPlaneWireError, ReplicaLogFactory, MAX_DATAPLANE_FRAME_BYTES,
 };
 pub use state_machine::{DecodeError, MetadataCommand, MetadataStateMachine, NodeRole, Placement};
 pub use transport::{

@@ -91,7 +91,10 @@ use ironbus_server::clock::SystemClock;
 // path, so they follow the same `#[cfg(unix)]` gate as the rest of the broker run.
 use ironbus_server::cluster::ClusterConfig;
 #[cfg(unix)]
-use ironbus_server::cluster::{ClusterRuntime, RuntimeError};
+use ironbus_server::cluster::{
+    dataplane_addr, ClusterRuntime, DataPlaneRuntime, DataPlaneServer, IsrConfig, MetadataCommand,
+    MetadataProposer, Placement, ReplicaLogFactory, RuntimeError,
+};
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
@@ -4378,6 +4381,15 @@ fn cmd_serve(
             // dir, no peer listener, and no driver thread exist: the broker is byte-for-byte
             // today's (the single-node-default guarantee, owned right here by the `Option` check).
             let cluster_runtime = start_cluster_runtime(cluster, data_dir, config)?;
+            // Construct + spawn + drive the DATA plane (#717) IFF a cluster runtime was started: it
+            // captures the engine's off-actor read plane HERE (before the engine moves into the append
+            // actor in `run_broker`), then a bootstrap thread waits for the committed placement, builds
+            // the `DataPlaneServer`, and runs the replication + quorum-ack data plane over real TCP.
+            // With NO cluster this is `None` — nothing constructs, and the produce hot path is unchanged.
+            let dataplane = match cluster_runtime.as_ref() {
+                Some(runtime) => Some(spawn_dataplane_serve(&engine, runtime, data_dir, config)?),
+                None => None,
+            };
             run_broker(
                 engine,
                 addr,
@@ -4387,6 +4399,7 @@ fn cmd_serve(
                 health_bind,
                 config_warnings,
                 cluster_runtime,
+                dataplane,
                 auth,
                 reload,
                 out,
@@ -4418,6 +4431,7 @@ fn cmd_serve(
                 health_addr,
                 health_bind,
                 config_warnings,
+                None,
                 None,
                 auth,
                 reload,
@@ -4473,6 +4487,310 @@ fn start_cluster_runtime(
         })
 }
 
+/// The fixed partition id the broker's default-stream log maps to in a clustered serve (#717). Today's
+/// broker is single-stream; the data plane replicates that one log as partition `0`. Multi-partition
+/// fan-out (mapping named streams to additional partitions) is later — FLAGGED.
+#[cfg(unix)]
+const DEFAULT_PARTITION: u64 = 0;
+
+/// How long the data-plane bootstrap polls for the committed placement before giving up for this serve
+/// (a generously long bound: the metadata cluster must elect a leader and the placement must commit +
+/// apply across a quorum, which on a healthy cluster is ~seconds). Re-checks the broker shutdown flag
+/// every poll, so a stop during bootstrap is prompt.
+#[cfg(unix)]
+const DATAPLANE_BOOTSTRAP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The poll cadence the data-plane bootstrap waits on between checks for the committed placement / a
+/// metadata leader.
+#[cfg(unix)]
+const DATAPLANE_BOOTSTRAP_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// A [`ReplicaLogFactory`] that opens each FOLLOWER partition's replica log as a real on-disk
+/// [`StdFs`] log under `<data_dir>/replicas/<partition>/` (#717). A follower OWNS its replica log and
+/// is its sole writer (the single-writer invariant: the leader is read-only via the read plane; a
+/// follower writes only its own replica). The replica log inherits the broker's segment cap.
+#[cfg(unix)]
+struct DiskReplicaLogs {
+    data_dir: std::path::PathBuf,
+    log_config: LogConfig,
+}
+
+#[cfg(unix)]
+impl ReplicaLogFactory<StdFs, SystemClock> for DiskReplicaLogs {
+    fn open_replica_log(
+        &self,
+        partition: u64,
+    ) -> Result<ironbus_storage::log::Log<StdFs, SystemClock>, String> {
+        let dir = self.data_dir.join("replicas").join(partition.to_string());
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("cannot create replica dir {}: {e}", dir.display()))?;
+        let fs = StdFs::new(dir);
+        ironbus_storage::log::Log::open(fs, SystemClock::new(), self.log_config)
+            .map_err(|e| format!("cannot open replica log for partition {partition}: {e}"))
+    }
+}
+
+/// A handle to the running data-plane serve (#717): the bootstrap thread (which waits for the committed
+/// placement, builds the [`DataPlaneServer`], and starts its [`DataPlaneRuntime`]) plus the shutdown
+/// flag the broker's serve teardown flips to stop it deterministically. Held by `run_broker` ONLY on a
+/// clustered serve; a single-node serve never constructs one, so its presence is the cluster opt-in.
+#[cfg(unix)]
+struct DataPlaneServeHandle {
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    bootstrap: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl DataPlaneServeHandle {
+    /// Signal shutdown and join the bootstrap thread (which, in turn, stops the
+    /// [`DataPlaneRuntime`] it owns and joins every data-plane peer thread). Idempotent.
+    fn stop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(h) = self.bootstrap.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Construct, spawn, and drive the DATA plane for a clustered serve (#717) — the final clustering
+/// plumbing that makes a real multi-node `ironbus serve --cluster-*` broker replicate produced data +
+/// quorum-gate `C2-fsync` produces over real TCP, end-to-end.
+///
+/// Called ONLY on a clustered disk serve (a [`ClusterRuntime`] present), where the concrete `StdFs`,
+/// the data dir, and the engine's off-actor read plane are all known. With NO cluster this is never
+/// called — nothing constructs, and the broker's produce/consume hot path is byte-for-byte today's
+/// (the single-node byte-identical guarantee).
+///
+/// It captures the engine's default-stream [`ReadPlane`](ironbus_storage::read_plane::ReadPlane) BEFORE
+/// the engine moves into the append actor (the leader serves committed bytes through it and NEVER writes
+/// its log — the single-writer invariant), then spawns a BOOTSTRAP thread that:
+///
+/// 1. if this node is the metadata leader, proposes the STATIC placement for [`DEFAULT_PARTITION`] over
+///    the configured peer set (leader = this node), so the whole cluster converges on ONE committed
+///    placement (rebalance / failover are C5 — FLAGGED);
+/// 2. polls the committed placement (published by the metadata driver via
+///    [`ClusterRuntime::placements`]) until [`DEFAULT_PARTITION`] is placed;
+/// 3. builds the [`DataPlaneServer`] from that committed placement + the engine read plane (for the led
+///    partition) + the on-disk replica-log factory (for followed partitions);
+/// 4. starts the [`DataPlaneRuntime`] (the data-plane listener + per-followed-partition fetch loops over
+///    real `TcpStream`s) and holds it until the broker shuts down.
+///
+/// Returns the stoppable handle (the broker's teardown flips its shutdown flag and joins it). The
+/// bootstrap runs off the serve thread, so the broker accepts client traffic immediately while the
+/// placement commits and the data plane comes up.
+///
+/// # Errors
+/// [`CliError::Internal`] if the engine's read plane cannot be built (the only synchronous failure; the
+/// rest happens on the bootstrap thread, which logs and exits on a fault rather than failing the serve).
+#[cfg(unix)]
+fn spawn_dataplane_serve(
+    engine: &Engine<StdFs, SystemClock>,
+    runtime: &ClusterRuntime,
+    data_dir: &Path,
+    config: &ServeConfig,
+) -> Result<DataPlaneServeHandle, CliError> {
+    // Capture the engine's off-actor read plane NOW, while the engine is still owned here (before it
+    // moves into the append actor). It is Arc-backed, so the leader role holds an Arc<ReadPlane> and
+    // serves committed bytes through it — the single append actor stays the sole writer.
+    let read_plane = std::sync::Arc::new(
+        engine
+            .read_plane()
+            .map_err(|e| CliError::Internal(format!("cannot build the leader read plane: {e}")))?,
+    );
+
+    let node_id = runtime.node_id();
+    let peers = runtime.peers();
+    let status = runtime.status_handle();
+    let proposer = runtime.metadata_proposer();
+    let log_config = LogConfig::new(config.max_segment_bytes)
+        .map_err(|e| CliError::Internal(format!("replica log config: {e}")))?
+        .with_max_total_bytes(config.max_total_bytes);
+    let data_dir = data_dir.to_path_buf();
+
+    // The committed placement's replica set is the sorted peer id set; the metadata leader names ITSELF
+    // the partition leader (deterministic + eligible — it is alive and current). Every other node reads
+    // the SAME committed placement and derives its own role from it.
+    let replicas: Vec<u64> = {
+        let mut v: Vec<u64> = peers.keys().copied().collect();
+        v.sort_unstable();
+        v
+    };
+
+    // R = 2f+1 / min_isr = f+1: the design quorum. With the configured peer count `n` (1/3/5),
+    // min_isr is the majority — a `C2-fsync` produce waits for a majority fsync (no false ack below it).
+    let isr_config = IsrConfig {
+        min_isr: replicas.len() / 2 + 1,
+        max_lag_records: 0,
+    };
+
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_t = std::sync::Arc::clone(&shutdown);
+
+    let bootstrap = std::thread::Builder::new()
+        .name("ib-dataplane-bootstrap".to_string())
+        .spawn(move || {
+            run_dataplane_bootstrap(
+                node_id,
+                &replicas,
+                isr_config,
+                read_plane,
+                &peers,
+                &status,
+                &proposer,
+                &data_dir,
+                log_config,
+                &shutdown_t,
+            );
+        })
+        .map_err(|e| CliError::Internal(format!("cannot spawn data-plane bootstrap: {e}")))?;
+
+    Ok(DataPlaneServeHandle {
+        shutdown,
+        bootstrap: Some(bootstrap),
+    })
+}
+
+/// The data-plane bootstrap thread body (#717): propose the static placement (if metadata leader),
+/// wait for the committed placement, build the [`DataPlaneServer`], start its [`DataPlaneRuntime`], and
+/// hold it until the broker shuts down. Logs + exits on a fault (never panics the serve).
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+// a thread entry point: each input is a distinct piece the
+// bootstrap needs for the whole thread lifetime; a bundling
+// struct would only move the noise.
+#[allow(clippy::needless_pass_by_value)] // a thread entry point: it OWNS the read-plane Arc (cloned
+                                         // into the leader role) + the log config for its lifetime;
+                                         // a borrow would fight the 'static spawn bound.
+fn run_dataplane_bootstrap(
+    node_id: u64,
+    replicas: &[u64],
+    isr_config: IsrConfig,
+    read_plane: std::sync::Arc<ironbus_storage::read_plane::ReadPlane<StdFs>>,
+    peers: &std::collections::BTreeMap<u64, std::net::SocketAddr>,
+    status: &std::sync::Arc<std::sync::Mutex<ironbus_server::cluster::ClusterStatus>>,
+    proposer: &MetadataProposer,
+    data_dir: &Path,
+    log_config: LogConfig,
+    shutdown: &std::sync::atomic::AtomicBool,
+) {
+    use std::sync::atomic::Ordering;
+
+    let deadline = std::time::Instant::now() + DATAPLANE_BOOTSTRAP_DEADLINE;
+    let mut placement_proposed = false;
+
+    // Wait for the committed placement for the default partition, proposing it once if we are the
+    // metadata leader. A non-leader simply waits for the leader's committed placement to replicate here.
+    let placement: Placement = loop {
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let snapshot = status.lock().map(|s| s.clone()).unwrap_or_default();
+        if let Some(p) = snapshot.placements.get(&DEFAULT_PARTITION) {
+            break p.clone();
+        }
+        // If we are the metadata leader and have not yet proposed, propose the static placement so the
+        // cluster converges on one committed placement. We name ourselves the partition leader (alive +
+        // current). Propose once; the driver applies it only if we are leader and it commits.
+        if snapshot.is_leader && !placement_proposed {
+            let epoch = snapshot.leader_epoch.max(1);
+            let cmd = MetadataCommand::PlacePartition {
+                partition: DEFAULT_PARTITION,
+                replicas: replicas.to_vec(),
+                leader: node_id,
+                epoch,
+            };
+            if proposer.propose(cmd).is_ok() {
+                placement_proposed = true;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            eprintln!(
+                "ironbus: data plane: no committed placement for partition {DEFAULT_PARTITION} within the bootstrap deadline; data plane not started"
+            );
+            return;
+        }
+        sleep_interruptible_cli(DATAPLANE_BOOTSTRAP_POLL, shutdown);
+    };
+
+    // Build the data-plane server from the committed placement: the led partition serves through the
+    // engine read plane (no &Log borrow — Send); a followed partition opens its own on-disk replica log.
+    let replica_logs = DiskReplicaLogs {
+        data_dir: data_dir.to_path_buf(),
+        log_config,
+    };
+    let placements: std::collections::BTreeMap<u64, Placement> =
+        [(DEFAULT_PARTITION, placement)].into_iter().collect();
+    let leader_plane_for = {
+        let rp = std::sync::Arc::clone(&read_plane);
+        move |p: u64| {
+            if p == DEFAULT_PARTITION {
+                Some(std::sync::Arc::clone(&rp))
+            } else {
+                None
+            }
+        }
+    };
+    let server = match DataPlaneServer::from_placements(
+        node_id,
+        &placements,
+        isr_config,
+        leader_plane_for,
+        &replica_logs,
+        |_| ironbus_core::epoch_cache::EpochCache::new(),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ironbus: data plane: cannot build the data-plane server from the committed placement: {e}");
+            return;
+        }
+    };
+
+    // Resolve every peer's DATA-plane address (its metadata address with the fixed port offset) and
+    // bind THIS node's data-plane listener at its own data address.
+    let Some(&self_meta_addr) = peers.get(&node_id) else {
+        eprintln!("ironbus: data plane: this node's own address is missing from the peer map");
+        return;
+    };
+    let self_data_addr = dataplane_addr(self_meta_addr);
+    let peer_data_addrs: std::collections::BTreeMap<u64, std::net::SocketAddr> = peers
+        .iter()
+        .map(|(&id, &addr)| (id, dataplane_addr(addr)))
+        .collect();
+
+    let mut dp_runtime = match DataPlaneRuntime::start(server, self_data_addr, &peer_data_addrs) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("ironbus: data plane: cannot bind the data-plane peer listener; data plane not started: {e}");
+            return;
+        }
+    };
+
+    eprintln!(
+        "ironbus: data plane started on node {node_id} for partition {DEFAULT_PARTITION}: replicating + quorum-gating produces over the cluster"
+    );
+
+    // Hold the runtime until the broker shuts down, then stop it (joins every data-plane peer thread).
+    while !shutdown.load(Ordering::Acquire) {
+        sleep_interruptible_cli(DATAPLANE_BOOTSTRAP_POLL, shutdown);
+    }
+    dp_runtime.stop();
+}
+
+/// Sleep for `dur` but wake early if shutdown is set, in small slices (the CLI-side twin of the
+/// data-plane runtime's own interruptible sleep), so a stop is never delayed by a full sleep.
+#[cfg(unix)]
+fn sleep_interruptible_cli(dur: std::time::Duration, shutdown: &std::sync::atomic::AtomicBool) {
+    use std::sync::atomic::Ordering;
+    let slice = std::time::Duration::from_millis(20);
+    let mut left = dur;
+    while left > std::time::Duration::ZERO && !shutdown.load(Ordering::Acquire) {
+        let this = slice.min(left);
+        std::thread::sleep(this);
+        left = left.checked_sub(this).unwrap_or(std::time::Duration::ZERO);
+    }
+}
+
 /// Runs an ALREADY-OPENED engine as the broker: actor spawn, wire bind, startup logging, the
 /// immutable-config handle + the startup reload self-check, signals, the health server, the accept
 /// loop, and the graceful drain. GENERIC over the engine's `Filesystem` (#443): the `disk` and
@@ -4500,6 +4818,7 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     health_bind: Option<HealthBindDecision>,
     config_warnings: &[String],
     cluster_runtime: Option<ClusterRuntime>,
+    dataplane: Option<DataPlaneServeHandle>,
     auth: Option<std::sync::Arc<ironbus_server::auth::AuthConfig>>,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
@@ -4695,6 +5014,14 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     signal_thread.stop();
     if let Some(h) = health_handle {
         let _ = h.join();
+    }
+    // Stop the DATA plane (#717) FIRST, if one was started: signal its shutdown flag and join the
+    // bootstrap thread (which stops its `DataPlaneRuntime`, joining every data-plane peer thread). It
+    // reads the engine only through the Arc-shared read plane (never the actor), so stopping it before
+    // the actor drain is safe; doing it first quiesces replication before the metadata plane stops.
+    // With no cluster (the single-node default) this is `None` and a no-op.
+    if let Some(mut dp) = dataplane {
+        dp.stop();
     }
     // Stop the metadata-cluster runtime (#684), if one was started: signal its own shutdown flag and
     // JOIN the driver / listener / dialer threads (a deterministic teardown, never a leak), BEFORE
@@ -13829,6 +14156,81 @@ mod tests {
         );
 
         // Tears down cleanly (joins the driver / listener / dialer threads).
+        runtime.stop();
+    }
+
+    /// #717: `spawn_dataplane_serve` constructs + spawns + drives the DATA plane on a clustered disk
+    /// serve — a 1-member cluster proposes the static placement, commits it, and the data-plane bootstrap
+    /// brings up the `DataPlaneServer` (the lone node LEADS the partition, so it builds the leader role
+    /// from the committed placement + the engine read plane). The single-node / NO-cluster path is the
+    /// proven counterpart: `start_cluster_runtime(None, ..)` returns `None`, so `spawn_dataplane_serve`
+    /// is never reached (the disk arm only calls it when `cluster_runtime.is_some()`) — nothing
+    /// constructs, the produce hot path is byte-for-byte today's.
+    #[test]
+    fn spawn_dataplane_serve_brings_up_the_data_plane_on_a_clustered_serve() {
+        use std::net::{Ipv4Addr, TcpListener};
+        use std::time::{Duration, Instant};
+
+        struct RemoveDirOnDrop(std::path::PathBuf);
+        impl Drop for RemoveDirOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let data_dir = std::env::temp_dir().join(format!(
+            "ironbus-cli-717-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let _guard = RemoveDirOnDrop(data_dir.clone());
+
+        let config = ServeConfig::bench_default();
+        // Open the real disk engine (the same constructor the disk serve arm uses).
+        let engine = open_disk_engine(&data_dir, &config, &[], &[]).expect("disk engine");
+
+        // A 1-member cluster: the lone node is the metadata leader, proposes the static placement for
+        // partition 0 over {1}, commits it, and leads it. Grab a free metadata port.
+        let port = {
+            let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let mut peers = std::collections::BTreeMap::new();
+        peers.insert(1u64, SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+        let cfg = ClusterConfig { node_id: 1, peers };
+        let mut runtime = start_cluster_runtime(Some(&cfg), &data_dir, &config)
+            .unwrap()
+            .expect("a configured cluster starts a runtime");
+
+        // Construct + spawn + drive the data plane (the #717 plumbing under test).
+        let mut dp = spawn_dataplane_serve(&engine, &runtime, &data_dir, &config)
+            .expect("data plane spawns");
+
+        // The bootstrap proposes the static placement once this node is the metadata leader; once it
+        // commits + applies, the runtime publishes it. Poll until partition 0 is committed-and-led.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut placed = false;
+        while Instant::now() < deadline {
+            let placements = runtime.placements();
+            if let Some(p) = placements.get(&DEFAULT_PARTITION) {
+                assert_eq!(p.leader, 1, "the lone node leads the committed placement");
+                assert_eq!(
+                    p.replicas,
+                    vec![1],
+                    "the committed replica set is the lone node"
+                );
+                placed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            placed,
+            "the data-plane bootstrap proposed + committed the static placement for partition 0"
+        );
+
+        // Tears down cleanly: stop the data plane (joins its bootstrap + peer threads) then the runtime.
+        dp.stop();
         runtime.stop();
     }
 }

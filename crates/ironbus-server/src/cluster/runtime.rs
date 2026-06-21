@@ -67,7 +67,7 @@ use ironbus_storage::log::LogConfig;
 use raft::eraftpb::Message;
 
 use crate::cluster::metadata_group::{GroupError, MetadataRaftGroup};
-use crate::cluster::state_machine::MetadataCommand;
+use crate::cluster::state_machine::{MetadataCommand, Placement};
 use crate::cluster::transport::{PeerLink, PeerRegistry, PeerWireError};
 
 /// How often the driver advances the raft election/heartbeat timer with one
@@ -92,6 +92,34 @@ const PEER_OUTBOUND_BOUND: usize = 1024;
 /// a down peer is retried at a steady, low rate rather than in a hot reconnect loop.
 const DIALER_RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 
+/// The fixed TCP-port offset the DATA-plane peer listener binds at, RELATIVE to a node's configured
+/// metadata address (#717). One `--cluster-peer <id>=<addr>` entry thus serves BOTH transports: the
+/// metadata Raft listener on `<addr>` and the data-plane (replication-fetch / ISR-report) listener on
+/// `<addr>+offset`. A follower resolves its leader's data-plane address by applying the same offset to
+/// the leader's configured metadata address, so no new config is needed for the data plane.
+///
+/// The offset is small and fixed so it stays inside the same ephemeral / operator-allocated port band;
+/// a `0` configured port (OS-assigned, used only in tests) is left untouched (the data plane binds its
+/// own OS-assigned port and the caller reads it back).
+pub const DATAPLANE_PORT_OFFSET: u16 = 1;
+
+/// The DATA-plane peer listener address for a node's configured metadata `addr` (#717): the same IP
+/// with the port shifted by [`DATAPLANE_PORT_OFFSET`]. A configured port of `0` (OS-assigned) is left
+/// as `0` (the caller binds and reads back the assigned port); a non-zero port is shifted, saturating
+/// at `u16::MAX` so the arithmetic never wraps to a privileged/zero port.
+#[must_use]
+pub fn dataplane_addr(addr: SocketAddr) -> SocketAddr {
+    let port = addr.port();
+    let data_port = if port == 0 {
+        0
+    } else {
+        port.saturating_add(DATAPLANE_PORT_OFFSET)
+    };
+    let mut out = addr;
+    out.set_port(data_port);
+    out
+}
+
 /// A point-in-time snapshot of the local cluster member's metadata-plane state, published by the
 /// driver each cycle so the rest of the broker (and tests / future admin endpoints) can OBSERVE the
 /// running consensus without touching the `RawNode` the driver owns. Read with
@@ -112,6 +140,10 @@ pub struct ClusterStatus {
     /// The applied index of the local metadata state machine (how far the replicated metadata log
     /// has been applied here).
     pub applied_index: u64,
+    /// A snapshot of EVERY committed partition placement (#717), published by the driver each cycle so
+    /// the DATA-plane serve path can derive its per-partition role from the committed metadata without
+    /// touching the `RawNode`. Empty until a placement command commits + applies on this node.
+    pub placements: BTreeMap<u64, Placement>,
 }
 
 /// A command for the driver to propose to the metadata group on behalf of the broker (or a test):
@@ -235,6 +267,12 @@ impl ClusterConfig {
 /// and joins them. Dropping the handle without `stop` still signals shutdown (so a panic on the
 /// serve path never leaks the threads), but `stop` is the deterministic join.
 pub struct ClusterRuntime {
+    /// This node's id within the metadata group (carried so the data-plane serve path can read it
+    /// without re-parsing the config).
+    node_id: u64,
+    /// The full peer-id -> address map (including this node). The data-plane serve path resolves a
+    /// leader's data-plane listener address from this (the metadata address with a fixed port offset).
+    peers: BTreeMap<u64, SocketAddr>,
     /// The shutdown flag the runtime OWNS (separate from the broker's serve-loop flag so a caller
     /// can stop the cluster plane independently; serve flips both on a stop).
     shutdown: Arc<AtomicBool>,
@@ -383,6 +421,8 @@ impl ClusterRuntime {
             .expect("spawn cluster driver thread");
 
         Ok(Self {
+            node_id: config.node_id,
+            peers: config.peers.clone(),
             shutdown,
             status,
             cmd_tx,
@@ -397,6 +437,52 @@ impl ClusterRuntime {
     #[must_use]
     pub fn status(&self) -> ClusterStatus {
         self.status.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    /// A snapshot of EVERY committed partition placement (#717) the driver last published — the input
+    /// the DATA-plane serve path derives its per-partition role from (leader / follower / none). Empty
+    /// until a placement command commits + applies on this node. Reads the shared status snapshot only;
+    /// it never touches the `RawNode` the driver owns.
+    #[must_use]
+    pub fn placements(&self) -> BTreeMap<u64, Placement> {
+        self.status
+            .lock()
+            .map(|s| s.placements.clone())
+            .unwrap_or_default()
+    }
+
+    /// This node's id within the metadata cluster.
+    #[must_use]
+    pub fn node_id(&self) -> u64 {
+        self.node_id
+    }
+
+    /// The shared status snapshot handle (the driver publishes leadership / epoch / committed
+    /// placements into it each cycle). Cloned so the data-plane serve bootstrap (#717) can poll the
+    /// committed placement + leadership on its OWN thread without borrowing the runtime — it never
+    /// touches the `RawNode` the driver owns.
+    #[must_use]
+    pub fn status_handle(&self) -> Arc<Mutex<ClusterStatus>> {
+        Arc::clone(&self.status)
+    }
+
+    /// A cloneable handle to propose a metadata command to the driver (e.g. the data-plane bootstrap
+    /// proposing the static partition placement once this node is the metadata leader). The driver owns
+    /// the `RawNode`, so a write is sent over the channel and proposed on the next cycle; it takes
+    /// effect only if this node is the leader and the entry commits + applies across a quorum.
+    #[must_use]
+    pub fn metadata_proposer(&self) -> MetadataProposer {
+        MetadataProposer {
+            cmd_tx: self.cmd_tx.clone(),
+        }
+    }
+
+    /// The peer-id -> address map of the whole metadata group (including this node). The data-plane
+    /// serve path (#717) resolves a follower's leader address from this to dial the data-plane peer
+    /// listener (which binds an offset port — see [`dataplane_addr`]).
+    #[must_use]
+    pub fn peers(&self) -> BTreeMap<u64, SocketAddr> {
+        self.peers.clone()
     }
 
     /// Ask the driver to propose a metadata command on the next cycle (the driver owns the group, so
@@ -435,6 +521,28 @@ impl Drop for ClusterRuntime {
         // Best-effort: a caller that forgets `stop` (or a panic on the serve path) still signals the
         // threads to wind down rather than leaking them. The deterministic join is `stop`.
         self.shutdown.store(true, Ordering::Release);
+    }
+}
+
+/// A cloneable handle for proposing a metadata command to a running [`ClusterRuntime`]'s driver, from
+/// another thread (the data-plane serve bootstrap, #717). It carries only the driver command channel,
+/// so it is `Send` and outlives a borrow of the runtime. A proposal takes effect only if this node is
+/// the metadata leader and the resulting entry commits + applies across a quorum.
+#[derive(Clone)]
+pub struct MetadataProposer {
+    cmd_tx: Sender<DriverCmd>,
+}
+
+impl MetadataProposer {
+    /// Propose a metadata command on the next driver cycle. Returns an error only if the driver has
+    /// already stopped (the runtime is tearing down).
+    ///
+    /// # Errors
+    /// [`RuntimeError::Config`] if the driver channel is closed.
+    pub fn propose(&self, cmd: MetadataCommand) -> Result<(), RuntimeError> {
+        self.cmd_tx
+            .send(DriverCmd::Propose(cmd))
+            .map_err(|_| RuntimeError::Config("cluster driver has stopped".to_string()))
     }
 }
 
@@ -536,13 +644,21 @@ fn run_driver<F, C>(
             }
         }
 
-        // Publish the latest status snapshot for observers (status() / future admin endpoints).
+        // Publish the latest status snapshot for observers (status() / future admin endpoints). The
+        // committed placements are published too, so the data-plane serve path (#717) reads its
+        // per-partition role from the committed metadata via `placements()` without ever touching the
+        // `RawNode` the driver owns. The snapshot is only re-cloned when the applied index advances, so
+        // a steady cluster does not re-clone the (small) placement map every tick.
         if let Ok(mut s) = status.lock() {
             s.node_id = node_id;
             s.is_leader = group.is_leader();
             s.leader_epoch = group.leader_epoch().get();
             s.voter_count = conf_voter_count;
-            s.applied_index = group.state().applied_index();
+            let applied = group.state().applied_index();
+            if applied != s.applied_index {
+                s.placements = group.state().placements();
+            }
+            s.applied_index = applied;
         }
     }
 }
