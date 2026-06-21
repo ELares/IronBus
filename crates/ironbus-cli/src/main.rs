@@ -10197,6 +10197,36 @@ mod tests {
         parts.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// Scale a GENEROUS base wait by the observed host slowdown (#618): a local copy of the cluster
+    /// tests' `host_scaled` (max-of-3-probes + a 24x cap), so a real-socket integration test's timing
+    /// waits stay truthful and flake-free on a contended host WITHOUT weakening what they prove. On an
+    /// unloaded host the factor is ~1 and the wait stays the base (the test exits the instant its
+    /// predicate holds).
+    #[cfg(unix)]
+    fn host_scaled(base: std::time::Duration) -> std::time::Duration {
+        fn probe_busy_nanos() -> u128 {
+            const ITERS: u64 = 2_000_000;
+            let start = std::time::Instant::now();
+            let mut acc: u64 = 0x9E37_79B9_7F4A_7C15;
+            for i in 0..ITERS {
+                acc = acc
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(i | 1);
+                acc ^= acc >> 29;
+            }
+            std::hint::black_box(acc);
+            start.elapsed().as_nanos().max(1)
+        }
+        const REFERENCE_BUSY_NANOS: u128 = 4_000_000;
+        const MAX_SCALE: u32 = 24;
+        let mut samples = [probe_busy_nanos(), probe_busy_nanos(), probe_busy_nanos()];
+        samples.sort_unstable();
+        let observed = samples[2];
+        let factor = (observed / REFERENCE_BUSY_NANOS).clamp(1, u128::from(MAX_SCALE));
+        let factor = u32::try_from(factor).unwrap_or(MAX_SCALE);
+        base * factor
+    }
+
     // ---- #382 TOML config-FILE layer + flag > env > FILE > default precedence ----
 
     /// Parses `serve` flags with an injected env map AND an injected config-file reader, so the
@@ -17228,26 +17258,43 @@ mod tests {
         // `<data_dir>/leaf-hub/<hex(stream)>/`, opened by the spawn fn — never the client log).
         let engine = open_disk_engine(&hub_dir, &config, &[], &[]).expect("hub disk engine");
 
-        // A free client-wire port; the cross-cluster serve binds at port + 2.
-        let client_port = {
-            let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            l.local_addr().unwrap().port()
-        };
-        let broker_addr = format!("127.0.0.1:{client_port}");
-        let serve_port = client_port + CROSS_CLUSTER_SERVE_PORT_OFFSET;
-
         // ENABLE the leaf hub via the flag's parsed value (no federation served stream — a PURE leaf hub).
+        // The serve listener binds at the DERIVED port `client_port + 2`. Picking an ephemeral client port
+        // and deriving + 2 races another parallel test that could grab the derived port between our probe
+        // and the serve bind; retry with a fresh client port until the bind succeeds (a transient
+        // resource race, never a logic failure — distinguished from a Usage error, which is fatal here).
         let receive_stream = "hub-inbox";
-        let mut serve = spawn_cross_cluster_serve_if_configured(
-            &engine,
-            &FederationConfig::default(),
-            Some(receive_stream),
-            &hub_dir,
-            &config,
-            &broker_addr,
-        )
-        .expect("serve spawns")
-        .expect("--leaf-hub-serve binds the listener");
+        let (mut serve, serve_port) = {
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                assert!(
+                    attempt < 50,
+                    "could not find a free derived serve port to bind"
+                );
+                let client_port = {
+                    let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                    l.local_addr().unwrap().port()
+                };
+                let broker_addr = format!("127.0.0.1:{client_port}");
+                let serve_port = client_port + CROSS_CLUSTER_SERVE_PORT_OFFSET;
+                match spawn_cross_cluster_serve_if_configured(
+                    &engine,
+                    &FederationConfig::default(),
+                    Some(receive_stream),
+                    &hub_dir,
+                    &config,
+                    &broker_addr,
+                ) {
+                    Ok(Some(runtime)) => break (runtime, serve_port),
+                    // A bind race (the derived port was taken between probe and bind): the loop retries a
+                    // fresh client port on the next pass.
+                    Err(CliError::Internal(_)) => {}
+                    Ok(None) => panic!("--leaf-hub-serve must bind a listener"),
+                    Err(e) => panic!("unexpected serve-spawn error: {e:?}"),
+                }
+            }
+        };
 
         // Seed a real on-disk LEAF log with records to push up (a separate stream the leaf forwards). A
         // SMALL segment cap so the records roll to sealed segments — the LeafForwarder only forwards the
@@ -17306,16 +17353,22 @@ mod tests {
         let key = format!("{serve_addr}/{receive_stream}");
         let mut cursor =
             LeafPushCursor::open(&StdFs::new(cursor_dir.clone())).expect("push cursor");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // Scale a GENEROUS base wait by the observed host slowdown (#618) so the connect-then-push retry
+        // loop stays flake-free on a contended host WITHOUT weakening what it proves (it exits the instant
+        // the whole sealed prefix is acked). The same `host_scaled` discipline the serve_accept tests use.
+        let deadline = Instant::now() + host_scaled(Duration::from_secs(20));
+        // A GENEROUS, host-scaled per-read timeout so a slow hub reply under heavy parallel-test
+        // contention does NOT break the connection mid-push (the hub's accept loop polls every 100ms and
+        // the hub append + fsync can lag under CPU starvation); the connection stays productive across the
+        // whole multi-round push instead of churning reconnects.
+        let read_timeout = host_scaled(Duration::from_secs(2));
         let mut pushed_all = false;
         while Instant::now() < deadline {
             let Ok(stream) = TcpStream::connect(serve_addr) else {
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
             };
-            stream
-                .set_read_timeout(Some(Duration::from_millis(200)))
-                .unwrap();
+            stream.set_read_timeout(Some(read_timeout)).unwrap();
             let mut link = LeafLink::new(stream);
             loop {
                 let plane = leaf_log.read_plane().unwrap();
