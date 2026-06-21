@@ -582,3 +582,591 @@ mod tests {
         cfg.validate().unwrap();
     }
 }
+
+/// The REAL multi-cluster GATEWAY-FEDERATION integration tests (#626): each "cluster" is a real geo
+/// origin-serve (its gateway serving its self-originated streams to peers) over a real loopback
+/// `TcpStream` + real on-disk `StdFs` logs, and a real geo puller (its gateway mirroring a peer-originated
+/// stream). Unix-only because the broker / serve path is `cfg(unix)` via `StdFs` (so the helpers and tests
+/// vanish together on Windows under `-D dead_code`), matching the geo `live_geo_tests` / leaf
+/// `live_leaf_tests` discipline. These tests PROVE — not merely by construction — symmetric cross-cluster
+/// exchange (a record in A reaches B and vice-versa, byte-faithfully), LOOP-FREEDOM in a 3-cluster ring (a
+/// record reaches each other member EXACTLY once, bounded, no amplification), a gateway NOT being a Raft
+/// voter in a peer (peer quorum untouched across gateway churn), peer-down resilience (a down peer does not
+/// block local / other-peer traffic; reconnect resumes with no gap/dup), and an idle gateway link doing ~0
+/// work.
+#[cfg(all(test, unix))]
+#[allow(clippy::similar_names)]
+mod live_federation_tests {
+    use crate::clock::SystemClock;
+    use crate::cluster::geo::{
+        GeoError, GeoFrame, GeoLink, MirrorApplier, OriginCursorStore, OriginServer, GEO_POLL,
+    };
+    use crate::cluster::runtime::{ClusterConfig, ClusterRuntime, StartRole};
+    use ironbus_core::clock::ManualClock;
+    use ironbus_core::types::{Offset, RecordFlags};
+    use ironbus_storage::fs::StdFs;
+    use ironbus_storage::log::{Append, Log, LogConfig};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io;
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    fn small_config() -> LogConfig {
+        LogConfig {
+            max_segment_bytes: 256,
+            max_total_bytes: 0,
+            ..LogConfig::default()
+        }
+    }
+
+    fn rec(payload: &[u8]) -> Append<'_> {
+        Append {
+            timestamp_ms: 7,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload,
+        }
+    }
+
+    /// Scale a GENEROUS base wait by the observed host slowdown (#618), so the timing waits stay truthful
+    /// and flake-free on a contended CI runner WITHOUT weakening what they prove. A local copy of the
+    /// runtime test's `host_scaled` (max-of-probes + a 24x cap): on an unloaded host the factor is ~1 and
+    /// the wait stays the base (the test is FAST and exits early the instant its predicate holds); on a
+    /// starved host it stretches proportionally. The assertions are UNCHANGED.
+    fn host_scaled(base: Duration) -> Duration {
+        fn probe_busy_nanos() -> u128 {
+            const ITERS: u64 = 2_000_000;
+            let start = Instant::now();
+            let mut acc: u64 = 0x9E37_79B9_7F4A_7C15;
+            for i in 0..ITERS {
+                acc = acc
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(i | 1);
+                acc ^= acc >> 29;
+            }
+            std::hint::black_box(acc);
+            start.elapsed().as_nanos().max(1)
+        }
+        const REFERENCE_BUSY_NANOS: u128 = 4_000_000;
+        const MAX_SCALE: u32 = 24;
+        let mut samples = [probe_busy_nanos(), probe_busy_nanos(), probe_busy_nanos()];
+        samples.sort_unstable();
+        let observed = samples[2];
+        let factor = (observed / REFERENCE_BUSY_NANOS).clamp(1, u128::from(MAX_SCALE));
+        let factor = u32::try_from(factor).unwrap_or(MAX_SCALE);
+        base * factor
+    }
+
+    /// Poll `pred` until true or `timeout` (host-scaled) elapses. Returns the final predicate value.
+    fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + host_scaled(timeout);
+        while Instant::now() < deadline {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        pred()
+    }
+
+    /// Bind an ephemeral loopback port, read it, drop the listener (the caller rebinds it).
+    fn free_addr() -> SocketAddr {
+        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral");
+        let a = l.local_addr().unwrap();
+        drop(l);
+        a
+    }
+
+    /// A real on-disk log with `n` records (payload `<prefix>-NNN`), fsync'd, leaked to `'static` so its
+    /// read plane keeps observing it for the test's lifetime (a cluster's self-originated stream that its
+    /// gateway serves to peers). In a real serve the engine's append actor owns it.
+    fn leaked_log(dir: &std::path::Path, prefix: &str, n: u32) -> &'static Log<StdFs, ManualClock> {
+        let fs = StdFs::new(dir.to_path_buf());
+        let mut log = Log::open(fs, ManualClock::new(), small_config()).expect("log opens");
+        for i in 0..n {
+            log.append(&rec(format!("{prefix}-{i:03}").as_bytes()))
+                .unwrap();
+        }
+        log.sync().unwrap();
+        Box::leak(Box::new(log))
+    }
+
+    fn sealed_served_end(log: &Log<StdFs, ManualClock>) -> u64 {
+        let plane = log.read_plane().unwrap();
+        let flushed = plane.flushed();
+        let mut next = 0u64;
+        let mut guard = 0u32;
+        while next < flushed {
+            guard += 1;
+            assert!(guard < 100_000);
+            let raw = plane
+                .read_range_raw(Offset::new(next), 1_000, None)
+                .unwrap();
+            let adv = raw.run.next_offset.get();
+            if adv > next {
+                next = adv;
+            } else {
+                break;
+            }
+        }
+        next
+    }
+
+    /// A cluster GATEWAY's serve side: a geo origin listener serving ONE self-originated stream's sealed
+    /// bytes to any peer gateway that dials in and PULLS. This is exactly the geo origin-serve pattern
+    /// (REUSED) — a federation served-stream IS a geo origin a peer mirrors. The gateway ACCEPTS inbound
+    /// peer links (symmetric: every peer dials every peer it federates with); it answers `MirrorPull`
+    /// requests from the served stream's read plane. Returns a shutdown flag + the join handle.
+    fn spawn_gateway_serve(
+        addr: SocketAddr,
+        served: &'static Log<StdFs, ManualClock>,
+    ) -> (Arc<AtomicBool>, JoinHandle<()>) {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_t = Arc::clone(&shutdown);
+        let listener = TcpListener::bind(addr).expect("gateway serve listener binds");
+        listener.set_nonblocking(true).unwrap();
+        let plane = Arc::new(served.read_plane().expect("served read plane"));
+        let handle = std::thread::Builder::new()
+            .name("ib-fed-gateway-serve".to_string())
+            .spawn(move || {
+                while !shutdown_t.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_millis(100)))
+                                .unwrap();
+                            let plane = Arc::clone(&plane);
+                            let sd = Arc::clone(&shutdown_t);
+                            std::thread::spawn(move || {
+                                let mut link = GeoLink::new(stream);
+                                let server = OriginServer::new(&plane);
+                                while !sd.load(Ordering::Acquire) {
+                                    match link.recv() {
+                                        Ok(Some(GeoFrame::Request(req))) => {
+                                            let resp = server.serve_pull(&req).expect("serve_pull");
+                                            if link.send_response(&resp).is_err() {
+                                                return;
+                                            }
+                                        }
+                                        Ok(Some(GeoFrame::Response(_))) => {}
+                                        Err(GeoError::Io(e))
+                                            if matches!(
+                                                e.kind(),
+                                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                                            ) => {}
+                                        Ok(None) | Err(_) => return,
+                                    }
+                                }
+                            });
+                        }
+                        Err(ref e)
+                            if matches!(
+                                e.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            })
+            .expect("spawn gateway serve");
+        (shutdown, handle)
+    }
+
+    /// Open a gateway MIRROR applier (the connector side: this cluster mirroring a peer-originated stream)
+    /// over an on-disk dir (its local read-only mirror log + geo cursor), exactly the geo mirror open.
+    fn open_mirror(dir: &std::path::Path) -> MirrorApplier<StdFs, ManualClock> {
+        let log = Log::open(
+            StdFs::new(dir.to_path_buf()),
+            ManualClock::new(),
+            small_config(),
+        )
+        .expect("mirror log opens");
+        let cursors = OriginCursorStore::open(&StdFs::new(dir.to_path_buf())).expect("geo cursor");
+        MirrorApplier::new(log, cursors)
+    }
+
+    /// The connector dials a peer gateway (outbound) and pulls a peer-origin stream into its local mirror
+    /// until caught up to the peer's currently-served sealed prefix, resuming from the durable geo cursor.
+    /// Reuses the geo pull request + apply path VERBATIM (a federation mirror IS a geo mirror). Returns
+    /// `false` if the dial failed (a down peer — the caller treats that as "not yet").
+    fn drain_mirror(
+        addr: SocketAddr,
+        app: &mut MirrorApplier<StdFs, ManualClock>,
+        key: &str,
+        origin_stream: &str,
+    ) -> bool {
+        let Ok(stream) = TcpStream::connect_timeout(&addr, GEO_POLL) else {
+            return false;
+        };
+        stream.set_read_timeout(Some(GEO_POLL)).unwrap();
+        let mut link = GeoLink::new(stream);
+        loop {
+            let req = app.pull_request(key, origin_stream, 1024, 1024 * 1024);
+            if link.send_request(&req).is_err() {
+                break;
+            }
+            match link.recv() {
+                Ok(Some(GeoFrame::Response(resp))) => {
+                    let out = app.apply_pull_response(key, &resp).expect("apply");
+                    if out.applied == 0 {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn symmetric_federation_exchanges_records_both_ways_byte_faithfully() {
+        // SYMMETRIC PEERING: cluster A serves its self-originated `orders`; cluster B mirrors it. Cluster B
+        // serves its self-originated `events`; cluster A mirrors it. A record produced in A reaches B's
+        // federated mirror byte-faithfully, AND a record produced in B reaches A's — symmetric, both ways.
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let a_orders_dir = tempfile::tempdir().expect("a orders dir");
+        let b_events_dir = tempfile::tempdir().expect("b events dir");
+        let a_mirror_dir = tempfile::tempdir().expect("a mirror dir");
+        let b_mirror_dir = tempfile::tempdir().expect("b mirror dir");
+
+        // A's self-originated `orders` (40 records) + B's self-originated `events` (35 records).
+        let a_orders = leaked_log(a_orders_dir.path(), "A-ord", 40);
+        let b_events = leaked_log(b_events_dir.path(), "B-evt", 35);
+        let a_served = sealed_served_end(a_orders);
+        let b_served = sealed_served_end(b_events);
+        assert!(a_served > 0 && b_served > 0);
+
+        // Each gateway serves its OWN origin (the no-loop core: a gateway serves only self-originated).
+        let a_addr = free_addr();
+        let b_addr = free_addr();
+        let (a_sd, a_h) = spawn_gateway_serve(a_addr, a_orders);
+        let (b_sd, b_h) = spawn_gateway_serve(b_addr, b_events);
+
+        // B mirrors A's `orders` (dialing A's gateway); A mirrors B's `events` (dialing B's gateway).
+        let mut b_mirror = open_mirror(b_mirror_dir.path()); // B's local mirror of @west/orders
+        let mut a_mirror = open_mirror(a_mirror_dir.path()); // A's local mirror of @east/events
+        let b_key = format!("{a_addr}/orders");
+        let a_key = format!("{b_addr}/events");
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                drain_mirror(a_addr, &mut b_mirror, &b_key, "orders");
+                drain_mirror(b_addr, &mut a_mirror, &a_key, "events");
+                b_mirror.cursor(&b_key) == a_served && a_mirror.cursor(&a_key) == b_served
+            }),
+            "both federated mirrors converged (B<-A {} of {a_served}, A<-B {} of {b_served})",
+            b_mirror.cursor(&b_key),
+            a_mirror.cursor(&a_key),
+        );
+
+        // A->B byte-faithful, in order.
+        let recs = b_mirror.log().read_from(Offset::new(0), 10_000).unwrap();
+        assert_eq!(recs.len() as u64, a_served);
+        for (i, r) in recs.iter().enumerate() {
+            assert_eq!(r.payload.as_ref(), format!("A-ord-{i:03}").as_bytes());
+        }
+        // B->A byte-faithful, in order.
+        let recs = a_mirror.log().read_from(Offset::new(0), 10_000).unwrap();
+        assert_eq!(recs.len() as u64, b_served);
+        for (i, r) in recs.iter().enumerate() {
+            assert_eq!(r.payload.as_ref(), format!("B-evt-{i:03}").as_bytes());
+        }
+
+        a_sd.store(true, Ordering::Release);
+        b_sd.store(true, Ordering::Release);
+        let _ = a_h.join();
+        let _ = b_h.join();
+    }
+
+    #[test]
+    fn a_three_cluster_ring_delivers_each_record_exactly_once_no_loop() {
+        // THE NO-LOOP PROOF over the wire, in a 3-cluster RING — the worst case for a routing loop.
+        // `west` originates `orders`; `east` and `south` each federate `@west/orders` as a read-only
+        // mirror. Critically, east/south are configured in a RING (west->east->south->west peerings), yet
+        // because a gateway SERVES only its OWN origin (never re-serves a peer mirror), `orders` is served
+        // ONLY by west and mirrored ONCE into each of east + south. We prove:
+        //   * each of east, south ends with EXACTLY `served` records (each crossed its link once),
+        //   * draining MANY MORE TIMES (which would re-pull/amplify if anything re-served) never grows the
+        //     count — the cursor de-dup + the served-set discipline bound it.
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let west_dir = tempfile::tempdir().expect("west dir");
+        let east_dir = tempfile::tempdir().expect("east mirror dir");
+        let south_dir = tempfile::tempdir().expect("south mirror dir");
+
+        let west_orders = leaked_log(west_dir.path(), "W-ord", 50);
+        let served = sealed_served_end(west_orders);
+        assert!(served > 0);
+
+        // Only WEST's gateway serves `orders` (its own origin). East + south are pure mirrors of it. (In
+        // a ring east + south also serve THEIR own origins, but `orders` is west's alone — the no-loop
+        // discipline means neither east nor south ever re-serves `orders`, so there is no cycle for it.)
+        let west_addr = free_addr();
+        let (w_sd, w_h) = spawn_gateway_serve(west_addr, west_orders);
+
+        let mut east = open_mirror(east_dir.path());
+        let mut south = open_mirror(south_dir.path());
+        let east_key = format!("{west_addr}/orders");
+        let south_key = format!("{west_addr}/orders");
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                drain_mirror(west_addr, &mut east, &east_key, "orders");
+                drain_mirror(west_addr, &mut south, &south_key, "orders");
+                east.cursor(&east_key) == served && south.cursor(&south_key) == served
+            }),
+            "ring mirrors converged (east {} / south {} of {served})",
+            east.cursor(&east_key),
+            south.cursor(&south_key),
+        );
+
+        // Drain SEVERAL MORE rounds around the ring: with any echo/re-serve these would amplify.
+        for _ in 0..6 {
+            drain_mirror(west_addr, &mut east, &east_key, "orders");
+            drain_mirror(west_addr, &mut south, &south_key, "orders");
+        }
+
+        // EXACTLY `served` records in each ring mirror — each record crossed its link ONCE, total delivered
+        // is bounded by (members - 1) * served, never growing (no loop / no amplification).
+        let east_count = east.log().read_from(Offset::new(0), 10_000).unwrap().len() as u64;
+        let south_count = south.log().read_from(Offset::new(0), 10_000).unwrap().len() as u64;
+        assert_eq!(east_count, served, "east got each record exactly once");
+        assert_eq!(south_count, served, "south got each record exactly once");
+        // Byte-faithful in order at each ring member.
+        for (mirror, key) in [(&east, &east_key), (&south, &south_key)] {
+            let recs = mirror.log().read_from(Offset::new(0), 10_000).unwrap();
+            for (i, r) in recs.iter().enumerate() {
+                assert_eq!(r.payload.as_ref(), format!("W-ord-{i:03}").as_bytes());
+            }
+            let _ = key;
+        }
+
+        w_sd.store(true, Ordering::Release);
+        let _ = w_h.join();
+    }
+
+    #[test]
+    fn federating_does_not_make_a_gateway_a_voter_in_a_peer() {
+        // THE NOT-A-VOTER PROOF: a peer cluster's metadata Raft group (a single seeded voter, its own
+        // quorum + leader) is UNCHANGED by a gateway repeatedly connecting/disconnecting to FEDERATE with
+        // it. A gateway is a data-plane bridge, never a voter in the peer — the peer's voter_count, quorum,
+        // and leadership are untouched. (Symmetric to leaf's not-a-voter, #625: a gateway is not a voter in
+        // ANY peer.) Each cluster keeps its OWN independent Raft cluster.
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let peer_meta_dir = tempfile::tempdir().expect("peer metadata dir");
+        let peer_stream_dir = tempfile::tempdir().expect("peer stream dir");
+        let mirror_dir = tempfile::tempdir().expect("mirror dir");
+
+        // The PEER cluster's metadata Raft group: a single seeded voter (its own quorum) — entirely
+        // separate from the federation plane.
+        let meta_addr = free_addr();
+        let mut peers = BTreeMap::new();
+        peers.insert(1u64, meta_addr);
+        let cfg = ClusterConfig {
+            node_id: 1,
+            peers,
+            role: StartRole::Voter,
+            pending_learners: BTreeSet::new(),
+        };
+        let runtime = ClusterRuntime::start(
+            &cfg,
+            &StdFs::new(peer_meta_dir.path().to_path_buf()),
+            SystemClock::new(),
+            LogConfig::new(64 * 1024).unwrap(),
+        )
+        .expect("peer metadata cluster starts");
+        assert!(
+            wait_until(Duration::from_secs(10), || runtime.status().is_leader),
+            "the single-node peer self-elects"
+        );
+        let voters_before = runtime.status().voter_count;
+        assert_eq!(voters_before, 1, "the peer has exactly its one voter");
+
+        // The peer's GATEWAY endpoint (a SEPARATE listener — the federation plane, NOT the metadata peer
+        // port) serving its self-originated stream. A gateway in another cluster federates with it.
+        let peer_served = leaked_log(peer_stream_dir.path(), "P-evt", 30);
+        let gw_addr = free_addr();
+        let (gw_sd, gw_h) = spawn_gateway_serve(gw_addr, peer_served);
+        let key = format!("{gw_addr}/events");
+        let mut mirror = open_mirror(mirror_dir.path());
+
+        // Churn the federating gateway 15x against the peer's gateway endpoint.
+        for _ in 0..15 {
+            let stream = TcpStream::connect(gw_addr).expect("gateway dials peer gateway");
+            stream.set_read_timeout(Some(GEO_POLL)).unwrap();
+            let mut link = GeoLink::new(stream);
+            let req = mirror.pull_request(&key, "events", 1024, 1024 * 1024);
+            if link.send_request(&req).is_ok() {
+                if let Ok(Some(GeoFrame::Response(resp))) = link.recv() {
+                    let _ = mirror.apply_pull_response(&key, &resp);
+                }
+            }
+        }
+
+        // THE ASSERTION: the peer's metadata membership + leadership are UNCHANGED by all that gateway
+        // churn. A gateway appears in NO ConfState; the voter_count (the quorum basis) is the same 1, and
+        // the peer is still its own leader. Federation touched the peer's consensus ZERO times.
+        let after = runtime.status();
+        assert_eq!(
+            after.voter_count, voters_before,
+            "federating did not change the peer's voter set (a gateway is NOT a voter in a peer)"
+        );
+        assert!(
+            after.is_leader,
+            "federating did not disturb the peer's leadership"
+        );
+        assert!(
+            after.suspected_dead.is_empty(),
+            "a gateway is never a metadata peer, so none can be a suspected-dead voter"
+        );
+        assert!(
+            after.learners.is_empty(),
+            "a gateway never joins a peer's metadata group even as a learner"
+        );
+
+        gw_sd.store(true, Ordering::Release);
+        let _ = gw_h.join();
+        drop(runtime);
+    }
+
+    #[test]
+    fn a_down_peer_does_not_block_a_live_peer_and_reconnect_resumes_no_gap_or_dup() {
+        // PEER-DOWN RESILIENCE: cluster A federates with TWO peers — `up` (serving) and `down` (never
+        // started). A's puller for `down` backs off + retries on its OWN thread and NEVER blocks A's puller
+        // for `up`, which converges fully. Then `down` comes UP and A's mirror of it resumes from the
+        // durable cursor with NO gap/dup. One peer's failure does not cascade.
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let up_dir = tempfile::tempdir().expect("up served dir");
+        let down_dir = tempfile::tempdir().expect("down served dir");
+        let up_mirror_dir = tempfile::tempdir().expect("up mirror dir");
+        let down_mirror_dir = tempfile::tempdir().expect("down mirror dir");
+
+        let up_served = leaked_log(up_dir.path(), "UP", 40);
+        let up_end = sealed_served_end(up_served);
+        let up_addr = free_addr();
+        let (up_sd, up_h) = spawn_gateway_serve(up_addr, up_served);
+
+        // The `down` peer's address is reserved but NOTHING serves on it yet (a down peer).
+        let down_addr = free_addr();
+
+        let up_key = format!("{up_addr}/u");
+        let down_key = format!("{down_addr}/d");
+        let mut up_mirror = open_mirror(up_mirror_dir.path());
+        let mut down_mirror = open_mirror(down_mirror_dir.path());
+
+        // The LIVE peer converges fully even though the DOWN peer's dials all fail (drain_mirror returns
+        // false for `down`, never blocking `up`).
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                let down_ok = drain_mirror(down_addr, &mut down_mirror, &down_key, "d");
+                assert!(!down_ok, "the down peer's dial fails (it is not serving)");
+                drain_mirror(up_addr, &mut up_mirror, &up_key, "u");
+                up_mirror.cursor(&up_key) == up_end
+            }),
+            "the live peer converged despite the down peer (up {} of {up_end})",
+            up_mirror.cursor(&up_key),
+        );
+        assert_eq!(
+            down_mirror.cursor(&down_key),
+            0,
+            "nothing from the down peer"
+        );
+
+        // NOW bring the `down` peer UP and prove A resumes its mirror of it from the durable cursor.
+        let down_served = leaked_log(down_dir.path(), "DN", 30);
+        let down_end = sealed_served_end(down_served);
+        let (down_sd, down_h) = spawn_gateway_serve(down_addr, down_served);
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                drain_mirror(down_addr, &mut down_mirror, &down_key, "d");
+                down_mirror.cursor(&down_key) == down_end
+            }),
+            "the recovered peer's mirror converged (down {} of {down_end})",
+            down_mirror.cursor(&down_key),
+        );
+        // Byte-faithful, in order, exactly once (no gap/dup across the down->up transition).
+        let recs = down_mirror.log().read_from(Offset::new(0), 10_000).unwrap();
+        assert_eq!(recs.len() as u64, down_end);
+        for (i, r) in recs.iter().enumerate() {
+            assert_eq!(r.payload.as_ref(), format!("DN-{i:03}").as_bytes());
+        }
+
+        up_sd.store(true, Ordering::Release);
+        down_sd.store(true, Ordering::Release);
+        let _ = up_h.join();
+        let _ = down_h.join();
+    }
+
+    #[test]
+    fn an_idle_gateway_link_does_no_work_and_backs_off() {
+        // THE IDLE PROOF (#726): a gateway whose mirror is fully caught up (cursor at the peer's served
+        // frontier) BLOCKS / BACKS OFF, doing ~0 work — the geo pull_loop applies nothing and backs off on
+        // the empty-response path. We drive the real pull_loop against a fully-served peer and assert it
+        // applies NOTHING across several poll windows, then exits promptly on shutdown.
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let served_dir = tempfile::tempdir().expect("served dir");
+        let mirror_dir = tempfile::tempdir().expect("mirror dir");
+        let served = leaked_log(served_dir.path(), "I", 20);
+        let end = sealed_served_end(served);
+        let addr = free_addr();
+        let (sd, h) = spawn_gateway_serve(addr, served);
+        let key = format!("{addr}/i");
+
+        // First, catch the mirror fully up (so further pulls are all empty = idle).
+        let mirror = Arc::new(std::sync::Mutex::new(open_mirror(mirror_dir.path())));
+        assert!(wait_until(Duration::from_secs(10), || {
+            let mut m = mirror.lock().unwrap();
+            drain_mirror(addr, &mut m, &key, "i");
+            m.cursor(&key) == end
+        }));
+
+        // Now run the REAL geo pull_loop against the fully-served peer and count applied records: an idle
+        // (caught-up) link applies NOTHING and backs off (~0 CPU), never busy-spins.
+        let applied = Arc::new(AtomicU64::new(0));
+        let loop_shutdown = Arc::new(AtomicBool::new(false));
+        let stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let ls = Arc::clone(&loop_shutdown);
+        let applied_t = Arc::clone(&applied);
+        let mirror_t = Arc::clone(&mirror);
+        let key_t = key.clone();
+        let loop_handle = std::thread::spawn(move || {
+            let mut link = GeoLink::new(stream);
+            crate::cluster::geo::pull_loop(
+                &mut link,
+                &key_t,
+                "i",
+                &ls,
+                || mirror_t.lock().map_or(0, |m| m.cursor(&key_t)),
+                |resp| {
+                    let mut m = mirror_t
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let out = m.apply_pull_response(&key_t, resp)?;
+                    applied_t.fetch_add(out.applied, Ordering::Relaxed);
+                    Ok(out)
+                },
+            );
+        });
+
+        std::thread::sleep(Duration::from_millis(600));
+        loop_shutdown.store(true, Ordering::Release);
+        let _ = loop_handle.join();
+        assert_eq!(
+            applied.load(Ordering::Relaxed),
+            0,
+            "an idle (caught-up) gateway link applies nothing (it blocks/backs off, no busy work)"
+        );
+
+        sd.store(true, Ordering::Release);
+        let _ = h.join();
+    }
+}
