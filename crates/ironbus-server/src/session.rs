@@ -400,6 +400,12 @@ pub struct Session {
     /// is always `None`, so an mTLS-mechanism connect fails closed (no verified cert) until TLS lands —
     /// the safe behavior, never a default-scope grant.
     peer_san: Option<String>,
+    /// The shared connection-signal ("connz") metric (#572), if the server wired one in. `None` for a
+    /// session that does not report connz (every test, and a `serve` overload built with the legacy
+    /// un-scraped metric). When `Some(_)`, the session records the AUTHED-FLIP (a successful `Connect`
+    /// handshake) on it; accept/close/refuse are recorded by the accept loop / slot guard, not here. A
+    /// cheap `Arc`-clone reference, never per-connection deep state.
+    connz: Option<std::sync::Arc<crate::connz::ConnectionMetrics>>,
 }
 
 impl Session {
@@ -440,6 +446,16 @@ impl Session {
             peer_san,
             ..Session::default()
         }
+    }
+
+    /// Attaches the shared connz metric (#572) to this session so a successful `Connect` handshake
+    /// records the AUTHED-FLIP on it. A builder-style setter (rather than a new constructor) so every
+    /// existing `Session::new` / `with_member_id` / `with_member_id_and_auth` call site is unchanged
+    /// and only the server's live accept path opts in. Takes a cheap `Arc` clone.
+    #[must_use]
+    pub fn with_connz(mut self, connz: std::sync::Arc<crate::connz::ConnectionMetrics>) -> Session {
+        self.connz = Some(connz);
+        self
     }
 
     /// The work-group this connection is subscribed to (`""` is the default group). Used to
@@ -826,6 +842,13 @@ impl Session {
                 self.scopes = scopes;
             }
             self.authenticated = true;
+            // Record the AUTHED-FLIP on the shared connz metric (#572): a `Connect` handshake that
+            // successfully resolved a credential. Recorded ONLY on the auth-required path (a no-auth
+            // broker authenticates nothing, so its authenticated total is honestly 0), off the engine
+            // lock, a single relaxed atomic. `None` (a session with no wired connz) is a no-op.
+            if let Some(connz) = self.connz.as_ref() {
+                connz.record_authenticated();
+            }
         }
         self.connected = true;
         // Record the client's request (re-recorded on a repeated Connect, which re-negotiates

@@ -38,6 +38,7 @@
 
 use crate::actor::EngineAccess;
 use crate::cluster::ack_level::{ClusterAckLevel, ClusterAckLevelMetrics};
+use crate::connz::{ConnectionMetrics, ConnectionMetricsSnapshot};
 use crate::engine::{
     BackpressureSnapshot, Counters, EngineConfigSnapshot, GroupConsumerStat, RecoveryArtifact,
     RecoveryCounters, RecoveryOutcome,
@@ -51,7 +52,9 @@ use ironbus_storage::loss::ReasonCode;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// How long to wait between non-blocking accept polls.
@@ -94,6 +97,53 @@ where
     C: Clock + Clone + 'static,
     E: EngineAccess<F, C>,
 {
+    // The legacy entry point: no connz metric is scraped (a fresh, un-shared one) and no data-dir is
+    // measured, so `/metrics` reports the honest zero / "unavailable" for the connz (#572) and
+    // disk-free (#573) series — exactly the at-rest block the cluster-ack series uses until serve-wired.
+    // The connz-aware bootstrap uses `serve_health_connz`, sharing the SAME connz `Arc` as the wire
+    // server and passing the broker's data directory.
+    serve_health_connz(
+        listener,
+        engine,
+        shutdown,
+        admin_enabled,
+        progress,
+        liveness_window_nanos,
+        clock,
+        &Arc::new(ConnectionMetrics::new()),
+        None,
+    )
+}
+
+/// Serves the health endpoints exactly like [`serve_health`], plus the connection-signal ("connz",
+/// #572) and disk-free storage telemetry (#573): the SAME shared `Arc<ConnectionMetrics>` the wire
+/// server records into (so `/metrics` exposes the live connz), and the broker's `data_dir` (so
+/// `ironbus_disk_free_bytes` reports the free space on the filesystem the durable log lives on, or the
+/// `-1` unavailable sentinel for an in-memory broker / when it cannot be read). [`serve_health`]
+/// delegates here with a fresh un-shared metric and no data-dir, keeping its signature stable for the
+/// existing callers.
+///
+/// # Errors
+/// Returns an IO error only from configuring the listener; per-connection IO errors are contained.
+#[allow(clippy::too_many_arguments)]
+pub fn serve_health_connz<F, C, E>(
+    listener: &TcpListener,
+    engine: &E,
+    shutdown: &AtomicBool,
+    admin_enabled: bool,
+    progress: &LivenessBeacon,
+    liveness_window_nanos: u64,
+    clock: &C,
+    connz: &Arc<ConnectionMetrics>,
+    data_dir: Option<&Path>,
+) -> std::io::Result<()>
+where
+    F: Filesystem + 'static,
+    C: Clock + Clone + 'static,
+    E: EngineAccess<F, C>,
+{
+    // Own the data-dir path once for the loop's lifetime (the per-request handler borrows it).
+    let data_dir = data_dir.map(Path::to_path_buf);
     listener.set_nonblocking(true)?;
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
@@ -106,6 +156,8 @@ where
                     progress,
                     liveness_window_nanos,
                     clock,
+                    connz,
+                    data_dir.as_deref(),
                 );
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -118,6 +170,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle<F, C, E>(
     mut stream: TcpStream,
     engine: &E,
@@ -125,6 +178,8 @@ fn handle<F, C, E>(
     progress: &LivenessBeacon,
     liveness_window_nanos: u64,
     clock: &C,
+    connz: &Arc<ConnectionMetrics>,
+    data_dir: Option<&Path>,
 ) -> std::io::Result<()>
 where
     F: Filesystem + 'static,
@@ -194,7 +249,7 @@ where
                 Err(_) => respond(&mut stream, 503, "Service Unavailable", "shutting down"),
             }
         }
-        "/metrics" => match metrics_snapshot(engine) {
+        "/metrics" => match metrics_snapshot(engine, connz, data_dir) {
             Ok(snapshot) => respond(&mut stream, 200, "OK", &metrics_body(snapshot)),
             Err(_) => respond(&mut stream, 503, "Service Unavailable", "shutting down"),
         },
@@ -358,7 +413,11 @@ fn admin_accept_decision(accept: &str) -> AcceptDecision {
 ///
 /// # Errors
 /// Returns [`ActorGone`](crate::actor::ActorGone) if the actor exited before the read.
-fn metrics_snapshot<F, C, E>(engine: &E) -> Result<MetricsSnapshot, crate::actor::ActorGone>
+fn metrics_snapshot<F, C, E>(
+    engine: &E,
+    connz: &ConnectionMetrics,
+    data_dir: Option<&Path>,
+) -> Result<MetricsSnapshot, crate::actor::ActorGone>
 where
     F: Filesystem + 'static,
     C: Clock + Clone + 'static,
@@ -397,6 +456,11 @@ where
                 physical_bytes_written_today: g.physical_bytes_written_today(),
                 daily_budget_sheds: g.daily_budget_sheds(),
                 produce_rejected: g.counters().produce_rejected,
+                // The on-disk storage footprint (#573): read under the same lock as the rest, so the
+                // disk-free gauge and the footprint it is measured against share one instant. Cast the
+                // segment count to a portable u64 (it is a small `usize`).
+                durable_record_bytes: g.durable_record_bytes(),
+                segment_count: u64::try_from(g.segment_count()).unwrap_or(u64::MAX),
             },
             // The durability observability inputs (#341, #379), read under the same lock: the active
             // level, whether it waives I2 (the sticky power-loss-unsafe signal), and the live unsynced
@@ -416,6 +480,12 @@ where
             backpressure: g.backpressure_snapshot(),
             // Filled in below, outside the engine lock; `None` is the not-yet-read placeholder.
             rss: None,
+            // The connection-signal snapshot (#572) and the disk-free reading (#573) are filled in
+            // below, OUTSIDE the engine lock: connz is a shared off-engine atomic set, and disk-free is
+            // a process-level `df` read, neither is engine state, so keeping them off the lock avoids a
+            // `df`/atomic read inside the actor job. The defaults are the not-yet-read placeholders.
+            connz: ConnectionMetricsSnapshot::default(),
+            disk_free: crate::rss::UNAVAILABLE,
             groups: g.group_consumer_stats(),
             // The bounded metric registry (#97) is rendered into a String inside the actor job (it walks
             // only the bounded series set and the fixed histograms, so the work is O(number of series),
@@ -430,6 +500,17 @@ where
     // the headroom gauge reports the honest sentinel rather than a misleading zero. It is not engine
     // state, so keeping it off the lock avoids a `ps`/`/proc` read inside the actor job.
     snapshot.rss = crate::rss::current_rss_bytes();
+    // Read the CONNECTION SIGNALS (#572) off-lock: a consistent-enough snapshot of the shared connz
+    // atomics (accept/close/refuse/open/auth), recorded by the wire server off the engine lock.
+    snapshot.connz = connz.snapshot();
+    // Read the DISK-FREE bytes (#573) off-lock on the filesystem the durable log lives on, when a data
+    // dir is known. An in-memory broker (no data dir) and a platform where `df` is unavailable both
+    // report the `-1` unavailable sentinel rather than a misleading zero, exactly like the RAM gauges.
+    snapshot.disk_free = data_dir
+        .and_then(crate::rss::disk_free_bytes)
+        .map_or(crate::rss::UNAVAILABLE, |free| {
+            i64::try_from(free).unwrap_or(i64::MAX)
+        });
     Ok(snapshot)
 }
 
@@ -489,6 +570,12 @@ struct EdgeMetrics {
     /// Folded into the `ironbus_produce_saturated` signal so the gauge fires on EITHER shed, matching
     /// its HELP text.
     produce_rejected: u64,
+    /// The stored record bytes currently durable on disk (#573): the on-disk log footprint the
+    /// disk-free gauge is measured against. A read-only engine count, rendered as a GAUGE.
+    durable_record_bytes: u64,
+    /// The number of open plus sealed durable-log segment files currently on disk (#573). A read-only
+    /// engine count, rendered as a GAUGE.
+    segment_count: u64,
 }
 
 /// The durability observability inputs (#341, #379), read under the same engine lock as the rest of
@@ -557,6 +644,16 @@ struct MetricsSnapshot {
     /// injected after the actor job returns; the RAM-headroom gauge degrades to the unavailable
     /// sentinel when it is `None`.
     rss: Option<u64>,
+    /// The connection-signal ("connz") snapshot (#572): accepted/closed/open/refused/authenticated.
+    /// Read OUTSIDE the engine lock from the shared connz atomics (a set of off-engine signals, not
+    /// engine state). On the legacy `serve_health` path (an un-shared fresh metric) this is the at-rest
+    /// all-zero block — the series exist (the frozen taxonomy requires them) but report the honest zero.
+    connz: ConnectionMetricsSnapshot,
+    /// The FREE bytes on the filesystem the durable log lives on (#573), or the `-1` unavailable
+    /// sentinel for an in-memory broker (no data dir), a platform where `df` is unavailable, or the
+    /// legacy `serve_health` path (no data dir threaded). Read OUTSIDE the engine lock (a process-level
+    /// `df` read, not engine state).
+    disk_free: i64,
     /// The backpressure controllers' observable state (#68, #69): the CoDel / retry-budget /
     /// fire-and-forget / egress shed counters and the sojourn-estimate / retry-ratio / egress-limit
     /// gauges. Read under the same engine lock as the rest, so every metric is from one instant. All
@@ -703,6 +800,8 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
         cluster_ack,
         backpressure,
         rss,
+        connz,
+        disk_free,
         groups,
         registry,
     } = snapshot;
@@ -723,7 +822,8 @@ fn metrics_body(snapshot: MetricsSnapshot) -> String {
     body.push_str(&recovery_loss_records_lines(&recovery_loss_records));
     body.push_str(&recovery_event_lines(&counters.recovery));
     body.push_str(&fsync_histogram_lines(&fsync));
-    body.push_str(&edge_metric_lines(&edge, rss));
+    body.push_str(&edge_metric_lines(&edge, rss, disk_free));
+    body.push_str(&connz_metric_lines(connz));
     body.push_str(&durability_metric_lines(&durability));
     body.push_str(&cluster_ack_metric_lines(&cluster_ack));
     body.push_str(&backpressure_metric_lines(&backpressure));
@@ -877,7 +977,7 @@ fn backpressure_metric_lines(bp: &BackpressureSnapshot) -> String {
 /// point (integer milli-units), and is `0.000` until the first logical byte is produced (a fresh
 /// broker has no ratio yet). `ram_headroom_bytes` is `ceiling - rss`, or the `-1` unavailable
 /// sentinel when no ceiling is set or RSS could not be read (see [`crate::rss`]).
-fn edge_metric_lines(edge: &EdgeMetrics, rss: Option<u64>) -> String {
+fn edge_metric_lines(edge: &EdgeMetrics, rss: Option<u64>, disk_free: i64) -> String {
     let mut s = String::new();
     // The write-amplification counters and the derived ratio (#118).
     let _ = write!(
@@ -907,6 +1007,49 @@ fn edge_metric_lines(edge: &EdgeMetrics, rss: Option<u64>) -> String {
         "# HELP ironbus_ram_headroom_bytes Bytes of headroom below the configured RAM ceiling (ram_ceiling_bytes minus the process RSS), or -1 when no ceiling is set or RSS is unavailable on this platform.\n\
          # TYPE ironbus_ram_headroom_bytes gauge\n\
          ironbus_ram_headroom_bytes {headroom}\n"
+    );
+    // The RAM-headroom RATIO and the RSS-vs-cap RATIO (#574): the byte headroom gauge expressed as a
+    // dimensionless, ceiling-relative per-mille (0..=1000) so an operator can alert on "under 10%
+    // headroom" without hard-coding the box's byte ceiling. Float-free integer per-mille (the same
+    // convention `ironbus_write_amp_ratio` uses), and the `-1` unavailable sentinel when no ceiling is
+    // set or RSS could not be read. The two are complements below the ceiling (they sum to 1.000); the
+    // rss-vs-cap clamps at 1.000 once at/over the cap. Rendered as `value/1000`.`value%1000`.
+    let headroom_ratio = crate::rss::ram_headroom_ratio_permille(edge.ram_ceiling_bytes, rss);
+    write_permille_ratio(
+        &mut s,
+        "ironbus_ram_headroom_ratio",
+        "The fraction of the configured RAM ceiling still available as headroom ((ceiling - rss) / ceiling), in [0, 1], or -1 when no ceiling is set or RSS is unavailable.",
+        headroom_ratio,
+    );
+    let rss_over_cap = crate::rss::rss_over_cap_ratio_permille(edge.ram_ceiling_bytes, rss);
+    write_permille_ratio(
+        &mut s,
+        "ironbus_rss_over_cap_ratio",
+        "The fraction of the configured RAM ceiling the process RSS currently occupies (rss / ceiling), in [0, 1] (clamped at 1 once at/over the cap), or -1 when no ceiling is set or RSS is unavailable.",
+        rss_over_cap,
+    );
+    // The DISK-FREE storage telemetry (#573): the free bytes on the filesystem the durable log lives
+    // on, or the `-1` unavailable sentinel for an in-memory broker / a platform where `df` is
+    // unavailable. Read OUT-OF-BAND in the snapshot (not from any in-process accounting), like RSS.
+    let _ = write!(
+        s,
+        "# HELP ironbus_disk_free_bytes Free (available-to-an-unprivileged-process) bytes on the filesystem the durable log lives on, or -1 for an in-memory broker or when it cannot be read on this platform.\n\
+         # TYPE ironbus_disk_free_bytes gauge\n\
+         ironbus_disk_free_bytes {disk_free}\n"
+    );
+    // The persisted DURABLE STORAGE footprint (#573): the durable record bytes and the segment count,
+    // the storage-side counterpart of the RAM gauges, so an operator can watch the on-disk growth that
+    // disk-free is measured against. Both are read-only engine counts, GAUGES (no `_total`).
+    let _ = write!(
+        s,
+        "# HELP ironbus_durable_record_bytes Stored record bytes currently durable on disk (the on-disk log footprint disk-free is measured against).\n\
+         # TYPE ironbus_durable_record_bytes gauge\n\
+         ironbus_durable_record_bytes {durable_bytes}\n\
+         # HELP ironbus_segment_count Open plus sealed durable-log segment files currently on disk.\n\
+         # TYPE ironbus_segment_count gauge\n\
+         ironbus_segment_count {segments}\n",
+        durable_bytes = edge.durable_record_bytes,
+        segments = edge.segment_count,
     );
     // The portable throughput-collapse / saturation signal (#118): a GAUGE that is 1 once the broker
     // has SHED at least one produce (a drop-new admission exhaustion: the byte cap, the daily write
@@ -958,6 +1101,57 @@ fn edge_metric_lines(edge: &EdgeMetrics, rss: Option<u64>) -> String {
 /// every target).
 fn counters_indicate_saturation(edge: &EdgeMetrics) -> bool {
     edge.produce_rejected > 0 || edge.daily_budget_sheds > 0
+}
+
+/// Renders the CONNECTION-SIGNAL ("connz") series (#572): one LABELED counter family
+/// `ironbus_connections_total{state="accepted|closed|refused|authenticated"}` plus the currently-open
+/// GAUGE `ironbus_connections_open`. The `state` label is a FIXED four-value enum (NOT a
+/// per-connection-id / per-peer value — a connection id is exactly the unbounded label the #576
+/// cardinality firewall forbids), so the connz surface is bounded BY CONSTRUCTION. A connection
+/// accept/close/auth is normal lifecycle and a refuse is a cap signal — none is a resilience
+/// loss/skip/dead-letter SHED — so the labeled `_total` is pinned ONLY in `FROZEN_METRIC_TYPES` (its
+/// LABELED sample lines are excluded from the unlabeled-`_total` resilience-taxonomy test by
+/// construction, exactly like `ironbus_cluster_ack_total{level}` / `ironbus_retry_shed_total{side}`);
+/// the open gauge carries no `_total`. On a broker whose connz was not serve-wired (the legacy
+/// `serve_health` path) every value is the honest `0` — the series exist and report zero.
+fn connz_metric_lines(connz: ConnectionMetricsSnapshot) -> String {
+    let mut s = String::new();
+    // The single labeled counter family (all samples of one family must be CONTIGUOUS).
+    let _ = write!(
+        s,
+        "# HELP ironbus_connections_total Connection lifecycle counts by state (#572); the `state` label is one of accepted|closed|refused|authenticated (accepted = became a live handler; closed = handler returned/unwound; refused = rejected before a handler, cap-full or accept error; authenticated = a Connect handshake resolved a credential, 0 on a no-auth broker).\n\
+         # TYPE ironbus_connections_total counter\n\
+         ironbus_connections_total{{state=\"accepted\"}} {accepted}\n\
+         ironbus_connections_total{{state=\"closed\"}} {closed}\n\
+         ironbus_connections_total{{state=\"refused\"}} {refused}\n\
+         ironbus_connections_total{{state=\"authenticated\"}} {authenticated}\n\
+         # HELP ironbus_connections_open Connections currently live (accepted minus closed), maintained incrementally.\n\
+         # TYPE ironbus_connections_open gauge\n\
+         ironbus_connections_open {open}\n",
+        accepted = connz.accepted,
+        closed = connz.closed,
+        refused = connz.refused,
+        authenticated = connz.authenticated,
+        open = connz.currently_open,
+    );
+    s
+}
+
+/// Renders a per-mille ratio gauge (#574) WITHOUT floating point: a value in `[0, 1000]` is printed
+/// as the `0.xyz` fraction (`value/1000`.`value%1000`), and the `-1` unavailable sentinel is printed
+/// verbatim as `-1` (a real ratio is never negative, so `-1` is unambiguous, the same convention
+/// `ironbus_ram_headroom_bytes` uses). Emits the `# HELP`/`# TYPE gauge` lines then the sample.
+fn write_permille_ratio(s: &mut String, name: &str, help: &str, permille: i64) {
+    let _ = writeln!(s, "# HELP {name} {help}");
+    let _ = writeln!(s, "# TYPE {name} gauge");
+    if permille < 0 {
+        // The unavailable sentinel: print it verbatim, not as a fraction.
+        let _ = writeln!(s, "{name} {permille}");
+    } else {
+        // A non-negative per-mille in [0, 1000] -> the `int.frac` ratio (e.g. 600 -> 0.600, 1000 -> 1.000).
+        let v = permille.unsigned_abs();
+        let _ = writeln!(s, "{name} {}.{:03}", v / 1000, v % 1000);
+    }
 }
 
 /// Computes `physical / logical` as an integer part plus a three-digit milli-fraction, WITHOUT
@@ -1779,54 +1973,55 @@ mod tests {
     use ironbus_storage::log::{Append, LogConfig};
     use std::sync::{Arc, Mutex};
 
+    /// The shared inert (back-compat byte-identical) engine config the `/metrics` test harnesses use,
+    /// extracted so the connz/disk-free integration test reuses the SAME config as `start()`.
+    fn test_eng_cfg() -> EngineConfig {
+        EngineConfig {
+            compression: ironbus_core::compress::Codec::None,
+            log: LogConfig::default(),
+            lease: LeaseConfig::default(),
+            delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+            max_in_flight: 16,
+            consumer_credit: 64,
+            consumer_credit_bytes: 0,
+            checkpoint_interval: 1024,
+            max_retained_bytes: 0,
+            max_age_ms: 0,
+            max_messages: 0,
+            max_groups: crate::engine::DEFAULT_MAX_GROUPS,
+            group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
+            ram_ceiling_bytes: 0,
+            disk_full_policy: DiskFullPolicy::DropNew,
+            dedup: ironbus_core::dedup::DedupConfig::default(),
+            durability_level: crate::engine::DurabilityLevel::Sync,
+            flush_interval_ms: 0,
+            flush_max_bytes: 0,
+            // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
+            // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
+            codel_target_ms: 0,
+            codel_interval_ms: 0,
+            retry_budget_ratio_per_million: 0,
+            retry_budget_window_ms: 0,
+            fire_and_forget_msg_rate: 0,
+            fire_and_forget_byte_rate: 0,
+            fire_and_forget_refill_ms: 0,
+            egress_limit: 0,
+            wal_fsync_headroom_bytes: 0,
+            // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
+            // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
+            default_message_ttl_ms: 0,
+            dead_letter_exchange: None,
+            dead_letter_expired: false,
+        }
+    }
+
     fn start() -> (
         std::net::SocketAddr,
         Arc<AtomicBool>,
         std::thread::JoinHandle<()>,
         SharedEngine<InMemoryFs, SystemClock>,
     ) {
-        let engine = Engine::open(
-            InMemoryFs::new(),
-            SystemClock::new(),
-            EngineConfig {
-                compression: ironbus_core::compress::Codec::None,
-                log: LogConfig::default(),
-                lease: LeaseConfig::default(),
-                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
-                max_in_flight: 16,
-                consumer_credit: 64,
-                consumer_credit_bytes: 0,
-                checkpoint_interval: 1024,
-                max_retained_bytes: 0,
-                max_age_ms: 0,
-                max_messages: 0,
-                max_groups: crate::engine::DEFAULT_MAX_GROUPS,
-                group_idle_evict_ms: crate::engine::DEFAULT_GROUP_IDLE_EVICT_MS,
-                ram_ceiling_bytes: 0,
-                disk_full_policy: DiskFullPolicy::DropNew,
-                dedup: ironbus_core::dedup::DedupConfig::default(),
-                durability_level: crate::engine::DurabilityLevel::Sync,
-                flush_interval_ms: 0,
-                flush_max_bytes: 0,
-                // Backpressure controls (#68, #69) default to inert, so these test/config builders keep
-                // the historical behavior (CoDel off, retry budget off, fire-and-forget ungoverned).
-                codel_target_ms: 0,
-                codel_interval_ms: 0,
-                retry_budget_ratio_per_million: 0,
-                retry_budget_window_ms: 0,
-                fire_and_forget_msg_rate: 0,
-                fire_and_forget_byte_rate: 0,
-                fire_and_forget_refill_ms: 0,
-                egress_limit: 0,
-                wal_fsync_headroom_bytes: 0,
-                // V2-M4 routing richness defaults to inert here (#549/#551): no message TTL, no
-                // dead-letter exchange (the existing fixed-DLQ behavior) — back-compat byte-identical.
-                default_message_ttl_ms: 0,
-                dead_letter_exchange: None,
-                dead_letter_expired: false,
-            },
-        )
-        .unwrap();
+        let engine = Engine::open(InMemoryFs::new(), SystemClock::new(), test_eng_cfg()).unwrap();
         let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4075,6 +4270,24 @@ mod tests {
         ("ironbus_group_consumed_total", "counter"),
         ("ironbus_throughput_labels_dropped_total", "counter"),
         ("ironbus_produce_ack_level_total", "counter"),
+        // Connection signals (connz, #572): one LABELED counter family
+        // `ironbus_connections_total{state}` (the `state` label is a fixed four-value enum, so the
+        // cardinality is bounded by construction — NEVER a per-connection-id label) plus the open
+        // GAUGE. A connection accept/close/auth is normal lifecycle and a refuse is a cap signal, none
+        // a resilience SHED, so the labeled `_total` is pinned ONLY here (its labeled sample lines are
+        // excluded from the unlabeled-`_total` resilience-taxonomy test by construction, exactly like
+        // `ironbus_cluster_ack_total{level}`); the open gauge carries no `_total`.
+        ("ironbus_connections_total", "counter"),
+        ("ironbus_connections_open", "gauge"),
+        // Disk-free + durable-storage telemetry (#573): the free bytes on the log's filesystem, the
+        // on-disk record footprint it is measured against, and the segment-file count. All GAUGES.
+        ("ironbus_disk_free_bytes", "gauge"),
+        ("ironbus_durable_record_bytes", "gauge"),
+        ("ironbus_segment_count", "gauge"),
+        // RAM ratios (#574): the headroom ratio and the rss-vs-cap ratio, float-free per-mille gauges
+        // (the byte headroom gauge expressed dimensionless), with the -1 unavailable sentinel.
+        ("ironbus_ram_headroom_ratio", "gauge"),
+        ("ironbus_rss_over_cap_ratio", "gauge"),
     ];
 
     #[test]
@@ -4120,6 +4333,87 @@ mod tests {
             names.len(),
             FROZEN_METRIC_TYPES.len(),
             "FROZEN_METRIC_TYPES has a duplicate metric name"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn connz_and_disk_free_render_live_through_serve_health_connz() {
+        // #572/#573: the connz-aware serve path exposes the LIVE connection signals (recorded into the
+        // shared metric) and a real disk-free reading (the temp dir's filesystem), proving the wiring
+        // end-to-end, not just the at-rest zero block the legacy `serve_health` renders.
+        let engine = Engine::open(InMemoryFs::new(), SystemClock::new(), test_eng_cfg()).unwrap();
+        let shared: SharedEngine<InMemoryFs, SystemClock> = Arc::new(Mutex::new(engine));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        // The SHARED connz metric: drive some signals BEFORE the scrape (as the wire server would).
+        let connz = Arc::new(ConnectionMetrics::new());
+        connz.record_accept();
+        connz.record_accept();
+        connz.record_accept();
+        connz.record_close(); // one of the three closed
+        connz.record_refused();
+        connz.record_authenticated();
+        connz.record_authenticated();
+        let data_dir = std::env::temp_dir();
+        let handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            let shared = Arc::clone(&shared);
+            let connz = Arc::clone(&connz);
+            let data_dir = data_dir.clone();
+            move || {
+                serve_health_connz(
+                    &listener,
+                    &shared,
+                    &shutdown,
+                    false,
+                    &LivenessBeacon::new(0),
+                    0,
+                    &SystemClock::new(),
+                    &connz,
+                    Some(&data_dir),
+                )
+                .unwrap();
+            }
+        });
+        let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(m.starts_with("HTTP/1.1 200 OK"), "{m}");
+        // The connz labeled family reports the live counts (3 accepted, 1 closed, 1 refused, 2 auth,
+        // open == 3 - 1 == 2).
+        assert!(
+            m.contains("ironbus_connections_total{state=\"accepted\"} 3"),
+            "{m}"
+        );
+        assert!(
+            m.contains("ironbus_connections_total{state=\"closed\"} 1"),
+            "{m}"
+        );
+        assert!(
+            m.contains("ironbus_connections_total{state=\"refused\"} 1"),
+            "{m}"
+        );
+        assert!(
+            m.contains("ironbus_connections_total{state=\"authenticated\"} 2"),
+            "{m}"
+        );
+        assert!(m.contains("ironbus_connections_open 2"), "{m}");
+        // Disk-free reads a REAL non-`-1` figure on a unix dev/CI host (the temp dir's filesystem). On
+        // an exotic host where `df` is unavailable it degrades to -1, which this tolerates.
+        let disk_line = m
+            .lines()
+            .find(|l| l.starts_with("ironbus_disk_free_bytes "))
+            .expect("disk-free line present");
+        let value: i64 = disk_line
+            .rsplit(' ')
+            .next()
+            .and_then(|v| v.parse().ok())
+            .expect("disk-free value parses");
+        assert!(
+            value > 0 || value == -1,
+            "disk-free is a real positive figure or the -1 sentinel: {value}"
         );
 
         shutdown.store(true, Ordering::Release);

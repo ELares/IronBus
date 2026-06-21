@@ -600,17 +600,20 @@ pub struct ThroughputRegistry {
     /// The number of occupied slots in `series`.
     len: usize,
     /// A label->slot side-index so a record for an existing label resolves O(1), preallocated at the
-    /// cap so a claim never resizes it on the hot path. One entry per occupied distinct series.
+    /// cap so a claim never resizes it on the hot path. One entry per occupied primary series, plus
+    /// one per distinct over-cap label tracked in the bounded overflow ledger (mapped to its ledger
+    /// slot via [`OVERFLOW_INDEX_BASE`](ThroughputRegistry::OVERFLOW_INDEX_BASE)), so a re-record of a
+    /// folded label resolves O(1) too.
     slot_index: HashMap<Box<[u8]>, usize>,
-    /// The folded produced count of every over-cap stream label (the `__overflow__` fold).
-    overflow_produced: u64,
-    /// The folded consumed count of every over-cap group label (the `__overflow__` fold).
-    overflow_consumed: u64,
-    /// Whether any label has been folded into the overflow series (so the scrape only emits the
-    /// `__overflow__` line once a label has actually been dropped).
-    overflow_used: bool,
-    /// `*_labels_dropped_total`: the number of DISTINCT labels refused a series at the cap. Bumps
-    /// only on the FIRST fold of a distinct label, NEVER per record, so a folded label recording
+    /// The BOUNDED overflow fold-ledger (mirrors [`ConsumerLagRegistry`]'s, #97): up to
+    /// [`MAX_OVERFLOW_LEDGER`] inline entries, one per DISTINCT over-cap label, so a re-record of a
+    /// folded label adds into ITS slot and `labels_dropped` counts each distinct label ONCE on its
+    /// first fold. Allocated once; part of the fixed memory ceiling, NOT an unbounded per-label map.
+    overflow_ledger: Box<[ThroughputSeries]>,
+    /// The number of occupied slots in `overflow_ledger` (the count of DISTINCT folded labels).
+    overflow_ledger_len: usize,
+    /// `*_labels_dropped_total`: the number of DISTINCT labels refused a primary series at the cap.
+    /// Bumps only on the FIRST fold of a distinct label, NEVER per record, so a folded label recording
     /// again does not inflate it. A monotonic cardinality-pressure signal.
     labels_dropped: u64,
 }
@@ -620,29 +623,46 @@ impl Default for ThroughputRegistry {
         ThroughputRegistry {
             series: vec![ThroughputSeries::EMPTY; MAX_CONSUMER_SERIES].into_boxed_slice(),
             len: 0,
-            slot_index: HashMap::with_capacity(MAX_CONSUMER_SERIES),
-            overflow_produced: 0,
-            overflow_consumed: 0,
-            overflow_used: false,
+            // Sized for the primary cap PLUS the overflow ledger cap, so neither a primary claim nor an
+            // overflow-ledger insert resizes the index on the record path.
+            slot_index: HashMap::with_capacity(MAX_CONSUMER_SERIES + MAX_OVERFLOW_LEDGER),
+            overflow_ledger: vec![ThroughputSeries::EMPTY; MAX_OVERFLOW_LEDGER].into_boxed_slice(),
+            overflow_ledger_len: 0,
             labels_dropped: 0,
         }
     }
 }
 
 impl ThroughputRegistry {
+    /// The `slot_index` value offset that distinguishes an OVERFLOW-LEDGER slot from a primary-series
+    /// slot: a stored value `>= OVERFLOW_INDEX_BASE` is `OVERFLOW_INDEX_BASE + ledger_slot`. Sized at
+    /// the primary cap, so the two index spaces never collide.
+    const OVERFLOW_INDEX_BASE: usize = MAX_CONSUMER_SERIES;
+
     /// Resolves (or claims, or folds) the series for `name` and applies `apply` to its counts.
-    /// O(1) and allocation-free for an existing label (the side-index resolves the slot, then a
-    /// borrowed mutation); a brand-new label claims a free slot (the only allocation, once per
-    /// distinct label, off the steady-state path) or folds into the bounded overflow counters at the
-    /// cap. The closure receives `(&mut produced, &mut consumed)`.
+    /// O(1) and allocation-free for an EXISTING label — a primary series OR an already-folded over-cap
+    /// label (the side-index resolves either, then a borrowed mutation). A brand-new label claims a
+    /// free primary slot, then a bounded overflow-ledger slot at the cap (the only allocations, once
+    /// per distinct label, off the steady-state path); `labels_dropped` counts each DISTINCT refused
+    /// label ONCE. The closure receives `(&mut produced, &mut consumed)`.
     fn record(&mut self, name: &[u8], apply: impl Fn(&mut u64, &mut u64)) {
         let key = stored_key(name);
+        // An EXISTING label — a primary series OR an already-folded over-cap label — resolves O(1).
         if let Some(&idx) = self.slot_index.get(key) {
-            if let Some(slot) = self.series.get_mut(idx) {
+            if idx >= Self::OVERFLOW_INDEX_BASE {
+                if let Some(slot) = self
+                    .overflow_ledger
+                    .get_mut(idx - Self::OVERFLOW_INDEX_BASE)
+                {
+                    apply(&mut slot.produced, &mut slot.consumed);
+                    return;
+                }
+            } else if let Some(slot) = self.series.get_mut(idx) {
                 apply(&mut slot.produced, &mut slot.consumed);
                 return;
             }
         }
+        // A brand-new label with a free primary slot: claim it and record its key->slot mapping.
         if self.len < MAX_CONSUMER_SERIES {
             if let Some(slot) = self.series.get_mut(self.len) {
                 slot.store_label(name);
@@ -652,14 +672,27 @@ impl ThroughputRegistry {
                 return;
             }
         }
-        // The cap is reached: refuse a distinct series and fold into the bounded overflow counters.
-        // A pure monotonic add is trivially idempotent (no floor to reconcile), so a `__overflow__`
-        // ledger is unnecessary; only the FIRST fold of a distinct label bumps `labels_dropped`.
-        if !self.overflow_used {
-            self.overflow_used = true;
+        // The primary cap is reached: a brand-new DISTINCT over-cap label folds into the bounded
+        // overflow ledger (counted ONCE), so a re-record of it resolves O(1) above next time.
+        if self.overflow_ledger_len < MAX_OVERFLOW_LEDGER {
+            if let Some(slot) = self.overflow_ledger.get_mut(self.overflow_ledger_len) {
+                slot.store_label(name);
+                apply(&mut slot.produced, &mut slot.consumed);
+                self.slot_index.insert(
+                    Box::from(key),
+                    Self::OVERFLOW_INDEX_BASE + self.overflow_ledger_len,
+                );
+                self.overflow_ledger_len += 1;
+                self.labels_dropped = self.labels_dropped.saturating_add(1);
+                return;
+            }
         }
+        // Even the bounded ledger is saturated (more distinct over-cap labels than its capacity over
+        // the broker's life): count the distinct drop, but do NOT fold its counts (it cannot be tracked
+        // without a slot, and an untracked fold could not be resolved O(1) on a re-record). The
+        // reported overflow totals are then a documented LOWER BOUND; `labels_dropped` still flags the
+        // pressure. The same coarse, monotonic, never-grows-wrong fallback the lag registry uses.
         self.labels_dropped = self.labels_dropped.saturating_add(1);
-        apply(&mut self.overflow_produced, &mut self.overflow_consumed);
     }
 
     /// Records one record PRODUCED to the stream `name` (#571). Allocation-free for an existing label.
@@ -673,8 +706,8 @@ impl ThroughputRegistry {
         self.record(name, |_, consumed| *consumed = consumed.saturating_add(1));
     }
 
-    /// Invokes `f(label, produced, consumed)` for each occupied DISTINCT series. O(number of series),
-    /// allocation-free; the overflow fold is emitted by the caller via the accessors below.
+    /// Invokes `f(label, produced, consumed)` for each occupied DISTINCT primary series. O(number of
+    /// series), allocation-free; the overflow fold is emitted by the caller via the accessors below.
     pub fn for_each_series<F: FnMut(&str, u64, u64)>(&self, mut f: F) {
         for slot in self.series.iter().take(self.len) {
             if slot.used {
@@ -683,32 +716,41 @@ impl ThroughputRegistry {
         }
     }
 
-    /// Whether the overflow fold is in use (at least one label refused a distinct series at the cap).
+    /// Whether the overflow fold is in use (at least one label refused a primary series at the cap).
     #[must_use]
     pub fn has_overflow(&self) -> bool {
-        self.overflow_used
+        self.overflow_ledger_len > 0 || self.labels_dropped > 0
     }
 
-    /// The folded produced count of every over-cap stream label (`{stream="__overflow__"}`).
+    /// The folded produced count of every over-cap stream label (`{stream="__overflow__"}`): the sum
+    /// over the bounded ledger. A documented LOWER BOUND if the ledger ever saturated.
     #[must_use]
     pub fn overflow_produced(&self) -> u64 {
-        self.overflow_produced
+        self.overflow_ledger
+            .iter()
+            .take(self.overflow_ledger_len)
+            .fold(0u64, |acc, s| acc.saturating_add(s.produced))
     }
 
-    /// The folded consumed count of every over-cap group label (`{group="__overflow__"}`).
+    /// The folded consumed count of every over-cap group label (`{group="__overflow__"}`): the sum
+    /// over the bounded ledger. A documented LOWER BOUND if the ledger ever saturated.
     #[must_use]
     pub fn overflow_consumed(&self) -> u64 {
-        self.overflow_consumed
+        self.overflow_ledger
+            .iter()
+            .take(self.overflow_ledger_len)
+            .fold(0u64, |acc, s| acc.saturating_add(s.consumed))
     }
 
-    /// The count of DISTINCT stream/group labels refused a series at the cap (a cardinality-pressure
-    /// signal, the `*_labels_dropped_total` counter). Counts each distinct label once.
+    /// The count of DISTINCT stream/group labels refused a primary series at the cap (a
+    /// cardinality-pressure signal, the `*_labels_dropped_total` counter). Counts each distinct label
+    /// once (on its first fold), never per record.
     #[must_use]
     pub fn labels_dropped(&self) -> u64 {
         self.labels_dropped
     }
 
-    /// The number of occupied distinct series (for the memory-ceiling test and operators).
+    /// The number of occupied distinct primary series (for the memory-ceiling test and operators).
     #[must_use]
     pub fn series_len(&self) -> usize {
         self.len
@@ -953,11 +995,11 @@ impl MetricRegistry {
 }
 
 /// The fixed registry-memory ceiling, in bytes, asserted by a test and signed off against the
-/// edge RAM budget. It is the sum of the consumer-series array (the dominant, capped term), the
-/// bounded overflow fold-ledger (a second capped array of the same per-entry cost), and the fixed
-/// core-series state (the two histograms plus the small scalars). It is INDEPENDENT of the record
-/// count, the disk size, and the number of live consumers, because BOTH the consumer-series array
-/// and the overflow ledger are preallocated at their fixed caps.
+/// edge RAM budget. It is the sum of the consumer-lag series array and its bounded overflow
+/// fold-ledger, the per-stream/per-group throughput series array and ITS bounded overflow ledger
+/// (#571), and the fixed core-series state (the histograms plus the small scalars). It is INDEPENDENT
+/// of the record count, the disk size, and the number of live consumers/streams/groups, because ALL
+/// FOUR series arrays are preallocated at their fixed caps.
 ///
 /// The exact value is asserted in the tests below against `size_of` so a struct-layout change that
 /// inflates the per-series cost is caught; the documented ceiling in `docs/METRICS.md` and the
@@ -970,13 +1012,15 @@ pub fn registry_memory_ceiling_bytes() -> usize {
     // entry, preallocated at its cap, so the overflow fold stays idempotent without an unbounded
     // per-consumer map. It is part of the hard ceiling, not an open-ended term.
     let overflow_ledger = MAX_OVERFLOW_LEDGER * core::mem::size_of::<ConsumerSeries>();
-    // The per-stream/per-group throughput series array (#571): a third capped, preallocated array,
-    // bounded at the SAME cardinality cap, so it is part of the hard ceiling, not an open-ended term.
+    // The per-stream/per-group throughput arrays (#571): a primary series array plus a bounded
+    // overflow fold-ledger, BOTH capped and preallocated at the SAME cardinality cap, so they are part
+    // of the hard ceiling, not open-ended terms.
     let throughput_series = MAX_CONSUMER_SERIES * core::mem::size_of::<ThroughputSeries>();
+    let throughput_overflow = MAX_OVERFLOW_LEDGER * core::mem::size_of::<ThroughputSeries>();
     // The fixed core state held inline in MetricRegistry (the two histograms plus the scalar
     // self-info and lag-registry bookkeeping). This is the fixed sub-100-series core cost.
     let core = core::mem::size_of::<MetricRegistry>();
-    consumer_series + overflow_ledger + throughput_series + core
+    consumer_series + overflow_ledger + throughput_series + throughput_overflow + core
 }
 
 #[cfg(test)]
@@ -1356,21 +1400,37 @@ mod tests {
             per_series <= MAX_CONSUMER_LABEL_BYTES + 16,
             "per-series cost drifted above label[64] + two words: {per_series}"
         );
-        // The overflow fold-ledger is a SECOND capped array of the same per-entry cost, also
-        // preallocated at its cap, so it too is a fixed term independent of live-consumer count.
+        // The throughput series (#571) is a parallel capped array (a per-stream/per-group counter
+        // payload instead of a lag floor), also preallocated at the cap with its own bounded overflow
+        // ledger, all fixed-width so it is identical across targets.
+        let per_throughput = core::mem::size_of::<ThroughputSeries>();
+        assert!(
+            per_throughput >= MAX_CONSUMER_LABEL_BYTES,
+            "the inline throughput label buffer must be stored, not heaped: {per_throughput}"
+        );
+        assert!(
+            per_throughput <= MAX_CONSUMER_LABEL_BYTES + 24,
+            "per-throughput-series cost drifted above label[64] + three words: {per_throughput}"
+        );
+        // The overflow fold-ledgers are SECOND capped arrays of the same per-entry cost, also
+        // preallocated at their caps, so they too are fixed terms independent of live-label count. The
+        // ceiling is exactly the four capped arrays (lag series + lag overflow + throughput series +
+        // throughput overflow) plus the fixed core.
         assert_eq!(
             ceiling,
             MAX_CONSUMER_SERIES * per_series
                 + MAX_OVERFLOW_LEDGER * per_series
+                + MAX_CONSUMER_SERIES * per_throughput
+                + MAX_OVERFLOW_LEDGER * per_throughput
                 + core::mem::size_of::<MetricRegistry>()
         );
-        // The signed-off ceiling: the two capped series arrays (the lag series plus the bounded
-        // overflow ledger) are the dominant terms and together are well under 256 KiB, so the whole
-        // registry is a small fixed slice of the 64 MiB edge RAM budget, INDEPENDENT of record count
-        // or disk size. (~80 bytes/series x 1024 x 2 arrays ~= 160 KiB.)
+        // The signed-off ceiling: the four capped series arrays (the lag series + its overflow ledger,
+        // the throughput series + its overflow ledger) are the dominant terms and together are well
+        // under 512 KiB, so the whole registry is a small fixed slice of the 64 MiB edge RAM budget,
+        // INDEPENDENT of record count or disk size. (~80-88 bytes/series x 1024 x 4 arrays ~= 340 KiB.)
         assert!(
-            ceiling < 256 * 1024,
-            "registry ceiling {ceiling} bytes exceeded the documented 256 KiB sign-off"
+            ceiling < 512 * 1024,
+            "registry ceiling {ceiling} bytes exceeded the documented 512 KiB sign-off"
         );
         // The core (non-consumer-series) state is a fixed sub-100-series cost: a handful of
         // histograms and scalars, well under 1 KiB.

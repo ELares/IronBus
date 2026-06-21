@@ -6,6 +6,7 @@ pub mod auth;
 pub mod clock;
 pub mod cluster;
 pub mod codes;
+pub mod connz;
 pub mod engine;
 pub mod health;
 pub mod liveness;
