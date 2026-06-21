@@ -117,6 +117,11 @@ impl ErrorCode {
     /// [`EngineError::UnknownStream`].
     pub const ERR_UNKNOWN_STREAM: ErrorCode = ErrorCode("ERR_UNKNOWN_STREAM");
 
+    /// A client PRODUCE targeted a READ-ONLY cross-cluster MIRROR stream (#623): a mirror's only writer
+    /// is the geo mirror-apply path, so a client produce is rejected. Maps
+    /// [`EngineError::MirrorReadOnly`].
+    pub const ERR_MIRROR_READ_ONLY: ErrorCode = ErrorCode("ERR_MIRROR_READ_ONLY");
+
     /// A subject or bind pattern was not valid #567 grammar (#585). Maps
     /// [`EngineError::InvalidSubject`].
     pub const ERR_INVALID_SUBJECT: ErrorCode = ErrorCode("ERR_INVALID_SUBJECT");
@@ -179,6 +184,7 @@ impl ErrorCode {
             EngineError::TooManyGroups { .. } => Self::ERR_TOO_MANY_GROUPS,
             EngineError::InvalidGroupName => Self::ERR_INVALID_GROUP_NAME,
             EngineError::InvalidStreamName { .. } => Self::ERR_INVALID_STREAM_NAME,
+            EngineError::MirrorReadOnly { .. } => Self::ERR_MIRROR_READ_ONLY,
             EngineError::UnknownStream { .. } => Self::ERR_UNKNOWN_STREAM,
             EngineError::InvalidSubject(_) => Self::ERR_INVALID_SUBJECT,
             EngineError::BindRejected(_) => Self::ERR_BIND_REJECTED,
@@ -237,6 +243,10 @@ mod tests {
     }
 
     #[test]
+    // One literal per EngineError variant: the table grows by one row per variant, so it is inherently
+    // long but is a single flat exhaustiveness fixture (not branching logic) — splitting it would only
+    // scatter the one mapping it proves.
+    #[allow(clippy::too_many_lines)]
     fn every_engine_error_maps_to_a_code() {
         // One representative per variant, so a NEW EngineError variant that forgets its code makes
         // `of_engine_error` non-exhaustive and fails to compile (the match has no wildcard).
@@ -284,6 +294,12 @@ mod tests {
                     name: "ghost".to_string(),
                 },
                 ErrorCode::ERR_UNKNOWN_STREAM,
+            ),
+            (
+                EngineError::MirrorReadOnly {
+                    name: "mirror-orders".to_string(),
+                },
+                ErrorCode::ERR_MIRROR_READ_ONLY,
             ),
             (
                 EngineError::InvalidSubject(ironbus_core::subject::SubjectError::Empty),

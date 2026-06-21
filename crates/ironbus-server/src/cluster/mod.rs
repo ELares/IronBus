@@ -267,6 +267,7 @@ pub mod client_ack;
 pub mod dataplane;
 pub mod divergence;
 pub mod eligibility;
+pub mod geo;
 pub mod isr;
 pub mod membership;
 pub mod metadata_group;
@@ -294,6 +295,11 @@ pub use divergence::{
 pub use eligibility::{
     eligible_leaders, evaluate_eligibility, is_eligible_leader, replica_state_from,
     IneligibleReason, ReplicaState,
+};
+pub use geo::{
+    pull_loop, ApplyOutcome as GeoApplyOutcome, GeoConfig, GeoError, GeoFrame, GeoLink, GeoMode,
+    GeoOrigin, GeoStreamConfig, MirrorApplier, MirrorPullRequest, MirrorPullResponse,
+    OriginCursorStore, OriginServer, GEO_POLL, MAX_GEO_PULL_BYTES, MAX_ORIGIN_STREAM_LEN,
 };
 pub use isr::{AckReplicatedBody, IsrConfig, IsrMembership, IsrTracker, PendingAck, QuorumAckGate};
 pub use membership::{LearnerCatchup, MemberOp, MembershipChange, PeerIdError};

@@ -626,6 +626,15 @@ pub enum EngineError {
         /// The rejected stream name.
         name: String,
     },
+    /// A client PRODUCE targeted a READ-ONLY cross-cluster MIRROR stream (#623, V2-C7-I1). A mirror's
+    /// ONLY writer is the geo mirror-apply path (single-writer preserved), so a client produce is
+    /// rejected fail-closed rather than admitting a second writer. Carries the mirrored stream's name.
+    /// (A SOURCE is NOT read-only — it may take local produces alongside the fan-in — so this fires only
+    /// for a `--mirror` stream, never a `--source`.)
+    MirrorReadOnly {
+        /// The read-only mirror stream the produce was rejected for.
+        name: String,
+    },
     /// A consume/ack/commit targeted a NAMED stream that is not open (#676): a stream must be
     /// produced to (which declares it) before it can be consumed from, so a consume on an
     /// unknown named stream is a typed rejection, not a silent empty read. The default stream is
@@ -712,6 +721,10 @@ impl core::fmt::Display for EngineError {
                 f,
                 "invalid stream name {name:?} (the default stream is \"\", otherwise 1 to \
                  {MAX_STREAM_NAME_LEN} graphic-ASCII bytes)"
+            ),
+            EngineError::MirrorReadOnly { name } => write!(
+                f,
+                "stream {name:?} is a read-only cross-cluster MIRROR; its only writer is the mirror-apply path, so a client produce is rejected"
             ),
             EngineError::UnknownStream { name } => write!(
                 f,
@@ -2390,6 +2403,12 @@ pub struct Engine<F: Filesystem, C: Clock> {
     /// `key_shared` mode and joins as a member. Held separate from the live per-group router so the
     /// declared config survives a group that has no current members.
     key_shared_groups: std::collections::BTreeSet<String>,
+    /// The set of NAMED local streams that are READ-ONLY cross-cluster MIRRORS (#623, V2-C7-I1): a
+    /// client PRODUCE to one of these is REJECTED with [`EngineError::MirrorReadOnly`], because a
+    /// mirror's ONLY writer is the geo mirror-apply path (single-writer preserved). EMPTY by default —
+    /// configured ONCE via [`Engine::set_mirror_read_only_streams`] only when a `--mirror` is present, so
+    /// a non-geo broker's produce path is byte-for-byte unchanged (a single `is_empty()` short-circuit).
+    mirror_read_only: std::collections::BTreeSet<String>,
     /// The opt-in effectively-once dedup registry (#3, #33): the per-producer bounded windows of
     /// `(msg_id -> offset)`. Empty until a producer opts in by sending a `msg_id`, so a broker no
     /// producer dedups against costs nothing here. Consulted on the produce path (the actor thread,
@@ -2748,6 +2767,10 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             // Empty by default: no group is key_shared until an operator configures one (#64), so an
             // unconfigured engine is plain competing everywhere and unchanged.
             key_shared_groups: std::collections::BTreeSet::new(),
+            // The read-only cross-cluster MIRROR set (#623): EMPTY by default, so a non-geo broker's
+            // produce path is byte-for-byte unchanged. Configured once via
+            // `set_mirror_read_only_streams` only when a `--mirror` is present.
+            mirror_read_only: std::collections::BTreeSet::new(),
             // The opt-in dedup registry (#33), sized by the configured window. Empty until a
             // producer opts in by sending a `msg_id`, so it costs nothing for a no-dedup workload.
             dedup: ironbus_core::dedup::DedupRegistry::new(config.dedup),
@@ -2851,6 +2874,23 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
 
     pub fn set_compaction_config(&mut self, config: ironbus_storage::compaction::CompactionConfig) {
         self.compaction = config;
+    }
+
+    /// Declare a set of NAMED local streams as READ-ONLY cross-cluster MIRRORS (#623, V2-C7-I1): a
+    /// client PRODUCE to any of these is rejected with [`EngineError::MirrorReadOnly`], so a mirror's
+    /// only writer stays the geo mirror-apply path (single-writer preserved). Configured ONCE on a
+    /// `--mirror` serve; with no geo config it is never called, so the set stays empty and the produce
+    /// path is byte-for-byte unchanged. The empty name (`""`, the default stream) is NEVER a mirror and
+    /// is filtered out defensively.
+    pub fn set_mirror_read_only_streams<I: IntoIterator<Item = String>>(&mut self, streams: I) {
+        self.mirror_read_only = streams.into_iter().filter(|s| !s.is_empty()).collect();
+    }
+
+    /// True if `stream` is a configured READ-ONLY mirror (a client produce to it must be rejected). The
+    /// fast path is a single `BTreeSet::is_empty` short-circuit, so a non-geo broker pays nothing.
+    #[must_use]
+    pub fn is_mirror_read_only(&self, stream: &str) -> bool {
+        !self.mirror_read_only.is_empty() && self.mirror_read_only.contains(stream)
     }
 
     /// The current key-compaction configuration (#337). Disabled by default. Read-only echo for the
@@ -3659,6 +3699,15 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // indistinguishable from the historical broker.
         if stream.is_empty() {
             return self.produce(message);
+        }
+        // READ-ONLY MIRROR guard (#623): a client produce to a configured cross-cluster mirror is
+        // rejected fail-closed BEFORE any declare/append, so a mirror's only writer stays the geo
+        // mirror-apply path (single-writer preserved). The check is a single set lookup, skipped entirely
+        // when no mirror is configured (the non-geo byte-identical path).
+        if self.is_mirror_read_only(stream) {
+            return Err(EngineError::MirrorReadOnly {
+                name: stream.to_string(),
+            });
         }
         let id = StreamId::named(stream)?;
         // Declare-on-first-produce: open the named stream's independent log under `streams/<hex>/`
@@ -13800,6 +13849,45 @@ mod tests {
             headers: b"",
             payload,
         }
+    }
+
+    #[test]
+    fn a_client_produce_to_a_read_only_mirror_is_rejected_typed() {
+        // #623 read-only enforcement: a stream declared a cross-cluster MIRROR rejects a client produce
+        // with the typed EngineError::MirrorReadOnly (its only writer is the geo apply path).
+        let fs = InMemoryFs::new();
+        let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        e.set_mirror_read_only_streams(["mirror-orders".to_string()]);
+        assert!(e.is_mirror_read_only("mirror-orders"));
+
+        // A produce to the mirror is rejected, typed, BEFORE any append (the stream stays unmaterialized).
+        let err = e
+            .produce_in_stream("mirror-orders", &append_at(b"nope"))
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::MirrorReadOnly { ref name } if name == "mirror-orders"),
+            "expected MirrorReadOnly, got {err:?}"
+        );
+        assert_eq!(
+            crate::codes::ErrorCode::of_engine_error(&err),
+            crate::codes::ErrorCode::ERR_MIRROR_READ_ONLY
+        );
+
+        // A NON-mirror named stream still produces fine (the guard is scoped to the configured set).
+        assert!(e.produce_in_stream("other", &append_at(b"ok")).is_ok());
+        // The default stream is never a mirror and is byte-for-byte unaffected.
+        assert!(e.produce(&append_at(b"default")).is_ok());
+    }
+
+    #[test]
+    fn no_mirror_configured_is_byte_identical_produce() {
+        // The non-geo guarantee: with no mirror configured the set is empty and EVERY produce is admitted
+        // exactly as today (the guard is a single is_empty() short-circuit).
+        let fs = InMemoryFs::new();
+        let mut e = Engine::open(fs, ManualClock::new(), config(10, 5)).unwrap();
+        assert!(!e.is_mirror_read_only("anything"));
+        assert!(e.produce_in_stream("anything", &append_at(b"ok")).is_ok());
+        assert!(e.produce(&append_at(b"ok")).is_ok());
     }
 
     #[test]

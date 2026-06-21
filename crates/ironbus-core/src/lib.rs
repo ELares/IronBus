@@ -18,6 +18,7 @@ pub mod codec;
 pub mod compress;
 pub mod config;
 pub mod confirm;
+pub mod crc;
 pub mod cursor;
 pub mod dedup;
 pub mod delivery;
