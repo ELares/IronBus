@@ -249,9 +249,20 @@ impl<F: Filesystem, C: Clock + Clone> MetadataRaftGroup<F, C> {
             leadership.observe(recovered_term, false, clock.now_monotonic_nanos());
         }
 
+        // RESTORE the application state machine from the durable SNAPSHOT (#660), if one was
+        // recovered: the snapshot is the committed metadata cut at its index, and the retained log
+        // TAIL above it folds on top through the normal ready/apply cycle the caller drives next.
+        // So a node restarting from {snapshot + tail} re-derives the EXACT committed state a full
+        // log replay would (#660 non-negotiable 1). A group with no snapshot starts with a fresh SM
+        // and recovers entirely from the log, exactly as before.
+        let state = match node.store().snapshot_state_bytes() {
+            Some(bytes) if !bytes.is_empty() => MetadataStateMachine::restore_from_snapshot(&bytes)?,
+            _ => MetadataStateMachine::new(),
+        };
+
         Ok(Self {
             node,
-            state: MetadataStateMachine::new(),
+            state,
             clock,
             leadership,
         })
@@ -517,14 +528,16 @@ impl<F: Filesystem, C: Clock + Clone> MetadataRaftGroup<F, C> {
         // 1. Outbound messages to peers (none at n=1) — collected for the caller.
         let mut outbound = ready.take_messages();
 
-        // 2. Apply a snapshot if present (handled for safety; not produced in the n=1 flows).
-        //    A snapshot replaces the durable log prefix; that is C1-I2's compaction follow-up,
-        //    so for now we surface it as an error rather than silently dropping it (the
-        //    metadata group's current flows never emit one).
+        // 2. APPLY A RECEIVED SNAPSHOT if present (#660 snapshot-based catch-up): a far-behind
+        //    follower/learner that raft-rs decided to catch up via snapshot transfer gets the
+        //    leader's point-in-time snapshot here. We DURABLY persist it (fsync) and install it into
+        //    storage (clearing the log prefix it subsumes), then RESTORE the application state
+        //    machine from the snapshot's DATA bytes. The replicated log TAIL above the snapshot then
+        //    arrives as normal committed entries (steps 3/8) and folds on top — no gap, no dup, no
+        //    replay of pre-snapshot entries.
         if !ready.snapshot().is_empty() {
-            return Err(GroupError::Raft(raft::Error::Store(
-                raft::StorageError::SnapshotTemporarilyUnavailable,
-            )));
+            let snapshot = ready.snapshot().clone();
+            self.install_snapshot(&snapshot)?;
         }
 
         // 3. Apply committed entries that came with this Ready (after a snapshot, or once
@@ -582,6 +595,103 @@ impl<F: Filesystem, C: Clock + Clone> MetadataRaftGroup<F, C> {
         self.refresh_leadership();
 
         Ok(outbound)
+    }
+
+    /// Install a snapshot RECEIVED from the leader (#660): durably persist it + install it into the
+    /// storage (clearing the subsumed log prefix), then RESTORE the application state machine from
+    /// the snapshot's DATA. A STALE snapshot (below our durable first index) is ignored — we already
+    /// hold that state and a newer tail, so re-installing would regress committed state.
+    ///
+    /// The state machine is restored from the snapshot's bytes ONLY when the snapshot actually
+    /// installs (it advances us); the membership view is also refreshed from the installed
+    /// `ConfState` so the SM's voter/learner table tracks the snapshot's membership.
+    fn install_snapshot(&mut self, snapshot: &raft::eraftpb::Snapshot) -> Result<(), GroupError> {
+        let installed = self.node.mut_store().install_received_snapshot(snapshot)?;
+        if !installed {
+            // Stale snapshot: keep our newer committed state. (raft-rs only sends a snapshot to a
+            // behind node, so this is defensive.)
+            return Ok(());
+        }
+        let meta = snapshot.get_metadata();
+        // RESTORE the application state machine from the snapshot's DATA (the serialized committed
+        // metadata cut). An empty data payload is only ever produced by the legacy/no-data path,
+        // which the storage never serves now (it returns SnapshotTemporarilyUnavailable instead), so
+        // a non-empty install always carries a full SM cut.
+        if snapshot.data.is_empty() {
+            // No SM bytes: keep the membership from the ConfState but leave the SM otherwise empty
+            // at the snapshot index (defensive; not produced by this storage's snapshot()).
+            self.state = MetadataStateMachine::new();
+        } else {
+            self.state = MetadataStateMachine::restore_from_snapshot(&snapshot.data)?;
+        }
+        // Track the snapshot's membership in the SM (the ConfState is the durable membership).
+        self.state.set_membership(
+            meta.index,
+            meta.get_conf_state().get_voters(),
+            meta.get_conf_state().get_voters_outgoing(),
+            meta.get_conf_state().get_learners(),
+            meta.get_conf_state().get_learners_next(),
+        );
+        Ok(())
+    }
+
+    /// The committed metadata-log index that has been APPLIED to this node's state machine. A
+    /// snapshot may be taken at or below this index (every entry up to it is durably applied).
+    #[must_use]
+    pub fn applied_index(&self) -> u64 {
+        self.state.applied_index()
+    }
+
+    /// The index of the last durable snapshot/compaction (0 before any). Every metadata log entry
+    /// at or below it is subsumed by the durable snapshot; the retained log is the tail above it.
+    #[must_use]
+    pub fn snapshot_index(&self) -> u64 {
+        self.node.store().snapshot_index()
+    }
+
+    /// The number of metadata log entries RETAINED above the last snapshot (the live, un-compacted
+    /// tail). The driver uses this as the bounded log-size signal for its snapshot cadence: when the
+    /// retained tail grows past a threshold, it snapshots + compacts to bound the log (#660). Reads
+    /// the durable storage's first/last index, never the wall clock.
+    #[must_use]
+    pub fn retained_log_len(&self) -> u64 {
+        let store = self.node.store();
+        let last = store.last_index().unwrap_or(0);
+        let first = store.first_index().unwrap_or(1);
+        // first_index is last_index + 1 for an empty (fully-compacted) log, so saturate.
+        last.saturating_add(1).saturating_sub(first)
+    }
+
+    /// CREATE a metadata snapshot at the current applied index and COMPACT the log up to it (#660),
+    /// IF the applied frontier has advanced past the last snapshot (else a no-op). The snapshot
+    /// captures the EXACT committed state machine at `applied_index` BEFORE the log prefix is
+    /// truncated, so a node restarting from snapshot+tail holds the identical committed state, and a
+    /// far-behind learner can be caught up from the snapshot + tail.
+    ///
+    /// Returns `true` if a snapshot was created (the log was compacted), `false` if it was a no-op
+    /// (nothing new to snapshot). Safe to call on any cadence; it only does work when the applied
+    /// frontier has moved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GroupError::Storage`] if the snapshot fails to persist durably or the compaction
+    /// fails, or [`GroupError::Raft`] if the applied index's term cannot be read.
+    pub fn create_snapshot(&mut self) -> Result<bool, GroupError> {
+        let applied = self.state.applied_index();
+        // Only snapshot a committed+applied index strictly above the last snapshot. raft-rs never
+        // compacts past the applied index, so this is always safe.
+        if applied <= self.node.store().snapshot_index() {
+            return Ok(false);
+        }
+        // The term of the entry at the applied index (the snapshot's term). It must be a present log
+        // entry (applied <= committed <= last_index), so `term` resolves it.
+        let term = self.node.store().term(applied)?;
+        // Serialize the EXACT committed state machine at the applied index.
+        let data = self.state.snapshot();
+        self.node
+            .mut_store()
+            .create_snapshot_and_compact(applied, term, &data)?;
+        Ok(true)
     }
 
     /// Fold a batch of committed entries into the state machine. A leader's empty no-op entry
@@ -1235,18 +1345,45 @@ mod tests {
     impl Mesh {
         /// Build a mesh of `voters`, each a group that knows the full voter set.
         fn new(voters: &[u64]) -> Self {
+            Self::with_segment_cap(voters, 64 * 1024)
+        }
+
+        /// Build a mesh whose nodes use a specific log segment cap, so a small cap forces several
+        /// sealed segments (and thus reclaimable prefix segments under compaction, #660).
+        fn with_segment_cap(voters: &[u64], segment_cap: u64) -> Self {
             let mut nodes = std::collections::BTreeMap::new();
             for &id in voters {
                 // Each node gets its OWN fs (its own durable metaraft/ image).
                 let fs = InMemoryFs::new();
-                let group =
-                    MetadataRaftGroup::open(id, voters, &fs, ManualClock::new(), log_config())
-                        .expect("open mesh node");
+                let group = MetadataRaftGroup::open(
+                    id,
+                    voters,
+                    &fs,
+                    ManualClock::new(),
+                    LogConfig::new(segment_cap).expect("valid segment cap"),
+                )
+                .expect("open mesh node");
                 // Leak the fs into the group's storage lifetime: the group owns its log, and the
                 // InMemoryFs is reference-counted internally, so we just drop our handle.
                 nodes.insert(id, group);
             }
             Self { nodes }
+        }
+
+        /// Add a new node to the mesh as a non-voting LEARNER joining an EXISTING cluster of
+        /// `existing_voters` (#617): it opens via `open_as_learner`, so it follows the quorum but
+        /// never campaigns (no term disruption) and back-fills by replication / snapshot transfer.
+        fn add_learner_node(&mut self, id: u64, existing_voters: &[u64], segment_cap: u64) {
+            let fs = InMemoryFs::new();
+            let group = MetadataRaftGroup::open_as_learner(
+                id,
+                existing_voters,
+                &fs,
+                ManualClock::new(),
+                LogConfig::new(segment_cap).expect("valid segment cap"),
+            )
+            .expect("open learner node");
+            self.nodes.insert(id, group);
         }
 
         /// Tick every node once (drives election timers).
@@ -1285,13 +1422,24 @@ mod tests {
         }
 
         /// Run the mesh to a fixed point: repeatedly tick (to drive heartbeats / re-broadcasts)
-        /// and pump messages until a full pass routes nothing and no node has pending work. The
-        /// per-pass pump is itself iterated so a message produced by one node's `step` is drained
+        /// and pump messages until the mesh has been QUIESCED for several consecutive idle rounds.
+        /// The per-pass pump is itself iterated so a message produced by one node's `step` is drained
         /// and routed in the same pass — important so a leader's just-appended entry (e.g. the
-        /// auto-appended LEAVE-JOINT conf change) replicates and commits within `run`. Bounded by
-        /// generous fuel so a bug cannot hang the test.
+        /// auto-appended LEAVE-JOINT conf change) replicates and commits within `run`.
+        ///
+        /// It does NOT break on the FIRST idle round: a multi-phase catch-up (notably SNAPSHOT
+        /// transfer to a freshly-added learner, #660) spans several heartbeat intervals — the leader
+        /// probes on a `heartbeat_tick` cadence, the learner rejects, the leader backs off and sends
+        /// a snapshot, the learner installs it and acks, then the tail replicates — with idle rounds
+        /// in between while waiting for the next heartbeat tick. Requiring a run of consecutive idle
+        /// rounds (well past `heartbeat_tick`) before stopping lets the whole negotiation complete,
+        /// while the outer fuel cap still bounds a genuinely stuck mesh.
         fn run(&mut self) {
-            for _ in 0..1024 {
+            // Idle rounds needed to conclude the mesh has truly settled: comfortably more than
+            // `heartbeat_tick` (3) so a between-heartbeat lull is never mistaken for completion.
+            const QUIET_ROUNDS_TO_SETTLE: u32 = 12;
+            let mut consecutive_idle: u32 = 0;
+            for _ in 0..2048 {
                 self.tick_all();
                 // Drain-and-route to a local fixed point before the next tick.
                 let mut progressed = false;
@@ -1305,7 +1453,12 @@ mod tests {
                     }
                 }
                 if self.quiesced() && !progressed {
-                    break;
+                    consecutive_idle += 1;
+                    if consecutive_idle >= QUIET_ROUNDS_TO_SETTLE {
+                        break;
+                    }
+                } else {
+                    consecutive_idle = 0;
                 }
             }
         }
@@ -1569,5 +1722,173 @@ mod tests {
             .expect("propose from local data");
         settle(&mut group);
         assert_eq!(learners_of(&group), vec![2]);
+    }
+
+    // --- #660: metadata log snapshot + compaction at the GROUP layer. ---
+
+    /// THE GROUP-LAYER COMMITTED-STATE-PRESERVED TEST (#660 non-negotiable 1): commit many metadata
+    /// commands on a single-node group, SNAPSHOT + COMPACT, and confirm (a) the log is BOUNDED (its
+    /// retained tail collapses, snapshot_index rises), (b) the live state is unchanged, and (c) a
+    /// REOPEN over the same durable image (a restart) recovers the IDENTICAL committed state from the
+    /// snapshot + the (empty/short) tail — equal to a full replay.
+    #[test]
+    fn snapshot_and_compaction_bounds_the_log_and_survives_reopen() {
+        let fs = InMemoryFs::new();
+        let expected_placements;
+        {
+            // A small segment so the many entries roll into several sealed segments (so compaction
+            // can reclaim whole prefix segments).
+            let mut group = MetadataRaftGroup::open(
+                1,
+                &[1],
+                &fs,
+                ManualClock::new(),
+                LogConfig::new(512).unwrap(),
+            )
+            .expect("open");
+            group.campaign().expect("campaign");
+            settle(&mut group);
+            assert!(group.is_leader());
+
+            // Commit a batch of placement + config commands so the log grows well past one segment.
+            for p in 0..30u64 {
+                group
+                    .propose(&MetadataCommand::AssignPartition {
+                        partition: p,
+                        leader: 1,
+                        epoch: 1,
+                    })
+                    .expect("propose");
+                settle(&mut group);
+            }
+            let applied_before = group.applied_index();
+            assert!(applied_before > 30, "many entries committed + applied");
+            assert_eq!(group.snapshot_index(), 0, "no snapshot yet");
+            let tail_before = group.retained_log_len();
+            assert!(tail_before > 20, "the log is long before compaction");
+
+            // SNAPSHOT + COMPACT at the applied index.
+            let created = group.create_snapshot().expect("create snapshot");
+            assert!(created, "a snapshot was created");
+            assert_eq!(
+                group.snapshot_index(),
+                applied_before,
+                "snapshot taken at the applied index"
+            );
+            assert!(
+                group.retained_log_len() < tail_before,
+                "the retained log shrank ({} < {tail_before})",
+                group.retained_log_len()
+            );
+
+            // The live state is unchanged by compaction.
+            for p in 0..30u64 {
+                assert_eq!(
+                    group.state().placement(p),
+                    Some(Placement::leader_only(1, 1)),
+                    "placement {p} survives compaction"
+                );
+            }
+            expected_placements = group.state().placements();
+
+            // A second snapshot with no new applied entries is a no-op.
+            assert!(
+                !group.create_snapshot().expect("noop snapshot"),
+                "snapshotting an unchanged applied frontier is a no-op"
+            );
+        }
+
+        // REOPEN over the same durable image (a restart): recovery installs the snapshot, then folds
+        // the (empty) tail. The committed state is IDENTICAL — equal to a full replay.
+        let mut reopened = MetadataRaftGroup::open(
+            1,
+            &[1],
+            &fs,
+            ManualClock::new(),
+            LogConfig::new(512).unwrap(),
+        )
+        .expect("reopen");
+        settle(&mut reopened);
+        assert_eq!(
+            reopened.state().placements(),
+            expected_placements,
+            "the committed metadata state survives snapshot + compaction + restart"
+        );
+        assert!(
+            reopened.snapshot_index() >= 30,
+            "the durable snapshot was recovered"
+        );
+    }
+
+    /// THE SNAPSHOT-CATCH-UP TEST on a REAL multi-node mesh (#660 non-negotiable 4): a far-behind
+    /// LEARNER that joins AFTER the leader has compacted its log receives a SNAPSHOT, installs it,
+    /// then applies the replicated log TAIL and converges to the leader's committed metadata state —
+    /// no gap, no dup, no replay of pre-snapshot entries. This is the #617/#724 fast-learner-join
+    /// scenario the issue calls out: the prefix the learner needs is GONE from the leader's log, so
+    /// snapshot transfer is the ONLY way to catch it up. A learner never campaigns, so there is no
+    /// term-disruption (the realistic catch-up shape, unlike an isolated voter).
+    #[test]
+    fn a_far_behind_learner_catches_up_via_snapshot_transfer_on_a_mesh() {
+        const CAP: u64 = 512; // small segments so compaction reclaims whole prefix segments
+        let mut mesh = Mesh::with_segment_cap(&[1, 2, 3], CAP);
+        mesh.elect(1);
+        let leader = mesh.leader().expect("leader");
+
+        // Commit a long run of commands across the 3 voters.
+        for p in 0..40u64 {
+            mesh.nodes
+                .get_mut(&leader)
+                .unwrap()
+                .propose(&MetadataCommand::AssignPartition {
+                    partition: p,
+                    leader,
+                    epoch: 1,
+                })
+                .expect("propose");
+            mesh.run();
+        }
+
+        // Add node 4 as a LEARNER through a committed conf change, so the leader knows to replicate
+        // to it. (It is not yet in the mesh transport, so it does not actually replicate yet.)
+        mesh.change_on_leader(&MembershipChange::new().add_learner(4))
+            .expect("add learner 4");
+
+        // SNAPSHOT + COMPACT on every voter, so the prefix the learner needs is physically GONE
+        // from the leader's retained log — the only way to catch the learner up is a snapshot.
+        for &id in &[1u64, 2u64, 3u64] {
+            let _ = mesh.nodes.get_mut(&id).unwrap().create_snapshot();
+        }
+        assert!(
+            mesh.nodes[&leader].snapshot_index() >= 40,
+            "the leader compacted past the entries the learner is missing"
+        );
+        let expected = mesh.nodes[&leader].state().placements();
+        assert_eq!(expected.len(), 40);
+
+        // NOW bring the learner online (it joins the mesh transport). It opens far behind (genesis),
+        // and the leader's first index is past its next index, so raft-rs must send a SNAPSHOT.
+        mesh.add_learner_node(4, &[1, 2, 3], CAP);
+        assert!(
+            mesh.nodes[&4].state().placements().is_empty(),
+            "the joining learner has none of the committed placements yet"
+        );
+
+        mesh.run();
+
+        assert_eq!(
+            mesh.nodes[&4].state().placements(),
+            expected,
+            "the far-behind learner converged to the leader's committed state via snapshot catch-up"
+        );
+        assert!(
+            mesh.nodes[&4].snapshot_index() > 0,
+            "the learner installed a snapshot (it did not replay the whole log)"
+        );
+        // No gap / no dup: the learner's applied index reached the leader's committed bar.
+        assert_eq!(
+            mesh.nodes[&4].applied_index(),
+            mesh.nodes[&leader].applied_index(),
+            "the learner's applied frontier matches the leader's (no gap, no dup)"
+        );
     }
 }

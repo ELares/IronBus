@@ -560,6 +560,23 @@ impl<F: Filesystem, C: Clock> MetadataLogStorage<F, C> {
             .snapshot_index
     }
 
+    /// The serialized state-machine bytes of the durable snapshot (#660), if one is installed (its
+    /// index is `> 0`). The group calls this at open to RESTORE its application state machine from
+    /// the recovered snapshot BEFORE folding the retained log tail on top, so the recovered
+    /// committed state equals a full replay. `None` when no snapshot is installed (a fresh or
+    /// never-compacted group recovers purely from the log).
+    #[must_use]
+    pub fn snapshot_state_bytes(&self) -> Option<Vec<u8>> {
+        let core = self
+            .core
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if core.snapshot_index == 0 {
+            return None;
+        }
+        Some(core.snapshot_data.clone())
+    }
+
     /// CREATE + persist a metadata snapshot at `index` carrying the serialized state-machine
     /// `data`, then COMPACT the log up to it (#660). This is the leader/driver-cadence path: the
     /// caller passes the bytes of its applied [`MetadataStateMachine::snapshot`](crate::cluster::state_machine::MetadataStateMachine::snapshot)
