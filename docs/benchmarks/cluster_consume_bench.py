@@ -24,12 +24,16 @@ Two legs, same machine, same payload, same consumer-fleet size:
 HONEST SCOPE (read `cluster-consume-report.md`): the IronBus side drives the `DataPlaneController`
 follower-read SERVE PATH in-process over the REAL live runtime (real loopback peer transport, real
 on-disk replicated logs) — the #723 tiers are not yet threaded into the per-connection wire session,
-so this is NOT a wire-to-wire number against NATS's end-to-end pull. Read the IronBus SCALING SHAPE
-(throughput vs R) as the headline; the NATS column is the leader-served-consume reference that the
-follower-read fan-out is meant to scale ABOVE. Durability tiers are labeled per leg.
+so this is NOT a wire-to-wire number against NATS's end-to-end pull. We therefore do NOT publish an
+IronBus-vs-NATS throughput ratio (it would compare a serve-path number to a wire number). The honest,
+comparable claim is the SCALING SHAPE: IronBus clustered consume is ~O(R) in the replica count
+(apportioned follower reads fan out across replicas) while NATS clustered consume is ~O(1) in stream
+replicas (served from the one stream leader) — a structural architectural advantage. The IronBus
+serve-path curve and the NATS wire number are reported separately; the apples-to-apples wire-to-wire
+ratio awaits the C6 client-routing wiring (a tracked follow-on). Durability tiers are labeled per leg.
 
-Local-loopback on commodity hardware: the SCALING SHAPE + relative ratios, not the absolute t4g-edge
-numbers (#636 is the separate hardware run).
+Local-loopback on commodity hardware: the SCALING SHAPE, not the absolute t4g-edge numbers
+(#636 is the separate hardware run).
 
 Emits one JSONL row per measurement to `--out`; writes the markdown report to `--md-out`.
 
@@ -335,9 +339,14 @@ def write_report(a, spec, replicas, ironbus_summary, nats_mean, nats_sd, nats_n,
                  "from the stream leader; adding stream replicas does not fan consume reads out across "
                  "them). The aggregate `Sub stats` rate.")
     lines.append("")
-    lines.append("## IronBus apportioned-read scaling curve")
+    lines.append("## IronBus apportioned-read scaling curve (in-process serve path)")
     lines.append("")
-    lines.append("| replicas R | aggregate records/s (mean) | stdev | vs R=" + str(base_r) + " | runs |")
+    lines.append("Labeled explicitly: this is the IronBus **in-process controller serve path** "
+                 "(`serve_leader_local_read` / `serve_follower_read`) over the real live cluster runtime "
+                 "— NOT a wire-to-wire client number (see the caveats and the scaling-shape section). "
+                 "Read the SHAPE (throughput vs R), not the absolute records/s as a client rate.")
+    lines.append("")
+    lines.append("| replicas R | aggregate records/s (mean, serve path) | stdev | vs R=" + str(base_r) + " | runs |")
     lines.append("| --- | --- | --- | --- | --- |")
     for R in replicas:
         m, sd, rates = ironbus_summary.get(R, (None, None, []))
@@ -355,18 +364,35 @@ def write_report(a, spec, replicas, ironbus_summary, nats_mean, nats_sd, nats_n,
         lines.append(f"| NATS JS pull ({a.consumers} consumers, file stream) | {nats_mean:,.0f} | {nats_sd:,.0f} | {nats_n} |")
         lines.append("")
         lines.append("NATS consume is served from the stream leader, so it does **not** scale with stream "
-                     "replicas — it is the flat baseline the IronBus follower-read fan-out scales above.")
-        if base_mean:
-            lines.append("")
-            lines.append("### IronBus / NATS ratio (read the SHAPE, not a wire-to-wire constant — see caveats)")
-            lines.append("")
-            lines.append("| replicas R | IronBus records/s | NATS msgs/s | ratio |")
-            lines.append("| --- | --- | --- | --- |")
-            for R in replicas:
-                m = ironbus_summary.get(R, (None,))[0]
-                if m is None:
-                    continue
-                lines.append(f"| {R} | {m:,.0f} | {nats_mean:,.0f} | {m / nats_mean:.1f}x |")
+                     "replicas — it stays flat as stream replicas are added.")
+        lines.append("")
+        lines.append("### The honest claim: SCALING SHAPE, not a head-to-head ratio")
+        lines.append("")
+        lines.append("**We deliberately do NOT publish an IronBus-vs-NATS throughput ratio.** The two "
+                     "numbers are not measured the same way: the IronBus curve is the **in-process "
+                     "controller serve path** (`serve_leader_local_read` / `serve_follower_read`) over the "
+                     "real live runtime, while the NATS number is **wire-to-wire** (full client pull over "
+                     "TCP). A literal ratio would compare a serve-path throughput to a wire throughput — "
+                     "apples to oranges — so it is omitted, not spun.")
+        lines.append("")
+        lines.append("What IS comparable, and is the point of this leg, is the **architectural scaling "
+                     "shape**:")
+        lines.append("")
+        lines.append("- **IronBus clustered consume scales ~`O(R)` in the replica count.** With the #723 "
+                     "apportioned follower reads, a consumer fleet fans its committed reads across all R "
+                     "replicas, each serving locally from its own replicated copy — so aggregate "
+                     "throughput rises with R (measured here as the in-process serve curve: "
+                     f"{', '.join(f'R{R}≈{ironbus_summary.get(R,(None,))[0]/1e6:.1f}M/s' for R in replicas if ironbus_summary.get(R,(None,))[0] is not None)}).")
+        lines.append("- **NATS clustered consume is ~`O(1)` in stream replicas.** Consume is served from "
+                     "the one stream leader, so adding stream replicas does not fan reads out — the "
+                     f"wire-to-wire rate stays flat (~{nats_mean:,.0f} msgs/s here, {nats_n} runs).")
+        lines.append("")
+        lines.append("That `O(R)` vs `O(1)` difference is a STRUCTURAL architectural advantage, "
+                     "independent of the absolute per-system rates. **The apples-to-apples wire-to-wire "
+                     "ratio awaits the C6 client-routing wiring** (threading the #723 follower-read tiers "
+                     "into the per-connection wire `session.rs` so a real client fans its reads across "
+                     "replicas) — a tracked follow-on; until then this leg reports the IronBus serve-path "
+                     "scaling curve and the NATS wire number separately, never as one ratio.")
     else:
         lines.append("**NATS leg: PENDING (not run).** `nats-server` and/or `nats` CLI unavailable, or "
                      "`--no-nats` was passed. The IronBus scaling curve above is real; the NATS comparison "
@@ -374,23 +400,29 @@ def write_report(a, spec, replicas, ironbus_summary, nats_mean, nats_sd, nats_n,
     lines.append("")
     lines.append("## Big-O / first-principles")
     lines.append("")
-    lines.append("The claim: aggregate committed-consume throughput is **O(R)** in the replica count when a "
-                 "fleet apportions committed reads across all R replicas, because each replica serves "
-                 "committed reads LOCALLY from its own page-cache copy (no leader round-trip on a clean "
-                 "read), so R independent serve paths run in parallel. NATS clustered consume is **O(1)** in "
-                 "stream replicas (served from the one stream leader). The measured IronBus curve above is "
-                 "the test of the O(R) model; the per-step ratio < R is the contention residual described in "
-                 "the caveats.")
+    lines.append("The claim under test is a SCALING SHAPE, not an absolute rate. Aggregate "
+                 "committed-consume throughput is **O(R)** in the replica count when a fleet apportions "
+                 "committed reads across all R replicas, because each replica serves committed reads "
+                 "LOCALLY from its own page-cache copy (no leader round-trip on a clean read), so R "
+                 "independent serve paths run in parallel. NATS clustered consume is **O(1)** in stream "
+                 "replicas (served from the one stream leader). The measured IronBus serve-path curve above "
+                 "is the test of the O(R) model; the per-step rise < R is the contention residual described "
+                 "in the caveats. This `O(R)` vs `O(1)` gap is the structural architectural advantage — it "
+                 "is what this leg claims, NOT a literal IronBus-vs-NATS throughput multiple (the two "
+                 "numbers are measured on different planes; see the scaling-shape section).")
     lines.append("")
     lines.append("## Honest caveats")
     lines.append("")
-    lines.append("- **In-process serve path, not the wire session.** The #723 follower-read tiers are not "
-                 "yet threaded into the per-connection wire session (`session.rs`); this harness drives the "
-                 "`DataPlaneController` serve methods directly over the REAL live runtime (real loopback "
-                 "peer transport, real on-disk replicated logs, real CRC-revalidated replication). The NATS "
-                 "leg is end-to-end over the wire. So the IronBus/NATS ratio is **not** a wire-to-wire "
-                 "number — read the IronBus SCALING SHAPE (throughput vs R) as the headline and the "
-                 "order-of-magnitude, not the literal ratio.")
+    lines.append("- **In-process serve path, not the wire session — so no head-to-head ratio is "
+                 "published.** The #723 follower-read tiers are not yet threaded into the per-connection "
+                 "wire session (`session.rs`); this harness drives the `DataPlaneController` serve methods "
+                 "directly over the REAL live runtime (real loopback peer transport, real on-disk "
+                 "replicated logs, real CRC-revalidated replication). The NATS leg is end-to-end over the "
+                 "wire. Because the two planes differ, this report does NOT quote an IronBus/NATS "
+                 "throughput ratio — it reports the IronBus serve-path SCALING SHAPE (throughput vs R) and "
+                 "the NATS wire number separately. The apples-to-apples wire-to-wire comparison awaits the "
+                 "**C6 client-routing wiring** (threading the #723 tiers into `session.rs` so a real client "
+                 "fans reads across replicas) — a tracked follow-on.")
     lines.append("- **Zero-copy raw byte runs.** A serve returns a contiguous committed `Bytes` run "
                  "(refcounted, no copy) per call, so the IronBus absolute records/s is high (page-cache "
                  "resident, no per-record syscall). That is a real property of the serve path, but it makes "
@@ -399,9 +431,9 @@ def write_report(a, spec, replicas, ironbus_summary, nats_mean, nats_sd, nats_n,
                  "co-located on one node contends on that lock; more replicas = more independent locks = the "
                  "sub-R scaling seen above. In a real multi-process wire serve each node is a separate "
                  "process, so this particular contention would be more separated, not less.")
-    lines.append("- **Local-loopback, commodity hardware.** This is the scaling shape + relative ratios on "
-                 "this machine, not the absolute t4g-edge numbers (#636 is the separate hardware run); those "
-                 "are NOT fabricated here.")
+    lines.append("- **Local-loopback, commodity hardware.** This is the scaling SHAPE on this machine, not "
+                 "the absolute t4g-edge numbers (#636 is the separate hardware run); those are NOT "
+                 "fabricated here.")
     lines.append("- **Durability tiers labeled.** IronBus reads only the quorum-committed safe prefix "
                  "(durable-committed); NATS drains a durable file stream. Both are durable-consume tiers.")
     lines.append("")

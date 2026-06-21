@@ -231,8 +231,12 @@ committed [`cluster-consume-rows.jsonl`](cluster-consume-rows.jsonl) and
 [`cluster-consume-report.md`](cluster-consume-report.md) are the data. HONEST scope
 (in the report): the IronBus side drives the `DataPlaneController` follower-read
 SERVE PATH in-process over the REAL live runtime (the #723 tiers are not yet threaded
-into the per-connection wire `session.rs`), while NATS is end-to-end over the wire —
-so read the IronBus SCALING SHAPE, not the literal wire-to-wire ratio.
+into the per-connection wire `session.rs`), while NATS is end-to-end over the wire.
+The report therefore does NOT publish an IronBus-vs-NATS throughput ratio (that would
+compare a serve-path number to a wire number); it reports the IronBus serve-path
+SCALING SHAPE (`O(R)`) and the NATS wire number (`O(1)` in stream replicas)
+separately. The apples-to-apples wire-to-wire ratio awaits the C6 client-routing
+wiring (a tracked follow-on).
 
 ```sh
 cargo build --release -p ironbus-bench --bin cluster-consume-bench
@@ -253,10 +257,15 @@ settles them, and measures per-node CPU (CPU-time delta) and network bytes/s
 metadata-Raft supports only 1/3/5 voters; 7 is refused at startup); NATS at {3,5,7}.
 The committed [`cluster-heartbeat-rows.jsonl`](cluster-heartbeat-rows.jsonl) and
 [`cluster-heartbeat-report.md`](cluster-heartbeat-report.md) are the data. HONEST
-(in the report): the network bytes/s curve is the trustworthy `O(N)`-vs-`O(N²)`
-asymptote; the measured IronBus idle CPU is dominated by a per-peer dialer-thread
-busy-spin (a real bug this benchmark surfaced — IronBus LOSES the idle-CPU comparison
-to NATS's ≈0% until it is fixed), reported plainly, not spun.
+(in the report): the first version of this benchmark surfaced a real bug — an idle
+IronBus cluster burning ~2 cores/node — which turned out to be a macOS-loopback
+`O_NONBLOCK`-inheritance artifact (accepted sockets inherited the listener's
+non-blocking flag, so `SO_RCVTIMEO` was ignored and the per-peer reader hot-spun),
+FIXED in #726; on Linux accepted sockets don't inherit `O_NONBLOCK`, so the
+production target was never affected. Post-fix the idle cluster uses ~0 idle CPU
+(~0.003 cores/node, comparable to NATS) and small idle network (~1.4–4.8 kB/s
+cluster-wide), both reported plainly alongside the original finding — not hidden,
+not spun.
 
 ```sh
 cargo build --release -p ironbus-cli --bin ironbus

@@ -25,8 +25,12 @@ per follower); NATS mesh gossip is O(N^2) cluster-wide. The measured bytes/s cur
 Emits one JSONL row per (system, nodes, node_id, run) to `--out`; writes the report to `--md-out`.
 
 HONEST: this is local loopback on commodity hardware — the SHAPE (cost vs N) and the relative
-ordering, not the absolute t4g-edge numbers (#636). Where IronBus is measured to LOSE (idle CPU), it
-is reported plainly.
+ordering, not the absolute t4g-edge numbers (#636). The first version of this benchmark surfaced a
+real bug — an idle IronBus cluster burning ~2 cores/node — which turned out to be a macOS-loopback
+`O_NONBLOCK`-inheritance artifact (accepted sockets inherited the listener's non-blocking flag so
+`SO_RCVTIMEO` was ignored and the per-peer reader hot-spun), FIXED in #726. On Linux accepted sockets
+do not inherit `O_NONBLOCK`, so the production (Linux/t4g) target was never affected. Post-fix idle
+CPU is ~0, comparable to NATS; both the original finding and the post-fix numbers are reported.
 
 Reproduce:
   python3 cluster_heartbeat_bench.py --ironbus /path/to/ironbus \
@@ -353,7 +357,7 @@ def fmt(v, unit=""):
 
 
 def fmt_cpu(v):
-    """CPU in cores to 2 decimals (the busy-spin signal lives in the tenths/hundredths)."""
+    """CPU in cores to 2 decimals (idle CPU is ~0 post-#726; kept at 2dp for an at-a-glance floor)."""
     return "—" if v is None else f"{v:.2f}"
 
 
@@ -401,8 +405,9 @@ def write_report(a, spec, ironbus_sizes, nats_sizes, ib, nats, nats_ok):
              f"~{IRONBUS_HEARTBEAT_ROUNDS_PER_SEC:.2f} rounds/s; one round is the leader -> (N-1) "
              "followers fan-out plus their replies, so cluster-wide metadata-consensus messages/s ≈ "
              f"2·(N-1)·{IRONBUS_HEARTBEAT_ROUNDS_PER_SEC:.2f}, i.e. O(N) by construction. NOTE: the "
-             "measured bytes/s above is NOT a clean proxy for this — it also includes the per-follower "
-             "data-plane fetch-loop traffic (see the big-O section), which dominates the idle wire cost.")
+             "measured bytes/s above is NOT a clean isolation of just the metadata heartbeat — it also "
+             "includes the per-follower data-plane fetch loop (see the big-O section); both are small "
+             "in the post-#726 steady state.")
     L.append("")
     if nats_ok and nats:
         L.append("## NATS: full-mesh route gossip (claim: O(N²) cluster-wide)")
@@ -435,46 +440,57 @@ def write_report(a, spec, ironbus_sizes, nats_sizes, ib, nats, nats_ok):
     L.append("- *NATS mesh gossip is O(N²) cluster-wide.* Every server holds a route to every other, so "
              "cluster-wide liveness bytes/s would scale with the N(N-1)/2 edges.")
     L.append("")
-    L.append("**What the measured bytes/s actually show (read honestly — the model is only partly "
-             "borne out):**")
+    L.append("**What the measured bytes/s actually show (read honestly — post-#726 numbers):**")
     L.append("")
-    L.append("- **IronBus rises FASTER than O(N), not O(N).** Cluster-wide idle traffic jumps from ~2 kB/s "
-             "(N=3) to ~57 kB/s (N=5) — far more than the 1.67× a clean O(N) metadata-only model "
-             "predicts. The reason is that the measured per-process bytes capture the WHOLE cluster "
-             "runtime, not just the metadata heartbeat: each follower also runs a continuous data-plane "
-             "follower-FETCH loop against its leader (`crates/ironbus-server/src/cluster/serve.rs`), and "
-             "those replication-poll round-trips — even with no data to move — dominate the idle wire "
-             "cost and grow with the follower count. So the metadata-Raft heartbeat IS O(N) by "
-             "construction, but the cluster's TOTAL idle traffic is dominated by the data-plane poll "
-             "loops and rises super-linearly here. Reported as measured, not as the clean O(N) we "
-             "predicted.")
+    L.append("- **IronBus idle CPU is now ~0, comparable to NATS.** An idle IronBus cluster uses ~0.003–"
+             "0.004 cores/node (mean; max sample ~0.01–0.014), essentially indistinguishable from NATS's "
+             "~0.001 cores/node and from a sleeping process. This replaces the originally-measured ~2 "
+             "cores/node, which was NOT real consensus work but a macOS-loopback `O_NONBLOCK`-inheritance "
+             "artifact (see the caveats), FIXED in #726. The idle-CPU floor is no longer a loss.")
+    L.append("- **IronBus idle network is small and rises roughly O(N), now in NATS's ballpark.** "
+             "Cluster-wide idle traffic is ~1.4 kB/s (N=3) → ~4.8 kB/s (N=5): small, dominated by the "
+             "per-follower data-plane fetch loop (`crates/ironbus-server/src/cluster/serve.rs`) plus the "
+             "metadata heartbeat, and growing with the follower count rather than exploding. (The "
+             "pre-#726 N=5 figure of ~57 kB/s was inflated by the same busy-spin churning the read/fetch "
+             "loops; with the reader parked, the idle wire cost collapses to this small steady-state.) "
+             "NATS's cluster-wide idle traffic over the same window is ~0.5/1.1/1.8 kB/s at N=3/5/7. "
+             "Both systems are small and grow about linearly across this range; IronBus is a modest "
+             "constant factor above NATS, not asymptotically worse.")
     L.append("- **NATS does NOT show O(N²) in this range — it is near-flat and tiny.** Cluster-wide idle "
-             "traffic is ~1.3–1.8 kB/s across N=3,5,7 (essentially constant), and per-node idle CPU is "
-             "≈0. NATS's gossip is interval-paced and small at these cluster sizes, so the O(N²) edge "
-             "count does not translate into a measurable quadratic at N≤7 on this rig; the asymptote "
-             "would only show at much larger N. The predicted O(N²) is therefore NOT observed here — "
-             "stated plainly rather than forced onto the data.")
-    L.append("- **Net-net at edge-relevant sizes (N≤7):** NATS's idle liveness footprint is both tiny and "
-             "flat; IronBus's idle NETWORK is larger and grows super-linearly (data-plane poll loops), "
-             "and its idle CPU is far worse (the busy-spin below). IronBus LOSES the idle-cost comparison "
-             "at these sizes. The metadata-Raft's O(N) heartbeat advantage over an O(N²) mesh is a real "
-             "asymptotic property but is not what dominates the measured idle cost on this rig.")
+             "traffic is ~0.5–1.8 kB/s across N=3,5,7 (roughly linear in N, not quadratic), and per-node "
+             "idle CPU is ≈0. NATS's gossip is interval-paced and small at these cluster sizes, so the "
+             "O(N²) edge count does not translate into a measurable quadratic at N≤7 on this rig; the "
+             "asymptote would only show at much larger N. The predicted O(N²) is therefore NOT observed "
+             "here — stated plainly rather than forced onto the data.")
+    L.append("- **Net-net at edge-relevant sizes (N≤7):** both systems have a tiny idle footprint — ≈0 "
+             "idle CPU and low-single-kB/s idle network. IronBus's idle network is a small constant "
+             "factor above NATS's and grows about linearly (data-plane fetch loop + O(N) metadata "
+             "heartbeat), while NATS stays slightly lower; neither shows a quadratic blow-up at these "
+             "sizes. The metadata-Raft's O(N) heartbeat advantage over an O(N²) mesh is a real asymptotic "
+             "property that does not dominate the measured idle cost at N≤7 on this rig — stated as "
+             "measured.")
     L.append("")
-    L.append("## Honest caveats (including where IronBus LOSES)")
+    L.append("## Honest caveats (including the original finding)")
     L.append("")
-    L.append("- **IronBus idle CPU is dominated by a busy-spin, NOT by heartbeat work — and it is high.** "
-             "On this machine an idle IronBus cluster burns ~2 cores per follower and ~4 cores on the "
-             "leader (measured by the unambiguous CPU-time delta), while an idle NATS cluster is "
-             "≈0% CPU. The cluster-runtime per-peer dialer threads (`ib-cluster-dial-*`, "
-             "`crates/ironbus-server/src/cluster/runtime.rs`) spin instead of blocking when their "
-             "outbound queue is idle. So the measured IronBus CPU column reflects that busy-spin, NOT the "
-             "~3.3 heartbeat-rounds/s of real consensus work; IronBus LOSES the idle-CPU comparison "
-             "decisively until that spin is fixed (a real bug this benchmark surfaced — reported, not "
-             "spun). The NETWORK column is the cleaner wire-cost signal (it is not inflated by the CPU "
-             "spin), but as the big-O section explains it is dominated by the per-follower data-plane "
-             "fetch loops, not the pure metadata heartbeat — so it is reported as a TOTAL idle-traffic "
-             "measurement, not as an isolated heartbeat asymptote. The CPU column is reported truthfully "
-             "as a loss + a found bug.")
+    L.append("- **The original ~2 cores/node idle CPU was a macOS-loopback `O_NONBLOCK`-inheritance bug "
+             "this benchmark FOUND — now fixed (#726).** The first version of this run measured an idle "
+             "IronBus cluster burning ~2 cores per follower and ~3–4 cores on the leader, vs NATS ≈0. "
+             "That was a real bug surfaced by this benchmark, not consensus work: the peer/data-plane "
+             "LISTENERs are non-blocking (so their accept loops can poll a shutdown flag), and on "
+             "BSD/macOS an accepted socket INHERITS the listener's `O_NONBLOCK`. The per-peer reader then "
+             "set a blocking-mode read timeout (`SO_RCVTIMEO`), which is IGNORED on a non-blocking socket "
+             "— so `read` returned `WouldBlock` instantly instead of parking up to the timeout, and the "
+             "reader hot-spun (~550k loop iterations/s, re-locking the registry + re-allocating its read "
+             "buffer each pass) while servicing only ~3–8 real messages/s. #726 restores blocking mode "
+             "(`set_nonblocking(false)`) on every accepted stream before setting the read timeout, and "
+             "paces the raft `tick()` to wall-clock instead of once per inbound wake. On Linux accepted "
+             "sockets do NOT inherit `O_NONBLOCK`, so the spin never affected the production (Linux/t4g) "
+             "target; it was a macOS-only artifact of this measurement rig. The benchmark is reported "
+             "with both numbers in view: it found a real (macOS) bug, and the post-fix idle CPU is ~0, "
+             "comparable to NATS. Not hidden, not spun.")
+    L.append("- **The post-fix numbers are the headline.** Idle CPU ~0.003–0.004 cores/node "
+             "(≈ NATS ~0.001), idle network ~1.4 kB/s (N=3) → ~4.8 kB/s (N=5) cluster-wide (NATS ~0.5–"
+             "1.8 kB/s at N=3,5,7). Both small; both grow about linearly at these sizes.")
     L.append("- **Local-loopback, commodity hardware.** Shape + relative ordering on this machine, not "
              "the absolute t4g-edge numbers (#636, a separate hardware run); not fabricated here.")
     L.append("- **Idle only.** This is the liveness/consensus FLOOR (no client load); a loaded cluster's "
