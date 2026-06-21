@@ -488,6 +488,11 @@ impl<F: Filesystem + Clone, C: Clock> DataPlaneServer<F, C> {
     /// also updates the follower's leader TARGET when a still-following node's leader changed to the new
     /// successor. `isr_config` sizes the promoted leader's ISR / quorum gate.
     ///
+    /// `committed_hw_bar` is the SAFE bar carried with the failover (the persisted committed-HW
+    /// checkpoint, #618b): on the in-place promotion it is RE-VERIFIED against this node's own durable
+    /// log (defense in depth), so a promotion that would leave a leader missing committed data is aborted
+    /// fail-closed rather than creating a false leader. Pass `0` for the no-bar / n=1 degenerate.
+    ///
     /// Returns `true` if this node's role for `partition` changed (a promotion or a re-targeted
     /// follower), `false` if nothing changed for this node (e.g. it does not hold the partition, or it
     /// was already the leader / still follows the same leader).
@@ -498,13 +503,14 @@ impl<F: Filesystem + Clone, C: Clock> DataPlaneServer<F, C> {
     /// promotion, which is the failover correctness property; a full live rebalance is C5-I2 (#617).
     ///
     /// # Errors
-    /// [`DataPlaneError`] if the in-place promotion fails (a read-plane build or a backward-epoch
-    /// assign — fail-closed).
+    /// [`DataPlaneError`] if the in-place promotion fails (a read-plane build, a backward-epoch assign,
+    /// or the apply-time committed-completeness self-verify — all fail-closed).
     pub fn reconcile_placement(
         &mut self,
         partition: u64,
         new_placement: &Placement,
         isr_config: IsrConfig,
+        committed_hw_bar: u64,
     ) -> Result<bool, DataPlaneError> {
         let role = role_for_placement(self.node_id, new_placement);
         match role {
@@ -514,11 +520,14 @@ impl<F: Filesystem + Clone, C: Clock> DataPlaneServer<F, C> {
                     return Ok(false);
                 }
                 // FOLLOWER → LEADER promotion over the held log (no data move), seeding the bumped epoch.
+                // The apply-time committed-completeness self-verify inside `promote_follower_to_leader`
+                // aborts fail-closed if this node's durable log does not cover `committed_hw_bar`.
                 self.seam.controller_mut().promote_follower_to_leader(
                     partition,
                     LeaderEpoch::new(new_placement.epoch),
                     &new_placement.replicas,
                     isr_config,
+                    committed_hw_bar,
                 )?;
                 // This node no longer follows the partition (it leads it now).
                 self.follower_targets.remove(&partition);
@@ -1912,7 +1921,9 @@ mod tests {
         assert_replicated_byte_identical(&succ_bytes_pre, leader_log);
         successor_follower
             .server
-            .reconcile_placement(P, &new_placement, quorum3())
+            // Carry the committed-HW bar (#618b): the apply-time self-verify confirms the promoted node's
+            // own durable log covers it before it becomes leader (it caught up to the full pre-death HW).
+            .reconcile_placement(P, &new_placement, quorum3(), committed_hw)
             .expect("the in-sync follower is promoted to leader in place");
         // (a) it is now the LEADER for the partition.
         assert!(
@@ -2039,10 +2050,11 @@ mod tests {
         let (new_listener, new_addr) = new_leader_addr;
         let new_addr = new_addr.unwrap();
 
-        // The other survivor reconciles too: it stays a follower but re-targets to the successor.
+        // The other survivor reconciles too: it stays a follower but re-targets to the successor. (As a
+        // follower the committed-HW bar is unused, but we pass it for symmetry with the leader path.)
         let changed = other_follower
             .server
-            .reconcile_placement(P, &new_placement, quorum3())
+            .reconcile_placement(P, &new_placement, quorum3(), committed_hw)
             .expect("the other survivor reconciles");
         assert!(changed, "the other survivor re-targeted to the new leader");
         assert_eq!(
@@ -2089,10 +2101,19 @@ mod tests {
 
         // FINAL: the falsifiable #618 invariant (CI5) over the REAL post-failover state — the successor
         // was in the ISR, holds every pre-death committed offset, and carries a strictly-higher epoch.
+        // `successor_in_isr` is DERIVED FROM REAL STATE (no hardcoded shortcut, #618b): a replica is in
+        // the ISR for failover purposes exactly when its durable prefix has reached the committed HW (the
+        // data-plane completeness criterion `place_partition` uses); we read the successor's measured
+        // pre-death durable HW and compute the predicate, rather than asserting it.
+        let successor_in_isr = succ_hw_pre >= committed_hw;
+        assert!(
+            successor_in_isr,
+            "the successor's measured durable HW ({succ_hw_pre}) reached the committed HW ({committed_hw}) — it really is ISR-complete"
+        );
         let failover_state = ironbus_core::cluster_invariants::Failover {
             dead_leader: 1,
             successor,
-            successor_in_isr: true, // it was caught up in phase 1 (an ISR member)
+            successor_in_isr,
             // The successor's TRUE durable prefix: every offset it durably appended as a follower (it
             // caught up to the full pre-death committed HW). The read-plane-served end can lag this by the
             // active (unsealed) tail, but the records are durably HELD — CI5 is about held committed data.
@@ -2618,6 +2639,9 @@ mod live_runtime_tests {
     #[test]
     fn live_three_node_runtime_replicates_and_quorum_gates_a_c2_fsync_produce() {
         const P: u64 = 0;
+        // Serialize against the other heavy multi-node cluster tests (here and in the `runtime` module)
+        // so this thread-spinning cluster runs on an un-contended host (no #687 starvation flake).
+        let _serial = crate::cluster::heavy_cluster_test_guard();
         let placement = Placement {
             replicas: vec![1, 2, 3],
             leader: 1,
@@ -2791,6 +2815,7 @@ mod live_runtime_tests {
     #[test]
     fn live_runtime_below_min_isr_keeps_the_wire_ack_parked() {
         const P: u64 = 0;
+        let _serial = crate::cluster::heavy_cluster_test_guard();
         let placement = Placement {
             replicas: vec![1, 2, 3],
             leader: 1,
@@ -2847,6 +2872,7 @@ mod live_runtime_tests {
     #[test]
     fn live_runtime_follower_restart_resumes_replication() {
         const P: u64 = 0;
+        let _serial = crate::cluster::heavy_cluster_test_guard();
         let placement = Placement {
             replicas: vec![1, 2],
             leader: 1,

@@ -308,7 +308,9 @@ pub use replication::{
 };
 pub use runtime::{
     dataplane_addr, partitions_led_by, plan_failovers, ClusterConfig, ClusterRuntime,
-    ClusterStatus, MetadataProposer, RuntimeError, DATAPLANE_PORT_OFFSET,
+    ClusterStatus, CommittedHwFn, FailoverInputs, FailoverInstaller, LivenessConfig,
+    MetadataProposer, OwnFrontierFn, RuntimeError, SurvivorStateFn, DATAPLANE_PORT_OFFSET,
+    DEFAULT_LIVENESS_TIMEOUT,
 };
 pub use serve::{
     decode_dataplane_peer_frame, encode_dataplane_peer_frame, DataPlaneLink, DataPlaneRuntime,
@@ -319,3 +321,24 @@ pub use transport::{
     decode_peer_frame, decode_raft_message, encode_raft_message, PeerLink, PeerRegistry,
     PeerWireError, MAX_RAFT_MSG_BYTES, RAFT_DECODE_RECURSION_LIMIT,
 };
+
+/// A process-wide SERIAL guard shared by the HEAVY multi-node cluster tests across the `runtime` and
+/// `serve` test modules (each spins several raft / data-plane driver threads + listeners; running many
+/// at once on a shared CI runner thrashes the scheduler so a starved driver cannot accumulate its
+/// election ticks even inside the host-scaled bound — the #687 starvation, amplified by N concurrent
+/// clusters). Both modules acquire [`heavy_cluster_test_guard`] for the duration of such a test, so the
+/// clusters form on an un-contended host and the timing waits stay truthful and flake-free. Test-only;
+/// it is NOT a dependency (no `serial_test`) — a plain `static Mutex`.
+#[cfg(all(test, unix))]
+pub(crate) static HEAVY_CLUSTER_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire the shared heavy-cluster-test serial guard, recovering a poisoned lock (only mutual
+/// exclusion is needed, not the protected unit value). Gated `all(test, unix)` to match its callers —
+/// the heavy multi-node cluster tests are unix-only (the broker/serve path is `cfg(unix)` via `StdFs`),
+/// so on Windows the guard and its callers vanish together (no `dead_code` under `-D warnings`).
+#[cfg(all(test, unix))]
+pub(crate) fn heavy_cluster_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    HEAVY_CLUSTER_TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}

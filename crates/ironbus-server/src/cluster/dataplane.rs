@@ -152,6 +152,19 @@ pub enum DataPlaneError {
     /// An underlying replication / codec / storage fault (a corrupt fetch response, a malformed
     /// report, a truncation failure). The replication layer's typed error, surfaced verbatim.
     Replication(ReplicationError),
+    /// The apply-time committed-completeness self-verify FAILED (#618b): a failover named THIS node the
+    /// new leader, but its own durable log does NOT cover the committed-HW bar carried with the
+    /// promotion — promoting it would lose committed data. The promotion is ABORTED fail-closed (no false
+    /// leader is created; the partition stays leaderless / recoverable). This is the defense-in-depth net
+    /// that makes committed-data loss impossible even from an optimistic / buggy proposal.
+    FailoverIncomplete {
+        /// The partition whose failover was aborted.
+        partition: u64,
+        /// THIS node's durable frontier (the first offset it has NOT durably appended).
+        durable_frontier: u64,
+        /// The committed-HW bar the successor had to hold (and did not).
+        committed_hw: u64,
+    },
 }
 
 impl core::fmt::Display for DataPlaneError {
@@ -168,6 +181,16 @@ impl core::fmt::Display for DataPlaneError {
                 "partition {partition} operation needs the {needed} role on this node"
             ),
             DataPlaneError::Replication(e) => write!(f, "replication fault: {e}"),
+            DataPlaneError::FailoverIncomplete {
+                partition,
+                durable_frontier,
+                committed_hw,
+            } => write!(
+                f,
+                "partition {partition} failover aborted (fail-closed): this node's durable frontier \
+                 {durable_frontier} is behind the committed-HW bar {committed_hw}; it is missing \
+                 committed data and must not become leader"
+            ),
         }
     }
 }
@@ -807,10 +830,22 @@ impl<F: Filesystem + Clone, C: Clock> DataPlaneController<F, C> {
     /// this via [`reassign_leadership`](super::placement::reassign_leadership)); the epoch-cache `assign`
     /// enforces strict monotonicity and fails closed if it does not.
     ///
+    /// ## Apply-time committed-completeness self-verify (defense in depth, #618b)
+    ///
+    /// `committed_hw_bar` is the SAFE bar carried with the failover (the persisted committed-HW
+    /// checkpoint the metadata plane proved this node holds before proposing the promotion). Even though
+    /// the proposer already gated on it, this method RE-CHECKS it against THIS node's OWN durable log
+    /// before it becomes leader: if its durable frontier does NOT cover the bar it ABORTS the promotion
+    /// (fail-closed — the partition stays leaderless; no false leader is created), so even an
+    /// optimistic / buggy / hand-built proposal can never make a leader that is missing committed data.
+    /// Pass `0` to skip the check (the n=1 / no-bar degenerate, where there is no committed data to lose).
+    ///
     /// # Errors
     /// - [`DataPlaneError::WrongRole`] if this node is already the leader (idempotent re-promotion is a
     ///   no-op caller-side; a double-promote is a logic error surfaced here);
     /// - [`DataPlaneError::UnknownPartition`] if this node holds no role for `partition`;
+    /// - [`DataPlaneError::FailoverIncomplete`] if this node's durable log does not cover
+    ///   `committed_hw_bar` (the apply-time self-verify fails closed — no false leader is created);
     /// - [`DataPlaneError::Replication`] if the read plane cannot be built or the epoch boundary cannot
     ///   be assigned (a backward epoch — fail-closed).
     pub fn promote_follower_to_leader(
@@ -819,6 +854,7 @@ impl<F: Filesystem + Clone, C: Clock> DataPlaneController<F, C> {
         new_epoch: LeaderEpoch,
         replica_ids: &[u64],
         isr_config: IsrConfig,
+        committed_hw_bar: u64,
     ) -> Result<(), DataPlaneError> {
         // Take the role out so we can consume the follower (or restore it on a wrong-role error).
         let role = self
@@ -836,6 +872,24 @@ impl<F: Filesystem + Clone, C: Clock> DataPlaneController<F, C> {
                 });
             }
         };
+        // APPLY-TIME COMMITTED-COMPLETENESS SELF-VERIFY (defense in depth, #618b). Before this node takes
+        // leadership, re-check that its OWN durable log covers the committed-HW bar carried with the
+        // failover. `next_offset()` is its durable frontier (the first offset it has NOT durably
+        // appended); it must be >= the bar (so every offset below the bar is durably held here). If not,
+        // ABORT — restore the follower role and fail closed, so no leader missing committed data is ever
+        // created (the partition stays leaderless / recoverable). This catches an optimistic or buggy
+        // proposal that the proposer-side gate somehow let through.
+        let durable_frontier = follower.follower().log().next_offset().get();
+        if durable_frontier < committed_hw_bar {
+            // Put the follower role back UNCHANGED — we did not consume it; this node keeps following.
+            self.roles
+                .insert(partition, PartitionRole::Follower { follower });
+            return Err(DataPlaneError::FailoverIncomplete {
+                partition,
+                durable_frontier,
+                committed_hw: committed_hw_bar,
+            });
+        }
         // Split the follower into its owned log + its learned epoch history. The log is the committed
         // data this node ALREADY holds — promotion serves it as-is (no fetch, no copy).
         let (follower, mut epochs) = follower.into_parts();
@@ -1732,6 +1786,86 @@ mod tests {
         assert_eq!(
             req.from_offset, 0,
             "the follower resumes from its recovered head"
+        );
+    }
+
+    // ---- #618b apply-time committed-completeness self-verify (defense in depth) -------------------
+
+    #[test]
+    fn promote_aborts_fail_closed_when_the_node_is_behind_the_committed_hw_bar() {
+        // Build a follower caught up to a known durable frontier, then attempt to promote it with a
+        // committed-HW bar ABOVE that frontier (modeling an optimistic/buggy proposal that names an
+        // incomplete node leader). The apply-time self-verify MUST abort fail-closed: it returns
+        // FailoverIncomplete, the node STAYS a follower (no false leader is created), and no committed
+        // data is exposed under a leader missing it.
+        const P: u64 = 0;
+        let mut leader_log = open_log(InMemoryFs::new(), small_config());
+        for i in 0..12u32 {
+            leader_log
+                .append(&rec(format!("rec-{i:02}").as_bytes()))
+                .unwrap();
+        }
+        leader_log.sync().unwrap();
+        let plane = leader_plane(&leader_log);
+        let served_end = plane_served_end(&plane);
+        assert!(
+            served_end > 0,
+            "the leader serves a non-empty sealed prefix"
+        );
+
+        let mut leader = DataPlaneController::<InMemoryFs, ManualClock>::new(1);
+        leader.start_leader(P, Arc::clone(&plane), EpochCache::new(), &[1, 2], quorum3());
+
+        let mut follower = DataPlaneController::new(2);
+        follower.start_follower(P, open_log(InMemoryFs::new(), small_config()));
+        // Catch the follower up to the served prefix.
+        for _ in 0..24 {
+            if follower.follower_high_watermark(P).unwrap() >= served_end {
+                break;
+            }
+            let req = follower.make_fetch_request(P, 8, 4096).unwrap();
+            let resp = leader.serve_fetch(P, &req).unwrap();
+            follower.apply_fetch_response(P, &resp).unwrap();
+        }
+        let durable = follower
+            .follower_log(P)
+            .expect("follower log")
+            .next_offset()
+            .get();
+        assert!(durable > 0, "the follower durably holds some records");
+
+        // A bar ABOVE the follower's durable frontier => the self-verify aborts fail-closed.
+        let bar_above = durable + 1;
+        let err = follower
+            .promote_follower_to_leader(P, LeaderEpoch::new(6), &[2], quorum3(), bar_above)
+            .expect_err("promotion with a bar above the durable frontier must fail closed");
+        match err {
+            DataPlaneError::FailoverIncomplete {
+                partition,
+                durable_frontier,
+                committed_hw,
+            } => {
+                assert_eq!(partition, P);
+                assert_eq!(durable_frontier, durable);
+                assert_eq!(committed_hw, bar_above);
+            }
+            other => panic!("expected FailoverIncomplete, got {other:?}"),
+        }
+        // CRITICAL: the node is STILL a follower (no false leader was created) and is NOT a leader.
+        assert!(
+            follower.is_follower(P),
+            "the aborted promotion left the node a follower (no false leader)"
+        );
+        assert!(!follower.is_leader(P), "the node did not become leader");
+
+        // A bar AT the follower's durable frontier (it really holds the committed prefix) => the
+        // promotion SUCCEEDS — the safe path is not over-zealous.
+        follower
+            .promote_follower_to_leader(P, LeaderEpoch::new(6), &[2], quorum3(), durable)
+            .expect("promotion with a bar the node holds succeeds");
+        assert!(
+            follower.is_leader(P),
+            "a complete node (durable frontier >= bar) is promoted to leader"
         );
     }
 
