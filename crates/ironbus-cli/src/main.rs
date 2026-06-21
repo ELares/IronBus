@@ -4621,6 +4621,10 @@ fn spawn_dataplane_serve(
     let peers = runtime.peers();
     let status = runtime.status_handle();
     let proposer = runtime.metadata_proposer();
+    // The cross-plane F2 auto-failover installer (#618): the bootstrap installs the LIVE ISR
+    // survivor-state + committed-HW providers once the data plane is up, so the metadata-Raft leader can
+    // auto-promote an ISR successor when a leader crashes. Until installed, auto-failover is fail-closed.
+    let failover_installer = runtime.failover_installer();
     let log_config = LogConfig::new(config.max_segment_bytes)
         .map_err(|e| CliError::Internal(format!("replica log config: {e}")))?
         .with_max_total_bytes(config.max_total_bytes);
@@ -4670,6 +4674,7 @@ fn spawn_dataplane_serve(
                 &peers,
                 &status,
                 &proposer,
+                &failover_installer,
                 &data_dir,
                 log_config,
                 &client_ack_slot_t,
@@ -4696,6 +4701,9 @@ fn spawn_dataplane_serve(
 #[allow(clippy::needless_pass_by_value)] // a thread entry point: it OWNS the read-plane Arc (cloned
                                          // into the leader role) + the log config for its lifetime;
                                          // a borrow would fight the 'static spawn bound.
+#[allow(clippy::too_many_lines)] // one linear bootstrap sequence (await placement, build the server,
+                                 // start the runtime, install the F2 cross-plane inputs, hold until
+                                 // shutdown); splitting it would scatter a single startup concern.
 fn run_dataplane_bootstrap(
     node_id: u64,
     replicas: &[u64],
@@ -4705,6 +4713,7 @@ fn run_dataplane_bootstrap(
     peers: &std::collections::BTreeMap<u64, std::net::SocketAddr>,
     status: &std::sync::Arc<std::sync::Mutex<ironbus_server::cluster::ClusterStatus>>,
     proposer: &MetadataProposer,
+    failover_installer: &ironbus_server::cluster::FailoverInstaller,
     data_dir: &Path,
     log_config: LogConfig,
     client_ack_slot: &ClientAckSlot,
@@ -4815,6 +4824,69 @@ fn run_dataplane_bootstrap(
     if let Some(gate) = dp_runtime.client_gate() {
         // Set-once: this is the only filler of the slot, on this one bootstrap thread.
         let _ = client_ack_slot.set(std::sync::Arc::clone(gate));
+    }
+
+    // INSTALL the cross-plane F2 auto-failover inputs (#618): now that the data plane is live, the
+    // metadata-Raft leader can auto-promote an ISR successor on a leader crash. The survivor-state
+    // provider surfaces the LIVE ISR: for THIS node it reports its real data-plane frontier (its
+    // follower high-watermark, or the served frontier if it leads), for a remote survivor it reports
+    // a node complete to the committed HW IFF that survivor was a committed replica — sound because the
+    // committed HW is the quorum-fsync'd frontier every ISR member holds by definition.
+    //
+    // FLAGGED (the honest cross-plane gap): a remote survivor that had LAGGED OUT of the ISR before the
+    // crash is not distinguished here without ISR gossip across the data plane; the conservative default
+    // treats a committed replica as in-ISR. THIS node's own out-of-ISR state IS detected (its real
+    // frontier is read). Full ISR gossip so any node can vet any survivor is the multi-partition / ISR-
+    // gossip follow-on (#693). For the single-partition target the surviving committed replicas that
+    // caught up ARE the ISR, so the default is correct for the shipped scope.
+    {
+        // This node's live committed frontier for a partition (its follower HW, or its leader
+        // quorum-commit) — the quorum-fsync'd prefix the ISR holds by definition.
+        let own_frontier_for = {
+            let server = std::sync::Arc::clone(dp_runtime.server());
+            move |partition: u64| -> u64 {
+                server
+                    .lock()
+                    .ok()
+                    .and_then(|s| {
+                        s.seam()
+                            .controller()
+                            .follower_high_watermark(partition)
+                            .or_else(|| s.seam().controller().quorum_commit(partition))
+                    })
+                    .unwrap_or(0)
+            }
+        };
+        let committed_replicas: std::collections::BTreeSet<u64> =
+            replicas.iter().copied().collect();
+        let own_frontier_s = own_frontier_for.clone();
+        let survivors: std::sync::Arc<ironbus_server::cluster::SurvivorStateFn> =
+            std::sync::Arc::new(move |partition: u64, survivor_ids: &[u64]| {
+                let own_hw = own_frontier_s(partition);
+                survivor_ids
+                    .iter()
+                    .filter_map(|&n| {
+                        if n == node_id {
+                            // THIS node: report its REAL durable frontier (out-of-ISR if it lags).
+                            Some(ironbus_core::placement::PlacementNode::healthy(n, own_hw))
+                        } else if committed_replicas.contains(&n) {
+                            // A remote committed replica: report it complete to THIS node's committed HW
+                            // (the quorum-fsync'd prefix the ISR holds). Eligible iff it was a committed
+                            // replica — the conservative single-partition default (FLAGGED above).
+                            Some(ironbus_core::placement::PlacementNode::healthy(n, own_hw))
+                        } else {
+                            None // not a committed replica — never a candidate.
+                        }
+                    })
+                    .collect()
+            });
+        // The committed HW the successor must be complete to: this node's own committed frontier.
+        let committed_hw: std::sync::Arc<ironbus_server::cluster::CommittedHwFn> =
+            std::sync::Arc::new(move |partition: u64| own_frontier_for(partition));
+        failover_installer.install(ironbus_server::cluster::FailoverInputs {
+            survivors,
+            committed_hw,
+        });
     }
 
     eprintln!(

@@ -2618,6 +2618,9 @@ mod live_runtime_tests {
     #[test]
     fn live_three_node_runtime_replicates_and_quorum_gates_a_c2_fsync_produce() {
         const P: u64 = 0;
+        // Serialize against the other heavy multi-node cluster tests (here and in the `runtime` module)
+        // so this thread-spinning cluster runs on an un-contended host (no #687 starvation flake).
+        let _serial = crate::cluster::heavy_cluster_test_guard();
         let placement = Placement {
             replicas: vec![1, 2, 3],
             leader: 1,
@@ -2791,6 +2794,7 @@ mod live_runtime_tests {
     #[test]
     fn live_runtime_below_min_isr_keeps_the_wire_ack_parked() {
         const P: u64 = 0;
+        let _serial = crate::cluster::heavy_cluster_test_guard();
         let placement = Placement {
             replicas: vec![1, 2, 3],
             leader: 1,
@@ -2847,6 +2851,7 @@ mod live_runtime_tests {
     #[test]
     fn live_runtime_follower_restart_resumes_replication() {
         const P: u64 = 0;
+        let _serial = crate::cluster::heavy_cluster_test_guard();
         let placement = Placement {
             replicas: vec![1, 2],
             leader: 1,
