@@ -568,15 +568,29 @@ impl<F: Filesystem> OriginCursorStore<F> {
     /// [`GeoError::Cursor`] on an IO fault opening / creating the cursor file, or on a recovered snapshot
     /// that fails to decode (a foreign / impossibly-shaped payload) — fail-closed.
     pub fn open(fs: &F) -> Result<OriginCursorStore<F>, GeoError> {
+        Self::open_named(fs, CURSOR_FILE)
+    }
+
+    /// Open (or initialize) a durable cursor store under `fs` in a NAMED file. [`open`](Self::open) is
+    /// this with the default [`CURSOR_FILE`]; the edge leaf-spoke (#625) reuses this store for its durable
+    /// PUSH cursor under its OWN file name, so a leaf that both mirrors (read-side, `geo.cursor`) and
+    /// forwards (write-through, `leaf.push.cursor`) keeps the two crash-safe dual-slot cursors in separate
+    /// files. The recovery story is identical regardless of name: a torn / missing file recovers as no
+    /// cursors (every key resumes from 0, the safe degrade); a corrupt slot is simply not selected.
+    ///
+    /// # Errors
+    /// [`GeoError::Cursor`] on an IO fault opening / creating the cursor file, or on a recovered snapshot
+    /// that fails to decode — fail-closed.
+    pub fn open_named(fs: &F, file_name: &str) -> Result<OriginCursorStore<F>, GeoError> {
         // The caller (SlotCheckpoint) owns the value bytes; we own the file's existence. Create it if
         // absent and fsync the dir so a power loss right after creation does not lose the file.
-        let existed = fs.exists(CURSOR_FILE).map_err(|e| GeoError::Cursor {
+        let existed = fs.exists(file_name).map_err(|e| GeoError::Cursor {
             what: e.to_string(),
         })?;
         let file = if existed {
-            fs.open(CURSOR_FILE)
+            fs.open(file_name)
         } else {
-            let f = fs.create_new(CURSOR_FILE);
+            let f = fs.create_new(file_name);
             // Best-effort dir fsync so the new file's directory entry is durable.
             let _ = fs.sync_dir();
             f

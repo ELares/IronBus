@@ -270,6 +270,7 @@ pub mod domain;
 pub mod eligibility;
 pub mod geo;
 pub mod isr;
+pub mod leaf;
 pub mod membership;
 pub mod metadata_group;
 pub mod metadata_storage;
@@ -307,6 +308,11 @@ pub use geo::{
     OriginCursorStore, OriginServer, GEO_POLL, MAX_GEO_PULL_BYTES, MAX_ORIGIN_STREAM_LEN,
 };
 pub use isr::{AckReplicatedBody, IsrConfig, IsrMembership, IsrTracker, PendingAck, QuorumAckGate};
+pub use leaf::{
+    push_loop, HubPushReceiver, LeafBridge, LeafConfig, LeafDirection, LeafError, LeafForwarder,
+    LeafFrame, LeafLink, LeafPushCursor, LeafPushRequest, LeafPushResponse, PushOutcome,
+    LEAF_PUSH_POLL, MAX_LEAF_PUSH_BYTES,
+};
 pub use membership::{LearnerCatchup, MemberOp, MembershipChange, PeerIdError};
 pub use metadata_group::{GroupError, MetadataRaftGroup};
 pub use metadata_storage::{MetadataLogStorage, MetadataStorageError, METADATA_SUBDIR};
