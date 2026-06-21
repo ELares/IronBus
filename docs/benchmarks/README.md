@@ -272,3 +272,54 @@ cargo build --release -p ironbus-cli --bin ironbus
 python3 cluster_heartbeat_bench.py --ironbus ../../target/release/ironbus \
     --out cluster-heartbeat-rows.jsonl --md-out cluster-heartbeat-report.md
 ```
+
+### Durability head-to-head: power-cut, divergence self-heal, split-brain (#627, #628, #630, C8-I1/2/3)
+
+The C8 CORRECTNESS legs. Where the throughput legs measure records/s, this one
+measures whether a CLAIMED durability guarantee actually HOLDS under real fault
+injection — power-cut, on-disk corruption, and split-brain — for IronBus C2-fsync
+R3 (`min_isr=2`) vs a NATS R3 file stream.
+[`cluster_durability_bench.py`](cluster_durability_bench.py) drives the
+[`cluster-durability-bench`](../../crates/ironbus-bench/src/bin/cluster_durability_bench.rs)
+Rust harness — which builds a REAL local IronBus cluster (real `StdFs` on-disk
+leader + replica logs, real CRC-revalidated follower fetch, the real `IsrTracker`
+quorum-commit, the real #697 quarantine-never-delete divergence path, and the real
+#722 epoch-fenced `promote_follower_to_leader`), injects a REAL fault, and re-opens
+the survivors' on-disk logs to MEASURE what survived / re-converged / diverged — and
+runs the MATCHED faults on real `nats-server` 2.14.x processes. The committed
+[`cluster-durability-rows.jsonl`](cluster-durability-rows.jsonl) and
+[`cluster-durability-report.md`](cluster-durability-report.md) are the data.
+
+- **power-cut (#627):** quorum-fsync-commit a prefix, drop the leader (a power-cut:
+  no clean flush), re-open the survivors' on-disk replica logs, and verify EVERY
+  committed offset survived byte-identical. MEASURED: IronBus 100% committed survival
+  (0 byte-mismatches); a NATS R3 file stream also loses nothing — both PASS (a
+  quorum-durable ack survives a minority power-cut by construction).
+- **divergence (#628):** flip bytes in a follower's on-disk replica segment; verify
+  IronBus DETECTS it (CRC/footer), QUARANTINES the bad bytes (copy-aside, never
+  delete), and RE-REPLICATES the clean bytes so the replica RE-CONVERGES
+  byte-identical. MEASURED: IronBus detects + quarantines (forensic bytes preserved)
+  + re-converges byte-identical (0 mismatches); a single NATS node recovers only the
+  uncorrupted prefix (no quorum to re-sync from) — the differentiator.
+- **split-brain (#630):** isolate the old leader, fence it with an epoch bump,
+  verify the isolated minority leader cannot quorum-commit a new write (no
+  double-commit), its stale epoch is fenced, and no committed offset diverges. NATS
+  per-stream Raft re-elects on the majority with the committed prefix intact — the
+  same fencing class. HONEST: the split-brain isolation is the controller-INVARIANT
+  test (no quorum-ack for a minority, stale-epoch rejection), NOT a live loopback
+  packet partition (that needs root on macOS — the separate #636 hardware run).
+
+HONEST scope (in the report): the IronBus legs run IN-PROCESS over the IDENTICAL
+durability code (the same `DataPlaneRuntime`/`DataPlaneController` machinery as the
+throughput legs) rather than over the broker's client wire listener, because on
+macOS loopback an accepted socket inherits the listener's `O_NONBLOCK` (the #726
+artifact) and a multi-process produce stalls under load on THIS rig (not on
+Linux/t4g). The faults are real; the caveat is a property of the measuring machine,
+not the product.
+
+```sh
+cargo build --release -p ironbus-bench --bin cluster-durability-bench
+python3 cluster_durability_bench.py \
+    --bench-bin ../../target/release/cluster-durability-bench \
+    --out cluster-durability-rows.jsonl --md-out cluster-durability-report.md
+```

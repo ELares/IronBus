@@ -53,6 +53,18 @@ path = "src/bin/consume_corpus.rs"
 name = "cluster-consume-bench"
 path = "src/bin/cluster_consume_bench.rs"
 
+# C8 DURABILITY / CORRECTNESS fault-injection harness (#627, #628, #630): builds a REAL local IronBus
+# cluster (real on-disk leader + replica logs, real CRC-revalidated replication, the real quorum-fsync
+# ISR gate + quarantine-never-delete divergence + epoch-fenced promotion — the SAME `DataPlaneRuntime`/
+# `DataPlaneController` machinery as the throughput legs) and injects a REAL fault — a node-death
+# power-cut (#627), an on-disk replica-segment byte corruption (#628), or a minority isolation +
+# fenced promotion (#630) — then re-opens the survivors' on-disk logs to MEASURE what survived /
+# re-converged / diverged. Emits one JSONL row per scenario. Unix-only (the broker is Unix-only). On
+# demand; off the per-PR CI path. See docs/benchmarks/cluster_durability_bench.py for the NATS leg.
+[[bin]]
+name = "cluster-durability-bench"
+path = "src/bin/cluster_durability_bench.rs"
+
 [dependencies]
 # The harness drives the broker through the REAL #11 client over a real socket, never a privileged
 # test path; it launches the shipping `ironbus` binary built by `ironbus-cli`.
