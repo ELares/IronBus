@@ -34,7 +34,7 @@ use raft::{Config, RawNode, StateRole, Storage as _};
 use raft_proto::ConfChangeI;
 use slog::{o, Discard, Logger};
 
-use crate::cluster::membership::{validate_change, MembershipChange, PeerIdError};
+use crate::cluster::membership::{validate_change, LearnerCatchup, MembershipChange, PeerIdError};
 use crate::cluster::metadata_storage::{MetadataLogStorage, MetadataStorageError};
 use crate::cluster::state_machine::{DecodeError, MetadataCommand, MetadataStateMachine};
 
@@ -162,7 +162,63 @@ impl<F: Filesystem, C: Clock + Clone> MetadataRaftGroup<F, C> {
         if !voters.contains(&node_id) {
             return Err(GroupError::SelfNotAVoter { node_id });
         }
+        Self::open_inner(node_id, voters, parent_fs, clock, config)
+    }
 
+    /// Open (or recover) a metadata group for a node JOINING an existing cluster as a NON-VOTING
+    /// LEARNER (C5-I2, #617). Unlike [`Self::open`], `node_id` is NOT itself in the seeded voter set:
+    /// the learner seeds the EXISTING voters (`existing_voters`, a supported 1/3/5 size) as its
+    /// initial `ConfState` WITHOUT including itself, so it knows the cluster it follows but is not a
+    /// member of it. It then learns its OWN role (learner, then voter) purely by REPLICATION, once the
+    /// metadata leader's committed
+    /// [`MembershipChange::add_learner`](crate::cluster::membership::MembershipChange::add_learner)
+    /// (then `promote_learner`) for it reaches this node. The learner back-fills the committed
+    /// metadata log by replication exactly like a follower — non-voting, so it never counts toward
+    /// quorum while it catches up. It is promoted to a voter only ONCE CAUGHT UP (the leader's #617
+    /// promotion gate), via a committed joint-consensus change.
+    ///
+    /// Seeding the EXISTING voters (rather than an empty set) is what lets the learner apply the
+    /// committed membership DELTAS correctly without a snapshot: the base membership is the seed, and
+    /// the `add_learner`/`promote_learner` conf changes that arrive over the log fold onto it. (An
+    /// empty seed would mis-apply the deltas — it would never learn the base `[voters]`.) Snapshot
+    /// transfer for a compacted log is a follow-on (it pairs with metadata-log compaction, not yet
+    /// implemented; today the full committed log is replicated to the learner).
+    ///
+    /// On a RECOVERED group the persisted `ConfState` wins (a restarted learner resumes with its
+    /// durable role), exactly as for a voter — the seed is only used for a brand-new join.
+    ///
+    /// # Errors
+    ///
+    /// [`GroupError::UnsupportedVoterCount`] if `existing_voters` is not a supported size,
+    /// [`GroupError::Storage`] if the durable metadata log cannot be opened / recovered, or
+    /// [`GroupError::Raft`] if the raft-rs config fails to validate.
+    pub fn open_as_learner(
+        node_id: u64,
+        existing_voters: &[u64],
+        parent_fs: &F,
+        clock: C,
+        config: LogConfig,
+    ) -> Result<Self, GroupError> {
+        let n = existing_voters.len();
+        if !SUPPORTED_VOTER_COUNTS.contains(&n) {
+            return Err(GroupError::UnsupportedVoterCount(n));
+        }
+        // The learner seeds the EXISTING voters as its initial ConfState but is NOT itself in it (it
+        // follows that quorum as a non-member until the leader's committed conf-change adds it).
+        Self::open_inner(node_id, existing_voters, parent_fs, clock, config)
+    }
+
+    /// The shared open path for a voter ([`Self::open`]) or a joining learner
+    /// ([`Self::open_as_learner`]): `seed_voters` is the voter `ConfState` to seed for a BRAND-NEW
+    /// group (the full voter set for a seeded voter, or EMPTY for a joining learner); a recovered
+    /// group always keeps its persisted membership and ignores the seed.
+    fn open_inner(
+        node_id: u64,
+        seed_voters: &[u64],
+        parent_fs: &F,
+        clock: C,
+        config: LogConfig,
+    ) -> Result<Self, GroupError> {
         let raft_config = Config {
             id: node_id,
             // Standard etcd-style ratio (heartbeat every tick window, election ~10x).
@@ -176,7 +232,7 @@ impl<F: Filesystem, C: Clock + Clone> MetadataRaftGroup<F, C> {
         // group; the persisted membership wins on a recovered one. Keep a clone of the clock for
         // the leadership lease so the group times leases off the SAME monotonic seam (I6) the
         // storage uses; the clock is moved into storage and re-read here only for monotonic time.
-        let storage = MetadataLogStorage::open(parent_fs, clock.clone(), config, voters)?;
+        let storage = MetadataLogStorage::open(parent_fs, clock.clone(), config, seed_voters)?;
         // default-logger is disabled; discard raft-rs's own slog output.
         let logger = Logger::root(Discard, o!());
         let node = RawNode::new(&raft_config, storage, &logger)?;
@@ -211,6 +267,39 @@ impl<F: Filesystem, C: Clock + Clone> MetadataRaftGroup<F, C> {
     #[must_use]
     pub fn is_leader(&self) -> bool {
         self.node.raft.state == StateRole::Leader
+    }
+
+    /// The metadata log's COMMITTED high-watermark (the raft committed index): every entry at or
+    /// below it is committed across a quorum. This is the bar a joining LEARNER must DURABLY hold
+    /// before it may be promoted to a voter (#617) — the metadata-plane committed frontier, read
+    /// directly off the core (no wall clock, no IO).
+    #[must_use]
+    pub fn committed_index(&self) -> u64 {
+        self.node.raft.raft_log.committed
+    }
+
+    /// The committed-frontier catch-up evidence for a LEARNER `node`, as the metadata LEADER sees it
+    /// (#617). On the leader, raft-rs tracks each peer's durably-acked log index in its progress set;
+    /// `matched` is that index for `node` (the prefix the learner is PROVEN to durably hold), and
+    /// `committed` is this leader's committed high-watermark. The leader compares them
+    /// ([`LearnerCatchup::is_caught_up`]) to decide whether the learner may be promoted.
+    ///
+    /// Returns `None` when this node is NOT the metadata leader (only the leader maintains peer
+    /// progress) or when `node` is not a tracked peer (a phantom learner the core has never seen) —
+    /// both cases FAIL CLOSED at the call site (no progress evidence ⇒ no promotion). A learner that
+    /// is tracked but has acked nothing reads `matched == 0`, which is below any real committed bar,
+    /// so it is correctly not-yet-caught-up.
+    #[must_use]
+    pub fn learner_catchup(&self, node: u64) -> Option<LearnerCatchup> {
+        if self.node.raft.state != StateRole::Leader {
+            return None;
+        }
+        let matched = self.node.raft.prs().get(node)?.matched;
+        Some(LearnerCatchup {
+            node,
+            matched,
+            committed: self.committed_index(),
+        })
     }
 
     /// True if the group has a pending `Ready` to drain (work the caller's transport should pump
@@ -1349,6 +1438,63 @@ mod tests {
             mesh.nodes[&leader].conf_state().unwrap().learners,
             vec![4],
             "node 4 joined as a learner"
+        );
+    }
+
+    /// The #617 learner-catchup ACCESSORS read the metadata core fail-closed: on the LEADER,
+    /// `learner_catchup(node)` reports the learner's durably-replicated `matched` vs the committed
+    /// bar, and a learner that has NOT replicated reads `matched < committed` (not caught up); on a
+    /// FOLLOWER (no progress set) it is `None`. `committed_index()` exposes the committed bar.
+    #[test]
+    fn learner_catchup_accessor_reads_progress_fail_closed() {
+        let mut mesh = Mesh::new(&[1, 2, 3]);
+        mesh.elect(1);
+        // Commit a few entries so the committed bar is well above 0 (the learner must clear it).
+        for i in 0..3u64 {
+            let cmd = MetadataCommand::SetConfig {
+                key: format!("k{i}"),
+                value: i.to_string(),
+            };
+            let leader = mesh.leader().expect("leader");
+            mesh.nodes.get_mut(&leader).unwrap().propose(&cmd).unwrap();
+            mesh.run();
+        }
+        // Add node 4 as a learner. It is NOT in the mesh transport, so it never replicates — its
+        // `matched` stays 0 while the committed bar is non-zero, i.e. NOT caught up (fail-closed).
+        mesh.change_on_leader(&MembershipChange::new().add_learner(4))
+            .expect("add learner 4");
+        let leader = mesh.leader().expect("leader");
+        let committed = mesh.nodes[&leader].committed_index();
+        assert!(committed > 0, "the committed bar is non-trivial");
+
+        let catchup = mesh.nodes[&leader]
+            .learner_catchup(4)
+            .expect("the leader tracks the learner's progress");
+        assert_eq!(catchup.node, 4);
+        assert_eq!(
+            catchup.committed, committed,
+            "the bar is the committed index"
+        );
+        assert!(
+            catchup.matched < committed,
+            "a learner that has not replicated is behind the committed bar (matched {} < {committed})",
+            catchup.matched
+        );
+        assert!(
+            !catchup.is_caught_up(),
+            "the never-replicated learner is NOT caught up — the gate fails closed"
+        );
+
+        // A FOLLOWER has no progress set, so the accessor is None (fail-closed at the call site).
+        let follower = mesh
+            .nodes
+            .keys()
+            .copied()
+            .find(|&id| id != leader)
+            .expect("a follower");
+        assert!(
+            mesh.nodes[&follower].learner_catchup(4).is_none(),
+            "a non-leader has no learner-progress evidence (None => never promote)"
         );
     }
 

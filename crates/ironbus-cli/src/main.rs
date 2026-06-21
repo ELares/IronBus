@@ -1938,6 +1938,19 @@ struct ServeFlags {
     /// is a typed usage error. Empty (no `--cluster-peer`) = the single-node default, no cluster.
     /// CLI-only and repeatable, exactly like `--key-shared-group`.
     cluster_peers: Vec<String>,
+    /// JOIN an already-running cluster as a non-voting LEARNER (#617), from `--cluster-join-as-learner`.
+    /// When set, this node is NOT seeded as a voter: it back-fills the committed metadata log by
+    /// replication and is promoted to a voter only ONCE it is caught up (the leader's promotion gate),
+    /// so the cluster keeps serving with no availability dip while it joins. The `--cluster-peer` set
+    /// must be the EXISTING voters (a supported 1/3/5 size) PLUS this learner. Default `false` (a node
+    /// is a seeded voter).
+    cluster_join_as_learner: bool,
+    /// PRE-DECLARED joining-learner ids (#617), from repeatable `--cluster-pending-learner <id>`. Set
+    /// on the existing VOTERS so they list a joining learner's address in `--cluster-peer` (and can
+    /// dial / replicate to it the moment the leader adds it) WITHOUT seeding it as a voter. A pending
+    /// learner does not count toward the seeded voter size, the quorum, or the liveness detector. Empty
+    /// in the C1 default (peers == voters). Raw id strings, parsed after collection.
+    cluster_pending_learners: Vec<String>,
     /// The TLS server certificate chain file (#629, V2-M7): a PEM path. RESERVED, NOT YET HONORED
     /// (#107): the TLS 1.3 handshake (rustls) is not wired (no allowed crypto provider), so a set value
     /// is a fail-closed startup REFUSAL rather than an accepted cert that would imply encryption this
@@ -2145,6 +2158,21 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             "--cluster-peer" => {
                 f.cluster_peers
                     .push(take_value("--cluster-peer", args, &mut i)?);
+            }
+            // A bare boolean flag (#617): JOIN an existing cluster as a non-voting learner. Advance ONE
+            // token (no value), like the other boolean flags, or the loop spins.
+            "--cluster-join-as-learner" => {
+                f.cluster_join_as_learner = true;
+                i += 1;
+            }
+            // Repeatable (#617): pre-declare a joining learner id on a voter (the raw id is parsed
+            // after collection, like `--cluster-peer`).
+            "--cluster-pending-learner" => {
+                f.cluster_pending_learners.push(take_value(
+                    "--cluster-pending-learner",
+                    args,
+                    &mut i,
+                )?);
             }
             "--visibility-timeout-ms" => {
                 f.visibility_ms = Some(take_number("--visibility-timeout-ms", args, &mut i)?);
@@ -2648,7 +2676,12 @@ fn parse_serve_flags_with_env_and_reader(
         // single-node default — NO cluster runtime, byte-for-byte today's broker. A present, valid
         // set of cluster flags builds a `ClusterConfig` here; a malformed peer spec or a missing
         // `--cluster-id` is a typed usage error (fail-closed), surfaced by `?` before any side effect.
-        cluster: parse_cluster_config(f.cluster_id, &f.cluster_peers)?,
+        cluster: parse_cluster_config(
+            f.cluster_id,
+            &f.cluster_peers,
+            f.cluster_join_as_learner,
+            &f.cluster_pending_learners,
+        )?,
         // Transport security material + auth references + pre-auth DoS knobs (#629/#631/#633): paths
         // resolved with flag > env > default; the bind guard + StrictModes + identity-table load run
         // at `cmd_serve` (after the bind is classified). The DoS knobs take their safe defaults.
@@ -2896,9 +2929,24 @@ fn map_durability_level(level: DurabilityLevelArg) -> ironbus_core::config::Dura
 fn parse_cluster_config(
     cluster_id: Option<u64>,
     cluster_peers: &[String],
+    join_as_learner: bool,
+    pending_learner_ids: &[String],
 ) -> Result<Option<ClusterConfig>, CliError> {
     // The single-node default: NEITHER flag given. Nothing cluster is constructed, so `cmd_serve`
-    // starts no runtime and the broker stays byte-for-byte today's.
+    // starts no runtime and the broker stays byte-for-byte today's. A bare `--cluster-join-as-learner`
+    // (or `--cluster-pending-learner`) without the cluster flags is meaningless — fail closed rather
+    // than silently ignore it.
+    if (join_as_learner || !pending_learner_ids.is_empty())
+        && cluster_id.is_none()
+        && cluster_peers.is_empty()
+    {
+        return Err(CliError::Usage(
+            "`--cluster-join-as-learner` / `--cluster-pending-learner` need `--cluster-id` and \
+             `--cluster-peer`: a learner join names a specific cluster (list the voters plus the \
+             learner)"
+                .to_string(),
+        ));
+    }
     match (cluster_id, cluster_peers.is_empty()) {
         (None, true) => return Ok(None),
         (None, false) => {
@@ -2942,7 +2990,42 @@ fn parse_cluster_config(
         )));
     }
 
-    Ok(Some(ClusterConfig { node_id, peers }))
+    // Parse the pre-declared joining-learner ids (#617). Each must be a known peer (it needs an
+    // address to be reachable) and must NOT be this node's own id (a node does not pre-declare itself
+    // as a learner — it joins via `--cluster-join-as-learner` with `role = Learner`).
+    let mut pending_learners: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for id_str in pending_learner_ids {
+        let id: u64 = id_str.trim().parse().map_err(|_| {
+            CliError::Usage(format!(
+                "`--cluster-pending-learner` id must be a non-negative integer, got `{id_str}`"
+            ))
+        })?;
+        if !peers.contains_key(&id) {
+            return Err(CliError::Usage(format!(
+                "`--cluster-pending-learner {id}` is not one of the `--cluster-peer` ids: a pending \
+                 learner needs its address in the peer set (add `--cluster-peer {id}=<addr>`)"
+            )));
+        }
+        if id == node_id {
+            return Err(CliError::Usage(format!(
+                "`--cluster-pending-learner {id}` is this node's own id: to JOIN as a learner use \
+                 `--cluster-join-as-learner` (a node does not pre-declare itself)"
+            )));
+        }
+        pending_learners.insert(id);
+    }
+
+    let role = if join_as_learner {
+        ironbus_server::cluster::StartRole::Learner
+    } else {
+        ironbus_server::cluster::StartRole::Voter
+    };
+    Ok(Some(ClusterConfig {
+        node_id,
+        peers,
+        role,
+        pending_learners,
+    }))
 }
 
 /// Parses one `--cluster-peer <id>=<addr>` spec into a `(node_id, addr)` pair, or a typed usage
@@ -14025,6 +14108,95 @@ mod tests {
         );
     }
 
+    /// `--cluster-join-as-learner` builds a LEARNER config (#617): the joining node lists the existing
+    /// voters PLUS itself, and the seeded voter set (peers minus the learner) is the valid 3-voter
+    /// cluster it joins. The node opens non-voting and is promoted once caught up.
+    #[test]
+    fn a_join_as_learner_config_is_built() {
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--cluster-id",
+            "4",
+            "--cluster-peer",
+            "1=127.0.0.1:7401",
+            "--cluster-peer",
+            "2=127.0.0.1:7402",
+            "--cluster-peer",
+            "3=127.0.0.1:7403",
+            "--cluster-peer",
+            "4=127.0.0.1:7404",
+            "--cluster-join-as-learner",
+        ]))
+        .unwrap();
+        let cfg = parsed.cluster.expect("a cluster config is built");
+        assert_eq!(cfg.node_id, 4);
+        assert_eq!(cfg.peers.len(), 4, "the address book lists all 4 members");
+        assert_eq!(
+            cfg.role,
+            ironbus_server::cluster::StartRole::Learner,
+            "the joining node starts as a learner"
+        );
+    }
+
+    /// A VOTER pre-declaring a `--cluster-pending-learner` lists the learner's address WITHOUT seeding
+    /// it as a voter (#617): the seeded voter set stays the 3 voters, and the pending learner is
+    /// recorded so the voter can replicate to it once the leader adds it.
+    #[test]
+    fn a_pending_learner_is_recorded_on_a_voter() {
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--cluster-id",
+            "1",
+            "--cluster-peer",
+            "1=127.0.0.1:7401",
+            "--cluster-peer",
+            "2=127.0.0.1:7402",
+            "--cluster-peer",
+            "3=127.0.0.1:7403",
+            "--cluster-peer",
+            "4=127.0.0.1:7404",
+            "--cluster-pending-learner",
+            "4",
+        ]))
+        .unwrap();
+        let cfg = parsed.cluster.expect("a cluster config is built");
+        assert_eq!(cfg.role, ironbus_server::cluster::StartRole::Voter);
+        assert!(
+            cfg.pending_learners.contains(&4),
+            "node 4 is recorded as a pending learner (in the address book, not a seeded voter)"
+        );
+    }
+
+    /// FAIL-CLOSED: a `--cluster-pending-learner` id that is not in the peer set is a typed usage error
+    /// (a pending learner needs its address to be reachable).
+    #[test]
+    fn a_pending_learner_not_in_the_peer_set_is_a_usage_error() {
+        let e = parse_serve_flags(&serve_args(&[
+            "--data-dir",
+            "/tmp/x",
+            "--cluster-id",
+            "1",
+            "--cluster-peer",
+            "1=127.0.0.1:7401",
+            "--cluster-peer",
+            "2=127.0.0.1:7402",
+            "--cluster-peer",
+            "3=127.0.0.1:7403",
+            "--cluster-pending-learner",
+            "4",
+        ]))
+        .unwrap_err();
+        match e {
+            CliError::Usage(m) => assert!(
+                m.contains("--cluster-pending-learner") && m.contains("--cluster-peer"),
+                "the error names the offending flags: {m}"
+            ),
+            other => panic!("expected a Usage error, got {other:?}"),
+        }
+    }
+
     /// FAIL-CLOSED: `--cluster-peer` without `--cluster-id` is a typed usage error (the broker can't
     /// know which member it is), never a silently half-started cluster.
     #[test]
@@ -14282,7 +14454,12 @@ mod tests {
         };
         let mut peers = std::collections::BTreeMap::new();
         peers.insert(1u64, SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
-        let cfg = ClusterConfig { node_id: 1, peers };
+        let cfg = ClusterConfig {
+            node_id: 1,
+            peers,
+            role: ironbus_server::cluster::StartRole::Voter,
+            pending_learners: std::collections::BTreeSet::new(),
+        };
         let mut runtime = start_cluster_runtime(Some(&cfg), &cluster_dir, &config)
             .unwrap()
             .expect("a configured 1-member cluster starts a runtime");
@@ -14350,7 +14527,12 @@ mod tests {
         };
         let mut peers = std::collections::BTreeMap::new();
         peers.insert(1u64, SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
-        let cfg = ClusterConfig { node_id: 1, peers };
+        let cfg = ClusterConfig {
+            node_id: 1,
+            peers,
+            role: ironbus_server::cluster::StartRole::Voter,
+            pending_learners: std::collections::BTreeSet::new(),
+        };
         let mut runtime = start_cluster_runtime(Some(&cfg), &data_dir, &config)
             .unwrap()
             .expect("a configured cluster starts a runtime");

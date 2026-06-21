@@ -296,7 +296,7 @@ pub use eligibility::{
     IneligibleReason, ReplicaState,
 };
 pub use isr::{AckReplicatedBody, IsrConfig, IsrMembership, IsrTracker, PendingAck, QuorumAckGate};
-pub use membership::{MemberOp, MembershipChange, PeerIdError};
+pub use membership::{LearnerCatchup, MemberOp, MembershipChange, PeerIdError};
 pub use metadata_group::{GroupError, MetadataRaftGroup};
 pub use metadata_storage::{MetadataLogStorage, MetadataStorageError, METADATA_SUBDIR};
 pub use placement::{
@@ -315,8 +315,8 @@ pub use replication::{
 pub use runtime::{
     dataplane_addr, partitions_led_by, plan_failovers, ClusterConfig, ClusterRuntime,
     ClusterStatus, CommittedHwFn, FailoverInputs, FailoverInstaller, LivenessConfig,
-    MetadataProposer, OwnFrontierFn, RuntimeError, SurvivorStateFn, DATAPLANE_PORT_OFFSET,
-    DEFAULT_LIVENESS_TIMEOUT,
+    MetadataProposer, OwnFrontierFn, RuntimeError, StartRole, SurvivorStateFn,
+    DATAPLANE_PORT_OFFSET, DEFAULT_LIVENESS_TIMEOUT,
 };
 pub use serve::{
     decode_dataplane_peer_frame, encode_dataplane_peer_frame, DataPlaneLink, DataPlaneRuntime,
