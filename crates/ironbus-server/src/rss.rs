@@ -115,7 +115,7 @@ pub fn disk_free_bytes(path: &std::path::Path) -> Option<u64> {
     // The data line is the LAST non-empty line (a long device name can wrap onto two lines in some
     // `df` variants, but `-P` forbids that wrap, so the single data line is the last one). Columns:
     // Filesystem, 1024-blocks, Used, Available, Capacity, Mounted-on. "Available" is index 3.
-    let data = text.lines().filter(|l| !l.trim().is_empty()).next_back()?;
+    let data = text.lines().rfind(|l| !l.trim().is_empty())?;
     let available_kib: u64 = data.split_whitespace().nth(3)?.parse().ok()?;
     Some(available_kib.saturating_mul(1024))
 }

@@ -103,7 +103,9 @@ where
 ///
 /// # Errors
 /// Propagates a fatal listener error, exactly like [`serve`].
-#[allow(clippy::needless_pass_by_value)]
+// One arg over the clippy default: the connz handle is additive to the existing 7-arg accept-loop
+// signature (the SAME wire surface, plus connz), so the cohesive accept loop stays one function.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 pub fn serve_with_auth_connz<F, C>(
     listener: &TcpListener,
     engine: &EngineHandle<F, C>,
@@ -174,7 +176,8 @@ where
 /// with the connection signals (#572) recorded into the shared `connz` metric on accept, refuse, and
 /// (via the per-connection slot guard) close. The authed-flip is recorded by the session, which gets
 /// the same `connz` handle.
-#[allow(clippy::needless_pass_by_value)]
+// One arg over the clippy default: the connz handle is additive to the cohesive 7-arg accept loop.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn serve_inner<F, C>(
     listener: &TcpListener,
     engine: &EngineHandle<F, C>,

@@ -764,7 +764,7 @@ impl ThroughputRegistry {
 /// ack-level counters. Allocation-free; a plain array bump under the engine lock.
 #[derive(Clone, Copy, Default)]
 pub struct AckLevelCounters {
-    /// Indexed by [`AckLevel::as_u8`] (`0`=NoAck, `1`=ServerAck, `2`=ServerAndClientAck).
+    /// Indexed by [`AckLevel::as_u8`] (`0`=`NoAck`, `1`=`ServerAck`, `2`=`ServerAndClientAck`).
     counts: [u64; 3],
 }
 
