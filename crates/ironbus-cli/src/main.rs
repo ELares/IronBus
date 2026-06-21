@@ -97,8 +97,8 @@ use ironbus_server::cluster::{
     LEAF_PUSH_POLL,
 };
 use ironbus_server::cluster::{
-    ClusterConfig, Domain, DomainRef, DomainResolver, GeoConfig, GeoMode, GeoOrigin,
-    GeoStreamConfig, LeafBridge, LeafConfig, LeafDirection,
+    ClusterConfig, Domain, DomainRef, DomainResolver, FederatedStream, FederationConfig, GeoConfig,
+    GeoMode, GeoOrigin, GeoStreamConfig, LeafBridge, LeafConfig, LeafDirection,
 };
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -1695,6 +1695,14 @@ struct ParsedServe {
     /// client produces (read-only) + pull the hub stream, and write-through bridges forward the leaf's
     /// local stream up to the hub. A leaf is NOT a Raft voter (this never touches the metadata group).
     leaf: LeafConfig,
+    /// The validated GATEWAY / SUPERCLUSTER FEDERATION config (#626, V2-C7-I4), built from
+    /// `--gateway-domain` + `--gateway` + `--federate`. EMPTY (no federation flags) is the non-federated
+    /// DEFAULT: `cmd_serve` constructs NO federation plane, so the produce/consume/storage hot path is
+    /// byte-for-byte today's broker. A non-empty config makes this node a peer in a SYMMETRIC supercluster:
+    /// its gateway SERVES its self-originated federated streams to peers AND MIRRORS peer-originated streams
+    /// (read-only) FROM them, loop-safe by the origin-domain discipline. A gateway is NOT a Raft voter in
+    /// any peer (this never touches any peer's metadata group), and each cluster stays independent.
+    federation: FederationConfig,
     /// The transport-security material + auth references + pre-auth `DoS` knobs (#629/#631/#633, V2-M7),
     /// resolved from the `--tls-*` / `--auth-config` / `--*-preauth-*` flags. Carried as one bundle so
     /// the (large) `ServeConfig` and its `Default` stay untouched. `cmd_serve` runs the fail-closed
@@ -1797,6 +1805,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         parsed.cluster.as_ref(),
         &parsed.geo,
         &parsed.leaf,
+        &parsed.federation,
         &parsed.transport,
         ReloadSource {
             config_path: parsed.config_path.as_deref(),
@@ -2009,6 +2018,23 @@ struct ServeFlags {
     /// forward local stream MUST differ from every mirror local (the loop-safety guard). Empty = no
     /// write-through. CLI-only and repeatable.
     leaf_forwards: Vec<String>,
+    /// Repeatable PEER GATEWAY endpoints (#626, V2-C7-I4): each `--gateway <domain>=<addr>` maps a PEER
+    /// cluster's domain to its gateway dial address — the symmetric supercluster peering, the ONLY source
+    /// of a peer's address (no auto-discovery). Raw `domain=addr` strings, validated after collection.
+    /// Empty = no peers. CLI-only and repeatable, like `--cluster-link`. A gateway is NOT a Raft voter in
+    /// any peer — `--gateway` never touches any peer's metadata group.
+    gateways: Vec<String>,
+    /// Repeatable FEDERATED stream declarations (#626): each `--federate <local>=@<origin-domain>/<stream>`
+    /// declares a stream that crosses the cluster boundary. If `<origin-domain>` is THIS cluster's own
+    /// (`--gateway-domain`), the gateway SERVES `<local>` to peers (it is self-originated); if it is a PEER
+    /// domain (named by a `--gateway`), the gateway MIRRORS the peer-origin stream into the read-only local
+    /// `<local>`. Raw strings, parsed after collection. Requires `--gateway-domain`. Empty = no federation.
+    federates: Vec<String>,
+    /// This cluster's OWN federation DOMAIN (#626), from `--gateway-domain <id>`. `None` (no flag) = the
+    /// non-federated default: NO federation plane, byte-for-byte today's broker. Distinct from
+    /// `--cluster-domain` (the geo-namespace own-domain) so the federation identity is explicit; falls back
+    /// to `--cluster-domain` when only the latter is set. Validated into a `Domain` after collection.
+    gateway_domain: Option<String>,
     /// The TLS server certificate chain file (#629, V2-M7): a PEM path. RESERVED, NOT YET HONORED
     /// (#107): the TLS 1.3 handshake (rustls) is not wired (no allowed crypto provider), so a set value
     /// is a fail-closed startup REFUSAL rather than an accepted cert that would imply encryption this
@@ -2262,6 +2288,16 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
             "--leaf-forward" => f
                 .leaf_forwards
                 .push(take_value("--leaf-forward", args, &mut i)?),
+            // The GATEWAY / SUPERCLUSTER FEDERATION topology (#626): a SYMMETRIC set of peer clusters.
+            // `--gateway-domain` is this cluster's own federation identity; `--gateway <domain>=<addr>` are
+            // the peer gateway endpoints (repeatable); `--federate <local>=@<origin>/<stream>` declares a
+            // federated stream (repeatable), parsed into a FederationConfig after collection (a malformed
+            // spec / missing domain is a typed usage error there). A gateway is NOT a Raft voter in a peer.
+            "--gateway-domain" => {
+                f.gateway_domain = Some(take_value("--gateway-domain", args, &mut i)?);
+            }
+            "--gateway" => f.gateways.push(take_value("--gateway", args, &mut i)?),
+            "--federate" => f.federates.push(take_value("--federate", args, &mut i)?),
             "--visibility-timeout-ms" => {
                 f.visibility_ms = Some(take_number("--visibility-timeout-ms", args, &mut i)?);
             }
@@ -2792,6 +2828,19 @@ fn parse_serve_flags_with_env_and_reader(
             &f.leaf_mirrors,
             &f.leaf_forwards,
             &build_domain_resolver(f.cluster_domain.as_deref(), &f.cluster_links)?,
+        )?,
+        // The GATEWAY / SUPERCLUSTER FEDERATION config (#626): empty (no `--gateway-domain`/`--gateway`/
+        // `--federate`) is the non-federated default — NO federation plane, byte-for-byte today's broker. A
+        // present `--gateway-domain` makes this node a peer in a SYMMETRIC supercluster; `--gateway`
+        // declares the peer endpoints and `--federate` the cross-cluster streams. The own-domain falls back
+        // to `--cluster-domain` when only the latter is set, so the geo-namespace and federation identities
+        // are one. A malformed spec / a peer naming this cluster / a duplicate local / a peer-origin stream
+        // with no `--gateway` (the loop-safety + no-leakage guards) is a typed usage error here,
+        // fail-closed before any side effect.
+        federation: parse_federation_config(
+            f.gateway_domain.as_deref().or(f.cluster_domain.as_deref()),
+            &f.gateways,
+            &f.federates,
         )?,
         // Transport security material + auth references + pre-auth DoS knobs (#629/#631/#633): paths
         // resolved with flag > env > default; the bind guard + StrictModes + identity-table load run
@@ -3489,6 +3538,102 @@ fn split_leaf_spec(flag: &str, spec: &str) -> Result<(String, String), CliError>
     Ok((local.to_string(), hub_stream.to_string()))
 }
 
+/// Builds the validated GATEWAY / SUPERCLUSTER FEDERATION [`FederationConfig`] (#626, V2-C7-I4) from
+/// `--gateway-domain` (this cluster's own federation domain) + the repeated `--gateway <domain>=<addr>`
+/// peer endpoints + the repeated `--federate <local>=@<origin-domain>/<stream>` stream declarations, or an
+/// EMPTY config when none are given (the non-federated default).
+///
+/// Fail-closed: a federated stream declared with no `--gateway-domain`, a malformed spec / domain, a peer
+/// naming this cluster's own domain, a duplicate local name, or a peer-origin stream with no `--gateway`
+/// endpoint (the loop-safety + no-leakage guards, re-checked in [`FederationConfig::validate`]) is a typed
+/// usage error before any side effect.
+///
+/// `--federate <local>=@<origin-domain>/<stream>` reuses the `@domain/stream` namespace: when
+/// `<origin-domain>` equals this cluster's own, the stream is SERVED to peers (self-originated); when it is
+/// a PEER domain (named by a `--gateway`), the stream is MIRRORED (read-only) FROM that peer.
+fn parse_federation_config(
+    gateway_domain: Option<&str>,
+    gateways: &[String],
+    federates: &[String],
+) -> Result<FederationConfig, CliError> {
+    // No own domain => the non-federated default. A `--gateway`/`--federate` without it is a typed usage
+    // error (federation needs this cluster's identity to know what it serves vs. mirrors).
+    let Some(own_spec) = gateway_domain else {
+        if !gateways.is_empty() || !federates.is_empty() {
+            return Err(CliError::Usage(
+                "`--gateway`/`--federate` require `--gateway-domain <id>` (a federation peer must name \
+                 its own domain so it knows which streams it serves vs. mirrors)"
+                    .to_string(),
+            ));
+        }
+        return Ok(FederationConfig::default());
+    };
+    let own = Domain::parse(own_spec)
+        .map_err(|e| CliError::Usage(format!("`--gateway-domain` `{own_spec}`: {e}")))?;
+
+    // The PEER table: each `--gateway <domain>=<addr>` is a peer cluster's gateway endpoint.
+    let mut peers = std::collections::BTreeMap::new();
+    for spec in gateways {
+        let (domain, addr) = spec.split_once('=').ok_or_else(|| {
+            CliError::Usage(format!(
+                "`--gateway` must be `<domain>=<addr>` (e.g. `--gateway east=10.0.0.2:7600`), got `{spec}`"
+            ))
+        })?;
+        let (domain, addr) = ironbus_server::cluster::parse_gateway_peer(domain, addr)
+            .map_err(|e| CliError::Usage(format!("`--gateway` `{spec}`: {e}")))?;
+        peers.insert(domain, addr);
+    }
+
+    // The FEDERATED streams: each `--federate <local>=@<origin-domain>/<stream>`.
+    let mut streams = Vec::new();
+    for spec in federates {
+        let (local, origin_ref) = spec.split_once('=').ok_or_else(|| {
+            CliError::Usage(format!(
+                "`--federate` must be `<local>=@<origin-domain>/<stream>` (e.g. \
+                 `--federate orders=@west/orders`), got `{spec}`"
+            ))
+        })?;
+        if local.is_empty() {
+            return Err(CliError::Usage(format!(
+                "`--federate` local stream name is empty in `{spec}`; the default stream (`\"\"`) cannot \
+                 be a federated local"
+            )));
+        }
+        // The origin is a `@<domain>/<stream>` reference (the same namespace the geo plane uses).
+        let reference = DomainRef::parse(origin_ref)
+            .map_err(|e| CliError::Usage(format!("`--federate` origin `{origin_ref}`: {e}")))?
+            .ok_or_else(|| {
+                CliError::Usage(format!(
+                    "`--federate` origin `{origin_ref}` must be a `@<origin-domain>/<stream>` reference \
+                     (in `{spec}`)"
+                ))
+            })?;
+        if reference.stream.len() > ironbus_server::cluster::MAX_ORIGIN_STREAM_LEN {
+            return Err(CliError::Usage(format!(
+                "`--federate` origin stream name `{}` is over the {}-byte cap (in `{spec}`)",
+                reference.stream,
+                ironbus_server::cluster::MAX_ORIGIN_STREAM_LEN
+            )));
+        }
+        streams.push(FederatedStream {
+            origin: reference.domain,
+            origin_stream: reference.stream,
+            local_stream: local.to_string(),
+        });
+    }
+
+    let cfg = FederationConfig {
+        own: Some(own),
+        peers,
+        streams,
+    };
+    // The layer's own fail-closed validation (no self-peer, unique locals, every peer-origin stream has a
+    // configured gateway — the loop-safety + no-leakage guards).
+    cfg.validate()
+        .map_err(|e| CliError::Usage(format!("invalid federation config: {e}")))?;
+    Ok(cfg)
+}
+
 /// Resolves the required `--data-dir`, validates the assembled config, and dispatches to the
 /// platform `cmd_serve`. Split out of `run_serve` so the flag-parsing loop stays a single concern.
 #[allow(clippy::too_many_arguments)] // each input (addr, data dir, config, groups, health, the
@@ -3505,6 +3650,7 @@ fn finish_serve(
     cluster: Option<&ClusterConfig>,
     geo: &GeoConfig,
     leaf: &LeafConfig,
+    federation: &FederationConfig,
     transport: &TransportSecurityFlags,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
@@ -3580,6 +3726,7 @@ fn finish_serve(
         cluster,
         geo,
         leaf,
+        federation,
         transport,
         reload,
         out,
@@ -4822,6 +4969,7 @@ fn cmd_serve(
     cluster: Option<&ClusterConfig>,
     geo: &GeoConfig,
     leaf: &LeafConfig,
+    federation: &FederationConfig,
     transport: &TransportSecurityFlags,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
@@ -4920,10 +5068,11 @@ fn cmd_serve(
             let _dir_lock = dirlock::DirLock::acquire(data_dir).map_err(|e| map_dir_error(&e))?;
             let mut engine =
                 open_disk_engine(data_dir, config, key_shared_groups, broadcast_groups)?;
-            // The READ-ONLY mirror set spans BOTH the geo plane (#623, `--mirror`) AND the edge leaf-spoke
-            // plane (#625, `--leaf-mirror`): a client produce to ANY mirror local is rejected, installed
-            // ONCE BEFORE the engine moves into the append actor; empty = byte-for-byte today's path.
-            install_mirror_read_only(&mut engine, geo, leaf);
+            // The READ-ONLY mirror set spans the geo plane (#623, `--mirror`), the edge leaf-spoke plane
+            // (#625, `--leaf-mirror`), AND the gateway-federation plane (#626, the peer-originated
+            // `--federate` mirrors): a client produce to ANY mirror local is rejected, installed ONCE
+            // BEFORE the engine moves into the append actor; empty = byte-for-byte today's path.
+            install_mirror_read_only(&mut engine, geo, leaf, federation);
             // The cross-cluster GEO plane (#623): pull loops spawned AFTER the engine moves; nothing
             // spawned with no `--mirror`/`--source` (the byte-identical non-geo guarantee).
             let geo_plane = spawn_geo_plane_if_configured(geo, data_dir, config)?;
@@ -4932,6 +5081,11 @@ fn cmd_serve(
             // voter — this never touches `start_cluster_runtime` / the metadata group, so leaf churn never
             // affects the hub's consensus (the byte-identical non-leaf guarantee when unset).
             let leaf_plane = spawn_leaf_plane_if_configured(leaf, data_dir, config)?;
+            // The GATEWAY / SUPERCLUSTER FEDERATION plane (#626): one per-peer-stream pull loop mirroring a
+            // peer-originated federated stream (geo dialer/applier REUSED). Nothing spawned with no
+            // `--gateway-domain`; a gateway is NOT a Raft voter in any peer (the non-federated/non-voter
+            // guarantee + the deferred accept-serve side are in `spawn_federation_plane`'s docs).
+            let fed_plane = spawn_federation_plane_if_configured(federation, data_dir, config)?;
             // Start the additive metadata-cluster plane (#684, V2-C1) IFF cluster flags were given.
             // This is the ONLY place a `ClusterRuntime` is started, on the DISK path, where a
             // concrete `StdFs` and the data dir are known — the runtime roots its `metaraft/` log
@@ -4967,9 +5121,10 @@ fn cmd_serve(
                 reload,
                 out,
             );
-            // Stop + join the geo (#623) and edge leaf-spoke (#625) bridge planes on the way out (each
-            // `Drop` also signals shutdown, but the explicit stop joins every thread deterministically).
-            if let Some(mut plane) = geo_plane {
+            // Stop + join the geo (#623), edge leaf-spoke (#625), and gateway-federation (#626) bridge
+            // planes on the way out (each `Drop` also signals shutdown, but the explicit stop joins every
+            // thread deterministically). geo + federation share `GeoPlaneHandle`, so flatten the two.
+            for mut plane in [geo_plane, fed_plane].into_iter().flatten() {
                 plane.stop();
             }
             if let Some(mut plane) = leaf_plane {
@@ -5169,18 +5324,23 @@ impl Drop for GeoPlaneHandle {
     }
 }
 
-/// Install the COMBINED read-only mirror set (geo `--mirror` locals + leaf `--leaf-mirror` locals) on the
-/// disk engine, so a client produce to ANY mirror local is rejected (its only writer is the apply/pull
-/// path). The engine's setter REPLACES the set, so the two sources are merged into one call here; with
-/// neither plane configured the set is empty and the produce path is byte-for-byte today's broker.
+/// Install the COMBINED read-only mirror set (geo `--mirror` locals + leaf `--leaf-mirror` locals +
+/// federation peer-originated `--federate` mirror locals) on the disk engine, so a client produce to ANY
+/// mirror local is rejected (its only writer is the apply/pull path). The engine's setter REPLACES the set,
+/// so the three sources are merged into one call here; with none configured the set is empty and the
+/// produce path is byte-for-byte today's broker. (A SELF-originated federated stream is NOT read-only — it
+/// is this cluster's own produced stream, served to peers — so only `federation.read_only_streams()` (the
+/// peer mirrors) is merged.)
 #[cfg(unix)]
 fn install_mirror_read_only(
     engine: &mut Engine<StdFs, SystemClock>,
     geo: &GeoConfig,
     leaf: &LeafConfig,
+    federation: &FederationConfig,
 ) {
     let mut read_only = geo.read_only_streams();
     read_only.extend(leaf.read_only_streams());
+    read_only.extend(federation.read_only_streams());
     if !read_only.is_empty() {
         engine.set_mirror_read_only_streams(read_only);
     }
@@ -5219,6 +5379,116 @@ fn spawn_leaf_plane_if_configured(
         return Ok(None);
     }
     Ok(Some(spawn_leaf_plane(leaf, data_dir, config)?))
+}
+
+/// Spawn the GATEWAY / SUPERCLUSTER FEDERATION plane IFF a `--gateway-domain` (with peers/streams) was
+/// configured, else `None` (the byte-identical non-federated path — nothing constructs). A thin gate so
+/// `cmd_serve` stays small.
+///
+/// # Errors
+/// Propagates [`spawn_federation_plane`]'s [`CliError::Internal`] (a local federation mirror log / cursor
+/// could not be opened).
+#[cfg(unix)]
+fn spawn_federation_plane_if_configured(
+    federation: &FederationConfig,
+    data_dir: &Path,
+    config: &ServeConfig,
+) -> Result<Option<GeoPlaneHandle>, CliError> {
+    if federation.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(spawn_federation_plane(federation, data_dir, config)?))
+}
+
+/// Construct + spawn the GATEWAY-FEDERATION mirror plane (#626, V2-C7-I4) — one async pull thread per
+/// peer-originated federated stream (the streams whose origin domain is a PEER, not this cluster's own).
+/// Called ONLY when a federation config is present (the caller checks `federation.is_empty()` first); with
+/// no federation config this is never called and the broker is byte-for-byte today's.
+///
+/// Each peer mirror is a geo mirror of a peer-origin stream, REUSED VERBATIM: a thread owns its OWN local
+/// read-only mirror [`Log`](ironbus_storage::log::Log) + a durable [`OriginCursorStore`] under
+/// `<data_dir>/federation/<hex(local)>/`, dials the peer gateway (reconnecting + backing off on a drop),
+/// and runs the geo [`pull_loop`](ironbus_server::cluster::pull_loop) — pull, CRC-revalidate, apply, advance
+/// the durable resume cursor — until shutdown. A peer disconnect/reconnect resumes from the cursor with no
+/// gap/dup; a DOWN peer's thread backs off and retries WITHOUT blocking any other peer's thread or local
+/// traffic (the resilience guarantee). A gateway is NOT a Raft voter — this plane never touches the
+/// metadata group / `ClusterRuntime`, so federating never affects any cluster's consensus.
+///
+/// The SERVE side (this cluster serving its OWN self-originated federated streams to peers, via the geo
+/// [`OriginServer`]) is the deferred broker-accept wiring — proven in the federation integration tests,
+/// exactly as the geo/leaf accept loops are. The reused [`GeoPlaneHandle`] carries the per-peer pull
+/// threads (the connector side this plane spawns here).
+///
+/// # Errors
+/// [`CliError::Internal`] if a local federation mirror log / cursor store cannot be opened (the only
+/// synchronous failure; a dial failure is handled by the pull thread's reconnect/backoff, never a serve
+/// failure).
+#[cfg(unix)]
+fn spawn_federation_plane(
+    federation: &FederationConfig,
+    data_dir: &Path,
+    config: &ServeConfig,
+) -> Result<GeoPlaneHandle, CliError> {
+    let log_config = LogConfig::new(config.max_segment_bytes)
+        .map_err(|e| CliError::Internal(format!("federation log config: {e}")))?
+        .with_max_total_bytes(config.max_total_bytes);
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut pullers = Vec::new();
+
+    // Only the PEER-originated streams are mirrored (the connector side). A SELF-originated stream is
+    // SERVED (the deferred accept side), never mirrored here — the loop-safety core: a gateway never
+    // mirrors its own origin.
+    for mirrored in federation.mirrored_streams() {
+        let handle = spawn_federation_mirror_puller(&mirrored, data_dir, log_config, &shutdown)?;
+        pullers.push(handle);
+    }
+
+    Ok(GeoPlaneHandle { shutdown, pullers })
+}
+
+/// Spawn ONE federation peer-mirror pull thread (#626): open the local read-only mirror log + durable
+/// cursor under `<data_dir>/federation/<hex(local)>/`, then run the geo per-origin puller (dial the peer
+/// gateway, pull, CRC-revalidate, apply, advance the cursor, reconnect on a drop) until shutdown. A
+/// federation mirror IS a geo mirror of a peer origin, so [`run_geo_puller`] is REUSED VERBATIM — no new
+/// connector code, no new wire frame.
+///
+/// # Errors
+/// [`CliError::Internal`] if the local mirror log / cursor store cannot be opened, or the thread cannot
+/// spawn.
+#[cfg(unix)]
+fn spawn_federation_mirror_puller(
+    mirrored: &ironbus_server::cluster::MirroredStream,
+    data_dir: &Path,
+    log_config: LogConfig,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<std::thread::JoinHandle<()>, CliError> {
+    let dir = data_dir
+        .join("federation")
+        .join(hex_dir_name(&mirrored.local_stream));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| CliError::Internal(format!("mkdir {}: {e}", dir.display())))?;
+    let log =
+        ironbus_storage::log::Log::open(StdFs::new(dir.clone()), SystemClock::new(), log_config)
+            .map_err(|e| {
+                CliError::Internal(format!("open federation mirror log {}: {e}", dir.display()))
+            })?;
+    let cursors = OriginCursorStore::open(&StdFs::new(dir.clone())).map_err(|e| {
+        CliError::Internal(format!(
+            "open federation mirror cursor {}: {e}",
+            dir.display()
+        ))
+    })?;
+    let applier = std::sync::Arc::new(std::sync::Mutex::new(MirrorApplier::new(log, cursors)));
+    let origin = mirrored.origin.clone();
+    let key = origin.cursor_key();
+    let local = mirrored.local_stream.clone();
+    let shutdown_t = std::sync::Arc::clone(shutdown);
+    std::thread::Builder::new()
+        .name(format!("ib-fed-mirror-{local}"))
+        .spawn(move || {
+            run_geo_puller(&applier, &origin, &key, &shutdown_t);
+        })
+        .map_err(|e| CliError::Internal(format!("spawn federation mirror: {e}")))
 }
 
 /// Construct + spawn the cross-cluster GEO pull plane (#623, V2-C7-I1) — one async pull thread per
@@ -6722,6 +6992,7 @@ fn cmd_serve(
     cluster: Option<&ClusterConfig>,
     geo: &GeoConfig,
     leaf: &LeafConfig,
+    federation: &FederationConfig,
     transport: &TransportSecurityFlags,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
@@ -6735,6 +7006,10 @@ fn cmd_serve(
     // stub consumes its parsed config to keep this signature byte-for-byte identical to the Unix one (the
     // same #288/#99 footgun: a new serve arg MUST appear in BOTH cmd_serve signatures).
     let _ = leaf;
+    // The GATEWAY / SUPERCLUSTER FEDERATION plane (#626) is likewise spawned only on the Unix serve path,
+    // so the non-Unix stub consumes its parsed config to keep this signature byte-for-byte identical to the
+    // Unix one (the same #288/#99 footgun: a new serve arg MUST appear in BOTH cmd_serve signatures).
+    let _ = federation;
     // The #87 materialized-config line, `Profile::name`, and `DiskFullPolicyArg::as_str` are reached
     // only from the Unix serve path, so build (and discard) the line here too: a function/method read
     // only on cfg(unix) trips the Windows `-D warnings` `never used` lint, invisible to a macOS
@@ -12834,6 +13109,7 @@ mod tests {
             parsed.cluster.as_ref(),
             &parsed.geo,
             &parsed.leaf,
+            &parsed.federation,
             &parsed.transport,
             ReloadSource {
                 config_path: parsed.config_path.as_deref(),
@@ -15322,6 +15598,7 @@ mod tests {
             parsed.cluster.as_ref(),
             &parsed.geo,
             &parsed.leaf,
+            &parsed.federation,
             &parsed.transport,
             ReloadSource {
                 config_path: parsed.config_path.as_deref(),
@@ -15433,6 +15710,7 @@ mod tests {
             parsed.cluster.as_ref(),
             &parsed.geo,
             &parsed.leaf,
+            &parsed.federation,
             &parsed.transport,
             ReloadSource {
                 config_path: parsed.config_path.as_deref(),
@@ -15550,6 +15828,124 @@ mod tests {
     }
 
     #[test]
+    fn federation_flags_parse_into_a_symmetric_config() {
+        // `west` is this cluster; it peers `east`. `orders` originates in `west` (SERVED to peers);
+        // `east-events` mirrors `east`'s `events` (read-only). The symmetric supercluster shape.
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--gateway-domain",
+            "west",
+            "--gateway",
+            "east=10.0.0.2:7600",
+            "--federate",
+            "orders=@west/orders",
+            "--federate",
+            "east-events=@east/events",
+        ]))
+        .unwrap();
+        assert!(!parsed.federation.is_empty());
+        // Only the peer-origin mirror is read-only; the self-origin served stream is locally produced.
+        assert_eq!(
+            parsed.federation.read_only_streams(),
+            vec!["east-events".to_string()]
+        );
+        // SERVED = only the self-originated `orders` (the no-loop core: never the peer mirror).
+        let served = parsed.federation.served_streams();
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].local_stream, "orders");
+        // MIRRORED = only the peer-originated `east-events`, over east's gateway.
+        let mirrored = parsed.federation.mirrored_streams();
+        assert_eq!(mirrored.len(), 1);
+        assert_eq!(mirrored[0].origin.addr, "10.0.0.2:7600");
+        assert_eq!(mirrored[0].origin.stream, "events");
+    }
+
+    #[test]
+    fn no_federation_flags_is_the_empty_non_federated_default() {
+        let parsed = parse_serve_flags(&serve_args(&[])).unwrap();
+        assert!(
+            parsed.federation.is_empty(),
+            "no --gateway-domain = no federation plane"
+        );
+    }
+
+    #[test]
+    fn the_federation_own_domain_falls_back_to_cluster_domain() {
+        // With only `--cluster-domain` set (no explicit `--gateway-domain`), the federation own-domain
+        // reuses it, so the geo-namespace and federation identities are one.
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--cluster-domain",
+            "west",
+            "--gateway",
+            "east=e:1",
+            "--federate",
+            "orders=@west/orders",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.federation.served_streams().len(),
+            1,
+            "orders is served by west"
+        );
+    }
+
+    #[test]
+    fn a_federate_without_a_gateway_domain_is_a_typed_usage_error() {
+        assert!(matches!(
+            parse_serve_flags(&serve_args(&["--federate", "orders=@west/orders"])),
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn a_peer_origin_federated_stream_with_no_gateway_is_rejected_no_leakage() {
+        // `south` originates a federated stream but is NOT in the peer table -> fail-closed (no
+        // auto-discovery, the namespace no-leakage rule).
+        assert!(matches!(
+            parse_serve_flags(&serve_args(&[
+                "--gateway-domain",
+                "west",
+                "--federate",
+                "south-s=@south/s",
+            ])),
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn a_gateway_peer_naming_this_clusters_own_domain_is_rejected() {
+        // A cluster does not federate with itself.
+        assert!(matches!(
+            parse_serve_flags(&serve_args(&[
+                "--gateway-domain",
+                "west",
+                "--gateway",
+                "west=self:1",
+            ])),
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn two_federated_streams_sharing_a_local_name_are_rejected() {
+        // A local log is either ONE peer's mirror or this cluster's own served origin, never both / two.
+        assert!(matches!(
+            parse_serve_flags(&serve_args(&[
+                "--gateway-domain",
+                "west",
+                "--gateway",
+                "east=e:1",
+                "--gateway",
+                "south=s:1",
+                "--federate",
+                "dup=@east/a",
+                "--federate",
+                "dup=@south/b",
+            ])),
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    #[test]
     fn leaf_flags_under_storage_memory_are_rejected() {
         let parsed = parse_serve_flags(&serve_args(&[
             "--storage",
@@ -15579,6 +15975,7 @@ mod tests {
             parsed.cluster.as_ref(),
             &parsed.geo,
             &parsed.leaf,
+            &parsed.federation,
             &parsed.transport,
             ReloadSource {
                 config_path: parsed.config_path.as_deref(),
