@@ -6210,11 +6210,25 @@ fn run_dataplane_bootstrap(
     // the shared slot so every per-connection produce path (which captured the slot at serve start)
     // reaches it: from now on a clustered `C2-fsync` led produce's wire `PubAck` is withheld until
     // quorum-fsync. Before this fill, the produce path acked immediately (the brief bootstrap window).
-    let mut dp_runtime = match DataPlaneRuntime::start_with_client_gate(
+    // The node-id -> CLIENT-address advertise map for the #735 `NOT_LEADER` leader HINT. There is no
+    // per-peer client-address config today (`--cluster-peer` carries only the metadata address; a peer's
+    // CLIENT listener `--addr` is not advertised), so this is EMPTY in production for now: the `NOT_LEADER`
+    // redirect still fires correctly (a client on a non-leader is redirected before any append/ack), but
+    // with NO concrete hint — the client re-tries its own configured peer set to find the leader. A
+    // `--cluster-peer-client <id>=<addr>` advertise that fills this hint is the flagged follow-up (#735).
+    let leader_client_addrs: std::collections::BTreeMap<u64, std::net::SocketAddr> =
+        std::collections::BTreeMap::new();
+    // Start the runtime with the client gate AND the #735 client cluster-awareness wiring: the (currently
+    // empty) leader-hint advertise map and the shared metadata status snapshot (the follower-read
+    // committed-HW safe-watermark source). The status handle is what lets a FOLLOWER serve committed reads
+    // over the wire (without it the follower-read fails closed to a 0 safe bar).
+    let mut dp_runtime = match DataPlaneRuntime::start_with_client_gate_aware(
         server,
         self_data_addr,
         &peer_data_addrs,
         configured_level,
+        leader_client_addrs,
+        std::sync::Arc::clone(status),
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -6617,7 +6631,11 @@ fn run_broker<F: Filesystem + Clone + 'static>(
                                      // struct would only move the noise, not remove it.
                                      // GENERIC over the engine's Filesystem (#443), like `run_broker`: the disk and memory storage
                                      // backends share the one health-server wiring, monomorphized by the same static dispatch.
-fn start_health_server<F: Filesystem + 'static>(
+                                     // `F: Clone` since the engine handle is used as an `EngineAccess` by `serve_health`, and the
+                                     // `EngineAccess` impl for `EngineHandle` carries `F: Clone` (the #735 follower-read consume override
+                                     // builds a read plane over a follower's owned log). The shipped filesystems are all `Clone`, so this is
+                                     // no real constraint — it just matches the serve loop, which already requires `F: Clone`.
+fn start_health_server<F: Filesystem + Clone + 'static>(
     config: &ServeConfig,
     health_addr: Option<&str>,
     health_bind: Option<HealthBindDecision>,

@@ -1050,6 +1050,65 @@ pub fn decode_produce_confirm(body: &[u8]) -> Result<ProduceConfirmBody, BodyErr
     Ok(ProduceConfirmBody { offset, status })
 }
 
+/// The version of the [`crate::frame::FrameType::NotLeader`] redirect body (#735). Version `1` is the
+/// first (and only) layout: a `body_version: u8` followed by the leader-hint address as a
+/// u16-length-prefixed UTF-8 string. The version byte lets a future field be appended after the address
+/// without a new frame tag (an old reader stops at the address it knows). A NON-cluster broker NEVER
+/// emits this frame, so it never appears on a single-node wire.
+pub const NOT_LEADER_BODY_VERSION: u8 = 1;
+
+/// A cluster `NotLeader` produce-redirect body (the [`crate::frame::FrameType::NotLeader`] frame, #735):
+/// the server tells a producer that the node it produced to is NOT the current leader of the target
+/// (clustered) partition, carrying a LEADER HINT — the current committed leader's CLIENT-facing address —
+/// so the client transparently reconnects/retries to the leader. The redirect happens BEFORE any local
+/// append or ack, so a redirected produce is never acked by the wrong node (no double-append, no false
+/// ack).
+///
+/// Layout (version-prefixed, forward-compatible): `body_version: u8` ([`NOT_LEADER_BODY_VERSION`]), then
+/// the `leader_hint` address as a u16-length-prefixed UTF-8 string. The hint is EMPTY (a zero-length
+/// string) when the current leader's client address is not yet known to this node (e.g. mid-failover, or
+/// the leader has not advertised a client address); the client then falls back to re-discovering the
+/// leader from its own known peer set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotLeaderBody<'a> {
+    /// The current leader's CLIENT-facing address (e.g. `"127.0.0.1:9000"`), or the EMPTY string when
+    /// this node does not yet know it. Borrowed from the decoded frame body (UTF-8 validated by the
+    /// caller — the bytes are taken verbatim here so the codec stays panic-free and allocation-free).
+    pub leader_hint: &'a str,
+}
+
+/// Encodes a `NotLeader` body onto the end of `out`: the version byte then the u16-length-prefixed
+/// leader-hint address.
+///
+/// # Errors
+/// Returns [`BodyError::FieldTooLarge`] if `leader_hint` exceeds the `u16` wire field limit (an address
+/// is far shorter, so this is unreachable in practice).
+pub fn encode_not_leader(redirect: &NotLeaderBody<'_>, out: &mut Vec<u8>) -> Result<(), BodyError> {
+    out.push(NOT_LEADER_BODY_VERSION);
+    push_var(out, redirect.leader_hint.as_bytes())
+}
+
+/// Decodes a `NotLeader` body: the version byte then the u16-length-prefixed leader-hint address. The
+/// `body_version` is NOT rejected if unknown (a future version is forward-compatible: the v1 address
+/// field is still read, and any appended bytes past it are tolerated and ignored), so a newer server's
+/// extended redirect still routes an older client. The address must be valid UTF-8 (an address always
+/// is); a non-UTF-8 hint is a [`BodyError::Truncated`]-class malformed body.
+///
+/// # Errors
+/// Returns a [`BodyError`] on a short body (no version byte / a length field exceeding the body) or a
+/// non-UTF-8 leader-hint.
+pub fn decode_not_leader(body: &[u8]) -> Result<NotLeaderBody<'_>, BodyError> {
+    let mut r = Reader::new(body);
+    // Read and discard the version byte: v1 is the only layout, but an unknown future version still
+    // carries the v1 address field first, so we stay forward-compatible by reading the field regardless.
+    let _body_version = r.u8()?;
+    let hint_bytes = r.var()?;
+    // Trailing bytes past the v1 address are a FUTURE version's appended fields: tolerated and ignored
+    // (no `at_end` check), so a newer server's extended redirect still decodes here.
+    let leader_hint = core::str::from_utf8(hint_bytes).map_err(|_| BodyError::Truncated)?;
+    Ok(NotLeaderBody { leader_hint })
+}
+
 /// The version of the `Connect`/`Info` handshake body framing (#292, refs #275, #65, #11). The
 /// handshake bodies were EMPTY before this; version `1` is the first non-empty layout. It is the
 /// handshake-BODY version, distinct from the (still un-wired) `wire_protocol_version` integer #71/#11
@@ -4778,5 +4837,44 @@ mod tests {
         huge.extend_from_slice(&u16::try_from(2usize).unwrap().to_le_bytes());
         huge.extend_from_slice(&claimed.to_le_bytes());
         assert_eq!(decode_pub_subject(&huge), Err(BodyError::BadLength));
+    }
+
+    #[test]
+    fn not_leader_round_trips_the_leader_hint() {
+        for hint in ["127.0.0.1:9000", "[::1]:7000", ""] {
+            let mut buf = Vec::new();
+            encode_not_leader(&NotLeaderBody { leader_hint: hint }, &mut buf).unwrap();
+            assert_eq!(
+                buf[0], NOT_LEADER_BODY_VERSION,
+                "version byte leads the body"
+            );
+            let decoded = decode_not_leader(&buf).unwrap();
+            assert_eq!(decoded.leader_hint, hint);
+        }
+    }
+
+    #[test]
+    fn not_leader_tolerates_a_future_version_and_trailing_fields() {
+        // A future version byte still carries the v1 address field first, and appended bytes past it are
+        // tolerated (forward-compatible): an older client still routes a newer server's extended redirect.
+        let mut buf = Vec::new();
+        buf.push(NOT_LEADER_BODY_VERSION + 7);
+        push_var(&mut buf, b"10.0.0.5:9000").unwrap();
+        buf.extend_from_slice(b"FUTURE-APPENDED-FIELD"); // a v2 field an old reader ignores
+        let decoded = decode_not_leader(&buf).unwrap();
+        assert_eq!(decoded.leader_hint, "10.0.0.5:9000");
+    }
+
+    #[test]
+    fn not_leader_fails_closed_on_malformed_input() {
+        // Empty body -> Truncated (no version byte). A declared length past the body -> Truncated, never
+        // an over-read. A non-UTF-8 hint -> Truncated (an address is always UTF-8).
+        assert_eq!(decode_not_leader(&[]), Err(BodyError::Truncated));
+        let mut short = vec![NOT_LEADER_BODY_VERSION];
+        short.extend_from_slice(&5u16.to_le_bytes()); // claims 5 bytes, none follow
+        assert_eq!(decode_not_leader(&short), Err(BodyError::Truncated));
+        let mut bad_utf8 = vec![NOT_LEADER_BODY_VERSION];
+        push_var(&mut bad_utf8, &[0xff, 0xfe]).unwrap();
+        assert_eq!(decode_not_leader(&bad_utf8), Err(BodyError::Truncated));
     }
 }

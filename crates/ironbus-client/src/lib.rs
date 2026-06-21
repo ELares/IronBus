@@ -28,13 +28,13 @@ use ironbus_core::types::RecordFlags;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
     decode_dead_letter, decode_deliver, decode_deliver_batch, decode_gap_marker, decode_info,
-    decode_produce_confirm, decode_pub_ack, decode_stream_info_response, decode_truncated,
-    encode_ack, encode_connect, encode_cumulative_ack, encode_fetch, encode_pub, encode_pub_to,
-    encode_stream_commit, encode_stream_declare, encode_stream_fetch, encode_stream_info,
-    encode_sub, encode_sub_to, produce_confirm_status, AckBody, AckLevel, AckOp, BodyError,
-    ConnectBody, ConsumeTier, CumulativeAckBody, DeliverBody, FetchBody, PubBody, PubToBody,
-    StreamCommitBody, StreamDeclareBody, StreamFetchBody, StreamInfoBody, SubBody, SubToBody,
-    PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
+    decode_not_leader, decode_produce_confirm, decode_pub_ack, decode_stream_info_response,
+    decode_truncated, encode_ack, encode_connect, encode_cumulative_ack, encode_fetch, encode_pub,
+    encode_pub_to, encode_stream_commit, encode_stream_declare, encode_stream_fetch,
+    encode_stream_info, encode_sub, encode_sub_to, produce_confirm_status, AckBody, AckLevel,
+    AckOp, BodyError, ConnectBody, ConsumeTier, CumulativeAckBody, DeliverBody, FetchBody, PubBody,
+    PubToBody, StreamCommitBody, StreamDeclareBody, StreamFetchBody, StreamInfoBody, SubBody,
+    SubToBody, PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -59,6 +59,17 @@ pub enum ClientError {
     BadResponse(&'static str),
     /// The connection closed before a complete response arrived.
     Closed,
+    /// The server REDIRECTED a produce: the node this client is connected to holds a clustered replica
+    /// role for the target partition but is NOT its current leader (#735), so the produce was NOT
+    /// appended/acked here — it must go to the leader. `leader_hint` is the current leader's CLIENT
+    /// address when the server knew it (`Some`), or `None` (mid-failover, or no advertised client address),
+    /// in which case the caller re-discovers the leader from its own known peers. A RECOVERABLE error: the
+    /// connection stays usable (the client can keep producing once it reconnects to the leader); see
+    /// [`Client::produce_to_leader`] for the transparent reconnect/retry helper.
+    NotLeader {
+        /// The current leader's CLIENT address to reconnect to, or `None` when the server did not know it.
+        leader_hint: Option<String>,
+    },
     /// A delivered payload carried the `COMPRESSED` flag but could not be decompressed back to
     /// the original bytes (#430): an unknown codec (e.g. a `zstd` record read by this pure-Rust
     /// client), a dictionary this client cannot resolve (`PoisonUnresolvedDict`; the client
@@ -112,6 +123,10 @@ impl core::fmt::Display for ClientError {
                     "delivered payload at offset {offset} failed decompression: {source}"
                 )
             }
+            ClientError::NotLeader { leader_hint } => match leader_hint {
+                Some(addr) => write!(f, "not leader: produce to the leader at {addr}"),
+                None => write!(f, "not leader: the current leader is unknown"),
+            },
         }
     }
 }
@@ -400,11 +415,15 @@ pub enum ProgressOutcome {
 /// One produce reply, classified: the single decode point shared by the half-duplex
 /// [`Client::produce_window`] drain and the [`Client::produce_stream`] reader thread (#458), so
 /// the two paths can never drift on the reply contract.
+#[derive(Debug)]
 enum PubReply {
     Acked(u64),
     Duplicate(u64),
     ServerErr(String),
     Pong,
+    /// A cluster `NotLeader` redirect (#735): the produce landed on a non-leader replica of the
+    /// partition and was NOT appended/acked; the leader's CLIENT-address hint (or `None` when unknown).
+    NotLeader(Option<String>),
 }
 
 /// One coalesced write's byte budget for [`Client::produce_stream`] (#458): large enough to
@@ -490,6 +509,20 @@ fn drain_stream_replies(
                 f.server_errors += 1;
                 if f.first_server_err.is_none() {
                     f.first_server_err = Some(msg);
+                }
+            }
+            // A cluster NotLeader redirect (#735) mid-stream: this node is not the leader, so these
+            // streamed produces did NOT land. Surface it like a server error (the first one is reported),
+            // so the caller learns the stream went to the wrong node and re-streams to the leader. Counted
+            // as done so the writer's window does not stall waiting on a reply that will never ack.
+            PubReply::NotLeader(hint) => {
+                f.done += 1;
+                f.server_errors += 1;
+                if f.first_server_err.is_none() {
+                    f.first_server_err = Some(match hint {
+                        Some(addr) => format!("not leader: produce to the leader at {addr}"),
+                        None => "not leader: the current leader is unknown".to_string(),
+                    });
                 }
             }
             // The terminal marker: the server's FIFO frame order guarantees every prior
@@ -596,6 +629,20 @@ fn confirm_outcome(status: u8) -> ConfirmOutcome {
     }
 }
 
+/// Decode a `NotLeader` redirect body (#735) into the typed [`ClientError::NotLeader`] with the leader
+/// hint (an empty hint -> `None`). A malformed body falls back to a `None` hint rather than a parse error,
+/// so a redirect is always actionable (the client re-tries its known peers).
+fn not_leader_error(body: &[u8]) -> ClientError {
+    let leader_hint = decode_not_leader(body).ok().and_then(|r| {
+        if r.leader_hint.is_empty() {
+            None
+        } else {
+            Some(r.leader_hint.to_string())
+        }
+    });
+    ClientError::NotLeader { leader_hint }
+}
+
 fn classify_pub_reply(ty: FrameType, body: &[u8]) -> Result<PubReply, ClientError> {
     match ty {
         FrameType::PubAck => {
@@ -612,6 +659,18 @@ fn classify_pub_reply(ty: FrameType, body: &[u8]) -> Result<PubReply, ClientErro
         }
         FrameType::Err => Ok(PubReply::ServerErr(String::from_utf8_lossy(body).into())),
         FrameType::Pong => Ok(PubReply::Pong),
+        // A cluster NotLeader redirect (#735): decode the leader hint (an empty hint -> `None`). The
+        // produce was NOT appended/acked here; the caller reconnects/retries to the leader.
+        FrameType::NotLeader => {
+            let redirect = decode_not_leader(body)
+                .map_err(|_| ClientError::BadResponse("malformed NotLeader redirect body"))?;
+            let hint = if redirect.leader_hint.is_empty() {
+                None
+            } else {
+                Some(redirect.leader_hint.to_string())
+            };
+            Ok(PubReply::NotLeader(hint))
+        }
         other => Err(ClientError::Unexpected(other)),
     }
 }
@@ -948,6 +1007,55 @@ impl Client {
         self.produce_dedup(message).map(|ack| ack.offset)
     }
 
+    /// Produce `message`, transparently following a cluster [`ClientError::NotLeader`] redirect (#735) to
+    /// the leader. On a non-cluster broker (or when already connected to the leader) this is exactly
+    /// [`Client::produce`]: one produce, no extra work. In a cluster, if the connected node is NOT the
+    /// leader of the partition, the server replies `NotLeader` with the current leader's CLIENT-address
+    /// hint; this RECONNECTS this client to the hinted leader (using `config` for the handshake, so the
+    /// negotiated capabilities are preserved) and RETRIES the produce there — so a client connected to the
+    /// wrong node (e.g. after a failover moved leadership) recovers automatically. Bounded by
+    /// `max_redirects` reconnects (a small value like 3 is ample; it guards against a redirect loop / a
+    /// rebalance storm).
+    ///
+    /// A `NotLeader` with NO hint (`leader_hint == None` — the server did not yet know the leader, e.g.
+    /// mid-failover) is returned to the caller UNCHANGED (this helper cannot guess an address): the caller
+    /// re-tries its own known peers. Every other error (a real server `Err`, a transport error) is
+    /// returned unchanged. On success the client REMAINS connected to the leader, so subsequent produces
+    /// go straight there.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::NotLeader`] when the redirect carried no hint, or when `max_redirects`
+    /// reconnects were exhausted (the last redirect is surfaced); a [`ClientError`] on a reconnect failure
+    /// or any non-redirect produce error.
+    pub fn produce_to_leader(
+        &mut self,
+        message: &PubBody<'_>,
+        config: &ClientConfig,
+        max_redirects: u32,
+    ) -> Result<u64, ClientError> {
+        let mut attempts = 0;
+        loop {
+            match self.produce(message) {
+                Ok(offset) => return Ok(offset),
+                Err(ClientError::NotLeader { leader_hint }) => {
+                    // No hint, or redirect budget exhausted: surface the redirect for the caller to handle
+                    // (re-discover the leader from its own peers). Never loop unbounded.
+                    match leader_hint {
+                        Some(addr) if attempts < max_redirects => {
+                            // Reconnect to the hinted leader (preserving the handshake-negotiated
+                            // capabilities), then retry the produce there. A reconnect failure surfaces as
+                            // the connect error.
+                            *self = Client::connect_with(addr.as_str(), config)?;
+                            attempts += 1;
+                        }
+                        other => return Err(ClientError::NotLeader { leader_hint: other }),
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Produces a message and returns the full [`ProduceAck`]: the assigned (or, on a dedup hit, the
     /// ORIGINAL) offset plus the `duplicate` indication (#33). When `message.dedup` is `Some`, the
     /// publish opts into the broker's effectively-once dedup window; if the `msg_id` was already seen
@@ -994,6 +1102,10 @@ impl Client {
             (FrameType::Err, body) => {
                 Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
             }
+            // A cluster NotLeader redirect (#735): this node is not the leader, so the produce did NOT
+            // land here. Surface the typed `NotLeader` error (with the leader hint) so the caller can
+            // reconnect/retry to the leader; the connection stays usable. `produce_to_leader` automates it.
+            (FrameType::NotLeader, body) => Err(not_leader_error(&body)),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -1268,6 +1380,14 @@ impl Client {
                 PubReply::ServerErr(msg) => {
                     if first_err.is_none() {
                         first_err = Some(ClientError::Server(msg));
+                    }
+                }
+                // A cluster NotLeader redirect (#735): this node is not the leader, so the windowed
+                // produces did NOT land. Remember it as the first error (with the leader hint); the drain
+                // continues so the connection stays framed, then the call returns the typed redirect.
+                PubReply::NotLeader(leader_hint) => {
+                    if first_err.is_none() {
+                        first_err = Some(ClientError::NotLeader { leader_hint });
                     }
                 }
                 PubReply::Pong => return Err(ClientError::Unexpected(FrameType::Pong)),
@@ -2781,6 +2901,14 @@ impl PipelinedProducer<'_> {
                 PubReply::ServerErr(msg) => {
                     if first_err.is_none() {
                         first_err = Some(ClientError::Server(msg));
+                    }
+                }
+                // A cluster NotLeader redirect (#735): the pipelined produces did NOT land on this
+                // non-leader node. Remember the typed redirect (with the leader hint) as the first error;
+                // the drain continues so the connection stays framed.
+                PubReply::NotLeader(leader_hint) => {
+                    if first_err.is_none() {
+                        first_err = Some(ClientError::NotLeader { leader_hint });
                     }
                 }
                 PubReply::Pong => return Err(ClientError::Unexpected(FrameType::Pong)),
@@ -6060,5 +6188,485 @@ mod tests {
         drop(conn);
         shutdown.store(true, Ordering::Release);
         serve_handle.join().unwrap();
+    }
+
+    // ---- #735 client NOT_LEADER redirect classification ----------------------------------------
+
+    #[test]
+    fn a_not_leader_frame_classifies_as_a_redirect_with_the_leader_hint() {
+        use ironbus_proto::message::{encode_not_leader, NotLeaderBody};
+        // A NotLeader frame carrying a concrete leader hint classifies as a redirect to that address.
+        let mut body = Vec::new();
+        encode_not_leader(
+            &NotLeaderBody {
+                leader_hint: "127.0.0.1:9002",
+            },
+            &mut body,
+        )
+        .unwrap();
+        match classify_pub_reply(FrameType::NotLeader, &body).unwrap() {
+            PubReply::NotLeader(Some(addr)) => assert_eq!(addr, "127.0.0.1:9002"),
+            other => panic!("expected a NotLeader redirect with a hint, got {other:?}"),
+        }
+        // The single-produce path surfaces it as the typed ClientError::NotLeader with the hint.
+        match not_leader_error(&body) {
+            ClientError::NotLeader {
+                leader_hint: Some(addr),
+            } => assert_eq!(addr, "127.0.0.1:9002"),
+            other => panic!("expected ClientError::NotLeader with a hint, got {other}"),
+        }
+    }
+
+    #[test]
+    fn a_hintless_not_leader_frame_classifies_as_a_redirect_with_no_hint() {
+        use ironbus_proto::message::{encode_not_leader, NotLeaderBody};
+        // An EMPTY leader hint (the server did not yet know the leader) classifies as a redirect with no
+        // hint — the caller re-discovers the leader from its own peers.
+        let mut body = Vec::new();
+        encode_not_leader(&NotLeaderBody { leader_hint: "" }, &mut body).unwrap();
+        match classify_pub_reply(FrameType::NotLeader, &body).unwrap() {
+            PubReply::NotLeader(None) => {}
+            other => panic!("expected a hintless NotLeader redirect, got {other:?}"),
+        }
+        match not_leader_error(&body) {
+            ClientError::NotLeader { leader_hint: None } => {}
+            other => panic!("expected a hintless ClientError::NotLeader, got {other}"),
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // #735 (V2 client cluster-awareness): a REAL client connection is transparently routed —
+    //   A. a produce to a NON-leader node is answered NOT_LEADER + a leader hint, and the client
+    //      retries to the leader where the produce succeeds (quorum-acked);
+    //   B. a consume from a FOLLOWER node serves committed records over the wire, never past the
+    //      safe watermark.
+    // ---------------------------------------------------------------------------------------------
+
+    /// A handle to one in-process broker spun up for the #735 tests: its address + the shared gate (so a
+    /// test can drive a follower's quorum-fsync report, like the runtime's follower thread), plus the
+    /// shutdown flag and serve thread.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    struct ClusterBroker {
+        addr: std::net::SocketAddr,
+        gate: Arc<ironbus_server::cluster::ClientAckGate<InMemoryFs, SystemClock>>,
+        shutdown: Arc<AtomicBool>,
+        serve: std::thread::JoinHandle<()>,
+    }
+
+    #[cfg(unix)]
+    impl ClusterBroker {
+        fn stop(self) {
+            self.shutdown.store(true, Ordering::Release);
+            self.serve.join().unwrap();
+        }
+    }
+
+    /// The shared engine config for the #735 brokers (sync durability, a generous credit).
+    #[cfg(unix)]
+    fn cluster_test_engine_config() -> EngineConfig {
+        EngineConfig {
+            log: LogConfig::default(),
+            lease: LeaseConfig::default(),
+            delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+            max_in_flight: 16,
+            consumer_credit: 256,
+            consumer_credit_bytes: 0,
+            checkpoint_interval: 1024,
+            max_retained_bytes: 0,
+            max_age_ms: 0,
+            max_messages: 0,
+            max_groups: DEFAULT_MAX_GROUPS,
+            group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
+            ram_ceiling_bytes: 0,
+            disk_full_policy: DiskFullPolicy::DropNew,
+            dedup: ironbus_core::dedup::DedupConfig::default(),
+            durability_level: ironbus_server::engine::DurabilityLevel::Sync,
+            flush_interval_ms: 0,
+            flush_max_bytes: 0,
+            codel_target_ms: 0,
+            codel_interval_ms: 0,
+            retry_budget_ratio_per_million: 0,
+            retry_budget_window_ms: 0,
+            fire_and_forget_msg_rate: 0,
+            fire_and_forget_byte_rate: 0,
+            fire_and_forget_refill_ms: 0,
+            egress_limit: 0,
+            wal_fsync_headroom_bytes: 0,
+            compression: ironbus_core::compress::Codec::None,
+            default_message_ttl_ms: 0,
+            dead_letter_exchange: None,
+            dead_letter_expired: false,
+        }
+    }
+
+    /// Build one clustered broker for partition 0 of `{1,2,3}` (`min_isr = 2`). When `lead` is true this
+    /// node LEADS (so a produce here is quorum-gated, never redirected); when false it FOLLOWS (leader is
+    /// node 2) over a replica log pre-seeded by replicating `seed_records` from a leader plane, so a real
+    /// client consume here serves committed records. `leader_client_addr` is advertised as node 2's CLIENT
+    /// address (the `NOT_LEADER` hint). The follower's committed-HW status covers the whole replicated
+    /// prefix.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)] // one cohesive broker-build helper (leader or follower role + wiring)
+    fn start_cluster_broker(
+        lead: bool,
+        leader_client_addr: Option<std::net::SocketAddr>,
+        seed_records: u32,
+    ) -> ClusterBroker {
+        use ironbus_server::actor::EngineHandle;
+        use ironbus_server::cluster::{
+            ClientAckGate, ClusterAckLevel, ClusterStatus, DataPlaneController, DataPlaneServer,
+            IsrConfig, ProduceAckSeam,
+        };
+        use ironbus_storage::log::{Append, Log};
+        use std::collections::BTreeMap;
+        use std::sync::{Mutex, OnceLock};
+
+        let engine = Engine::open(
+            InMemoryFs::new(),
+            SystemClock::new(),
+            cluster_test_engine_config(),
+        )
+        .unwrap();
+
+        let isr = IsrConfig {
+            min_isr: 2,
+            max_lag_records: 0,
+        };
+        let self_id = if lead { 1 } else { 3 };
+        let mut controller = DataPlaneController::new(self_id);
+        let mut committed_hw = 0u64;
+        if lead {
+            let leader_log: &'static mut Log<InMemoryFs, SystemClock> = Box::leak(Box::new(
+                Log::open(InMemoryFs::new(), SystemClock::new(), LogConfig::default()).unwrap(),
+            ));
+            controller.start_leader(
+                C2_PARTITION,
+                Arc::new(leader_log.read_plane().unwrap()),
+                ironbus_core::epoch_cache::EpochCache::new(),
+                &[1, 2, 3],
+                isr,
+            );
+        } else {
+            // Seed a leader plane, then replicate it into this node's follower log (the in-process
+            // catch-up the dataplane tests use), so the follower holds a committed prefix to serve.
+            let small = LogConfig {
+                max_segment_bytes: 256,
+                max_total_bytes: 0,
+                ..LogConfig::default()
+            };
+            let leader_log: &'static mut Log<InMemoryFs, SystemClock> = Box::leak(Box::new(
+                Log::open(InMemoryFs::new(), SystemClock::new(), small).unwrap(),
+            ));
+            for i in 0..seed_records {
+                leader_log
+                    .append(&Append {
+                        timestamp_ms: 7,
+                        flags: ironbus_core::types::RecordFlags::EMPTY,
+                        key: b"",
+                        headers: b"",
+                        payload: format!("c735-{i:02}").as_bytes(),
+                    })
+                    .unwrap();
+            }
+            leader_log.sync().unwrap();
+            let plane = Arc::new(leader_log.read_plane().unwrap());
+            let mut served_end = 0u64;
+            loop {
+                let raw = plane
+                    .read_range_raw(ironbus_core::types::Offset::new(served_end), 1_000, None)
+                    .unwrap();
+                let next = raw.run.next_offset.get();
+                if next <= served_end {
+                    break;
+                }
+                served_end = next;
+            }
+            committed_hw = served_end;
+            let mut leader_ctrl: DataPlaneController<InMemoryFs, SystemClock> =
+                DataPlaneController::new(2);
+            leader_ctrl.start_leader(
+                C2_PARTITION,
+                Arc::clone(&plane),
+                ironbus_core::epoch_cache::EpochCache::new(),
+                &[1, 2, 3],
+                isr,
+            );
+            controller.start_follower(
+                C2_PARTITION,
+                Log::open(InMemoryFs::new(), SystemClock::new(), small).unwrap(),
+            );
+            for _ in 0..(served_end + 8) {
+                if controller.follower_high_watermark(C2_PARTITION).unwrap() >= served_end {
+                    break;
+                }
+                let req = controller
+                    .make_fetch_request(C2_PARTITION, 8, 4096)
+                    .unwrap();
+                let resp = leader_ctrl.serve_fetch(C2_PARTITION, &req).unwrap();
+                controller
+                    .apply_fetch_response(C2_PARTITION, &resp)
+                    .unwrap();
+            }
+        }
+
+        let mut server = DataPlaneServer::new(self_id, ProduceAckSeam::new(controller));
+        if !lead {
+            server.set_follower_target(C2_PARTITION, 2);
+        }
+        let mut addrs: BTreeMap<u64, std::net::SocketAddr> = BTreeMap::new();
+        if let Some(a) = leader_client_addr {
+            addrs.insert(2, a);
+        }
+        let mut status = ClusterStatus::default();
+        status.last_committed_hw.insert(C2_PARTITION, committed_hw);
+        let gate = Arc::new(
+            ClientAckGate::new(Arc::new(Mutex::new(server)), ClusterAckLevel::C2Fsync)
+                .with_leader_client_addrs(addrs)
+                .with_status_handle(Arc::new(Mutex::new(status))),
+        );
+
+        let slot: ironbus_server::actor::ClientAckSlot<InMemoryFs, SystemClock> =
+            Arc::new(OnceLock::new());
+        slot.set(Arc::clone(&gate)).ok();
+        let (handle_engine, _actor): (EngineHandle<InMemoryFs, SystemClock>, _) =
+            spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        let handle_engine = handle_engine.with_client_ack_slot(slot);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let serve = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            move || {
+                let clock = SystemClock::new();
+                let beacon =
+                    ironbus_server::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                serve(&listener, &handle_engine, &shutdown, 16, &clock, &beacon).unwrap();
+            }
+        });
+        ClusterBroker {
+            addr,
+            gate,
+            shutdown,
+            serve,
+        }
+    }
+
+    /// Drive a follower quorum-fsync report on `gate` until it RELEASES a parked C2-fsync ack (or a
+    /// deadline) — standing in for the data-plane runtime's follower thread, on a side thread so a client
+    /// can await its quorum-gated `PubAck`.
+    #[cfg(unix)]
+    fn spawn_quorum_releaser(
+        gate: Arc<ironbus_server::cluster::ClientAckGate<InMemoryFs, SystemClock>>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if gate.on_follower_report(
+                    C2_PARTITION,
+                    &ironbus_server::cluster::AckReplicatedBody {
+                        follower_id: 2,
+                        fsynced_offset: 1,
+                    },
+                ) > 0
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    }
+
+    /// A: a real client produces to a NON-leader node, gets `NOT_LEADER` + the leader hint, transparently
+    /// retries to the leader where the produce SUCCEEDS and is quorum-acked (#720). The end-to-end #735
+    /// half-A proof over real sockets.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_client_redirects_a_not_leader_produce_to_the_leader_and_succeeds() {
+        let leader = start_cluster_broker(true, None, 0);
+        let follower = start_cluster_broker(false, Some(leader.addr), 0);
+
+        let mut client = Client::connect(follower.addr).unwrap();
+        let msg = PubBody {
+            flags: 0,
+            timestamp_ms: 0,
+            key: b"",
+            headers: b"",
+            dedup: None,
+            fire_and_forget: false,
+            payload: b"to-the-leader",
+        };
+        // A bare produce on the FOLLOWER gets a typed NotLeader redirect carrying the leader's address.
+        match client.produce(&msg) {
+            Err(ClientError::NotLeader { leader_hint }) => {
+                assert_eq!(
+                    leader_hint.as_deref(),
+                    Some(leader.addr.to_string().as_str()),
+                    "the redirect carries the current leader's client address as the hint"
+                );
+            }
+            other => panic!("expected a NotLeader redirect from the follower, got {other:?}"),
+        }
+
+        // produce_to_leader follows the hint: it reconnects to the leader and retries there, where the
+        // C2-fsync ack is quorum-gated (#719) — release it on a side thread.
+        let releaser = spawn_quorum_releaser(Arc::clone(&leader.gate));
+        let offset = client
+            .produce_to_leader(&msg, &ClientConfig::default(), 3)
+            .expect("the produce succeeds on the leader after the redirect");
+        assert_eq!(offset, 0, "the leader assigned the durable offset 0");
+        releaser.join().unwrap();
+
+        leader.stop();
+        follower.stop();
+    }
+
+    /// A no-false-NOT_LEADER guard: a produce to the actual LEADER proceeds (quorum-gated), never a
+    /// redirect.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_client_produce_to_the_leader_is_not_redirected() {
+        let leader = start_cluster_broker(true, None, 0);
+        let mut client = Client::connect(leader.addr).unwrap();
+        let releaser = spawn_quorum_releaser(Arc::clone(&leader.gate));
+        let offset = client
+            .produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"on-the-leader",
+            })
+            .expect("a produce to the leader proceeds (never a NotLeader redirect)");
+        assert_eq!(offset, 0, "the leader assigned offset 0 (no redirect)");
+        releaser.join().unwrap();
+        leader.stop();
+    }
+
+    /// B: a real client CONSUMES committed records from a FOLLOWER node over the wire (a Tier-S
+    /// `StreamFetch`), byte-faithfully, never past the safe watermark. The end-to-end #735 half-B proof.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_client_consumes_committed_records_from_a_follower_over_the_wire() {
+        use ironbus_proto::message::{encode_stream_fetch, StreamFetchBody};
+        const N: u32 = 12;
+        let follower = start_cluster_broker(false, None, N);
+
+        let cfg = ClientConfig {
+            understands_streaming: true,
+            ..ClientConfig::default()
+        };
+        let mut conn = raw_connect_with(follower.addr, &cfg);
+
+        let mut body = Vec::new();
+        encode_stream_fetch(
+            &StreamFetchBody {
+                start_offset: 0,
+                max_records: 1_000,
+                max_bytes: 0,
+            },
+            &mut body,
+        );
+        conn.write_frame(FrameType::StreamFetch, &body);
+
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "follower-read response did not terminate"
+            );
+            match conn.next_frame() {
+                Some((FrameType::Deliver, b)) => {
+                    let d = ironbus_proto::message::decode_deliver(&b).unwrap();
+                    payloads.push(d.payload.to_vec());
+                }
+                Some((FrameType::FlowEnd, _)) => break,
+                Some((other, _)) => {
+                    panic!("unexpected frame in a follower-read response: {other:?}")
+                }
+                // A read-timeout with no whole frame yet: loop and re-check the deadline.
+                None => {}
+            }
+        }
+        assert!(
+            !payloads.is_empty(),
+            "the follower served committed records over the wire (not vacuously empty)"
+        );
+        assert!(
+            payloads.len() <= N as usize,
+            "the follower never serves more than the committed prefix"
+        );
+        for (i, p) in payloads.iter().enumerate() {
+            assert_eq!(
+                p.as_slice(),
+                format!("c735-{i:02}").as_bytes(),
+                "follower-read payload {i} is byte-faithful"
+            );
+        }
+
+        drop(conn);
+        follower.stop();
+    }
+
+    /// A raw connection with an explicit handshake `config` (so a test can advertise Tier-S streaming).
+    #[cfg(unix)]
+    fn raw_connect_with(addr: std::net::SocketAddr, config: &ClientConfig) -> RawConn {
+        use ironbus_proto::message::{encode_connect, ConnectBody};
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut conn = RawConn {
+            stream,
+            buf: Vec::new(),
+        };
+        let mut body = Vec::new();
+        encode_connect(
+            &ConnectBody {
+                understands_streaming: config.understands_streaming,
+                ..ConnectBody::default()
+            },
+            &mut body,
+        );
+        conn.write_frame(FrameType::Connect, &body);
+        let (ty, _b) = conn.next_frame().expect("Info handshake reply");
+        assert_eq!(ty, FrameType::Info);
+        conn
+    }
+
+    /// Byte-identical guarantee (#735 non-negotiable 1): a NON-cluster broker's produce + consume hot
+    /// path is unchanged — a produce returns a normal `PubAck` (NEVER a `NotLeader` redirect), and the
+    /// record round-trips byte-faithfully on consume. The non-cluster `start_server` broker builds NO
+    /// `ClientAckGate`, so `cluster_produce_routing`/`cluster_follower_consume` take their cheap default
+    /// (`Local` / `None`) and the produce + consume paths are the existing ones.
+    #[test]
+    fn a_non_cluster_produce_and_consume_is_never_redirected_or_follower_routed() {
+        let (addr, shutdown, handle) = start_server();
+        let mut c = Client::connect(addr).unwrap();
+        // A produce on a non-cluster broker returns a normal PubAck offset — never a NotLeader redirect.
+        let offset = c
+            .produce(&PubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"single-node",
+            })
+            .expect("a non-cluster produce returns a PubAck, never a NotLeader redirect");
+        assert_eq!(offset, 0, "the single-node broker assigned offset 0");
+        // The consume round-trips the record byte-faithfully through the normal (non-follower) path.
+        let messages = c.fetch(10).unwrap().messages;
+        assert_eq!(messages.len(), 1, "the record is consumed normally");
+        assert_eq!(messages[0].offset, 0);
+        assert_eq!(messages[0].payload.as_slice(), b"single-node");
+        drop(c);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
     }
 }
