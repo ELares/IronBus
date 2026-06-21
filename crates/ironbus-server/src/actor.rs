@@ -39,7 +39,11 @@ use ironbus_core::types::Offset;
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use crate::cluster::client_ack::ClientAckGate;
+use crate::cluster::dataplane::AckDisposition;
+use ironbus_core::keyshared::MemberId;
 
 /// The default bound on the actor command channel: the most produce/engine commands that may be
 /// in flight before a sender blocks (backpressure). Sized for the edge box's bounded connection
@@ -373,7 +377,21 @@ pub struct EngineHandle<F: Filesystem, C: Clock> {
     /// only; the actor's own byte-cap check stays authoritative (I2 / ordering), and the gate is
     /// engineered to NEVER false-reject (see [`crate::produce_gate`]).
     cap_gate: Arc<ProduceCapGate>,
+    /// The CLUSTER produce-ack gate slot (#719, V2-C2): `None` on a SINGLE-NODE / no-cluster broker
+    /// (the slot is never even created, so the produce-ack hot path never consults it and is
+    /// byte-for-byte today's — the single-node guarantee, owned by this `Option`). On a clustered serve
+    /// it is `Some(Arc<OnceLock<..>>)`: a shared, set-once slot created at serve start and POPULATED by
+    /// the data-plane bootstrap thread once the committed placement builds the
+    /// [`ClientAckGate`](crate::cluster::client_ack::ClientAckGate). The `Arc` is SHARED on clone (like
+    /// `cap_gate`): every connection reads the one slot the bootstrap fills. Until it is filled (the
+    /// brief bootstrap window) the produce path acks immediately exactly as the non-cluster path does.
+    client_ack: Option<ClientAckSlot<F, C>>,
 }
+
+/// The shared, set-once slot holding the clustered [`ClientAckGate`] (#719). Created empty at serve
+/// start and filled by the data-plane bootstrap once the placement commits, so every per-connection
+/// [`EngineHandle`] clone (which captured the slot at serve start) reaches the SAME gate.
+pub type ClientAckSlot<F, C> = Arc<OnceLock<Arc<ClientAckGate<F, C>>>>;
 
 // Derived `Clone` would demand `F: Clone`; the handle clones the `SyncSender` and the clock (`C` is
 // already `Clock + Clone` everywhere a handle is built), so spell it out for any `F`.
@@ -390,11 +408,45 @@ impl<F: Filesystem, C: Clock + Clone> Clone for EngineHandle<F, C> {
             // The SAME shared gate (#476): every connection reads the one byte-cap snapshot the actor
             // publishes, so the `Arc` is shared on clone (NOT freshened like `reply_pool`).
             cap_gate: Arc::clone(&self.cap_gate),
+            // The SAME shared cluster produce-ack slot (#719): every connection reads the one slot the
+            // data-plane bootstrap fills, so the `Arc<OnceLock>` is shared on clone. `None` off-cluster.
+            client_ack: self.client_ack.clone(),
         }
     }
 }
 
 impl<F: Filesystem + 'static, C: Clock + 'static> EngineHandle<F, C> {
+    /// Install the SHARED cluster produce-ack slot (#719) on this base handle, returning the handle.
+    /// Called ONCE on a clustered serve, RIGHT AFTER [`spawn_actor_with_gather`] and BEFORE any
+    /// per-connection clone, so every connection's handle captures the same slot. The slot is filled
+    /// later by the data-plane bootstrap once the placement commits. A single-node / no-cluster serve
+    /// never calls this, so its handles carry `None` and the produce-ack path stays byte-for-byte
+    /// today's (the single-node guarantee).
+    #[must_use]
+    pub fn with_client_ack_slot(mut self, slot: ClientAckSlot<F, C>) -> Self {
+        self.client_ack = Some(slot);
+        self
+    }
+
+    /// The shared cluster produce-ack gate (#719), once the data-plane bootstrap has filled the slot;
+    /// `None` on a single-node / no-cluster serve (no slot) or during the brief bootstrap window before
+    /// the placement commits (the slot exists but is empty). The produce path consults it ONLY when it
+    /// is `Some` — the single-node path never reaches here.
+    #[must_use]
+    fn client_ack_gate(&self) -> Option<&Arc<ClientAckGate<F, C>>> {
+        self.client_ack.as_ref().and_then(|slot| slot.get())
+    }
+
+    /// Drop any released-but-undrained cluster produce-acks for a DISCONNECTED producer connection
+    /// (#719), so the gate's outbox does not leak. An inherent forwarder (the connection-cleanup path in
+    /// `server.rs` holds a concrete [`EngineHandle`], not an `EngineAccess` bound). A no-op on a
+    /// single-node / no-cluster broker (no gate), so the disconnect path is byte-for-byte unchanged.
+    pub fn drop_client_acks(&self, member: MemberId) {
+        if let Some(gate) = self.client_ack_gate() {
+            gate.drop_connection(member);
+        }
+    }
+
     /// The static per-consumer credit caps (#292): `(consumer_credit, consumer_credit_bytes)`,
     /// snapshotted from the engine config at `spawn_actor`. Read by the `Connect` handshake to
     /// negotiate the per-consumer credit WITHOUT a round-trip through the actor (so a stalled produce
@@ -637,6 +689,57 @@ pub trait EngineAccess<F: Filesystem, C: Clock> {
     /// off the actor's hot path and a stalled produce cannot head-of-line-block a handshake (#177).
     /// `.0` is the message-count cap (floored to >= 1); `.1` of `0` is unlimited.
     fn consumer_credit_caps(&self) -> (u32, u64);
+
+    /// Whether this engine carries a CLUSTER produce-ack gate (#719): `false` on a SINGLE-NODE /
+    /// no-cluster broker (the DEFAULT), so the produce-ack hot path can skip building the gate's bytes
+    /// and write the immediate ack directly — the zero-cost byte-identical fast path. A cheap LOCAL read
+    /// (no actor round-trip, no lock). [`EngineHandle`] overrides it to report whether its cluster slot
+    /// is filled.
+    fn has_client_ack_gate(&self) -> bool {
+        false
+    }
+
+    /// The CLUSTER produce-ack decision (#719) for one durable produce on connection `member`: called
+    /// AFTER the local group-commit fsync returned `Appended(offset)`, with the `offset`, and the EXACT
+    /// wire-`PubAck` frame bytes the session would otherwise write now.
+    ///
+    /// Returns `None` on a SINGLE-NODE / no-cluster broker (the DEFAULT impl): there is no gate, so the
+    /// session writes the immediate ack-after-local-fsync reply exactly as today — byte-for-byte, with
+    /// ZERO added work (no lock, no allocation). [`EngineHandle`] overrides it to consult the shared
+    /// [`ClientAckGate`](crate::cluster::client_ack::ClientAckGate) ONLY when the cluster slot is filled
+    /// (a clustered serve past bootstrap); even then it returns `None` unless the gate is present, so the
+    /// non-cluster and pre-bootstrap paths stay the immediate ack. A `Some(AckDisposition)` tells the
+    /// session whether to WRITE the reply now or WITHHOLD it (the gate parked it; the data plane releases
+    /// it on quorum-fsync, drained later via [`EngineAccess::drain_client_acks`]).
+    ///
+    /// The DEFAULT-partition scoping (#693 is multi-partition routing) is the gate's concern; the session
+    /// passes the default partition. `reply_bytes` is returned verbatim inside `WriteNow` so the caller
+    /// can move them back out without a clone on the common immediate-ack path.
+    fn client_ack_disposition(
+        &self,
+        _member: MemberId,
+        _offset: u64,
+        _reply_bytes: Vec<u8>,
+    ) -> Option<AckDisposition> {
+        None
+    }
+
+    /// Drain (and remove) every cluster produce-ack the data plane RELEASED for connection `member`
+    /// since its last pass (#719), in release/offset order, for the session to flush on its OWN pass —
+    /// the cross-thread hand-off (the data plane releases on a peer-I/O thread; only the owning
+    /// connection's thread may write its socket), exactly like the #497 `ProduceConfirm` drain. The
+    /// DEFAULT impl returns empty (single-node / no-cluster: nothing is ever parked, so nothing
+    /// releases) WITHOUT any work. [`EngineHandle`] overrides it to drain the gate's outbox when the
+    /// cluster slot is filled.
+    fn drain_client_acks(&self, _member: MemberId) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
+    /// Drop any released-but-undrained cluster produce-acks for a producer connection that DISCONNECTED
+    /// (#719), so the gate's outbox does not leak. The DEFAULT impl is a no-op (no gate). [`EngineHandle`]
+    /// overrides it to clear the gate's outbox entry when the cluster slot is filled. Called from the
+    /// connection-cleanup path, like #497's `drop_l2_confirms`.
+    fn drop_client_acks(&self, _member: MemberId) {}
 }
 
 impl<F: Filesystem + 'static, C: Clock + Clone + 'static> EngineAccess<F, C>
@@ -674,6 +777,43 @@ impl<F: Filesystem + 'static, C: Clock + Clone + 'static> EngineAccess<F, C>
     fn consumer_credit_caps(&self) -> (u32, u64) {
         // A LOCAL read of the snapshotted caps, no actor round-trip (the #177 head-of-line guard).
         EngineHandle::consumer_credit_caps(self)
+    }
+
+    fn has_client_ack_gate(&self) -> bool {
+        // A cheap local read: the slot exists AND is filled (a clustered serve past bootstrap).
+        self.client_ack_gate().is_some()
+    }
+
+    fn client_ack_disposition(
+        &self,
+        member: MemberId,
+        offset: u64,
+        reply_bytes: Vec<u8>,
+    ) -> Option<AckDisposition> {
+        // SINGLE-NODE / no-cluster / pre-bootstrap: `client_ack_gate` is `None`, so this returns `None`
+        // with ZERO work (no lock, no alloc) and the session writes the immediate ack exactly as today.
+        // Only a clustered serve past bootstrap reaches the gate, which itself NO-OPs (writes now) for
+        // every non-C2-fsync configured level or non-led partition.
+        let gate = self.client_ack_gate()?;
+        Some(gate.on_local_fsynced_ack(
+            member,
+            crate::cluster::client_ack::DEFAULT_PARTITION,
+            offset,
+            reply_bytes,
+        ))
+    }
+
+    fn drain_client_acks(&self, member: MemberId) -> Vec<Vec<u8>> {
+        // No gate (single-node / pre-bootstrap): nothing was ever parked, so nothing releases — empty,
+        // no work. With a gate, drain this connection's released wire PubAcks (the common case is empty).
+        match self.client_ack_gate() {
+            Some(gate) => gate.drain_released(member),
+            None => Vec::new(),
+        }
+    }
+
+    fn drop_client_acks(&self, member: MemberId) {
+        EngineHandle::drop_client_acks(self, member);
     }
 }
 
@@ -947,6 +1087,11 @@ where
             reply_pool: Arc::new(Mutex::new(Vec::new())),
             // The shared fast-reject gate (#476); every connection `clone` shares this same `Arc`.
             cap_gate,
+            // No cluster produce-ack slot by default (#719): the single-node / no-cluster broker never
+            // creates one. A clustered serve installs the shared slot via
+            // [`EngineHandle::with_client_ack_slot`] right after this returns, BEFORE any connection's
+            // handle is cloned, so every connection sees it.
+            client_ack: None,
         },
         join,
     )

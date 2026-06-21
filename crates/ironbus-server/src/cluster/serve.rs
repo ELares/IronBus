@@ -580,12 +580,43 @@ const FETCH_MAX_BYTES: u32 = 1024 * 1024;
 pub struct DataPlaneRuntime<F: Filesystem, C: Clock> {
     /// The shared, `Send` data-plane server every peer thread drives under a short per-frame lock.
     server: Arc<Mutex<DataPlaneServer<F, C>>>,
+    /// The CLIENT produce-ack gate (#719) the leader-side readers release quorum-fsync'd acks through,
+    /// when this runtime was started with one ([`DataPlaneRuntime::start_with_client_gate`]). It wraps
+    /// the SAME `server` Arc, so the one seam is the single source of truth. `None` for a runtime
+    /// started without a client gate (the in-process tests / the observability serve).
+    client_gate: Option<Arc<super::client_ack::ClientAckGate<F, C>>>,
     /// The shutdown flag the runtime OWNS; `stop` sets it and joins every thread.
     shutdown: Arc<AtomicBool>,
     /// The data-plane peer LISTENER thread (leader side: accepts inbound links, spawns readers).
     listener: Option<JoinHandle<()>>,
     /// One FOLLOWER fetch thread per followed partition (dials the leader, fetch + apply + report).
     followers: Vec<JoinHandle<()>>,
+}
+
+/// How a leader-side data-plane reader RELEASES a quorum-fsync'd produce ack from a follower's
+/// [`AckReplicatedBody`](super::isr::AckReplicatedBody) report (#719): either the CLIENT produce-ack
+/// gate (which deposits each released wire `PubAck` into its owner connection's outbox to flush) or, in
+/// the no-client-gate case, the server-only path that drives the gate and drops the bytes (the ISR /
+/// parked state is still advanced — observability / a self-driven test).
+enum AckRelease<F: Filesystem, C: Clock> {
+    /// The clustered client serve (#719): route the report through the shared
+    /// [`ClientAckGate`](super::client_ack::ClientAckGate), depositing each released wire `PubAck` into
+    /// its owner connection's outbox.
+    Gate(Arc<super::client_ack::ClientAckGate<F, C>>),
+    /// No client gate (a runtime started without one): drive the seam directly and drop the released
+    /// bytes (the gate's parked / ISR state is still correctly advanced).
+    ServerOnly,
+}
+
+// Hand-written (a derive would demand `F: Clone` / `C: Clone`): each variant is just an `Arc` clone or
+// a unit, so cloning is cheap and `F`/`C`-free.
+impl<F: Filesystem, C: Clock> Clone for AckRelease<F, C> {
+    fn clone(&self) -> Self {
+        match self {
+            AckRelease::Gate(g) => AckRelease::Gate(Arc::clone(g)),
+            AckRelease::ServerOnly => AckRelease::ServerOnly,
+        }
+    }
 }
 
 impl<F, C> DataPlaneRuntime<F, C>
@@ -614,6 +645,47 @@ where
         self_data_addr: SocketAddr,
         peer_data_addrs: &BTreeMap<u64, SocketAddr>,
     ) -> io::Result<Self> {
+        Self::start_inner(server, self_data_addr, peer_data_addrs, None)
+    }
+
+    /// Like [`Self::start`], but BUILDS a shared CLIENT produce-ack
+    /// [`ClientAckGate`](super::client_ack::ClientAckGate) (#719) at `configured_level` around the SAME
+    /// `Arc<Mutex<DataPlaneServer>>` this runtime drives (so the one seam is the single source of truth),
+    /// and routes the leader-side quorum-ack release THROUGH it: a follower's `AckReplicated` report that
+    /// brings quorum-fsync past a parked offset deposits the released wire `PubAck` into its owner
+    /// connection's outbox, for that connection to flush on its own pass. The built gate is returned by
+    /// [`Self::client_gate`] so the caller can publish it to its per-connection produce paths. Below
+    /// `min_isr` nothing releases (no false ack on the real client wire).
+    ///
+    /// # Errors
+    /// As [`Self::start`].
+    ///
+    /// # Panics
+    /// As [`Self::start`].
+    pub fn start_with_client_gate(
+        server: DataPlaneServer<F, C>,
+        self_data_addr: SocketAddr,
+        peer_data_addrs: &BTreeMap<u64, SocketAddr>,
+        configured_level: super::ack_level::ClusterAckLevel,
+    ) -> io::Result<Self> {
+        Self::start_inner(
+            server,
+            self_data_addr,
+            peer_data_addrs,
+            Some(configured_level),
+        )
+    }
+
+    /// The shared work of [`Self::start`] / [`Self::start_with_client_gate`]: when `client_level` is
+    /// `Some`, a [`ClientAckGate`](super::client_ack::ClientAckGate) is built around the wrapped server
+    /// Arc and the leader-side readers release through it (`AckRelease::Gate`); when `None`, the readers
+    /// drive the seam directly and drop the released bytes (`AckRelease::ServerOnly`).
+    fn start_inner(
+        server: DataPlaneServer<F, C>,
+        self_data_addr: SocketAddr,
+        peer_data_addrs: &BTreeMap<u64, SocketAddr>,
+        client_level: Option<super::ack_level::ClusterAckLevel>,
+    ) -> io::Result<Self> {
         // Bind the data-plane peer listener BEFORE spawning anything, so a bind failure is synchronous
         // (no half-started runtime). Non-blocking so the accept loop polls the shutdown flag.
         let listener = TcpListener::bind(self_data_addr)?;
@@ -622,13 +694,27 @@ where
         let follower_partitions = server.follower_partitions();
         let server = Arc::new(Mutex::new(server));
         let shutdown = Arc::new(AtomicBool::new(false));
+        // Build the client produce-ack gate around the SAME server Arc when a configured level was given
+        // (#719). The gate and every leader-side reader share this one Arc, so the seam's parked state is
+        // one source of truth.
+        let client_gate = client_level.map(|level| {
+            Arc::new(super::client_ack::ClientAckGate::new(
+                Arc::clone(&server),
+                level,
+            ))
+        });
+        let release = match &client_gate {
+            Some(g) => AckRelease::Gate(Arc::clone(g)),
+            None => AckRelease::ServerOnly,
+        };
 
         // The LEADER side: accept inbound peer links and serve fetches / record reports.
         let shutdown_l = Arc::clone(&shutdown);
         let server_l = Arc::clone(&server);
+        let release_l = release.clone();
         let listener_handle = std::thread::Builder::new()
             .name("ib-dataplane-listen".to_string())
-            .spawn(move || run_dataplane_listener(listener, server_l, shutdown_l))
+            .spawn(move || run_dataplane_listener(listener, server_l, release_l, shutdown_l))
             .expect("spawn data-plane listener thread");
 
         // The FOLLOWER side: one fetch loop per followed partition, dialing the leader's data address.
@@ -658,6 +744,7 @@ where
 
         Ok(Self {
             server,
+            client_gate,
             shutdown,
             listener: Some(listener_handle),
             followers,
@@ -669,6 +756,14 @@ where
     #[must_use]
     pub fn server(&self) -> &Arc<Mutex<DataPlaneServer<F, C>>> {
         &self.server
+    }
+
+    /// The CLIENT produce-ack gate (#719) this runtime drives, when it was started with
+    /// [`Self::start_with_client_gate`]; `None` otherwise. The caller publishes it to its per-connection
+    /// produce paths so a clustered `C2-fsync` led produce gets its wire `PubAck` only on quorum-fsync.
+    #[must_use]
+    pub fn client_gate(&self) -> Option<&Arc<super::client_ack::ClientAckGate<F, C>>> {
+        self.client_gate.as_ref()
     }
 
     /// Signal shutdown and join every data-plane thread. Idempotent. Called by the broker's serve teardown
@@ -702,6 +797,7 @@ impl<F: Filesystem, C: Clock> Drop for DataPlaneRuntime<F, C> {
 fn run_dataplane_listener<F, C>(
     listener: TcpListener,
     server: Arc<Mutex<DataPlaneServer<F, C>>>,
+    release: AckRelease<F, C>,
     shutdown: Arc<AtomicBool>,
 ) where
     F: Filesystem + Send + Sync + 'static,
@@ -714,10 +810,13 @@ fn run_dataplane_listener<F, C>(
                 // idle inbound link never wedges a stop.
                 let _ = stream.set_read_timeout(Some(DATAPLANE_POLL));
                 let server = Arc::clone(&server);
+                let release = release.clone();
                 let sd = Arc::clone(&shutdown);
                 let _ = std::thread::Builder::new()
                     .name("ib-dataplane-read".to_string())
-                    .spawn(move || run_dataplane_reader(DataPlaneLink::new(stream), &server, &sd));
+                    .spawn(move || {
+                        run_dataplane_reader(DataPlaneLink::new(stream), &server, &release, &sd);
+                    });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 sleep_interruptible(DATAPLANE_POLL, &shutdown);
@@ -730,16 +829,19 @@ fn run_dataplane_listener<F, C>(
 /// A per-connection data-plane reader (the LEADER side of one follower's link): pull bounded,
 /// CRC-revalidated frames off the wire and route each through the shared server, writing any response
 /// back on the SAME link. A `FetchRecords` / `OffsetForLeaderEpoch` is answered with a response frame
-/// served from the off-actor read plane; an `AckReplicated` report drives the quorum-ack gate (the
-/// released wire-`PubAck` bytes are the produce path's to flush — when the seam is threaded — so they
-/// are taken under the lock and dropped here, since this slice does not yet own the parked producer
-/// connections; the gate's parked state is correctly advanced regardless).
+/// served from the off-actor read plane; an `AckReplicated` report drives the quorum-ack gate (#719):
+/// with a [`ClientAckGate`](super::client_ack::ClientAckGate) (`release = Gate`) each released wire
+/// `PubAck` is deposited into its OWNER producer connection's outbox, for that connection to flush on
+/// its own pass; without one (`release = ServerOnly`) the seam is driven and the bytes are dropped (the
+/// ISR / parked state is still advanced). Below `min_isr` nothing releases (no false ack on the real
+/// client wire).
 ///
 /// Every bound in [`DataPlaneLink::recv`] is applied: a hostile / oversized / corrupt frame is a typed
 /// error that drops the link, never a panic or an over-allocation (the fail-closed bounded codec).
 fn run_dataplane_reader<F, C>(
     mut link: DataPlaneLink<TcpStream>,
     server: &Arc<Mutex<DataPlaneServer<F, C>>>,
+    release: &AckRelease<F, C>,
     shutdown: &AtomicBool,
 ) where
     F: Filesystem + Send + Sync + 'static,
@@ -747,6 +849,26 @@ fn run_dataplane_reader<F, C>(
 {
     while !shutdown.load(Ordering::Acquire) {
         match link.recv() {
+            // An `AckReplicated` report drives the quorum-ack gate (#719). Route it through the CLIENT
+            // produce-ack gate when present (it deposits each released wire `PubAck` into its owner
+            // connection's outbox, for that connection to flush on its own pass); without a gate, drive
+            // the seam directly and drop the bytes (the ISR / parked state is still advanced). Handled
+            // OUTSIDE the server lock — the gate takes its own server lock — so no re-entrant lock.
+            Ok(Some((partition, DataPlaneFrame::AckReplicated(report)))) => {
+                match release {
+                    AckRelease::Gate(gate) => {
+                        // Deposits each released reply into its owner connection's outbox; below min_isr
+                        // releases nothing (no false ack on the real client wire).
+                        let _ = gate.on_follower_report(partition, &report);
+                    }
+                    AckRelease::ServerOnly => {
+                        let Ok(mut srv) = server.lock() else {
+                            return; // poisoned: the runtime is tearing down
+                        };
+                        let _ = srv.on_follower_report_bytes(partition, &report);
+                    }
+                }
+            }
             Ok(Some((partition, frame))) => {
                 // Route one frame under a short lock, computing the outbound action, then RELEASE the
                 // lock before writing it to the wire (never hold the server lock across a socket write).
@@ -754,16 +876,7 @@ fn run_dataplane_reader<F, C>(
                     let Ok(mut srv) = server.lock() else {
                         return; // poisoned: the runtime is tearing down
                     };
-                    match frame {
-                        DataPlaneFrame::AckReplicated(report) => {
-                            // Drive the quorum-ack gate. The released wire-`PubAck` bytes belong to the
-                            // produce path (FLAGGED: the per-connection seam thread); advancing the gate
-                            // here keeps the ISR / parked state correct. Drop the bytes for now.
-                            let _ = srv.on_follower_report_bytes(partition, &report);
-                            None
-                        }
-                        other => srv.handle_frame(partition, other).ok(),
-                    }
+                    srv.handle_frame(partition, frame).ok()
                 };
                 match action {
                     Some(DataPlaneAction::SendFetchResponse {

@@ -571,6 +571,19 @@ impl Session {
         // the close), but the FIRST error wins: a drain error after a loop error is the same fatal
         // engine event and is subsumed by it.
         let drained = drain_parked(engine, member_id, &mut parked, out);
+        // Drain any CLUSTER produce-acks the data plane RELEASED for this connection onto the wire
+        // (#719): a clustered `C2-fsync` produce's wire `PubAck` was WITHHELD when it parked (in
+        // `drain_parked` above), and the data plane flushes it onto this connection's outbox once the
+        // ISR quorum has fsync'd the offset — on a peer-I/O thread, which may not write this socket. So
+        // the OWNING connection drains and writes them HERE on its own pass (the cross-thread hand-off,
+        // exactly like the L2 confirm drain below). BYTE-IDENTICAL single-node guarantee: the default
+        // `drain_client_acks` (no cluster) returns empty with ZERO work — no lock, no actor round-trip —
+        // so a single-node / no-cluster / pre-bootstrap connection's pass is unchanged. Off the actor
+        // (an outbox lock only), so it never head-of-line-blocks a ping (#177). FIFO/offset order is the
+        // gate's release order, written after this window's own replies and before the L2 confirms.
+        for frame in engine.drain_client_acks(member_id) {
+            out.extend_from_slice(&frame);
+        }
         // Drain any READY Level-2 `ProduceConfirm`s for THIS producer connection onto the wire (#497),
         // so a producer awaiting a confirm receives it on its next pass. A confirm becomes ready when a
         // consumer in the designated group acks the record (or it dead-letters / force-reaps / times
@@ -3438,7 +3451,7 @@ fn drain_parked<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAc
             ProduceOutcome::Appended(offset) if p.wants_confirm => Some(*offset),
             _ => None,
         };
-        write_pub_reply(outcome, p.fire_and_forget, out)?;
+        write_pub_reply_gated(engine, member_id, outcome, p.fire_and_forget, out)?;
         if let Some(offset) = confirm_offset {
             // Register AFTER the `PubAck` was written: the record is durable (the covering fsync ran
             // before the actor reported `Appended`) and its durability ack is already on the wire, so
@@ -3449,6 +3462,72 @@ fn drain_parked<F: Filesystem + 'static, C: Clock + Clone + 'static, E: EngineAc
         }
     }
     Ok(())
+}
+
+/// Like [`write_pub_reply`], but for a FRESH durable `Appended` it routes the wire `PubAck` through the
+/// CLUSTER produce-ack gate (#719) FIRST: on a clustered `C2-fsync` produce to a led partition the gate
+/// PARKS the ack (returns [`AckDisposition::Parked`]) and this WITHHOLDS the frame — the data plane
+/// flushes it onto this connection's outbox once the ISR quorum has fsync'd the offset, and the session
+/// drains it on a later pass ([`EngineAccess::drain_client_acks`]). For every OTHER outcome — and for
+/// `Appended` on a SINGLE-NODE / no-cluster broker (the gate returns `None`), a non-`C2-fsync` level, or
+/// a non-led partition (the gate returns `WriteNow`) — it writes the SAME bytes immediately, BYTE-FOR-
+/// BYTE today's path. A fire-and-forget produce never reaches the gate (its `Appended` is
+/// `FireAndForgetAppended`, a no-frame outcome).
+///
+/// # Single-node byte-identical
+/// On a single-node / no-cluster broker `engine.has_client_ack_gate()` is `false` (a cheap local bool,
+/// zero work), so the `Appended` arm writes the `PubAck` DIRECTLY — same frame, same order, NO temp
+/// allocation, NO lock, byte-for-byte [`write_pub_reply`]. The gate is consulted (and the bytes built
+/// for it) ONLY on a clustered serve past bootstrap.
+fn write_pub_reply_gated<
+    F: Filesystem + 'static,
+    C: Clock + Clone + 'static,
+    E: EngineAccess<F, C>,
+>(
+    engine: &E,
+    member_id: MemberId,
+    outcome: ProduceOutcome,
+    fire_and_forget: bool,
+    out: &mut Vec<u8>,
+) -> Result<(), SessionError> {
+    if let ProduceOutcome::Appended(offset) = outcome {
+        // SINGLE-NODE / no-cluster FAST PATH (zero added cost): with NO cluster gate the produce-ack is
+        // written DIRECTLY into `out`, byte-for-byte today's path — no temp allocation, no lock, no extra
+        // work. `has_client_ack_gate` is a cheap local bool (default `false`), so the non-cluster hot
+        // path never even builds the bytes the gate would need.
+        if !engine.has_client_ack_gate() {
+            reply_pub_ack(out, FrameType::PubAck, offset);
+            return Ok(());
+        }
+        // CLUSTERED path: build the EXACT wire PubAck bytes the immediate-ack path would write, then let
+        // the gate decide whether to write them now or withhold them for quorum-fsync.
+        let mut reply_bytes = Vec::with_capacity(11);
+        reply_pub_ack(&mut reply_bytes, FrameType::PubAck, offset);
+        match engine.client_ack_disposition(member_id, offset.get(), reply_bytes) {
+            // The gate vanished between the bool check and here (a teardown race), or handed the bytes
+            // back (non-C2-fsync level, or a partition this node does not lead): write them now,
+            // byte-identical.
+            None => {
+                reply_pub_ack(out, FrameType::PubAck, offset);
+            }
+            Some(crate::cluster::dataplane::AckDisposition::WriteNow(bytes)) => {
+                out.extend_from_slice(&bytes);
+            }
+            // A just-parked C2-fsync ack whose quorum was ALREADY met (a fast follower reported first):
+            // write the released real replies now, in offset order.
+            Some(crate::cluster::dataplane::AckDisposition::WriteNowBatch(frames)) => {
+                for f in frames {
+                    out.extend_from_slice(&f);
+                }
+            }
+            // Clustered C2-fsync to a led partition, below/at quorum: WITHHOLD the wire PubAck. The data
+            // plane releases it onto this connection's outbox on quorum-fsync; the session drains it on a
+            // later pass. No false ack below min_isr (the gate releases nothing).
+            Some(crate::cluster::dataplane::AckDisposition::Parked) => {}
+        }
+        return Ok(());
+    }
+    write_pub_reply(outcome, fire_and_forget, out)
 }
 
 /// Maps one produce outcome to its wire reply, byte-identical to the pre-pipelining inline match:

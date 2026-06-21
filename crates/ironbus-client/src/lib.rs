@@ -5782,4 +5782,283 @@ mod tests {
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // #719 (V2-C2): a REAL client connection over a clustered C2-fsync broker observes QUORUM-FSYNC
+    // ack timing — its wire PubAck arrives ONLY after the data plane's follower report brings
+    // quorum-fsync, NOT on leader-only-fsync.
+    // ---------------------------------------------------------------------------------------------
+
+    /// The default partition the single-stream broker maps to (the client produce-ack gate routes every
+    /// produce here; multi-partition is #693).
+    #[cfg(unix)]
+    const C2_PARTITION: u64 = 0;
+
+    /// Start an in-process broker whose produce-ack path is gated by a CLUSTERED C2-fsync
+    /// `ClientAckGate` (#719): this node LEADS partition 0 of `{1,2,3}` with `min_isr = 2`. Returns the
+    /// broker address, its shutdown flag + serve-thread handle, and the SHARED gate so the test can
+    /// DRIVE a follower's quorum-fsync report (standing in for the data-plane runtime's follower thread).
+    /// A real `serve` loop accepts the real client connection; only the produce-ack gating + the
+    /// follower-report driver are simulated in-process.
+    #[cfg(unix)]
+    #[allow(clippy::type_complexity)]
+    fn start_clustered_c2_server() -> (
+        std::net::SocketAddr,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        Arc<ironbus_server::cluster::ClientAckGate<InMemoryFs, SystemClock>>,
+    ) {
+        use ironbus_server::actor::EngineHandle;
+        use ironbus_server::cluster::{
+            ClientAckGate, ClusterAckLevel, DataPlaneController, DataPlaneServer, IsrConfig,
+            ProduceAckSeam,
+        };
+        use ironbus_storage::log::Log;
+        use std::sync::{Mutex, OnceLock};
+
+        let engine = Engine::open(
+            InMemoryFs::new(),
+            SystemClock::new(),
+            EngineConfig {
+                log: LogConfig::default(),
+                lease: LeaseConfig::default(),
+                delivery: DeliveryConfig::new(5, false, vec![]).unwrap(),
+                max_in_flight: 16,
+                consumer_credit: 64,
+                consumer_credit_bytes: 0,
+                checkpoint_interval: 1024,
+                max_retained_bytes: 0,
+                max_age_ms: 0,
+                max_messages: 0,
+                max_groups: DEFAULT_MAX_GROUPS,
+                group_idle_evict_ms: DEFAULT_GROUP_IDLE_EVICT_MS,
+                ram_ceiling_bytes: 0,
+                disk_full_policy: DiskFullPolicy::DropNew,
+                dedup: ironbus_core::dedup::DedupConfig::default(),
+                durability_level: ironbus_server::engine::DurabilityLevel::Sync,
+                flush_interval_ms: 0,
+                flush_max_bytes: 0,
+                codel_target_ms: 0,
+                codel_interval_ms: 0,
+                retry_budget_ratio_per_million: 0,
+                retry_budget_window_ms: 0,
+                fire_and_forget_msg_rate: 0,
+                fire_and_forget_byte_rate: 0,
+                fire_and_forget_refill_ms: 0,
+                egress_limit: 0,
+                wal_fsync_headroom_bytes: 0,
+                compression: ironbus_core::compress::Codec::None,
+                default_message_ttl_ms: 0,
+                dead_letter_exchange: None,
+                dead_letter_expired: false,
+            },
+        )
+        .unwrap();
+
+        // Build a data-plane server that LEADS partition 0 of {1,2,3} with min_isr=2. A leaked, empty
+        // leader log gives the read plane a `'static` lifetime; the gate's quorum decision (not the read
+        // plane content) is what the test exercises, and the leader-fsync frontier is advanced by the
+        // produce path itself (#719) as records append.
+        let leader_log: &'static Log<InMemoryFs, SystemClock> = Box::leak(Box::new(
+            Log::open(InMemoryFs::new(), SystemClock::new(), LogConfig::default()).unwrap(),
+        ));
+        let plane = Arc::new(leader_log.read_plane().unwrap());
+        let mut controller = DataPlaneController::new(1);
+        controller.start_leader(
+            C2_PARTITION,
+            plane,
+            ironbus_core::epoch_cache::EpochCache::new(),
+            &[1, 2, 3],
+            IsrConfig {
+                min_isr: 2,
+                max_lag_records: 0,
+            },
+        );
+        let server = Arc::new(Mutex::new(DataPlaneServer::new(
+            1,
+            ProduceAckSeam::new(controller),
+        )));
+        let gate = Arc::new(ClientAckGate::new(server, ClusterAckLevel::C2Fsync));
+
+        // Install the gate on the engine handle via the shared set-once slot (exactly the serve path:
+        // the slot is filled, then the handle is installed before any per-connection clone).
+        let slot: ironbus_server::actor::ClientAckSlot<InMemoryFs, SystemClock> =
+            Arc::new(OnceLock::new());
+        slot.set(Arc::clone(&gate)).ok();
+        let (handle_engine, _actor): (EngineHandle<InMemoryFs, SystemClock>, _) =
+            spawn_actor(engine, DEFAULT_CHANNEL_BOUND);
+        let handle_engine = handle_engine.with_client_ack_slot(slot);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let serve_handle = std::thread::spawn({
+            let shutdown = Arc::clone(&shutdown);
+            move || {
+                let clock = SystemClock::new();
+                let beacon =
+                    ironbus_server::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                serve(&listener, &handle_engine, &shutdown, 16, &clock, &beacon).unwrap();
+            }
+        });
+        (addr, shutdown, serve_handle, gate)
+    }
+
+    /// A raw wire connection that keeps a PERSISTENT read buffer across reads, so a single TCP read that
+    /// returns several frames (e.g. a released `PubAck` flushed alongside the Pong on one pass) never
+    /// drops the trailing frames.
+    #[cfg(unix)]
+    struct RawConn {
+        stream: std::net::TcpStream,
+        buf: Vec<u8>,
+    }
+
+    #[cfg(unix)]
+    impl RawConn {
+        /// Pull the next whole frame, decoding from the persistent buffer first and reading more bytes
+        /// only when no whole frame is buffered. `None` on a clean close or a read timeout with no whole
+        /// frame.
+        fn next_frame(&mut self) -> Option<(FrameType, Vec<u8>)> {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match decode_frame(&self.buf) {
+                    Ok(FrameDecode::Frame {
+                        type_tag,
+                        body,
+                        consumed,
+                    }) => {
+                        let f = (FrameType::from_u8(type_tag).unwrap(), body.to_vec());
+                        self.buf.drain(..consumed);
+                        return Some(f);
+                    }
+                    _ => match self.stream.read(&mut chunk) {
+                        // A clean close (0) or a read timeout (Err) with no whole frame: stop.
+                        Ok(0) | Err(_) => return None,
+                        Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                    },
+                }
+            }
+        }
+
+        fn write_frame(&mut self, ty: FrameType, body: &[u8]) {
+            self.stream.write_all(&frame(ty, body)).unwrap();
+        }
+
+        /// Send a `Ping` and collect every frame the broker flushes this round, up to (and including) the
+        /// `Pong` boundary. A withheld-then-released `PubAck` is flushed alongside (or before) the Pong on
+        /// the pass the Ping drives, exactly as the L2 `ProduceConfirm` drain works.
+        fn ping_round(&mut self) -> Vec<(FrameType, Vec<u8>)> {
+            self.write_frame(FrameType::Ping, &[]);
+            let mut frames = Vec::new();
+            while let Some((ty, body)) = self.next_frame() {
+                let is_pong = ty == FrameType::Pong;
+                frames.push((ty, body));
+                if is_pong {
+                    break;
+                }
+            }
+            frames
+        }
+    }
+
+    /// Do the Connect handshake by hand on a raw stream against the real serve: send a default
+    /// `Connect`, read the `Info` reply. Returns the connected [`RawConn`] (persistent buffer).
+    #[cfg(unix)]
+    fn raw_connect(addr: std::net::SocketAddr) -> RawConn {
+        use ironbus_proto::message::{encode_connect, ConnectBody};
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut conn = RawConn {
+            stream,
+            buf: Vec::new(),
+        };
+        let mut body = Vec::new();
+        encode_connect(&ConnectBody::default(), &mut body);
+        conn.write_frame(FrameType::Connect, &body);
+        let (ty, _b) = conn.next_frame().expect("Info handshake reply");
+        assert_eq!(ty, FrameType::Info, "the broker replies Info to a Connect");
+        conn
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_client_c2_fsync_produce_acks_only_after_quorum_fsync_not_leader_only() {
+        use ironbus_proto::message::{encode_pub, PubBody as ProtoPubBody};
+        let (addr, shutdown, serve_handle, gate) = start_clustered_c2_server();
+
+        // A REAL client connection over loopback.
+        let mut conn = raw_connect(addr);
+
+        // Send a normal (Level-1) PUB. On this clustered C2-fsync serve the produce is durable on the
+        // leader (its local fsync, I2) but its wire PubAck is WITHHELD by the gate until the ISR quorum
+        // fsyncs the offset — the leader-only-fsync ack is NOT sent.
+        let mut pub_body = Vec::new();
+        encode_pub(
+            &ProtoPubBody {
+                flags: 0,
+                timestamp_ms: 0,
+                key: b"",
+                headers: b"",
+                dedup: None,
+                fire_and_forget: false,
+                payload: b"quorum-gated",
+            },
+            &mut pub_body,
+        )
+        .unwrap();
+        conn.write_frame(FrameType::Pub, &pub_body);
+
+        // BEFORE quorum: drive a few broker passes (Pings). The PubAck must NOT appear — the leader has
+        // locally fsync'd (durable) but no follower has reported, so the 2-of-3 quorum is not met. This
+        // is the property under test: NO leader-only-fsync ack on the real client wire.
+        for _ in 0..3 {
+            let frames = conn.ping_round();
+            assert!(
+                frames.iter().all(|(ty, _)| *ty != FrameType::PubAck),
+                "the C2-fsync produce's wire PubAck is WITHHELD before quorum-fsync (got {frames:?})"
+            );
+        }
+
+        // The data plane (here, the test driving the SHARED gate exactly as the runtime's follower
+        // thread does) receives a follower's report bringing the 2-of-3 quorum: follower 2 has fsync'd
+        // offset 0 (frontier 1), and the leader already fsync'd it (the produce path advanced the leader
+        // frontier), so the quorum-commit now covers offset 0 and the parked ack RELEASES into this
+        // connection's outbox.
+        let released = gate.on_follower_report(
+            C2_PARTITION,
+            &ironbus_server::cluster::AckReplicatedBody {
+                follower_id: 2,
+                fsynced_offset: 1,
+            },
+        );
+        assert_eq!(
+            released, 1,
+            "the follower report brought quorum and released the parked ack"
+        );
+
+        // AFTER quorum: the next broker pass (Ping) flushes the released PubAck onto the wire. The CLIENT
+        // now observes its quorum-durable ack — only after quorum-fsync, never on leader-only-fsync.
+        let mut got_ack = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while got_ack.is_none() && std::time::Instant::now() < deadline {
+            for (ty, body) in conn.ping_round() {
+                if ty == FrameType::PubAck {
+                    got_ack = Some(body);
+                    break;
+                }
+            }
+        }
+        let ack_body = got_ack.expect("the wire PubAck arrives after the quorum-fsync report");
+        let ack = ironbus_proto::message::decode_pub_ack(&ack_body).unwrap();
+        assert_eq!(
+            ack.offset, 0,
+            "the released PubAck is the REAL reply for the produced offset (the durable offset 0)"
+        );
+
+        drop(conn);
+        shutdown.store(true, Ordering::Release);
+        serve_handle.join().unwrap();
+    }
 }

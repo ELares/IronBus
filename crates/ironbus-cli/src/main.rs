@@ -92,8 +92,8 @@ use ironbus_server::clock::SystemClock;
 use ironbus_server::cluster::ClusterConfig;
 #[cfg(unix)]
 use ironbus_server::cluster::{
-    dataplane_addr, ClusterRuntime, DataPlaneRuntime, DataPlaneServer, IsrConfig, MetadataCommand,
-    MetadataProposer, Placement, ReplicaLogFactory, RuntimeError,
+    dataplane_addr, ClusterAckLevel, ClusterRuntime, DataPlaneRuntime, DataPlaneServer, IsrConfig,
+    MetadataCommand, MetadataProposer, Placement, ReplicaLogFactory, RuntimeError,
 };
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -4390,6 +4390,10 @@ fn cmd_serve(
                 Some(runtime) => Some(spawn_dataplane_serve(&engine, runtime, data_dir, config)?),
                 None => None,
             };
+            // The shared client produce-ack slot (#719) the bootstrap fills, cloned out BEFORE the
+            // handle moves into `run_broker`, so `run_broker` can install it on the engine handle. `None`
+            // when no data plane runs (the single-node disk serve).
+            let client_ack_slot = dataplane.as_ref().map(|dp| dp.client_ack_slot.clone());
             run_broker(
                 engine,
                 addr,
@@ -4400,6 +4404,7 @@ fn cmd_serve(
                 config_warnings,
                 cluster_runtime,
                 dataplane,
+                client_ack_slot,
                 auth,
                 reload,
                 out,
@@ -4431,6 +4436,7 @@ fn cmd_serve(
                 health_addr,
                 health_bind,
                 config_warnings,
+                None,
                 None,
                 None,
                 auth,
@@ -4534,10 +4540,22 @@ impl ReplicaLogFactory<StdFs, SystemClock> for DiskReplicaLogs {
 /// placement, builds the [`DataPlaneServer`], and starts its [`DataPlaneRuntime`]) plus the shutdown
 /// flag the broker's serve teardown flips to stop it deterministically. Held by `run_broker` ONLY on a
 /// clustered serve; a single-node serve never constructs one, so its presence is the cluster opt-in.
+/// The shared, set-once slot the data-plane bootstrap fills with the clustered
+/// [`ClientAckGate`](ironbus_server::cluster::ClientAckGate) (#719), and which every per-connection
+/// [`EngineHandle`](ironbus_server::actor::EngineHandle) clone reads to gate its produce-acks on
+/// quorum-fsync. Created at serve start (empty) and shared into BOTH `run_broker` (which installs it on
+/// the engine handle before any connection clones it) and the bootstrap thread (which fills it once the
+/// placement commits).
+#[cfg(unix)]
+type ClientAckSlot = ironbus_server::actor::ClientAckSlot<StdFs, SystemClock>;
+
 #[cfg(unix)]
 struct DataPlaneServeHandle {
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     bootstrap: Option<std::thread::JoinHandle<()>>,
+    /// The shared client produce-ack slot (#719), handed to `run_broker` to install on the engine
+    /// handle so every connection's produce-ack path reaches the gate the bootstrap fills.
+    client_ack_slot: ClientAckSlot,
 }
 
 #[cfg(unix)]
@@ -4624,6 +4642,19 @@ fn spawn_dataplane_serve(
         max_lag_records: 0,
     };
 
+    // The serve-wide CONFIGURED cluster ack level (#696/#719): resolved from the replication factor —
+    // a 3+-replica cluster defaults to `C2-fsync` (quorum-fsync-gated produce-acks), a 1-replica
+    // "cluster" to `C1`. A per-publish wire override is later. This is the level the client produce-ack
+    // gate holds a led produce to.
+    let configured_level = ClusterAckLevel::default_for_replication_factor(replicas.len());
+
+    // The shared, set-once client produce-ack slot (#719): created EMPTY here, shared into both the
+    // bootstrap (which fills it once the placement commits + the data-plane server is built) and
+    // `run_broker` (which installs it on the engine handle before any connection clones it). Until it is
+    // filled, the produce-ack path acks immediately exactly as the non-cluster path.
+    let client_ack_slot: ClientAckSlot = std::sync::Arc::new(std::sync::OnceLock::new());
+    let client_ack_slot_t = std::sync::Arc::clone(&client_ack_slot);
+
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_t = std::sync::Arc::clone(&shutdown);
 
@@ -4634,12 +4665,14 @@ fn spawn_dataplane_serve(
                 node_id,
                 &replicas,
                 isr_config,
+                configured_level,
                 read_plane,
                 &peers,
                 &status,
                 &proposer,
                 &data_dir,
                 log_config,
+                &client_ack_slot_t,
                 &shutdown_t,
             );
         })
@@ -4648,6 +4681,7 @@ fn spawn_dataplane_serve(
     Ok(DataPlaneServeHandle {
         shutdown,
         bootstrap: Some(bootstrap),
+        client_ack_slot,
     })
 }
 
@@ -4666,12 +4700,14 @@ fn run_dataplane_bootstrap(
     node_id: u64,
     replicas: &[u64],
     isr_config: IsrConfig,
+    configured_level: ClusterAckLevel,
     read_plane: std::sync::Arc<ironbus_storage::read_plane::ReadPlane<StdFs>>,
     peers: &std::collections::BTreeMap<u64, std::net::SocketAddr>,
     status: &std::sync::Arc<std::sync::Mutex<ironbus_server::cluster::ClusterStatus>>,
     proposer: &MetadataProposer,
     data_dir: &Path,
     log_config: LogConfig,
+    client_ack_slot: &ClientAckSlot,
     shutdown: &std::sync::atomic::AtomicBool,
 ) {
     use std::sync::atomic::Ordering;
@@ -4758,16 +4794,32 @@ fn run_dataplane_bootstrap(
         .map(|(&id, &addr)| (id, dataplane_addr(addr)))
         .collect();
 
-    let mut dp_runtime = match DataPlaneRuntime::start(server, self_data_addr, &peer_data_addrs) {
+    // Start the runtime WITH the client produce-ack gate (#719): it builds the shared
+    // `ClientAckGate` (at the configured cluster ack level) around the runtime's own server Arc, and
+    // routes each quorum-fsync'd release into its owner connection's outbox. PUBLISH the built gate into
+    // the shared slot so every per-connection produce path (which captured the slot at serve start)
+    // reaches it: from now on a clustered `C2-fsync` led produce's wire `PubAck` is withheld until
+    // quorum-fsync. Before this fill, the produce path acked immediately (the brief bootstrap window).
+    let mut dp_runtime = match DataPlaneRuntime::start_with_client_gate(
+        server,
+        self_data_addr,
+        &peer_data_addrs,
+        configured_level,
+    ) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("ironbus: data plane: cannot bind the data-plane peer listener; data plane not started: {e}");
             return;
         }
     };
+    if let Some(gate) = dp_runtime.client_gate() {
+        // Set-once: this is the only filler of the slot, on this one bootstrap thread.
+        let _ = client_ack_slot.set(std::sync::Arc::clone(gate));
+    }
 
     eprintln!(
-        "ironbus: data plane started on node {node_id} for partition {DEFAULT_PARTITION}: replicating + quorum-gating produces over the cluster"
+        "ironbus: data plane started on node {node_id} for partition {DEFAULT_PARTITION} at cluster ack level {}: replicating + quorum-gating produces over the cluster",
+        configured_level.as_str()
     );
 
     // Hold the runtime until the broker shuts down, then stop it (joins every data-plane peer thread).
@@ -4819,6 +4871,7 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     config_warnings: &[String],
     cluster_runtime: Option<ClusterRuntime>,
     dataplane: Option<DataPlaneServeHandle>,
+    client_ack_slot: Option<ironbus_server::actor::ClientAckSlot<F, SystemClock>>,
     auth: Option<std::sync::Arc<ironbus_server::auth::AuthConfig>>,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
@@ -4829,6 +4882,15 @@ fn run_broker<F: Filesystem + Clone + 'static>(
     // the graceful-shutdown cursor flush (#195) completes before the process exits 0.
     let (shared, actor) =
         spawn_actor_with_gather(engine, DEFAULT_CHANNEL_BOUND, config.commit_gather_us);
+    // Install the SHARED client produce-ack slot (#719) onto the base handle BEFORE any per-connection
+    // clone, so every connection's produce-ack path reaches the gate the data-plane bootstrap fills.
+    // `None` on a single-node / no-cluster / memory serve: the handle carries no slot and the produce
+    // path is byte-for-byte today's (the single-node guarantee). The base handle is rebound so the
+    // installed slot rides into every `serve_with_auth` clone.
+    let shared = match client_ack_slot {
+        Some(slot) => shared.with_client_ack_slot(slot),
+        None => shared,
+    };
     let listener = TcpListener::bind(addr)
         .map_err(|e| CliError::Internal(format!("cannot bind {addr}: {e}")))?;
     let local = listener

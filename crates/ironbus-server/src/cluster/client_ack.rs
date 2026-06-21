@@ -1,0 +1,444 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! The CLIENT produce-ack gate (#719, V2-C2): the one shared handle that makes the (`Send`)
+//! [`ProduceAckSeam`](super::dataplane::ProduceAckSeam) reachable from a real producer connection's
+//! per-connection produce-ack path, so a clustered `C2-fsync` produce to a LED partition gets its wire
+//! `PubAck` only AFTER quorum-fsync — not the immediate local-fsync ack.
+//!
+//! # The problem it closes
+//!
+//! After #718 the data plane RUNS: the [`DataPlaneRuntime`](super::serve::DataPlaneRuntime) replicates
+//! over real TCP and DRIVES the seam's park/release end-to-end from the live follower reports — but a
+//! real EXTERNAL CLIENT's wire `PubAck` was still sent on the immediate local-fsync ack, because the
+//! seam lives inside the runtime's peer-I/O thread and the per-connection produce path (`session.rs`)
+//! could not reach it: sessions touch the engine only via the per-call
+//! [`EngineAccess`](crate::actor::EngineAccess) trait, with no shared mutable seam state, and a
+//! released ack arrives on the RUNTIME's thread while only the owning connection's OWN thread may write
+//! its socket.
+//!
+//! # The shape (mirrors the #497 Level-2 confirm registry)
+//!
+//! [`ClientAckGate`] is an `Arc`-shared, `Send + Sync` bundle of:
+//! * the SAME [`Arc<Mutex<DataPlaneServer>>`](super::serve::DataPlaneServer) the
+//!   [`DataPlaneRuntime`](super::serve::DataPlaneRuntime) drives (ONE seam — one source of truth for the
+//!   parked state); and
+//! * a per-producer-connection OUTBOX of RELEASED-but-not-yet-flushed wire `PubAck` bytes, keyed by the
+//!   producer's [`MemberId`](ironbus_core::keyshared::MemberId).
+//!
+//! The produce path, on `Appended(offset)` for a clustered `C2-fsync` led produce, calls
+//! [`ClientAckGate::on_local_fsynced_ack`] tagging the park with the connection's member id; if the
+//! ack is PARKED it withholds the wire `PubAck`. The runtime's follower-report path calls
+//! [`ClientAckGate::on_follower_report`], which drives the gate and DEPOSITS each released reply into
+//! its owner's outbox. The owning connection then DRAINS its outbox on its OWN next pass
+//! ([`ClientAckGate::drain_released`]) — exactly the cross-thread hand-off the #497 `ProduceConfirm`
+//! registry uses (a terminal produced on another thread, drained on the producer's own pass).
+//!
+//! # Single-node byte-identical (BY CONSTRUCTION)
+//!
+//! A non-clustered broker NEVER constructs a [`ClientAckGate`] (it is created only on the clustered
+//! disk serve path), so the produce-ack hot path never consults it: the
+//! [`EngineAccess`](crate::actor::EngineAccess) handle carries `None`, the produce path's
+//! cluster-gated branch is skipped, and the immediate ack-after-local-fsync path is byte-for-byte
+//! today's, with ZERO added work, latency, or allocation. The gate is a no-op without a cluster.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use ironbus_core::clock::Clock;
+use ironbus_core::keyshared::MemberId;
+use ironbus_storage::fs::Filesystem;
+
+use super::ack_level::ClusterAckLevel;
+use super::dataplane::AckDisposition;
+use super::isr::AckReplicatedBody;
+use super::serve::DataPlaneServer;
+
+/// The fixed partition the broker's DEFAULT-stream log maps to in a clustered serve (#717/#719).
+/// Today's broker is single-stream; the data plane replicates that one log as partition `0` and the
+/// client produce-ack gate routes every produce to it. Multi-partition routing (a produce to the right
+/// partition leader's seam) is the #693 multi-partition engine — FLAGGED, out of scope here.
+pub const DEFAULT_PARTITION: u64 = 0;
+
+/// The shared client produce-ack gate (#719): the seam (via the shared
+/// [`DataPlaneServer`](super::serve::DataPlaneServer)) plus the per-connection released-ack outbox.
+/// Held in an `Arc` and shared between every producer connection (via the
+/// [`EngineAccess`](crate::actor::EngineAccess) handle) and the
+/// [`DataPlaneRuntime`](super::serve::DataPlaneRuntime). Created ONLY on a clustered serve.
+pub struct ClientAckGate<F: Filesystem, C: Clock> {
+    /// The SAME shared data-plane server the runtime drives — the one [`ProduceAckSeam`] and its parked
+    /// state. Locked briefly per produce-ack decision / per follower report; the lock is NEVER held
+    /// across a socket write.
+    ///
+    /// [`ProduceAckSeam`]: super::dataplane::ProduceAckSeam
+    server: Arc<Mutex<DataPlaneServer<F, C>>>,
+    /// The serve-wide CONFIGURED cluster ack level (#696): the durability contract a produce to a led
+    /// partition is held to. Only [`ClusterAckLevel::C2Fsync`] gates a produce on quorum-fsync; every
+    /// other level acks immediately. Resolved at serve time (today from the replication factor via
+    /// [`ClusterAckLevel::default_for_replication_factor`]); a per-publish wire override is later.
+    configured_level: ClusterAckLevel,
+    /// Per-producer-connection released wire `PubAck` byte-frames, keyed by the producer's member id,
+    /// in release (offset) order. The runtime deposits here on quorum-fsync; the owning connection
+    /// drains here on its own pass. Empty for any connection with nothing released-pending.
+    outbox: Mutex<HashMap<u64, Vec<Vec<u8>>>>,
+}
+
+impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
+    /// Build the gate around the SAME shared server the runtime drives, held to `configured_level`.
+    /// Called ONLY on a clustered serve.
+    #[must_use]
+    pub fn new(
+        server: Arc<Mutex<DataPlaneServer<F, C>>>,
+        configured_level: ClusterAckLevel,
+    ) -> Self {
+        Self {
+            server,
+            configured_level,
+            outbox: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The serve-wide configured cluster ack level this gate holds produces to (#696).
+    #[must_use]
+    pub fn configured_level(&self) -> ClusterAckLevel {
+        self.configured_level
+    }
+
+    /// The shared data-plane server, for the runtime to drive (the runtime is built around the SAME
+    /// `Arc<Mutex<DataPlaneServer>>` so the seam's parked state is one source of truth).
+    #[must_use]
+    pub fn server(&self) -> &Arc<Mutex<DataPlaneServer<F, C>>> {
+        &self.server
+    }
+
+    /// The PRODUCE-ACK decision for one produce on connection `member` (#719): called AFTER the local
+    /// group-commit fsync returned `Appended(offset)` (the leader's I2 holds), with the `partition` it
+    /// landed on, the appended `offset`, and the EXACT wire-`PubAck` frame bytes the caller would
+    /// otherwise write now. The produce is held to the gate's serve-wide [`Self::configured_level`].
+    ///
+    /// Returns [`AckDisposition::Parked`] — the caller WITHHOLDS the wire reply, and the runtime
+    /// releases it into this connection's outbox on quorum-fsync — ONLY for a `C2-fsync` configured
+    /// level AND a partition THIS node leads, below or at quorum. In every other case (not `C2-fsync`,
+    /// not the leader) it returns [`AckDisposition::WriteNow`] with the bytes verbatim and the caller
+    /// writes them immediately, byte-for-byte the existing path. A just-parked ack whose quorum was
+    /// ALREADY met (a fast follower reported first) comes back as [`AckDisposition::WriteNowBatch`].
+    ///
+    /// Locks the shared server briefly (never across a socket write).
+    ///
+    /// A poisoned server lock yields [`AckDisposition::WriteNow`] (fail to the immediate ack rather than
+    /// withhold a reply that nothing will ever release).
+    pub fn on_local_fsynced_ack(
+        &self,
+        member: MemberId,
+        partition: u64,
+        offset: u64,
+        reply_bytes: Vec<u8>,
+    ) -> AckDisposition {
+        // FAST NON-CLUSTER-LEVEL GATE: only a C2-fsync configured serve ever locks the server / parks.
+        // Any other configured level (C0/C1/C2-pagecache) is the immediate ack, decided WITHOUT taking
+        // the shared lock — so a clustered serve at C1 pays no per-produce lock either.
+        if !self.configured_level.ack_implies_quorum_fsync() {
+            return AckDisposition::WriteNow(reply_bytes);
+        }
+        let Ok(mut srv) = self.server.lock() else {
+            // A poisoned lock means the runtime is tearing down; fall back to the immediate ack rather
+            // than withhold a reply that nothing will ever release. Correctness-safe: the immediate ack
+            // is the leader's already-durable I2 ack (it never over-claims durability — only the
+            // quorum-wait is dropped on this teardown edge).
+            return AckDisposition::WriteNow(reply_bytes);
+        };
+        // NOT THE LEADER of this partition (the #693 multi-partition routing concern, or a stale role on
+        // a teardown/rebalance edge): ack IMMEDIATELY with the REAL bytes — never quorum-withhold a
+        // produce this node does not lead, and never lose the reply. Checked HERE (before the seam call
+        // that would move `reply_bytes`) so a non-led produce keeps its real wire PubAck. The seam's own
+        // `on_local_fsynced_ack_owned` makes the same non-led decision (`WriteNow(reply_bytes)`); this
+        // mirror just keeps the bytes recoverable in the gate.
+        if !srv.seam().controller().is_leader(partition) {
+            return AckDisposition::WriteNow(reply_bytes);
+        }
+        // ADVANCE the leader's OWN fsync'd frontier in the seam's ISR tracker to past this offset (#719):
+        // the leader has ALREADY locally fsync'd through `offset` (the I2 that just returned `Appended`),
+        // so its frontier is `offset + 1`. The ISR seeds the leader frontier ONCE at start (#718), so
+        // without this the quorum-commit would be capped at the stale start frontier and a real produce
+        // would never release. The leader is one of the `min_isr` quorum members, so its frontier is
+        // load-bearing. Saturating so `u64::MAX` cannot overflow (unreachable in practice).
+        srv.seam_mut()
+            .controller_mut()
+            .observe_leader_fsync(partition, offset.saturating_add(1));
+        // Park (or fast-release) the REAL wire bytes. The leader role is confirmed above, so the seam
+        // never errors here (its only error is a non-led / unknown partition). The fallback is purely
+        // defensive (NO panic on the serve path, #11): on the unreachable error it acks immediately with
+        // the real bytes (cloned cheaply only on this rare clustered C2-fsync path, never on the
+        // single-node hot path), so a produce can never silently lose its reply.
+        let fallback = reply_bytes.clone();
+        match srv.seam_mut().on_local_fsynced_ack_owned(
+            member.get(),
+            self.configured_level,
+            partition,
+            offset,
+            reply_bytes,
+        ) {
+            Ok(disposition) => disposition,
+            Err(_) => AckDisposition::WriteNow(fallback),
+        }
+    }
+
+    /// Feed a follower's [`AckReplicatedBody`] for `partition` into the gate (driven by the runtime's
+    /// follower-report path) and DEPOSIT each released wire `PubAck` into its OWNER connection's outbox,
+    /// in offset order, for that connection to flush on its own pass. Below `min_isr` releases NOTHING
+    /// (the no-false-ack property, on the real client wire). Returns the number of replies released.
+    ///
+    /// Locks the shared server, then the outbox — both briefly, NEVER across a socket write (the
+    /// release just moves bytes into the outbox; the owning connection's thread does the actual write).
+    pub fn on_follower_report(&self, partition: u64, report: &AckReplicatedBody) -> usize {
+        let released = {
+            let Ok(mut srv) = self.server.lock() else {
+                return 0;
+            };
+            match srv.seam_mut().on_follower_report_owned(partition, report) {
+                Ok(r) => r,
+                Err(_) => return 0,
+            }
+        };
+        if released.is_empty() {
+            return 0;
+        }
+        let count = released.len();
+        let mut outbox = self
+            .outbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (owner, bytes) in released {
+            outbox.entry(owner).or_default().push(bytes);
+        }
+        count
+    }
+
+    /// Drain (and remove) every RELEASED wire `PubAck` for producer connection `member`, in release
+    /// (offset) order, for the connection to flush on its OWN pass. Empty for a connection with nothing
+    /// released-pending (the common case), so a connection that never parked a clustered `C2-fsync`
+    /// produce pays only a brief lock + miss.
+    #[must_use]
+    pub fn drain_released(&self, member: MemberId) -> Vec<Vec<u8>> {
+        let mut outbox = self
+            .outbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        outbox.remove(&member.get()).unwrap_or_default()
+    }
+
+    /// Drop any released-but-undrained acks for a producer connection that DISCONNECTED (#719): nobody
+    /// is left to flush them, so the outbox entry is removed rather than leaked. Called from the
+    /// connection-cleanup path, like the #497 `drop_l2_confirms`. (A still-PARKED ack — withheld inside
+    /// the seam, not yet released — is left to the seam's bounded gate; this only clears the outbox.)
+    pub fn drop_connection(&self, member: MemberId) {
+        let mut outbox = self
+            .outbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        outbox.remove(&member.get());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::dataplane::{DataPlaneController, ProduceAckSeam};
+    use crate::cluster::isr::IsrConfig;
+    use crate::cluster::state_machine::Placement;
+    use ironbus_core::clock::ManualClock;
+    use ironbus_storage::fs::InMemoryFs;
+    use ironbus_storage::log::{Log, LogConfig};
+
+    const P: u64 = 0;
+
+    /// A leaked leader log so the read plane's `Arc` lifetime is `'static` for the test (the same
+    /// pattern the serve.rs cluster tests use). The gate's seam logic does not read the plane content —
+    /// the gate/quorum decision is what is under test — so an empty leader log suffices.
+    fn leader_plane() -> Arc<ironbus_storage::read_plane::ReadPlane<InMemoryFs>> {
+        let log: &'static Log<InMemoryFs, ManualClock> = Box::leak(Box::new(
+            Log::open(InMemoryFs::new(), ManualClock::new(), LogConfig::default())
+                .expect("open leader log"),
+        ));
+        Arc::new(log.read_plane().expect("read plane"))
+    }
+
+    fn quorum3() -> IsrConfig {
+        IsrConfig {
+            min_isr: 2,
+            max_lag_records: 0,
+        }
+    }
+
+    /// Build a leader [`ClientAckGate`] for node 1 leading `{1,2,3}` with `min_isr = 2`, held to
+    /// `level`. `leader_fsync` seeds the leader's OWN fsync'd frontier (the leader has locally fsync'd
+    /// through it, the I2 ack), so a follower report at or past an offset can bring the 2-of-3 quorum.
+    fn leader_gate_at(
+        level: ClusterAckLevel,
+        leader_fsync: u64,
+    ) -> ClientAckGate<InMemoryFs, ManualClock> {
+        let placement = Placement {
+            replicas: vec![1, 2, 3],
+            leader: 1,
+            epoch: 1,
+        };
+        let mut controller = DataPlaneController::new(1);
+        controller.start_leader(
+            P,
+            leader_plane(),
+            ironbus_core::epoch_cache::EpochCache::new(),
+            &placement.replicas,
+            quorum3(),
+        );
+        // The leader has locally fsync'd through `leader_fsync` (its own I2). The quorum-commit is the
+        // min_isr-th largest fsync'd frontier, so a single in-sync follower past an offset meets the
+        // 2-of-3 quorum for it.
+        controller.observe_leader_fsync(P, leader_fsync);
+        let seam = ProduceAckSeam::new(controller);
+        let server = DataPlaneServer::new(1, seam);
+        ClientAckGate::new(Arc::new(Mutex::new(server)), level)
+    }
+
+    /// A C2-fsync gate (the quorum-gated default for a 3-replica cluster).
+    fn leader_gate(leader_fsync: u64) -> ClientAckGate<InMemoryFs, ManualClock> {
+        leader_gate_at(ClusterAckLevel::C2Fsync, leader_fsync)
+    }
+
+    fn wire_ack(offset: u64) -> Vec<u8> {
+        // A stand-in for the real wire PubAck frame bytes — the gate treats them as opaque; the test
+        // asserts the EXACT bytes round-trip through park -> release -> drain.
+        let mut v = b"PUBACK".to_vec();
+        v.extend_from_slice(&offset.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn a_c2_fsync_led_produce_is_parked_then_released_to_its_owner_outbox_on_quorum() {
+        // The leader has locally fsync'd record 0 (frontier 1); no follower has it yet, so the 2-of-3
+        // quorum is not met.
+        let gate = leader_gate(1);
+        let member = MemberId::new(42);
+        let offset = 0;
+        let reply = wire_ack(offset);
+
+        // The clustered C2-fsync led produce parks: the wire PubAck is WITHHELD.
+        let disposition = gate.on_local_fsynced_ack(member, P, offset, reply.clone());
+        assert_eq!(disposition, AckDisposition::Parked);
+        // Nothing is in the owner's outbox yet (no quorum).
+        assert!(gate.drain_released(member).is_empty());
+
+        // A single follower at offset 0 brings min_isr=2 (leader + follower 2) for offset 0.
+        let report = AckReplicatedBody {
+            follower_id: 2,
+            fsynced_offset: 1,
+        };
+        let released = gate.on_follower_report(P, &report);
+        assert_eq!(
+            released, 1,
+            "the quorum-fsync released exactly one parked ack"
+        );
+
+        // The owner connection drains the REAL reply bytes (byte-identical to what was parked).
+        let drained = gate.drain_released(member);
+        assert_eq!(
+            drained,
+            vec![reply],
+            "the released bytes ARE the original PubAck"
+        );
+        // A second drain is empty (the outbox entry was removed).
+        assert!(gate.drain_released(member).is_empty());
+    }
+
+    #[test]
+    fn below_min_isr_the_wire_puback_stays_withheld_no_false_ack() {
+        // The leader has fsync'd through offset 5 (frontier 6), but with NO follower in sync the ISR is
+        // the leader alone (size 1 < min_isr 2): no quorum, so a parked ack is NEVER released.
+        let gate = leader_gate(6);
+        let member = MemberId::new(7);
+        let offset = 5;
+        let disposition = gate.on_local_fsynced_ack(member, P, offset, wire_ack(offset));
+        assert_eq!(disposition, AckDisposition::Parked);
+        // A follower at offset 0 does NOT bring quorum at offset 5: nothing released.
+        let report = AckReplicatedBody {
+            follower_id: 2,
+            fsynced_offset: 0,
+        };
+        assert_eq!(gate.on_follower_report(P, &report), 0);
+        assert!(
+            gate.drain_released(member).is_empty(),
+            "below min_isr the client's wire PubAck is NEVER released (no false ack)"
+        );
+    }
+
+    #[test]
+    fn non_c2_fsync_levels_ack_immediately_never_parked() {
+        let member = MemberId::new(1);
+        for level in [
+            ClusterAckLevel::C0,
+            ClusterAckLevel::C1,
+            ClusterAckLevel::C2Pagecache,
+        ] {
+            // A gate CONFIGURED at a non-C2-fsync level acks immediately (never quorum-gated), without
+            // even taking the shared lock.
+            let gate = leader_gate_at(level, 1);
+            let reply = wire_ack(0);
+            let disposition = gate.on_local_fsynced_ack(member, P, 0, reply.clone());
+            assert_eq!(
+                disposition,
+                AckDisposition::WriteNow(reply),
+                "{level:?} acks immediately (never quorum-gated)"
+            );
+            // Nothing was ever parked or released.
+            assert!(gate.drain_released(member).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_produce_to_a_partition_this_node_does_not_lead_acks_immediately() {
+        // Node 1 FOLLOWS partition 0 (leader is node 2). A produce routed here (the #693 multi-partition
+        // routing concern, or a stale role) must ack IMMEDIATELY with the REAL bytes — never quorum-
+        // withhold a produce this node does not lead, and never lose the reply.
+        let placement = Placement {
+            replicas: vec![1, 2, 3],
+            leader: 2,
+            epoch: 1,
+        };
+        let mut controller = DataPlaneController::new(1);
+        let replica_log =
+            Log::open(InMemoryFs::new(), ManualClock::new(), LogConfig::default()).unwrap();
+        controller.start_follower(P, replica_log);
+        let _ = placement; // the role is set directly via start_follower (node 1 is a follower here)
+        let seam = ProduceAckSeam::new(controller);
+        let server = DataPlaneServer::new(1, seam);
+        let gate = ClientAckGate::new(Arc::new(Mutex::new(server)), ClusterAckLevel::C2Fsync);
+
+        let member = MemberId::new(3);
+        let reply = wire_ack(7);
+        assert_eq!(
+            gate.on_local_fsynced_ack(member, P, 7, reply.clone()),
+            AckDisposition::WriteNow(reply),
+            "a non-led produce acks immediately with the REAL reply (no quorum withholding, no loss)"
+        );
+        assert!(gate.drain_released(member).is_empty());
+    }
+
+    #[test]
+    fn a_disconnect_drops_undrained_released_acks() {
+        let gate = leader_gate(1);
+        let member = MemberId::new(99);
+        let reply = wire_ack(0);
+        assert_eq!(
+            gate.on_local_fsynced_ack(member, P, 0, reply),
+            AckDisposition::Parked
+        );
+        let report = AckReplicatedBody {
+            follower_id: 2,
+            fsynced_offset: 1,
+        };
+        assert_eq!(gate.on_follower_report(P, &report), 1);
+        // The released ack is waiting in the outbox; the connection disconnects before draining.
+        gate.drop_connection(member);
+        assert!(
+            gate.drain_released(member).is_empty(),
+            "a disconnect drops the undrained released acks (no outbox leak)"
+        );
+    }
+}
