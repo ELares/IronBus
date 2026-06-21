@@ -3529,4 +3529,160 @@ mod live_runtime_tests {
         f_rt.stop();
         leader_rt.stop();
     }
+
+    // ---- #737 (follow-up to #735): the NOT_LEADER redirect carries the leader's CLIENT address ----
+
+    /// THE #737 PROOF over the LIVE runtime: a FOLLOWER runtime started via
+    /// [`DataPlaneRuntime::start_with_client_gate_aware`] with a POPULATED node-id -> client-address
+    /// advertise map redirects a non-led produce to the CURRENT committed leader's CLIENT address (the
+    /// `NOT_LEADER` hint). An EMPTY map keeps the hintless redirect (the #735 baseline). The leader's own
+    /// gate proceeds LOCAL (never a false NOT_LEADER). This extends the #735 client-gate-aware harness to
+    /// prove the #737 CLI wiring (the `--cluster-peer-client` advertise map) installs into the live gate.
+    #[test]
+    fn live_follower_gate_redirects_to_the_leaders_client_address_when_advertised() {
+        use crate::cluster::client_ack::ClusterProduceRouting;
+
+        const P: u64 = 0;
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let placement = Placement {
+            replicas: vec![1, 2],
+            leader: 1,
+            epoch: 4,
+        };
+        let placements: BTreeMap<u64, Placement> = [(P, placement)].into_iter().collect();
+        // R=2, min_isr=1: keep the focus on the routing decision, not the quorum-ack gate.
+        let isr = IsrConfig {
+            min_isr: 1,
+            max_lag_records: 0,
+        };
+        let data_addrs: BTreeMap<u64, SocketAddr> = (1u64..=2)
+            .map(|id| (id, SocketAddr::from((Ipv4Addr::LOCALHOST, free_port()))))
+            .collect();
+
+        // Node 1's advertised CLIENT address (its `--addr` listener), DISTINCT from its data-plane peer
+        // address above — exactly what `--cluster-peer-client 1=<client-addr>` populates.
+        let leader_client_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, free_port()));
+        let advertise: BTreeMap<u64, SocketAddr> =
+            [(1u64, leader_client_addr)].into_iter().collect();
+
+        // The LEADER (node 1): a real on-disk leader serving through its read plane.
+        let leader_dir = tempfile::tempdir().expect("leader dir");
+        let leader_log = leaked_disk_leader(leader_dir.path(), 16);
+        let leader_pl = disk_leader_plane(leader_log);
+        let served_end = plane_served_end(&leader_pl);
+        assert!(served_end > 0, "the leader has a committed prefix");
+        let leader_server = DataPlaneServer::from_placements(
+            1,
+            &placements,
+            isr,
+            |p| (p == P).then(|| Arc::clone(&leader_pl)),
+            &DiskReplicaLogs {
+                root: leader_dir.path().to_path_buf(),
+            },
+            |_| EpochCache::new(),
+        )
+        .unwrap();
+        // The leader's OWN gate (also advertising node 1's client addr) must proceed LOCAL on its own
+        // partition — never a false NOT_LEADER on the leader (the #735 is-leader-first check, unchanged).
+        let leader_status = Arc::new(Mutex::new(crate::cluster::runtime::ClusterStatus::default()));
+        let mut leader_rt = DataPlaneRuntime::start_with_client_gate_aware(
+            leader_server,
+            data_addrs[&1],
+            &data_addrs,
+            crate::cluster::ack_level::ClusterAckLevel::C1,
+            advertise.clone(),
+            Arc::clone(&leader_status),
+        )
+        .expect("leader runtime with client gate");
+        let leader_gate = leader_rt
+            .client_gate()
+            .cloned()
+            .expect("the leader runtime built a client gate");
+        assert_eq!(
+            leader_gate.produce_routing(P),
+            ClusterProduceRouting::Local,
+            "the leader proceeds locally, never a false NOT_LEADER"
+        );
+
+        // The FOLLOWER (node 2), started WITH the populated advertise map (the #737 wiring under test).
+        let f_dir = tempfile::tempdir().expect("f dir");
+        let f_status = Arc::new(Mutex::new(crate::cluster::runtime::ClusterStatus::default()));
+        let follower_server = DataPlaneServer::from_placements(
+            2,
+            &placements,
+            isr,
+            |_| None,
+            &DiskReplicaLogs {
+                root: f_dir.path().to_path_buf(),
+            },
+            |_| EpochCache::new(),
+        )
+        .unwrap();
+        assert!(follower_server.seam().controller().is_follower(P));
+        assert_eq!(follower_server.follower_leader(P), Some(1));
+        let mut f_rt = DataPlaneRuntime::start_with_client_gate_aware(
+            follower_server,
+            data_addrs[&2],
+            &data_addrs,
+            crate::cluster::ack_level::ClusterAckLevel::C1,
+            advertise.clone(),
+            Arc::clone(&f_status),
+        )
+        .expect("follower runtime with client gate");
+        let follower_gate = f_rt
+            .client_gate()
+            .cloned()
+            .expect("the follower runtime built a client gate");
+
+        // THE #737 ASSERTION: a non-led produce on the follower redirects to the CURRENT committed leader's
+        // advertised CLIENT address (node 1) — the concrete one-hop hint, not the hintless #735 baseline.
+        assert_eq!(
+            follower_gate.produce_routing(P),
+            ClusterProduceRouting::Redirect {
+                leader_hint: Some(leader_client_addr),
+            },
+            "the follower redirects a non-led produce to the leader's ADVERTISED client address"
+        );
+
+        // The BASELINE (#735, no advertise): a follower gate built with an EMPTY map still redirects, but
+        // HINTLESS — the byte-identical-off-flag guarantee (no --cluster-peer-client => no concrete hint).
+        let f_dir2 = tempfile::tempdir().expect("f dir2");
+        let follower_server2 = DataPlaneServer::from_placements(
+            2,
+            &placements,
+            isr,
+            |_| None,
+            &DiskReplicaLogs {
+                root: f_dir2.path().to_path_buf(),
+            },
+            |_| EpochCache::new(),
+        )
+        .unwrap();
+        // A fresh self-addr so this second follower runtime does not collide with `f_rt`'s still-bound
+        // data-plane port (the routing decision needs only the local role, not a live peer to dial).
+        let f2_self = SocketAddr::from((Ipv4Addr::LOCALHOST, free_port()));
+        let mut f_rt2 = DataPlaneRuntime::start_with_client_gate_aware(
+            follower_server2,
+            f2_self,
+            &BTreeMap::new(), // no peers to dial; the routing decision needs only the local role
+            crate::cluster::ack_level::ClusterAckLevel::C1,
+            BTreeMap::new(), // EMPTY advertise map (the hintless baseline)
+            Arc::new(Mutex::new(crate::cluster::runtime::ClusterStatus::default())),
+        )
+        .expect("follower runtime, empty advertise");
+        let hintless_gate = f_rt2
+            .client_gate()
+            .cloned()
+            .expect("a client gate is built even with an empty advertise map");
+        assert_eq!(
+            hintless_gate.produce_routing(P),
+            ClusterProduceRouting::Redirect { leader_hint: None },
+            "with no advertised client address the redirect still fires, but hintless (the #735 baseline)"
+        );
+
+        f_rt2.stop();
+        f_rt.stop();
+        leader_rt.stop();
+        let _ = served_end;
+    }
 }
