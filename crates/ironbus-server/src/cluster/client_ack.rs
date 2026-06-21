@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! The CLIENT produce-ack gate (#719, V2-C2): the one shared handle that makes the (`Send`)
 //! [`ProduceAckSeam`](super::dataplane::ProduceAckSeam) reachable from a real producer connection's
 //! per-connection produce-ack path, so a clustered `C2-fsync` produce to a LED partition gets its wire
