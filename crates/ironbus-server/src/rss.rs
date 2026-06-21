@@ -80,6 +80,46 @@ fn current_rss_bytes_macos() -> Option<u64> {
     Some(kb.saturating_mul(1024))
 }
 
+/// The value the disk-free and ratio gauges report when the quantity cannot be computed on this
+/// platform (or no ceiling is configured): `-1`, the same unambiguous "unavailable" sentinel
+/// [`RSS_UNAVAILABLE`] uses. A real free-byte count or ratio is never negative, so `-1` is
+/// unambiguous and consistent with the existing `ironbus_ram_headroom_bytes` / `_last_dead_lettered`
+/// convention on `/metrics`.
+pub const UNAVAILABLE: i64 = -1;
+
+/// Reads the FREE (available-to-an-unprivileged-process) bytes on the filesystem that holds `path`,
+/// or `None` if it cannot be determined on this platform (so the caller reports "unavailable" rather
+/// than a misleading zero).
+///
+/// Implemented without `unsafe` and without a new dependency by shelling out to the POSIX
+/// `df -k -P <path>` (the portable, header-stable form), exactly as [`current_rss_bytes`] shells to
+/// `ps` on macOS: it parses the "Available" 1024-byte-block column and multiplies to bytes. It is
+/// available on Linux and macOS (the edge target and the dev host); anywhere `df` is absent or
+/// unparseable it degrades to `None`. Best-effort and side-effect-free beyond the read; never panics
+/// and never blocks the broker. Read OUT-OF-BAND (not from any in-process accounting), like RSS.
+#[must_use]
+pub fn disk_free_bytes(path: &std::path::Path) -> Option<u64> {
+    // `df -P` (POSIX mode) guarantees a stable single header line then one data line per filesystem;
+    // `-k` pins the block size to 1024 bytes so the "Available" column is portable across Linux and
+    // macOS (which otherwise default to different block sizes). Pass the path so we measure the
+    // filesystem the data dir actually lives on, not the cwd's.
+    let out = std::process::Command::new("df")
+        .args(["-k", "-P"])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // The data line is the LAST non-empty line (a long device name can wrap onto two lines in some
+    // `df` variants, but `-P` forbids that wrap, so the single data line is the last one). Columns:
+    // Filesystem, 1024-blocks, Used, Available, Capacity, Mounted-on. "Available" is index 3.
+    let data = text.lines().rfind(|l| !l.trim().is_empty())?;
+    let available_kib: u64 = data.split_whitespace().nth(3)?.parse().ok()?;
+    Some(available_kib.saturating_mul(1024))
+}
+
 /// Computes the `ironbus_ram_headroom_bytes` value from the configured RAM `ceiling` and a measured
 /// `rss`: the bytes of headroom remaining below the ceiling (saturating at `0` once RSS reaches or
 /// exceeds the ceiling), or [`RSS_UNAVAILABLE`] when either input is unusable.
@@ -100,6 +140,54 @@ pub fn ram_headroom_bytes(ceiling: u64, rss: Option<u64>) -> i64 {
         (ceiling, Some(rss)) => {
             let headroom = ceiling.saturating_sub(rss);
             i64::try_from(headroom).unwrap_or(i64::MAX)
+        }
+    }
+}
+
+/// The number of parts-per-thousand the `ironbus_ram_headroom_ratio` gauge reports as: a fraction in
+/// `[0, 1]` rendered as an integer in `[0, 1000]` (per-mille), so the ratio is exposed WITHOUT
+/// floating point (the same float-free integer-milli convention `ironbus_write_amp_ratio` uses). The
+/// renderer prints `value / 1000`.`value % 1000` as the `0.xyz` ratio.
+pub const RATIO_SCALE: u64 = 1000;
+
+/// Computes the RAM headroom RATIO in per-mille (#574): the fraction of the configured RAM `ceiling`
+/// that is still HEADROOM (`(ceiling - rss) / ceiling`), as an integer in `[0, RATIO_SCALE]`, or
+/// [`UNAVAILABLE`] (`-1`) when the ceiling is unset (`0`) or RSS could not be read. It is the
+/// headroom-bytes gauge expressed as a dimensionless, ceiling-relative ratio so an operator can
+/// alert on "under 10% headroom" without hard-coding the box's byte ceiling. Computed in `u128` to
+/// avoid overflow on the scale multiply, rounded to the nearest per-mille; `1000` = all headroom (RSS
+/// near zero), `0` = at or over the ceiling. Pairs with [`rss_over_cap_ratio`].
+#[must_use]
+pub fn ram_headroom_ratio_permille(ceiling: u64, rss: Option<u64>) -> i64 {
+    match (ceiling, rss) {
+        (0, _) | (_, None) => UNAVAILABLE,
+        (ceiling, Some(rss)) => {
+            let headroom = ceiling.saturating_sub(rss);
+            // round(headroom * 1000 / ceiling), in u128 so the multiply cannot overflow.
+            let permille = (u128::from(headroom) * u128::from(RATIO_SCALE)
+                + u128::from(ceiling) / 2)
+                / u128::from(ceiling);
+            i64::try_from(permille).unwrap_or(i64::from(u32::try_from(RATIO_SCALE).unwrap_or(1000)))
+        }
+    }
+}
+
+/// Computes the RSS-vs-cap RATIO in per-mille (#574): the fraction of the configured RAM `ceiling`
+/// the process RSS currently OCCUPIES (`rss / ceiling`), as an integer in `[0, RATIO_SCALE]` (and
+/// CLAMPED at `RATIO_SCALE` once RSS is at or over the ceiling, so an over-ceiling process reads a
+/// full `1000` rather than wrapping), or [`UNAVAILABLE`] (`-1`) when the ceiling is unset or RSS is
+/// unreadable. It is the complement of [`ram_headroom_ratio_permille`] (the two sum to `RATIO_SCALE`
+/// below the ceiling) and the rss-vs-cap signal the issue asks for: `0` = empty, `1000` = at/over the
+/// cap. Computed in `u128` to avoid overflow on the scale multiply.
+#[must_use]
+pub fn rss_over_cap_ratio_permille(ceiling: u64, rss: Option<u64>) -> i64 {
+    match (ceiling, rss) {
+        (0, _) | (_, None) => UNAVAILABLE,
+        (ceiling, Some(rss)) => {
+            let permille = (u128::from(rss) * u128::from(RATIO_SCALE) + u128::from(ceiling) / 2)
+                / u128::from(ceiling);
+            let clamped = permille.min(u128::from(RATIO_SCALE));
+            i64::try_from(clamped).unwrap_or(i64::from(u32::try_from(RATIO_SCALE).unwrap_or(1000)))
         }
     }
 }
@@ -622,5 +710,59 @@ mod tests {
         assert_eq!(ram_headroom_bytes(100, None), RSS_UNAVAILABLE);
         // Both unusable: still the sentinel.
         assert_eq!(ram_headroom_bytes(0, None), RSS_UNAVAILABLE);
+    }
+
+    #[test]
+    fn the_headroom_ratio_is_per_mille_of_the_ceiling() {
+        // 40 of 100 bytes resident -> 60% headroom -> 600 per-mille.
+        assert_eq!(ram_headroom_ratio_permille(100, Some(40)), 600);
+        // At the ceiling: zero headroom.
+        assert_eq!(ram_headroom_ratio_permille(100, Some(100)), 0);
+        // Over the ceiling: still zero (saturating sub), never negative-but-the-sentinel.
+        assert_eq!(ram_headroom_ratio_permille(100, Some(140)), 0);
+        // Empty: full headroom is the scale.
+        assert_eq!(
+            ram_headroom_ratio_permille(100, Some(0)),
+            i64::try_from(RATIO_SCALE).unwrap()
+        );
+    }
+
+    #[test]
+    fn the_rss_over_cap_ratio_is_the_complement_and_clamps() {
+        // 40 of 100 resident -> 40% of cap occupied -> 400 per-mille; complements the headroom 600.
+        assert_eq!(rss_over_cap_ratio_permille(100, Some(40)), 400);
+        assert_eq!(
+            rss_over_cap_ratio_permille(100, Some(40)) + ram_headroom_ratio_permille(100, Some(40)),
+            i64::try_from(RATIO_SCALE).unwrap(),
+            "headroom and rss-over-cap ratios sum to the scale below the ceiling"
+        );
+        // Over the ceiling clamps at the scale (a full 1000), never wraps.
+        assert_eq!(
+            rss_over_cap_ratio_permille(100, Some(250)),
+            i64::try_from(RATIO_SCALE).unwrap()
+        );
+    }
+
+    #[test]
+    fn both_ratios_are_unavailable_without_a_ceiling_or_an_rss() {
+        assert_eq!(ram_headroom_ratio_permille(0, Some(40)), UNAVAILABLE);
+        assert_eq!(ram_headroom_ratio_permille(100, None), UNAVAILABLE);
+        assert_eq!(rss_over_cap_ratio_permille(0, Some(40)), UNAVAILABLE);
+        assert_eq!(rss_over_cap_ratio_permille(100, None), UNAVAILABLE);
+    }
+
+    #[test]
+    #[cfg(all(test, unix))]
+    fn disk_free_reads_a_nonzero_available_on_a_real_fs() {
+        // On a unix dev/edge host `df` reads the temp dir's filesystem and reports a non-zero free
+        // figure. Anywhere `df` is unavailable or unparseable this degrades to `None`, which the
+        // test tolerates rather than failing the build on an exotic environment.
+        let dir = std::env::temp_dir();
+        if let Some(free) = disk_free_bytes(&dir) {
+            assert!(
+                free > 0,
+                "the temp filesystem should report some free space"
+            );
+        }
     }
 }

@@ -400,6 +400,12 @@ pub struct Session {
     /// is always `None`, so an mTLS-mechanism connect fails closed (no verified cert) until TLS lands —
     /// the safe behavior, never a default-scope grant.
     peer_san: Option<String>,
+    /// The shared connection-signal ("connz") metric (#572), if the server wired one in. `None` for a
+    /// session that does not report connz (every test, and a `serve` overload built with the legacy
+    /// un-scraped metric). When `Some(_)`, the session records the AUTHED-FLIP (a successful `Connect`
+    /// handshake) on it; accept/close/refuse are recorded by the accept loop / slot guard, not here. A
+    /// cheap `Arc`-clone reference, never per-connection deep state.
+    connz: Option<std::sync::Arc<crate::connz::ConnectionMetrics>>,
 }
 
 impl Session {
@@ -440,6 +446,16 @@ impl Session {
             peer_san,
             ..Session::default()
         }
+    }
+
+    /// Attaches the shared connz metric (#572) to this session so a successful `Connect` handshake
+    /// records the AUTHED-FLIP on it. A builder-style setter (rather than a new constructor) so every
+    /// existing `Session::new` / `with_member_id` / `with_member_id_and_auth` call site is unchanged
+    /// and only the server's live accept path opts in. Takes a cheap `Arc` clone.
+    #[must_use]
+    pub fn with_connz(mut self, connz: std::sync::Arc<crate::connz::ConnectionMetrics>) -> Session {
+        self.connz = Some(connz);
+        self
     }
 
     /// The work-group this connection is subscribed to (`""` is the default group). Used to
@@ -826,6 +842,13 @@ impl Session {
                 self.scopes = scopes;
             }
             self.authenticated = true;
+            // Record the AUTHED-FLIP on the shared connz metric (#572): a `Connect` handshake that
+            // successfully resolved a credential. Recorded ONLY on the auth-required path (a no-auth
+            // broker authenticates nothing, so its authenticated total is honestly 0), off the engine
+            // lock, a single relaxed atomic. `None` (a session with no wired connz) is a no-op.
+            if let Some(connz) = self.connz.as_ref() {
+                connz.record_authenticated();
+            }
         }
         self.connected = true;
         // Record the client's request (re-recorded on a repeated Connect, which re-negotiates
@@ -1171,6 +1194,10 @@ impl Session {
             // fire-and-forget bucket WITHOUT acking, and otherwise appends it durably but sends NO
             // PubAck. Level 1 (and the Level-2-as-Level-1 fallback) leave it clear.
             fire_and_forget,
+            // The produce ACK LEVEL (#571), captured from the wire PUB flags ABOVE (before the
+            // wire-only level bits were masked out of `flags`), so the actor can attribute the
+            // accepted record to its level (c0/c1/c2) for the per-ack-level produce counters.
+            ack_level,
         };
         // LEVEL 0 (no-ack fast path, #495): submit the produce with NO reply channel and return
         // immediately — do NOT park. The producer fired and forgot, so there is no PubAck to write, no
@@ -2820,6 +2847,9 @@ impl Session {
             dedup,
             enqueue_monotonic_nanos: engine.now_monotonic_nanos(),
             fire_and_forget: false,
+            // The produce ACK LEVEL (#571) from the wire PUB flags, for the per-ack-level produce
+            // counters; this named-stream produce path counts it explicitly in the engine job below.
+            ack_level: ironbus_proto::message::pub_ack_level(msg.flags),
         };
         let stream = stream.to_string();
         let outcome = engine.with(move |e| {
@@ -2830,7 +2860,16 @@ impl Session {
                 headers: &append.headers,
                 payload: &append.payload,
             };
-            e.produce_in_stream(&stream, &view)
+            let level = append.ack_level;
+            let result = e.produce_in_stream(&stream, &view);
+            // Per-ack-level PRODUCE throughput (#571) for the named-stream produce path (which does not
+            // route through the actor drain that counts the default path): attribute the accepted record
+            // to its level only on a successful append, so the per-level sum matches the fresh-append
+            // count. Allocation-free under the same engine job.
+            if result.is_ok() {
+                e.record_produce_ack_level(level);
+            }
+            result
         })?;
         match outcome {
             Ok(offset) => {
@@ -3084,6 +3123,9 @@ impl Session {
             dedup,
             enqueue_monotonic_nanos: engine.now_monotonic_nanos(),
             fire_and_forget: false,
+            // The produce ACK LEVEL (#571) from the wire PUB flags, for the per-ack-level produce
+            // counters; this subject-routed produce path counts it explicitly in the engine job below.
+            ack_level: ironbus_proto::message::pub_ack_level(msg.flags),
         };
         let subject = subject.to_string();
         // Move the per-connection resolve cache into the job; the job returns it (and the produce
@@ -3091,7 +3133,15 @@ impl Session {
         let cache = std::mem::take(&mut self.subject_cache);
         let (cache, outcome) = engine.with(move |e| {
             let mut cache = cache;
+            let level = append.ack_level;
             let outcome = resolve_then_produce(e, &mut cache, &subject, &append);
+            // Per-ack-level PRODUCE throughput (#571) for the subject-routed produce path (which runs
+            // synchronously in this engine job, not through the actor drain that counts the default
+            // batched path): count only on a successful append, so the per-level sum matches the
+            // fresh-append count. Allocation-free under the same job.
+            if outcome.is_ok() {
+                e.record_produce_ack_level(level);
+            }
             (cache, outcome)
         })?;
         self.subject_cache = cache;
@@ -8900,6 +8950,7 @@ mod tests {
                 dedup: None,
                 enqueue_monotonic_nanos: 0,
                 fire_and_forget: false,
+                ack_level: ironbus_proto::message::AckLevel::ServerAck,
             })
             .unwrap();
         control.wait_for_sync_gate_entered(1);
