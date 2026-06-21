@@ -116,9 +116,9 @@ pub(crate) fn load(path: &Path) -> Result<Config, CliError> {
 /// Parses the TOML config text. The schema is a top-level `current` string plus a `[contexts.<name>]`
 /// table per context, each with optional `addr`/`token`/`tls_ca`/`tls_server_name`/`data_dir` keys.
 fn parse(text: &str, path: &Path) -> Result<Config, CliError> {
-    let value: toml::Value = text.parse().map_err(|e| {
-        CliError::Usage(format!("malformed config {}: {e}", path.display()))
-    })?;
+    let value: toml::Value = text
+        .parse()
+        .map_err(|e| CliError::Usage(format!("malformed config {}: {e}", path.display())))?;
     let mut cfg = Config::default();
     if let Some(cur) = value.get("current") {
         cfg.current = Some(
@@ -235,9 +235,8 @@ pub(crate) fn save(path: &Path, cfg: &Config) -> Result<(), CliError> {
     let body = serialize(cfg);
     let tmp = path.with_extension("toml.tmp");
     write_owner_only(&tmp, body.as_bytes())?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        CliError::Internal(format!("installing config {}: {e}", path.display()))
-    })?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| CliError::Internal(format!("installing config {}: {e}", path.display())))?;
     Ok(())
 }
 
@@ -330,8 +329,8 @@ fn context_create(path: &Path, args: &[String], out: &mut impl Write) -> Result<
             }
         }
     }
-    let name = name
-        .ok_or_else(|| CliError::Usage("context create requires a <name>".to_string()))?;
+    let name =
+        name.ok_or_else(|| CliError::Usage("context create requires a <name>".to_string()))?;
     let mut cfg = load(path)?;
     let existed = cfg.contexts.insert(name.clone(), ctx).is_some();
     if set_current || cfg.current.is_none() {
@@ -395,7 +394,11 @@ fn context_show(path: &Path, args: &[String], out: &mut impl Write) -> Result<()
     writeln!(
         out,
         "token: {}",
-        if ctx.token.is_some() { "<set>" } else { "<unset>" }
+        if ctx.token.is_some() {
+            "<set>"
+        } else {
+            "<unset>"
+        }
     )?;
     writeln!(
         out,
@@ -508,8 +511,10 @@ mod tests {
 
     #[test]
     fn serialize_parse_round_trips_byte_stably() {
-        let mut cfg = Config::default();
-        cfg.current = Some("prod".to_string());
+        let mut cfg = Config {
+            current: Some("prod".to_string()),
+            ..Config::default()
+        };
         cfg.contexts.insert(
             "prod".to_string(),
             Context {
@@ -559,7 +564,13 @@ mod tests {
         let mut buf = Vec::new();
         context_create(
             &path,
-            &args(&["prod", "--addr", "example.com:7000", "--token", "sup3rsecretvalue"]),
+            &args(&[
+                "prod",
+                "--addr",
+                "example.com:7000",
+                "--token",
+                "sup3rsecretvalue",
+            ]),
             &mut buf,
         )
         .unwrap();
@@ -581,7 +592,10 @@ mod tests {
         context_show(&path, &args(&["prod"]), &mut buf).unwrap();
         let shown = String::from_utf8(buf.clone()).unwrap();
         assert!(shown.contains("token: <set>"), "{shown}");
-        assert!(!shown.contains("sup3rsecretvalue"), "secret leaked: {shown}");
+        assert!(
+            !shown.contains("sup3rsecretvalue"),
+            "secret leaked: {shown}"
+        );
 
         // rm of the current clears current.
         buf.clear();
@@ -601,10 +615,7 @@ mod tests {
     #[test]
     fn resolve_addr_flag_overrides_context() {
         // Flag always wins, regardless of any context.
-        assert_eq!(
-            resolve_addr(Some("flag:1"), "default:0").unwrap(),
-            "flag:1"
-        );
+        assert_eq!(resolve_addr(Some("flag:1"), "default:0").unwrap(), "flag:1");
     }
 
     /// On Unix the saved config file is owner-only (0o600) so the secret token is not exposed.

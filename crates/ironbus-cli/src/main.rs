@@ -81,12 +81,12 @@ mod config_reload;
 #[cfg(all(unix, feature = "zstd"))]
 mod dict_cmd;
 
-/// The uniform `--json` envelope + frozen exit-code contract (V2-M6, #579).
-mod json_envelope;
-/// Named connection profiles (server + auth + TLS + data-dir), `kubectl config`-style (#581).
-mod context;
 /// Shell-completion generation from the real command tree, plus the `cheat` sheet (#598).
 mod completion;
+/// Named connection profiles (server + auth + TLS + data-dir), `kubectl config`-style (#581).
+mod context;
+/// The uniform `--json` envelope + frozen exit-code contract (V2-M6, #579).
+mod json_envelope;
 
 use ironbus_client::{Client, ClientError};
 use ironbus_core::clock::Clock;
@@ -17597,7 +17597,7 @@ mod tests {
         );
     }
 
-    /// FROZEN error-envelope shape: schema, ok=false, the mapped exit_code, and `error.{kind,message}`
+    /// FROZEN error-envelope shape: schema, ok=false, the mapped `exit_code`, and `error.{kind,message}`
     /// in fixed key order, with the message escaped. A snapshot of the shape.
     #[test]
     fn frozen_json_error_envelope_shape() {
@@ -17697,7 +17697,9 @@ mod tests {
 
         let mut buf = Vec::new();
         run(&["completion".to_string(), "bash".to_string()], &mut buf).unwrap();
-        assert!(String::from_utf8(buf).unwrap().contains("complete -F _ironbus"));
+        assert!(String::from_utf8(buf)
+            .unwrap()
+            .contains("complete -F _ironbus"));
 
         let mut buf = Vec::new();
         run(&["cheat".to_string()], &mut buf).unwrap();

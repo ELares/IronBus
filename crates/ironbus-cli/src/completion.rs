@@ -44,7 +44,15 @@ pub(crate) const COMMAND_TREE: &[Cmd] = &[
     Cmd {
         name: "sub",
         about: "Consume messages from a group",
-        flags: &["--addr", "--group", "--max", "--ack", "--nack", "--term", "--delay-ms"],
+        flags: &[
+            "--addr",
+            "--group",
+            "--max",
+            "--ack",
+            "--nack",
+            "--term",
+            "--delay-ms",
+        ],
         subs: &[],
     },
     Cmd {
@@ -124,7 +132,14 @@ pub(crate) const COMMAND_TREE: &[Cmd] = &[
     Cmd {
         name: "top",
         about: "Live broker / data-dir dashboard",
-        flags: &["--addr", "--health-addr", "--data-dir", "--interval", "--once", "--no-color"],
+        flags: &[
+            "--addr",
+            "--health-addr",
+            "--data-dir",
+            "--interval",
+            "--once",
+            "--no-color",
+        ],
         subs: &[],
     },
     Cmd {
@@ -164,7 +179,13 @@ pub(crate) const COMMAND_TREE: &[Cmd] = &[
     Cmd {
         name: "record-start",
         about: "Drive the failed-start counter (systemd)",
-        flags: &["--dest", "--failed", "--ok", "--check", "--max-failed-starts"],
+        flags: &[
+            "--dest",
+            "--failed",
+            "--ok",
+            "--check",
+            "--max-failed-starts",
+        ],
         subs: &[],
     },
     Cmd {
@@ -181,7 +202,13 @@ pub(crate) const COMMAND_TREE: &[Cmd] = &[
             Cmd {
                 name: "train",
                 about: "Train a dictionary from a sample corpus",
-                flags: &["--type", "--samples", "--out", "--target-dict-bytes", "--min-samples"],
+                flags: &[
+                    "--type",
+                    "--samples",
+                    "--out",
+                    "--target-dict-bytes",
+                    "--min-samples",
+                ],
                 subs: &[],
             },
             Cmd {
@@ -407,7 +434,12 @@ fn generate_zsh(tree: &[Cmd]) -> String {
             s.push_str("            local -a _subs\n");
             s.push_str("            _subs=(\n");
             for sub in cmd.subs {
-                let _ = writeln!(s, "                '{}:{}'", sub.name, zsh_escape(sub.about));
+                let _ = writeln!(
+                    s,
+                    "                '{}:{}'",
+                    sub.name,
+                    zsh_escape(sub.about)
+                );
             }
             s.push_str("            )\n");
             s.push_str("            if (( CURRENT == 3 )); then _describe 'subcommand' _subs; return; fi\n");
