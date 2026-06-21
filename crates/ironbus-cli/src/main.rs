@@ -89,12 +89,13 @@ use ironbus_server::clock::SystemClock;
 // cross-platform serve flag parser (and named in the platform-independent unit tests), so it is
 // imported unconditionally; `ClusterRuntime`/`RuntimeError` are only STARTED on the Unix serve
 // path, so they follow the same `#[cfg(unix)]` gate as the rest of the broker run.
-use ironbus_server::cluster::ClusterConfig;
 #[cfg(unix)]
 use ironbus_server::cluster::{
-    dataplane_addr, ClusterAckLevel, ClusterRuntime, DataPlaneRuntime, DataPlaneServer, IsrConfig,
-    MetadataCommand, MetadataProposer, Placement, ReplicaLogFactory, RuntimeError,
+    dataplane_addr, ClusterAckLevel, ClusterRuntime, DataPlaneRuntime, DataPlaneServer, GeoLink,
+    IsrConfig, MetadataCommand, MetadataProposer, MirrorApplier, OriginCursorStore, Placement,
+    ReplicaLogFactory, RuntimeError, GEO_POLL,
 };
+use ironbus_server::cluster::{ClusterConfig, GeoConfig, GeoMode, GeoOrigin, GeoStreamConfig};
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
@@ -1677,6 +1678,12 @@ struct ParsedServe {
     /// opts into the additive metadata-Raft plane (#682/#683): the metadata quorum runs, but the
     /// DATA-plane produce/consume replication (#686/#691) is the FLAGGED follow-up, NOT this PR.
     cluster: Option<ClusterConfig>,
+    /// The validated cross-cluster GEO config (#623, V2-C7-I1), built from `--mirror` / `--source`. EMPTY
+    /// (no geo flags) is the non-geo DEFAULT: `cmd_serve` then constructs NO geo plane, so the
+    /// produce/consume/storage hot path is byte-for-byte today's broker. A non-empty config opts into the
+    /// async cross-cluster mirror/source plane (this PR): the configured read-only mirrors reject client
+    /// produces, and a per-origin pull loop replicates each origin into its local stream.
+    geo: GeoConfig,
     /// The transport-security material + auth references + pre-auth `DoS` knobs (#629/#631/#633, V2-M7),
     /// resolved from the `--tls-*` / `--auth-config` / `--*-preauth-*` flags. Carried as one bundle so
     /// the (large) `ServeConfig` and its `Default` stay untouched. `cmd_serve` runs the fail-closed
@@ -1777,6 +1784,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         parsed.health_addr.as_deref(),
         &parsed.config_warnings,
         parsed.cluster.as_ref(),
+        &parsed.geo,
         &parsed.transport,
         ReloadSource {
             config_path: parsed.config_path.as_deref(),
@@ -1951,6 +1959,16 @@ struct ServeFlags {
     /// learner does not count toward the seeded voter size, the quorum, or the liveness detector. Empty
     /// in the C1 default (peers == voters). Raw id strings, parsed after collection.
     cluster_pending_learners: Vec<String>,
+    /// Repeatable cross-cluster MIRROR specs (#623, V2-C7-I1): each `--mirror <local>=<origin-addr>/<origin-stream>`
+    /// declares a local READ-ONLY stream that asynchronously pulls ONE remote origin stream. Raw
+    /// `local=addr/stream` strings, parsed into a [`ironbus_server::cluster::GeoConfig`] after collection
+    /// (a malformed spec is a typed usage error there). Empty (no `--mirror`) = the non-geo default.
+    /// CLI-only and repeatable, exactly like `--cluster-peer`.
+    mirrors: Vec<String>,
+    /// Repeatable cross-cluster SOURCE specs (#623): each
+    /// `--source <local>=<addr1>/<stream1>,<addr2>/<stream2>,...` declares a local stream that FANS IN one
+    /// or more remote origin streams. Raw strings parsed after collection. Empty = the non-geo default.
+    sources: Vec<String>,
     /// The TLS server certificate chain file (#629, V2-M7): a PEM path. RESERVED, NOT YET HONORED
     /// (#107): the TLS 1.3 handshake (rustls) is not wired (no allowed crypto provider), so a set value
     /// is a fail-closed startup REFUSAL rather than an accepted cert that would imply encryption this
@@ -2174,6 +2192,11 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
                     &mut i,
                 )?);
             }
+            // Repeatable cross-cluster geo specs (#623), parsed into a GeoConfig after collection (a
+            // malformed spec is a typed usage error there), like `--cluster-peer`. `--mirror` is a
+            // read-only single-origin replica; `--source` is a fan-in of one or more origins.
+            "--mirror" => f.mirrors.push(take_value("--mirror", args, &mut i)?),
+            "--source" => f.sources.push(take_value("--source", args, &mut i)?),
             "--visibility-timeout-ms" => {
                 f.visibility_ms = Some(take_number("--visibility-timeout-ms", args, &mut i)?);
             }
@@ -2682,6 +2705,10 @@ fn parse_serve_flags_with_env_and_reader(
             f.cluster_join_as_learner,
             &f.cluster_pending_learners,
         )?,
+        // The cross-cluster GEO config (#623): empty (no `--mirror`/`--source`) is the non-geo default —
+        // NO geo plane, byte-for-byte today's broker. A malformed spec is a typed usage error here,
+        // fail-closed before any side effect.
+        geo: parse_geo_config(&f.mirrors, &f.sources)?,
         // Transport security material + auth references + pre-auth DoS knobs (#629/#631/#633): paths
         // resolved with flag > env > default; the bind guard + StrictModes + identity-table load run
         // at `cmd_serve` (after the bind is classified). The DoS knobs take their safe defaults.
@@ -3057,6 +3084,112 @@ fn parse_cluster_peer(spec: &str) -> Result<(u64, std::net::SocketAddr), CliErro
     Ok((id, addr))
 }
 
+/// Builds the validated cross-cluster [`GeoConfig`] (#623, V2-C7-I1) from the repeated `--mirror` /
+/// `--source` specs, or an EMPTY config when none are given (the non-geo default). Fail-closed: a
+/// malformed spec, an empty local name, a duplicate local stream across mirror/source, or an origin spec
+/// missing its `<addr>/<stream>` shape is a typed usage error before any side effect.
+///
+/// `--mirror <local>=<origin-addr>/<origin-stream>` (exactly ONE origin, read-only).
+/// `--source <local>=<addr1>/<stream1>,<addr2>/<stream2>,...` (one or more origins, fan-in).
+fn parse_geo_config(mirrors: &[String], sources: &[String]) -> Result<GeoConfig, CliError> {
+    let mut streams = Vec::new();
+    let mut seen_local: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    for spec in mirrors {
+        let (local, origins_str) = split_geo_spec("--mirror", spec)?;
+        let origins = parse_geo_origins("--mirror", spec, origins_str)?;
+        if origins.len() != 1 {
+            return Err(CliError::Usage(format!(
+                "`--mirror` declares exactly ONE origin (a read-only single-origin replica); use \
+                 `--source` for fan-in. Got {} origins in `{spec}`",
+                origins.len()
+            )));
+        }
+        if !seen_local.insert(local.clone()) {
+            return Err(CliError::Usage(format!(
+                "geo local stream `{local}` is declared more than once (in `{spec}`); each local \
+                 mirror/source name must be unique"
+            )));
+        }
+        streams.push(GeoStreamConfig {
+            local_stream: local,
+            mode: GeoMode::Mirror(origins.into_iter().next().expect("exactly one origin")),
+        });
+    }
+
+    for spec in sources {
+        let (local, origins_str) = split_geo_spec("--source", spec)?;
+        let origins = parse_geo_origins("--source", spec, origins_str)?;
+        if origins.is_empty() {
+            return Err(CliError::Usage(format!(
+                "`--source` needs at least one `<addr>/<stream>` origin (in `{spec}`)"
+            )));
+        }
+        if !seen_local.insert(local.clone()) {
+            return Err(CliError::Usage(format!(
+                "geo local stream `{local}` is declared more than once (in `{spec}`); each local \
+                 mirror/source name must be unique"
+            )));
+        }
+        streams.push(GeoStreamConfig {
+            local_stream: local,
+            mode: GeoMode::Source(origins),
+        });
+    }
+
+    Ok(GeoConfig { streams })
+}
+
+/// Split a `--mirror`/`--source` spec into `(local_stream, origins_str)` at the FIRST `=`. Fail-closed on
+/// a missing `=` or an empty local name.
+fn split_geo_spec<'a>(flag: &str, spec: &'a str) -> Result<(String, &'a str), CliError> {
+    let (local, origins) = spec.split_once('=').ok_or_else(|| {
+        CliError::Usage(format!(
+            "`{flag}` must be `<local>=<addr>/<stream>` (e.g. \
+             `{flag} mirror-orders=10.0.0.1:7500/orders`), got `{spec}`"
+        ))
+    })?;
+    if local.is_empty() {
+        return Err(CliError::Usage(format!(
+            "`{flag}` local stream name is empty in `{spec}`; the default stream (`\"\"`) cannot be a \
+             mirror/source"
+        )));
+    }
+    Ok((local.to_string(), origins))
+}
+
+/// Parse a comma-separated list of `<addr>/<stream>` origin specs into [`GeoOrigin`]s. Fail-closed on a
+/// missing `/`, an empty addr, or an over-long origin stream name.
+fn parse_geo_origins(flag: &str, spec: &str, origins: &str) -> Result<Vec<GeoOrigin>, CliError> {
+    let mut out = Vec::new();
+    for one in origins.split(',') {
+        // Split at the FIRST `/` so the addr keeps its `host:port` and the stream is the remainder (a
+        // stream name may itself contain no `/`, which the engine's name rule already enforces).
+        let (addr, stream) = one.split_once('/').ok_or_else(|| {
+            CliError::Usage(format!(
+                "`{flag}` origin must be `<addr>/<stream>` (e.g. `10.0.0.1:7500/orders`), got `{one}` \
+                 in `{spec}`"
+            ))
+        })?;
+        if addr.is_empty() {
+            return Err(CliError::Usage(format!(
+                "`{flag}` origin address is empty in `{one}` (in `{spec}`)"
+            )));
+        }
+        if stream.len() > ironbus_server::cluster::MAX_ORIGIN_STREAM_LEN {
+            return Err(CliError::Usage(format!(
+                "`{flag}` origin stream name `{stream}` is over the {}-byte cap (in `{spec}`)",
+                ironbus_server::cluster::MAX_ORIGIN_STREAM_LEN
+            )));
+        }
+        out.push(GeoOrigin {
+            addr: addr.to_string(),
+            stream: stream.to_string(),
+        });
+    }
+    Ok(out)
+}
+
 /// Resolves the required `--data-dir`, validates the assembled config, and dispatches to the
 /// platform `cmd_serve`. Split out of `run_serve` so the flag-parsing loop stays a single concern.
 #[allow(clippy::too_many_arguments)] // each input (addr, data dir, config, groups, health, the
@@ -3071,6 +3204,7 @@ fn finish_serve(
     health_addr: Option<&str>,
     config_warnings: &[String],
     cluster: Option<&ClusterConfig>,
+    geo: &GeoConfig,
     transport: &TransportSecurityFlags,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
@@ -3085,6 +3219,18 @@ fn finish_serve(
             "`--cluster-id`/`--cluster-peer` require `--storage disk`: the metadata cluster is a \
              durable on-disk plane (it keeps a `metaraft/` log under the data dir and recovers it \
              on restart), so it cannot run under `--storage memory` (which keeps no on-disk state)"
+                .to_string(),
+        ));
+    }
+    // The cross-cluster GEO plane (#623) is likewise DURABLE: a mirror/source keeps its applied records
+    // in a local on-disk log + a durable resume cursor (`geo.cursor`) so it resumes across a restart.
+    // Under `--storage memory` it would lose both on every stop (re-pulling the whole origin each boot),
+    // so reject it fail-closed BEFORE any side effect rather than silently start a non-durable mirror.
+    if !geo.is_empty() && config.storage == StorageArg::Memory {
+        return Err(CliError::Usage(
+            "`--mirror`/`--source` require `--storage disk`: a cross-cluster mirror/source keeps a \
+             durable local log + resume cursor so it resumes across a restart, so it cannot run \
+             under `--storage memory` (which keeps no on-disk state)"
                 .to_string(),
         ));
     }
@@ -3120,6 +3266,7 @@ fn finish_serve(
         health_addr,
         config_warnings,
         cluster,
+        geo,
         transport,
         reload,
         out,
@@ -4360,6 +4507,7 @@ fn cmd_serve(
     health_addr: Option<&str>,
     config_warnings: &[String],
     cluster: Option<&ClusterConfig>,
+    geo: &GeoConfig,
     transport: &TransportSecurityFlags,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
@@ -4456,7 +4604,20 @@ fn cmd_serve(
             // released by the OS when it drops on return (and unconditionally on process exit).
             dirlock::prepare_data_dir(data_dir).map_err(|e| map_dir_error(&e))?;
             let _dir_lock = dirlock::DirLock::acquire(data_dir).map_err(|e| map_dir_error(&e))?;
-            let engine = open_disk_engine(data_dir, config, key_shared_groups, broadcast_groups)?;
+            let mut engine =
+                open_disk_engine(data_dir, config, key_shared_groups, broadcast_groups)?;
+            // The cross-cluster GEO plane (#623), IFF a `--mirror`/`--source` was configured. With NO geo
+            // config NOTHING here runs: the read-only set stays empty (the produce path is byte-for-byte
+            // today's) and no pull loop is spawned (the byte-identical non-geo guarantee). The READ-ONLY
+            // mirror set is installed on the engine BEFORE it moves into the append actor, so a client
+            // produce to a mirror is rejected (single-writer preserved); the pull loops are spawned after
+            // the engine moves (they own their OWN local logs + durable cursors under `<data_dir>/geo/`).
+            let geo_plane = if geo.is_empty() {
+                None
+            } else {
+                engine.set_mirror_read_only_streams(geo.read_only_streams());
+                Some(spawn_geo_plane(geo, data_dir, config)?)
+            };
             // Start the additive metadata-cluster plane (#684, V2-C1) IFF cluster flags were given.
             // This is the ONLY place a `ClusterRuntime` is started, on the DISK path, where a
             // concrete `StdFs` and the data dir are known — the runtime roots its `metaraft/` log
@@ -4477,7 +4638,7 @@ fn cmd_serve(
             // handle moves into `run_broker`, so `run_broker` can install it on the engine handle. `None`
             // when no data plane runs (the single-node disk serve).
             let client_ack_slot = dataplane.as_ref().map(|dp| dp.client_ack_slot.clone());
-            run_broker(
+            let result = run_broker(
                 engine,
                 addr,
                 Some(data_dir),
@@ -4491,7 +4652,13 @@ fn cmd_serve(
                 auth,
                 reload,
                 out,
-            )
+            );
+            // Stop + join the geo pull plane on the way out (its `Drop` also signals shutdown, but the
+            // explicit stop joins every pull thread deterministically). `None` when no geo was configured.
+            if let Some(mut plane) = geo_plane {
+                plane.stop();
+            }
+            result
         }
         StorageArg::Memory => {
             // The OPT-IN ephemeral in-memory broker (#443): the SAME engine and the SAME
@@ -4652,6 +4819,173 @@ impl DataPlaneServeHandle {
             let _ = h.join();
         }
     }
+}
+
+/// The stoppable handle for the cross-cluster GEO pull plane (#623): the shutdown flag every per-origin
+/// pull thread polls, plus the join handles. The broker's teardown calls [`stop`](GeoPlaneHandle::stop).
+#[cfg(unix)]
+struct GeoPlaneHandle {
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pullers: Vec<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl GeoPlaneHandle {
+    /// Signal shutdown and join every per-origin pull thread. Idempotent. Called by the broker's serve
+    /// teardown so the geo plane winds down deterministically.
+    fn stop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        for h in self.pullers.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GeoPlaneHandle {
+    fn drop(&mut self) {
+        // Best-effort: a caller that forgets `stop` (or a panic on the serve path) still signals the
+        // pull threads to wind down rather than leaking them. The deterministic join is `stop`.
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Construct + spawn the cross-cluster GEO pull plane (#623, V2-C7-I1) — one async pull thread per
+/// configured `(local_stream, origin)`. Called ONLY when a `--mirror`/`--source` was configured (the
+/// caller checks `geo.is_empty()` first); with no geo config this is never called and the broker is
+/// byte-for-byte today's.
+///
+/// Each pull thread owns its OWN local on-disk [`Log`](ironbus_storage::log::Log) + a durable
+/// [`OriginCursorStore`] under `<data_dir>/geo/<hex(local_stream)>/`, so the geo applier is the local
+/// stream's SOLE writer (single-writer preserved; the engine's append actor never touches this log). It
+/// dials the origin (reconnecting + backing off on a drop), and on a live link runs the
+/// [`pull_loop`](ironbus_server::cluster::pull_loop) — pull → CRC-revalidate → apply → durably advance
+/// the resume cursor — until shutdown. An idle origin BLOCKS / BACKS OFF (the #726 ~0-idle-CPU
+/// discipline). A SOURCE's N origins each get their OWN thread + cursor (independent fan-in); a MIRROR's
+/// one origin gets one. All origins of one local stream apply into the SAME local log (the fan-in
+/// interleaving), guarded by a shared mutex so the single-writer invariant holds across the threads.
+///
+/// # Errors
+/// [`CliError::Internal`] if a local geo log / cursor store cannot be opened (the only synchronous
+/// failure; a dial failure is handled by the pull thread's reconnect/backoff, never a serve failure).
+#[cfg(unix)]
+fn spawn_geo_plane(
+    geo: &GeoConfig,
+    data_dir: &Path,
+    config: &ServeConfig,
+) -> Result<GeoPlaneHandle, CliError> {
+    let log_config = LogConfig::new(config.max_segment_bytes)
+        .map_err(|e| CliError::Internal(format!("geo log config: {e}")))?
+        .with_max_total_bytes(config.max_total_bytes);
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut pullers = Vec::new();
+
+    for stream in &geo.streams {
+        // One local on-disk log + durable cursor per local stream, under `<data_dir>/geo/<hex(name)>/`
+        // (the same hex-name layout the StreamSet uses, so a stream name with odd bytes is path-safe).
+        let dir = data_dir
+            .join("geo")
+            .join(hex_dir_name(&stream.local_stream));
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| CliError::Internal(format!("mkdir {}: {e}", dir.display())))?;
+        let log = ironbus_storage::log::Log::open(
+            StdFs::new(dir.clone()),
+            SystemClock::new(),
+            log_config,
+        )
+        .map_err(|e| CliError::Internal(format!("open geo log {}: {e}", dir.display())))?;
+        let cursors = OriginCursorStore::open(&StdFs::new(dir.clone()))
+            .map_err(|e| CliError::Internal(format!("open geo cursor {}: {e}", dir.display())))?;
+        // The applier is shared across this stream's origins (a source fans N origins into ONE log), so
+        // the single-writer invariant holds across the per-origin threads via the mutex.
+        let applier = std::sync::Arc::new(std::sync::Mutex::new(MirrorApplier::new(log, cursors)));
+
+        for origin in stream.mode.origins() {
+            let applier = std::sync::Arc::clone(&applier);
+            let shutdown = std::sync::Arc::clone(&shutdown);
+            let key = origin.cursor_key();
+            let local = stream.local_stream.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!("ib-geo-pull-{local}"))
+                .spawn(move || {
+                    run_geo_puller(&applier, &origin, &key, &shutdown);
+                })
+                .map_err(|e| CliError::Internal(format!("spawn geo puller: {e}")))?;
+            pullers.push(handle);
+        }
+    }
+
+    Ok(GeoPlaneHandle { shutdown, pullers })
+}
+
+/// One per-origin GEO pull thread (#623): dial the origin, run the pull loop until the link breaks, then
+/// reconnect + back off — until shutdown. The applier is shared (a source's origins fan into one log), so
+/// each pull takes the mutex only to build the request + apply the response (never across a socket
+/// read/write), exactly the intra-cluster follower-fetch lock discipline.
+#[cfg(unix)]
+fn run_geo_puller(
+    applier: &std::sync::Mutex<MirrorApplier<StdFs, SystemClock>>,
+    origin: &GeoOrigin,
+    origin_key: &str,
+    shutdown: &std::sync::atomic::AtomicBool,
+) {
+    use std::sync::atomic::Ordering;
+
+    let addr: std::net::SocketAddr = match origin.addr.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!(
+                "ironbus: geo: bad origin address {:?} ({e}); not pulling this origin",
+                origin.addr
+            );
+            return;
+        }
+    };
+    while !shutdown.load(Ordering::Acquire) {
+        if let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, GEO_POLL) {
+            let _ = stream.set_read_timeout(Some(GEO_POLL));
+            let _ = stream.set_write_timeout(Some(GEO_POLL));
+            let mut link = GeoLink::new(stream);
+            // The pull loop owns the read/apply cadence; it reads the cursor + applies under the mutex
+            // (off the socket IO), so the applier is never borrowed across a wire op.
+            ironbus_server::cluster::pull_loop(
+                &mut link,
+                origin_key,
+                &origin.stream,
+                shutdown,
+                || applier.lock().map_or(0, |a| a.cursor(origin_key)),
+                |resp| {
+                    let mut a = applier
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    a.apply_pull_response(origin_key, resp)
+                },
+            );
+        } else {
+            // Origin not reachable yet: back off and retry (interruptible by shutdown).
+            let mut left = GEO_POLL;
+            let slice = std::time::Duration::from_millis(20);
+            while left > std::time::Duration::ZERO && !shutdown.load(Ordering::Acquire) {
+                let this = slice.min(left);
+                std::thread::sleep(this);
+                left = left.checked_sub(this).unwrap_or(std::time::Duration::ZERO);
+            }
+        }
+    }
+}
+
+/// The hex directory name for a geo local stream, matching the `StreamSet`'s `streams/<hex(name)>/`
+/// layout so any byte in a stream name is filesystem-safe.
+#[cfg(unix)]
+fn hex_dir_name(name: &str) -> String {
+    let mut s = String::with_capacity(name.len() * 2);
+    for b in name.as_bytes() {
+        s.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
+        s.push(char::from_digit(u32::from(b & 0xf), 16).unwrap_or('0'));
+    }
+    s
 }
 
 /// Construct, spawn, and drive the DATA plane for a clustered serve (#717) — the final clustering
@@ -11899,6 +12233,7 @@ mod tests {
             parsed.health_addr.as_deref(),
             &parsed.config_warnings,
             parsed.cluster.as_ref(),
+            &parsed.geo,
             &parsed.transport,
             ReloadSource {
                 config_path: parsed.config_path.as_deref(),
@@ -14385,6 +14720,117 @@ mod tests {
             parsed.health_addr.as_deref(),
             &parsed.config_warnings,
             parsed.cluster.as_ref(),
+            &parsed.geo,
+            &parsed.transport,
+            ReloadSource {
+                config_path: parsed.config_path.as_deref(),
+                allow_unknown_config: parsed.allow_unknown_config,
+                reload_pins: parsed.reload_pins,
+            },
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(
+                m.contains("--storage disk") && m.contains("durable"),
+                "the rejection must explain the durable-disk requirement: {m}"
+            ),
+            other => panic!("expected a Usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mirror_and_source_flags_parse_into_a_geo_config() {
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--mirror",
+            "mirror-orders=10.0.0.1:7500/orders",
+            "--source",
+            "events=10.0.0.2:7500/a,10.0.0.3:7500/b",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.geo.streams.len(), 2);
+        // The mirror is read-only with exactly one origin; the source fans in two origins.
+        assert_eq!(
+            parsed.geo.read_only_streams(),
+            vec!["mirror-orders".to_string()]
+        );
+        match &parsed.geo.streams[0].mode {
+            GeoMode::Mirror(o) => {
+                assert_eq!(o.addr, "10.0.0.1:7500");
+                assert_eq!(o.stream, "orders");
+            }
+            GeoMode::Source(_) => panic!("expected a mirror, got a source"),
+        }
+        match &parsed.geo.streams[1].mode {
+            GeoMode::Source(os) => {
+                assert_eq!(os.len(), 2);
+                assert_eq!(os[0].addr, "10.0.0.2:7500");
+                assert_eq!(os[1].stream, "b");
+            }
+            GeoMode::Mirror(_) => panic!("expected a source, got a mirror"),
+        }
+    }
+
+    #[test]
+    fn no_geo_flags_is_the_empty_non_geo_default() {
+        let parsed = parse_serve_flags(&serve_args(&[])).unwrap();
+        assert!(parsed.geo.is_empty(), "no --mirror/--source = no geo plane");
+    }
+
+    #[test]
+    fn a_malformed_mirror_spec_is_a_typed_usage_error() {
+        // Missing `=`.
+        assert!(matches!(
+            parse_serve_flags(&serve_args(&["--mirror", "no-equals-sign"])),
+            Err(CliError::Usage(_))
+        ));
+        // A mirror with two origins is rejected (use --source for fan-in).
+        assert!(matches!(
+            parse_serve_flags(&serve_args(&["--mirror", "m=a:1/s1,b:2/s2"])),
+            Err(CliError::Usage(_))
+        ));
+        // Origin missing its `/stream`.
+        assert!(matches!(
+            parse_serve_flags(&serve_args(&["--mirror", "m=10.0.0.1:7500"])),
+            Err(CliError::Usage(_))
+        ));
+        // Duplicate local stream across a mirror and a source.
+        assert!(matches!(
+            parse_serve_flags(&serve_args(&[
+                "--mirror",
+                "dup=a:1/s",
+                "--source",
+                "dup=b:2/t",
+            ])),
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn geo_flags_under_storage_memory_are_rejected() {
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--storage",
+            "memory",
+            "--ephemeral-loss-ack",
+            "--max-total-bytes",
+            "1048576",
+            "--mirror",
+            "m=10.0.0.1:7500/orders",
+        ]))
+        .unwrap();
+        assert!(!parsed.geo.is_empty(), "the flags parse into a geo config");
+        let mut buf = Vec::new();
+        let e = finish_serve(
+            &parsed.addr,
+            parsed.data_dir.as_deref(),
+            &parsed.config,
+            &parsed.key_shared_groups,
+            &parsed.broadcast_groups,
+            parsed.health_addr.as_deref(),
+            &parsed.config_warnings,
+            parsed.cluster.as_ref(),
+            &parsed.geo,
             &parsed.transport,
             ReloadSource {
                 config_path: parsed.config_path.as_deref(),
