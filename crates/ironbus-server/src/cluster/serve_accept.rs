@@ -84,7 +84,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use ironbus_proto::frame::{decode_frame_with_cap, encode_frame, FrameDecode, FrameError, FrameType};
+use ironbus_proto::frame::{
+    decode_frame_with_cap, encode_frame, FrameDecode, FrameError, FrameType,
+};
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::read_plane::ReadPlane;
 
@@ -224,6 +226,7 @@ impl Drop for CrossClusterServeRuntime {
 /// loop is non-blocking and polls the shutdown flag so a stop is prompt and an idle accept does ~0 work.
 // A thread entry point: it OWNS the listener + the served config (cloned into each per-connection
 // reader) for the thread's lifetime; a borrow would fight the 'static spawn bound.
+#[allow(clippy::needless_pass_by_value)]
 fn run_serve_listener<F, C>(
     listener: TcpListener,
     config: CrossClusterServeConfig<F, C>,
@@ -284,7 +287,8 @@ fn run_serve_reader<F, C>(
     while !shutdown.load(Ordering::Acquire) {
         match conn.recv_frame() {
             Ok(Some((frame_type, body))) => {
-                if handle_one(&mut conn, frame_type, &body, origin.as_ref(), hub_receiver).is_err() {
+                if handle_one(&mut conn, frame_type, &body, origin.as_ref(), hub_receiver).is_err()
+                {
                     return;
                 }
             }
@@ -365,7 +369,7 @@ where
                     Err(_) => return Err(()),
                 }
             };
-            conn.send_leaf_response(&ack).map_err(|_| ())
+            conn.send_leaf_response(ack).map_err(|_| ())
         }
         // Any other (or unknown) frame type on the cross-cluster serve link is unexpected: fail closed.
         _ => Err(()),
@@ -382,6 +386,11 @@ struct ServeConn {
     /// Accumulated, not-yet-consumed inbound bytes (a partial frame may straddle reads).
     inbuf: Vec<u8>,
 }
+
+/// One decoded inbound frame off the cross-cluster serve wire: its interpreted [`FrameType`] (`None`
+/// for an unrecognized tag, which the dispatcher fails closed on) plus its body bytes. Aliased so the
+/// connection reader's return type stays readable.
+type DecodedFrame = (Option<FrameType>, Vec<u8>);
 
 /// A typed error from the cross-cluster serve connection: a bounded framing / IO failure. The reader
 /// always surfaces one of these rather than panicking or over-allocating — a hostile remote is
@@ -414,7 +423,7 @@ impl ServeConn {
     /// Returns `Ok(Some((frame_type, body)))` for a complete frame (`frame_type` is `None` for an
     /// unrecognized tag, which the dispatcher fails closed on), `Ok(None)` when the peer closes cleanly,
     /// and `Err` on a bounded framing error or an IO fault (incl. a read timeout).
-    fn recv_frame(&mut self) -> Result<Option<(Option<FrameType>, Vec<u8>)>, ServeConnError> {
+    fn recv_frame(&mut self) -> Result<Option<DecodedFrame>, ServeConnError> {
         // Heap chunk (matches the geo / leaf links + the intra-cluster `DataPlaneLink`): a 64 KiB stack
         // array trips the large-stack-array lint, and the read loop reuses the one buffer regardless.
         let mut chunk = vec![0u8; 64 * 1024];
@@ -433,8 +442,7 @@ impl ServeConn {
 
     /// Decode one buffered frame if a complete one is present, consuming its bytes. Returns `Ok(None)`
     /// when more bytes are needed. Applies the size cap BEFORE allocation (the bounded codec).
-    #[allow(clippy::type_complexity)]
-    fn try_decode_one(&mut self) -> Result<Option<(Option<FrameType>, Vec<u8>)>, ServeConnError> {
+    fn try_decode_one(&mut self) -> Result<Option<DecodedFrame>, ServeConnError> {
         match decode_frame_with_cap(&self.inbuf, MAX_SERVE_FRAME_BYTES) {
             Ok(FrameDecode::Frame {
                 type_tag,
@@ -462,8 +470,8 @@ impl ServeConn {
     }
 
     /// Frame + write a `LeafPush` RESPONSE (the ack) back to the leaf (the leaf wire shape — tag 41,
-    /// kind 1).
-    fn send_leaf_response(&mut self, resp: &LeafPushResponse) -> Result<(), ServeConnError> {
+    /// kind 1). Takes the small [`LeafPushResponse`] (one `u64`) by value — it is `Copy`.
+    fn send_leaf_response(&mut self, resp: LeafPushResponse) -> Result<(), ServeConnError> {
         let mut frame = Vec::new();
         encode_frame(FrameType::LeafPush, &resp.encode(), &mut frame)
             .map_err(ServeConnError::Frame)?;
@@ -486,10 +494,11 @@ fn sleep_interruptible(dur: Duration, shutdown: &AtomicBool) {
 }
 
 // A small compile-time assertion that the serve cap admits a maximal leaf push (the largest legitimate
-// inbound frame) plus its header, and stays under the absolute envelope cap.
+// inbound frame) plus its header, and stays under the absolute envelope cap. Compared in `u64` so the
+// `usize` stream-name cap widens (never a truncating `as u32`).
 const _: () = {
     assert!(MAX_SERVE_FRAME_BYTES >= MAX_LEAF_PUSH_BYTES);
-    assert!(MAX_SERVE_FRAME_BYTES >= MAX_ORIGIN_STREAM_LEN as u32);
+    assert!(MAX_SERVE_FRAME_BYTES as u64 >= MAX_ORIGIN_STREAM_LEN as u64);
     assert!(MAX_SERVE_FRAME_BYTES <= ironbus_proto::frame::MAX_FRAME_LEN);
 };
 
@@ -625,9 +634,14 @@ mod tests {
     }
 
     fn open_mirror(dir: &std::path::Path) -> MirrorApplier<StdFs, ManualClock> {
-        let log = Log::open(StdFs::new(dir.to_path_buf()), ManualClock::new(), small_config())
-            .expect("mirror log opens");
-        let cursors = OriginCursorStore::open(&StdFs::new(dir.to_path_buf())).expect("cursor store");
+        let log = Log::open(
+            StdFs::new(dir.to_path_buf()),
+            ManualClock::new(),
+            small_config(),
+        )
+        .expect("mirror log opens");
+        let cursors =
+            OriginCursorStore::open(&StdFs::new(dir.to_path_buf())).expect("cursor store");
         MirrorApplier::new(log, cursors)
     }
 
@@ -646,7 +660,7 @@ mod tests {
     /// Spawn the NEW broker serve-ACCEPT runtime over a real loopback listener, dial it with a real
     /// `TcpStream`, send `MirrorPull` requests for a served stream, and prove the committed records come
     /// back BYTE-FAITHFULLY — the end-to-end accept-loop wiring over a real socket (in-process). This is
-    /// the load-bearing proof: it exercises the real accept + dispatch + serve_pull path, not just the
+    /// the load-bearing proof: it exercises the real accept + dispatch + `serve_pull` path, not just the
     /// serve logic the geo unit tests already cover.
     #[test]
     fn a_real_socket_pull_serves_committed_records_byte_faithfully() {
@@ -654,7 +668,10 @@ mod tests {
         let origin_dir = tempfile::tempdir().expect("origin dir");
         let mirror_dir = tempfile::tempdir().expect("mirror dir");
         let (origin, served) = leaked_log_with_served_end(origin_dir.path(), "o", 40);
-        assert!(served > 0, "the origin has a non-empty sealed prefix to serve");
+        assert!(
+            served > 0,
+            "the origin has a non-empty sealed prefix to serve"
+        );
 
         let addr = free_addr();
         let mut runtime =
@@ -665,9 +682,8 @@ mod tests {
         let mut app = open_mirror(mirror_dir.path());
         assert!(
             wait_until(Duration::from_secs(10), || {
-                let stream = match TcpStream::connect(addr) {
-                    Ok(s) => s,
-                    Err(_) => return false,
+                let Ok(stream) = TcpStream::connect(addr) else {
+                    return false;
                 };
                 stream
                     .set_read_timeout(Some(Duration::from_millis(200)))
@@ -739,13 +755,12 @@ mod tests {
         // A real client socket drives the leaf LeafPush protocol against the spawned accept loop: read
         // the leaf log's sealed bytes, push them up, advance the durable push cursor to the hub's ack.
         let key = format!("{addr}/orders");
-        let mut cursor =
-            LeafPushCursor::open(&StdFs::new(cursor_dir.path().to_path_buf())).expect("push cursor");
+        let mut cursor = LeafPushCursor::open(&StdFs::new(cursor_dir.path().to_path_buf()))
+            .expect("push cursor");
         assert!(
             wait_until(Duration::from_secs(10), || {
-                let stream = match TcpStream::connect(addr) {
-                    Ok(s) => s,
-                    Err(_) => return false,
+                let Ok(stream) = TcpStream::connect(addr) else {
+                    return false;
                 };
                 stream
                     .set_read_timeout(Some(Duration::from_millis(200)))
@@ -754,9 +769,8 @@ mod tests {
                 loop {
                     let plane = leaf_log.read_plane().unwrap();
                     let fwd = LeafForwarder::new(&plane);
-                    let req = match fwd.next_push("orders", cursor.cursor(&key)) {
-                        Ok(r) => r,
-                        Err(_) => break,
+                    let Ok(req) = fwd.next_push("orders", cursor.cursor(&key)) else {
+                        break;
                     };
                     if req.record_count == 0 {
                         break;
@@ -839,7 +853,8 @@ mod tests {
         // Dial and hold the connection OPEN without sending a request. The accept loop accepted it and
         // its reader is now PARKED on the blocking read (no frame to decode).
         let idle = TcpStream::connect(addr).expect("idle client dials");
-        idle.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        idle.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
 
         // The server never speaks first: an idle reader sends ~0 unsolicited bytes. A short read returns
         // a timeout (WouldBlock/TimedOut) or 0 — never server-pushed data.
@@ -848,7 +863,10 @@ mod tests {
             Ok(0) => {}
             Ok(n) => panic!("idle serve connection pushed {n} unsolicited bytes"),
             Err(e) => assert!(
-                matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
+                matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ),
                 "expected an idle read timeout, got {e:?}"
             ),
         }

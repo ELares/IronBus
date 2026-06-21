@@ -4958,6 +4958,11 @@ fn durability_loss_description(config: &ServeConfig) -> String {
 // health addr, the config-file warnings, the cluster config,
 // the reload source, out) is a distinct concern; a bundling
 // struct would only move the noise.
+#[allow(clippy::too_many_lines)]
+// one linear serve-startup orchestration: bind guards, open the engine, install
+// the read-only mirror set, spawn the geo / leaf / federation / cross-cluster-serve
+// planes + the cluster + data plane, run the broker, then tear each down in order;
+// splitting it would scatter a single startup concern across helpers.
 fn cmd_serve(
     addr: &str,
     data_dir: Option<&Path>,
@@ -5499,7 +5504,9 @@ fn spawn_cross_cluster_serve_if_configured(
     // moves into the append actor). Arc-backed + read-only: the OriginServer serves committed bytes
     // through it; the single append actor stays the sole writer (single-writer preserved).
     let read_plane = std::sync::Arc::new(engine.read_plane().map_err(|e| {
-        CliError::Internal(format!("cannot build the cross-cluster serve read plane: {e}"))
+        CliError::Internal(format!(
+            "cannot build the cross-cluster serve read plane: {e}"
+        ))
     })?);
 
     let serve_addr = cross_cluster_serve_addr(broker_addr)?;
@@ -16506,7 +16513,7 @@ mod tests {
     /// The CLI WIRING end-to-end: with a FEDERATION own-origin served stream, the broker spawns the
     /// cross-cluster serve-accept listener at the derived `--addr + 2` port, a real client `TcpStream`
     /// CONNECTS to it (proving the accept loop is live), and `stop()` tears it down cleanly. The
-    /// byte-faithful serve over the socket is proven by the serve_accept module's real-socket test; this
+    /// byte-faithful serve over the socket is proven by the `serve_accept` module's real-socket test; this
     /// proves the CLI gate + read-plane capture + derived-addr bind + teardown.
     #[cfg(unix)]
     #[test]
@@ -16539,13 +16546,14 @@ mod tests {
         let expected_serve_port = client_port + CROSS_CLUSTER_SERVE_PORT_OFFSET;
 
         // `west` serves its OWN `orders` (origin domain == own) => served_streams() is non-empty.
-        let federation = parse_federation_config(
-            Some("west"),
-            &[],
-            &["orders=@west/orders".to_string()],
-        )
-        .expect("federation parses");
-        assert_eq!(federation.served_streams().len(), 1, "one own-origin served stream");
+        let federation =
+            parse_federation_config(Some("west"), &[], &["orders=@west/orders".to_string()])
+                .expect("federation parses");
+        assert_eq!(
+            federation.served_streams().len(),
+            1,
+            "one own-origin served stream"
+        );
 
         let mut serve = spawn_cross_cluster_serve_if_configured(&engine, &federation, &broker_addr)
             .expect("serve spawns")
@@ -16594,12 +16602,9 @@ mod tests {
         let _guard = RemoveDirOnDrop(data_dir.clone());
         let config = test_serve_config(64, 1);
         let engine = open_disk_engine(&data_dir, &config, &[], &[]).expect("disk engine");
-        let federation = parse_federation_config(
-            Some("west"),
-            &[],
-            &["orders=@west/orders".to_string()],
-        )
-        .expect("federation parses");
+        let federation =
+            parse_federation_config(Some("west"), &[], &["orders=@west/orders".to_string()])
+                .expect("federation parses");
         assert!(matches!(
             spawn_cross_cluster_serve_if_configured(&engine, &federation, "127.0.0.1:0"),
             Err(CliError::Usage(_))
