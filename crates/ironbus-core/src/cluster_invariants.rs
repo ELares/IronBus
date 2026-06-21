@@ -24,6 +24,12 @@
 //! * **CI4 — epoch monotonicity / no stale-leader-commit.** Leadership epochs are monotonic and a
 //!   record may not be committed under an epoch older than the cluster-known epoch — a stale leader
 //!   cannot commit (the #668 + #614 property). [`check_epoch_monotonic`].
+//! * **CI5 — leaderless-node failover preserves committed data + fences the old leader.** On a leader
+//!   death the successor promoted from the surviving replicas must be an ISR member, must hold every
+//!   offset that was quorum-acked before the death (no committed record is lost on promotion — the
+//!   data-plane analogue of CI1 across a leadership change), and must carry a strictly higher epoch so
+//!   the old leader is fenced (KIP-101). This is the #618 leaderless-failover property, the data-plane
+//!   twin of the #614 leader-completeness restriction. [`check_failover_preserves_committed`].
 //!
 //! ## The leader-completeness ELIGIBILITY predicate (C4-I4, #614)
 //!
@@ -82,6 +88,36 @@ pub enum ClusterInvariantViolation {
         /// The offending (older or regressed) epoch that was observed/committed.
         offending: LeaderEpoch,
     },
+    /// CI5: a leaderless-node FAILOVER lost a committed record — the successor leader promoted on a
+    /// leader death does NOT hold an offset that was quorum-acked BEFORE the death. The successor must
+    /// have been chosen from the ISR (the set that holds every committed record); promoting a replica
+    /// missing a committed offset would silently lose acknowledged data. This is the data-plane analogue
+    /// of CI1 across a leadership change (the #618 leaderless-failover property, the data-plane twin of
+    /// the #614 leader-completeness restriction).
+    FailoverLostCommitted {
+        /// The successor leader promoted on the old leader's death.
+        successor: u64,
+        /// The committed offset (quorum-acked before the death) the successor does NOT hold.
+        offset: u64,
+    },
+    /// CI5: a leaderless-node FAILOVER did NOT fence the dead leader — the successor's leadership epoch
+    /// did not strictly exceed the dead leader's, so a stale/returning old leader is not fenced
+    /// (KIP-101). A failover MUST bump the partition's leader epoch so the old leader can no longer ack
+    /// or serve as leader.
+    FailoverEpochNotFenced {
+        /// The dead leader's epoch at the time of failover.
+        dead_epoch: LeaderEpoch,
+        /// The successor's epoch (which must strictly exceed `dead_epoch` to fence the old leader).
+        successor_epoch: LeaderEpoch,
+    },
+    /// CI5: a leaderless-node FAILOVER promoted a successor that is NOT in the in-sync replica set — a
+    /// non-ISR replica may be missing committed records, so promoting it can lose acknowledged data
+    /// (the exact Jepsen failure the #614 restriction forbids, here at failover time). The successor
+    /// MUST be an ISR member that already holds the committed log.
+    FailoverPromotedNonIsr {
+        /// The successor that was promoted despite being out of the ISR.
+        successor: u64,
+    },
 }
 
 /// Why a detected divergence violated CI3 (it was NOT bounded + reported + repaired / fail-closed).
@@ -127,6 +163,25 @@ impl std::fmt::Display for ClusterInvariantViolation {
                 "CI4: epoch {} is stale/regressed against the cluster epoch {}",
                 offending.get(),
                 current.get()
+            ),
+            ClusterInvariantViolation::FailoverLostCommitted { successor, offset } => write!(
+                f,
+                "CI5: failover successor {successor} does not hold committed offset {offset} \
+                 (a quorum-acked record was lost on promotion)"
+            ),
+            ClusterInvariantViolation::FailoverEpochNotFenced {
+                dead_epoch,
+                successor_epoch,
+            } => write!(
+                f,
+                "CI5: failover did not fence the dead leader: successor epoch {} does not exceed the \
+                 dead leader's epoch {} (old leader not fenced)",
+                successor_epoch.get(),
+                dead_epoch.get()
+            ),
+            ClusterInvariantViolation::FailoverPromotedNonIsr { successor } => write!(
+                f,
+                "CI5: failover promoted out-of-ISR replica {successor} (it may be missing committed records)"
             ),
         }
     }
@@ -359,6 +414,96 @@ pub fn check_epoch_monotonic(
             }
         }
         prev = Some(entry.epoch);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------------
+// CI5 — leaderless-node failover preserves committed data + fences the old leader (C5-I3, #618).
+// ---------------------------------------------------------------------------------------------------
+
+/// The observable state of a leaderless-node FAILOVER, for the CI5 checker: who died, who was promoted,
+/// what the cluster had quorum-acked before the death, and the successor's own durable prefix + epoch.
+///
+/// These are small, IO-free value-types (the same shape as the I1 to I4 / eligibility inputs): the
+/// `ironbus-server` plane projects its rich state (the ISR tracker, the committed placement's epoch, the
+/// successor's replica-log frontier) onto them and calls the checker. A `Failover` describes the result
+/// of promoting `successor` when `dead_leader` left; CI5 falsifies it against the three failover faults
+/// (lost-committed, unfenced, non-ISR successor).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failover {
+    /// The node id of the leader that died / left, triggering the failover.
+    pub dead_leader: u64,
+    /// The successor leader promoted from the surviving replicas. MUST be an ISR member that already
+    /// holds the committed log (`successor_in_isr`) — promoting a non-ISR replica is a CI5 violation.
+    pub successor: u64,
+    /// Whether the successor was in the in-sync replica set at the moment of failover. Only an ISR
+    /// member is guaranteed to hold every committed record, so only an ISR member may be promoted.
+    pub successor_in_isr: bool,
+    /// The successor's durable (fsync'd) prefix frontier at failover: the first offset it has NOT durably
+    /// appended. It must cover every offset that was quorum-acked before the death (`>= committed_hw`).
+    pub successor_durable_prefix: u64,
+    /// The cluster-known committed high-watermark at the death: every offset strictly below this was
+    /// quorum-acked (fsync'd on `min_isr` replicas), so it is acknowledged and MUST survive the failover.
+    pub committed_hw: u64,
+    /// The dead leader's leadership epoch at the time of failover (the epoch the successor must exceed).
+    pub dead_leader_epoch: LeaderEpoch,
+    /// The successor's NEW leadership epoch, assigned by the failover re-placement. It MUST strictly
+    /// exceed `dead_leader_epoch` so a stale/returning old leader is fenced (KIP-101): the old leader
+    /// can no longer ack or serve as leader once a higher epoch exists.
+    pub successor_epoch: LeaderEpoch,
+}
+
+/// CI5 — a leaderless-node failover NEVER loses a committed record and ALWAYS fences the old leader.
+///
+/// When a leader dies, the successor leader (promoted from the surviving replicas) must, by
+/// construction:
+///
+/// 1. be an ISR member (`successor_in_isr`) — the set that holds every quorum-fsync'd record; promoting
+///    a non-ISR replica risks losing acknowledged data (the #614 Jepsen failure, at failover time);
+/// 2. hold every committed offset (`successor_durable_prefix >= committed_hw`) — its log covers every
+///    record that was quorum-acked before the death, so no acknowledged record is lost on promotion
+///    (the data-plane analogue of CI1 across a leadership change); and
+/// 3. carry a strictly higher leadership epoch (`successor_epoch > dead_leader_epoch`) — so the old
+///    leader is fenced (KIP-101): it can no longer ack or serve as leader once the higher epoch exists.
+///
+/// The checks are ordered most-fundamental-first (ISR membership → committed completeness → epoch
+/// fence), so a violated failover is always explained by its first failure. A clean failover (an ISR
+/// successor, complete to the committed HW, with a bumped epoch) passes.
+///
+/// # Errors
+/// - [`ClusterInvariantViolation::FailoverPromotedNonIsr`] if the successor was not in the ISR;
+/// - [`ClusterInvariantViolation::FailoverLostCommitted`] if the successor's durable prefix is behind
+///   the committed HW (so it is missing a quorum-acked offset — the FIRST such offset is reported);
+/// - [`ClusterInvariantViolation::FailoverEpochNotFenced`] if the successor's epoch does not strictly
+///   exceed the dead leader's (so the old leader is not fenced).
+pub fn check_failover_preserves_committed(
+    failover: &Failover,
+) -> Result<(), ClusterInvariantViolation> {
+    // (1) The successor MUST be an ISR member — only the ISR is guaranteed to hold every committed
+    // record. A non-ISR successor is the Jepsen failure (a replica that "managed to become leader
+    // despite its [incomplete] state"), here at failover time.
+    if !failover.successor_in_isr {
+        return Err(ClusterInvariantViolation::FailoverPromotedNonIsr {
+            successor: failover.successor,
+        });
+    }
+    // (2) The successor MUST hold every quorum-acked-before-death offset. If its durable prefix is
+    // behind the committed HW it is missing a committed record; report the FIRST missing offset (the
+    // first offset at or above its durable prefix that is still below the committed HW).
+    if failover.successor_durable_prefix < failover.committed_hw {
+        return Err(ClusterInvariantViolation::FailoverLostCommitted {
+            successor: failover.successor,
+            offset: failover.successor_durable_prefix,
+        });
+    }
+    // (3) The failover MUST bump the epoch so the dead leader is fenced (KIP-101). A successor epoch
+    // that does not strictly exceed the dead leader's leaves the old leader able to ack/serve.
+    if failover.successor_epoch <= failover.dead_leader_epoch {
+        return Err(ClusterInvariantViolation::FailoverEpochNotFenced {
+            dead_epoch: failover.dead_leader_epoch,
+            successor_epoch: failover.successor_epoch,
+        });
     }
     Ok(())
 }
@@ -732,6 +877,96 @@ mod tests {
                 current: epoch(5),
                 offending: epoch(9),
             })
+        );
+    }
+
+    // ----- CI5: leaderless-node failover preserves committed data + fences the old leader -----
+
+    fn failover(
+        successor: u64,
+        in_isr: bool,
+        durable: u64,
+        hw: u64,
+        dead_e: u64,
+        succ_e: u64,
+    ) -> Failover {
+        Failover {
+            dead_leader: 1,
+            successor,
+            successor_in_isr: in_isr,
+            successor_durable_prefix: durable,
+            committed_hw: hw,
+            dead_leader_epoch: epoch(dead_e),
+            successor_epoch: epoch(succ_e),
+        }
+    }
+
+    #[test]
+    fn ci5_passes_for_an_isr_successor_complete_to_hw_with_a_bumped_epoch() {
+        // The successor was in the ISR, holds every committed offset (durable 100 >= HW 100), and its
+        // epoch (6) strictly exceeds the dead leader's (5): a clean, committed-data-preserving,
+        // old-leader-fencing failover.
+        check_failover_preserves_committed(&failover(2, true, 100, 100, 5, 6)).unwrap();
+        // A successor AHEAD of the HW (it held an uncommitted suffix too) is still complete => passes.
+        check_failover_preserves_committed(&failover(2, true, 150, 100, 5, 6)).unwrap();
+    }
+
+    #[test]
+    fn ci5_negative_fixture_a_successor_missing_a_committed_offset_loses_data() {
+        // The successor's durable prefix (80) is BEHIND the committed HW (100): offsets 80..100 were
+        // quorum-acked before the death but the successor does NOT hold them — promoting it loses
+        // acknowledged data. CI5 reports the FIRST missing offset (80).
+        assert_eq!(
+            check_failover_preserves_committed(&failover(2, true, 80, 100, 5, 6)),
+            Err(ClusterInvariantViolation::FailoverLostCommitted {
+                successor: 2,
+                offset: 80,
+            })
+        );
+    }
+
+    #[test]
+    fn ci5_negative_fixture_a_failover_that_does_not_bump_the_epoch_does_not_fence_the_old_leader()
+    {
+        // The successor is complete, but its epoch (5) equals the dead leader's (5): the old leader is
+        // NOT fenced — a stale/returning old leader at epoch 5 could still ack/serve. A failover MUST
+        // strictly bump the epoch.
+        assert_eq!(
+            check_failover_preserves_committed(&failover(2, true, 100, 100, 5, 5)),
+            Err(ClusterInvariantViolation::FailoverEpochNotFenced {
+                dead_epoch: epoch(5),
+                successor_epoch: epoch(5),
+            })
+        );
+        // An epoch that goes BACKWARD is even worse — still reported as unfenced.
+        assert_eq!(
+            check_failover_preserves_committed(&failover(2, true, 100, 100, 5, 4)),
+            Err(ClusterInvariantViolation::FailoverEpochNotFenced {
+                dead_epoch: epoch(5),
+                successor_epoch: epoch(4),
+            })
+        );
+    }
+
+    #[test]
+    fn ci5_negative_fixture_promoting_a_non_isr_replica_is_a_violation() {
+        // The successor was NOT in the ISR: it may be missing committed records (it lagged out / was
+        // never caught up). Promoting it is the Jepsen failure at failover time, regardless of the
+        // (possibly stale) durable-prefix number it reports.
+        assert_eq!(
+            check_failover_preserves_committed(&failover(3, false, 100, 100, 5, 6)),
+            Err(ClusterInvariantViolation::FailoverPromotedNonIsr { successor: 3 })
+        );
+    }
+
+    #[test]
+    fn ci5_checks_are_ordered_most_fundamental_first() {
+        // A failover that violates ALL THREE (non-ISR, behind HW, no epoch bump) is reported by its
+        // most fundamental failure first: NOT-IN-ISR. This keeps the verdict deterministic + the most
+        // load-bearing exclusion surfaced.
+        assert_eq!(
+            check_failover_preserves_committed(&failover(3, false, 50, 100, 5, 5)),
+            Err(ClusterInvariantViolation::FailoverPromotedNonIsr { successor: 3 })
         );
     }
 

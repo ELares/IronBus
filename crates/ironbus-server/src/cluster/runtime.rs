@@ -144,6 +144,20 @@ pub struct ClusterStatus {
     /// the DATA-plane serve path can derive its per-partition role from the committed metadata without
     /// touching the `RawNode`. Empty until a placement command commits + applies on this node.
     pub placements: BTreeMap<u64, Placement>,
+    /// The set of node ids that LEFT the committed cluster membership (the durable raft `ConfState`)
+    /// since the cluster formed — the leaderless-FAILOVER (#618) detection signal. A node is in this set
+    /// once a committed joint-consensus membership change (a graceful leave / admin remove) has dropped
+    /// it from the voter+learner set. The data-plane FAILOVER driver reads this together with
+    /// [`Self::placements`]: for every partition a departed node LED, the metadata leader proposes a
+    /// re-placement promoting an in-sync survivor (the #618 [`reassign_leadership`]). Monotonic: a node
+    /// that left stays listed (it can rejoin as a fresh add).
+    ///
+    /// FLAGGED — this is the CLEAN, committed leave signal (no timing assumption). A node that CRASHES
+    /// without a membership change stays a voter in the `ConfState` (raft does not auto-evict it), so
+    /// crash-failover additionally needs a peer-liveness/heartbeat death-detector that PROPOSES the
+    /// membership removal on a timeout; that detector (and its timing bound) is the remaining wiring,
+    /// deliberately separated so this signal carries no timing assumption.
+    pub departed_members: std::collections::BTreeSet<u64>,
 }
 
 /// A command for the driver to propose to the metadata group on behalf of the broker (or a test):
@@ -546,6 +560,83 @@ impl MetadataProposer {
     }
 }
 
+/// The partitions a `node` currently LEADS, from a committed `placements` snapshot — the partitions a
+/// leaderless-FAILOVER (#618) must re-place when `node` departs. Pure, deterministic (sorted by id).
+#[must_use]
+pub fn partitions_led_by(
+    placements: &BTreeMap<u64, Placement>,
+    node: u64,
+) -> Vec<(u64, Placement)> {
+    placements
+        .iter()
+        .filter(|(_, p)| p.leader == node)
+        .map(|(&id, p)| (id, p.clone()))
+        .collect()
+}
+
+/// Plan the leaderless-node FAILOVER re-placements for a set of `departed` nodes against a committed
+/// `placements` snapshot (#618). For every partition a departed node LED, this consults the #618
+/// [`reassign_leadership`](crate::cluster::placement::reassign_leadership) policy — which chooses a
+/// successor ONLY from the in-sync, complete SURVIVORS (the ISR) — and collects the committable
+/// [`MetadataCommand::PlacePartition`] that promotes it (one entry per re-placed partition).
+///
+/// `survivor_states` is the ISR-AWARE projection the caller supplies: given a partition id and the
+/// surviving replica ids, it returns each survivor's [`PlacementNode`](ironbus_core::placement::PlacementNode)
+/// (its in-ISR flag + durable frontier + divergence). The data-plane FAILOVER driver fills this from the
+/// live ISR / replica-log frontiers (the metadata plane does not itself hold ISR state — keeping the
+/// decision ISR-aware is exactly why the caller, which DOES, supplies it). `committed_hw_for` gives each
+/// partition's cluster-known committed high-watermark the successor must be complete to.
+///
+/// Returns the proposals to commit through the metadata raft (via [`MetadataProposer::propose`]), so
+/// every node converges on the same new placements. A partition with NO eligible survivor yields NO
+/// proposal (fail-closed — it is left leaderless until a survivor catches up, never promoting an
+/// incomplete replica that would lose committed data).
+///
+/// Pure + deterministic + IO-free: it reads no wall clock and the choice is the pure
+/// [`reassign_leadership`](crate::cluster::placement::reassign_leadership) policy.
+#[must_use]
+pub fn plan_failovers<S, H>(
+    placements: &BTreeMap<u64, Placement>,
+    departed: &std::collections::BTreeSet<u64>,
+    mut survivor_states: S,
+    mut committed_hw_for: H,
+    leader_load: &ironbus_core::placement::LeaderLoad,
+) -> Vec<MetadataCommand>
+where
+    S: FnMut(u64, &[u64]) -> Vec<ironbus_core::placement::PlacementNode>,
+    H: FnMut(u64) -> u64,
+{
+    let mut proposals = Vec::new();
+    for &dead in departed {
+        for (partition, placement) in partitions_led_by(placements, dead) {
+            let survivors: Vec<u64> = placement
+                .replicas
+                .iter()
+                .copied()
+                .filter(|&n| n != dead)
+                .collect();
+            let states = survivor_states(partition, &survivors);
+            let committed_hw = committed_hw_for(partition);
+            if let crate::cluster::placement::FailoverOutcome::Promoted { command, .. } =
+                crate::cluster::placement::reassign_leadership(
+                    partition,
+                    dead,
+                    &placement.replicas,
+                    placement.epoch,
+                    placement.epoch,
+                    &states,
+                    committed_hw,
+                    leader_load,
+                )
+            {
+                proposals.push(command);
+            }
+            // No eligible survivor => no proposal (fail-closed; left leaderless until one catches up).
+        }
+    }
+    proposals
+}
+
 /// The driver loop: OWNS the metadata group and is the only thread that touches the `RawNode`.
 ///
 /// On a fixed cadence it (1) advances the election/heartbeat timer with `tick`, (2) drains every
@@ -580,6 +671,11 @@ fn run_driver<F, C>(
     // The membership view last published to the registry, so we only re-lock + rewrite it when the
     // committed `ConfState` actually changes (a committed membership change), not every cycle.
     let mut last_members: Vec<u64> = Vec::new();
+    // Every node id ever seen in the committed membership, so a node that LEAVES (dropped from a later
+    // `ConfState`) can be detected as departed = (ever-seen) - (currently-present). The #618 failover
+    // detection signal; published in the status snapshot for the data-plane failover driver.
+    let mut ever_seen_members: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let mut departed_members: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     // The durable `ConfState` voter count, refreshed each cycle below and published as the status
     // `voter_count`. This is the cluster's AGREED voter set (the seeded-then-replicated raft
     // `ConfState`), not the state machine's apply-driven membership table — the latter is empty on a
@@ -640,6 +736,11 @@ fn run_driver<F, C>(
                 if let Ok(mut reg) = registry.lock() {
                     *reg = PeerRegistry::from_members(cs.get_voters(), cs.get_learners());
                 }
+                // Update the failover detection signal: any node ever seen but now ABSENT has departed.
+                // (The set only grows / shifts on a real committed membership change, not every cycle.)
+                ever_seen_members.extend(members.iter().copied());
+                let present: std::collections::BTreeSet<u64> = members.iter().copied().collect();
+                departed_members = ever_seen_members.difference(&present).copied().collect();
                 last_members = members;
             }
         }
@@ -659,6 +760,12 @@ fn run_driver<F, C>(
                 s.placements = group.state().placements();
             }
             s.applied_index = applied;
+            // Publish the leaderless-failover detection signal (the departed-members set), so the
+            // data-plane failover driver can re-place every partition a departed node led (#618). Only
+            // re-cloned when it actually changed (a committed membership shrink), not every tick.
+            if s.departed_members != departed_members {
+                s.departed_members.clone_from(&departed_members);
+            }
         }
     }
 }
@@ -850,6 +957,162 @@ fn run_reader(
                 return;
             }
         }
+    }
+}
+
+// Pure, platform-agnostic tests for the #618 leaderless-failover DETECTION + PLANNING helpers
+// (`partitions_led_by` / `plan_failovers`). They touch no filesystem / socket, so they are NOT
+// unix-gated (unlike the StdFs runtime tests below) and run on every platform.
+#[cfg(test)]
+mod failover_planning_tests {
+    use super::*;
+    use ironbus_core::placement::{LeaderLoad, PlacementNode};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn placements(entries: &[(u64, Vec<u64>, u64, u64)]) -> BTreeMap<u64, Placement> {
+        entries
+            .iter()
+            .map(|(p, replicas, leader, epoch)| {
+                (
+                    *p,
+                    Placement {
+                        replicas: replicas.clone(),
+                        leader: *leader,
+                        epoch: *epoch,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn partitions_led_by_finds_exactly_the_dead_leaders_partitions() {
+        // Node 1 leads partitions 0 + 2; node 2 leads partition 1. When node 1 departs, partitions 0 + 2
+        // are the ones to re-place.
+        let pl = placements(&[
+            (0, vec![1, 2, 3], 1, 5),
+            (1, vec![1, 2, 3], 2, 5),
+            (2, vec![1, 2, 3], 1, 5),
+        ]);
+        let led = partitions_led_by(&pl, 1);
+        let ids: Vec<u64> = led.iter().map(|(p, _)| *p).collect();
+        assert_eq!(
+            ids,
+            vec![0, 2],
+            "exactly the partitions node 1 leads, sorted"
+        );
+        assert!(
+            partitions_led_by(&pl, 3).is_empty(),
+            "a non-leader leads nothing"
+        );
+    }
+
+    #[test]
+    fn plan_failovers_proposes_one_isr_promotion_per_partition_the_dead_node_led() {
+        // Node 1 (leading partitions 0 + 2) departs. Survivors 2 + 3 are in-sync + complete. The plan
+        // proposes ONE PlacePartition per partition, each promoting an in-sync survivor at a bumped epoch
+        // over the surviving replica set — and NONE for partition 1 (which node 1 did not lead).
+        let pl = placements(&[
+            (0, vec![1, 2, 3], 1, 5),
+            (1, vec![1, 2, 3], 2, 5),
+            (2, vec![1, 2, 3], 1, 7),
+        ]);
+        let departed: BTreeSet<u64> = [1u64].into_iter().collect();
+        let proposals = plan_failovers(
+            &pl,
+            &departed,
+            // ISR-aware survivor states: both survivors are healthy + complete to HW 100.
+            |_partition, survivors| {
+                survivors
+                    .iter()
+                    .map(|&n| PlacementNode::healthy(n, 100))
+                    .collect()
+            },
+            |_partition| 100,
+            &LeaderLoad::new(),
+        );
+        assert_eq!(
+            proposals.len(),
+            2,
+            "one proposal per partition the dead node led (0 + 2)"
+        );
+        for cmd in &proposals {
+            match cmd {
+                MetadataCommand::PlacePartition {
+                    partition,
+                    replicas,
+                    leader,
+                    epoch,
+                } => {
+                    assert!(*partition == 0 || *partition == 2);
+                    assert_eq!(
+                        replicas,
+                        &vec![2, 3],
+                        "the dead leader is dropped from the replica set"
+                    );
+                    assert_ne!(*leader, 1, "the dead leader is never re-chosen");
+                    assert!(
+                        replicas.contains(leader),
+                        "the new leader is one of the survivors"
+                    );
+                    // Partition 0 was at epoch 5 => fenced to 6; partition 2 at epoch 7 => fenced to 8.
+                    let expected = if *partition == 0 { 6 } else { 8 };
+                    assert_eq!(
+                        *epoch, expected,
+                        "the epoch is bumped strictly above the dead leader's"
+                    );
+                }
+                other => panic!("expected PlacePartition, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn plan_failovers_proposes_nothing_when_no_survivor_is_in_sync() {
+        // Node 1 departs, but the only survivor (node 2) is OUT of the ISR (it lagged out). There is no
+        // eligible successor => NO proposal (fail-closed: the partition is left leaderless rather than
+        // promoting an incomplete replica that would lose committed data).
+        let pl = placements(&[(0, vec![1, 2], 1, 5)]);
+        let departed: BTreeSet<u64> = [1u64].into_iter().collect();
+        let proposals = plan_failovers(
+            &pl,
+            &departed,
+            |_p, survivors| {
+                survivors
+                    .iter()
+                    .map(|&n| {
+                        let mut node = PlacementNode::healthy(n, 100);
+                        node.in_isr = false; // out of the ISR => ineligible
+                        node
+                    })
+                    .collect()
+            },
+            |_p| 100,
+            &LeaderLoad::new(),
+        );
+        assert!(
+            proposals.is_empty(),
+            "no in-sync survivor => no failover proposal (fail-closed, never promote an incomplete replica)"
+        );
+    }
+
+    #[test]
+    fn plan_failovers_is_empty_when_no_node_departed() {
+        // A steady cluster (no departures) plans NO failover — the no-false-failover property.
+        let pl = placements(&[(0, vec![1, 2, 3], 1, 5)]);
+        let proposals = plan_failovers(
+            &pl,
+            &BTreeSet::new(),
+            |_p, survivors| {
+                survivors
+                    .iter()
+                    .map(|&n| PlacementNode::healthy(n, 100))
+                    .collect()
+            },
+            |_p| 100,
+            &LeaderLoad::new(),
+        );
+        assert!(proposals.is_empty(), "no departure => no failover");
     }
 }
 

@@ -719,6 +719,17 @@ impl<F: Filesystem, C: Clock> Follower<F, C> {
         &self.log
     }
 
+    /// CONSUME the follower and return its underlying [`Log`] — the #618 leaderless-FAILOVER promotion
+    /// seam. When this node is promoted from FOLLOWER to LEADER for the partition, it must serve the
+    /// SAME committed log it already holds (no data move): the controller takes the owned log out of the
+    /// follower role and builds the leader's read plane over it. The single-writer invariant is
+    /// preserved — the follower's own writer is dropped here, and the promoted leader's append actor
+    /// becomes the sole writer.
+    #[must_use]
+    pub fn into_log(self) -> Log<F, C> {
+        self.log
+    }
+
     /// Borrow the follower's underlying log MUTABLY — for the C4 self-heal path
     /// ([`crate::cluster::divergence`]), which truncates a detected-divergent suffix via the bounded,
     /// reported [`Log::truncate_to`] before re-fetching the clean bytes from the quorum. The C4 resync
@@ -909,6 +920,16 @@ impl<F: Filesystem, C: Clock> EpochAwareFollower<F, C> {
     #[must_use]
     pub fn epochs(&self) -> &EpochCache {
         &self.epochs
+    }
+
+    /// CONSUME the epoch-aware follower and return its wrapped [`Follower`] + its learned
+    /// [`EpochCache`] — the #618 leaderless-FAILOVER promotion seam. On promotion to LEADER the
+    /// controller takes both: the follower's owned log (via [`Follower::into_log`]) becomes the leader's
+    /// served log (no data move), and the learned epoch history seeds the leader's epoch cache so the
+    /// leader can answer `OffsetForLeaderEpoch` and the new (bumped) epoch boundary fences the old leader.
+    #[must_use]
+    pub fn into_parts(self) -> (Follower<F, C>, EpochCache) {
+        (self.follower, self.epochs)
     }
 
     /// Records that the records the follower is replicating FROM `start_offset` were appended under

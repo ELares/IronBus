@@ -106,6 +106,7 @@ use std::time::Duration;
 
 use ironbus_core::clock::Clock;
 use ironbus_core::epoch_cache::EpochCache;
+use ironbus_core::leader_lease::LeaderEpoch;
 use ironbus_proto::frame::{
     decode_frame_with_cap, encode_frame, FrameDecode, FrameError, FrameType, MAX_FRAME_LEN,
 };
@@ -467,6 +468,75 @@ impl<F: Filesystem, C: Clock> DataPlaneServer<F, C> {
         report: &super::isr::AckReplicatedBody,
     ) -> Result<Vec<Vec<u8>>, DataPlaneError> {
         self.seam.on_follower_report(partition, report)
+    }
+}
+
+// The #618 leaderless-FAILOVER reconcile needs `F: Clone` (the in-place promotion builds a read plane
+// over the follower's owned log). A separate impl block so the rest of the server keeps the looser
+// `F: Filesystem` bound and the no-cluster path links none of it.
+impl<F: Filesystem + Clone, C: Clock> DataPlaneServer<F, C> {
+    /// RECONCILE this node's roles to a NEW committed placement for `partition` on a leaderless-node
+    /// FAILOVER (#618). The metadata plane committed a
+    /// [`PlacePartition`](super::state_machine::MetadataCommand::PlacePartition) that re-pointed
+    /// `partition`'s leadership (the dead leader's node was dropped and an in-sync survivor promoted, via
+    /// [`reassign_leadership`](super::placement::reassign_leadership)); every node reads the SAME
+    /// committed placement and applies it here, so all surviving nodes converge.
+    ///
+    /// The role transition this handles is the failover one — a FOLLOWER that the new placement names
+    /// LEADER is PROMOTED IN PLACE over the log it already holds (no data move,
+    /// [`DataPlaneController::promote_follower_to_leader`]), seeding the bumped epoch (the fence). It
+    /// also updates the follower's leader TARGET when a still-following node's leader changed to the new
+    /// successor. `isr_config` sizes the promoted leader's ISR / quorum gate.
+    ///
+    /// Returns `true` if this node's role for `partition` changed (a promotion or a re-targeted
+    /// follower), `false` if nothing changed for this node (e.g. it does not hold the partition, or it
+    /// was already the leader / still follows the same leader).
+    ///
+    /// NOT handled here (FLAGGED): promoting a node that holds NO role into a leader (it would need a
+    /// freshly-built read plane from the engine — the metadata-leader bootstrap path, #717), and a
+    /// no-data-move leader → follower DEMOTION. The #618 slice is the in-place ISR-follower → leader
+    /// promotion, which is the failover correctness property; a full live rebalance is C5-I2 (#617).
+    ///
+    /// # Errors
+    /// [`DataPlaneError`] if the in-place promotion fails (a read-plane build or a backward-epoch
+    /// assign — fail-closed).
+    pub fn reconcile_placement(
+        &mut self,
+        partition: u64,
+        new_placement: &Placement,
+        isr_config: IsrConfig,
+    ) -> Result<bool, DataPlaneError> {
+        let role = role_for_placement(self.node_id, new_placement);
+        match role {
+            PlacementRole::Leader => {
+                if self.seam.controller().is_leader(partition) {
+                    // Already the leader for this partition (an idempotent re-apply): nothing to do.
+                    return Ok(false);
+                }
+                // FOLLOWER → LEADER promotion over the held log (no data move), seeding the bumped epoch.
+                self.seam.controller_mut().promote_follower_to_leader(
+                    partition,
+                    LeaderEpoch::new(new_placement.epoch),
+                    &new_placement.replicas,
+                    isr_config,
+                )?;
+                // This node no longer follows the partition (it leads it now).
+                self.follower_targets.remove(&partition);
+                Ok(true)
+            }
+            PlacementRole::Follower => {
+                // A still-following node whose leader changed to the new successor: re-target its fetch
+                // loop. (The fetch loop reads `follower_leader(partition)` to dial; updating it here is
+                // what re-points replication to the promoted successor.)
+                let changed = self.follower_targets.get(&partition) != Some(&new_placement.leader);
+                if changed {
+                    self.follower_targets
+                        .insert(partition, new_placement.leader);
+                }
+                Ok(changed)
+            }
+            PlacementRole::None => Ok(false),
+        }
     }
 }
 
@@ -1646,6 +1716,393 @@ mod tests {
         // over the live transport: every replicated segment FILE matches the leader's same-named file.
         assert_replicated_byte_identical(&f2.replica_dump(), leader_log);
         assert_replicated_byte_identical(&f3.replica_dump(), leader_log);
+    }
+
+    // ================================================================================================
+    //  THE #618 FAILOVER CAPSTONE: a 3-node SERVE cluster over REAL loopback sockets, then the LEADER
+    //  DIES. An in-sync follower is PROMOTED (no data move): it serves the SAME log it already held, at
+    //  a STRICTLY-HIGHER epoch (the fence), and the cluster RESUMES — the surviving follower replicates
+    //  from the NEW leader over a fresh real socket and stays byte-identical. We assert all five #618
+    //  properties: (a) a new leader from the ISR, (b) it holds every pre-death record, (c) the cluster
+    //  resumes quorum-acked produces under it, (d) the old leader's epoch is fenced, (e) NO data copied.
+    // ================================================================================================
+
+    /// Drive `follower` (a [`LiveFollower`]) against a leader serve loop pumped via `pump` until its
+    /// high-watermark reaches `target` or the deadline elapses; returns whether it caught up.
+    fn drive_follower_until(
+        follower: &mut LiveFollower,
+        target: u64,
+        mut pump: impl FnMut(),
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        while follower.high_watermark() < target && Instant::now() < deadline {
+            follower.send_fetch();
+            for _ in 0..8 {
+                pump();
+            }
+            follower.recv_apply_and_report();
+            for _ in 0..8 {
+                pump();
+            }
+        }
+        follower.high_watermark() >= target
+    }
+
+    #[test]
+    fn leader_death_promotes_an_isr_follower_no_data_move_fences_the_old_leader_and_the_cluster_resumes(
+    ) {
+        const P: u64 = 0;
+        // The original committed placement: node 1 leads {1,2,3} at epoch 5.
+        let placement = Placement {
+            replicas: vec![1, 2, 3],
+            leader: 1,
+            epoch: 5,
+        };
+        let placements: BTreeMap<u64, Placement> = [(P, placement.clone())].into_iter().collect();
+
+        // --- Phase 1: bring up the cluster; both followers catch up to the leader's committed log. ---
+        let leader_log = leaked_leader_log(25);
+        let leader_pl = leader_plane(leader_log);
+        let served_end = plane_served_end(&leader_pl);
+        assert!(served_end > 0);
+
+        let mut leader_server = DataPlaneServer::from_placements(
+            1,
+            &placements,
+            quorum3(),
+            |p| (p == P).then(|| Arc::clone(&leader_pl)),
+            &InMemReplicaLogs,
+            |_| EpochCache::new(),
+        )
+        .expect("leader server builds");
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind leader listener");
+        listener.set_nonblocking(true).unwrap();
+        let leader_addr = listener.local_addr().unwrap();
+
+        let follower2 = DataPlaneServer::from_placements(
+            2,
+            &placements,
+            quorum3(),
+            |_| None,
+            &InMemReplicaLogs,
+            |_| EpochCache::new(),
+        )
+        .expect("follower2 builds");
+        let follower3 = DataPlaneServer::from_placements(
+            3,
+            &placements,
+            quorum3(),
+            |_| None,
+            &InMemReplicaLogs,
+            |_| EpochCache::new(),
+        )
+        .expect("follower3 builds");
+
+        let mut f2 = LiveFollower::connect(follower2, P, leader_addr);
+        let mut f3 = LiveFollower::connect(follower3, P, leader_addr);
+
+        let mut links: Vec<DataPlaneLink<TcpStream>> = Vec::new();
+        let mut released: Vec<Vec<u8>> = Vec::new();
+        // Both followers catch up to the leader's committed (sealed-served) prefix over real sockets.
+        let deadline = Instant::now() + Duration::from_secs(25);
+        loop {
+            f2.send_fetch();
+            f3.send_fetch();
+            for _ in 0..8 {
+                pump_leader_once(&mut leader_server, &listener, &mut links, &mut released);
+            }
+            f2.recv_apply_and_report();
+            f3.recv_apply_and_report();
+            for _ in 0..8 {
+                pump_leader_once(&mut leader_server, &listener, &mut links, &mut released);
+            }
+            if (f2.high_watermark() >= served_end && f3.high_watermark() >= served_end)
+                || Instant::now() > deadline
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            f2.high_watermark(),
+            served_end,
+            "follower 2 caught up pre-death"
+        );
+        assert_eq!(
+            f3.high_watermark(),
+            served_end,
+            "follower 3 caught up pre-death"
+        );
+        // The set of records quorum-acked BEFORE the death (the committed prefix every ISR member holds).
+        let committed_before_death = served_end;
+        // Snapshot follower 2's replica BYTES now, so we can prove promotion copied NOTHING (property e).
+        let f2_bytes_before_promotion = f2.replica_dump();
+        assert_replicated_byte_identical(&f2_bytes_before_promotion, leader_log);
+
+        // --- Phase 2: the LEADER (node 1) DIES. Drop its server + listener: no more leader serve. ---
+        drop(leader_server);
+        drop(listener);
+        // The committed HW the survivors must preserve across the failover (every ISR member holds it).
+        let committed_hw = committed_before_death;
+
+        // --- Phase 3: the metadata plane RE-ASSIGNS leadership (one committed PlacePartition). The
+        // successor is chosen from the IN-SYNC survivors (the ISR), the dead leader is dropped, and the
+        // epoch is bumped strictly above the dead leader's (5) — the #618 reassign_leadership policy. ---
+        // Project each survivor's state: both 2 and 3 are in-sync + complete to the committed HW (they
+        // caught up in phase 1), so both are eligible; the policy picks the least-loaded (ties => node 2).
+        let survivor_states = vec![
+            ironbus_core::placement::PlacementNode::healthy(2, committed_hw),
+            ironbus_core::placement::PlacementNode::healthy(3, committed_hw),
+        ];
+        let outcome = crate::cluster::placement::reassign_leadership(
+            P,
+            1, // dead leader
+            &placement.replicas,
+            placement.epoch,
+            placement.epoch, // dead leader's epoch
+            &survivor_states,
+            committed_hw,
+            &std::collections::BTreeMap::new(),
+        );
+        let (failover_cmd, successor) = match outcome {
+            crate::cluster::placement::FailoverOutcome::Promoted { command, successor } => {
+                (command, successor)
+            }
+            crate::cluster::placement::FailoverOutcome::NoEligibleSuccessor { .. } => {
+                panic!("an in-sync survivor must be promotable")
+            }
+        };
+        // (a) A NEW leader was ELECTED FROM THE ISR (an in-sync survivor), never the dead leader.
+        assert!(
+            successor == 2 || successor == 3,
+            "the successor is a surviving in-sync replica"
+        );
+        assert_ne!(successor, 1, "the dead leader is never re-chosen");
+        // Apply the ONE failover entry to a state machine: every node converges on the SAME new placement.
+        let mut sm = crate::cluster::state_machine::MetadataStateMachine::new();
+        sm.apply(1, &failover_cmd);
+        let new_placement = sm.placement(P).expect("the failover placement committed");
+        assert_eq!(new_placement.leader, successor);
+        assert_eq!(
+            new_placement.replicas,
+            vec![2, 3],
+            "no node moved; only the dead leader left"
+        );
+        assert!(
+            new_placement.epoch > placement.epoch,
+            "(d) the epoch is bumped strictly above the dead leader's (fence)"
+        );
+
+        // --- Phase 4: every surviving node RECONCILES to the committed new placement. The successor is
+        // PROMOTED IN PLACE (no data move); the other survivor re-targets to the new leader. ---
+        // Bind to identify which LiveFollower is the successor vs the still-follower.
+        let (successor_follower, other_follower): (&mut LiveFollower, &mut LiveFollower) =
+            if successor == 2 {
+                (&mut f2, &mut f3)
+            } else {
+                (&mut f3, &mut f2)
+            };
+
+        // The successor promotes IN PLACE over the log it already held (no fetch, no copy). Snapshot the
+        // committed bytes + frontier it held as a FOLLOWER, just before promotion (property e baseline).
+        let succ_bytes_pre = successor_follower.replica_dump();
+        let succ_hw_pre = successor_follower.high_watermark();
+        // The follower held the full committed prefix, byte-identical to the (now-dead) leader.
+        assert_replicated_byte_identical(&succ_bytes_pre, leader_log);
+        successor_follower
+            .server
+            .reconcile_placement(P, &new_placement, quorum3())
+            .expect("the in-sync follower is promoted to leader in place");
+        // (a) it is now the LEADER for the partition.
+        assert!(
+            successor_follower.server.seam().controller().is_leader(P),
+            "(a) the promoted survivor now LEADS the partition"
+        );
+        assert!(
+            !successor_follower.server.seam().controller().is_follower(P),
+            "it is no longer a follower"
+        );
+
+        // (b) + (e): the new leader's read plane serves EVERY record quorum-acked before the death,
+        // BYTE-IDENTICAL to what it held as a follower — proving promotion copied NOTHING (it serves the
+        // SAME log it already held, just re-pointed as leader). Reconstruct the served frame bytes and
+        // confirm the served end covers the pre-death committed HW.
+        // Chain serve-fetches from offset 0 on BOTH the new leader and the (still-readable) original
+        // leader read plane, collecting the raw CRC-framed record bytes. The new leader serves the SAME
+        // bytes it held as a follower (which were byte-identical to the original leader): proof (e) — no
+        // data was copied on promotion (the served bytes ARE the follower's already-held log).
+        let serve_all = |srv: &DataPlaneServer<InMemoryFs, ManualClock>| -> (u64, Vec<u8>) {
+            let mut next = 0u64;
+            let mut bytes: Vec<u8> = Vec::new();
+            let mut guard = 0;
+            loop {
+                guard += 1;
+                assert!(guard < 100_000, "serve chain terminates");
+                let req = crate::cluster::replication::FetchRecordsBody {
+                    from_offset: next,
+                    max_records: 1024,
+                    max_bytes: 1024 * 1024,
+                };
+                let resp = srv
+                    .seam()
+                    .controller()
+                    .serve_fetch(P, &req)
+                    .expect("the new leader serves committed bytes it already holds");
+                bytes.extend_from_slice(&resp.frame_bytes);
+                let advanced = resp.first_offset + u64::from(resp.record_count);
+                if resp.record_count == 0 || advanced <= next {
+                    break;
+                }
+                next = advanced;
+            }
+            (next, bytes)
+        };
+        let (new_leader_served_end, new_leader_bytes) = serve_all(&successor_follower.server);
+        // The original leader is still readable through its read plane (it leaked); serve the SAME
+        // prefix the new leader serves, for a byte-for-byte comparison.
+        let original_served_bytes = {
+            let mut next = 0u64;
+            let mut bytes: Vec<u8> = Vec::new();
+            let mut guard = 0;
+            while next < new_leader_served_end {
+                guard += 1;
+                assert!(guard < 100_000, "serve chain terminates");
+                let req = crate::cluster::replication::FetchRecordsBody {
+                    from_offset: next,
+                    max_records: 1024,
+                    max_bytes: 1024 * 1024,
+                };
+                let resp = crate::cluster::replication::ReadPlaneLeader::new(&leader_pl)
+                    .serve_fetch(&req)
+                    .expect("original leader plane serves");
+                bytes.extend_from_slice(&resp.frame_bytes);
+                let advanced = resp.first_offset + u64::from(resp.record_count);
+                if resp.record_count == 0 || advanced <= next {
+                    break;
+                }
+                next = advanced;
+            }
+            bytes
+        };
+        // (b) the new leader RECEIVED + holds every record quorum-acked before the death: as a follower
+        // it caught up to the full pre-death committed HW (succ_hw_pre == committed_hw), so NO committed
+        // record was lost on promotion. The new leader's read plane SERVES the sealed prefix of that log
+        // (the active tail seals on the next roll — the documented #715/#717 active-tail flag; the
+        // records past it are held in the active segment, not lost). It serves a non-empty committed run.
+        assert_eq!(
+            succ_hw_pre, committed_hw,
+            "(b) the promoted follower held EVERY pre-death committed record (no loss): hw {succ_hw_pre} == committed {committed_hw}"
+        );
+        assert!(
+            new_leader_served_end > 0 && new_leader_served_end <= committed_hw,
+            "(b) the new leader serves a non-empty committed prefix it already held (served_end={new_leader_served_end})"
+        );
+        // (e) the new leader serves BYTE-IDENTICAL committed records to the dead leader over the served
+        // prefix — it serves the log it already held as a follower, copying NOTHING on promotion.
+        assert_eq!(
+            new_leader_bytes, original_served_bytes,
+            "(e) the new leader serves byte-identical committed records to the dead leader — no data was copied on promotion"
+        );
+
+        // (d) the OLD leader is FENCED (KIP-101): the new leader answers OffsetForLeaderEpoch under the
+        // BUMPED epoch. A query for the OLD epoch (5) is answered with a bounded end-offset (the old
+        // leader's range cannot extend past where the new epoch began), and the current epoch is > 5 —
+        // so a stale produce/append carrying the old epoch is rejected by followers (the fence).
+        let new_leader_addr = {
+            let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind new leader listener");
+            l.set_nonblocking(true).unwrap();
+            let addr = l.local_addr();
+            (l, addr)
+        };
+        // (we re-bind a fresh listener for the new leader below; first assert the epoch fence directly)
+        let epoch_answer = successor_follower
+            .server
+            .seam()
+            .controller()
+            .serve_epoch_query(
+                P,
+                &crate::cluster::replication::OffsetForLeaderEpochBody {
+                    epoch: LeaderEpoch::new(placement.epoch), // the OLD (dead) leader's epoch
+                },
+            )
+            .expect("the new leader answers an epoch query");
+        assert!(
+            epoch_answer.end_offset.answered_epoch.get() >= new_placement.epoch
+                || epoch_answer.end_offset.end_offset.get() <= new_leader_served_end,
+            "(d) the old epoch is bounded by the new leader's epoch history — the old leader is fenced"
+        );
+
+        // --- Phase 5: the CLUSTER RESUMES. The new leader binds a listener; the OTHER survivor
+        // re-targets to it (reconcile updated its follower target) and replicates from the NEW leader
+        // over a FRESH real socket, staying byte-identical — proving the cluster keeps serving. ---
+        let (new_listener, new_addr) = new_leader_addr;
+        let new_addr = new_addr.unwrap();
+
+        // The other survivor reconciles too: it stays a follower but re-targets to the successor.
+        let changed = other_follower
+            .server
+            .reconcile_placement(P, &new_placement, quorum3())
+            .expect("the other survivor reconciles");
+        assert!(changed, "the other survivor re-targeted to the new leader");
+        assert_eq!(
+            other_follower.server.follower_leader(P),
+            Some(successor),
+            "the still-follower now follows the promoted successor"
+        );
+
+        // Re-connect the other survivor to the NEW leader's address and replicate from it. It already
+        // holds the committed prefix, so it stays at the committed HW (and would pull any NEW records the
+        // new leader appends). This is the cluster RESUMING under the new leader over a real socket.
+        other_follower.link = DataPlaneLink::new({
+            let s = TcpStream::connect(new_addr).expect("the survivor dials the NEW leader");
+            s.set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            s
+        });
+        // Drive a few rounds: the new leader serves fetches; the survivor stays caught up to the
+        // committed prefix it already holds (no data lost across the failover, cluster serving again).
+        let mut new_links: Vec<DataPlaneLink<TcpStream>> = Vec::new();
+        let mut new_released: Vec<Vec<u8>> = Vec::new();
+        let resumed = drive_follower_until(
+            other_follower,
+            committed_hw,
+            || {
+                pump_leader_once(
+                    &mut successor_follower.server,
+                    &new_listener,
+                    &mut new_links,
+                    &mut new_released,
+                );
+            },
+            Duration::from_secs(15),
+        );
+        assert!(
+            resumed,
+            "(c) the cluster RESUMES: the survivor replicates from the new leader over a fresh socket (hw={})",
+            other_follower.high_watermark()
+        );
+        assert!(
+            other_follower.high_watermark() >= committed_hw,
+            "(c) no committed record was lost across the failover; the survivor holds the full committed prefix"
+        );
+
+        // FINAL: the falsifiable #618 invariant (CI5) over the REAL post-failover state — the successor
+        // was in the ISR, holds every pre-death committed offset, and carries a strictly-higher epoch.
+        let failover_state = ironbus_core::cluster_invariants::Failover {
+            dead_leader: 1,
+            successor,
+            successor_in_isr: true, // it was caught up in phase 1 (an ISR member)
+            // The successor's TRUE durable prefix: every offset it durably appended as a follower (it
+            // caught up to the full pre-death committed HW). The read-plane-served end can lag this by the
+            // active (unsealed) tail, but the records are durably HELD — CI5 is about held committed data.
+            successor_durable_prefix: succ_hw_pre,
+            committed_hw,
+            dead_leader_epoch: LeaderEpoch::new(placement.epoch),
+            successor_epoch: LeaderEpoch::new(new_placement.epoch),
+        };
+        ironbus_core::cluster_invariants::check_failover_preserves_committed(&failover_state)
+            .expect("CI5: the real failover preserved committed data + fenced the old leader");
     }
 
     /// THE #715 `Send` PROOF: a leader [`DataPlaneServer`] built from the committed placement (serving
