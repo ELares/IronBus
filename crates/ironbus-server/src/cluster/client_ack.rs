@@ -42,7 +42,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ironbus_core::clock::Clock;
 use ironbus_core::keyshared::MemberId;
@@ -60,6 +62,17 @@ use super::serve::DataPlaneServer;
 /// client produce-ack gate routes every produce to it. Multi-partition routing (a produce to the right
 /// partition leader's seam) is the #693 multi-partition engine — FLAGGED, out of scope here.
 pub const DEFAULT_PARTITION: u64 = 0;
+
+/// The PRODUCTION dirty-tier committed-HW CONFIRM timeout (#739) in MILLISECONDS — the default the gate's
+/// `confirm_timeout_millis` is seeded with: [`HW_CONFIRM_TIMEOUT`](super::serve::HW_CONFIRM_TIMEOUT)
+/// (500 ms). Kept as a `u64` (no lossy `u128`->`u64` cast) and pinned to the [`Duration`] source of truth
+/// by the `const` assertion below, so the two can never drift.
+const HW_CONFIRM_DEFAULT_MILLIS: u64 = 500;
+
+// Compile-time guard: the `u64`-millis default MUST equal the production `Duration` confirm timeout, so
+// the gate's seeded default is exactly the hardcoded production budget (#739, production unchanged).
+const _: () =
+    assert!(super::serve::HW_CONFIRM_TIMEOUT.as_millis() == HW_CONFIRM_DEFAULT_MILLIS as u128);
 
 /// How a clustered produce to `partition` should be ROUTED at the wire level (#735, the `NOT_LEADER`
 /// redirect, half A). The output of [`ClientAckGate::produce_routing`]: the produce path consults it
@@ -132,6 +145,17 @@ pub struct ClientAckGate<F: Filesystem, C: Clock> {
     /// to a `0` committed bar (serve nothing) rather than risk a stale read. Read under a brief lock, never
     /// across a socket write.
     status: Option<Arc<Mutex<super::runtime::ClusterStatus>>>,
+    /// The DIRTY-TIER committed-HW CONFIRM connect+read timeout (#739), in MILLISECONDS — the budget
+    /// [`resolve_dirty_tier`](Self::resolve_dirty_tier) gives
+    /// [`query_leader_committed_hw`](super::serve::query_leader_committed_hw) for one over-the-wire confirm.
+    /// PRODUCTION holds [`HW_CONFIRM_TIMEOUT`](super::serve::HW_CONFIRM_TIMEOUT) (500 ms): a slow / dead
+    /// leader cannot stall the consume path, and on a timeout the read FAILS CLOSED to the clean tier
+    /// (never an unconfirmed offset). An [`AtomicU64`] so a test holding the shared `Arc<ClientAckGate>`
+    /// can OVERRIDE it to a host-scaled value ([`Self::set_confirm_timeout`]) so the confirm completes
+    /// under a contended CI runner — the override only changes HOW LONG the confirm waits, never the
+    /// fail-closed / never-serve-unconfirmed semantics. Read with `Relaxed` (a single scalar; no other
+    /// state is ordered against it).
+    confirm_timeout_millis: AtomicU64,
 }
 
 impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
@@ -149,6 +173,8 @@ impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
             leader_client_addrs: BTreeMap::new(),
             leader_data_addrs: BTreeMap::new(),
             status: None,
+            // PRODUCTION default — the dirty-tier confirm bounds at 500 ms unless overridden (#739).
+            confirm_timeout_millis: AtomicU64::new(HW_CONFIRM_DEFAULT_MILLIS),
         }
     }
 
@@ -187,6 +213,39 @@ impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
     pub fn with_status_handle(mut self, status: Arc<Mutex<super::runtime::ClusterStatus>>) -> Self {
         self.status = Some(status);
         self
+    }
+
+    /// Override the DIRTY-TIER committed-HW CONFIRM timeout (#739), returning the gate. PRODUCTION leaves
+    /// it at [`HW_CONFIRM_TIMEOUT`](super::serve::HW_CONFIRM_TIMEOUT) (500 ms — the default this builder is
+    /// NOT called for): this exists so a test can give a contended runner a host-scaled budget so the
+    /// confirm completes in time, WITHOUT changing the fail-closed / never-serve-unconfirmed semantics (the
+    /// timeout only governs how long the confirm waits). Builder-style; a non-cluster broker never builds
+    /// the gate, so this never runs off-cluster.
+    #[must_use]
+    pub fn with_confirm_timeout(self, timeout: Duration) -> Self {
+        self.set_confirm_timeout(timeout);
+        self
+    }
+
+    /// Set the DIRTY-TIER committed-HW CONFIRM timeout (#739) through a SHARED reference — usable on the
+    /// `Arc<ClientAckGate>` a runtime hands back ([`DataPlaneRuntime::client_gate`](super::serve::DataPlaneRuntime::client_gate)).
+    /// Same contract as [`Self::with_confirm_timeout`]: PRODUCTION never calls it (stays at 500 ms); a test
+    /// uses it to scale the confirm budget for a contended runner without weakening fail-closed. A timeout
+    /// of zero is clamped to 1 ms (a zero connect-timeout is an immediate error on some platforms — never
+    /// what a caller asking to "wait this long" means). `Relaxed`: a single scalar with nothing ordered
+    /// against it.
+    pub fn set_confirm_timeout(&self, timeout: Duration) {
+        let millis = u64::try_from(timeout.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        self.confirm_timeout_millis.store(millis, Ordering::Relaxed);
+    }
+
+    /// The current DIRTY-TIER committed-HW CONFIRM timeout (#739): [`HW_CONFIRM_TIMEOUT`](super::serve::HW_CONFIRM_TIMEOUT)
+    /// (500 ms) in production, or whatever a test installed via [`Self::set_confirm_timeout`].
+    #[must_use]
+    pub fn confirm_timeout(&self) -> Duration {
+        Duration::from_millis(self.confirm_timeout_millis.load(Ordering::Relaxed))
     }
 
     /// The per-partition committed-HW bar this node has applied from the replicated metadata (#722) — the
@@ -500,9 +559,12 @@ impl<F: Filesystem + Clone, C: Clock> ClientAckGate<F, C> {
                 .and_then(|leader_id| self.leader_data_addrs.get(&leader_id).copied())
         };
         // The real, bounded, over-the-wire confirm (#723's `ConfirmWithLeader`): ask the leader for its
-        // CURRENT committed HW. `None` on no route / timeout / link error -> fail closed (the clean tier).
-        let confirmed_hw = leader_data_addr
-            .and_then(|addr| super::serve::query_leader_committed_hw(addr, partition));
+        // CURRENT committed HW, bounded by the gate's confirm timeout (PRODUCTION 500 ms; a test may scale
+        // it). `None` on no route / timeout / link error -> fail closed (the clean tier).
+        let confirm_timeout = self.confirm_timeout();
+        let confirmed_hw = leader_data_addr.and_then(|addr| {
+            super::serve::query_leader_committed_hw(addr, partition, confirm_timeout)
+        });
         // RAISE the bar to the confirmed HW (never lower it): the re-serve uses `max(known, confirmed)`,
         // so it serves up to `min(own_flushed, raised_bar)`. On a FAILED confirm `confirmed_hw` is `None`,
         // so the bar stays the original `known_committed_hw` and the re-serve is the plain clean tier —

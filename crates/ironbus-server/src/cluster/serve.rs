@@ -362,7 +362,11 @@ impl<S: Read + Write> DataPlaneLink<S> {
 /// must NOT stall the consumer — on a timeout the follower FAILS CLOSED to the clean tier (serve only up
 /// to its safe watermark, never an unconfirmed offset). The same `connect_timeout` + `read_timeout`
 /// discipline the follower fetch loop uses, sized for a single round-trip rather than a steady poll.
-const HW_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
+///
+/// This is the PRODUCTION default; it is what [`ClientAckGate`](super::client_ack::ClientAckGate) holds
+/// unless overridden ([`ClientAckGate::set_confirm_timeout`](super::client_ack::ClientAckGate::set_confirm_timeout),
+/// a test-robustness seam). Production behaviour is unchanged: the confirm still bounds at 500 ms.
+pub const HW_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Perform ONE bounded, over-the-wire DIRTY-TIER committed-HW CONFIRM (#739): dial the partition
 /// LEADER's data-plane address `leader_data_addr`, send a [`DataPlaneFrame::CommittedHwQuery`] for
@@ -371,18 +375,27 @@ const HW_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
 /// wire — a tiny HW-version query (NOT the data) so a follower can serve a read-your-writes prefix above
 /// its known safe watermark, and NEVER an offset the leader has not confirmed committed.
 ///
-/// It is a short-lived, single-shot link with the `HW_CONFIRM_TIMEOUT` bound on BOTH the connect and the
-/// read, so a slow / dead / wrong-role leader cannot stall the consume path. Returns `Some(committed_hw)`
-/// ONLY on a clean round-trip whose response is the leader's committed HW for THIS partition; on ANY
-/// failure (no route, connect/read timeout, link error, wrong partition / verb) it returns `None` so the
-/// caller FAILS CLOSED to the clean tier (serves only up to its safe watermark — never unconfirmed).
+/// It is a short-lived, single-shot link with `timeout` bound on BOTH the connect and the read, so a
+/// slow / dead / wrong-role leader cannot stall the consume path. `timeout` is the caller's confirm
+/// budget — [`HW_CONFIRM_TIMEOUT`] (500 ms) in production; a test may pass a host-scaled value so the
+/// confirm completes under a contended CI runner WITHOUT changing the fail-closed semantics. Returns
+/// `Some(committed_hw)` ONLY on a clean round-trip whose response is the leader's committed HW for THIS
+/// partition; on ANY failure (no route, connect/read timeout, link error, wrong partition / verb) it
+/// returns `None` so the caller FAILS CLOSED to the clean tier (serves only up to its safe watermark —
+/// never unconfirmed). The timeout only governs HOW LONG the confirm waits — never WHETHER an unconfirmed
+/// offset is served (on a timeout it still returns `None` → fail-closed), so never-serve-unconfirmed holds
+/// for any timeout.
 ///
 /// It never panics and never serves data: it is a read-only HW query (single-writer preserved).
 #[must_use]
-pub fn query_leader_committed_hw(leader_data_addr: SocketAddr, partition: u64) -> Option<u64> {
-    let stream = TcpStream::connect_timeout(&leader_data_addr, HW_CONFIRM_TIMEOUT).ok()?;
-    stream.set_read_timeout(Some(HW_CONFIRM_TIMEOUT)).ok()?;
-    stream.set_write_timeout(Some(HW_CONFIRM_TIMEOUT)).ok()?;
+pub fn query_leader_committed_hw(
+    leader_data_addr: SocketAddr,
+    partition: u64,
+    timeout: Duration,
+) -> Option<u64> {
+    let stream = TcpStream::connect_timeout(&leader_data_addr, timeout).ok()?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    stream.set_write_timeout(Some(timeout)).ok()?;
     let mut link = DataPlaneLink::new(stream);
     link.send(
         partition,
@@ -727,6 +740,11 @@ struct ClientGateConfig {
     /// The shared metadata status snapshot the follower-read reads the committed-HW bar from (#735, half
     /// B); `None` fails the follower-read closed (serve nothing) until a checkpoint is known.
     status: Option<Arc<Mutex<super::runtime::ClusterStatus>>>,
+    /// The dirty-tier committed-HW CONFIRM timeout (#739) the built gate holds — the connect+read budget
+    /// for [`query_leader_committed_hw`]. PRODUCTION uses [`HW_CONFIRM_TIMEOUT`] (500 ms); a test may
+    /// override it (e.g. host-scaled) so the confirm completes under a contended runner without weakening
+    /// the fail-closed semantics. A `None` here defaults to [`HW_CONFIRM_TIMEOUT`].
+    confirm_timeout: Option<Duration>,
 }
 
 pub struct DataPlaneRuntime<F: Filesystem, C: Clock> {
@@ -833,6 +851,7 @@ where
                 // the dirty-tier confirm reachable for a runtime started this way.
                 leader_data_addrs: peer_data_addrs.clone(),
                 status: None,
+                confirm_timeout: None,
             }),
         )
     }
@@ -868,6 +887,7 @@ where
                 // the safe watermark can confirm with the leader before serving (never unconfirmed).
                 leader_data_addrs: peer_data_addrs.clone(),
                 status: Some(status),
+                confirm_timeout: None,
             }),
         )
     }
@@ -903,6 +923,9 @@ where
                     .with_leader_data_addrs(cfg.leader_data_addrs);
             if let Some(status) = cfg.status {
                 gate = gate.with_status_handle(status);
+            }
+            if let Some(confirm_timeout) = cfg.confirm_timeout {
+                gate = gate.with_confirm_timeout(confirm_timeout);
             }
             Arc::new(gate)
         });
@@ -2819,6 +2842,37 @@ mod live_runtime_tests {
         pred()
     }
 
+    /// Scale a GENEROUS base budget by the observed host slowdown (#618): a local copy of the runtime
+    /// test's `host_scaled` (max-of-3-probes + a 24x cap), so a timing-sensitive budget stays truthful and
+    /// flake-free on a contended CI runner WITHOUT weakening what the test proves. On an unloaded host the
+    /// factor is ~1 and the budget stays the base. Used by the #739 dirty-tier HAPPY-PATH test to size the
+    /// over-the-wire committed-HW CONFIRM timeout so the confirm completes even under heavy CI contention
+    /// (the production default stays the hardcoded 500 ms — this only governs how long the confirm waits,
+    /// never the fail-closed / never-serve-unconfirmed semantics).
+    fn host_scaled(base: Duration) -> Duration {
+        fn probe_busy_nanos() -> u128 {
+            const ITERS: u64 = 2_000_000;
+            let start = Instant::now();
+            let mut acc: u64 = 0x9E37_79B9_7F4A_7C15;
+            for i in 0..ITERS {
+                acc = acc
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(i | 1);
+                acc ^= acc >> 29;
+            }
+            std::hint::black_box(acc);
+            start.elapsed().as_nanos().max(1)
+        }
+        const REFERENCE_BUSY_NANOS: u128 = 4_000_000;
+        const MAX_SCALE: u32 = 24;
+        let mut samples = [probe_busy_nanos(), probe_busy_nanos(), probe_busy_nanos()];
+        samples.sort_unstable();
+        let observed = samples[2];
+        let factor = (observed / REFERENCE_BUSY_NANOS).clamp(1, u128::from(MAX_SCALE));
+        let factor = u32::try_from(factor).unwrap_or(MAX_SCALE);
+        base * factor
+    }
+
     fn dump_segments(log: &Log<StdFs, ManualClock>) -> Vec<(String, Vec<u8>)> {
         let fs = log.filesystem();
         let mut out = Vec::new();
@@ -3907,6 +3961,14 @@ mod live_runtime_tests {
             .client_gate()
             .cloned()
             .expect("the follower runtime built a client gate");
+        // HAPPY-PATH ROBUSTNESS (#739): the over-the-wire committed-HW CONFIRM is bounded by a SHORT
+        // production timeout (500 ms). On a heavily-contended CI runner a localhost round-trip can exceed
+        // that, so the confirm would TIME OUT and the dirty read would (correctly) FAIL CLOSED to the clean
+        // tier — failing THIS happy-path assertion. Give the confirm a HOST-SCALED budget so it completes
+        // even under load. This changes ONLY how long this test waits for the confirm; production keeps the
+        // hardcoded default, and the fail-closed / never-serve-unconfirmed semantics are untouched (the
+        // fail-closed test below proves an unreachable leader still fails fast on connect-refused).
+        gate.set_confirm_timeout(host_scaled(Duration::from_millis(500)));
 
         // Wait until the follower's runtime fetch loop has replicated the leader's whole served prefix.
         let f_hw = || {
