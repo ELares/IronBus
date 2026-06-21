@@ -44,6 +44,15 @@ path = "src/bin/stream_consume_bench.rs"
 name = "consume-corpus"
 path = "src/bin/consume_corpus.rs"
 
+# Clustered-consume APPORTIONED-READ throughput vs replica count (#634, V2-C8-I5): builds a real
+# on-disk leader log + a live `DataPlaneRuntime` cluster (R in {1,3,5}) over loopback, waits for the
+# followers to replicate the committed prefix, then drains it from a consumer fleet apportioned across
+# the replicas via the #723 follower-read serve path. Emits per-run JSONL rows. Unix-only (the broker
+# is Unix-only). On demand; off the per-PR CI path.
+[[bin]]
+name = "cluster-consume-bench"
+path = "src/bin/cluster_consume_bench.rs"
+
 [dependencies]
 # The harness drives the broker through the REAL #11 client over a real socket, never a privileged
 # test path; it launches the shipping `ironbus` binary built by `ironbus-cli`.

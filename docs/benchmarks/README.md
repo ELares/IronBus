@@ -204,3 +204,71 @@ collapsing** — the prior super-linear degradation (148k → 23k across 20k →
 crossing under NATS near ~30k records) is gone because #665 clamps the server
 `StreamFetch` read span to the consumer window. The win is now unconditional across
 the measured range; NATS JS pull stays flat ~104k – 109k /s.
+
+## Cluster performance corpus (#634, #632, V2-C8)
+
+The single-node corpora above bench one broker. The C8 cluster corpus benches the
+**clustered** broker — the consensus + replication + read-consistency machinery
+(`crates/ironbus-server/src/cluster/`) — on two axes, on real local clusters
+(loopback) on commodity hardware. These are the SCALING SHAPE + relative ratios;
+the absolute edge (t4g) numbers are issue #636, a separate hardware run, NOT
+fabricated here. Each leg's report carries its machine spec, run count, and the
+honest caveats (including where IronBus loses).
+
+### Clustered-consume apportioned-read scaling (#634, C8-I5)
+
+The headline: with the #723 follower-read tiers, a consumer fleet can fan its
+committed reads across all `R` replicas (a follower serves a `<=` safe-HW committed
+read LOCALLY from its own replicated copy — CRAQ clean; the leader serves a 0-RTT
+lease-local read), so aggregate consume throughput scales ~`O(R)`, vs NATS where
+consume is served from the one stream leader (`O(1)` in stream replicas).
+[`cluster_consume_bench.py`](cluster_consume_bench.py) drives the
+[`cluster-consume-bench`](../../crates/ironbus-bench/src/bin/cluster_consume_bench.rs)
+Rust harness (a real on-disk leader log + a live `DataPlaneRuntime` cluster over
+loopback; followers replicate the committed prefix, then a fleet drains it via the
+#723 serve path) for `R` in {1,3,5} and the matched NATS file-stream pull leg. The
+committed [`cluster-consume-rows.jsonl`](cluster-consume-rows.jsonl) and
+[`cluster-consume-report.md`](cluster-consume-report.md) are the data. HONEST scope
+(in the report): the IronBus side drives the `DataPlaneController` follower-read
+SERVE PATH in-process over the REAL live runtime (the #723 tiers are not yet threaded
+into the per-connection wire `session.rs`), while NATS is end-to-end over the wire.
+The report therefore does NOT publish an IronBus-vs-NATS throughput ratio (that would
+compare a serve-path number to a wire number); it reports the IronBus serve-path
+SCALING SHAPE (`O(R)`) and the NATS wire number (`O(1)` in stream replicas)
+separately. The apples-to-apples wire-to-wire ratio awaits the C6 client-routing
+wiring (a tracked follow-on).
+
+```sh
+cargo build --release -p ironbus-bench --bin cluster-consume-bench
+python3 cluster_consume_bench.py \
+    --bench-bin ../../target/release/cluster-consume-bench \
+    --out cluster-consume-rows.jsonl --md-out cluster-consume-report.md
+```
+
+### Heartbeat-cost scaling (#632, C8-I4)
+
+The per-node cost a cluster pays JUST to stay alive (heartbeats, liveness,
+consensus) when IDLE, as it grows. IronBus uses one KRaft-style metadata-Raft
+(`O(N)` heartbeat from one leader to N-1 voters every ~300 ms); NATS uses a full
+route mesh (`O(N²)` gossip). [`cluster_heartbeat_bench.py`](cluster_heartbeat_bench.py)
+launches real `ironbus serve --cluster-*` and `nats-server` cluster processes,
+settles them, and measures per-node CPU (CPU-time delta) and network bytes/s
+(`nettop` delta) over a window, 5 runs each. IronBus runs at N in {3,5} (its
+metadata-Raft supports only 1/3/5 voters; 7 is refused at startup); NATS at {3,5,7}.
+The committed [`cluster-heartbeat-rows.jsonl`](cluster-heartbeat-rows.jsonl) and
+[`cluster-heartbeat-report.md`](cluster-heartbeat-report.md) are the data. HONEST
+(in the report): the first version of this benchmark surfaced a real bug — an idle
+IronBus cluster burning ~2 cores/node — which turned out to be a macOS-loopback
+`O_NONBLOCK`-inheritance artifact (accepted sockets inherited the listener's
+non-blocking flag, so `SO_RCVTIMEO` was ignored and the per-peer reader hot-spun),
+FIXED in #726; on Linux accepted sockets don't inherit `O_NONBLOCK`, so the
+production target was never affected. Post-fix the idle cluster uses ~0 idle CPU
+(~0.003 cores/node, comparable to NATS) and small idle network (~1.4–4.8 kB/s
+cluster-wide), both reported plainly alongside the original finding — not hidden,
+not spun.
+
+```sh
+cargo build --release -p ironbus-cli --bin ironbus
+python3 cluster_heartbeat_bench.py --ironbus ../../target/release/ironbus \
+    --out cluster-heartbeat-rows.jsonl --md-out cluster-heartbeat-report.md
+```
