@@ -224,8 +224,7 @@ mod imp {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_nanos());
             let mut path = std::env::temp_dir();
             path.push(format!(
                 "ironbus-cluster-bench-{}-{nanos}-{n}",
