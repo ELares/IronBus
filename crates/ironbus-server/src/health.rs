@@ -4339,6 +4339,177 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// The CARDINALITY FIREWALL allowlist (#576): the COMPLETE set of label KEYS any `/metrics`
+    /// series may carry. Every key here is a BOUNDED dimension — a fixed enum, a fixed histogram
+    /// bucket, or a bounded + overflow-folded name (capped at 1024 distinct values then folded into
+    /// `__overflow__`). An UNBOUNDED label — a per-message id, a subject, an offset, a connection id,
+    /// a peer address — would introduce a label key NOT in this set, which the firewall rejects: that
+    /// is exactly the class of label that turns a single series into millions and OOMs the very node
+    /// the metrics protect. ADDING a label key here MUST be a deliberate, reviewed edit that proves the
+    /// new dimension is bounded.
+    const FROZEN_LABEL_KEYS: &[&str] = &[
+        // Bounded + overflow-folded NAMES (cap 1024 -> `__overflow__`): consumer lag (#97), and the
+        // per-stream / per-group throughput (#571). NOT a free-form per-message value.
+        "consumer", "group", "stream",
+        // Fixed ENUMS: the cluster/produce ack level, the retry side, the connz state, the recovery
+        // artifact/outcome, the recovery-loss reason. All closed, small value sets.
+        "level", "side", "state", "artifact", "outcome", "reason",
+        // The fixed histogram bucket bound, and the single build-version of `ironbus_build_info`.
+        "le", "version",
+    ];
+
+    /// The firewall's per-family distinct-series cap (#576): no labeled metric family may emit MORE
+    /// than this many distinct series in one scrape. The bounded-name dimensions cap at 1024 distinct
+    /// values plus a `__overflow__` fold and a possible default label, so a generous ceiling above
+    /// 1024 catches a runaway (unbounded) family without false-positiving the legitimately-capped ones.
+    const FIREWALL_MAX_SERIES_PER_FAMILY: usize = 1100;
+
+    /// The CARDINALITY FIREWALL check (#576), factored out so it runs against BOTH the real `/metrics`
+    /// body AND a synthetic body (to prove it BITES). Returns the list of violations found; an empty
+    /// list means the exposition is firewall-clean. It flags two failure modes:
+    ///
+    /// 1. A labeled sample whose label KEY is not in [`FROZEN_LABEL_KEYS`] — the unbounded-label
+    ///    class (a per-message id / subject / offset / connection id / peer address).
+    /// 2. A labeled metric FAMILY that emitted more than [`FIREWALL_MAX_SERIES_PER_FAMILY`] distinct
+    ///    series in one scrape — a runaway even if its key looked innocuous.
+    fn cardinality_firewall_violations(body: &str) -> Vec<String> {
+        use std::collections::{BTreeMap, BTreeSet};
+        let allowed: BTreeSet<&str> = FROZEN_LABEL_KEYS.iter().copied().collect();
+        let mut violations = Vec::new();
+        // family name -> count of distinct labeled series seen.
+        let mut family_series: BTreeMap<&str, usize> = BTreeMap::new();
+        for line in body.lines() {
+            let line = line.trim();
+            // Only SAMPLE lines (skip `# HELP` / `# TYPE` and blanks). A labeled sample has the shape
+            // `name{k1="v1",k2="v2"} value`.
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some(brace) = line.find('{') else {
+                continue; // an UNLABELED sample carries no label, so it cannot be unbounded by a label
+            };
+            let name = &line[..brace];
+            let Some(close) = line[brace..].find('}') else {
+                continue;
+            };
+            let labels = &line[brace + 1..brace + close];
+            *family_series.entry(name).or_insert(0) += 1;
+            // Each label is `key="value"`, comma-separated. Extract the KEYS and check the allowlist.
+            for kv in labels.split(',') {
+                let Some(eq) = kv.find('=') else {
+                    continue;
+                };
+                let key = kv[..eq].trim();
+                if !allowed.contains(key) {
+                    violations.push(format!(
+                        "metric `{name}` carries UNBOUNDED-RISK label key `{key}` (not in FROZEN_LABEL_KEYS); \
+                         a per-message/subject/offset/connection-id label would OOM the node — keep metrics low-cardinality"
+                    ));
+                }
+            }
+        }
+        for (name, count) in family_series {
+            if count > FIREWALL_MAX_SERIES_PER_FAMILY {
+                violations.push(format!(
+                    "metric family `{name}` emitted {count} distinct series in one scrape, over the firewall cap {FIREWALL_MAX_SERIES_PER_FAMILY} — a runaway (unbounded) family"
+                ));
+            }
+        }
+        violations
+    }
+
+    #[test]
+    fn the_cardinality_firewall_passes_on_the_real_metrics_surface() {
+        // #576: the LIVE `/metrics` exposition must be firewall-clean — every labeled series carries
+        // only bounded label keys, and no family is a runaway. This is the CI lint that fails the build
+        // if any future metric sneaks an unbounded (per-message / subject / offset / connection-id)
+        // label onto the surface. Drive a few produces/acks first so the throughput families actually
+        // emit labeled samples to scan, not just the at-rest zero block.
+        let (addr, shutdown, handle, engine) = start();
+        // Produce a few records so `ironbus_stream_produced_total{stream=""}` carries a real labeled
+        // sample to scan (not just the at-rest zero block).
+        {
+            let mut g = engine.lock().unwrap();
+            for _ in 0..3 {
+                g.produce(&Append {
+                    timestamp_ms: 0,
+                    flags: RecordFlags::EMPTY,
+                    key: b"",
+                    headers: b"",
+                    payload: b"x",
+                })
+                .unwrap();
+            }
+        }
+        let m = request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(m.starts_with("HTTP/1.1 200 OK"), "{m}");
+        let body = m.split("\r\n\r\n").nth(1).unwrap_or(&m);
+        let violations = cardinality_firewall_violations(body);
+        assert!(
+            violations.is_empty(),
+            "the /metrics surface tripped the cardinality firewall (#576):\n{}",
+            violations.join("\n")
+        );
+        // Every label key the surface actually uses is in the frozen allowlist, AND every allowlist
+        // entry is documented as a bounded dimension (a guard on the allowlist itself: a stray key
+        // could be removed from the surface but linger here, but a key never on the surface is benign).
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn the_cardinality_firewall_bites_a_synthetic_unbounded_metric() {
+        // #576 PROVE-IT-BITES: a synthetic exposition that smuggles an UNBOUNDED label (a per-message
+        // id, a per-connection id, a per-offset value) MUST be rejected by the firewall, so the lint
+        // is real, not vacuous. Each of these is the canonical unbounded-cardinality footgun.
+        let synthetic_msg_id = "\
+            # TYPE ironbus_evil_total counter\n\
+            ironbus_evil_total{msg_id=\"a1b2c3\"} 1\n";
+        let v = cardinality_firewall_violations(synthetic_msg_id);
+        assert!(
+            v.iter().any(|s| s.contains("msg_id")),
+            "the firewall must reject a per-message-id label: {v:?}"
+        );
+
+        let synthetic_conn = "ironbus_evil_total{connection_id=\"7f3a\"} 1\n";
+        assert!(
+            cardinality_firewall_violations(synthetic_conn)
+                .iter()
+                .any(|s| s.contains("connection_id")),
+            "the firewall must reject a per-connection-id label"
+        );
+
+        let synthetic_offset = "ironbus_evil_total{offset=\"123456789\"} 1\n";
+        assert!(
+            cardinality_firewall_violations(synthetic_offset)
+                .iter()
+                .any(|s| s.contains("offset")),
+            "the firewall must reject a per-offset label"
+        );
+
+        // A RUNAWAY family (an innocuous-looking but unbounded number of distinct series under an
+        // allowed key) is also caught by the per-family series cap.
+        let mut runaway = String::from("# TYPE ironbus_runaway_total counter\n");
+        for i in 0..(FIREWALL_MAX_SERIES_PER_FAMILY + 5) {
+            // Uses an ALLOWED key (`group`) but an unbounded number of distinct values — the firewall's
+            // second guard (the per-family series cap) catches what the key allowlist alone would not.
+            let _ = writeln!(runaway, "ironbus_runaway_total{{group=\"g{i}\"}} 1");
+        }
+        assert!(
+            cardinality_firewall_violations(&runaway)
+                .iter()
+                .any(|s| s.contains("runaway") && s.contains("distinct series")),
+            "the firewall must reject a family that blew past the per-family series cap"
+        );
+
+        // And a CLEAN labeled line (an allowed, bounded key) passes the firewall (no false positive).
+        let clean = "ironbus_cluster_ack_total{level=\"c2_fsync\"} 0\n";
+        assert!(
+            cardinality_firewall_violations(clean).is_empty(),
+            "a bounded-key labeled series must pass the firewall"
+        );
+    }
+
     #[test]
     fn connz_and_disk_free_render_live_through_serve_health_connz() {
         // #572/#573: the connz-aware serve path exposes the LIVE connection signals (recorded into the
