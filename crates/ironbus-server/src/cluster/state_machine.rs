@@ -162,6 +162,9 @@ pub enum DecodeError {
     /// A `PlacePartition` command had an empty replica set (a placement must hold at least one
     /// replica).
     EmptyReplicaSet,
+    /// A serialized state-machine SNAPSHOT (#660) carried an unknown format version, so it was not
+    /// written by a compatible encoder — fail closed rather than mis-decode a torn/foreign blob.
+    UnknownSnapshotVersion(u8),
 }
 
 impl core::fmt::Display for DecodeError {
@@ -179,6 +182,9 @@ impl core::fmt::Display for DecodeError {
                 write!(f, "placement leader is not in its own replica set")
             }
             DecodeError::EmptyReplicaSet => write!(f, "placement has an empty replica set"),
+            DecodeError::UnknownSnapshotVersion(v) => {
+                write!(f, "unknown metadata snapshot format version {v}")
+            }
         }
     }
 }
@@ -564,6 +570,174 @@ impl MetadataStateMachine {
     pub fn applied_index(&self) -> u64 {
         self.applied_index
     }
+
+    /// Serialize a CONSISTENT, point-in-time SNAPSHOT of the committed state machine (#660).
+    ///
+    /// A snapshot is a complete, canonical serialization of EVERY piece of committed metadata —
+    /// membership, placements, committed-HW, config — plus the `applied_index` the snapshot is
+    /// taken at. It is what the metadata Raft log snapshot/compaction (#660) captures BEFORE the
+    /// log prefix is truncated, and what a far-behind learner installs to catch up without
+    /// replaying the whole log (the snapshot-based catch-up that pairs with #617/#724).
+    ///
+    /// The encoding is the SAME explicit, length-prefixed, little-endian, zero-dependency style as
+    /// [`MetadataCommand::encode`] (so the snapshot adds NO new dependency and has one canonical
+    /// meaning across nodes), prefixed by a one-byte format `version` so a future field can be
+    /// added without mis-decoding an older blob. Maps are written in their `BTreeMap` order, which
+    /// is deterministic (sorted by key), so two state machines with identical committed state
+    /// serialize to BYTE-IDENTICAL snapshots — the property the round-trip and catch-up tests
+    /// rely on.
+    ///
+    /// The snapshot is BOUNDED: the metadata state is small by construction (a cluster's
+    /// members / placements / config, not per-record data), so the serialization is O(members +
+    /// placements + config) bytes — kilobytes, not the unbounded log.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(SNAPSHOT_VERSION);
+        out.extend_from_slice(&self.applied_index.to_le_bytes());
+
+        // members: [count:u32][ (node:u64, role:u8) ... ] in BTreeMap (sorted) order.
+        push_u32_len(&mut out, self.members.len());
+        for (node, role) in &self.members {
+            out.extend_from_slice(&node.to_le_bytes());
+            out.push(role.tag());
+        }
+
+        // placements: [count:u32][ (partition:u64, replica_count:u32, replicas:u64..., leader:u64,
+        // epoch:u64) ... ] in sorted order.
+        push_u32_len(&mut out, self.placements.len());
+        for (partition, placement) in &self.placements {
+            out.extend_from_slice(&partition.to_le_bytes());
+            push_u32_len(&mut out, placement.replicas.len());
+            for r in &placement.replicas {
+                out.extend_from_slice(&r.to_le_bytes());
+            }
+            out.extend_from_slice(&placement.leader.to_le_bytes());
+            out.extend_from_slice(&placement.epoch.to_le_bytes());
+        }
+
+        // committed_hw: [count:u32][ (partition:u64, offset:u64) ... ] in sorted order.
+        push_u32_len(&mut out, self.committed_hw.len());
+        for (partition, offset) in &self.committed_hw {
+            out.extend_from_slice(&partition.to_le_bytes());
+            out.extend_from_slice(&offset.to_le_bytes());
+        }
+
+        // config: [count:u32][ (key:str, value:str) ... ] in sorted order.
+        push_u32_len(&mut out, self.config.len());
+        for (key, value) in &self.config {
+            push_str(&mut out, key);
+            push_str(&mut out, value);
+        }
+
+        out
+    }
+
+    /// Decode a serialized snapshot (the inverse of [`Self::snapshot`]) into a fresh state machine.
+    ///
+    /// Installing a snapshot REPLACES the whole committed state (it is a point-in-time cut, not a
+    /// delta), so this returns a brand-new [`MetadataStateMachine`] whose maps + `applied_index`
+    /// are exactly the snapshot's. A node restoring from a snapshot then applies the retained log
+    /// TAIL (entries strictly above `applied_index`) on top, reaching the identical committed state
+    /// it would have by replaying the full log.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DecodeError`] if the buffer carries an unknown version, is truncated, has an
+    /// overrunning length, holds invalid UTF-8, names a malformed placement (leader absent from
+    /// its replica set / empty replica set), or has trailing bytes — so a torn or foreign blob is
+    /// a typed, fail-closed error, never a silently-mis-installed state.
+    pub fn restore_from_snapshot(buf: &[u8]) -> Result<Self, DecodeError> {
+        let mut cur = Cursor::new(buf);
+        let version = cur.u8()?;
+        if version != SNAPSHOT_VERSION {
+            return Err(DecodeError::UnknownSnapshotVersion(version));
+        }
+        let applied_index = cur.u64()?;
+
+        let mut members = BTreeMap::new();
+        let member_count = cur.u32()? as usize;
+        // Reject a hostile/torn count before allocating per-element: each member is 9 bytes.
+        if cur.remaining() < member_count.saturating_mul(9) {
+            return Err(DecodeError::BadLength);
+        }
+        for _ in 0..member_count {
+            let node = cur.u64()?;
+            let role = NodeRole::from_tag(cur.u8()?).ok_or(DecodeError::UnknownRole(0))?;
+            members.insert(node, role);
+        }
+
+        let mut placements = BTreeMap::new();
+        let placement_count = cur.u32()? as usize;
+        for _ in 0..placement_count {
+            let partition = cur.u64()?;
+            let replica_count = cur.u32()? as usize;
+            if cur.remaining() < replica_count.saturating_mul(8) {
+                return Err(DecodeError::BadLength);
+            }
+            let mut replicas = Vec::with_capacity(replica_count);
+            for _ in 0..replica_count {
+                replicas.push(cur.u64()?);
+            }
+            let leader = cur.u64()?;
+            let epoch = cur.u64()?;
+            if replicas.is_empty() {
+                return Err(DecodeError::EmptyReplicaSet);
+            }
+            if !replicas.contains(&leader) {
+                return Err(DecodeError::LeaderNotAReplica);
+            }
+            placements.insert(
+                partition,
+                Placement {
+                    replicas,
+                    leader,
+                    epoch,
+                },
+            );
+        }
+
+        let mut committed_hw = BTreeMap::new();
+        let hw_count = cur.u32()? as usize;
+        if cur.remaining() < hw_count.saturating_mul(16) {
+            return Err(DecodeError::BadLength);
+        }
+        for _ in 0..hw_count {
+            let partition = cur.u64()?;
+            let offset = cur.u64()?;
+            committed_hw.insert(partition, offset);
+        }
+
+        let mut config = BTreeMap::new();
+        let config_count = cur.u32()? as usize;
+        for _ in 0..config_count {
+            let key = cur.string()?;
+            let value = cur.string()?;
+            config.insert(key, value);
+        }
+
+        if cur.remaining() != 0 {
+            return Err(DecodeError::TrailingBytes);
+        }
+        Ok(MetadataStateMachine {
+            members,
+            placements,
+            committed_hw,
+            config,
+            applied_index,
+        })
+    }
+}
+
+/// The serialized-snapshot format version (#660). Bumped only if the snapshot field layout changes
+/// incompatibly; an unknown version is rejected fail-closed at decode time.
+const SNAPSHOT_VERSION: u8 = 1;
+
+/// Push a `usize` count as a `u32-le` length prefix, saturating at `u32::MAX` (a count this large
+/// is unreachable for the small metadata state, but the saturation keeps the encode total).
+fn push_u32_len(out: &mut Vec<u8>, n: usize) {
+    let len = u32::try_from(n).unwrap_or(u32::MAX);
+    out.extend_from_slice(&len.to_le_bytes());
 }
 
 #[cfg(test)]
@@ -844,5 +1018,238 @@ mod tests {
         sm.apply_encoded(5, &data).expect("apply encoded");
         assert_eq!(sm.role(1), Some(NodeRole::Voter));
         assert_eq!(sm.applied_index(), 5);
+    }
+
+    // --- #660: state-machine snapshot serialization + restore. ---
+
+    /// Build a state machine with one of every kind of committed state, so the snapshot exercises
+    /// every map (members, placements, committed-HW, config) and the applied index.
+    fn populated_sm() -> MetadataStateMachine {
+        let mut sm = MetadataStateMachine::new();
+        sm.apply(
+            1,
+            &MetadataCommand::AddNode {
+                node: 1,
+                role: NodeRole::Voter,
+            },
+        );
+        sm.apply(
+            2,
+            &MetadataCommand::AddNode {
+                node: 2,
+                role: NodeRole::Learner,
+            },
+        );
+        sm.apply(
+            3,
+            &MetadataCommand::PlacePartition {
+                partition: 7,
+                replicas: vec![1, 2, 3],
+                leader: 1,
+                epoch: 4,
+            },
+        );
+        sm.apply(
+            4,
+            &MetadataCommand::AssignPartition {
+                partition: 9,
+                leader: 2,
+                epoch: 5,
+            },
+        );
+        sm.apply(
+            5,
+            &MetadataCommand::CheckpointCommittedHw {
+                partition: 7,
+                offset: 1234,
+            },
+        );
+        sm.apply(
+            6,
+            &MetadataCommand::SetConfig {
+                key: "replication".to_owned(),
+                value: "3".to_owned(),
+            },
+        );
+        sm
+    }
+
+    /// A snapshot round-trips: restoring a serialized snapshot yields a state machine BYTE-EQUAL to
+    /// the original (every map + the applied index), proving the snapshot captures ALL committed
+    /// state at its index (the #660 committed-state-preserved invariant, at the SM layer).
+    #[test]
+    fn snapshot_then_restore_yields_an_identical_state_machine() {
+        let sm = populated_sm();
+        let bytes = sm.snapshot();
+        let restored = MetadataStateMachine::restore_from_snapshot(&bytes).expect("restore");
+        assert_eq!(
+            restored, sm,
+            "the restored state machine equals the original"
+        );
+        assert_eq!(restored.applied_index(), sm.applied_index());
+        // Spot-check a representative value from each map survived.
+        assert_eq!(restored.role(1), Some(NodeRole::Voter));
+        assert_eq!(restored.role(2), Some(NodeRole::Learner));
+        assert_eq!(
+            restored.placement(7),
+            Some(Placement {
+                replicas: vec![1, 2, 3],
+                leader: 1,
+                epoch: 4
+            })
+        );
+        assert_eq!(restored.placement(9), Some(Placement::leader_only(2, 5)));
+        assert_eq!(restored.committed_hw(7), Some(1234));
+        assert_eq!(restored.config("replication"), Some("3"));
+    }
+
+    /// Two state machines with IDENTICAL committed state serialize to BYTE-IDENTICAL snapshots
+    /// (the `BTreeMap` order is deterministic), regardless of the ORDER the commands were applied —
+    /// the point-in-time-consistency property a snapshot relies on.
+    #[test]
+    fn snapshot_is_deterministic_regardless_of_apply_order() {
+        let a = populated_sm();
+        // Apply the same commands in a DIFFERENT order, but at the same final applied index.
+        let mut b = MetadataStateMachine::new();
+        b.apply(
+            6,
+            &MetadataCommand::SetConfig {
+                key: "replication".to_owned(),
+                value: "3".to_owned(),
+            },
+        );
+        b.apply(
+            5,
+            &MetadataCommand::CheckpointCommittedHw {
+                partition: 7,
+                offset: 1234,
+            },
+        );
+        b.apply(
+            4,
+            &MetadataCommand::AssignPartition {
+                partition: 9,
+                leader: 2,
+                epoch: 5,
+            },
+        );
+        b.apply(
+            3,
+            &MetadataCommand::PlacePartition {
+                partition: 7,
+                replicas: vec![1, 2, 3],
+                leader: 1,
+                epoch: 4,
+            },
+        );
+        b.apply(
+            2,
+            &MetadataCommand::AddNode {
+                node: 2,
+                role: NodeRole::Learner,
+            },
+        );
+        // Re-set the applied index to match `a` (the last apply above set it to 2).
+        b.apply(
+            6,
+            &MetadataCommand::AddNode {
+                node: 1,
+                role: NodeRole::Voter,
+            },
+        );
+        assert_eq!(a.snapshot(), b.snapshot(), "snapshots are byte-identical");
+    }
+
+    /// Restoring a snapshot then applying the log TAIL on top reaches the SAME state as a full
+    /// replay (the snapshot+tail == full-replay invariant, at the SM layer). This is the heart of
+    /// snapshot-based catch-up: a node that installs a snapshot at index N and applies N+1.. is
+    /// identical to a node that replayed 1...
+    #[test]
+    fn restore_then_apply_tail_equals_full_replay() {
+        // Full replay: apply commands 1..=8.
+        let mut full = populated_sm();
+        full.apply(
+            7,
+            &MetadataCommand::AddNode {
+                node: 3,
+                role: NodeRole::Voter,
+            },
+        );
+        full.apply(
+            8,
+            &MetadataCommand::SetConfig {
+                key: "k".to_owned(),
+                value: "v".to_owned(),
+            },
+        );
+
+        // Snapshot-at-6 + tail 7,8: restore the snapshot, then apply only the tail.
+        let snapshot = populated_sm().snapshot();
+        let mut from_snap =
+            MetadataStateMachine::restore_from_snapshot(&snapshot).expect("restore");
+        assert_eq!(
+            from_snap.applied_index(),
+            6,
+            "restored at the snapshot index"
+        );
+        from_snap.apply(
+            7,
+            &MetadataCommand::AddNode {
+                node: 3,
+                role: NodeRole::Voter,
+            },
+        );
+        from_snap.apply(
+            8,
+            &MetadataCommand::SetConfig {
+                key: "k".to_owned(),
+                value: "v".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            from_snap, full,
+            "restore(snapshot@6) + apply(7,8) == full replay(1..=8)"
+        );
+        assert_eq!(from_snap.applied_index(), 8);
+    }
+
+    /// An empty (fresh) state machine snapshots and restores cleanly (the genesis case).
+    #[test]
+    fn an_empty_state_machine_snapshots_and_restores() {
+        let sm = MetadataStateMachine::new();
+        let bytes = sm.snapshot();
+        let restored = MetadataStateMachine::restore_from_snapshot(&bytes).expect("restore empty");
+        assert_eq!(restored, sm);
+        assert_eq!(restored.applied_index(), 0);
+    }
+
+    /// Restore fails CLOSED on a foreign / torn blob: an unknown version, trailing bytes, and a
+    /// truncated buffer are typed errors, never a silently mis-installed state.
+    #[test]
+    fn restore_rejects_a_foreign_or_torn_snapshot() {
+        // Unknown version byte.
+        assert_eq!(
+            MetadataStateMachine::restore_from_snapshot(&[0xff, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Err(DecodeError::UnknownSnapshotVersion(0xff))
+        );
+        // Trailing bytes after a valid snapshot.
+        let mut bytes = populated_sm().snapshot();
+        bytes.push(0x00);
+        assert_eq!(
+            MetadataStateMachine::restore_from_snapshot(&bytes),
+            Err(DecodeError::TrailingBytes)
+        );
+        // Truncated mid-snapshot.
+        let good = populated_sm().snapshot();
+        assert!(matches!(
+            MetadataStateMachine::restore_from_snapshot(&good[..good.len() / 2]),
+            Err(DecodeError::Truncated | DecodeError::BadLength)
+        ));
+        // Empty buffer.
+        assert_eq!(
+            MetadataStateMachine::restore_from_snapshot(&[]),
+            Err(DecodeError::Truncated)
+        );
     }
 }
