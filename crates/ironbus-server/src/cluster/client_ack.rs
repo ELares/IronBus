@@ -1043,4 +1043,94 @@ mod tests {
             "the leader uses the normal consume path, not the follower-read"
         );
     }
+
+    // ---- #739: the dirty-tier confirm fail-closes when the leader is unreachable -----------------
+
+    /// THE #739 in-process FAIL-CLOSED unit test: a caught-up follower whose KNOWN committed-HW bar is
+    /// STALE, with NO leader data address to confirm against. A `FollowerLatest` (dirty) read above the
+    /// stale bar CANNOT confirm (no route), so it FALLS BACK to the clean tier — it serves ONLY up to the
+    /// stale safe watermark, NEVER an unconfirmed offset (a read STARTING at the bar serves nothing).
+    #[test]
+    fn serve_follower_consume_dirty_tier_fails_closed_with_no_leader_route() {
+        let (caught, served_end) = caught_up_follower_gate(30);
+        assert!(served_end >= 6, "a healthy replicated prefix");
+        // Rebuild a gate over the SAME caught-up server with a STALE committed-HW bar and a follower target
+        // (so the dirty path tries to resolve a leader) but NO leader_data_addrs (so the confirm can find
+        // no route -> fail-closed). The follower target is set on the shared server.
+        let server = Arc::clone(caught.server());
+        let stale = served_end / 3;
+        assert!(stale > 0 && stale < served_end);
+        {
+            let mut srv = server.lock().unwrap();
+            srv.set_follower_target(P, 1); // names a leader, but with no data address mapped
+        }
+        let mut status = super::super::runtime::ClusterStatus::default();
+        status.last_committed_hw.insert(P, stale);
+        let gate = ClientAckGate::new(server, ClusterAckLevel::C2Fsync)
+            .with_status_handle(Arc::new(Mutex::new(status)));
+        // leader_data_addrs is EMPTY (never wired), so the confirm finds no route -> fail-closed.
+
+        // A DIRTY read from 0: it serves the clean prefix [0, stale) and never above the unconfirmed bar.
+        let mut from = Offset::ZERO;
+        let mut max_seen: Option<u64> = None;
+        let mut guard = 0u32;
+        loop {
+            guard += 1;
+            assert!(guard < 10_000, "chain failed to terminate");
+            let outcome = gate
+                .serve_follower_consume(P, ReadTier::FollowerLatest, from, usize::MAX, None)
+                .expect("a follower returns Some(outcome)");
+            let run = match outcome {
+                FollowerReadOutcome::Served(r) => r.run,
+                FollowerReadOutcome::ConfirmWithLeader { .. } => {
+                    panic!(
+                        "a fail-closed dirty read resolves to a clean Served run, never a confirm"
+                    )
+                }
+            };
+            if run.record_count == 0 {
+                break;
+            }
+            let mut off = run.first_offset.get();
+            let mut cursor = 0usize;
+            while cursor < run.bytes.len() {
+                let (_v, consumed) = ironbus_core::codec::decode(&run.bytes[cursor..]).unwrap();
+                assert!(
+                    off < stale,
+                    "fail-closed: served offset {off} at/above the unconfirmed bar {stale}"
+                );
+                max_seen = Some(max_seen.map_or(off, |m| m.max(off)));
+                off += 1;
+                cursor += consumed;
+            }
+            let next = run.next_offset.get();
+            if next <= from.get() {
+                break;
+            }
+            from = Offset::new(next);
+        }
+        assert!(
+            max_seen.is_some(),
+            "the clean fallback still served the committed prefix below the stale bar"
+        );
+        // A dirty read STARTING at the stale bar serves NOTHING (the confirm cannot raise the bar).
+        let at_bar = gate
+            .serve_follower_consume(
+                P,
+                ReadTier::FollowerLatest,
+                Offset::new(stale),
+                usize::MAX,
+                None,
+            )
+            .expect("a follower returns Some(outcome)");
+        match at_bar {
+            FollowerReadOutcome::Served(r) => assert_eq!(
+                r.run.record_count, 0,
+                "fail-closed: a dirty read at the bar with no reachable leader serves nothing"
+            ),
+            FollowerReadOutcome::ConfirmWithLeader { .. } => {
+                panic!("a fail-closed dirty read never surfaces a confirm to the caller")
+            }
+        }
+    }
 }

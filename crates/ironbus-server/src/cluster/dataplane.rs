@@ -1016,12 +1016,12 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
                 // committed-HW source, so the follower never trusts a non-leader's answer and falls back
                 // to the clean tier. NEVER an over-claimed HW: the leader's flushed frontier is its
                 // proven-committed prefix.
-                let committed_hw = self.leader_committed_hw(partition).ok_or(
-                    DataPlaneError::WrongRole {
-                        partition,
-                        needed: "leader",
-                    },
-                )?;
+                let committed_hw =
+                    self.leader_committed_hw(partition)
+                        .ok_or(DataPlaneError::WrongRole {
+                            partition,
+                            needed: "leader",
+                        })?;
                 Ok(DataPlaneAction::SendCommittedHwResponse {
                     partition,
                     response: CommittedHwResponseBody { committed_hw },
@@ -2917,6 +2917,78 @@ mod tests {
         for (off, _) in decode_run(&run.run) {
             assert!(off >= stale_known && off < leader_hw);
         }
+    }
+
+    /// THE #739 wire-routing test: a [`DataPlaneFrame::CommittedHwQuery`] routed through the LEADER's
+    /// `handle_frame` is answered with a [`DataPlaneAction::SendCommittedHwResponse`] carrying the leader's
+    /// current committed HW; the SAME query routed through a FOLLOWER is a wrong-role error (a follower is
+    /// never an authoritative committed-HW source, so the follower never trusts a non-leader's answer).
+    #[test]
+    fn committed_hw_query_is_answered_by_the_leader_and_rejected_by_a_follower() {
+        use super::{CommittedHwQueryBody, DataPlaneAction, DataPlaneFrame};
+        const P: u64 = 0;
+        let mut leader_log = open_log(InMemoryFs::new(), small_config());
+        for i in 0..20u32 {
+            leader_log
+                .append(&rec(format!("hw-{i:02}").as_bytes()))
+                .unwrap();
+        }
+        leader_log.sync().unwrap();
+        let plane = leader_plane(&leader_log);
+        let mut leader = DataPlaneController::<InMemoryFs, ManualClock>::new(1);
+        leader.start_leader(P, Arc::clone(&plane), EpochCache::new(), &[1, 2], quorum3());
+        let mut follower = DataPlaneController::new(2);
+        follower.start_follower(P, open_log(InMemoryFs::new(), small_config()));
+
+        // The leader answers the HW query from its current committed HW (its read plane's flushed frontier).
+        let action = leader
+            .handle_frame(P, DataPlaneFrame::CommittedHwQuery(CommittedHwQueryBody))
+            .expect("the leader answers a committed-HW query");
+        match action {
+            DataPlaneAction::SendCommittedHwResponse {
+                partition,
+                response,
+            } => {
+                assert_eq!(partition, P);
+                assert_eq!(
+                    response.committed_hw,
+                    leader.leader_committed_hw(P).unwrap(),
+                    "the answer is the leader's current committed HW"
+                );
+            }
+            other => panic!("expected a committed-HW response, got {other:?}"),
+        }
+        // A query routed to a FOLLOWER is a wrong-role error (only the leader answers authoritatively).
+        assert!(matches!(
+            follower.handle_frame(P, DataPlaneFrame::CommittedHwQuery(CommittedHwQueryBody)),
+            Err(DataPlaneError::WrongRole {
+                needed: "leader",
+                ..
+            })
+        ));
+        // A query for a partition no role is held for is an unknown-partition error.
+        assert!(matches!(
+            leader.handle_frame(99, DataPlaneFrame::CommittedHwQuery(CommittedHwQueryBody)),
+            Err(DataPlaneError::WrongRole { .. } | DataPlaneError::UnknownPartition { .. })
+        ));
+    }
+
+    /// The #739 committed-HW body codec round-trips and is fail-closed on a bad kind byte / length.
+    #[test]
+    fn committed_hw_bodies_round_trip_and_reject_malformed() {
+        use super::{CommittedHwQueryBody, CommittedHwResponseBody};
+        let q = CommittedHwQueryBody;
+        assert_eq!(CommittedHwQueryBody::decode(&q.encode()).unwrap(), q);
+        let r = CommittedHwResponseBody {
+            committed_hw: 1_234_567,
+        };
+        assert_eq!(CommittedHwResponseBody::decode(&r.encode()).unwrap(), r);
+        // A response decoded as a query (wrong kind byte) is rejected, and vice-versa.
+        assert!(CommittedHwQueryBody::decode(&r.encode()).is_err());
+        assert!(CommittedHwResponseBody::decode(&q.encode()).is_err());
+        // A truncated / empty body is rejected.
+        assert!(CommittedHwQueryBody::decode(&[]).is_err());
+        assert!(CommittedHwResponseBody::decode(&[1, 2, 3]).is_err());
     }
 
     /// A follower is NOT an authoritative committed-HW source: `leader_committed_hw` returns `None` on a
