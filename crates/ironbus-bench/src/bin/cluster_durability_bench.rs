@@ -669,21 +669,16 @@ mod imp {
         // Confirm the ORIGINAL corrupt bytes were preserved (copy-aside), never deleted: the
         // quarantine dir holds a copy. (#697 quarantine-never-delete.)
         let quarantine_bytes: u64 = if quarantined {
-            std::fs::read_dir(&quarantine_dir)
-                .map(|d| {
-                    d.filter_map(Result::ok)
-                        .filter_map(|e| e.metadata().ok())
-                        .map(|m| m.len())
-                        .sum()
-                })
-                .unwrap_or(0)
+            std::fs::read_dir(&quarantine_dir).map_or(0, |d| {
+                d.filter_map(Result::ok)
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
         } else {
             0
         };
-        let recovered_after = reopened
-            .as_ref()
-            .map(|lg| lg.flushed_offset().get())
-            .unwrap_or(0);
+        let recovered_after = reopened.as_ref().map_or(0, |lg| lg.flushed_offset().get());
         log(format_args!(
             "  detection: recovered prefix {recovered_after}/{replicated_hw} (shorter => corrupt tail quarantined), detected={detected}, quarantined={quarantined} ({quarantine_bytes} forensic bytes)"
         ));
