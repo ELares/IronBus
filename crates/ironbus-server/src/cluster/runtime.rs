@@ -929,10 +929,9 @@ struct DriverFailover<C: Clock + Clone> {
 /// metadata-Raft leader, both go through the metadata Raft log (committed, ordered), and both are
 /// idempotent (a removal of an already-gone node and a promotion of an already-converged placement are
 /// skipped) — so no two nodes can drive a different failover; the Raft log linearizes it.
-#[allow(clippy::too_many_lines)]
-// the driver loop is ONE linear consensus cycle (tick, step+record,
-// drive_ready, registry refresh, F1 detect, F2 auto-fire, publish);
-// splitting it would scatter a single tightly-ordered concern.
+#[allow(clippy::too_many_lines)] // the driver loop is ONE linear consensus cycle (tick, step+record,
+                                 // drive_ready, registry refresh, F1 detect, F2 auto-fire, publish);
+                                 // splitting it would scatter a single tightly-ordered concern.
 #[allow(clippy::needless_pass_by_value)] // a thread entry point: it OWNS the group + the shared
                                          // channels/Arcs + the failover wiring for the thread's whole
                                          // lifetime; a borrow would fight the 'static spawn bound.
