@@ -399,6 +399,22 @@ pub enum FrameType {
     /// peers). The session layer (`crate::session` in `ironbus-server`) and the client are its only
     /// encoder/decoder.
     NotLeader,
+    /// The FOLLOWER-READ DIRTY-TIER committed-HW CONFIRM frame (#739, V2-C6, wire tag 43). The tiny
+    /// HW-VERSION query (NOT the data) a FOLLOWER sends to the partition LEADER when a "latest/dirty"
+    /// follower-read reaches ABOVE the follower's known safe watermark (#723's
+    /// `ConfirmWithLeader`): it asks the leader for the partition's CURRENT committed high-watermark so
+    /// the follower can serve the now-confirmed prefix LOCALLY — and NEVER serve an offset the leader
+    /// has not confirmed committed. It rides the intra-cluster DATA-plane peer link (the same bounded
+    /// `[len][type][body]` envelope as the replication verbs), NOT the client wire: a CLIENT never sends
+    /// or receives it. Request and response SHARE this one tag, distinguished by a leading `kind` byte
+    /// (like [`FrameType::OffsetForLeaderEpoch`] / [`FrameType::MirrorPull`]). Body (request):
+    /// `kind: u8 = 0` (the partition id is carried by the data-plane envelope's partition prefix). Body
+    /// (response): `kind: u8 = 1`, `committed_hw: u64` — the leader's current committed HW (its read
+    /// plane's flushed frontier). It is a NEW append-only tag; tags 1-42 are byte-for-byte unchanged.
+    /// A single-node broker NEVER constructs the data plane, so this tag never appears off-cluster. The
+    /// cluster data plane (`crate::cluster::dataplane` / `crate::cluster::serve` in `ironbus-server`) is
+    /// its only encoder/decoder.
+    CommittedHwQuery,
 }
 
 impl FrameType {
@@ -448,6 +464,7 @@ impl FrameType {
             FrameType::MirrorPull => 40,
             FrameType::LeafPush => 41,
             FrameType::NotLeader => 42,
+            FrameType::CommittedHwQuery => 43,
         }
     }
 
@@ -498,6 +515,7 @@ impl FrameType {
             40 => FrameType::MirrorPull,
             41 => FrameType::LeafPush,
             42 => FrameType::NotLeader,
+            43 => FrameType::CommittedHwQuery,
             _ => return None,
         })
     }
@@ -630,7 +648,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const ALL_TYPES: [FrameType; 42] = [
+    const ALL_TYPES: [FrameType; 43] = [
         FrameType::Connect,
         FrameType::Info,
         FrameType::Ping,
@@ -673,6 +691,7 @@ mod tests {
         FrameType::MirrorPull,
         FrameType::LeafPush,
         FrameType::NotLeader,
+        FrameType::CommittedHwQuery,
     ];
 
     #[test]
@@ -733,6 +752,7 @@ mod tests {
         assert_eq!(FrameType::MirrorPull.as_u8(), 40);
         assert_eq!(FrameType::LeafPush.as_u8(), 41);
         assert_eq!(FrameType::NotLeader.as_u8(), 42);
+        assert_eq!(FrameType::CommittedHwQuery.as_u8(), 43);
     }
 
     #[test]
@@ -750,8 +770,9 @@ mod tests {
         // verbs; 38 is the cluster OffsetForLeaderEpoch divergence-query (#599, V2-C2-I4); 39 is the
         // cluster SegmentFingerprints divergence-advertisement (#611, V2-C4-I1); 40 is the
         // cross-cluster MirrorPull (#623, V2-C7-I1); 41 is the edge leaf-spoke LeafPush write-through
-        // (#625, V2-C7-I3); 42 is the cluster NotLeader produce-redirect (#735); 43 is now the next-free
-        // (still unknown) tag, so it frames but is not known.
+        // (#625, V2-C7-I3); 42 is the cluster NotLeader produce-redirect (#735); 43 is the follower-read
+        // dirty-tier CommittedHwQuery confirm (#739); 44 is now the next-free (still unknown) tag, so it
+        // frames but is not known.
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
         assert_eq!(
             FrameType::from_u8(38),
@@ -761,7 +782,8 @@ mod tests {
         assert_eq!(FrameType::from_u8(40), Some(FrameType::MirrorPull));
         assert_eq!(FrameType::from_u8(41), Some(FrameType::LeafPush));
         assert_eq!(FrameType::from_u8(42), Some(FrameType::NotLeader));
-        assert_eq!(FrameType::from_u8(43), None);
+        assert_eq!(FrameType::from_u8(43), Some(FrameType::CommittedHwQuery));
+        assert_eq!(FrameType::from_u8(44), None);
         for ty in [
             FrameType::BindSubject,
             FrameType::PubSubject,
@@ -804,7 +826,8 @@ mod tests {
         // 37 is the cluster AckReplicated report (#593); 38 is the cluster OffsetForLeaderEpoch
         // divergence-query (#599); 39 is the cluster SegmentFingerprints divergence-advertisement
         // (#611); 40 is the cross-cluster MirrorPull (#623); 41 is the edge leaf-spoke LeafPush (#625);
-        // 42 is the cluster NotLeader produce-redirect (#735); 43 is the next-free (still unknown) tag.
+        // 42 is the cluster NotLeader produce-redirect (#735); 43 is the follower-read dirty-tier
+        // CommittedHwQuery confirm (#739); 44 is the next-free (still unknown) tag.
         assert_eq!(FrameType::from_u8(37), Some(FrameType::AckReplicated));
         assert_eq!(
             FrameType::from_u8(38),
@@ -814,7 +837,8 @@ mod tests {
         assert_eq!(FrameType::from_u8(40), Some(FrameType::MirrorPull));
         assert_eq!(FrameType::from_u8(41), Some(FrameType::LeafPush));
         assert_eq!(FrameType::from_u8(42), Some(FrameType::NotLeader));
-        assert_eq!(FrameType::from_u8(43), None);
+        assert_eq!(FrameType::from_u8(43), Some(FrameType::CommittedHwQuery));
+        assert_eq!(FrameType::from_u8(44), None);
         for ty in [
             FrameType::StreamDeclare,
             FrameType::StreamInfo,
@@ -892,7 +916,8 @@ mod tests {
         // OffsetForLeaderEpoch divergence-query (#599, V2-C2-I4); 39 is the cluster SegmentFingerprints
         // divergence-advertisement (#611, V2-C4-I1); 40 is the cross-cluster MirrorPull (#623,
         // V2-C7-I1); 41 is the edge leaf-spoke LeafPush write-through (#625, V2-C7-I3); 42 is the
-        // cluster NotLeader produce-redirect (#735); 43 is now the next-free (still unknown) tag, so it
+        // cluster NotLeader produce-redirect (#735); 43 is the follower-read dirty-tier CommittedHwQuery
+        // confirm (#739); 44 is now the next-free (still unknown) tag, so it
         // frames but is not a known type. (Tags 27 = cluster-peer
         // Raft #667; 28-31 = the stream-addressed verbs #588; 32-33 = the cluster replication-fetch
         // verbs #590; 34-36 = the subject-routing verbs #585.)
@@ -905,7 +930,8 @@ mod tests {
         assert_eq!(FrameType::from_u8(40), Some(FrameType::MirrorPull));
         assert_eq!(FrameType::from_u8(41), Some(FrameType::LeafPush));
         assert_eq!(FrameType::from_u8(42), Some(FrameType::NotLeader));
-        assert_eq!(FrameType::from_u8(43), None);
+        assert_eq!(FrameType::from_u8(43), Some(FrameType::CommittedHwQuery));
+        assert_eq!(FrameType::from_u8(44), None);
         for ty in [FrameType::StreamFetch, FrameType::StreamCommit] {
             let mut buf = Vec::new();
             encode_frame(ty, b"\x07\x08", &mut buf).unwrap();
@@ -933,7 +959,8 @@ mod tests {
         // OffsetForLeaderEpoch divergence-query (#599, V2-C2-I4); 39 is the cluster SegmentFingerprints
         // divergence-advertisement (#611, V2-C4-I1); 40 is the cross-cluster MirrorPull (#623,
         // V2-C7-I1); 41 is the edge leaf-spoke LeafPush write-through (#625, V2-C7-I3); 42 is the
-        // cluster NotLeader produce-redirect (#735); 43 is now the next-free (still unknown) tag, so it
+        // cluster NotLeader produce-redirect (#735); 43 is the follower-read dirty-tier CommittedHwQuery
+        // confirm (#739); 44 is now the next-free (still unknown) tag, so it
         // frames but is not a known type. (Tags 27 = cluster-peer
         // Raft #667; 28-31 = the stream-addressed verbs #588; 32-33 = the cluster replication-fetch
         // verbs #590; 34-36 = the subject-routing verbs #585.)
@@ -946,7 +973,8 @@ mod tests {
         assert_eq!(FrameType::from_u8(40), Some(FrameType::MirrorPull));
         assert_eq!(FrameType::from_u8(41), Some(FrameType::LeafPush));
         assert_eq!(FrameType::from_u8(42), Some(FrameType::NotLeader));
-        assert_eq!(FrameType::from_u8(43), None);
+        assert_eq!(FrameType::from_u8(43), Some(FrameType::CommittedHwQuery));
+        assert_eq!(FrameType::from_u8(44), None);
         let mut buf = Vec::new();
         encode_frame(FrameType::DeliverBatch, b"\x09\x0a", &mut buf).unwrap();
         match decode_frame(&buf).unwrap() {
@@ -1141,7 +1169,7 @@ mod tests {
         /// An unknown type tag still decodes at the envelope level (forward compatibility):
         /// the body and length are recovered; only `from_u8` reports it unknown.
         #[test]
-        fn an_unknown_type_tag_still_frames(tag in 43u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
+        fn an_unknown_type_tag_still_frames(tag in 44u8..=255, body in prop::collection::vec(any::<u8>(), 0..256)) {
             let frame_len = 1u32 + u32::try_from(body.len()).unwrap();
             let mut buf = frame_len.to_le_bytes().to_vec();
             buf.push(tag);
