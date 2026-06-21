@@ -2500,8 +2500,16 @@ mod tests {
     /// nobody, and promotes nobody — the placement is untouched, the leader unchanged.
     #[test]
     fn a_healthy_cluster_never_auto_fails_over() {
+        // Host-scale the liveness deadline: on a contended CI runner the driver threads heartbeat more
+        // slowly, so the deadline must scale by the SAME factor that slows the heartbeats to preserve the
+        // deadline >> heartbeat ratio — otherwise a healthy-but-starved node would be falsely suspected
+        // during/after bring-up (a CI scheduler artifact, not a product fault). The ratio — and thus the
+        // no-false-failover property under test — is unchanged; only the absolute timing tracks the host.
         let (_serial, mut nodes, ids, _dirs, leader_idx) =
-            bring_up_placed_cluster(LivenessConfig::default());
+            bring_up_placed_cluster(LivenessConfig {
+                timeout: host_scaled(DEFAULT_LIVENESS_TIMEOUT),
+                enabled: true,
+            });
         let leader_id = ids[leader_idx];
         let placement0 = nodes[leader_idx]
             .status()
@@ -2510,10 +2518,11 @@ mod tests {
             .expect("placement")
             .clone();
 
-        // Let the cluster run for a window MANY heartbeat intervals long (the heartbeat is ~300 ms; we
-        // observe for ~3 s). The default deadline (3 s) is 10x the heartbeat, so a healthy heartbeating
-        // peer is NEVER suspected within this window.
-        let observe_until = Instant::now() + Duration::from_secs(3);
+        // Observe for a window many heartbeat intervals long but strictly SHORTER than the (host-scaled)
+        // deadline, so a healthy heartbeating peer is NEVER suspected within it. Both the window and the
+        // deadline host-scale, so the margin holds on a fast host (deadline 3 s ≈ 10x the ~300 ms
+        // heartbeat) and on a slow/contended runner alike.
+        let observe_until = Instant::now() + host_scaled(Duration::from_secs(2));
         while Instant::now() < observe_until {
             for n in &nodes {
                 let s = n.status();

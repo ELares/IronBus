@@ -334,7 +334,7 @@ pub(crate) static HEAVY_CLUSTER_TEST_SERIAL: std::sync::Mutex<()> = std::sync::M
 
 /// Acquire the shared heavy-cluster-test serial guard, recovering a poisoned lock (only mutual
 /// exclusion is needed, not the protected unit value). Gated `all(test, unix)` to match its callers —
-/// the heavy multi-node cluster tests are unix-only (the broker/serve path is `cfg(unix)` via StdFs),
+/// the heavy multi-node cluster tests are unix-only (the broker/serve path is `cfg(unix)` via `StdFs`),
 /// so on Windows the guard and its callers vanish together (no `dead_code` under `-D warnings`).
 #[cfg(all(test, unix))]
 pub(crate) fn heavy_cluster_test_guard() -> std::sync::MutexGuard<'static, ()> {
