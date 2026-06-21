@@ -40,16 +40,19 @@
 //! cluster-gated branch is skipped, and the immediate ack-after-local-fsync path is byte-for-byte
 //! today's, with ZERO added work, latency, or allocation. The gate is a no-op without a cluster.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use ironbus_core::clock::Clock;
 use ironbus_core::keyshared::MemberId;
+use ironbus_core::types::Offset;
 use ironbus_storage::fs::Filesystem;
 
 use super::ack_level::ClusterAckLevel;
-use super::dataplane::AckDisposition;
+use super::dataplane::{AckDisposition, FollowerReadOutcome};
 use super::isr::AckReplicatedBody;
+use super::read_consistency::ReadTier;
 use super::serve::DataPlaneServer;
 
 /// The fixed partition the broker's DEFAULT-stream log maps to in a clustered serve (#717/#719).
@@ -57,6 +60,33 @@ use super::serve::DataPlaneServer;
 /// client produce-ack gate routes every produce to it. Multi-partition routing (a produce to the right
 /// partition leader's seam) is the #693 multi-partition engine — FLAGGED, out of scope here.
 pub const DEFAULT_PARTITION: u64 = 0;
+
+/// How a clustered produce to `partition` should be ROUTED at the wire level (#735, the `NOT_LEADER`
+/// redirect, half A). The output of [`ClientAckGate::produce_routing`]: the produce path consults it
+/// BEFORE any local append/ack and either proceeds locally (as today) or short-circuits with a typed
+/// `NOT_LEADER` redirect carrying the current leader's CLIENT address.
+///
+/// A NON-cluster broker never builds a [`ClientAckGate`], so the produce path never calls this and the
+/// single-node hot path is byte-for-byte unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClusterProduceRouting {
+    /// PROCEED with the local produce exactly as today: this node either LEADS the partition (the #720
+    /// quorum gate then applies), or holds no clustered role for it (the brief bootstrap window, or a
+    /// partition that is not clustered) — in which case the local engine is authoritative and a redirect
+    /// would be a FALSE `NOT_LEADER`. The fail-safe default: never redirect unless this node provably holds
+    /// a clustered replica role it does not lead.
+    Local,
+    /// REDIRECT: this node holds a clustered REPLICA role for the partition but is NOT its current leader,
+    /// so the produce must go to the leader. The produce path writes a `NOT_LEADER` frame carrying
+    /// `leader_hint` (the current committed leader's CLIENT address, or `None` when this node does not yet
+    /// know it — mid-failover, or no advertised client address) and does NOT append/ack locally. The
+    /// client reconnects/retries to the leader (or, with no hint, re-tries its known peers).
+    Redirect {
+        /// The current leader's CLIENT-facing address, or `None` when unknown (the client falls back to
+        /// re-discovering the leader from its own configured peer set).
+        leader_hint: Option<SocketAddr>,
+    },
+}
 
 /// The shared client produce-ack gate (#719): the seam (via the shared
 /// [`DataPlaneServer`](super::serve::DataPlaneServer)) plus the per-connection released-ack outbox.
@@ -79,6 +109,20 @@ pub struct ClientAckGate<F: Filesystem, C: Clock> {
     /// in release (offset) order. The runtime deposits here on quorum-fsync; the owning connection
     /// drains here on its own pass. Empty for any connection with nothing released-pending.
     outbox: Mutex<HashMap<u64, Vec<Vec<u8>>>>,
+    /// The node-id -> CLIENT-facing address advertise map (#735), the source of the `NOT_LEADER` leader
+    /// HINT. When this node holds a non-leader replica role for a partition, the produce path looks up the
+    /// current leader's node id (via the shared server's follower target) and maps it here to the address
+    /// the client should reconnect to. EMPTY when no client addresses are advertised (the redirect still
+    /// fires, but with no hint — the client re-tries its own known peers). Immutable after construction
+    /// (the committed placement is static this phase; #693 dynamic re-placement is the flagged follow-up).
+    leader_client_addrs: BTreeMap<u64, SocketAddr>,
+    /// The shared metadata-plane status snapshot (#722/#735, half B): the source of the per-partition
+    /// committed-HW bar (`last_committed_hw`) the follower-read safe watermark `min(own_flushed,
+    /// known_committed_hw)` clamps to. `None` when no status handle was installed (the in-process tests
+    /// that drive the follower-read directly pass the HW explicitly): the follower-read then fails CLOSED
+    /// to a `0` committed bar (serve nothing) rather than risk a stale read. Read under a brief lock, never
+    /// across a socket write.
+    status: Option<Arc<Mutex<super::runtime::ClusterStatus>>>,
 }
 
 impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
@@ -93,7 +137,43 @@ impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
             server,
             configured_level,
             outbox: Mutex::new(HashMap::new()),
+            leader_client_addrs: BTreeMap::new(),
+            status: None,
         }
+    }
+
+    /// Install the node-id -> CLIENT-address advertise map (#735) used to fill the `NOT_LEADER` leader
+    /// HINT, returning the gate. Each entry maps a cluster node id to the address a CLIENT should dial to
+    /// reach that node's broker (its `--addr` listener). The redirect mechanism works with an EMPTY map
+    /// (the client re-tries its known peers); a populated map lets the redirect carry a concrete hint so
+    /// the client reconnects straight to the leader. Builder-style so the runtime can supply it at
+    /// construction (a non-cluster broker never builds the gate, so this never runs off-cluster).
+    #[must_use]
+    pub fn with_leader_client_addrs(mut self, addrs: BTreeMap<u64, SocketAddr>) -> Self {
+        self.leader_client_addrs = addrs;
+        self
+    }
+
+    /// Install the shared metadata-plane status snapshot (#735, half B), returning the gate. The
+    /// follower-read consume reads the per-partition committed-HW bar (`last_committed_hw`) from it for the
+    /// SAFE watermark `min(own_flushed, known_committed_hw)`. Without it the follower-read fails CLOSED
+    /// (a `0` committed bar — serve nothing — until a checkpoint is known), so installing it is what makes
+    /// a follower actually serve committed records. Builder-style; a non-cluster broker never builds the
+    /// gate, so this never runs off-cluster.
+    #[must_use]
+    pub fn with_status_handle(mut self, status: Arc<Mutex<super::runtime::ClusterStatus>>) -> Self {
+        self.status = Some(status);
+        self
+    }
+
+    /// The per-partition committed-HW bar this node has applied from the replicated metadata (#722) — the
+    /// `known_committed_hw` the follower-read safe watermark clamps to. Reads the shared status snapshot
+    /// (a brief lock); `None` when no status handle is installed or no checkpoint has committed for the
+    /// partition yet (the follower-read then fails closed to a `0` safe bar — serve nothing).
+    fn known_committed_hw(&self, partition: u64) -> Option<u64> {
+        let status = self.status.as_ref()?;
+        let snapshot = status.lock().ok()?;
+        snapshot.last_committed_hw.get(&partition).copied()
     }
 
     /// The serve-wide configured cluster ack level this gate holds produces to (#696).
@@ -181,6 +261,50 @@ impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
         }
     }
 
+    /// The cluster PRODUCE-ROUTING decision for `partition` (#735, the `NOT_LEADER` redirect, half A):
+    /// called by the produce path BEFORE any local append or ack. Returns:
+    ///
+    /// * [`ClusterProduceRouting::Local`] — PROCEED locally (byte-for-byte today's path) when this node
+    ///   LEADS the partition (the #720 quorum gate then applies on the local produce), OR holds NO
+    ///   clustered role for it (the brief bootstrap window before the placement commits here, or a
+    ///   non-clustered partition). The fail-safe default — NEVER a false `NOT_LEADER` on the leader, and
+    ///   never a redirect on a partition this node is authoritative for.
+    /// * [`ClusterProduceRouting::Redirect`] — this node holds a clustered REPLICA (follower) role for the
+    ///   partition but is NOT the leader, so the produce must be redirected to the current leader. The
+    ///   hint is the leader's CLIENT address from [`Self::with_leader_client_addrs`] (mapped from the
+    ///   follower's committed leader-target node id), or `None` when unknown.
+    ///
+    /// Locks the shared server briefly (the SAME `Arc<Mutex<DataPlaneServer>>` the runtime drives), never
+    /// across a socket write. A poisoned lock fails SAFE to [`ClusterProduceRouting::Local`] (proceed
+    /// locally rather than wrongly redirect a produce on a teardown edge — the local engine's own append
+    /// stays authoritative and no false `NOT_LEADER` is emitted).
+    #[must_use]
+    pub fn produce_routing(&self, partition: u64) -> ClusterProduceRouting {
+        let Ok(srv) = self.server.lock() else {
+            // Teardown edge (poisoned lock): proceed locally. The local engine append is authoritative;
+            // we never emit a false `NOT_LEADER` here.
+            return ClusterProduceRouting::Local;
+        };
+        // LEADER of this partition: proceed locally exactly as today (the #720 quorum gate applies on the
+        // produce). This is checked FIRST so a leader NEVER gets a false `NOT_LEADER`.
+        if srv.seam().controller().is_leader(partition) {
+            return ClusterProduceRouting::Local;
+        }
+        // NOT the leader. Only REDIRECT when this node provably holds a clustered FOLLOWER role for the
+        // partition (it is a replica that does not lead). If it holds no role at all — the bootstrap
+        // window, or a partition that is not clustered here — proceed LOCALLY (the local engine is
+        // authoritative; a redirect would be a false `NOT_LEADER`). `follower_leader` is `Some` exactly when
+        // this node follows the partition, and it names the current committed leader to redirect to.
+        match srv.follower_leader(partition) {
+            Some(leader_id) => {
+                let leader_hint = self.leader_client_addrs.get(&leader_id).copied();
+                ClusterProduceRouting::Redirect { leader_hint }
+            }
+            // No clustered role for this partition (bootstrap / non-clustered): proceed locally.
+            None => ClusterProduceRouting::Local,
+        }
+    }
+
     /// Feed a follower's [`AckReplicatedBody`] for `partition` into the gate (driven by the runtime's
     /// follower-report path) and DEPOSIT each released wire `PubAck` into its OWNER connection's outbox,
     /// in offset order, for that connection to flush on its own pass. Below `min_isr` releases NOTHING
@@ -235,6 +359,63 @@ impl<F: Filesystem, C: Clock> ClientAckGate<F, C> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         outbox.remove(&member.get());
+    }
+}
+
+// The FOLLOWER-READ consume serve (#735, half B) needs `F: Clone`: the follower read plane is built over
+// the follower's owned replica log (the #621 `DataPlaneController::serve_follower_read` lives in the
+// `F: Filesystem + Clone` impl block). A SEPARATE impl block keeps the rest of the gate — and the
+// no-cluster path — on the looser `F: Filesystem` bound; nothing on the single-node path links this.
+impl<F: Filesystem + Clone, C: Clock> ClientAckGate<F, C> {
+    /// Serve a CLUSTER FOLLOWER-READ consume of `[from, from + max_records)` for `partition` at `tier`
+    /// (#735, half B), LOCALLY from this node's follower read plane via the #723 read-consistency tiers
+    /// ([`DataPlaneController::serve_follower_read`](super::dataplane::DataPlaneController::serve_follower_read)).
+    /// The committed-HW bar is read from the installed status snapshot ([`Self::with_status_handle`]); the
+    /// serve is fail-closed by the SAFE watermark `min(own_flushed, known_committed_hw)` (a `0` bar when no
+    /// checkpoint is known), so a follower NEVER serves a record past the committed bar.
+    ///
+    /// Returns `None` when this node holds NO follower role for the partition (it is the leader, or holds
+    /// no role): the caller then serves the consume through the normal (leader/local-engine) path. Returns
+    /// `Some(outcome)` when this node follows the partition: either the served zero-copy bytes
+    /// ([`FollowerReadOutcome::Served`]) or a [`FollowerReadOutcome::ConfirmWithLeader`] signal for a
+    /// latest/dirty read above the safe watermark.
+    ///
+    /// Locks the shared server briefly, never across a socket write. A poisoned lock fails SAFE to `None`
+    /// (the caller serves through the normal path rather than risk a stale follower read).
+    #[must_use]
+    pub fn serve_follower_consume(
+        &self,
+        partition: u64,
+        tier: ReadTier,
+        from: Offset,
+        max_records: usize,
+        max_bytes: Option<usize>,
+    ) -> Option<FollowerReadOutcome> {
+        // The committed-HW bar from the replicated metadata (#722): the SAFE watermark clamps to it.
+        // Read BEFORE the server lock (its own brief lock), and `None` when unknown -> the serve fails
+        // closed to a `0` safe bar (serve nothing) rather than risk a stale read.
+        let known_committed_hw = self.known_committed_hw(partition);
+        let Ok(srv) = self.server.lock() else {
+            return None;
+        };
+        // Only a FOLLOWER serves a follower read. A leader / no-role partition returns `None` so the
+        // caller uses the normal consume path (the single-writer / leader read plane), never this.
+        if !srv.seam().controller().is_follower(partition) {
+            return None;
+        }
+        // A serve fault (IO) or a role race maps to `None` (the caller serves the normal path) — never a
+        // panic on the serve path and never an unsafe stale serve.
+        srv.seam()
+            .controller()
+            .serve_follower_read(
+                partition,
+                tier,
+                known_committed_hw,
+                from,
+                max_records,
+                max_bytes,
+            )
+            .ok()
     }
 }
 

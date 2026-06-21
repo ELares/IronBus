@@ -19,6 +19,8 @@
 use crate::actor::{
     ActorGone, EngineAccess, OwnedAppend, OwnedDedup, ProduceOutcome, ProduceSubmission,
 };
+use crate::cluster::dataplane::FollowerReadOutcome;
+use crate::cluster::read_consistency::ReadTier;
 use crate::engine::{
     AckResult, Engine, EngineError, NackResult, Poll, ProgressResult, StreamBatch, StreamRawBatch,
 };
@@ -39,11 +41,11 @@ use ironbus_proto::message::{
     decode_pub, decode_pub_subject, decode_pub_to, decode_stream_commit, decode_stream_declare,
     decode_stream_fetch, decode_stream_info, decode_sub, decode_sub_subject, decode_sub_to,
     encode_dead_letter, encode_deliver, encode_deliver_batch, encode_gap_marker, encode_info,
-    encode_produce_confirm, encode_pub_ack, encode_stream_info_response, encode_truncated,
-    gap_reason, parse_connect_auth, produce_confirm_status, pub_ack_level, AckLevel, AckOp,
-    ConsumeTier, CreditAdvert, DeadLetterBody, DeliverBatchHeader, DeliverBody, GapMarkerBody,
-    InfoBody, ProduceConfirmBody, PubAckBody, StreamInfoResponseBody, TruncatedBody,
-    DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
+    encode_not_leader, encode_produce_confirm, encode_pub_ack, encode_stream_info_response,
+    encode_truncated, gap_reason, parse_connect_auth, produce_confirm_status, pub_ack_level,
+    AckLevel, AckOp, ConsumeTier, CreditAdvert, DeadLetterBody, DeliverBatchHeader, DeliverBody,
+    GapMarkerBody, InfoBody, NotLeaderBody, ProduceConfirmBody, PubAckBody, StreamInfoResponseBody,
+    TruncatedBody, DEAD_LETTER_MAX_DELIVER, PUB_WIRE_ONLY_FLAGS,
 };
 use ironbus_storage::fs::Filesystem;
 use ironbus_storage::log::Append;
@@ -1033,6 +1035,30 @@ impl Session {
         // existing parked-ack path is unchanged.
         let level0 = matches!(ack_level, AckLevel::NoAck);
         let fire_and_forget = level0;
+        // CLUSTER `NOT_LEADER` PRODUCE REDIRECT (#735, half A): on a clustered serve, if this node holds a
+        // replica role for the partition but is NOT its current leader, the produce must go to the leader
+        // — redirect it BEFORE any local append/ack, so it is never acked by the wrong node (no
+        // double-append, no false ack; the client retries to the leader where the #720 quorum gate
+        // applies). SINGLE-NODE / no-cluster is BYTE-IDENTICAL: `cluster_produce_routing` returns
+        // `Local` via a cheap default (no gate, no lock, no alloc), so this whole branch is skipped and
+        // the produce path is byte-for-byte today's. NEVER a false `NOT_LEADER` on the leader (it returns
+        // `Local`) or on a non-clustered / pre-bootstrap partition (also `Local`). The default-stream log
+        // maps to the cluster default partition; multi-partition routing is the flagged #693 follow-up.
+        if let crate::cluster::client_ack::ClusterProduceRouting::Redirect { leader_hint } =
+            engine.cluster_produce_routing(crate::cluster::client_ack::DEFAULT_PARTITION)
+        {
+            // Preserve the wire reply order: flush the earlier pipelined produces' acks FIRST (exactly
+            // like every other pre-submit return in this function), THEN the redirect.
+            drain_parked(engine, member_id, parked, out)?;
+            // A LEVEL-0 (fire-and-forget) produce expects NO reply by contract: drop it silently (the
+            // record is simply not appended on this wrong node — the QoS-0 producer accepts loss and will
+            // re-fire to the leader on its own). An at-least-once produce gets the typed `NOT_LEADER` frame
+            // carrying the leader hint so the client transparently reconnects/retries to the leader.
+            if !fire_and_forget {
+                reply_not_leader(out, leader_hint);
+            }
+            return Ok(());
+        }
         // Enforce the dedup id length caps (#33) at the wire boundary, BEFORE the bytes cross into
         // owned storage. The `producer_id` keys the per-producer window map and the `msg_id` keys the
         // per-window ring; both are wire-supplied and attacker-chosen (up to the 64 KiB wire field
@@ -2100,6 +2126,32 @@ impl Session {
         let start = Offset::new(req.start_offset);
         let group = self.subscription.clone();
         let member = self.member_id;
+        // CLUSTER FOLLOWER-READ over the wire (#735, half B): if this node FOLLOWS the partition, serve the
+        // Tier-S streaming fetch from its OWN follower read plane via the #723 read-consistency tiers —
+        // fail-closed by the SAFE committed watermark `min(own_flushed, known_committed_hw)`, so a follower
+        // NEVER serves a record past the committed bar (CRAQ committed reads off a replica). This is the
+        // lease-FREE, cursor-FREE Tier-S contract, which is exactly the stateless follower-read shape (the
+        // follower serves via the read plane and never writes — single-writer preserved). SINGLE-NODE /
+        // no-cluster is BYTE-IDENTICAL: `cluster_follower_consume` returns `None` via a cheap default (no
+        // gate), so this branch is skipped and the normal (leader/local-engine) Tier-S path runs unchanged.
+        // A `Some` outcome means this node follows the partition: serve from the follower run (or, for a
+        // latest/dirty read above the safe bar, reply an empty batch — never a speculative unconfirmed
+        // serve; the dirty-tier leader confirm over the wire is the flagged follow-up).
+        if let Some(outcome) = engine.cluster_follower_consume(
+            crate::cluster::client_ack::DEFAULT_PARTITION,
+            ReadTier::FollowerCommitted,
+            start,
+            want,
+            max_bytes,
+        ) {
+            let delivered = Self::serve_follower_read_outcome(outcome, out);
+            // Terminate with the SAME FlowEnd a leader Tier-S batch uses, so the client frames a
+            // follower-read response exactly like any other streaming batch. No keep-up auto-tune on the
+            // follower path (the credit window is the leader engine's concern); a follower-read just serves
+            // its committed prefix.
+            reply(out, FrameType::FlowEnd, &delivered.to_le_bytes());
+            return Ok(());
+        }
         // A consumer that advertised the DeliverBatch capability (#541) takes the RAW-FRAMED batch path:
         // a contiguous run ships as ONE `DeliverBatch` (the on-disk frame bytes verbatim, sendfile-ready
         // for #658) instead of N per-record `Deliver` frames, with no broker re-encode of the sealed run.
@@ -2131,6 +2183,54 @@ impl Session {
         // client frames the streaming batch exactly like a Fetch batch.
         reply(out, FrameType::FlowEnd, &delivered.to_le_bytes());
         Ok(())
+    }
+
+    /// Emit a CLUSTER FOLLOWER-READ outcome (#735, half B) as per-record `Deliver` frames, returning the
+    /// number of records written. The follower serves the committed prefix from its OWN read plane as a
+    /// zero-copy [`RawSealedRead`] run; this decodes each CRC-framed record (re-validating the header AND
+    /// body CRC via [`ironbus_core::codec::decode`] — fail-closed, a torn/corrupt frame stops the run
+    /// rather than shipping a bad byte) into the SAME `Deliver` wire shape a leader Tier-S serve uses.
+    /// Generation `0` (lease-free, like every Tier-S delivery): a follower-read consumer commits by offset,
+    /// never by a fencing token. A [`FollowerReadOutcome::ConfirmWithLeader`] (a latest/dirty read above
+    /// the safe watermark) serves NOTHING here — never a speculative unconfirmed serve; the over-the-wire
+    /// dirty-tier leader confirm is the flagged follow-up.
+    fn serve_follower_read_outcome(outcome: FollowerReadOutcome, out: &mut Vec<u8>) -> u32 {
+        let run = match outcome {
+            FollowerReadOutcome::Served(read) => read.run,
+            // A latest/dirty read above the safe watermark: do NOT speculatively serve unconfirmed bytes.
+            // Serve nothing (an empty batch); the client re-reads / the wire dirty-tier confirm is the
+            // flagged follow-up.
+            FollowerReadOutcome::ConfirmWithLeader { .. } => return 0,
+        };
+        let mut delivered = 0u32;
+        let mut cursor = 0usize;
+        let mut offset = run.first_offset.get();
+        while cursor < run.bytes.len() {
+            // Re-validate and decode each stored frame (header + body CRC). A torn/corrupt frame is
+            // fail-closed: stop the run here rather than ship a bad record (never a blind-trusted byte).
+            let Ok((view, consumed)) = ironbus_core::codec::decode(&run.bytes[cursor..]) else {
+                break;
+            };
+            let msg = DeliverBody {
+                offset,
+                // Lease-free Tier-S follower-read: generation 0, commit-by-offset (no fencing token).
+                generation: 0,
+                flags: view.flags.bits(),
+                timestamp_ms: view.timestamp_ms,
+                key: view.key,
+                headers: view.headers,
+                payload: view.payload,
+            };
+            let mut frame_body = Vec::new();
+            if encode_deliver(&msg, &mut frame_body).is_err() {
+                break;
+            }
+            reply(out, FrameType::Deliver, &frame_body);
+            delivered += 1;
+            offset += 1;
+            cursor += consumed;
+        }
+        delivered
     }
 
     /// The per-record half of [`Session::handle_stream_fetch`] (the consumer did NOT advertise
@@ -3346,6 +3446,24 @@ fn reply_pub_ack(out: &mut Vec<u8>, frame_type: FrameType, offset: Offset) {
         &mut body,
     );
     reply(out, frame_type, &body);
+}
+
+/// Emits a cluster `NotLeader` produce-redirect reply (#735): the current leader's CLIENT-address hint
+/// (or the EMPTY string when this node does not yet know it), via the shared [`encode_not_leader`] codec
+/// so the wire body cannot drift from the proto definition. Written ONLY on a clustered serve when a
+/// produce lands on a non-leader replica of the partition (see [`ClusterProduceRouting::Redirect`]); a
+/// single-node broker never reaches this. The encode is infallible for an address (well under the u16
+/// field cap); on the unreachable over-cap error it falls back to an empty hint so the redirect still
+/// fires (the client re-tries its known peers) rather than panicking on the serve path (#11).
+fn reply_not_leader(out: &mut Vec<u8>, leader_hint: Option<std::net::SocketAddr>) {
+    let hint = leader_hint.map(|a| a.to_string()).unwrap_or_default();
+    let mut body = Vec::new();
+    if encode_not_leader(&NotLeaderBody { leader_hint: &hint }, &mut body).is_err() {
+        body.clear();
+        // Unreachable for a real address; emit an empty-hint redirect rather than panic.
+        let _ = encode_not_leader(&NotLeaderBody { leader_hint: "" }, &mut body);
+    }
+    reply(out, FrameType::NotLeader, &body);
 }
 
 /// Writes one Level-2 `ProduceConfirm` frame (#497) for a ready terminal: the durable offset plus the

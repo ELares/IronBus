@@ -660,6 +660,22 @@ const DATAPLANE_POLL: Duration = Duration::from_millis(100);
 /// [`ClusterRuntime`](super::runtime::ClusterRuntime)). With no cluster config NOTHING here is
 /// constructed — no server, no listener, no thread, no data frame — and the broker's produce/consume
 /// hot path is byte-for-byte today's.
+/// The client-gate construction inputs threaded into [`DataPlaneRuntime::start_inner`] (#719/#735): the
+/// configured cluster ack level (#719) plus the #735 client cluster-awareness wiring — the node-id ->
+/// CLIENT-address advertise map (the `NOT_LEADER` leader hint) and the shared metadata status snapshot (the
+/// follower-read committed-HW safe-watermark source). `None` for a runtime started without a client gate
+/// (the in-process tests / the observability serve).
+struct ClientGateConfig {
+    /// The serve-wide configured cluster ack level the produce-ack gate holds produces to (#719/#696).
+    configured_level: super::ack_level::ClusterAckLevel,
+    /// The node-id -> CLIENT-address advertise map for the `NOT_LEADER` leader hint (#735); empty means the
+    /// redirect carries no hint (the client re-tries its known peers).
+    leader_client_addrs: BTreeMap<u64, SocketAddr>,
+    /// The shared metadata status snapshot the follower-read reads the committed-HW bar from (#735, half
+    /// B); `None` fails the follower-read closed (serve nothing) until a checkpoint is known.
+    status: Option<Arc<Mutex<super::runtime::ClusterStatus>>>,
+}
+
 pub struct DataPlaneRuntime<F: Filesystem, C: Clock> {
     /// The shared, `Send` data-plane server every peer thread drives under a short per-frame lock.
     server: Arc<Mutex<DataPlaneServer<F, C>>>,
@@ -755,19 +771,56 @@ where
             server,
             self_data_addr,
             peer_data_addrs,
-            Some(configured_level),
+            Some(ClientGateConfig {
+                configured_level,
+                leader_client_addrs: BTreeMap::new(),
+                status: None,
+            }),
         )
     }
 
-    /// The shared work of [`Self::start`] / [`Self::start_with_client_gate`]: when `client_level` is
-    /// `Some`, a [`ClientAckGate`](super::client_ack::ClientAckGate) is built around the wrapped server
-    /// Arc and the leader-side readers release through it (`AckRelease::Gate`); when `None`, the readers
-    /// drive the seam directly and drop the released bytes (`AckRelease::ServerOnly`).
+    /// Like [`Self::start_with_client_gate`], but ALSO supplies the #735 client cluster-awareness wiring:
+    /// the node-id -> CLIENT-address advertise map (the `NOT_LEADER` leader HINT) and the shared metadata
+    /// status snapshot (the follower-read committed-HW safe-watermark source). With an empty advertise map
+    /// the `NOT_LEADER` redirect still fires (the client re-tries its known peers); without a status handle a
+    /// follower-read fails closed (serves nothing) until a committed-HW checkpoint is known.
+    ///
+    /// # Errors
+    /// As [`Self::start`].
+    ///
+    /// # Panics
+    /// As [`Self::start`].
+    pub fn start_with_client_gate_aware(
+        server: DataPlaneServer<F, C>,
+        self_data_addr: SocketAddr,
+        peer_data_addrs: &BTreeMap<u64, SocketAddr>,
+        configured_level: super::ack_level::ClusterAckLevel,
+        leader_client_addrs: BTreeMap<u64, SocketAddr>,
+        status: Arc<Mutex<super::runtime::ClusterStatus>>,
+    ) -> io::Result<Self> {
+        Self::start_inner(
+            server,
+            self_data_addr,
+            peer_data_addrs,
+            Some(ClientGateConfig {
+                configured_level,
+                leader_client_addrs,
+                status: Some(status),
+            }),
+        )
+    }
+
+    /// The shared work of [`Self::start`] / [`Self::start_with_client_gate`] /
+    /// [`Self::start_with_client_gate_aware`]: when `client_cfg` is `Some`, a
+    /// [`ClientAckGate`](super::client_ack::ClientAckGate) is built around the wrapped server Arc (with the
+    /// #735 leader-hint advertise map + status handle) and the leader-side readers release through it
+    /// (`AckRelease::Gate`); when `None`, the readers drive the seam directly and drop the released bytes
+    /// (`AckRelease::ServerOnly`).
     fn start_inner(
         server: DataPlaneServer<F, C>,
         self_data_addr: SocketAddr,
         peer_data_addrs: &BTreeMap<u64, SocketAddr>,
-        client_level: Option<super::ack_level::ClusterAckLevel>,
+        client_cfg: Option<ClientGateConfig>,
     ) -> io::Result<Self> {
         // Bind the data-plane peer listener BEFORE spawning anything, so a bind failure is synchronous
         // (no half-started runtime). Non-blocking so the accept loop polls the shutdown flag.
@@ -777,14 +830,18 @@ where
         let follower_partitions = server.follower_partitions();
         let server = Arc::new(Mutex::new(server));
         let shutdown = Arc::new(AtomicBool::new(false));
-        // Build the client produce-ack gate around the SAME server Arc when a configured level was given
-        // (#719). The gate and every leader-side reader share this one Arc, so the seam's parked state is
-        // one source of truth.
-        let client_gate = client_level.map(|level| {
-            Arc::new(super::client_ack::ClientAckGate::new(
-                Arc::clone(&server),
-                level,
-            ))
+        // Build the client produce-ack gate around the SAME server Arc when a config was given (#719/#735).
+        // The gate and every leader-side reader share this one Arc, so the seam's parked state is one
+        // source of truth. The #735 wiring (the `NOT_LEADER` leader-hint advertise map + the follower-read
+        // committed-HW status handle) is layered on via the gate's builders.
+        let client_gate = client_cfg.map(|cfg| {
+            let mut gate =
+                super::client_ack::ClientAckGate::new(Arc::clone(&server), cfg.configured_level)
+                    .with_leader_client_addrs(cfg.leader_client_addrs);
+            if let Some(status) = cfg.status {
+                gate = gate.with_status_handle(status);
+            }
+            Arc::new(gate)
         });
         let release = match &client_gate {
             Some(g) => AckRelease::Gate(Arc::clone(g)),

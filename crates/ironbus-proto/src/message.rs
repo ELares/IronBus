@@ -4844,7 +4844,10 @@ mod tests {
         for hint in ["127.0.0.1:9000", "[::1]:7000", ""] {
             let mut buf = Vec::new();
             encode_not_leader(&NotLeaderBody { leader_hint: hint }, &mut buf).unwrap();
-            assert_eq!(buf[0], NOT_LEADER_BODY_VERSION, "version byte leads the body");
+            assert_eq!(
+                buf[0], NOT_LEADER_BODY_VERSION,
+                "version byte leads the body"
+            );
             let decoded = decode_not_leader(&buf).unwrap();
             assert_eq!(decoded.leader_hint, hint);
         }

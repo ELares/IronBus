@@ -41,8 +41,9 @@ use ironbus_storage::log::Append;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::cluster::client_ack::ClientAckGate;
-use crate::cluster::dataplane::AckDisposition;
+use crate::cluster::client_ack::{ClientAckGate, ClusterProduceRouting};
+use crate::cluster::dataplane::{AckDisposition, FollowerReadOutcome};
+use crate::cluster::read_consistency::ReadTier;
 use ironbus_core::keyshared::MemberId;
 
 /// The default bound on the actor command channel: the most produce/engine commands that may be
@@ -740,9 +741,48 @@ pub trait EngineAccess<F: Filesystem, C: Clock> {
     /// overrides it to clear the gate's outbox entry when the cluster slot is filled. Called from the
     /// connection-cleanup path, like #497's `drop_l2_confirms`.
     fn drop_client_acks(&self, _member: MemberId) {}
+
+    /// The cluster PRODUCE-ROUTING decision (#735, the `NOT_LEADER` redirect): called by the produce path
+    /// BEFORE any local append/ack. The DEFAULT impl returns [`ClusterProduceRouting::Local`] (a
+    /// SINGLE-NODE / no-cluster broker — proceed exactly as today, with ZERO work: no lock, no allocation,
+    /// the byte-identical hot path). [`EngineHandle`] overrides it to consult the shared
+    /// [`ClientAckGate`](crate::cluster::client_ack::ClientAckGate) ONLY when the cluster slot is filled (a
+    /// clustered serve past bootstrap); even then it returns `Local` unless this node provably holds a
+    /// clustered replica role for the partition it does NOT lead, in which case it returns
+    /// [`ClusterProduceRouting::Redirect`] with the current leader's CLIENT-address hint. NEVER a false
+    /// `NOT_LEADER` on the leader or on a non-clustered partition.
+    fn cluster_produce_routing(&self, _partition: u64) -> ClusterProduceRouting {
+        ClusterProduceRouting::Local
+    }
+
+    /// Serve a CLUSTER FOLLOWER-READ consume (#735, half B) from this node's follower read plane via the
+    /// #723 read-consistency tiers, fail-closed by the SAFE committed watermark. The DEFAULT impl returns
+    /// `None` (SINGLE-NODE / no-cluster: there is no follower role — serve the consume the normal way,
+    /// with ZERO work). [`EngineHandle`] overrides it to consult the gate ONLY when the cluster slot is
+    /// filled; it returns `None` unless this node FOLLOWS the partition (the leader / no-role case uses the
+    /// normal path), else `Some(outcome)` — the served zero-copy bytes or a confirm-with-leader signal.
+    /// The committed-HW safe-watermark bar is sourced internally by the gate from the metadata status, so
+    /// the caller need not know it.
+    fn cluster_follower_consume(
+        &self,
+        _partition: u64,
+        _tier: ReadTier,
+        _from: Offset,
+        _max_records: usize,
+        _max_bytes: Option<usize>,
+    ) -> Option<FollowerReadOutcome> {
+        None
+    }
 }
 
-impl<F: Filesystem + 'static, C: Clock + Clone + 'static> EngineAccess<F, C>
+// `F: Clone` is required by the follower-read consume override (#735, half B): the gate's
+// `serve_follower_consume` builds a read plane over the follower's owned replica log (the #621
+// `serve_follower_read` lives in the `F: Filesystem + Clone` impl). Every PRODUCTION path that uses an
+// `EngineHandle` as an `EngineAccess` already carries `F: Clone` (the serve loop in `server.rs` requires
+// it for `session.process`), and the shipped filesystems (`InMemoryFs`/`StdFs`) are all `Clone`, so this
+// adds no real constraint; the CLI/bench helpers that hold a non-`Clone` `EngineHandle` use only its
+// inherent methods, not this trait impl.
+impl<F: Filesystem + Clone + 'static, C: Clock + Clone + 'static> EngineAccess<F, C>
     for EngineHandle<F, C>
 {
     fn produce(&self, append: OwnedAppend) -> Result<ProduceOutcome, ActorGone> {
@@ -814,6 +854,37 @@ impl<F: Filesystem + 'static, C: Clock + Clone + 'static> EngineAccess<F, C>
 
     fn drop_client_acks(&self, member: MemberId) {
         EngineHandle::drop_client_acks(self, member);
+    }
+
+    fn cluster_produce_routing(&self, partition: u64) -> ClusterProduceRouting {
+        // SINGLE-NODE / no-cluster / pre-bootstrap: `client_ack_gate` is `None`, so this returns `Local`
+        // with ZERO work (no lock, no alloc) and the produce path proceeds exactly as today — the
+        // byte-identical hot path. Only a clustered serve past bootstrap reaches the gate, which itself
+        // returns `Local` for a led / no-role partition and `Redirect` only for a non-led replica role.
+        match self.client_ack_gate() {
+            Some(gate) => gate.produce_routing(partition),
+            None => ClusterProduceRouting::Local,
+        }
+    }
+
+    fn cluster_follower_consume(
+        &self,
+        partition: u64,
+        tier: ReadTier,
+        from: Offset,
+        max_records: usize,
+        max_bytes: Option<usize>,
+    ) -> Option<FollowerReadOutcome> {
+        // SINGLE-NODE / no-cluster / pre-bootstrap: no gate, so this returns `None` with ZERO work and the
+        // consume serves through the normal (local-engine) path — byte-identical. Only a clustered serve
+        // past bootstrap reaches the gate, which returns `None` unless this node FOLLOWS the partition.
+        self.client_ack_gate()?.serve_follower_consume(
+            partition,
+            tier,
+            from,
+            max_records,
+            max_bytes,
+        )
     }
 }
 
