@@ -12,13 +12,53 @@
 //!
 //! # Cardinality
 //!
-//! Connz is a FIXED, UNLABELED set of scalar gauges/counters: total accepted, total closed, total
-//! refused, currently-open, and total authenticated. There is NO per-connection-id, per-peer, or
-//! per-address label — a connection id is exactly the kind of unbounded, per-connection label the
-//! #576 cardinality firewall forbids — so the connz surface is bounded BY CONSTRUCTION regardless of
-//! how many connections the broker has ever served.
+//! Connz is a FIXED set of scalar gauges/counters (total accepted, total closed, total refused,
+//! currently-open, total authenticated) plus ONE labeled counter family,
+//! `ironbus_connections_rejected_total{reason}` (#633): the pre-auth DoS rejections, with a `reason`
+//! label drawn from a FIXED, four-value enum ([`RejectReason`]). There is NO per-connection-id,
+//! per-peer, or per-address label — a connection id (or a source IP) is exactly the kind of
+//! unbounded, per-connection label the #576 cardinality firewall forbids; the `reason` label is a
+//! closed enum, so the surface is bounded BY CONSTRUCTION regardless of how many connections the
+//! broker has ever served or how many distinct attackers it has rejected.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The bounded reason an UNAUTHENTICATED connection was rejected by a pre-auth DoS defense (#633),
+/// the `reason` label on `ironbus_connections_rejected_total`. It is a CLOSED four-value enum so the
+/// labeled family is low-cardinality by construction (the #576 firewall's `reason` key is already
+/// allowlisted): a per-IP or per-connection label here would be the unbounded footgun the firewall
+/// forbids, so the SOURCE of the rejection is never a label — only its bounded class is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejectReason {
+    /// The per-source-IP new-connection token bucket was empty: this source connected faster than its
+    /// configured sustained rate. `reason="rate_limited"`.
+    RateLimited,
+    /// The global half-open (accepted-but-not-yet-authenticated) connection cap was full: too many
+    /// connections are mid-handshake, so a new one is refused before it can consume handshake work.
+    /// `reason="half_open_cap"`.
+    HalfOpenCap,
+    /// The source IP is in its failed-auth lockout cooldown: it exceeded the failed-auth threshold
+    /// within the window, so new connections from it are refused until the cooldown lapses.
+    /// `reason="locked_out"`.
+    LockedOut,
+    /// An authentication attempt FAILED (a bad/unmatched credential, an unknown mechanism, or a
+    /// missing credential on an auth-required broker). Counted at the failure, distinct from the
+    /// pre-connection refusals above. `reason="auth_failed"`.
+    AuthFailed,
+}
+
+impl RejectReason {
+    /// The fixed, lowercase wire/label value. A closed set, so the `reason` label stays bounded.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RejectReason::RateLimited => "rate_limited",
+            RejectReason::HalfOpenCap => "half_open_cap",
+            RejectReason::LockedOut => "locked_out",
+            RejectReason::AuthFailed => "auth_failed",
+        }
+    }
+}
 
 /// The shared, lock-free connection-signal counters (#572). Created ONCE at broker bootstrap and
 /// shared (via `Arc`) between the wire-server accept loop / handler threads (which RECORD) and the
@@ -48,6 +88,21 @@ pub struct ConnectionMetrics {
     /// AUTHENTICATED against the configured identity table (#631). Monotonic. Zero on a no-auth
     /// (zero-config loopback-dev) broker, which authenticates nothing.
     authenticated: AtomicU64,
+    /// `ironbus_connections_rejected_total{reason="rate_limited"}` (#633): connections refused because
+    /// the per-source-IP new-connection token bucket was empty. Monotonic. Zero when no per-IP rate
+    /// limit is configured. A separate atomic per reason keeps the record path a single relaxed add
+    /// with NO map and NO label allocation (the label is materialized only at scrape time).
+    rejected_rate_limited: AtomicU64,
+    /// `ironbus_connections_rejected_total{reason="half_open_cap"}` (#633): connections refused
+    /// because the global half-open (accepted-but-not-yet-authed) cap was full. Monotonic.
+    rejected_half_open_cap: AtomicU64,
+    /// `ironbus_connections_rejected_total{reason="locked_out"}` (#633): connections refused because
+    /// the source IP was in its failed-auth lockout cooldown. Monotonic.
+    rejected_locked_out: AtomicU64,
+    /// `ironbus_connections_rejected_total{reason="auth_failed"}` (#633): authentication attempts that
+    /// FAILED (bad/unmatched/missing credential, or unknown mechanism). Monotonic. Zero on a no-auth
+    /// broker, which authenticates nothing and so fails nothing.
+    rejected_auth_failed: AtomicU64,
 }
 
 impl ConnectionMetrics {
@@ -92,6 +147,21 @@ impl ConnectionMetrics {
         self.authenticated.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records one PRE-AUTH DoS rejection (#633) by its bounded [`RejectReason`]: bump the per-reason
+    /// total. Lock-free (a single relaxed atomic add into one of four fixed atomics, NO map, NO label
+    /// allocation), so an unauthenticated connection FLOOD costs one atomic per rejection and never
+    /// touches the engine. The `reason` label is materialized only at scrape time, so the record path
+    /// stays O(1) and the metric stays bounded (a closed four-value enum, never a per-IP label).
+    pub fn record_rejected(&self, reason: RejectReason) {
+        let counter = match reason {
+            RejectReason::RateLimited => &self.rejected_rate_limited,
+            RejectReason::HalfOpenCap => &self.rejected_half_open_cap,
+            RejectReason::LockedOut => &self.rejected_locked_out,
+            RejectReason::AuthFailed => &self.rejected_auth_failed,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Reads a consistent-enough snapshot of every counter for the `/metrics` scrape. Each load is
     /// relaxed and independent (no global lock), so the five values may be from infinitesimally
     /// different instants under concurrent connection churn — acceptable for a monitoring scrape, and
@@ -104,6 +174,10 @@ impl ConnectionMetrics {
             refused: self.refused.load(Ordering::Relaxed),
             currently_open: self.currently_open.load(Ordering::Relaxed),
             authenticated: self.authenticated.load(Ordering::Relaxed),
+            rejected_rate_limited: self.rejected_rate_limited.load(Ordering::Relaxed),
+            rejected_half_open_cap: self.rejected_half_open_cap.load(Ordering::Relaxed),
+            rejected_locked_out: self.rejected_locked_out.load(Ordering::Relaxed),
+            rejected_auth_failed: self.rejected_auth_failed.load(Ordering::Relaxed),
         }
     }
 }
@@ -123,6 +197,18 @@ pub struct ConnectionMetricsSnapshot {
     pub currently_open: u64,
     /// Connections that authenticated (`ironbus_connections_authenticated_total`).
     pub authenticated: u64,
+    /// Pre-auth rejections for an empty per-IP rate-limit bucket (#633),
+    /// `ironbus_connections_rejected_total{reason="rate_limited"}`.
+    pub rejected_rate_limited: u64,
+    /// Pre-auth rejections for a full half-open cap (#633),
+    /// `ironbus_connections_rejected_total{reason="half_open_cap"}`.
+    pub rejected_half_open_cap: u64,
+    /// Pre-auth rejections for a locked-out source IP (#633),
+    /// `ironbus_connections_rejected_total{reason="locked_out"}`.
+    pub rejected_locked_out: u64,
+    /// Failed authentication attempts (#633),
+    /// `ironbus_connections_rejected_total{reason="auth_failed"}`.
+    pub rejected_auth_failed: u64,
 }
 
 #[cfg(test)]
@@ -148,6 +234,42 @@ mod tests {
         assert_eq!(s.refused, 2);
         assert_eq!(s.currently_open, 2, "open == accepted - closed");
         assert_eq!(s.authenticated, 2);
+    }
+
+    #[test]
+    fn rejected_total_accounts_each_reason_independently_and_is_bounded() {
+        // #633: each pre-auth DoS reason is its own monotonic counter; the `reason` label is a closed
+        // four-value enum (never a per-IP label), so the family is bounded by construction.
+        let m = ConnectionMetrics::new();
+        m.record_rejected(RejectReason::RateLimited);
+        m.record_rejected(RejectReason::RateLimited);
+        m.record_rejected(RejectReason::HalfOpenCap);
+        m.record_rejected(RejectReason::LockedOut);
+        m.record_rejected(RejectReason::LockedOut);
+        m.record_rejected(RejectReason::LockedOut);
+        m.record_rejected(RejectReason::AuthFailed);
+        let s = m.snapshot();
+        assert_eq!(s.rejected_rate_limited, 2);
+        assert_eq!(s.rejected_half_open_cap, 1);
+        assert_eq!(s.rejected_locked_out, 3);
+        assert_eq!(s.rejected_auth_failed, 1);
+        // The reasons do NOT cross-contaminate the lifecycle counters.
+        assert_eq!(s.accepted, 0);
+        assert_eq!(s.refused, 0);
+        // The label set is exactly four bounded values.
+        let labels: Vec<&str> = [
+            RejectReason::RateLimited,
+            RejectReason::HalfOpenCap,
+            RejectReason::LockedOut,
+            RejectReason::AuthFailed,
+        ]
+        .iter()
+        .map(|r| r.as_str())
+        .collect();
+        assert_eq!(
+            labels,
+            ["rate_limited", "half_open_cap", "locked_out", "auth_failed"]
+        );
     }
 
     #[test]
