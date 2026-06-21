@@ -276,6 +276,7 @@ pub mod metadata_storage;
 pub mod placement;
 pub mod read_consistency;
 pub mod replication;
+pub mod rereplication;
 pub mod runtime;
 pub mod serve;
 pub mod state_machine;
