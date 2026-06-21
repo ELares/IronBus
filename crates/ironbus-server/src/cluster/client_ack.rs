@@ -625,9 +625,6 @@ mod tests {
 
     // ---- #735 half A: the NOT_LEADER produce-routing decision ------------------------------------
 
-    use std::collections::BTreeMap;
-    use std::net::SocketAddr;
-
     /// A follower [`ClientAckGate`] for node 1 FOLLOWING partition 0 (leader is node `leader_id`), built
     /// over a fresh empty replica log. The follower target names `leader_id` so `produce_routing` finds
     /// the leader to redirect to. The optional `(leader_id, addr)` advertise entries fill the leader hint.
@@ -688,12 +685,58 @@ mod tests {
     }
 
     #[test]
+    fn produce_routing_after_a_failover_redirects_to_the_new_leader() {
+        // FAILOVER RECOVERY (#735, composes with #720/#722): node 1 starts as the LEADER of partition 0
+        // (a produce proceeds locally). Then leadership MOVES to node 2 (a committed placement change):
+        // node 1 becomes a FOLLOWER of node 2. A produce on the OLD leader now redirects to the NEW
+        // leader's advertised client address — the client recovers automatically.
+        let new_leader_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        // Build a node-1 LEADER gate that ALSO advertises node 2's client address (for after the failover).
+        let mut controller = DataPlaneController::new(1);
+        controller.start_leader(
+            P,
+            leader_plane(),
+            ironbus_core::epoch_cache::EpochCache::new(),
+            &[1, 2, 3],
+            quorum3(),
+        );
+        let seam = ProduceAckSeam::new(controller);
+        let server = Arc::new(Mutex::new(DataPlaneServer::new(1, seam)));
+        let gate = ClientAckGate::new(Arc::clone(&server), ClusterAckLevel::C2Fsync)
+            .with_leader_client_addrs([(2, new_leader_addr)].into_iter().collect());
+        // BEFORE the failover: node 1 leads, so a produce proceeds locally (no false NOT_LEADER).
+        assert_eq!(gate.produce_routing(P), ClusterProduceRouting::Local);
+
+        // FAILOVER: leadership moves to node 2. Apply it to the SAME shared server the gate reads: node 1
+        // stops leading and becomes a follower of node 2 (exactly the role transition a committed
+        // re-placement drives).
+        {
+            let mut srv = server.lock().unwrap();
+            assert!(srv.seam_mut().controller_mut().stop_partition(P));
+            srv.seam_mut().controller_mut().start_follower(
+                P,
+                Log::open(InMemoryFs::new(), ManualClock::new(), LogConfig::default()).unwrap(),
+            );
+            srv.set_follower_target(P, 2);
+        }
+
+        // AFTER the failover: a produce on the OLD leader redirects to the NEW leader (node 2).
+        assert_eq!(
+            gate.produce_routing(P),
+            ClusterProduceRouting::Redirect {
+                leader_hint: Some(new_leader_addr),
+            },
+            "after leadership moves, the old leader redirects to the new leader"
+        );
+    }
+
+    #[test]
     fn produce_routing_with_no_role_for_the_partition_is_local() {
         // Node 1 leads partition 0 but the produce names a DIFFERENT partition it holds no role for (the
         // bootstrap window / a non-clustered partition): proceed LOCALLY — never a false NOT_LEADER on a
         // partition this node is not a clustered replica of.
-        let gate = leader_gate(1);
         const OTHER_PARTITION: u64 = 7;
+        let gate = leader_gate(1);
         assert_eq!(
             gate.produce_routing(OTHER_PARTITION),
             ClusterProduceRouting::Local,

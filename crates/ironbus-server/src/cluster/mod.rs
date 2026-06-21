@@ -286,7 +286,7 @@ pub mod state_machine;
 pub mod transport;
 
 pub use ack_level::{ClusterAckLevel, ClusterAckLevelMetrics};
-pub use client_ack::ClientAckGate;
+pub use client_ack::{ClientAckGate, ClusterProduceRouting};
 pub use dataplane::{
     decode_dataplane_frame, role_for_placement, AckDisposition, AckToken, DataPlaneAction,
     DataPlaneController, DataPlaneError, DataPlaneFrame, FollowerReadOutcome, PlacementRole,
