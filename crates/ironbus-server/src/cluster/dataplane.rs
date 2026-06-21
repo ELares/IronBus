@@ -238,6 +238,98 @@ pub enum DataPlaneFrame {
     EpochQuery(OffsetForLeaderEpochBody),
     /// A leader → follower leader-epoch offset response (received on the follower side, #599).
     EpochResponse(OffsetForLeaderEpochResponse),
+    /// A follower → leader DIRTY-TIER committed-HW QUERY (received on the leader side, #739): the tiny
+    /// HW-version confirm a follower sends when a "latest" follower-read reaches above its safe
+    /// watermark. The partition is carried by the data-plane envelope's partition prefix.
+    CommittedHwQuery(CommittedHwQueryBody),
+    /// A leader → follower committed-HW RESPONSE (received on the follower side, #739): the leader's
+    /// CURRENT committed HW, which the follower uses to raise its servable bound before re-serving the
+    /// confirmed prefix locally — never an offset above this.
+    CommittedHwResponse(CommittedHwResponseBody),
+}
+
+/// The `kind` discriminant byte leading a [`FrameType::CommittedHwQuery`] body (#739), so the request
+/// and the response (which SHARE the wire tag 43, like `OffsetForLeaderEpoch`) are never confused.
+const HW_KIND_REQUEST: u8 = 0;
+const HW_KIND_RESPONSE: u8 = 1;
+
+/// The fixed little-endian byte length of an encoded [`CommittedHwQueryBody`]: just the `kind: u8`
+/// (the partition rides the data-plane envelope's partition prefix).
+const HW_QUERY_REQUEST_LEN: usize = 1;
+
+/// The fixed little-endian byte length of an encoded [`CommittedHwResponseBody`]: `kind: u8` +
+/// `committed_hw: u64`.
+const HW_QUERY_RESPONSE_LEN: usize = 1 + 8;
+
+/// A follower → leader DIRTY-TIER committed-HW QUERY (#739, the #723 `ConfirmWithLeader` over the
+/// wire): "what is YOUR current committed high-watermark for this partition?" — a tiny HW-VERSION query,
+/// NOT a data fetch. The follower asks this when a "latest" follower-read reaches ABOVE its known safe
+/// watermark, so it can serve the now-confirmed prefix locally and NEVER an unconfirmed offset. Rides
+/// the [`FrameType::CommittedHwQuery`] envelope (tag 43) with a leading `kind = 0` byte; the partition
+/// is the data-plane envelope's partition prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommittedHwQueryBody;
+
+impl CommittedHwQueryBody {
+    /// Encode this query to its fixed-layout body bytes (just the request `kind` byte).
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        vec![HW_KIND_REQUEST]
+    }
+
+    /// Decode a query from its body bytes.
+    ///
+    /// # Errors
+    /// Returns [`ReplicationError::Frame`] if `body` is not exactly the request length or its `kind`
+    /// byte is not the request discriminant — fail-closed, never guessed at.
+    pub fn decode(body: &[u8]) -> Result<CommittedHwQueryBody, ReplicationError> {
+        if body.len() != HW_QUERY_REQUEST_LEN || body[0] != HW_KIND_REQUEST {
+            return Err(ReplicationError::Frame {
+                what: format!("malformed CommittedHwQuery request (len {})", body.len()),
+            });
+        }
+        Ok(CommittedHwQueryBody)
+    }
+}
+
+/// A leader → follower committed-HW RESPONSE (#739): the leader's CURRENT committed HW for the
+/// partition (its read plane's flushed frontier — the SAME committed offset
+/// [`DataPlaneController::leader_committed_hw`] answers). The follower raises its servable bound to (at
+/// most) this and re-serves the confirmed prefix locally. Rides the [`FrameType::CommittedHwQuery`]
+/// envelope (tag 43) with a leading `kind = 1` byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommittedHwResponseBody {
+    /// The leader's current committed high-watermark for the partition.
+    pub committed_hw: u64,
+}
+
+impl CommittedHwResponseBody {
+    /// Encode this response to its fixed-layout little-endian body bytes.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HW_QUERY_RESPONSE_LEN);
+        out.push(HW_KIND_RESPONSE);
+        out.extend_from_slice(&self.committed_hw.to_le_bytes());
+        out
+    }
+
+    /// Decode a response from its body bytes.
+    ///
+    /// # Errors
+    /// Returns [`ReplicationError::Frame`] if `body` is not exactly the response length or its `kind`
+    /// byte is not the response discriminant.
+    pub fn decode(body: &[u8]) -> Result<CommittedHwResponseBody, ReplicationError> {
+        if body.len() != HW_QUERY_RESPONSE_LEN || body[0] != HW_KIND_RESPONSE {
+            return Err(ReplicationError::Frame {
+                what: format!("malformed CommittedHwQuery response (len {})", body.len()),
+            });
+        }
+        let mut hw = [0u8; 8];
+        hw.copy_from_slice(&body[1..9]);
+        Ok(CommittedHwResponseBody {
+            committed_hw: u64::from_le_bytes(hw),
+        })
+    }
 }
 
 /// The leading byte of an [`OffsetForLeaderEpochBody`] encoding — the kind discriminant that
@@ -276,6 +368,17 @@ pub fn decode_dataplane_frame(type_tag: u8, body: &[u8]) -> Result<DataPlaneFram
                 what: "malformed OffsetForLeaderEpoch kind byte on a data-plane frame".to_string(),
             })),
         },
+        Some(FrameType::CommittedHwQuery) => match body.first().copied() {
+            Some(HW_KIND_REQUEST) => Ok(DataPlaneFrame::CommittedHwQuery(
+                CommittedHwQueryBody::decode(body)?,
+            )),
+            Some(HW_KIND_RESPONSE) => Ok(DataPlaneFrame::CommittedHwResponse(
+                CommittedHwResponseBody::decode(body)?,
+            )),
+            _ => Err(DataPlaneError::Replication(ReplicationError::Frame {
+                what: "malformed CommittedHwQuery kind byte on a data-plane frame".to_string(),
+            })),
+        },
         _ => Err(DataPlaneError::Replication(ReplicationError::Frame {
             what: format!("unexpected frame type tag {type_tag} on a data-plane link"),
         })),
@@ -303,6 +406,15 @@ pub enum DataPlaneAction {
         partition: u64,
         /// The leader's epoch end-offset answer.
         response: OffsetForLeaderEpochResponse,
+    },
+    /// Reply to the querying follower with this committed-HW answer (#739): the leader served a
+    /// dirty-tier [`DataPlaneFrame::CommittedHwQuery`] from its current committed HW. The follower uses
+    /// it to raise its servable bound (never above it) before re-serving the confirmed prefix locally.
+    SendCommittedHwResponse {
+        /// The partition the response is for.
+        partition: u64,
+        /// The leader's current committed-HW answer.
+        response: CommittedHwResponseBody,
     },
     /// Acks released by a follower's report reaching quorum: the caller maps each opaque token back to
     /// its parked producer reply and writes the wire `PubAck`. Empty unless this report advanced the
@@ -894,6 +1006,31 @@ impl<F: Filesystem, C: Clock> DataPlaneController<F, C> {
                 // An epoch response is consumed by an in-flight reconcile (the `leader_end_offset`
                 // closure of `reconcile_follower`), not by the steady-state frame router. A stray one
                 // is absorbed.
+                Ok(DataPlaneAction::None)
+            }
+            DataPlaneFrame::CommittedHwQuery(_) => {
+                // The DIRTY-TIER committed-HW confirm (#739): a follower asks the leader for its current
+                // committed HW. Answer it from the leader's read plane (the SAME committed offset
+                // `leader_committed_hw` advertises). A query landing on a node that does NOT lead the
+                // partition is a wrong-role error the caller drops — only the LEADER is an authoritative
+                // committed-HW source, so the follower never trusts a non-leader's answer and falls back
+                // to the clean tier. NEVER an over-claimed HW: the leader's flushed frontier is its
+                // proven-committed prefix.
+                let committed_hw = self.leader_committed_hw(partition).ok_or(
+                    DataPlaneError::WrongRole {
+                        partition,
+                        needed: "leader",
+                    },
+                )?;
+                Ok(DataPlaneAction::SendCommittedHwResponse {
+                    partition,
+                    response: CommittedHwResponseBody { committed_hw },
+                })
+            }
+            DataPlaneFrame::CommittedHwResponse(_) => {
+                // A committed-HW response is consumed by the in-flight dirty-tier confirm on the
+                // requesting (follower) side (a short-lived query link reads it directly), not by the
+                // steady-state frame router. A stray one is absorbed.
                 Ok(DataPlaneAction::None)
             }
         }

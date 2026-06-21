@@ -199,6 +199,9 @@ fn frame_type_for(frame: &DataPlaneFrame) -> FrameType {
         DataPlaneFrame::EpochQuery(_) | DataPlaneFrame::EpochResponse(_) => {
             FrameType::OffsetForLeaderEpoch
         }
+        DataPlaneFrame::CommittedHwQuery(_) | DataPlaneFrame::CommittedHwResponse(_) => {
+            FrameType::CommittedHwQuery
+        }
     }
 }
 
@@ -211,6 +214,8 @@ fn encode_dataplane_body(frame: &DataPlaneFrame) -> Vec<u8> {
         DataPlaneFrame::AckReplicated(b) => b.encode(),
         DataPlaneFrame::EpochQuery(b) => b.encode(),
         DataPlaneFrame::EpochResponse(b) => b.encode(),
+        DataPlaneFrame::CommittedHwQuery(b) => b.encode(),
+        DataPlaneFrame::CommittedHwResponse(b) => b.encode(),
     }
 }
 
@@ -348,6 +353,50 @@ impl<S: Read + Write> DataPlaneLink<S> {
             }
             self.inbuf.extend_from_slice(&chunk[..n]);
         }
+    }
+}
+
+/// The bounded timeout for the DIRTY-TIER committed-HW confirm (#739): how long the follower's query
+/// link waits to CONNECT to, and to READ a [`CommittedHwResponseBody`] from, the partition leader. It is
+/// deliberately SHORT (sub-second): the confirm sits on the consume serve path, so a slow / dead leader
+/// must NOT stall the consumer — on a timeout the follower FAILS CLOSED to the clean tier (serve only up
+/// to its safe watermark, never an unconfirmed offset). The same `connect_timeout` + `read_timeout`
+/// discipline the follower fetch loop uses, sized for a single round-trip rather than a steady poll.
+const HW_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Perform ONE bounded, over-the-wire DIRTY-TIER committed-HW CONFIRM (#739): dial the partition
+/// LEADER's data-plane address `leader_data_addr`, send a [`DataPlaneFrame::CommittedHwQuery`] for
+/// `partition`, and read back the leader's current committed HW from its
+/// [`DataPlaneFrame::CommittedHwResponse`]. This is the #723 `ConfirmWithLeader` made REAL over the
+/// wire — a tiny HW-version query (NOT the data) so a follower can serve a read-your-writes prefix above
+/// its known safe watermark, and NEVER an offset the leader has not confirmed committed.
+///
+/// It is a short-lived, single-shot link with the `HW_CONFIRM_TIMEOUT` bound on BOTH the connect and the
+/// read, so a slow / dead / wrong-role leader cannot stall the consume path. Returns `Some(committed_hw)`
+/// ONLY on a clean round-trip whose response is the leader's committed HW for THIS partition; on ANY
+/// failure (no route, connect/read timeout, link error, wrong partition / verb) it returns `None` so the
+/// caller FAILS CLOSED to the clean tier (serves only up to its safe watermark — never unconfirmed).
+///
+/// It never panics and never serves data: it is a read-only HW query (single-writer preserved).
+#[must_use]
+pub fn query_leader_committed_hw(leader_data_addr: SocketAddr, partition: u64) -> Option<u64> {
+    let stream = TcpStream::connect_timeout(&leader_data_addr, HW_CONFIRM_TIMEOUT).ok()?;
+    stream.set_read_timeout(Some(HW_CONFIRM_TIMEOUT)).ok()?;
+    stream.set_write_timeout(Some(HW_CONFIRM_TIMEOUT)).ok()?;
+    let mut link = DataPlaneLink::new(stream);
+    link.send(
+        partition,
+        &DataPlaneFrame::CommittedHwQuery(super::dataplane::CommittedHwQueryBody),
+    )
+    .ok()?;
+    // Read exactly one response, bounded by the read timeout. Anything other than a committed-HW response
+    // for THIS partition is a failed confirm → `None` → the caller serves the clean tier (never
+    // unconfirmed). The leader-side reader answers a CommittedHwQuery with exactly this frame.
+    match link.recv() {
+        Ok(Some((p, DataPlaneFrame::CommittedHwResponse(resp)))) if p == partition => {
+            Some(resp.committed_hw)
+        }
+        _ => None,
     }
 }
 
@@ -671,6 +720,10 @@ struct ClientGateConfig {
     /// The node-id -> CLIENT-address advertise map for the `NOT_LEADER` leader hint (#735); empty means the
     /// redirect carries no hint (the client re-tries its known peers).
     leader_client_addrs: BTreeMap<u64, SocketAddr>,
+    /// The node-id -> DATA-PLANE peer address map for the dirty-tier committed-HW confirm (#739); empty
+    /// means a "latest" follower-read above the safe watermark fails closed to the clean tier (never
+    /// unconfirmed).
+    leader_data_addrs: BTreeMap<u64, SocketAddr>,
     /// The shared metadata status snapshot the follower-read reads the committed-HW bar from (#735, half
     /// B); `None` fails the follower-read closed (serve nothing) until a checkpoint is known.
     status: Option<Arc<Mutex<super::runtime::ClusterStatus>>>,
@@ -774,6 +827,11 @@ where
             Some(ClientGateConfig {
                 configured_level,
                 leader_client_addrs: BTreeMap::new(),
+                // The dirty-tier confirm (#739) targets the leader's data-plane address — the SAME
+                // `peer_data_addrs` the follower fetch loop dials. With no #735-aware wiring there is no
+                // status handle, so the follower-read fails closed anyway; the data addresses still make
+                // the dirty-tier confirm reachable for a runtime started this way.
+                leader_data_addrs: peer_data_addrs.clone(),
                 status: None,
             }),
         )
@@ -805,6 +863,10 @@ where
             Some(ClientGateConfig {
                 configured_level,
                 leader_client_addrs,
+                // The dirty-tier committed-HW confirm (#739) dials the leader's DATA-plane address — the
+                // SAME `peer_data_addrs` the follower fetch loop uses — so a "latest" follower-read above
+                // the safe watermark can confirm with the leader before serving (never unconfirmed).
+                leader_data_addrs: peer_data_addrs.clone(),
                 status: Some(status),
             }),
         )
@@ -837,7 +899,8 @@ where
         let client_gate = client_cfg.map(|cfg| {
             let mut gate =
                 super::client_ack::ClientAckGate::new(Arc::clone(&server), cfg.configured_level)
-                    .with_leader_client_addrs(cfg.leader_client_addrs);
+                    .with_leader_client_addrs(cfg.leader_client_addrs)
+                    .with_leader_data_addrs(cfg.leader_data_addrs);
             if let Some(status) = cfg.status {
                 gate = gate.with_status_handle(status);
             }
@@ -1044,6 +1107,19 @@ fn run_dataplane_reader<F, C>(
                     }) => {
                         if link
                             .send(partition, &DataPlaneFrame::EpochResponse(response))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    // The DIRTY-TIER committed-HW confirm (#739): the leader answers a follower's
+                    // HW-version query with its current committed HW on the SAME link.
+                    Some(DataPlaneAction::SendCommittedHwResponse {
+                        partition,
+                        response,
+                    }) => {
+                        if link
+                            .send(partition, &DataPlaneFrame::CommittedHwResponse(response))
                             .is_err()
                         {
                             return;
