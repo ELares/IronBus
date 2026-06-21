@@ -28,13 +28,13 @@ use ironbus_core::types::RecordFlags;
 use ironbus_proto::frame::{decode_frame, encode_frame, FrameDecode, FrameError, FrameType};
 use ironbus_proto::message::{
     decode_dead_letter, decode_deliver, decode_deliver_batch, decode_gap_marker, decode_info,
-    decode_produce_confirm, decode_pub_ack, decode_stream_info_response, decode_truncated,
-    encode_ack, encode_connect, encode_cumulative_ack, encode_fetch, encode_pub, encode_pub_to,
-    encode_stream_commit, encode_stream_declare, encode_stream_fetch, encode_stream_info,
-    encode_sub, encode_sub_to, produce_confirm_status, AckBody, AckLevel, AckOp, BodyError,
-    ConnectBody, ConsumeTier, CumulativeAckBody, DeliverBody, FetchBody, PubBody, PubToBody,
-    StreamCommitBody, StreamDeclareBody, StreamFetchBody, StreamInfoBody, SubBody, SubToBody,
-    PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
+    decode_not_leader, decode_produce_confirm, decode_pub_ack, decode_stream_info_response,
+    decode_truncated, encode_ack, encode_connect, encode_cumulative_ack, encode_fetch, encode_pub,
+    encode_pub_to, encode_stream_commit, encode_stream_declare, encode_stream_fetch,
+    encode_stream_info, encode_sub, encode_sub_to, produce_confirm_status, AckBody, AckLevel,
+    AckOp, BodyError, ConnectBody, ConsumeTier, CumulativeAckBody, DeliverBody, FetchBody, PubBody,
+    PubToBody, StreamCommitBody, StreamDeclareBody, StreamFetchBody, StreamInfoBody, SubBody,
+    SubToBody, PUB_FLAG_ACK_LEVEL_MASK, PUB_FLAG_ACK_LEVEL_SHIFT,
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -59,6 +59,17 @@ pub enum ClientError {
     BadResponse(&'static str),
     /// The connection closed before a complete response arrived.
     Closed,
+    /// The server REDIRECTED a produce: the node this client is connected to holds a clustered replica
+    /// role for the target partition but is NOT its current leader (#735), so the produce was NOT
+    /// appended/acked here — it must go to the leader. `leader_hint` is the current leader's CLIENT
+    /// address when the server knew it (`Some`), or `None` (mid-failover, or no advertised client address),
+    /// in which case the caller re-discovers the leader from its own known peers. A RECOVERABLE error: the
+    /// connection stays usable (the client can keep producing once it reconnects to the leader); see
+    /// [`Client::produce_to_leader`] for the transparent reconnect/retry helper.
+    NotLeader {
+        /// The current leader's CLIENT address to reconnect to, or `None` when the server did not know it.
+        leader_hint: Option<String>,
+    },
     /// A delivered payload carried the `COMPRESSED` flag but could not be decompressed back to
     /// the original bytes (#430): an unknown codec (e.g. a `zstd` record read by this pure-Rust
     /// client), a dictionary this client cannot resolve (`PoisonUnresolvedDict`; the client
@@ -112,6 +123,10 @@ impl core::fmt::Display for ClientError {
                     "delivered payload at offset {offset} failed decompression: {source}"
                 )
             }
+            ClientError::NotLeader { leader_hint } => match leader_hint {
+                Some(addr) => write!(f, "not leader: produce to the leader at {addr}"),
+                None => write!(f, "not leader: the current leader is unknown"),
+            },
         }
     }
 }
@@ -400,11 +415,15 @@ pub enum ProgressOutcome {
 /// One produce reply, classified: the single decode point shared by the half-duplex
 /// [`Client::produce_window`] drain and the [`Client::produce_stream`] reader thread (#458), so
 /// the two paths can never drift on the reply contract.
+#[derive(Debug)]
 enum PubReply {
     Acked(u64),
     Duplicate(u64),
     ServerErr(String),
     Pong,
+    /// A cluster `NotLeader` redirect (#735): the produce landed on a non-leader replica of the
+    /// partition and was NOT appended/acked; the leader's CLIENT-address hint (or `None` when unknown).
+    NotLeader(Option<String>),
 }
 
 /// One coalesced write's byte budget for [`Client::produce_stream`] (#458): large enough to
@@ -490,6 +509,20 @@ fn drain_stream_replies(
                 f.server_errors += 1;
                 if f.first_server_err.is_none() {
                     f.first_server_err = Some(msg);
+                }
+            }
+            // A cluster NotLeader redirect (#735) mid-stream: this node is not the leader, so these
+            // streamed produces did NOT land. Surface it like a server error (the first one is reported),
+            // so the caller learns the stream went to the wrong node and re-streams to the leader. Counted
+            // as done so the writer's window does not stall waiting on a reply that will never ack.
+            PubReply::NotLeader(hint) => {
+                f.done += 1;
+                f.server_errors += 1;
+                if f.first_server_err.is_none() {
+                    f.first_server_err = Some(match hint {
+                        Some(addr) => format!("not leader: produce to the leader at {addr}"),
+                        None => "not leader: the current leader is unknown".to_string(),
+                    });
                 }
             }
             // The terminal marker: the server's FIFO frame order guarantees every prior
@@ -596,6 +629,20 @@ fn confirm_outcome(status: u8) -> ConfirmOutcome {
     }
 }
 
+/// Decode a `NotLeader` redirect body (#735) into the typed [`ClientError::NotLeader`] with the leader
+/// hint (an empty hint -> `None`). A malformed body falls back to a `None` hint rather than a parse error,
+/// so a redirect is always actionable (the client re-tries its known peers).
+fn not_leader_error(body: &[u8]) -> ClientError {
+    let leader_hint = decode_not_leader(body).ok().and_then(|r| {
+        if r.leader_hint.is_empty() {
+            None
+        } else {
+            Some(r.leader_hint.to_string())
+        }
+    });
+    ClientError::NotLeader { leader_hint }
+}
+
 fn classify_pub_reply(ty: FrameType, body: &[u8]) -> Result<PubReply, ClientError> {
     match ty {
         FrameType::PubAck => {
@@ -612,6 +659,18 @@ fn classify_pub_reply(ty: FrameType, body: &[u8]) -> Result<PubReply, ClientErro
         }
         FrameType::Err => Ok(PubReply::ServerErr(String::from_utf8_lossy(body).into())),
         FrameType::Pong => Ok(PubReply::Pong),
+        // A cluster NotLeader redirect (#735): decode the leader hint (an empty hint -> `None`). The
+        // produce was NOT appended/acked here; the caller reconnects/retries to the leader.
+        FrameType::NotLeader => {
+            let redirect = decode_not_leader(body)
+                .map_err(|_| ClientError::BadResponse("malformed NotLeader redirect body"))?;
+            let hint = if redirect.leader_hint.is_empty() {
+                None
+            } else {
+                Some(redirect.leader_hint.to_string())
+            };
+            Ok(PubReply::NotLeader(hint))
+        }
         other => Err(ClientError::Unexpected(other)),
     }
 }
@@ -948,6 +1007,55 @@ impl Client {
         self.produce_dedup(message).map(|ack| ack.offset)
     }
 
+    /// Produce `message`, transparently following a cluster [`ClientError::NotLeader`] redirect (#735) to
+    /// the leader. On a non-cluster broker (or when already connected to the leader) this is exactly
+    /// [`Client::produce`]: one produce, no extra work. In a cluster, if the connected node is NOT the
+    /// leader of the partition, the server replies `NotLeader` with the current leader's CLIENT-address
+    /// hint; this RECONNECTS this client to the hinted leader (using `config` for the handshake, so the
+    /// negotiated capabilities are preserved) and RETRIES the produce there — so a client connected to the
+    /// wrong node (e.g. after a failover moved leadership) recovers automatically. Bounded by
+    /// `max_redirects` reconnects (a small value like 3 is ample; it guards against a redirect loop / a
+    /// rebalance storm).
+    ///
+    /// A `NotLeader` with NO hint (`leader_hint == None` — the server did not yet know the leader, e.g.
+    /// mid-failover) is returned to the caller UNCHANGED (this helper cannot guess an address): the caller
+    /// re-tries its own known peers. Every other error (a real server `Err`, a transport error) is
+    /// returned unchanged. On success the client REMAINS connected to the leader, so subsequent produces
+    /// go straight there.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::NotLeader`] when the redirect carried no hint, or when `max_redirects`
+    /// reconnects were exhausted (the last redirect is surfaced); a [`ClientError`] on a reconnect failure
+    /// or any non-redirect produce error.
+    pub fn produce_to_leader(
+        &mut self,
+        message: &PubBody<'_>,
+        config: &ClientConfig,
+        max_redirects: u32,
+    ) -> Result<u64, ClientError> {
+        let mut attempts = 0;
+        loop {
+            match self.produce(message) {
+                Ok(offset) => return Ok(offset),
+                Err(ClientError::NotLeader { leader_hint }) => {
+                    // No hint, or redirect budget exhausted: surface the redirect for the caller to handle
+                    // (re-discover the leader from its own peers). Never loop unbounded.
+                    match leader_hint {
+                        Some(addr) if attempts < max_redirects => {
+                            // Reconnect to the hinted leader (preserving the handshake-negotiated
+                            // capabilities), then retry the produce there. A reconnect failure surfaces as
+                            // the connect error.
+                            *self = Client::connect_with(addr.as_str(), config)?;
+                            attempts += 1;
+                        }
+                        other => return Err(ClientError::NotLeader { leader_hint: other }),
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Produces a message and returns the full [`ProduceAck`]: the assigned (or, on a dedup hit, the
     /// ORIGINAL) offset plus the `duplicate` indication (#33). When `message.dedup` is `Some`, the
     /// publish opts into the broker's effectively-once dedup window; if the `msg_id` was already seen
@@ -994,6 +1102,10 @@ impl Client {
             (FrameType::Err, body) => {
                 Err(ClientError::Server(String::from_utf8_lossy(&body).into()))
             }
+            // A cluster NotLeader redirect (#735): this node is not the leader, so the produce did NOT
+            // land here. Surface the typed `NotLeader` error (with the leader hint) so the caller can
+            // reconnect/retry to the leader; the connection stays usable. `produce_to_leader` automates it.
+            (FrameType::NotLeader, body) => Err(not_leader_error(&body)),
             (other, _) => Err(ClientError::Unexpected(other)),
         }
     }
@@ -1268,6 +1380,14 @@ impl Client {
                 PubReply::ServerErr(msg) => {
                     if first_err.is_none() {
                         first_err = Some(ClientError::Server(msg));
+                    }
+                }
+                // A cluster NotLeader redirect (#735): this node is not the leader, so the windowed
+                // produces did NOT land. Remember it as the first error (with the leader hint); the drain
+                // continues so the connection stays framed, then the call returns the typed redirect.
+                PubReply::NotLeader(leader_hint) => {
+                    if first_err.is_none() {
+                        first_err = Some(ClientError::NotLeader { leader_hint });
                     }
                 }
                 PubReply::Pong => return Err(ClientError::Unexpected(FrameType::Pong)),
@@ -2781,6 +2901,14 @@ impl PipelinedProducer<'_> {
                 PubReply::ServerErr(msg) => {
                     if first_err.is_none() {
                         first_err = Some(ClientError::Server(msg));
+                    }
+                }
+                // A cluster NotLeader redirect (#735): the pipelined produces did NOT land on this
+                // non-leader node. Remember the typed redirect (with the leader hint) as the first error;
+                // the drain continues so the connection stays framed.
+                PubReply::NotLeader(leader_hint) => {
+                    if first_err.is_none() {
+                        first_err = Some(ClientError::NotLeader { leader_hint });
                     }
                 }
                 PubReply::Pong => return Err(ClientError::Unexpected(FrameType::Pong)),
@@ -6060,5 +6188,49 @@ mod tests {
         drop(conn);
         shutdown.store(true, Ordering::Release);
         serve_handle.join().unwrap();
+    }
+
+    // ---- #735 client NOT_LEADER redirect classification ----------------------------------------
+
+    #[test]
+    fn a_not_leader_frame_classifies_as_a_redirect_with_the_leader_hint() {
+        use ironbus_proto::message::{encode_not_leader, NotLeaderBody};
+        // A NotLeader frame carrying a concrete leader hint classifies as a redirect to that address.
+        let mut body = Vec::new();
+        encode_not_leader(
+            &NotLeaderBody {
+                leader_hint: "127.0.0.1:9002",
+            },
+            &mut body,
+        )
+        .unwrap();
+        match classify_pub_reply(FrameType::NotLeader, &body).unwrap() {
+            PubReply::NotLeader(Some(addr)) => assert_eq!(addr, "127.0.0.1:9002"),
+            other => panic!("expected a NotLeader redirect with a hint, got {other:?}"),
+        }
+        // The single-produce path surfaces it as the typed ClientError::NotLeader with the hint.
+        match not_leader_error(&body) {
+            ClientError::NotLeader {
+                leader_hint: Some(addr),
+            } => assert_eq!(addr, "127.0.0.1:9002"),
+            other => panic!("expected ClientError::NotLeader with a hint, got {other}"),
+        }
+    }
+
+    #[test]
+    fn a_hintless_not_leader_frame_classifies_as_a_redirect_with_no_hint() {
+        use ironbus_proto::message::{encode_not_leader, NotLeaderBody};
+        // An EMPTY leader hint (the server did not yet know the leader) classifies as a redirect with no
+        // hint — the caller re-discovers the leader from its own peers.
+        let mut body = Vec::new();
+        encode_not_leader(&NotLeaderBody { leader_hint: "" }, &mut body).unwrap();
+        match classify_pub_reply(FrameType::NotLeader, &body).unwrap() {
+            PubReply::NotLeader(None) => {}
+            other => panic!("expected a hintless NotLeader redirect, got {other:?}"),
+        }
+        match not_leader_error(&body) {
+            ClientError::NotLeader { leader_hint: None } => {}
+            other => panic!("expected a hintless ClientError::NotLeader, got {other}"),
+        }
     }
 }
