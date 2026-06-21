@@ -3725,6 +3725,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .streams
             .append_to(&id, message)
             .map_err(EngineError::Storage)?;
+        // Per-stream PRODUCE throughput (#571): one record produced to THIS named stream, keyed by its
+        // name (bounded + overflow-folded so an unbounded stream cardinality cannot OOM the node). The
+        // default stream is counted in `append_no_sync` under the empty label; a named produce never
+        // reaches `append_no_sync` (it routes through the StreamSet), so the two paths never double-count.
+        self.registry.record_stream_produced(stream.as_bytes());
         // ONE coordinated commit tick (#678): K dirtied named streams => K fdatasync barriers,
         // amortized over the batch; a clean stream costs nothing. The default `""` slot is never
         // dirtied here, so this never syncs the root a second time.
@@ -4236,6 +4241,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // `produced_bytes` keeps its producer-facing LOGICAL meaning regardless of the codec; the
         // stored (post-compression) truth is `durable_record_bytes` and the #118 physical meters.
         self.registry.record_appended();
+        // Per-stream PRODUCE throughput (#571): one record produced to the DEFAULT stream (the empty
+        // name). `append_no_sync` is the single chokepoint every default-stream produce funnels through
+        // (the actor's group-commit drain calls it directly), so counting here counts each produced
+        // record exactly once. A NAMED stream's produce routes through `produce_in_stream` and is
+        // counted there under its own label. Bounded + overflow-folded; allocation-free for the (single)
+        // default-stream label.
+        self.registry.record_stream_produced(b"");
         self.counters.produced += 1;
         let bytes = message.key.len() + message.headers.len() + message.payload.len();
         self.counters.produced_bytes = self
@@ -4554,6 +4566,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         self.backpressure.retry_budget.record_accept(now);
     }
 
+    /// Records one freshly-appended record's produce ACK LEVEL (#571) into the bounded metric
+    /// registry's fixed three-slot per-ack-level counter (`c0`/`c1`/`c2`). Allocation-free (a
+    /// fixed-index array bump under the single-writer engine lock). Called by the append actor's drain
+    /// on a FRESH append only, so the per-level sum equals the fresh-append count.
+    pub fn record_produce_ack_level(&mut self, level: ironbus_proto::message::AckLevel) {
+        self.registry.record_ack_level(level);
+    }
+
     /// The broker-side per-client retry-budget re-check for a SHED request (#69): records one request
     /// the broker shed (raising the request count without the accept count), which drives the throttle
     /// probability up. Called when a produce is shed (CoDel, byte cap, or backstop). A no-op when the
@@ -4778,6 +4798,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // The durability barrier, chosen by the active level. Returns whether a REAL `fdatasync` ran
         // this batch, so the fsync/append-latency histograms record only genuine barriers (a relaxed
         // level's deferred-sync batch must not log a fake 0-ns fsync sample).
+        // Stamp the produce->ack window start BEFORE the durability barrier (#570): the records were
+        // appended in this drained batch and are acked to their producers only once this barrier makes
+        // them durable, so the engine time across the barrier is the producer-visible ack latency.
+        // One clock-seam read, no allocation; only used if a real fsync ran below.
+        let produce_ack_start = self.log.now_monotonic();
         if self.commit_durability_barrier()? {
             // A real fsync covered this batch: it is the shared durable-append cost (group commit
             // amortizes ONE fsync over the whole drained batch), so record it once into the
@@ -4789,6 +4814,12 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             self.fsync.observe(fsync_nanos);
             self.registry.observe_fsync_nanos(fsync_nanos);
             self.registry.observe_append_nanos(fsync_nanos);
+            // The produce->ACK request-path latency (#570): the engine time the barrier took to make
+            // this batch durable (and thus ackable). Measured across the barrier from the seam, so it
+            // captures the full produce->ack window the producer waits on, distinct from the bare
+            // `last_fsync_nanos` syscall cost. Allocation-free; recorded only on a real barrier.
+            let produce_ack_nanos = self.log.now_monotonic().saturating_sub(produce_ack_start);
+            self.registry.observe_produce_ack_nanos(produce_ack_nanos);
         }
         // Consumer-safe retention (refs #13, #80): after the records are durable, reclaim disk by the
         // size, age, or count bound, by deleting whole old SEALED segments while the log is over the
@@ -5333,11 +5364,25 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     ///
     /// # Errors
     /// As [`Engine::poll`].
+    /// A thin timing wrapper over [`Engine::poll_in_timed`] that records the deliver request-path
+    /// latency (#570): one clock-seam read at entry, the inner scan, and — ONLY when the poll handed
+    /// out a delivery ([`Poll::Message`]) — one allocation-free `observe` of the engine time the poll
+    /// took. An idle/parked/truncated poll records nothing (no delivery happened), so the histogram is
+    /// the distribution of latencies for polls that actually delivered.
+    pub fn poll_in(&mut self, group: &str, now: u64) -> Result<Poll, EngineError> {
+        let outcome = self.poll_in_timed(group, now);
+        if matches!(outcome, Ok(Poll::Message(_))) {
+            let deliver_nanos = self.log.now_monotonic().saturating_sub(now);
+            self.registry.observe_deliver_nanos(deliver_nanos);
+        }
+        outcome
+    }
+
     // The poll loop is one cohesive scan (truncation, compaction-hole, retry-throttle, claim,
     // disposition, dead-letter capture); splitting it would scatter the single in-flight-window walk
     // across helpers and obscure the order the cases must be checked in. Mirrors `poll_in_member`.
     #[allow(clippy::too_many_lines)]
-    pub fn poll_in(&mut self, group: &str, now: u64) -> Result<Poll, EngineError> {
+    fn poll_in_timed(&mut self, group: &str, now: u64) -> Result<Poll, EngineError> {
         // Mark the group being polled active FIRST (if it is already live), so the sweep below never
         // evicts the very group this poll is about to drain (#277): a poll IS activity, so refreshing
         // its last-activity before the sweep keeps a self-poll of an otherwise-idle group from
@@ -6431,6 +6476,16 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 // byte-for-byte unchanged. The `g` borrow has ended (`sync_consumer_lag` above took
                 // `&mut self`), so this re-borrows `self` safely.
                 self.confirm_designated_commit(group, committed);
+                // The consume (ack) request-path latency (#570): the engine time to service this ack
+                // that committed (lease ack + cursor commit + lag maintenance). One clock-seam read,
+                // allocation-free, recorded only on a real commit (a fenced ack records nothing).
+                let consume_nanos = self.log.now_monotonic().saturating_sub(now);
+                self.registry.observe_consume_nanos(consume_nanos);
+                // Per-group CONSUME throughput (#571): one record consumed (acked) by this group.
+                // Bounded + overflow-folded, keyed by the group name, allocation-free for an existing
+                // label. Recorded only on a real commit (a fenced ack records nothing), mirroring the
+                // lag-maintenance point above.
+                self.registry.record_group_consumed(group.as_bytes());
                 AckResult::Acked
             }
             AckOutcome::Fenced => AckResult::Fenced,

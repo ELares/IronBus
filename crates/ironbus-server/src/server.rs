@@ -13,6 +13,7 @@
 
 use crate::actor::EngineHandle;
 use crate::auth::AuthConfig;
+use crate::connz::ConnectionMetrics;
 use crate::session::Session;
 use ironbus_core::clock::Clock;
 use ironbus_core::keyshared::MemberId;
@@ -32,12 +33,22 @@ const ACCEPT_POLL: Duration = Duration::from_millis(50);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Decrements the active-connection count on drop, so the count is released on both a
-/// normal handler return and a panic unwind.
-struct ConnectionSlot<'a>(&'a AtomicUsize);
+/// normal handler return and a panic unwind. Also records the connection CLOSE on the shared connz
+/// metric (#572), so the close is accounted on every exit path (normal return AND panic unwind),
+/// exactly like the cap slot it releases.
+struct ConnectionSlot {
+    /// The connection-cap slot to release on drop.
+    active: Arc<AtomicUsize>,
+    /// The shared connz metric to record the close on (#572).
+    connz: Arc<ConnectionMetrics>,
+}
 
-impl Drop for ConnectionSlot<'_> {
+impl Drop for ConnectionSlot {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.active.fetch_sub(1, Ordering::AcqRel);
+        // The connection's life ended (handler returned or unwound): record the close off the engine
+        // lock, the close half of the accept recorded at admission.
+        self.connz.record_close();
     }
 }
 
@@ -68,8 +79,11 @@ where
 {
     // The no-auth overload: an accept loop with no configured identity table (the zero-config
     // loopback-dev broker, and every test/bench that drives the loop directly). The scope gate is
-    // bypassed for the whole loop, byte-for-byte today's behavior.
-    serve_with_auth(
+    // bypassed for the whole loop, byte-for-byte today's behavior. A fresh, un-scraped connz metric
+    // is created here so the legacy entry points keep their signature (#572): a caller that wants the
+    // connz signals on `/metrics` uses [`serve_with_auth_connz`] and shares the same `Arc` with the
+    // health server.
+    serve_with_auth_connz(
         listener,
         engine,
         shutdown,
@@ -77,6 +91,44 @@ where
         clock,
         progress,
         None,
+        &Arc::new(ConnectionMetrics::new()),
+    )
+}
+
+/// Serves connections exactly like [`serve_with_auth`], but records connection signals (#572) into the
+/// shared `connz` metric (accept / close / refuse here; the authed-flip is recorded by the session).
+/// The broker bootstrap creates ONE `Arc<ConnectionMetrics>` and passes the SAME handle to both this
+/// accept loop and the health server, so `/metrics` exposes the live connz. [`serve_with_auth`]
+/// delegates here with a fresh, un-scraped metric, keeping its signature stable.
+///
+/// # Errors
+/// Propagates a fatal listener error, exactly like [`serve`].
+// One arg over the clippy default: the connz handle is additive to the existing 7-arg accept-loop
+// signature (the SAME wire surface, plus connz), so the cohesive accept loop stays one function.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+pub fn serve_with_auth_connz<F, C>(
+    listener: &TcpListener,
+    engine: &EngineHandle<F, C>,
+    shutdown: &AtomicBool,
+    max_connections: usize,
+    clock: &C,
+    progress: &crate::liveness::LivenessBeacon,
+    auth: Option<Arc<AuthConfig>>,
+    connz: &Arc<ConnectionMetrics>,
+) -> std::io::Result<()>
+where
+    F: Filesystem + Clone + 'static,
+    C: Clock + Clone + 'static,
+{
+    serve_inner(
+        listener,
+        engine,
+        shutdown,
+        max_connections,
+        clock,
+        progress,
+        auth,
+        connz,
     )
 }
 
@@ -106,6 +158,40 @@ where
     F: Filesystem + Clone + 'static,
     C: Clock + Clone + 'static,
 {
+    // The connz-less overload: a fresh, un-scraped metric keeps this entry point's signature stable
+    // for the existing callers (#572). The connz-aware bootstrap uses `serve_with_auth_connz`.
+    serve_inner(
+        listener,
+        engine,
+        shutdown,
+        max_connections,
+        clock,
+        progress,
+        auth,
+        &Arc::new(ConnectionMetrics::new()),
+    )
+}
+
+/// The shared accept loop for [`serve_with_auth`] and [`serve_with_auth_connz`]: identical behavior,
+/// with the connection signals (#572) recorded into the shared `connz` metric on accept, refuse, and
+/// (via the per-connection slot guard) close. The authed-flip is recorded by the session, which gets
+/// the same `connz` handle.
+// One arg over the clippy default: the connz handle is additive to the cohesive 7-arg accept loop.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+fn serve_inner<F, C>(
+    listener: &TcpListener,
+    engine: &EngineHandle<F, C>,
+    shutdown: &AtomicBool,
+    max_connections: usize,
+    clock: &C,
+    progress: &crate::liveness::LivenessBeacon,
+    auth: Option<Arc<AuthConfig>>,
+    connz: &Arc<ConnectionMetrics>,
+) -> std::io::Result<()>
+where
+    F: Filesystem + Clone + 'static,
+    C: Clock + Clone + 'static,
+{
     listener.set_nonblocking(true)?;
     let active = Arc::new(AtomicUsize::new(0));
     // A monotonic per-connection counter that mints a distinct key_shared member id (#64) for each
@@ -123,11 +209,17 @@ where
         match listener.accept() {
             Ok((stream, _addr)) => {
                 if active.load(Ordering::Acquire) >= max_connections {
-                    // At capacity: refuse by dropping the stream (it closes).
+                    // At capacity: REFUSE by dropping the stream (it closes). Record the refusal on
+                    // connz (#572): it never became a live handler, so it counts only as refused, not
+                    // accepted/open. Off the engine lock, a single relaxed atomic.
+                    connz.record_refused();
                     drop(stream);
                     continue;
                 }
                 active.fetch_add(1, Ordering::AcqRel);
+                // The connection is now live: record the ACCEPT on connz (#572), the accept half the
+                // slot guard's drop matches with a close. Off the engine lock.
+                connz.record_accept();
                 // Each handler gets its own cheap clone of the actor handle (a `SyncSender` clone);
                 // they all fan into the same single actor, preserving the single-writer rule.
                 let engine = engine.clone();
@@ -136,19 +228,30 @@ where
                 // A cheap `Arc` clone of the shared, immutable auth table (or `None` on a no-auth
                 // broker), so the handler can pin the connection's scope set at `Connect` time.
                 let auth = auth.clone();
+                // A cheap `Arc` clone of the shared connz metric, so the slot guard can record the
+                // close and the session can record the authed-flip (#572).
+                let connz = Arc::clone(connz);
                 std::thread::spawn(move || {
-                    // The guard decrements the slot on return AND on a panic unwind, so a
-                    // panicking handler can never permanently leak a connection-cap slot.
-                    let _slot = ConnectionSlot(&active);
-                    let _ = handle_connection(stream, &engine, member_id, auth);
+                    // The guard decrements the cap slot AND records the connz close on return OR a
+                    // panic unwind, so a panicking handler can never leak a slot nor miss a close.
+                    let _slot = ConnectionSlot {
+                        active,
+                        connz: Arc::clone(&connz),
+                    };
+                    let _ = handle_connection(stream, &engine, member_id, auth, &connz);
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(ACCEPT_POLL);
             }
-            // A transient accept failure (fd exhaustion, an aborted/interrupted connection)
-            // must not tear down the whole listener: back off briefly and keep serving.
-            Err(_) => std::thread::sleep(ACCEPT_POLL),
+            // A transient accept failure (fd exhaustion, an aborted/interrupted connection) must not
+            // tear down the whole listener: back off briefly and keep serving. Record it as a connz
+            // REFUSAL (#572) — the connection never became a live handler, so it is a refused
+            // connection, the same disposition as a cap refusal.
+            Err(_) => {
+                connz.record_refused();
+                std::thread::sleep(ACCEPT_POLL);
+            }
         }
     }
     Ok(())
@@ -161,6 +264,7 @@ fn handle_connection<F, C>(
     engine: &EngineHandle<F, C>,
     member_id: MemberId,
     auth: Option<Arc<AuthConfig>>,
+    connz: &Arc<ConnectionMetrics>,
 ) -> std::io::Result<()>
 where
     F: Filesystem + Clone + 'static,
@@ -175,10 +279,12 @@ where
     // authenticate and verbs are scope-gated; with `None` the gate is bypassed (loopback-dev). No TLS
     // peer certificate is available in this PR (the TLS handshake is the flagged follow-up), so the
     // mTLS SAN identity is `None` for now — an mTLS-mechanism connect fails closed until TLS lands.
+    // The connz handle (#572) is attached so a successful `Connect` records the authed-flip.
     let mut session = match auth {
         Some(cfg) => Session::with_member_id_and_auth(member_id, cfg, None),
         None => Session::with_member_id(member_id),
-    };
+    }
+    .with_connz(Arc::clone(connz));
     // The read/dispatch loop, run to completion so the cleanup below ALWAYS executes on exit:
     // whether the client closed cleanly, a read/write timed out, or a malformed frame ended the
     // session, this connection must leave any key_shared group it joined (#64) and flush its cursor.
@@ -376,13 +482,21 @@ mod tests {
 
     #[test]
     fn a_panicking_handler_releases_its_connection_slot() {
-        // The drop-guard must release the slot on a panic unwind, not just a normal return,
-        // so a panicking handler can never permanently leak a connection-cap slot.
+        // The drop-guard must release the slot AND record the connz close on a panic unwind, not just
+        // a normal return, so a panicking handler can never permanently leak a connection-cap slot nor
+        // miss a close (#572).
         let active = Arc::new(AtomicUsize::new(0));
         active.fetch_add(1, Ordering::AcqRel);
+        let connz = Arc::new(ConnectionMetrics::new());
+        // Mirror the accept the slot's close pairs with, so currently_open returns to 0 on the close.
+        connz.record_accept();
         let a = Arc::clone(&active);
+        let cz = Arc::clone(&connz);
         let handle = std::thread::spawn(move || {
-            let _slot = ConnectionSlot(&a);
+            let _slot = ConnectionSlot {
+                active: a,
+                connz: cz,
+            };
             panic!("simulate a handler panic");
         });
         assert!(handle.join().is_err(), "the handler panicked");
@@ -391,6 +505,9 @@ mod tests {
             0,
             "the connection slot was released on unwind"
         );
+        let s = connz.snapshot();
+        assert_eq!(s.closed, 1, "the connz close was recorded on unwind");
+        assert_eq!(s.currently_open, 0, "the live gauge returned to zero");
     }
 
     /// Opens an in-memory engine and spawns the append actor over it, returning a handle plus the
@@ -565,7 +682,8 @@ mod tests {
             let engine = handle.clone();
             move || {
                 let (stream, _) = listener.accept().unwrap();
-                handle_connection(stream, &engine, MemberId::new(0), None)
+                let connz = Arc::new(ConnectionMetrics::new());
+                handle_connection(stream, &engine, MemberId::new(0), None, &connz)
             }
         });
 

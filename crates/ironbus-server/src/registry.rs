@@ -39,6 +39,7 @@
 //! `ironbus-server` next to the engine and the `/metrics` rendering it feeds, alongside the
 //! existing [`crate::metrics`] histogram.
 
+use ironbus_proto::message::AckLevel;
 use std::collections::HashMap;
 
 /// The frozen registry-histogram bucket upper bounds, in NANOSECONDS, ascending, matching the
@@ -523,6 +524,269 @@ impl ConsumerLagRegistry {
     }
 }
 
+/// One per-label throughput series (#571): the inline (heap-free) label plus the two monotonic
+/// counts — records PRODUCED to this stream and records CONSUMED (acked) by this group. Fixed size,
+/// so an array of these has a fixed memory cost, exactly like [`ConsumerSeries`].
+#[derive(Clone, Copy)]
+struct ThroughputSeries {
+    /// The stream/group label, stored inline as a fixed byte buffer (no heap allocation).
+    label: [u8; MAX_CONSUMER_LABEL_BYTES],
+    /// The used length of `label` (a fixed-width `u16` for a portable per-series size).
+    label_len: u16,
+    /// Whether this slot is occupied.
+    used: bool,
+    /// Records produced to this stream (monotonic).
+    produced: u64,
+    /// Records consumed (acked) by this group (monotonic).
+    consumed: u64,
+}
+
+impl ThroughputSeries {
+    const EMPTY: ThroughputSeries = ThroughputSeries {
+        label: [0u8; MAX_CONSUMER_LABEL_BYTES],
+        label_len: 0,
+        used: false,
+        produced: 0,
+        consumed: 0,
+    };
+
+    /// Copies `name`'s (possibly truncated) stored key into the inline label buffer and marks used.
+    /// Allocation-free (a fixed-size `copy_from_slice` into the preallocated buffer).
+    fn store_label(&mut self, name: &[u8]) {
+        let key = stored_key(name);
+        let n = key.len().min(MAX_CONSUMER_LABEL_BYTES);
+        if let (Some(dst), Some(src)) = (self.label.get_mut(..n), key.get(..n)) {
+            dst.copy_from_slice(src);
+        }
+        self.label_len = u16::try_from(n).unwrap_or(u16::MAX);
+        self.used = true;
+    }
+
+    /// The rendered label as a `&str` (the stored bytes are a prefix of a validated graphic-ASCII
+    /// name, so valid UTF-8; a defensive failure renders empty rather than panicking in a lib path).
+    fn label_str(&self) -> &str {
+        let stored = self.label.get(..usize::from(self.label_len)).unwrap_or(&[]);
+        core::str::from_utf8(stored).unwrap_or("")
+    }
+}
+
+/// The synthetic label every over-cap throughput series folds into, so the TOTAL produced/consumed
+/// stays visible even once distinct stream/group labels are refused at the cap (#571). Distinct from
+/// [`OVERFLOW_CONSUMER_LABEL`] only in NAME meaning (it labels a `stream`/`group`, not a `consumer`);
+/// reusing the `__overflow__` spelling keeps the over-cap fold convention uniform across the surface.
+pub const OVERFLOW_THROUGHPUT_LABEL: &str = "__overflow__";
+
+/// The per-stream / per-group THROUGHPUT registry (#571): records produced per stream and records
+/// consumed (acked) per group, as monotonic counters keyed by the stream/group LABEL, with the SAME
+/// hard cardinality bound as [`ConsumerLagRegistry`] — up to [`MAX_CONSUMER_SERIES`] distinct labels,
+/// then a new label is REFUSED its own series and its counts fold into `{stream|group="__overflow__"}`,
+/// so an unbounded stream/group cardinality can never OOM the node the metrics protect while the TOTAL
+/// throughput stays visible.
+///
+/// Unlike the lag registry's FLOOR semantics (where a re-commit must update-in-place to stay
+/// idempotent), throughput is a pure MONOTONIC COUNTER: each record adds a delta of one. So the
+/// over-cap fold is the trivial idempotent case — an over-cap label's increments simply add into the
+/// shared overflow counters; there is no per-overflow-label ledger to keep, because there is no floor
+/// to reconcile. `labels_dropped` counts each DISTINCT refused label once (on its first fold), an
+/// operator's cardinality-pressure signal, exactly like the lag registry's.
+///
+/// Allocation-free on the steady-state record path (an existing label resolves O(1) via the
+/// label->slot side-index, like the lag registry's #486 index); the once-per-new-label claim records
+/// the mapping off the hot path. Never walks the log or the disk.
+pub struct ThroughputRegistry {
+    /// The fixed-capacity series array (a boxed slice of exactly [`MAX_CONSUMER_SERIES`] slots),
+    /// allocated ONCE at construction. A new label takes the first free slot; past the cap it folds.
+    series: Box<[ThroughputSeries]>,
+    /// The number of occupied slots in `series`.
+    len: usize,
+    /// A label->slot side-index so a record for an existing label resolves O(1), preallocated at the
+    /// cap so a claim never resizes it on the hot path. One entry per occupied primary series, plus
+    /// one per distinct over-cap label tracked in the bounded overflow ledger (mapped to its ledger
+    /// slot via [`OVERFLOW_INDEX_BASE`](ThroughputRegistry::OVERFLOW_INDEX_BASE)), so a re-record of a
+    /// folded label resolves O(1) too.
+    slot_index: HashMap<Box<[u8]>, usize>,
+    /// The BOUNDED overflow fold-ledger (mirrors [`ConsumerLagRegistry`]'s, #97): up to
+    /// [`MAX_OVERFLOW_LEDGER`] inline entries, one per DISTINCT over-cap label, so a re-record of a
+    /// folded label adds into ITS slot and `labels_dropped` counts each distinct label ONCE on its
+    /// first fold. Allocated once; part of the fixed memory ceiling, NOT an unbounded per-label map.
+    overflow_ledger: Box<[ThroughputSeries]>,
+    /// The number of occupied slots in `overflow_ledger` (the count of DISTINCT folded labels).
+    overflow_ledger_len: usize,
+    /// `*_labels_dropped_total`: the number of DISTINCT labels refused a primary series at the cap.
+    /// Bumps only on the FIRST fold of a distinct label, NEVER per record, so a folded label recording
+    /// again does not inflate it. A monotonic cardinality-pressure signal.
+    labels_dropped: u64,
+}
+
+impl Default for ThroughputRegistry {
+    fn default() -> ThroughputRegistry {
+        ThroughputRegistry {
+            series: vec![ThroughputSeries::EMPTY; MAX_CONSUMER_SERIES].into_boxed_slice(),
+            len: 0,
+            // Sized for the primary cap PLUS the overflow ledger cap, so neither a primary claim nor an
+            // overflow-ledger insert resizes the index on the record path.
+            slot_index: HashMap::with_capacity(MAX_CONSUMER_SERIES + MAX_OVERFLOW_LEDGER),
+            overflow_ledger: vec![ThroughputSeries::EMPTY; MAX_OVERFLOW_LEDGER].into_boxed_slice(),
+            overflow_ledger_len: 0,
+            labels_dropped: 0,
+        }
+    }
+}
+
+impl ThroughputRegistry {
+    /// The `slot_index` value offset that distinguishes an OVERFLOW-LEDGER slot from a primary-series
+    /// slot: a stored value `>= OVERFLOW_INDEX_BASE` is `OVERFLOW_INDEX_BASE + ledger_slot`. Sized at
+    /// the primary cap, so the two index spaces never collide.
+    const OVERFLOW_INDEX_BASE: usize = MAX_CONSUMER_SERIES;
+
+    /// Resolves (or claims, or folds) the series for `name` and applies `apply` to its counts.
+    /// O(1) and allocation-free for an EXISTING label — a primary series OR an already-folded over-cap
+    /// label (the side-index resolves either, then a borrowed mutation). A brand-new label claims a
+    /// free primary slot, then a bounded overflow-ledger slot at the cap (the only allocations, once
+    /// per distinct label, off the steady-state path); `labels_dropped` counts each DISTINCT refused
+    /// label ONCE. The closure receives `(&mut produced, &mut consumed)`.
+    fn record(&mut self, name: &[u8], apply: impl Fn(&mut u64, &mut u64)) {
+        let key = stored_key(name);
+        // An EXISTING label — a primary series OR an already-folded over-cap label — resolves O(1).
+        if let Some(&idx) = self.slot_index.get(key) {
+            if idx >= Self::OVERFLOW_INDEX_BASE {
+                if let Some(slot) = self
+                    .overflow_ledger
+                    .get_mut(idx - Self::OVERFLOW_INDEX_BASE)
+                {
+                    apply(&mut slot.produced, &mut slot.consumed);
+                    return;
+                }
+            } else if let Some(slot) = self.series.get_mut(idx) {
+                apply(&mut slot.produced, &mut slot.consumed);
+                return;
+            }
+        }
+        // A brand-new label with a free primary slot: claim it and record its key->slot mapping.
+        if self.len < MAX_CONSUMER_SERIES {
+            if let Some(slot) = self.series.get_mut(self.len) {
+                slot.store_label(name);
+                apply(&mut slot.produced, &mut slot.consumed);
+                self.slot_index.insert(Box::from(key), self.len);
+                self.len += 1;
+                return;
+            }
+        }
+        // The primary cap is reached: a brand-new DISTINCT over-cap label folds into the bounded
+        // overflow ledger (counted ONCE), so a re-record of it resolves O(1) above next time.
+        if self.overflow_ledger_len < MAX_OVERFLOW_LEDGER {
+            if let Some(slot) = self.overflow_ledger.get_mut(self.overflow_ledger_len) {
+                slot.store_label(name);
+                apply(&mut slot.produced, &mut slot.consumed);
+                self.slot_index.insert(
+                    Box::from(key),
+                    Self::OVERFLOW_INDEX_BASE + self.overflow_ledger_len,
+                );
+                self.overflow_ledger_len += 1;
+                self.labels_dropped = self.labels_dropped.saturating_add(1);
+                return;
+            }
+        }
+        // Even the bounded ledger is saturated (more distinct over-cap labels than its capacity over
+        // the broker's life): count the distinct drop, but do NOT fold its counts (it cannot be tracked
+        // without a slot, and an untracked fold could not be resolved O(1) on a re-record). The
+        // reported overflow totals are then a documented LOWER BOUND; `labels_dropped` still flags the
+        // pressure. The same coarse, monotonic, never-grows-wrong fallback the lag registry uses.
+        self.labels_dropped = self.labels_dropped.saturating_add(1);
+    }
+
+    /// Records one record PRODUCED to the stream `name` (#571). Allocation-free for an existing label.
+    pub fn record_produced(&mut self, name: &[u8]) {
+        self.record(name, |produced, _| *produced = produced.saturating_add(1));
+    }
+
+    /// Records one record CONSUMED (acked) by the group `name` (#571). Allocation-free for an existing
+    /// label.
+    pub fn record_consumed(&mut self, name: &[u8]) {
+        self.record(name, |_, consumed| *consumed = consumed.saturating_add(1));
+    }
+
+    /// Invokes `f(label, produced, consumed)` for each occupied DISTINCT primary series. O(number of
+    /// series), allocation-free; the overflow fold is emitted by the caller via the accessors below.
+    pub fn for_each_series<F: FnMut(&str, u64, u64)>(&self, mut f: F) {
+        for slot in self.series.iter().take(self.len) {
+            if slot.used {
+                f(slot.label_str(), slot.produced, slot.consumed);
+            }
+        }
+    }
+
+    /// Whether the overflow fold is in use (at least one label refused a primary series at the cap).
+    #[must_use]
+    pub fn has_overflow(&self) -> bool {
+        self.overflow_ledger_len > 0 || self.labels_dropped > 0
+    }
+
+    /// The folded produced count of every over-cap stream label (`{stream="__overflow__"}`): the sum
+    /// over the bounded ledger. A documented LOWER BOUND if the ledger ever saturated.
+    #[must_use]
+    pub fn overflow_produced(&self) -> u64 {
+        self.overflow_ledger
+            .iter()
+            .take(self.overflow_ledger_len)
+            .fold(0u64, |acc, s| acc.saturating_add(s.produced))
+    }
+
+    /// The folded consumed count of every over-cap group label (`{group="__overflow__"}`): the sum
+    /// over the bounded ledger. A documented LOWER BOUND if the ledger ever saturated.
+    #[must_use]
+    pub fn overflow_consumed(&self) -> u64 {
+        self.overflow_ledger
+            .iter()
+            .take(self.overflow_ledger_len)
+            .fold(0u64, |acc, s| acc.saturating_add(s.consumed))
+    }
+
+    /// The count of DISTINCT stream/group labels refused a primary series at the cap (a
+    /// cardinality-pressure signal, the `*_labels_dropped_total` counter). Counts each distinct label
+    /// once (on its first fold), never per record.
+    #[must_use]
+    pub fn labels_dropped(&self) -> u64 {
+        self.labels_dropped
+    }
+
+    /// The number of occupied distinct primary series (for the memory-ceiling test and operators).
+    #[must_use]
+    pub fn series_len(&self) -> usize {
+        self.len
+    }
+}
+
+/// The per-ack-level (Level 0/1/2) produce counters (#571): a FIXED three-slot array indexed by
+/// [`AckLevel::as_u8`], so the cardinality is bounded BY CONSTRUCTION (a closed three-value enum, no
+/// overflow fold needed). Each slot is the count of records accepted at that ack level
+/// (`c0` no-ack / `c1` server-ack / `c2` server+client-ack), the single-node twin of the cluster
+/// ack-level counters. Allocation-free; a plain array bump under the engine lock.
+#[derive(Clone, Copy, Default)]
+pub struct AckLevelCounters {
+    /// Indexed by [`AckLevel::as_u8`] (`0`=`NoAck`, `1`=`ServerAck`, `2`=`ServerAndClientAck`).
+    counts: [u64; 3],
+}
+
+impl AckLevelCounters {
+    /// Records one record accepted at ack level `level`. Allocation-free (a fixed-index array bump).
+    pub fn record(&mut self, level: AckLevel) {
+        let idx = usize::from(level.as_u8());
+        if let Some(slot) = self.counts.get_mut(idx) {
+            *slot = slot.saturating_add(1);
+        }
+    }
+
+    /// The count of records accepted at ack level `level`.
+    #[must_use]
+    pub fn count(&self, level: AckLevel) -> u64 {
+        self.counts
+            .get(usize::from(level.as_u8()))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 /// The owner of the bounded metric registry (#97): the two fixed-bucket histograms
 /// (`ironbus_fsync_duration_seconds` and the append-latency histogram), the per-consumer lag
 /// registry, and the self-monitoring series. Constructed once at engine open with the build
@@ -534,8 +798,28 @@ pub struct MetricRegistry {
     fsync_duration: FixedHistogram,
     /// The append-latency histogram (the cost of one durable append), over the SAME fixed buckets.
     append_latency: FixedHistogram,
+    /// `ironbus_produce_ack_duration_seconds` (#570): the produce->ACK request-path latency — the
+    /// engine time from a group-commit batch starting its durability barrier to the records being
+    /// durable (acked). Observed once per real-fsync batch (group commit amortizes one barrier over
+    /// the batch), over the SAME fixed buckets, so an operator sees the producer-visible ack latency
+    /// distribution distinct from the bare fsync syscall cost.
+    produce_ack_latency: FixedHistogram,
+    /// `ironbus_deliver_duration_seconds` (#570): the deliver request-path latency — the engine time
+    /// to service one poll that handed out a delivery (the poll scan + lease grant), over the SAME
+    /// fixed buckets. A poll that delivered nothing records nothing.
+    deliver_latency: FixedHistogram,
+    /// `ironbus_consume_duration_seconds` (#570): the consume (ack) request-path latency — the engine
+    /// time to service one ack that committed (the lease ack + cursor commit + lag maintenance), over
+    /// the SAME fixed buckets. A fenced/no-op ack records nothing.
+    consume_latency: FixedHistogram,
     /// The per-consumer lag registry (incremental, capped at [`MAX_CONSUMER_SERIES`]).
     consumer_lag: ConsumerLagRegistry,
+    /// The per-stream/per-group THROUGHPUT registry (#571): records produced per stream and consumed
+    /// per group, bounded at [`MAX_CONSUMER_SERIES`] distinct labels with an `__overflow__` fold.
+    throughput: ThroughputRegistry,
+    /// The per-ack-level (0/1/2) produce counters (#571): a fixed three-slot array, bounded by the
+    /// closed [`AckLevel`] enum (no overflow fold needed).
+    ack_levels: AckLevelCounters,
     /// The build version string (`CARGO_PKG_VERSION`), the `version` label of `ironbus_build_info`.
     /// A `&'static str`, so the self-info series carries no heap allocation.
     build_version: &'static str,
@@ -561,7 +845,12 @@ impl MetricRegistry {
         MetricRegistry {
             fsync_duration: FixedHistogram::default(),
             append_latency: FixedHistogram::default(),
+            produce_ack_latency: FixedHistogram::default(),
+            deliver_latency: FixedHistogram::default(),
+            consume_latency: FixedHistogram::default(),
             consumer_lag: ConsumerLagRegistry::default(),
+            throughput: ThroughputRegistry::default(),
+            ack_levels: AckLevelCounters::default(),
             build_version,
             start_time_unix_seconds,
             start_monotonic_nanos,
@@ -577,6 +866,24 @@ impl MetricRegistry {
     /// Records one append-latency observation, in nanoseconds. Allocation-free hot-path call.
     pub fn observe_append_nanos(&mut self, nanos: u64) {
         self.append_latency.observe(nanos);
+    }
+
+    /// Records one produce->ack request-path latency observation (#570), in nanoseconds.
+    /// Allocation-free hot-path call.
+    pub fn observe_produce_ack_nanos(&mut self, nanos: u64) {
+        self.produce_ack_latency.observe(nanos);
+    }
+
+    /// Records one deliver request-path latency observation (#570), in nanoseconds. Allocation-free
+    /// hot-path call; called only when a poll actually delivered.
+    pub fn observe_deliver_nanos(&mut self, nanos: u64) {
+        self.deliver_latency.observe(nanos);
+    }
+
+    /// Records one consume (ack) request-path latency observation (#570), in nanoseconds.
+    /// Allocation-free hot-path call; called only when an ack actually committed.
+    pub fn observe_consume_nanos(&mut self, nanos: u64) {
+        self.consume_latency.observe(nanos);
     }
 
     /// Records that one record was appended (the durable head advanced by one). Allocation-free and
@@ -599,6 +906,23 @@ impl MetricRegistry {
         self.consumer_lag.set_committed(name, committed);
     }
 
+    /// Records one record PRODUCED to stream `name` (#571). Allocation-free for an existing label; a
+    /// brand-new stream claims a bounded series slot (or folds into `__overflow__` at the cap).
+    pub fn record_stream_produced(&mut self, name: &[u8]) {
+        self.throughput.record_produced(name);
+    }
+
+    /// Records one record CONSUMED (acked) by group `name` (#571). Allocation-free for an existing
+    /// label; a brand-new group claims a bounded series slot (or folds into `__overflow__` at the cap).
+    pub fn record_group_consumed(&mut self, name: &[u8]) {
+        self.throughput.record_consumed(name);
+    }
+
+    /// Records one record accepted at ack level `level` (#571). Allocation-free (a fixed-index bump).
+    pub fn record_ack_level(&mut self, level: AckLevel) {
+        self.ack_levels.record(level);
+    }
+
     /// The fsync-duration histogram (`ironbus_fsync_duration_seconds`).
     #[must_use]
     pub fn fsync_duration(&self) -> &FixedHistogram {
@@ -611,10 +935,41 @@ impl MetricRegistry {
         &self.append_latency
     }
 
+    /// The produce->ack request-path latency histogram (`ironbus_produce_ack_duration_seconds`, #570).
+    #[must_use]
+    pub fn produce_ack_latency(&self) -> &FixedHistogram {
+        &self.produce_ack_latency
+    }
+
+    /// The deliver request-path latency histogram (`ironbus_deliver_duration_seconds`, #570).
+    #[must_use]
+    pub fn deliver_latency(&self) -> &FixedHistogram {
+        &self.deliver_latency
+    }
+
+    /// The consume (ack) request-path latency histogram (`ironbus_consume_duration_seconds`, #570).
+    #[must_use]
+    pub fn consume_latency(&self) -> &FixedHistogram {
+        &self.consume_latency
+    }
+
     /// The per-consumer lag registry (for the scrape rendering and the cap/overflow tests).
     #[must_use]
     pub fn consumer_lag(&self) -> &ConsumerLagRegistry {
         &self.consumer_lag
+    }
+
+    /// The per-stream/per-group throughput registry (#571), for the scrape rendering and the
+    /// cap/overflow tests.
+    #[must_use]
+    pub fn throughput(&self) -> &ThroughputRegistry {
+        &self.throughput
+    }
+
+    /// The per-ack-level (0/1/2) produce counters (#571), for the scrape rendering.
+    #[must_use]
+    pub fn ack_levels(&self) -> &AckLevelCounters {
+        &self.ack_levels
     }
 
     /// The build version string (the `version` label of `ironbus_build_info`).
@@ -640,11 +995,11 @@ impl MetricRegistry {
 }
 
 /// The fixed registry-memory ceiling, in bytes, asserted by a test and signed off against the
-/// edge RAM budget. It is the sum of the consumer-series array (the dominant, capped term), the
-/// bounded overflow fold-ledger (a second capped array of the same per-entry cost), and the fixed
-/// core-series state (the two histograms plus the small scalars). It is INDEPENDENT of the record
-/// count, the disk size, and the number of live consumers, because BOTH the consumer-series array
-/// and the overflow ledger are preallocated at their fixed caps.
+/// edge RAM budget. It is the sum of the consumer-lag series array and its bounded overflow
+/// fold-ledger, the per-stream/per-group throughput series array and ITS bounded overflow ledger
+/// (#571), and the fixed core-series state (the histograms plus the small scalars). It is INDEPENDENT
+/// of the record count, the disk size, and the number of live consumers/streams/groups, because ALL
+/// FOUR series arrays are preallocated at their fixed caps.
 ///
 /// The exact value is asserted in the tests below against `size_of` so a struct-layout change that
 /// inflates the per-series cost is caught; the documented ceiling in `docs/METRICS.md` and the
@@ -657,10 +1012,15 @@ pub fn registry_memory_ceiling_bytes() -> usize {
     // entry, preallocated at its cap, so the overflow fold stays idempotent without an unbounded
     // per-consumer map. It is part of the hard ceiling, not an open-ended term.
     let overflow_ledger = MAX_OVERFLOW_LEDGER * core::mem::size_of::<ConsumerSeries>();
+    // The per-stream/per-group throughput arrays (#571): a primary series array plus a bounded
+    // overflow fold-ledger, BOTH capped and preallocated at the SAME cardinality cap, so they are part
+    // of the hard ceiling, not open-ended terms.
+    let throughput_series = MAX_CONSUMER_SERIES * core::mem::size_of::<ThroughputSeries>();
+    let throughput_overflow = MAX_OVERFLOW_LEDGER * core::mem::size_of::<ThroughputSeries>();
     // The fixed core state held inline in MetricRegistry (the two histograms plus the scalar
     // self-info and lag-registry bookkeeping). This is the fixed sub-100-series core cost.
     let core = core::mem::size_of::<MetricRegistry>();
-    consumer_series + overflow_ledger + core
+    consumer_series + overflow_ledger + throughput_series + throughput_overflow + core
 }
 
 #[cfg(test)]
@@ -1040,21 +1400,37 @@ mod tests {
             per_series <= MAX_CONSUMER_LABEL_BYTES + 16,
             "per-series cost drifted above label[64] + two words: {per_series}"
         );
-        // The overflow fold-ledger is a SECOND capped array of the same per-entry cost, also
-        // preallocated at its cap, so it too is a fixed term independent of live-consumer count.
+        // The throughput series (#571) is a parallel capped array (a per-stream/per-group counter
+        // payload instead of a lag floor), also preallocated at the cap with its own bounded overflow
+        // ledger, all fixed-width so it is identical across targets.
+        let per_throughput = core::mem::size_of::<ThroughputSeries>();
+        assert!(
+            per_throughput >= MAX_CONSUMER_LABEL_BYTES,
+            "the inline throughput label buffer must be stored, not heaped: {per_throughput}"
+        );
+        assert!(
+            per_throughput <= MAX_CONSUMER_LABEL_BYTES + 24,
+            "per-throughput-series cost drifted above label[64] + three words: {per_throughput}"
+        );
+        // The overflow fold-ledgers are SECOND capped arrays of the same per-entry cost, also
+        // preallocated at their caps, so they too are fixed terms independent of live-label count. The
+        // ceiling is exactly the four capped arrays (lag series + lag overflow + throughput series +
+        // throughput overflow) plus the fixed core.
         assert_eq!(
             ceiling,
             MAX_CONSUMER_SERIES * per_series
                 + MAX_OVERFLOW_LEDGER * per_series
+                + MAX_CONSUMER_SERIES * per_throughput
+                + MAX_OVERFLOW_LEDGER * per_throughput
                 + core::mem::size_of::<MetricRegistry>()
         );
-        // The signed-off ceiling: the two capped series arrays (the lag series plus the bounded
-        // overflow ledger) are the dominant terms and together are well under 256 KiB, so the whole
-        // registry is a small fixed slice of the 64 MiB edge RAM budget, INDEPENDENT of record count
-        // or disk size. (~80 bytes/series x 1024 x 2 arrays ~= 160 KiB.)
+        // The signed-off ceiling: the four capped series arrays (the lag series + its overflow ledger,
+        // the throughput series + its overflow ledger) are the dominant terms and together are well
+        // under 512 KiB, so the whole registry is a small fixed slice of the 64 MiB edge RAM budget,
+        // INDEPENDENT of record count or disk size. (~80-88 bytes/series x 1024 x 4 arrays ~= 340 KiB.)
         assert!(
-            ceiling < 256 * 1024,
-            "registry ceiling {ceiling} bytes exceeded the documented 256 KiB sign-off"
+            ceiling < 512 * 1024,
+            "registry ceiling {ceiling} bytes exceeded the documented 512 KiB sign-off"
         );
         // The core (non-consumer-series) state is a fixed sub-100-series cost: a handful of
         // histograms and scalars, well under 1 KiB.
@@ -1086,6 +1462,119 @@ mod tests {
         assert_eq!(
             allocs, 0,
             "the append/commit hot path allocated {allocs} times"
+        );
+    }
+
+    #[test]
+    fn the_throughput_and_ack_level_record_paths_are_allocation_free() {
+        // #571: the per-stream produce / per-group consume counters and the per-ack-level counters
+        // must be allocation-free on the STEADY-STATE hot path (an existing label), so leaving them on
+        // is affordable on the edge box, exactly like the lag registry. Pre-touch the labels OUTSIDE
+        // the counted window (claiming a series slot copies the label into the preallocated array).
+        let mut reg = MetricRegistry::new("0.0.0", 0, 0);
+        reg.record_stream_produced(b""); // the default stream
+        reg.record_group_consumed(b"orders");
+        let allocs = count_allocs(|| {
+            for _ in 0..1000u64 {
+                reg.record_stream_produced(b"");
+                reg.record_group_consumed(b"orders");
+                reg.record_ack_level(AckLevel::NoAck);
+                reg.record_ack_level(AckLevel::ServerAck);
+                reg.record_ack_level(AckLevel::ServerAndClientAck);
+            }
+        });
+        assert_eq!(
+            allocs, 0,
+            "the throughput/ack-level record path allocated {allocs} times"
+        );
+        // The counts landed where expected (1 pre-touch + 1000 in-window).
+        let tp = reg.throughput();
+        tp.for_each_series(|label, produced, consumed| match label {
+            "" => assert_eq!(produced, 1001),
+            "orders" => assert_eq!(consumed, 1001),
+            other => panic!("unexpected throughput label {other:?}"),
+        });
+        assert_eq!(reg.ack_levels().count(AckLevel::NoAck), 1000);
+        assert_eq!(reg.ack_levels().count(AckLevel::ServerAck), 1000);
+        assert_eq!(reg.ack_levels().count(AckLevel::ServerAndClientAck), 1000);
+    }
+
+    #[test]
+    fn the_throughput_registry_caps_cardinality_and_folds_overflow() {
+        // #571: past MAX_CONSUMER_SERIES distinct labels, a new label is REFUSED its own series and its
+        // counts FOLD into `__overflow__`, bounding the series memory (the cardinality firewall the
+        // registry enforces). `labels_dropped` counts each DISTINCT refused label once.
+        let mut reg = MetricRegistry::new("0.0.0", 0, 0);
+        // Fill exactly to the cap with distinct stream labels, each produced once.
+        for i in 0..MAX_CONSUMER_SERIES {
+            reg.record_stream_produced(format!("stream-{i}").as_bytes());
+        }
+        let tp = reg.throughput();
+        assert_eq!(tp.series_len(), MAX_CONSUMER_SERIES);
+        assert!(!tp.has_overflow(), "at the cap exactly, no overflow yet");
+        assert_eq!(tp.labels_dropped(), 0);
+        // Two MORE distinct over-cap labels, each produced twice: both fold, and the fold sums their
+        // counts (a pure monotonic add is trivially idempotent — no floor to reconcile).
+        reg.record_stream_produced(b"over-a");
+        reg.record_stream_produced(b"over-a");
+        reg.record_stream_produced(b"over-b");
+        reg.record_stream_produced(b"over-b");
+        let tp = reg.throughput();
+        assert!(tp.has_overflow());
+        assert_eq!(
+            tp.overflow_produced(),
+            4,
+            "both over-cap labels' produces fold into __overflow__"
+        );
+        assert_eq!(
+            tp.labels_dropped(),
+            2,
+            "each DISTINCT refused label is counted once, never per record"
+        );
+        assert_eq!(
+            tp.series_len(),
+            MAX_CONSUMER_SERIES,
+            "the series array never grows past the cap"
+        );
+    }
+
+    #[test]
+    fn the_throughput_overflow_label_is_invisible_until_a_label_is_dropped() {
+        // #571: a healthy broker (under the cap) emits NO `__overflow__` throughput series, so the
+        // overflow line only appears once cardinality pressure forced a fold.
+        let mut reg = MetricRegistry::new("0.0.0", 0, 0);
+        reg.record_stream_produced(b"orders");
+        reg.record_group_consumed(b"orders");
+        assert!(!reg.throughput().has_overflow());
+    }
+
+    #[test]
+    fn the_request_path_latency_histograms_observe_and_are_allocation_free() {
+        // #570: the produce->ack / deliver / consume request-path histograms record into the SAME
+        // fixed bucket set, and their observe is allocation-free just like fsync/append (so leaving
+        // the request-path latency metrics on is affordable on the edge box).
+        let mut reg = MetricRegistry::new("0.0.0", 0, 0);
+        let allocs = count_allocs(|| {
+            for _ in 0..1000u64 {
+                reg.observe_produce_ack_nanos(250_000); // <= 0.0005 s bucket 0
+                reg.observe_deliver_nanos(1_500_000); // <= 0.002 s bucket 2
+                reg.observe_consume_nanos(9_000_000_000); // > 5 s -> +Inf only
+            }
+        });
+        assert_eq!(
+            allocs, 0,
+            "the latency observe path allocated {allocs} times"
+        );
+        assert_eq!(reg.produce_ack_latency().count(), 1000);
+        assert_eq!(reg.deliver_latency().count(), 1000);
+        assert_eq!(reg.consume_latency().count(), 1000);
+        // Each landed in its expected cumulative bucket.
+        assert_eq!(reg.produce_ack_latency().cumulative_buckets()[0], 1000);
+        assert_eq!(reg.deliver_latency().cumulative_buckets()[2], 1000);
+        assert_eq!(
+            reg.consume_latency().cumulative_buckets()[REGISTRY_BUCKET_BOUNDS_NANOS.len() - 1],
+            0,
+            "a > 5 s observation is only in +Inf, not the 5 s bucket"
         );
     }
 

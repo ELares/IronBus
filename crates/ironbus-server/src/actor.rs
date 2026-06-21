@@ -147,6 +147,13 @@ pub struct OwnedAppend {
     /// old client is byte-for-byte unchanged. Derived from the wire `PUB_FLAG_FIRE_AND_FORGET` bit by
     /// the session.
     pub fire_and_forget: bool,
+    /// The produce ACK LEVEL (#494/#571), derived by the session from the wire PUB flags via
+    /// [`ironbus_proto::message::pub_ack_level`] BEFORE the wire-only level bits are masked out of
+    /// `flags`. Carried here so the actor can attribute each accepted record to its level
+    /// (`c0`/`c1`/`c2`) for the per-ack-level produce counters, without re-reading the (now-masked)
+    /// flags. Defaults to [`AckLevel::ServerAck`] (Level 1), the old-client / no-level-bit encoding,
+    /// so every existing constructor and an old client are unchanged.
+    pub ack_level: ironbus_proto::message::AckLevel,
 }
 
 /// An owned copy of a produce's dedup identity (#33), so it can cross the actor channel (the wire
@@ -1486,6 +1493,12 @@ fn process_produce<F, C>(
             // An accepted produce feeds the broker-side retry-budget accept count (#69), so the
             // observed retry ratio stays meaningful under load.
             engine.retry_budget_record_accept();
+            // Per-ack-level PRODUCE throughput (#571): attribute this freshly-appended record to its
+            // ack level (c0/c1/c2). Counted on a FRESH append only (a dedup hit / fence / out-of-order
+            // appended nothing), so the per-level sum equals the fresh-append count, the single-node
+            // twin of the cluster ack-level counters. Allocation-free (a fixed-index array bump under
+            // the actor's single-writer lock).
+            engine.record_produce_ack_level(append.ack_level);
             // A fire-and-forget (QoS-0) produce is appended durably exactly like a normal produce
             // (covering group-commit fsync) but gets NO `PubAck`, so park it as the no-ack outcome; a
             // normal produce parks as `Appended`. (A Level-0 produce carries `reply: None`, so even
@@ -1673,13 +1686,16 @@ mod tests {
             dedup: None,
             enqueue_monotonic_nanos: 0,
             fire_and_forget: false,
+            ack_level: ironbus_proto::message::AckLevel::ServerAck,
         }
     }
 
     /// A FIRE-AND-FORGET (QoS-0, #11) owned produce, for the actor-level fire-and-forget tier tests.
+    /// A faf produce IS a Level-0 publish (#495), so its ack level is `NoAck`.
     fn append_faf(payload: &[u8]) -> OwnedAppend {
         OwnedAppend {
             fire_and_forget: true,
+            ack_level: ironbus_proto::message::AckLevel::NoAck,
             ..append(payload)
         }
     }
@@ -1701,6 +1717,7 @@ mod tests {
             }),
             enqueue_monotonic_nanos: 0,
             fire_and_forget: false,
+            ack_level: ironbus_proto::message::AckLevel::ServerAck,
         }
     }
 

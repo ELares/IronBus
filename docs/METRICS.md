@@ -529,25 +529,118 @@ an NTP step.
 
 ### The memory ceiling (signed off against the #19 / #115 edge RAM budget)
 
-The registry's resident cost is a **fixed** sub-100-series core plus the capped
-consumer-series array and the equally-capped bounded overflow fold-ledger,
-asserted by a test (`the_registry_memory_ceiling_is_fixed_and_bounded`):
+The registry's resident cost is a **fixed** sub-100-series core plus FOUR capped,
+preallocated series arrays — the consumer-lag series and its bounded overflow
+fold-ledger, plus (V2-M6 #571) the per-stream/per-group throughput series and ITS
+bounded overflow fold-ledger — asserted by a test
+(`the_registry_memory_ceiling_is_fixed_and_bounded`):
 
 ```
-ceiling = MAX_CONSUMER_SERIES (1024) x per-series cost (80 bytes, fixed-width inline label)
-        + the bounded overflow fold-ledger (1024) x the same per-entry cost (80 bytes)
-        + the fixed core state (two histograms + scalars, < 1 KiB)
-       ~= 80 KiB + 80 KiB + < 1 KiB  <  256 KiB
+ceiling = MAX_CONSUMER_SERIES (1024) x lag per-series cost (~80 bytes, fixed-width inline label)
+        + the lag overflow fold-ledger (1024) x the same per-entry cost (~80 bytes)
+        + MAX_CONSUMER_SERIES (1024) x throughput per-series cost (~88 bytes, fixed-width inline label)   (#571)
+        + the throughput overflow fold-ledger (1024) x the same per-entry cost (~88 bytes)                (#571)
+        + the fixed core state (histograms + scalars, < 1 KiB)
+       ~= 80 + 80 + 88 + 88 KiB + < 1 KiB  <  512 KiB
 ```
 
-The per-series (and per-ledger-entry) cost is fixed (an inline 64-byte label
+Each per-series (and per-ledger-entry) cost is fixed (an inline 64-byte label
 buffer plus fixed-width bookkeeping, identical on 32-bit and 64-bit targets), so
 the ceiling is INDEPENDENT of the record count, the disk size, and the number of
-live consumers (both arrays are preallocated at the cap). At ~161 KiB it is a
-small fixed slice of the 64 MiB `tiny`-profile RAM ceiling in
-[RAM_BUDGET.md](RAM_BUDGET.md) (well under 0.3% of it), so leaving the full
-metric surface on permanently is affordable on a 64 MiB edge node. This is the
-#19 sign-off the issue requires.
+live consumers/streams/groups (all four arrays are preallocated at the cap). At
+~340 KiB it is still a small fixed slice of the 64 MiB `tiny`-profile RAM ceiling
+in [RAM_BUDGET.md](RAM_BUDGET.md) (~0.5% of it), so leaving the full metric surface
+on permanently remains affordable on a 64 MiB edge node. This is the #19 sign-off
+the issue requires.
+
+## Operator observability series (V2-M6: #570–#574, #576)
+
+The V2-M6 operator-metrics batch adds request-path latency, throughput, ack-level,
+connection, storage, and RAM-ratio series. Every one is **low-cardinality** (a
+bounded + overflow-folded name, a fixed enum, or an unlabeled scalar — never a
+per-message / subject / offset / connection-id label) and the recording is a cheap
+allocation-free op on the hot path, so leaving them on stays affordable on the edge.
+
+### Request-path latency histograms (#570)
+
+Over the **same** fixed registry bucket set as `ironbus_fsync_duration_seconds`:
+
+- `ironbus_produce_ack_duration_seconds` — the produce→ack request-path latency
+  (engine time across the group-commit durability barrier that makes a batch
+  durable and ackable). Observed once per real-fsync batch.
+- `ironbus_deliver_duration_seconds` — the deliver request-path latency (a poll
+  that handed out a delivery). A poll that delivered nothing records nothing.
+- `ironbus_consume_duration_seconds` — the consume (ack) request-path latency (an
+  ack that committed). A fenced/no-op ack records nothing.
+
+### Per-stream / per-group throughput + per-ack-level counters (#571)
+
+```
+ironbus_stream_produced_total{stream=...}             records produced per stream (bounded 1024 + __overflow__)
+ironbus_group_consumed_total{group=...}               records consumed (acked) per group (bounded 1024 + __overflow__)
+ironbus_throughput_labels_dropped_total               distinct stream/group labels refused at the cap (a cardinality-pressure signal)
+ironbus_produce_ack_level_total{level="c0|c1|c2"}     records produced at each ack level (no-ack / server-ack / server+client-ack)
+```
+
+The `stream` / `group` labels are bounded + overflow-folded NAMES (the same hard
+1024-series cap and `__overflow__` fold as `ironbus_consumer_lag_records`), tracked
+in a bounded ledger so `*_labels_dropped_total` counts each distinct dropped label
+**once**. The `level` label is a fixed three-value enum (the single-node twin of
+`ironbus_cluster_ack_total`). The recording is allocation-free for an existing
+label (an O(1) side-index lookup); the registry's memory ceiling now covers the
+throughput series array and its overflow ledger too (signed off below).
+
+### Connection signals — "connz" (#572)
+
+```
+ironbus_connections_total{state="accepted|closed|refused|authenticated"}   connection lifecycle counts by state
+ironbus_connections_open                                                   connections currently live (accepted - closed)
+```
+
+A single labeled counter family plus an unlabeled gauge. The `state` label is a
+fixed four-value enum — **never** a per-connection-id / per-peer label (which the
+cardinality firewall forbids). The signals are a set of shared lock-free atomics
+recorded **off the engine lock** by the wire accept loop (accept/refuse), the
+connection slot's drop guard (close), and the session's authed-flip; the scrape
+reads a snapshot off-lock. A connection accept/close/auth is normal lifecycle and a
+refuse is a cap signal — **none** is a resilience SHED, so the labeled `_total` is
+pinned only in the `(name, type)` contract, not the resilience-counter taxonomy.
+
+### Disk-free + durable-storage telemetry (#573)
+
+```
+ironbus_disk_free_bytes        free bytes on the filesystem the durable log lives on (-1 = in-memory / unavailable)
+ironbus_durable_record_bytes   stored record bytes currently durable on disk (the footprint disk-free is measured against)
+ironbus_segment_count          open + sealed durable-log segment files on disk
+```
+
+Disk-free is read **out-of-band** (a `df -k -P` on the data-dir filesystem) in the
+scrape, off the engine lock, like RSS; it degrades to the `-1` sentinel for an
+in-memory broker or a platform where `df` is unavailable.
+
+### RAM ratios (#574)
+
+```
+ironbus_ram_headroom_ratio    headroom as a fraction of the RAM ceiling ((ceiling-rss)/ceiling), in [0,1] (-1 = unavailable)
+ironbus_rss_over_cap_ratio    RSS as a fraction of the RAM ceiling (rss/ceiling), in [0,1], clamped at 1 (-1 = unavailable)
+```
+
+Both are float-free per-mille gauges (the byte `ironbus_ram_headroom_bytes` gauge
+expressed dimensionless), so an operator can alert on "under 10% headroom" without
+hard-coding the box's byte ceiling. They use the same `-1` unavailable sentinel.
+
+### The cardinality firewall (#576)
+
+A CI lint (`the_cardinality_firewall_passes_on_the_real_metrics_surface`) scrapes
+`/metrics` and **fails the build** if any series carries a label key outside the
+frozen bounded-dimension allowlist (`consumer`, `group`, `stream`, `level`, `side`,
+`state`, `artifact`, `outcome`, `reason`, `le`, `version`) or if any family emits a
+runaway number of distinct series. A companion test
+(`the_cardinality_firewall_bites_a_synthetic_unbounded_metric`) proves it bites:
+a synthetic `msg_id` / `connection_id` / `offset` label and a runaway family are all
+rejected. This is the structural guard that keeps the metric surface from ever
+acquiring an unbounded (per-message / subject / offset / connection-id) label that
+would OOM the very node the metrics protect.
 
 ## Dispositions that are deliberately NOT counted (and why)
 
