@@ -91,13 +91,14 @@ use ironbus_server::clock::SystemClock;
 // path, so they follow the same `#[cfg(unix)]` gate as the rest of the broker run.
 #[cfg(unix)]
 use ironbus_server::cluster::{
-    dataplane_addr, ClusterAckLevel, ClusterRuntime, DataPlaneRuntime, DataPlaneServer, GeoLink,
-    IsrConfig, MetadataCommand, MetadataProposer, MirrorApplier, OriginCursorStore, Placement,
-    ReplicaLogFactory, RuntimeError, GEO_POLL,
+    dataplane_addr, push_loop, ClusterAckLevel, ClusterRuntime, DataPlaneRuntime, DataPlaneServer,
+    GeoLink, IsrConfig, LeafForwarder, LeafLink, LeafPushCursor, MetadataCommand, MetadataProposer,
+    MirrorApplier, OriginCursorStore, Placement, ReplicaLogFactory, RuntimeError, GEO_POLL,
+    LEAF_PUSH_POLL,
 };
 use ironbus_server::cluster::{
     ClusterConfig, Domain, DomainRef, DomainResolver, GeoConfig, GeoMode, GeoOrigin,
-    GeoStreamConfig,
+    GeoStreamConfig, LeafBridge, LeafConfig, LeafDirection,
 };
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -1687,6 +1688,13 @@ struct ParsedServe {
     /// async cross-cluster mirror/source plane (this PR): the configured read-only mirrors reject client
     /// produces, and a per-origin pull loop replicates each origin into its local stream.
     geo: GeoConfig,
+    /// The validated EDGE LEAF-SPOKE config (#625, V2-C7-I3), built from `--leaf-hub` + `--leaf-mirror` /
+    /// `--leaf-forward`. EMPTY (no `--leaf-hub`) is the non-leaf DEFAULT: `cmd_serve` constructs NO leaf
+    /// plane, so the produce/consume/storage hot path is byte-for-byte today's broker. A non-empty config
+    /// opts this node into being a LEAF that dials OUTBOUND to the hub: read-side mirror bridges reject
+    /// client produces (read-only) + pull the hub stream, and write-through bridges forward the leaf's
+    /// local stream up to the hub. A leaf is NOT a Raft voter (this never touches the metadata group).
+    leaf: LeafConfig,
     /// The transport-security material + auth references + pre-auth `DoS` knobs (#629/#631/#633, V2-M7),
     /// resolved from the `--tls-*` / `--auth-config` / `--*-preauth-*` flags. Carried as one bundle so
     /// the (large) `ServeConfig` and its `Default` stay untouched. `cmd_serve` runs the fail-closed
@@ -1788,6 +1796,7 @@ fn run_serve(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
         &parsed.config_warnings,
         parsed.cluster.as_ref(),
         &parsed.geo,
+        &parsed.leaf,
         &parsed.transport,
         ReloadSource {
             config_path: parsed.config_path.as_deref(),
@@ -1983,6 +1992,23 @@ struct ServeFlags {
     /// to a dial address (no auto-discovery). Raw `domain=addr` strings, validated after collection. Empty
     /// = no remote domains configured. CLI-only and repeatable, like `--cluster-peer`.
     cluster_links: Vec<String>,
+    /// The HUB this node is a LEAF of (#625, V2-C7-I3), from `--leaf-hub <domain-or-addr>`. Declares this
+    /// broker an EDGE LEAF that dials OUTBOUND to the hub (the hub never dials the leaf). `None` (no flag)
+    /// = the non-leaf DEFAULT: NO leaf plane, byte-for-byte today's broker. A `@domain` value resolves
+    /// through the SAME `--cluster-link` table the geo plane uses; a raw `host:port` is used directly.
+    /// CLI-only and singular. A leaf is NOT a Raft voter — `--leaf-hub` never touches the metadata group.
+    leaf_hub: Option<String>,
+    /// Repeatable read-side LEAF MIRROR bridges (#625): each `--leaf-mirror <local>=<hub-stream>` declares
+    /// a local READ-ONLY stream that mirrors a hub stream (the DOWN direction — a geo mirror of the hub).
+    /// Raw `local=hub-stream` strings, parsed after collection. Requires `--leaf-hub`. Empty = no read
+    /// bridges. CLI-only and repeatable.
+    leaf_mirrors: Vec<String>,
+    /// Repeatable write-through LEAF FORWARD bridges (#625): each `--leaf-forward <local>=<hub-stream>`
+    /// declares that the leaf forwards its LOCAL stream's produces UP to a hub stream (the UP direction —
+    /// write-through). Raw `local=hub-stream` strings, parsed after collection. Requires `--leaf-hub`. A
+    /// forward local stream MUST differ from every mirror local (the loop-safety guard). Empty = no
+    /// write-through. CLI-only and repeatable.
+    leaf_forwards: Vec<String>,
     /// The TLS server certificate chain file (#629, V2-M7): a PEM path. RESERVED, NOT YET HONORED
     /// (#107): the TLS 1.3 handshake (rustls) is not wired (no allowed crypto provider), so a set value
     /// is a fail-closed startup REFUSAL rather than an accepted cert that would imply encryption this
@@ -2223,6 +2249,19 @@ fn collect_serve_flags(args: &[String]) -> Result<ServeFlags, CliError> {
                 f.cluster_links
                     .push(take_value("--cluster-link", args, &mut i)?);
             }
+            // The EDGE LEAF-SPOKE topology (#625): this node is a LEAF that dials OUTBOUND to the hub.
+            // `--leaf-hub` is singular (the one hub a leaf links to); `--leaf-mirror` / `--leaf-forward`
+            // are repeatable per-stream bridge directions, parsed into a LeafConfig after collection (a
+            // malformed spec / missing hub is a typed usage error there). A leaf is NOT a Raft voter.
+            "--leaf-hub" => {
+                f.leaf_hub = Some(take_value("--leaf-hub", args, &mut i)?);
+            }
+            "--leaf-mirror" => f
+                .leaf_mirrors
+                .push(take_value("--leaf-mirror", args, &mut i)?),
+            "--leaf-forward" => f
+                .leaf_forwards
+                .push(take_value("--leaf-forward", args, &mut i)?),
             "--visibility-timeout-ms" => {
                 f.visibility_ms = Some(take_number("--visibility-timeout-ms", args, &mut i)?);
             }
@@ -2740,6 +2779,18 @@ fn parse_serve_flags_with_env_and_reader(
         geo: parse_geo_config(
             &f.mirrors,
             &f.sources,
+            &build_domain_resolver(f.cluster_domain.as_deref(), &f.cluster_links)?,
+        )?,
+        // The EDGE LEAF-SPOKE config (#625): empty (no `--leaf-hub`) is the non-leaf default — NO leaf
+        // plane, byte-for-byte today's broker. A present `--leaf-hub` makes this node a LEAF that dials
+        // OUTBOUND to the hub; the hub address resolves through the SAME domain resolver (a `@domain` hub)
+        // or a raw `host:port`. A malformed spec / a missing hub for a declared bridge / a local stream
+        // configured as BOTH a mirror and a forward (the loop-safety guard) is a typed usage error here,
+        // fail-closed before any side effect.
+        leaf: parse_leaf_config(
+            f.leaf_hub.as_deref(),
+            &f.leaf_mirrors,
+            &f.leaf_forwards,
             &build_domain_resolver(f.cluster_domain.as_deref(), &f.cluster_links)?,
         )?,
         // Transport security material + auth references + pre-auth DoS knobs (#629/#631/#633): paths
@@ -3308,6 +3359,136 @@ fn parse_geo_origins(
     Ok(out)
 }
 
+/// Builds the validated EDGE LEAF-SPOKE [`LeafConfig`] (#625, V2-C7-I3) from `--leaf-hub` + the repeated
+/// `--leaf-mirror` / `--leaf-forward` specs, or an EMPTY config when no `--leaf-hub` is given (the
+/// non-leaf default). Fail-closed: a bridge declared with no `--leaf-hub`, a malformed spec, an empty
+/// local name, a duplicate local stream, or a local stream configured as BOTH a mirror and a forward (the
+/// loop-safety guard) is a typed usage error before any side effect.
+///
+/// `--leaf-hub <addr-or-@domain>` — the hub this node is a leaf of, dialed OUTBOUND. A `@<domain>` value
+/// resolves through the SAME `--cluster-link` table the geo plane uses (no auto-discovery); a raw
+/// `host:port` is used directly. (A `@domain` hub names a CLUSTER, not a stream, so any stream remainder on
+/// the reference is ignored — the per-bridge `--leaf-mirror`/`--leaf-forward` carry the hub stream names.)
+/// `--leaf-mirror <local>=<hub-stream>` — a read-only local mirror of a hub stream (DOWN).
+/// `--leaf-forward <local>=<hub-stream>` — forward a local stream up to a hub stream (UP, write-through).
+fn parse_leaf_config(
+    leaf_hub: Option<&str>,
+    leaf_mirrors: &[String],
+    leaf_forwards: &[String],
+    resolver: &DomainResolver,
+) -> Result<LeafConfig, CliError> {
+    // No `--leaf-hub` => the non-leaf default. A `--leaf-mirror`/`--leaf-forward` without a hub is a typed
+    // usage error (a bridge needs a hub to dial), surfaced by `LeafConfig::validate` below.
+    let Some(hub_spec) = leaf_hub else {
+        if !leaf_mirrors.is_empty() || !leaf_forwards.is_empty() {
+            return Err(CliError::Usage(
+                "`--leaf-mirror`/`--leaf-forward` require `--leaf-hub <addr-or-@domain>` (an edge leaf \
+                 must name the hub it dials)"
+                    .to_string(),
+            ));
+        }
+        return Ok(LeafConfig::default());
+    };
+
+    // Resolve the hub address: a `@<domain>` reference through the explicit link table, or a raw address.
+    let hub_addr = resolve_leaf_hub_addr(hub_spec, resolver)?;
+
+    // Each bridge maps a local stream to a hub stream, in one direction. A local stream named on a
+    // `--leaf-mirror` is a read-only MIRROR local; one named on `--leaf-forward` is a write-through
+    // FORWARD local. The two MUST be distinct (the loop-safety guard, re-checked in `validate`).
+    let mut bridges = Vec::new();
+    let mut seen_local: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for spec in leaf_mirrors {
+        let (local, hub_stream) = split_leaf_spec("--leaf-mirror", spec)?;
+        if !seen_local.insert(local.clone()) {
+            return Err(CliError::Usage(format!(
+                "leaf local stream `{local}` is declared more than once (in `{spec}`); each leaf \
+                 local stream name must be unique"
+            )));
+        }
+        bridges.push(LeafBridge {
+            hub_stream,
+            mirror_local_stream: Some(local),
+            forward_local_stream: None,
+            direction: LeafDirection::Mirror,
+        });
+    }
+    for spec in leaf_forwards {
+        let (local, hub_stream) = split_leaf_spec("--leaf-forward", spec)?;
+        if !seen_local.insert(local.clone()) {
+            return Err(CliError::Usage(format!(
+                "leaf local stream `{local}` is declared more than once (in `{spec}`); each leaf \
+                 local stream name must be unique"
+            )));
+        }
+        bridges.push(LeafBridge {
+            hub_stream,
+            mirror_local_stream: None,
+            forward_local_stream: Some(local),
+            direction: LeafDirection::Forward,
+        });
+    }
+
+    let cfg = LeafConfig { hub_addr, bridges };
+    // The layer's own fail-closed validation (hub present, every bridge carries its directional local, and
+    // the LOOP-SAFETY guard: no local is both a mirror and a forward).
+    cfg.validate()
+        .map_err(|e| CliError::Usage(format!("invalid leaf config: {e}")))?;
+    Ok(cfg)
+}
+
+/// Resolve a `--leaf-hub` value to a concrete dial address: a `@<domain>` reference through the explicit
+/// `--cluster-link` table (no auto-discovery), or a raw `host:port` used directly. A `@domain` hub names a
+/// CLUSTER (not a stream), so any stream remainder on the reference is ignored (the per-bridge specs carry
+/// the hub stream names). Fail-closed on an empty value or an unresolvable / self domain.
+fn resolve_leaf_hub_addr(hub_spec: &str, resolver: &DomainResolver) -> Result<String, CliError> {
+    if hub_spec.is_empty() {
+        return Err(CliError::Usage(
+            "`--leaf-hub` value is empty; name the hub address (`host:port`) or `@<domain>`"
+                .to_string(),
+        ));
+    }
+    let maybe_ref = DomainRef::parse(hub_spec)
+        .map_err(|e| CliError::Usage(format!("`--leaf-hub` domain reference `{hub_spec}`: {e}")))?;
+    match maybe_ref {
+        Some(reference) => {
+            // Resolve the DOMAIN through the link table; the stream component (if any) is ignored — a hub
+            // is a cluster, addressed by domain, not a single stream.
+            let (addr, _ignored_stream) = resolver.resolve(&reference).map_err(|e| {
+                CliError::Usage(format!(
+                    "`--leaf-hub` cannot resolve domain reference `{hub_spec}`: {e}"
+                ))
+            })?;
+            Ok(addr)
+        }
+        // A raw address: used directly (the back-compat path, like a raw geo origin address).
+        None => Ok(hub_spec.to_string()),
+    }
+}
+
+/// Split a `--leaf-mirror`/`--leaf-forward` spec into `(local_stream, hub_stream)` at the FIRST `=`.
+/// Fail-closed on a missing `=`, an empty local name, or an over-long hub stream name.
+fn split_leaf_spec(flag: &str, spec: &str) -> Result<(String, String), CliError> {
+    let (local, hub_stream) = spec.split_once('=').ok_or_else(|| {
+        CliError::Usage(format!(
+            "`{flag}` must be `<local>=<hub-stream>` (e.g. `{flag} edge-orders=orders`), got `{spec}`"
+        ))
+    })?;
+    if local.is_empty() {
+        return Err(CliError::Usage(format!(
+            "`{flag}` local stream name is empty in `{spec}`; the default stream (`\"\"`) cannot be a \
+             leaf bridge local"
+        )));
+    }
+    if hub_stream.len() > ironbus_server::cluster::MAX_ORIGIN_STREAM_LEN {
+        return Err(CliError::Usage(format!(
+            "`{flag}` hub stream name `{hub_stream}` is over the {}-byte cap (in `{spec}`)",
+            ironbus_server::cluster::MAX_ORIGIN_STREAM_LEN
+        )));
+    }
+    Ok((local.to_string(), hub_stream.to_string()))
+}
+
 /// Resolves the required `--data-dir`, validates the assembled config, and dispatches to the
 /// platform `cmd_serve`. Split out of `run_serve` so the flag-parsing loop stays a single concern.
 #[allow(clippy::too_many_arguments)] // each input (addr, data dir, config, groups, health, the
@@ -3323,6 +3504,7 @@ fn finish_serve(
     config_warnings: &[String],
     cluster: Option<&ClusterConfig>,
     geo: &GeoConfig,
+    leaf: &LeafConfig,
     transport: &TransportSecurityFlags,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
@@ -3349,6 +3531,18 @@ fn finish_serve(
             "`--mirror`/`--source` require `--storage disk`: a cross-cluster mirror/source keeps a \
              durable local log + resume cursor so it resumes across a restart, so it cannot run \
              under `--storage memory` (which keeps no on-disk state)"
+                .to_string(),
+        ));
+    }
+    // The EDGE LEAF-SPOKE plane (#625) is likewise DURABLE: a leaf keeps its mirror's local log +
+    // `geo.cursor` AND (for write-through) its `leaf.push.cursor` on disk so it resumes across a restart.
+    // Under `--storage memory` it would lose them on every stop, so reject it fail-closed BEFORE any side
+    // effect rather than silently start a non-durable leaf.
+    if !leaf.is_empty() && config.storage == StorageArg::Memory {
+        return Err(CliError::Usage(
+            "`--leaf-hub` (edge leaf-spoke) requires `--storage disk`: a leaf keeps a durable local \
+             log + resume/push cursors so it resumes across a restart, so it cannot run under \
+             `--storage memory` (which keeps no on-disk state)"
                 .to_string(),
         ));
     }
@@ -3385,6 +3579,7 @@ fn finish_serve(
         config_warnings,
         cluster,
         geo,
+        leaf,
         transport,
         reload,
         out,
@@ -4626,6 +4821,7 @@ fn cmd_serve(
     config_warnings: &[String],
     cluster: Option<&ClusterConfig>,
     geo: &GeoConfig,
+    leaf: &LeafConfig,
     transport: &TransportSecurityFlags,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
@@ -4724,18 +4920,18 @@ fn cmd_serve(
             let _dir_lock = dirlock::DirLock::acquire(data_dir).map_err(|e| map_dir_error(&e))?;
             let mut engine =
                 open_disk_engine(data_dir, config, key_shared_groups, broadcast_groups)?;
-            // The cross-cluster GEO plane (#623), IFF a `--mirror`/`--source` was configured. With NO geo
-            // config NOTHING here runs: the read-only set stays empty (the produce path is byte-for-byte
-            // today's) and no pull loop is spawned (the byte-identical non-geo guarantee). The READ-ONLY
-            // mirror set is installed on the engine BEFORE it moves into the append actor, so a client
-            // produce to a mirror is rejected (single-writer preserved); the pull loops are spawned after
-            // the engine moves (they own their OWN local logs + durable cursors under `<data_dir>/geo/`).
-            let geo_plane = if geo.is_empty() {
-                None
-            } else {
-                engine.set_mirror_read_only_streams(geo.read_only_streams());
-                Some(spawn_geo_plane(geo, data_dir, config)?)
-            };
+            // The READ-ONLY mirror set spans BOTH the geo plane (#623, `--mirror`) AND the edge leaf-spoke
+            // plane (#625, `--leaf-mirror`): a client produce to ANY mirror local is rejected, installed
+            // ONCE BEFORE the engine moves into the append actor; empty = byte-for-byte today's path.
+            install_mirror_read_only(&mut engine, geo, leaf);
+            // The cross-cluster GEO plane (#623): pull loops spawned AFTER the engine moves; nothing
+            // spawned with no `--mirror`/`--source` (the byte-identical non-geo guarantee).
+            let geo_plane = spawn_geo_plane_if_configured(geo, data_dir, config)?;
+            // The EDGE LEAF-SPOKE plane (#625): per-bridge pull (read-side, reusing the geo dialer/applier)
+            // + push (write-through) loops; nothing spawned with no `--leaf-hub`. A leaf is NOT a Raft
+            // voter — this never touches `start_cluster_runtime` / the metadata group, so leaf churn never
+            // affects the hub's consensus (the byte-identical non-leaf guarantee when unset).
+            let leaf_plane = spawn_leaf_plane_if_configured(leaf, data_dir, config)?;
             // Start the additive metadata-cluster plane (#684, V2-C1) IFF cluster flags were given.
             // This is the ONLY place a `ClusterRuntime` is started, on the DISK path, where a
             // concrete `StdFs` and the data dir are known — the runtime roots its `metaraft/` log
@@ -4771,9 +4967,12 @@ fn cmd_serve(
                 reload,
                 out,
             );
-            // Stop + join the geo pull plane on the way out (its `Drop` also signals shutdown, but the
-            // explicit stop joins every pull thread deterministically). `None` when no geo was configured.
+            // Stop + join the geo (#623) and edge leaf-spoke (#625) bridge planes on the way out (each
+            // `Drop` also signals shutdown, but the explicit stop joins every thread deterministically).
             if let Some(mut plane) = geo_plane {
+                plane.stop();
+            }
+            if let Some(mut plane) = leaf_plane {
                 plane.stop();
             }
             result
@@ -4970,6 +5169,58 @@ impl Drop for GeoPlaneHandle {
     }
 }
 
+/// Install the COMBINED read-only mirror set (geo `--mirror` locals + leaf `--leaf-mirror` locals) on the
+/// disk engine, so a client produce to ANY mirror local is rejected (its only writer is the apply/pull
+/// path). The engine's setter REPLACES the set, so the two sources are merged into one call here; with
+/// neither plane configured the set is empty and the produce path is byte-for-byte today's broker.
+#[cfg(unix)]
+fn install_mirror_read_only(
+    engine: &mut Engine<StdFs, SystemClock>,
+    geo: &GeoConfig,
+    leaf: &LeafConfig,
+) {
+    let mut read_only = geo.read_only_streams();
+    read_only.extend(leaf.read_only_streams());
+    if !read_only.is_empty() {
+        engine.set_mirror_read_only_streams(read_only);
+    }
+}
+
+/// Spawn the cross-cluster GEO plane IFF a `--mirror`/`--source` was configured, else `None` (the
+/// byte-identical non-geo path — nothing constructs). A thin gate so `cmd_serve` stays small.
+///
+/// # Errors
+/// Propagates [`spawn_geo_plane`]'s [`CliError::Internal`] (a local geo log / cursor could not be opened).
+#[cfg(unix)]
+fn spawn_geo_plane_if_configured(
+    geo: &GeoConfig,
+    data_dir: &Path,
+    config: &ServeConfig,
+) -> Result<Option<GeoPlaneHandle>, CliError> {
+    if geo.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(spawn_geo_plane(geo, data_dir, config)?))
+}
+
+/// Spawn the EDGE LEAF-SPOKE plane IFF a `--leaf-hub` was configured, else `None` (the byte-identical
+/// non-leaf path — nothing constructs). A thin gate so `cmd_serve` stays small.
+///
+/// # Errors
+/// Propagates [`spawn_leaf_plane`]'s [`CliError::Internal`] (a local leaf log / cursor could not be
+/// opened).
+#[cfg(unix)]
+fn spawn_leaf_plane_if_configured(
+    leaf: &LeafConfig,
+    data_dir: &Path,
+    config: &ServeConfig,
+) -> Result<Option<LeafPlaneHandle>, CliError> {
+    if leaf.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(spawn_leaf_plane(leaf, data_dir, config)?))
+}
+
 /// Construct + spawn the cross-cluster GEO pull plane (#623, V2-C7-I1) — one async pull thread per
 /// configured `(local_stream, origin)`. Called ONLY when a `--mirror`/`--source` was configured (the
 /// caller checks `geo.is_empty()` first); with no geo config this is never called and the broker is
@@ -5104,6 +5355,225 @@ fn hex_dir_name(name: &str) -> String {
         s.push(char::from_digit(u32::from(b & 0xf), 16).unwrap_or('0'));
     }
     s
+}
+
+/// The running EDGE LEAF-SPOKE plane (#625): the shared shutdown flag every leaf bridge thread polls, plus
+/// the join handles. The broker's teardown calls [`stop`](LeafPlaneHandle::stop). A leaf is NOT a Raft
+/// voter — this plane is purely outbound bridges, entirely separate from the metadata cluster.
+#[cfg(unix)]
+struct LeafPlaneHandle {
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl LeafPlaneHandle {
+    /// Signal shutdown and join every leaf bridge thread (read-side pull + write-through push).
+    /// Idempotent. Called by the broker's serve teardown so the leaf plane winds down deterministically.
+    fn stop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        for h in self.workers.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LeafPlaneHandle {
+    fn drop(&mut self) {
+        // Best-effort: a caller that forgets `stop` (or a panic on the serve path) still signals the
+        // bridge threads to wind down rather than leaking them. The deterministic join is `stop`.
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Construct + spawn the EDGE LEAF-SPOKE plane (#625, V2-C7-I3) — one read-side PULL thread per
+/// `--leaf-mirror` bridge and one write-through PUSH thread per `--leaf-forward` bridge. Called ONLY when
+/// a `--leaf-hub` was configured (the caller checks `leaf.is_empty()` first); with no leaf config this is
+/// never called and the broker is byte-for-byte today's.
+///
+/// A leaf is NOT a Raft voter: this plane is purely OUTBOUND bridges and never touches the metadata group
+/// / `ClusterRuntime`. Each thread DIALS the hub (the hub never dials the leaf), reconnecting + backing
+/// off on a drop.
+///
+/// A read-side (`--leaf-mirror`) thread owns a local on-disk mirror [`Log`](ironbus_storage::log::Log) +
+/// a durable [`OriginCursorStore`] under `<data_dir>/leaf/mirror/<hex(local)>/`, and runs the geo
+/// [`pull_loop`](ironbus_server::cluster::pull_loop) (pull, CRC-revalidate, apply, advance cursor) — the
+/// read bridge IS a geo mirror of the hub stream, reused verbatim.
+///
+/// A write-through (`--leaf-forward`) thread reads the leaf's OWN local FORWARD stream's log (under
+/// `<data_dir>/leaf/forward/<hex(local)>/`) and runs [`push_loop`](ironbus_server::cluster::push_loop)
+/// (build-push from the durable push cursor, send, ack, advance push cursor). De-duplicated by the push
+/// cursor so a record crosses the link once.
+///
+/// # Errors
+/// [`CliError::Internal`] if a local leaf log / cursor store cannot be opened (the only synchronous
+/// failure; a dial failure is handled by the bridge thread's reconnect/backoff, never a serve failure).
+#[cfg(unix)]
+fn spawn_leaf_plane(
+    leaf: &LeafConfig,
+    data_dir: &Path,
+    config: &ServeConfig,
+) -> Result<LeafPlaneHandle, CliError> {
+    let log_config = LogConfig::new(config.max_segment_bytes)
+        .map_err(|e| CliError::Internal(format!("leaf log config: {e}")))?
+        .with_max_total_bytes(config.max_total_bytes);
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut workers = Vec::new();
+
+    for bridge in &leaf.bridges {
+        // READ-SIDE (DOWN): a leaf mirror of the hub stream. Reuse the geo applier + dialer verbatim.
+        if let Some(local) = &bridge.mirror_local_stream {
+            let dir = data_dir
+                .join("leaf")
+                .join("mirror")
+                .join(hex_dir_name(local));
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| CliError::Internal(format!("mkdir {}: {e}", dir.display())))?;
+            let log = ironbus_storage::log::Log::open(
+                StdFs::new(dir.clone()),
+                SystemClock::new(),
+                log_config,
+            )
+            .map_err(|e| {
+                CliError::Internal(format!("open leaf mirror log {}: {e}", dir.display()))
+            })?;
+            let cursors = OriginCursorStore::open(&StdFs::new(dir.clone())).map_err(|e| {
+                CliError::Internal(format!("open leaf mirror cursor {}: {e}", dir.display()))
+            })?;
+            let applier =
+                std::sync::Arc::new(std::sync::Mutex::new(MirrorApplier::new(log, cursors)));
+            // The hub is the leaf's ONE origin (the read bridge IS a geo mirror); dial it outbound.
+            let origin = GeoOrigin {
+                addr: leaf.hub_addr.clone(),
+                stream: bridge.hub_stream.clone(),
+            };
+            let key = origin.cursor_key();
+            let shutdown_t = std::sync::Arc::clone(&shutdown);
+            let local_name = local.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!("ib-leaf-mirror-{local_name}"))
+                .spawn(move || {
+                    // Reuse the geo per-origin puller exactly: dial the hub, pull, apply, advance cursor,
+                    // reconnect on a drop. A leaf's read bridge is operationally a geo mirror.
+                    run_geo_puller(&applier, &origin, &key, &shutdown_t);
+                })
+                .map_err(|e| CliError::Internal(format!("spawn leaf mirror: {e}")))?;
+            workers.push(handle);
+        }
+        // WRITE-THROUGH (UP): forward the leaf's local stream up to the hub stream.
+        if let Some(local) = &bridge.forward_local_stream {
+            let dir = data_dir
+                .join("leaf")
+                .join("forward")
+                .join(hex_dir_name(local));
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| CliError::Internal(format!("mkdir {}: {e}", dir.display())))?;
+            // The leaf's LOCAL forward log: the leaf produces into it locally; the push thread reads its
+            // sealed bytes and forwards them. (In this PR the forward stream is its OWN on-disk log under
+            // the leaf data dir; threading a forward off the engine's primary default stream is the
+            // FLAGGED follow-on — see the PR notes.)
+            let log = ironbus_storage::log::Log::open(
+                StdFs::new(dir.clone()),
+                SystemClock::new(),
+                log_config,
+            )
+            .map_err(|e| {
+                CliError::Internal(format!("open leaf forward log {}: {e}", dir.display()))
+            })?;
+            let cursor = LeafPushCursor::open(&StdFs::new(dir.clone())).map_err(|e| {
+                CliError::Internal(format!("open leaf push cursor {}: {e}", dir.display()))
+            })?;
+            let shared = std::sync::Arc::new(std::sync::Mutex::new((log, cursor)));
+            let hub_addr = leaf.hub_addr.clone();
+            let hub_stream = bridge.hub_stream.clone();
+            // The durable push-cursor key is the `<hub_addr>/<hub_stream>` identity (stable across restart).
+            let key = format!("{hub_addr}/{hub_stream}");
+            let shutdown_t = std::sync::Arc::clone(&shutdown);
+            let local_name = local.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!("ib-leaf-forward-{local_name}"))
+                .spawn(move || {
+                    run_leaf_forwarder(&shared, &hub_addr, &hub_stream, &key, &shutdown_t);
+                })
+                .map_err(|e| CliError::Internal(format!("spawn leaf forward: {e}")))?;
+            workers.push(handle);
+        }
+    }
+
+    Ok(LeafPlaneHandle { shutdown, workers })
+}
+
+/// One per-bridge WRITE-THROUGH thread (#625): dial the hub OUTBOUND, run the push loop until the link
+/// breaks, then reconnect + back off — until shutdown. The (log, cursor) pair is shared behind a mutex so
+/// each push takes the lock only to read the leaf log's bytes + build the request + advance the cursor
+/// (never across a socket read/write), exactly the geo follower-fetch lock discipline.
+#[cfg(unix)]
+fn run_leaf_forwarder(
+    shared: &std::sync::Mutex<(
+        ironbus_storage::log::Log<StdFs, SystemClock>,
+        LeafPushCursor<StdFs>,
+    )>,
+    hub_addr: &str,
+    hub_stream: &str,
+    push_key: &str,
+    shutdown: &std::sync::atomic::AtomicBool,
+) {
+    use std::sync::atomic::Ordering;
+
+    let addr: std::net::SocketAddr = match hub_addr.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!(
+                "ironbus: leaf: bad hub address {hub_addr:?} ({e}); not forwarding this bridge"
+            );
+            return;
+        }
+    };
+    while !shutdown.load(Ordering::Acquire) {
+        if let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, LEAF_PUSH_POLL) {
+            let _ = stream.set_read_timeout(Some(LEAF_PUSH_POLL));
+            let _ = stream.set_write_timeout(Some(LEAF_PUSH_POLL));
+            let mut link = LeafLink::new(stream);
+            push_loop(
+                &mut link,
+                shutdown,
+                || {
+                    // Build the next push under the lock: read the leaf's sealed local bytes from the push
+                    // cursor (off the socket IO). The forwarder reads the leaf's OWN log — never a mirror's
+                    // log — so a mirrored-down record is never forwarded back up (loop-free by construction).
+                    let guard = shared
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let (log, cursor) = &*guard;
+                    let plane = log.read_plane().map_err(|e| {
+                        ironbus_server::cluster::LeafError::Cursor {
+                            what: format!("leaf forward read plane: {e}"),
+                        }
+                    })?;
+                    let fwd = LeafForwarder::new(&plane);
+                    fwd.next_push(hub_stream, cursor.cursor(push_key))
+                },
+                |acked| {
+                    let mut guard = shared
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard.1.commit(push_key, acked)
+                },
+            );
+        } else {
+            // Hub not reachable yet: back off and retry (interruptible by shutdown).
+            let mut left = LEAF_PUSH_POLL;
+            let slice = std::time::Duration::from_millis(20);
+            while left > std::time::Duration::ZERO && !shutdown.load(Ordering::Acquire) {
+                let this = slice.min(left);
+                std::thread::sleep(this);
+                left = left.checked_sub(this).unwrap_or(std::time::Duration::ZERO);
+            }
+        }
+    }
 }
 
 /// Construct, spawn, and drive the DATA plane for a clustered serve (#717) — the final clustering
@@ -6251,6 +6721,7 @@ fn cmd_serve(
     config_warnings: &[String],
     cluster: Option<&ClusterConfig>,
     geo: &GeoConfig,
+    leaf: &LeafConfig,
     transport: &TransportSecurityFlags,
     reload: ReloadSource<'_>,
     out: &mut impl Write,
@@ -6260,6 +6731,10 @@ fn cmd_serve(
     // the Unix one (a mismatched arity is the recurring #288/#99 Windows footgun, invisible to a macOS
     // reviewer).
     let _ = geo;
+    // The EDGE LEAF-SPOKE plane (#625) is likewise spawned only on the Unix serve path, so the non-Unix
+    // stub consumes its parsed config to keep this signature byte-for-byte identical to the Unix one (the
+    // same #288/#99 footgun: a new serve arg MUST appear in BOTH cmd_serve signatures).
+    let _ = leaf;
     // The #87 materialized-config line, `Profile::name`, and `DiskFullPolicyArg::as_str` are reached
     // only from the Unix serve path, so build (and discard) the line here too: a function/method read
     // only on cfg(unix) trips the Windows `-D warnings` `never used` lint, invisible to a macOS
@@ -12358,6 +12833,7 @@ mod tests {
             &parsed.config_warnings,
             parsed.cluster.as_ref(),
             &parsed.geo,
+            &parsed.leaf,
             &parsed.transport,
             ReloadSource {
                 config_path: parsed.config_path.as_deref(),
@@ -14845,6 +15321,7 @@ mod tests {
             &parsed.config_warnings,
             parsed.cluster.as_ref(),
             &parsed.geo,
+            &parsed.leaf,
             &parsed.transport,
             ReloadSource {
                 config_path: parsed.config_path.as_deref(),
@@ -14955,6 +15432,153 @@ mod tests {
             &parsed.config_warnings,
             parsed.cluster.as_ref(),
             &parsed.geo,
+            &parsed.leaf,
+            &parsed.transport,
+            ReloadSource {
+                config_path: parsed.config_path.as_deref(),
+                allow_unknown_config: parsed.allow_unknown_config,
+                reload_pins: parsed.reload_pins,
+            },
+            &mut buf,
+        )
+        .unwrap_err();
+        assert_eq!(e.exit_code(), EXIT_USAGE);
+        match e {
+            CliError::Usage(m) => assert!(
+                m.contains("--storage disk") && m.contains("durable"),
+                "the rejection must explain the durable-disk requirement: {m}"
+            ),
+            other => panic!("expected a Usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn leaf_flags_parse_into_a_leaf_config() {
+        // `--leaf-hub` + per-stream `--leaf-mirror` / `--leaf-forward` make this node an edge leaf.
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--leaf-hub",
+            "10.0.0.1:7500",
+            "--leaf-mirror",
+            "edge-orders=orders",
+            "--leaf-forward",
+            "edge-events=events",
+        ]))
+        .unwrap();
+        assert!(
+            !parsed.leaf.is_empty(),
+            "the flags parse into a leaf config"
+        );
+        assert_eq!(parsed.leaf.hub_addr, "10.0.0.1:7500");
+        assert_eq!(parsed.leaf.bridges.len(), 2);
+        // The mirror local is read-only; the forward local is the leaf's own produced stream (NOT
+        // read-only).
+        assert_eq!(
+            parsed.leaf.read_only_streams(),
+            vec!["edge-orders".to_string()]
+        );
+        // The read-side bridge surfaces as a geo Mirror of the hub stream over the hub address.
+        let modes = parsed.leaf.mirror_geo_modes();
+        assert_eq!(modes.len(), 1);
+        assert_eq!(modes[0].0, "edge-orders");
+        match &modes[0].1 {
+            GeoMode::Mirror(o) => {
+                assert_eq!(o.addr, "10.0.0.1:7500");
+                assert_eq!(o.stream, "orders");
+            }
+            GeoMode::Source(_) => panic!("a leaf mirror is a geo Mirror"),
+        }
+    }
+
+    #[test]
+    fn no_leaf_flags_is_the_empty_non_leaf_default() {
+        let parsed = parse_serve_flags(&serve_args(&[])).unwrap();
+        assert!(parsed.leaf.is_empty(), "no --leaf-hub = no leaf plane");
+    }
+
+    #[test]
+    fn a_leaf_bridge_without_a_hub_is_a_typed_usage_error() {
+        assert!(matches!(
+            parse_serve_flags(&serve_args(&["--leaf-mirror", "m=orders"])),
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn a_leaf_local_as_both_mirror_and_forward_is_rejected_no_loop() {
+        // THE LOOP-SAFETY GUARD at the CLI: the same local stream as both a mirror local and a forward
+        // local would echo a record across the link. Rejected fail-closed.
+        assert!(matches!(
+            parse_serve_flags(&serve_args(&[
+                "--leaf-hub",
+                "10.0.0.1:7500",
+                "--leaf-mirror",
+                "shared=orders",
+                "--leaf-forward",
+                "shared=events",
+            ])),
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn a_leaf_hub_can_be_a_domain_reference() {
+        // A `@<domain>` hub resolves through the SAME `--cluster-link` table the geo plane uses.
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--cluster-link",
+            "hub-east=10.9.9.9:7500",
+            "--leaf-hub",
+            "@hub-east",
+            "--leaf-mirror",
+            "edge-orders=orders",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.leaf.hub_addr, "10.9.9.9:7500");
+    }
+
+    #[test]
+    fn a_leaf_hub_with_an_unconfigured_domain_is_a_typed_usage_error() {
+        // No `--cluster-link` for `@nope`: fail-closed (no auto-discovery).
+        assert!(matches!(
+            parse_serve_flags(&serve_args(&[
+                "--leaf-hub",
+                "@nope",
+                "--leaf-mirror",
+                "m=orders",
+            ])),
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn leaf_flags_under_storage_memory_are_rejected() {
+        let parsed = parse_serve_flags(&serve_args(&[
+            "--storage",
+            "memory",
+            "--ephemeral-loss-ack",
+            "--max-total-bytes",
+            "1048576",
+            "--leaf-hub",
+            "10.0.0.1:7500",
+            "--leaf-mirror",
+            "edge-orders=orders",
+        ]))
+        .unwrap();
+        assert!(
+            !parsed.leaf.is_empty(),
+            "the flags parse into a leaf config"
+        );
+        let mut buf = Vec::new();
+        let e = finish_serve(
+            &parsed.addr,
+            parsed.data_dir.as_deref(),
+            &parsed.config,
+            &parsed.key_shared_groups,
+            &parsed.broadcast_groups,
+            parsed.health_addr.as_deref(),
+            &parsed.config_warnings,
+            parsed.cluster.as_ref(),
+            &parsed.geo,
+            &parsed.leaf,
             &parsed.transport,
             ReloadSource {
                 config_path: parsed.config_path.as_deref(),
