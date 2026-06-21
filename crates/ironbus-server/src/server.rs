@@ -209,6 +209,12 @@ where
     if session.produced_l2() {
         let _ = engine.with(move |e| e.drop_l2_confirms(member_id));
     }
+    // Drop any released-but-undrained CLUSTER produce-acks for this connection (#719): a producer that
+    // parked a `C2-fsync` ack, had it quorum-released into its outbox, then disconnected before draining
+    // it leaves nothing to flush, so the gate's outbox entry is cleared rather than leaked. Off-actor (a
+    // gate outbox lock only) and a no-op on a single-node / no-cluster broker (no gate), so the
+    // single-node disconnect path is byte-for-byte unchanged.
+    engine.drop_client_acks(member_id);
     let group = session.subscription().to_string();
     let _ = engine.with(move |e| {
         let _ = e.checkpoint_group(&group);

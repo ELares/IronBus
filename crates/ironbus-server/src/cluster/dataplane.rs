@@ -857,10 +857,14 @@ pub struct ProduceAckSeam<F: Filesystem, C: Clock> {
     /// The next per-park token. Monotonic; keys [`Self::parked`] and is what the controller's gate
     /// holds + hands back on release. Wraps only after `u64::MAX` parks, which is unreachable.
     next_token: u64,
-    /// The parked wire-`PubAck` frame bytes, keyed by the token the controller's gate holds. The REAL
-    /// reply each parked produce will get; removed and returned in offset order on quorum-fsync
-    /// release. Empty whenever nothing is withheld (single-node / no-cluster never inserts).
-    parked: BTreeMap<AckToken, Vec<u8>>,
+    /// The parked wire-`PubAck` frame bytes, keyed by the token the controller's gate holds, each
+    /// tagged with the OPAQUE OWNER id (the producer connection's [`MemberId`](ironbus_core::keyshared::MemberId)
+    /// `u64`) that parked it, so a real serve can route the released reply back to the RIGHT producer
+    /// connection. The REAL reply each parked produce will get; removed and returned in offset order on
+    /// quorum-fsync release. Empty whenever nothing is withheld (single-node / no-cluster never inserts).
+    /// The owner is opaque here (the in-process #703 test and the existing un-owned API tag it `0`; the
+    /// client-ack path #719 tags it with the connection's member id), exactly like [`AckToken`].
+    parked: BTreeMap<AckToken, (u64, Vec<u8>)>,
 }
 
 impl<F: Filesystem, C: Clock> ProduceAckSeam<F, C> {
@@ -919,30 +923,59 @@ impl<F: Filesystem, C: Clock> ProduceAckSeam<F, C> {
         offset: u64,
         reply_bytes: Vec<u8>,
     ) -> Result<AckDisposition, DataPlaneError> {
+        // The un-owned API (the in-process #703 test + the serve-path observability callers) tags the
+        // park with owner `0`; routing the released bytes back to a specific producer connection is the
+        // #719 client-ack path, which calls `on_local_fsynced_ack_owned`. The decision logic is shared.
+        self.on_local_fsynced_ack_owned(0, ack_level, partition, offset, reply_bytes)
+    }
+
+    /// The OWNER-tagged produce-ack decision (#719): identical to [`Self::on_local_fsynced_ack`] but
+    /// records the OPAQUE `owner` id (a producer connection's [`MemberId`](ironbus_core::keyshared::MemberId))
+    /// alongside the parked reply, so the release path ([`Self::on_follower_report_owned`]) can route the
+    /// released wire `PubAck` back to the RIGHT producer connection. The seam never interprets `owner`.
+    ///
+    /// Single-node byte-identical is unchanged: the seam is never CONSTRUCTED off-cluster, and this
+    /// returns [`AckDisposition::WriteNow`] verbatim for every non-`C2-fsync` / non-led case (no park,
+    /// no owner recorded).
+    ///
+    /// # Errors
+    /// [`DataPlaneError`] only if the controller rejects the park (never for a led partition — the
+    /// `Parked` branch is taken only when [`DataPlaneController::is_leader`] is already true).
+    pub fn on_local_fsynced_ack_owned(
+        &mut self,
+        owner: u64,
+        ack_level: ClusterAckLevel,
+        partition: u64,
+        offset: u64,
+        reply_bytes: Vec<u8>,
+    ) -> Result<AckDisposition, DataPlaneError> {
         // The seam engages ONLY for a clustered C2-fsync produce to a LED partition. Anything else is
         // the existing immediate ack: returned verbatim, no parking state constructed.
         if !ack_level.ack_implies_quorum_fsync() || !self.controller.is_leader(partition) {
             return Ok(AckDisposition::WriteNow(reply_bytes));
         }
-        // Park the REAL wire bytes keyed by a fresh token, then thread that token through the
-        // controller's gate at the appended offset. The leader has ALREADY locally fsync'd (the I2
-        // ack-after-its-own-fsync); the gate adds the quorum-fsync condition.
+        // Park the REAL wire bytes keyed by a fresh token (tagged with the owner), then thread that token
+        // through the controller's gate at the appended offset. The leader has ALREADY locally fsync'd
+        // (the I2 ack-after-its-own-fsync); the gate adds the quorum-fsync condition.
         let token = self.next_token;
         self.next_token = self.next_token.wrapping_add(1);
-        self.parked.insert(token, reply_bytes);
+        self.parked.insert(token, (owner, reply_bytes));
         self.controller.park_produce_ack(partition, offset, token)?;
         // Re-check the CURRENT quorum-commit: a follower may already have reported past this offset
         // (its report arrived before this produce's local fsync completed), in which case the ack is
         // immediately quorum-committed and we hand the real bytes straight back to write now. Below
         // min_isr this releases nothing and the ack stays parked (no false ack on the wire).
-        let released = self.take_released(partition)?;
+        let released = self.take_released_owned(partition)?;
         if released.is_empty() {
             Ok(AckDisposition::Parked)
         } else {
             // The quorum had already fsync'd this offset (a follower reported past it before this
             // produce's local fsync completed), so the gate released the real reply (and any
-            // co-released earlier ones, in offset order) straight back to write now.
-            Ok(AckDisposition::WriteNowBatch(released))
+            // co-released earlier ones, in offset order) straight back to write now. The un-owned
+            // disposition drops the owner tags (the caller of the un-owned path holds one connection).
+            Ok(AckDisposition::WriteNowBatch(
+                released.into_iter().map(|(_owner, bytes)| bytes).collect(),
+            ))
         }
     }
 
@@ -959,22 +992,44 @@ impl<F: Filesystem, C: Clock> ProduceAckSeam<F, C> {
         partition: u64,
         report: &AckReplicatedBody,
     ) -> Result<Vec<Vec<u8>>, DataPlaneError> {
+        Ok(self
+            .on_follower_report_owned(partition, report)?
+            .into_iter()
+            .map(|(_owner, bytes)| bytes)
+            .collect())
+    }
+
+    /// The OWNER-tagged release (#719): like [`Self::on_follower_report`] but returns each released wire
+    /// `PubAck` paired with the OPAQUE owner id ([`Self::on_local_fsynced_ack_owned`]'s `owner`) that
+    /// parked it, so a real serve routes each reply back to the RIGHT producer connection. Below
+    /// `min_isr` releases nothing (the no-false-ack property, on the real wire).
+    ///
+    /// # Errors
+    /// [`DataPlaneError`] if the controller rejects the report (an unknown / non-led partition).
+    pub fn on_follower_report_owned(
+        &mut self,
+        partition: u64,
+        report: &AckReplicatedBody,
+    ) -> Result<Vec<(u64, Vec<u8>)>, DataPlaneError> {
         let tokens = self.controller.apply_follower_report(partition, report)?;
-        Ok(self.bytes_for_tokens(&tokens))
+        Ok(self.owned_bytes_for_tokens(&tokens))
     }
 
     /// Re-drive the quorum-ack release for `partition` against the CURRENT ISR state (e.g. after the
     /// leader's own local fsync advanced, or a follower rejoined the ISR) and return any newly-released
-    /// wire `PubAck` byte-frames in offset order. Below `min_isr` releases nothing.
-    fn take_released(&mut self, partition: u64) -> Result<Vec<Vec<u8>>, DataPlaneError> {
+    /// owner-tagged wire `PubAck` byte-frames in offset order. Below `min_isr` releases nothing.
+    fn take_released_owned(
+        &mut self,
+        partition: u64,
+    ) -> Result<Vec<(u64, Vec<u8>)>, DataPlaneError> {
         let tokens = self.controller.release_quorum_acked(partition)?;
-        Ok(self.bytes_for_tokens(&tokens))
+        Ok(self.owned_bytes_for_tokens(&tokens))
     }
 
-    /// Map released gate tokens (in offset order) back to their parked wire-`PubAck` bytes, removing
-    /// them from the side-table. A token with no entry is skipped defensively (it can only happen if a
-    /// token was released twice, which the gate's `released_through` prevents).
-    fn bytes_for_tokens(&mut self, tokens: &[AckToken]) -> Vec<Vec<u8>> {
+    /// Map released gate tokens (in offset order) back to their parked `(owner, wire-PubAck bytes)`,
+    /// removing them from the side-table. A token with no entry is skipped defensively (it can only
+    /// happen if a token was released twice, which the gate's `released_through` prevents).
+    fn owned_bytes_for_tokens(&mut self, tokens: &[AckToken]) -> Vec<(u64, Vec<u8>)> {
         tokens
             .iter()
             .filter_map(|t| self.parked.remove(t))
