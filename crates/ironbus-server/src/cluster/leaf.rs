@@ -982,12 +982,14 @@ impl LeafConfig {
                     Some(s) => {
                         mirror_locals.insert(s.clone());
                     }
-                    None => return Err(LeafError::Config {
-                        what: format!(
+                    None => {
+                        return Err(LeafError::Config {
+                            what: format!(
                             "bridge for hub stream `{}` is a mirror but has no local mirror stream",
                             b.hub_stream
                         ),
-                    }),
+                        })
+                    }
                 }
             }
             if b.direction.forwards() {
@@ -1429,5 +1431,829 @@ mod tests {
             }],
         };
         assert!(matches!(cfg.validate(), Err(LeafError::Config { .. })));
+    }
+}
+
+/// The REAL two-node LEAF-SPOKE integration tests (#625): a HUB serve and a separate LEAF serve over real
+/// loopback `TcpStream`s + real on-disk `StdFs` logs. Unix-only because the broker / serve path is
+/// `cfg(unix)` via `StdFs` (so the helpers and tests vanish together on Windows under `-D dead_code`),
+/// matching the geo `live_geo_tests` discipline. These tests PROVE — not merely by construction — the
+/// asymmetric dial, byte-faithful read-side mirror + resume, byte-faithful write-through + resume,
+/// loop-freedom (a record crosses once), leaf churn not degrading the hub, an idle leaf doing ~0 work, and
+/// a leaf NOT being a Raft voter (hub quorum untouched across leaf churn).
+#[cfg(all(test, unix))]
+#[allow(clippy::similar_names)]
+mod live_leaf_tests {
+    use super::*;
+    use crate::clock::SystemClock;
+    use crate::cluster::geo::{
+        GeoFrame, GeoLink, MirrorApplier, OriginCursorStore, OriginServer, GEO_POLL,
+    };
+    use crate::cluster::runtime::{ClusterConfig, ClusterRuntime, StartRole};
+    use ironbus_core::clock::ManualClock;
+    use ironbus_core::types::RecordFlags;
+    use ironbus_storage::fs::StdFs;
+    use ironbus_storage::log::{Append, Log, LogConfig};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    fn small_config() -> LogConfig {
+        LogConfig {
+            max_segment_bytes: 256,
+            max_total_bytes: 0,
+            ..LogConfig::default()
+        }
+    }
+
+    fn rec(payload: &[u8]) -> Append<'_> {
+        Append {
+            timestamp_ms: 7,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload,
+        }
+    }
+
+    /// Scale a GENEROUS base wait by the observed host slowdown (#618), so the timing waits stay truthful
+    /// and flake-free on a contended CI runner WITHOUT weakening what they prove. A local copy of the
+    /// runtime test's `host_scaled` (max-of-probes + a 24x cap): on an unloaded host the factor is ~1 and
+    /// the wait stays the base (the test is FAST and exits early the instant its predicate holds); on a
+    /// starved host it stretches proportionally. The assertions are UNCHANGED.
+    fn host_scaled(base: Duration) -> Duration {
+        fn probe_busy_nanos() -> u128 {
+            const ITERS: u64 = 2_000_000;
+            let start = Instant::now();
+            let mut acc: u64 = 0x9E37_79B9_7F4A_7C15;
+            for i in 0..ITERS {
+                acc = acc
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(i | 1);
+                acc ^= acc >> 29;
+            }
+            std::hint::black_box(acc);
+            start.elapsed().as_nanos().max(1)
+        }
+        const REFERENCE_BUSY_NANOS: u128 = 4_000_000;
+        const MAX_SCALE: u32 = 24;
+        let mut samples = [probe_busy_nanos(), probe_busy_nanos(), probe_busy_nanos()];
+        samples.sort_unstable();
+        let observed = samples[2];
+        let factor = (observed / REFERENCE_BUSY_NANOS).clamp(1, u128::from(MAX_SCALE));
+        let factor = u32::try_from(factor).unwrap_or(MAX_SCALE);
+        base * factor
+    }
+
+    /// Poll `pred` until true or `timeout` (host-scaled) elapses. Returns the final predicate value.
+    fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + host_scaled(timeout);
+        while Instant::now() < deadline {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        pred()
+    }
+
+    /// Bind an ephemeral loopback port, read it, drop the listener (the caller rebinds it).
+    fn free_addr() -> SocketAddr {
+        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral");
+        let a = l.local_addr().unwrap();
+        drop(l);
+        a
+    }
+
+    /// A real on-disk log with `n` records, fsync'd, leaked to `'static` so its read plane keeps observing
+    /// it for the test's lifetime (in a real serve the engine's append actor owns it).
+    fn leaked_log(dir: &std::path::Path, prefix: &str, n: u32) -> &'static Log<StdFs, ManualClock> {
+        let fs = StdFs::new(dir.to_path_buf());
+        let mut log = Log::open(fs, ManualClock::new(), small_config()).expect("log opens");
+        for i in 0..n {
+            log.append(&rec(format!("{prefix}-{i:03}").as_bytes()))
+                .unwrap();
+        }
+        log.sync().unwrap();
+        Box::leak(Box::new(log))
+    }
+
+    fn sealed_served_end(log: &Log<StdFs, ManualClock>) -> u64 {
+        let plane = log.read_plane().unwrap();
+        let flushed = plane.flushed();
+        let mut next = 0u64;
+        let mut guard = 0u32;
+        while next < flushed {
+            guard += 1;
+            assert!(guard < 100_000);
+            let raw = plane
+                .read_range_raw(Offset::new(next), 1_000, None)
+                .unwrap();
+            let adv = raw.run.next_offset.get();
+            if adv > next {
+                next = adv;
+            } else {
+                break;
+            }
+        }
+        next
+    }
+
+    /// THE ASYMMETRY (read-side): a HUB geo origin listener the LEAF dials OUTBOUND. The hub NEVER dials
+    /// the leaf — it ACCEPTS the leaf's inbound link and answers `MirrorPull` requests from the hub
+    /// stream's read plane. Returns a shutdown flag + the join handle; exits promptly on shutdown. This is
+    /// the geo origin-serve pattern, REUSED — a leaf's read bridge IS a geo mirror of a hub stream.
+    fn spawn_hub_mirror_serve(
+        addr: SocketAddr,
+        hub: &'static Log<StdFs, ManualClock>,
+    ) -> (Arc<AtomicBool>, JoinHandle<()>) {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_t = Arc::clone(&shutdown);
+        let listener = TcpListener::bind(addr).expect("hub mirror listener binds");
+        listener.set_nonblocking(true).unwrap();
+        let plane = Arc::new(hub.read_plane().expect("hub read plane"));
+        let handle = std::thread::Builder::new()
+            .name("ib-leaf-hub-mirror".to_string())
+            .spawn(move || {
+                while !shutdown_t.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_millis(100)))
+                                .unwrap();
+                            let plane = Arc::clone(&plane);
+                            let sd = Arc::clone(&shutdown_t);
+                            std::thread::spawn(move || {
+                                let mut link = GeoLink::new(stream);
+                                let server = OriginServer::new(&plane);
+                                while !sd.load(Ordering::Acquire) {
+                                    match link.recv() {
+                                        Ok(Some(GeoFrame::Request(req))) => {
+                                            let resp = server.serve_pull(&req).expect("serve_pull");
+                                            if link.send_response(&resp).is_err() {
+                                                return;
+                                            }
+                                        }
+                                        Ok(Some(GeoFrame::Response(_))) => {}
+                                        Err(GeoError::Io(e))
+                                            if matches!(
+                                                e.kind(),
+                                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                                            ) => {}
+                                        Ok(None) | Err(_) => return,
+                                    }
+                                }
+                            });
+                        }
+                        Err(ref e)
+                            if matches!(
+                                e.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            })
+            .expect("spawn hub mirror serve");
+        (shutdown, handle)
+    }
+
+    /// The handles a hub push serve returns: a shutdown flag, the listener join handle, and the shared
+    /// hub-receiver (so the test can read what the hub durably appended). Aliased to keep the spawn
+    /// signature under the clippy type-complexity bar.
+    type HubPushHandles = (
+        Arc<AtomicBool>,
+        JoinHandle<()>,
+        Arc<Mutex<HubPushReceiver<StdFs, SystemClock>>>,
+    );
+
+    /// THE ASYMMETRY (write-through): a HUB push-receiver listener the LEAF dials OUTBOUND. The hub NEVER
+    /// dials the leaf — it ACCEPTS the leaf's inbound link, RE-VALIDATES each pushed frame, appends to the
+    /// hub stream's log, and acks. Returns a shutdown flag, the join handle, and the shared hub-receiver
+    /// (so the test can read what the hub appended).
+    fn spawn_hub_push_serve(addr: SocketAddr, hub_dir: &std::path::Path) -> HubPushHandles {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_t = Arc::clone(&shutdown);
+        let listener = TcpListener::bind(addr).expect("hub push listener binds");
+        listener.set_nonblocking(true).unwrap();
+        let hub_log = Log::open(
+            StdFs::new(hub_dir.to_path_buf()),
+            SystemClock::new(),
+            small_config(),
+        )
+        .expect("hub push log opens");
+        let receiver = Arc::new(Mutex::new(HubPushReceiver::new(hub_log)));
+        let receiver_t = Arc::clone(&receiver);
+        let handle = std::thread::Builder::new()
+            .name("ib-leaf-hub-push".to_string())
+            .spawn(move || {
+                while !shutdown_t.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_millis(100)))
+                                .unwrap();
+                            let receiver = Arc::clone(&receiver_t);
+                            let sd = Arc::clone(&shutdown_t);
+                            std::thread::spawn(move || {
+                                let mut link = LeafLink::new(stream);
+                                while !sd.load(Ordering::Acquire) {
+                                    match link.recv() {
+                                        Ok(Some(LeafFrame::Request(req))) => {
+                                            // RE-VALIDATE + append under the lock (off the socket IO),
+                                            // then ack the leaf offset accepted through.
+                                            let ack = {
+                                                let mut r = receiver.lock().unwrap_or_else(
+                                                    std::sync::PoisonError::into_inner,
+                                                );
+                                                match r.apply_push(&req) {
+                                                    Ok(out) => LeafPushResponse {
+                                                        accepted_through_leaf_offset: out
+                                                            .accepted_through_leaf_offset,
+                                                    },
+                                                    // A corrupt push still durably kept its validated
+                                                    // prefix; ack exactly that so the leaf resumes after it.
+                                                    Err(LeafError::CorruptFrame {
+                                                        at_leaf_offset,
+                                                        ..
+                                                    }) => LeafPushResponse {
+                                                        accepted_through_leaf_offset:
+                                                            at_leaf_offset,
+                                                    },
+                                                    Err(_) => return,
+                                                }
+                                            };
+                                            if link.send_response(&ack).is_err() {
+                                                return;
+                                            }
+                                        }
+                                        Ok(Some(LeafFrame::Response(_))) => {}
+                                        Err(LeafError::Io(e))
+                                            if matches!(
+                                                e.kind(),
+                                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                                            ) => {}
+                                        Ok(None) | Err(_) => return,
+                                    }
+                                }
+                            });
+                        }
+                        Err(ref e)
+                            if matches!(
+                                e.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            })
+            .expect("spawn hub push serve");
+        (shutdown, handle, receiver)
+    }
+
+    /// Open a leaf MIRROR applier (read-side bridge) over an on-disk dir (its local mirror log + geo
+    /// cursor), exactly the geo mirror open.
+    fn open_leaf_mirror(dir: &std::path::Path) -> MirrorApplier<StdFs, ManualClock> {
+        let log = Log::open(
+            StdFs::new(dir.to_path_buf()),
+            ManualClock::new(),
+            small_config(),
+        )
+        .expect("leaf mirror log opens");
+        let cursors = OriginCursorStore::open(&StdFs::new(dir.to_path_buf())).expect("geo cursor");
+        MirrorApplier::new(log, cursors)
+    }
+
+    /// The leaf DIALS the hub (outbound) and pulls one origin into its mirror until caught up to the hub's
+    /// currently-served sealed prefix, resuming from the durable geo cursor. Reuses the geo pull request
+    /// + apply path verbatim (the read-side bridge IS a geo mirror).
+    fn leaf_drain_mirror(
+        addr: SocketAddr,
+        app: &mut MirrorApplier<StdFs, ManualClock>,
+        key: &str,
+        hub_stream: &str,
+    ) {
+        let stream = TcpStream::connect(addr).expect("leaf dials hub");
+        stream.set_read_timeout(Some(GEO_POLL)).unwrap();
+        let mut link = GeoLink::new(stream);
+        loop {
+            let req = app.pull_request(key, hub_stream, 1024, 1024 * 1024);
+            if link.send_request(&req).is_err() {
+                break;
+            }
+            match link.recv() {
+                Ok(Some(GeoFrame::Response(resp))) => {
+                    let out = app.apply_pull_response(key, &resp).expect("apply");
+                    if out.applied == 0 {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+
+    /// The leaf DIALS the hub (outbound) and forwards its local FORWARD stream to the hub until fully
+    /// forwarded (push cursor reaches the leaf's sealed-served frontier), resuming from the durable push
+    /// cursor. Returns the cursor after.
+    fn leaf_drain_forward(
+        addr: SocketAddr,
+        leaf_forward: &Log<StdFs, ManualClock>,
+        cursor: &mut LeafPushCursor<StdFs>,
+        key: &str,
+        hub_stream: &str,
+    ) {
+        let stream = TcpStream::connect(addr).expect("leaf dials hub");
+        stream.set_read_timeout(Some(LEAF_PUSH_POLL)).unwrap();
+        let mut link = LeafLink::new(stream);
+        loop {
+            let plane = leaf_forward.read_plane().unwrap();
+            let fwd = LeafForwarder::new(&plane);
+            let req = fwd
+                .next_push(hub_stream, cursor.cursor(key))
+                .expect("build push");
+            if req.record_count == 0 {
+                break;
+            }
+            if link.send_request(&req).is_err() {
+                break;
+            }
+            match link.recv() {
+                Ok(Some(LeafFrame::Response(ack))) => {
+                    cursor
+                        .commit(key, ack.accepted_through_leaf_offset)
+                        .expect("commit push cursor");
+                }
+                _ => break,
+            }
+        }
+    }
+
+    fn dump_segments(log: &Log<StdFs, ManualClock>) -> BTreeMap<String, Vec<u8>> {
+        use ironbus_storage::io::RandomAccessFile;
+        let fs = log.filesystem();
+        let mut out = BTreeMap::new();
+        for name in fs.list().expect("list segments") {
+            let file = fs.open(&name).expect("open segment");
+            let len = usize::try_from(file.len().expect("len")).expect("len fits");
+            let mut buf = vec![0u8; len];
+            file.read_exact_at(&mut buf, 0).expect("read segment");
+            out.insert(name, buf);
+        }
+        out
+    }
+
+    #[test]
+    fn a_leaf_mirrors_a_hub_stream_byte_faithfully_over_the_wire() {
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let hub_dir = tempfile::tempdir().expect("hub dir");
+        let leaf_dir = tempfile::tempdir().expect("leaf dir");
+        let hub = leaked_log(hub_dir.path(), "h", 40);
+        let served = sealed_served_end(hub);
+        assert!(served > 0);
+
+        let addr = free_addr();
+        let (shutdown, handle) = spawn_hub_mirror_serve(addr, hub);
+
+        let key = format!("{addr}/");
+        let mut app = open_leaf_mirror(leaf_dir.path());
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                leaf_drain_mirror(addr, &mut app, &key, "");
+                app.cursor(&key) == served
+            }),
+            "leaf mirror converged to the hub's sealed prefix (cursor {} of {served})",
+            app.cursor(&key)
+        );
+
+        // Byte-faithful, in order.
+        let recs = app.log().read_from(Offset::new(0), 10_000).unwrap();
+        assert_eq!(recs.len() as u64, served);
+        for (i, r) in recs.iter().enumerate() {
+            assert_eq!(r.payload.as_ref(), format!("h-{i:03}").as_bytes());
+        }
+        // BYTE-IDENTITY: at least one fully-sealed leaf segment is byte-for-byte the hub's.
+        let leaf_dump = dump_segments(app.log());
+        let hub_dump = dump_segments(hub);
+        assert!(
+            leaf_dump
+                .iter()
+                .any(|(name, bytes)| hub_dump.get(name) == Some(bytes)),
+            "at least one leaf mirror segment is byte-identical to the hub's over the wire"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn a_leaf_mirror_resumes_across_a_disconnect_with_no_gap_or_dup() {
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let hub_dir = tempfile::tempdir().expect("hub dir");
+        let leaf_dir = tempfile::tempdir().expect("leaf dir");
+        let hub = leaked_log(hub_dir.path(), "h", 40);
+        let served = sealed_served_end(hub);
+
+        let addr = free_addr();
+        let (shutdown, handle) = spawn_hub_mirror_serve(addr, hub);
+        let key = format!("{addr}/");
+
+        // First connection: pull one batch then DROP the applier (a disconnect + restart). The cursor +
+        // log are durable on disk, so a reopen resumes from the durable cursor.
+        let partial = {
+            let mut app = open_leaf_mirror(leaf_dir.path());
+            let stream = TcpStream::connect(addr).unwrap();
+            stream.set_read_timeout(Some(GEO_POLL)).unwrap();
+            let mut link = GeoLink::new(stream);
+            let req = app.pull_request(&key, "", 1024, 1024 * 1024);
+            link.send_request(&req).unwrap();
+            if let Ok(Some(GeoFrame::Response(resp))) = link.recv() {
+                let out = app.apply_pull_response(&key, &resp).unwrap();
+                assert!(out.applied >= 1, "first batch applied something");
+            }
+            app.cursor(&key)
+        };
+        assert!(
+            partial > 0 && partial < served,
+            "partial catch-up before the disconnect"
+        );
+
+        // REOPEN over the same dir: durable cursor recovers, draining RESUMES with no gap / no dup.
+        let mut app = open_leaf_mirror(leaf_dir.path());
+        assert_eq!(app.cursor(&key), partial, "cursor recovered durably");
+        assert!(wait_until(Duration::from_secs(10), || {
+            leaf_drain_mirror(addr, &mut app, &key, "");
+            app.cursor(&key) == served
+        }));
+        let recs = app.log().read_from(Offset::new(0), 10_000).unwrap();
+        assert_eq!(recs.len() as u64, served, "exactly the sealed prefix, once");
+        for (i, r) in recs.iter().enumerate() {
+            assert_eq!(
+                r.payload.as_ref(),
+                format!("h-{i:03}").as_bytes(),
+                "in order, no gap/dup"
+            );
+        }
+
+        shutdown.store(true, Ordering::Release);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn a_leaf_writes_through_to_the_hub_byte_faithfully_over_the_wire() {
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let leaf_fwd_dir = tempfile::tempdir().expect("leaf forward dir");
+        let leaf_cursor_dir = tempfile::tempdir().expect("leaf cursor dir");
+        let hub_dir = tempfile::tempdir().expect("hub dir");
+        // The leaf's LOCAL forward stream: 40 locally-produced records.
+        let leaf_forward = leaked_log(leaf_fwd_dir.path(), "L", 40);
+        let served = sealed_served_end(leaf_forward);
+        assert!(served > 0);
+
+        let addr = free_addr();
+        let (shutdown, handle, receiver) = spawn_hub_push_serve(addr, hub_dir.path());
+        let key = format!("{addr}/orders");
+
+        let mut cursor =
+            LeafPushCursor::open(&StdFs::new(leaf_cursor_dir.path().to_path_buf())).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                leaf_drain_forward(addr, leaf_forward, &mut cursor, &key, "orders");
+                cursor.cursor(&key) == served
+            }),
+            "leaf wrote its local stream through to the hub (cursor {} of {served})",
+            cursor.cursor(&key)
+        );
+
+        // The hub holds the leaf's records, byte-faithful, in order.
+        let r = receiver.lock().unwrap();
+        let recs = r.log().read_from(Offset::new(0), 10_000).unwrap();
+        assert_eq!(recs.len() as u64, served);
+        for (i, rr) in recs.iter().enumerate() {
+            assert_eq!(rr.payload.as_ref(), format!("L-{i:03}").as_bytes());
+        }
+        drop(r);
+
+        shutdown.store(true, Ordering::Release);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn a_leaf_write_through_resumes_across_a_disconnect_with_no_gap_or_dup() {
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let leaf_fwd_dir = tempfile::tempdir().expect("leaf forward dir");
+        let leaf_cursor_dir = tempfile::tempdir().expect("leaf cursor dir");
+        let hub_dir = tempfile::tempdir().expect("hub dir");
+        let leaf_forward = leaked_log(leaf_fwd_dir.path(), "L", 40);
+        let served = sealed_served_end(leaf_forward);
+
+        let addr = free_addr();
+        let (shutdown, handle, receiver) = spawn_hub_push_serve(addr, hub_dir.path());
+        let key = format!("{addr}/orders");
+        let cursor_fs = StdFs::new(leaf_cursor_dir.path().to_path_buf());
+
+        // First push: forward ONE batch then DROP the cursor handle + link (a disconnect). The push cursor
+        // is durable on disk, so a reopen resumes from it.
+        let partial = {
+            let mut cursor = LeafPushCursor::open(&cursor_fs).unwrap();
+            let stream = TcpStream::connect(addr).unwrap();
+            stream.set_read_timeout(Some(LEAF_PUSH_POLL)).unwrap();
+            let mut link = LeafLink::new(stream);
+            let plane = leaf_forward.read_plane().unwrap();
+            let fwd = LeafForwarder::new(&plane);
+            let req = fwd.next_push("orders", cursor.cursor(&key)).unwrap();
+            assert!(req.record_count >= 1, "first batch forwarded something");
+            link.send_request(&req).unwrap();
+            if let Ok(Some(LeafFrame::Response(ack))) = link.recv() {
+                cursor
+                    .commit(&key, ack.accepted_through_leaf_offset)
+                    .unwrap();
+            }
+            cursor.cursor(&key)
+        };
+        assert!(
+            partial > 0 && partial < served,
+            "partial forward before the disconnect"
+        );
+
+        // REOPEN the push cursor over the same fs: it recovers durably and forwarding RESUMES, no gap/dup.
+        let mut cursor = LeafPushCursor::open(&cursor_fs).unwrap();
+        assert_eq!(
+            cursor.cursor(&key),
+            partial,
+            "push cursor recovered durably"
+        );
+        assert!(wait_until(Duration::from_secs(10), || {
+            leaf_drain_forward(addr, leaf_forward, &mut cursor, &key, "orders");
+            cursor.cursor(&key) == served
+        }));
+
+        // The hub holds exactly the sealed prefix, once, in order (no gap, no dup across the disconnect).
+        let r = receiver.lock().unwrap();
+        let recs = r.log().read_from(Offset::new(0), 10_000).unwrap();
+        assert_eq!(recs.len() as u64, served, "exactly the sealed prefix, once");
+        for (i, rr) in recs.iter().enumerate() {
+            assert_eq!(
+                rr.payload.as_ref(),
+                format!("L-{i:03}").as_bytes(),
+                "in order, no gap/dup"
+            );
+        }
+        drop(r);
+
+        shutdown.store(true, Ordering::Release);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn write_through_does_not_loop_a_record_crosses_the_link_once() {
+        // THE NO-LOOP PROOF over the wire: a leaf that ALSO mirrors a DIFFERENT hub stream forwards its
+        // local forward stream UP exactly once. The hub ends with exactly the leaf's records (count ==
+        // served), never a multiple — even after repeated drain rounds (which would re-forward if the
+        // cursor did not de-dup). The mirror local and forward local are DISTINCT logs, so a mirrored-down
+        // record is never in the forward stream to echo up.
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let leaf_fwd_dir = tempfile::tempdir().expect("leaf forward dir");
+        let leaf_cursor_dir = tempfile::tempdir().expect("leaf cursor dir");
+        let hub_dir = tempfile::tempdir().expect("hub dir");
+        let leaf_forward = leaked_log(leaf_fwd_dir.path(), "L", 40);
+        let served = sealed_served_end(leaf_forward);
+
+        let addr = free_addr();
+        let (shutdown, handle, receiver) = spawn_hub_push_serve(addr, hub_dir.path());
+        let key = format!("{addr}/orders");
+        let mut cursor =
+            LeafPushCursor::open(&StdFs::new(leaf_cursor_dir.path().to_path_buf())).unwrap();
+
+        // Forward to convergence...
+        assert!(wait_until(Duration::from_secs(10), || {
+            leaf_drain_forward(addr, leaf_forward, &mut cursor, &key, "orders");
+            cursor.cursor(&key) == served
+        }));
+        // ...then drain SEVERAL MORE TIMES. With no de-dup these rounds would re-forward + double the hub.
+        for _ in 0..5 {
+            leaf_drain_forward(addr, leaf_forward, &mut cursor, &key, "orders");
+        }
+
+        // The hub has EXACTLY `served` records — each crossed the link ONCE (the cursor de-dup; no echo).
+        let r = receiver.lock().unwrap();
+        let count = r.log().read_from(Offset::new(0), 10_000).unwrap().len() as u64;
+        assert_eq!(
+            count, served,
+            "each record crossed the link exactly once (no loop/echo)"
+        );
+        drop(r);
+
+        shutdown.store(true, Ordering::Release);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn many_leaf_connects_and_disconnects_do_not_degrade_the_hub() {
+        // LEAF CHURN: a leaf connects + disconnects repeatedly; the hub is UNAFFECTED. The hub serves every
+        // (re)connection cleanly and the leaf converges byte-faithfully despite the churn — bounded
+        // per-leaf resources (one reader per inbound link, torn down on disconnect), no degradation.
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let hub_dir = tempfile::tempdir().expect("hub dir");
+        let leaf_dir = tempfile::tempdir().expect("leaf dir");
+        let hub = leaked_log(hub_dir.path(), "h", 60);
+        let served = sealed_served_end(hub);
+
+        let addr = free_addr();
+        let (shutdown, handle) = spawn_hub_mirror_serve(addr, hub);
+        let key = format!("{addr}/");
+        let mut app = open_leaf_mirror(leaf_dir.path());
+
+        // 20 connect/pull-one-batch/disconnect cycles: each cycle is a fresh dial + a short pull + a drop.
+        // The hub keeps serving across all of them (a disconnect tears down only that leaf's reader).
+        for _ in 0..20 {
+            let stream = TcpStream::connect(addr).expect("leaf re-dials hub across churn");
+            stream.set_read_timeout(Some(GEO_POLL)).unwrap();
+            let mut link = GeoLink::new(stream);
+            let req = app.pull_request(&key, "", 1024, 1024 * 1024);
+            if link.send_request(&req).is_ok() {
+                if let Ok(Some(GeoFrame::Response(resp))) = link.recv() {
+                    let _ = app.apply_pull_response(&key, &resp);
+                }
+            }
+            // `link`/`stream` drop here = a disconnect; the hub's per-leaf reader winds down.
+        }
+        // After the churn the hub is still fully serving: a final drain converges byte-faithfully.
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                leaf_drain_mirror(addr, &mut app, &key, "");
+                app.cursor(&key) == served
+            }),
+            "the hub kept serving across 20 leaf connect/disconnect cycles (cursor {} of {served})",
+            app.cursor(&key)
+        );
+        let recs = app.log().read_from(Offset::new(0), 10_000).unwrap();
+        assert_eq!(recs.len() as u64, served);
+        for (i, r) in recs.iter().enumerate() {
+            assert_eq!(r.payload.as_ref(), format!("h-{i:03}").as_bytes());
+        }
+
+        shutdown.store(true, Ordering::Release);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn a_leaf_is_not_a_voter_and_leaf_churn_never_touches_hub_quorum() {
+        // THE NOT-A-VOTER PROOF: a single-node HUB metadata cluster has voter_count == 1 and is its own
+        // leader. A leaf connects/disconnects repeatedly against a SEPARATE leaf endpoint; the hub's
+        // metadata-Raft membership (voter_count) and leadership are UNCHANGED — a leaf is never a voter,
+        // so leaf churn never touches the hub's consensus / quorum / availability.
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let hub_meta_dir = tempfile::tempdir().expect("hub metadata dir");
+        let hub_stream_dir = tempfile::tempdir().expect("hub stream dir");
+        let leaf_dir = tempfile::tempdir().expect("leaf dir");
+
+        // The HUB's metadata Raft group: a single seeded voter (its own quorum). This is the hub's
+        // CONSENSUS plane — entirely separate from the leaf plane.
+        let meta_addr = free_addr();
+        let mut peers = BTreeMap::new();
+        peers.insert(1u64, meta_addr);
+        let cfg = ClusterConfig {
+            node_id: 1,
+            peers,
+            role: StartRole::Voter,
+            pending_learners: BTreeSet::new(),
+        };
+        let runtime = ClusterRuntime::start(
+            &cfg,
+            &StdFs::new(hub_meta_dir.path().to_path_buf()),
+            SystemClock::new(),
+            LogConfig::new(64 * 1024).unwrap(),
+        )
+        .expect("hub metadata cluster starts");
+        // A lone voter self-elects.
+        assert!(
+            wait_until(Duration::from_secs(10), || runtime.status().is_leader),
+            "the single-node hub self-elects"
+        );
+        let voters_before = runtime.status().voter_count;
+        assert_eq!(voters_before, 1, "the hub has exactly its one voter");
+
+        // The hub's leaf endpoint (a SEPARATE listener — the leaf plane, NOT the metadata peer port).
+        let leaf_hub = leaked_log(hub_stream_dir.path(), "h", 30);
+        let leaf_addr = free_addr();
+        let (shutdown, handle) = spawn_hub_mirror_serve(leaf_addr, leaf_hub);
+        let key = format!("{leaf_addr}/");
+        let mut app = open_leaf_mirror(leaf_dir.path());
+
+        // Churn the leaf 15x against the hub's leaf endpoint.
+        for _ in 0..15 {
+            let stream = TcpStream::connect(leaf_addr).expect("leaf dials hub leaf endpoint");
+            stream.set_read_timeout(Some(GEO_POLL)).unwrap();
+            let mut link = GeoLink::new(stream);
+            let req = app.pull_request(&key, "", 1024, 1024 * 1024);
+            if link.send_request(&req).is_ok() {
+                if let Ok(Some(GeoFrame::Response(resp))) = link.recv() {
+                    let _ = app.apply_pull_response(&key, &resp);
+                }
+            }
+        }
+
+        // THE ASSERTION: the hub's metadata membership + leadership are UNCHANGED by all that leaf churn.
+        // A leaf appears in NO ConfState; the voter_count (the quorum basis) is the same 1, and the hub is
+        // still its own leader. Leaf churn touched consensus zero times.
+        let status_after = runtime.status();
+        assert_eq!(
+            status_after.voter_count, voters_before,
+            "leaf churn did not change the hub's voter set (a leaf is NOT a voter)"
+        );
+        assert!(
+            status_after.is_leader,
+            "leaf churn did not disturb the hub's leadership"
+        );
+        assert!(
+            status_after.suspected_dead.is_empty(),
+            "no leaf is ever a metadata peer, so none can be a suspected-dead voter"
+        );
+        assert!(
+            status_after.learners.is_empty(),
+            "a leaf never joins the metadata group even as a learner"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        let _ = handle.join();
+        drop(runtime);
+    }
+
+    #[test]
+    fn an_idle_leaf_push_loop_does_no_work_and_backs_off() {
+        // THE IDLE PROOF (#726): a leaf with NOTHING new to forward (its push cursor is at the local
+        // frontier) BLOCKS / BACKS OFF, doing ~0 work — the push_loop applies nothing and never sends an
+        // empty push (it pauses on the build-empty path). We prove it does not spin: a fully-forwarded
+        // leaf's loop forwards NOTHING across several poll windows and exits promptly on shutdown.
+        let _serial = crate::cluster::heavy_cluster_test_guard();
+        let leaf_fwd_dir = tempfile::tempdir().expect("leaf forward dir");
+        let leaf_cursor_dir = tempfile::tempdir().expect("leaf cursor dir");
+        let hub_dir = tempfile::tempdir().expect("hub dir");
+        // An EMPTY leaf forward log: nothing to forward, ever.
+        let leaf_forward = leaked_log(leaf_fwd_dir.path(), "L", 0);
+        let addr = free_addr();
+        let (shutdown, handle, _receiver) = spawn_hub_push_serve(addr, hub_dir.path());
+        let key = format!("{addr}/orders");
+
+        let cursor = Arc::new(Mutex::new(
+            LeafPushCursor::open(&StdFs::new(leaf_cursor_dir.path().to_path_buf())).unwrap(),
+        ));
+        let pushed = Arc::new(AtomicU64::new(0));
+        let loop_shutdown = Arc::new(AtomicBool::new(false));
+        // The read plane is `Send + Sync` (the `Log` itself is not — it caches a `RefCell` plane), so the
+        // forward thread captures the `Arc<ReadPlane>`, exactly the geo origin-serve pattern.
+        let plane = Arc::new(leaf_forward.read_plane().unwrap());
+
+        let stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let ls = Arc::clone(&loop_shutdown);
+        let pushed_t = Arc::clone(&pushed);
+        let cursor_t = Arc::clone(&cursor);
+        let plane_t = Arc::clone(&plane);
+        let loop_handle = std::thread::spawn(move || {
+            let mut link = LeafLink::new(stream);
+            push_loop(
+                &mut link,
+                &ls,
+                || {
+                    let c = cursor_t.lock().unwrap();
+                    let fwd = LeafForwarder::new(&plane_t);
+                    let req = fwd.next_push("orders", c.cursor(&key))?;
+                    if req.record_count > 0 {
+                        pushed_t.fetch_add(u64::from(req.record_count), Ordering::Relaxed);
+                    }
+                    Ok(req)
+                },
+                |acked| {
+                    cursor_t.lock().unwrap().commit(&key, acked)?;
+                    Ok(())
+                },
+            );
+        });
+
+        // Let the idle loop run a few poll windows, then stop it. An idle leaf forwards NOTHING.
+        std::thread::sleep(Duration::from_millis(600));
+        loop_shutdown.store(true, Ordering::Release);
+        let _ = loop_handle.join();
+        assert_eq!(
+            pushed.load(Ordering::Relaxed),
+            0,
+            "an idle leaf forwards nothing (it blocks/backs off, no busy work)"
+        );
+
+        shutdown.store(true, Ordering::Release);
+        let _ = handle.join();
     }
 }
