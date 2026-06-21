@@ -4698,9 +4698,10 @@ fn spawn_dataplane_serve(
 // a thread entry point: each input is a distinct piece the
 // bootstrap needs for the whole thread lifetime; a bundling
 // struct would only move the noise.
-#[allow(clippy::needless_pass_by_value)] // a thread entry point: it OWNS the read-plane Arc (cloned
-                                         // into the leader role) + the log config for its lifetime;
-                                         // a borrow would fight the 'static spawn bound.
+#[allow(clippy::needless_pass_by_value)]
+// a thread entry point: it OWNS the read-plane Arc (cloned
+// into the leader role) + the log config for its lifetime;
+// a borrow would fight the 'static spawn bound.
 #[allow(clippy::too_many_lines)] // one linear bootstrap sequence (await placement, build the server,
                                  // start the runtime, install the F2 cross-plane inputs, hold until
                                  // shutdown); splitting it would scatter a single startup concern.

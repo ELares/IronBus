@@ -113,7 +113,7 @@ const DIALER_RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 /// It is a DEFAULT: the deadline is injectable ([`LivenessConfig`]) and the clock is the I6 monotonic
 /// seam, so the kill-the-leader test drives detection deterministically (advance a [`ManualClock`])
 /// rather than sleeping a real 3 s — no wall-clock flake.
-pub const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_millis(3_000);
+pub const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How often the data-plane LEADER proposes a committed-HW CHECKPOINT into the metadata Raft (#618b):
 /// the cadence at which it persists "every offset below this is quorum-fsync'd" so the bar SURVIVES its
@@ -929,9 +929,10 @@ struct DriverFailover<C: Clock + Clone> {
 /// metadata-Raft leader, both go through the metadata Raft log (committed, ordered), and both are
 /// idempotent (a removal of an already-gone node and a promotion of an already-converged placement are
 /// skipped) — so no two nodes can drive a different failover; the Raft log linearizes it.
-#[allow(clippy::too_many_lines)] // the driver loop is ONE linear consensus cycle (tick, step+record,
-                                 // drive_ready, registry refresh, F1 detect, F2 auto-fire, publish);
-                                 // splitting it would scatter a single tightly-ordered concern.
+#[allow(clippy::too_many_lines)]
+// the driver loop is ONE linear consensus cycle (tick, step+record,
+// drive_ready, registry refresh, F1 detect, F2 auto-fire, publish);
+// splitting it would scatter a single tightly-ordered concern.
 #[allow(clippy::needless_pass_by_value)] // a thread entry point: it OWNS the group + the shared
                                          // channels/Arcs + the failover wiring for the thread's whole
                                          // lifetime; a borrow would fight the 'static spawn bound.
