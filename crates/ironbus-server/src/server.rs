@@ -696,6 +696,112 @@ mod tests {
     }
 
     #[test]
+    fn preauth_rate_limit_rejects_a_second_rapid_connection_and_emits_the_metric() {
+        // #633 end-to-end: with a per-IP rate limit (burst 1, 1/s) and a NON-advancing injected clock,
+        // the FIRST loopback connection is admitted (and handshakes), but the SECOND from the same IP
+        // (127.0.0.1, the only source in a loopback test) finds an empty bucket and is REJECTED before a
+        // handler — the server drops the stream, the client sees EOF, and connz records
+        // `rejected_total{reason="rate_limited"}`. The clock never advances, so no token refills: the
+        // assertion is deterministic, never a wall-clock flake.
+        use crate::preauth::{PreAuthConfig, PreAuthGuard};
+        use ironbus_core::clock::ManualClock;
+
+        let (handle, actor) = spawn_inmem();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let connz = Arc::new(ConnectionMetrics::new());
+        // The guard's OWN injected clock (a ManualClock that never advances), independent of the serve
+        // loop's SystemClock. Burst 1 / rate 1: one token, no refill while the clock is frozen.
+        let guard = Arc::new(PreAuthGuard::new(
+            PreAuthConfig {
+                per_ip_rate_per_sec: 1,
+                per_ip_burst: 1,
+                half_open_cap: 0,
+                lockout_threshold: 0,
+                lockout_window_ms: 0,
+                lockout_cooldown_ms: 0,
+            },
+            Arc::new(ManualClock::new()) as Arc<dyn ironbus_core::clock::Clock>,
+            Arc::clone(&connz),
+        ));
+        let server = std::thread::spawn({
+            let engine = handle.clone();
+            let shutdown = Arc::clone(&shutdown);
+            let connz = Arc::clone(&connz);
+            let guard = Arc::clone(&guard);
+            move || {
+                let clock = SystemClock::new();
+                let beacon = crate::liveness::LivenessBeacon::new(clock.now_monotonic_nanos());
+                serve_with_auth_connz_preauth(
+                    &listener,
+                    &engine,
+                    &shutdown,
+                    16,
+                    &clock,
+                    &beacon,
+                    None,
+                    &connz,
+                    Some(guard),
+                )
+                .unwrap();
+            }
+        });
+
+        // FIRST connection: admitted, handshakes (spends the one token).
+        let mut c1 = TcpStream::connect(addr).unwrap();
+        c1.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = Vec::new();
+        c1.write_all(&frame(FrameType::Connect, b"")).unwrap();
+        assert_eq!(read_one_frame(&mut c1, &mut buf).0, FrameType::Info);
+
+        // SECOND connection from the same loopback IP: the bucket is empty and the clock has not
+        // advanced, so it is REJECTED. The server drops the stream; a write+read sees EOF/error (the
+        // peer closed before any handshake). Poll connz for the rejection (bounded wait, no sleep race).
+        let mut rejected = false;
+        for _ in 0..50 {
+            if let Ok(mut c2) = TcpStream::connect(addr) {
+                c2.set_read_timeout(Some(Duration::from_millis(200)))
+                    .unwrap();
+                let _ = c2.write_all(&frame(FrameType::Connect, b""));
+                let mut b = [0u8; 16];
+                // A rejected connection was dropped by the server: the read returns 0 (EOF) or errors.
+                let n = c2.read(&mut b).unwrap_or(0);
+                if n == 0 {
+                    // Confirm via the metric (the authoritative signal), bounded-retry for the accept
+                    // thread to record it.
+                    for _ in 0..50 {
+                        if connz.snapshot().rejected_rate_limited >= 1 {
+                            rejected = true;
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                }
+            }
+            if rejected {
+                break;
+            }
+        }
+        assert!(
+            rejected,
+            "a second rapid connection from the same IP must be rate-limited and counted: {:?}",
+            connz.snapshot()
+        );
+        // The legitimate first connection was NOT rejected (it handshaked above) and is still open.
+        assert_eq!(
+            connz.snapshot().rejected_half_open_cap,
+            0,
+            "no half-open rejection (the cap is disabled here)"
+        );
+
+        drop(c1);
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+        let _ = recover_engine(handle, actor);
+    }
+
+    #[test]
     fn full_produce_fetch_ack_round_trip_over_tcp() {
         let (handle, actor) = spawn_inmem();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
