@@ -1024,6 +1024,27 @@ fn registry_body(registry: &crate::registry::MetricRegistry, now_monotonic: u64)
         "The whole durable-append (append + fsync) latency on produce, over the fixed registry buckets.",
         registry.append_latency(),
     );
+    // The request-path latency histograms (#570): the produce->ack, deliver, and consume (ack)
+    // request paths, over the SAME fixed registry buckets, so an operator sees the producer- and
+    // consumer-visible latency distributions alongside the durability-barrier (fsync/append) ones.
+    fixed_histogram_lines(
+        &mut s,
+        "ironbus_produce_ack_duration_seconds",
+        "The produce->ack request-path latency: the engine time across the group-commit durability barrier that makes a produced batch durable (and thus acked to its producers), over the fixed registry buckets.",
+        registry.produce_ack_latency(),
+    );
+    fixed_histogram_lines(
+        &mut s,
+        "ironbus_deliver_duration_seconds",
+        "The deliver request-path latency: the engine time to service one poll that handed out a delivery (the poll scan plus the lease grant), over the fixed registry buckets.",
+        registry.deliver_latency(),
+    );
+    fixed_histogram_lines(
+        &mut s,
+        "ironbus_consume_duration_seconds",
+        "The consume (ack) request-path latency: the engine time to service one ack that committed (the lease ack plus the cursor commit and lag maintenance), over the fixed registry buckets.",
+        registry.consume_latency(),
+    );
     consumer_lag_lines(&mut s, registry);
     self_monitoring_lines(&mut s, registry, now_monotonic);
     s
@@ -3933,6 +3954,11 @@ mod tests {
         ("ironbus_fsync_seconds", "histogram"),
         ("ironbus_fsync_duration_seconds", "histogram"),
         ("ironbus_append_duration_seconds", "histogram"),
+        // Request-path latency histograms (#570): produce->ack, deliver, consume (ack). Over the same
+        // fixed registry buckets; all gauges/histograms, so no resilience-counter taxonomy change.
+        ("ironbus_produce_ack_duration_seconds", "histogram"),
+        ("ironbus_deliver_duration_seconds", "histogram"),
+        ("ironbus_consume_duration_seconds", "histogram"),
     ];
 
     #[test]

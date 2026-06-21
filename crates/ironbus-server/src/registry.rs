@@ -534,6 +534,20 @@ pub struct MetricRegistry {
     fsync_duration: FixedHistogram,
     /// The append-latency histogram (the cost of one durable append), over the SAME fixed buckets.
     append_latency: FixedHistogram,
+    /// `ironbus_produce_ack_duration_seconds` (#570): the produce->ACK request-path latency — the
+    /// engine time from a group-commit batch starting its durability barrier to the records being
+    /// durable (acked). Observed once per real-fsync batch (group commit amortizes one barrier over
+    /// the batch), over the SAME fixed buckets, so an operator sees the producer-visible ack latency
+    /// distribution distinct from the bare fsync syscall cost.
+    produce_ack_latency: FixedHistogram,
+    /// `ironbus_deliver_duration_seconds` (#570): the deliver request-path latency — the engine time
+    /// to service one poll that handed out a delivery (the poll scan + lease grant), over the SAME
+    /// fixed buckets. A poll that delivered nothing records nothing.
+    deliver_latency: FixedHistogram,
+    /// `ironbus_consume_duration_seconds` (#570): the consume (ack) request-path latency — the engine
+    /// time to service one ack that committed (the lease ack + cursor commit + lag maintenance), over
+    /// the SAME fixed buckets. A fenced/no-op ack records nothing.
+    consume_latency: FixedHistogram,
     /// The per-consumer lag registry (incremental, capped at [`MAX_CONSUMER_SERIES`]).
     consumer_lag: ConsumerLagRegistry,
     /// The build version string (`CARGO_PKG_VERSION`), the `version` label of `ironbus_build_info`.
@@ -561,6 +575,9 @@ impl MetricRegistry {
         MetricRegistry {
             fsync_duration: FixedHistogram::default(),
             append_latency: FixedHistogram::default(),
+            produce_ack_latency: FixedHistogram::default(),
+            deliver_latency: FixedHistogram::default(),
+            consume_latency: FixedHistogram::default(),
             consumer_lag: ConsumerLagRegistry::default(),
             build_version,
             start_time_unix_seconds,
@@ -577,6 +594,24 @@ impl MetricRegistry {
     /// Records one append-latency observation, in nanoseconds. Allocation-free hot-path call.
     pub fn observe_append_nanos(&mut self, nanos: u64) {
         self.append_latency.observe(nanos);
+    }
+
+    /// Records one produce->ack request-path latency observation (#570), in nanoseconds.
+    /// Allocation-free hot-path call.
+    pub fn observe_produce_ack_nanos(&mut self, nanos: u64) {
+        self.produce_ack_latency.observe(nanos);
+    }
+
+    /// Records one deliver request-path latency observation (#570), in nanoseconds. Allocation-free
+    /// hot-path call; called only when a poll actually delivered.
+    pub fn observe_deliver_nanos(&mut self, nanos: u64) {
+        self.deliver_latency.observe(nanos);
+    }
+
+    /// Records one consume (ack) request-path latency observation (#570), in nanoseconds.
+    /// Allocation-free hot-path call; called only when an ack actually committed.
+    pub fn observe_consume_nanos(&mut self, nanos: u64) {
+        self.consume_latency.observe(nanos);
     }
 
     /// Records that one record was appended (the durable head advanced by one). Allocation-free and
@@ -609,6 +644,24 @@ impl MetricRegistry {
     #[must_use]
     pub fn append_latency(&self) -> &FixedHistogram {
         &self.append_latency
+    }
+
+    /// The produce->ack request-path latency histogram (`ironbus_produce_ack_duration_seconds`, #570).
+    #[must_use]
+    pub fn produce_ack_latency(&self) -> &FixedHistogram {
+        &self.produce_ack_latency
+    }
+
+    /// The deliver request-path latency histogram (`ironbus_deliver_duration_seconds`, #570).
+    #[must_use]
+    pub fn deliver_latency(&self) -> &FixedHistogram {
+        &self.deliver_latency
+    }
+
+    /// The consume (ack) request-path latency histogram (`ironbus_consume_duration_seconds`, #570).
+    #[must_use]
+    pub fn consume_latency(&self) -> &FixedHistogram {
+        &self.consume_latency
     }
 
     /// The per-consumer lag registry (for the scrape rendering and the cap/overflow tests).
@@ -1086,6 +1139,33 @@ mod tests {
         assert_eq!(
             allocs, 0,
             "the append/commit hot path allocated {allocs} times"
+        );
+    }
+
+    #[test]
+    fn the_request_path_latency_histograms_observe_and_are_allocation_free() {
+        // #570: the produce->ack / deliver / consume request-path histograms record into the SAME
+        // fixed bucket set, and their observe is allocation-free just like fsync/append (so leaving
+        // the request-path latency metrics on is affordable on the edge box).
+        let mut reg = MetricRegistry::new("0.0.0", 0, 0);
+        let allocs = count_allocs(|| {
+            for _ in 0..1000u64 {
+                reg.observe_produce_ack_nanos(250_000); // <= 0.0005 s bucket 0
+                reg.observe_deliver_nanos(1_500_000); // <= 0.002 s bucket 2
+                reg.observe_consume_nanos(9_000_000_000); // > 5 s -> +Inf only
+            }
+        });
+        assert_eq!(allocs, 0, "the latency observe path allocated {allocs} times");
+        assert_eq!(reg.produce_ack_latency().count(), 1000);
+        assert_eq!(reg.deliver_latency().count(), 1000);
+        assert_eq!(reg.consume_latency().count(), 1000);
+        // Each landed in its expected cumulative bucket.
+        assert_eq!(reg.produce_ack_latency().cumulative_buckets()[0], 1000);
+        assert_eq!(reg.deliver_latency().cumulative_buckets()[2], 1000);
+        assert_eq!(
+            reg.consume_latency().cumulative_buckets()[REGISTRY_BUCKET_BOUNDS_NANOS.len() - 1],
+            0,
+            "a > 5 s observation is only in +Inf, not the 5 s bucket"
         );
     }
 
