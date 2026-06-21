@@ -91,10 +91,10 @@ use ironbus_server::clock::SystemClock;
 // path, so they follow the same `#[cfg(unix)]` gate as the rest of the broker run.
 #[cfg(unix)]
 use ironbus_server::cluster::{
-    dataplane_addr, push_loop, ClusterAckLevel, ClusterRuntime, DataPlaneRuntime, DataPlaneServer,
-    GeoLink, IsrConfig, LeafForwarder, LeafLink, LeafPushCursor, MetadataCommand, MetadataProposer,
-    MirrorApplier, OriginCursorStore, Placement, ReplicaLogFactory, RuntimeError, GEO_POLL,
-    LEAF_PUSH_POLL,
+    dataplane_addr, push_loop, ClusterAckLevel, ClusterRuntime, CrossClusterServeConfig,
+    CrossClusterServeRuntime, DataPlaneRuntime, DataPlaneServer, GeoLink, IsrConfig, LeafForwarder,
+    LeafLink, LeafPushCursor, MetadataCommand, MetadataProposer, MirrorApplier, OriginCursorStore,
+    Placement, ReplicaLogFactory, RuntimeError, GEO_POLL, LEAF_PUSH_POLL,
 };
 use ironbus_server::cluster::{
     ClusterConfig, Domain, DomainRef, DomainResolver, FederatedStream, FederationConfig, GeoConfig,
@@ -5086,6 +5086,14 @@ fn cmd_serve(
             // `--gateway-domain`; a gateway is NOT a Raft voter in any peer (the non-federated/non-voter
             // guarantee + the deferred accept-serve side are in `spawn_federation_plane`'s docs).
             let fed_plane = spawn_federation_plane_if_configured(federation, data_dir, config)?;
+            // The cross-cluster SERVE-ACCEPT listener (#728/#732/#733 follow-up): bind a listener that
+            // ACCEPTS inbound `MirrorPull` connections and serves this broker's FEDERATION own-origin
+            // streams READ-ONLY off the engine read plane (captured HERE, before the engine moves into
+            // the append actor). Spawned ONLY when a federation own-origin served stream is configured;
+            // with none NOTHING binds and the broker is byte-for-byte today's. This closes the deferred
+            // SERVE side the #728/#732/#733 PRs flagged (their PULLER side is the planes above).
+            let mut cross_cluster_serve =
+                spawn_cross_cluster_serve_if_configured(&engine, federation, addr)?;
             // Start the additive metadata-cluster plane (#684, V2-C1) IFF cluster flags were given.
             // This is the ONLY place a `ClusterRuntime` is started, on the DISK path, where a
             // concrete `StdFs` and the data dir are known — the runtime roots its `metaraft/` log
@@ -5129,6 +5137,12 @@ fn cmd_serve(
             }
             if let Some(mut plane) = leaf_plane {
                 plane.stop();
+            }
+            // Stop + join the cross-cluster serve-accept listener (#728/#732/#733 follow-up): signal
+            // shutdown and join the accept thread deterministically (its per-connection readers are
+            // detached and exit on the same flag). `Drop` also signals, but the explicit stop joins.
+            if let Some(mut serve) = cross_cluster_serve.take() {
+                serve.stop();
             }
             result
         }
@@ -5398,6 +5412,110 @@ fn spawn_federation_plane_if_configured(
         return Ok(None);
     }
     Ok(Some(spawn_federation_plane(federation, data_dir, config)?))
+}
+
+/// The fixed port offset of the cross-cluster SERVE-ACCEPT listener from the broker's client wire
+/// `--addr` (#728/#732/#733 follow-up): a deterministic address a remote MIRROR / SOURCE / GATEWAY
+/// dials to PULL this broker's served streams, mirroring the data-plane peer listener's own
+/// [`dataplane_addr`] +1 convention so the two derived listeners never collide (+2 here). An operator
+/// points the remote's `--mirror`/`--source`/`--gateway` origin address at `<broker-host>:<port + 2>`.
+#[cfg(unix)]
+const CROSS_CLUSTER_SERVE_PORT_OFFSET: u16 = 2;
+
+/// Derive THIS broker's cross-cluster serve-accept listen address from its client wire `--addr`: the
+/// same resolved host, with the port shifted by [`CROSS_CLUSTER_SERVE_PORT_OFFSET`]. Returns the FIRST
+/// resolved socket address (the bind site picks one). A configured client port of `0` (OS-assigned) has
+/// no stable derived port, so the cross-cluster serve cannot be hosted on it — surfaced as a usage error
+/// so an operator who configured a served stream on an ephemeral `--addr` learns why nothing serves.
+///
+/// # Errors
+/// [`CliError::Usage`] if `--addr` does not resolve, or resolves to an OS-assigned (`:0`) port for which
+/// no stable cross-cluster serve port exists.
+#[cfg(unix)]
+fn cross_cluster_serve_addr(broker_addr: &str) -> Result<std::net::SocketAddr, CliError> {
+    let resolved = broker_addr
+        .to_socket_addrs()
+        .map_err(|e| {
+            CliError::Usage(format!(
+                "`--addr` value `{broker_addr}` could not be resolved for the cross-cluster serve: {e}"
+            ))
+        })?
+        .next()
+        .ok_or_else(|| {
+            CliError::Usage(format!(
+                "`--addr` value `{broker_addr}` resolved to no address for the cross-cluster serve"
+            ))
+        })?;
+    let port = resolved.port();
+    if port == 0 {
+        return Err(CliError::Usage(
+            "a cross-cluster served stream (`--federate` own-origin) needs a fixed broker `--addr` \
+             port; an OS-assigned `:0` port has no stable cross-cluster serve address"
+                .to_string(),
+        ));
+    }
+    let mut serve = resolved;
+    serve.set_port(port.saturating_add(CROSS_CLUSTER_SERVE_PORT_OFFSET));
+    Ok(serve)
+}
+
+/// Spawn the cross-cluster SERVE-ACCEPT listener (#728/#732/#733 follow-up) IFF this broker SERVES a
+/// cross-cluster stream — i.e. it has a FEDERATION own-origin served stream
+/// ([`FederationConfig::served_streams`], the precisely-configured serve side the #733 PR deferred).
+/// With none configured this returns `None` and NOTHING binds — the byte-identical off-feature
+/// guarantee (the broker is byte-for-byte today's). A remote mirror / source / gateway dials
+/// [`cross_cluster_serve_addr`] and sends a `MirrorPull` (wire tag 40); this broker serves the requested
+/// committed records READ-ONLY off the engine's `Arc`-shared off-actor read plane via the geo
+/// `OriginServer` — the served log is NEVER written (the single append actor stays the sole writer).
+///
+/// The `engine` read plane is captured HERE while the engine is still owned (before it moves into the
+/// append actor), exactly as [`spawn_dataplane_serve`] captures it. In this single-stream slice (#693) a
+/// `MirrorPull` for any served stream name resolves to the broker's one default-stream read plane;
+/// mapping named served streams to distinct read planes is the multi-partition follow-up.
+///
+/// The leaf-HUB `LeafPush` accept path is fully wired + tested in
+/// [`CrossClusterServeRuntime`](ironbus_server::cluster::CrossClusterServeRuntime); its CLI enablement
+/// awaits a dedicated hub-serve flag (a leaf hub is NOT the same role as a federation gateway, so it is
+/// not co-enabled here) — see the PR notes. `serve_plane`-only is wired now.
+///
+/// # Errors
+/// [`CliError::Usage`] if the cross-cluster serve address cannot be derived (an unresolved / ephemeral
+/// `--addr`), or [`CliError::Internal`] if the engine read plane cannot be built or the serve listener
+/// cannot bind.
+#[cfg(unix)]
+fn spawn_cross_cluster_serve_if_configured(
+    engine: &Engine<StdFs, SystemClock>,
+    federation: &FederationConfig,
+    broker_addr: &str,
+) -> Result<Option<CrossClusterServeRuntime>, CliError> {
+    // The CONFIG-DRIVEN gate: only a FEDERATION own-origin served stream makes this broker a
+    // cross-cluster ORIGIN that must ACCEPT inbound pulls. Nothing else serves, so with no served stream
+    // NOTHING binds (byte-identical).
+    if federation.served_streams().is_empty() {
+        return Ok(None);
+    }
+
+    // Capture the engine's off-actor read plane NOW, while the engine is still owned here (before it
+    // moves into the append actor). Arc-backed + read-only: the OriginServer serves committed bytes
+    // through it; the single append actor stays the sole writer (single-writer preserved).
+    let read_plane = std::sync::Arc::new(engine.read_plane().map_err(|e| {
+        CliError::Internal(format!("cannot build the cross-cluster serve read plane: {e}"))
+    })?);
+
+    let serve_addr = cross_cluster_serve_addr(broker_addr)?;
+    // `C = SystemClock` annotates the (here-unused) hub-receiver half so the broker's clock type is
+    // fixed; the leaf-hub accept path awaits a dedicated hub-serve flag (see the fn doc): a federation
+    // gateway is not implicitly a leaf hub, so it is not co-enabled here.
+    let serve_config: CrossClusterServeConfig<StdFs, SystemClock> = CrossClusterServeConfig {
+        serve_plane: Some(read_plane),
+        hub_receiver: None,
+    };
+    let runtime = CrossClusterServeRuntime::start(serve_addr, serve_config).map_err(|e| {
+        CliError::Internal(format!(
+            "cannot bind the cross-cluster serve listener on {serve_addr}: {e}"
+        ))
+    })?;
+    Ok(Some(runtime))
 }
 
 /// Construct + spawn the GATEWAY-FEDERATION mirror plane (#626, V2-C7-I4) — one async pull thread per

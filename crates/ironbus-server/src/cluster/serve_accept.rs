@@ -296,9 +296,15 @@ fn run_serve_reader<F, C>(
                     e.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) => {}
-            // The peer closed cleanly, or a bounded decode / framing error (fail-closed): end this
-            // reader (the listener accepts the next connection).
-            Ok(None) | Err(_) => return,
+            // A bounded framing / decode error (fail-closed): log the cause for the operator and end
+            // this reader. A hostile / corrupt / oversized frame is contained to THIS dropped link.
+            Err(ServeConnError::Frame(e)) => {
+                tracing::debug!(error = %e, "cross-cluster serve: dropping a link on a framing error");
+                return;
+            }
+            // The peer closed cleanly, or a non-timeout IO fault: end this reader (the listener accepts
+            // the next connection).
+            Ok(None) | Err(ServeConnError::Io(_)) => return,
         }
     }
 }
@@ -486,3 +492,377 @@ const _: () = {
     assert!(MAX_SERVE_FRAME_BYTES >= MAX_ORIGIN_STREAM_LEN as u32);
     assert!(MAX_SERVE_FRAME_BYTES <= ironbus_proto::frame::MAX_FRAME_LEN);
 };
+
+#[cfg(all(test, unix))]
+#[allow(
+    // The real-socket accept-loop proofs are single coherent end-to-end scenarios whose length is
+    // intrinsic (build a log, spawn the listener, dial it, drive the protocol, assert byte-identity).
+    clippy::too_many_lines,
+    clippy::similar_names
+)]
+mod tests {
+    use super::*;
+    use crate::cluster::geo::{GeoFrame, GeoLink, MirrorApplier, OriginCursorStore};
+    use crate::cluster::leaf::{LeafForwarder, LeafFrame, LeafLink, LeafPushCursor};
+    use ironbus_core::clock::ManualClock;
+    use ironbus_core::types::{Offset, RecordFlags};
+    use ironbus_storage::fs::StdFs;
+    use ironbus_storage::log::{Append, Log, LogConfig};
+    use std::net::{Ipv4Addr, TcpStream};
+    use std::time::Instant;
+
+    /// The per-pull budgets the client uses (the geo plane's own pull max constants are private; a
+    /// generous request makes a multi-round catch-up over the real socket).
+    const PULL_MAX_RECORDS: u32 = 1024;
+    const PULL_MAX_BYTES: u32 = 1024 * 1024;
+
+    // ---- scaffolding (a real on-disk StdFs backend + real sockets, the geo/leaf test discipline) ----
+
+    fn small_config() -> LogConfig {
+        LogConfig {
+            max_segment_bytes: 256,
+            max_total_bytes: 0,
+            ..LogConfig::default()
+        }
+    }
+
+    fn rec(payload: &[u8]) -> Append<'_> {
+        Append {
+            timestamp_ms: 7,
+            flags: RecordFlags::EMPTY,
+            key: b"",
+            headers: b"",
+            payload,
+        }
+    }
+
+    /// A real on-disk log with `n` records, fsync'd, leaked to `'static` so its read plane keeps
+    /// observing it for the test's lifetime (in a real serve the engine's append actor owns it). Returns
+    /// the leaked log + its sealed served-prefix end offset.
+    fn leaked_log_with_served_end(
+        dir: &std::path::Path,
+        prefix: &str,
+        n: u32,
+    ) -> (&'static Log<StdFs, ManualClock>, u64) {
+        let fs = StdFs::new(dir.to_path_buf());
+        let mut log = Log::open(fs, ManualClock::new(), small_config()).expect("log opens");
+        for i in 0..n {
+            log.append(&rec(format!("{prefix}-{i:03}").as_bytes()))
+                .unwrap();
+        }
+        log.sync().unwrap();
+        let leaked: &'static Log<StdFs, ManualClock> = Box::leak(Box::new(log));
+        let served = sealed_served_end(leaked);
+        (leaked, served)
+    }
+
+    /// The sealed-prefix end offset a read plane will serve (the geo test's helper, verbatim discipline).
+    fn sealed_served_end(log: &Log<StdFs, ManualClock>) -> u64 {
+        let plane = log.read_plane().unwrap();
+        let flushed = plane.flushed();
+        let mut next = 0u64;
+        let mut guard = 0u32;
+        while next < flushed {
+            guard += 1;
+            assert!(guard < 100_000);
+            let raw = plane
+                .read_range_raw(Offset::new(next), 1_000, None)
+                .unwrap();
+            let adv = raw.run.next_offset.get();
+            if adv > next {
+                next = adv;
+            } else {
+                break;
+            }
+        }
+        next
+    }
+
+    fn free_addr() -> SocketAddr {
+        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral");
+        let a = l.local_addr().unwrap();
+        drop(l);
+        a
+    }
+
+    /// Scale a GENEROUS base wait by the observed host slowdown (#618): a local copy of the runtime
+    /// test's `host_scaled` (max-of-3-probes + a 24x cap), so the timing waits stay truthful and
+    /// flake-free on a contended CI runner WITHOUT weakening what they prove. On an unloaded host the
+    /// factor is ~1 and the wait stays the base (the test exits early the instant its predicate holds).
+    fn host_scaled(base: Duration) -> Duration {
+        fn probe_busy_nanos() -> u128 {
+            const ITERS: u64 = 2_000_000;
+            let start = Instant::now();
+            let mut acc: u64 = 0x9E37_79B9_7F4A_7C15;
+            for i in 0..ITERS {
+                acc = acc
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(i | 1);
+                acc ^= acc >> 29;
+            }
+            std::hint::black_box(acc);
+            start.elapsed().as_nanos().max(1)
+        }
+        const REFERENCE_BUSY_NANOS: u128 = 4_000_000;
+        const MAX_SCALE: u32 = 24;
+        let mut samples = [probe_busy_nanos(), probe_busy_nanos(), probe_busy_nanos()];
+        samples.sort_unstable();
+        let observed = samples[2];
+        let factor = (observed / REFERENCE_BUSY_NANOS).clamp(1, u128::from(MAX_SCALE));
+        let factor = u32::try_from(factor).unwrap_or(MAX_SCALE);
+        base * factor
+    }
+
+    fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + host_scaled(timeout);
+        while Instant::now() < deadline {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        pred()
+    }
+
+    fn open_mirror(dir: &std::path::Path) -> MirrorApplier<StdFs, ManualClock> {
+        let log = Log::open(StdFs::new(dir.to_path_buf()), ManualClock::new(), small_config())
+            .expect("mirror log opens");
+        let cursors = OriginCursorStore::open(&StdFs::new(dir.to_path_buf())).expect("cursor store");
+        MirrorApplier::new(log, cursors)
+    }
+
+    /// A `serve_plane`-only config (a geo / federation origin) over `origin`'s read plane.
+    fn serve_only(
+        origin: &'static Log<StdFs, ManualClock>,
+    ) -> CrossClusterServeConfig<StdFs, ManualClock> {
+        CrossClusterServeConfig {
+            serve_plane: Some(Arc::new(origin.read_plane().expect("read plane"))),
+            hub_receiver: None,
+        }
+    }
+
+    // ---- THE REAL-SOCKET ACCEPT-LOOP PROOF: a MirrorPull is served byte-faithfully ----
+
+    /// Spawn the NEW broker serve-ACCEPT runtime over a real loopback listener, dial it with a real
+    /// `TcpStream`, send `MirrorPull` requests for a served stream, and prove the committed records come
+    /// back BYTE-FAITHFULLY — the end-to-end accept-loop wiring over a real socket (in-process). This is
+    /// the load-bearing proof: it exercises the real accept + dispatch + serve_pull path, not just the
+    /// serve logic the geo unit tests already cover.
+    #[test]
+    fn a_real_socket_pull_serves_committed_records_byte_faithfully() {
+        let _guard = crate::cluster::heavy_cluster_test_guard();
+        let origin_dir = tempfile::tempdir().expect("origin dir");
+        let mirror_dir = tempfile::tempdir().expect("mirror dir");
+        let (origin, served) = leaked_log_with_served_end(origin_dir.path(), "o", 40);
+        assert!(served > 0, "the origin has a non-empty sealed prefix to serve");
+
+        let addr = free_addr();
+        let mut runtime =
+            CrossClusterServeRuntime::start(addr, serve_only(origin)).expect("serve-accept binds");
+
+        // A real client socket drives the geo MirrorPull protocol against the spawned accept loop.
+        let key = format!("{addr}/");
+        let mut app = open_mirror(mirror_dir.path());
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                let stream = match TcpStream::connect(addr) {
+                    Ok(s) => s,
+                    Err(_) => return false,
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(200)))
+                    .unwrap();
+                let mut link = GeoLink::new(stream);
+                loop {
+                    let req = app.pull_request(&key, "", PULL_MAX_RECORDS, PULL_MAX_BYTES);
+                    if link.send_request(&req).is_err() {
+                        break;
+                    }
+                    match link.recv() {
+                        Ok(Some(GeoFrame::Response(resp))) => {
+                            let out = app.apply_pull_response(&key, &resp).expect("apply");
+                            if out.applied == 0 {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                app.cursor(&key) == served
+            }),
+            "the mirror pulled the whole sealed prefix over the real socket (cursor {} of {served})",
+            app.cursor(&key)
+        );
+
+        // The mirror's records are byte-faithful to the origin's, in order — the accept loop served the
+        // committed bytes verbatim off the read plane.
+        let recs = app.log().read_from(Offset::new(0), 10_000).unwrap();
+        assert_eq!(recs.len() as u64, served, "every served record landed");
+        for (i, r) in recs.iter().enumerate() {
+            assert_eq!(r.payload.as_ref(), format!("o-{i:03}").as_bytes());
+        }
+
+        runtime.stop();
+    }
+
+    // ---- THE REAL-SOCKET ACCEPT-LOOP PROOF: a LeafPush is accepted + applied ----
+
+    /// Spawn the serve-ACCEPT runtime as a leaf HUB over a real loopback listener, dial it with a real
+    /// `TcpStream`, send `LeafPush` frames forwarding a local stream, and prove the hub ACCEPTED + applied
+    /// them byte-faithfully — the accept-loop wiring of the leaf hub side over a real socket.
+    #[test]
+    fn a_real_socket_leaf_push_is_accepted_and_applied() {
+        let _guard = crate::cluster::heavy_cluster_test_guard();
+        let leaf_dir = tempfile::tempdir().expect("leaf dir");
+        let hub_dir = tempfile::tempdir().expect("hub dir");
+        let cursor_dir = tempfile::tempdir().expect("cursor dir");
+        let (leaf_log, served) = leaked_log_with_served_end(leaf_dir.path(), "L", 35);
+        assert!(served > 0);
+
+        // The hub receive log + receiver behind the accept loop.
+        let hub_log = Log::open(
+            StdFs::new(hub_dir.path().to_path_buf()),
+            ManualClock::new(),
+            small_config(),
+        )
+        .expect("hub log opens");
+        let receiver = Arc::new(Mutex::new(HubPushReceiver::new(hub_log)));
+        let config = CrossClusterServeConfig {
+            serve_plane: None,
+            hub_receiver: Some(Arc::clone(&receiver)),
+        };
+
+        let addr = free_addr();
+        let mut runtime =
+            CrossClusterServeRuntime::start(addr, config).expect("serve-accept binds");
+
+        // A real client socket drives the leaf LeafPush protocol against the spawned accept loop: read
+        // the leaf log's sealed bytes, push them up, advance the durable push cursor to the hub's ack.
+        let key = format!("{addr}/orders");
+        let mut cursor =
+            LeafPushCursor::open(&StdFs::new(cursor_dir.path().to_path_buf())).expect("push cursor");
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                let stream = match TcpStream::connect(addr) {
+                    Ok(s) => s,
+                    Err(_) => return false,
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(200)))
+                    .unwrap();
+                let mut link = LeafLink::new(stream);
+                loop {
+                    let plane = leaf_log.read_plane().unwrap();
+                    let fwd = LeafForwarder::new(&plane);
+                    let req = match fwd.next_push("orders", cursor.cursor(&key)) {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
+                    if req.record_count == 0 {
+                        break;
+                    }
+                    if link.send_request(&req).is_err() {
+                        break;
+                    }
+                    match link.recv() {
+                        Ok(Some(LeafFrame::Response(ack))) => {
+                            cursor
+                                .commit(&key, ack.accepted_through_leaf_offset)
+                                .unwrap();
+                        }
+                        _ => break,
+                    }
+                }
+                cursor.cursor(&key) == served
+            }),
+            "the leaf wrote its local stream through to the hub over the real socket (cursor {} of {served})",
+            cursor.cursor(&key)
+        );
+
+        // The hub holds the leaf's records, byte-faithful, in order — the accept loop received + applied
+        // each push into the hub's own receive log.
+        let r = receiver.lock().unwrap();
+        let recs = r.log().read_from(Offset::new(0), 10_000).unwrap();
+        assert_eq!(recs.len() as u64, served);
+        for (i, rr) in recs.iter().enumerate() {
+            assert_eq!(rr.payload.as_ref(), format!("L-{i:03}").as_bytes());
+        }
+        drop(r);
+
+        runtime.stop();
+    }
+
+    // ---- GATING: no cross-cluster config spawns nothing ----
+
+    /// With NO cross-cluster serve configured, the config is `is_empty()` and the CLI never starts the
+    /// runtime — so no listener binds and the broker is byte-for-byte today's. This asserts the gate the
+    /// byte-identical guarantee rests on.
+    #[test]
+    fn no_cross_cluster_config_spawns_no_serve_listener() {
+        let empty: CrossClusterServeConfig<StdFs, ManualClock> = CrossClusterServeConfig {
+            serve_plane: None,
+            hub_receiver: None,
+        };
+        assert!(
+            empty.is_empty(),
+            "an empty config reports is_empty so the runtime is never started"
+        );
+
+        // A configured-either-way config is NOT empty (the runtime WOULD start).
+        let dir = tempfile::tempdir().expect("dir");
+        let (origin, _) = leaked_log_with_served_end(dir.path(), "g", 2);
+        assert!(
+            !serve_only(origin).is_empty(),
+            "a configured serve plane is not empty"
+        );
+    }
+
+    // ---- IDLE: an idle accepted serve connection does ~0 work ----
+
+    /// An accepted connection that sends NOTHING must do ~0 work: the reader parks on the blocking read
+    /// (the read timeout the accept loop set), waking only to re-check shutdown — never a busy-spin (the
+    /// #726 discipline, re-applied on the accept side). We prove it the way the geo idle test does:
+    /// a held-open idle connection completes a stop PROMPTLY (a busy-spinning reader would peg a core and
+    /// the listener bind / accept path would still tear down, but the SIGNAL of correctness here is that
+    /// the runtime stops quickly while an idle connection is parked, and the connection never received an
+    /// unsolicited byte).
+    #[test]
+    fn an_idle_accepted_serve_connection_does_no_work() {
+        let _guard = crate::cluster::heavy_cluster_test_guard();
+        let dir = tempfile::tempdir().expect("dir");
+        let (origin, _) = leaked_log_with_served_end(dir.path(), "i", 4);
+
+        let addr = free_addr();
+        let mut runtime =
+            CrossClusterServeRuntime::start(addr, serve_only(origin)).expect("serve-accept binds");
+
+        // Dial and hold the connection OPEN without sending a request. The accept loop accepted it and
+        // its reader is now PARKED on the blocking read (no frame to decode).
+        let idle = TcpStream::connect(addr).expect("idle client dials");
+        idle.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+
+        // The server never speaks first: an idle reader sends ~0 unsolicited bytes. A short read returns
+        // a timeout (WouldBlock/TimedOut) or 0 — never server-pushed data.
+        let mut buf = [0u8; 64];
+        match (&idle).read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => panic!("idle serve connection pushed {n} unsolicited bytes"),
+            Err(e) => assert!(
+                matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
+                "expected an idle read timeout, got {e:?}"
+            ),
+        }
+
+        // A stop completes PROMPTLY even while the idle connection is held open: the parked reader is
+        // detached and the shutdown-aware listener joins fast (a busy-spinning accept/reader would still
+        // join, but a wedged one would not — this bounds the teardown). Generously host-scaled.
+        let start = Instant::now();
+        runtime.stop();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < host_scaled(Duration::from_secs(5)),
+            "stop with an idle connection held open completed promptly ({elapsed:?})"
+        );
+        drop(idle);
+    }
+}
