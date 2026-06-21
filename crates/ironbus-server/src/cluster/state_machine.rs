@@ -493,6 +493,15 @@ impl MetadataStateMachine {
         self.placements.get(&partition).cloned()
     }
 
+    /// A snapshot of EVERY committed partition placement, keyed by partition id. The data-plane serve
+    /// path (#717) reads this to derive its per-partition role from the committed metadata: the driver
+    /// publishes this snapshot each cycle so the data plane can construct / refresh its roles without
+    /// touching the `RawNode`. Empty until a placement command commits + applies.
+    #[must_use]
+    pub fn placements(&self) -> BTreeMap<u64, Placement> {
+        self.placements.clone()
+    }
+
     /// A config value by key.
     #[must_use]
     pub fn config(&self, key: &str) -> Option<&str> {
