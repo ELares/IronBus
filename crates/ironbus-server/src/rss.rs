@@ -164,7 +164,8 @@ pub fn ram_headroom_ratio_permille(ceiling: u64, rss: Option<u64>) -> i64 {
         (ceiling, Some(rss)) => {
             let headroom = ceiling.saturating_sub(rss);
             // round(headroom * 1000 / ceiling), in u128 so the multiply cannot overflow.
-            let permille = (u128::from(headroom) * u128::from(RATIO_SCALE) + u128::from(ceiling) / 2)
+            let permille = (u128::from(headroom) * u128::from(RATIO_SCALE)
+                + u128::from(ceiling) / 2)
                 / u128::from(ceiling);
             i64::try_from(permille).unwrap_or(i64::from(u32::try_from(RATIO_SCALE).unwrap_or(1000)))
         }
@@ -758,7 +759,10 @@ mod tests {
         // test tolerates rather than failing the build on an exotic environment.
         let dir = std::env::temp_dir();
         if let Some(free) = disk_free_bytes(&dir) {
-            assert!(free > 0, "the temp filesystem should report some free space");
+            assert!(
+                free > 0,
+                "the temp filesystem should report some free space"
+            );
         }
     }
 }

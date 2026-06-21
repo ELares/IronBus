@@ -3725,6 +3725,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
             .streams
             .append_to(&id, message)
             .map_err(EngineError::Storage)?;
+        // Per-stream PRODUCE throughput (#571): one record produced to THIS named stream, keyed by its
+        // name (bounded + overflow-folded so an unbounded stream cardinality cannot OOM the node). The
+        // default stream is counted in `append_no_sync` under the empty label; a named produce never
+        // reaches `append_no_sync` (it routes through the StreamSet), so the two paths never double-count.
+        self.registry.record_stream_produced(stream.as_bytes());
         // ONE coordinated commit tick (#678): K dirtied named streams => K fdatasync barriers,
         // amortized over the batch; a clean stream costs nothing. The default `""` slot is never
         // dirtied here, so this never syncs the root a second time.
@@ -4236,6 +4241,13 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
         // `produced_bytes` keeps its producer-facing LOGICAL meaning regardless of the codec; the
         // stored (post-compression) truth is `durable_record_bytes` and the #118 physical meters.
         self.registry.record_appended();
+        // Per-stream PRODUCE throughput (#571): one record produced to the DEFAULT stream (the empty
+        // name). `append_no_sync` is the single chokepoint every default-stream produce funnels through
+        // (the actor's group-commit drain calls it directly), so counting here counts each produced
+        // record exactly once. A NAMED stream's produce routes through `produce_in_stream` and is
+        // counted there under its own label. Bounded + overflow-folded; allocation-free for the (single)
+        // default-stream label.
+        self.registry.record_stream_produced(b"");
         self.counters.produced += 1;
         let bytes = message.key.len() + message.headers.len() + message.payload.len();
         self.counters.produced_bytes = self
@@ -4552,6 +4564,14 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
     pub fn retry_budget_record_accept(&mut self) {
         let now = self.log.now_monotonic();
         self.backpressure.retry_budget.record_accept(now);
+    }
+
+    /// Records one freshly-appended record's produce ACK LEVEL (#571) into the bounded metric
+    /// registry's fixed three-slot per-ack-level counter (`c0`/`c1`/`c2`). Allocation-free (a
+    /// fixed-index array bump under the single-writer engine lock). Called by the append actor's drain
+    /// on a FRESH append only, so the per-level sum equals the fresh-append count.
+    pub fn record_produce_ack_level(&mut self, level: ironbus_proto::message::AckLevel) {
+        self.registry.record_ack_level(level);
     }
 
     /// The broker-side per-client retry-budget re-check for a SHED request (#69): records one request
@@ -6461,6 +6481,11 @@ impl<F: Filesystem, C: Clock + Clone> Engine<F, C> {
                 // allocation-free, recorded only on a real commit (a fenced ack records nothing).
                 let consume_nanos = self.log.now_monotonic().saturating_sub(now);
                 self.registry.observe_consume_nanos(consume_nanos);
+                // Per-group CONSUME throughput (#571): one record consumed (acked) by this group.
+                // Bounded + overflow-folded, keyed by the group name, allocation-free for an existing
+                // label. Recorded only on a real commit (a fenced ack records nothing), mirroring the
+                // lag-maintenance point above.
+                self.registry.record_group_consumed(group.as_bytes());
                 AckResult::Acked
             }
             AckOutcome::Fenced => AckResult::Fenced,

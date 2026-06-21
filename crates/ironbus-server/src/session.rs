@@ -1171,6 +1171,10 @@ impl Session {
             // fire-and-forget bucket WITHOUT acking, and otherwise appends it durably but sends NO
             // PubAck. Level 1 (and the Level-2-as-Level-1 fallback) leave it clear.
             fire_and_forget,
+            // The produce ACK LEVEL (#571), captured from the wire PUB flags ABOVE (before the
+            // wire-only level bits were masked out of `flags`), so the actor can attribute the
+            // accepted record to its level (c0/c1/c2) for the per-ack-level produce counters.
+            ack_level,
         };
         // LEVEL 0 (no-ack fast path, #495): submit the produce with NO reply channel and return
         // immediately — do NOT park. The producer fired and forgot, so there is no PubAck to write, no
@@ -2820,6 +2824,9 @@ impl Session {
             dedup,
             enqueue_monotonic_nanos: engine.now_monotonic_nanos(),
             fire_and_forget: false,
+            // The produce ACK LEVEL (#571) from the wire PUB flags, for the per-ack-level produce
+            // counters; this named-stream produce path counts it explicitly in the engine job below.
+            ack_level: ironbus_proto::message::pub_ack_level(msg.flags),
         };
         let stream = stream.to_string();
         let outcome = engine.with(move |e| {
@@ -2830,7 +2837,16 @@ impl Session {
                 headers: &append.headers,
                 payload: &append.payload,
             };
-            e.produce_in_stream(&stream, &view)
+            let level = append.ack_level;
+            let result = e.produce_in_stream(&stream, &view);
+            // Per-ack-level PRODUCE throughput (#571) for the named-stream produce path (which does not
+            // route through the actor drain that counts the default path): attribute the accepted record
+            // to its level only on a successful append, so the per-level sum matches the fresh-append
+            // count. Allocation-free under the same engine job.
+            if result.is_ok() {
+                e.record_produce_ack_level(level);
+            }
+            result
         })?;
         match outcome {
             Ok(offset) => {
@@ -3084,6 +3100,9 @@ impl Session {
             dedup,
             enqueue_monotonic_nanos: engine.now_monotonic_nanos(),
             fire_and_forget: false,
+            // The produce ACK LEVEL (#571) from the wire PUB flags, for the per-ack-level produce
+            // counters; this subject-routed produce path counts it explicitly in the engine job below.
+            ack_level: ironbus_proto::message::pub_ack_level(msg.flags),
         };
         let subject = subject.to_string();
         // Move the per-connection resolve cache into the job; the job returns it (and the produce
@@ -3091,7 +3110,15 @@ impl Session {
         let cache = std::mem::take(&mut self.subject_cache);
         let (cache, outcome) = engine.with(move |e| {
             let mut cache = cache;
+            let level = append.ack_level;
             let outcome = resolve_then_produce(e, &mut cache, &subject, &append);
+            // Per-ack-level PRODUCE throughput (#571) for the subject-routed produce path (which runs
+            // synchronously in this engine job, not through the actor drain that counts the default
+            // batched path): count only on a successful append, so the per-level sum matches the
+            // fresh-append count. Allocation-free under the same job.
+            if outcome.is_ok() {
+                e.record_produce_ack_level(level);
+            }
             (cache, outcome)
         })?;
         self.subject_cache = cache;
@@ -8900,6 +8927,7 @@ mod tests {
                 dedup: None,
                 enqueue_monotonic_nanos: 0,
                 fire_and_forget: false,
+                ack_level: ironbus_proto::message::AckLevel::ServerAck,
             })
             .unwrap();
         control.wait_for_sync_gate_entered(1);

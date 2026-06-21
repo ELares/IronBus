@@ -1046,8 +1046,106 @@ fn registry_body(registry: &crate::registry::MetricRegistry, now_monotonic: u64)
         registry.consume_latency(),
     );
     consumer_lag_lines(&mut s, registry);
+    throughput_lines(&mut s, registry);
+    ack_level_lines(&mut s, registry);
     self_monitoring_lines(&mut s, registry, now_monotonic);
     s
+}
+
+/// Renders the per-stream / per-group THROUGHPUT series (#571): records produced per stream
+/// (`ironbus_stream_produced_total{stream}`) and consumed per group
+/// (`ironbus_group_consumed_total{group}`), as monotonic counters with the SAME bounded cardinality
+/// as the consumer-lag series — up to 1024 distinct labels then a `{stream|group="__overflow__"}`
+/// fold (only emitted once a label has been dropped, so a healthy broker omits it), plus the
+/// `ironbus_throughput_labels_dropped_total` cardinality-pressure counter. The `stream`/`group` label
+/// is a bounded, overflow-folded WORK-GROUP / STREAM NAME (NOT a per-message / per-offset value), so
+/// the cardinality is firewall-safe. Both labeled `_total` sample lines carry a label, so they are
+/// pinned only in `FROZEN_METRIC_TYPES` (the unlabeled-`_total` resilience-taxonomy filter excludes
+/// them by construction); the unlabeled `*_labels_dropped_total` is a never-silent cardinality-cap
+/// event, so it is ALSO in `FROZEN_RESILIENCE_COUNTERS`, exactly like `ironbus_consumer_labels_dropped_total`.
+fn throughput_lines(s: &mut String, registry: &crate::registry::MetricRegistry) {
+    let tp = registry.throughput();
+    // Each metric family must be CONTIGUOUS in the exposition (one HELP/TYPE then every sample), so
+    // the produced family and the consumed family are emitted as whole blocks, not interleaved.
+    let _ = writeln!(
+        s,
+        "# HELP ironbus_stream_produced_total Records produced per stream (maintained incrementally, capped cardinality; over-cap streams fold into stream=\"__overflow__\")."
+    );
+    let _ = writeln!(s, "# TYPE ironbus_stream_produced_total counter");
+    tp.for_each_series(|label, produced, _consumed| {
+        let _ = writeln!(
+            s,
+            "ironbus_stream_produced_total{{stream=\"{}\"}} {produced}",
+            escape_label(label)
+        );
+    });
+    if tp.has_overflow() {
+        let _ = writeln!(
+            s,
+            "ironbus_stream_produced_total{{stream=\"{}\"}} {}",
+            crate::registry::OVERFLOW_THROUGHPUT_LABEL,
+            tp.overflow_produced()
+        );
+    }
+    let _ = writeln!(
+        s,
+        "# HELP ironbus_group_consumed_total Records consumed (acked) per work-group (maintained incrementally, capped cardinality; over-cap groups fold into group=\"__overflow__\")."
+    );
+    let _ = writeln!(s, "# TYPE ironbus_group_consumed_total counter");
+    tp.for_each_series(|label, _produced, consumed| {
+        let _ = writeln!(
+            s,
+            "ironbus_group_consumed_total{{group=\"{}\"}} {consumed}",
+            escape_label(label)
+        );
+    });
+    if tp.has_overflow() {
+        let _ = writeln!(
+            s,
+            "ironbus_group_consumed_total{{group=\"{}\"}} {}",
+            crate::registry::OVERFLOW_THROUGHPUT_LABEL,
+            tp.overflow_consumed()
+        );
+    }
+    let _ = writeln!(
+        s,
+        "# HELP ironbus_throughput_labels_dropped_total Stream/group throughput labels refused a distinct series at the cardinality cap (folded into __overflow__)."
+    );
+    let _ = writeln!(s, "# TYPE ironbus_throughput_labels_dropped_total counter");
+    let _ = writeln!(
+        s,
+        "ironbus_throughput_labels_dropped_total {}",
+        tp.labels_dropped()
+    );
+}
+
+/// Renders the per-ack-level (0/1/2) PRODUCE counters (#571): one labeled counter per ack level
+/// (`ironbus_produce_ack_level_total{level="c0|c1|c2"}`), the single-node twin of the cluster
+/// ack-level counters (`ironbus_cluster_ack_total`). The `level` label is a fixed THREE-value enum,
+/// so the cardinality is bounded BY CONSTRUCTION (no overflow fold needed). A labeled `_total`, so its
+/// sample line is excluded from the unlabeled-`_total` resilience-taxonomy test by construction and is
+/// pinned only in `FROZEN_METRIC_TYPES`, exactly like `ironbus_cluster_ack_total`. On a fresh broker
+/// every level is `0` — the series exist (the frozen taxonomy requires them) and report the honest zero.
+fn ack_level_lines(s: &mut String, registry: &crate::registry::MetricRegistry) {
+    use ironbus_proto::message::AckLevel;
+    let acks = registry.ack_levels();
+    let _ = writeln!(
+        s,
+        "# HELP ironbus_produce_ack_level_total Records produced at each per-publish ack level (#494/#571); the `level` label is one of c0|c1|c2 (no-ack / server-ack / server+client-ack). The single-node twin of ironbus_cluster_ack_total."
+    );
+    let _ = writeln!(s, "# TYPE ironbus_produce_ack_level_total counter");
+    // Emit in spectrum order (c0, c1, c2), one labeled sample per level.
+    for (level, label) in [
+        (AckLevel::NoAck, "c0"),
+        (AckLevel::ServerAck, "c1"),
+        (AckLevel::ServerAndClientAck, "c2"),
+    ] {
+        let _ = writeln!(
+            s,
+            "ironbus_produce_ack_level_total{{level=\"{label}\"}} {}",
+            acks.count(level)
+        );
+    }
 }
 
 /// Renders one fixed-bucket [`FixedHistogram`] as a Prometheus histogram (`name`, cumulative `le`
@@ -3773,6 +3871,15 @@ mod tests {
         // The `ironbus_recovery_loss_*` / `ironbus_recovery_data_loss_bytes` series are GAUGES (no
         // `_total`), so they are excluded here too.
         "ironbus_torn_tail_repairs_total",
+        // The per-stream/per-group throughput cardinality-cap counter (#571): a stream/group label
+        // refused a distinct series at the 1024-series cap was folded into `__overflow__`. A
+        // cardinality-pressure signal, never a silent drop, so it belongs in the frozen taxonomy,
+        // exactly like `ironbus_consumer_labels_dropped_total`. The throughput SAMPLE counters
+        // (`ironbus_stream_produced_total{stream}` / `ironbus_group_consumed_total{group}`) and the
+        // per-ack-level counter (`ironbus_produce_ack_level_total{level}`) all carry a LABEL, so their
+        // sample lines are excluded from this unlabeled-`_total` set by construction and pinned only in
+        // `FROZEN_METRIC_TYPES`.
+        "ironbus_throughput_labels_dropped_total",
     ];
 
     #[test]
@@ -3959,6 +4066,15 @@ mod tests {
         ("ironbus_produce_ack_duration_seconds", "histogram"),
         ("ironbus_deliver_duration_seconds", "histogram"),
         ("ironbus_consume_duration_seconds", "histogram"),
+        // Per-stream/per-group throughput counters (#571): the labeled produce/consume sample counters
+        // (the `stream`/`group` label is a bounded, overflow-folded NAME, never a per-message value),
+        // the unlabeled cardinality-cap counter (ALSO in FROZEN_RESILIENCE_COUNTERS), and the labeled
+        // per-ack-level produce counter (the single-node twin of `ironbus_cluster_ack_total`; the
+        // `level` label is a fixed three-value enum, so the cardinality is bounded by construction).
+        ("ironbus_stream_produced_total", "counter"),
+        ("ironbus_group_consumed_total", "counter"),
+        ("ironbus_throughput_labels_dropped_total", "counter"),
+        ("ironbus_produce_ack_level_total", "counter"),
     ];
 
     #[test]
