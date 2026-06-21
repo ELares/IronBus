@@ -3536,7 +3536,7 @@ mod live_runtime_tests {
     /// [`DataPlaneRuntime::start_with_client_gate_aware`] with a POPULATED node-id -> client-address
     /// advertise map redirects a non-led produce to the CURRENT committed leader's CLIENT address (the
     /// `NOT_LEADER` hint). An EMPTY map keeps the hintless redirect (the #735 baseline). The leader's own
-    /// gate proceeds LOCAL (never a false NOT_LEADER). This extends the #735 client-gate-aware harness to
+    /// gate proceeds LOCAL (never a false `NOT_LEADER`). This extends the #735 client-gate-aware harness to
     /// prove the #737 CLI wiring (the `--cluster-peer-client` advertise map) installs into the live gate.
     #[test]
     fn live_follower_gate_redirects_to_the_leaders_client_address_when_advertised() {
@@ -3683,6 +3683,5 @@ mod live_runtime_tests {
         f_rt2.stop();
         f_rt.stop();
         leader_rt.stop();
-        let _ = served_end;
     }
 }

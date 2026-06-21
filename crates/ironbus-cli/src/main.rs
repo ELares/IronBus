@@ -16317,7 +16317,7 @@ mod tests {
         );
     }
 
-    /// No `--cluster-peer-client` = the EMPTY advertise map (the default: the NOT_LEADER redirect is
+    /// No `--cluster-peer-client` = the EMPTY advertise map (the default: the `NOT_LEADER` redirect is
     /// hintless), even with a cluster configured. The byte-identical-off-flag guarantee for #737.
     #[test]
     fn no_cluster_peer_client_is_the_empty_advertise_map() {
@@ -17193,9 +17193,12 @@ mod tests {
     /// PUSHES a local stream's committed records, and the hub ACCEPTS + applies them into its OWN on-disk
     /// receive log under `<data_dir>/leaf-hub/<hex(receive-stream)>/`, byte-faithfully. This extends the
     /// #734 serve-accept real-socket proof to the CLI enablement gate (the flag opens the listener + routes
-    /// LeafPush to the HubPushReceiver).
+    /// `LeafPush` to the `HubPushReceiver`).
+    // A single coherent end-to-end scenario whose length is intrinsic (open the hub engine, enable the
+    // leaf hub, seed a leaf log, drive the push protocol over a real socket, assert byte-identity).
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn leaf_hub_serve_accepts_a_real_leaf_push_into_the_receive_stream() {
         use ironbus_core::types::Offset;
         use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -17260,8 +17263,8 @@ mod tests {
             leaf_log_cfg,
         )
         .expect("leaf log opens");
-        const N: u64 = 40;
-        for i in 0..N {
+        let n: u64 = 40;
+        for i in 0..n {
             leaf_log
                 .append(&Append {
                     timestamp_ms: 7,
