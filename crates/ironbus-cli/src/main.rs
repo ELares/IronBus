@@ -16449,4 +16449,160 @@ mod tests {
         dp.stop();
         runtime.stop();
     }
+
+    /// GATING (the byte-identical guarantee): with NO federation own-origin served stream, the
+    /// cross-cluster serve-accept listener is NOT spawned — nothing binds, the broker is byte-for-byte
+    /// today's. A non-federated config and a peer-MIRROR-only config (no own-origin served stream) both
+    /// gate it OFF.
+    #[cfg(unix)]
+    #[test]
+    fn no_served_stream_spawns_no_cross_cluster_serve() {
+        struct RemoveDirOnDrop(std::path::PathBuf);
+        impl Drop for RemoveDirOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let data_dir = std::env::temp_dir().join(format!(
+            "ironbus-cli-xcluster-gate-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let _guard = RemoveDirOnDrop(data_dir.clone());
+        let config = test_serve_config(64, 1);
+        let engine = open_disk_engine(&data_dir, &config, &[], &[]).expect("disk engine");
+
+        // The NON-federated default: nothing served.
+        let empty = FederationConfig::default();
+        assert!(
+            spawn_cross_cluster_serve_if_configured(&engine, &empty, "127.0.0.1:7700")
+                .expect("gating never errors")
+                .is_none(),
+            "no federation config => no cross-cluster serve listener"
+        );
+
+        // A PEER-MIRROR-only federation (own domain `west`, mirroring east's `events`, serving NOTHING of
+        // its own): served_streams() is empty, so still no serve listener (the no-loop core: a gateway
+        // serves only its OWN origin).
+        let mirror_only = parse_federation_config(
+            Some("west"),
+            &["east=10.0.0.2:7600".to_string()],
+            &["east-events=@east/events".to_string()],
+        )
+        .expect("federation parses");
+        assert!(
+            mirror_only.served_streams().is_empty(),
+            "a peer-mirror-only gateway serves nothing of its own"
+        );
+        assert!(
+            spawn_cross_cluster_serve_if_configured(&engine, &mirror_only, "127.0.0.1:7700")
+                .expect("gating never errors")
+                .is_none(),
+            "a peer-mirror-only federation serves nothing => no listener"
+        );
+    }
+
+    /// The CLI WIRING end-to-end: with a FEDERATION own-origin served stream, the broker spawns the
+    /// cross-cluster serve-accept listener at the derived `--addr + 2` port, a real client `TcpStream`
+    /// CONNECTS to it (proving the accept loop is live), and `stop()` tears it down cleanly. The
+    /// byte-faithful serve over the socket is proven by the serve_accept module's real-socket test; this
+    /// proves the CLI gate + read-plane capture + derived-addr bind + teardown.
+    #[cfg(unix)]
+    #[test]
+    fn a_served_stream_binds_the_cross_cluster_serve_listener_a_client_can_dial() {
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+        use std::time::{Duration, Instant};
+
+        struct RemoveDirOnDrop(std::path::PathBuf);
+        impl Drop for RemoveDirOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let data_dir = std::env::temp_dir().join(format!(
+            "ironbus-cli-xcluster-bind-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let _guard = RemoveDirOnDrop(data_dir.clone());
+        let config = test_serve_config(64, 1);
+        let engine = open_disk_engine(&data_dir, &config, &[], &[]).expect("disk engine");
+
+        // A free client-wire port; the cross-cluster serve binds at port + 2.
+        let client_port = {
+            let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let broker_addr = format!("127.0.0.1:{client_port}");
+        let expected_serve_port = client_port + CROSS_CLUSTER_SERVE_PORT_OFFSET;
+
+        // `west` serves its OWN `orders` (origin domain == own) => served_streams() is non-empty.
+        let federation = parse_federation_config(
+            Some("west"),
+            &[],
+            &["orders=@west/orders".to_string()],
+        )
+        .expect("federation parses");
+        assert_eq!(federation.served_streams().len(), 1, "one own-origin served stream");
+
+        let mut serve = spawn_cross_cluster_serve_if_configured(&engine, &federation, &broker_addr)
+            .expect("serve spawns")
+            .expect("a served stream binds the listener");
+
+        // A real client socket can CONNECT to the spawned accept loop at the derived address — the
+        // accept loop is LIVE. (A produce-and-pull byte-faithful proof over the socket is the
+        // serve_accept module's real-socket test; here we prove the CLI brought the listener up.)
+        let serve_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, expected_serve_port));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut connected = false;
+        while Instant::now() < deadline {
+            if TcpStream::connect(serve_addr).is_ok() {
+                connected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            connected,
+            "a client dialed the cross-cluster serve listener at the derived addr {serve_addr}"
+        );
+
+        // Clean teardown: signal shutdown + join the accept thread.
+        serve.stop();
+    }
+
+    /// An OS-assigned (`:0`) client `--addr` has no stable derived cross-cluster serve port, so a served
+    /// stream on it is a fail-closed usage error (an operator learns why nothing serves) rather than a
+    /// silent no-serve.
+    #[cfg(unix)]
+    #[test]
+    fn an_ephemeral_addr_with_a_served_stream_is_a_usage_error() {
+        struct RemoveDirOnDrop(std::path::PathBuf);
+        impl Drop for RemoveDirOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let data_dir = std::env::temp_dir().join(format!(
+            "ironbus-cli-xcluster-eph-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let _guard = RemoveDirOnDrop(data_dir.clone());
+        let config = test_serve_config(64, 1);
+        let engine = open_disk_engine(&data_dir, &config, &[], &[]).expect("disk engine");
+        let federation = parse_federation_config(
+            Some("west"),
+            &[],
+            &["orders=@west/orders".to_string()],
+        )
+        .expect("federation parses");
+        assert!(matches!(
+            spawn_cross_cluster_serve_if_configured(&engine, &federation, "127.0.0.1:0"),
+            Err(CliError::Usage(_))
+        ));
+    }
 }
