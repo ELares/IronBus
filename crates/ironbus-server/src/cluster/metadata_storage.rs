@@ -235,7 +235,13 @@ impl Core {
     /// Refuses (returns `false`) a STALE snapshot whose index is below our current first index — we
     /// already hold that state and a newer tail, so installing it would REGRESS committed state
     /// (the `SnapshotOutOfDate` guard). The caller surfaces this fail-closed.
-    fn apply_snapshot(&mut self, index: u64, term: u64, conf_state: ConfState, data: Vec<u8>) -> bool {
+    fn apply_snapshot(
+        &mut self,
+        index: u64,
+        term: u64,
+        conf_state: ConfState,
+        data: Vec<u8>,
+    ) -> bool {
         if self.first_index() > index {
             return false; // stale snapshot: we already have this and more.
         }
@@ -345,7 +351,9 @@ impl<F: Filesystem, C: Clock> MetadataLogStorage<F, C> {
             let file = if fs.exists(SNAPSHOT_CHECKPOINT).map_err(StorageError::Io)? {
                 fs.open(SNAPSHOT_CHECKPOINT).map_err(StorageError::Io)?
             } else {
-                let file = fs.create_new(SNAPSHOT_CHECKPOINT).map_err(StorageError::Io)?;
+                let file = fs
+                    .create_new(SNAPSHOT_CHECKPOINT)
+                    .map_err(StorageError::Io)?;
                 fs.sync_dir().map_err(StorageError::Io)?; // the new file's dir entry must be durable
                 file
             };
@@ -625,14 +633,7 @@ impl<F: Filesystem, C: Clock> MetadataLogStorage<F, C> {
             .clone();
 
         // (1) Build + DURABLY persist the snapshot BEFORE dropping any log prefix.
-        let mut snapshot = Snapshot::default();
-        snapshot.data = bytes::Bytes::copy_from_slice(data);
-        {
-            let meta = snapshot.mut_metadata();
-            meta.index = index;
-            meta.term = term;
-            meta.set_conf_state(conf_state);
-        }
+        let snapshot = build_snapshot(index, term, conf_state, data);
         let snapshot_bytes = snapshot.write_to_bytes()?;
         self.snapshot_checkpoint.write(&snapshot_bytes)?;
 
@@ -712,26 +713,21 @@ impl<F: Filesystem, C: Clock> MetadataLogStorage<F, C> {
     fn reclaim_log_prefix(&mut self, snapshot_index: u64) -> Result<(), MetadataStorageError> {
         // Find the protect floor: the lowest IronBus offset of a record that must be RETAINED.
         // Anything strictly below this floor is fully superseded and may be reaped.
-        let records = self
-            .log
-            .read_from(Offset::ZERO, usize::MAX)?;
+        let records = self.log.read_from(Offset::ZERO, usize::MAX)?;
         let mut protect_floor: Option<u64> = None;
         for record in &records {
             let headers = record.headers.as_ref();
             let Some(&kind) = headers.first() else {
                 continue;
             };
-            let retain = match kind {
-                // An ENTRY record is retained iff its raft index is strictly above the snapshot.
-                // The (index, term) are in the header right after the kind byte (LE u64 each).
-                KIND_ENTRY => entry_index_from_header(headers).is_some_and(|idx| idx > snapshot_index),
-                // Conservatively retain ALL state records: the latest one is load-bearing and the
-                // checkpoint-record bytes are tiny, so never reap a segment holding one. (After the
-                // snapshot the group rewrites a fresh STATE record on its next ready cycle, so old
-                // ones drain out of the active segment naturally over time.)
-                KIND_STATE => true,
-                _ => true,
-            };
+            // An ENTRY record is retained iff its raft index is strictly above the snapshot (its
+            // (index, term) are in the header right after the kind byte, LE u64 each). EVERY other
+            // record kind — a STATE checkpoint (the latest is load-bearing; the bytes are tiny) or
+            // any unknown kind — is retained conservatively, so a segment holding one is never
+            // reaped. (After the snapshot the group rewrites a fresh STATE record on its next ready
+            // cycle, so old ones drain out of the active segment naturally over time.)
+            let retain = kind != KIND_ENTRY
+                || entry_index_from_header(headers).is_some_and(|idx| idx > snapshot_index);
             if retain {
                 let off = record.offset.get();
                 protect_floor = Some(protect_floor.map_or(off, |f| f.min(off)));
@@ -748,6 +744,21 @@ impl<F: Filesystem, C: Clock> MetadataLogStorage<F, C> {
         self.log.reap_to_size(1, floor)?;
         Ok(())
     }
+}
+
+/// Build a raft `Snapshot` from its parts (#660): the `data` (serialized state-machine bytes) plus
+/// the `(index, term, conf_state)` metadata. Centralizes the construction so the `mut_metadata`
+/// dance is written once.
+fn build_snapshot(index: u64, term: u64, conf_state: ConfState, data: &[u8]) -> Snapshot {
+    let mut snapshot = Snapshot {
+        data: bytes::Bytes::copy_from_slice(data),
+        ..Snapshot::default()
+    };
+    let meta = snapshot.mut_metadata();
+    meta.index = index;
+    meta.term = term;
+    meta.set_conf_state(conf_state);
+    snapshot
 }
 
 /// Read an `KIND_ENTRY` record's raft index from its header without decoding the protobuf payload.
@@ -938,13 +949,12 @@ impl<F: Filesystem, C: Clock> Storage for MetadataLogStorage<F, C> {
         // If we have a durable data-bearing snapshot at or above the requested index, serve it
         // verbatim (its data is the consistent cut at `snapshot_index`).
         if core.snapshot_index >= request_index && core.snapshot_index > 0 {
-            let mut snapshot = Snapshot::default();
-            snapshot.data = bytes::Bytes::copy_from_slice(&core.snapshot_data);
-            let meta = snapshot.mut_metadata();
-            meta.index = core.snapshot_index;
-            meta.term = core.snapshot_term;
-            meta.set_conf_state(core.conf_state.clone());
-            return Ok(snapshot);
+            return Ok(build_snapshot(
+                core.snapshot_index,
+                core.snapshot_term,
+                core.conf_state.clone(),
+                &core.snapshot_data,
+            ));
         }
         // Otherwise we have no fresh-enough DATA-bearing snapshot to serve; ask raft-rs to retry,
         // by which point the driver's snapshot cadence will have created one covering this index.
@@ -1353,7 +1363,7 @@ mod tests {
                 .create_snapshot_and_compact(6, 3, &sm_bytes("idx6"))
                 .expect("snapshot+compact");
             // The on-disk log still holds all 10 records (single segment, not reaped).
-            assert_eq!(storage.log().durable_record_count() >= 10, true);
+            assert!(storage.log().durable_record_count() >= 10);
         }
 
         // Reopen: the snapshot installs (index 6), and the log replay's pre-snapshot entries (1..=6)
@@ -1416,9 +1426,11 @@ mod tests {
         // Corrupt the snapshot checkpoint file in the metaraft/ subdir (flip bytes across BOTH
         // slots so neither validates) — a torn snapshot.
         let meta_fs = fs.subdir(METADATA_SUBDIR).expect("metaraft subdir");
-        let file = meta_fs.open(SNAPSHOT_CHECKPOINT).expect("open snapshot ckpt");
+        let file = meta_fs
+            .open(SNAPSHOT_CHECKPOINT)
+            .expect("open snapshot ckpt");
         let mut raw = file.snapshot();
-        for b in raw.iter_mut() {
+        for b in &mut raw {
             *b ^= 0xff;
         }
         file.write_all_at(&raw, 0).expect("write corrupted");
@@ -1441,15 +1453,15 @@ mod tests {
         {
             let mut storage = open(&fs, &[1]);
             // A snapshot arriving from a leader at index 30, term 5.
-            let mut snapshot = Snapshot::default();
-            snapshot.data = bytes::Bytes::copy_from_slice(&sm_bytes("recv30"));
-            {
-                let meta = snapshot.mut_metadata();
-                meta.index = 30;
-                meta.term = 5;
-                meta.set_conf_state(conf_state(vec![1, 2, 3], vec![4]));
-            }
-            let installed = storage.install_received_snapshot(&snapshot).expect("install");
+            let snapshot = build_snapshot(
+                30,
+                5,
+                conf_state(vec![1, 2, 3], vec![4]),
+                &sm_bytes("recv30"),
+            );
+            let installed = storage
+                .install_received_snapshot(&snapshot)
+                .expect("install");
             assert!(installed);
             assert_eq!(storage.snapshot_index(), 30);
             assert_eq!(
@@ -1479,21 +1491,16 @@ mod tests {
 
     /// A STALE received snapshot (index below our current first index — we already hold that and a
     /// newer tail) is REFUSED, never regressing committed state (#660 non-negotiable 1,
-    /// fail-closed): the `first_index() > index` `SnapshotOutOfDate` guard, matching MemStorage.
+    /// fail-closed): the `first_index() > index` `SnapshotOutOfDate` guard, matching `MemStorage`.
     #[test]
     fn a_stale_received_snapshot_is_refused() {
         let fs = InMemoryFs::new();
         let mut storage = open(&fs, &[1]);
         // First install a snapshot at index 10, so our first index is 11.
-        let mut newer = Snapshot::default();
-        newer.data = bytes::Bytes::copy_from_slice(&sm_bytes("idx10"));
-        {
-            let meta = newer.mut_metadata();
-            meta.index = 10;
-            meta.term = 2;
-            meta.set_conf_state(conf_state(vec![1], vec![]));
-        }
-        assert!(storage.install_received_snapshot(&newer).expect("install newer"));
+        let newer = build_snapshot(10, 2, conf_state(vec![1], vec![]), &sm_bytes("idx10"));
+        assert!(storage
+            .install_received_snapshot(&newer)
+            .expect("install newer"));
         assert_eq!(storage.first_index().unwrap(), 11);
 
         // A LATER-arriving snapshot at index 5 is stale: it is below our first index (11).

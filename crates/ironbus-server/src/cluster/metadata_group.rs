@@ -256,7 +256,9 @@ impl<F: Filesystem, C: Clock + Clone> MetadataRaftGroup<F, C> {
         // log replay would (#660 non-negotiable 1). A group with no snapshot starts with a fresh SM
         // and recovers entirely from the log, exactly as before.
         let state = match node.store().snapshot_state_bytes() {
-            Some(bytes) if !bytes.is_empty() => MetadataStateMachine::restore_from_snapshot(&bytes)?,
+            Some(bytes) if !bytes.is_empty() => {
+                MetadataStateMachine::restore_from_snapshot(&bytes)?
+            }
             _ => MetadataStateMachine::new(),
         };
 
@@ -1728,7 +1730,7 @@ mod tests {
 
     /// THE GROUP-LAYER COMMITTED-STATE-PRESERVED TEST (#660 non-negotiable 1): commit many metadata
     /// commands on a single-node group, SNAPSHOT + COMPACT, and confirm (a) the log is BOUNDED (its
-    /// retained tail collapses, snapshot_index rises), (b) the live state is unchanged, and (c) a
+    /// retained tail collapses, `snapshot_index` rises), (b) the live state is unchanged, and (c) a
     /// REOPEN over the same durable image (a restart) recovers the IDENTICAL committed state from the
     /// snapshot + the (empty/short) tail — equal to a full replay.
     #[test]

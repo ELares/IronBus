@@ -1082,7 +1082,10 @@ mod tests {
         let sm = populated_sm();
         let bytes = sm.snapshot();
         let restored = MetadataStateMachine::restore_from_snapshot(&bytes).expect("restore");
-        assert_eq!(restored, sm, "the restored state machine equals the original");
+        assert_eq!(
+            restored, sm,
+            "the restored state machine equals the original"
+        );
         assert_eq!(restored.applied_index(), sm.applied_index());
         // Spot-check a representative value from each map survived.
         assert_eq!(restored.role(1), Some(NodeRole::Voter));
@@ -1182,8 +1185,13 @@ mod tests {
 
         // Snapshot-at-6 + tail 7,8: restore the snapshot, then apply only the tail.
         let snapshot = populated_sm().snapshot();
-        let mut from_snap = MetadataStateMachine::restore_from_snapshot(&snapshot).expect("restore");
-        assert_eq!(from_snap.applied_index(), 6, "restored at the snapshot index");
+        let mut from_snap =
+            MetadataStateMachine::restore_from_snapshot(&snapshot).expect("restore");
+        assert_eq!(
+            from_snap.applied_index(),
+            6,
+            "restored at the snapshot index"
+        );
         from_snap.apply(
             7,
             &MetadataCommand::AddNode {
