@@ -91,10 +91,10 @@ use ironbus_server::clock::SystemClock;
 // path, so they follow the same `#[cfg(unix)]` gate as the rest of the broker run.
 #[cfg(unix)]
 use ironbus_server::cluster::{
-    dataplane_addr, push_loop, ClusterAckLevel, ClusterRuntime, DataPlaneRuntime, DataPlaneServer,
-    GeoLink, IsrConfig, LeafForwarder, LeafLink, LeafPushCursor, MetadataCommand, MetadataProposer,
-    MirrorApplier, OriginCursorStore, Placement, ReplicaLogFactory, RuntimeError, GEO_POLL,
-    LEAF_PUSH_POLL,
+    dataplane_addr, push_loop, ClusterAckLevel, ClusterRuntime, CrossClusterServeConfig,
+    CrossClusterServeRuntime, DataPlaneRuntime, DataPlaneServer, GeoLink, IsrConfig, LeafForwarder,
+    LeafLink, LeafPushCursor, MetadataCommand, MetadataProposer, MirrorApplier, OriginCursorStore,
+    Placement, ReplicaLogFactory, RuntimeError, GEO_POLL, LEAF_PUSH_POLL,
 };
 use ironbus_server::cluster::{
     ClusterConfig, Domain, DomainRef, DomainResolver, FederatedStream, FederationConfig, GeoConfig,
@@ -4958,6 +4958,11 @@ fn durability_loss_description(config: &ServeConfig) -> String {
 // health addr, the config-file warnings, the cluster config,
 // the reload source, out) is a distinct concern; a bundling
 // struct would only move the noise.
+#[allow(clippy::too_many_lines)]
+// one linear serve-startup orchestration: bind guards, open the engine, install
+// the read-only mirror set, spawn the geo / leaf / federation / cross-cluster-serve
+// planes + the cluster + data plane, run the broker, then tear each down in order;
+// splitting it would scatter a single startup concern across helpers.
 fn cmd_serve(
     addr: &str,
     data_dir: Option<&Path>,
@@ -5086,6 +5091,14 @@ fn cmd_serve(
             // `--gateway-domain`; a gateway is NOT a Raft voter in any peer (the non-federated/non-voter
             // guarantee + the deferred accept-serve side are in `spawn_federation_plane`'s docs).
             let fed_plane = spawn_federation_plane_if_configured(federation, data_dir, config)?;
+            // The cross-cluster SERVE-ACCEPT listener (#728/#732/#733 follow-up): bind a listener that
+            // ACCEPTS inbound `MirrorPull` connections and serves this broker's FEDERATION own-origin
+            // streams READ-ONLY off the engine read plane (captured HERE, before the engine moves into
+            // the append actor). Spawned ONLY when a federation own-origin served stream is configured;
+            // with none NOTHING binds and the broker is byte-for-byte today's. This closes the deferred
+            // SERVE side the #728/#732/#733 PRs flagged (their PULLER side is the planes above).
+            let mut cross_cluster_serve =
+                spawn_cross_cluster_serve_if_configured(&engine, federation, addr)?;
             // Start the additive metadata-cluster plane (#684, V2-C1) IFF cluster flags were given.
             // This is the ONLY place a `ClusterRuntime` is started, on the DISK path, where a
             // concrete `StdFs` and the data dir are known — the runtime roots its `metaraft/` log
@@ -5129,6 +5142,12 @@ fn cmd_serve(
             }
             if let Some(mut plane) = leaf_plane {
                 plane.stop();
+            }
+            // Stop + join the cross-cluster serve-accept listener (#728/#732/#733 follow-up): signal
+            // shutdown and join the accept thread deterministically (its per-connection readers are
+            // detached and exit on the same flag). `Drop` also signals, but the explicit stop joins.
+            if let Some(mut serve) = cross_cluster_serve.take() {
+                serve.stop();
             }
             result
         }
@@ -5398,6 +5417,112 @@ fn spawn_federation_plane_if_configured(
         return Ok(None);
     }
     Ok(Some(spawn_federation_plane(federation, data_dir, config)?))
+}
+
+/// The fixed port offset of the cross-cluster SERVE-ACCEPT listener from the broker's client wire
+/// `--addr` (#728/#732/#733 follow-up): a deterministic address a remote MIRROR / SOURCE / GATEWAY
+/// dials to PULL this broker's served streams, mirroring the data-plane peer listener's own
+/// [`dataplane_addr`] +1 convention so the two derived listeners never collide (+2 here). An operator
+/// points the remote's `--mirror`/`--source`/`--gateway` origin address at `<broker-host>:<port + 2>`.
+#[cfg(unix)]
+const CROSS_CLUSTER_SERVE_PORT_OFFSET: u16 = 2;
+
+/// Derive THIS broker's cross-cluster serve-accept listen address from its client wire `--addr`: the
+/// same resolved host, with the port shifted by [`CROSS_CLUSTER_SERVE_PORT_OFFSET`]. Returns the FIRST
+/// resolved socket address (the bind site picks one). A configured client port of `0` (OS-assigned) has
+/// no stable derived port, so the cross-cluster serve cannot be hosted on it — surfaced as a usage error
+/// so an operator who configured a served stream on an ephemeral `--addr` learns why nothing serves.
+///
+/// # Errors
+/// [`CliError::Usage`] if `--addr` does not resolve, or resolves to an OS-assigned (`:0`) port for which
+/// no stable cross-cluster serve port exists.
+#[cfg(unix)]
+fn cross_cluster_serve_addr(broker_addr: &str) -> Result<std::net::SocketAddr, CliError> {
+    let resolved = broker_addr
+        .to_socket_addrs()
+        .map_err(|e| {
+            CliError::Usage(format!(
+                "`--addr` value `{broker_addr}` could not be resolved for the cross-cluster serve: {e}"
+            ))
+        })?
+        .next()
+        .ok_or_else(|| {
+            CliError::Usage(format!(
+                "`--addr` value `{broker_addr}` resolved to no address for the cross-cluster serve"
+            ))
+        })?;
+    let port = resolved.port();
+    if port == 0 {
+        return Err(CliError::Usage(
+            "a cross-cluster served stream (`--federate` own-origin) needs a fixed broker `--addr` \
+             port; an OS-assigned `:0` port has no stable cross-cluster serve address"
+                .to_string(),
+        ));
+    }
+    let mut serve = resolved;
+    serve.set_port(port.saturating_add(CROSS_CLUSTER_SERVE_PORT_OFFSET));
+    Ok(serve)
+}
+
+/// Spawn the cross-cluster SERVE-ACCEPT listener (#728/#732/#733 follow-up) IFF this broker SERVES a
+/// cross-cluster stream — i.e. it has a FEDERATION own-origin served stream
+/// ([`FederationConfig::served_streams`], the precisely-configured serve side the #733 PR deferred).
+/// With none configured this returns `None` and NOTHING binds — the byte-identical off-feature
+/// guarantee (the broker is byte-for-byte today's). A remote mirror / source / gateway dials
+/// [`cross_cluster_serve_addr`] and sends a `MirrorPull` (wire tag 40); this broker serves the requested
+/// committed records READ-ONLY off the engine's `Arc`-shared off-actor read plane via the geo
+/// `OriginServer` — the served log is NEVER written (the single append actor stays the sole writer).
+///
+/// The `engine` read plane is captured HERE while the engine is still owned (before it moves into the
+/// append actor), exactly as [`spawn_dataplane_serve`] captures it. In this single-stream slice (#693) a
+/// `MirrorPull` for any served stream name resolves to the broker's one default-stream read plane;
+/// mapping named served streams to distinct read planes is the multi-partition follow-up.
+///
+/// The leaf-HUB `LeafPush` accept path is fully wired + tested in
+/// [`CrossClusterServeRuntime`](ironbus_server::cluster::CrossClusterServeRuntime); its CLI enablement
+/// awaits a dedicated hub-serve flag (a leaf hub is NOT the same role as a federation gateway, so it is
+/// not co-enabled here) — see the PR notes. `serve_plane`-only is wired now.
+///
+/// # Errors
+/// [`CliError::Usage`] if the cross-cluster serve address cannot be derived (an unresolved / ephemeral
+/// `--addr`), or [`CliError::Internal`] if the engine read plane cannot be built or the serve listener
+/// cannot bind.
+#[cfg(unix)]
+fn spawn_cross_cluster_serve_if_configured(
+    engine: &Engine<StdFs, SystemClock>,
+    federation: &FederationConfig,
+    broker_addr: &str,
+) -> Result<Option<CrossClusterServeRuntime>, CliError> {
+    // The CONFIG-DRIVEN gate: only a FEDERATION own-origin served stream makes this broker a
+    // cross-cluster ORIGIN that must ACCEPT inbound pulls. Nothing else serves, so with no served stream
+    // NOTHING binds (byte-identical).
+    if federation.served_streams().is_empty() {
+        return Ok(None);
+    }
+
+    // Capture the engine's off-actor read plane NOW, while the engine is still owned here (before it
+    // moves into the append actor). Arc-backed + read-only: the OriginServer serves committed bytes
+    // through it; the single append actor stays the sole writer (single-writer preserved).
+    let read_plane = std::sync::Arc::new(engine.read_plane().map_err(|e| {
+        CliError::Internal(format!(
+            "cannot build the cross-cluster serve read plane: {e}"
+        ))
+    })?);
+
+    let serve_addr = cross_cluster_serve_addr(broker_addr)?;
+    // `C = SystemClock` annotates the (here-unused) hub-receiver half so the broker's clock type is
+    // fixed; the leaf-hub accept path awaits a dedicated hub-serve flag (see the fn doc): a federation
+    // gateway is not implicitly a leaf hub, so it is not co-enabled here.
+    let serve_config: CrossClusterServeConfig<StdFs, SystemClock> = CrossClusterServeConfig {
+        serve_plane: Some(read_plane),
+        hub_receiver: None,
+    };
+    let runtime = CrossClusterServeRuntime::start(serve_addr, serve_config).map_err(|e| {
+        CliError::Internal(format!(
+            "cannot bind the cross-cluster serve listener on {serve_addr}: {e}"
+        ))
+    })?;
+    Ok(Some(runtime))
 }
 
 /// Construct + spawn the GATEWAY-FEDERATION mirror plane (#626, V2-C7-I4) — one async pull thread per
@@ -16330,5 +16455,159 @@ mod tests {
         // Tears down cleanly: stop the data plane (joins its bootstrap + peer threads) then the runtime.
         dp.stop();
         runtime.stop();
+    }
+
+    /// GATING (the byte-identical guarantee): with NO federation own-origin served stream, the
+    /// cross-cluster serve-accept listener is NOT spawned — nothing binds, the broker is byte-for-byte
+    /// today's. A non-federated config and a peer-MIRROR-only config (no own-origin served stream) both
+    /// gate it OFF.
+    #[cfg(unix)]
+    #[test]
+    fn no_served_stream_spawns_no_cross_cluster_serve() {
+        struct RemoveDirOnDrop(std::path::PathBuf);
+        impl Drop for RemoveDirOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let data_dir = std::env::temp_dir().join(format!(
+            "ironbus-cli-xcluster-gate-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let _guard = RemoveDirOnDrop(data_dir.clone());
+        let config = test_serve_config(64, 1);
+        let engine = open_disk_engine(&data_dir, &config, &[], &[]).expect("disk engine");
+
+        // The NON-federated default: nothing served.
+        let empty = FederationConfig::default();
+        assert!(
+            spawn_cross_cluster_serve_if_configured(&engine, &empty, "127.0.0.1:7700")
+                .expect("gating never errors")
+                .is_none(),
+            "no federation config => no cross-cluster serve listener"
+        );
+
+        // A PEER-MIRROR-only federation (own domain `west`, mirroring east's `events`, serving NOTHING of
+        // its own): served_streams() is empty, so still no serve listener (the no-loop core: a gateway
+        // serves only its OWN origin).
+        let mirror_only = parse_federation_config(
+            Some("west"),
+            &["east=10.0.0.2:7600".to_string()],
+            &["east-events=@east/events".to_string()],
+        )
+        .expect("federation parses");
+        assert!(
+            mirror_only.served_streams().is_empty(),
+            "a peer-mirror-only gateway serves nothing of its own"
+        );
+        assert!(
+            spawn_cross_cluster_serve_if_configured(&engine, &mirror_only, "127.0.0.1:7700")
+                .expect("gating never errors")
+                .is_none(),
+            "a peer-mirror-only federation serves nothing => no listener"
+        );
+    }
+
+    /// The CLI WIRING end-to-end: with a FEDERATION own-origin served stream, the broker spawns the
+    /// cross-cluster serve-accept listener at the derived `--addr + 2` port, a real client `TcpStream`
+    /// CONNECTS to it (proving the accept loop is live), and `stop()` tears it down cleanly. The
+    /// byte-faithful serve over the socket is proven by the `serve_accept` module's real-socket test; this
+    /// proves the CLI gate + read-plane capture + derived-addr bind + teardown.
+    #[cfg(unix)]
+    #[test]
+    fn a_served_stream_binds_the_cross_cluster_serve_listener_a_client_can_dial() {
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+        use std::time::{Duration, Instant};
+
+        struct RemoveDirOnDrop(std::path::PathBuf);
+        impl Drop for RemoveDirOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let data_dir = std::env::temp_dir().join(format!(
+            "ironbus-cli-xcluster-bind-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let _guard = RemoveDirOnDrop(data_dir.clone());
+        let config = test_serve_config(64, 1);
+        let engine = open_disk_engine(&data_dir, &config, &[], &[]).expect("disk engine");
+
+        // A free client-wire port; the cross-cluster serve binds at port + 2.
+        let client_port = {
+            let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let broker_addr = format!("127.0.0.1:{client_port}");
+        let expected_serve_port = client_port + CROSS_CLUSTER_SERVE_PORT_OFFSET;
+
+        // `west` serves its OWN `orders` (origin domain == own) => served_streams() is non-empty.
+        let federation =
+            parse_federation_config(Some("west"), &[], &["orders=@west/orders".to_string()])
+                .expect("federation parses");
+        assert_eq!(
+            federation.served_streams().len(),
+            1,
+            "one own-origin served stream"
+        );
+
+        let mut serve = spawn_cross_cluster_serve_if_configured(&engine, &federation, &broker_addr)
+            .expect("serve spawns")
+            .expect("a served stream binds the listener");
+
+        // A real client socket can CONNECT to the spawned accept loop at the derived address — the
+        // accept loop is LIVE. (A produce-and-pull byte-faithful proof over the socket is the
+        // serve_accept module's real-socket test; here we prove the CLI brought the listener up.)
+        let serve_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, expected_serve_port));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut connected = false;
+        while Instant::now() < deadline {
+            if TcpStream::connect(serve_addr).is_ok() {
+                connected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            connected,
+            "a client dialed the cross-cluster serve listener at the derived addr {serve_addr}"
+        );
+
+        // Clean teardown: signal shutdown + join the accept thread.
+        serve.stop();
+    }
+
+    /// An OS-assigned (`:0`) client `--addr` has no stable derived cross-cluster serve port, so a served
+    /// stream on it is a fail-closed usage error (an operator learns why nothing serves) rather than a
+    /// silent no-serve.
+    #[cfg(unix)]
+    #[test]
+    fn an_ephemeral_addr_with_a_served_stream_is_a_usage_error() {
+        struct RemoveDirOnDrop(std::path::PathBuf);
+        impl Drop for RemoveDirOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let data_dir = std::env::temp_dir().join(format!(
+            "ironbus-cli-xcluster-eph-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let _guard = RemoveDirOnDrop(data_dir.clone());
+        let config = test_serve_config(64, 1);
+        let engine = open_disk_engine(&data_dir, &config, &[], &[]).expect("disk engine");
+        let federation =
+            parse_federation_config(Some("west"), &[], &["orders=@west/orders".to_string()])
+                .expect("federation parses");
+        assert!(matches!(
+            spawn_cross_cluster_serve_if_configured(&engine, &federation, "127.0.0.1:0"),
+            Err(CliError::Usage(_))
+        ));
     }
 }

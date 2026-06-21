@@ -281,6 +281,7 @@ pub mod replication;
 pub mod rereplication;
 pub mod runtime;
 pub mod serve;
+pub mod serve_accept;
 pub mod state_machine;
 pub mod transport;
 
@@ -344,6 +345,7 @@ pub use serve::{
     decode_dataplane_peer_frame, encode_dataplane_peer_frame, DataPlaneLink, DataPlaneRuntime,
     DataPlaneServer, DataPlaneWireError, ReplicaLogFactory, MAX_DATAPLANE_FRAME_BYTES,
 };
+pub use serve_accept::{CrossClusterServeConfig, CrossClusterServeRuntime};
 pub use state_machine::{DecodeError, MetadataCommand, MetadataStateMachine, NodeRole, Placement};
 pub use transport::{
     decode_peer_frame, decode_raft_message, encode_raft_message, PeerLink, PeerRegistry,
